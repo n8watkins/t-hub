@@ -278,7 +278,7 @@ status  Appturnity / Auth Refactor  ~/projects/appturnity  [Preview] [Files] [..
 
 ## 6.10 Rate-limit scheduling / night mode
 
-**1.** Detect Claude rate-limit usage and reset timestamp from structured status data.
+**1.** Detect Claude rate-limit usage and reset timestamp from structured status data. Verified caveat: the statusline `rate_limits.*.resets_at` and `used_percentage` fields are present only for Claude.ai Pro/Max subscriptions and only after the session's first API response. The scheduler must therefore treat the reset time as initially unknown, capture it once a session has made at least one call, and degrade gracefully when the block is absent.
 
 **2.** When a session becomes blocked, show a non-audio overlay/badge asking whether to auto-resume after reset.
 
@@ -472,7 +472,7 @@ Claude stores local JSONL transcripts under `~/.claude/projects/` and removes th
 
 ## 10.3 Existing-session discovery
 
-Claude's Agent SDK exposes session enumeration and metadata such as exact ID, summary, last modified time, branch, cwd, and first prompt across one directory or all projects. TermHub should use this for import and verification while maintaining its own lightweight index for the normal UI. [R6]
+Claude's Agent SDK exposes session enumeration, resume, fork, and a custom session store (`listSessions`, `getSessionInfo`, `getSessionMessages`, `rename`, `tag`). Verified caveat: the SDK metadata surface is thinner than a full catalog — the exact session ID and the message transcript are available, but summary, cwd, branch, and first prompt are **not** returned as session metadata and must be derived by parsing the transcript or by maintaining TermHub's own index. This reinforces the decision to keep a lightweight TermHub index for the normal UI and to use the SDK for import, resume, fork, and verification rather than as the primary metadata source. [R6]
 
 ## 10.4 Worktree truth hierarchy
 
@@ -558,6 +558,9 @@ Claude's UserPromptSubmit hook can add `additionalContext` before a submitted pr
 | 1.1 - Night mode | Resume opted-in work after subscription reset. | Rate-limit overlay; reset scheduler; exact resume; continuation prompts; apply-to-all; cancel/audit safeguards. | A deliberately scheduled session resumes once, at the right time, without duplicating a live session. |
 | 1.5 - Automation and preview | Integrate external browser and agent control. | Managed Chromium; background reload; MCP; open-file prompt context; process attribution improvements. | One preview page per project/session is reused reliably; Claude can organize TermHub within permission boundaries. |
 | 2.0 - Agent operations | Handle deeper context and parallel structures. | Context threshold/handoff policies; subagent/worktree mapping; provider adapters; API usage dashboards. | TermHub can explain and transition complex parallel agent work without relying on terminal motion. |
+
+|   | **Sequencing note (verified 2026-06-13):** Claude Code already ships `SubagentStart`/`SubagentStop` (each carrying a unique `agent_id`), `TaskCreated`/`TaskCompleted`, and `Elicitation` hooks. The read-only parallel-agent awareness listed under 2.0 — orchestrator→subagent tree, per-subagent state, and waiting-on-subagents classification — therefore has its full event substrate available today and should be pulled forward into 0.5/1.0 as a first-class part of the status model rather than deferred. The deeper 2.0 work (context-threshold handoff policies and automated worktree mapping) remains later. |
+| --- | --- |
 
 ## 13.1 Estimated implementation sequence
 
