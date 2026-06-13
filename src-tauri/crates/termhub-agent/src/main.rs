@@ -15,9 +15,10 @@
 //!   Windows app closing, replayed to the core on connect.
 //! - Serve control RPCs: tmux/session registry ([`registry`]), host metrics +
 //!   git/worktree queries ([`host`]).
-//! - Ingest the Claude hook → journal spine (hook handler scripts append to the
-//!   journal file; the agent tails it and forwards new entries — wired in a
-//!   later round; the journal append API is defined now).
+//! - Ingest the Claude hook → journal spine: `--hook <EVENT>` mode reads the
+//!   hook's JSON from stdin, appends a durable journal entry, and exits 0 so
+//!   Claude's turn is never blocked ([`hook`]).
+//! - Stream new journal entries live to the connected core ([`transport`]).
 //!
 //! ## Concurrency / head-of-line blocking
 //! The protocol tags every frame with a [`termhub_protocol::Channel`] and every
@@ -27,29 +28,55 @@
 //! (filled in by a subagent); `main` wires the pieces together.
 
 mod dispatch;
+mod hook;
 mod host;
 mod journal;
 mod registry;
 mod transport;
 
 use std::io::Write;
+use std::sync::Arc;
 
-/// CLI surface. Only `--stdio` is meaningful in 0.5 (run the NDJSON bridge on
-/// stdin/stdout); other modes are reserved.
+/// CLI surface.
+///
+/// ## Modes (mutually exclusive)
+/// - `--stdio`         Run the NDJSON bridge on stdin/stdout (long-lived agent).
+/// - `--hook <EVENT>`  Hook ingest: read one JSON object from stdin, append it
+///                     to the journal, exit 0.  Never blocks; never fails Claude.
+///
+/// ## Shared flags
+/// - `--journal-dir <PATH>`  Override the journal directory (default:
+///                           `~/.termhub/journal`). Used by tests and by the
+///                           core when it relocates the store.
 struct Args {
-    stdio: bool,
-    /// Override the journal directory (default: `~/.termhub/journal`). Used by
-    /// tests and by the core when it relocates the store.
+    /// Which mode to run in.
+    mode: Mode,
+    /// Override the journal directory (default: `~/.termhub/journal`).
     journal_dir: Option<String>,
 }
 
+enum Mode {
+    Stdio,
+    Hook { event: String },
+    None,
+}
+
 fn parse_args() -> Args {
-    let mut stdio = false;
+    let mut mode = Mode::None;
     let mut journal_dir = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--stdio" => stdio = true,
+            "--stdio" => mode = Mode::Stdio,
+            "--hook" => {
+                match it.next() {
+                    Some(event) => mode = Mode::Hook { event },
+                    None => {
+                        eprintln!("termhub-agent: --hook requires an EVENT name argument");
+                        std::process::exit(1);
+                    }
+                }
+            }
             "--journal-dir" => journal_dir = it.next(),
             "--version" | "-V" => {
                 println!("termhub-agent {}", env!("CARGO_PKG_VERSION"));
@@ -60,7 +87,7 @@ fn parse_args() -> Args {
             }
         }
     }
-    Args { stdio, journal_dir }
+    Args { mode, journal_dir }
 }
 
 /// Human-readable agent build string sent in the handshake.
@@ -70,31 +97,53 @@ pub fn agent_version() -> String {
 
 fn main() {
     let args = parse_args();
-    if !args.stdio {
-        eprintln!(
-            "termhub-agent {}: no mode selected; pass --stdio to run the NDJSON bridge.",
-            env!("CARGO_PKG_VERSION")
-        );
-        std::process::exit(2);
-    }
 
-    // Open (or create) the durable journal before serving so we can report its
-    // head sequence in the handshake.
-    let journal_dir = journal::resolve_journal_dir(args.journal_dir.as_deref());
-    let journal = match journal::Journal::open(&journal_dir) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("termhub-agent: failed to open journal at {journal_dir:?}: {e:#}");
-            std::process::exit(1);
+    match args.mode {
+        // ------------------------------------------------------------------
+        // --hook <EVENT>: short-lived hook ingest.  MUST exit 0 always.
+        // ------------------------------------------------------------------
+        Mode::Hook { event } => {
+            if let Err(e) = hook::run(&event, args.journal_dir.as_deref()) {
+                eprintln!("termhub-agent --hook {event}: unexpected error: {e:#}");
+            }
+            // Always exit 0 — never fail Claude's turn.
+            std::process::exit(0);
         }
-    };
 
-    if let Err(e) = transport::serve_stdio(journal) {
-        // A clean EOF on stdin (core closed the pipe) is a normal shutdown, not
-        // an error; `serve_stdio` returns Ok in that case. A real error here
-        // means the loop itself failed.
-        eprintln!("termhub-agent: stdio bridge exited with error: {e:#}");
-        let _ = std::io::stderr().flush();
-        std::process::exit(1);
+        // ------------------------------------------------------------------
+        // --stdio: long-lived NDJSON bridge.
+        // ------------------------------------------------------------------
+        Mode::Stdio => {
+            let journal_dir = journal::resolve_journal_dir(args.journal_dir.as_deref());
+            let journal = match journal::Journal::open(&journal_dir) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!(
+                        "termhub-agent: failed to open journal at {journal_dir:?}: {e:#}"
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+            if let Err(e) = transport::serve_stdio(Arc::new(journal)) {
+                // A clean EOF on stdin (core closed the pipe) is a normal
+                // shutdown, not an error; `serve_stdio` returns Ok in that
+                // case. A real error here means the loop itself failed.
+                eprintln!("termhub-agent: stdio bridge exited with error: {e:#}");
+                let _ = std::io::stderr().flush();
+                std::process::exit(1);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // No mode selected.
+        // ------------------------------------------------------------------
+        Mode::None => {
+            eprintln!(
+                "termhub-agent {}: no mode selected; pass --stdio or --hook <EVENT>.",
+                env!("CARGO_PKG_VERSION")
+            );
+            std::process::exit(2);
+        }
     }
 }
