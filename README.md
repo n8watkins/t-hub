@@ -5,6 +5,7 @@ TermHub is a **terminal-first command center for running and supervising many pe
 ## Contents
 
 - **[PRD.md](./PRD.md)** — TermHub Detailed Product Requirements Document, v1.0 (June 13, 2026). Source-of-truth product and implementation specification.
+- **[REVIEW.md](./REVIEW.md)** — Technical review of the PRD: strengths, ranked risks, and Claude Code integration assumptions to validate.
 
 The PRD was authored in Microsoft Word and converted to Markdown (headings, tables, lists, code blocks, and reference links preserved) so it can be reviewed and planned against directly in the repo.
 
