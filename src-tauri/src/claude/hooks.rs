@@ -114,36 +114,157 @@ pub fn handler_script(agent_bin: &str, hook_event: &str) -> String {
 /// all [`HOOK_EVENTS`], each pointing at the rendered handler and tagged with
 /// [`TERMHUB_HOOK_MARKER`].
 ///
-/// SUBAGENT(claude-adapter): produce the real per-event matcher objects in the
-/// shape Claude expects (`{ "hooks": { "<Event>": [ { "hooks": [ { "type":
-/// "command", "command": "<script>" } ] } ] } }`), each carrying the marker.
-pub fn termhub_hooks_fragment(_agent_bin: &str) -> serde_json::Value {
-    // Stub: an empty object. The real fragment is built by the subagent.
-    serde_json::json!({ "hooks": {} })
+/// ## Command-string convention
+/// The `command` value placed into settings is a one-liner:
+/// `<agent_bin> --hook <EVENT> # __termhub_managed__`
+///
+/// This embeds the marker directly in the command string so `remove_from_settings`
+/// can identify our entries by scanning command strings, without needing to parse
+/// the script body. The `handler_script` function renders a fuller bash script
+/// that a caller can write to disk; that script also carries the marker, but for
+/// settings.json entries we use the compact one-liner.
+///
+/// ## Matcher-group shape emitted
+/// ```json
+/// {
+///   "hooks": {
+///     "SessionStart": [
+///       { "matcher": "*", "hooks": [ { "type": "command", "command": "<cmd>" } ] }
+///     ],
+///     ...
+///   }
+/// }
+/// ```
+/// `"matcher": "*"` is included on every event for consistency; Claude Code
+/// ignores it on events that don't support matchers, so it is harmless.
+pub fn termhub_hooks_fragment(agent_bin: &str) -> serde_json::Value {
+    let mut events_map = serde_json::Map::new();
+    for event in HOOK_EVENTS {
+        let command = format!(
+            "{bin} --hook {event} # {marker}",
+            bin = agent_bin,
+            event = event,
+            marker = TERMHUB_HOOK_MARKER,
+        );
+        let group = serde_json::json!([{
+            "matcher": "*",
+            "hooks": [{ "type": "command", "command": command }]
+        }]);
+        events_map.insert(event.to_string(), group);
+    }
+    serde_json::json!({ "hooks": events_map })
+}
+
+/// Return true if a matcher-group object contains any TermHub-managed command.
+///
+/// A group is TermHub-managed when at least one of its inner `hooks[].command`
+/// strings contains [`TERMHUB_HOOK_MARKER`].
+fn group_is_termhub(group: &serde_json::Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map(|inner_hooks| {
+            inner_hooks.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.contains(TERMHUB_HOOK_MARKER))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Non-destructively merge the TermHub hooks into an existing settings.json
-/// value, returning the merged value. Must preserve every non-TermHub key and
-/// every user hook entry; only add/refresh entries tagged with the marker.
+/// value, returning the merged value.
 ///
-/// SUBAGENT(claude-adapter): implement the deep merge + idempotency (re-running
-/// install must not duplicate entries) and round-trip-test against a settings
-/// file that already has user hooks.
+/// ## Algorithm
+/// 1. Clone `existing` (or start from `{}` if it is not an object).
+/// 2. Ensure a top-level `"hooks"` object exists, preserving all other keys.
+/// 3. For each event in [`HOOK_EVENTS`]:
+///    - Keep the event's current array (user-authored groups survive).
+///    - Remove any pre-existing TermHub groups (identified by the marker) to
+///      avoid duplicates on re-install.
+///    - Append our fresh TermHub matcher-group.
+///
+/// ## Idempotency
+/// Running install twice yields exactly ONE TermHub group per event (the old one
+/// is dropped before the fresh one is appended), while user groups are never
+/// touched.
+///
+/// ## Preservation
+/// Every non-hook top-level key in `existing` (e.g. `model`, `permissions`,
+/// `cleanupPeriodDays`) is carried through unchanged.
 pub fn merge_into_settings(
     existing: &serde_json::Value,
-    _agent_bin: &str,
+    agent_bin: &str,
 ) -> serde_json::Value {
-    // Stub: return the existing settings unchanged (no-op merge) so callers
-    // compile and an accidental call is non-destructive.
-    existing.clone()
+    // Start from existing (clone) or an empty object if existing is not an object.
+    let mut root: serde_json::Map<String, serde_json::Value> = existing
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+
+    // Ensure the top-level "hooks" key is an object.
+    let hooks_obj: &mut serde_json::Map<String, serde_json::Value> = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("hooks must be an object");
+
+    let fragment = termhub_hooks_fragment(agent_bin);
+    let fragment_hooks = fragment["hooks"].as_object().expect("fragment has hooks");
+
+    for event in HOOK_EVENTS {
+        // Get the new TermHub group for this event from the fragment.
+        let new_termhub_group = &fragment_hooks[*event].as_array().expect("array")[0].clone();
+
+        // Get or create the event's group array.
+        let event_array: &mut Vec<serde_json::Value> = hooks_obj
+            .entry(event.to_string())
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .expect("event value must be an array");
+
+        // Drop any pre-existing TermHub groups (idempotency).
+        event_array.retain(|g| !group_is_termhub(g));
+
+        // Append the fresh TermHub group.
+        event_array.push(new_termhub_group.clone());
+    }
+
+    serde_json::Value::Object(root)
 }
 
 /// Remove exactly the TermHub-tagged hook entries from a settings.json value
-/// (clean uninstall), leaving the user's own hooks intact.
+/// (clean uninstall), leaving user-authored hooks and all non-hook keys intact.
 ///
-/// SUBAGENT(claude-adapter): strip entries whose command contains the marker.
+/// For each event array under `hooks`, matcher-groups whose any inner
+/// `hooks[].command` contains [`TERMHUB_HOOK_MARKER`] are dropped. If an event's
+/// array becomes empty the event key is removed entirely. All user (non-marker)
+/// groups are preserved, as are all top-level keys outside `hooks`.
 pub fn remove_from_settings(existing: &serde_json::Value) -> serde_json::Value {
-    existing.clone()
+    let mut root: serde_json::Map<String, serde_json::Value> = existing
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(hooks_val) = root.get_mut("hooks") {
+        if let Some(hooks_obj) = hooks_val.as_object_mut() {
+            // For each event, drop TermHub groups.
+            hooks_obj.retain(|_event, groups_val| {
+                if let Some(groups) = groups_val.as_array_mut() {
+                    groups.retain(|g| !group_is_termhub(g));
+                    // Remove the event key if no groups remain.
+                    !groups.is_empty()
+                } else {
+                    // Non-array value: leave untouched.
+                    true
+                }
+            });
+        }
+    }
+
+    serde_json::Value::Object(root)
 }
 
 #[cfg(test)]
@@ -191,5 +312,209 @@ mod tests {
         assert!(s.contains(TERMHUB_HOOK_MARKER));
         assert!(s.contains("--hook SessionStart"));
         assert!(s.starts_with("#!/usr/bin/env bash"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // termhub_hooks_fragment
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn fragment_has_all_15_events_with_marker() {
+        let bin = "/usr/local/bin/termhub-agent";
+        let frag = termhub_hooks_fragment(bin);
+        let hooks = frag["hooks"].as_object().expect("hooks must be object");
+        assert_eq!(hooks.len(), HOOK_EVENTS.len());
+        for event in HOOK_EVENTS {
+            let groups = hooks[*event].as_array().expect("event must be array");
+            assert_eq!(groups.len(), 1, "event {event} should have exactly 1 group");
+            let cmd = groups[0]["hooks"][0]["command"]
+                .as_str()
+                .expect("command must be string");
+            assert!(
+                cmd.contains(TERMHUB_HOOK_MARKER),
+                "command for {event} must contain marker"
+            );
+            assert!(
+                cmd.contains(&format!("--hook {event}")),
+                "command for {event} must contain --hook <EVENT>"
+            );
+            assert_eq!(
+                groups[0]["matcher"].as_str(),
+                Some("*"),
+                "matcher for {event} must be *"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // merge_into_settings — empty base
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn merge_into_empty_produces_all_15_events() {
+        let bin = "/usr/local/bin/termhub-agent";
+        let result = merge_into_settings(&serde_json::json!({}), bin);
+        let hooks = result["hooks"].as_object().expect("hooks must be object");
+        assert_eq!(
+            hooks.len(),
+            HOOK_EVENTS.len(),
+            "all 15 events must be present after merging into empty"
+        );
+        for event in HOOK_EVENTS {
+            let groups = hooks[*event].as_array().expect("event must be array");
+            assert_eq!(groups.len(), 1);
+            let cmd = groups[0]["hooks"][0]["command"]
+                .as_str()
+                .expect("command string");
+            assert!(
+                cmd.contains(TERMHUB_HOOK_MARKER),
+                "command for {event} must carry marker"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // merge_into_settings — preservation
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn merge_preserves_user_hooks_and_non_hook_keys() {
+        let bin = "/usr/local/bin/termhub-agent";
+
+        // Pre-existing settings: a non-hook keys, a user PreToolUse group, and a
+        // user Stop group (no marker — this is a user-authored Stop handler).
+        let existing = serde_json::json!({
+            "model": "opus",
+            "cleanupPeriodDays": 30,
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo user_pretooluse" }] }
+                ],
+                "Stop": [
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": "echo user_stop_handler" }] }
+                ]
+            }
+        });
+
+        let result = merge_into_settings(&existing, bin);
+
+        // Non-hook keys must be preserved.
+        assert_eq!(result["model"].as_str(), Some("opus"));
+        assert_eq!(result["cleanupPeriodDays"].as_u64(), Some(30));
+
+        let hooks = result["hooks"].as_object().expect("hooks");
+
+        // User PreToolUse group must survive (PreToolUse is not in HOOK_EVENTS,
+        // so it should be left completely untouched).
+        let pretooluse = hooks["PreToolUse"].as_array().expect("array");
+        assert_eq!(pretooluse.len(), 1, "user PreToolUse group must be preserved");
+        assert_eq!(
+            pretooluse[0]["hooks"][0]["command"].as_str(),
+            Some("echo user_pretooluse")
+        );
+
+        // User Stop group (no marker) must survive alongside the TermHub Stop group.
+        let stop_groups = hooks["Stop"].as_array().expect("array");
+        let user_stop_groups: Vec<_> = stop_groups
+            .iter()
+            .filter(|g| !group_is_termhub(g))
+            .collect();
+        assert_eq!(user_stop_groups.len(), 1, "user Stop group must be preserved");
+        assert_eq!(
+            user_stop_groups[0]["hooks"][0]["command"].as_str(),
+            Some("echo user_stop_handler")
+        );
+
+        // TermHub Stop group must also be present.
+        let termhub_stop_groups: Vec<_> =
+            stop_groups.iter().filter(|g| group_is_termhub(g)).collect();
+        assert_eq!(termhub_stop_groups.len(), 1, "TermHub Stop group must be present");
+    }
+
+    // ---------------------------------------------------------------------------
+    // merge_into_settings — idempotency
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn double_merge_produces_exactly_one_termhub_group_per_event() {
+        let bin = "/usr/local/bin/termhub-agent";
+        let base = serde_json::json!({});
+
+        // First merge.
+        let after_first = merge_into_settings(&base, bin);
+        // Second merge on top of the first result.
+        let after_second = merge_into_settings(&after_first, bin);
+
+        let hooks = after_second["hooks"].as_object().expect("hooks");
+        for event in HOOK_EVENTS {
+            let groups = hooks[*event].as_array().expect("array");
+            let termhub_count = groups.iter().filter(|g| group_is_termhub(g)).count();
+            assert_eq!(
+                termhub_count, 1,
+                "event {event} must have exactly 1 TermHub group after double-merge, got {termhub_count}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // remove_from_settings
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn remove_strips_termhub_groups_and_preserves_user_entries() {
+        let bin = "/usr/local/bin/termhub-agent";
+
+        // Build the same "existing" settings as the preservation test, then merge.
+        let existing = serde_json::json!({
+            "model": "opus",
+            "cleanupPeriodDays": 30,
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo user_pretooluse" }] }
+                ],
+                "Stop": [
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": "echo user_stop_handler" }] }
+                ]
+            }
+        });
+        let merged = merge_into_settings(&existing, bin);
+
+        // Now remove TermHub entries.
+        let cleaned = remove_from_settings(&merged);
+
+        // Non-hook keys preserved.
+        assert_eq!(cleaned["model"].as_str(), Some("opus"));
+        assert_eq!(cleaned["cleanupPeriodDays"].as_u64(), Some(30));
+
+        let hooks = cleaned["hooks"].as_object().expect("hooks");
+
+        // PreToolUse: user group remains, no TermHub group was ever there.
+        let pretooluse = hooks["PreToolUse"].as_array().expect("array");
+        assert_eq!(pretooluse.len(), 1);
+        assert_eq!(
+            pretooluse[0]["hooks"][0]["command"].as_str(),
+            Some("echo user_pretooluse")
+        );
+
+        // Stop: TermHub group stripped, user group intact.
+        let stop_groups = hooks["Stop"].as_array().expect("array");
+        assert_eq!(stop_groups.len(), 1, "only user Stop group should remain");
+        assert_eq!(
+            stop_groups[0]["hooks"][0]["command"].as_str(),
+            Some("echo user_stop_handler")
+        );
+
+        // All 15 TermHub-managed events should have no TermHub groups remaining.
+        for event in HOOK_EVENTS {
+            if let Some(groups_val) = hooks.get(*event) {
+                let groups = groups_val.as_array().expect("array");
+                let termhub_count = groups.iter().filter(|g| group_is_termhub(g)).count();
+                assert_eq!(
+                    termhub_count, 0,
+                    "event {event} must have 0 TermHub groups after remove"
+                );
+            }
+            // If the key was removed entirely (empty array → key removed), that's also fine.
+        }
     }
 }

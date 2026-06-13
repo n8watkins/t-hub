@@ -26,12 +26,16 @@ mod connection;
 
 pub use connection::ConnectionState;
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 use parking_lot::Mutex;
-use termhub_protocol::{AgentRequest, AgentResponse, EventJournalEntry, HostMetrics, WorktreeInfo};
+use termhub_protocol::{
+    AgentRequest, AgentResponse, Channel, CoreFrame, CoreToAgent, EventJournalEntry, Hello,
+    HostMetrics, Priority, WorktreeInfo, PROTOCOL_VERSION,
+};
 
 use crate::supervision::Supervisor;
+use connection::{spawn_child, spawn_reader, write_frame, TransportHandles};
 
 /// How the core reaches the agent on this platform.
 ///
@@ -78,6 +82,9 @@ struct BridgeInner {
     /// Highest journal sequence the core has durably consumed (the replay
     /// cursor). Advanced as entries arrive; persisted by workstream G later.
     journal_cursor: Mutex<u64>,
+    /// Live transport handles (stdin writer + correlation map). `None` when
+    /// disconnected. Set by `connect()`, read by `request()`.
+    transport: Mutex<Option<Arc<TransportHandles>>>,
 }
 
 impl Default for AgentBridge {
@@ -87,6 +94,7 @@ impl Default for AgentBridge {
                 supervisor: Mutex::new(Supervisor::new()),
                 state: Mutex::new(ConnectionState::Disconnected),
                 journal_cursor: Mutex::new(0),
+                transport: Mutex::new(None),
             }),
         }
     }
@@ -115,19 +123,167 @@ impl AgentBridge {
 
     /// Launch the agent and complete the handshake.
     ///
-    /// SUBAGENT(agent-bridge): spawn [`launch_argv`], wire reader/writer threads,
-    /// send `Hello`, await `Ready`, then (if the agent's `journal_head_seq` >
-    /// our cursor) issue a `ReplayJournal`. Set [`ConnectionState`] accordingly.
-    pub fn connect(&self, _distro: &str) -> Result<(), String> {
-        Err("agent bridge transport not yet implemented (SUBAGENT(agent-bridge))".to_string())
+    /// Spawns the child from [`launch_argv`] with piped stdin/stdout (stderr
+    /// inherited). Starts a reader thread that dispatches incoming
+    /// [`termhub_protocol::AgentToCore`] frames. Sends `Hello`, waits for
+    /// `Ready`, and if the agent's `journal_head_seq` is ahead of our cursor,
+    /// sends `ReplayJournal` and waits for `ReplayComplete` before setting the
+    /// state to `Live`.
+    ///
+    /// The `TERMHUB_AGENT_BIN` env var overrides argv[0] for tests / dev
+    /// (see [`connection::spawn_child`]).
+    pub fn connect(&self, distro: &str) -> Result<(), String> {
+        // Build argv and spawn child.
+        let argv = launch_argv(distro);
+        let mut child = spawn_child(argv).map_err(|e| format!("failed to spawn agent: {e}"))?;
+
+        // Take ownership of the stdio handles before the child handle moves
+        // into TransportHandles.
+        let child_stdin = child
+            .stdin
+            .take()
+            .ok_or("child has no stdin pipe")?;
+        let child_stdout = child
+            .stdout
+            .take()
+            .ok_or("child has no stdout pipe")?;
+
+        // Build the shared correlation map and next-id counter.
+        let pending = Arc::new(connection::CorrelationMap::new(
+            std::collections::HashMap::new(),
+        ));
+        let next_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+        // Build transport handles (Arc so request() can clone a reference).
+        let handles = Arc::new(TransportHandles {
+            stdin: Mutex::new(child_stdin),
+            pending: Arc::clone(&pending),
+            next_id: Arc::clone(&next_id),
+            child: Mutex::new(child),
+        });
+
+        // One-shot channels for the handshake/replay synchronisation.
+        let (ready_tx, ready_rx) = mpsc::channel::<u64>();
+        let (replay_done_tx, replay_done_rx) = mpsc::channel::<u64>();
+
+        // Spawn the reader thread.  It captures a clone of `self` (AgentBridge
+        // is Clone/Arc-backed) so it can call consume_journal_entry.
+        spawn_reader(
+            child_stdout,
+            Arc::clone(&pending),
+            self.clone(),
+            ready_tx,
+            replay_done_tx,
+        );
+
+        // Set state and store transport handles.
+        *self.inner.state.lock() = ConnectionState::Handshaking;
+        *self.inner.transport.lock() = Some(Arc::clone(&handles));
+
+        // --- Handshake: send Hello ---
+        {
+            let hello = CoreFrame {
+                channel: Channel::Control,
+                msg: CoreToAgent::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    core_version: "termhub 0.5.0".to_string(),
+                }),
+            };
+            let mut stdin_guard = handles.stdin.lock();
+            write_frame(&mut *stdin_guard, &hello)
+                .map_err(|e| format!("failed to write Hello: {e}"))?;
+        }
+
+        // Wait for Ready (10 s timeout).
+        let journal_head_seq = ready_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|_| "timed out waiting for Ready from agent")?;
+
+        // If the agent has journal entries we haven't consumed, request replay.
+        let cursor = self.journal_cursor();
+        if journal_head_seq > cursor {
+            *self.inner.state.lock() = ConnectionState::Replaying;
+
+            let replay_frame = CoreFrame {
+                channel: Channel::Control,
+                msg: CoreToAgent::ReplayJournal { after_seq: cursor },
+            };
+            {
+                let mut stdin_guard = handles.stdin.lock();
+                write_frame(&mut *stdin_guard, &replay_frame)
+                    .map_err(|e| format!("failed to write ReplayJournal: {e}"))?;
+            }
+
+            // Wait for ReplayComplete (30 s — replay can be large).
+            replay_done_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|_| "timed out waiting for ReplayComplete from agent")?;
+        }
+
+        *self.inner.state.lock() = ConnectionState::Live;
+        Ok(())
     }
 
-    /// Send a request and await its correlated response (blocking with a
-    /// timeout). The priority hint lets the scheduler interleave it appropriately.
+    /// Send a request and await its correlated response (blocking, 10 s timeout).
     ///
-    /// SUBAGENT(agent-bridge): implement correlation by [`RequestId`].
-    pub fn request(&self, _req: AgentRequest) -> Result<AgentResponse, String> {
-        Err("agent bridge not connected (SUBAGENT(agent-bridge))".to_string())
+    /// Allocates the next [`termhub_protocol::RequestId`] from an atomic
+    /// counter, registers a one-shot [`mpsc`] sender in the correlation map,
+    /// serializes the [`CoreFrame`] to the child's stdin (behind a `Mutex` so
+    /// concurrent callers don't interleave bytes), then blocks on the receiver.
+    ///
+    /// **Channel / Priority**: `Channel::Control` and `Priority::Normal` are
+    /// used for all requests today. A future scheduler can inspect the request
+    /// body to select the appropriate channel and priority before writing.
+    pub fn request(&self, req: AgentRequest) -> Result<AgentResponse, String> {
+        // Grab the transport handles (returns an error if not connected).
+        let handles = {
+            let guard = self.inner.transport.lock();
+            guard.as_ref()
+                .cloned()
+                .ok_or_else(|| "agent bridge not connected".to_string())?
+        };
+
+        // Allocate a unique request id.
+        let id = handles.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Register the one-shot channel before writing so the reader thread
+        // can never race ahead of us.
+        let (tx, rx) = mpsc::channel::<AgentResponse>();
+        handles.pending.lock().insert(id, tx);
+
+        // Build and write the request frame.
+        // NOTE: Channel::Control and Priority::Normal are used for all ops
+        // today. Channel and Priority are fully serialized and echoed by the
+        // agent; a future priority scheduler uses them to reorder the outbound
+        // queue without protocol changes.
+        let frame = CoreFrame {
+            channel: Channel::Control,
+            msg: CoreToAgent::Request {
+                id,
+                priority: Priority::Normal,
+                body: req,
+            },
+        };
+
+        {
+            let mut stdin_guard = handles.stdin.lock();
+            write_frame(&mut *stdin_guard, &frame).map_err(|e| {
+                // Remove the dangling correlation entry on write failure.
+                handles.pending.lock().remove(&id);
+                format!("failed to write request id={id}: {e}")
+            })?;
+        }
+
+        // Block until the reader delivers the response or we time out.
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(response) => Ok(response),
+            Err(_) => {
+                // Clean up the correlation entry so the reader doesn't deliver
+                // a stale response after we've given up.
+                handles.pending.lock().remove(&id);
+                Err(format!("request id={id} timed out after 10 seconds"))
+            }
+        }
     }
 
     /// Convenience: fetch a host metrics snapshot.
