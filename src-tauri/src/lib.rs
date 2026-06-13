@@ -1,4 +1,5 @@
 mod commands;
+mod events;
 mod pty;
 mod tmux;
 
