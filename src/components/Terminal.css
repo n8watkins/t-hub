@@ -1,0 +1,20 @@
+/* Make the xterm instance fill the tile container so FitAddon measures the full
+ * tile and the viewport scrolls within it rather than overflowing the layout. */
+.termhub-terminal {
+  position: relative;
+  overflow: hidden;
+  background: #0a0a0a;
+}
+
+.termhub-terminal .xterm,
+.termhub-terminal .xterm-viewport,
+.termhub-terminal .xterm-screen {
+  height: 100%;
+  width: 100%;
+}
+
+/* A little breathing room so glyphs don't sit flush against the tile edge. */
+.termhub-terminal .xterm {
+  padding: 4px;
+  box-sizing: border-box;
+}
