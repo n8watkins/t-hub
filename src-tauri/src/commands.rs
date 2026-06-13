@@ -64,12 +64,22 @@ fn resolve_cwd(opts: &SpawnOptions) -> String {
     if let Some(cwd) = opts.cwd.as_ref().filter(|c| !c.trim().is_empty()) {
         return cwd.clone();
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return home.to_string_lossy().to_string();
+    // On Windows the tmux pane runs inside WSL, so a Windows path would be
+    // meaningless as `-c`; default to empty and let the pane inherit wsl.exe's
+    // working directory. On Unix, prefer $HOME, then the process cwd.
+    #[cfg(windows)]
+    {
+        String::new()
     }
-    std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "/".to_string())
+    #[cfg(unix)]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return home.to_string_lossy().to_string();
+        }
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "/".to_string())
+    }
 }
 
 /// Pick the human-readable title for the tile: the caller's `name`, else the

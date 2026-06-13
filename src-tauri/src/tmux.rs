@@ -53,7 +53,18 @@ impl From<TmuxError> for String {
 }
 
 /// Build a `tmux -L termhub` command with the given args.
+///
+/// tmux lives inside WSL, so on Windows every control command is routed through
+/// `wsl.exe -- tmux …`; on Unix (including the WSL dev build) tmux is invoked
+/// directly. Both then carry `-L termhub` plus the caller's args.
 fn tmux(args: &[&str]) -> Command {
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("wsl.exe");
+        c.arg("--").arg("tmux");
+        c
+    };
+    #[cfg(unix)]
     let mut cmd = Command::new("tmux");
     cmd.arg("-L").arg(SOCKET);
     cmd.args(args);
@@ -114,7 +125,14 @@ fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxErro
 /// track the most recently active client instead of shrinking to the smallest,
 /// which would otherwise corrupt the visible layout (REVIEW.md risk #4).
 pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), TmuxError> {
-    let mut args: Vec<&str> = vec!["new-session", "-d", "-s", name, "-c", cwd];
+    // `-c CWD` only when we actually have a (WSL-side) directory; on Windows the
+    // default is empty so the pane starts in wsl.exe's launch dir rather than an
+    // invalid Windows path.
+    let mut args: Vec<&str> = vec!["new-session", "-d", "-s", name];
+    if !cwd.is_empty() {
+        args.push("-c");
+        args.push(cwd);
+    }
     if let Some(cmd) = command {
         // The command (and any embedded args) is the trailing program for the
         // session's first pane; tmux runs it via the shell.

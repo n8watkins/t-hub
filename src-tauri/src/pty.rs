@@ -121,17 +121,14 @@ impl Drop for PtySession {
 
 /// Build the argv that attaches a PTY client to tmux session `name`.
 ///
-/// `cwd` is only used on Windows, where `wsl.exe --cd` sets the distro-side
-/// working directory before exec'ing tmux; on Unix tmux is invoked directly and
-/// the working directory is irrelevant to the attach (the session's pane
-/// already has its own cwd from `new-session -c`).
+/// On Windows this fronts `wsl.exe` so the ConPTY child runs `tmux attach` inside
+/// the distro; on Unix tmux is invoked directly. `cwd` is unused: attaching binds
+/// to an existing session whose pane already has its own working directory.
 pub fn attach_argv(name: &str, _cwd: &str) -> Vec<String> {
     #[cfg(windows)]
     {
         vec![
             "wsl.exe".to_string(),
-            "--cd".to_string(),
-            _cwd.to_string(),
             "--".to_string(),
             "tmux".to_string(),
             "-L".to_string(),
