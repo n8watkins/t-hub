@@ -45,6 +45,9 @@ export function Canvas() {
   const remove = useWorkspace((s) => s.remove);
   const setFocus = useWorkspace((s) => s.setFocus);
   const updateState = useWorkspace((s) => s.updateState);
+  const zoomIn = useWorkspace((s) => s.zoomIn);
+  const zoomOut = useWorkspace((s) => s.zoomOut);
+  const zoomReset = useWorkspace((s) => s.zoomReset);
 
   // Seed the live terminal set and keep lifecycle state in sync with the backend.
   useEffect(() => {
@@ -108,11 +111,20 @@ export function Canvas() {
       } else if (key === "w") {
         e.preventDefault();
         closeFocused();
+      } else if (key === "=" || key === "+") {
+        e.preventDefault();
+        zoomIn();
+      } else if (key === "-" || key === "_") {
+        e.preventDefault();
+        zoomOut();
+      } else if (key === "0") {
+        e.preventDefault();
+        zoomReset();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [spawn, closeFocused]);
+  }, [spawn, closeFocused, zoomIn, zoomOut, zoomReset]);
 
   // Empty state: a single centered call-to-action.
   if (order.length === 0) {

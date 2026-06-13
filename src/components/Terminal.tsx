@@ -26,6 +26,7 @@ import {
   writeTerminal,
 } from "../ipc/client";
 import type { TerminalId } from "../ipc/types";
+import { useWorkspace } from "../store/workspace";
 import "./Terminal.css";
 
 export interface TerminalViewProps {
@@ -43,6 +44,9 @@ export function TerminalView({
   // Guards against a second init for the same (id, visible) effect run even
   // though main.tsx omits StrictMode — belt-and-braces against double `open()`.
   const initializedRef = useRef(false);
+  const fitRef = useRef<FitAddon | null>(null);
+  // Global zoom: every tile reads the same font size so they scale together.
+  const fontSize = useWorkspace((s) => s.fontSize);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -61,7 +65,7 @@ export function TerminalView({
     const term = new Terminal({
       allowProposedApi: true,
       fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "JetBrains Mono", monospace',
-      fontSize: 13,
+      fontSize: useWorkspace.getState().fontSize,
       cursorBlink: true,
       scrollback: 5000,
       theme: { background: "#0a0a0a" },
@@ -76,6 +80,7 @@ export function TerminalView({
 
     const fit = new FitAddon();
     term.loadAddon(fit);
+    fitRef.current = fit;
     const search = new SearchAddon();
     term.loadAddon(search);
 
@@ -168,8 +173,22 @@ export function TerminalView({
 
       term.dispose();
       termRef.current = null;
+      fitRef.current = null;
     };
   }, [terminalId, visible]);
+
+  // Apply global zoom changes live, without recreating the terminal.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.fontSize = fontSize;
+    try {
+      fitRef.current?.fit();
+      void resizeTerminal(terminalId, term.cols, term.rows);
+    } catch {
+      /* container detached mid-zoom; ignore */
+    }
+  }, [fontSize, terminalId]);
 
   return <div ref={containerRef} className="termhub-terminal h-full w-full" />;
 }

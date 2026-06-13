@@ -179,8 +179,8 @@ pub async fn attach_terminal(
     // (the tile is visible and streaming) we keep it and just re-seed xterm with
     // the current scrollback. If not (first attach, or re-attach after
     // `close_terminal` detached it), create a fresh attach client.
+    let has_live = state.sessions.lock().contains_key(&id);
     {
-        let has_live = state.sessions.lock().contains_key(&id);
         if !has_live {
             // Best-effort cwd for the Windows attach path; the pane already has
             // its own cwd, so an empty string is acceptable on Unix.
@@ -204,9 +204,15 @@ pub async fn attach_terminal(
         }
     }
 
-    // Seed xterm with the current pane contents + scrollback (ANSI preserved).
-    let scrollback = tmux::capture_pane(&tmux_session)
-        .map_err(|e| format!("failed to capture scrollback: {e}"))?;
+    // Seed xterm. A fresh spawn (has_live -- the client was created by
+    // spawn_terminal) takes only the visible screen so the tile shows one clean
+    // prompt; a true reattach takes full scrollback history to restore context.
+    let scrollback = if has_live {
+        tmux::capture_visible(&tmux_session)
+    } else {
+        tmux::capture_pane(&tmux_session)
+    }
+    .map_err(|e| format!("failed to capture scrollback: {e}"))?;
     Ok(STANDARD.encode(scrollback))
 }
 
