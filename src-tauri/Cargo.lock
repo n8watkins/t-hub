@@ -3341,7 +3341,27 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "termhub-protocol",
  "uuid",
+]
+
+[[package]]
+name = "termhub-agent"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "termhub-protocol",
+]
+
+[[package]]
+name = "termhub-protocol"
+version = "0.5.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
