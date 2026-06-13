@@ -60,8 +60,11 @@ impl From<TmuxError> for String {
 fn tmux(args: &[&str]) -> Command {
     #[cfg(windows)]
     let mut cmd = {
+        // `--cd ~` roots the tmux server (and each new session's pane) at the WSL
+        // home, so new terminals open in ~ (native ext4) instead of the app's
+        // /mnt/c launch dir -- matching the user's normal `~` terminal view.
         let mut c = Command::new("wsl.exe");
-        c.arg("--").arg("tmux");
+        c.arg("--cd").arg("~").arg("--").arg("tmux");
         c
     };
     #[cfg(unix)]
