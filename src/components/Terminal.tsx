@@ -60,7 +60,7 @@ export function TerminalView({
 
     const term = new Terminal({
       allowProposedApi: true,
-      fontFamily: "JetBrains Mono, Cascadia Code, Consolas, monospace",
+      fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "JetBrains Mono", monospace',
       fontSize: 13,
       cursorBlink: true,
       scrollback: 5000,
