@@ -34,10 +34,40 @@ impl Default for AppState {
     }
 }
 
+/// The default WSL distro to launch the agent in. Overridable via the
+/// `TERMHUB_DISTRO` env var; ignored on unix (the agent is launched directly).
+fn default_distro() -> String {
+    std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+}
+
+/// Connect the agent bridge on startup, off the main thread so app launch is
+/// never blocked on the WSL hop / handshake. A connect failure is logged (the
+/// UI shows the connection state); it does not abort startup. The bridge owns
+/// reconnect behavior internally.
+fn spawn_agent_connect(state: &AppState) {
+    let bridge = state.agent.clone();
+    let distro = default_distro();
+    std::thread::Builder::new()
+        .name("termhub-agent-connect".into())
+        .spawn(move || {
+            if let Err(e) = bridge.connect(&distro) {
+                eprintln!("termhub: agent bridge connect failed: {e}");
+            }
+        })
+        .ok();
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(TerminalManager::default())
         .manage(AppState::default())
+        .setup(|app| {
+            // Kick off the agent connection in the background once state exists.
+            use tauri::Manager;
+            let state = app.state::<AppState>().inner().clone();
+            spawn_agent_connect(&state);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             // 0.1 nucleus
             commands::spawn_terminal,
