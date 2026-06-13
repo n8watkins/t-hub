@@ -15,14 +15,26 @@ import {
 import { Tile } from "./Tile";
 
 /**
- * Deterministic near-square grid dimensions for `n` tiles.
- * cols = ceil(sqrt(n)); rows = ceil(n / cols). Both clamped to >= 1 so the
- * `repeat()` track lists are always valid even with a single (or zero) tile.
+ * Split `ids` into balanced rows that completely fill the canvas — no empty
+ * cells. Columns target a near-square (cols = ceil(sqrt(n))); the tiles are then
+ * spread as evenly as possible across the rows, so a short last row's tiles just
+ * grow wider instead of leaving a gap.
  */
-function gridDims(n: number): { cols: number; rows: number } {
-  const cols = Math.max(1, Math.ceil(Math.sqrt(n)));
-  const rows = Math.max(1, Math.ceil(n / cols));
-  return { cols, rows };
+function splitRows<T>(ids: T[]): T[][] {
+  const n = ids.length;
+  if (n === 0) return [];
+  const cols = Math.ceil(Math.sqrt(n));
+  const rows = Math.ceil(n / cols);
+  const base = Math.floor(n / rows);
+  const extra = n % rows; // the first `extra` rows get one additional tile
+  const out: T[][] = [];
+  let i = 0;
+  for (let r = 0; r < rows; r++) {
+    const count = base + (r < extra ? 1 : 0);
+    out.push(ids.slice(i, i + count));
+    i += count;
+  }
+  return out;
 }
 
 export function Canvas() {
@@ -117,25 +129,24 @@ export function Canvas() {
     );
   }
 
-  const { cols, rows } = gridDims(order.length);
+  const layout = splitRows(order);
 
   return (
     <div className="relative h-full w-full bg-neutral-950">
-      <div
-        className="grid h-full w-full gap-1 p-1"
-        style={{
-          gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
-          gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))`,
-        }}
-      >
-        {order.map((id) => (
-          <Tile
-            key={id}
-            terminalId={id}
-            focused={id === focusedId}
-            onFocus={() => setFocus(id)}
-            onClose={() => close(id)}
-          />
+      <div className="flex h-full w-full flex-col gap-1 p-1">
+        {layout.map((row, r) => (
+          <div key={r} className="flex min-h-0 flex-1 gap-1">
+            {row.map((id) => (
+              <div key={id} className="min-h-0 min-w-0 flex-1">
+                <Tile
+                  terminalId={id}
+                  focused={id === focusedId}
+                  onFocus={() => setFocus(id)}
+                  onClose={() => close(id)}
+                />
+              </div>
+            ))}
+          </div>
         ))}
       </div>
 
