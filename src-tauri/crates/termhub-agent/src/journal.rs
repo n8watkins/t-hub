@@ -119,7 +119,8 @@ impl Journal {
         self.inner.lock().expect("journal mutex poisoned").head_seq
     }
 
-    /// The on-disk path of the log file (for diagnostics).
+    /// The on-disk path of the log file (for diagnostics / `--hook` ingest path).
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }
