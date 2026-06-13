@@ -22,6 +22,7 @@
 //! not change `termhub-protocol`, `model.rs`, or `supervision.rs`.
 
 pub mod hooks;
+pub mod install;
 pub mod status;
 
 // Public contract surface (mirrored in src/ipc/model.ts). `RateLimitWindow` is
@@ -29,3 +30,5 @@ pub mod status;
 // directly yet, so the adapter's status types are reachable as `claude::*`.
 #[allow(unused_imports)]
 pub use status::{RateLimitWindow, StatusBridge, StatusSnapshot};
+#[allow(unused_imports)]
+pub use install::InstallReport;

@@ -120,6 +120,14 @@ export interface ProjectRecord {
   distro?: string;
 }
 
+/** The outcome of a Claude hook install/uninstall (mirrors install.rs). */
+export interface InstallReport {
+  settingsPath: string;
+  backedUp: boolean;
+  managedEvents: number;
+  message: string;
+}
+
 // --- Status bridge snapshot (src/claude/status.rs) -------------------------
 
 /** One rate-limit window from the statusline `rate_limits` block. */

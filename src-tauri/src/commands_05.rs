@@ -99,3 +99,27 @@ pub async fn ingest_status(
         .unwrap_or(0);
     Ok(state.status.ingest(&session_id, &payload, now_ms))
 }
+
+// --- Claude hook installer (Workstream B; consent-gated, non-destructive) ---
+
+/// Install TermHub's hook handlers into `~/.claude/settings.json`. `consent`
+/// MUST be true (collected explicitly in the UI) or this refuses.
+#[tauri::command]
+pub async fn install_claude_hooks(
+    agent_bin: String,
+    consent: bool,
+) -> Result<crate::claude::InstallReport, String> {
+    crate::claude::install::install_hooks(&agent_bin, consent).map_err(|e| e.to_string())
+}
+
+/// Remove TermHub's hook handlers (clean uninstall), leaving user hooks intact.
+#[tauri::command]
+pub async fn uninstall_claude_hooks() -> Result<crate::claude::InstallReport, String> {
+    crate::claude::install::uninstall_hooks().map_err(|e| e.to_string())
+}
+
+/// Whether TermHub hooks are currently installed (for the UI install state).
+#[tauri::command]
+pub async fn claude_hooks_installed() -> Result<bool, String> {
+    crate::claude::install::hooks_installed().map_err(|e| e.to_string())
+}

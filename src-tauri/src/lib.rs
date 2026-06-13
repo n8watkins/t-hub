@@ -56,6 +56,9 @@ pub fn run() {
             commands_05::session_status,
             commands_05::status_snapshot,
             commands_05::ingest_status,
+            commands_05::install_claude_hooks,
+            commands_05::uninstall_claude_hooks,
+            commands_05::claude_hooks_installed,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TermHub");

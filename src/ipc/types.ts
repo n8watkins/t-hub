@@ -80,6 +80,12 @@ export const Commands05 = {
   statusSnapshot: "status_snapshot",
   /** Push a raw statusline payload into the status bridge. */
   ingestStatus: "ingest_status",
+  /** Install TermHub hooks into ~/.claude/settings.json (consent-gated). */
+  installClaudeHooks: "install_claude_hooks",
+  /** Remove TermHub hooks (clean uninstall). */
+  uninstallClaudeHooks: "uninstall_claude_hooks",
+  /** Whether TermHub hooks are currently installed. */
+  claudeHooksInstalled: "claude_hooks_installed",
 } as const;
 
 /**

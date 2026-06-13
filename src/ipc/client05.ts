@@ -7,6 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Commands05, Events05 } from "./types";
 import type {
+  InstallReport,
   SessionStatus,
   StatusSnapshot,
   SupervisionTree,
@@ -65,6 +66,24 @@ export function ingestStatus(
   payload: unknown,
 ): Promise<StatusSnapshot> {
   return invoke(Commands05.ingestStatus, { sessionId, payload });
+}
+
+/** Install TermHub hooks into ~/.claude/settings.json. `consent` must be true. */
+export function installClaudeHooks(
+  agentBin: string,
+  consent: boolean,
+): Promise<InstallReport> {
+  return invoke(Commands05.installClaudeHooks, { agentBin, consent });
+}
+
+/** Remove TermHub hooks (clean uninstall). */
+export function uninstallClaudeHooks(): Promise<InstallReport> {
+  return invoke(Commands05.uninstallClaudeHooks);
+}
+
+/** Whether TermHub hooks are currently installed. */
+export function claudeHooksInstalled(): Promise<boolean> {
+  return invoke(Commands05.claudeHooksInstalled);
 }
 
 // --- Events ----------------------------------------------------------------
