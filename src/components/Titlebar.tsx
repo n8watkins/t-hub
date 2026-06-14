@@ -26,7 +26,7 @@
 import { useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useWorkspace } from "../store/workspace";
+import { useWorkspace, deriveLabel } from "../store/workspace";
 import { useSettings } from "../store/settings";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
@@ -63,6 +63,11 @@ function tabUnder(x: number, y: number): string | null {
 /** Height (px) of the titlebar row (matches the bar's h-8); a drop below this is
  *  out in the canvas, used to decide a tear-off vs an in-strip drop (TASK 2). */
 const TITLEBAR_H = 32;
+
+/** Matches the auto-generated default tab name "Workspace N" (#labels): such a
+ *  name carries no user intent, so a single-terminal tab can instead surface that
+ *  terminal's friendly label. A renamed tab (anything else) always wins. */
+const AUTO_TAB_NAME = /^Workspace \d+$/;
 
 /**
  * True when a drag was released AWAY from the tab strip — out in the canvas area
@@ -331,6 +336,10 @@ function WindowControls({ satellite = false }: { satellite?: boolean }) {
 function TabStrip() {
   const tabs = useWorkspace((s) => s.tabs);
   const activeTabId = useWorkspace((s) => s.activeTabId);
+  // Live terminal records + user labels: a single-terminal tab that still has its
+  // default "Workspace N" name shows that terminal's friendly label instead (#labels).
+  const terminals = useWorkspace((s) => s.terminals);
+  const labels = useWorkspace((s) => s.labels);
   const setActiveTab = useWorkspace((s) => s.setActiveTab);
   const addTab = useWorkspace((s) => s.addTab);
   const renameTab = useWorkspace((s) => s.renameTab);
@@ -463,6 +472,26 @@ function TabStrip() {
         // dragged onto it; never highlight the tab being dragged itself.
         const isDropTarget = dropTabId === tab.id && draggingTabId !== tab.id;
         const isDragging = draggingTabId === tab.id;
+        // When a tab is a single terminal and still carries its auto "Workspace N"
+        // name, show that terminal's friendly label (with the short id faint) so a
+        // terminal-tab reads like the terminal it holds (#labels). A user-renamed
+        // tab keeps its own name; multi-tile / empty tabs keep theirs too.
+        const soleId =
+          tab.order.length === 1 && AUTO_TAB_NAME.test(tab.name)
+            ? tab.order[0]
+            : null;
+        const soleInfo = soleId ? terminals[soleId] : undefined;
+        const termLabel = soleId
+          ? deriveLabel({
+              id: soleId,
+              label: labels[soleId],
+              title: soleInfo?.title,
+              cwd: soleInfo?.cwd,
+            })
+          : null;
+        const tabLabel = termLabel ?? tab.name;
+        // The faint short id, shown only when the label isn't already that id.
+        const tabShortId = soleId && termLabel !== soleId ? soleId : null;
         return (
           <div
             key={tab.id}
@@ -485,7 +514,7 @@ function TabStrip() {
                 ? { boxShadow: "0 0 0 1px var(--th-accent)" }
                 : undefined
             }
-            title={tab.name}
+            title={tabShortId ? `${tabLabel} · ${tabShortId}` : tabLabel}
           >
             <span
               className={`h-1.5 w-1.5 shrink-0 rounded-full ${
@@ -508,7 +537,17 @@ function TabStrip() {
                 style={{ boxShadow: "0 0 0 1px var(--th-accent)" }}
               />
             ) : (
-              <span className="min-w-0 flex-1 truncate">{tab.name}</span>
+              <span className="flex min-w-0 flex-1 items-baseline gap-1.5 truncate">
+                <span className="min-w-0 truncate">{tabLabel}</span>
+                {tabShortId && (
+                  <span
+                    className="shrink-0 font-mono text-[0.8em]"
+                    style={{ color: "var(--th-fg-muted)" }}
+                  >
+                    {tabShortId}
+                  </span>
+                )}
+              </span>
             )}
             {tab.order.length > 0 && (
               <span

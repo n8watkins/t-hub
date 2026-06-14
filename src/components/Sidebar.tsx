@@ -24,7 +24,7 @@ import {
 } from "../store/supervision";
 import { useAgentTelemetry } from "../store/telemetry";
 import { useSettings } from "../store/settings";
-import { useWorkspace, type WorkspaceTab } from "../store/workspace";
+import { useWorkspace, deriveLabel, type WorkspaceTab } from "../store/workspace";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { SupervisionTreeBody } from "./SupervisionTree";
@@ -379,6 +379,9 @@ function WorkspaceList({
   const draggingTabId = useWorkspace((s) => s.draggingTabId);
   const draggingTileId = useWorkspace((s) => s.draggingTileId);
   const dropWsId = useWorkspace((s) => s.dropTabId);
+  // User-set labels: the highest-priority input to a terminal's friendly display
+  // name (#labels). Read once here and threaded to the rows / drag ghost.
+  const labels = useWorkspace((s) => s.labels);
 
   // id of the workspace whose name is being renamed inline (null = none).
   const [editing, setEditing] = useState<string | null>(null);
@@ -454,10 +457,15 @@ function WorkspaceList({
   ) => {
     if (e.button !== 0) return;
     suppressClickRef.current = false;
-    // Ghost details captured at press time: just the terminal's title (no
+    // Ghost details captured at press time: the terminal's friendly label (no
     // lifecycle-state subtitle — the ghost shows the terminal name only).
     const info = terminals[terminalId];
-    const termTitle = info?.title?.trim() || terminalId;
+    const termTitle = deriveLabel({
+      id: terminalId,
+      label: labels[terminalId],
+      title: info?.title,
+      cwd: info?.cwd,
+    });
     let ghost: DragGhost | null = null;
     startPointerDrag(e.clientX, e.clientY, {
       onBegin: () => {
@@ -511,6 +519,7 @@ function WorkspaceList({
           active={tab.id === activeTabId}
           setActiveTab={setActiveTab}
           terminals={terminals}
+          labels={labels}
           setFocus={setFocus}
           // A live drop target by EITHER a workspace reorder or a terminal being
           // dragged onto it; never the drag source itself.
@@ -548,6 +557,7 @@ function WorkspaceRow({
   active,
   setActiveTab,
   terminals,
+  labels,
   setFocus,
   isDropTarget,
   isDragging,
@@ -566,6 +576,7 @@ function WorkspaceRow({
   active: boolean;
   setActiveTab: (id: string) => void;
   terminals: Record<TerminalId, TerminalInfo>;
+  labels: Record<TerminalId, string>;
   setFocus: (id: TerminalId) => void;
   isDropTarget: boolean;
   isDragging: boolean;
@@ -674,6 +685,7 @@ function WorkspaceRow({
                 key={id}
                 id={id}
                 info={terminals[id]}
+                userLabel={labels[id]}
                 onClick={() => {
                   // A committed cross-workspace drag swallows its trailing click.
                   if (consumeSuppressedClick()) return;
@@ -698,16 +710,27 @@ function WorkspaceRow({
 function TerminalRow({
   id,
   info,
+  userLabel,
   onClick,
   onPointerDown,
 }: {
   id: TerminalId;
   info?: TerminalInfo;
+  /** User-set label override for this terminal (#labels); highest priority. */
+  userLabel?: string;
   onClick: () => void;
   onPointerDown: (e: ReactPointerEvent) => void;
 }) {
   const state: TerminalState = info?.state ?? "starting";
-  const title = info?.title?.trim() || id;
+  // Friendly display name (user label > preset·cwd > short id); the short id is
+  // shown faint beside it so the raw session id stays discoverable (#labels).
+  const label = deriveLabel({
+    id,
+    label: userLabel,
+    title: info?.title,
+    cwd: info?.cwd,
+  });
+  const showShortId = label !== id;
   return (
     <li>
       <button
@@ -716,14 +739,24 @@ function TerminalRow({
         onPointerDown={onPointerDown}
         className="flex w-full cursor-pointer touch-none items-center gap-2 py-0.5 pr-2 pl-7 text-left text-xs hover:bg-neutral-900"
         style={{ color: "var(--th-fg-muted)" }}
-        title={`${title} — ${state}`}
+        title={`${showShortId ? `${label} · ${id}` : label} — ${state}`}
       >
         <span
           className="h-2 w-2 shrink-0 rounded-full"
           style={{ backgroundColor: DOT_VAR[state] }}
           aria-hidden
         />
-        <span className="min-w-0 flex-1 truncate">{title}</span>
+        <span className="min-w-0 flex-1 truncate" style={{ color: "var(--th-fg)" }}>
+          {label}
+        </span>
+        {showShortId && (
+          <span
+            className="shrink-0 font-mono text-[0.9em]"
+            style={{ color: "var(--th-fg-muted)" }}
+          >
+            {id}
+          </span>
+        )}
       </button>
     </li>
   );
