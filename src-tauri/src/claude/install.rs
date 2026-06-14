@@ -207,14 +207,35 @@ fn count_managed(settings: &serde_json::Value) -> usize {
 /// `termhub-agent` binary; it gains a `--hook <EVENT>` mode). Refuses without
 /// `consent`. Non-destructive + atomic + backed up. Resolves the settings path
 /// from the environment; see [`install_hooks_at`] for the path-injected core.
+// Kept as the "install everything" convenience + a stable entry point; the
+// command path uses install_hooks_events. Tests use install_hooks_at.
+#[allow(dead_code)]
 pub fn install_hooks(agent_bin: &str, consent: bool) -> Result<InstallReport> {
+    let all: Vec<String> = hooks::HOOK_EVENTS.iter().map(|s| s.to_string()).collect();
+    install_hooks_events(agent_bin, consent, &all)
+}
+
+/// Install ONLY the selected hook `events`, reconciling the managed set to be
+/// exactly that selection (so unchecking an event uninstalls it). Empty = all.
+pub fn install_hooks_events(
+    agent_bin: &str,
+    consent: bool,
+    events: &[String],
+) -> Result<InstallReport> {
     // Resolve the REAL absolute path to termhub-agent. Claude Code runs hooks via
     // `/bin/sh` with a minimal PATH that does NOT include `~/.local/bin`, so a
     // bare `termhub-agent` (the UI default) or a stale `/usr/bin/termhub-agent`
     // fails with "not found" and no hook ever fires. We resolve a concrete path
     // inside WSL instead of trusting the passed value.
     let resolved = resolve_agent_bin(agent_bin);
-    install_hooks_at(&settings_path()?, &resolved, consent)
+    install_hooks_at_events(&settings_path()?, &resolved, consent, events)
+}
+
+/// The subset of TermHub hook events currently installed in the user's
+/// settings.json (so the UI can pre-check the right boxes).
+pub fn managed_event_names() -> Result<Vec<String>> {
+    let existing = read_settings(&settings_path()?)?;
+    Ok(hooks::managed_events(&existing))
 }
 
 /// Resolve the absolute path to the `termhub-agent` binary that the hooks will
@@ -271,16 +292,41 @@ fn resolve_agent_bin(passed: &str) -> String {
 
 /// Path-injected core of [`install_hooks`] — operates on an explicit
 /// `settings.json` path (no env reads), so it is race-free under test.
+#[allow(dead_code)] // used by tests + as the "install everything at path" helper
 pub fn install_hooks_at(path: &Path, agent_bin: &str, consent: bool) -> Result<InstallReport> {
+    let all: Vec<String> = hooks::HOOK_EVENTS.iter().map(|s| s.to_string()).collect();
+    install_hooks_at_events(path, agent_bin, consent, &all)
+}
+
+/// Path-injected, subset-aware install. Reconciles the managed set to EXACTLY
+/// `events`: strips all TermHub hooks first, then merges the selection, so an
+/// unchecked event is removed. Empty `events` is treated as "all".
+pub fn install_hooks_at_events(
+    path: &Path,
+    agent_bin: &str,
+    consent: bool,
+    events: &[String],
+) -> Result<InstallReport> {
     if !consent {
         return Err(anyhow!(
             "refusing to modify {} without explicit consent",
             path.display()
         ));
     }
+    let all_events: Vec<String>;
+    let events: &[String] = if events.is_empty() {
+        all_events = hooks::HOOK_EVENTS.iter().map(|s| s.to_string()).collect();
+        &all_events
+    } else {
+        events
+    };
     let existing = read_settings(path)?;
     let backed_up = backup_once(path).is_ok();
-    let merged = hooks::merge_into_settings(&existing, agent_bin);
+    // Strip every TermHub hook, then merge exactly the selection — the managed
+    // set ends up equal to `events` (deselecting an event uninstalls it).
+    let cleaned = hooks::remove_from_settings(&existing);
+    let event_refs: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
+    let merged = hooks::merge_into_settings_for(&cleaned, agent_bin, &event_refs);
     write_settings_atomic(path, &merged)?;
     let managed = count_managed(&merged);
     Ok(InstallReport {

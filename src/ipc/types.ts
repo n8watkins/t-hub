@@ -94,6 +94,8 @@ export const Commands05 = {
   uninstallClaudeHooks: "uninstall_claude_hooks",
   /** Whether TermHub hooks are currently installed. */
   claudeHooksInstalled: "claude_hooks_installed",
+  /** Which hook events TermHub currently manages (for the install checklist). */
+  claudeHooksManaged: "claude_hooks_managed",
 } as const;
 
 /**

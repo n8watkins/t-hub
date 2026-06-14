@@ -245,6 +245,7 @@ pub fn run() {
             commands_05::install_claude_hooks,
             commands_05::uninstall_claude_hooks,
             commands_05::claude_hooks_installed,
+            commands_05::claude_hooks_managed,
             // Files: index + search + tree + reader (PRD §6.8/§9.7)
             files::index_project,
             files::search_files,

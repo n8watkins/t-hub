@@ -115,8 +115,12 @@ pub async fn ingest_status(
 pub async fn install_claude_hooks(
     agent_bin: String,
     consent: bool,
+    events: Vec<String>,
 ) -> Result<crate::claude::InstallReport, String> {
-    crate::claude::install::install_hooks(&agent_bin, consent).map_err(|e| e.to_string())
+    // `events` is the user's selection; an empty vec means "all" (handled in the
+    // installer). The managed set is reconciled to exactly this selection.
+    crate::claude::install::install_hooks_events(&agent_bin, consent, &events)
+        .map_err(|e| e.to_string())
 }
 
 /// Remove TermHub's hook handlers (clean uninstall), leaving user hooks intact.
@@ -129,4 +133,10 @@ pub async fn uninstall_claude_hooks() -> Result<crate::claude::InstallReport, St
 #[tauri::command]
 pub async fn claude_hooks_installed() -> Result<bool, String> {
     crate::claude::install::hooks_installed().map_err(|e| e.to_string())
+}
+
+/// Which hook events TermHub currently manages (so the UI can pre-check them).
+#[tauri::command]
+pub async fn claude_hooks_managed() -> Result<Vec<String>, String> {
+    crate::claude::install::managed_event_names().map_err(|e| e.to_string())
 }

@@ -138,8 +138,15 @@ pub fn handler_script(agent_bin: &str, hook_event: &str) -> String {
 /// `"matcher": "*"` is included on every event for consistency; Claude Code
 /// ignores it on events that don't support matchers, so it is harmless.
 pub fn termhub_hooks_fragment(agent_bin: &str) -> serde_json::Value {
+    termhub_hooks_fragment_for(agent_bin, HOOK_EVENTS)
+}
+
+/// Like [`termhub_hooks_fragment`] but for an explicit subset of events (the
+/// user's hook selection). Building from a subset lets the installer manage only
+/// the chosen events.
+pub fn termhub_hooks_fragment_for(agent_bin: &str, events: &[&str]) -> serde_json::Value {
     let mut events_map = serde_json::Map::new();
-    for event in HOOK_EVENTS {
+    for event in events {
         let command = format!(
             "{bin} --hook {event} # {marker}",
             bin = agent_bin,
@@ -153,6 +160,23 @@ pub fn termhub_hooks_fragment(agent_bin: &str) -> serde_json::Value {
         events_map.insert(event.to_string(), group);
     }
     serde_json::json!({ "hooks": events_map })
+}
+
+/// The subset of [`HOOK_EVENTS`] currently managed by TermHub in `settings`
+/// (each event whose group array contains a marker-tagged command). Lets the UI
+/// pre-check exactly the installed events.
+pub fn managed_events(settings: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) {
+        for event in HOOK_EVENTS {
+            if let Some(arr) = hooks.get(*event).and_then(|v| v.as_array()) {
+                if arr.iter().any(group_is_termhub) {
+                    out.push(event.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Return true if a matcher-group object contains any TermHub-managed command.
@@ -198,6 +222,18 @@ pub fn merge_into_settings(
     existing: &serde_json::Value,
     agent_bin: &str,
 ) -> serde_json::Value {
+    merge_into_settings_for(existing, agent_bin, HOOK_EVENTS)
+}
+
+/// Like [`merge_into_settings`] but manages only the given `events` subset (the
+/// user's hook selection). Events not listed are left untouched here; the
+/// installer first strips ALL TermHub hooks then merges the selection, so the
+/// managed set ends up exactly equal to `events`.
+pub fn merge_into_settings_for(
+    existing: &serde_json::Value,
+    agent_bin: &str,
+    events: &[&str],
+) -> serde_json::Value {
     // Start from existing (clone) or an empty object if existing is not an object.
     let mut root: serde_json::Map<String, serde_json::Value> = existing
         .as_object()
@@ -211,10 +247,10 @@ pub fn merge_into_settings(
         .as_object_mut()
         .expect("hooks must be an object");
 
-    let fragment = termhub_hooks_fragment(agent_bin);
+    let fragment = termhub_hooks_fragment_for(agent_bin, events);
     let fragment_hooks = fragment["hooks"].as_object().expect("fragment has hooks");
 
-    for event in HOOK_EVENTS {
+    for event in events {
         // Get the new TermHub group for this event from the fragment.
         let new_termhub_group = &fragment_hooks[*event].as_array().expect("array")[0].clone();
 
