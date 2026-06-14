@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Core capability for the main TermHub window (events + core APIs).",
-  "windows": ["main"],
+  "description": "Core capability for TermHub windows (events + core APIs). Applies to the main window and to popped-out satellite windows (#21), whose labels are 'th-pop-*'.",
+  "windows": ["main", "th-pop-*"],
   "permissions": [
     "core:default",
     "core:window:allow-minimize",
@@ -13,6 +13,8 @@
     "core:window:allow-hide",
     "core:window:allow-show",
     "core:window:allow-set-focus",
-    "core:window:allow-unminimize"
+    "core:window:allow-unminimize",
+    "core:window:allow-destroy",
+    "core:webview:allow-create-webview-window"
   ]
 }

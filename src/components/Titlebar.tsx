@@ -25,6 +25,7 @@ import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
+import { popOutTab, closeSatellite, readSatelliteTab } from "../lib/windows";
 
 /** Minimize the window, swallowing any IPC rejection. */
 function minimize(): void {
@@ -53,7 +54,14 @@ function tabUnder(x: number, y: number): string | null {
   return el?.closest<HTMLElement>("[data-tab-id]")?.getAttribute("data-tab-id") ?? null;
 }
 
-export function Titlebar() {
+/**
+ * The top bar. In the MAIN window it hosts the workspace tab strip + new-tab
+ * button. In a SATELLITE window (#21, a popped-out tab) there is no strip — just
+ * the brand, the popped tab's name, and a "return to main window" control — since
+ * a satellite renders exactly one tab and creating/closing tabs there is
+ * meaningless.
+ */
+export function Titlebar({ satellite = false }: { satellite?: boolean }) {
   const toggleSettings = useSettings((s) => s.toggleSettings);
   return (
     <div
@@ -66,18 +74,71 @@ export function Titlebar() {
       {/* Brand, top-left (#6). Doubles as a left drag handle. */}
       <Brand />
 
-      {/* Workspace tabs (+ the new-tab button at the right of the last tab). */}
-      <TabStrip />
-
-      {/* Flexible drag region: dragging this empty stretch moves the window. */}
-      <div data-tauri-drag-region className="min-w-0 flex-1" aria-hidden />
+      {satellite ? (
+        // Satellite: show the popped-out tab's name + a return control, then a
+        // draggable stretch. No tab strip / new-tab button.
+        <SatelliteBar />
+      ) : (
+        // Main: workspace tabs (+ the new-tab button at the right of the strip),
+        // then a flexible drag region.
+        <>
+          <TabStrip />
+          <div data-tauri-drag-region className="min-w-0 flex-1" aria-hidden />
+        </>
+      )}
 
       {/* Settings (#3): opens the settings/theme surface (also Ctrl/Cmd+,). */}
       <SettingsButton onClick={toggleSettings} />
 
-      {/* Window controls (top-right). No drag-region, or clicks would drag. */}
-      <WindowControls />
+      {/* Window controls (top-right). No drag-region, or clicks would drag. In a
+          satellite the close button returns the tab to the main window (destroy +
+          pop-in) instead of the main window's close-to-tray hide. */}
+      <WindowControls satellite={satellite} />
     </div>
+  );
+}
+
+/**
+ * The middle region for a satellite window (#21): the popped-out tab's name and
+ * a "return to main window" button that closes the satellite (handing the tab
+ * back to the main window). The remaining stretch is a window-drag handle.
+ */
+function SatelliteBar() {
+  const tabId = readSatelliteTab();
+  // The satellite's store holds exactly its one tab; read its name for the label.
+  const name = useWorkspace(
+    (s) => s.tabs.find((t) => t.id === tabId)?.name ?? "Workspace",
+  );
+  return (
+    <>
+      <div
+        data-tauri-drag-region
+        className="flex min-w-0 flex-1 select-none items-center gap-2 pl-3 pr-1"
+      >
+        <span className="truncate text-neutral-300">{name}</span>
+        <span
+          className="shrink-0 rounded px-1.5 py-px text-[10px] uppercase tracking-wide"
+          style={{
+            backgroundColor:
+              "color-mix(in srgb, var(--th-accent) 18%, transparent)",
+            color: "var(--th-accent)",
+          }}
+          title="This tab is popped out into its own window"
+        >
+          popped out
+        </span>
+      </div>
+      <button
+        type="button"
+        onClick={() => void closeSatellite()}
+        title="Return this tab to the main window"
+        aria-label="Return this tab to the main window"
+        className="flex h-8 items-center gap-1 px-2.5 text-neutral-300 transition-colors hover:bg-neutral-700"
+      >
+        <PopInIcon />
+        <span className="text-[11px]">Return</span>
+      </button>
+    </>
   );
 }
 
@@ -137,8 +198,14 @@ function SettingsButton({ onClick }: { onClick: () => void }) {
 // ---------------------------------------------------------------------------
 // Window controls: minimize, maximize/restore, close. Fixed-width hover targets
 // matching the bar height; close goes red on hover.
+//
+// In a SATELLITE window (#21) the close button doesn't use the main window's
+// close-to-tray hide — it returns the tab to the main window and force-destroys
+// the satellite (closeSatellite), so closing a popped-out window cleanly hands
+// its tab back rather than leaving a hidden, still-attached client.
 // ---------------------------------------------------------------------------
-function WindowControls() {
+function WindowControls({ satellite = false }: { satellite?: boolean }) {
+  const onClose = satellite ? () => void closeSatellite() : closeWindow;
   return (
     <div className="flex shrink-0 items-stretch">
       <button
@@ -187,7 +254,7 @@ function WindowControls() {
         type="button"
         aria-label="Close"
         title="Close"
-        onClick={closeWindow}
+        onClick={onClose}
         className="flex h-8 w-11 items-center justify-center text-neutral-300 transition-colors hover:bg-red-600 hover:text-white"
       >
         <svg
@@ -355,6 +422,23 @@ function TabStrip() {
                 {tab.order.length}
               </span>
             )}
+            {/* Pop-out (#21): tear this tab off into its own window. Shown on
+                hover next to the close ×. Available for any tab (the point is to
+                pop out a tab WITH terminals); pointerDown is stopped so it never
+                starts a tab drag/reorder. */}
+            <button
+              type="button"
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                void popOutTab(tab.id);
+              }}
+              className="ml-0.5 hidden shrink-0 rounded p-0.5 leading-none text-neutral-500 hover:bg-neutral-600 hover:text-neutral-100 group-hover:inline-flex"
+              title="Pop out into a new window"
+              aria-label={`Pop out ${tab.name} into a new window`}
+            >
+              <PopOutIcon />
+            </button>
             {closable && (
               <button
                 type="button"
@@ -385,5 +469,55 @@ function TabStrip() {
         ＋
       </button>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Small inline icons for the tear-off controls (#21). Sized to sit inline with
+// the tab text; they inherit `currentColor` so they follow the button's hover.
+// ---------------------------------------------------------------------------
+
+/** "Open in new window" arrow (pop a tab out). */
+function PopOutIcon() {
+  return (
+    <svg
+      width="11"
+      height="11"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="pointer-events-none"
+      aria-hidden
+    >
+      <path d="M14 4h6v6" />
+      <path d="M20 4 11 13" />
+      <path d="M19 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4" />
+    </svg>
+  );
+}
+
+/** Arrow pointing back into a frame (return a popped tab to the main window). */
+function PopInIcon() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="pointer-events-none"
+      aria-hidden
+    >
+      <path d="M9 10 4 5" />
+      <path d="M4 9V5h4" />
+      <path d="M20 4H10a2 2 0 0 0-2 2v4" />
+      <path d="M5 14v4a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V8" />
+    </svg>
   );
 }
