@@ -8,7 +8,7 @@ mod tmux;
 mod agent; // core-side agent bridge (Workstream A, core half)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
-mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6)
+pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
 mod model; // data-model structs (PRD §8)
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
@@ -16,6 +16,28 @@ mod supervision; // orchestrator->subagent tree + status (Workstream C)
 use agent::AgentBridge;
 use claude::StatusBridge;
 use commands::TerminalManager;
+
+// --- Test/proof seams (used by `tests/mcp_e2e.rs`) -------------------------
+// The end-to-end MCP proof seeds a real `Supervisor` + `StatusBridge`, starts a
+// real control listener, and drives the real `termhub-mcp` binary against it.
+// These thin constructors expose just enough of the otherwise-internal modules
+// for that integration test without widening the general public surface.
+
+/// Re-export the supervision reducer type for the e2e proof.
+#[doc(hidden)]
+pub use supervision::Supervisor;
+
+/// Build a fresh, empty supervision reducer (for the e2e proof to seed).
+#[doc(hidden)]
+pub fn supervision_for_test() -> Supervisor {
+    Supervisor::new()
+}
+
+/// Build a fresh status bridge (for the e2e proof to ingest a snapshot into).
+#[doc(hidden)]
+pub fn status_bridge_for_test() -> StatusBridge {
+    StatusBridge::new()
+}
 
 /// App-wide 0.5 state, managed alongside the 0.1 [`TerminalManager`]. Grouped so
 /// the command surface can pull exactly what it needs from Tauri-managed state.

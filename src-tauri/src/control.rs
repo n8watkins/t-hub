@@ -592,6 +592,26 @@ impl ControlContext {
             token,
         }
     }
+
+    /// Test/proof constructor: build a context directly over a shared
+    /// `Mutex<Supervisor>` (and a status bridge), wiring the visitor closure
+    /// internally. Lets the end-to-end integration test seed real supervision +
+    /// status state, start a real listener, and exercise the real `termhub-mcp`
+    /// binary against it — without standing up the whole Tauri app.
+    #[doc(hidden)]
+    pub fn with_shared_supervisor(
+        status: Arc<StatusBridge>,
+        supervisor: Arc<parking_lot::Mutex<Supervisor>>,
+        token: String,
+    ) -> Self {
+        let sup = supervisor.clone();
+        let visitor: Arc<dyn Fn(&mut dyn FnMut(&Supervisor)) + Send + Sync> =
+            Arc::new(move |f: &mut dyn FnMut(&Supervisor)| {
+                let guard = sup.lock();
+                f(&guard);
+            });
+        Self::new(status, visitor, token)
+    }
 }
 
 #[cfg(test)]
