@@ -10,6 +10,7 @@ mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.
 mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
+mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/diag)
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
 mod model; // data-model structs (PRD §8)
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
@@ -250,6 +251,10 @@ pub fn run() {
             // #sqlite: durable workspace-layout persistence (mirrors localStorage).
             db::save_workspace_snapshot,
             db::load_workspace_snapshot,
+            // feat/diag: runtime diagnostics sink (mirrors frontend logs to a file
+            // the WSL-side orchestrator can read from a RELEASE build).
+            diag::diag_log,
+            diag::diag_clear,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TermHub");
