@@ -32,6 +32,7 @@ import { useTerminalSlot } from "./TerminalPool";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { useShiftHeld } from "../lib/useShiftHeld";
 
 export interface TileProps {
   terminalId: TerminalId;
@@ -106,6 +107,10 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
   const showCwd = useTheme((s) => s.active.chrome.showCwd);
   const headerOnHover = useTheme((s) => s.active.chrome.headerOnHover);
   const showTileHeader = useTheme((s) => s.active.chrome.showTileHeader);
+  // Hold Shift -> the close (×) control morphs into a delete (kill-session)
+  // control across every tile, with a destructive look + label. Shared tracker
+  // (one window listener) so a wall of tiles doesn't each bind keydown/keyup.
+  const shiftHeld = useShiftHeld();
 
   const state: TerminalState = info?.state ?? "starting";
   const cwd = info?.cwd ?? "";
@@ -260,54 +265,49 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
           </span>
         )}
         {(!showCwd || !cwd) && <span className="flex-1" />}
-        {/* Delete session (destructive): a small trash control. Opens a themed
-            confirm before killing the tmux session for good. Kept distinct from
-            the × so a destructive delete is never one stray click away. */}
+        {/* ONE lifecycle control that MORPHS with Shift (per the user's model):
+            - default  →  "×"  : CLOSE the terminal (detach; tmux session lives on)
+            - Shift    →  trash: DELETE the terminal from the session (kills tmux),
+                          gated behind a confirm. Holding Shift recolors it to the
+                          error tone + swaps the glyph + tooltip so it's obvious the
+                          next click destroys. The actual action keys off the real
+                          event modifier (e.shiftKey), so it's correct even if the
+                          tracked state lags by a frame. */}
         <button
           type="button"
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            e.stopPropagation();
-            setConfirmDelete(true);
-          }}
-          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
-          style={{ color: "var(--th-fg-muted)" }}
-          title="Delete session (kills tmux — asks first)"
-          aria-label="Delete session"
-        >
-          {/* Inline trash glyph; inherits currentColor so it follows the theme. */}
-          <svg
-            viewBox="0 0 16 16"
-            width="0.9em"
-            height="0.9em"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.3"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden
-            className="hover:text-[var(--th-dot-error)]"
-          >
-            <path d="M2.5 4h11M6 4V2.5h4V4M5 4l.5 9.5h5L11 4M6.5 6.5v5M9.5 6.5v5" />
-          </svg>
-        </button>
-        <button
-          type="button"
-          // Don't let the × start a drag/focus. Plain click DETACHES (keeps the
-          // tmux session alive). Shift-click is the shortcut to the confirmed
-          // delete-session flow (same as the trash control).
           onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation();
             if (e.shiftKey) setConfirmDelete(true);
             else onClose();
           }}
-          className="shrink-0 rounded px-1 leading-none text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
-          style={{ color: "var(--th-fg-muted)" }}
-          title={"Detach — keeps the session alive (shift-click to delete)"}
-          aria-label="Detach terminal"
+          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
+          style={{ color: shiftHeld ? "var(--th-dot-error)" : "var(--th-fg-muted)" }}
+          title={
+            shiftHeld
+              ? "Delete terminal from session (kills tmux — asks first)"
+              : "Close terminal (keeps the session alive; hold Shift to delete)"
+          }
+          aria-label={shiftHeld ? "Delete terminal from session" : "Close terminal"}
         >
-          ×
+          {shiftHeld ? (
+            // Inline trash glyph; inherits currentColor so it follows the theme.
+            <svg
+              viewBox="0 0 16 16"
+              width="0.9em"
+              height="0.9em"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.3"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <path d="M2.5 4h11M6 4V2.5h4V4M5 4l.5 9.5h5L11 4M6.5 6.5v5M9.5 6.5v5" />
+            </svg>
+          ) : (
+            "×"
+          )}
         </button>
       </div>
 

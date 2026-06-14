@@ -617,9 +617,20 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
           ref={(el) => {
             if (el) {
               wrapRefs.current.set(id, el);
-              // Park offscreen until the first sync positions it (avoids a 0,0
-              // flash on mount before useLayoutEffect runs).
-              el.style.transform = "translate(-100000px, 0px)";
+              // THE MUTED-GRID FIX: only seed the offscreen park on a wrapper's
+              // FIRST attach (no transform yet). This inline ref is recreated
+              // every render, so React re-invokes it on EVERY pool re-render —
+              // and unconditionally resetting the transform here yanked ALL
+              // already-positioned terminals offscreen. When that render did NOT
+              // also change tabs/version/activeTabId (e.g. opening/closing the "+"
+              // spawn menu re-renders Canvas only), the positioning layout-effect
+              // never re-ran, so the whole grid stayed parked offscreen = muted
+              // until an unrelated re-sync. Guarding on "no transform yet" keeps an
+              // existing wrapper at its current position across re-renders; a brand
+              // new wrapper still gets the initial offscreen park before first sync.
+              if (!el.style.transform) {
+                el.style.transform = "translate(-100000px, 0px)";
+              }
             } else {
               wrapRefs.current.delete(id);
             }
