@@ -168,10 +168,40 @@ mod imp {
         _id: usize,
         _ref_data: usize,
     ) -> LRESULT {
+        // BUG 3 FIX (max/restore did nothing on Win11): the maximize-button CLICK
+        // must be handled by US, BEFORE DWM. We report HTMAXBUTTON for that slot so
+        // the Win11 Snap Layouts flyout appears on hover (DWM drives that off the
+        // hover/move messages, below). But that also moves the slot into the
+        // non-client area, so the WebView's React onClick(toggleMaximize) never
+        // fires. We therefore toggle maximize ourselves on a press+release over
+        // HTMAXBUTTON. Previously these click messages fell THROUGH to
+        // `DwmDefWindowProc` first; DWM returns "handled" for caption-button
+        // messages on a tao frameless window WITHOUT actually maximizing (tao
+        // answers WM_NCCALCSIZE with 0, so there's no real caption frame to drive
+        // the maximize), and we returned that result early - so our toggle arm
+        // never ran and the button was inert. Intercepting the click here (ahead of
+        // DWM) restores click-to-maximize while leaving the hover/flyout path
+        // (every OTHER message, including the NC mouse-move that pops the flyout)
+        // untouched.
+        if wparam.0 as u32 == HTMAXBUTTON {
+            match msg {
+                // Swallow the down so DefWindowProc doesn't enter its own caption-
+                // button tracking loop; we act on the up.
+                WM_NCLBUTTONDOWN => return LRESULT(0),
+                WM_NCLBUTTONUP => {
+                    toggle_maximize(hwnd);
+                    return LRESULT(0);
+                }
+                _ => {}
+            }
+        }
+
         // Let DWM handle the message first. For caption-button messages (incl. the
-        // maximize-button hover that drives Snap Layouts) it returns TRUE and fills
+        // maximize-button HOVER that drives Snap Layouts) it returns TRUE and fills
         // `dwm_result`; we then return that and do nothing else. This is required
         // by the custom-frame contract - the flyout will NOT appear if we skip it.
+        // (The maximize-button CLICK is handled above, ahead of this, so DWM can't
+        // swallow it.)
         let mut dwm_result = LRESULT(0);
         let dwm_handled = DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut dwm_result).as_bool();
         if dwm_handled {
@@ -194,22 +224,9 @@ mod imp {
                 // with no real non-client frame, returns HTCLIENT).
                 DefSubclassProc(hwnd, msg, wparam, lparam)
             }
-            // The maximize button slot now reports HTMAXBUTTON (so the Win11 Snap
-            // Layouts flyout appears on hover). Because that takes the press out of
-            // the WebView's hands, the frontend's React onClick(toggleMaximize) no
-            // longer fires for a plain click on it - so we toggle maximize here on
-            // a press+release over HTMAXBUTTON, restoring the click-to-maximize
-            // behavior. Snap Layouts itself is driven by DWM off the HTMAXBUTTON
-            // hover (via DwmDefWindowProc above), independent of these messages.
-            WM_NCLBUTTONDOWN if wparam.0 as u32 == HTMAXBUTTON => {
-                // Swallow the down so DefWindowProc doesn't enter its own caption-
-                // button tracking loop; we act on the up.
-                LRESULT(0)
-            }
-            WM_NCLBUTTONUP if wparam.0 as u32 == HTMAXBUTTON => {
-                toggle_maximize(hwnd);
-                LRESULT(0)
-            }
+            // NOTE: the maximize-button click (WM_NCLBUTTONDOWN/UP over
+            // HTMAXBUTTON) is intercepted at the TOP of this proc, ahead of
+            // DwmDefWindowProc, so those arms are not repeated here.
             WM_NCDESTROY => {
                 // Remove ourselves before the window goes away.
                 let _ = RemoveWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID);
