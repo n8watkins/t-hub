@@ -15,7 +15,7 @@
 // data arrives via the agent bridge's event emit spine (agent://journal →
 // supervision://tree / session://status / status://snapshot); the telemetry hook
 // subscribes and feeds the store.
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   useSupervision,
   attentionSessions,
@@ -28,6 +28,24 @@ import { StatusBadge, statusLabel } from "./StatusBadge";
 import { WslHealth } from "./WslHealth";
 import { HookInstallPanel } from "./HookInstallPanel";
 import type { StatusSnapshot, SupervisionTree } from "../ipc/model";
+import type {
+  TerminalId,
+  TerminalInfo,
+  TerminalState,
+} from "../ipc/types";
+
+/**
+ * Lifecycle-dot color per terminal state, mirroring Tile.tsx's DOT_VAR so the
+ * per-workspace terminal list (#2) reads the same themed `--th-dot-*` palette
+ * (amber=starting / green=live / gray=detached / dim=exited / red=error).
+ */
+const DOT_VAR: Record<TerminalState, string> = {
+  starting: "var(--th-dot-starting)",
+  live: "var(--th-dot-live)",
+  detached: "var(--th-dot-detached)",
+  exited: "var(--th-dot-exited)",
+  error: "var(--th-dot-error)",
+};
 
 /**
  * The sidebar's 3-state collapse mode (App owns + persists it; #1):
@@ -65,10 +83,14 @@ export function Sidebar({
   agentBin = "termhub-agent",
 }: SidebarProps) {
   // Workspace tabs (read-only, #2): list every tab with its tile count and let
-  // a click activate it. We never mutate the store beyond setActiveTab.
+  // a click activate it. Each tab also expands to its terminals (looked up in
+  // the live `terminals` map) so the user can peek into OTHER workspaces without
+  // switching. We never mutate the store beyond setActiveTab / setFocus.
   const tabs = useWorkspace((s) => s.tabs);
   const activeTabId = useWorkspace((s) => s.activeTabId);
   const setActiveTab = useWorkspace((s) => s.setActiveTab);
+  const terminals = useWorkspace((s) => s.terminals);
+  const setFocus = useWorkspace((s) => s.setFocus);
 
   // Rail mode: a thin, iconic strip. Render before pulling the heavier
   // supervision selectors below stays cheap, but hooks must run unconditionally,
@@ -91,6 +113,8 @@ export function Sidebar({
       tabs={tabs}
       activeTabId={activeTabId}
       setActiveTab={setActiveTab}
+      terminals={terminals}
+      setFocus={setFocus}
     />
   );
 }
@@ -102,6 +126,8 @@ interface FullProps {
   tabs: WorkspaceTab[];
   activeTabId: string;
   setActiveTab: (id: string) => void;
+  terminals: Record<TerminalId, TerminalInfo>;
+  setFocus: (id: TerminalId) => void;
 }
 
 function SidebarFull({
@@ -111,6 +137,8 @@ function SidebarFull({
   tabs,
   activeTabId,
   setActiveTab,
+  terminals,
+  setFocus,
 }: FullProps) {
   const { metrics, agent } = useAgentTelemetry();
   const trees = useSupervision((s) => s.trees);
@@ -144,19 +172,28 @@ function SidebarFull({
       }}
     >
       {/* 0. Workspaces (#2) — the user's tabs with tile counts, active one
-          highlighted; a click activates the tab. Gives the otherwise-empty
-          sidebar immediate utility. */}
-      <section className="border-b border-neutral-800">
+          highlighted; a click activates the tab. Each row expands to that tab's
+          terminals so the user can peek into OTHER workspaces without switching.
+          Gives the otherwise-empty sidebar immediate utility. */}
+      <section
+        className="border-b"
+        style={{ borderColor: "var(--th-border)" }}
+      >
         <Header>Workspaces</Header>
         <WorkspaceList
           tabs={tabs}
           activeTabId={activeTabId}
           setActiveTab={setActiveTab}
+          terminals={terminals}
+          setFocus={setFocus}
         />
       </section>
 
       {/* 1. Attention queue */}
-      <section className="border-b border-neutral-800">
+      <section
+        className="border-b"
+        style={{ borderColor: "var(--th-border)" }}
+      >
         <Header>Attention</Header>
         {queue.length === 0 ? (
           <Muted>Nothing needs you.</Muted>
@@ -167,11 +204,14 @@ function SidebarFull({
                 <button
                   type="button"
                   onClick={() => onSelectSession?.(sessionId)}
-                  className="flex w-full items-center gap-2 px-2 py-1 text-left text-xs hover:bg-neutral-900"
+                  className="flex w-full items-center gap-2 px-2 py-1 text-left text-sm hover:bg-neutral-900"
                   title={`${statusLabel(status)} — ${sessionId}`}
                 >
                   <StatusBadge status={status} dotOnly />
-                  <span className="min-w-0 flex-1 truncate text-neutral-300">
+                  <span
+                    className="min-w-0 flex-1 truncate"
+                    style={{ color: "var(--th-fg)" }}
+                  >
                     {sessionId}
                   </span>
                 </button>
@@ -187,7 +227,7 @@ function SidebarFull({
         {treeList.length === 0 ? (
           <Muted>No supervised sessions.</Muted>
         ) : (
-          <div className="divide-y divide-neutral-900">
+          <div className="divide-y divide-neutral-800">
             {treeList.map((tree) => (
               <SessionRow
                 key={tree.sessionId}
@@ -202,12 +242,18 @@ function SidebarFull({
       </section>
 
       {/* 3. Claude hooks (consent-gated install/uninstall) */}
-      <section className="border-t border-neutral-800">
+      <section
+        className="border-t"
+        style={{ borderColor: "var(--th-border)" }}
+      >
         <HookInstallPanel agentBin={agentBin} />
       </section>
 
       {/* 4. Utility area (low priority) */}
-      <section className="border-t border-neutral-800">
+      <section
+        className="border-t"
+        style={{ borderColor: "var(--th-border)" }}
+      >
         <Header>WSL</Header>
         <WslHealth metrics={metrics} connection={agent?.connection} />
       </section>
@@ -215,44 +261,152 @@ function SidebarFull({
   );
 }
 
-/** The Workspaces list (full mode): one row per tab = name + tile count, the
- *  active tab accent-highlighted; clicking activates it via setActiveTab (#2). */
+/** The Workspaces list (full mode): one expandable row per tab = name + tile
+ *  count, the active tab accent-highlighted. Clicking the row activates it via
+ *  setActiveTab; the chevron toggles an inline list of that tab's terminals so
+ *  the user can see what's in OTHER workspaces without switching (#2). */
 function WorkspaceList({
   tabs,
   activeTabId,
   setActiveTab,
+  terminals,
+  setFocus,
 }: {
   tabs: WorkspaceTab[];
   activeTabId: string;
   setActiveTab: (id: string) => void;
+  terminals: Record<TerminalId, TerminalInfo>;
+  setFocus: (id: TerminalId) => void;
 }) {
   if (tabs.length === 0) return <Muted>No workspaces.</Muted>;
   return (
     <ul>
-      {tabs.map((tab) => {
-        const active = tab.id === activeTabId;
-        const count = tab.order.length;
-        return (
-          <li key={tab.id}>
-            <button
-              type="button"
-              onClick={() => setActiveTab(tab.id)}
-              className="flex w-full items-center gap-2 px-2 py-1 text-left text-xs hover:bg-neutral-900"
-              style={
-                active
-                  ? { backgroundColor: "var(--th-accent)", color: "var(--th-fg)" }
-                  : { color: "var(--th-fg-muted)" }
-              }
-              title={`${tab.name} — ${count} terminal${count === 1 ? "" : "s"}`}
-              aria-current={active ? "true" : undefined}
-            >
-              <span className="min-w-0 flex-1 truncate">{tab.name}</span>
-              <span className="shrink-0 tabular-nums opacity-70">{count}</span>
-            </button>
-          </li>
-        );
-      })}
+      {tabs.map((tab) => (
+        <WorkspaceRow
+          key={tab.id}
+          tab={tab}
+          active={tab.id === activeTabId}
+          setActiveTab={setActiveTab}
+          terminals={terminals}
+          setFocus={setFocus}
+        />
+      ))}
     </ul>
+  );
+}
+
+/** One workspace row: a header (chevron + name + tile count, click activates the
+ *  tab) plus a collapsible list of the tab's terminals. The active workspace
+ *  defaults expanded; the rest start collapsed (local useState, #2). */
+function WorkspaceRow({
+  tab,
+  active,
+  setActiveTab,
+  terminals,
+  setFocus,
+}: {
+  tab: WorkspaceTab;
+  active: boolean;
+  setActiveTab: (id: string) => void;
+  terminals: Record<TerminalId, TerminalInfo>;
+  setFocus: (id: TerminalId) => void;
+}) {
+  const count = tab.order.length;
+  // Active workspace starts open; the others collapse so the list stays compact.
+  const [expanded, setExpanded] = useState(active);
+
+  return (
+    <li>
+      <div
+        className="flex w-full items-center hover:bg-neutral-900"
+        style={
+          active
+            ? { backgroundColor: "var(--th-accent)", color: "var(--th-fg)" }
+            : { color: "var(--th-fg)" }
+        }
+      >
+        {/* Chevron toggle — expand/collapse without switching workspaces. */}
+        <button
+          type="button"
+          onClick={() => setExpanded((e) => !e)}
+          className="flex h-6 w-5 shrink-0 items-center justify-center text-[10px] leading-none opacity-70 hover:opacity-100"
+          aria-label={expanded ? "Collapse workspace" : "Expand workspace"}
+          aria-expanded={expanded}
+          title={expanded ? "Collapse" : "Expand"}
+        >
+          {expanded ? "v" : ">"}
+        </button>
+        {/* Name + count — activates the tab. */}
+        <button
+          type="button"
+          onClick={() => setActiveTab(tab.id)}
+          className="flex min-w-0 flex-1 items-center gap-2 py-1 pr-2 text-left text-sm"
+          title={`${tab.name} — ${count} terminal${count === 1 ? "" : "s"}`}
+          aria-current={active ? "true" : undefined}
+        >
+          <span className="min-w-0 flex-1 truncate">{tab.name}</span>
+          <span className="shrink-0 tabular-nums opacity-70">{count}</span>
+        </button>
+      </div>
+      {expanded && (
+        <ul className="pb-1">
+          {count === 0 ? (
+            <li
+              className="px-2 py-0.5 pl-7 text-xs"
+              style={{ color: "var(--th-fg-muted)" }}
+            >
+              No terminals.
+            </li>
+          ) : (
+            tab.order.map((id) => (
+              <TerminalRow
+                key={id}
+                id={id}
+                info={terminals[id]}
+                onClick={() => {
+                  setActiveTab(tab.id);
+                  setFocus(id);
+                }}
+              />
+            ))
+          )}
+        </ul>
+      )}
+    </li>
+  );
+}
+
+/** One terminal under a workspace: a themed lifecycle dot + the terminal title.
+ *  Clicking activates the owning tab and focuses this tile (#2). The record may
+ *  be missing if the live map hasn't seeded that id yet -- fall back gracefully. */
+function TerminalRow({
+  id,
+  info,
+  onClick,
+}: {
+  id: TerminalId;
+  info?: TerminalInfo;
+  onClick: () => void;
+}) {
+  const state: TerminalState = info?.state ?? "starting";
+  const title = info?.title?.trim() || id;
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onClick}
+        className="flex w-full items-center gap-2 py-0.5 pr-2 pl-7 text-left text-xs hover:bg-neutral-900"
+        style={{ color: "var(--th-fg-muted)" }}
+        title={`${title} — ${state}`}
+      >
+        <span
+          className="h-2 w-2 shrink-0 rounded-full"
+          style={{ backgroundColor: DOT_VAR[state] }}
+          aria-hidden
+        />
+        <span className="min-w-0 flex-1 truncate">{title}</span>
+      </button>
+    </li>
   );
 }
 
@@ -318,7 +472,7 @@ function SidebarRail({
       })}
       {tabs.length === 0 && (
         <div
-          className="text-[9px]"
+          className="text-xs"
           style={{ color: "var(--th-fg-muted)" }}
           title="No workspaces"
         >
@@ -382,7 +536,10 @@ function UsageLine({ snapshot }: { snapshot: StatusSnapshot }) {
   if (cost != null) parts.push(`$${cost.toFixed(2)}`);
   if (parts.length === 0) return null;
   return (
-    <div className="px-2 pb-1 pl-4 text-[10px] text-neutral-600">
+    <div
+      className="px-2 pb-1 pl-4 text-xs"
+      style={{ color: "var(--th-fg-muted)" }}
+    >
       {parts.join(" · ")}
     </div>
   );
@@ -390,12 +547,22 @@ function UsageLine({ snapshot }: { snapshot: StatusSnapshot }) {
 
 function Header({ children }: { children: React.ReactNode }) {
   return (
-    <div className="px-2 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-600">
+    <div
+      className="px-2 pt-2 pb-1 text-xs font-semibold uppercase tracking-wide"
+      style={{ color: "var(--th-fg-muted)" }}
+    >
       {children}
     </div>
   );
 }
 
 function Muted({ children }: { children: React.ReactNode }) {
-  return <div className="px-2 py-1 text-xs text-neutral-600">{children}</div>;
+  return (
+    <div
+      className="px-2 py-1 text-sm"
+      style={{ color: "var(--th-fg-muted)" }}
+    >
+      {children}
+    </div>
+  );
 }
