@@ -64,6 +64,22 @@ export function applyControl(command: string, args: ControlApply["args"]): void 
       return;
     }
 
+    case "new_tab": {
+      // MCP schema: { name? } -> create a new (empty) workspace tab and switch
+      // to it. addTab() auto-names + activates; an optional `name` renames it.
+      const id = ws.addTab();
+      const name = str(args, "name");
+      if (name) useWorkspace.getState().renameTab(id, name);
+      return;
+    }
+
+    case "focus_tab": {
+      // MCP schema: { tabId } -> activate that workspace tab.
+      const tabId = str(args, "tabId") ?? str(args, "id");
+      if (tabId && ws.tabs.some((t) => t.id === tabId)) ws.setActiveTab(tabId);
+      return;
+    }
+
     case "focus_session": {
       // MCP schema: { sessionId } -> switch to the session's tab and focus its
       // tile. The id may name a terminal/tile id, the owning tab's id, or a tab

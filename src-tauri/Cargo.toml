@@ -36,7 +36,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# `devtools` keeps the WebView2 devtools (F12) available in the RELEASE build so
+# the user can open the console on their machine (feat/diag).
+tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 portable-pty = "0.8"

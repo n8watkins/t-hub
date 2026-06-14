@@ -303,6 +303,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "wsl_health" => wsl_health(ctx),
         "search_files" => search_files(ctx, args),
         "list_tabs" => list_tabs(),
+        "read_terminal" | "capture_pane" => read_terminal(args),
 
         // ---- Organization tier (PRD §11.2: allowed, audited) ---------------
         // These are surfaced by the MCP server and accepted here, but the
@@ -312,8 +313,21 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "focus_session" => organization_apply(ctx, "focus_session", args),
         "move_tile" => organization_apply(ctx, "move_tile", args),
         "rename_tab" => organization_apply(ctx, "rename_tab", args),
+        "new_tab" => organization_apply(ctx, "new_tab", args),
+        "focus_tab" => organization_apply(ctx, "focus_tab", args),
         "open_file" => open_file(ctx, args),
+
+        // ---- Process-changing tier (PRD §11.2: confirmation required) ------
+        // `spawn_terminal` stays gated off (it would create an untracked tmux
+        // session the UI never adopts). The session-targeted process actions —
+        // typing into / interrupting / closing an *existing* session — are
+        // executed directly against tmux: the MCP tool descriptions mark them
+        // CONFIRMATION REQUIRED, which is the user-facing gate, and they only
+        // ever act on a `th_*` session the app already owns.
         "spawn_terminal" => gated_process_change("spawn_terminal"),
+        "send_text" => send_text(args),
+        "send_keys" => send_keys(args),
+        "close_terminal" => close_terminal(args),
 
         // ---- Theme (forwarded by name; parallel track owns the handlers) ----
         "get_theme" | "set_theme" => Err(format!(
@@ -428,6 +442,32 @@ fn list_tabs() -> Result<Value, String> {
     }))
 }
 
+/// `read_terminal` / `capture_pane`: return a session's recent visible output as
+/// plain text so an external Claude can SEE what the session shows. Talks to tmux
+/// directly (`tmux -L termhub capture-pane -p [-S -N] -t th_<id>`), no UI round
+/// trip. Args: `sessionId` (required), `historyLines` (optional, default 0 =
+/// visible screen only; clamped to keep responses bounded).
+fn read_terminal(args: &Value) -> Result<Value, String> {
+    let session_id = arg_str(args, "sessionId")
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("read_terminal requires a 'sessionId' argument")?;
+    let target = tmux_target(&session_id);
+    let history = args
+        .get("historyLines")
+        .or_else(|| args.get("history_lines"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(10_000) as u32;
+    let text = tmux::capture_pane_text(&target, history)
+        .map_err(|e| format!("failed to capture pane for '{session_id}': {e}"))?;
+    Ok(json!({
+        "sessionId": session_id,
+        "target": target,
+        "historyLines": history,
+        "text": text,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Organization-tier handlers
 // ---------------------------------------------------------------------------
@@ -489,6 +529,99 @@ fn gated_process_change(command: &str) -> Result<Value, String> {
          gated off in this build — it requires explicit confirmation/permission \
          and is not executed over the control channel yet"
     ))
+}
+
+/// `send_text`: type literal `text` into an existing session, optionally pressing
+/// Enter to submit it. Process-changing (PRD §11.2): the MCP tool description
+/// marks it CONFIRMATION REQUIRED. Backend-only — drives tmux directly
+/// (`send-keys -l`), no UI round trip. Args: `sessionId` + `text` (required),
+/// `enter` (optional, default true). Requires the session to exist.
+fn send_text(args: &Value) -> Result<Value, String> {
+    let session_id = arg_str(args, "sessionId")
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("send_text requires a 'sessionId' argument")?;
+    let text = arg_str(args, "text").ok_or("send_text requires a 'text' argument")?;
+    let enter = args.get("enter").and_then(|v| v.as_bool()).unwrap_or(true);
+    let target = tmux_target(&session_id);
+    if !tmux::has_session(&target) {
+        return Err(format!("send_text: no such session '{session_id}' (target {target})"));
+    }
+    tmux::send_text(&target, &text, enter)
+        .map_err(|e| format!("failed to send text to '{session_id}': {e}"))?;
+    Ok(json!({
+        "accepted": "send_text",
+        "sessionId": session_id,
+        "target": target,
+        "enter": enter,
+        "audited": true,
+    }))
+}
+
+/// `send_keys`: send one or more named control keys (e.g. `C-c`, `Up`, `Escape`)
+/// to an existing session. Process-changing (confirmation-required). Backend-only
+/// (`send-keys` with key-name interpretation). Args: `sessionId` (required) +
+/// `keys` (required, a non-empty array of tmux key names).
+fn send_keys(args: &Value) -> Result<Value, String> {
+    let session_id = arg_str(args, "sessionId")
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("send_keys requires a 'sessionId' argument")?;
+    let keys: Vec<String> = args
+        .get("keys")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if keys.is_empty() {
+        return Err("send_keys requires a non-empty 'keys' array of tmux key names".into());
+    }
+    let target = tmux_target(&session_id);
+    if !tmux::has_session(&target) {
+        return Err(format!("send_keys: no such session '{session_id}' (target {target})"));
+    }
+    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+    tmux::send_keys(&target, &key_refs)
+        .map_err(|e| format!("failed to send keys to '{session_id}': {e}"))?;
+    Ok(json!({
+        "accepted": "send_keys",
+        "sessionId": session_id,
+        "target": target,
+        "keys": keys,
+        "audited": true,
+    }))
+}
+
+/// `close_terminal`: kill an existing session and its process tree. Process-
+/// changing/destructive (confirmation-required). Backend-only via tmux
+/// `kill-session`, which is idempotent (already-gone ⇒ success). Args:
+/// `sessionId` (required).
+fn close_terminal(args: &Value) -> Result<Value, String> {
+    let session_id = arg_str(args, "sessionId")
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("close_terminal requires a 'sessionId' argument")?;
+    let target = tmux_target(&session_id);
+    tmux::kill_session(&target)
+        .map_err(|e| format!("failed to close terminal '{session_id}': {e}"))?;
+    Ok(json!({
+        "accepted": "close_terminal",
+        "sessionId": session_id,
+        "target": target,
+        "audited": true,
+    }))
+}
+
+/// Resolve a caller-supplied session id to its tmux target name on the `termhub`
+/// socket. The control listener lists terminals by stripping the `th_` prefix
+/// (see [`list_terminals`]), so a bare id maps back to `th_<id>`. We also accept a
+/// caller that already passed the full `th_`-prefixed name (idempotent).
+fn tmux_target(session_id: &str) -> String {
+    if session_id.starts_with("th_") {
+        session_id.to_string()
+    } else {
+        format!("th_{session_id}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -716,6 +849,107 @@ mod tests {
         let ctx = test_ctx("t");
         let err = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap_err();
         assert!(err.contains("process-changing"), "got: {err}");
+    }
+
+    #[test]
+    fn read_terminal_requires_session_id() {
+        let ctx = test_ctx("t");
+        let err = dispatch(&ctx, "read_terminal", &Value::Null).unwrap_err();
+        assert!(err.contains("sessionId"), "got: {err}");
+    }
+
+    #[test]
+    fn send_text_requires_session_and_text() {
+        let ctx = test_ctx("t");
+        let err = dispatch(&ctx, "send_text", &json!({"text": "hi"})).unwrap_err();
+        assert!(err.contains("sessionId"), "got: {err}");
+        let err = dispatch(&ctx, "send_text", &json!({"sessionId": "x"})).unwrap_err();
+        assert!(err.contains("text"), "got: {err}");
+    }
+
+    #[test]
+    fn send_keys_requires_non_empty_keys() {
+        let ctx = test_ctx("t");
+        let err = dispatch(&ctx, "send_keys", &json!({"sessionId": "x", "keys": []})).unwrap_err();
+        assert!(err.contains("keys"), "got: {err}");
+    }
+
+    #[test]
+    fn close_terminal_requires_session_id() {
+        let ctx = test_ctx("t");
+        let err = dispatch(&ctx, "close_terminal", &Value::Null).unwrap_err();
+        assert!(err.contains("sessionId"), "got: {err}");
+    }
+
+    #[test]
+    fn send_to_missing_session_is_a_clear_error() {
+        // No `th_*` session named this exists ⇒ a readable "no such session".
+        let ctx = test_ctx("t");
+        let err = dispatch(
+            &ctx,
+            "send_text",
+            &json!({"sessionId": "definitely_absent_xyz", "text": "hi"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("no such session"), "got: {err}");
+    }
+
+    #[test]
+    fn tmux_target_maps_id_and_is_idempotent() {
+        assert_eq!(tmux_target("abc"), "th_abc");
+        assert_eq!(tmux_target("th_abc"), "th_abc");
+    }
+
+    #[test]
+    fn new_tab_and_focus_tab_are_organization_apply() {
+        // No sink (headless): accepted + audited, but not applied — same contract
+        // as the other organization-tier actions.
+        let ctx = test_ctx("t");
+        for (cmd, args) in [
+            ("new_tab", json!({"name": "Logs"})),
+            ("focus_tab", json!({"tabId": "tab-1"})),
+        ] {
+            let v = dispatch(&ctx, cmd, &args).unwrap();
+            assert_eq!(v["accepted"], cmd);
+            assert_eq!(v["audited"], true);
+            assert_eq!(v["applied"], false);
+        }
+    }
+
+    /// Live round-trip through dispatch: spawn a real tmux session, type a line
+    /// via `send_text`, read it back via `read_terminal`, then `close_terminal`.
+    /// Needs a real tmux on PATH (WSL2 dev shell; not the Windows CI target).
+    #[test]
+    fn live_send_read_close_roundtrip() {
+        let id = format!(
+            "mcp3test{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let target = format!("th_{id}");
+        let _ = tmux::kill_session(&target);
+        tmux::new_session(&target, "/tmp", None).expect("spawn session");
+
+        let ctx = test_ctx("t");
+        dispatch(
+            &ctx,
+            "send_text",
+            &json!({"sessionId": id, "text": "echo MCP3_ROUNDTRIP_OK", "enter": true}),
+        )
+        .expect("send_text should succeed");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let v = dispatch(&ctx, "read_terminal", &json!({"sessionId": id})).unwrap();
+        assert!(
+            v["text"].as_str().unwrap().contains("MCP3_ROUNDTRIP_OK"),
+            "read_terminal should show the echoed sentinel; got {v:?}"
+        );
+
+        let c = dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+        assert_eq!(c["accepted"], "close_terminal");
+        assert!(!tmux::has_session(&target), "session should be gone after close");
     }
 
     #[test]
