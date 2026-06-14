@@ -10,6 +10,13 @@ import { create } from "zustand";
 
 const PERSIST_KEY = "termhub.settings.v1";
 
+/** Bounds for the configurable titlebar auto-hide timings (used by both the
+ *  persistence clamp and the Settings sliders, so they can't drift apart). */
+export const TITLEBAR_HIDE_DELAY_MIN = 500;
+export const TITLEBAR_HIDE_DELAY_MAX = 6000;
+export const TITLEBAR_REVEAL_ANIM_MIN = 40;
+export const TITLEBAR_REVEAL_ANIM_MAX = 400;
+
 /** Persisted flag defaults. */
 const DEFAULTS = {
   /** Titlebar auto-reveal pushes the body down (vs. overlays it). */
@@ -17,11 +24,26 @@ const DEFAULTS = {
   /** Auto-hide the titlebar when the window is maximized (opt-in). Default OFF
    *  so maximize/restore is always reachable; the user can enable it. */
   autoHideTitlebarMaximized: false,
+  /** Delay (ms) before an auto-hidden titlebar hides — both after the initial
+   *  maximize reveal and after the pointer leaves the bar. */
+  titlebarHideDelayMs: 2000,
+  /** Duration (ms) of the titlebar show/hide slide animation. */
+  titlebarRevealAnimMs: 140,
 } as const;
 
 interface PersistedSettings {
   revealPushesContent: boolean;
   autoHideTitlebarMaximized: boolean;
+  titlebarHideDelayMs: number;
+  titlebarRevealAnimMs: number;
+}
+
+/** Clamp a persisted/incoming number into a range, falling back to a default
+ *  when it isn't a finite number. */
+function clampNum(v: unknown, min: number, max: number, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v)
+    ? Math.max(min, Math.min(max, Math.round(v)))
+    : fallback;
 }
 
 function loadPersisted(): PersistedSettings {
@@ -39,6 +61,18 @@ function loadPersisted(): PersistedSettings {
         typeof p.autoHideTitlebarMaximized === "boolean"
           ? p.autoHideTitlebarMaximized
           : DEFAULTS.autoHideTitlebarMaximized,
+      titlebarHideDelayMs: clampNum(
+        p.titlebarHideDelayMs,
+        TITLEBAR_HIDE_DELAY_MIN,
+        TITLEBAR_HIDE_DELAY_MAX,
+        DEFAULTS.titlebarHideDelayMs,
+      ),
+      titlebarRevealAnimMs: clampNum(
+        p.titlebarRevealAnimMs,
+        TITLEBAR_REVEAL_ANIM_MIN,
+        TITLEBAR_REVEAL_ANIM_MAX,
+        DEFAULTS.titlebarRevealAnimMs,
+      ),
     };
   } catch {
     return { ...DEFAULTS };
@@ -68,31 +102,74 @@ interface SettingsState {
   /** Auto-hide the titlebar when maximized (opt-in; default false). */
   autoHideTitlebarMaximized: boolean;
   setAutoHideTitlebarMaximized: (v: boolean) => void;
+
+  /** Delay (ms) before an auto-hidden titlebar hides. Clamped on write. */
+  titlebarHideDelayMs: number;
+  setTitlebarHideDelayMs: (v: number) => void;
+
+  /** Duration (ms) of the titlebar show/hide slide animation. Clamped on write. */
+  titlebarRevealAnimMs: number;
+  setTitlebarRevealAnimMs: (v: number) => void;
 }
 
 const initial = loadPersisted();
 
-export const useSettings = create<SettingsState>((set, get) => ({
-  settingsOpen: false,
-  openSettings: () => set({ settingsOpen: true }),
-  closeSettings: () => set({ settingsOpen: false }),
-  toggleSettings: () => set({ settingsOpen: !get().settingsOpen }),
-
-  revealPushesContent: initial.revealPushesContent,
-  setRevealPushesContent: (v) => {
-    set({ revealPushesContent: v });
+export const useSettings = create<SettingsState>((set, get) => {
+  /** Snapshot every persisted field off the current state. Each setter writes
+   *  its new value into the store first, then persists this whole snapshot, so
+   *  fields stay in sync no matter which setter fired. */
+  const persistAll = () => {
+    const s = get();
     savePersisted({
-      revealPushesContent: v,
-      autoHideTitlebarMaximized: get().autoHideTitlebarMaximized,
+      revealPushesContent: s.revealPushesContent,
+      autoHideTitlebarMaximized: s.autoHideTitlebarMaximized,
+      titlebarHideDelayMs: s.titlebarHideDelayMs,
+      titlebarRevealAnimMs: s.titlebarRevealAnimMs,
     });
-  },
+  };
 
-  autoHideTitlebarMaximized: initial.autoHideTitlebarMaximized,
-  setAutoHideTitlebarMaximized: (v) => {
-    set({ autoHideTitlebarMaximized: v });
-    savePersisted({
-      revealPushesContent: get().revealPushesContent,
-      autoHideTitlebarMaximized: v,
-    });
-  },
-}));
+  return {
+    settingsOpen: false,
+    openSettings: () => set({ settingsOpen: true }),
+    closeSettings: () => set({ settingsOpen: false }),
+    toggleSettings: () => set({ settingsOpen: !get().settingsOpen }),
+
+    revealPushesContent: initial.revealPushesContent,
+    setRevealPushesContent: (v) => {
+      set({ revealPushesContent: v });
+      persistAll();
+    },
+
+    autoHideTitlebarMaximized: initial.autoHideTitlebarMaximized,
+    setAutoHideTitlebarMaximized: (v) => {
+      set({ autoHideTitlebarMaximized: v });
+      persistAll();
+    },
+
+    titlebarHideDelayMs: initial.titlebarHideDelayMs,
+    setTitlebarHideDelayMs: (v) => {
+      set({
+        titlebarHideDelayMs: clampNum(
+          v,
+          TITLEBAR_HIDE_DELAY_MIN,
+          TITLEBAR_HIDE_DELAY_MAX,
+          DEFAULTS.titlebarHideDelayMs,
+        ),
+      });
+      persistAll();
+    },
+
+    titlebarRevealAnimMs: initial.titlebarRevealAnimMs,
+    setTitlebarRevealAnimMs: (v) => {
+      set({
+        titlebarRevealAnimMs: clampNum(
+          v,
+          TITLEBAR_REVEAL_ANIM_MIN,
+          TITLEBAR_REVEAL_ANIM_MAX,
+          DEFAULTS.titlebarRevealAnimMs,
+        ),
+      });
+      persistAll();
+    },
+  };
+});

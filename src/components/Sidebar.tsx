@@ -25,6 +25,7 @@ import {
 import { useAgentTelemetry } from "../store/telemetry";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import { startPointerDrag } from "../lib/pointerDrag";
+import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { SupervisionTreeBody } from "./SupervisionTree";
 import { StatusBadge, statusLabel } from "./StatusBadge";
 import { WslHealth } from "./WslHealth";
@@ -352,17 +353,31 @@ function WorkspaceList({
     if (editing === tabId) return; // let the rename input own the pointer
     if (e.button !== 0) return;
     suppressClickRef.current = false;
+    // Ghost details captured at press time (the workspace's name + tile count) so
+    // the floating chip matches the titlebar/tile drags' "I'm carrying this" cue.
+    const tab = tabs.find((t) => t.id === tabId);
+    const wsCount = tab?.order.length ?? 0;
+    const wsName = `${tab?.name ?? "Workspace"} · ${wsCount} terminal${
+      wsCount === 1 ? "" : "s"
+    }`;
+    let ghost: DragGhost | null = null;
     startPointerDrag(e.clientX, e.clientY, {
       onBegin: () => {
         actions.setDraggingTab(tabId);
         document.body.dataset.thDragging = "1";
+        // Header-only chip (bodyHeight 0), like the titlebar tab ghost; fold the
+        // tile count into the title so it shows on the single-line chip.
+        ghost = createDragGhost({ title: wsName, width: 160, bodyHeight: 0 });
       },
       onMove: (x, y) => {
+        ghost?.move(x, y);
         const overId = workspaceUnder(x, y);
         actions.setDropTab(overId && overId !== tabId ? overId : null);
       },
       onEnd: (x, y, committed) => {
         const targetId = committed ? workspaceUnder(x, y) : null;
+        ghost?.destroy();
+        ghost = null;
         delete document.body.dataset.thDragging;
         actions.setDraggingTab(null);
         actions.setDropTab(null);
@@ -387,17 +402,33 @@ function WorkspaceList({
   ) => {
     if (e.button !== 0) return;
     suppressClickRef.current = false;
+    // Ghost details captured at press time: the terminal's title + lifecycle
+    // state, mirroring the TerminalRow tooltip (`${title} — ${state}`).
+    const info = terminals[terminalId];
+    const termTitle = info?.title?.trim() || terminalId;
+    const termState = info?.state ?? "starting";
+    let ghost: DragGhost | null = null;
     startPointerDrag(e.clientX, e.clientY, {
       onBegin: () => {
         actions.setDraggingTile(terminalId);
         document.body.dataset.thDragging = "1";
+        // Small chip with a faded subtitle line showing the lifecycle state.
+        ghost = createDragGhost({
+          title: termTitle,
+          subtitle: termState,
+          width: 180,
+          bodyHeight: 22,
+        });
       },
       onMove: (x, y) => {
+        ghost?.move(x, y);
         const overId = workspaceUnder(x, y);
         actions.setDropTab(overId && overId !== ownTabId ? overId : null);
       },
       onEnd: (x, y, committed) => {
         const targetId = committed ? workspaceUnder(x, y) : null;
+        ghost?.destroy();
+        ghost = null;
         delete document.body.dataset.thDragging;
         actions.setDraggingTile(null);
         actions.setDropTab(null);

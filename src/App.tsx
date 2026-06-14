@@ -53,9 +53,9 @@ function nextSidebarMode(m: SidebarMode): SidebarMode {
 
 /** Titlebar height in px (matches <Titlebar/>'s h-8); used for the reveal shift. */
 const TITLEBAR_H = 32;
-/** Maximized auto-hide delay after the bar is shown / the pointer leaves it. */
-const HIDE_AFTER_INITIAL_MS = 2000; // ~2s after maximize (#7)
-const HIDE_AFTER_LEAVE_MS = 3000; // ~3s after the pointer leaves the bar (#7)
+// The maximized auto-hide delay (after the bar is shown / the pointer leaves it)
+// and the reveal slide duration are now user-configurable in Settings
+// (settings.titlebarHideDelayMs / settings.titlebarRevealAnimMs).
 
 function clampSidebar(n: number): number {
   if (!Number.isFinite(n)) return SIDEBAR_DEFAULT;
@@ -106,8 +106,13 @@ function useWindowMaximized(): boolean {
  * Titlebar auto-hide/reveal state. `enabled` is true only when the window is
  * maximized AND the user opted into auto-hide; when false the bar is always
  * revealed (no timers), so the default experience keeps a permanent visible bar.
+ * `initialHideMs` is the configurable delay before the bar auto-hides after the
+ * initial maximize reveal (settings.titlebarHideDelayMs).
  */
-function useTitlebarReveal(enabled: boolean): {
+function useTitlebarReveal(
+  enabled: boolean,
+  initialHideMs: number,
+): {
   revealed: boolean;
   reveal: () => void;
   scheduleHide: (ms: number) => void;
@@ -141,12 +146,9 @@ function useTitlebarReveal(enabled: boolean): {
     }
     // Auto-hide active: show briefly, then hide.
     setRevealed(true);
-    timerRef.current = window.setTimeout(
-      () => setRevealed(false),
-      HIDE_AFTER_INITIAL_MS,
-    );
+    timerRef.current = window.setTimeout(() => setRevealed(false), initialHideMs);
     return clearTimer;
-  }, [enabled, clearTimer]);
+  }, [enabled, initialHideMs, clearTimer]);
 
   return { revealed, reveal, scheduleHide };
 }
@@ -198,10 +200,18 @@ export default function App() {
   const maximized = useWindowMaximized();
   const revealPushesContent = useSettings((s) => s.revealPushesContent);
   const autoHide = useSettings((s) => s.autoHideTitlebarMaximized);
+  // Configurable auto-hide timings (Settings -> General -> Titlebar).
+  const hideDelayMs = useSettings((s) => s.titlebarHideDelayMs);
+  const revealAnimMs = useSettings((s) => s.titlebarRevealAnimMs);
   // Auto-hide only kicks in when maximized AND opted in; otherwise the titlebar
   // is always a visible row so maximize/restore is always reachable.
   const hideable = maximized && autoHide;
-  const { revealed, reveal, scheduleHide } = useTitlebarReveal(hideable);
+  const { revealed, reveal, scheduleHide } = useTitlebarReveal(
+    hideable,
+    hideDelayMs,
+  );
+  // Reveal/hide slide duration, shared by both bar layout modes.
+  const barTransition = `${revealAnimMs}ms ease`;
 
   // The bar is shown whenever auto-hide isn't active, or when it is and revealed.
   const barShown = !hideable || revealed;
@@ -210,7 +220,7 @@ export default function App() {
   const barHover = hideable
     ? {
         onPointerEnter: reveal,
-        onPointerLeave: () => scheduleHide(HIDE_AFTER_LEAVE_MS),
+        onPointerLeave: () => scheduleHide(hideDelayMs),
       }
     : undefined;
 
@@ -295,10 +305,10 @@ export default function App() {
           className="absolute inset-x-0 top-0 z-30"
           style={{
             transform: barShown ? "translateY(0)" : "translateY(-100%)",
-            transition: "transform 140ms ease",
+            transition: `transform ${barTransition}`,
           }}
           onPointerEnter={reveal}
-          onPointerLeave={() => scheduleHide(HIDE_AFTER_LEAVE_MS)}
+          onPointerLeave={() => scheduleHide(hideDelayMs)}
         >
           <Titlebar satellite={SATELLITE} tabStripOffset={sidebarOffset} />
         </div>
@@ -307,7 +317,7 @@ export default function App() {
           style={{
             height: barShown ? TITLEBAR_H : 0,
             overflow: "hidden",
-            transition: "height 140ms ease",
+            transition: `height ${barTransition}`,
           }}
           {...barHover}
         >

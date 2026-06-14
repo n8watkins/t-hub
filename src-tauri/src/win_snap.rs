@@ -7,14 +7,35 @@
 //!
 //!   * the Windows 11 **Snap Layouts** flyout (hovering the maximize button pops
 //!     a snap-zone picker), which the shell only offers when a window reports
-//!     `HTMAXBUTTON` from `WM_NCHITTEST`; and
+//!     `HTMAXBUTTON` from `WM_NCHITTEST` *and* still owns a DWM-managed frame the
+//!     flyout can anchor to; and
 //!   * native **edge/corner resize** affordances (the `HTLEFT`/`HTTOP`/... codes).
 //!
-//! We restore both by subclassing the window's Win32 `HWND` and answering
-//! `WM_NCHITTEST` ourselves: edge/corner resize codes near the borders, then
-//! `HTMAXBUTTON` over the custom maximize button's slot (top-right), then
-//! `HTCAPTION` over the rest of the draggable titlebar, and `HTCLIENT`
-//! everywhere else (so the WebView keeps all its normal input).
+//! ## Why the first attempt (just returning `HTMAXBUTTON`) did not show the flyout
+//!
+//! Tauri's Windows backend (tao) keeps the window's *styles* (`WS_CAPTION`,
+//! `WS_THICKFRAME`, `WS_MAXIMIZEBOX`) but makes the window look frameless by
+//! answering `WM_NCCALCSIZE` with `0`, which **collapses the non-client area to
+//! zero**. With a zero-height non-client frame there is no DWM caption frame for
+//! the OS to anchor the Snap Layouts flyout to, so even a correct `HTMAXBUTTON`
+//! from `WM_NCHITTEST` produces *nothing* on hover. This is the canonical Win32
+//! "custom frame" gotcha (see Microsoft's "Custom Window Frame Using DWM").
+//!
+//! ## The fix (keeps the frameless custom T-Hub bar)
+//!
+//! Two missing ingredients, both standard for custom-frame Win32 windows:
+//!
+//!   1. **`DwmExtendFrameIntoClientArea`** with a tiny (1px top) margin. This
+//!      re-establishes a DWM-managed frame *behind* the client area without
+//!      changing how the window looks (tao's `WM_NCCALCSIZE` still gives us the
+//!      full client rect), restoring the surface the Snap flyout attaches to.
+//!   2. **`DwmDefWindowProc` first** in the subclass proc. DWM's default proc is
+//!      what actually drives the maximize-button hover highlight and the Snap
+//!      Layouts flyout off the `HTMAXBUTTON` we report. We must give every
+//!      message to it first and honor a handled result.
+//!
+//! With those in place we still answer `WM_NCHITTEST` ourselves for the resize
+//! bands, the `HTMAXBUTTON` slot, and `HTCAPTION` over the draggable titlebar.
 //!
 //! Everything here is `#[cfg(windows)]`; on unix this module compiles to an
 //! empty `install` no-op so the rest of the app is untouched.
@@ -51,12 +72,15 @@ pub fn install<R: tauri::Runtime>(_window: &tauri::WebviewWindow<R>) -> tauri::R
 #[cfg(windows)]
 mod imp {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Graphics::Dwm::{DwmDefWindowProc, DwmExtendFrameIntoClientArea};
+    use windows::Win32::UI::Controls::MARGINS;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowRect, IsZoomed, SendMessageW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
         HTCLIENT, HTLEFT, HTMAXBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, SC_MAXIMIZE,
-        SC_RESTORE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_SYSCOMMAND,
+        SC_RESTORE, WM_ACTIVATE, WM_DPICHANGED, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN,
+        WM_NCLBUTTONUP, WM_SYSCOMMAND,
     };
 
     /// Titlebar height in *logical* (CSS) pixels - must match the `h-8` row in
@@ -79,8 +103,8 @@ mod imp {
     /// subclass chain works; "THSN" = TermHub SNap, as ASCII bytes).
     const SUBCLASS_ID: usize = 0x5448_534E;
 
-    /// Install the subclass. Idempotent-ish: Tauri builds the main window once at
-    /// startup, and we install exactly once from `setup()`.
+    /// Install the subclass + extend the DWM frame. Idempotent-ish: Tauri builds
+    /// the main window once at startup, and we install exactly once from `setup()`.
     pub fn install<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> tauri::Result<()> {
         let hwnd = window.hwnd()?;
         // SAFETY: `hwnd` is a live top-level window owned by Tauri for the life of
@@ -96,13 +120,46 @@ mod imp {
                     "SetWindowSubclass failed to install the Snap-Layouts hit-test hook",
                 )));
             }
+            // Re-establish a DWM-managed frame so the Snap Layouts flyout has
+            // something to anchor to. Without this, tao's zero non-client area
+            // (it answers WM_NCCALCSIZE with 0) means the flyout never appears
+            // even though we report HTMAXBUTTON. A 1px top margin is enough; the
+            // window still *looks* frameless because tao keeps the full client
+            // rect. A failure here is logged but non-fatal (resize still works).
+            extend_frame(hwnd);
+            eprintln!(
+                "termhub: win_snap installed (subclass + DWM frame) on HWND {:?}",
+                hwnd.0
+            );
         }
         Ok(())
     }
 
-    /// The window subclass proc. We only special-case `WM_NCHITTEST`; everything
-    /// else (including all the messages Tauri/wry rely on) falls through to
-    /// `DefSubclassProc`, preserving normal window behavior.
+    /// Extend the DWM frame by a tiny top margin so the window keeps a DWM-managed
+    /// caption frame (the surface the Snap Layouts flyout attaches to) while still
+    /// presenting a full client area visually. Per Microsoft's custom-frame guide
+    /// this is re-applied on activation / DPI change.
+    unsafe fn extend_frame(hwnd: HWND) {
+        // A 1px top sliver is enough to give DWM a frame; left/right/bottom 0 so we
+        // do not paint any visible glass border. (A negative "-1" sheet-of-glass
+        // margin would also work but can tint the whole window; 1px top is the
+        // least-invasive value that restores the flyout anchor.)
+        let margins = MARGINS {
+            cxLeftWidth: 0,
+            cxRightWidth: 0,
+            cyTopHeight: 1,
+            cyBottomHeight: 0,
+        };
+        if let Err(e) = DwmExtendFrameIntoClientArea(hwnd, &margins) {
+            eprintln!("termhub: win_snap DwmExtendFrameIntoClientArea failed: {e}");
+        }
+    }
+
+    /// The window subclass proc. DWM's default proc gets first crack at every
+    /// message (so the maximize-button hover highlight + Snap Layouts flyout
+    /// render); then we special-case `WM_NCHITTEST` (resize bands + caption +
+    /// the `HTMAXBUTTON` slot). Everything else - including all the messages
+    /// Tauri/wry rely on - falls through to `DefSubclassProc`.
     unsafe extern "system" fn subclass_proc(
         hwnd: HWND,
         msg: u32,
@@ -111,7 +168,24 @@ mod imp {
         _id: usize,
         _ref_data: usize,
     ) -> LRESULT {
+        // Let DWM handle the message first. For caption-button messages (incl. the
+        // maximize-button hover that drives Snap Layouts) it returns TRUE and fills
+        // `dwm_result`; we then return that and do nothing else. This is required
+        // by the custom-frame contract - the flyout will NOT appear if we skip it.
+        let mut dwm_result = LRESULT(0);
+        let dwm_handled = DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut dwm_result).as_bool();
+        if dwm_handled {
+            return dwm_result;
+        }
+
         match msg {
+            // Keep the DWM frame anchored across activation + DPI changes (Microsoft
+            // recommends re-extending here rather than only at creation). We then
+            // fall through to default handling so Tauri/wry still see the message.
+            WM_ACTIVATE | WM_DPICHANGED => {
+                extend_frame(hwnd);
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
             WM_NCHITTEST => {
                 if let Some(code) = hit_test(hwnd, lparam) {
                     return LRESULT(code as isize);
@@ -125,8 +199,8 @@ mod imp {
             // the WebView's hands, the frontend's React onClick(toggleMaximize) no
             // longer fires for a plain click on it - so we toggle maximize here on
             // a press+release over HTMAXBUTTON, restoring the click-to-maximize
-            // behavior. Snap Layouts itself is driven by the OS off the HTMAXBUTTON
-            // hover, independent of these messages.
+            // behavior. Snap Layouts itself is driven by DWM off the HTMAXBUTTON
+            // hover (via DwmDefWindowProc above), independent of these messages.
             WM_NCLBUTTONDOWN if wparam.0 as u32 == HTMAXBUTTON => {
                 // Swallow the down so DefWindowProc doesn't enter its own caption-
                 // button tracking loop; we act on the up.
