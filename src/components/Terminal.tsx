@@ -108,6 +108,61 @@ export function TerminalView({
       void writeTerminal(terminalId, d);
     });
 
+    // Match the user's Windows Terminal bindings: Ctrl+C copies the selection
+    // (and clears it) or, with nothing selected, falls through to the shell as
+    // SIGINT; Ctrl+V pastes (bracketed-paste aware via term.paste). Ctrl +/-/0
+    // zoom is handled here too because a focused xterm otherwise swallows those
+    // before they reach the window-level handler. Returning false stops xterm
+    // from sending the key to the PTY; stopPropagation prevents the Canvas
+    // window handler from double-firing.
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== "keydown") return true;
+      const mod = e.ctrlKey || e.metaKey;
+      if (!mod || e.altKey) return true;
+      const key = e.key.toLowerCase();
+
+      if (key === "c") {
+        if (term.hasSelection()) {
+          void navigator.clipboard.writeText(term.getSelection()).catch(() => {});
+          term.clearSelection();
+          e.preventDefault();
+          e.stopPropagation();
+          return false;
+        }
+        return true; // no selection -> let Ctrl+C reach the shell as SIGINT
+      }
+      if (key === "v") {
+        void navigator.clipboard
+          .readText()
+          .then((t) => {
+            if (t) term.paste(t);
+          })
+          .catch(() => {});
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+      }
+      if (key === "=" || key === "+") {
+        useWorkspace.getState().zoomIn();
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+      }
+      if (key === "-" || key === "_") {
+        useWorkspace.getState().zoomOut();
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+      }
+      if (key === "0") {
+        useWorkspace.getState().zoomReset();
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+      }
+      return true;
+    });
+
     const pushResize = () => {
       if (disposed) return;
       try {

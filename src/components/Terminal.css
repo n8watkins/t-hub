@@ -16,3 +16,22 @@
   padding: 0;
   box-sizing: border-box;
 }
+
+/* No visible scrollbar -- scroll via the wheel. A reserved/visible scrollbar
+ * wastes space and reads like an unwanted overflow. */
+.termhub-terminal .xterm-viewport {
+  scrollbar-width: none; /* Firefox */
+}
+.termhub-terminal .xterm-viewport::-webkit-scrollbar {
+  display: none; /* WebKit / Chromium (WebView2) */
+  width: 0;
+  height: 0;
+}
+
+/* Normal arrow cursor over the terminal, not the text I-beam (selection still
+ * works on drag). */
+.termhub-terminal .xterm,
+.termhub-terminal .xterm-viewport,
+.termhub-terminal .xterm-screen {
+  cursor: default;
+}

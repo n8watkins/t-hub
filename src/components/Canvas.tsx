@@ -178,7 +178,7 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
         onClick={() => void spawn()}
         title="New terminal (Ctrl/Cmd+T)"
         aria-label="New terminal"
-        className="absolute bottom-3 right-3 flex h-9 w-9 items-center justify-center rounded-full border border-neutral-700 bg-neutral-900/90 text-lg leading-none text-neutral-200 shadow-lg hover:border-emerald-600 hover:text-white"
+        className="absolute bottom-3 right-3 z-30 flex h-9 w-9 cursor-pointer items-center justify-center rounded-full border border-neutral-700 bg-neutral-900/90 text-lg leading-none text-neutral-200 shadow-lg hover:border-emerald-600 hover:text-white"
       >
         +
       </button>
