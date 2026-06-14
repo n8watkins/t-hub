@@ -61,6 +61,13 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_HiDpi",
+    # DWM custom-frame APIs: DwmExtendFrameIntoClientArea + DwmDefWindowProc.
+    # Extending a 1px frame re-establishes the DWM caption surface the Snap
+    # Layouts flyout anchors to (tao collapses the non-client area to zero), and
+    # DwmDefWindowProc drives the maximize-button hover that triggers the flyout.
+    "Win32_Graphics_Dwm",
+    # MARGINS struct passed to DwmExtendFrameIntoClientArea.
+    "Win32_UI_Controls",
 ] }
 
 [profile.release]
