@@ -108,6 +108,12 @@ interface SettingsState {
   openSettings: () => void;
   closeSettings: () => void;
   toggleSettings: () => void;
+  /** Deep-link target: the settings nav section to show when the panel next
+   *  opens (e.g. open straight to "hooks" from the sidebar usage hint). Read by
+   *  ThemeEditorPanel on mount, then cleared on close. Transient. */
+  settingsSection: string | null;
+  /** Open the settings panel directly to a given nav section. */
+  openSettingsTo: (section: string) => void;
 
   /** Titlebar auto-reveal pushes content down (true) vs. overlays it (false). */
   revealPushesContent: boolean;
@@ -154,9 +160,11 @@ export const useSettings = create<SettingsState>((set, get) => {
 
   return {
     settingsOpen: false,
+    settingsSection: null,
     openSettings: () => set({ settingsOpen: true }),
-    closeSettings: () => set({ settingsOpen: false }),
+    closeSettings: () => set({ settingsOpen: false, settingsSection: null }),
     toggleSettings: () => set({ settingsOpen: !get().settingsOpen }),
+    openSettingsTo: (section) => set({ settingsOpen: true, settingsSection: section }),
 
     revealPushesContent: initial.revealPushesContent,
     setRevealPushesContent: (v) => {

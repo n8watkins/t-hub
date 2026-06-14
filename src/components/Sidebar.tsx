@@ -483,10 +483,19 @@ function UsageSummary({
 }: {
   snapshots: Record<string, StatusSnapshot>;
 }) {
+  const openSettingsTo = useSettings((s) => s.openSettingsTo);
   const list = Object.values(snapshots);
   if (list.length === 0) {
     return (
-      <Muted>No Claude usage yet — install hooks to see context, cost, and rate limits.</Muted>
+      <button
+        type="button"
+        onClick={() => openSettingsTo("hooks")}
+        className="block w-full px-2 py-1 text-left text-sm hover:underline"
+        style={{ color: "var(--th-fg-muted)" }}
+        title="Open Settings → Hooks to install Claude hooks"
+      >
+        No Claude usage yet — install hooks to see context, cost, and rate limits.
+      </button>
     );
   }
   let cost = 0;

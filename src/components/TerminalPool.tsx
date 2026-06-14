@@ -614,6 +614,11 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
           // during a tile drag, so elementFromPoint falls through to the grid
           // placeholder (data-tile-id) underneath for drop resolution.
           data-th-pool-tile={id}
+          // Clicking INTO a terminal (its body, to type) must focus that tile —
+          // otherwise focusedId only tracked header clicks, so the Files tree
+          // (which roots at the focused terminal's cwd) never followed when you
+          // clicked between terminals. Capture phase so it wins before xterm.
+          onPointerDownCapture={() => useWorkspace.getState().setFocus(id)}
           ref={(el) => {
             if (el) {
               wrapRefs.current.set(id, el);

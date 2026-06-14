@@ -98,7 +98,10 @@ type SectionId =
   | "terminal";
 
 function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
-  const [section, setSection] = useState<SectionId>("general");
+  // Honor a deep-link target (e.g. the sidebar "install hooks" hint opens us
+  // straight to Hooks) captured when the panel was opened; default to General.
+  const target = useSettings.getState().settingsSection as SectionId | null;
+  const [section, setSection] = useState<SectionId>(target ?? "general");
 
   return (
     // Scrim: a click anywhere outside the panel closes the editor. The panel
