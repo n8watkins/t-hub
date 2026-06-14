@@ -62,7 +62,14 @@ export function Sidebar({ onSelectSession, agentBin = "termhub-agent" }: Sidebar
   const queue = attentionSessions(displayStatuses);
 
   return (
-    <aside className="flex h-full w-64 shrink-0 flex-col border-r border-neutral-800 bg-neutral-950 text-neutral-200">
+    <aside
+      className="flex h-full w-64 shrink-0 flex-col border-r"
+      style={{
+        backgroundColor: "var(--th-sidebar-bg)",
+        borderColor: "var(--th-border)",
+        color: "var(--th-fg)",
+      }}
+    >
       {/* 1. Attention queue */}
       <section className="border-b border-neutral-800">
         <Header>Attention</Header>

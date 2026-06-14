@@ -18,6 +18,7 @@ import { useState } from "react";
 import type { DragEvent } from "react";
 import type { TerminalId, TerminalState } from "../ipc/types";
 import { useWorkspace } from "../store/workspace";
+import { useTheme } from "../store/theme";
 import { killTerminal } from "../ipc/client";
 import { TerminalView } from "./Terminal";
 
@@ -35,13 +36,18 @@ export interface TileProps {
   onClose: () => void;
 }
 
-/** Status-dot color per lifecycle state (PRD §5.3 tile chrome). */
-const DOT_CLASS: Record<TerminalState, string> = {
-  starting: "bg-amber-500",
-  live: "bg-emerald-500",
-  detached: "bg-neutral-400",
-  exited: "bg-neutral-600",
-  error: "bg-red-500",
+/**
+ * Status-dot color per lifecycle state (PRD §5.3 tile chrome). These are now
+ * themed: each maps to a CSS var the theme store writes, so retheming the dot
+ * palette is live. Used as an inline `backgroundColor` (Tailwind can't take a
+ * dynamic var key per state).
+ */
+const DOT_VAR: Record<TerminalState, string> = {
+  starting: "var(--th-dot-starting)",
+  live: "var(--th-dot-live)",
+  detached: "var(--th-dot-detached)",
+  exited: "var(--th-dot-exited)",
+  error: "var(--th-dot-error)",
 };
 
 export function Tile({
@@ -58,6 +64,11 @@ export function Tile({
   // Is SOME tile being dragged right now? (Drives the drop overlay on every
   // tile so drops land above xterm.)
   const draggingTileId = useWorkspace((s) => s.draggingTileId);
+  // Themed header behavior: hide the cwd, and/or collapse the header to a
+  // hover-reveal hairline. Subscribed so a live toggle in the editor re-renders.
+  const showCwd = useTheme((s) => s.active.chrome.showCwd);
+  const headerOnHover = useTheme((s) => s.active.chrome.headerOnHover);
+  const showTileHeader = useTheme((s) => s.active.chrome.showTileHeader);
 
   // True while another tile is being dragged over this one (drop highlight).
   const [dropTarget, setDropTarget] = useState(false);
@@ -106,33 +117,70 @@ export function Tile({
 
   return (
     <div
+      // Header visibility + hover-reveal are driven purely by CSS off these data
+      // attributes (see index.css) so toggling them is instant with no extra
+      // React state and the stylesheet can own the header's height.
+      data-tile-header={showTileHeader ? "1" : "0"}
+      data-header-hover={headerOnHover ? "1" : "0"}
       className={[
-        "relative flex h-full min-h-0 w-full flex-col overflow-hidden rounded-sm bg-neutral-900",
-        focused ? "ring-1 ring-emerald-500" : "border border-neutral-800",
-        dropTarget ? "ring-2 ring-emerald-400" : "",
+        "relative flex h-full min-h-0 w-full flex-col overflow-hidden",
         isSelfDragging ? "opacity-40" : "",
       ].join(" ")}
+      style={{
+        backgroundColor: "var(--th-tile-bg)",
+        borderRadius: "var(--th-radius)",
+        // Always reserve a 1px border so focusing never reflows the tile by 1px;
+        // it's transparent when focused (the inset ring shows instead) and the
+        // themed border color otherwise. The focus/drop ring is an inset
+        // box-shadow (no layout cost) whose width comes from a token.
+        border: "1px solid",
+        borderColor: focused ? "transparent" : "var(--th-border)",
+        boxShadow: dropTarget
+          ? "inset 0 0 0 2px var(--th-accent)"
+          : focused
+            ? "inset 0 0 0 var(--th-focus-ring-w) var(--th-focus-ring)"
+            : "none",
+      }}
     >
-      {/* Header (~22px). Clicking anywhere here focuses the tile; it is also the
-          drag handle for move. */}
+      {/* Header. Clicking anywhere here focuses the tile; it is also the drag
+          handle for move. Height + colors + visibility are themed; the
+          `th-tile-header` class lets index.css drive the hover-reveal mode. */}
       <div
         draggable
         onDragStart={onDragStart}
         onDragEnd={onDragEnd}
         onMouseDown={onFocus}
-        className="flex h-[22px] shrink-0 cursor-grab select-none items-center gap-2 border-b border-neutral-800 bg-neutral-950/60 px-2 text-xs active:cursor-grabbing"
+        // Height / display / hover-reveal are driven from index.css (off the
+        // `th-tile-header` class + the parent's data-header-hover) so the
+        // stylesheet's hover rule can override the height — an inline height
+        // would win by specificity and break the reveal. Only the per-instance
+        // colors/font live inline here.
+        className="th-tile-header flex shrink-0 cursor-grab select-none items-center gap-2 border-b px-2 active:cursor-grabbing"
+        style={{
+          backgroundColor: "var(--th-header-bg)",
+          borderColor: "var(--th-border)",
+          fontSize: "var(--th-font-size)",
+        }}
         title={cwd}
       >
         <span
-          className={`h-2 w-2 shrink-0 rounded-full ${DOT_CLASS[state]}`}
+          className="h-2 w-2 shrink-0 rounded-full"
+          style={{ backgroundColor: DOT_VAR[state] }}
           aria-label={state}
           title={state}
         />
-        <span className="truncate text-neutral-200">{title}</span>
-        {cwd && (
-          <span className="min-w-0 flex-1 truncate text-neutral-500">{cwd}</span>
+        <span className="truncate" style={{ color: "var(--th-fg)" }}>
+          {title}
+        </span>
+        {showCwd && cwd && (
+          <span
+            className="min-w-0 flex-1 truncate"
+            style={{ color: "var(--th-fg-muted)" }}
+          >
+            {cwd}
+          </span>
         )}
-        {!cwd && <span className="flex-1" />}
+        {(!showCwd || !cwd) && <span className="flex-1" />}
         <button
           type="button"
           // Don't let the × start a drag; shift-click stops (kills) the session,
@@ -146,6 +194,7 @@ export function Tile({
             else onClose();
           }}
           className="shrink-0 rounded px-1 leading-none text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+          style={{ color: "var(--th-fg-muted)" }}
           title={"Detach (click) · Stop (shift-click)"}
           aria-label="Close terminal"
         >
@@ -169,8 +218,16 @@ export function Tile({
           className={[
             "absolute inset-0 z-20",
             isSelfDragging ? "pointer-events-none" : "",
-            dropTarget ? "bg-emerald-400/10" : "",
           ].join(" ")}
+          // Themed drop tint: a faint wash of the accent over the target tile.
+          style={
+            dropTarget
+              ? {
+                  backgroundColor:
+                    "color-mix(in srgb, var(--th-accent) 12%, transparent)",
+                }
+              : undefined
+          }
           onDragOver={onDragOver}
           onDragLeave={onDragLeave}
           onDrop={onDrop}

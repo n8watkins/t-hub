@@ -8,5 +8,9 @@
   <body class="bg-neutral-950">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <!-- Theming system: a self-contained module that mounts the ThemeProvider
+         (live theme application + backend/MCP bridge + Ctrl/Cmd+, editor) into
+         its own React root, so it needs no hook in App.tsx / main.tsx. -->
+    <script type="module" src="/src/themeBootstrap.tsx"></script>
   </body>
 </html>
