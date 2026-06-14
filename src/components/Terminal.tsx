@@ -27,7 +27,40 @@ import {
 } from "../ipc/client";
 import type { TerminalId } from "../ipc/types";
 import { useWorkspace } from "../store/workspace";
+import { useTheme, type TerminalPalette } from "../store/theme";
+import type { ITheme } from "@xterm/xterm";
 import "./Terminal.css";
+
+/** Default xterm theme when the active theme carries no terminal palette. */
+const DEFAULT_TERM_THEME: ITheme = { background: "#0a0a0a" };
+
+/** Map TermHub's TerminalPalette onto xterm's ITheme (default when absent). */
+function toXtermTheme(p: TerminalPalette | undefined): ITheme {
+  if (!p) return DEFAULT_TERM_THEME;
+  return {
+    background: p.background,
+    foreground: p.foreground,
+    cursor: p.cursor,
+    cursorAccent: p.background,
+    selectionBackground: p.selection,
+    black: p.ansi.black,
+    red: p.ansi.red,
+    green: p.ansi.green,
+    yellow: p.ansi.yellow,
+    blue: p.ansi.blue,
+    magenta: p.ansi.magenta,
+    cyan: p.ansi.cyan,
+    white: p.ansi.white,
+    brightBlack: p.ansi.brightBlack,
+    brightRed: p.ansi.brightRed,
+    brightGreen: p.ansi.brightGreen,
+    brightYellow: p.ansi.brightYellow,
+    brightBlue: p.ansi.brightBlue,
+    brightMagenta: p.ansi.brightMagenta,
+    brightCyan: p.ansi.brightCyan,
+    brightWhite: p.ansi.brightWhite,
+  };
+}
 
 export interface TerminalViewProps {
   terminalId: TerminalId;
@@ -49,6 +82,8 @@ export function TerminalView({
   const zoomMountRef = useRef(true);
   // Global zoom: every tile reads the same font size so they scale together.
   const fontSize = useWorkspace((s) => s.fontSize);
+  // Live terminal palette from the active theme (undefined => xterm defaults).
+  const termPalette = useTheme((s) => s.active.terminal);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -72,7 +107,7 @@ export function TerminalView({
       fontSize: useWorkspace.getState().fontSize,
       cursorBlink: true,
       scrollback: 5000,
-      theme: { background: "#0a0a0a" },
+      theme: toXtermTheme(useTheme.getState().active.terminal),
     });
     termRef.current = term;
 
@@ -288,6 +323,11 @@ export function TerminalView({
       /* container detached mid-zoom; ignore */
     }
   }, [fontSize, terminalId]);
+
+  // Live-apply terminal palette changes (theme editor / MCP set_theme).
+  useEffect(() => {
+    if (termRef.current) termRef.current.options.theme = toXtermTheme(termPalette);
+  }, [termPalette]);
 
   return <div ref={containerRef} className="termhub-terminal h-full w-full" />;
 }
