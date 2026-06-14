@@ -32,6 +32,7 @@ import { SupervisionTreeBody } from "./SupervisionTree";
 import { StatusBadge, statusLabel } from "./StatusBadge";
 import { WslHealth } from "./WslHealth";
 import { HookInstallPanel } from "./HookInstallPanel";
+import { FileTree } from "./FileTree";
 import type { StatusSnapshot, SupervisionTree } from "../ipc/model";
 import type {
   TerminalId,
@@ -300,8 +301,8 @@ function SidebarFull({
         )}
       </section>
 
-      {/* 2. Session / supervision tree (scrolls) */}
-      <section className="min-h-0 flex-1 overflow-y-auto">
+      {/* 2. Session / supervision tree */}
+      <section className="max-h-44 shrink-0 overflow-y-auto">
         <Header>Sessions</Header>
         {treeList.length === 0 ? (
           <Muted>No supervised sessions.</Muted>
@@ -318,6 +319,22 @@ function SidebarFull({
             ))}
           </div>
         )}
+      </section>
+
+      {/* Files — browse the project file tree (the tree + reader are
+          self-contained in FileTree.tsx; rooted at the projects dir for now). */}
+      <section
+        className="flex min-h-0 flex-1 flex-col border-t"
+        style={{ borderColor: "var(--th-border)" }}
+      >
+        <Header>Files</Header>
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <FileTree
+            root="/home/natkins/n8builds"
+            embedReader
+            className="h-full"
+          />
+        </div>
       </section>
 
       {/* 3. Claude hooks (consent-gated install/uninstall) */}
