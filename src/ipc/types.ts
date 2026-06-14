@@ -124,3 +124,67 @@ export interface ExitEvent {
   id: TerminalId;
   code: number | null;
 }
+
+// ---------------------------------------------------------------------------
+// Files — index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7;
+// FR-014/015/016/017). Mirrors `src-tauri/src/files.rs` (all structs there use
+// `rename_all = "camelCase"`). Typed wrappers live in ./files. Keep in lockstep.
+// ---------------------------------------------------------------------------
+
+/** File-index Tauri command names (used with `invoke`). */
+export const CommandsFiles = {
+  /** Walk a project root and build/refresh the in-memory index. → IndexSummary */
+  indexProject: "index_project",
+  /** Fuzzy basename/path/extension search over the index. → FileHit[] */
+  searchFiles: "search_files",
+  /** Shallow directory listing for the tree (no recursion). → DirEntry[] */
+  listDir: "list_dir",
+  /** Read a text file for the reader (capped, rejects binary). → FileContents */
+  readTextFile: "read_text_file",
+} as const;
+
+/** Summary returned by `index_project` (the index itself stays in the backend). */
+export interface IndexSummary {
+  /** The normalized root that was indexed. */
+  root: string;
+  /** Number of files in the index. */
+  count: number;
+}
+
+/** A ranked search hit from `search_files`. */
+export interface FileHit {
+  /** Path relative to the indexed root, `/`-separated. */
+  relPath: string;
+  /** Final path component (e.g. `lib.rs`). */
+  basename: string;
+  /** Lowercased extension without the dot (e.g. `rs`), or `""`. */
+  ext: string;
+  /** True for high-signal project files (README, package.json, ...). */
+  isKeyFile: boolean;
+  /** Opaque ranking score; higher is a better match. */
+  score: number;
+}
+
+/** One shallow directory entry from `list_dir`. */
+export interface DirEntry {
+  /** Final path component. */
+  name: string;
+  /** Absolute path to this entry. */
+  path: string;
+  isDir: boolean;
+  /** File size in bytes (0 for directories). */
+  size: number;
+}
+
+/** The capped result of `read_text_file`. */
+export interface FileContents {
+  path: string;
+  /** Lowercased extension without the dot (drives Markdown-vs-plain rendering). */
+  ext: string;
+  /** Decoded UTF-8 text (lossy for stray non-UTF-8 bytes). */
+  text: string;
+  /** True if the file exceeded the read cap and `text` is a prefix. */
+  truncated: boolean;
+  /** Total size of the file on disk, in bytes. */
+  size: number;
+}

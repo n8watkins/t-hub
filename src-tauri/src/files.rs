@@ -1,0 +1,923 @@
+//! File index, fuzzy search, shallow directory listing, and a capped text
+//! reader for the Files panel (PRD §6.8 reading/editing, §9.7 file indexing;
+//! FR-014/015/016/017).
+//!
+//! Scope for this module (the V1 nucleus of the Files feature):
+//!   - Walk a project root and build a compact **in-memory** index of relative
+//!     paths / basenames / extensions, honoring `.gitignore` and skipping
+//!     `.git`, dependency/build dirs, and binary blobs (PRD §9.7: "Index names
+//!     and metadata, not file contents").
+//!   - Fuzzy basename/path/extension ranking over that index.
+//!   - A shallow `list_dir` for the tree (folder expansion is UI state, not a
+//!     rescan — PRD §9.7).
+//!   - A size-capped `read_text_file` for the reader.
+//!
+//! Deliberately **out of scope** here (later workstreams, noted in the report):
+//!   - SQLite persistence + startup hydration + inotify incremental updates
+//!     (PRD §9.7 / FR-014). This index is rebuilt on demand and cached per root
+//!     in memory only.
+//!   - Editing / atomic-save / external-change detection (PRD §6.8.5 / FR-017).
+//!   - Routing through the WSL agent for native Linux paths (FR-014). In this
+//!     WSL dev environment a native path already *is* the Linux path, so we
+//!     index the path we are given directly.
+//!
+//! Boundaries: this file owns its own state ([`FileIndexState`], registered in
+//! `lib.rs` as Tauri-managed state). It is self-contained and shares nothing
+//! with the agent/supervision/status modules.
+
+// Some index fields (e.g. `is_key_file`) and helpers are surfaced over IPC and
+// exercised by tests but may not all be read from within the crate yet.
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use ignore::WalkBuilder;
+use parking_lot::Mutex;
+use serde::Serialize;
+
+/// Maximum number of bytes [`read_text_file`] will return. Larger files are
+/// rejected so the reader never tries to render a multi-megabyte blob. ~2 MiB
+/// comfortably covers source files and typical Markdown docs.
+const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
+
+/// How many bytes of a file we sniff to decide "is this text or a binary blob".
+const SNIFF_BYTES: usize = 8 * 1024;
+
+/// Directory names that are always pruned during indexing regardless of
+/// `.gitignore` (PRD §9.7: ignore `.git`, dependency/build directories). These
+/// are skipped *in addition to* whatever `.gitignore` excludes.
+const PRUNED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target", // Rust build output
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".svelte-kit",
+    ".turbo",
+    ".cache",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    "vendor",
+    ".gradle",
+    ".idea",
+    ".vscode",
+];
+
+/// Basenames considered "key files" — the high-signal project entry points the
+/// UI's Key Files view leans on (FR-016). Matched case-insensitively, and any
+/// `readme*`/`changelog*`/`license*` variant also counts (handled in code).
+const KEY_FILE_NAMES: &[&str] = &[
+    "package.json",
+    "cargo.toml",
+    "pyproject.toml",
+    "go.mod",
+    "tsconfig.json",
+    "tauri.conf.json",
+    "dockerfile",
+    "makefile",
+    ".gitignore",
+    ".env",
+    ".env.example",
+];
+
+/// One indexed file. Compact on purpose: names + metadata, never contents.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileEntry {
+    /// Path relative to the indexed root, using `/` separators.
+    pub rel_path: String,
+    /// Final path component (e.g. `lib.rs`).
+    pub basename: String,
+    /// Lowercased extension without the dot (e.g. `rs`), or `""` if none.
+    pub ext: String,
+    /// True for high-signal project files (see [`KEY_FILE_NAMES`]).
+    pub is_key_file: bool,
+}
+
+impl FileEntry {
+    fn from_rel(rel_path: String) -> Self {
+        let basename = rel_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&rel_path)
+            .to_string();
+        let ext = Path::new(&basename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_key_file = is_key_file(&basename);
+        Self {
+            rel_path,
+            basename,
+            ext,
+            is_key_file,
+        }
+    }
+}
+
+/// Whether a basename is a "key file" (case-insensitive; covers README/LICENSE/
+/// CHANGELOG variants by prefix).
+fn is_key_file(basename: &str) -> bool {
+    let lower = basename.to_ascii_lowercase();
+    if KEY_FILE_NAMES.contains(&lower.as_str()) {
+        return true;
+    }
+    lower.starts_with("readme")
+        || lower.starts_with("changelog")
+        || lower.starts_with("license")
+        || lower.starts_with("licence")
+}
+
+/// The compact in-memory index for one project root.
+#[derive(Debug, Clone)]
+pub struct ProjectIndex {
+    /// Absolute, normalized root the entries are relative to.
+    pub root: PathBuf,
+    pub entries: Vec<FileEntry>,
+}
+
+/// What `index_project` returns to the UI — a summary, not the whole index
+/// (the index can be large; the UI searches it via `search_files`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexSummary {
+    /// The root that was indexed (normalized, absolute when possible).
+    pub root: String,
+    /// Number of files in the index.
+    pub count: usize,
+}
+
+/// A ranked search result.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileHit {
+    pub rel_path: String,
+    pub basename: String,
+    pub ext: String,
+    pub is_key_file: bool,
+    /// Higher is a better match. Opaque to the UI beyond ordering.
+    pub score: i64,
+}
+
+/// One shallow directory entry for the tree (`list_dir`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirEntry {
+    /// Final path component.
+    pub name: String,
+    /// Absolute path to this entry (so the UI can drill in / open directly).
+    pub path: String,
+    pub is_dir: bool,
+    /// File size in bytes (0 for directories).
+    pub size: u64,
+}
+
+/// The capped result of reading a text file for the reader.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContents {
+    pub path: String,
+    /// Lowercased extension without the dot (drives Markdown-vs-plain rendering).
+    pub ext: String,
+    /// The decoded UTF-8 text (lossy for stray non-UTF-8 bytes).
+    pub text: String,
+    /// True if the file was longer than [`MAX_READ_BYTES`] and `text` is a prefix.
+    pub truncated: bool,
+    /// Total size of the file on disk, in bytes.
+    pub size: u64,
+}
+
+/// Tauri-managed state: a small cache of `root -> index` so repeated searches
+/// after one `index_project` don't re-walk the tree. Cleared implicitly by
+/// re-indexing the same root.
+#[derive(Default)]
+pub struct FileIndexState {
+    indexes: Mutex<HashMap<PathBuf, Arc<ProjectIndex>>>,
+}
+
+impl FileIndexState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, root: &Path) -> Option<Arc<ProjectIndex>> {
+        self.indexes.lock().get(root).cloned()
+    }
+
+    fn put(&self, index: ProjectIndex) -> Arc<ProjectIndex> {
+        let arc = Arc::new(index);
+        self.indexes.lock().insert(arc.root.clone(), arc.clone());
+        arc
+    }
+}
+
+/// Normalize a user-supplied path to an absolute, lexically-clean form. We
+/// canonicalize when the path exists (resolves symlinks/`..`); otherwise we
+/// fall back to the path as given so error messages stay meaningful.
+fn normalize(path: &str) -> PathBuf {
+    let p = Path::new(path);
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Build (or rebuild) the index for `root`, honoring `.gitignore` + pruned dirs
+/// + a binary sniff, and walk it into a flat [`ProjectIndex`].
+fn build_index(root: &Path) -> Result<ProjectIndex, String> {
+    if !root.is_dir() {
+        return Err(format!("not a directory: {}", root.display()));
+    }
+
+    let mut entries = Vec::new();
+
+    // `ignore::WalkBuilder` gives us .gitignore + global gitignore + .ignore
+    // semantics for free. We additionally prune the always-skip dirs and skip
+    // files that sniff as binary.
+    let walker = WalkBuilder::new(root)
+        .hidden(false) // we still want dotfiles like .env.example; we prune .git explicitly
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(true)
+        .filter_entry(|e| {
+            // Prune the always-skip directories by name.
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Some(name) = e.file_name().to_str() {
+                    if PRUNED_DIRS.contains(&name) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .build();
+
+    for result in walker {
+        let dent = match result {
+            Ok(d) => d,
+            Err(_) => continue, // unreadable entry: skip, don't fail the whole walk
+        };
+        // Only index files (the root dir itself and subdirs are not entries).
+        if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = dent.path();
+        // Skip binary blobs by content sniff (cheap; only first few KiB).
+        if is_probably_binary(path) {
+            continue;
+        }
+        let rel = match path.strip_prefix(root) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let rel_str = rel_to_slash(rel);
+        if rel_str.is_empty() {
+            continue;
+        }
+        entries.push(FileEntry::from_rel(rel_str));
+    }
+
+    // Stable, predictable order: by relative path. Search reorders by score.
+    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+    Ok(ProjectIndex {
+        root: root.to_path_buf(),
+        entries,
+    })
+}
+
+/// Convert a relative path to a `/`-separated string (normalizes Windows `\`).
+fn rel_to_slash(rel: &Path) -> String {
+    let mut parts = Vec::new();
+    for comp in rel.components() {
+        if let std::path::Component::Normal(os) = comp {
+            parts.push(os.to_string_lossy().into_owned());
+        }
+    }
+    parts.join("/")
+}
+
+/// Cheap binary sniff: read up to [`SNIFF_BYTES`] and treat the file as binary
+/// if it contains a NUL byte. This is the same heuristic Git uses and is good
+/// enough to keep images/executables/archives out of a text index/reader.
+fn is_probably_binary(path: &Path) -> bool {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return true, // can't read → don't index it as text
+    };
+    let mut buf = [0u8; SNIFF_BYTES];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return true,
+    };
+    buf[..n].contains(&0)
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy matching
+// ---------------------------------------------------------------------------
+
+/// Subsequence fuzzy match with a small scoring model tuned for file paths.
+/// Returns `None` when `needle` is not a subsequence of `haystack`.
+///
+/// Scoring rewards: matches in the basename over the directory portion, runs of
+/// consecutive characters, matches at word boundaries (`/`, `_`, `-`, `.`, or a
+/// camelCase hump), and an exact-prefix start. Earlier matches beat later ones.
+fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let h: Vec<char> = haystack.chars().collect();
+    let hl: Vec<char> = haystack.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let n: Vec<char> = needle.chars().map(|c| c.to_ascii_lowercase()).collect();
+
+    let mut score: i64 = 0;
+    let mut hi = 0usize;
+    let mut prev_match: Option<usize> = None;
+
+    for &nc in &n {
+        // Advance haystack to the next occurrence of nc.
+        let mut found = None;
+        while hi < hl.len() {
+            if hl[hi] == nc {
+                found = Some(hi);
+                break;
+            }
+            hi += 1;
+        }
+        let idx = found?; // not a subsequence
+        // Base reward for a matched char.
+        score += 10;
+        // Consecutive-run bonus.
+        if let Some(prev) = prev_match {
+            if idx == prev + 1 {
+                score += 12;
+            } else {
+                // Gap penalty grows with distance (capped) so tight matches win.
+                let gap = (idx - prev) as i64;
+                score -= (gap.min(8)) * 1;
+            }
+        } else {
+            // First matched char: prefix start is best.
+            if idx == 0 {
+                score += 18;
+            }
+        }
+        // Word-boundary bonus.
+        if is_boundary(&h, idx) {
+            score += 9;
+        }
+        // Exact-case (the original char matched without lowercasing) small bonus.
+        if h[idx] == nc {
+            score += 1;
+        }
+        prev_match = Some(idx);
+        hi = idx + 1;
+    }
+
+    // Prefer shorter haystacks (a hit in `a.rs` beats the same in `deep/a.rs`).
+    score -= (h.len() as i64) / 16;
+    Some(score)
+}
+
+/// Is position `idx` a "word boundary" in `chars` (start, or preceded by a
+/// separator, or a lower→upper camelCase hump)?
+fn is_boundary(chars: &[char], idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    let prev = chars[idx - 1];
+    if matches!(prev, '/' | '\\' | '_' | '-' | '.' | ' ') {
+        return true;
+    }
+    // camelCase hump: previous lower, current upper.
+    prev.is_ascii_lowercase() && chars[idx].is_ascii_uppercase()
+}
+
+/// Score a single entry against `query`, taking the best of basename / full-path
+/// / extension matches (with basename weighted highest). Returns `None` if the
+/// query matches none of them.
+fn score_entry(entry: &FileEntry, query: &str) -> Option<i64> {
+    // An extension-style query like ".rs" or "rs" should rank exact-ext hits high.
+    let ext_query = query.strip_prefix('.').unwrap_or(query);
+    let ext_bonus = if !ext_query.is_empty() && entry.ext == ext_query.to_ascii_lowercase() {
+        40
+    } else {
+        0
+    };
+
+    let base = fuzzy_score(&entry.basename, query).map(|s| s + 25); // basename weighted up
+    let path = fuzzy_score(&entry.rel_path, query);
+
+    let best = match (base, path) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+
+    match best {
+        Some(s) => Some(s + ext_bonus + if entry.is_key_file { 5 } else { 0 }),
+        // Pure extension query that matched the ext but not as a subsequence.
+        None if ext_bonus > 0 => Some(ext_bonus),
+        None => None,
+    }
+}
+
+/// Rank `index` against `query`, returning up to `limit` hits best-first.
+fn search_index(index: &ProjectIndex, query: &str, limit: usize) -> Vec<FileHit> {
+    let query = query.trim();
+    if query.is_empty() {
+        // Empty query: return key files first, then a stable prefix of the index.
+        let mut hits: Vec<FileHit> = index
+            .entries
+            .iter()
+            .map(|e| FileHit {
+                rel_path: e.rel_path.clone(),
+                basename: e.basename.clone(),
+                ext: e.ext.clone(),
+                is_key_file: e.is_key_file,
+                score: if e.is_key_file { 1 } else { 0 },
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.rel_path.cmp(&b.rel_path))
+        });
+        hits.truncate(limit);
+        return hits;
+    }
+
+    let mut scored: Vec<FileHit> = index
+        .entries
+        .iter()
+        .filter_map(|e| {
+            score_entry(e, query).map(|score| FileHit {
+                rel_path: e.rel_path.clone(),
+                basename: e.basename.clone(),
+                ext: e.ext.clone(),
+                is_key_file: e.is_key_file,
+                score,
+            })
+        })
+        .collect();
+
+    // Best score first; tie-break by shorter path then lexical for stability.
+    scored.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.rel_path.len().cmp(&b.rel_path.len()))
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+    scored.truncate(limit);
+    scored
+}
+
+/// Shallow directory listing: directories first, then files, each alphabetical.
+fn read_dir_shallow(dir: &Path) -> Result<Vec<DirEntry>, String> {
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", dir.display()));
+    }
+    let mut out = Vec::new();
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir failed: {e}"))?;
+    for ent in rd {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = ent.file_name().to_string_lossy().into_owned();
+        // Prune the always-skip dirs from the tree view too (PRD §9.7).
+        let meta = match ent.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let is_dir = meta.is_dir();
+        if is_dir && PRUNED_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        out.push(DirEntry {
+            name,
+            path: ent.path().to_string_lossy().into_owned(),
+            is_dir,
+            size: if is_dir { 0 } else { meta.len() },
+        });
+    }
+    out.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir) // dirs (true) before files (false)
+            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+    });
+    Ok(out)
+}
+
+/// Read a text file with a hard size cap, returning lossy-UTF-8 text. Rejects
+/// binary blobs (the reader is for text/Markdown only).
+fn read_text_capped(path: &Path) -> Result<FileContents, String> {
+    use std::io::Read;
+    let meta = std::fs::metadata(path).map_err(|e| format!("stat failed: {e}"))?;
+    if meta.is_dir() {
+        return Err(format!("is a directory: {}", path.display()));
+    }
+    let size = meta.len();
+
+    if is_probably_binary(path) {
+        return Err(format!("not a text file: {}", path.display()));
+    }
+
+    let file = std::fs::File::open(path).map_err(|e| format!("open failed: {e}"))?;
+    let truncated = size > MAX_READ_BYTES;
+    let mut buf = Vec::with_capacity(size.min(MAX_READ_BYTES) as usize);
+    file.take(MAX_READ_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read failed: {e}"))?;
+
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    Ok(FileContents {
+        path: path.to_string_lossy().into_owned(),
+        ext,
+        text,
+        truncated,
+        size,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands (registered in lib.rs; mirrored in src/ipc/files.ts)
+// ---------------------------------------------------------------------------
+
+/// Walk `root`, build the compact in-memory index (cached by root), and return a
+/// summary (root + file count). Subsequent `search_files` calls reuse the cache.
+#[tauri::command]
+pub async fn index_project(
+    state: tauri::State<'_, FileIndexState>,
+    root: String,
+) -> Result<IndexSummary, String> {
+    let root = normalize(&root);
+    let index = build_index(&root)?;
+    let count = index.entries.len();
+    let root_str = index.root.to_string_lossy().into_owned();
+    state.put(index);
+    Ok(IndexSummary {
+        root: root_str,
+        count,
+    })
+}
+
+/// Fuzzy-search the index for `root`. If the root has not been indexed yet (or
+/// the cache was lost), it is indexed on demand first.
+#[tauri::command]
+pub async fn search_files(
+    state: tauri::State<'_, FileIndexState>,
+    root: String,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<FileHit>, String> {
+    let root = normalize(&root);
+    let index = match state.get(&root) {
+        Some(i) => i,
+        None => state.put(build_index(&root)?),
+    };
+    let limit = limit.unwrap_or(50).clamp(1, 1000);
+    Ok(search_index(&index, &query, limit))
+}
+
+/// Shallow directory listing for the tree view (no recursion; folder expansion
+/// is a follow-up `list_dir` call, per PRD §9.7).
+#[tauri::command]
+pub async fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
+    let dir = normalize(&path);
+    read_dir_shallow(&dir)
+}
+
+/// Read a (text) file for the reader, capped at [`MAX_READ_BYTES`].
+#[tauri::command]
+pub async fn read_text_file(path: String) -> Result<FileContents, String> {
+    let p = normalize(&path);
+    read_text_capped(&p)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+
+    /// Build a small fixture tree in a unique temp dir and return its root.
+    fn make_fixture() -> PathBuf {
+        let mut root = std::env::temp_dir();
+        root.push(format!("termhub-files-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        // A gitignore that hides `secret.txt` and the `ignored/` dir.
+        fs::write(root.join(".gitignore"), "secret.txt\nignored/\n*.log\n").unwrap();
+
+        fs::write(root.join("README.md"), "# Title\n\nhello").unwrap();
+        fs::write(root.join("package.json"), "{}").unwrap();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src/lib.rs"), "// lib").unwrap();
+        fs::write(root.join("src/utils.ts"), "export {}").unwrap();
+
+        // Should be ignored by .gitignore.
+        fs::write(root.join("secret.txt"), "shh").unwrap();
+        fs::write(root.join("debug.log"), "noise").unwrap();
+        fs::create_dir_all(root.join("ignored")).unwrap();
+        fs::write(root.join("ignored/x.txt"), "x").unwrap();
+
+        // Should be pruned as a dependency dir even without .gitignore listing it.
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "module.exports={}").unwrap();
+
+        // Should be pruned by the explicit .git skip.
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/config"), "[core]").unwrap();
+
+        // A binary blob (contains NUL) should be skipped by the sniff.
+        let mut bin = fs::File::create(root.join("blob.bin")).unwrap();
+        bin.write_all(&[0u8, 1, 2, 3, 0, 9]).unwrap();
+
+        root
+    }
+
+    fn cleanup(root: &Path) {
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn rel_set(index: &ProjectIndex) -> Vec<String> {
+        index.entries.iter().map(|e| e.rel_path.clone()).collect()
+    }
+
+    #[test]
+    fn index_respects_gitignore_and_prunes() {
+        let root = make_fixture();
+        let index = build_index(&root).unwrap();
+        let rels = rel_set(&index);
+
+        // Included.
+        assert!(rels.contains(&"README.md".to_string()));
+        assert!(rels.contains(&"package.json".to_string()));
+        assert!(rels.contains(&"src/main.rs".to_string()));
+        assert!(rels.contains(&"src/lib.rs".to_string()));
+        assert!(rels.contains(&"src/utils.ts".to_string()));
+
+        // Excluded by .gitignore.
+        assert!(!rels.contains(&"secret.txt".to_string()), "gitignored file leaked");
+        assert!(!rels.contains(&"debug.log".to_string()), "*.log leaked");
+        assert!(
+            !rels.iter().any(|r| r.starts_with("ignored/")),
+            "gitignored dir leaked"
+        );
+
+        // Pruned dirs.
+        assert!(
+            !rels.iter().any(|r| r.starts_with("node_modules")),
+            "node_modules leaked"
+        );
+        assert!(!rels.iter().any(|r| r.starts_with(".git/")), ".git leaked");
+
+        // Binary blob skipped.
+        assert!(!rels.contains(&"blob.bin".to_string()), "binary blob leaked");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn entry_metadata_is_correct() {
+        let root = make_fixture();
+        let index = build_index(&root).unwrap();
+        let main = index
+            .entries
+            .iter()
+            .find(|e| e.rel_path == "src/main.rs")
+            .expect("main.rs indexed");
+        assert_eq!(main.basename, "main.rs");
+        assert_eq!(main.ext, "rs");
+        assert!(!main.is_key_file);
+
+        let pkg = index
+            .entries
+            .iter()
+            .find(|e| e.rel_path == "package.json")
+            .unwrap();
+        assert!(pkg.is_key_file, "package.json should be a key file");
+
+        let readme = index
+            .entries
+            .iter()
+            .find(|e| e.rel_path == "README.md")
+            .unwrap();
+        assert!(readme.is_key_file, "README should be a key file");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn fuzzy_basename_ranks_above_path() {
+        let root = make_fixture();
+        let index = build_index(&root).unwrap();
+
+        // "main" should surface src/main.rs as the top hit.
+        let hits = search_index(&index, "main", 10);
+        assert!(!hits.is_empty(), "expected hits for 'main'");
+        assert_eq!(hits[0].rel_path, "src/main.rs");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn fuzzy_subsequence_matches() {
+        let root = make_fixture();
+        let index = build_index(&root).unwrap();
+
+        // "srlib" is a subsequence of "src/lib.rs" but not of others meaningfully.
+        let hits = search_index(&index, "srlib", 10);
+        assert!(
+            hits.iter().any(|h| h.rel_path == "src/lib.rs"),
+            "subsequence match failed: {:?}",
+            hits.iter().map(|h| &h.rel_path).collect::<Vec<_>>()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn extension_query_ranks_matching_ext() {
+        let root = make_fixture();
+        let index = build_index(&root).unwrap();
+
+        let hits = search_index(&index, ".ts", 10);
+        assert!(!hits.is_empty(), "expected .ts hits");
+        assert_eq!(hits[0].ext, "ts", "top hit should be the .ts file");
+        assert_eq!(hits[0].rel_path, "src/utils.ts");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn empty_query_returns_key_files_first() {
+        let root = make_fixture();
+        let index = build_index(&root).unwrap();
+        let hits = search_index(&index, "", 10);
+        assert!(!hits.is_empty());
+        // The first results should be key files (README/package.json).
+        assert!(
+            hits[0].is_key_file,
+            "empty query should lead with key files, got {:?}",
+            hits[0].rel_path
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn no_match_returns_empty() {
+        let root = make_fixture();
+        let index = build_index(&root).unwrap();
+        let hits = search_index(&index, "zzzzzqqqqq", 10);
+        assert!(hits.is_empty(), "garbage query should not match");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn search_respects_limit() {
+        let root = make_fixture();
+        let index = build_index(&root).unwrap();
+        let hits = search_index(&index, "", 2);
+        assert_eq!(hits.len(), 2, "limit should cap results");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn list_dir_is_shallow_dirs_first_and_prunes() {
+        let root = make_fixture();
+        let entries = read_dir_shallow(&root).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        // Shallow: src is listed as a dir, but src/main.rs is not present.
+        assert!(names.contains(&"src"));
+        assert!(!names.contains(&"main.rs"));
+
+        // node_modules is pruned from the tree.
+        assert!(!names.contains(&"node_modules"));
+
+        // Dirs come before files: the first non-pruned entry should be a dir.
+        let first_dir_idx = entries.iter().position(|e| e.is_dir);
+        let first_file_idx = entries.iter().position(|e| !e.is_dir);
+        if let (Some(d), Some(f)) = (first_dir_idx, first_file_idx) {
+            assert!(d < f, "directories should sort before files");
+        }
+
+        // src must be a directory with size 0.
+        let src = entries.iter().find(|e| e.name == "src").unwrap();
+        assert!(src.is_dir);
+        assert_eq!(src.size, 0);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn read_text_file_reads_and_reports_ext() {
+        let root = make_fixture();
+        let readme = root.join("README.md");
+        let contents = read_text_capped(&readme).unwrap();
+        assert_eq!(contents.ext, "md");
+        assert!(contents.text.contains("# Title"));
+        assert!(!contents.truncated);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn read_text_file_rejects_binary() {
+        let root = make_fixture();
+        let blob = root.join("blob.bin");
+        let err = read_text_capped(&blob).unwrap_err();
+        assert!(err.contains("not a text file"), "got: {err}");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn read_text_file_truncates_oversize() {
+        let root = make_fixture();
+        let big = root.join("big.txt");
+        // Write just over the cap of printable ASCII (no NULs → counts as text).
+        let chunk = "a".repeat(1024);
+        let mut f = fs::File::create(&big).unwrap();
+        let mut written = 0u64;
+        while written <= MAX_READ_BYTES {
+            f.write_all(chunk.as_bytes()).unwrap();
+            written += chunk.len() as u64;
+        }
+        drop(f);
+
+        let contents = read_text_capped(&big).unwrap();
+        assert!(contents.truncated, "oversize file should be marked truncated");
+        assert!(
+            contents.text.len() as u64 <= MAX_READ_BYTES,
+            "returned text exceeds cap"
+        );
+        cleanup(&root);
+    }
+
+    /// Evidence harness (ignored by default): index this very repo and print a
+    /// few real search results. Run with:
+    ///   cargo test --manifest-path src-tauri/Cargo.toml files::tests::evidence_index_this_repo -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn evidence_index_this_repo() {
+        // src-tauri/ is CARGO_MANIFEST_DIR; the repo root is its parent.
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest.parent().unwrap().to_path_buf();
+        let index = build_index(&repo_root).unwrap();
+        println!(
+            "\n=== indexed {} : {} files ===",
+            repo_root.display(),
+            index.entries.len()
+        );
+        // Sanity: node_modules / target / .git must not be present.
+        let leaked: Vec<_> = index
+            .entries
+            .iter()
+            .filter(|e| {
+                e.rel_path.contains("node_modules")
+                    || e.rel_path.starts_with(".git/")
+                    || e.rel_path.contains("/target/")
+                    || e.rel_path.starts_with("target/")
+            })
+            .collect();
+        assert!(leaked.is_empty(), "ignored dirs leaked: {leaked:?}");
+
+        for q in ["files", "ipc", "lib.rs", ".rs", "term"] {
+            let hits = search_index(&index, q, 5);
+            println!("query {:?} -> {} hits:", q, hits.len());
+            for h in &hits {
+                println!("    {:>5}  {}", h.score, h.rel_path);
+            }
+        }
+    }
+
+    #[test]
+    fn build_index_errors_on_nonexistent_root() {
+        let mut root = std::env::temp_dir();
+        root.push(format!("termhub-does-not-exist-{}", uuid::Uuid::new_v4()));
+        let err = build_index(&root).unwrap_err();
+        assert!(err.contains("not a directory"), "got: {err}");
+    }
+}

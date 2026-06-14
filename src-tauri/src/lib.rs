@@ -8,6 +8,7 @@ mod tmux;
 mod agent; // core-side agent bridge (Workstream A, core half)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
+mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
 mod model; // data-model structs (PRD §8)
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
 
@@ -61,6 +62,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(TerminalManager::default())
         .manage(AppState::default())
+        .manage(files::FileIndexState::new())
         .setup(|app| {
             // Wire the live UI event sink now that the AppHandle exists (the
             // bridge + status bridge were built earlier in AppState::default(),
@@ -98,6 +100,11 @@ pub fn run() {
             commands_05::install_claude_hooks,
             commands_05::uninstall_claude_hooks,
             commands_05::claude_hooks_installed,
+            // Files: index + search + tree + reader (PRD §6.8/§9.7)
+            files::index_project,
+            files::search_files,
+            files::list_dir,
+            files::read_text_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TermHub");
