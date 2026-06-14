@@ -18,7 +18,7 @@
 // Window controls (minimize / maximize-restore / close) and the settings gear
 // use the Tauri window API / the settings store and must NOT carry
 // data-tauri-drag-region, or a click would start a window drag instead.
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useWorkspace } from "../store/workspace";
@@ -229,6 +229,12 @@ function TabStrip() {
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
 
+  // Tracks the previous pointerdown for manual double-click detection. We rename
+  // only when the second click of a pair lands on a tab that was ALREADY active
+  // at the FIRST click — so renaming an unfocused tab takes three clicks total
+  // (one to focus, then a double-click). Prevents accidental renames.
+  const clickRef = useRef<{ id: string; time: number; wasActiveAtFirst: boolean } | null>(null);
+
   const startRename = (id: string, name: string) => {
     setEditing(id);
     setDraft(name);
@@ -243,8 +249,22 @@ function TabStrip() {
   const onTabPointerDown = (tabId: string, e: ReactPointerEvent) => {
     if (editing === tabId) return; // let the rename input own the pointer
     if (e.button !== 0) return;
-    setActiveTab(tabId);
     const name = tabs.find((t) => t.id === tabId)?.name ?? "Workspace";
+    const wasActive = tabId === activeTabId;
+    const now = Date.now();
+    // Second click of a pair on an already-active tab => rename, no drag.
+    if (
+      clickRef.current &&
+      clickRef.current.id === tabId &&
+      now - clickRef.current.time < 400 &&
+      clickRef.current.wasActiveAtFirst
+    ) {
+      startRename(tabId, name);
+      clickRef.current = null;
+      return;
+    }
+    clickRef.current = { id: tabId, time: now, wasActiveAtFirst: wasActive };
+    setActiveTab(tabId);
     let ghost: DragGhost | null = null;
     startPointerDrag(e.clientX, e.clientY, {
       onBegin: () => {
@@ -287,7 +307,6 @@ function TabStrip() {
             // data-tab-id: the drop target a tab reorder / a tile drag resolves to.
             data-tab-id={tab.id}
             onPointerDown={(e) => onTabPointerDown(tab.id, e)}
-            onDoubleClick={() => startRename(tab.id, tab.name)}
             className={[
               "group flex min-w-[8.5rem] shrink-0 cursor-pointer touch-none select-none items-center gap-1.5 rounded px-3",
               active
@@ -326,7 +345,13 @@ function TabStrip() {
               <span className="min-w-0 flex-1 truncate">{tab.name}</span>
             )}
             {tab.order.length > 0 && (
-              <span className="shrink-0 text-[10px] text-neutral-500">
+              <span
+                className="shrink-0 rounded-full px-1.5 text-[11px] font-semibold leading-tight"
+                style={{
+                  backgroundColor: "color-mix(in srgb, var(--th-accent) 22%, transparent)",
+                  color: "var(--th-accent)",
+                }}
+              >
                 {tab.order.length}
               </span>
             )}
