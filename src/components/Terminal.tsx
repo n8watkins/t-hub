@@ -63,6 +63,7 @@ export function TerminalView({
     let webgl: WebglAddon | null = null;
     let webglContextLoss: { dispose(): void } | null = null;
     let disposed = false;
+    let promptTimer: ReturnType<typeof setTimeout> | null = null;
     let rafId = 0;
 
     const term = new Terminal({
@@ -214,6 +215,15 @@ export function TerminalView({
               return;
             }
             unlisteners.push(offExit);
+
+            // A fresh pane's prompt may have been printed before we subscribed
+            // (so it never streamed to us), and a tiny resize-redraw trail can
+            // leave duplicate prompts. Now that we're attached + subscribed,
+            // nudge zsh to clear+redraw one clean prompt. Ctrl-L (\x0c) only
+            // redraws on an otherwise-empty fresh terminal.
+            promptTimer = setTimeout(() => {
+              if (!disposed) void writeTerminal(terminalId, "\x0c");
+            }, 350);
           } catch {
             // attach failed (e.g. session gone); leave the tile rendered but inert.
           }
@@ -233,6 +243,7 @@ export function TerminalView({
       initializedRef.current = false;
 
       cancelAnimationFrame(rafId);
+      if (promptTimer) clearTimeout(promptTimer);
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeObserver?.disconnect();
       resizeObserver = null;
