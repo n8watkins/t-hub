@@ -173,12 +173,23 @@ pub(crate) fn spawn_child(argv: Vec<String>) -> std::io::Result<Child> {
 
     let args = &argv[1..];
 
-    Command::new(&program)
-        .args(args)
+    let mut cmd = Command::new(&program);
+    cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()) // agent diagnostics go to core's stderr
-        .spawn()
+        .stderr(Stdio::inherit()); // agent diagnostics go to core's stderr
+
+    // On Windows `program` is `wsl.exe` (from `launch_argv`); without
+    // CREATE_NO_WINDOW that raw spawn flashes a console (CMD) window. Gate behind
+    // cfg(windows) so the unix dev build (which spawns termhub-agent directly) is
+    // unaffected.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
+    cmd.spawn()
 }
 
 // ---------------------------------------------------------------------------
