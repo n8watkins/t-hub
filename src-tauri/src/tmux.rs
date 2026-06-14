@@ -154,11 +154,15 @@ pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), T
     run("set-option", &["set-option", "-t", name, "window-size", "latest"])?;
 
     // TermHub draws its own tile chrome, so suppress tmux's status bar (the green
-    // "0:zsh" line) and its mouse capture. With mouse off, xterm owns selection
-    // (so Ctrl+C copy works) and right-click falls through to the native menu
-    // instead of tmux's. Best-effort -- purely cosmetic/UX, never fail the spawn.
+    // "0:zsh" line). Best-effort -- purely cosmetic, never fail the spawn.
     let _ = run("set-option", &["set-option", "-t", name, "status", "off"]);
-    let _ = run("set-option", &["set-option", "-t", name, "mouse", "off"]);
+    // Mouse ON (global): full-screen apps that request mouse mode (Claude Code,
+    // vim, less, ...) receive the wheel and scroll their OWN content instead of
+    // the terminal translating the wheel into Up/Down arrow keys; a plain shell's
+    // wheel enters tmux copy-mode scrollback. Set globally (`-g`) so it also
+    // applies to already-running sessions, not just this new one. Trade-off:
+    // mouse text-selection now needs Shift+drag (which bypasses tmux's capture).
+    let _ = run("set-option", &["set-option", "-g", "mouse", "on"]);
     Ok(())
 }
 
@@ -256,6 +260,84 @@ pub fn list_sessions() -> Result<Vec<String>, TmuxError> {
         code: output.status.code(),
         message: stderr.trim().to_string(),
     })
+}
+
+/// Per-session foreground command + current working directory, so the UI can
+/// label a tile by what's actually running (`claude`, `zsh`, ...) and where,
+/// instead of a raw session id.
+pub struct PaneInfo {
+    pub session: String,
+    pub command: String,
+    pub cwd: String,
+}
+
+/// List every pane's `session_name|pane_current_command|pane_current_path`.
+///
+/// Unlike [`list_sessions`], this needs a tmux FORMAT (`#{...}`). A bare
+/// `#{...}` argv word is swallowed as a shell comment over the `wsl.exe`
+/// round-trip (see the note in `list_sessions`), so we run the whole tmux call
+/// inside a `bash -lc` script where the format is SINGLE-QUOTED — inside single
+/// quotes `#` is literal, so it survives intact. Best-effort: a missing server
+/// (no sessions) returns an empty Vec rather than erroring.
+pub fn pane_info() -> Result<Vec<PaneInfo>, TmuxError> {
+    const SCRIPT: &str =
+        "tmux -L termhub list-panes -a -F '#{session_name}|#{pane_current_command}|#{pane_current_path}'";
+    let output = pane_info_command(SCRIPT).output().map_err(|e| TmuxError {
+        op: "list-panes",
+        code: None,
+        message: format!("failed to spawn tmux: {e}"),
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_no_server(&stderr) || stderr.contains("error connecting to") {
+            return Ok(Vec::new());
+        }
+        return Err(TmuxError {
+            op: "list-panes",
+            code: output.status.code(),
+            message: stderr.trim().to_string(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '|');
+        let session = parts.next().unwrap_or("").trim().to_string();
+        let command = parts.next().unwrap_or("").trim().to_string();
+        let cwd = parts.next().unwrap_or("").trim().to_string();
+        if !session.is_empty() {
+            out.push(PaneInfo {
+                session,
+                command,
+                cwd,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Build the `bash -lc <script>` command used by [`pane_info`]. On Windows this
+/// goes through `wsl.exe` (CREATE_NO_WINDOW so no console flashes); on unix it
+/// runs `sh -c` directly. The single-quoted tmux format inside `script` is what
+/// protects `#{...}` from being eaten as a shell comment.
+#[cfg(windows)]
+fn pane_info_command(script: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut c = Command::new("wsl.exe");
+    c.arg("--cd").arg("~").arg("--").arg("bash").arg("-lc").arg(script);
+    c.creation_flags(0x0800_0000);
+    c
+}
+
+#[cfg(unix)]
+fn pane_info_command(script: &str) -> Command {
+    let mut c = Command::new("sh");
+    c.arg("-c").arg(script);
+    c
 }
 
 /// Capture the visible pane plus `SCROLLBACK_LINES` of scrollback for `name`,

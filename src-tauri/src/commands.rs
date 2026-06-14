@@ -363,6 +363,15 @@ pub async fn list_terminals(
     let live_sessions = tmux::list_sessions()
         .map_err(|e| format!("failed to list tmux sessions: {e}"))?;
 
+    // Per-session foreground command + live cwd (best-effort), so each tile is
+    // labeled by what's actually running (`claude`, `zsh`, ...) and where, rather
+    // than a raw id. A failure here just leaves the old id-based label.
+    let pane_map: std::collections::HashMap<String, (String, String)> = tmux::pane_info()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.session, (p.command, p.cwd)))
+        .collect();
+
     let sessions = state.sessions.lock();
 
     // Reconcile: every tmux session named `th_*` is a TermHub terminal. Reverse
@@ -394,13 +403,18 @@ pub async fn list_terminals(
             ),
         };
 
+        // Foreground command + live cwd from tmux (pane_info), so the UI labels
+        // this tile by what's running and where instead of the raw id.
+        let (cmd, cwd) = pane_map.get(tmux_session).cloned().unwrap_or_default();
         infos.push(TerminalInfo {
             id,
             tmux_session: tmux_session.clone(),
-            // tmux owns the real cwd of the pane; we don't track it server-side
-            // after spawn, so report empty rather than a stale guess.
-            cwd: String::new(),
-            title: tmux_session.clone(),
+            cwd,
+            title: if cmd.is_empty() {
+                tmux_session.clone()
+            } else {
+                cmd
+            },
             state: state_val,
         });
     }
