@@ -6,6 +6,7 @@ import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Side
 import { Titlebar } from "./components/Titlebar";
 import { useSettings } from "./store/settings";
 import { initWindowSync, isSatellite } from "./lib/windows";
+import { LifecycleKeybinds } from "./lib/useLifecycleKeybinds";
 
 // Multi-window tear-off (#21): a window opened with `?tab=<id>` is a SATELLITE
 // rendering only that one tab (the workspace store scopes itself at boot). The
@@ -287,6 +288,10 @@ export default function App() {
 
   return (
     <div className="relative flex h-full w-full flex-col bg-neutral-950 text-neutral-100">
+      {/* Lifecycle keybinds (feat/lifecycle): Ctrl/Cmd+Shift+W deletes the focused
+          terminal's session behind a confirm (Ctrl/Cmd+W still detaches). Renders
+          only its confirm dialog when armed. */}
+      <LifecycleKeybinds />
       {/* Top-edge reveal hot zone — only while auto-hide is active AND the bar is
           hidden, so it never steals clicks from the visible bar (#7/#8). */}
       {hideable && !barShown && (

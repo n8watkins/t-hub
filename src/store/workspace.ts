@@ -108,6 +108,15 @@ interface WorkspaceState {
   addAfterFocused: (info: TerminalInfo) => void;
   /** Drop a terminal from every tab + the map, moving focus to a neighbor. */
   remove: (id: TerminalId) => void;
+  /** Lifecycle: DETACH a tile — remove it from the layout but KEEP the tmux
+   *  session alive (so it can be re-adopted later). Calls the backend
+   *  `close_terminal` (detach the PTY client, tmux survives) then drops the tile
+   *  via `remove`. The default "X" / Ctrl-W action. */
+  detachTile: (id: TerminalId) => void;
+  /** Lifecycle: DELETE a terminal — KILL its tmux session for good (backend
+   *  `kill_terminal`, terminating the process tree) then drop the tile via
+   *  `remove`. Destructive; callers gate this behind a confirm. */
+  deleteTerminal: (id: TerminalId) => void;
   /** Set the focused tile. */
   setFocus: (id: TerminalId) => void;
   /** Update a terminal's lifecycle state from a terminal://state event. */
@@ -716,6 +725,27 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
       set({ terminals: nextTerminals, tabs: nextTabs, focusedId: nextFocus });
       persist();
+    },
+
+    detachTile: (id) => {
+      // Detach the PTY client but DO NOT kill tmux: the backing session keeps
+      // running so the terminal can be re-adopted later. Drop the tile from the
+      // layout immediately; the backend call is fire-and-forget. The dynamic
+      // import keeps the store free of a hard Tauri dependency (web/test safe),
+      // matching saveToBackend's pattern.
+      void import("../ipc/client")
+        .then((m) => m.closeTerminal(id))
+        .catch((err) => console.error("closeTerminal failed", err));
+      get().remove(id);
+    },
+
+    deleteTerminal: (id) => {
+      // Destructive: kill the tmux session for good (terminates its process
+      // tree) via the backend, then drop the tile. Dynamic import as above.
+      void import("../ipc/client")
+        .then((m) => m.killTerminal(id))
+        .catch((err) => console.error("killTerminal failed", err));
+      get().remove(id);
     },
 
     setFocus: (id) => {
