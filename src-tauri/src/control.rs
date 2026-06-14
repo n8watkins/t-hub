@@ -106,6 +106,18 @@ pub struct ControlHandshake {
     pub pid: u32,
 }
 
+/// A sink that delivers an Organization-tier UI mutation to the frontend. The
+/// real implementation (wired from `lib.rs`) emits a Tauri `control://apply`
+/// event carrying `{command, args}`; the frontend `controlBridge` subscribes and
+/// dispatches it into the workspace store. Boxed as a trait object so this module
+/// stays free of any `tauri` dependency and the e2e/unit tests can omit it.
+pub trait ApplySink: Send + Sync {
+    /// Forward an accepted Organization command + its args to the UI. Returns
+    /// `Ok(())` if the event was emitted, or an error string the dispatcher
+    /// surfaces (the command is still audited regardless).
+    fn apply(&self, command: &str, args: &Value) -> Result<(), String>;
+}
+
 /// The shared state the control dispatcher reads. Holds exactly the handles the
 /// Read + Organization tools need.
 ///
@@ -127,6 +139,10 @@ pub struct ControlContext {
     supervisor: Arc<dyn Fn(&mut dyn FnMut(&Supervisor)) + Send + Sync>,
     /// Private file index cache for control-channel searches.
     files: Arc<files::FileIndexState>,
+    /// Sink that forwards Organization-tier UI mutations (`focus_session`,
+    /// `move_tile`, `rename_tab`) to the frontend. `None` in headless tests /
+    /// proofs (those just audit); `Some` once `lib.rs` wires the `AppHandle`.
+    apply_sink: Option<Arc<dyn ApplySink>>,
     /// The per-launch auth token.
     token: String,
 }
@@ -293,9 +309,9 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // process-changing subset (spawn) is gated behind the confirmation flag
         // in the MCP tool description AND refused here unless explicitly enabled,
         // so the dev-box proof never spawns/kills anything by accident.
-        "focus_session" => organization_ack("focus_session", args),
-        "move_tile" => organization_ack("move_tile", args),
-        "rename_tab" => organization_ack("rename_tab", args),
+        "focus_session" => organization_apply(ctx, "focus_session", args),
+        "move_tile" => organization_apply(ctx, "move_tile", args),
+        "rename_tab" => organization_apply(ctx, "rename_tab", args),
         "open_file" => open_file(ctx, args),
         "spawn_terminal" => gated_process_change("spawn_terminal"),
 
@@ -426,20 +442,40 @@ fn open_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     Ok(serde_json::to_value(contents).map_err(|e| e.to_string())?)
 }
 
-/// Organization-tier actions whose UI side-effect (focus/move/rename) has no
-/// headless backing on the control channel yet. We **accept and audit** them
-/// (PRD §11.2: "allowed with visible audit event") by echoing the intent, rather
-/// than failing — the MCP surface stays complete and the audit trail is the
-/// returned acknowledgement. The actual UI mutation is delivered when the
-/// frontend-facing command for it lands.
-fn organization_ack(command: &str, args: &Value) -> Result<Value, String> {
+/// Organization-tier actions whose effect is a pure UI mutation
+/// (`focus_session`, `move_tile`, `rename_tab`). We **accept and audit** them
+/// (PRD §11.2: "allowed with visible audit event") AND apply them: the accepted
+/// `{command, args}` is forwarded to the frontend through the [`ApplySink`]
+/// (a Tauri `control://apply` event), where `controlBridge.ts` dispatches it into
+/// the workspace store. `applied` reflects whether the forward happened — `true`
+/// once the app has wired its sink (the normal app path), `false` in the headless
+/// proof/tests that run the listener without an `AppHandle` (still audited).
+fn organization_apply(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, String> {
+    let applied = match &ctx.apply_sink {
+        Some(sink) => match sink.apply(command, args) {
+            Ok(()) => true,
+            // A forward failure is non-fatal: the action is still accepted +
+            // audited. Surface the reason in the note but keep the response `ok`.
+            Err(e) => {
+                eprintln!("termhub-control: failed to forward '{command}' to the UI: {e}");
+                false
+            }
+        },
+        // No sink (headless proof/tests): accept + audit only.
+        None => false,
+    };
     Ok(json!({
         "accepted": command,
         "args": args,
         "audited": true,
-        "applied": false,
-        "note": "organization action accepted + audited; UI application is delivered \
-                 by the frontend command (PRD §11.2 organization tier).",
+        "applied": applied,
+        "note": if applied {
+            "organization action accepted, audited, and forwarded to the UI \
+             (control://apply) for application (PRD §11.2 organization tier)."
+        } else {
+            "organization action accepted + audited; UI application is delivered \
+             by the frontend command (PRD §11.2 organization tier)."
+        },
     }))
 }
 
@@ -589,8 +625,18 @@ impl ControlContext {
             status,
             supervisor,
             files: Arc::new(files::FileIndexState::new()),
+            apply_sink: None,
             token,
         }
+    }
+
+    /// Attach the [`ApplySink`] that forwards Organization-tier UI mutations to
+    /// the frontend (a `control://apply` Tauri event). Builder-style so `lib.rs`
+    /// can wire it after constructing the context, while headless tests/proofs
+    /// keep the sink-less context (they audit without applying).
+    pub fn with_apply_sink(mut self, sink: Arc<dyn ApplySink>) -> Self {
+        self.apply_sink = Some(sink);
+        self
     }
 
     /// Test/proof constructor: build a context directly over a shared
@@ -719,6 +765,7 @@ mod tests {
 
     #[test]
     fn organization_actions_are_accepted_and_audited() {
+        // No apply sink (headless): accepted + audited, but not applied.
         let ctx = test_ctx("t");
         for cmd in ["focus_session", "move_tile", "rename_tab"] {
             let v = dispatch(&ctx, cmd, &json!({"x": 1})).unwrap();
@@ -726,6 +773,43 @@ mod tests {
             assert_eq!(v["audited"], true);
             assert_eq!(v["applied"], false);
         }
+    }
+
+    /// A recording sink that captures every forwarded `{command, args}` so the
+    /// test can assert the dispatcher forwards Organization-tier mutations to it.
+    struct RecordingSink {
+        calls: StdMutex<Vec<(String, Value)>>,
+    }
+    impl ApplySink for RecordingSink {
+        fn apply(&self, command: &str, args: &Value) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((command.to_string(), args.clone()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn organization_actions_are_forwarded_and_applied_with_a_sink() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+
+        for cmd in ["focus_session", "move_tile", "rename_tab"] {
+            let v = dispatch(&ctx, cmd, &json!({"tabId": "tab-1"})).unwrap();
+            assert_eq!(v["accepted"], cmd);
+            assert_eq!(v["audited"], true);
+            // With a sink wired, the action is forwarded to the UI and applied.
+            assert_eq!(v["applied"], true, "expected applied:true for {cmd}");
+        }
+
+        // Every Organization-tier command reached the sink, in order, with args.
+        let calls = sink.calls.lock().unwrap();
+        let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(names, ["focus_session", "move_tile", "rename_tab"]);
+        assert_eq!(calls[0].1, json!({"tabId": "tab-1"}));
     }
 
     #[test]

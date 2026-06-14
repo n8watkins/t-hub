@@ -243,6 +243,68 @@ function defaultLayout(): PersistedLayout {
 }
 
 /**
+ * Sanitize/repair a parsed layout into a valid `PersistedLayout` (>=1 tab, a
+ * valid activeTabId, an in-range focusedId, a clamped fontSize, and no popped
+ * tab id that collides with a visible one). Shared by the localStorage and the
+ * SQLite (#sqlite) load paths so both apply identical invariants.
+ */
+function finalizeLayout(layout: PersistedLayout): PersistedLayout {
+  // A popped-out tab id must never also appear in `tabs` (it would render in
+  // two places). Drop any popped record whose id collides with a visible tab.
+  const visibleIds = new Set(layout.tabs.map((t) => t.id));
+  layout.poppedOutTabs = (layout.poppedOutTabs ?? []).filter(
+    (t) => !visibleIds.has(t.id),
+  );
+  // Keep >=1 tab. If EVERY tab is currently popped out (all windows are
+  // satellites of the same set), re-adopt the first popped one so the main
+  // window still has a canvas; its satellite's resync will hide it again.
+  if (layout.tabs.length === 0) {
+    if (layout.poppedOutTabs.length > 0) {
+      layout.tabs = [layout.poppedOutTabs.shift()!];
+    } else {
+      layout.tabs = [{ id: newTabId(), name: DEFAULT_TAB_NAME, order: [] }];
+    }
+  }
+  if (!layout.tabs.some((t) => t.id === layout.activeTabId)) {
+    layout.activeTabId = layout.tabs[0].id;
+  }
+  const active = layout.tabs.find((t) => t.id === layout.activeTabId)!;
+  if (!layout.focusedId || !active.order.includes(layout.focusedId)) {
+    layout.focusedId = active.order[0] ?? null;
+  }
+  layout.fontSize = clampFont(layout.fontSize);
+  return layout;
+}
+
+/**
+ * Parse + sanitize a raw v2-snapshot JSON string into a finalized layout, or
+ * `null` if it is missing/unparseable. Used by both the localStorage v2 branch
+ * and the durable SQLite (#sqlite) load path.
+ */
+function parseV2Snapshot(raw: string | null | undefined): PersistedLayout | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<PersistedLayout>;
+    return finalizeLayout({
+      tabs: cleanTabs(parsed.tabs),
+      activeTabId:
+        typeof parsed.activeTabId === "string" ? parsed.activeTabId : "",
+      focusedId:
+        typeof parsed.focusedId === "string"
+          ? shortenId(parsed.focusedId)
+          : null,
+      fontSize:
+        typeof parsed.fontSize === "number"
+          ? parsed.fontSize
+          : DEFAULT_FONT_SIZE,
+      poppedOutTabs: cleanTabs(parsed.poppedOutTabs),
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Read the persisted layout. Prefers the v2 (tabbed) snapshot; if absent, a
  * legacy v1 (flat order/focus) snapshot is migrated into a single tab so an
  * upgrading user keeps their terminals. Always returns >=1 tab and a valid
@@ -255,57 +317,11 @@ function loadPersisted(): PersistedLayout {
     return d;
   }
 
-  const finalize = (layout: PersistedLayout): PersistedLayout => {
-    // A popped-out tab id must never also appear in `tabs` (it would render in
-    // two places). Drop any popped record whose id collides with a visible tab.
-    const visibleIds = new Set(layout.tabs.map((t) => t.id));
-    layout.poppedOutTabs = (layout.poppedOutTabs ?? []).filter(
-      (t) => !visibleIds.has(t.id),
-    );
-    // Keep >=1 tab. If EVERY tab is currently popped out (all windows are
-    // satellites of the same set), re-adopt the first popped one so the main
-    // window still has a canvas; its satellite's resync will hide it again.
-    if (layout.tabs.length === 0) {
-      if (layout.poppedOutTabs.length > 0) {
-        layout.tabs = [layout.poppedOutTabs.shift()!];
-      } else {
-        layout.tabs = [{ id: newTabId(), name: DEFAULT_TAB_NAME, order: [] }];
-      }
-    }
-    if (!layout.tabs.some((t) => t.id === layout.activeTabId)) {
-      layout.activeTabId = layout.tabs[0].id;
-    }
-    const active = layout.tabs.find((t) => t.id === layout.activeTabId)!;
-    if (!layout.focusedId || !active.order.includes(layout.focusedId)) {
-      layout.focusedId = active.order[0] ?? null;
-    }
-    layout.fontSize = clampFont(layout.fontSize);
-    return layout;
-  };
+  const finalize = finalizeLayout;
 
   // Preferred: v2 tabbed snapshot.
-  try {
-    const raw = localStorage.getItem(PERSIST_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as Partial<PersistedLayout>;
-      return finalize({
-        tabs: cleanTabs(parsed.tabs),
-        activeTabId:
-          typeof parsed.activeTabId === "string" ? parsed.activeTabId : "",
-        focusedId:
-          typeof parsed.focusedId === "string"
-            ? shortenId(parsed.focusedId)
-            : null,
-        fontSize:
-          typeof parsed.fontSize === "number"
-            ? parsed.fontSize
-            : DEFAULT_FONT_SIZE,
-        poppedOutTabs: cleanTabs(parsed.poppedOutTabs),
-      });
-    }
-  } catch {
-    /* fall through to legacy / default */
-  }
+  const v2 = parseV2Snapshot(localStorage.getItem(PERSIST_KEY));
+  if (v2) return v2;
 
   // Migration: legacy v1 flat snapshot -> a single tab.
   try {
@@ -343,14 +359,40 @@ function loadPersisted(): PersistedLayout {
   return finalize(defaultLayout());
 }
 
-/** Persist the layout subset (best-effort; ignore quota/serialization errors). */
+/**
+ * Mirror the layout JSON into the durable SQLite copy (#sqlite phase 1), in
+ * addition to localStorage. Best-effort and fire-and-forget: the import is
+ * dynamic so the store keeps no hard dependency on Tauri (a plain web/test
+ * context without a backend must not throw), and failures are swallowed — the
+ * localStorage copy above remains the live source whenever the backend is
+ * absent. Skipped in a satellite window (it holds only its own pruned tab and
+ * must never clobber the shared snapshot the main window owns).
+ */
+function saveToBackend(json: string): void {
+  if (SATELLITE_TAB) return;
+  void import("../ipc/persistence")
+    .then((m) => m.saveWorkspaceSnapshot(json))
+    .catch(() => {});
+}
+
+/** Persist the layout subset (best-effort; ignore quota/serialization errors).
+ *  Writes the localStorage mirror synchronously, then fans the same JSON out to
+ *  the durable SQLite copy (fire-and-forget). */
 function savePersisted(layout: PersistedLayout): void {
-  if (typeof localStorage === "undefined") return;
+  let json: string;
   try {
-    localStorage.setItem(PERSIST_KEY, JSON.stringify(layout));
+    json = JSON.stringify(layout);
   } catch {
-    /* ignore */
+    return; // un-serializable layout — nothing to persist
   }
+  if (typeof localStorage !== "undefined") {
+    try {
+      localStorage.setItem(PERSIST_KEY, json);
+    } catch {
+      /* ignore quota errors — the durable copy below still runs */
+    }
+  }
+  saveToBackend(json);
 }
 
 /**
@@ -857,3 +899,83 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     },
   };
 });
+
+/**
+ * Hydrate the live store from the durable SQLite snapshot (#sqlite phase 1),
+ * preferring it over the localStorage copy the store already booted from. Runs
+ * once at module load, off the critical path:
+ *
+ *   - SATELLITE windows are skipped entirely. They scope to a single tab and
+ *     never persist, so they must not pull (or seed) the shared full snapshot.
+ *   - If SQLite HAS a snapshot, parse + finalize it (same invariants as the
+ *     localStorage path), adopt any orphaned popped-out tabs (a fresh main-window
+ *     launch owns every popped tab — see adoptOrphans), and apply ONLY the
+ *     persisted fields. The live `terminals` map and transient drag state are
+ *     left untouched; setTerminals() will reconcile real tiles from the backend.
+ *     The localStorage mirror is refreshed via persist() so both copies align.
+ *   - If SQLite is EMPTY (fresh install, or first run after this feature ships),
+ *     seed it once from whatever the store booted with — migrating the existing
+ *     localStorage arrangement into the durable copy.
+ *
+ * Best-effort: a missing backend (plain web / test) or any error is swallowed,
+ * leaving the localStorage-derived boot state in place. The dynamic import keeps
+ * the store free of a hard Tauri dependency.
+ *
+ * Race note: this resolves a microtask/IPC hop after module load, typically
+ * before components mount and call setTerminals(). If a spawn/reconcile lands
+ * first, applying the snapshot's tab ORDER here would still be correct — the
+ * next setTerminals() re-prunes to live ids — but to avoid yanking a tile the
+ * user just acted on, we only adopt the SQLite layout when it is non-trivially
+ * present and the store still holds its initial (un-reconciled) terminal set.
+ */
+async function hydrateFromBackend(): Promise<void> {
+  if (SATELLITE_TAB) return;
+  if (typeof window === "undefined") return; // no webview → no backend
+  try {
+    const { loadWorkspaceSnapshot } = await import("../ipc/persistence");
+    const json = await loadWorkspaceSnapshot();
+    const snapshot = parseV2Snapshot(json);
+
+    if (!snapshot) {
+      // Nothing durable yet: seed SQLite once from the current (localStorage-
+      // derived) layout so subsequent boots can prefer the durable copy.
+      const { tabs, activeTabId, focusedId, fontSize, poppedOutTabs } =
+        useWorkspace.getState();
+      saveToBackend(
+        JSON.stringify({ tabs, activeTabId, focusedId, fontSize, poppedOutTabs }),
+      );
+      return;
+    }
+
+    // The durable copy wins. Adopt orphaned popped-out tabs (a fresh main-window
+    // launch has no satellites yet) just like the localStorage boot path does.
+    const layout = adoptOrphans(snapshot);
+
+    // Only overwrite if the store hasn't already reconciled live terminals onto
+    // a different arrangement (i.e. a spawn/listTerminals beat us). If it has, the
+    // backend's setTerminals reconciliation is authoritative for this session;
+    // we still refresh the durable copy from that state via the next persist().
+    if (Object.keys(useWorkspace.getState().terminals).length > 0) return;
+
+    useWorkspace.setState({
+      tabs: layout.tabs,
+      activeTabId: layout.activeTabId,
+      focusedId: layout.focusedId,
+      fontSize: layout.fontSize,
+      poppedOutTabs: layout.poppedOutTabs,
+    });
+    // Re-mirror to localStorage so both copies agree after adopting SQLite.
+    savePersisted({
+      tabs: layout.tabs,
+      activeTabId: layout.activeTabId,
+      focusedId: layout.focusedId,
+      fontSize: layout.fontSize,
+      poppedOutTabs: layout.poppedOutTabs,
+    });
+  } catch {
+    // No backend or a transient error — keep the localStorage-derived boot state.
+  }
+}
+
+// Kick off durable hydration once, fire-and-forget. Never blocks module load.
+void hydrateFromBackend();

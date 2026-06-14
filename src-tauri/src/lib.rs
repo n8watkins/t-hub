@@ -9,6 +9,7 @@ mod agent; // core-side agent bridge (Workstream A, core half)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.
+mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
 mod model; // data-model structs (PRD §8)
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
@@ -108,7 +109,32 @@ fn spawn_agent_connect(state: &AppState) {
 /// it is written to the handshake file alongside the bound port so `termhub-mcp`
 /// can discover + authenticate to the channel. An explicit `TERMHUB_CONTROL_TOKEN`
 /// overrides the generated token (useful for test harnesses).
-fn start_control_listener(state: &AppState) {
+// --- MCP control://apply forwarder (feat/mcp2) -----------------------------
+// The Organization-tier MCP tools (`focus_session`, `move_tile`, `rename_tab`)
+// apply a pure UI mutation. The control listener accepts + audits them, then
+// forwards `{command, args}` to the frontend via this sink, which emits a Tauri
+// `control://apply` event; `src/ipc/controlBridge.ts` subscribes and dispatches
+// it into the workspace store. Kept here (a clearly separate block) so the sink
+// stays out of `control.rs`'s tauri-free surface.
+const CONTROL_APPLY_EVENT: &str = "control://apply";
+
+struct AppHandleApplySink {
+    app: tauri::AppHandle,
+}
+
+impl control::ApplySink for AppHandleApplySink {
+    fn apply(&self, command: &str, args: &serde_json::Value) -> Result<(), String> {
+        use tauri::Emitter;
+        self.app
+            .emit(
+                CONTROL_APPLY_EVENT,
+                serde_json::json!({ "command": command, "args": args }),
+            )
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn start_control_listener(state: &AppState, app: &tauri::AppHandle) {
     let token = std::env::var("TERMHUB_CONTROL_TOKEN")
         .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
 
@@ -121,7 +147,12 @@ fn start_control_listener(state: &AppState) {
         bridge.with_supervisor(|s| f(s));
     });
 
-    let ctx = control::ControlContext::new(state.status.clone(), supervisor, token);
+    // Forward Organization-tier UI mutations to the frontend via control://apply.
+    let apply_sink: std::sync::Arc<dyn control::ApplySink> =
+        std::sync::Arc::new(AppHandleApplySink { app: app.clone() });
+
+    let ctx = control::ControlContext::new(state.status.clone(), supervisor, token)
+        .with_apply_sink(apply_sink);
     match control::start(ctx) {
         Ok(h) => eprintln!(
             "termhub: control listener on {} (handshake: {})",
@@ -159,7 +190,7 @@ pub fn run() {
             // `tools/call` over the local control channel (PRD §9.6). A bind
             // failure is logged and does not abort startup (the channel is
             // optional, like the agent bridge).
-            start_control_listener(&state);
+            start_control_listener(&state, app.handle());
             // Install the system-tray icon + menu (#17). A tray build failure is
             // logged and does not abort startup; the app remains usable via its
             // window (close-to-tray still works regardless via on_window_event).
@@ -176,6 +207,11 @@ pub fn run() {
                     eprintln!("termhub: failed to install Snap-Layouts hit-test hook: {e}");
                 }
             }
+            // --- #sqlite: open the durable workspace DB (app_data_dir/termhub.db,
+            // WAL+NORMAL) and manage it so save/load_workspace_snapshot share one
+            // handle. A failure resolves to a no-op Db (logged inside), never
+            // aborting startup — the frontend keeps its localStorage mirror.
+            app.manage(db::init(&app.handle().clone()));
             Ok(())
         })
         // Closing the main window hides it to the tray instead of quitting; only
@@ -211,6 +247,9 @@ pub fn run() {
             // theme://changed.
             theme::get_theme,
             theme::set_theme,
+            // #sqlite: durable workspace-layout persistence (mirrors localStorage).
+            db::save_workspace_snapshot,
+            db::load_workspace_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TermHub");

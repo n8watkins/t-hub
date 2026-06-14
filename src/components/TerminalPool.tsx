@@ -34,6 +34,14 @@ import { useWorkspace } from "../store/workspace";
 import { TerminalView } from "./Terminal";
 import type { TerminalId } from "../ipc/types";
 
+// Upper bound on the chained deferred re-syncs the pool will schedule while an
+// active-tab terminal's placeholder rect is still degenerate. A transient
+// mid-reorder reflow settles in 1-2 frames; this generous ceiling tolerates a
+// slow multi-pass layout yet stops a PERMANENTLY-zero rect (pathological CSS)
+// from spinning a re-sync every frame forever. Reset whenever a real measure
+// lands (see deferredRetriesRef).
+const MAX_DEFERRED_RETRIES = 10;
+
 // ---------------------------------------------------------------------------
 // Placeholder registry (context). Each Tile registers the empty body box it
 // renders, keyed by terminal id; the pool reads the registry to know where to
@@ -187,6 +195,22 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // of the stable poolIds order above.
   const lastTransformRef = useRef<Map<TerminalId, string>>(new Map());
 
+  // THE MUTED-BUG FIX (last-good rect cache). Per terminal id we remember the
+  // last NON-degenerate placeholder geometry we measured while it was on the
+  // active tab: the on-screen offset (relative to the container base) plus its
+  // width/height. During a reorder, `moveTile` drops manual sizes and the grid
+  // reflows; a sync that lands mid-reflow can read a transient ZERO rect (or a
+  // zero container base). Previously that parked the ACTIVE-tab terminal
+  // (visibility:hidden + offscreen) and it STAYED parked -- a focus click does
+  // not re-run sync, the store's `tabs`/`activeTabId` don't change -- so the
+  // whole grid read blank until a tab switch re-synced. Now an active-tab
+  // terminal is NEVER hidden for a transient/zero rect: we re-apply its
+  // last-good geometry and schedule a deferred re-sync that lands the correct
+  // position once the reflow settles.
+  const lastGoodRectRef = useRef<
+    Map<TerminalId, { offsetX: number; offsetY: number; width: number; height: number }>
+  >(new Map());
+
   // Derive, per render, which tab each terminal lives in — so the sync knows
   // whether its placeholder belongs to the *active* (displayed) tab. A terminal
   // on an inactive tab has a placeholder in the DOM (every tab stays mounted),
@@ -198,70 +222,213 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
     return m;
   }, [tabs]);
 
+  // A deferred re-sync scheduled on the next animation frame. A sync that lands
+  // mid-reflow (transient zero rect / zero container base) is always followed by
+  // one that reads settled geometry, so any active-tab terminal pinned to its
+  // last-good rect snaps to the correct position once layout settles. Coalesced:
+  // many triggers in a frame schedule at most one follow-up.
+  const deferredRafRef = useRef(0);
+  // Bounds the deferred-rAF retry chain so a PERMANENTLY-degenerate active rect
+  // (pathological CSS, not a transient reflow) can't spin a re-sync every frame
+  // forever. Reset to 0 whenever any healthy SHOW lands (real layout settled);
+  // a reorder/tab-switch's `useLayoutEffect` always starts a fresh chain anyway.
+  const deferredRetriesRef = useRef(0);
+
+  // Position one wrapper as a VISIBLE active terminal: write transform/size and,
+  // if it moved on-screen (a same-tab reorder/swap that the IntersectionObserver
+  // can't catch), fire "th-pool-moved" so Terminal.tsx repaints rather than
+  // showing a stale frame. Shared by the healthy-show and last-good-hold paths.
+  const applyVisible = useCallback(
+    (
+      wrap: HTMLDivElement,
+      transform: string,
+      width: number,
+      height: number,
+      id: TerminalId,
+    ) => {
+      wrap.style.visibility = "visible";
+      wrap.style.pointerEvents = "";
+      wrap.style.transform = transform;
+      wrap.style.width = `${width}px`;
+      wrap.style.height = `${height}px`;
+      const prevTransform = lastTransformRef.current.get(id);
+      if (
+        prevTransform !== undefined &&
+        prevTransform !== transform &&
+        prevTransform !== "translate(-100000px, 0px)"
+      ) {
+        wrap.dispatchEvent(new CustomEvent("th-pool-moved"));
+      }
+      lastTransformRef.current.set(id, transform);
+    },
+    [],
+  );
+
   // Position every pooled terminal over its placeholder. Runs after layout
   // (useLayoutEffect) so we read settled rects and paint with no flash.
-  const sync = useCallback(() => {
-    const container = containerRef.current;
-    if (!container) return;
-    const base = container.getBoundingClientRect();
-    const slots = slotsRef.current;
-    if (!slots) return;
+  // `trigger` tags the call site for the `[pool]` devtools instrumentation so we
+  // can SEE, on the user's machine, which path drove each show/park decision.
+  const sync = useCallback(
+    (trigger: string) => {
+      const container = containerRef.current;
+      if (!container) {
+        console.warn(`[pool] sync(${trigger}) aborted: no container`);
+        return;
+      }
+      const base = container.getBoundingClientRect();
+      const slots = slotsRef.current;
+      if (!slots) {
+        console.warn(`[pool] sync(${trigger}) aborted: no slots map`);
+        return;
+      }
+      // A degenerate container base means the whole canvas is mid-reflow (e.g.
+      // the grid is between layout passes after a reorder dropped manual sizes).
+      // Reading per-placeholder rects against a zero base would compute garbage
+      // offsets, so DON'T park active terminals on it: pin them to last-good and
+      // schedule a deferred re-sync that lands once the base settles.
+      const baseDegenerate = base.width <= 0 || base.height <= 0;
+      if (baseDegenerate) {
+        console.warn(
+          `[pool] sync(${trigger}): container base degenerate (w=${base.width} h=${base.height}); ` +
+            `holding active terminals at last-good + scheduling deferred re-sync`,
+        );
+      }
 
-    for (const id of wrapRefs.current.keys()) {
-      const wrap = wrapRefs.current.get(id);
-      if (!wrap) continue;
-      const slot = slots.get(id);
-      const onActiveTab = tabOfId.get(id) === activeTabId;
-      const rect = slot?.getBoundingClientRect();
-      // Show only when the terminal's tile is on the active tab and its
-      // placeholder has a real (non-zero) box. Otherwise park it hidden so the
-      // xterm stays mounted/attached in the background.
-      if (slot && onActiveTab && rect && rect.width > 0 && rect.height > 0) {
-        wrap.style.visibility = "visible";
-        wrap.style.pointerEvents = "";
-        const transform = `translate(${rect.left - base.left}px, ${
-          rect.top - base.top
-        }px)`;
-        wrap.style.transform = transform;
-        wrap.style.width = `${rect.width}px`;
-        wrap.style.height = `${rect.height}px`;
-        // If this VISIBLE terminal moved to a new position (a same-tab reorder
-        // / swap), tell its Terminal to repaint -- the IntersectionObserver
-        // only catches on/off-screen parks, not an on-screen reposition, so a
-        // reorder could otherwise leave a stale frame. Skip the offscreen park
-        // value so un-parking doesn't double-fire (the observer handles that).
-        const prevTransform = lastTransformRef.current.get(id);
-        if (
-          prevTransform !== undefined &&
-          prevTransform !== transform &&
-          prevTransform !== "translate(-100000px, 0px)"
-        ) {
-          wrap.dispatchEvent(new CustomEvent("th-pool-moved"));
+      let needDeferred = baseDegenerate;
+
+      for (const id of wrapRefs.current.keys()) {
+        const wrap = wrapRefs.current.get(id);
+        if (!wrap) continue;
+        const slot = slots.get(id);
+        const onActiveTab = tabOfId.get(id) === activeTabId;
+        const rect = slot?.getBoundingClientRect();
+        const rectOk =
+          !!rect && rect.width > 0 && rect.height > 0 && !baseDegenerate;
+
+        // Healthy show path: tile is on the active tab and has a real box and the
+        // container base is sane. Position over the placeholder and cache the
+        // geometry as this id's last-good rect.
+        if (slot && onActiveTab && rectOk && rect) {
+          const offsetX = rect.left - base.left;
+          const offsetY = rect.top - base.top;
+          lastGoodRectRef.current.set(id, {
+            offsetX,
+            offsetY,
+            width: rect.width,
+            height: rect.height,
+          });
+          const transform = `translate(${offsetX}px, ${offsetY}px)`;
+          console.debug(
+            `[pool] sync(${trigger}) SHOW ${id}: rect ${Math.round(
+              rect.width,
+            )}x${Math.round(rect.height)} @ (${Math.round(offsetX)},${Math.round(
+              offsetY,
+            )}) base ${Math.round(base.width)}x${Math.round(base.height)}`,
+          );
+          applyVisible(wrap, transform, rect.width, rect.height, id);
+          // A real measure landed -> the layout has settled for this id; reset
+          // the deferred retry budget so future transient reflows get a fresh
+          // chain rather than inheriting an exhausted one.
+          deferredRetriesRef.current = 0;
+          continue;
         }
-        lastTransformRef.current.set(id, transform);
-      } else {
-        // Keep mounted but invisible + inert. Park at the last known size so a
-        // hidden tab's xterm isn't forced to a 0x0 (which would refit to 0 cols).
+
+        // HARDENING: an ACTIVE-tab terminal must NEVER be hidden for a
+        // transient/zero rect (or a degenerate base). If we have a last-good rect
+        // for it, hold it there (keep it visible) and schedule a deferred re-sync
+        // to land the settled position. Only when there is no last-good rect at
+        // all (truly never measured) do we leave it parked -- it has nothing to
+        // show yet anyway.
+        if (onActiveTab) {
+          const lastGood = lastGoodRectRef.current.get(id);
+          if (lastGood) {
+            console.warn(
+              `[pool] sync(${trigger}) HOLD ${id}: active-tab terminal with ` +
+                `degenerate rect (rect=${
+                  rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : "none"
+                }, baseDegenerate=${baseDegenerate}); pinning to last-good ` +
+                `${Math.round(lastGood.width)}x${Math.round(lastGood.height)} @ (${Math.round(
+                  lastGood.offsetX,
+                )},${Math.round(lastGood.offsetY)}) and scheduling re-sync`,
+            );
+            const transform = `translate(${lastGood.offsetX}px, ${lastGood.offsetY}px)`;
+            applyVisible(wrap, transform, lastGood.width, lastGood.height, id);
+            needDeferred = true;
+            continue;
+          }
+          console.warn(
+            `[pool] sync(${trigger}) PARK ${id}: active-tab terminal but NO ` +
+              `last-good rect yet (rect=${
+                rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : "none"
+              }); parking until first real measure`,
+          );
+          // Fall through to park; a deferred re-sync will pick it up once it has
+          // a real placeholder box.
+          needDeferred = true;
+        }
+
+        // Inactive-tab (or never-measured active) terminal: keep mounted but
+        // invisible + inert, parked offscreen so it never overlaps the active
+        // grid. Park at the last known size so a hidden tab's xterm isn't forced
+        // to 0x0 (which would refit to 0 cols).
+        console.debug(
+          `[pool] sync(${trigger}) PARK ${id}: onActiveTab=${onActiveTab} rect=${
+            rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : "none"
+          }`,
+        );
         wrap.style.visibility = "hidden";
         wrap.style.pointerEvents = "none";
         if (rect && rect.width > 0 && rect.height > 0) {
           wrap.style.width = `${rect.width}px`;
           wrap.style.height = `${rect.height}px`;
         }
-        // Leave the offscreen transform in place (set on creation) so a parked
-        // terminal never overlaps the active grid.
         wrap.style.transform = "translate(-100000px, 0px)";
         lastTransformRef.current.set(id, "translate(-100000px, 0px)");
       }
-    }
-  }, [containerRef, slotsRef, tabOfId, activeTabId]);
+
+      // Schedule the deferred re-sync OUTSIDE the loop so a single follow-up
+      // covers every held/parked active terminal this pass. Bounded so a
+      // permanently-degenerate rect can't loop forever; the bound is generous
+      // (10 frames) so a slow multi-pass reflow still resolves.
+      if (needDeferred) {
+        if (deferredRetriesRef.current < MAX_DEFERRED_RETRIES) {
+          deferredRetriesRef.current += 1;
+          if (deferredRafRef.current)
+            cancelAnimationFrame(deferredRafRef.current);
+          deferredRafRef.current = requestAnimationFrame(() => {
+            deferredRafRef.current = 0;
+            sync("deferred-rAF");
+          });
+        } else {
+          console.warn(
+            `[pool] sync(${trigger}): deferred re-sync budget exhausted ` +
+              `(${MAX_DEFERRED_RETRIES} frames); active terminals held at last-good. ` +
+              `A real resize/tab-switch will re-sync.`,
+          );
+        }
+      }
+    },
+    [containerRef, slotsRef, tabOfId, activeTabId, applyVisible],
+  );
 
   // Re-sync on every dependency that can move a placeholder: the placeholder set
   // (version), the active tab, and the tabs array (order/sizes changes all
   // produce a new `tabs` reference via the store). useLayoutEffect lands the
   // position before paint so a tab switch / move shows no transient mis-place.
+  //
+  // A same-tab REORDER (moveTile) produces a new `tabs` reference (it drops
+  // manual sizes), so this fires and re-measures -- confirming the reorder path
+  // re-syncs. But the synchronous layout-effect read can still catch the grid
+  // mid-reflow (transient zero rects), so we ALSO schedule a next-frame
+  // re-measure tagged `layout-rAF`. The hardened sync holds active terminals at
+  // their last-good rect on the transient pass; this follow-up lands the settled
+  // position. (sync() already self-schedules a deferred re-sync if it had to
+  // hold/park anything, so this is a belt-and-suspenders second frame that
+  // always runs after a tabs/active-tab change.)
   useLayoutEffect(() => {
-    sync();
+    sync("layout-effect");
+    const raf = requestAnimationFrame(() => sync("layout-rAF"));
+    return () => cancelAnimationFrame(raf);
   }, [sync, version, tabs, activeTabId]);
 
   // Keep terminals glued to their placeholders as the window/container resizes
@@ -274,26 +441,38 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
     const container = containerRef.current;
     if (!container) return;
     let raf = 0;
-    const schedule = () => {
+    const schedule = (trigger: string) => {
       if (raf) return;
       raf = requestAnimationFrame(() => {
         raf = 0;
-        sync();
+        sync(trigger);
       });
     };
-    const ro = new ResizeObserver(schedule);
+    const ro = new ResizeObserver(() => schedule("resize-observer"));
     ro.observe(container);
     const slots = slotsRef.current;
     if (slots) for (const el of slots.values()) ro.observe(el);
-    window.addEventListener("resize", schedule);
+    const onWindowResize = () => schedule("window-resize");
+    window.addEventListener("resize", onWindowResize);
     return () => {
       if (raf) cancelAnimationFrame(raf);
       ro.disconnect();
-      window.removeEventListener("resize", schedule);
+      window.removeEventListener("resize", onWindowResize);
     };
     // Re-establish observers when the placeholder set changes (version) so newly
     // mounted cells are observed and removed ones are dropped.
   }, [containerRef, slotsRef, sync, version]);
+
+  // Cancel any pending deferred re-sync on unmount so a stray rAF can't fire
+  // sync() into a torn-down layer.
+  useEffect(() => {
+    return () => {
+      if (deferredRafRef.current) {
+        cancelAnimationFrame(deferredRafRef.current);
+        deferredRafRef.current = 0;
+      }
+    };
+  }, []);
 
   return (
     <div
