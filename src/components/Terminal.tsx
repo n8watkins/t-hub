@@ -130,6 +130,13 @@ export function TerminalView({
     try {
       webgl = new WebglAddon();
       webglContextLoss = webgl.onContextLoss(() => {
+        // Diagnostic (mutedbug): distinguishes a real GPU/WebView2 context loss
+        // (this fires) from a DOM-move blank (canvas stays but reads stale -- no
+        // context-loss event). If the grid mutes WITHOUT this line, it's a
+        // dom-move/stale-frame, not a context loss, and forceRepaint fixes it.
+        console.warn(
+          `[termhub] WebGL context lost on terminal ${terminalId}; falling back to canvas renderer`,
+        );
         webgl?.dispose();
         webgl = null;
       });
@@ -328,6 +335,15 @@ export function TerminalView({
       if (disposed) return;
       const t = termRef.current;
       if (!t) return;
+      // Diagnostic (mutedbug): a repaint requested while the terminal has no rows
+      // means there's no buffer to draw -- it would render blank regardless of
+      // dom-move vs context-loss, so flag it to keep a devtools session honest.
+      if (t.rows <= 0) {
+        console.warn(
+          `[termhub] forceRepaint on terminal ${terminalId} with no buffer (rows=${t.rows})`,
+        );
+        return;
+      }
       try {
         t.refresh(0, t.rows - 1);
       } catch {
@@ -359,6 +375,17 @@ export function TerminalView({
       visObserver.observe(container);
     }
 
+    // Belt-and-suspenders repaint on an on-screen REPOSITION. The pool dispatches
+    // a "th-pool-moved" event on this terminal's wrapper whenever it repositions
+    // a VISIBLE terminal to a new transform (a same-tab reorder/swap). That move
+    // keeps the terminal on-screen, so the IntersectionObserver above never fires
+    // -- and a moved WebGL canvas can read stale/blank until something dirties it.
+    // We repaint on the next frame (after the pool's layout sync settles the box).
+    // ADDITIVE: never fits or attaches, so the first-fit/prompt cascade is intact.
+    const wrapEl = container.closest("[data-th-pool-tile]") as HTMLElement | null;
+    const onPoolMoved = () => requestAnimationFrame(forceRepaint);
+    wrapEl?.addEventListener("th-pool-moved", onPoolMoved);
+
     // Debounced resize -> keep PTY columns/rows in sync with the tile size, but
     // only ONCE the drag SETTLES. A continuous window/gutter drag fires this
     // observer (and the pool's per-placeholder one) rapidly; firing a PTY resize
@@ -386,6 +413,7 @@ export function TerminalView({
       resizeObserver = null;
       visObserver?.disconnect();
       visObserver = null;
+      wrapEl?.removeEventListener("th-pool-moved", onPoolMoved);
 
       dataSub.dispose();
       webglContextLoss?.dispose();
