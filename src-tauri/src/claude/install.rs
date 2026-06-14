@@ -208,7 +208,65 @@ fn count_managed(settings: &serde_json::Value) -> usize {
 /// `consent`. Non-destructive + atomic + backed up. Resolves the settings path
 /// from the environment; see [`install_hooks_at`] for the path-injected core.
 pub fn install_hooks(agent_bin: &str, consent: bool) -> Result<InstallReport> {
-    install_hooks_at(&settings_path()?, agent_bin, consent)
+    // Resolve the REAL absolute path to termhub-agent. Claude Code runs hooks via
+    // `/bin/sh` with a minimal PATH that does NOT include `~/.local/bin`, so a
+    // bare `termhub-agent` (the UI default) or a stale `/usr/bin/termhub-agent`
+    // fails with "not found" and no hook ever fires. We resolve a concrete path
+    // inside WSL instead of trusting the passed value.
+    let resolved = resolve_agent_bin(agent_bin);
+    install_hooks_at(&settings_path()?, &resolved, consent)
+}
+
+/// Resolve the absolute path to the `termhub-agent` binary that the hooks will
+/// invoke. Prefers a login-shell `command -v` (finds wherever it's installed),
+/// then `~/.local/bin/termhub-agent` (the standard install location), then the
+/// value the caller passed as a last resort.
+#[cfg(windows)]
+fn resolve_agent_bin(passed: &str) -> String {
+    use std::os::windows::process::CommandExt;
+    let distro = wsl_distro();
+    if let Ok(out) = std::process::Command::new("wsl.exe")
+        .args(["-d", &distro, "--", "bash", "-lc", "command -v termhub-agent"])
+        .creation_flags(0x0800_0000)
+        .output()
+    {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if p.starts_with('/') {
+                return p;
+            }
+        }
+    }
+    if let Ok(home) = wsl_home(&distro) {
+        return format!("{home}/.local/bin/termhub-agent");
+    }
+    passed.to_string()
+}
+
+#[cfg(unix)]
+fn resolve_agent_bin(passed: &str) -> String {
+    // An absolute path that actually exists wins.
+    if passed.starts_with('/') && Path::new(passed).exists() {
+        return passed.to_string();
+    }
+    if let Ok(out) = std::process::Command::new("bash")
+        .args(["-lc", "command -v termhub-agent"])
+        .output()
+    {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if p.starts_with('/') {
+                return p;
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Path::new(&home)
+            .join(".local/bin/termhub-agent")
+            .to_string_lossy()
+            .into_owned();
+    }
+    passed.to_string()
 }
 
 /// Path-injected core of [`install_hooks`] — operates on an explicit

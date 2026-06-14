@@ -37,6 +37,7 @@ import {
   useState,
 } from "react";
 import { listDir, searchFiles } from "../ipc/files";
+import { tlog } from "../lib/diag";
 import type { DirEntry, FileHit } from "../ipc/types";
 import { FilePanel } from "./FilePanel";
 import { PreviewOverlay } from "./PreviewOverlay";
@@ -581,11 +582,14 @@ function useDirEntries(path: string, enabled = true): DirEntriesState | null {
     let cancelled = false;
     setLoadedPath(path);
     setState({ status: "loading" });
+    tlog("files", `list_dir -> ${path}`);
     listDir(path)
       .then((entries) => {
+        tlog("files", `list_dir OK ${path}: ${entries.length} entries`);
         if (!cancelled) setState({ status: "ready", entries });
       })
       .catch((e) => {
+        tlog("files", `list_dir ERROR ${path}: ${String(e)}`);
         if (!cancelled) setState({ status: "error", message: String(e) });
       });
     return () => {
