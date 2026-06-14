@@ -39,6 +39,8 @@ import {
 import { listDir, searchFiles } from "../ipc/files";
 import type { DirEntry, FileHit } from "../ipc/types";
 import { FilePanel } from "./FilePanel";
+import { PreviewOverlay } from "./PreviewOverlay";
+import { WebPreview } from "./WebPreview";
 
 export interface FileTreeProps {
   /**
@@ -58,9 +60,19 @@ export interface FileTreeProps {
   /**
    * When true (and `onOpenFile` is NOT provided), render the FilePanel reader to
    * the right of the tree so this component is a complete Files panel on its own.
-   * Ignored when `onOpenFile` is provided (the host owns the reader then).
+   * Ignored when `onOpenFile` is provided (the host owns the reader then), or
+   * when `previewInOverlay` is on (the overlay takes over opening instead).
    */
   embedReader?: boolean;
+  /**
+   * When true (the default, and only when `onOpenFile` is NOT provided), clicking
+   * a file opens it in a large, centered <PreviewOverlay> over the whole app
+   * (like the Settings modal) using the FilePanel reader — rather than the inline
+   * `embedReader` split. This also surfaces a small "Web preview" affordance in
+   * the search bar that opens a <WebPreview> in the same overlay. Set false to
+   * keep the old inline-reader behavior. Ignored when `onOpenFile` is provided.
+   */
+  previewInOverlay?: boolean;
   /** The currently-open file (absolute path), to highlight its row. Optional. */
   activePath?: string | null;
   /** Max results for a search query (default 50). */
@@ -76,10 +88,18 @@ type IndexState =
   | { status: "ready"; count: number; root: string }
   | { status: "error"; message: string };
 
+/** What the self-contained preview overlay is currently showing (when the host
+ *  doesn't own opening and `previewInOverlay` is on). `null` = overlay closed. */
+type Preview =
+  | { kind: "file"; path: string }
+  | { kind: "web" }
+  | null;
+
 export function FileTree({
   root,
   onOpenFile,
   embedReader = false,
+  previewInOverlay = true,
   activePath,
   searchLimit = 50,
   className,
@@ -91,6 +111,13 @@ export function FileTree({
   // Internal selection only used when the host doesn't own opening (no
   // onOpenFile). Lets the embedded reader work as a drop-in panel.
   const [internalPath, setInternalPath] = useState<string | null>(null);
+  // The self-contained preview overlay's current content (file or web), or null
+  // when closed. Only used when this component owns opening (no onOpenFile) and
+  // `previewInOverlay` is on. Mounted once at the bottom of the tree's Shell.
+  const [preview, setPreview] = useState<Preview>(null);
+  // Whether THIS instance routes opens through the centered overlay. The host
+  // owning opens (onOpenFile) always wins; otherwise the overlay is the default.
+  const useOverlay = !onOpenFile && previewInOverlay;
 
   // Normalized root reported by the background indexer (matches the abs paths
   // search_files relative paths join onto). Falls back to the prop until the
@@ -98,7 +125,11 @@ export function FileTree({
   // not depend on this.
   const indexedRoot =
     indexState.status === "ready" ? indexState.root : (root ?? "");
-  const selectedPath = activePath ?? (onOpenFile ? null : internalPath);
+  // Highlight the row of whatever's currently open: the host's activePath, else
+  // the file showing in the overlay, else the inline reader's selection.
+  const previewPath = preview?.kind === "file" ? preview.path : null;
+  const selectedPath =
+    activePath ?? (onOpenFile ? null : (previewPath ?? internalPath));
 
   // Reset transient UI when the root changes. We deliberately do NOT index here.
   // The tree renders straight from shallow list_dir calls (instant, per-folder);
@@ -112,17 +143,20 @@ export function FileTree({
     setHits([]);
     setSearching(false);
     setInternalPath(null);
+    setPreview(null);
     setIndexState({ status: "idle" });
   }, [root]);
 
-  // Open a file: hand it to the host, or track it internally for the embedded
-  // reader. -----------------------------------------------------------------
+  // Open a file: hand it to the host (onOpenFile wins), else open it in the
+  // centered preview overlay (the default), else track it internally for the
+  // inline embedded reader. ------------------------------------------------
   const open = useCallback(
     (absPath: string) => {
       if (onOpenFile) onOpenFile(absPath);
+      else if (previewInOverlay) setPreview({ kind: "file", path: absPath });
       else setInternalPath(absPath);
     },
-    [onOpenFile],
+    [onOpenFile, previewInOverlay],
   );
 
   // Debounced fuzzy search. The backend indexes on demand, so search works even
@@ -169,8 +203,14 @@ export function FileTree({
   const tree = (
     <div className="flex h-full min-h-0 w-full flex-col">
       {/* Search box ABOVE the tree. The tiny index hint lives inside it so it
-          never blocks or overlays the tree. */}
-      <SearchBar query={query} onQuery={setQuery} indexState={indexState} />
+          never blocks or overlays the tree. The "Web preview" affordance only
+          appears when this instance owns the centered overlay. */}
+      <SearchBar
+        query={query}
+        onQuery={setQuery}
+        indexState={indexState}
+        onWebPreview={useOverlay ? () => setPreview({ kind: "web" }) : undefined}
+      />
 
       {/* Body: search results when querying, else the instant folder tree. */}
       <div className="th-scroll min-h-0 flex-1 overflow-y-auto">
@@ -193,9 +233,45 @@ export function FileTree({
     </div>
   );
 
-  // Embedded-reader mode: tree on the left, FilePanel reader on the right.
-  // Only used when the host hasn't claimed opening via onOpenFile.
-  if (embedReader && !onOpenFile) {
+  // The self-contained preview overlay, mounted once and shared by every return
+  // path below. It floats over the whole app (like Settings) and is the default
+  // way files open when this component owns opening (no onOpenFile). Closing
+  // (Esc / backdrop / ✕) clears `preview`.
+  const overlay = useOverlay ? (
+    <PreviewOverlay
+      open={preview !== null}
+      onClose={() => setPreview(null)}
+      title={
+        preview?.kind === "file"
+          ? basenameOf(preview.path)
+          : preview?.kind === "web"
+            ? "Web preview"
+            : ""
+      }
+      subtitle={preview?.kind === "file" ? preview.path : undefined}
+    >
+      {preview?.kind === "file" ? (
+        // FilePanel as a PURE reader (readerOnly) — the overlay header already
+        // shows the path; this just renders the file body (it caps large files
+        // and rejects binary, surfacing a friendly error). Keyed by path so a
+        // new selection loads fresh.
+        <FilePanel
+          key={preview.path}
+          root={root}
+          initialFile={preview.path}
+          readerOnly
+          className="h-full"
+        />
+      ) : preview?.kind === "web" ? (
+        <WebPreview />
+      ) : null}
+    </PreviewOverlay>
+  ) : null;
+
+  // Inline embedded-reader mode: tree on the left, FilePanel reader on the
+  // right. Only used when the host hasn't claimed opening AND the overlay is
+  // disabled (previewInOverlay=false) — otherwise the overlay is the reader.
+  if (embedReader && !onOpenFile && !useOverlay) {
     return (
       <Shell className={className}>
         <div className="flex min-h-0 flex-1">
@@ -206,10 +282,6 @@ export function FileTree({
             {tree}
           </div>
           <div className="min-h-0 min-w-0 flex-1">
-            {/* FilePanel as a PURE reader (readerOnly): no duplicate search box
-             * or tree — this FileTree already owns navigation. The key forces a
-             * fresh reader load when the selection changes; before a file is
-             * picked it shows the reader's gentle "select a file" empty state. */}
             <FilePanel
               key={internalPath ?? "none"}
               root={root}
@@ -222,7 +294,19 @@ export function FileTree({
     );
   }
 
-  return <Shell className={className}>{tree}</Shell>;
+  return (
+    <Shell className={className}>
+      {tree}
+      {overlay}
+    </Shell>
+  );
+}
+
+/** Final path component (handles both `/` and `\`), for the overlay title. */
+function basenameOf(p: string): string {
+  const norm = p.replace(/\\/g, "/").replace(/\/+$/, "");
+  const idx = norm.lastIndexOf("/");
+  return idx >= 0 ? norm.slice(idx + 1) : norm;
 }
 
 // --- Shell -----------------------------------------------------------------
@@ -250,10 +334,14 @@ function SearchBar({
   query,
   onQuery,
   indexState,
+  onWebPreview,
 }: {
   query: string;
   onQuery: (q: string) => void;
   indexState: IndexState;
+  /** When provided, render a small "Web preview" affordance that opens the
+   *  WebPreview surface in the shared overlay. Omitted = no button. */
+  onWebPreview?: () => void;
 }) {
   return (
     <div
@@ -298,7 +386,43 @@ function SearchBar({
       {/* Tiny, non-blocking index hint — purely informational, never gates the
           tree. */}
       <IndexHint indexState={indexState} />
+      {/* "Web preview" affordance — opens a URL/iframe surface in the shared
+          overlay. Only present when this instance owns the overlay. */}
+      {onWebPreview && (
+        <button
+          type="button"
+          onClick={onWebPreview}
+          title="Preview a webpage (e.g. a local dev server)"
+          aria-label="Web preview"
+          className="flex h-6 w-6 shrink-0 items-center justify-center rounded transition-colors hover:bg-neutral-700/40"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          <GlobeIcon />
+        </button>
+      )}
     </div>
+  );
+}
+
+/** A small globe glyph for the Web-preview affordance. */
+function GlobeIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="pointer-events-none"
+      aria-hidden
+    >
+      <circle cx="12" cy="12" r="10" />
+      <path d="M2 12h20" />
+      <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+    </svg>
   );
 }
 
