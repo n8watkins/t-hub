@@ -36,6 +36,14 @@ pub struct SpawnOptions {
     pub cwd: Option<String>,
     pub shell: Option<String>,
     pub name: Option<String>,
+    /// Optional command to run in the new pane after the login shell starts
+    /// (the "+" spawn presets: e.g. `claude`, `claude --resume`, or a custom
+    /// line). Unlike `shell` (which REPLACES the pane's program and so dies with
+    /// it), this is run *inside* an interactive login shell that the pane then
+    /// `exec`s back into, so exiting the command (e.g. quitting Claude) drops to
+    /// a live shell instead of closing the tile. `None`/empty => plain login
+    /// shell, byte-for-byte today's "Shell" behavior (no regression).
+    pub startup_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +101,44 @@ fn resolve_title(opts: &SpawnOptions) -> String {
         .unwrap_or_else(|| "terminal".to_string())
 }
 
+/// Single-quote `s` for safe embedding inside a POSIX `sh -c '...'` string: wrap
+/// in single quotes and replace every embedded `'` with the `'\''` idiom (close
+/// quote, escaped literal quote, reopen quote). Lets an arbitrary user "Custom…"
+/// command (which may itself contain quotes) ride safely into the pane program.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Resolve the tmux pane program for this spawn.
+///
+/// Precedence:
+///   1. An explicit `shell` preset becomes the pane's program verbatim (legacy
+///      behavior; it REPLACES the shell and the pane dies when it exits).
+///   2. A `startup_command` ("+" presets / Custom…) runs *inside* an interactive
+///      login shell that the pane then `exec`s back into, so quitting the command
+///      (e.g. exiting Claude) drops to a live shell rather than closing the tile.
+///   3. Otherwise `None` — tmux launches the user's plain login shell, exactly
+///      today's "Shell" behavior (no regression).
+fn resolve_pane_command(opts: &SpawnOptions) -> Option<String> {
+    if let Some(shell) = opts.shell.as_deref().filter(|s| !s.trim().is_empty()) {
+        return Some(shell.to_string());
+    }
+    let startup = opts
+        .startup_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    // Run the startup command, then exec back into an interactive login shell so
+    // the tile survives the command exiting. `$SHELL` is the user's login shell
+    // (matching the plain-shell path); fall back to /bin/sh if it is unset.
+    Some(format!(
+        "sh -c {}",
+        sh_single_quote(&format!(
+            "{startup}; exec \"${{SHELL:-/bin/sh}}\" -l"
+        ))
+    ))
+}
+
 #[tauri::command]
 pub async fn spawn_terminal(
     app: tauri::AppHandle,
@@ -113,10 +159,12 @@ pub async fn spawn_terminal(
     let title = resolve_title(&opts);
 
     // Create the detached tmux session that backs this terminal. With
-    // `command == None` tmux launches the user's login shell, which is what the
-    // nucleus wants; an explicit `shell` preset becomes the pane's program.
-    let command = opts.shell.as_deref().filter(|s| !s.trim().is_empty());
-    tmux::new_session(&tmux_session, &cwd, command)
+    // `command == None` tmux launches the user's login shell (the "Shell" preset
+    // / today's default). A `shell` preset becomes the pane's program verbatim; a
+    // `startupCommand` ("+" presets: Claude / Resume Claude / Custom…) is run
+    // inside a login shell the pane execs back into (see `resolve_pane_command`).
+    let command = resolve_pane_command(&opts);
+    tmux::new_session(&tmux_session, &cwd, command.as_deref())
         .map_err(|e| format!("failed to create tmux session: {e}"))?;
 
     // Spawn the PTY attach client that streams this session to the frontend. If

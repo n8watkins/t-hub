@@ -21,6 +21,14 @@ export interface SpawnOptions {
   shell?: string;
   /** Optional human-readable label. */
   name?: string;
+  /**
+   * Optional command run in the new pane after the login shell starts (the "+"
+   * spawn presets — e.g. `claude`, `claude --resume`, or a Custom… line). Run
+   * INSIDE a login shell the pane execs back into, so exiting the command drops
+   * to a live shell instead of closing the tile. Empty/omitted => plain login
+   * shell (the "Shell" preset = today's behavior, no regression).
+   */
+  startupCommand?: string;
 }
 
 export interface TerminalInfo {
