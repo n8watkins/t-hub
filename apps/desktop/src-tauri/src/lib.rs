@@ -13,6 +13,9 @@ mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
 mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/diag)
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
 mod model; // data-model structs (PRD §8)
+// --- feat/projects-sidebar (Agent A) ---------------------------------------
+mod recent; // recent recallable Claude sessions for the sidebar "Recent" list
+// ---------------------------------------------------------------------------
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
 mod theme; // live theming contract: get_theme/set_theme + theme://changed (MCP-facing)
 mod tray; // system-tray icon + close-to-tray (hide instead of quit) (#17)
@@ -266,6 +269,10 @@ pub fn run() {
             // #recovery: snapshot-history read commands for the Recovery review UI.
             db::list_snapshots,
             db::get_snapshot,
+            // --- feat/projects-sidebar (Agent A) -------------------------------
+            // Recent recallable Claude sessions for the sidebar "Recent" list.
+            recent::recent_sessions,
+            // -------------------------------------------------------------------
             // feat/diag: runtime diagnostics sink (mirrors frontend logs to a file
             // the WSL-side orchestrator can read from a RELEASE build).
             diag::diag_log,

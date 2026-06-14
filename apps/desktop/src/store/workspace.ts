@@ -153,6 +153,17 @@ interface WorkspaceState {
    *  rename always wins. Blank/whitespace clears the Claude title. NOT persisted. */
   setClaudeTitle: (id: TerminalId, title: string) => void;
 
+  // --- Recall (feat/projects-sidebar, Agent A) ---
+  /** Recall a past Claude session into the ACTIVE workspace tab: spawn a NEW
+   *  terminal rooted at `cwd` running `claude --resume <sessionId>` (resuming the
+   *  conversation in place), insert the tile after the focused one, and focus it.
+   *  Reuses the existing spawn path (the same `spawnTerminal` IPC + `addAfterFocused`
+   *  the "+" menu / Canvas use) — recall is just a spawn with a cwd + a resume
+   *  startup command. Best-effort: a spawn failure is logged, not thrown, so a
+   *  click can never crash the sidebar. Returns the new terminal id, or null on
+   *  failure. */
+  recall: (sessionId: string, cwd: string) => Promise<TerminalId | null>;
+
   // --- Tabs (PRD §5.2) ---
   /** Create a new empty tab (auto-named) and activate it; returns its id. */
   addTab: () => string;
@@ -766,6 +777,38 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         focusedId: info.id,
       });
       persist();
+    },
+
+    // --- Recall (feat/projects-sidebar, Agent A) ------------------------------
+    // Re-spawn + resume a past Claude session into the active tab. This is the
+    // store-side spawn helper the sidebar's Recent list uses; it deliberately
+    // reuses the SAME spawn path as Canvas's "+" menu (`spawnTerminal` IPC then
+    // `addAfterFocused`) so there is exactly one way a tile gets created. We add
+    // it here (rather than reaching into Canvas, which another agent owns) per the
+    // build split. The dynamic `../ipc/client` import keeps the store free of a
+    // hard Tauri dependency, matching detachTile/deleteTerminal/saveToBackend.
+    recall: async (sessionId, cwd) => {
+      const id = sessionId.trim();
+      const dir = cwd.trim();
+      if (!id) return null;
+      try {
+        const { spawnTerminal } = await import("../ipc/client");
+        // Spawn rooted at the session's cwd, resuming THAT session by id. Quoting
+        // the id keeps a defensive guard even though Claude session ids are plain
+        // UUIDs. `claude --resume <id>` resumes the conversation directly (vs. the
+        // "+" menu's bare `claude --resume`, which shows the interactive picker).
+        const info = await spawnTerminal({
+          cwd: dir || undefined,
+          startupCommand: `claude --resume '${id}'`,
+        });
+        // Insert after the focused tile in the active tab and focus it — exactly
+        // how a "+" spawn lands. Persistence + reconcile come for free.
+        get().addAfterFocused(info);
+        return info.id;
+      } catch (err) {
+        console.error("recall failed", err);
+        return null;
+      }
     },
 
     remove: (id) => {
