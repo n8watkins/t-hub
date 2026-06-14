@@ -1,7 +1,23 @@
 // xterm.js terminal tile for the 0.1 terminal nucleus.
 //
+// RENDERER (mutedbug fix): we deliberately do NOT load the WebGL addon. Each
+// xterm WebGL addon opens its OWN WebGL context, and WebView2 (Chromium) caps
+// the number of simultaneously-live WebGL contexts and evicts the
+// least-recently-used ones under GPU/memory pressure. With 6+ terminals (each a
+// context) plus a relayout/repaint (e.g. clicking a tile that was repositioned
+// while unfocused), WebView2 would evict contexts across the grid. xterm's
+// WebGL addon responds to the browser's `webglcontextlost` event by calling
+// preventDefault() and waiting a HARD-CODED 3000ms before firing its
+// onContextLoss fallback -- during which every evicted canvas is blank with
+// nothing repainting it. That is the "all terminals go blank / uniform muted
+// gray, then a tab switch resets them" symptom. Using xterm's default DOM
+// renderer (no GPU context) removes the ceiling entirely, so the eviction --
+// and the blanking -- cannot happen. For 6-12 terminals the DOM renderer is
+// plenty fast, and it also sidesteps WebView2 driver-state context refusals and
+// the stale-frame-on-move class of bugs.
+//
 // Responsibilities (PRD §9.1, FR-004/FR-005, §12.1):
-//   - Create an xterm.js Terminal with Fit + WebGL + Search + Unicode11 addons.
+//   - Create an xterm.js Terminal with Fit + Search + Unicode11 addons.
 //   - On mount/visible: attachTerminal(id, cols, rows), write the base64 scrollback,
 //     subscribe onOutput -> xterm.write(decodeBase64(...)).
 //   - xterm.onData -> writeTerminal(id, data); ResizeObserver/FitAddon -> resizeTerminal.
@@ -15,7 +31,6 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { WebglAddon } from "@xterm/addon-webgl";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   attachTerminal,
@@ -95,8 +110,6 @@ export function TerminalView({
     const unlisteners: UnlistenFn[] = [];
     let resizeObserver: ResizeObserver | null = null;
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
-    let webgl: WebglAddon | null = null;
-    let webglContextLoss: { dispose(): void } | null = null;
     let disposed = false;
     let promptTimer: ReturnType<typeof setTimeout> | null = null;
     let rafId = 0;
@@ -123,28 +136,11 @@ export function TerminalView({
     const search = new SearchAddon();
     term.loadAddon(search);
 
+    // No WebGL addon: xterm uses its default DOM renderer. See the file header
+    // (mutedbug fix) for why -- a per-terminal WebGL context hits WebView2's
+    // context ceiling and blanks the whole grid on eviction. The DOM renderer
+    // has no GPU context, so that failure mode does not exist.
     term.open(container);
-
-    // WebGL renderer is best-effort. Some GPUs/driver states refuse a context;
-    // on loss we drop the addon and xterm transparently falls back to canvas.
-    try {
-      webgl = new WebglAddon();
-      webglContextLoss = webgl.onContextLoss(() => {
-        // Diagnostic (mutedbug): distinguishes a real GPU/WebView2 context loss
-        // (this fires) from a DOM-move blank (canvas stays but reads stale -- no
-        // context-loss event). If the grid mutes WITHOUT this line, it's a
-        // dom-move/stale-frame, not a context loss, and forceRepaint fixes it.
-        console.warn(
-          `[termhub] WebGL context lost on terminal ${terminalId}; falling back to canvas renderer`,
-        );
-        webgl?.dispose();
-        webgl = null;
-      });
-      term.loadAddon(webgl);
-    } catch {
-      webgl?.dispose();
-      webgl = null;
-    }
 
     // Forward keystrokes/paste to the PTY.
     const dataSub = term.onData((d) => {
@@ -262,7 +258,7 @@ export function TerminalView({
     };
 
     // Defer the first fit until the browser has completed the constrained-flex
-    // layout pass (and WebGL has loaded). A synchronous fit here reads a
+    // layout pass. A synchronous fit here reads a
     // transient/unconstrained height and oversizes the grid. Attaching from
     // inside the rAF means the backend PTY is created at the settled geometry,
     // so there is no 80x24 -> real-size redraw trail. Double-rAF reliably lands
@@ -324,20 +320,20 @@ export function TerminalView({
       });
     });
 
-    // Force xterm's renderer to repaint the whole viewport. The WebGL (and
-    // canvas) renderers don't redraw a frame when the element merely goes
-    // hidden->visible (or the window settles after a resize) at the SAME size,
-    // because nothing wrote new cells and no fit/SIGWINCH fired -- so the
-    // backing canvas shows a stale/blank frame until something dirties it (e.g.
-    // a click). `term.refresh(0, rows-1)` marks every line dirty and forces a
+    // Force xterm's renderer to repaint the whole viewport. The DOM renderer
+    // (like the GPU ones before it) doesn't redraw a frame when the element
+    // merely goes hidden->visible (or the window settles after a resize) at the
+    // SAME size, because nothing wrote new cells and no fit/SIGWINCH fired -- so
+    // the box can show a stale/blank frame until something dirties it (e.g. a
+    // click). `term.refresh(0, rows-1)` marks every line dirty and forces a
     // fresh frame. Cheap and idempotent; safe to call whenever the box reappears.
     const forceRepaint = () => {
       if (disposed) return;
       const t = termRef.current;
       if (!t) return;
-      // Diagnostic (mutedbug): a repaint requested while the terminal has no rows
-      // means there's no buffer to draw -- it would render blank regardless of
-      // dom-move vs context-loss, so flag it to keep a devtools session honest.
+      // Diagnostic (mutedbug): a repaint requested while the terminal has no
+      // rows means there's no buffer to draw -- it would render blank no matter
+      // what, so flag it to keep a devtools session honest.
       if (t.rows <= 0) {
         console.warn(
           `[termhub] forceRepaint on terminal ${terminalId} with no buffer (rows=${t.rows})`,
@@ -416,7 +412,6 @@ export function TerminalView({
       wrapEl?.removeEventListener("th-pool-moved", onPoolMoved);
 
       dataSub.dispose();
-      webglContextLoss?.dispose();
 
       // Await all event unlisteners so no stray onOutput fires into a disposed
       // term. Any subscriptions still in-flight bail via the `disposed` flag.
