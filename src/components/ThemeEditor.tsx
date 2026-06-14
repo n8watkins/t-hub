@@ -19,13 +19,24 @@
 // one panel at a time instead of one long scroll. Each control is bound
 // straight to a store's setters, so editing is live.
 import { useEffect, useRef, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   useTheme,
   BUILTIN_PRESETS,
   type ChromeTokens,
   type AnsiPalette,
 } from "../store/theme";
-import { useSettings } from "../store/settings";
+import {
+  useSettings,
+  TITLEBAR_HIDE_DELAY_MIN,
+  TITLEBAR_HIDE_DELAY_MAX,
+  TITLEBAR_REVEAL_ANIM_MIN,
+  TITLEBAR_REVEAL_ANIM_MAX,
+} from "../store/settings";
+// Build-time app version/name from package.json (resolveJsonModule is on). Used
+// as the fallback / "build" version; the live Tauri runtime version is fetched
+// at runtime via getVersion() in the About group.
+import pkg from "../../package.json";
 
 /**
  * Wire the global `Ctrl/Cmd+,` toggle (and Esc-to-close) onto the settings
@@ -181,21 +192,99 @@ function GeneralSection() {
   const setAutoHideTitlebarMaximized = useSettings(
     (s) => s.setAutoHideTitlebarMaximized,
   );
+  const titlebarHideDelayMs = useSettings((s) => s.titlebarHideDelayMs);
+  const setTitlebarHideDelayMs = useSettings((s) => s.setTitlebarHideDelayMs);
+  const titlebarRevealAnimMs = useSettings((s) => s.titlebarRevealAnimMs);
+  const setTitlebarRevealAnimMs = useSettings((s) => s.setTitlebarRevealAnimMs);
 
   return (
-    <Group title="Titlebar">
-      <SettingToggleRow
-        label="Auto-hide titlebar when maximized"
-        hint="When the window is maximized, hide the titlebar to reclaim space. It reappears when you move the pointer to the top edge."
-        value={autoHideTitlebarMaximized}
-        onChange={setAutoHideTitlebarMaximized}
-      />
-      <SettingToggleRow
-        label="Titlebar reveal pushes content down"
-        hint="When a hidden titlebar reveals, push the content down to make room (on) instead of overlaying it on top of the content (off)."
-        value={revealPushesContent}
-        onChange={setRevealPushesContent}
-      />
+    <>
+      <Group title="Titlebar">
+        <SettingToggleRow
+          label="Auto-hide titlebar when maximized"
+          hint="When the window is maximized, hide the titlebar to reclaim space. It reappears when you move the pointer to the top edge."
+          value={autoHideTitlebarMaximized}
+          onChange={setAutoHideTitlebarMaximized}
+        />
+        <SettingToggleRow
+          label="Titlebar reveal pushes content down"
+          hint="When a hidden titlebar reveals, push the content down to make room (on) instead of overlaying it on top of the content (off)."
+          value={revealPushesContent}
+          onChange={setRevealPushesContent}
+        />
+        <SettingSliderRow
+          label="Auto-hide delay"
+          hint="How long the auto-hidden titlebar stays visible after a maximize or after the pointer leaves it, before it hides again."
+          value={titlebarHideDelayMs}
+          min={TITLEBAR_HIDE_DELAY_MIN}
+          max={TITLEBAR_HIDE_DELAY_MAX}
+          step={100}
+          suffix="ms"
+          onChange={setTitlebarHideDelayMs}
+        />
+        <SettingSliderRow
+          label="Reveal animation"
+          hint="Duration of the titlebar show/hide slide animation."
+          value={titlebarRevealAnimMs}
+          min={TITLEBAR_REVEAL_ANIM_MIN}
+          max={TITLEBAR_REVEAL_ANIM_MAX}
+          step={10}
+          suffix="ms"
+          onChange={setTitlebarRevealAnimMs}
+        />
+      </Group>
+
+      <AboutGroup />
+    </>
+  );
+}
+
+/**
+ * About — shows the app name and version so the user can tell what build they're
+ * running. The real runtime version comes from Tauri's getVersion() (the actual
+ * packaged app version); we fall back to the build-time package.json version
+ * when not running inside Tauri (e.g. a plain `pnpm dev` browser session).
+ */
+function AboutGroup() {
+  const [runtimeVersion, setRuntimeVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    getVersion()
+      .then((v) => {
+        if (!disposed) setRuntimeVersion(v);
+      })
+      .catch(() => {
+        // Not inside Tauri (or the call failed) — keep the package.json fallback.
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const version = runtimeVersion ?? pkg.version;
+  return (
+    <Group title="About" description="Which build of TermHub you're running.">
+      <Row label="App">
+        <span style={{ color: "var(--th-fg)" }}>T-Hub</span>
+      </Row>
+      <Row label="Version">
+        <span className="font-mono text-xs" style={{ color: "var(--th-fg)" }}>
+          {version}
+        </span>
+      </Row>
+      {/* When the runtime version differs from the bundled package.json (e.g. a
+          dev build), surface the build-time version too for clarity. */}
+      {runtimeVersion && runtimeVersion !== pkg.version && (
+        <Row label="Build">
+          <span
+            className="font-mono text-xs"
+            style={{ color: "var(--th-fg-muted)" }}
+          >
+            {pkg.version}
+          </span>
+        </Row>
+      )}
     </Group>
   );
 }
@@ -990,6 +1079,68 @@ function SettingToggleRow({
       </span>
       <span className="mt-0.5 shrink-0">
         <Switch checked={value} onChange={onChange} label={label} />
+      </span>
+    </div>
+  );
+}
+
+/**
+ * A numeric slider wired to a plain callback (used for settings-store values,
+ * which aren't chrome tokens). Same label + helper-text layout as
+ * {@link SettingToggleRow}; only the slider changes the value (the label and
+ * helper text are inert), and the current value is shown beside the track.
+ */
+function SettingSliderRow({
+  label,
+  value,
+  min,
+  max,
+  step = 1,
+  suffix,
+  onChange,
+  hint,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+  suffix?: string;
+  onChange: (v: number) => void;
+  hint?: string;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3 text-sm">
+      <span className="flex min-w-0 flex-col">
+        <span style={{ color: "var(--th-fg)" }}>{label}</span>
+        {hint && (
+          <span
+            className="mt-1 text-xs leading-snug"
+            style={{ color: "var(--th-fg-muted)" }}
+          >
+            {hint}
+          </span>
+        )}
+      </span>
+      <span className="mt-0.5 flex shrink-0 items-center gap-3">
+        <input
+          type="range"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={(e) => onChange(Number(e.target.value))}
+          className="w-36 cursor-pointer"
+          style={{ accentColor: "var(--th-accent)" }}
+          aria-label={label}
+        />
+        <span
+          className="w-16 text-right font-mono text-xs"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          {value}
+          {suffix}
+        </span>
       </span>
     </div>
   );
