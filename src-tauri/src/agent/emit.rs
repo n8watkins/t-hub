@@ -42,6 +42,11 @@ pub const EVT_AGENT_STATE: &str = "agent://state";
 /// `status://snapshot` — a new statusline snapshot was ingested. Payload:
 /// [`crate::claude::StatusSnapshot`].
 pub const EVT_STATUS_SNAPSHOT: &str = "status://snapshot";
+/// `agent://title` — a Claude-derived, human-readable title/summary for a
+/// session changed (derived from a lifecycle hook — see [`SessionTitlePayload`]).
+/// The UI uses it to label the terminal by what Claude is doing rather than the
+/// raw command·cwd. Payload: [`SessionTitlePayload`].
+pub const EVT_TITLE: &str = "agent://title";
 
 // ---------------------------------------------------------------------------
 // Payload shapes (mirrored in src/ipc/protocol.ts)
@@ -67,6 +72,23 @@ pub struct JournalEventPayload<'a> {
 pub struct SessionStatusPayload {
     pub session_id: String,
     pub status: crate::model::SessionStatus,
+}
+
+/// Payload of the `agent://title` event (mirrors `SessionTitleEvent` in
+/// `src/ipc/protocol.ts`). A short, Claude-derived label for what a session is
+/// doing, plus the session's `cwd` so the UI can correlate the Claude session id
+/// to a TermHub terminal (terminals are keyed by their own tmux id, not the
+/// Claude session id, but they share a working directory). camelCase to match TS.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTitlePayload {
+    /// The Claude Code session id the title is for.
+    pub session_id: String,
+    /// The session's working directory at the time of the event (for terminal
+    /// correlation on the frontend). `None` if the hook payload didn't carry one.
+    pub cwd: Option<String>,
+    /// The short human-readable title/summary (already trimmed + length-capped).
+    pub title: String,
 }
 
 // ---------------------------------------------------------------------------

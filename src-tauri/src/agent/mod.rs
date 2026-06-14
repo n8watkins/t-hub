@@ -39,8 +39,8 @@ use termhub_protocol::{
 use crate::supervision::Supervisor;
 use connection::{spawn_child, spawn_reader, write_frame, TransportHandles};
 use emit::{
-    JournalEventPayload, SessionStatusPayload, EVT_AGENT_STATE, EVT_JOURNAL, EVT_SESSION_STATUS,
-    EVT_STATUS_SNAPSHOT, EVT_SUPERVISION,
+    JournalEventPayload, SessionStatusPayload, SessionTitlePayload, EVT_AGENT_STATE, EVT_JOURNAL,
+    EVT_SESSION_STATUS, EVT_STATUS_SNAPSHOT, EVT_SUPERVISION, EVT_TITLE,
 };
 
 /// How the core reaches the agent on this platform.
@@ -476,6 +476,14 @@ impl AgentBridge {
             self.ingest_status_from_journal(entry);
         }
 
+        // 3b. Derive a Claude-suggested title for the session (GOAL NAMES) and
+        //     emit `agent://title`. The strongest signal is `UserPromptSubmit`'s
+        //     prompt (what the user just asked Claude to do); `SessionStart`
+        //     gives the project/cwd as a fallback. The UI prefers this over the
+        //     raw command·cwd label. Carries `cwd` so the frontend can correlate
+        //     the Claude session id to a TermHub terminal.
+        self.emit_session_title(entry);
+
         // 4. Feed the supervision reducer. Pull the subagent base fields out of
         //    the payload (hooks put `agent_id` / `agent_type` in stdin inside
         //    subagents — REVIEW base fields).
@@ -516,6 +524,34 @@ impl AgentBridge {
         );
     }
 
+    /// Derive a Claude-suggested title from a title-bearing hook entry and emit
+    /// `agent://title` for the session (GOAL NAMES). No-op for entries that carry
+    /// no usable title signal, or that have no session id. Best-effort + behind
+    /// the optional emitter, like every other emit on this path.
+    fn emit_session_title(&self, entry: &EventJournalEntry) {
+        let session_id = entry
+            .entity_id
+            .as_deref()
+            .or_else(|| entry.payload.get("session_id").and_then(|v| v.as_str()));
+        let Some(sid) = session_id else { return };
+        let Some(title) = derive_session_title(entry.event_type, &entry.payload) else {
+            return;
+        };
+        let cwd = entry
+            .payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned());
+        self.inner.emit(
+            EVT_TITLE,
+            &SessionTitlePayload {
+                session_id: sid.to_string(),
+                cwd,
+                title,
+            },
+        );
+    }
+
     /// Route a `StatusSnapshot` journal entry into the status bridge (if wired)
     /// and emit `status://snapshot`. The payload carries the raw statusline JSON
     /// (the hook/agent put it there); we ingest it under the entry's session id.
@@ -537,6 +573,84 @@ impl AgentBridge {
         let snap = status_bridge.ingest(sid, raw, entry.timestamp_ms);
         self.inner.emit(EVT_STATUS_SNAPSHOT, &snap);
     }
+}
+
+/// Max characters for a derived session title before we ellipsize it. Long
+/// enough to carry a useful task summary, short enough to fit a tile/tab label.
+const TITLE_MAX_CHARS: usize = 60;
+
+/// Derive a short, human-readable title for a session from a lifecycle hook
+/// payload (GOAL NAMES). Pure (no I/O), so it is unit-tested directly.
+///
+/// Signal preference, strongest first:
+///   - **`UserPromptSubmit`**: the user's `prompt` — what they just asked Claude
+///     to do. Its first non-empty line, trimmed + capped, is the best label.
+///   - **`SessionStart`**: the project basename (last path segment of `cwd`) —
+///     a stable fallback so a fresh session still gets a meaningful name before
+///     the first prompt.
+///
+/// Returns `None` for events we don't title or when no usable text is present
+/// (the caller then emits nothing and the existing command·cwd label stands).
+///
+// TODO(claude-title): when a per-session summary signal is available (e.g. a
+// `Stop`/`SessionEnd` payload carrying a model-written one-line summary, or a
+// transcript tail), prefer it here over the raw prompt's first line.
+fn derive_session_title(
+    event_type: termhub_protocol::JournalEventType,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    use termhub_protocol::JournalEventType as E;
+    let raw = match event_type {
+        E::UserPromptSubmit => payload.get("prompt").and_then(|v| v.as_str()),
+        E::SessionStart => {
+            // Fallback to the project (cwd basename) so a brand-new session is
+            // labelled before the user's first prompt arrives.
+            let cwd = payload.get("cwd").and_then(|v| v.as_str())?;
+            return cwd_basename(cwd).map(|s| s.to_string());
+        }
+        _ => None,
+    }?;
+
+    // First non-empty line, collapsed whitespace, capped length.
+    let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(cap_title(line))
+}
+
+/// The last non-empty path segment of `cwd` (POSIX or Windows separators), or
+/// `None` if there is none or it is just `~`.
+fn cwd_basename(cwd: &str) -> Option<&str> {
+    let last = cwd
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty() && *s != "~")?;
+    Some(last)
+}
+
+/// Collapse internal whitespace runs to single spaces and cap to
+/// [`TITLE_MAX_CHARS`] characters (ellipsizing on a char boundary).
+fn cap_title(s: &str) -> String {
+    let collapsed: String = {
+        let mut out = String::with_capacity(s.len());
+        let mut prev_ws = false;
+        for ch in s.chars() {
+            if ch.is_whitespace() {
+                if !prev_ws {
+                    out.push(' ');
+                }
+                prev_ws = true;
+            } else {
+                out.push(ch);
+                prev_ws = false;
+            }
+        }
+        out.trim().to_string()
+    };
+    if collapsed.chars().count() <= TITLE_MAX_CHARS {
+        return collapsed;
+    }
+    let truncated: String = collapsed.chars().take(TITLE_MAX_CHARS - 1).collect();
+    format!("{}…", truncated.trim_end())
 }
 
 #[cfg(test)]
@@ -756,5 +870,90 @@ mod tests {
         assert_eq!(snap_ev.1["contextUsedPct"], 55.0);
         // And the status bridge holds it (queryable via the command).
         assert_eq!(status.get("o1").unwrap().context_used_pct, Some(55.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // GOAL NAMES: derive_session_title + agent://title emit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn user_prompt_submit_titles_from_first_prompt_line() {
+        let p = serde_json::json!({
+            "session_id": "s1",
+            "prompt": "Fix the WSL hooks install path\n\nlots of detail follows"
+        });
+        let t = super::derive_session_title(JournalEventType::UserPromptSubmit, &p).unwrap();
+        assert_eq!(t, "Fix the WSL hooks install path");
+    }
+
+    #[test]
+    fn user_prompt_submit_caps_long_prompts() {
+        let long = "a ".repeat(80);
+        let p = serde_json::json!({ "session_id": "s1", "prompt": long });
+        let t = super::derive_session_title(JournalEventType::UserPromptSubmit, &p).unwrap();
+        assert!(t.chars().count() <= super::TITLE_MAX_CHARS, "got {} chars", t.chars().count());
+        assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn session_start_falls_back_to_cwd_basename() {
+        let p = serde_json::json!({ "session_id": "s1", "cwd": "/home/natkins/n8builds/tools/" });
+        let t = super::derive_session_title(JournalEventType::SessionStart, &p).unwrap();
+        assert_eq!(t, "tools");
+    }
+
+    #[test]
+    fn no_title_for_unrelated_events_or_empty_signal() {
+        // Stop carries no title signal.
+        assert!(super::derive_session_title(
+            JournalEventType::Stop,
+            &serde_json::json!({ "session_id": "s1" })
+        )
+        .is_none());
+        // Empty prompt -> no title.
+        assert!(super::derive_session_title(
+            JournalEventType::UserPromptSubmit,
+            &serde_json::json!({ "session_id": "s1", "prompt": "   \n  " })
+        )
+        .is_none());
+        // SessionStart with no cwd -> no title.
+        assert!(super::derive_session_title(
+            JournalEventType::SessionStart,
+            &serde_json::json!({ "session_id": "s1" })
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn consume_emits_agent_title_with_cwd_for_correlation() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec.clone()));
+
+        let entry = EventJournalEntry {
+            seq: 1,
+            timestamp_ms: 1,
+            source: JournalSource::Hook,
+            entity_id: Some("sess-7".into()),
+            event_type: JournalEventType::UserPromptSubmit,
+            payload: serde_json::json!({
+                "session_id": "sess-7",
+                "cwd": "/home/u/proj",
+                "prompt": "Wire the hook titles\nmore"
+            }),
+            result: None,
+        };
+        bridge.consume_journal_entry(&entry);
+
+        let title_ev = rec
+            .events
+            .lock()
+            .iter()
+            .find(|(c, _)| c == super::EVT_TITLE)
+            .cloned()
+            .expect("agent://title must be emitted");
+        assert_eq!(title_ev.1["sessionId"], "sess-7");
+        assert_eq!(title_ev.1["cwd"], "/home/u/proj");
+        assert_eq!(title_ev.1["title"], "Wire the hook titles");
     }
 }

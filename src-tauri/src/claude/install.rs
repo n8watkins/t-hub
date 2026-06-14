@@ -26,6 +26,10 @@ use crate::claude::hooks;
 
 /// `~/.claude` config dir, honoring `CLAUDE_CONFIG_DIR` (which relocates the
 /// whole Claude store — REVIEW §10.2).
+///
+/// **Unix only.** On Windows the Claude store we must edit lives *inside WSL*
+/// (Claude Code runs there), not at the Windows `HOME`; see [`settings_path`].
+#[cfg(unix)]
 fn claude_config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         let dir = PathBuf::from(dir);
@@ -37,10 +41,77 @@ fn claude_config_dir() -> Option<PathBuf> {
 }
 
 /// Path to the user-scope `settings.json` (where global hooks live).
+///
+/// **The Windows↔WSL gotcha (PROBLEM 1):** TermHub is a *Windows* process, but
+/// Claude Code runs *inside WSL* and reads `~/.claude/settings.json` at the WSL
+/// `$HOME` (e.g. `/home/<user>/.claude/...`). The Windows `HOME` env var (if set
+/// at all) points at `C:\Users\<user>`, so writing there has no effect on Claude.
+///
+/// So on Windows we resolve the **WSL** home by shelling
+/// `wsl.exe -d <distro> -- bash -lc 'echo $HOME'` once (distro from
+/// `TERMHUB_DISTRO`, default `Ubuntu-24.04`), then target the file via its UNC
+/// form `\\wsl.localhost\<distro>\home\<user>\.claude\settings.json`, which
+/// std::fs can read/write directly from Windows. On unix we keep the native
+/// `HOME` / `CLAUDE_CONFIG_DIR` behavior.
+#[cfg(unix)]
 fn settings_path() -> Result<PathBuf> {
     claude_config_dir()
         .map(|d| d.join("settings.json"))
         .ok_or_else(|| anyhow!("could not resolve ~/.claude (no HOME / CLAUDE_CONFIG_DIR)"))
+}
+
+#[cfg(windows)]
+fn settings_path() -> Result<PathBuf> {
+    let distro = wsl_distro();
+    let home = wsl_home(&distro)?; // e.g. "/home/natkins"
+    Ok(wsl_settings_unc(&distro, &home))
+}
+
+/// The WSL distro to target, mirroring `crate::default_distro` (env
+/// `TERMHUB_DISTRO`, default `Ubuntu-24.04`).
+#[cfg(windows)]
+fn wsl_distro() -> String {
+    std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+}
+
+/// Resolve the WSL `$HOME` for `distro` by shelling a login bash once. Uses the
+/// CREATE_NO_WINDOW flag (0x08000000 — same as `tmux.rs`) so no console flashes.
+#[cfg(windows)]
+fn wsl_home(distro: &str) -> Result<String> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("wsl.exe")
+        .arg("-d")
+        .arg(distro)
+        .arg("--")
+        .arg("bash")
+        .arg("-lc")
+        .arg("echo $HOME")
+        .creation_flags(0x0800_0000)
+        .output()
+        .with_context(|| format!("running `wsl.exe -d {distro} -- bash -lc 'echo $HOME'`"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "wsl.exe -d {distro} could not resolve $HOME (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let home = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if home.is_empty() {
+        return Err(anyhow!("wsl.exe -d {distro} returned an empty $HOME"));
+    }
+    Ok(home)
+}
+
+/// Build the Windows-visible UNC path to the WSL `~/.claude/settings.json`:
+/// `\\wsl.localhost\<distro>\<home-with-backslashes>\.claude\settings.json`.
+/// The WSL `$HOME` (a POSIX path like `/home/natkins`) maps under the distro
+/// share with `/` → `\`. std::fs reads/writes this directly from Windows.
+#[cfg(windows)]
+fn wsl_settings_unc(distro: &str, wsl_home: &str) -> PathBuf {
+    let home_rel = wsl_home.trim_start_matches('/').replace('/', "\\");
+    let s = format!(r"\\wsl.localhost\{distro}\{home_rel}\.claude\settings.json");
+    PathBuf::from(s)
 }
 
 /// Read the current settings JSON. A missing file → `{}` (a fresh install);
@@ -304,5 +375,17 @@ mod tests {
         let err = install_hooks_at(&path, "/usr/bin/termhub-agent", true).unwrap_err();
         assert!(err.to_string().contains("parsing"));
         cleanup(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_settings_unc_maps_posix_home_to_distro_share() {
+        // POSIX `$HOME` → UNC under the distro share, `/` → `\`, with the
+        // leading slash dropped so we don't get a doubled separator.
+        let p = super::wsl_settings_unc("Ubuntu-24.04", "/home/natkins");
+        assert_eq!(
+            p.to_string_lossy(),
+            r"\\wsl.localhost\Ubuntu-24.04\home\natkins\.claude\settings.json"
+        );
     }
 }
