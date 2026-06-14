@@ -28,11 +28,21 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import type { TerminalId, TerminalState } from "../ipc/types";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import { useTheme } from "../store/theme";
+import { usePanels, type PanelTab } from "../store/panels";
 import { useTerminalSlot } from "./TerminalPool";
+import { TilePanel } from "./TilePanel";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { useShiftHeld } from "../lib/useShiftHeld";
+
+/** The tile-header tab bar order + labels. Terminal is the default view. */
+const PANEL_TABS: { id: PanelTab; label: string }[] = [
+  { id: "terminal", label: "Terminal" },
+  { id: "files", label: "Files" },
+  { id: "preview", label: "Preview" },
+  { id: "dev", label: "Dev" },
+];
 
 export interface TileProps {
   terminalId: TerminalId;
@@ -43,6 +53,18 @@ export interface TileProps {
    *  placeholder the pool positions the pooled terminal over. The pool decides
    *  visibility (active tab + real placeholder rect), so this prop is unused. */
   visible?: boolean;
+  /**
+   * Whether THIS Tile instance owns the pool placeholder for its terminal.
+   * Defaults to true. When a tile is fullscreen it is rendered TWICE — once in
+   * its (hidden, covered) grid cell and once in the full-window fullscreen layer
+   * (Canvas) — and both call useTerminalSlot for the same id. Exactly one must
+   * register the placeholder the pool positions the xterm over, else the two
+   * registrations race (last writer wins) and the xterm can land over the hidden
+   * grid copy. The grid cell passes `slotActive={false}` for the fullscreen id so
+   * only the fullscreen instance registers; in normal (non-fullscreen) rendering
+   * this stays true and is a no-op. Only affects the Terminal tab (the only tab
+   * that renders a placeholder). */
+  slotActive?: boolean;
   onFocus: () => void;
   onClose: () => void;
 }
@@ -80,7 +102,13 @@ function dropTargetAt(
   return { tileId: null, tabId: null };
 }
 
-export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
+export function Tile({
+  terminalId,
+  focused,
+  slotActive = true,
+  onFocus,
+  onClose,
+}: TileProps) {
   // Register this tile's body box with the terminal pool: the pooled (persistent)
   // <TerminalView> for this id is positioned over this placeholder. Moving the
   // tile to another tab/slot just repositions the pooled terminal — it is never
@@ -111,6 +139,16 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
   // control across every tile, with a destructive look + label. Shared tracker
   // (one window listener) so a wall of tiles doesn't each bind keydown/keyup.
   const shiftHeld = useShiftHeld();
+
+  // Per-tile panel state (the Terminal / Files / Preview / Dev workbench). Kept
+  // in usePanels — NOT workspace.ts — so this presentational state doesn't
+  // contend with the workspace store. The active tab decides whether the body
+  // shows the pooled terminal (terminal) or an in-tile surface (files/preview/
+  // dev); fullscreen blows this one tile up to fill the window.
+  const activeTab = usePanels((s) => s.tab[terminalId] ?? "terminal");
+  const setTab = usePanels((s) => s.setTab);
+  const toggleFullscreen = usePanels((s) => s.toggleFullscreen);
+  const isFullscreen = usePanels((s) => s.fullscreenId === terminalId);
 
   const state: TerminalState = info?.state ?? "starting";
   const cwd = info?.cwd ?? "";
@@ -275,6 +313,97 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
           </span>
         )}
         {(!showCwd || !cwd) && <span className="flex-1" />}
+
+        {/* Per-tile view switcher: Terminal / Files / Preview / Dev. Clicking a
+            tab sets THIS tile's usePanels tab; the body (below) swaps to that
+            surface and the terminal pool re-syncs (it subscribes to the tab) so
+            the pooled xterm is shown only on the Terminal tab and parked
+            otherwise. pointerDown is stopped so a tab click doesn't start the
+            header's drag-to-move gesture. */}
+        <div
+          className="flex shrink-0 items-center gap-0.5"
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          {PANEL_TABS.map((t) => {
+            const selected = activeTab === t.id;
+            return (
+              <button
+                key={t.id}
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  // Focus the tile so any view scoped to the focused terminal
+                  // (e.g. cwd-derived chrome) follows when you switch its tab.
+                  onFocus();
+                  setTab(terminalId, t.id);
+                }}
+                className="rounded px-1.5 py-0.5 text-[0.85em] leading-none transition-colors"
+                style={{
+                  color: selected ? "var(--th-fg)" : "var(--th-fg-muted)",
+                  backgroundColor: selected
+                    ? "color-mix(in srgb, var(--th-accent) 22%, transparent)"
+                    : "transparent",
+                }}
+                title={`${t.label} view`}
+                aria-pressed={selected}
+              >
+                {t.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Fullscreen toggle (⤢): blow THIS tile up to fill the window; other
+            tiles keep running underneath. Toggling (or Esc — handled in Canvas)
+            returns to the grid. Kept next to the × so the two chrome controls
+            sit together. */}
+        <button
+          type="button"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            onFocus();
+            toggleFullscreen(terminalId);
+          }}
+          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
+          style={{ color: "var(--th-fg-muted)" }}
+          title={isFullscreen ? "Exit fullscreen (Esc)" : "Fullscreen this tile"}
+          aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen tile"}
+          aria-pressed={isFullscreen}
+        >
+          {isFullscreen ? (
+            // Collapse glyph (arrows pointing inward) when already fullscreen.
+            <svg
+              viewBox="0 0 16 16"
+              width="0.9em"
+              height="0.9em"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.3"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <path d="M6 2.5v3.5H2.5M10 2.5v3.5h3.5M6 13.5V10H2.5M10 13.5V10h3.5" />
+            </svg>
+          ) : (
+            // Expand glyph (arrows pointing outward) for the enter-fullscreen state.
+            <svg
+              viewBox="0 0 16 16"
+              width="0.9em"
+              height="0.9em"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.3"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <path d="M6 2.5H2.5V6M10 2.5h3.5V6M6 13.5H2.5V10M10 13.5h3.5V10" />
+            </svg>
+          )}
+        </button>
+
         {/* ONE lifecycle control that MORPHS with Shift (per the user's model):
             - default  →  "×"  : CLOSE the terminal (detach; tmux session lives on)
             - Shift    →  trash: DELETE the terminal from the session (kills tmux),
@@ -388,12 +517,40 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
         </>
       )}
 
-      {/* Body placeholder: an empty box marking where the terminal should sit.
-          The actual xterm is rendered ONCE in the persistent pool overlay
-          (TerminalPool.tsx) and positioned over this box, so moving/resizing the
-          tile never remounts or reattaches it (#20). Kept data-tile-id-covered by
-          the parent so drag drop-resolution (elementFromPoint) still lands here. */}
-      <div ref={slotRef} className="min-h-0 flex-1 overflow-hidden" />
+      {/* Body. On the Terminal tab this is the EMPTY placeholder box marking
+          where the pooled xterm should sit: the actual xterm is rendered ONCE in
+          the persistent pool overlay (TerminalPool.tsx) and positioned over this
+          box, so moving/resizing the tile never remounts/reattaches it (#20).
+          On the other tabs we render the chosen surface (Files/Preview/Dev) in
+          the body INSTEAD, and the pool parks this terminal (hidden offscreen)
+          because it only SHOWs a terminal whose tile is on the Terminal tab —
+          see TerminalPool.sync(). The placeholder must stay MOUNTED on the
+          terminal tab so the pool has a rect to position over; we don't render it
+          at all on the other tabs (the pool keys "show" off the active tab, not
+          off the placeholder's presence). */}
+      {isFullscreen && !slotActive ? (
+        // This is the COVERED grid copy of the fullscreen tile (the fullscreen
+        // layer renders the visible copy). It's entirely hidden behind the
+        // fullscreen layer, so render an empty body: don't register a placeholder
+        // (slotActive is already false) and don't duplicate the Files/Preview/Dev
+        // surface (which would double-index/double-iframe needlessly). The Tile
+        // chrome above still renders so its drop target (data-tile-id) stays in
+        // the grid for drag resolution.
+        <div className="min-h-0 flex-1 overflow-hidden" />
+      ) : activeTab === "terminal" ? (
+        // Attach the pool placeholder ref ONLY when this instance owns the slot
+        // (slotActive). When a fullscreen tile is also rendered in its hidden
+        // grid cell, that grid copy passes slotActive={false} so it doesn't
+        // re-register and steal the placeholder from the fullscreen copy.
+        <div
+          ref={slotActive ? slotRef : undefined}
+          className="min-h-0 flex-1 overflow-hidden"
+        />
+      ) : (
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <TilePanel terminalId={terminalId} cwd={cwd} tab={activeTab} />
+        </div>
+      )}
     </div>
   );
 }

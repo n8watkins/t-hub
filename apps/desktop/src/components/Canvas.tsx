@@ -26,6 +26,7 @@ import {
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { useWorkspace } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
+import { usePanels } from "../store/panels";
 import {
   spawnTerminal,
   listTerminals,
@@ -83,6 +84,13 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
   const zoomIn = useWorkspace((s) => s.zoomIn);
   const zoomOut = useWorkspace((s) => s.zoomOut);
   const zoomReset = useWorkspace((s) => s.zoomReset);
+
+  // Per-tile fullscreen: when set, ONE tile is blown up to fill the whole window
+  // (covering the sidebar/titlebar for a true fullscreen). The grid + pool keep
+  // running underneath; the pooled xterm follows the fullscreen tile's
+  // placeholder automatically. Esc / the ⤢ toggle returns to the grid.
+  const fullscreenId = usePanels((s) => s.fullscreenId);
+  const setFullscreen = usePanels((s) => s.setFullscreen);
 
   // Seed the live terminal set and keep lifecycle state in sync with the backend.
   useEffect(() => {
@@ -241,6 +249,34 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
     onToggleSidebar,
   ]);
 
+  // Clear a STALE fullscreen target. The fullscreen tile can be removed out from
+  // under us by any deletion path (Ctrl/Cmd+W, the context-menu delete, a
+  // lifecycle keybind, a backend exit), most of which live in workspace.ts /
+  // other components we don't own and so can't call setFullscreen(null)
+  // themselves. If fullscreenId no longer matches a tile in any tab, drop it so
+  // we don't leave an empty full-window layer up. (panels.forget() exists for
+  // the same purpose but isn't wired into those paths.)
+  useEffect(() => {
+    if (fullscreenId == null) return;
+    const stillExists = tabs.some((t) => t.order.includes(fullscreenId));
+    if (!stillExists) setFullscreen(null);
+  }, [fullscreenId, tabs, setFullscreen]);
+
+  // Esc exits fullscreen (the ⤢ toggle in the tile header is the other way out).
+  // Only armed while a tile is fullscreen; captured so it wins before any other
+  // Esc consumer when the fullscreen layer is up.
+  useEffect(() => {
+    if (fullscreenId == null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setFullscreen(null);
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [fullscreenId, setFullscreen]);
+
   return (
     <div
       className="relative flex h-full w-full flex-col"
@@ -269,6 +305,7 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
                     tab={tab}
                     active={active}
                     focusedId={focusedId}
+                    fullscreenId={fullscreenId}
                     onFocus={setFocus}
                     onClose={close}
                   />
@@ -276,6 +313,38 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
               </div>
             );
           })}
+
+          {/* FULLSCREEN LAYER. When a tile is fullscreen we render THAT tile a
+              second time, expanded to fill the whole window (a fixed layer that
+              covers the sidebar/titlebar for a true fullscreen). It lives INSIDE
+              the pool provider so its Tile's useTerminalSlot registers with the
+              same registry — the pool then positions the pooled xterm over this
+              full-window placeholder automatically (its offset is computed
+              relative to the pool container, so negative offsets reach the
+              viewport origin) and lifts itself above this layer (see the pool
+              overlay z-index) so the terminal paints over the fullscreen body.
+              The original grid copy of this tile keeps rendering underneath but
+              passes slotActive={false} (see TabGrid) so it doesn't fight for the
+              placeholder. Other tiles keep running (parked offscreen). */}
+          {fullscreenId != null && (
+            <div
+              className="fixed inset-0 z-40"
+              style={{ backgroundColor: "var(--th-app-bg)" }}
+            >
+              <Tile
+                key={`fs-${fullscreenId}`}
+                terminalId={fullscreenId}
+                focused={fullscreenId === focusedId}
+                onFocus={() => setFocus(fullscreenId)}
+                onClose={() => {
+                  // Closing the fullscreen tile detaches it AND drops fullscreen
+                  // so we don't leave an empty full-window layer up.
+                  setFullscreen(null);
+                  close(fullscreenId);
+                }}
+              />
+            </div>
+          )}
         </TerminalPoolProvider>
       </div>
 
@@ -368,11 +437,22 @@ interface TabGridProps {
   tab: WorkspaceTab;
   active: boolean;
   focusedId: TerminalId | null;
+  /** The tile (if any) currently fullscreen. Its grid cell still renders (it's
+   *  covered by the fullscreen layer) but must NOT own the pool placeholder —
+   *  the fullscreen copy does — so we pass it slotActive={false}. */
+  fullscreenId: TerminalId | null;
   onFocus: (id: TerminalId) => void;
   onClose: (id: TerminalId) => void;
 }
 
-function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
+function TabGrid({
+  tab,
+  active,
+  focusedId,
+  fullscreenId,
+  onFocus,
+  onClose,
+}: TabGridProps) {
   const layout = splitRows(tab.order);
   const setTabSizes = useWorkspace((s) => s.setTabSizes);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -672,6 +752,10 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
                   <Tile
                     terminalId={id}
                     focused={active && id === focusedId}
+                    // When this tile is fullscreen, its fullscreen copy (Canvas)
+                    // owns the pool placeholder; this covered grid copy must not
+                    // re-register and steal it, so it yields the slot.
+                    slotActive={id !== fullscreenId}
                     // #20: the xterm body lives in the persistent pool overlay,
                     // not in the tile — the tile renders header + placeholder.
                     onFocus={() => onFocus(id)}

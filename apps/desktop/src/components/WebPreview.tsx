@@ -17,6 +17,7 @@
 // owns only its URL/loading/error state and the one shell `open()` side effect.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ReactElement } from "react";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 
 /**
@@ -61,7 +62,7 @@ export interface WebPreviewProps {
   initialUrl?: string;
 }
 
-export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps) {
+export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps): ReactElement {
   // `url` is the committed (submitted) address driving the iframe; `draft` is
   // the editable input value. Splitting them means typing doesn't reload on
   // every keystroke — only Enter / the Go button navigates.
@@ -93,6 +94,26 @@ export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps) {
     },
     [normalize],
   );
+
+  // Follow a LIVE `initialUrl`. The per-tile Preview tab passes the project's
+  // detected dev-server URL (usePanels.devUrl) as `initialUrl`; when the Dev
+  // runner detects/changes it, the prop changes and we should navigate there —
+  // but ONLY when it's a genuinely new server URL, never clobbering an address
+  // the user typed into the bar. We remember the last `initialUrl` we adopted
+  // and re-navigate only when the incoming prop differs from BOTH that adopted
+  // value and the currently committed `url` (so a user override sticks). The
+  // mount-time value is already adopted via useState above, so we seed the ref
+  // with it and this effect is a no-op on the first render.
+  const adoptedInitialRef = useRef(initialUrl);
+  useEffect(() => {
+    if (initialUrl === adoptedInitialRef.current) return; // unchanged prop
+    adoptedInitialRef.current = initialUrl;
+    if (!initialUrl) return; // cleared (no dev URL yet) — leave the bar as-is
+    if (initialUrl === url) return; // already showing it (e.g. user typed it)
+    navigate(initialUrl);
+    // `navigate` is stable (useCallback); `url` is read to avoid a redundant
+    // reload when we're already on the incoming URL.
+  }, [initialUrl, navigate, url]);
 
   // Watchdog: when a navigation starts, assume framing was refused if no `load`
   // event lands within the window. The iframe's onLoad clears this by moving us
