@@ -11,11 +11,13 @@
 //   - Esc closes it; a click on the scrim closes it.
 //
 // Structure: the panel has a left nav splitting settings into two top-level
-// sections — **General** (app behavior flags from useSettings) and **Theme**
-// (presets, colors, status dots, layout, typography, terminal palette). Each
-// control is bound straight to a store's setters, so editing is live. The Theme
-// section's Preset group also does Save-as-preset, preset switching, and
-// Import/Export JSON (themes are shareable text, like VS Code).
+// sections — **General** (app behavior flags from useSettings) and **Theme**.
+// Theme carries a lot of controls, so it has its own second-level sub-nav: the
+// Preset group is pinned at the top (preset switch, Save-as-preset, Import/
+// Export JSON — themes are shareable text, like VS Code), and the rest is split
+// into tabs (Colors / Layout / Typography / Terminal) so the user focuses on
+// one panel at a time instead of one long scroll. Each control is bound
+// straight to a store's setters, so editing is live.
 import { useEffect, useRef, useState } from "react";
 import {
   useTheme,
@@ -84,7 +86,9 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
         // Fixed height (capped at 85vh on short viewports) so switching between
         // the General and Theme sections never resizes the frame - only the
         // scrollable body inside changes. The panel stays the same size always.
-        className="flex h-[640px] max-h-[85vh] w-[680px] max-w-[92vw] flex-col overflow-hidden rounded-lg border shadow-2xl"
+        // Sized generously (within the 92vw / 85vh caps) so the many controls
+        // and now-larger labels have room to breathe and read comfortably.
+        className="flex h-[760px] max-h-[85vh] w-[900px] max-w-[92vw] flex-col overflow-hidden rounded-lg border shadow-2xl"
         onMouseDown={(e) => e.stopPropagation()}
         style={{
           backgroundColor: "var(--th-sidebar-bg)",
@@ -95,10 +99,10 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
       >
         {/* Header */}
         <div
-          className="flex shrink-0 items-center justify-between border-b px-4 py-3"
+          className="flex shrink-0 items-center justify-between border-b px-5 py-3.5"
           style={{ borderColor: "var(--th-border)" }}
         >
-          <div className="text-sm font-semibold">Settings</div>
+          <div className="text-base font-semibold">Settings</div>
           <button
             type="button"
             onClick={onClose}
@@ -114,7 +118,7 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
         {/* Body: left nav (top-level sections) + scrollable content pane. */}
         <div className="flex min-h-0 flex-1">
           <SectionNav active={section} onSelect={setSection} />
-          <div className="th-scroll min-h-0 flex-1 overflow-y-auto px-4 py-3">
+          <div className="th-scroll min-h-0 flex-1 overflow-y-auto px-5 py-4">
             {section === "general" ? <GeneralSection /> : <ThemeSection />}
           </div>
         </div>
@@ -137,7 +141,7 @@ function SectionNav({
   ];
   return (
     <nav
-      className="flex w-36 shrink-0 flex-col gap-0.5 border-r p-2"
+      className="flex w-44 shrink-0 flex-col gap-0.5 border-r p-2.5"
       style={{ borderColor: "var(--th-border)" }}
       aria-label="Settings sections"
     >
@@ -148,7 +152,7 @@ function SectionNav({
             key={it.id}
             type="button"
             onClick={() => onSelect(it.id)}
-            className="rounded px-2 py-1.5 text-left text-xs transition-colors hover:bg-neutral-700/30"
+            className="rounded px-2.5 py-2 text-left text-sm transition-colors hover:bg-neutral-700/30"
             aria-current={isActive ? "page" : undefined}
             title={it.hint}
             style={{
@@ -198,11 +202,86 @@ function GeneralSection() {
 
 // ---------------------------------------------------------------------------
 // Theme section — presets, colors, status dots, layout, type, terminal palette.
+//
+// The Theme surface carries a lot of controls, so it is split into a second-
+// level sub-nav: Presets stay pinned at the top (always reachable), and the
+// rest of the controls are grouped into tabs (Colors / Layout / Typography /
+// Terminal) so the user works through one focused panel at a time instead of
+// one long scroll. Every control stays bound straight to `useTheme` setters.
 // ---------------------------------------------------------------------------
+type ThemeTabId = "colors" | "layout" | "typography" | "terminal";
+
+const THEME_TABS: { id: ThemeTabId; label: string }[] = [
+  { id: "colors", label: "Colors" },
+  { id: "layout", label: "Layout" },
+  { id: "typography", label: "Typography" },
+  { id: "terminal", label: "Terminal" },
+];
+
 function ThemeSection() {
+  const [tab, setTab] = useState<ThemeTabId>("colors");
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Presets stay pinned at the top so switching/saving is always one click
+          away regardless of which sub-tab is open. */}
+      <PresetGroup />
+
+      {/* Second-level segmented nav: pick one focused panel at a time. */}
+      <ThemeTabs active={tab} onSelect={setTab} />
+
+      <div>
+        {tab === "colors" && <ColorsTab />}
+        {tab === "layout" && <LayoutTab />}
+        {tab === "typography" && <TypographyTab />}
+        {tab === "terminal" && <TerminalGroup />}
+      </div>
+    </div>
+  );
+}
+
+/** The Theme sub-navigation: a themed segmented control (tabs). */
+function ThemeTabs({
+  active,
+  onSelect,
+}: {
+  active: ThemeTabId;
+  onSelect: (t: ThemeTabId) => void;
+}) {
+  return (
+    <div
+      className="flex gap-1 rounded-md border p-1"
+      role="tablist"
+      aria-label="Theme sections"
+      style={{ borderColor: "var(--th-border)" }}
+    >
+      {THEME_TABS.map((t) => {
+        const isActive = t.id === active;
+        return (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={isActive}
+            onClick={() => onSelect(t.id)}
+            className="flex-1 rounded px-3 py-1.5 text-center text-sm transition-colors hover:bg-neutral-700/30"
+            style={{
+              backgroundColor: isActive ? "var(--th-tile-bg)" : "transparent",
+              color: isActive ? "var(--th-fg)" : "var(--th-fg-muted)",
+              fontWeight: isActive ? 600 : 400,
+            }}
+          >
+            {t.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Presets / share — pinned at the top of the Theme section. */
+function PresetGroup() {
   const active = useTheme((s) => s.active);
   const presets = useTheme((s) => s.presets);
-  const setChromeToken = useTheme((s) => s.setChromeToken);
   const applyPreset = useTheme((s) => s.applyPreset);
   const saveAsPreset = useTheme((s) => s.saveAsPreset);
   const deletePreset = useTheme((s) => s.deletePreset);
@@ -210,7 +289,6 @@ function ThemeSection() {
   const importJSON = useTheme((s) => s.importJSON);
   const resetToDefault = useTheme((s) => s.resetToDefault);
 
-  const c = active.chrome;
   const presetNames = [
     ...BUILTIN_PRESETS.map((p) => p.name),
     ...Object.keys(presets),
@@ -219,38 +297,44 @@ function ThemeSection() {
     Object.prototype.hasOwnProperty.call(presets, name);
 
   return (
-    <>
-      {/* --- Presets / share --- */}
-      <Group title="Preset">
-        <Row label="Active">
-          <ThemeSelect
-            value={presetNames.includes(active.name) ? active.name : ""}
-            onChange={(v) => applyPreset(v)}
-            title="Switch to a built-in or saved preset"
-          >
-            {!presetNames.includes(active.name) && (
-              <Opt value="">{active.name} (edited)</Opt>
-            )}
-            {presetNames.map((n) => (
-              <Opt key={n} value={n}>
-                {n}
-                {isUserPreset(n) ? " ·" : ""}
-              </Opt>
-            ))}
-          </ThemeSelect>
-        </Row>
-        <PresetActions
-          activeName={active.name}
-          canDelete={isUserPreset(active.name)}
-          onSave={saveAsPreset}
-          onDelete={() => deletePreset(active.name)}
-          onExport={exportJSON}
-          onImport={importJSON}
-          onReset={resetToDefault}
-        />
-      </Group>
+    <Group title="Preset">
+      <Row label="Active">
+        <ThemeSelect
+          value={presetNames.includes(active.name) ? active.name : ""}
+          onChange={(v) => applyPreset(v)}
+          title="Switch to a built-in or saved preset"
+        >
+          {!presetNames.includes(active.name) && (
+            <Opt value="">{active.name} (edited)</Opt>
+          )}
+          {presetNames.map((n) => (
+            <Opt key={n} value={n}>
+              {n}
+              {isUserPreset(n) ? " ·" : ""}
+            </Opt>
+          ))}
+        </ThemeSelect>
+      </Row>
+      <PresetActions
+        activeName={active.name}
+        canDelete={isUserPreset(active.name)}
+        onSave={saveAsPreset}
+        onDelete={() => deletePreset(active.name)}
+        onExport={exportJSON}
+        onImport={importJSON}
+        onReset={resetToDefault}
+      />
+    </Group>
+  );
+}
 
-      {/* --- Colors --- */}
+/** Colors tab — chrome colors + the per-state status dots. */
+function ColorsTab() {
+  const active = useTheme((s) => s.active);
+  const setChromeToken = useTheme((s) => s.setChromeToken);
+  const c = active.chrome;
+  return (
+    <>
       <Group title="Colors" cols={2}>
         <ColorRow label="Accent" k="accent" value={c.accent} set={setChromeToken} hint="Brand color: active tab dot, hover affordances, primary buttons." />
         <ColorRow label="Focus ring" k="focusRing" value={c.focusRing} set={setChromeToken} hint="Outline color drawn around the focused tile." />
@@ -264,7 +348,6 @@ function ThemeSection() {
         <ColorRow label="Muted text" k="fgMuted" value={c.fgMuted} set={setChromeToken} hint="Secondary/dimmed text (cwd, captions)." />
       </Group>
 
-      {/* --- Status dots --- */}
       <Group
         title="Status dots"
         cols={2}
@@ -276,102 +359,113 @@ function ThemeSection() {
         <ColorRow label="Exited" k="dotExited" value={c.dotExited} set={setChromeToken} hint="A terminal whose process has exited." />
         <ColorRow label="Error" k="dotError" value={c.dotError} set={setChromeToken} hint="A terminal that failed to start or crashed." />
       </Group>
-
-      {/* --- Layout --- */}
-      <Group title="Layout">
-        <SliderRow
-          label="Tile header height"
-          hint="Height of the header bar at the top of each tile (px)."
-          k="tileHeaderHeight"
-          value={c.tileHeaderHeight}
-          min={16}
-          max={40}
-          suffix="px"
-          set={setChromeToken}
-        />
-        <SliderRow
-          label="Focus ring width"
-          hint="Thickness of the outline around the focused tile (px). 0 disables it."
-          k="focusRingWidth"
-          value={c.focusRingWidth}
-          min={0}
-          max={4}
-          suffix="px"
-          set={setChromeToken}
-        />
-        <SliderRow
-          label="Grid gap"
-          hint="Spacing between tiles in the grid (px)."
-          k="gridGap"
-          value={c.gridGap}
-          min={0}
-          max={24}
-          suffix="px"
-          set={setChromeToken}
-        />
-        <SliderRow
-          label="Corner radius"
-          hint="Roundness of tile and chrome corners (px). 0 is square."
-          k="cornerRadius"
-          value={c.cornerRadius}
-          min={0}
-          max={20}
-          suffix="px"
-          set={setChromeToken}
-        />
-        <ToggleRow
-          label="Show tile header"
-          hint="Show the header bar (title, status, controls) on each tile."
-          k="showTileHeader"
-          value={c.showTileHeader}
-          set={setChromeToken}
-        />
-        <ToggleRow
-          label="Header on hover only"
-          hint="Hide the tile header until you hover the tile, for a compact look."
-          k="headerOnHover"
-          value={c.headerOnHover}
-          set={setChromeToken}
-        />
-        <ToggleRow
-          label="Show cwd"
-          hint="Show the terminal's current working directory in the tile header."
-          k="showCwd"
-          value={c.showCwd}
-          set={setChromeToken}
-        />
-      </Group>
-
-      {/* --- Typography --- */}
-      <Group title="Typography">
-        <Row label="UI font">
-          <ThemeSelect
-            value={c.fontFamily}
-            onChange={(v) => setChromeToken("fontFamily", v)}
-            title="Font family used across the app chrome"
-          >
-            {FONT_OPTIONS.map((f) => (
-              <Opt key={f.label} value={f.value}>
-                {f.label}
-              </Opt>
-            ))}
-          </ThemeSelect>
-        </Row>
-        <SliderRow
-          label="Base font size"
-          hint="Base UI font size for the app chrome (px)."
-          k="fontSize"
-          value={c.fontSize}
-          min={9}
-          max={18}
-          suffix="px"
-          set={setChromeToken}
-        />
-      </Group>
-
-      {/* --- Terminal palette --- */}
-      <TerminalGroup />
     </>
+  );
+}
+
+/** Layout tab — sizing sliders + header visibility toggles. */
+function LayoutTab() {
+  const active = useTheme((s) => s.active);
+  const setChromeToken = useTheme((s) => s.setChromeToken);
+  const c = active.chrome;
+  return (
+    <Group title="Layout">
+      <SliderRow
+        label="Tile header height"
+        hint="Height of the header bar at the top of each tile (px)."
+        k="tileHeaderHeight"
+        value={c.tileHeaderHeight}
+        min={16}
+        max={40}
+        suffix="px"
+        set={setChromeToken}
+      />
+      <SliderRow
+        label="Focus ring width"
+        hint="Thickness of the outline around the focused tile (px). 0 disables it."
+        k="focusRingWidth"
+        value={c.focusRingWidth}
+        min={0}
+        max={4}
+        suffix="px"
+        set={setChromeToken}
+      />
+      <SliderRow
+        label="Grid gap"
+        hint="Spacing between tiles in the grid (px)."
+        k="gridGap"
+        value={c.gridGap}
+        min={0}
+        max={24}
+        suffix="px"
+        set={setChromeToken}
+      />
+      <SliderRow
+        label="Corner radius"
+        hint="Roundness of tile and chrome corners (px). 0 is square."
+        k="cornerRadius"
+        value={c.cornerRadius}
+        min={0}
+        max={20}
+        suffix="px"
+        set={setChromeToken}
+      />
+      <ToggleRow
+        label="Show tile header"
+        hint="Show the header bar (title, status, controls) on each tile."
+        k="showTileHeader"
+        value={c.showTileHeader}
+        set={setChromeToken}
+      />
+      <ToggleRow
+        label="Header on hover only"
+        hint="Hide the tile header until you hover the tile, for a compact look."
+        k="headerOnHover"
+        value={c.headerOnHover}
+        set={setChromeToken}
+      />
+      <ToggleRow
+        label="Show cwd"
+        hint="Show the terminal's current working directory in the tile header."
+        k="showCwd"
+        value={c.showCwd}
+        set={setChromeToken}
+      />
+    </Group>
+  );
+}
+
+/** Typography tab — UI font family + base font size. */
+function TypographyTab() {
+  const active = useTheme((s) => s.active);
+  const setChromeToken = useTheme((s) => s.setChromeToken);
+  const c = active.chrome;
+  return (
+    <Group title="Typography">
+      <Row label="UI font">
+        <ThemeSelect
+          value={c.fontFamily}
+          onChange={(v) => setChromeToken("fontFamily", v)}
+          title="Font family used across the app chrome"
+        >
+          {FONT_OPTIONS.map((f) => (
+            <Opt key={f.label} value={f.value}>
+              {f.label}
+            </Opt>
+          ))}
+        </ThemeSelect>
+      </Row>
+      <SliderRow
+        label="Base font size"
+        hint="Base UI font size for the app chrome (px)."
+        k="fontSize"
+        value={c.fontSize}
+        min={9}
+        max={18}
+        suffix="px"
+        set={setChromeToken}
+      />
+    </Group>
   );
 }
 
@@ -435,8 +529,8 @@ function PresetActions({
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="Preset name"
-          className="min-w-0 flex-1 rounded border bg-transparent px-2 py-1 text-xs"
-          style={{ borderColor: "var(--th-border)" }}
+          className="min-w-0 flex-1 rounded border bg-transparent px-2 py-1.5 text-sm"
+          style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
         />
         {/* Compact icon actions (same behavior as the old text buttons). */}
         <IconBtn onClick={() => onSave(name)} title="Save the current theme as a named preset" label="Save preset">
@@ -469,7 +563,7 @@ function PresetActions({
         />
       </div>
       {msg && (
-        <div className="text-[10px]" style={{ color: "var(--th-fg-muted)" }}>
+        <div className="text-xs" style={{ color: "var(--th-fg-muted)" }}>
           {msg}
         </div>
       )}
@@ -532,25 +626,25 @@ function TerminalGroup() {
         <button
           type="button"
           onClick={() => setShowAnsi((v) => !v)}
-          className="flex w-full items-center gap-1.5 px-2 py-1.5 text-left"
+          className="flex w-full items-center gap-1.5 px-2.5 py-2 text-left"
           aria-expanded={showAnsi}
           title="Advanced: the 16 base ANSI terminal colors"
         >
           <Chevron open={showAnsi} />
           <span
-            className="text-[10px] font-semibold uppercase tracking-wide"
-            style={{ color: "var(--th-fg-muted)" }}
+            className="text-xs font-semibold uppercase tracking-wide"
+            style={{ color: "var(--th-fg)" }}
           >
             ANSI palette
           </span>
-          <span className="text-[10px]" style={{ color: "var(--th-fg-muted)" }}>
+          <span className="text-xs" style={{ color: "var(--th-fg-muted)" }}>
             (advanced)
           </span>
         </button>
         {showAnsi && (
-          <div className="px-2 pb-2">
+          <div className="px-2.5 pb-2.5">
             <p
-              className="text-[10px] leading-snug"
+              className="text-xs leading-snug"
               style={{ color: "var(--th-fg-muted)" }}
             >
               These are the 16 base colors terminal programs use to draw text.
@@ -616,14 +710,14 @@ function Group({
   return (
     <section className="mb-4">
       <div
-        className="text-[10px] font-semibold uppercase tracking-wide"
-        style={{ color: "var(--th-fg-muted)" }}
+        className="text-xs font-semibold uppercase tracking-wide"
+        style={{ color: "var(--th-fg)" }}
       >
         {title}
       </div>
       {description && (
         <p
-          className="mb-1.5 mt-0.5 text-[10px] leading-snug"
+          className="mb-2 mt-1 text-xs leading-snug"
           style={{ color: "var(--th-fg-muted)" }}
         >
           {description}
@@ -631,10 +725,10 @@ function Group({
       )}
       <div
         className={
-          (description ? "" : "mt-1.5 ") +
+          (description ? "" : "mt-2 ") +
           (cols === 2
-            ? "grid grid-cols-2 gap-x-4 gap-y-1.5"
-            : "flex flex-col gap-1.5")
+            ? "grid grid-cols-2 gap-x-5 gap-y-2"
+            : "flex flex-col gap-2")
         }
       >
         {children}
@@ -645,7 +739,7 @@ function Group({
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-center justify-between gap-3 text-xs">
+    <div className="flex items-center justify-between gap-3 text-sm">
       <span className="shrink-0" style={{ color: "var(--th-fg)" }}>
         {label}
       </span>
@@ -674,7 +768,7 @@ function ThemeSelect({
       value={value}
       onChange={(e) => onChange(e.target.value)}
       title={title}
-      className="w-full cursor-pointer rounded border px-2 py-1 text-xs outline-none"
+      className="w-full cursor-pointer rounded border px-2 py-1.5 text-sm outline-none"
       style={{
         backgroundColor: "var(--th-tile-bg)",
         color: "var(--th-fg)",
@@ -749,7 +843,7 @@ function ColorInputRow({
 }) {
   const swatch = value.startsWith("#") ? value.slice(0, 7) : "#000000";
   return (
-    <div className="flex items-center justify-between gap-2 text-xs" title={hint}>
+    <div className="flex items-center justify-between gap-2 text-sm" title={hint}>
       <span
         className="min-w-0 flex-1 truncate"
         style={{ color: "var(--th-fg)" }}
@@ -761,7 +855,7 @@ function ColorInputRow({
         type="color"
         value={swatch}
         onChange={(e) => onChange(e.target.value)}
-        className="h-5 w-6 shrink-0 cursor-pointer rounded border-0 bg-transparent p-0"
+        className="h-6 w-7 shrink-0 cursor-pointer rounded border-0 bg-transparent p-0"
         aria-label={`${label} color`}
         title={`Pick ${label} color`}
       />
@@ -769,8 +863,8 @@ function ColorInputRow({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         spellCheck={false}
-        className="w-[88px] shrink-0 rounded border bg-transparent px-1.5 py-0.5 font-mono text-[11px]"
-        style={{ borderColor: "var(--th-border)" }}
+        className="w-[96px] shrink-0 rounded border bg-transparent px-1.5 py-1 font-mono text-xs"
+        style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
         aria-label={`${label} hex`}
         title={`${label} hex value`}
       />
@@ -799,11 +893,11 @@ function SliderRow({
   hint?: string;
 }) {
   return (
-    <div className="flex items-center justify-between gap-3 text-xs" title={hint}>
+    <div className="flex items-center justify-between gap-3 text-sm" title={hint}>
       <span className="shrink-0" style={{ color: "var(--th-fg)" }} title={hint}>
         {label}
       </span>
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-3">
         <input
           type="range"
           min={min}
@@ -811,12 +905,12 @@ function SliderRow({
           step={1}
           value={value}
           onChange={(e) => set(k, Number(e.target.value) as ChromeTokens[typeof k])}
-          className="w-28 cursor-pointer"
+          className="w-36 cursor-pointer"
           style={{ accentColor: "var(--th-accent)" }}
           title={hint}
         />
         <span
-          className="w-10 text-right font-mono text-[11px]"
+          className="w-12 text-right font-mono text-xs"
           style={{ color: "var(--th-fg-muted)" }}
         >
           {value}
@@ -827,7 +921,13 @@ function SliderRow({
   );
 }
 
-/** A boolean toggle wired to a chrome token by key. */
+/**
+ * A boolean toggle wired to a chrome token by key.
+ *
+ * The row is a plain <div> (NOT a <label>) and the label is plain text, so
+ * clicking the name does nothing — only the Switch control itself toggles the
+ * value. This avoids the surprise of flipping a setting by clicking its label.
+ */
 function ToggleRow({
   label,
   k,
@@ -842,8 +942,8 @@ function ToggleRow({
   hint?: string;
 }) {
   return (
-    <label
-      className="flex cursor-pointer items-center justify-between gap-3 text-xs"
+    <div
+      className="flex items-center justify-between gap-3 text-sm"
       title={hint}
     >
       <span style={{ color: "var(--th-fg)" }}>{label}</span>
@@ -852,7 +952,7 @@ function ToggleRow({
         onChange={(v) => set(k, v as ChromeTokens[typeof k])}
         label={label}
       />
-    </label>
+    </div>
   );
 }
 
@@ -860,6 +960,9 @@ function ToggleRow({
  * A boolean toggle wired to a plain callback (used for settings-store flags,
  * which aren't chrome tokens). Same visual style as {@link ToggleRow}, with an
  * optional muted helper line under the label.
+ *
+ * Like {@link ToggleRow}, the row is a plain <div> and the label is plain text:
+ * only the Switch toggles the value, never the label/helper text.
  */
 function SettingToggleRow({
   label,
@@ -873,15 +976,12 @@ function SettingToggleRow({
   hint?: string;
 }) {
   return (
-    <label
-      className="flex cursor-pointer items-start justify-between gap-3 text-xs"
-      title={hint}
-    >
+    <div className="flex items-start justify-between gap-3 text-sm">
       <span className="flex min-w-0 flex-col">
         <span style={{ color: "var(--th-fg)" }}>{label}</span>
         {hint && (
           <span
-            className="mt-0.5 text-[10px] leading-snug"
+            className="mt-1 text-xs leading-snug"
             style={{ color: "var(--th-fg-muted)" }}
           >
             {hint}
@@ -891,7 +991,7 @@ function SettingToggleRow({
       <span className="mt-0.5 shrink-0">
         <Switch checked={value} onChange={onChange} label={label} />
       </span>
-    </label>
+    </div>
   );
 }
 
@@ -909,7 +1009,7 @@ function Btn({
       type="button"
       onClick={onClick}
       title={title}
-      className="rounded border px-2 py-1 text-xs hover:bg-neutral-700/30"
+      className="rounded border px-2.5 py-1.5 text-sm hover:bg-neutral-700/30"
       style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
     >
       {children}
@@ -961,7 +1061,7 @@ function Switch({
 }) {
   return (
     <span
-      className="relative inline-flex h-[14px] w-[26px] shrink-0 items-center rounded-full transition-colors"
+      className="relative inline-flex h-[18px] w-[32px] shrink-0 items-center rounded-full transition-colors"
       style={{
         backgroundColor: checked ? "var(--th-accent)" : "var(--th-border)",
       }}
@@ -974,11 +1074,11 @@ function Switch({
         className="absolute inset-0 m-0 cursor-pointer opacity-0"
       />
       <span
-        className="pointer-events-none absolute h-[10px] w-[10px] rounded-full transition-transform"
+        className="pointer-events-none absolute h-[13px] w-[13px] rounded-full transition-transform"
         style={{
           backgroundColor: "var(--th-fg)",
           left: 2,
-          transform: checked ? "translateX(12px)" : "translateX(0)",
+          transform: checked ? "translateX(14px)" : "translateX(0)",
         }}
       />
     </span>
