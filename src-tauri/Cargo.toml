@@ -49,6 +49,20 @@ ignore = "0.4"
 # The shared agent⇄core NDJSON contract (workspace member).
 termhub-protocol = { path = "crates/termhub-protocol" }
 
+# Windows-only: direct Win32 access to subclass the frameless main window and
+# answer WM_NCHITTEST, restoring Windows 11 Snap Layouts (the hover-the-maximize
+# flyout) + native edge-resize (src/win_snap.rs). Pinned to 0.61 to unify with
+# the version Tauri already resolves, so the `HWND` returned by `WebviewWindow::
+# hwnd()` is the same type we pass to SetWindowSubclass. Only the features this
+# module uses are enabled; on non-Windows targets this dependency is absent.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+] }
+
 [profile.release]
 codegen-units = 1
 lto = true

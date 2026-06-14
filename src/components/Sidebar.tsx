@@ -15,7 +15,8 @@
 // data arrives via the agent bridge's event emit spine (agent://journal →
 // supervision://tree / session://status / status://snapshot); the telemetry hook
 // subscribes and feeds the store.
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import {
   useSupervision,
   attentionSessions,
@@ -23,6 +24,7 @@ import {
 } from "../store/supervision";
 import { useAgentTelemetry } from "../store/telemetry";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
+import { startPointerDrag } from "../lib/pointerDrag";
 import { SupervisionTreeBody } from "./SupervisionTree";
 import { StatusBadge, statusLabel } from "./StatusBadge";
 import { WslHealth } from "./WslHealth";
@@ -33,6 +35,17 @@ import type {
   TerminalInfo,
   TerminalState,
 } from "../ipc/types";
+
+/** The workspace-row id under a viewport point, or null (drag resolution). Each
+ *  WorkspaceRow header carries `data-ws-id`; elementFromPoint returns the topmost
+ *  element under the pointer, so we walk up to the owning row with `closest`. Used
+ *  by BOTH the workspace-reorder drag and the cross-workspace terminal drag. */
+function workspaceUnder(x: number, y: number): string | null {
+  const el = document.elementFromPoint(x, y) as HTMLElement | null;
+  return (
+    el?.closest<HTMLElement>("[data-ws-id]")?.getAttribute("data-ws-id") ?? null
+  );
+}
 
 /**
  * Lifecycle-dot color per terminal state, mirroring Tile.tsx's DOT_VAR so the
@@ -117,6 +130,24 @@ export function Sidebar({
       setFocus={setFocus}
     />
   );
+}
+
+/**
+ * The Workspaces section's pointer-drag actions, pulled together so WorkspaceList
+ * can drive both interactions (reorder a workspace, move a terminal across
+ * workspaces) and the inline rename. These reuse the EXISTING store actions +
+ * the SAME transient drag fields the titlebar/tile drags use, so the sidebar's
+ * drop highlighting stays consistent with the rest of the app.
+ */
+function useWorkspaceDragActions() {
+  return {
+    moveTab: useWorkspace((s) => s.moveTab),
+    renameTab: useWorkspace((s) => s.renameTab),
+    moveTileToTab: useWorkspace((s) => s.moveTileToTab),
+    setDraggingTab: useWorkspace((s) => s.setDraggingTab),
+    setDraggingTile: useWorkspace((s) => s.setDraggingTile),
+    setDropTab: useWorkspace((s) => s.setDropTab),
+  };
 }
 
 interface FullProps {
@@ -264,7 +295,17 @@ function SidebarFull({
 /** The Workspaces list (full mode): one expandable row per tab = name + tile
  *  count, the active tab accent-highlighted. Clicking the row activates it via
  *  setActiveTab; the chevron toggles an inline list of that tab's terminals so
- *  the user can see what's in OTHER workspaces without switching (#2). */
+ *  the user can see what's in OTHER workspaces without switching (#2).
+ *
+ *  Three pointer-based operations live here, all reusing existing store actions:
+ *   - drag a workspace row up/down to reorder it (moveTab);
+ *   - double-click a row's name to rename it inline (renameTab);
+ *   - drag a TerminalRow onto a DIFFERENT workspace to move it there
+ *     (moveTileToTab).
+ *  The inline-rename draft and the live drop-target id are lifted here so every
+ *  row shares them (only one row is ever editing / highlighted at a time). The
+ *  drop highlight reuses the store's transient drag fields (the same the titlebar
+ *  /tile drags use) for app-wide consistency. */
 function WorkspaceList({
   tabs,
   activeTabId,
@@ -278,6 +319,107 @@ function WorkspaceList({
   terminals: Record<TerminalId, TerminalInfo>;
   setFocus: (id: TerminalId) => void;
 }) {
+  const actions = useWorkspaceDragActions();
+  // The drag source (a workspace being reordered, or a terminal being moved) and
+  // the row currently under the pointer — read live for drop-target highlighting,
+  // mirroring the titlebar/tile drags. The drag source itself is never a target.
+  const draggingTabId = useWorkspace((s) => s.draggingTabId);
+  const draggingTileId = useWorkspace((s) => s.draggingTileId);
+  const dropWsId = useWorkspace((s) => s.dropTabId);
+
+  // id of the workspace whose name is being renamed inline (null = none).
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  // Set true the instant a drag commits so the synthetic click that fires on
+  // pointerup (over the drag-source row/terminal) is swallowed — otherwise a
+  // committed reorder/move would ALSO activate/focus the source. Cleared on the
+  // next pointerdown. (A plain click never sets it, so click-to-activate works.)
+  const suppressClickRef = useRef(false);
+
+  const startRename = (id: string, name: string) => {
+    setEditing(id);
+    setDraft(name);
+  };
+  const commitRename = () => {
+    if (editing) actions.renameTab(editing, draft);
+    setEditing(null);
+  };
+
+  // Reorder a workspace by dragging its header up/down. A plain press (under the
+  // helper's threshold) never reorders, so click-to-activate still works; the
+  // row under release resolves via elementFromPoint + [data-ws-id].
+  const onRowPointerDown = (tabId: string, e: ReactPointerEvent) => {
+    if (editing === tabId) return; // let the rename input own the pointer
+    if (e.button !== 0) return;
+    suppressClickRef.current = false;
+    startPointerDrag(e.clientX, e.clientY, {
+      onBegin: () => {
+        actions.setDraggingTab(tabId);
+        document.body.dataset.thDragging = "1";
+      },
+      onMove: (x, y) => {
+        const overId = workspaceUnder(x, y);
+        actions.setDropTab(overId && overId !== tabId ? overId : null);
+      },
+      onEnd: (x, y, committed) => {
+        const targetId = committed ? workspaceUnder(x, y) : null;
+        delete document.body.dataset.thDragging;
+        actions.setDraggingTab(null);
+        actions.setDropTab(null);
+        if (!committed) return;
+        // A real drag happened: swallow the trailing click so the source row
+        // isn't activated by it.
+        suppressClickRef.current = true;
+        if (targetId && targetId !== tabId) {
+          actions.moveTab(tabId, targetId);
+        }
+      },
+    });
+  };
+
+  // Drag a terminal onto a DIFFERENT workspace row to move it there. Dropping on
+  // its OWN workspace (or off any row) is a no-op; the target resolves the same
+  // way as the workspace reorder (elementFromPoint + [data-ws-id]).
+  const onTerminalPointerDown = (
+    terminalId: TerminalId,
+    ownTabId: string,
+    e: ReactPointerEvent,
+  ) => {
+    if (e.button !== 0) return;
+    suppressClickRef.current = false;
+    startPointerDrag(e.clientX, e.clientY, {
+      onBegin: () => {
+        actions.setDraggingTile(terminalId);
+        document.body.dataset.thDragging = "1";
+      },
+      onMove: (x, y) => {
+        const overId = workspaceUnder(x, y);
+        actions.setDropTab(overId && overId !== ownTabId ? overId : null);
+      },
+      onEnd: (x, y, committed) => {
+        const targetId = committed ? workspaceUnder(x, y) : null;
+        delete document.body.dataset.thDragging;
+        actions.setDraggingTile(null);
+        actions.setDropTab(null);
+        if (!committed) return;
+        // A real drag happened: swallow the trailing click so it doesn't focus
+        // the terminal / activate its source tab.
+        suppressClickRef.current = true;
+        if (targetId && targetId !== ownTabId) {
+          actions.moveTileToTab(terminalId, targetId);
+        }
+      },
+    });
+  };
+
+  // True when the just-finished gesture was a committed drag, so the row/terminal
+  // click handlers can no-op the synthetic click that immediately follows.
+  const consumeSuppressedClick = (): boolean => {
+    if (!suppressClickRef.current) return false;
+    suppressClickRef.current = false;
+    return true;
+  };
+
   if (tabs.length === 0) return <Muted>No workspaces.</Muted>;
   return (
     <ul>
@@ -289,6 +431,26 @@ function WorkspaceList({
           setActiveTab={setActiveTab}
           terminals={terminals}
           setFocus={setFocus}
+          // A live drop target by EITHER a workspace reorder or a terminal being
+          // dragged onto it; never the drag source itself.
+          isDropTarget={
+            dropWsId === tab.id &&
+            draggingTabId !== tab.id
+          }
+          // Dim the workspace currently being reordered (matches the tab strip).
+          isDragging={draggingTabId === tab.id}
+          // Suppress the row's click-to-activate while a terminal drag is in
+          // flight so releasing over a row doesn't also switch to it.
+          dragInProgress={draggingTileId != null}
+          editing={editing === tab.id}
+          draft={draft}
+          onDraftChange={setDraft}
+          onStartRename={() => startRename(tab.id, tab.name)}
+          onCommitRename={commitRename}
+          onCancelRename={() => setEditing(null)}
+          onRowPointerDown={onRowPointerDown}
+          onTerminalPointerDown={onTerminalPointerDown}
+          consumeSuppressedClick={consumeSuppressedClick}
         />
       ))}
     </ul>
@@ -297,19 +459,49 @@ function WorkspaceList({
 
 /** One workspace row: a header (chevron + name + tile count, click activates the
  *  tab) plus a collapsible list of the tab's terminals. The active workspace
- *  defaults expanded; the rest start collapsed (local useState, #2). */
+ *  defaults expanded; the rest start collapsed (local useState, #2). The header
+ *  carries `data-ws-id` so it resolves as a drop target for the workspace reorder
+ *  and the cross-workspace terminal drag. */
 function WorkspaceRow({
   tab,
   active,
   setActiveTab,
   terminals,
   setFocus,
+  isDropTarget,
+  isDragging,
+  dragInProgress,
+  editing,
+  draft,
+  onDraftChange,
+  onStartRename,
+  onCommitRename,
+  onCancelRename,
+  onRowPointerDown,
+  onTerminalPointerDown,
+  consumeSuppressedClick,
 }: {
   tab: WorkspaceTab;
   active: boolean;
   setActiveTab: (id: string) => void;
   terminals: Record<TerminalId, TerminalInfo>;
   setFocus: (id: TerminalId) => void;
+  isDropTarget: boolean;
+  isDragging: boolean;
+  dragInProgress: boolean;
+  editing: boolean;
+  draft: string;
+  onDraftChange: (v: string) => void;
+  onStartRename: () => void;
+  onCommitRename: () => void;
+  onCancelRename: () => void;
+  onRowPointerDown: (tabId: string, e: ReactPointerEvent) => void;
+  onTerminalPointerDown: (
+    terminalId: TerminalId,
+    ownTabId: string,
+    e: ReactPointerEvent,
+  ) => void;
+  consumeSuppressedClick: () => boolean;
 }) {
   const count = tab.order.length;
   // Active workspace starts open; the others collapse so the list stays compact.
@@ -318,12 +510,23 @@ function WorkspaceRow({
   return (
     <li>
       <div
-        className="flex w-full items-center hover:bg-neutral-900"
-        style={
-          active
-            ? { backgroundColor: "var(--th-accent)", color: "var(--th-fg)" }
-            : { color: "var(--th-fg)" }
-        }
+        // data-ws-id: the drop target a workspace reorder / a terminal drag
+        // resolves to via elementFromPoint + closest.
+        data-ws-id={tab.id}
+        className={`flex w-full items-center hover:bg-neutral-900 ${
+          isDragging ? "opacity-40" : ""
+        }`}
+        style={{
+          color: "var(--th-fg)",
+          ...(active
+            ? { backgroundColor: "var(--th-accent)" }
+            : {}),
+          // A subtle themed drop indicator: an accent inset ring on the row the
+          // pointer is over, matching the tab strip / tile drop styling.
+          ...(isDropTarget
+            ? { boxShadow: "inset 0 0 0 1px var(--th-accent)" }
+            : {}),
+        }}
       >
         {/* Chevron toggle — expand/collapse without switching workspaces. */}
         <button
@@ -336,17 +539,44 @@ function WorkspaceRow({
         >
           {expanded ? "v" : ">"}
         </button>
-        {/* Name + count — activates the tab. */}
-        <button
-          type="button"
-          onClick={() => setActiveTab(tab.id)}
-          className="flex min-w-0 flex-1 items-center gap-2 py-1 pr-2 text-left text-sm"
-          title={`${tab.name} — ${count} terminal${count === 1 ? "" : "s"}`}
-          aria-current={active ? "true" : undefined}
-        >
-          <span className="min-w-0 flex-1 truncate">{tab.name}</span>
-          <span className="shrink-0 tabular-nums opacity-70">{count}</span>
-        </button>
+        {/* Name + count — pressing activates the tab; dragging reorders it
+            (pointer-based, threshold-gated so a plain click still activates).
+            Double-clicking the name renames it inline. While a terminal drag is
+            in flight, suppress the activate so releasing over a row only moves
+            the terminal. */}
+        {editing ? (
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => onDraftChange(e.target.value)}
+            onBlur={onCommitRename}
+            onPointerDown={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") onCommitRename();
+              else if (e.key === "Escape") onCancelRename();
+            }}
+            className="my-0.5 mr-2 min-w-0 flex-1 bg-neutral-700 px-1 text-sm text-neutral-100 outline-none"
+            style={{ boxShadow: "0 0 0 1px var(--th-accent)" }}
+          />
+        ) : (
+          <button
+            type="button"
+            onPointerDown={(e) => onRowPointerDown(tab.id, e)}
+            onClick={() => {
+              // Swallow the click that trails a committed reorder; a terminal
+              // drag in flight also shouldn't activate the source tab.
+              if (consumeSuppressedClick() || dragInProgress) return;
+              setActiveTab(tab.id);
+            }}
+            onDoubleClick={onStartRename}
+            className="flex min-w-0 flex-1 cursor-pointer touch-none select-none items-center gap-2 py-1 pr-2 text-left text-sm"
+            title={`${tab.name} — ${count} terminal${count === 1 ? "" : "s"}`}
+            aria-current={active ? "true" : undefined}
+          >
+            <span className="min-w-0 flex-1 truncate">{tab.name}</span>
+            <span className="shrink-0 tabular-nums opacity-70">{count}</span>
+          </button>
+        )}
       </div>
       {expanded && (
         <ul className="pb-1">
@@ -364,9 +594,12 @@ function WorkspaceRow({
                 id={id}
                 info={terminals[id]}
                 onClick={() => {
+                  // A committed cross-workspace drag swallows its trailing click.
+                  if (consumeSuppressedClick()) return;
                   setActiveTab(tab.id);
                   setFocus(id);
                 }}
+                onPointerDown={(e) => onTerminalPointerDown(id, tab.id, e)}
               />
             ))
           )}
@@ -377,16 +610,20 @@ function WorkspaceRow({
 }
 
 /** One terminal under a workspace: a themed lifecycle dot + the terminal title.
- *  Clicking activates the owning tab and focuses this tile (#2). The record may
- *  be missing if the live map hasn't seeded that id yet -- fall back gracefully. */
+ *  Clicking activates the owning tab and focuses this tile (#2). Dragging it onto
+ *  a DIFFERENT workspace row moves it there (pointer-based, threshold-gated so a
+ *  plain click still focuses). The record may be missing if the live map hasn't
+ *  seeded that id yet -- fall back gracefully. */
 function TerminalRow({
   id,
   info,
   onClick,
+  onPointerDown,
 }: {
   id: TerminalId;
   info?: TerminalInfo;
   onClick: () => void;
+  onPointerDown: (e: ReactPointerEvent) => void;
 }) {
   const state: TerminalState = info?.state ?? "starting";
   const title = info?.title?.trim() || id;
@@ -395,7 +632,8 @@ function TerminalRow({
       <button
         type="button"
         onClick={onClick}
-        className="flex w-full items-center gap-2 py-0.5 pr-2 pl-7 text-left text-xs hover:bg-neutral-900"
+        onPointerDown={onPointerDown}
+        className="flex w-full cursor-pointer touch-none items-center gap-2 py-0.5 pr-2 pl-7 text-left text-xs hover:bg-neutral-900"
         style={{ color: "var(--th-fg-muted)" }}
         title={`${title} — ${state}`}
       >

@@ -143,30 +143,49 @@ interface PoolLayerProps {
  * placeholder are hidden and parked.
  */
 function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) {
-  // Every terminal id that has a tile somewhere (across ALL tabs), de-duped and
-  // in a stable order so React keeps each wrapper mounted. We render the union of
-  // tab orders rather than the live `terminals` map so a wrapper exists exactly
-  // for tiles the user placed (and survives tab switches).
+  // Every terminal id that has a tile somewhere (across ALL tabs), de-duped.
+  // We render the union of tab orders rather than the live `terminals` map so a
+  // wrapper exists exactly for tiles the user placed (and survives tab switches).
   const tabs = useWorkspace((s) => s.tabs);
   const activeTabId = useWorkspace((s) => s.activeTabId);
 
+  // THE FIX (mutedbug): poolIds must be a STABLE DOM order that does NOT change
+  // when a tile is reordered or moved between tabs. Positioning is absolute
+  // (each wrapper is placed by its `transform`), so the DOM order of the
+  // wrappers is irrelevant to layout. But React keys the wrappers off this list:
+  // if the list reorders, React physically MOVES the wrapper <div> (and its
+  // <canvas>) in the DOM. WebView2 blanks a WebGL/canvas element the instant it
+  // is detached/re-inserted during such a move, so every reorder muted the grid.
+  //
+  // We therefore keep ids in their first-seen ("established") pool order forever:
+  // reconcile each render by keeping the current order filtered to ids that are
+  // still present, then appending any newly-seen ids at the end. An id is never
+  // moved once placed, so a reorder only changes each wrapper's transform.
+  const poolOrderRef = useRef<TerminalId[]>([]);
   const poolIds = useMemo(() => {
-    const seen = new Set<TerminalId>();
-    const ids: TerminalId[] = [];
-    for (const t of tabs) {
-      for (const id of t.order) {
-        if (!seen.has(id)) {
-          seen.add(id);
-          ids.push(id);
-        }
-      }
-    }
-    return ids;
+    const present = new Set<TerminalId>();
+    for (const t of tabs) for (const id of t.order) present.add(id);
+    // 1) keep established order, dropping ids whose tiles are gone.
+    const next = poolOrderRef.current.filter((id) => present.has(id));
+    // 2) append any newly-seen ids at the END (never reorder an existing id).
+    const known = new Set(next);
+    for (const id of present) if (!known.has(id)) next.push(id);
+    poolOrderRef.current = next;
+    return next;
   }, [tabs]);
 
   // Stable wrapper element refs so the sync can write inline position styles
   // imperatively (no React re-render per pointer-move while resizing/dragging).
   const wrapRefs = useRef<Map<TerminalId, HTMLDivElement>>(new Map());
+
+  // Last transform we wrote per wrapper, so the sync can tell when a VISIBLE
+  // terminal actually moved (a same-tab reorder repositions it while it stays
+  // on-screen, so the Terminal's IntersectionObserver never fires). When a
+  // visible terminal's transform changes we dispatch a "th-pool-moved" event on
+  // its wrapper; Terminal.tsx listens for it and forces a repaint, so the new
+  // position never shows a stale/blank WebGL frame. Belt-and-suspenders on top
+  // of the stable poolIds order above.
+  const lastTransformRef = useRef<Map<TerminalId, string>>(new Map());
 
   // Derive, per render, which tab each terminal lives in — so the sync knows
   // whether its placeholder belongs to the *active* (displayed) tab. A terminal
@@ -200,11 +219,26 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       if (slot && onActiveTab && rect && rect.width > 0 && rect.height > 0) {
         wrap.style.visibility = "visible";
         wrap.style.pointerEvents = "";
-        wrap.style.transform = `translate(${rect.left - base.left}px, ${
+        const transform = `translate(${rect.left - base.left}px, ${
           rect.top - base.top
         }px)`;
+        wrap.style.transform = transform;
         wrap.style.width = `${rect.width}px`;
         wrap.style.height = `${rect.height}px`;
+        // If this VISIBLE terminal moved to a new position (a same-tab reorder
+        // / swap), tell its Terminal to repaint -- the IntersectionObserver
+        // only catches on/off-screen parks, not an on-screen reposition, so a
+        // reorder could otherwise leave a stale frame. Skip the offscreen park
+        // value so un-parking doesn't double-fire (the observer handles that).
+        const prevTransform = lastTransformRef.current.get(id);
+        if (
+          prevTransform !== undefined &&
+          prevTransform !== transform &&
+          prevTransform !== "translate(-100000px, 0px)"
+        ) {
+          wrap.dispatchEvent(new CustomEvent("th-pool-moved"));
+        }
+        lastTransformRef.current.set(id, transform);
       } else {
         // Keep mounted but invisible + inert. Park at the last known size so a
         // hidden tab's xterm isn't forced to a 0x0 (which would refit to 0 cols).
@@ -217,6 +251,7 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
         // Leave the offscreen transform in place (set on creation) so a parked
         // terminal never overlaps the active grid.
         wrap.style.transform = "translate(-100000px, 0px)";
+        lastTransformRef.current.set(id, "translate(-100000px, 0px)");
       }
     }
   }, [containerRef, slotsRef, tabOfId, activeTabId]);
