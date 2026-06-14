@@ -34,6 +34,7 @@ import {
 } from "../ipc/client";
 import { Tile } from "./Tile";
 import { TerminalPoolProvider } from "./TerminalPool";
+import { SpawnMenu } from "./SpawnMenu";
 import type { TerminalId } from "../ipc/types";
 
 /**
@@ -102,14 +103,25 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
     };
   }, [setTerminals, updateState]);
 
-  const spawn = useCallback(async () => {
-    try {
-      const info = await spawnTerminal({});
-      addAfterFocused(info);
-    } catch (err) {
-      console.error("spawnTerminal failed", err);
-    }
-  }, [addAfterFocused]);
+  // Whether the "+" spawn-preset menu is open (anchored to the FAB).
+  const [spawnMenuOpen, setSpawnMenuOpen] = useState(false);
+
+  // Spawn a terminal, optionally running a startup command in it (the "+"
+  // presets: Claude / Resume Claude / Custom…). An undefined startupCommand is
+  // the plain "Shell" preset = today's bare login shell (no regression).
+  const spawn = useCallback(
+    async (startupCommand?: string) => {
+      try {
+        const info = await spawnTerminal(
+          startupCommand ? { startupCommand } : {},
+        );
+        addAfterFocused(info);
+      } catch (err) {
+        console.error("spawnTerminal failed", err);
+      }
+    },
+    [addAfterFocused],
+  );
 
   const closeFocused = useCallback(() => {
     const id = useWorkspace.getState().focusedId;
@@ -206,7 +218,7 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
                 aria-hidden={!active}
               >
                 {tab.order.length === 0 ? (
-                  <EmptyTab onSpawn={() => void spawn()} />
+                  <EmptyTab onSpawn={() => setSpawnMenuOpen(true)} />
                 ) : (
                   <TabGrid
                     tab={tab}
@@ -222,12 +234,16 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
         </TerminalPoolProvider>
       </div>
 
-      {/* Persistent affordance to add more terminals to the active tab. */}
+      {/* Persistent affordance to add more terminals to the active tab. Opens the
+          spawn-preset menu (Claude / Shell / Resume Claude / Custom…) anchored
+          just above it. Ctrl/Cmd+T remains a fast plain-shell spawn. */}
       <button
         type="button"
-        onClick={() => void spawn()}
+        onClick={() => setSpawnMenuOpen((v) => !v)}
         title="New terminal (Ctrl/Cmd+T)"
         aria-label="New terminal"
+        aria-haspopup="menu"
+        aria-expanded={spawnMenuOpen}
         // Themed FAB: tile-surface bg + themed border/text; the hover border
         // picks up the accent so the primary affordance follows the theme.
         className="th-accent-hover absolute bottom-3 right-3 z-30 flex h-9 w-9 cursor-pointer items-center justify-center rounded-full border text-lg leading-none shadow-lg"
@@ -239,6 +255,13 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
       >
         +
       </button>
+
+      {spawnMenuOpen && (
+        <SpawnMenu
+          onClose={() => setSpawnMenuOpen(false)}
+          onSpawn={(startupCommand) => void spawn(startupCommand)}
+        />
+      )}
     </div>
   );
 }
