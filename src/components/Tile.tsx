@@ -4,8 +4,12 @@
 // each terminal once in a persistent pool overlay (TerminalPool.tsx) and
 // positions it over this tile's placeholder, so moving/resizing the tile only
 // repositions the pooled terminal — it is never remounted/reattached (no flash).
-// Pressing the header focuses the tile; the × detaches (closeTerminal), and
-// shift-clicking the × stops it (killTerminal).
+// Pressing the header focuses the tile. The header carries TWO lifecycle
+// affordances (feat/lifecycle): the × DETACHES the tile (closeTerminal) while
+// KEEPING the tmux session alive so it can be re-adopted later — the default,
+// non-destructive close. A separate trash control DELETES the session for good
+// (killTerminal), gated behind a themed confirm dialog; shift-clicking the × is
+// a shortcut to that same confirmed delete.
 //
 // Drag-to-move (PRD §5.3 manual mode): the header is a drag HANDLE built on
 // POINTER events (not HTML5 drag-and-drop, which dies over xterm's WebGL canvas
@@ -19,14 +23,15 @@
 // point resolves to the owning tile (data-tile-id) rather than the canvas. The
 // drag never touches the backend — only the visual order changes; the tmux
 // session and any agent stay attached and alive.
+import { useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { TerminalId, TerminalState } from "../ipc/types";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import { useTheme } from "../store/theme";
-import { killTerminal } from "../ipc/client";
 import { useTerminalSlot } from "./TerminalPool";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 export interface TileProps {
   terminalId: TerminalId;
@@ -87,6 +92,9 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
   const userLabel = useWorkspace((s) => s.labels[terminalId]);
   const moveTile = useWorkspace((s) => s.moveTile);
   const moveTileToTab = useWorkspace((s) => s.moveTileToTab);
+  // Lifecycle: deleting a terminal KILLS its tmux session for good — gated behind
+  // a themed confirm (the trash control / shift-click on the ×).
+  const deleteTerminal = useWorkspace((s) => s.deleteTerminal);
   const setDraggingTile = useWorkspace((s) => s.setDraggingTile);
   const setDropTile = useWorkspace((s) => s.setDropTile);
   const setDropTab = useWorkspace((s) => s.setDropTab);
@@ -115,6 +123,11 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
 
   const isSelfDragging = draggingTileId === terminalId;
   const isDropTarget = dropTileId === terminalId && draggingTileId !== terminalId;
+
+  // Whether the "delete session" confirm is up for this tile. The destructive
+  // kill only runs once the user confirms (button / Enter); cancel/Esc/backdrop
+  // dismiss it. Detach (the plain ×) needs no confirm — tmux survives.
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   // --- Drag source (the header), pointer-based ---
   const onHeaderPointerDown = (e: ReactPointerEvent) => {
@@ -247,24 +260,78 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
           </span>
         )}
         {(!showCwd || !cwd) && <span className="flex-1" />}
+        {/* Delete session (destructive): a small trash control. Opens a themed
+            confirm before killing the tmux session for good. Kept distinct from
+            the × so a destructive delete is never one stray click away. */}
         <button
           type="button"
-          // Don't let the × start a drag/focus; shift-click stops (kills) the
-          // session, plain click detaches.
           onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation();
-            if (e.shiftKey) void killTerminal(terminalId);
+            setConfirmDelete(true);
+          }}
+          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
+          style={{ color: "var(--th-fg-muted)" }}
+          title="Delete session (kills tmux — asks first)"
+          aria-label="Delete session"
+        >
+          {/* Inline trash glyph; inherits currentColor so it follows the theme. */}
+          <svg
+            viewBox="0 0 16 16"
+            width="0.9em"
+            height="0.9em"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.3"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden
+            className="hover:text-[var(--th-dot-error)]"
+          >
+            <path d="M2.5 4h11M6 4V2.5h4V4M5 4l.5 9.5h5L11 4M6.5 6.5v5M9.5 6.5v5" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          // Don't let the × start a drag/focus. Plain click DETACHES (keeps the
+          // tmux session alive). Shift-click is the shortcut to the confirmed
+          // delete-session flow (same as the trash control).
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (e.shiftKey) setConfirmDelete(true);
             else onClose();
           }}
           className="shrink-0 rounded px-1 leading-none text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
           style={{ color: "var(--th-fg-muted)" }}
-          title={"Detach (click) · Stop (shift-click)"}
-          aria-label="Close terminal"
+          title={"Detach — keeps the session alive (shift-click to delete)"}
+          aria-label="Detach terminal"
         >
           ×
         </button>
       </div>
+
+      {/* Destructive confirm for deleting (killing) this terminal's session. */}
+      <ConfirmDialog
+        open={confirmDelete}
+        title="Delete session?"
+        body={
+          <>
+            This permanently kills the tmux session{" "}
+            <span className="font-mono" style={{ color: "var(--th-fg)" }}>
+              {terminalId}
+            </span>{" "}
+            and everything running in it. This can't be undone. To just close the
+            tile and keep the session running, use Detach (×) instead.
+          </>
+        }
+        confirmLabel="Delete session"
+        onConfirm={() => {
+          setConfirmDelete(false);
+          deleteTerminal(terminalId);
+        }}
+        onCancel={() => setConfirmDelete(false)}
+      />
 
       {/* Body placeholder: an empty box marking where the terminal should sit.
           The actual xterm is rendered ONCE in the persistent pool overlay

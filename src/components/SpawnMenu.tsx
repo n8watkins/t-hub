@@ -3,7 +3,11 @@
 // with four presets:
 //   - Claude         → start `claude` in the new terminal
 //   - Shell          → a plain login shell (today's behavior; no startup command)
-//   - Resume Claude  → run `claude --resume` (Claude shows its session picker)
+//   - Resume Claude… → opens a NEW terminal running `claude --resume`, which shows
+//                      Claude's interactive session PICKER in that terminal so the
+//                      user chooses which past session to resume. It does NOT
+//                      resume every session, and it always opens a fresh tile (the
+//                      old "Resume Claude" label left this ambiguous — #lifecycle).
 //   - Custom…        → a free-text command the user types
 //
 // Selecting a preset calls back with an optional `startupCommand` string (None
@@ -47,8 +51,10 @@ const PRESETS: Preset[] = [
   { key: "shell", label: "Shell", hint: "Plain login shell", command: undefined },
   {
     key: "resume",
-    label: "Resume Claude",
-    hint: "claude --resume (session picker)",
+    label: "Resume Claude…",
+    // Make it unambiguous: a NEW terminal opens, showing Claude's session picker
+    // there so the user chooses which session to resume (it doesn't resume all).
+    hint: "New terminal → pick a session to resume",
     command: CLAUDE_RESUME_CMD,
   },
 ];
