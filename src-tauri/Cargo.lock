@@ -3438,6 +3438,7 @@ dependencies = [
  "tauri-build",
  "termhub-protocol",
  "uuid",
+ "windows",
 ]
 
 [[package]]

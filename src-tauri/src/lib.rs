@@ -14,6 +14,7 @@ mod model; // data-model structs (PRD §8)
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
 mod theme; // live theming contract: get_theme/set_theme + theme://changed (MCP-facing)
 mod tray; // system-tray icon + close-to-tray (hide instead of quit) (#17)
+mod win_snap; // Windows 11 Snap Layouts + native edge-resize on the frameless window (no-op on unix)
 
 use agent::AgentBridge;
 use claude::StatusBridge;
@@ -147,6 +148,16 @@ pub fn run() {
             // window (close-to-tray still works regardless via on_window_event).
             if let Err(e) = tray::build(app.handle()) {
                 eprintln!("termhub: failed to build system tray: {e}");
+            }
+            // Restore Windows 11 Snap Layouts (hover-the-maximize-button flyout)
+            // and native edge-resize on the frameless main window by subclassing
+            // its HWND to answer WM_NCHITTEST (#snap). On unix this is a no-op. A
+            // failure here is logged and never aborts startup; the window stays
+            // fully usable, just without the native snap flyout / edge resize.
+            if let Some(main) = app.get_webview_window("main") {
+                if let Err(e) = win_snap::install(&main) {
+                    eprintln!("termhub: failed to install Snap-Layouts hit-test hook: {e}");
+                }
             }
             Ok(())
         })
