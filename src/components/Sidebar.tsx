@@ -371,7 +371,7 @@ function SidebarFull({
         grow
         className="border-b"
       >
-        <div className="min-h-0 flex-1 overflow-hidden">
+        <div className="min-h-[180px] flex-1 overflow-hidden">
           <FileTree root={filesRoot} className="h-full" />
         </div>
       </CollapsibleSection>
@@ -380,7 +380,7 @@ function SidebarFull({
       <CollapsibleSection
         id="hooks"
         title="Hooks"
-        defaultOpen
+        defaultOpen={false}
         className="border-b"
       >
         <HookInstallPanel agentBin={agentBin} />
