@@ -107,10 +107,17 @@ function filesRootFor(
   terminals: Record<TerminalId, TerminalInfo>,
   activeTab: WorkspaceTab | undefined,
 ): string {
-  const focusedCwd = focusedId ? terminals[focusedId]?.cwd?.trim() : "";
-  if (focusedCwd) return focusedCwd;
-  // No focused cwd: try the active tab's first terminal with a cwd.
-  for (const id of activeTab?.order ?? []) {
+  const order = activeTab?.order ?? [];
+  // Honor the focused terminal's cwd ONLY when that terminal is in the ACTIVE
+  // workspace. A stale cross-tab focusedId (focus left on a terminal in another
+  // workspace) must NOT root the tree at that other workspace's project — that
+  // was the "tree shows .../tools while site-forge is focused" bug.
+  if (focusedId && order.includes(focusedId)) {
+    const cwd = terminals[focusedId]?.cwd?.trim();
+    if (cwd) return cwd;
+  }
+  // Otherwise fall back to the active workspace's first terminal that has a cwd.
+  for (const id of order) {
     const cwd = terminals[id]?.cwd?.trim();
     if (cwd) return cwd;
   }
