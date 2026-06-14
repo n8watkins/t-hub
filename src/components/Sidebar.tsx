@@ -83,6 +83,40 @@ export type SidebarMode = "full" | "rail" | "hidden";
 /** Pixel width of the rail strip (kept in sync with App's RAIL width). */
 export const SIDEBAR_RAIL_WIDTH = 48;
 
+/**
+ * Fallback root for the Files tree when no terminal cwd is available (no
+ * terminals yet, or the focused tile has no cwd). The projects dir.
+ */
+const FILES_FALLBACK_ROOT = "/home/natkins/n8builds";
+
+/**
+ * Compute the Files-tree root from the active terminal's working directory.
+ *
+ * The store tracks each terminal's `cwd` (its spawn-time directory — see
+ * `TerminalInfo.cwd`). We root the tree at the focused tile's cwd so the Files
+ * view follows the project the user is working in. Falls back to the focused
+ * tab's first terminal, then to the projects dir.
+ *
+ * TODO: `cwd` is the SPAWN cwd, not the terminal's LIVE cwd — if the user `cd`s
+ * elsewhere inside the shell the tree won't follow until we track live cwd
+ * (e.g. via OSC 7 / tmux `pane_current_path` polling). Per-terminal LIVE cwd
+ * isn't tracked in the store yet; this uses the best currently-available root.
+ */
+function filesRootFor(
+  focusedId: TerminalId | null,
+  terminals: Record<TerminalId, TerminalInfo>,
+  activeTab: WorkspaceTab | undefined,
+): string {
+  const focusedCwd = focusedId ? terminals[focusedId]?.cwd?.trim() : "";
+  if (focusedCwd) return focusedCwd;
+  // No focused cwd: try the active tab's first terminal with a cwd.
+  for (const id of activeTab?.order ?? []) {
+    const cwd = terminals[id]?.cwd?.trim();
+    if (cwd) return cwd;
+  }
+  return FILES_FALLBACK_ROOT;
+}
+
 export interface SidebarProps {
   /** Called when the user clicks an attention-queue row or a tree header. */
   onSelectSession?: (sessionId: string) => void;
@@ -121,6 +155,10 @@ export function Sidebar({
   const setActiveTab = useWorkspace((s) => s.setActiveTab);
   const terminals = useWorkspace((s) => s.terminals);
   const setFocus = useWorkspace((s) => s.setFocus);
+  // The active terminal's working directory roots the Files tree (read-only
+  // selector). `focusedId` is the focused tile in the active tab; its
+  // `TerminalInfo.cwd` is the project we want the tree to follow.
+  const focusedId = useWorkspace((s) => s.focusedId);
 
   // Rail mode: a thin, iconic strip. Render before pulling the heavier
   // supervision selectors below stays cheap, but hooks must run unconditionally,
@@ -136,6 +174,13 @@ export function Sidebar({
       />
     );
   }
+  // The Files tree root follows the active terminal's cwd (read-only).
+  const filesRoot = filesRootFor(
+    focusedId,
+    terminals,
+    tabs.find((t) => t.id === activeTabId),
+  );
+
   return (
     <SidebarFull
       onSelectSession={onSelectSession}
@@ -147,6 +192,7 @@ export function Sidebar({
       terminals={terminals}
       setFocus={setFocus}
       onToggleSidebar={onToggleSidebar}
+      filesRoot={filesRoot}
     />
   );
 }
@@ -179,6 +225,8 @@ interface FullProps {
   terminals: Record<TerminalId, TerminalInfo>;
   setFocus: (id: TerminalId) => void;
   onToggleSidebar?: () => void;
+  /** Root for the Files tree (the active terminal's cwd; see filesRootFor). */
+  filesRoot: string;
 }
 
 function SidebarFull({
@@ -191,6 +239,7 @@ function SidebarFull({
   terminals,
   setFocus,
   onToggleSidebar,
+  filesRoot,
 }: FullProps) {
   const { metrics, agent } = useAgentTelemetry();
   const trees = useSupervision((s) => s.trees);
@@ -309,7 +358,8 @@ function SidebarFull({
       </CollapsibleSection>
 
       {/* Files — browse the project file tree (the tree + reader are
-          self-contained in FileTree.tsx; rooted at the projects dir for now).
+          self-contained in FileTree.tsx). The root FOLLOWS the active terminal's
+          cwd (filesRoot), so the tree tracks the project you're working in.
           Collapsible (#3); open by default and grows to fill the height. */}
       <CollapsibleSection
         id="files"
@@ -319,11 +369,7 @@ function SidebarFull({
         className="border-b"
       >
         <div className="min-h-0 flex-1 overflow-hidden">
-          <FileTree
-            root="/home/natkins/n8builds"
-            embedReader
-            className="h-full"
-          />
+          <FileTree root={filesRoot} embedReader className="h-full" />
         </div>
       </CollapsibleSection>
 
