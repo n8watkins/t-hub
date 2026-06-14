@@ -18,8 +18,8 @@
 // Window controls (minimize / maximize-restore / close) and the settings gear
 // use the Tauri window API / the settings store and must NOT carry
 // data-tauri-drag-region, or a click would start a window drag instead.
-import { useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent, Ref, RefObject } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
@@ -55,6 +55,21 @@ function tabUnder(x: number, y: number): string | null {
   return el?.closest<HTMLElement>("[data-tab-id]")?.getAttribute("data-tab-id") ?? null;
 }
 
+/** Height (px) of the titlebar row (matches the bar's h-8); a drop below this is
+ *  out in the canvas, used to decide a tear-off vs an in-strip drop (TASK 2). */
+const TITLEBAR_H = 32;
+
+/**
+ * True when a drag was released AWAY from the tab strip — out in the canvas area
+ * rather than within the titlebar row (TASK 2). The caller only consults this
+ * once it knows the release wasn't over any tab; here we just check the release
+ * is below the titlebar, so a drop into the strip's own empty/drag region (still
+ * within the bar) is NOT treated as a tear-off.
+ */
+function droppedOutsideStrip(y: number): boolean {
+  return y > TITLEBAR_H;
+}
+
 /**
  * The top bar. In the MAIN window it hosts the workspace tab strip + new-tab
  * button. In a SATELLITE window (#21, a popped-out tab) there is no strip — just
@@ -62,8 +77,26 @@ function tabUnder(x: number, y: number): string | null {
  * a satellite renders exactly one tab and creating/closing tabs there is
  * meaningless.
  */
-export function Titlebar({ satellite = false }: { satellite?: boolean }) {
+export function Titlebar({
+  satellite = false,
+  tabStripOffset = 0,
+}: {
+  satellite?: boolean;
+  /**
+   * How far (px) from the window's left edge the workspace tab strip should
+   * begin — set by App to the sidebar's current effective width so the leftmost
+   * tab aligns with the canvas's left edge (TASK 1). The brand stays pinned at
+   * the far left; a draggable spacer between the brand and the strip widens to
+   * fill the gap. Updates live as the sidebar mode/width changes. Ignored in a
+   * satellite (no tab strip there). Defaults to 0 (brand-hugging strip).
+   */
+  tabStripOffset?: number;
+}) {
   const toggleSettings = useSettings((s) => s.toggleSettings);
+  // Measure the brand so the tab-strip spacer can offset by the sidebar width
+  // minus the brand's own footprint (TASK 1). Unused in a satellite (no strip).
+  const brandRef = useRef<HTMLDivElement | null>(null);
+  const brandWidth = useMeasuredWidth(brandRef);
   return (
     <div
       className="flex h-8 shrink-0 items-stretch border-b text-xs"
@@ -73,16 +106,18 @@ export function Titlebar({ satellite = false }: { satellite?: boolean }) {
       }}
     >
       {/* Brand, top-left (#6). Doubles as a left drag handle. */}
-      <Brand />
+      <Brand innerRef={brandRef} />
 
       {satellite ? (
         // Satellite: show the popped-out tab's name + a return control, then a
         // draggable stretch. No tab strip / new-tab button.
         <SatelliteBar />
       ) : (
-        // Main: workspace tabs (+ the new-tab button at the right of the strip),
-        // then a flexible drag region.
+        // Main: a draggable spacer that pushes the tab strip out to the sidebar's
+        // right edge (TASK 1), then the workspace tabs (+ the new-tab button at
+        // the right of the strip), then a flexible drag region.
         <>
+          <TabStripSpacer offset={tabStripOffset} brandWidth={brandWidth} />
           <TabStrip />
           <div data-tauri-drag-region className="min-w-0 flex-1" aria-hidden />
         </>
@@ -144,10 +179,54 @@ function SatelliteBar() {
   );
 }
 
-/** "T-Hub" wordmark with a small accent glyph, anchored top-left (#6). */
-function Brand() {
+/**
+ * Draggable filler between the brand and the tab strip (TASK 1). It widens so
+ * the strip begins `offset` px from the window's left edge — i.e. at the
+ * sidebar's right / the canvas's left edge — making the leftmost tab align with
+ * the canvas. The brand precedes it, so the spacer takes the offset minus the
+ * brand's measured width; when the sidebar is hidden (offset 0) or narrower than
+ * the brand, the spacer collapses to 0 and the strip simply hugs the brand. The
+ * brand width is measured live (a ResizeObserver on the real brand box, via the
+ * forwarded ref) so this stays correct across theme/font changes, and the offset
+ * itself updates live from App. Carries data-tauri-drag-region so grabbing this
+ * gap still moves the window like the rest of the empty bar.
+ */
+function TabStripSpacer({ offset, brandWidth }: { offset: number; brandWidth: number }) {
+  const width = Math.max(0, offset - brandWidth);
   return (
     <div
+      data-tauri-drag-region
+      aria-hidden
+      className="shrink-0"
+      style={{ width }}
+    />
+  );
+}
+
+/**
+ * Live pixel width of an element via ResizeObserver. Used to measure the brand
+ * box so TabStripSpacer can subtract it from the sidebar offset without hard-
+ * coding a magic number that would drift with the wordmark/theme/font.
+ */
+function useMeasuredWidth(ref: RefObject<HTMLElement | null>): number {
+  const [width, setWidth] = useState(0);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const measure = () => setWidth(el.getBoundingClientRect().width);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [ref]);
+  return width;
+}
+
+/** "T-Hub" wordmark with a small accent glyph, anchored top-left (#6). */
+function Brand({ innerRef }: { innerRef?: Ref<HTMLDivElement> }) {
+  return (
+    <div
+      ref={innerRef}
       data-tauri-drag-region
       className="flex shrink-0 select-none items-center gap-1.5 pl-2.5 pr-2"
     >
@@ -383,7 +462,18 @@ function TabStrip() {
         delete document.body.dataset.thDragging;
         setDraggingTab(null);
         setDropTab(null);
-        if (committed && targetId && targetId !== tabId) moveTab(tabId, targetId);
+        if (!committed) return;
+        if (targetId && targetId !== tabId) {
+          // Released over another tab -> reorder within the strip (as before).
+          moveTab(tabId, targetId);
+        } else if (!targetId && droppedOutsideStrip(y)) {
+          // Released AWAY from the strip — not over any tab and below the ~32px
+          // titlebar, i.e. out in the canvas — so tear the tab off into its own
+          // window (TASK 2), same path as the per-tab pop-out button.
+          void popOutTab(tabId);
+        }
+        // Released over the strip's empty area (no tab, still in the titlebar):
+        // no-op, matching the prior behavior.
       },
     });
   };
@@ -393,7 +483,10 @@ function TabStrip() {
     // the available width, so the flexible drag region + controls stay reachable.
     // `overflow-y-hidden` clips the scrollbar gutter so it can't steal the row.
     // `th-scroll-thin` gives that horizontal bar a thin, on-brand look (#4).
-    <div className="th-scroll-thin flex min-w-0 items-stretch gap-1 overflow-x-auto overflow-y-hidden pl-4 pr-1">
+    // pl-1: the strip box starts at the sidebar's right edge (via the spacer); a
+    // 4px hair of inset keeps the rounded leftmost tab off the seam while still
+    // aligning it with the canvas's left edge (TASK 1).
+    <div className="th-scroll-thin flex min-w-0 items-stretch gap-1 overflow-x-auto overflow-y-hidden pl-1 pr-1">
       {tabs.map((tab) => {
         const active = tab.id === activeTabId;
         // Any tab can be closed as long as it isn't the last one. A non-empty tab

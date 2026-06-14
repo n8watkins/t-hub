@@ -261,6 +261,20 @@ export default function App() {
     };
   }, [onResizeMove, onResizeEnd]);
 
+  // The sidebar's current effective on-screen width (TASK 1). The titlebar uses
+  // this to indent its tab strip so the leftmost tab aligns with the canvas's
+  // left edge (the sidebar's right edge): 0 when hidden, the rail width when
+  // railed, the resizable width when full. The SidebarResizer itself has a net-
+  // zero layout footprint (-mx-[3px] on a w-1.5 box), so the canvas's left edge
+  // sits exactly this many px from the window's left. Updates live as the mode/
+  // width changes because it's derived straight from the state each render.
+  const sidebarOffset =
+    sidebarMode === "hidden"
+      ? 0
+      : sidebarMode === "rail"
+        ? SIDEBAR_RAIL_WIDTH
+        : sidebarWidth;
+
   return (
     <div className="relative flex h-full w-full flex-col bg-neutral-950 text-neutral-100">
       {/* Top-edge reveal hot zone — only while auto-hide is active AND the bar is
@@ -286,7 +300,7 @@ export default function App() {
           onPointerEnter={reveal}
           onPointerLeave={() => scheduleHide(HIDE_AFTER_LEAVE_MS)}
         >
-          <Titlebar satellite={SATELLITE} />
+          <Titlebar satellite={SATELLITE} tabStripOffset={sidebarOffset} />
         </div>
       ) : (
         <div
@@ -297,7 +311,7 @@ export default function App() {
           }}
           {...barHover}
         >
-          <Titlebar satellite={SATELLITE} />
+          <Titlebar satellite={SATELLITE} tabStripOffset={sidebarOffset} />
         </div>
       )}
 
