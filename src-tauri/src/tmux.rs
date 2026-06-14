@@ -265,6 +265,60 @@ pub fn capture_visible(name: &str) -> Result<Vec<u8>, TmuxError> {
     Ok(output.stdout)
 }
 
+/// Capture the visible pane of `name` as **plain text** (no ANSI escapes),
+/// optionally including the last `history_lines` of scrollback above the screen.
+///
+/// This is the MCP/control-channel read path (`capture_pane`/`read_terminal`):
+/// an external Claude wants to *read* what a session currently shows, so we omit
+/// `-e` (no escape sequences — clean readable text) unlike [`capture_pane`],
+/// which preserves ANSI to seed xterm. `tmux -L termhub capture-pane -p [-S -N] -t <name>`.
+///
+/// `history_lines == 0` ⇒ visible screen only; `Some(n)` ⇒ start `n` lines into
+/// the scrollback (`-S -n`). Returns the captured text as a `String`.
+pub fn capture_pane_text(name: &str, history_lines: u32) -> Result<String, TmuxError> {
+    let start; // owns the `-N` string for the borrow below
+    let output = if history_lines > 0 {
+        start = format!("-{history_lines}");
+        run(
+            "capture-pane",
+            &["capture-pane", "-p", "-S", &start, "-t", name],
+        )?
+    } else {
+        run("capture-pane", &["capture-pane", "-p", "-t", name])?
+    };
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Send literal `text` to session `name` via `tmux -L termhub send-keys -l`, then
+/// (when `enter` is true) a trailing `Enter` keystroke to submit it.
+///
+/// `-l` makes tmux treat the payload literally (no key-name interpretation), so
+/// arbitrary text — including characters that would otherwise be parsed as key
+/// names — is typed verbatim. The `Enter` is sent as a *separate* `send-keys`
+/// without `-l` so tmux interprets it as the Enter key. This is the write path
+/// for the process-changing `send_text` MCP tool.
+pub fn send_text(name: &str, text: &str, enter: bool) -> Result<(), TmuxError> {
+    // Type the literal text. `--` guards against a payload that begins with `-`.
+    run("send-keys", &["send-keys", "-t", name, "-l", "--", text])?;
+    if enter {
+        run("send-keys", &["send-keys", "-t", name, "Enter"])?;
+    }
+    Ok(())
+}
+
+/// Send one or more **named keys** (e.g. `C-c`, `Enter`, `Up`, `Escape`) to
+/// session `name` via `tmux -L termhub send-keys -t <name> <key>...`.
+///
+/// Unlike [`send_text`], keys are *not* literal: tmux interprets each token as a
+/// key name, so this drives control sequences (Ctrl-C to interrupt, arrows to
+/// navigate, etc.). Backs the `keys` mode of the process-changing `send_keys` tool.
+pub fn send_keys(name: &str, keys: &[&str]) -> Result<(), TmuxError> {
+    let mut args: Vec<&str> = vec!["send-keys", "-t", name];
+    args.extend_from_slice(keys);
+    run("send-keys", &args)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +368,50 @@ mod tests {
             !has_session(&name),
             "session should be gone after kill_session"
         );
+    }
+
+    /// The MCP read/write helpers round-trip through a real session: send a
+    /// literal line, then read it back as plain text from the captured pane.
+    ///
+    /// Like `lifecycle_create_list_capture_kill`, this needs a real `tmux` on
+    /// PATH (present in the WSL2 dev shell, not on the Windows CI target).
+    #[test]
+    fn send_text_then_capture_plain_text_roundtrips() {
+        let name = unique_name();
+        let _ = kill_session(&name);
+        new_session(&name, "/tmp", None).expect("new_session should succeed");
+
+        // Echo a sentinel so it lands in the visible pane, then submit it.
+        send_text(&name, "echo TERMHUB_MCP_SENTINEL_42", true).expect("send_text should succeed");
+        // Give the shell a beat to execute + render the echo output.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let text = capture_pane_text(&name, 0).expect("capture_pane_text should succeed");
+        assert!(
+            text.contains("TERMHUB_MCP_SENTINEL_42"),
+            "captured plain text should echo the sentinel; got: {text:?}"
+        );
+        // Plain capture must not carry raw ANSI escape bytes.
+        assert!(
+            !text.contains('\u{1b}'),
+            "plain capture should be free of ANSI escapes"
+        );
+
+        kill_session(&name).expect("kill_session should succeed");
+    }
+
+    /// `send_keys` interprets named keys: a `C-c` then `Enter` should not error
+    /// on a live session (it interrupts whatever is running / clears the line).
+    #[test]
+    fn send_keys_named_keys_succeed_on_live_session() {
+        let name = unique_name();
+        let _ = kill_session(&name);
+        new_session(&name, "/tmp", None).expect("new_session should succeed");
+
+        send_keys(&name, &["C-c"]).expect("send_keys C-c should succeed");
+        send_keys(&name, &["Enter"]).expect("send_keys Enter should succeed");
+
+        kill_session(&name).expect("kill_session should succeed");
     }
 
     /// kill_session on a missing session is idempotent (success), and
