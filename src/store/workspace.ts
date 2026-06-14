@@ -1,23 +1,58 @@
-// The workspace store holds the live terminal set, focus, grid order, and the
-// global terminal font size (zoom), and persists/rehydrates that layout so the
-// canvas can reattach after a UI reopen (PRD §5.3, §6.5, FR-010). For 0.1,
-// persistence is localStorage; SQLite lands later. Only `order`, `focusedId`,
-// and `fontSize` are persisted -- the live `terminals` map is re-fetched from
-// the backend on mount via listTerminals().
+// The workspace store holds the live terminal set and a list of user-named
+// workspace *tabs* (PRD §5.2). Each tab is its own canvas: an ordered set of
+// terminal tiles plus optional manual-mode size ratios for the grid's rows and
+// columns (PRD §5.3). Exactly one tab is active; only that tab's tiles render,
+// while tiles in inactive tabs unmount (their tmux sessions stay alive backend
+// -side, see Terminal.tsx `visible`). The global terminal font size (zoom) is
+// shared by every tile.
+//
+// Persistence (PRD §6.5, FR-010) is localStorage for now (SQLite lands later):
+// we persist the tab list, the active tab, and the font size. The live
+// `terminals` map is NOT persisted -- it is re-fetched from the backend on
+// mount via listTerminals() and reconciled back onto the persisted tabs.
 import { create } from "zustand";
 import type { TerminalInfo, TerminalId, TerminalState } from "../ipc/types";
 
-/** localStorage key for the 0.1 layout snapshot. */
-const PERSIST_KEY = "termhub.workspace.v1";
+/**
+ * localStorage key for the workspace snapshot. v2 introduced workspace tabs;
+ * a v1 snapshot (flat order/focus) is migrated into a single tab on load.
+ */
+const PERSIST_KEY = "termhub.workspace.v2";
+const LEGACY_KEY = "termhub.workspace.v1";
 
 /** Global terminal font size (px) bounds + default, shared by every tile. */
 const DEFAULT_FONT_SIZE = 13;
 const MIN_FONT_SIZE = 6;
 const MAX_FONT_SIZE = 28;
 
+/** Default name for the first/auto-created tab. */
+const DEFAULT_TAB_NAME = "Workspace 1";
+
+/**
+ * Manual-mode size ratios for one tab's grid. `rows` holds a flex-grow weight
+ * per grid row; `cols[r]` holds a weight per tile within row `r`. Weights are
+ * relative (the grid normalizes them), so any positive numbers work. Empty /
+ * missing arrays mean "even split" (default auto-grid behavior).
+ */
+export interface TabSizes {
+  rows: number[];
+  cols: number[][];
+}
+
+/** A user-named canvas: an ordered tile set plus optional manual size ratios. */
+export interface WorkspaceTab {
+  id: string;
+  name: string;
+  /** Tile order within this tab, by terminal id. */
+  order: TerminalId[];
+  /** Optional manual-mode grid ratios; absent => even auto-grid. */
+  sizes?: TabSizes;
+}
+
 /** The subset of state we persist across UI reopens. */
 interface PersistedLayout {
-  order: TerminalId[];
+  tabs: WorkspaceTab[];
+  activeTabId: string;
   focusedId: TerminalId | null;
   fontSize: number;
 }
@@ -25,24 +60,45 @@ interface PersistedLayout {
 interface WorkspaceState {
   /** Live terminal set, keyed by id (re-fetched from the backend, not persisted). */
   terminals: Record<TerminalId, TerminalInfo>;
-  /** Grid order, by terminal id (persisted). */
-  order: TerminalId[];
-  /** Currently focused tile, or null (persisted). */
+  /** All workspace tabs, in strip order (persisted). */
+  tabs: WorkspaceTab[];
+  /** The active tab's id; only its tiles render (persisted). */
+  activeTabId: string;
+  /** Currently focused tile across the active tab, or null (persisted). */
   focusedId: TerminalId | null;
   /** Global terminal font size in px, applied to every tile equally (persisted). */
   fontSize: number;
 
-  /** Replace the live set from a listTerminals() result, reconciling order/focus. */
+  /** Replace the live set from a listTerminals() result, reconciling tabs/order/focus. */
   setTerminals: (list: TerminalInfo[]) => void;
-  /** Insert a freshly-spawned terminal after the focused tile (else append) and focus it. */
+  /** Insert a freshly-spawned terminal after the focused tile in the active tab (else append) and focus it. */
   addAfterFocused: (info: TerminalInfo) => void;
-  /** Drop a terminal from the map + order, moving focus to a neighbor. */
+  /** Drop a terminal from every tab + the map, moving focus to a neighbor. */
   remove: (id: TerminalId) => void;
   /** Set the focused tile. */
   setFocus: (id: TerminalId) => void;
   /** Update a terminal's lifecycle state from a terminal://state event. */
   updateState: (id: TerminalId, state: TerminalState) => void;
-  /** Global zoom: bump every terminal's font size up/down or reset. */
+
+  // --- Tabs (PRD §5.2) ---
+  /** Create a new empty tab (auto-named) and activate it; returns its id. */
+  addTab: () => string;
+  /** Rename a tab (no-op on blank/unknown id). */
+  renameTab: (id: string, name: string) => void;
+  /** Close an *empty* tab; refuses if it has tiles or is the last tab. */
+  closeTab: (id: string) => void;
+  /** Activate a tab (moves focus onto one of its tiles). */
+  setActiveTab: (id: string) => void;
+  /** Cycle to the next (+1) / previous (-1) tab, wrapping. */
+  cycleTab: (dir: 1 | -1) => void;
+
+  // --- Manual layout (PRD §5.3) ---
+  /** Reorder/swap tiles within the active tab: move `id` to `targetId`'s slot. */
+  moveTile: (id: TerminalId, targetId: TerminalId) => void;
+  /** Persist manual size ratios for a tab. */
+  setTabSizes: (id: string, sizes: TabSizes) => void;
+
+  // --- Global zoom ---
   zoomIn: () => void;
   zoomOut: () => void;
   zoomReset: () => void;
@@ -53,33 +109,138 @@ function clampFont(n: number): number {
   return Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, Math.round(n)));
 }
 
-/** Read the persisted layout snapshot from localStorage (best-effort). */
-function loadPersisted(): PersistedLayout {
-  const fallback: PersistedLayout = {
-    order: [],
+let tabSeq = 0;
+/** Monotonic-ish tab id (timestamp + counter so rapid creates stay unique). */
+function newTabId(): string {
+  tabSeq += 1;
+  return `tab-${Date.now().toString(36)}-${tabSeq.toString(36)}`;
+}
+
+/** Sanitize an arbitrary parsed value into a clean order array of string ids. */
+function cleanOrder(value: unknown): TerminalId[] {
+  return Array.isArray(value)
+    ? value.filter((id): id is TerminalId => typeof id === "string")
+    : [];
+}
+
+/** Sanitize parsed TabSizes; drops anything malformed (=> even split). */
+function cleanSizes(value: unknown): TabSizes | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const v = value as { rows?: unknown; cols?: unknown };
+  const rows = Array.isArray(v.rows)
+    ? v.rows.filter((n): n is number => typeof n === "number" && n > 0)
+    : [];
+  const cols = Array.isArray(v.cols)
+    ? v.cols.map((row) =>
+        Array.isArray(row)
+          ? row.filter((n): n is number => typeof n === "number" && n > 0)
+          : [],
+      )
+    : [];
+  if (rows.length === 0 && cols.length === 0) return undefined;
+  return { rows, cols };
+}
+
+/** Build the default single-tab layout (empty canvas). */
+function defaultLayout(): PersistedLayout {
+  return {
+    tabs: [{ id: newTabId(), name: DEFAULT_TAB_NAME, order: [] }],
+    activeTabId: "",
     focusedId: null,
     fontSize: DEFAULT_FONT_SIZE,
   };
-  if (typeof localStorage === "undefined") return fallback;
+}
+
+/**
+ * Read the persisted layout. Prefers the v2 (tabbed) snapshot; if absent, a
+ * legacy v1 (flat order/focus) snapshot is migrated into a single tab so an
+ * upgrading user keeps their terminals. Always returns >=1 tab and a valid
+ * activeTabId.
+ */
+function loadPersisted(): PersistedLayout {
+  if (typeof localStorage === "undefined") {
+    const d = defaultLayout();
+    d.activeTabId = d.tabs[0].id;
+    return d;
+  }
+
+  const finalize = (layout: PersistedLayout): PersistedLayout => {
+    if (layout.tabs.length === 0) {
+      layout.tabs = [{ id: newTabId(), name: DEFAULT_TAB_NAME, order: [] }];
+    }
+    if (!layout.tabs.some((t) => t.id === layout.activeTabId)) {
+      layout.activeTabId = layout.tabs[0].id;
+    }
+    const active = layout.tabs.find((t) => t.id === layout.activeTabId)!;
+    if (!layout.focusedId || !active.order.includes(layout.focusedId)) {
+      layout.focusedId = active.order[0] ?? null;
+    }
+    layout.fontSize = clampFont(layout.fontSize);
+    return layout;
+  };
+
+  // Preferred: v2 tabbed snapshot.
   try {
     const raw = localStorage.getItem(PERSIST_KEY);
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw) as Partial<PersistedLayout>;
-    const order = Array.isArray(parsed.order)
-      ? parsed.order.filter((id): id is TerminalId => typeof id === "string")
-      : [];
-    const focusedId =
-      typeof parsed.focusedId === "string" && order.includes(parsed.focusedId)
-        ? parsed.focusedId
-        : null;
-    const fontSize =
-      typeof parsed.fontSize === "number"
-        ? clampFont(parsed.fontSize)
-        : DEFAULT_FONT_SIZE;
-    return { order, focusedId, fontSize };
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<PersistedLayout>;
+      const tabs: WorkspaceTab[] = Array.isArray(parsed.tabs)
+        ? parsed.tabs
+            .filter((t): t is WorkspaceTab => !!t && typeof t === "object")
+            .map((t) => ({
+              id: typeof t.id === "string" && t.id ? t.id : newTabId(),
+              name: typeof t.name === "string" && t.name ? t.name : "Workspace",
+              order: cleanOrder(t.order),
+              sizes: cleanSizes(t.sizes),
+            }))
+        : [];
+      return finalize({
+        tabs,
+        activeTabId:
+          typeof parsed.activeTabId === "string" ? parsed.activeTabId : "",
+        focusedId:
+          typeof parsed.focusedId === "string" ? parsed.focusedId : null,
+        fontSize:
+          typeof parsed.fontSize === "number"
+            ? parsed.fontSize
+            : DEFAULT_FONT_SIZE,
+      });
+    }
   } catch {
-    return fallback;
+    /* fall through to legacy / default */
   }
+
+  // Migration: legacy v1 flat snapshot -> a single tab.
+  try {
+    const raw = localStorage.getItem(LEGACY_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as {
+        order?: unknown;
+        focusedId?: unknown;
+        fontSize?: unknown;
+      };
+      const order = cleanOrder(parsed.order);
+      const tab: WorkspaceTab = {
+        id: newTabId(),
+        name: DEFAULT_TAB_NAME,
+        order,
+      };
+      return finalize({
+        tabs: [tab],
+        activeTabId: tab.id,
+        focusedId:
+          typeof parsed.focusedId === "string" ? parsed.focusedId : null,
+        fontSize:
+          typeof parsed.fontSize === "number"
+            ? parsed.fontSize
+            : DEFAULT_FONT_SIZE,
+      });
+    }
+  } catch {
+    /* fall through to default */
+  }
+
+  return finalize(defaultLayout());
 }
 
 /** Persist the layout subset (best-effort; ignore quota/serialization errors). */
@@ -113,65 +274,111 @@ function neighborFocus(
   return nextOrder[idx] ?? nextOrder[idx - 1] ?? nextOrder[0] ?? null;
 }
 
+/** The tab whose `order` contains `id`, or undefined. */
+function tabOf(tabs: WorkspaceTab[], id: TerminalId): WorkspaceTab | undefined {
+  return tabs.find((t) => t.order.includes(id));
+}
+
 const initial = loadPersisted();
 
 export const useWorkspace = create<WorkspaceState>((set, get) => {
-  // Persist the current (order, focusedId, fontSize) triple.
+  // Persist the current (tabs, activeTabId, focusedId, fontSize).
   const persist = () => {
-    const { order, focusedId, fontSize } = get();
-    savePersisted({ order, focusedId, fontSize });
+    const { tabs, activeTabId, focusedId, fontSize } = get();
+    savePersisted({ tabs, activeTabId, focusedId, fontSize });
+  };
+
+  /** The active tab (always present: the store guarantees >=1 tab). */
+  const activeTab = (): WorkspaceTab => {
+    const { tabs, activeTabId } = get();
+    return tabs.find((t) => t.id === activeTabId) ?? tabs[0];
   };
 
   return {
     terminals: {},
-    order: initial.order,
+    tabs: initial.tabs,
+    activeTabId: initial.activeTabId,
     focusedId: initial.focusedId,
     fontSize: initial.fontSize,
 
     setTerminals: (list) => {
       const terminals: Record<TerminalId, TerminalInfo> = {};
       for (const t of list) terminals[t.id] = t;
-
-      const prev = get().order;
       const liveIds = new Set(list.map((t) => t.id));
-      const kept = prev.filter((id) => liveIds.has(id));
-      const known = new Set(kept);
-      const appended = list.filter((t) => !known.has(t.id)).map((t) => t.id);
-      const order = [...kept, ...appended];
 
+      const { tabs, activeTabId } = get();
+      // Keep each tab's ordering for ids that still exist; prune dead ids.
+      const placed = new Set<TerminalId>();
+      const nextTabs = tabs.map((t) => {
+        const order = t.order.filter((id) => liveIds.has(id));
+        for (const id of order) placed.add(id);
+        return { ...t, order };
+      });
+
+      // Any live terminal not already placed in some tab is appended to the
+      // active tab (covers first load with pre-existing sessions, or sessions
+      // spawned out-of-band by another surface).
+      const appended = list.map((t) => t.id).filter((id) => !placed.has(id));
+      if (appended.length > 0) {
+        const activeIdx = nextTabs.findIndex((t) => t.id === activeTabId);
+        const idx = activeIdx >= 0 ? activeIdx : 0;
+        nextTabs[idx] = {
+          ...nextTabs[idx],
+          order: [...nextTabs[idx].order, ...appended],
+        };
+      }
+
+      const active = nextTabs.find((t) => t.id === activeTabId) ?? nextTabs[0];
       const focusedId =
-        get().focusedId && order.includes(get().focusedId as TerminalId)
+        get().focusedId && active.order.includes(get().focusedId as TerminalId)
           ? get().focusedId
-          : order[0] ?? null;
+          : active.order[0] ?? null;
 
-      set({ terminals, order, focusedId });
+      set({ terminals, tabs: nextTabs, focusedId });
       persist();
     },
 
     addAfterFocused: (info) => {
-      const { order, focusedId, terminals } = get();
-      const nextOrder = order.slice();
+      const { tabs, focusedId, terminals } = get();
+      const active = activeTab();
+      const nextOrder = active.order.slice();
       const focusIdx = focusedId ? nextOrder.indexOf(focusedId) : -1;
       if (focusIdx >= 0) nextOrder.splice(focusIdx + 1, 0, info.id);
       else nextOrder.push(info.id);
 
+      const nextTabs = tabs.map((t) =>
+        t.id === active.id ? { ...t, order: nextOrder } : t,
+      );
+
       set({
         terminals: { ...terminals, [info.id]: info },
-        order: nextOrder,
+        tabs: nextTabs,
         focusedId: info.id,
       });
       persist();
     },
 
     remove: (id) => {
-      const { order, focusedId, terminals } = get();
-      const nextOrder = order.filter((x) => x !== id);
-      const nextFocus = neighborFocus(order, nextOrder, id, focusedId);
+      const { tabs, focusedId, terminals, activeTabId } = get();
+      const owner = tabOf(tabs, id);
+      const nextTabs = tabs.map((t) =>
+        t.order.includes(id)
+          ? { ...t, order: t.order.filter((x) => x !== id) }
+          : t,
+      );
+
+      // Only recompute focus if the removed tile lived in the active tab.
+      let nextFocus = focusedId;
+      if (owner && owner.id === activeTabId) {
+        const prevOrder = owner.order;
+        const newOrder = prevOrder.filter((x) => x !== id);
+        nextFocus = neighborFocus(prevOrder, newOrder, id, focusedId);
+      }
 
       const nextTerminals = { ...terminals };
       delete nextTerminals[id];
 
-      set({ terminals: nextTerminals, order: nextOrder, focusedId: nextFocus });
+      set({ terminals: nextTerminals, tabs: nextTabs, focusedId: nextFocus });
       persist();
     },
 
@@ -187,6 +394,103 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       set({
         terminals: { ...get().terminals, [id]: { ...existing, state } },
       });
+    },
+
+    addTab: () => {
+      const { tabs } = get();
+      // Auto-name "Workspace N" using the lowest free index.
+      const used = new Set(
+        tabs
+          .map((t) => /^Workspace (\d+)$/.exec(t.name)?.[1])
+          .filter((n): n is string => !!n)
+          .map((n) => Number(n)),
+      );
+      let n = 1;
+      while (used.has(n)) n += 1;
+      const tab: WorkspaceTab = {
+        id: newTabId(),
+        name: `Workspace ${n}`,
+        order: [],
+      };
+      set({ tabs: [...tabs, tab], activeTabId: tab.id, focusedId: null });
+      persist();
+      return tab.id;
+    },
+
+    renameTab: (id, name) => {
+      const trimmed = name.trim();
+      if (!trimmed) return;
+      const { tabs } = get();
+      if (!tabs.some((t) => t.id === id)) return;
+      set({ tabs: tabs.map((t) => (t.id === id ? { ...t, name: trimmed } : t)) });
+      persist();
+    },
+
+    closeTab: (id) => {
+      const { tabs, activeTabId, focusedId } = get();
+      if (tabs.length <= 1) return; // keep at least one tab
+      const target = tabs.find((t) => t.id === id);
+      if (!target || target.order.length > 0) return; // only close-empty
+
+      const idx = tabs.findIndex((t) => t.id === id);
+      const nextTabs = tabs.filter((t) => t.id !== id);
+
+      // If we closed the active tab, activate a neighbor.
+      let nextActive = activeTabId;
+      let nextFocus = focusedId;
+      if (activeTabId === id) {
+        const neighbor = nextTabs[idx] ?? nextTabs[idx - 1] ?? nextTabs[0];
+        nextActive = neighbor.id;
+        nextFocus = neighbor.order[0] ?? null;
+      }
+      set({ tabs: nextTabs, activeTabId: nextActive, focusedId: nextFocus });
+      persist();
+    },
+
+    setActiveTab: (id) => {
+      const { tabs, activeTabId } = get();
+      if (id === activeTabId) return;
+      const tab = tabs.find((t) => t.id === id);
+      if (!tab) return;
+      set({ activeTabId: id, focusedId: tab.order[0] ?? null });
+      persist();
+    },
+
+    cycleTab: (dir) => {
+      const { tabs, activeTabId } = get();
+      if (tabs.length <= 1) return;
+      const idx = tabs.findIndex((t) => t.id === activeTabId);
+      const nextIdx = (idx + dir + tabs.length) % tabs.length;
+      const next = tabs[nextIdx];
+      set({ activeTabId: next.id, focusedId: next.order[0] ?? null });
+      persist();
+    },
+
+    moveTile: (id, targetId) => {
+      if (id === targetId) return;
+      const { tabs } = get();
+      const active = activeTab();
+      const from = active.order.indexOf(id);
+      const to = active.order.indexOf(targetId);
+      if (from < 0 || to < 0) return; // both must be in the active tab
+
+      const order = active.order.slice();
+      const [moved] = order.splice(from, 1);
+      order.splice(to, 0, moved);
+
+      // Tile count/shape may change rows -> drop stale manual sizes for safety.
+      const nextTabs = tabs.map((t) =>
+        t.id === active.id ? { ...t, order, sizes: undefined } : t,
+      );
+      set({ tabs: nextTabs, focusedId: id });
+      persist();
+    },
+
+    setTabSizes: (id, sizes) => {
+      const { tabs } = get();
+      if (!tabs.some((t) => t.id === id)) return;
+      set({ tabs: tabs.map((t) => (t.id === id ? { ...t, sizes } : t)) });
+      persist();
     },
 
     zoomIn: () => {
