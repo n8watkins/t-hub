@@ -34,6 +34,7 @@ import { WslHealth } from "./WslHealth";
 import { HookInstallPanel } from "./HookInstallPanel";
 import { FileTree } from "./FileTree";
 import type { StatusSnapshot, SupervisionTree } from "../ipc/model";
+import type { HostMetrics, ConnectionState } from "../ipc/protocol";
 import type {
   TerminalId,
   TerminalInfo,
@@ -400,12 +401,165 @@ function SidebarFull({
           />
         </CollapsibleSection>
 
-        {/* Utility area (low priority). */}
-        <CollapsibleSection title="WSL" {...acc("wsl")}>
-          <WslHealth metrics={metrics} connection={agent?.connection} />
-        </CollapsibleSection>
       </div>
+
+      {/* Pinned to the very bottom (outside the accordion): a status strip that
+          toggles between WSL health and Claude usage, collapsible to a single
+          row. Lives here rather than as an accordion section so it's always at
+          the bottom-left regardless of which section is open (#wsl-bottom). */}
+      <BottomStatus
+        metrics={metrics}
+        connection={agent?.connection}
+        snapshots={snapshots}
+      />
     </aside>
+  );
+}
+
+/**
+ * Bottom-pinned status strip (#wsl-bottom): a thin always-visible bar with a
+ * collapse chevron and two toggles — WSL (host/distro health) and Usage (Claude
+ * context/cost/rate-limit, aggregated across supervised sessions). Pinned to the
+ * sidebar's bottom-left, independent of the accordion above. Open/collapsed +
+ * which view is showing both persist to localStorage.
+ */
+function BottomStatus({
+  metrics,
+  connection,
+  snapshots,
+}: {
+  metrics: HostMetrics | null;
+  connection?: ConnectionState;
+  snapshots: Record<string, StatusSnapshot>;
+}) {
+  const [open, setOpen] = useState<boolean>(() => {
+    if (typeof localStorage === "undefined") return true;
+    return localStorage.getItem("termhub.sidebar.bottom.open") !== "0";
+  });
+  const [view, setView] = useState<"wsl" | "usage">(() => {
+    if (typeof localStorage === "undefined") return "wsl";
+    return localStorage.getItem("termhub.sidebar.bottom.view") === "usage"
+      ? "usage"
+      : "wsl";
+  });
+  const persistOpen = (v: boolean) => {
+    setOpen(v);
+    try {
+      localStorage.setItem("termhub.sidebar.bottom.open", v ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  };
+  const persistView = (v: "wsl" | "usage") => {
+    setView(v);
+    try {
+      localStorage.setItem("termhub.sidebar.bottom.view", v);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  return (
+    <div
+      className="shrink-0 border-t"
+      style={{ borderColor: "var(--th-border)" }}
+    >
+      <div className="flex items-stretch">
+        <button
+          type="button"
+          onClick={() => persistOpen(!open)}
+          className="flex h-7 w-6 shrink-0 items-center justify-center opacity-70 hover:opacity-100"
+          aria-expanded={open}
+          title={open ? "Collapse" : "Expand"}
+        >
+          <ChevronIcon open={open} />
+        </button>
+        <BottomTab label="WSL" active={view === "wsl"} onClick={() => persistView("wsl")} />
+        <BottomTab label="Usage" active={view === "usage"} onClick={() => persistView("usage")} />
+      </div>
+      {open && (
+        <div className="border-t" style={{ borderColor: "var(--th-border)" }}>
+          {view === "wsl" ? (
+            <WslHealth metrics={metrics} connection={connection} />
+          ) : (
+            <UsageSummary snapshots={snapshots} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One toggle in the bottom status strip. */
+function BottomTab({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-current={active ? "true" : undefined}
+      className="px-2 py-1 text-xs font-semibold uppercase tracking-wide"
+      style={{
+        color: active ? "var(--th-fg)" : "var(--th-fg-muted)",
+        borderBottom: active ? "2px solid var(--th-accent)" : "2px solid transparent",
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+/** Aggregate Claude usage across all supervised sessions (sum cost, peak context
+ *  %, peak rate-limit window %). Empty/hint when no snapshots (hooks off). */
+function UsageSummary({
+  snapshots,
+}: {
+  snapshots: Record<string, StatusSnapshot>;
+}) {
+  const list = Object.values(snapshots);
+  if (list.length === 0) {
+    return (
+      <Muted>No Claude usage yet — install hooks to see context, cost, and rate limits.</Muted>
+    );
+  }
+  let cost = 0;
+  let ctx = 0;
+  let rl = 0;
+  for (const s of list) {
+    if (s.costUsd != null) cost += s.costUsd;
+    if (s.contextUsedPct != null) ctx = Math.max(ctx, s.contextUsedPct);
+    rl = Math.max(
+      rl,
+      s.fiveHour?.usedPercentage ?? 0,
+      s.sevenDay?.usedPercentage ?? 0,
+    );
+  }
+  return (
+    <div className="px-2 py-1.5 text-xs" style={{ color: "var(--th-fg-muted)" }}>
+      <div className="flex items-center justify-between">
+        <span>Sessions</span>
+        <span className="tabular-nums" style={{ color: "var(--th-fg)" }}>{list.length}</span>
+      </div>
+      <div className="flex items-center justify-between">
+        <span>Peak context</span>
+        <span className="tabular-nums" style={{ color: "var(--th-fg)" }}>{ctx.toFixed(0)}%</span>
+      </div>
+      <div className="flex items-center justify-between">
+        <span>Peak rate limit</span>
+        <span className="tabular-nums" style={{ color: "var(--th-fg)" }}>{rl.toFixed(0)}%</span>
+      </div>
+      <div className="flex items-center justify-between">
+        <span>Total cost</span>
+        <span className="tabular-nums" style={{ color: "var(--th-fg)" }}>${cost.toFixed(2)}</span>
+      </div>
+    </div>
   );
 }
 

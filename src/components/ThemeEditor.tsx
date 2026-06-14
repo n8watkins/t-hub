@@ -81,7 +81,17 @@ export function ThemeEditor() {
 // ---------------------------------------------------------------------------
 // The panel (only mounted while open).
 // ---------------------------------------------------------------------------
-type SectionId = "general" | "theme";
+// One flat nav of sections (the old two-level General/Theme + Theme sub-tabs are
+// gone — everything is reachable straight from the left nav now).
+type SectionId =
+  | "general"
+  | "hotkeys"
+  | "about"
+  | "preset"
+  | "colors"
+  | "layout"
+  | "typography"
+  | "terminal";
 
 function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
   const [section, setSection] = useState<SectionId>("general");
@@ -133,7 +143,7 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
         <div className="flex min-h-0 flex-1">
           <SectionNav active={section} onSelect={setSection} />
           <div className="th-scroll min-h-0 flex-1 overflow-y-auto px-5 py-4">
-            {section === "general" ? <GeneralSection /> : <ThemeSection />}
+            <SectionContent section={section} />
           </div>
         </div>
       </div>
@@ -141,7 +151,8 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
   );
 }
 
-/** The left-hand nav switching between the top-level settings sections. */
+/** The left-hand nav — a single flat list (grouped under small APP / THEME
+ *  labels) so every section is one click away, with no second-level top tabs. */
 function SectionNav({
   active,
   onSelect,
@@ -149,38 +160,89 @@ function SectionNav({
   active: SectionId;
   onSelect: (s: SectionId) => void;
 }) {
-  const items: { id: SectionId; label: string; hint: string }[] = [
-    { id: "general", label: "General", hint: "App behavior" },
-    { id: "theme", label: "Theme", hint: "Colors & layout" },
+  const groups: {
+    label: string;
+    items: { id: SectionId; label: string; hint?: string }[];
+  }[] = [
+    {
+      label: "App",
+      items: [
+        { id: "general", label: "General", hint: "App behavior" },
+        { id: "hotkeys", label: "Hotkeys", hint: "Keyboard shortcuts" },
+        { id: "about", label: "About & Setup", hint: "What it is + how to use it" },
+      ],
+    },
+    {
+      label: "Theme",
+      items: [
+        { id: "preset", label: "Preset", hint: "Switch / save / share themes" },
+        { id: "colors", label: "Colors", hint: "Chrome + status colors" },
+        { id: "layout", label: "Layout", hint: "Sizing + header visibility" },
+        { id: "typography", label: "Typography", hint: "Font + base size" },
+        { id: "terminal", label: "Terminal", hint: "xterm palette" },
+      ],
+    },
   ];
   return (
     <nav
-      className="flex w-44 shrink-0 flex-col gap-0.5 border-r p-2.5"
+      className="th-scroll flex w-44 shrink-0 flex-col gap-3 overflow-y-auto border-r p-2.5"
       style={{ borderColor: "var(--th-border)" }}
       aria-label="Settings sections"
     >
-      {items.map((it) => {
-        const isActive = it.id === active;
-        return (
-          <button
-            key={it.id}
-            type="button"
-            onClick={() => onSelect(it.id)}
-            className="rounded px-2.5 py-2 text-left text-sm transition-colors hover:bg-neutral-700/30"
-            aria-current={isActive ? "page" : undefined}
-            title={it.hint}
-            style={{
-              backgroundColor: isActive ? "var(--th-tile-bg)" : "transparent",
-              color: isActive ? "var(--th-fg)" : "var(--th-fg-muted)",
-              fontWeight: isActive ? 600 : 400,
-            }}
+      {groups.map((g) => (
+        <div key={g.label} className="flex flex-col gap-0.5">
+          <div
+            className="px-2.5 pb-1 text-[10px] font-semibold uppercase tracking-wider"
+            style={{ color: "var(--th-fg-muted)", opacity: 0.7 }}
           >
-            {it.label}
-          </button>
-        );
-      })}
+            {g.label}
+          </div>
+          {g.items.map((it) => {
+            const isActive = it.id === active;
+            return (
+              <button
+                key={it.id}
+                type="button"
+                onClick={() => onSelect(it.id)}
+                className="rounded px-2.5 py-2 text-left text-sm transition-colors hover:bg-neutral-700/30"
+                aria-current={isActive ? "page" : undefined}
+                title={it.hint}
+                style={{
+                  backgroundColor: isActive ? "var(--th-tile-bg)" : "transparent",
+                  color: isActive ? "var(--th-fg)" : "var(--th-fg-muted)",
+                  fontWeight: isActive ? 600 : 400,
+                }}
+              >
+                {it.label}
+              </button>
+            );
+          })}
+        </div>
+      ))}
     </nav>
   );
+}
+
+/** Render the panel for the selected nav section. */
+function SectionContent({ section }: { section: SectionId }) {
+  switch (section) {
+    case "general":
+      return <GeneralSection />;
+    case "hotkeys":
+      return <HotkeysSection />;
+    case "about":
+      return <AboutSetupSection />;
+    case "preset":
+      return <PresetGroup />;
+    case "colors":
+      return <ColorsTab />;
+    case "layout":
+      return <LayoutTab />;
+    case "typography":
+      return <TypographyTab />;
+    case "terminal":
+      return <TerminalGroup />;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +335,7 @@ function GeneralSection() {
         </Row>
       </Group>
 
-      <AboutGroup />
+      {/* About moved to its own "About & Setup" nav section. */}
 
       {/* The recovery modal renders its own scrim/panel above this one. */}
       <RecoveryReview open={recoveryOpen} onClose={() => setRecoveryOpen(false)} />
@@ -306,7 +368,7 @@ function AboutGroup() {
 
   const version = runtimeVersion ?? pkg.version;
   return (
-    <Group title="About" description="Which build of TermHub you're running.">
+    <Group title="About" description="Which build of T-Hub you're running.">
       <Row label="App">
         <span style={{ color: "var(--th-fg)" }}>T-Hub</span>
       </Row>
@@ -340,71 +402,125 @@ function AboutGroup() {
 // Terminal) so the user works through one focused panel at a time instead of
 // one long scroll. Every control stays bound straight to `useTheme` setters.
 // ---------------------------------------------------------------------------
-type ThemeTabId = "colors" | "layout" | "typography" | "terminal";
+// (The old ThemeSection + ThemeTabs segmented control were removed — every theme
+// panel is now its own left-nav section rendered directly by SectionContent.)
 
-const THEME_TABS: { id: ThemeTabId; label: string }[] = [
-  { id: "colors", label: "Colors" },
-  { id: "layout", label: "Layout" },
-  { id: "typography", label: "Typography" },
-  { id: "terminal", label: "Terminal" },
-];
-
-function ThemeSection() {
-  const [tab, setTab] = useState<ThemeTabId>("colors");
+// ---------------------------------------------------------------------------
+// Hotkeys — a reference list of the app's keyboard shortcuts.
+// ---------------------------------------------------------------------------
+function HotkeysSection() {
+  const groups: { title: string; keys: [string, string][] }[] = [
+    {
+      title: "Terminals",
+      keys: [
+        ["Ctrl/Cmd + T", "New terminal"],
+        ["Ctrl/Cmd + W", "Close terminal (detach — keeps the session alive)"],
+        ["Ctrl/Cmd + Shift + W", "Delete terminal from session (kills tmux)"],
+      ],
+    },
+    {
+      title: "Navigation",
+      keys: [
+        ["Ctrl/Cmd + B", "Cycle sidebar (full → rail → hidden)"],
+        ["Ctrl/Cmd + Tab", "Next workspace tab (Shift = previous)"],
+        ["Ctrl/Cmd + 1…9", "Jump to workspace tab"],
+        ["Ctrl/Cmd + ,", "Open / close Settings"],
+      ],
+    },
+    {
+      title: "Zoom",
+      keys: [
+        ["Ctrl/Cmd + =", "Increase terminal font size"],
+        ["Ctrl/Cmd + -", "Decrease terminal font size"],
+        ["Ctrl/Cmd + 0", "Reset terminal font size"],
+      ],
+    },
+    {
+      title: "Inside a terminal",
+      keys: [
+        ["Ctrl + C", "Copy selection (or send SIGINT when nothing is selected)"],
+        ["Ctrl + V", "Paste"],
+        ["Mouse wheel", "Scroll (tmux mouse mode is on)"],
+        ["Shift + drag", "Select text"],
+      ],
+    },
+  ];
   return (
-    <div className="flex flex-col gap-4">
-      {/* Presets stay pinned at the top so switching/saving is always one click
-          away regardless of which sub-tab is open. */}
-      <PresetGroup />
+    <>
+      {groups.map((g) => (
+        <Group key={g.title} title={g.title}>
+          {g.keys.map(([combo, desc]) => (
+            <div
+              key={combo}
+              className="flex items-center justify-between gap-3 text-sm"
+            >
+              <span style={{ color: "var(--th-fg-muted)" }}>{desc}</span>
+              <kbd
+                className="shrink-0 rounded border px-1.5 py-0.5 font-mono text-xs"
+                style={{
+                  borderColor: "var(--th-border)",
+                  color: "var(--th-fg)",
+                  backgroundColor: "var(--th-tile-bg)",
+                }}
+              >
+                {combo}
+              </kbd>
+            </div>
+          ))}
+        </Group>
+      ))}
+    </>
+  );
+}
 
-      {/* Second-level segmented nav: pick one focused panel at a time. */}
-      <ThemeTabs active={tab} onSelect={setTab} />
+// ---------------------------------------------------------------------------
+// About & Setup — what T-Hub is + a short how-it-works tutorial.
+// ---------------------------------------------------------------------------
+function AboutSetupSection() {
+  return (
+    <>
+      <AboutGroup />
+      <Group
+        title="What is T-Hub"
+        description="A local, terminal-first cockpit for running and supervising many Claude Code sessions at once — free and open source, by n8builds. Windows + WSL."
+      >
+        <Bullet>Every terminal is a persistent tmux session — closing a tile detaches it; the session keeps running and can be re-adopted.</Bullet>
+        <Bullet>Drag, resize, and reorder tiles freely — terminals never reload when they move.</Bullet>
+        <Bullet>Install the Claude hooks to light up the supervision tree, the attention queue, and live context/cost/usage.</Bullet>
+      </Group>
+      <Group title="Quick start">
+        <Step n={1}>Hit the “+” (bottom-right) or Ctrl/Cmd+T to open a terminal. Pick Shell, or Resume Claude to reopen a past session.</Step>
+        <Step n={2}>Drag a tile’s header to rearrange the grid; drag a column/row gutter to resize. Drag a tile onto a workspace tab to move it there.</Step>
+        <Step n={3}>Hold Shift over a tile’s “×” to turn it into delete (kills the session); a plain “×” just detaches.</Step>
+        <Step n={4}>Open the Files panel to browse the focused terminal’s project; click a file to preview it.</Step>
+      </Group>
+    </>
+  );
+}
 
-      <div>
-        {tab === "colors" && <ColorsTab />}
-        {tab === "layout" && <LayoutTab />}
-        {tab === "typography" && <TypographyTab />}
-        {tab === "terminal" && <TerminalGroup />}
-      </div>
+/** A simple bulleted line for the About/Setup copy. */
+function Bullet({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex gap-2 text-sm" style={{ color: "var(--th-fg-muted)" }}>
+      <span style={{ color: "var(--th-accent)" }}>•</span>
+      <span className="leading-snug">{children}</span>
     </div>
   );
 }
 
-/** The Theme sub-navigation: a themed segmented control (tabs). */
-function ThemeTabs({
-  active,
-  onSelect,
-}: {
-  active: ThemeTabId;
-  onSelect: (t: ThemeTabId) => void;
-}) {
+/** A numbered step for the Quick start tutorial. */
+function Step({ n, children }: { n: number; children: React.ReactNode }) {
   return (
-    <div
-      className="flex gap-1 rounded-md border p-1"
-      role="tablist"
-      aria-label="Theme sections"
-      style={{ borderColor: "var(--th-border)" }}
-    >
-      {THEME_TABS.map((t) => {
-        const isActive = t.id === active;
-        return (
-          <button
-            key={t.id}
-            type="button"
-            role="tab"
-            aria-selected={isActive}
-            onClick={() => onSelect(t.id)}
-            className="flex-1 rounded px-3 py-1.5 text-center text-sm transition-colors hover:bg-neutral-700/30"
-            style={{
-              backgroundColor: isActive ? "var(--th-tile-bg)" : "transparent",
-              color: isActive ? "var(--th-fg)" : "var(--th-fg-muted)",
-              fontWeight: isActive ? 600 : 400,
-            }}
-          >
-            {t.label}
-          </button>
-        );
-      })}
+    <div className="flex gap-2.5 text-sm">
+      <span
+        className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-xs font-semibold"
+        style={{ backgroundColor: "var(--th-tile-bg)", color: "var(--th-fg)" }}
+      >
+        {n}
+      </span>
+      <span className="leading-snug" style={{ color: "var(--th-fg-muted)" }}>
+        {children}
+      </span>
     </div>
   );
 }
@@ -839,9 +955,15 @@ function Group({
   cols?: 1 | 2;
 }) {
   return (
-    <section className="mb-4">
+    // A divider line + top padding between groups so subsections read as
+    // distinct (the first group in a pane drops the rule). Header bumped up a
+    // step so sub-section titles are easier to scan.
+    <section
+      className="mb-5 border-t pt-4 first:border-t-0 first:pt-0"
+      style={{ borderColor: "var(--th-border)" }}
+    >
       <div
-        className="text-xs font-semibold uppercase tracking-wide"
+        className="text-[13px] font-semibold uppercase tracking-wide"
         style={{ color: "var(--th-fg)" }}
       >
         {title}
