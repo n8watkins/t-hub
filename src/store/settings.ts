@@ -29,6 +29,10 @@ const DEFAULTS = {
   titlebarHideDelayMs: 2000,
   /** Duration (ms) of the titlebar show/hide slide animation. */
   titlebarRevealAnimMs: 140,
+  /** Play a short chime on key session events (attention / done / error). */
+  soundsEnabled: true,
+  /** Show desktop (OS) notifications for key session events. */
+  notificationsEnabled: true,
 } as const;
 
 interface PersistedSettings {
@@ -36,6 +40,8 @@ interface PersistedSettings {
   autoHideTitlebarMaximized: boolean;
   titlebarHideDelayMs: number;
   titlebarRevealAnimMs: number;
+  soundsEnabled: boolean;
+  notificationsEnabled: boolean;
 }
 
 /** Clamp a persisted/incoming number into a range, falling back to a default
@@ -73,6 +79,14 @@ function loadPersisted(): PersistedSettings {
         TITLEBAR_REVEAL_ANIM_MAX,
         DEFAULTS.titlebarRevealAnimMs,
       ),
+      soundsEnabled:
+        typeof p.soundsEnabled === "boolean"
+          ? p.soundsEnabled
+          : DEFAULTS.soundsEnabled,
+      notificationsEnabled:
+        typeof p.notificationsEnabled === "boolean"
+          ? p.notificationsEnabled
+          : DEFAULTS.notificationsEnabled,
     };
   } catch {
     return { ...DEFAULTS };
@@ -110,6 +124,14 @@ interface SettingsState {
   /** Duration (ms) of the titlebar show/hide slide animation. Clamped on write. */
   titlebarRevealAnimMs: number;
   setTitlebarRevealAnimMs: (v: number) => void;
+
+  /** Play a short chime on key session events. Respected by lib/notify.ts. */
+  soundsEnabled: boolean;
+  setSoundsEnabled: (v: boolean) => void;
+
+  /** Show desktop notifications for key session events. Respected by notify.ts. */
+  notificationsEnabled: boolean;
+  setNotificationsEnabled: (v: boolean) => void;
 }
 
 const initial = loadPersisted();
@@ -125,6 +147,8 @@ export const useSettings = create<SettingsState>((set, get) => {
       autoHideTitlebarMaximized: s.autoHideTitlebarMaximized,
       titlebarHideDelayMs: s.titlebarHideDelayMs,
       titlebarRevealAnimMs: s.titlebarRevealAnimMs,
+      soundsEnabled: s.soundsEnabled,
+      notificationsEnabled: s.notificationsEnabled,
     });
   };
 
@@ -169,6 +193,18 @@ export const useSettings = create<SettingsState>((set, get) => {
           DEFAULTS.titlebarRevealAnimMs,
         ),
       });
+      persistAll();
+    },
+
+    soundsEnabled: initial.soundsEnabled,
+    setSoundsEnabled: (v) => {
+      set({ soundsEnabled: v });
+      persistAll();
+    },
+
+    notificationsEnabled: initial.notificationsEnabled,
+    setNotificationsEnabled: (v) => {
+      set({ notificationsEnabled: v });
       persistAll();
     },
   };
