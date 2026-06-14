@@ -3,5 +3,12 @@
   "identifier": "default",
   "description": "Core capability for the main TermHub window (events + core APIs).",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging"
+  ]
 }
