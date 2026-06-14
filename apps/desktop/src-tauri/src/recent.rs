@@ -258,6 +258,34 @@ fn host_distro() -> String {
     std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
 }
 
+/// Resolve the WSL `$HOME` for `distro` by shelling a login bash once (the proven
+/// pattern from claude/install.rs::wsl_home). Returns None on failure/empty so the
+/// caller degrades to an empty Recent list. `echo $HOME` is the one thing that
+/// reliably resolves the distro home from a Windows GUI spawn.
+#[cfg(windows)]
+fn wsl_home(distro: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("wsl.exe")
+        .arg("-d")
+        .arg(distro)
+        .arg("--")
+        .arg("bash")
+        .arg("-lc")
+        .arg("echo $HOME")
+        .creation_flags(0x0800_0000)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let home = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if home.is_empty() {
+        None
+    } else {
+        Some(home)
+    }
+}
+
 #[cfg(windows)]
 fn read_sessions_windows() -> Vec<RecentSession> {
     use std::os::windows::process::CommandExt;
@@ -277,13 +305,25 @@ fn read_sessions_windows() -> Vec<RecentSession> {
     // (effectively "not loading"). The prefix is all we need; `size` is the byte
     // count the frame declares so the parser slices exactly what we sent.
     let cap = 32 * 1024;
+    // The projects dir is passed as $1 (an ABSOLUTE path resolved in Rust below),
+    // NOT derived from $HOME inside the script: `echo $HOME` works, but the empty
+    // result we saw in the diag log means relying on $HOME mid-script was fragile,
+    // so we mirror files.rs (which passes absolute paths as $1 and works). We also
+    // enumerate with `find` instead of a shell glob (`"$dir"/*/*.jsonl`), since a
+    // glob that expands to nothing silently yields zero output; `find` is robust.
+    // Diagnostics go to STDERR (TH_NODIR / TH_DIR_OK / TH_COUNT) and are logged
+    // unconditionally, so a future empty list is self-explaining.
     let script = format!(
         r#"
-dir="$HOME/.claude/projects"
-[ -d "$dir" ] || exit 0
-ls -t "$dir"/*/*.jsonl 2>/dev/null | head -n {limit} | while IFS= read -r f; do
+dir="$1"
+if [ ! -d "$dir" ]; then echo "TH_NODIR:$dir HOME=$HOME" >&2; exit 0; fi
+echo "TH_DIR_OK:$dir" >&2
+count=$(find "$dir" -mindepth 2 -maxdepth 2 -name '*.jsonl' 2>/dev/null | wc -l)
+echo "TH_COUNT:$count" >&2
+find "$dir" -mindepth 2 -maxdepth 2 -name '*.jsonl' -printf '%T@\t%p\n' 2>/dev/null \
+  | sort -rn | head -n {limit} | while IFS=$'\t' read -r mt f; do
   id=$(basename "$f" .jsonl)
-  mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+  mtime=${{mt%.*}}
   fsize=$(stat -c %s "$f" 2>/dev/null || echo 0)
   size=$fsize; [ "$fsize" -gt {cap} ] && size={cap}
   printf '\036%s\t%s\t%s\037' "$id" "$mtime" "$size"
@@ -293,16 +333,27 @@ done
     );
 
     let mut cmd = Command::new("wsl.exe");
-    // Target the distro EXPLICITLY (-d), matching files.rs's working pattern,
-    // rather than relying on the default distro. The script reaches the catalog
-    // via $HOME (set by the `bash -l` login shell), so we don't need `--cd`.
+    // Target the distro EXPLICITLY (-d), matching files.rs's working pattern.
+    // Resolve the WSL $HOME once (the proven install.rs approach) and pass the
+    // absolute projects dir as $1 ($0 is a label, like files.rs's wsl_bash).
     let distro = host_distro();
+    let projects_dir = match wsl_home(&distro) {
+        Some(home) => format!("{}/.claude/projects", home.trim_end_matches('/')),
+        None => {
+            crate::diag::diag_log(format!(
+                "{{\"t\":\"recent\",\"m\":\"wsl_home FAILED (distro={distro}); cannot locate ~/.claude\"}}"
+            ));
+            return Vec::new();
+        }
+    };
     cmd.arg("-d")
         .arg(&distro)
         .arg("--")
         .arg("bash")
         .arg("-lc")
-        .arg(&script);
+        .arg(&script)
+        .arg("termhub")
+        .arg(&projects_dir);
     // CREATE_NO_WINDOW: suppress the brief console flash every `wsl.exe` spawn
     // would otherwise show (same flag tmux.rs uses).
     cmd.creation_flags(0x0800_0000);
@@ -328,6 +379,15 @@ done
             stderr.trim().replace('"', "'").chars().take(300).collect::<String>()
         ));
         return Vec::new();
+    }
+    // Always surface the script's stderr diagnostics (TH_DIR_OK / TH_NODIR /
+    // TH_COUNT) so a zero result is explained even on a "success" exit.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        crate::diag::diag_log(format!(
+            "{{\"t\":\"recent\",\"m\":\"script stderr: {}\"}}",
+            stderr.trim().replace('"', "'").chars().take(300).collect::<String>()
+        ));
     }
     let sessions = parse_framed(&output.stdout);
     crate::diag::diag_log(format!(
