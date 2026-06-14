@@ -357,10 +357,13 @@ function SidebarFull({
         )}
       </CollapsibleSection>
 
-      {/* Files — browse the project file tree (the tree + reader are
-          self-contained in FileTree.tsx). The root FOLLOWS the active terminal's
-          cwd (filesRoot), so the tree tracks the project you're working in.
-          Collapsible (#3); open by default and grows to fill the height. */}
+      {/* Files — browse the project file tree (the tree is self-contained in
+          FileTree.tsx). Clicking a file opens it in a large, centered preview
+          OVERLAY (like Settings) via FileTree's built-in PreviewOverlay; the
+          search bar also exposes a "Web preview" affordance that frames a URL
+          (e.g. a local dev server) in that same overlay. The root FOLLOWS the
+          active terminal's cwd (filesRoot), so the tree tracks the project
+          you're working in. Collapsible (#3); open by default, grows to fill. */}
       <CollapsibleSection
         id="files"
         title="Files"
@@ -369,7 +372,7 @@ function SidebarFull({
         className="border-b"
       >
         <div className="min-h-0 flex-1 overflow-hidden">
-          <FileTree root={filesRoot} embedReader className="h-full" />
+          <FileTree root={filesRoot} className="h-full" />
         </div>
       </CollapsibleSection>
 
