@@ -73,6 +73,7 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
   const activeTabId = useWorkspace((s) => s.activeTabId);
   const focusedId = useWorkspace((s) => s.focusedId);
   const setTerminals = useWorkspace((s) => s.setTerminals);
+  const updateTerminalsMeta = useWorkspace((s) => s.updateTerminalsMeta);
   const addAfterFocused = useWorkspace((s) => s.addAfterFocused);
   const remove = useWorkspace((s) => s.remove);
   const setFocus = useWorkspace((s) => s.setFocus);
@@ -104,6 +105,32 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
       unlisten?.();
     };
   }, [setTerminals, updateState]);
+
+  // Keep the focused terminal's live cwd (which roots the Files tree) + tile
+  // labels fresh. cwd is captured only by the mount-time listTerminals(), so the
+  // tree wouldn't follow a terminal that `cd`s elsewhere, nor update when you
+  // switch focus to a terminal in a different project. Re-list immediately on a
+  // focus change (this effect re-runs via focusedId) and when the window regains
+  // focus, plus a light 5s poll so an in-place `cd` is picked up too. Skipped
+  // while the window is hidden; updateTerminalsMeta only touches cwd/title/state
+  // (no order/focus churn, not persisted). (#6)
+  useEffect(() => {
+    const refresh = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        return;
+      }
+      void listTerminals()
+        .then(updateTerminalsMeta)
+        .catch(() => {});
+    };
+    refresh();
+    const id = window.setInterval(refresh, 5000);
+    window.addEventListener("focus", refresh);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener("focus", refresh);
+    };
+  }, [focusedId, updateTerminalsMeta]);
 
   // Whether the "+" spawn-preset menu is open (anchored to the FAB).
   const [spawnMenuOpen, setSpawnMenuOpen] = useState(false);

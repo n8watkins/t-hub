@@ -119,6 +119,13 @@ interface WorkspaceState {
 
   /** Replace the live set from a listTerminals() result, reconciling tabs/order/focus. */
   setTerminals: (list: TerminalInfo[]) => void;
+  /** Refresh ONLY the live metadata (cwd/title/state) of already-known terminals
+   *  from a fresh listTerminals(), without touching tab order, focus, or
+   *  persisting. The Files tree roots at the focused terminal's cwd, but cwd is
+   *  otherwise captured only at mount — so this keeps the tree (and tile labels)
+   *  following a terminal as it `cd`s around. New/removed terminals are ignored
+   *  here (they flow through setTerminals). */
+  updateTerminalsMeta: (list: TerminalInfo[]) => void;
   /** Insert a freshly-spawned terminal after the focused tile in the active tab (else append) and focus it. */
   addAfterFocused: (info: TerminalInfo) => void;
   /** Drop a terminal from every tab + the map, moving focus to a neighbor. */
@@ -722,6 +729,23 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
       set({ terminals, tabs: nextTabs, poppedOutTabs: nextPopped, focusedId });
       persist();
+    },
+
+    updateTerminalsMeta: (list) => {
+      const { terminals } = get();
+      let changed = false;
+      const next: Record<TerminalId, TerminalInfo> = { ...terminals };
+      for (const t of list) {
+        const ex = next[t.id];
+        if (!ex) continue; // unknown id: new terminals arrive via setTerminals
+        if (ex.cwd !== t.cwd || ex.title !== t.title || ex.state !== t.state) {
+          next[t.id] = { ...ex, cwd: t.cwd, title: t.title, state: t.state };
+          changed = true;
+        }
+      }
+      // No order/focus change and NOT persisted (live metadata only): avoids
+      // thrashing the layout snapshot on every poll.
+      if (changed) set({ terminals: next });
     },
 
     addAfterFocused: (info) => {
