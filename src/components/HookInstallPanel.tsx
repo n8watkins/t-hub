@@ -57,15 +57,20 @@ export function HookInstallPanel({
   const [busy, setBusy] = useState(false);
   const [report, setReport] = useState<InstallReport | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // The user's selection. Defaults to ALL; once we learn what's currently
-  // managed we pre-check exactly those (so re-applying preserves their choice).
+  // The user's selection (what Apply will install). Defaults to ALL; once we
+  // learn what's currently managed we pre-check exactly those.
   const [selected, setSelected] = useState<Set<string>>(() => new Set(ALL_EVENTS));
+  // Which events are CURRENTLY installed (for the per-row "installed" badge), so
+  // it's clear what's live vs. what you're about to change.
+  const [installedEvents, setInstalledEvents] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     let alive = true;
     claudeHooksManaged()
       .then((managed) => {
-        if (alive && managed.length > 0) setSelected(new Set(managed));
+        if (!alive) return;
+        setInstalledEvents(new Set(managed));
+        setSelected(managed.length > 0 ? new Set(managed) : new Set(ALL_EVENTS));
       })
       .catch(() => {});
     return () => {
@@ -91,6 +96,7 @@ export function HookInstallPanel({
       const r = await installClaudeHooks(agentBin, consent, events);
       setReport(r);
       setInstalled(events.length > 0);
+      setInstalledEvents(new Set(events)); // managed set is now exactly the selection
     } catch (e) {
       setError(String(e));
     } finally {
@@ -105,6 +111,7 @@ export function HookInstallPanel({
       const r = await uninstallClaudeHooks();
       setReport(r);
       setInstalled(false);
+      setInstalledEvents(new Set());
     } catch (e) {
       setError(String(e));
     } finally {
@@ -129,19 +136,16 @@ export function HookInstallPanel({
         settings are preserved.
       </p>
 
-      {/* Selection toolbar. */}
+      {/* Selection toolbar: Select all / Deselect all on the LEFT, the count on
+          the RIGHT. */}
       <div className="flex items-center gap-2 text-xs">
-        <span style={{ color: "var(--th-fg-muted)" }}>
-          {selectedCount} of {ALL_EVENTS.length} selected
-        </span>
-        <span className="flex-1" />
         <button
           type="button"
           onClick={selectAll}
           className="rounded border px-2 py-0.5 hover:bg-neutral-700/30"
           style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
         >
-          All
+          Select all
         </button>
         <button
           type="button"
@@ -149,8 +153,12 @@ export function HookInstallPanel({
           className="rounded border px-2 py-0.5 hover:bg-neutral-700/30"
           style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
         >
-          None
+          Deselect all
         </button>
+        <span className="flex-1" />
+        <span className="tabular-nums" style={{ color: "var(--th-fg-muted)" }}>
+          {selectedCount} / {ALL_EVENTS.length} selected
+        </span>
       </div>
 
       {/* The checklist. */}
@@ -170,9 +178,23 @@ export function HookInstallPanel({
               onChange={() => toggle(event)}
               className="mt-0.5"
             />
-            <span className="flex min-w-0 flex-col">
-              <span className="font-mono text-xs" style={{ color: "var(--th-fg)" }}>
-                {event}
+            <span className="flex min-w-0 flex-1 flex-col">
+              <span className="flex items-center gap-2">
+                <span className="font-mono text-xs" style={{ color: "var(--th-fg)" }}>
+                  {event}
+                </span>
+                {installedEvents.has(event) && (
+                  <span
+                    className="rounded-full px-1.5 py-px text-[9px] font-semibold uppercase tracking-wide"
+                    style={{
+                      backgroundColor: "color-mix(in srgb, var(--th-dot-live) 22%, transparent)",
+                      color: "var(--th-dot-live)",
+                    }}
+                    title="Currently installed"
+                  >
+                    installed
+                  </span>
+                )}
               </span>
               <span className="text-[11px] leading-snug" style={{ color: "var(--th-fg-muted)" }}>
                 {desc}

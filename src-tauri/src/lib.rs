@@ -166,6 +166,10 @@ fn start_control_listener(state: &AppState, app: &tauri::AppHandle) {
 
 pub fn run() {
     tauri::Builder::default()
+        // Shell plugin: lets the frontend open URLs/paths in the OS default
+        // browser (web-preview "Open externally"). Without it the JS open() is a
+        // no-op. Paired with the `shell:allow-open` capability.
+        .plugin(tauri_plugin_shell::init())
         .manage(TerminalManager::default())
         .manage(AppState::default())
         .manage(files::FileIndexState::new())

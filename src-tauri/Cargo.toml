@@ -20,7 +20,7 @@ anyhow = "1"
 
 [package]
 name = "termhub"
-version = "0.1.15"
+version = "0.1.16"
 description = "TermHub — terminal-first command center for Claude Code sessions in WSL2"
 authors = ["Nathan Watkins"]
 edition = "2021"
@@ -39,6 +39,10 @@ tauri-build = { version = "2", features = [] }
 # `devtools` keeps the WebView2 devtools (F12) available in the RELEASE build so
 # the user can open the console on their machine (feat/diag).
 tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
+# Opens URLs/paths in the OS default app (the web-preview "Open externally"
+# button + external links). The JS @tauri-apps/plugin-shell needs this Rust side
+# registered + the `shell:allow-open` capability or its open() is a no-op.
+tauri-plugin-shell = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 portable-pty = "0.8"

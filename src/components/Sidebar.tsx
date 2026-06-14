@@ -438,7 +438,12 @@ function BottomStatus({
         <BottomTab label="Usage" active={view === "usage"} onClick={() => persistView("usage")} />
       </div>
       {open && (
-        <div className="border-t" style={{ borderColor: "var(--th-border)" }}>
+        // FIXED height so toggling WSL <-> Usage never changes the strip's size
+        // (locked tight); each view scrolls within it if needed.
+        <div
+          className="th-scroll overflow-y-auto border-t"
+          style={{ borderColor: "var(--th-border)", height: 116 }}
+        >
           {view === "wsl" ? (
             <WslHealth metrics={metrics} connection={connection} />
           ) : (

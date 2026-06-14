@@ -133,6 +133,9 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
   // kill only runs once the user confirms (button / Enter); cancel/Esc/backdrop
   // dismiss it. Detach (the plain ×) needs no confirm — tmux survives.
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // Right-click context menu position (null = closed). Right-clicking the header
+  // opens Close / Delete actions at the pointer.
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
 
   // --- Drag source (the header), pointer-based ---
   const onHeaderPointerDown = (e: ReactPointerEvent) => {
@@ -220,6 +223,13 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
           `th-tile-header` class lets index.css drive the hover-reveal mode. */}
       <div
         onPointerDown={onHeaderPointerDown}
+        // Right-click the header → a Close / Delete context menu at the pointer
+        // (focus the tile first so the action targets it).
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onFocus();
+          setCtxMenu({ x: e.clientX, y: e.clientY });
+        }}
         // Height / display / hover-reveal are driven from index.css (off the
         // `th-tile-header` class + the parent's data-header-hover) so the
         // stylesheet's hover rule can override the height — an inline height
@@ -333,6 +343,51 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
         onCancel={() => setConfirmDelete(false)}
       />
 
+      {/* Right-click context menu: Close (detach, session lives on in the
+          background) or Delete (kill the session, behind the confirm). */}
+      {ctxMenu && (
+        <>
+          <div
+            className="fixed inset-0 z-40"
+            onPointerDown={() => setCtxMenu(null)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setCtxMenu(null);
+            }}
+          />
+          <div
+            className="fixed z-50 min-w-[200px] overflow-hidden rounded-md border shadow-2xl"
+            style={{
+              left: ctxMenu.x,
+              top: ctxMenu.y,
+              backgroundColor: "var(--th-header-bg)",
+              borderColor: "var(--th-border)",
+              color: "var(--th-fg)",
+              fontFamily: "var(--th-font)",
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <CtxItem
+              label="Close terminal"
+              hint="Detach — keeps the session running in the background"
+              onClick={() => {
+                setCtxMenu(null);
+                onClose();
+              }}
+            />
+            <CtxItem
+              label="Delete session"
+              hint="Kills the tmux session — can't be undone"
+              danger
+              onClick={() => {
+                setCtxMenu(null);
+                setConfirmDelete(true);
+              }}
+            />
+          </div>
+        </>
+      )}
+
       {/* Body placeholder: an empty box marking where the terminal should sit.
           The actual xterm is rendered ONCE in the persistent pool overlay
           (TerminalPool.tsx) and positioned over this box, so moving/resizing the
@@ -340,5 +395,36 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
           the parent so drag drop-resolution (elementFromPoint) still lands here. */}
       <div ref={slotRef} className="min-h-0 flex-1 overflow-hidden" />
     </div>
+  );
+}
+
+/** One row in the tile right-click context menu. */
+function CtxItem({
+  label,
+  hint,
+  danger,
+  onClick,
+}: {
+  label: string;
+  hint: string;
+  danger?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex w-full flex-col items-start gap-0.5 px-3 py-2 text-left transition-colors hover:bg-neutral-700/30"
+    >
+      <span
+        className="text-sm"
+        style={{ color: danger ? "var(--th-dot-error)" : "var(--th-fg)" }}
+      >
+        {label}
+      </span>
+      <span className="text-xs" style={{ color: "var(--th-fg-muted)" }}>
+        {hint}
+      </span>
+    </button>
   );
 }

@@ -91,11 +91,8 @@ type SectionId =
   | "hotkeys"
   | "hooks"
   | "about"
-  | "preset"
-  | "colors"
-  | "layout"
-  | "typography"
-  | "terminal";
+  | "setup"
+  | "theme";
 
 function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
   // Honor a deep-link target (e.g. the sidebar "install hooks" hint opens us
@@ -177,17 +174,14 @@ function SectionNav({
         { id: "general", label: "General", hint: "App behavior" },
         { id: "hotkeys", label: "Hotkeys", hint: "Keyboard shortcuts" },
         { id: "hooks", label: "Hooks", hint: "Claude Code lifecycle hooks" },
-        { id: "about", label: "About & Setup", hint: "What it is + how to use it" },
+        { id: "about", label: "About", hint: "What T-Hub is + version" },
+        { id: "setup", label: "Setup", hint: "How to use it" },
       ],
     },
     {
       label: "Theme",
       items: [
-        { id: "preset", label: "Preset", hint: "Switch / save / share themes" },
-        { id: "colors", label: "Colors", hint: "Chrome + status colors" },
-        { id: "layout", label: "Layout", hint: "Sizing + header visibility" },
-        { id: "typography", label: "Typography", hint: "Font + base size" },
-        { id: "terminal", label: "Terminal", hint: "xterm palette" },
+        { id: "theme", label: "Theme", hint: "Presets, colors, layout, type, terminal" },
       ],
     },
   ];
@@ -241,17 +235,11 @@ function SectionContent({ section }: { section: SectionId }) {
     case "hooks":
       return <HooksSection />;
     case "about":
-      return <AboutSetupSection />;
-    case "preset":
-      return <PresetGroup />;
-    case "colors":
-      return <ColorsTab />;
-    case "layout":
-      return <LayoutTab />;
-    case "typography":
-      return <TypographyTab />;
-    case "terminal":
-      return <TerminalGroup />;
+      return <AboutSection />;
+    case "setup":
+      return <SetupSection />;
+    case "theme":
+      return <ThemeSection />;
   }
 }
 
@@ -412,8 +400,76 @@ function AboutGroup() {
 // Terminal) so the user works through one focused panel at a time instead of
 // one long scroll. Every control stays bound straight to `useTheme` setters.
 // ---------------------------------------------------------------------------
-// (The old ThemeSection + ThemeTabs segmented control were removed — every theme
-// panel is now its own left-nav section rendered directly by SectionContent.)
+// ---------------------------------------------------------------------------
+// Theme — ONE left-nav page whose sub-panels (Preset / Colors / Layout /
+// Typography / Terminal) are horizontal peer tabs on top (NOT separate left-nav
+// items). Preset is pinned above the tabs so switching/saving is always reachable.
+// ---------------------------------------------------------------------------
+type ThemeTabId = "colors" | "layout" | "typography" | "terminal";
+
+const THEME_TABS: { id: ThemeTabId; label: string }[] = [
+  { id: "colors", label: "Colors" },
+  { id: "layout", label: "Layout" },
+  { id: "typography", label: "Typography" },
+  { id: "terminal", label: "Terminal" },
+];
+
+function ThemeSection() {
+  const [tab, setTab] = useState<ThemeTabId>("colors");
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Presets pinned at the top so switching/saving is always one click away. */}
+      <PresetGroup />
+      {/* Horizontal sub-tabs: one focused panel at a time. */}
+      <ThemeTabs active={tab} onSelect={setTab} />
+      <div>
+        {tab === "colors" && <ColorsTab />}
+        {tab === "layout" && <LayoutTab />}
+        {tab === "typography" && <TypographyTab />}
+        {tab === "terminal" && <TerminalGroup />}
+      </div>
+    </div>
+  );
+}
+
+/** The Theme page's horizontal sub-navigation (a themed segmented control). */
+function ThemeTabs({
+  active,
+  onSelect,
+}: {
+  active: ThemeTabId;
+  onSelect: (t: ThemeTabId) => void;
+}) {
+  return (
+    <div
+      className="flex gap-1 rounded-md border p-1"
+      role="tablist"
+      aria-label="Theme sections"
+      style={{ borderColor: "var(--th-border)" }}
+    >
+      {THEME_TABS.map((t) => {
+        const isActive = t.id === active;
+        return (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={isActive}
+            onClick={() => onSelect(t.id)}
+            className="flex-1 rounded px-3 py-1.5 text-center text-sm transition-colors hover:bg-neutral-700/30"
+            style={{
+              backgroundColor: isActive ? "var(--th-tile-bg)" : "transparent",
+              color: isActive ? "var(--th-fg)" : "var(--th-fg-muted)",
+              fontWeight: isActive ? 600 : 400,
+            }}
+          >
+            {t.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Hotkeys — a reference list of the app's keyboard shortcuts.
@@ -507,7 +563,7 @@ function HooksSection() {
 // ---------------------------------------------------------------------------
 // About & Setup — what T-Hub is + a short how-it-works tutorial.
 // ---------------------------------------------------------------------------
-function AboutSetupSection() {
+function AboutSection() {
   return (
     <>
       <AboutGroup />
@@ -519,13 +575,19 @@ function AboutSetupSection() {
         <Bullet>Drag, resize, and reorder tiles freely — terminals never reload when they move.</Bullet>
         <Bullet>Install the Claude hooks to light up the supervision tree, the attention queue, and live context/cost/usage.</Bullet>
       </Group>
-      <Group title="Quick start">
-        <Step n={1}>Hit the “+” (bottom-right) or Ctrl/Cmd+T to open a terminal. Pick Shell, or Resume Claude to reopen a past session.</Step>
-        <Step n={2}>Drag a tile’s header to rearrange the grid; drag a column/row gutter to resize. Drag a tile onto a workspace tab to move it there.</Step>
-        <Step n={3}>Hold Shift over a tile’s “×” to turn it into delete (kills the session); a plain “×” just detaches.</Step>
-        <Step n={4}>Open the Files panel to browse the focused terminal’s project; click a file to preview it.</Step>
-      </Group>
     </>
+  );
+}
+
+function SetupSection() {
+  return (
+    <Group title="Quick start">
+      <Step n={1}>Hit the “+” (bottom-right) or Ctrl/Cmd+T to open a terminal. Pick Shell, or Resume Claude to reopen a past session.</Step>
+      <Step n={2}>Drag a tile’s header to rearrange the grid; drag a column/row gutter to resize. Drag a tile onto a workspace tab to move it there.</Step>
+      <Step n={3}>Right-click a tile (or hold Shift over its “×”) to close or delete it; a plain “×” detaches (the session keeps running).</Step>
+      <Step n={4}>Open the Files panel to browse the focused terminal’s project; click a file to preview or edit it.</Step>
+      <Step n={5}>Install Claude hooks in Settings → Hooks (pick which events) to get the supervision tree, attention queue, and live usage.</Step>
+    </Group>
   );
 }
 

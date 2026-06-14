@@ -22,6 +22,7 @@ import {
 } from "../ipc/files";
 import type { DirEntry, FileContents, FileHit } from "../ipc/types";
 import { Markdown } from "./Markdown";
+import { tlog } from "../lib/diag";
 
 const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx", "mdown", "markdn"]);
 
@@ -116,8 +117,10 @@ export function FilePanel({
   const openFile = useCallback((path: string) => {
     setActivePath(path);
     setReader({ status: "loading", path });
+    tlog("files", `read -> ${path}`);
     readTextFile(path)
       .then((contents) => {
+        tlog("files", `read OK ${path}: ${contents.size}B`);
         const isMd = MARKDOWN_EXTS.has(contents.ext);
         setReader({
           status: "ready",
@@ -126,6 +129,9 @@ export function FilePanel({
         });
       })
       .catch((e) => {
+        // DIAG: capture the exact path + error for "cannot find file" reports so
+        // we can see whether it's a path-translation / distro / stale-entry issue.
+        tlog("files", `read ERROR ${path}: ${String(e)}`);
         setReader({ status: "error", path, message: String(e) });
       });
   }, []);
