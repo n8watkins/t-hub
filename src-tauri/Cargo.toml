@@ -38,6 +38,8 @@ anyhow = { workspace = true }
 parking_lot = "0.12"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
+# Filesystem walking with .gitignore semantics for the file index (files.rs).
+ignore = "0.4"
 # The shared agent⇄core NDJSON contract (workspace member).
 termhub-protocol = { path = "crates/termhub-protocol" }
 
