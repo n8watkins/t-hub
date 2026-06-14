@@ -1,8 +1,9 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Github, Heart, ArrowRight, Cpu } from "lucide-react";
+import { Github, Star, Download, ArrowRight, Cpu } from "lucide-react";
 import { site, stats } from "@/lib/site";
+import { ClaudeIcon } from "@/components/ui/BrandIcons";
 import TerminalGrid from "@/components/ui/TerminalGrid";
 
 const ease = [0.25, 0.1, 0.25, 1] as const;
@@ -40,8 +41,10 @@ export default function Hero() {
             </span>
           </span>
           <span className="text-white/20">·</span>
-          <span className="text-slate-400">
-            A local cockpit for Claude Code, by n8builds
+          <span className="flex items-center gap-1.5 text-slate-400">
+            A session-first cockpit for
+            <ClaudeIcon className="h-3.5 w-3.5" />
+            Claude Code
           </span>
           <ArrowRight className="h-3.5 w-3.5 text-slate-600 transition-transform group-hover:translate-x-0.5" />
         </motion.a>
@@ -53,10 +56,10 @@ export default function Hero() {
           transition={{ duration: 0.6, delay: 0.1, ease }}
           className="mx-auto max-w-4xl text-center text-[2.6rem] font-extrabold leading-[1.03] tracking-tight text-slate-50 sm:text-6xl lg:text-[4.4rem]"
         >
-          Run a hundred agents.
+          Run many agents.
           <br />
           <span className="gradient-text bg-[length:200%_auto] animate-gradient-x">
-            Lose none of them.
+            Supervise them all.
           </span>
         </motion.h1>
 
@@ -67,17 +70,16 @@ export default function Hero() {
           transition={{ duration: 0.55, delay: 0.26, ease }}
           className="mx-auto mt-6 max-w-2xl text-center text-base leading-relaxed text-haze sm:text-lg"
         >
-          T-Hub is a terminal-first cockpit for running and supervising{" "}
+          T-Hub is a{" "}
           <span className="font-semibold text-slate-200">
-            many persistent Claude Code sessions
+            session-first terminal IDE for agentic coding
           </span>{" "}
-          at once — tiled terminals you drag without a reload, an attention queue
-          that tells you which agent needs you, and live context, cost &amp;
-          rate-limit usage. The personal tool I built for myself, now{" "}
+          — an opinionated cockpit to run and supervise many Claude Code sessions
+          at once, instead of squinting through a dozen project windows. See every
+          session and its files in one tree, click any file, jump to any session.{" "}
           <span className="font-semibold text-slate-200">
-            free &amp; open source
+            Free, open source, 100% local.
           </span>
-          . Local. Yours. No subscription.
         </motion.p>
 
         {/* pipeline note */}
@@ -87,10 +89,10 @@ export default function Hero() {
           transition={{ duration: 0.5, delay: 0.42 }}
           className="mt-5 flex flex-wrap items-center justify-center gap-2.5 font-mono text-[0.72rem] text-slate-600"
         >
-          {["spawn", "supervise", "unblock", "ship", "repeat"].map((w, i, a) => (
+          {["Spawn.", "Supervise.", "Ship.", "Repeat."].map((w, i, a) => (
             <span key={w} className="flex items-center gap-2.5">
               <span className="text-slate-500">{w}</span>
-              {i < a.length - 1 && <span className="text-white/15">→</span>}
+              {i < a.length - 1 && <span className="text-white/15">·</span>}
             </span>
           ))}
         </motion.div>
@@ -103,22 +105,22 @@ export default function Hero() {
           className="mt-8 flex flex-wrap items-center justify-center gap-3"
         >
           <a
-            href={site.github}
+            href={site.releases}
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 px-6 py-3 text-sm font-bold text-ink-900 shadow-lg shadow-blue-900/40 transition-all hover:scale-[1.03] hover:shadow-glow"
           >
-            <Github className="h-4.5 w-4.5" />
+            <Download className="h-4.5 w-4.5" />
             Download free on GitHub
           </a>
           <a
-            href={site.kofi}
+            href={site.github}
             target="_blank"
             rel="noopener noreferrer"
-            className="flex items-center gap-2 rounded-xl border border-white/12 bg-white/[0.04] px-6 py-3 text-sm font-bold text-slate-200 transition-all hover:scale-[1.03] hover:bg-white/[0.08]"
+            className="group flex items-center gap-2 rounded-xl border border-white/12 bg-white/[0.04] px-6 py-3 text-sm font-bold text-slate-200 transition-all hover:scale-[1.03] hover:bg-white/[0.08]"
           >
-            <Heart className="h-4.5 w-4.5 text-pink-400" />
-            Support on Ko-fi
+            <Star className="h-4.5 w-4.5 text-amber-300 transition-transform group-hover:rotate-12" />
+            Star on GitHub
           </a>
         </motion.div>
 
@@ -159,10 +161,10 @@ export default function Hero() {
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ delay: 1 }}
-          className="mt-8 flex items-center justify-center gap-2 text-center text-xs text-slate-600"
+          className="mt-8 flex flex-wrap items-center justify-center gap-2 text-center text-xs text-slate-600"
         >
           <Cpu className="h-3.5 w-3.5" />
-          Windows-only (for now) · WSL2 + Tauri 2 · open source · a tool by {" "}
+          Windows + WSL-first build · architecture not WSL-locked · a tool by{" "}
           <a
             href={site.builderSite}
             target="_blank"

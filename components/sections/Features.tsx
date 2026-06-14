@@ -2,17 +2,18 @@
 
 import { motion } from "framer-motion";
 import {
-  LayoutGrid,
   Bell,
-  Palette,
   GitBranch,
   DatabaseBackup,
   Gauge,
   PanelsTopLeft,
   Plug,
-  FolderTree,
+  Move,
+  Activity,
+  Sparkles,
 } from "lucide-react";
 import Reveal from "@/components/ui/Reveal";
+import { ClaudeIcon } from "@/components/ui/BrandIcons";
 
 type Feature = {
   icon: React.ReactNode;
@@ -22,58 +23,60 @@ type Feature = {
   tag?: string;
 };
 
+// Lead with the unique differentiators. Spans are tuned so the 3-column bento
+// grid fills exactly — every row sums to 3 columns, no empty cells, no overflow.
 const features: Feature[] = [
   {
-    icon: <LayoutGrid className="h-5 w-5" />,
-    title: "A tiled terminal grid with zero reloads",
-    body: "Drag, resize, and reorder live terminals like windows. A persistent xterm pool sits over placeholder cells, so layout never tears down and your scrollback never blinks out.",
-    span: "md:col-span-2 md:row-span-1",
+    icon: <GitBranch className="h-5 w-5" />,
+    title: "Session supervision tree",
+    body: "A live tree of every agent and its child sessions — supervise the whole fleet from one place instead of one prompt at a time.",
+    span: "md:col-span-2",
     tag: "Signature",
   },
   {
     icon: <Bell className="h-5 w-5" />,
-    title: "An attention queue",
-    body: "Deep Claude Code hooks surface exactly which agents are blocked and waiting on you — no hunting across tiles for the one that asked a question.",
+    title: "Cross-agent attention queue",
+    body: "The one agent that's blocked and waiting on you jumps to the top — no hunting across tiles for who asked a question.",
     tag: "Hooks",
+  },
+  {
+    icon: <Gauge className="h-5 w-5" />,
+    title: "Live usage readouts",
+    body: "Per-session context fill, spend, and rate-limit headroom at a glance — know which agent is about to stall before it does.",
+    tag: "Quality of life",
+  },
+  {
+    icon: <Move className="h-5 w-5" />,
+    title: "Persistent terminals you drag with zero reload",
+    body: "Tiles come from a real xterm pool on a tmux spine. Drag, resize, and reorder live sessions — scrollback never blinks out, processes never restart.",
+    span: "md:col-span-2",
+  },
+  {
+    icon: <Plug className="h-5 w-5" />,
+    title: "Built-in MCP server",
+    body: "T-Hub ships its own MCP server, so Claude can spawn terminals, move tiles, switch themes, and read the supervision tree.",
+    tag: "MCP",
+  },
+  {
+    icon: <Sparkles className="h-5 w-5" />,
+    title: "Configure it by just asking Claude",
+    body: "“Spin up three sessions and theme them blue.” Because Claude drives the app over MCP, you set up your cockpit in plain English.",
+  },
+  {
+    icon: <DatabaseBackup className="h-5 w-5" />,
+    title: "SQLite snapshot recovery",
+    body: "Sessions, layouts, and themes snapshot to SQLite and survive crashes and restarts. Close a tile and the process detaches via tmux instead of dying.",
+  },
+  {
+    icon: <Activity className="h-5 w-5" />,
+    title: "Monitor WSL usage",
+    body: "WSL health, memory, and disk live right in the status bar, so you catch a thrashing distro before it takes your agents down.",
   },
   {
     icon: <PanelsTopLeft className="h-5 w-5" />,
     title: "Workspaces + tear-off windows",
-    body: "Group sessions into workspace tabs and pop any of them into its own window across monitors.",
-  },
-  {
-    icon: <Palette className="h-5 w-5" />,
-    title: "Live theming, no reload",
-    body: "Recolor the whole cockpit instantly. Themes apply across every terminal in real time.",
-  },
-  {
-    icon: <Gauge className="h-5 w-5" />,
-    title: "Live context, cost & rate-limit usage",
-    body: "See per-session context fill, spend, and rate-limit headroom at a glance — know when an agent is about to stall before it does.",
+    body: "Group sessions into workspace tabs and pop any of them into its own window across monitors — it supports as many windows as you want.",
     span: "md:col-span-2",
-    tag: "Supervision",
-  },
-  {
-    icon: <GitBranch className="h-5 w-5" />,
-    title: "Session supervision tree",
-    body: "A live tree of every agent and its descendants — see the whole fleet, not just one prompt.",
-  },
-  {
-    icon: <DatabaseBackup className="h-5 w-5" />,
-    title: "SQLite-backed recovery",
-    body: "Sessions survive crashes and restarts. Close a tile and the process detaches via tmux instead of dying.",
-  },
-  {
-    icon: <FolderTree className="h-5 w-5" />,
-    title: "File tree + file/web preview",
-    body: "Browse the repo and pop a file or a web page into an overlay without leaving the cockpit.",
-  },
-  {
-    icon: <Plug className="h-5 w-5" />,
-    title: "An MCP server — Claude drives the app",
-    body: "T-Hub ships its own MCP server, so Claude itself can spawn terminals, move tiles, switch themes, and read the supervision tree.",
-    span: "md:col-span-2",
-    tag: "MCP",
   },
 ];
 
@@ -84,12 +87,11 @@ export default function Features() {
         <Reveal className="mx-auto max-w-2xl text-center">
           <p className="eyebrow">The cockpit</p>
           <h2 className="mt-3 text-3xl font-bold tracking-tight text-slate-50 sm:text-4xl">
-            Everything you need to fly a fleet of agents
+            Built for supervising many agents at once
           </h2>
           <p className="mt-4 text-haze">
-            One persistent UI built for the way real agent work actually
-            happens: many sessions, long-running, all needing a human at the
-            right moment.
+            One persistent UI for the way real agent work actually happens: many
+            sessions, long-running, all needing a human at the right moment.
           </p>
         </Reveal>
 
@@ -117,7 +119,10 @@ export default function Features() {
                   {f.icon}
                 </span>
                 {f.tag && (
-                  <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2.5 py-0.5 text-[0.6rem] font-bold uppercase tracking-wider text-cyan-300">
+                  <span className="flex items-center gap-1 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2.5 py-0.5 text-[0.6rem] font-bold uppercase tracking-wider text-cyan-300">
+                    {(f.tag === "Hooks" || f.tag === "MCP") && (
+                      <ClaudeIcon className="h-3 w-3" />
+                    )}
                     {f.tag}
                   </span>
                 )}

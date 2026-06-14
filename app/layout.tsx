@@ -17,8 +17,8 @@ const mono = JetBrains_Mono({
   weight: ["400", "500", "700"],
 });
 
-// PLACEHOLDER: set the real production URL before deploying.
-const siteUrl = "https://t-hub.n8builds.dev";
+// Public alias for the deployed site.
+const siteUrl = "https://termhub-site.vercel.app";
 
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),
@@ -31,18 +31,20 @@ export const metadata: Metadata = {
     "T-Hub",
     "n8builds",
     "Claude Code",
+    "agentic coding",
+    "session-first terminal IDE",
     "open source",
     "free",
     "terminal multiplexer",
     "AI agent cockpit",
+    "agent supervision",
     "local AI agents",
     "tmux",
     "WSL2",
     "Tauri",
     "xterm",
-    "Nathan Watkins",
   ],
-  authors: [{ name: site.author, url: site.builderSite }],
+  authors: [{ name: site.brand, url: site.builderSite }],
   openGraph: {
     title: `${site.name} — ${site.tagline}`,
     description: site.description,

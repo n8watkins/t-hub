@@ -2,14 +2,15 @@
 
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { Github, Heart, Terminal } from "lucide-react";
+import { Github, Star, Terminal } from "lucide-react";
 import { site } from "@/lib/site";
 
 const links = [
+  { href: "#why", label: "Why free" },
   { href: "#features", label: "Features" },
   { href: "#cockpit", label: "Cockpit" },
-  { href: "#why", label: "Why free" },
   { href: "#stack", label: "Stack" },
+  { href: "#roadmap", label: "Roadmap" },
 ];
 
 export default function Navbar() {
@@ -65,22 +66,22 @@ export default function Navbar() {
 
         <div className="flex items-center gap-2">
           <a
-            href={site.kofi}
+            href={site.github}
             target="_blank"
             rel="noopener noreferrer"
-            className="hidden items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3.5 py-2 text-sm font-semibold text-slate-200 transition-all hover:scale-[1.03] hover:bg-white/[0.08] sm:flex"
+            className="group hidden items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3.5 py-2 text-sm font-semibold text-slate-200 transition-all hover:scale-[1.03] hover:bg-white/[0.08] sm:flex"
           >
-            <Heart className="h-4 w-4 text-pink-400" />
-            Support
+            <Star className="h-4 w-4 text-amber-300 transition-transform group-hover:rotate-12" />
+            Star
           </a>
           <a
-            href={site.github}
+            href={site.releases}
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-cyan-400 to-blue-600 px-3.5 py-2 text-sm font-bold text-ink-900 transition-all hover:scale-[1.03] hover:shadow-glow"
           >
             <Github className="h-4 w-4" />
-            GitHub
+            Download
           </a>
         </div>
       </nav>

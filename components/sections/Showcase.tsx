@@ -2,6 +2,7 @@
 
 import Reveal from "@/components/ui/Reveal";
 import Screenshot from "@/components/ui/Screenshot";
+import ThemeShift from "@/components/ui/ThemeShift";
 import { Check } from "lucide-react";
 
 type Row = {
@@ -9,23 +10,23 @@ type Row = {
   title: string;
   body: string;
   bullets: string[];
-  shot: {
+  shot?: {
     src: string;
     alt: string;
     width: number;
     height: number;
-    placeholderLabel?: string;
   };
+  animated?: boolean;
   flip?: boolean;
 };
 
 const rows: Row[] = [
   {
     eyebrow: "The grid",
-    title: "Your whole fleet, tiled in one window",
-    body: "Workspace tabs across the top, attention badges where it matters, and a 2×2 (or denser) grid of live terminals below. Drag any tile to a new slot and the session keeps running — no reload, no lost scrollback.",
+    title: "Your whole fleet, tiled in one cockpit",
+    body: "Workspace tabs across the top, attention badges where it matters, and a grid of live terminals below. Drag any tile to a new slot and the session keeps running — no reload, no lost scrollback.",
     bullets: [
-      "Persistent xterm pool positioned over placeholder cells",
+      "Persistent xterm pool positioned over the grid",
       "Workspace tabs with per-workspace attention counts",
       "WSL health, context %, and live spend in the status bar",
     ],
@@ -39,9 +40,9 @@ const rows: Row[] = [
   {
     eyebrow: "Supervision",
     title: "Know which agent needs you — instantly",
-    body: "A live session supervision tree and an attention queue, fed by deep Claude Code hooks. When an agent stops to ask a question or hits a wall, it surfaces to the top instead of getting buried.",
+    body: "A live session supervision tree and a cross-agent attention queue, fed by deep Claude Code hooks. When an agent stops to ask or hits a wall, it surfaces to the top instead of getting buried.",
     bullets: [
-      "Session supervision tree of every agent and its children",
+      "Supervision tree of every agent and its children",
       "Attention queue: who is blocked and waiting on input",
       "Per-session context, cost, and rate-limit usage",
     ],
@@ -54,22 +55,15 @@ const rows: Row[] = [
     flip: true,
   },
   {
-    eyebrow: "Theming",
-    title: "Live theming and a file/web preview overlay",
-    body: "Recolor the entire cockpit instantly with no reload, browse the repo with the file tree, and pop a file or a web page into an overlay without leaving your terminals.",
+    eyebrow: "Live theming",
+    title: "Recolor the whole cockpit, instantly",
+    body: "Switch themes and the entire UI — every terminal, the file rail, the status bar — recolors live with no reload. Browse files in the rail and preview them without leaving your sessions.",
     bullets: [
       "Instant, no-reload theme switching across all terminals",
-      "File tree with file + web preview overlay",
+      "File rail with inline file preview",
       "Frameless Tauri window — native feel, web speed",
     ],
-    shot: {
-      src: "/screenshots/theming.png",
-      alt: "T-Hub live theming and file preview overlay",
-      width: 1440,
-      height: 900,
-      placeholderLabel:
-        "Needed: a shot of the live-theming picker open and/or the file/web preview overlay. Save to public/screenshots/theming.png.",
-    },
+    animated: true,
   },
 ];
 
@@ -94,10 +88,7 @@ export default function Showcase() {
               key={row.title}
               className="grid grid-cols-1 items-center gap-10 lg:grid-cols-2 lg:gap-14"
             >
-              <Reveal
-                className={row.flip ? "lg:order-2" : ""}
-                y={20}
-              >
+              <Reveal className={row.flip ? "lg:order-2" : ""} y={20}>
                 <p className="eyebrow">{row.eyebrow}</p>
                 <h3 className="mt-3 text-2xl font-bold tracking-tight text-slate-50 sm:text-3xl">
                   {row.title}
@@ -115,8 +106,12 @@ export default function Showcase() {
                 </ul>
               </Reveal>
 
-              <div className={row.flip ? "lg:order-1" : ""}>
-                <Screenshot {...row.shot} />
+              <div className={`[perspective:1600px] ${row.flip ? "lg:order-1" : ""}`}>
+                {row.animated ? (
+                  <ThemeShift />
+                ) : (
+                  row.shot && <Screenshot {...row.shot} />
+                )}
               </div>
             </div>
           ))}
