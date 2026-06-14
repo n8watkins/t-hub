@@ -1,10 +1,12 @@
 // The workspace store holds the live terminal set and a list of user-named
 // workspace *tabs* (PRD §5.2). Each tab is its own canvas: an ordered set of
 // terminal tiles plus optional manual-mode size ratios for the grid's rows and
-// columns (PRD §5.3). Exactly one tab is active; only that tab's tiles render,
-// while tiles in inactive tabs unmount (their tmux sessions stay alive backend
-// -side, see Terminal.tsx `visible`). The global terminal font size (zoom) is
-// shared by every tile.
+// columns (PRD §5.3). Exactly one tab is active; the active tab's canvas is the
+// one the user interacts with. Every tab stays MOUNTED at all times (shell v2):
+// the canvas toggles inactive tabs with CSS `display:none` and keeps passing
+// `visible={true}` to their tiles, so xterm/PTY clients stay attached in the
+// background and switching tabs never reloads a terminal. The global terminal
+// font size (zoom) is shared by every tile.
 //
 // Persistence (PRD §6.5, FR-010) is localStorage for now (SQLite lands later):
 // we persist the tab list, the active tab, and the font size. The live
@@ -89,11 +91,17 @@ interface WorkspaceState {
   closeTab: (id: string) => void;
   /** Activate a tab (moves focus onto one of its tiles). */
   setActiveTab: (id: string) => void;
+  /** Activate the tab at strip index `i` (0-based); no-op if out of range. */
+  setActiveTabByIndex: (i: number) => void;
   /** Cycle to the next (+1) / previous (-1) tab, wrapping. */
   cycleTab: (dir: 1 | -1) => void;
+  /** Reorder the tab strip: move tab `id` to occupy `targetId`'s slot. */
+  moveTab: (id: string, targetId: string) => void;
 
   // --- Manual layout (PRD §5.3) ---
-  /** Reorder/swap tiles within the active tab: move `id` to `targetId`'s slot. */
+  /** Reorder tiles within the active tab: pull `id` out and re-insert it at
+   *  `targetId`'s position, so a tile can be dropped onto ANY other tile
+   *  (including a diagonal grid neighbor), not just an adjacent one. */
   moveTile: (id: TerminalId, targetId: TerminalId) => void;
   /** Persist manual size ratios for a tab. */
   setTabSizes: (id: string, sizes: TabSizes) => void;
@@ -456,6 +464,14 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       persist();
     },
 
+    setActiveTabByIndex: (i) => {
+      const { tabs, activeTabId } = get();
+      const tab = tabs[i];
+      if (!tab || tab.id === activeTabId) return;
+      set({ activeTabId: tab.id, focusedId: tab.order[0] ?? null });
+      persist();
+    },
+
     cycleTab: (dir) => {
       const { tabs, activeTabId } = get();
       if (tabs.length <= 1) return;
@@ -463,6 +479,20 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       const nextIdx = (idx + dir + tabs.length) % tabs.length;
       const next = tabs[nextIdx];
       set({ activeTabId: next.id, focusedId: next.order[0] ?? null });
+      persist();
+    },
+
+    moveTab: (id, targetId) => {
+      if (id === targetId) return;
+      const { tabs } = get();
+      const from = tabs.findIndex((t) => t.id === id);
+      const to = tabs.findIndex((t) => t.id === targetId);
+      if (from < 0 || to < 0) return;
+      const next = tabs.slice();
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      // Reordering doesn't change which tab is active; activeTabId is untouched.
+      set({ tabs: next });
       persist();
     },
 
