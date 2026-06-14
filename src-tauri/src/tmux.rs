@@ -147,6 +147,13 @@ pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), T
     // session still exists, so we surface it as an error only if tmux reports
     // one (the session create above already succeeded).
     run("set-option", &["set-option", "-t", name, "window-size", "latest"])?;
+
+    // TermHub draws its own tile chrome, so suppress tmux's status bar (the green
+    // "0:zsh" line) and its mouse capture. With mouse off, xterm owns selection
+    // (so Ctrl+C copy works) and right-click falls through to the native menu
+    // instead of tmux's. Best-effort -- purely cosmetic/UX, never fail the spawn.
+    let _ = run("set-option", &["set-option", "-t", name, "status", "off"]);
+    let _ = run("set-option", &["set-option", "-t", name, "mouse", "off"]);
     Ok(())
 }
 
