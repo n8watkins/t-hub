@@ -36,12 +36,12 @@ export default function Hero() {
               <span className="relative inline-flex h-2 w-2 rounded-full bg-cyan-400" />
             </span>
             <span className="text-[0.7rem] font-bold uppercase tracking-widest">
-              Free &amp; local
+              Free &amp; open source
             </span>
           </span>
           <span className="text-white/20">·</span>
           <span className="text-slate-400">
-            A new home for your Claude Code agents
+            A local cockpit for Claude Code, by n8builds
           </span>
           <ArrowRight className="h-3.5 w-3.5 text-slate-600 transition-transform group-hover:translate-x-0.5" />
         </motion.a>
@@ -67,13 +67,17 @@ export default function Hero() {
           transition={{ duration: 0.55, delay: 0.26, ease }}
           className="mx-auto mt-6 max-w-2xl text-center text-base leading-relaxed text-haze sm:text-lg"
         >
-          TermHub is a terminal-first cockpit for running and supervising{" "}
+          T-Hub is a terminal-first cockpit for running and supervising{" "}
           <span className="font-semibold text-slate-200">
             many persistent Claude Code sessions
           </span>{" "}
           at once — tiled terminals you drag without a reload, an attention queue
           that tells you which agent needs you, and live context, cost &amp;
-          rate-limit usage. Local. Yours. Free.
+          rate-limit usage. The personal tool I built for myself, now{" "}
+          <span className="font-semibold text-slate-200">
+            free &amp; open source
+          </span>
+          . Local. Yours. No subscription.
         </motion.p>
 
         {/* pipeline note */}
@@ -105,7 +109,7 @@ export default function Hero() {
             className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 px-6 py-3 text-sm font-bold text-ink-900 shadow-lg shadow-blue-900/40 transition-all hover:scale-[1.03] hover:shadow-glow"
           >
             <Github className="h-4.5 w-4.5" />
-            Get it on GitHub
+            Download free on GitHub
           </a>
           <a
             href={site.kofi}
@@ -158,7 +162,7 @@ export default function Hero() {
           className="mt-8 flex items-center justify-center gap-2 text-center text-xs text-slate-600"
         >
           <Cpu className="h-3.5 w-3.5" />
-          Windows 11 + WSL2 · Tauri 2 · built by {" "}
+          Windows-only (for now) · WSL2 + Tauri 2 · open source · a tool by {" "}
           <a
             href={site.builderSite}
             target="_blank"

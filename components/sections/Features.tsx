@@ -71,7 +71,7 @@ const features: Feature[] = [
   {
     icon: <Plug className="h-5 w-5" />,
     title: "An MCP server — Claude drives the app",
-    body: "TermHub ships its own MCP server, so Claude itself can spawn terminals, move tiles, switch themes, and read the supervision tree.",
+    body: "T-Hub ships its own MCP server, so Claude itself can spawn terminals, move tiles, switch themes, and read the supervision tree.",
     span: "md:col-span-2",
     tag: "MCP",
   },

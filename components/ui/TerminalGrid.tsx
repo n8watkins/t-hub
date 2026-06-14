@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 
-// A self-contained, animated mock of the TermHub cockpit:
+// A self-contained, animated mock of the T-Hub cockpit:
 // a 2x2 tiled grid of "terminals" that type Claude-Code-style output,
 // with workspace tabs, attention badges, and a status bar.
 // Pure presentational eye-candy for the hero — no real terminals.

@@ -11,12 +11,12 @@ export default function Footer() {
               <Terminal className="h-4.5 w-4.5" strokeWidth={2.5} />
             </span>
             <span className="text-[1.05rem] font-extrabold tracking-tight">
-              Term<span className="gradient-text">Hub</span>
+              T-<span className="gradient-text">Hub</span>
             </span>
           </a>
           <p className="mt-3 text-sm text-slate-500">
-            A free, local terminal cockpit for supervising many Claude Code
-            agents. Built in public by{" "}
+            A free, open-source, local terminal cockpit for supervising many
+            Claude Code agents. Windows-only for now. A tool by{" "}
             <a
               href={site.builderSite}
               target="_blank"

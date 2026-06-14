@@ -18,37 +18,47 @@ const mono = JetBrains_Mono({
 });
 
 // PLACEHOLDER: set the real production URL before deploying.
-const siteUrl = "https://termhub.n8builds.dev";
+const siteUrl = "https://t-hub.n8builds.dev";
 
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),
-  title: `${site.name} — ${site.tagline}`,
+  title: `${site.name} — ${site.tagline} · a free, open-source tool by ${site.brand}`,
   description: site.description,
+  applicationName: site.name,
+  creator: site.brand,
+  publisher: site.brand,
   keywords: [
-    "TermHub",
+    "T-Hub",
+    "n8builds",
     "Claude Code",
+    "open source",
+    "free",
     "terminal multiplexer",
-    "AI agent dashboard",
+    "AI agent cockpit",
+    "local AI agents",
     "tmux",
     "WSL2",
     "Tauri",
     "xterm",
-    "n8builds",
     "Nathan Watkins",
   ],
-  authors: [{ name: site.author }],
+  authors: [{ name: site.author, url: site.builderSite }],
   openGraph: {
     title: `${site.name} — ${site.tagline}`,
     description: site.description,
     url: siteUrl,
-    siteName: site.name,
+    siteName: `${site.name} · ${site.brand}`,
     type: "website",
+    // PLACEHOLDER: add a 1200x630 OG image at /public/og.png and uncomment.
+    // images: [{ url: "/og.png", width: 1200, height: 630, alt: site.name }],
   },
   twitter: {
     card: "summary_large_image",
     title: `${site.name} — ${site.tagline}`,
     description: site.description,
     creator: "@n8watkins",
+    // PLACEHOLDER: add the OG image here too once created.
+    // images: ["/og.png"],
   },
 };
 

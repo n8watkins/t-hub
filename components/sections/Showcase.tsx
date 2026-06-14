@@ -31,7 +31,7 @@ const rows: Row[] = [
     ],
     shot: {
       src: "/screenshots/grid.png",
-      alt: "TermHub cockpit: workspace tabs and a 2x2 grid of live terminal tiles",
+      alt: "T-Hub cockpit: workspace tabs and a 2x2 grid of live terminal tiles",
       width: 955,
       height: 720,
     },
@@ -47,7 +47,7 @@ const rows: Row[] = [
     ],
     shot: {
       src: "/screenshots/supervision.png",
-      alt: "TermHub sidebar showing the session supervision tree and attention queue",
+      alt: "T-Hub sidebar showing the session supervision tree and attention queue",
       width: 955,
       height: 720,
     },
@@ -64,7 +64,7 @@ const rows: Row[] = [
     ],
     shot: {
       src: "/screenshots/theming.png",
-      alt: "TermHub live theming and file preview overlay",
+      alt: "T-Hub live theming and file preview overlay",
       width: 1440,
       height: 900,
       placeholderLabel:

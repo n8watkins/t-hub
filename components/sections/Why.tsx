@@ -7,8 +7,8 @@ import Reveal from "@/components/ui/Reveal";
 const pillars = [
   {
     icon: <Wallet className="h-5 w-5" />,
-    title: "Free, forever",
-    body: "No subscription, no seats, no usage meter on the dashboard itself. You already pay for Claude — the cockpit shouldn't cost extra.",
+    title: "Free & open source",
+    body: "No subscription, no seats, no usage meter on the dashboard itself, and the full source is on GitHub. You already pay for Claude — the cockpit shouldn't cost extra.",
   },
   {
     icon: <HardDrive className="h-5 w-5" />,
@@ -27,6 +27,7 @@ const compare: { label: string; cloud: boolean; termhub: boolean }[] = [
   { label: "Your code never leaves your box", cloud: false, termhub: true },
   { label: "No monthly subscription", cloud: false, termhub: true },
   { label: "No per-seat / per-agent pricing", cloud: false, termhub: true },
+  { label: "Fully open source — read every line", cloud: false, termhub: true },
   { label: "Persistent terminals you can drag live", cloud: false, termhub: true },
   { label: "Attention queue across many agents", cloud: true, termhub: true },
   { label: "Works offline / behind your firewall", cloud: false, termhub: true },
@@ -49,8 +50,9 @@ export default function Why() {
           </h2>
           <p className="mt-4 text-haze">
             Cloud &ldquo;AI agent dashboard&rdquo; services want a monthly fee to
-            watch agents run on their infrastructure. TermHub does it on yours,
-            for nothing.
+            watch agents run on their infrastructure. Stop paying for that. T-Hub
+            does it on your own machine, for free, with the source right there to
+            read.
           </p>
         </Reveal>
 
@@ -81,7 +83,7 @@ export default function Why() {
               <span></span>
               <span className="w-24 text-center sm:w-32">Cloud service</span>
               <span className="w-24 text-center sm:w-32">
-                <span className="gradient-text">TermHub</span>
+                <span className="gradient-text">T-Hub</span>
               </span>
             </div>
             {compare.map((c, i) => (

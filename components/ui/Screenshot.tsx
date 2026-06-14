@@ -41,7 +41,7 @@ export default function Screenshot({
         <span className="h-2.5 w-2.5 rounded-full bg-[#febc2e]" />
         <span className="h-2.5 w-2.5 rounded-full bg-[#28c840]" />
         <span className="ml-3 font-mono text-[0.68rem] text-slate-500">
-          TermHub
+          T-Hub
         </span>
       </div>
 

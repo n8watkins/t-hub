@@ -38,8 +38,16 @@ export default function Navbar() {
           <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-cyan-400 to-blue-600 text-ink-900 shadow-glow">
             <Terminal className="h-4.5 w-4.5" strokeWidth={2.5} />
           </span>
-          <span className="text-[1.05rem] font-extrabold tracking-tight">
-            Term<span className="gradient-text">Hub</span>
+          <span className="flex flex-col leading-none">
+            <span className="text-[1.05rem] font-extrabold tracking-tight">
+              T-<span className="gradient-text">Hub</span>
+            </span>
+            <span className="mt-0.5 text-[0.6rem] font-medium uppercase tracking-wider text-slate-500">
+              a tool by{" "}
+              <span className="text-slate-400 group-hover:text-cyan-400">
+                {site.brand}
+              </span>
+            </span>
           </span>
         </a>
 

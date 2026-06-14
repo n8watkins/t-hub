@@ -28,7 +28,7 @@ export default function CTA() {
           <div className="relative">
             <span className="mx-auto mb-6 flex w-fit items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-4 py-1.5 text-[0.7rem] font-bold uppercase tracking-widest text-cyan-300">
               <Star className="h-3.5 w-3.5" />
-              Free &amp; open to use
+              Free &amp; open source
             </span>
             <h2 className="mx-auto max-w-2xl text-3xl font-extrabold tracking-tight text-slate-50 sm:text-5xl">
               Stop babysitting one terminal.
@@ -36,9 +36,9 @@ export default function CTA() {
               <span className="gradient-text">Command the whole fleet.</span>
             </h2>
             <p className="mx-auto mt-5 max-w-xl text-haze">
-              Grab TermHub on GitHub and run your Claude Code agents the way they
-              deserve. If it saves you time, a Ko-fi tip keeps it free for
-              everyone.
+              Download T-Hub free from GitHub and run your Claude Code agents the
+              way they deserve — locally, on your machine, no subscription. If it
+              saves you time, a Ko-fi tip keeps it going.
             </p>
 
             <div className="mt-9 flex flex-wrap items-center justify-center gap-3">
@@ -49,7 +49,7 @@ export default function CTA() {
                 className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 px-7 py-3.5 text-sm font-bold text-ink-900 shadow-lg shadow-blue-900/40 transition-all hover:scale-[1.04] hover:shadow-glow"
               >
                 <Github className="h-5 w-5" />
-                Get it on GitHub
+                Download free on GitHub
               </a>
               <a
                 href={site.kofi}
@@ -62,7 +62,8 @@ export default function CTA() {
               </a>
             </div>
             <p className="mt-5 text-xs text-slate-600">
-              Windows 11 + WSL2 · repository is private during build-out
+              Windows-only for now (Windows 11 + WSL2) · open source · a tool by
+              n8builds
             </p>
           </div>
         </motion.div>

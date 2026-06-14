@@ -37,7 +37,7 @@ export default function HowItWorks() {
         <Reveal className="mx-auto max-w-2xl text-center">
           <p className="eyebrow">The loop</p>
           <h2 className="mt-3 text-3xl font-bold tracking-tight text-slate-50 sm:text-4xl">
-            How a TermHub session flows
+            How a T-Hub session flows
           </h2>
         </Reveal>
 
