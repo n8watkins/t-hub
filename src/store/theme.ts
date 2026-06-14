@@ -315,8 +315,275 @@ const PAPER: Theme = {
   },
 };
 
+/**
+ * "Dracula" — the well-known purple-tinted dark scheme (draculatheme.com).
+ * Chrome derives from the canonical palette; the terminal carries the full
+ * 16-color ANSI set so terminal output matches the upstream theme.
+ */
+const DRACULA: Theme = {
+  name: "Dracula",
+  chrome: {
+    ...MIDNIGHT.chrome,
+    accent: "#bd93f9", // purple
+    focusRing: "#bd93f9",
+    appBg: "#282a36", // background
+    tileBg: "#21222c", // darker surface
+    headerBg: "#282a36cc",
+    sidebarBg: "#21222c",
+    titlebarBg: "#282a36",
+    fgPrimary: "#f8f8f2", // foreground
+    fgMuted: "#6272a4", // comment
+    border: "#44475a", // selection/current-line
+    cornerRadius: 6,
+    dotStarting: "#ffb86c", // orange
+    dotLive: "#50fa7b", // green
+    dotDetached: "#6272a4", // comment
+    dotExited: "#44475a",
+    dotError: "#ff5555", // red
+  },
+  terminal: {
+    background: "#282a36",
+    foreground: "#f8f8f2",
+    cursor: "#f8f8f2",
+    selection: "#44475a",
+    ansi: {
+      black: "#21222c",
+      red: "#ff5555",
+      green: "#50fa7b",
+      yellow: "#f1fa8c",
+      blue: "#bd93f9",
+      magenta: "#ff79c6",
+      cyan: "#8be9fd",
+      white: "#f8f8f2",
+      brightBlack: "#6272a4",
+      brightRed: "#ff6e6e",
+      brightGreen: "#69ff94",
+      brightYellow: "#ffffa5",
+      brightBlue: "#d6acff",
+      brightMagenta: "#ff92df",
+      brightCyan: "#a4ffff",
+      brightWhite: "#ffffff",
+    },
+  },
+};
+
+/**
+ * "Nord" — the arctic, bluish palette (nordtheme.com). Polar-night surfaces,
+ * snow-storm foreground, frost accent.
+ */
+const NORD: Theme = {
+  name: "Nord",
+  chrome: {
+    ...MIDNIGHT.chrome,
+    accent: "#88c0d0", // frost
+    focusRing: "#88c0d0",
+    appBg: "#2e3440", // nord0 (polar night)
+    tileBg: "#3b4252", // nord1
+    headerBg: "#2e3440cc",
+    sidebarBg: "#2e3440",
+    titlebarBg: "#3b4252",
+    fgPrimary: "#eceff4", // nord6 (snow storm)
+    fgMuted: "#7b88a1", // muted frost/night blend
+    border: "#434c5e", // nord2
+    cornerRadius: 6,
+    dotStarting: "#ebcb8b", // aurora yellow
+    dotLive: "#a3be8c", // aurora green
+    dotDetached: "#81a1c1", // frost blue
+    dotExited: "#4c566a", // nord3
+    dotError: "#bf616a", // aurora red
+  },
+  terminal: {
+    background: "#2e3440",
+    foreground: "#d8dee9",
+    cursor: "#d8dee9",
+    selection: "#434c5e",
+    ansi: {
+      black: "#3b4252",
+      red: "#bf616a",
+      green: "#a3be8c",
+      yellow: "#ebcb8b",
+      blue: "#81a1c1",
+      magenta: "#b48ead",
+      cyan: "#88c0d0",
+      white: "#e5e9f0",
+      brightBlack: "#4c566a",
+      brightRed: "#bf616a",
+      brightGreen: "#a3be8c",
+      brightYellow: "#ebcb8b",
+      brightBlue: "#81a1c1",
+      brightMagenta: "#b48ead",
+      brightCyan: "#8fbcbb",
+      brightWhite: "#eceff4",
+    },
+  },
+};
+
+/**
+ * "Solarized Dark" — Ethan Schoonover's precision palette (the dark base03
+ * variant). Low-saturation accents on a teal-tinted dark ground.
+ */
+const SOLARIZED_DARK: Theme = {
+  name: "Solarized Dark",
+  chrome: {
+    ...MIDNIGHT.chrome,
+    accent: "#268bd2", // blue
+    focusRing: "#268bd2",
+    appBg: "#002b36", // base03
+    tileBg: "#073642", // base02
+    headerBg: "#002b36cc",
+    sidebarBg: "#002b36",
+    titlebarBg: "#073642",
+    fgPrimary: "#93a1a1", // base1
+    fgMuted: "#586e75", // base01
+    border: "#073642", // base02
+    cornerRadius: 4,
+    dotStarting: "#b58900", // yellow
+    dotLive: "#859900", // green
+    dotDetached: "#657b83", // base00
+    dotExited: "#073642",
+    dotError: "#dc322f", // red
+  },
+  terminal: {
+    background: "#002b36",
+    foreground: "#839496", // base0
+    cursor: "#93a1a1",
+    selection: "#073642",
+    ansi: {
+      black: "#073642",
+      red: "#dc322f",
+      green: "#859900",
+      yellow: "#b58900",
+      blue: "#268bd2",
+      magenta: "#d33682",
+      cyan: "#2aa198",
+      white: "#eee8d5",
+      brightBlack: "#002b36",
+      brightRed: "#cb4b16",
+      brightGreen: "#586e75",
+      brightYellow: "#657b83",
+      brightBlue: "#839496",
+      brightMagenta: "#6c71c4",
+      brightCyan: "#93a1a1",
+      brightWhite: "#fdf6e3",
+    },
+  },
+};
+
+/**
+ * "Gruvbox Dark" — the warm, retro-groove palette (morhetz/gruvbox), dark
+ * medium variant. Earthy backgrounds with bright aqua/orange accents.
+ */
+const GRUVBOX_DARK: Theme = {
+  name: "Gruvbox Dark",
+  chrome: {
+    ...MIDNIGHT.chrome,
+    accent: "#fe8019", // orange
+    focusRing: "#fe8019",
+    appBg: "#282828", // bg0
+    tileBg: "#3c3836", // bg1
+    headerBg: "#282828cc",
+    sidebarBg: "#282828",
+    titlebarBg: "#3c3836",
+    fgPrimary: "#ebdbb2", // fg1
+    fgMuted: "#928374", // gray
+    border: "#504945", // bg2
+    cornerRadius: 4,
+    dotStarting: "#fabd2f", // yellow
+    dotLive: "#b8bb26", // green
+    dotDetached: "#928374", // gray
+    dotExited: "#504945",
+    dotError: "#fb4934", // red
+  },
+  terminal: {
+    background: "#282828",
+    foreground: "#ebdbb2",
+    cursor: "#ebdbb2",
+    selection: "#504945",
+    ansi: {
+      black: "#282828",
+      red: "#cc241d",
+      green: "#98971a",
+      yellow: "#d79921",
+      blue: "#458588",
+      magenta: "#b16286",
+      cyan: "#689d6a",
+      white: "#a89984",
+      brightBlack: "#928374",
+      brightRed: "#fb4934",
+      brightGreen: "#b8bb26",
+      brightYellow: "#fabd2f",
+      brightBlue: "#83a598",
+      brightMagenta: "#d3869b",
+      brightCyan: "#8ec07c",
+      brightWhite: "#ebdbb2",
+    },
+  },
+};
+
+/**
+ * "High Contrast" — a maximum-legibility dark theme: pure black ground, pure
+ * white text, saturated primaries, and a thick yellow focus ring. Useful for
+ * accessibility and bright-room visibility.
+ */
+const HIGH_CONTRAST: Theme = {
+  name: "High Contrast",
+  chrome: {
+    ...MIDNIGHT.chrome,
+    accent: "#ffff00", // yellow
+    focusRing: "#ffff00",
+    focusRingWidth: 3,
+    appBg: "#000000",
+    tileBg: "#000000",
+    headerBg: "#000000",
+    sidebarBg: "#000000",
+    titlebarBg: "#000000",
+    fgPrimary: "#ffffff",
+    fgMuted: "#c0c0c0",
+    border: "#ffffff",
+    cornerRadius: 0,
+    dotStarting: "#ffff00",
+    dotLive: "#00ff00",
+    dotDetached: "#00ffff",
+    dotExited: "#808080",
+    dotError: "#ff0000",
+  },
+  terminal: {
+    background: "#000000",
+    foreground: "#ffffff",
+    cursor: "#ffff00",
+    selection: "#ffffff",
+    ansi: {
+      black: "#000000",
+      red: "#ff0000",
+      green: "#00ff00",
+      yellow: "#ffff00",
+      blue: "#0080ff",
+      magenta: "#ff00ff",
+      cyan: "#00ffff",
+      white: "#ffffff",
+      brightBlack: "#808080",
+      brightRed: "#ff5555",
+      brightGreen: "#55ff55",
+      brightYellow: "#ffff55",
+      brightBlue: "#5599ff",
+      brightMagenta: "#ff55ff",
+      brightCyan: "#55ffff",
+      brightWhite: "#ffffff",
+    },
+  },
+};
+
 /** The built-in presets, in dropdown order. "Midnight" is the default. */
-export const BUILTIN_PRESETS: Theme[] = [MIDNIGHT, SLATE, PAPER];
+export const BUILTIN_PRESETS: Theme[] = [
+  MIDNIGHT,
+  SLATE,
+  PAPER,
+  DRACULA,
+  NORD,
+  SOLARIZED_DARK,
+  GRUVBOX_DARK,
+  HIGH_CONTRAST,
+];
 
 /** The default active theme on a fresh install. */
 export const DEFAULT_THEME: Theme = MIDNIGHT;
