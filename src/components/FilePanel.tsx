@@ -35,6 +35,13 @@ export interface FilePanelProps {
   initialFile?: string;
   /** Optional max results for a search query (default 50). */
   searchLimit?: number;
+  /**
+   * When true, render ONLY the reader for `initialFile` — no header, no search
+   * box, no internal file tree. Used when a host (e.g. FileTree in embedReader
+   * mode) already owns navigation and just needs FilePanel as a pure reader,
+   * avoiding a duplicate search box + tree. Requires `initialFile`.
+   */
+  readerOnly?: boolean;
   className?: string;
 }
 
@@ -51,6 +58,7 @@ export function FilePanel({
   root,
   initialFile,
   searchLimit = 50,
+  readerOnly = false,
   className,
 }: FilePanelProps) {
   const [indexState, setIndexState] = useState<
@@ -67,8 +75,11 @@ export function FilePanel({
   const [activePath, setActivePath] = useState<string | null>(null);
 
   // --- Indexing: (re)index whenever the root changes. --------------------
+  // Skipped entirely in reader-only mode — the host owns navigation/search, so
+  // this instance is a pure reader and never builds its own index.
   useEffect(() => {
     let cancelled = false;
+    if (readerOnly) return;
     if (!root) {
       setIndexState({ status: "idle" });
       setHits([]);
@@ -98,7 +109,7 @@ export function FilePanel({
     return () => {
       cancelled = true;
     };
-  }, [root]);
+  }, [root, readerOnly]);
 
   // --- Open a file into the reader. --------------------------------------
   const openFile = useCallback((path: string) => {
@@ -118,18 +129,20 @@ export function FilePanel({
       });
   }, []);
 
-  // Open the initial file once the panel has a root + index.
+  // Open the initial file. In reader-only mode there is no index, so open it
+  // immediately; otherwise wait until the index is ready (so the surrounding
+  // search/tree are live by the time the reader fills).
   const openedInitial = useRef(false);
   useEffect(() => {
     if (
       !openedInitial.current &&
       initialFile &&
-      indexState.status === "ready"
+      (readerOnly || indexState.status === "ready")
     ) {
       openedInitial.current = true;
       openFile(initialFile);
     }
-  }, [initialFile, indexState.status, openFile]);
+  }, [initialFile, indexState.status, openFile, readerOnly]);
 
   // --- Debounced fuzzy search. -------------------------------------------
   useEffect(() => {
@@ -156,6 +169,21 @@ export function FilePanel({
       clearTimeout(handle);
     };
   }, [query, root, indexState.status, searchLimit]);
+
+  // Reader-only: just the reader pane (no header/search/tree). The host owns
+  // navigation; this is a pure file viewer for `initialFile`.
+  if (readerOnly) {
+    return (
+      <PanelShell className={className}>
+        <Reader
+          reader={reader}
+          onSetMode={(mode) =>
+            setReader((r) => (r.status === "ready" ? { ...r, mode } : r))
+          }
+        />
+      </PanelShell>
+    );
+  }
 
   if (!root) {
     return (
