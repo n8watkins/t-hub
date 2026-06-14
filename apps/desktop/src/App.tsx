@@ -5,8 +5,10 @@ import { Canvas } from "./components/Canvas";
 import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { useSettings } from "./store/settings";
+import { useWorkspace } from "./store/workspace";
 import { initWindowSync, isSatellite } from "./lib/windows";
 import { LifecycleKeybinds } from "./lib/useLifecycleKeybinds";
+import type { TerminalId } from "./ipc/types";
 
 // Multi-window tear-off (#21): a window opened with `?tab=<id>` is a SATELLITE
 // rendering only that one tab (the workspace store scopes itself at boot). The
@@ -161,8 +163,31 @@ export default function App() {
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>(() =>
     SATELLITE ? "hidden" : loadSidebarMode(),
   );
-  const [, setSelectedSession] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
+
+  // --- Sidebar wiring (feat/projects-sidebar, Agent A) ---------------------
+  // The sidebar is pure Projects navigation + Recent recall now. Two callbacks:
+  //   - onSelectProject(id): reveal + focus a terminal. The clicked project may
+  //     live in ANY tab, so find the tab that owns it, activate that tab, then
+  //     focus the tile. (This replaces the old, dead onSelectSession wiring,
+  //     whose selectedSession state was never read.)
+  //   - onRecall(id, cwd): re-spawn `claude --resume <id>` in `cwd` and focus it,
+  //     via the workspace store's recall action (it reuses the normal spawn path).
+  const recall = useWorkspace((s) => s.recall);
+  const selectProject = useCallback((id: TerminalId) => {
+    const { tabs, setActiveTab, setFocus } = useWorkspace.getState();
+    const owner = tabs.find((t) => t.order.includes(id));
+    // Activate the owning tab first (so its canvas is visible), then focus the
+    // tile. setActiveTab is a no-op if it's already active, so focus still lands.
+    if (owner) setActiveTab(owner.id);
+    setFocus(id);
+  }, []);
+  const onRecall = useCallback(
+    (sessionId: string, cwd: string) => {
+      void recall(sessionId, cwd);
+    },
+    [recall],
+  );
 
   // Cycle the collapse state (full -> rail -> hidden -> full) and persist it.
   // This is exactly what App hands to Canvas as onToggleSidebar, so Canvas's
@@ -336,7 +361,8 @@ export default function App() {
             <Sidebar
               mode={sidebarMode}
               width={sidebarMode === "rail" ? SIDEBAR_RAIL_WIDTH : sidebarWidth}
-              onSelectSession={setSelectedSession}
+              onSelectProject={selectProject}
+              onRecall={onRecall}
               onToggleSidebar={cycleSidebarMode}
             />
             {/* Drag-resize only applies to the full state; the rail is fixed. */}
