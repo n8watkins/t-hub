@@ -300,8 +300,7 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                "wsl.exe", "--cd", "/home/user", "--", "tmux", "-L", "termhub", "attach", "-t",
-                "th_abc123"
+                "wsl.exe", "--", "tmux", "-L", "termhub", "attach", "-t", "th_abc123"
             ]
         );
     }

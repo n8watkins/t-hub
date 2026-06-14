@@ -45,6 +45,8 @@ export function TerminalView({
   // though main.tsx omits StrictMode — belt-and-braces against double `open()`.
   const initializedRef = useRef(false);
   const fitRef = useRef<FitAddon | null>(null);
+  // Skips the zoom effect's first (mount) run so it doesn't double-fit on open.
+  const zoomMountRef = useRef(true);
   // Global zoom: every tile reads the same font size so they scale together.
   const fontSize = useWorkspace((s) => s.fontSize);
 
@@ -61,6 +63,7 @@ export function TerminalView({
     let webgl: WebglAddon | null = null;
     let webglContextLoss: { dispose(): void } | null = null;
     let disposed = false;
+    let rafId = 0;
 
     const term = new Terminal({
       allowProposedApi: true,
@@ -115,36 +118,53 @@ export function TerminalView({
       }
     };
 
-    // Initial sizing before attach so the backend PTY starts at the right size.
-    fit.fit();
-
-    void (async () => {
-      try {
-        const scrollback = await attachTerminal(terminalId, term.cols, term.rows);
+    // Defer the first fit until the browser has completed the constrained-flex
+    // layout pass (and WebGL has loaded). A synchronous fit here reads a
+    // transient/unconstrained height and oversizes the grid. Attaching from
+    // inside the rAF means the backend PTY is created at the settled geometry,
+    // so there is no 80x24 -> real-size redraw trail. Double-rAF reliably lands
+    // after layout + paint.
+    rafId = requestAnimationFrame(() => {
+      rafId = requestAnimationFrame(() => {
         if (disposed) return;
-        term.write(decodeBase64(scrollback));
-
-        const offOutput = await onOutput((e) => {
-          if (e.id === terminalId) term.write(decodeBase64(e.base64));
-        });
-        if (disposed) {
-          void offOutput();
-          return;
+        try {
+          fit.fit();
+        } catch {
+          /* container detached; ignore */
         }
-        unlisteners.push(offOutput);
+        void (async () => {
+          try {
+            const scrollback = await attachTerminal(
+              terminalId,
+              term.cols,
+              term.rows,
+            );
+            if (disposed) return;
+            term.write(decodeBase64(scrollback));
 
-        const offExit = await onExit((e) => {
-          if (e.id === terminalId) term.writeln("\r\n[process exited]");
-        });
-        if (disposed) {
-          void offExit();
-          return;
-        }
-        unlisteners.push(offExit);
-      } catch {
-        // attach failed (e.g. session gone); leave the tile rendered but inert.
-      }
-    })();
+            const offOutput = await onOutput((e) => {
+              if (e.id === terminalId) term.write(decodeBase64(e.base64));
+            });
+            if (disposed) {
+              void offOutput();
+              return;
+            }
+            unlisteners.push(offOutput);
+
+            const offExit = await onExit((e) => {
+              if (e.id === terminalId) term.writeln("\r\n[process exited]");
+            });
+            if (disposed) {
+              void offExit();
+              return;
+            }
+            unlisteners.push(offExit);
+          } catch {
+            // attach failed (e.g. session gone); leave the tile rendered but inert.
+          }
+        })();
+      });
+    });
 
     // Debounced resize → keep PTY columns/rows in sync with the tile size.
     resizeObserver = new ResizeObserver(() => {
@@ -157,6 +177,7 @@ export function TerminalView({
       disposed = true;
       initializedRef.current = false;
 
+      cancelAnimationFrame(rafId);
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeObserver?.disconnect();
       resizeObserver = null;
@@ -177,8 +198,14 @@ export function TerminalView({
     };
   }, [terminalId, visible]);
 
-  // Apply global zoom changes live, without recreating the terminal.
+  // Apply global zoom changes live, without recreating the terminal. Skips the
+  // first (mount) run -- the init effect already fits once, so fitting again
+  // here would double-fit and trigger a redundant SIGWINCH / prompt redraw.
   useEffect(() => {
+    if (zoomMountRef.current) {
+      zoomMountRef.current = false;
+      return;
+    }
     const term = termRef.current;
     if (!term) return;
     term.options.fontSize = fontSize;

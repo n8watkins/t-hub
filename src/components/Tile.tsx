@@ -73,7 +73,7 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
       </div>
 
       {/* Body fills the rest of the cell; xterm fits to this box. */}
-      <div className="min-h-0 flex-1">
+      <div className="min-h-0 flex-1 overflow-hidden">
         <TerminalView terminalId={terminalId} visible />
       </div>
     </div>
