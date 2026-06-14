@@ -237,21 +237,34 @@ export function TerminalView({
     // so a pure vertical resize never throws away readable scrollback.
     const settleResize = () => {
       if (disposed) return;
-      const before = term.cols;
       pushResize();
-      const widthChanged = term.cols !== before || term.cols !== lastCols;
+      // A width change is the only thing that reflows xterm's wrapped scrollback;
+      // compare against the LAST settled width (not the pre-fit value) so an
+      // unchanged width during a resize burst is a true no-op.
+      const widthChanged = term.cols !== lastCols;
+      const firstSettle = lastCols === 0;
       lastCols = term.cols;
-      // DIAG (#blank): trace every settle so a fresh repro of "spawn blanks the
-      // grid" shows whether each terminal resized + whether width-change cleared
-      // scrollback (the suspected blank window while tmux re-renders).
+      // THE BLANK-GRID FIX: term.clear() wipes the ACTIVE buffer. For a
+      // full-screen app (Claude Code, vim, less, ...) the active buffer is the
+      // ALTERNATE screen, so clearing it erases the app's visible frame — and
+      // during a spawn/relayout resize burst it gets erased faster than the app
+      // can redraw, so the pane (and, because a spawn reflows every tile, the
+      // WHOLE grid) reads blank/muted until something else redraws it. We
+      // therefore NEVER clear while the alt buffer is active: full-screen apps
+      // repaint themselves on the SIGWINCH from pushResize(), so there is no
+      // duplicated scrollback for us to clean up. We also only clear on a REAL
+      // width change of an inline (normal-buffer) terminal, and skip the very
+      // first settle (nothing to dedupe yet). This collapses the boot/spawn
+      // "422 clears" storm to near-zero and removes the blanking entirely.
+      const onAltScreen = term.buffer.active.type === "alternate";
       tlog(
         "resize",
-        `${terminalId} settle cols ${before}->${term.cols} rows=${term.rows} widthChanged=${widthChanged}`,
+        `${terminalId} settle cols->${term.cols} rows=${term.rows} widthChanged=${widthChanged} alt=${onAltScreen}`,
       );
-      // Defer clear + repaint to the next frame so tmux's post-SIGWINCH redraw
-      // has a chance to land first; clearing only removes scrollback above the
-      // live line, and the forced repaint then shows a clean, single frame.
-      if (widthChanged) {
+      if (widthChanged && !firstSettle && !onAltScreen) {
+        // Defer clear + repaint to the next frame so the post-SIGWINCH redraw of
+        // the inline shell lands first; clear only removes scrollback above the
+        // live line, then the forced repaint shows a clean, single frame.
         requestAnimationFrame(() => {
           if (disposed) return;
           try {
