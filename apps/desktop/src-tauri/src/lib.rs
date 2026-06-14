@@ -10,6 +10,7 @@ mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.
 mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
+mod devserver; // feat/dev-runner: managed `npm run dev` per-project runner (Dev tab)
 mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/diag)
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
 mod model; // data-model structs (PRD §8)
@@ -259,6 +260,11 @@ pub fn run() {
             files::list_dir,
             files::read_text_file,
             files::write_text_file,
+            // feat/dev-runner: managed per-project dev server (Dev tab). Self-
+            // contained (its own process-global registry; no .manage() needed).
+            // Streams output on `devserver://<terminal_id>`.
+            devserver::start_dev_server,
+            devserver::stop_dev_server,
             // Theming contract (MCP-facing): read/write the active theme + emit
             // theme://changed.
             theme::get_theme,
