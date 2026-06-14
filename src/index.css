@@ -120,3 +120,21 @@ body {
   border-color: var(--th-accent);
   color: var(--th-fg);
 }
+
+/*
+ * Pointer-based drag (tiles + workspace tabs). HTML5 DnD is unreliable over
+ * xterm's WebGL canvas in WebView2, so drags use pointer events +
+ * elementFromPoint (see src/lib/pointerDrag.ts). While a drag is in progress the
+ * <body> carries data-th-dragging="1"; terminals then ignore the pointer so the
+ * gesture tracks cleanly over them AND elementFromPoint resolves to the owning
+ * tile (which carries data-tile-id) instead of the canvas underneath.
+ */
+[data-th-dragging="1"] .xterm,
+[data-th-dragging="1"] .xterm-viewport,
+[data-th-dragging="1"] .xterm-screen,
+[data-th-dragging="1"] .xterm-helper-textarea {
+  pointer-events: none !important;
+}
+[data-th-dragging="1"] {
+  cursor: grabbing;
+}
