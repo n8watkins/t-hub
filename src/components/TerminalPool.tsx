@@ -47,6 +47,15 @@ import { tlog } from "../lib/diag";
 // lands (see deferredRetriesRef).
 const MAX_DEFERRED_RETRIES = 10;
 
+// Absolute ceiling on the first-paint re-arm chain (BUG 2). Before the first
+// healthy active SHOW we keep the deferred budget topped up so the startup
+// hydration window (no container / zero rects for a few frames) always resolves
+// to a real measure and the muted flash can't persist. This caps that
+// keep-trying at ~60 frames (~1s) so a genuinely pathological layout (active
+// terminals whose placeholders never lay out at all) still stops spinning a
+// re-sync every frame forever, rather than relying solely on firstPaintSettled.
+const MAX_FIRST_PAINT_RETRIES = 60;
+
 // ---------------------------------------------------------------------------
 // Placeholder registry (context). Each Tile registers the empty body box it
 // renders, keyed by terminal id; the pool reads the registry to know where to
@@ -244,6 +253,53 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // a reorder/tab-switch's `useLayoutEffect` always starts a fresh chain anyway.
   const deferredRetriesRef = useRef(0);
 
+  // Always-current pointer to the latest `sync`, so the abort paths (and the
+  // very-first-paint settle) can re-arm a deferred re-sync without forming a
+  // useCallback dependency cycle with `sync` itself. Set after `sync` is built.
+  const syncRef = useRef<(trigger: string) => void>(() => {});
+
+  // Whether the pool has ever landed a healthy SHOW (a real, non-degenerate
+  // active-tab rect). Until it has, the FIRST layout passes can read no
+  // container / zero rects (the placeholder set + persisted tabs are still
+  // hydrating), during which the wrappers sit at their initial offscreen park
+  // (translate(-100000px)) — so the active grid cells flash their muted
+  // background for the ~frame(s) before the first real measure lands. We use
+  // this to keep re-arming a next-frame re-sync through that window (instead of
+  // bailing on an abort and waiting for an external trigger), so the active
+  // terminals snap on as soon as their rects exist — collapsing the flash.
+  const firstPaintSettledRef = useRef(false);
+  // Counts first-paint re-arms so the keep-trying window is itself bounded (see
+  // MAX_FIRST_PAINT_RETRIES) and can't spin forever on a pathological layout.
+  const firstPaintRetriesRef = useRef(0);
+
+  // Schedule (or re-arm) the deferred next-frame re-sync. Coalesced to one
+  // pending rAF. Bounded by the retry budget so a permanently-degenerate layout
+  // can't spin forever; before the first healthy paint we keep the budget topped
+  // up (within MAX_FIRST_PAINT_RETRIES) so the initial hydration window — which
+  // can span several frames — always resolves to a real measure.
+  const scheduleDeferredSync = useCallback((reason: string) => {
+    // During the very first paint window, don't let the budget run dry: each
+    // healthy SHOW resets it to 0 anyway, so this only matters while rects are
+    // still degenerate (no visible terminal yet) — exactly when we must keep
+    // trying so the muted flash can't persist. Reset BEFORE the exhaustion guard
+    // so a slow multi-frame hydration never stalls before the first real measure,
+    // but stop once the absolute first-paint ceiling is hit so a layout that
+    // never lays out at all doesn't re-arm a frame forever.
+    if (!firstPaintSettledRef.current) {
+      if (firstPaintRetriesRef.current < MAX_FIRST_PAINT_RETRIES) {
+        firstPaintRetriesRef.current += 1;
+        deferredRetriesRef.current = 0;
+      }
+    }
+    if (deferredRetriesRef.current >= MAX_DEFERRED_RETRIES) return;
+    deferredRetriesRef.current += 1;
+    if (deferredRafRef.current) cancelAnimationFrame(deferredRafRef.current);
+    deferredRafRef.current = requestAnimationFrame(() => {
+      deferredRafRef.current = 0;
+      syncRef.current(reason);
+    });
+  }, []);
+
   // Position one wrapper as a VISIBLE active terminal: write transform/size and,
   // if it moved on-screen (a same-tab reorder/swap that the IntersectionObserver
   // can't catch), fire "th-pool-moved" so Terminal.tsx repaints rather than
@@ -294,13 +350,21 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
     (trigger: string) => {
       const container = containerRef.current;
       if (!container) {
-        tlog("pool", `sync(${trigger}) aborted: no container`);
+        // BUG 2 (startup flicker): the first layout-effect can run before the
+        // provider's container ref has attached. Don't just bail (that left the
+        // wrappers parked offscreen until the next EXTERNAL trigger — a ~frame
+        // gap during which the active grid cells flashed their muted
+        // background). Re-arm a next-frame re-sync so we position the active
+        // terminals the instant the container exists.
+        tlog("pool", `sync(${trigger}) aborted: no container; re-arming re-sync`);
+        scheduleDeferredSync("post-no-container");
         return;
       }
       const base = container.getBoundingClientRect();
       const slots = slotsRef.current;
       if (!slots) {
-        tlog("pool", `sync(${trigger}) aborted: no slots map`);
+        tlog("pool", `sync(${trigger}) aborted: no slots map; re-arming re-sync`);
+        scheduleDeferredSync("post-no-slots");
         return;
       }
       // A degenerate container base means the whole canvas is mid-reflow (e.g.
@@ -358,6 +422,9 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
             // A real measure landed -> layout has settled for this id; reset the
             // deferred retry budget so future transient reflows get a fresh chain.
             deferredRetriesRef.current = 0;
+            // First healthy active SHOW: the startup hydration window is over, so
+            // the muted-flash guard can stop topping up the deferred budget.
+            firstPaintSettledRef.current = true;
             continue;
           }
 
@@ -419,16 +486,15 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       // Schedule the deferred re-sync OUTSIDE the loop so a single follow-up
       // covers every held active terminal this pass. Bounded so a permanently-
       // degenerate rect can't loop forever; the bound is generous (10 frames) so
-      // a slow multi-pass reflow still resolves.
+      // a slow multi-pass reflow still resolves. The helper also keeps the budget
+      // topped up through the first-paint hydration window (BUG 2) so the muted
+      // flash can't persist while rects are still settling.
       if (needDeferred) {
-        if (deferredRetriesRef.current < MAX_DEFERRED_RETRIES) {
-          deferredRetriesRef.current += 1;
-          if (deferredRafRef.current)
-            cancelAnimationFrame(deferredRafRef.current);
-          deferredRafRef.current = requestAnimationFrame(() => {
-            deferredRafRef.current = 0;
-            sync("deferred-rAF");
-          });
+        if (
+          deferredRetriesRef.current < MAX_DEFERRED_RETRIES ||
+          !firstPaintSettledRef.current
+        ) {
+          scheduleDeferredSync("deferred-rAF");
         } else {
           tlog(
             "pool",
@@ -439,8 +505,12 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
         }
       }
     },
-    [containerRef, slotsRef, tabOfId, activeTabId, applyVisible],
+    [containerRef, slotsRef, tabOfId, activeTabId, applyVisible, scheduleDeferredSync],
   );
+
+  // Keep `syncRef` pointing at the latest `sync` so the deferred scheduler and
+  // abort paths always invoke the current closure (no useCallback dep cycle).
+  syncRef.current = sync;
 
   // Re-sync on every dependency that can move a placeholder: the placeholder set
   // (version), the active tab, and the tabs array (order/sizes changes all

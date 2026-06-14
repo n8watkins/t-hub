@@ -23,7 +23,7 @@
 // Window controls (minimize / maximize-restore / close) and the settings gear
 // use the Tauri window API / settings store and must NOT carry
 // data-tauri-drag-region, or a click would start a window drag instead.
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useWorkspace, deriveLabel } from "../store/workspace";
@@ -45,6 +45,44 @@ function toggleMaximize(): void {
   void getCurrentWindow()
     .toggleMaximize()
     .catch(() => {});
+}
+
+/**
+ * Live "is the window maximized?" flag (BUG 3 — icon reflects state). Seeds from
+ * the current state on mount, then re-reads it on every `tauri://resize` (which
+ * Tauri fires on the maximize/restore transition however it was triggered — our
+ * button, the native Snap flyout, a double-click on the caption, or a keyboard
+ * shortcut). Cleans up the listener on unmount. Errors are swallowed so a missing
+ * Tauri context (e.g. a browser dev server) just leaves the flag false.
+ */
+function useMaximizedState(): boolean {
+  const [maximized, setMaximized] = useState(false);
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    const refresh = () => {
+      void win
+        .isMaximized()
+        .then((m) => {
+          if (!cancelled) setMaximized(m);
+        })
+        .catch(() => {});
+    };
+    refresh();
+    void win
+      .onResized(() => refresh())
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+  return maximized;
 }
 
 /** Close the window, swallowing any IPC rejection. */
@@ -257,6 +295,14 @@ function Brand() {
 // window.
 // ---------------------------------------------------------------------------
 function WindowControls({ satellite = false }: { satellite?: boolean }) {
+  // Track the window's maximized state so the middle button reflects it (BUG 3):
+  // a single square when restored ("Maximize"), overlapping squares when
+  // maximized ("Restore"). Tauri fires `tauri://resize` (onResized) on every
+  // size change, including the maximize/restore transition driven from the
+  // native WM_SYSCOMMAND in src-tauri/src/win_snap.rs, so polling isMaximized()
+  // there keeps the icon in lockstep no matter HOW the toggle happened (our
+  // button, the OS Snap flyout, a double-click, or a keyboard shortcut).
+  const maximized = useMaximizedState();
   return (
     <div className="flex shrink-0 items-stretch">
       <button
@@ -278,28 +324,57 @@ function WindowControls({ satellite = false }: { satellite?: boolean }) {
       </button>
       <button
         type="button"
-        aria-label="Maximize"
-        title="Maximize / Restore"
+        aria-label={maximized ? "Restore" : "Maximize"}
+        title={maximized ? "Restore" : "Maximize"}
         onClick={toggleMaximize}
         className="flex h-8 w-11 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
       >
-        <svg
-          width="10"
-          height="10"
-          viewBox="0 0 10 10"
-          aria-hidden
-          className="pointer-events-none"
-        >
-          <rect
-            x="1"
-            y="1"
-            width="8"
-            height="8"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1"
-          />
-        </svg>
+        {maximized ? (
+          // Restore glyph: two overlapping squares (the front one is the window,
+          // the offset one behind hints it can return to a smaller size).
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 10 10"
+            aria-hidden
+            className="pointer-events-none"
+          >
+            <rect
+              x="1"
+              y="3"
+              width="6"
+              height="6"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1"
+            />
+            <path
+              d="M3 3 V1 H9 V7 H7"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1"
+            />
+          </svg>
+        ) : (
+          // Maximize glyph: a single square (the whole screen).
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 10 10"
+            aria-hidden
+            className="pointer-events-none"
+          >
+            <rect
+              x="1"
+              y="1"
+              width="8"
+              height="8"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1"
+            />
+          </svg>
+        )}
       </button>
       {/* Close (×) — main window only. A satellite returns via "Return" (#6). */}
       {!satellite && (

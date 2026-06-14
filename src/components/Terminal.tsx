@@ -43,6 +43,7 @@ import {
 import type { TerminalId } from "../ipc/types";
 import { useWorkspace } from "../store/workspace";
 import { useTheme, type TerminalPalette } from "../store/theme";
+import { tlog } from "../lib/diag";
 import type { ITheme } from "@xterm/xterm";
 import "./Terminal.css";
 
@@ -273,6 +274,53 @@ export function TerminalView({
         }
         void (async () => {
           try {
+            // STARTUP-FREEZE FIX (BUG 1): subscribe to terminal://output BEFORE
+            // requesting attach, so the backend never streams PTY bytes into a
+            // callback that doesn't exist yet. The OLD ordering attached first
+            // (which spawns the reader thread and starts emitting immediately),
+            // THEN registered onOutput -- so on a cold relaunch with ~16
+            // terminals all attaching at once, the readers flooded OUTPUT events
+            // at callback ids the page hadn't registered (or had torn down during
+            // the mount churn), producing the thousands of "[TAURI] Couldn't find
+            // callback id N" warnings and a grid that rendered blank/frozen until
+            // a manual reload (by which time Rust was idle, so no race).
+            //
+            // Because the listener is now live BEFORE the seed/scrollback is
+            // captured, live bytes can arrive while we're still awaiting the
+            // attach response. We BUFFER those into `liveBuffer` and only start
+            // writing to xterm directly once the seed has been written, then
+            // flush the buffer -- so history (seed) and live output stay correctly
+            // ordered with no duplication and no lost bytes.
+            let seeded = false;
+            const liveBuffer: Uint8Array[] = [];
+
+            const offOutput = await onOutput((e) => {
+              if (e.id !== terminalId || disposed) return;
+              const bytes = decodeBase64(e.base64);
+              if (seeded) term.write(bytes);
+              else liveBuffer.push(bytes);
+            });
+            if (disposed) {
+              void offOutput();
+              return;
+            }
+            unlisteners.push(offOutput);
+
+            const offExit = await onExit((e) => {
+              if (e.id === terminalId && !disposed)
+                term.writeln("\r\n[process exited]");
+            });
+            if (disposed) {
+              void offExit();
+              return;
+            }
+            unlisteners.push(offExit);
+
+            tlog(
+              "attach",
+              `subscribed ${terminalId} (listeners live BEFORE attach); requesting attach ${term.cols}x${term.rows}`,
+            );
+
             const scrollback = await attachTerminal(
               terminalId,
               term.cols,
@@ -286,23 +334,22 @@ export function TerminalView({
             const freshSpawn = seed.length === 0;
             if (!freshSpawn) term.write(seed);
 
-            const offOutput = await onOutput((e) => {
-              if (e.id === terminalId) term.write(decodeBase64(e.base64));
-            });
-            if (disposed) {
-              void offOutput();
-              return;
+            // Seed is on screen; switch to live writes and flush anything that
+            // arrived on the listener while we were awaiting attach/seed.
+            seeded = true;
+            if (liveBuffer.length > 0) {
+              for (const chunk of liveBuffer) term.write(chunk);
+              tlog(
+                "attach",
+                `attached ${terminalId}: seed ${seed.length}B, flushed ${liveBuffer.length} buffered live chunk(s)`,
+              );
+              liveBuffer.length = 0;
+            } else {
+              tlog(
+                "attach",
+                `attached ${terminalId}: seed ${seed.length}B, no buffered live chunks`,
+              );
             }
-            unlisteners.push(offOutput);
-
-            const offExit = await onExit((e) => {
-              if (e.id === terminalId) term.writeln("\r\n[process exited]");
-            });
-            if (disposed) {
-              void offExit();
-              return;
-            }
-            unlisteners.push(offExit);
 
             // On a fresh spawn we seeded nothing, so draw one clean prompt: send
             // Ctrl-L (\x0c) once subscribed. If zsh is still loading it buffers
@@ -415,6 +462,16 @@ export function TerminalView({
 
       // Await all event unlisteners so no stray onOutput fires into a disposed
       // term. Any subscriptions still in-flight bail via the `disposed` flag.
+      // Tearing the listener down on unmount is the OTHER half of the BUG 1 fix:
+      // an orphaned terminal://output listener (one whose xterm is gone) is
+      // exactly the dead callback id the backend would later emit into, so we
+      // must fully drop it rather than leak it.
+      if (unlisteners.length > 0) {
+        tlog(
+          "attach",
+          `teardown ${terminalId}: unlistening ${unlisteners.length} channel(s)`,
+        );
+      }
       void Promise.all(unlisteners.map((un) => un())).catch(() => {
         /* ignore unlisten races */
       });
