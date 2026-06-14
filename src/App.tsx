@@ -11,16 +11,17 @@ import { useSettings } from "./store/settings";
 // (Ctrl/Cmd+B, handled in Canvas) and its width is user-resizable (#2).
 //
 // The OS window is frameless (decorations:false); <Titlebar/> is the only window
-// chrome. When the window is NOT maximized the bar is always visible (a real
-// layout row). When MAXIMIZED it auto-hides for max terminal space (#7) and is
-// revealed by touching the very top edge; on reveal it either pushes the body
-// content down (a layout shift, the default) or overlays it, toggled by the
-// `revealPushesContent` setting (#8).
+// chrome. By default the bar is ALWAYS a visible layout row (so maximize/restore
+// is always reachable). Auto-hide-when-maximized is OPT-IN
+// (settings.autoHideTitlebarMaximized): when enabled and the window is
+// maximized, the bar auto-hides for max terminal space and is revealed by
+// touching the very top edge — either pushing content down (default) or
+// overlaying it, per settings.revealPushesContent (#7/#8).
 
 // Sidebar width (px) — resizable (#2), persisted to localStorage and clamped to
 // a sane range so it can be neither dragged uselessly narrow nor hog the canvas.
 const SIDEBAR_MIN = 180;
-const SIDEBAR_MAX = 480;
+const SIDEBAR_MAX = 360;
 const SIDEBAR_DEFAULT = 256; // matches the old fixed w-64 (16rem)
 const SIDEBAR_KEY = "termhub.sidebar.v1";
 
@@ -76,12 +77,11 @@ function useWindowMaximized(): boolean {
 }
 
 /**
- * Titlebar auto-hide/reveal state for maximized mode (#7/#8). When not
- * maximized the bar is always revealed (no timers). When maximized it reveals
- * briefly then hides after a delay; `reveal()` (top-edge / bar hover) re-shows
- * it and `scheduleHide(ms)` arms the next hide.
+ * Titlebar auto-hide/reveal state. `enabled` is true only when the window is
+ * maximized AND the user opted into auto-hide; when false the bar is always
+ * revealed (no timers), so the default experience keeps a permanent visible bar.
  */
-function useTitlebarReveal(maximized: boolean): {
+function useTitlebarReveal(enabled: boolean): {
   revealed: boolean;
   reveal: () => void;
   scheduleHide: (ms: number) => void;
@@ -109,18 +109,18 @@ function useTitlebarReveal(maximized: boolean): {
 
   useEffect(() => {
     clearTimer();
-    if (!maximized) {
-      setRevealed(true); // always shown when not maximized
+    if (!enabled) {
+      setRevealed(true); // always shown unless auto-hide is active
       return;
     }
-    // Just maximized: show briefly, then auto-hide.
+    // Auto-hide active: show briefly, then hide.
     setRevealed(true);
     timerRef.current = window.setTimeout(
       () => setRevealed(false),
       HIDE_AFTER_INITIAL_MS,
     );
     return clearTimer;
-  }, [maximized, clearTimer]);
+  }, [enabled, clearTimer]);
 
   return { revealed, reveal, scheduleHide };
 }
@@ -132,14 +132,17 @@ export default function App() {
 
   const maximized = useWindowMaximized();
   const revealPushesContent = useSettings((s) => s.revealPushesContent);
-  const { revealed, reveal, scheduleHide } = useTitlebarReveal(maximized);
+  const autoHide = useSettings((s) => s.autoHideTitlebarMaximized);
+  // Auto-hide only kicks in when maximized AND opted in; otherwise the titlebar
+  // is always a visible row so maximize/restore is always reachable.
+  const hideable = maximized && autoHide;
+  const { revealed, reveal, scheduleHide } = useTitlebarReveal(hideable);
 
-  // The bar is shown whenever not maximized, or when maximized and revealed.
-  // In maximized mode it overlays the content unless the push-down setting is on.
-  const barShown = !maximized || revealed;
-  const overlay = maximized && !revealPushesContent;
-  // While maximized, hovering the bar keeps it open; leaving re-arms the hide.
-  const barHover = maximized
+  // The bar is shown whenever auto-hide isn't active, or when it is and revealed.
+  const barShown = !hideable || revealed;
+  const overlay = hideable && !revealPushesContent;
+  // While auto-hiding, hovering the bar keeps it open; leaving re-arms the hide.
+  const barHover = hideable
     ? {
         onPointerEnter: reveal,
         onPointerLeave: () => scheduleHide(HIDE_AFTER_LEAVE_MS),
@@ -195,9 +198,9 @@ export default function App() {
 
   return (
     <div className="relative flex h-full w-full flex-col bg-neutral-950 text-neutral-100">
-      {/* Top-edge reveal hot zone — only while maximized AND the bar is hidden,
-          so it never steals clicks from the revealed bar (#7/#8). */}
-      {maximized && !barShown && (
+      {/* Top-edge reveal hot zone — only while auto-hide is active AND the bar is
+          hidden, so it never steals clicks from the visible bar (#7/#8). */}
+      {hideable && !barShown && (
         <div
           className="absolute inset-x-0 top-0 z-40 h-1.5"
           onPointerEnter={reveal}
@@ -207,7 +210,7 @@ export default function App() {
 
       {/* Titlebar. Overlay mode: absolute, slides over the content. Otherwise an
           in-flow row whose height animates 0<->32px, so revealing it in
-          maximized mode shoves the body down (#8). */}
+          auto-hide mode shoves the body down (#8). */}
       {overlay ? (
         <div
           className="absolute inset-x-0 top-0 z-30"

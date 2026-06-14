@@ -24,6 +24,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
 import { startPointerDrag } from "../lib/pointerDrag";
+import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 
 /** Minimize the window, swallowing any IPC rejection. */
 function minimize(): void {
@@ -243,17 +244,23 @@ function TabStrip() {
     if (editing === tabId) return; // let the rename input own the pointer
     if (e.button !== 0) return;
     setActiveTab(tabId);
+    const name = tabs.find((t) => t.id === tabId)?.name ?? "Workspace";
+    let ghost: DragGhost | null = null;
     startPointerDrag(e.clientX, e.clientY, {
       onBegin: () => {
         setDraggingTab(tabId);
         document.body.dataset.thDragging = "1";
+        ghost = createDragGhost({ title: name, width: 150 });
       },
       onMove: (x, y) => {
+        ghost?.move(x, y);
         const overId = tabUnder(x, y);
         setDropTab(overId && overId !== tabId ? overId : null);
       },
       onEnd: (x, y, committed) => {
         const targetId = committed ? tabUnder(x, y) : null;
+        ghost?.destroy();
+        ghost = null;
         delete document.body.dataset.thDragging;
         setDraggingTab(null);
         setDropTab(null);
@@ -266,7 +273,7 @@ function TabStrip() {
     // The strip scrolls horizontally if there are many tabs; it never grows past
     // the available width, so the flexible drag region + controls stay reachable.
     // `overflow-y-hidden` clips the scrollbar gutter so it can't steal the row.
-    <div className="flex min-w-0 items-stretch gap-1 overflow-x-auto overflow-y-hidden px-1">
+    <div className="flex min-w-0 items-stretch gap-1 overflow-x-auto overflow-y-hidden pl-4 pr-1">
       {tabs.map((tab) => {
         const active = tab.id === activeTabId;
         const closable = tabs.length > 1 && tab.order.length === 0;
