@@ -31,6 +31,7 @@ import {
   useState,
 } from "react";
 import { useWorkspace } from "../store/workspace";
+import { usePanels } from "../store/panels";
 import { TerminalView } from "./Terminal";
 import type { TerminalId } from "../ipc/types";
 // Diagnostics: tlog mirrors every pool show/park decision into a file the
@@ -175,6 +176,18 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // re-run on focus. We subscribe to it here purely to drive a rAF re-sync after
   // a focus/selection change (see the focus effect), so positions always settle.
   const focusedId = useWorkspace((s) => s.focusedId);
+
+  // Per-tile panel state (usePanels) now gates terminal visibility too: a pooled
+  // terminal is SHOWN only when its tile's active tab is "terminal" (the Files/
+  // Preview/Dev surfaces render in the tile body instead and must not be covered
+  // by the xterm), and only when it isn't eclipsed by ANOTHER tile's fullscreen.
+  // We subscribe to BOTH the tab map and fullscreenId so switching a tile's tab
+  // or toggling fullscreen re-renders this layer, which re-runs the position/
+  // visibility sync via the layout-effect below (panelTab/fullscreenId are in
+  // its dep list). The whole `tab` record object is a fresh reference whenever
+  // any tile's tab changes (see panels.setTab), so this is a sufficient trigger.
+  const panelTab = usePanels((s) => s.tab);
+  const fullscreenId = usePanels((s) => s.fullscreenId);
 
   // THE FIX (mutedbug): poolIds must be a STABLE DOM order that does NOT change
   // when a tile is reordered or moved between tabs. Positioning is absolute
@@ -335,19 +348,41 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // `trigger` tags the call site for the diag instrumentation (tlog -> file) so
   // we can SEE, on the user's machine, which path drove each show/park decision.
   //
-  // THE INVARIANT (mutedbug fix): a terminal whose tab is the ACTIVE tab is
-  // NEVER hidden/parked by sync(). It is always visible, positioned at the best
-  // geometry we have (a freshly-measured real rect, else its last-good rect).
-  // Only terminals on INACTIVE tabs are parked offscreen. Previously an
-  // active-tab terminal with a transient/zero rect (e.g. a sync that landed
-  // mid-reflow, or — see setFocus — a sync triggered by a focus/resize while the
-  // grid was momentarily un-laid-out) could be parked and STAY parked, because
-  // a focus click does not change tabs/activeTabId and so never re-ran the
-  // layout effect. The whole active grid then read blank until a drag/tab-switch
-  // forced a re-sync. Making "active tab => always shown" an unconditional
-  // invariant removes that failure mode entirely.
+  // THE INVARIANT (mutedbug fix), now scoped to the per-tile panel: a terminal
+  // that is ELIGIBLE to show is NEVER hidden/parked by sync() for a transient/
+  // zero rect — it is held visible at the best geometry we have (a freshly-
+  // measured real rect, else its last-good rect) and a deferred re-sync lands
+  // the settled position once layout settles. This is what stops the active grid
+  // flashing blank after a reorder/focus mid-reflow.
+  //
+  // A terminal is ELIGIBLE (shouldShow) when ALL hold:
+  //   1. its tile is on the ACTIVE workspace tab (inactive tabs are display:none
+  //      so their placeholders have zero-area rects — never stack them at 0,0);
+  //   2. its tile's panel tab is "terminal" (on Files/Preview/Dev the tile body
+  //      renders that surface and the xterm must be parked so it doesn't cover
+  //      it); and
+  //   3. it is not eclipsed by ANOTHER tile's fullscreen. When some tile is
+  //      fullscreen, ONLY that tile is visible (Canvas renders its placeholder in
+  //      a full-window layer over everything), so every other terminal parks.
+  // Terminals that are NOT eligible are parked offscreen + hidden, exactly like
+  // an inactive-tab terminal always was.
   const sync = useCallback(
     (trigger: string) => {
+      // Latest panel state. Read here (not via closure) so the predicate is
+      // always current even when sync runs from a deferred rAF; the layout-effect
+      // still re-runs sync when panelTab/fullscreenId change (they're in its dep
+      // list), so a tab/fullscreen toggle always triggers a fresh sync.
+      const panels = usePanels.getState();
+      const fsId = panels.fullscreenId;
+      const tabMap = panels.tab;
+      // Eligibility: see the long comment above. The fullscreen tile shows only
+      // its own terminal (and only if its panel tab is "terminal"); with no
+      // fullscreen, every active-tab terminal-on-Terminal shows.
+      const shouldShow = (id: TerminalId): boolean => {
+        if ((tabMap[id] ?? "terminal") !== "terminal") return false;
+        if (fsId != null) return id === fsId;
+        return tabOfId.get(id) === activeTabId;
+      };
       const container = containerRef.current;
       if (!container) {
         // BUG 2 (startup flicker): the first layout-effect can run before the
@@ -389,7 +424,7 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
         const wrap = wrapRefs.current.get(id);
         if (!wrap) continue;
         const slot = slots.get(id);
-        const onActiveTab = tabOfId.get(id) === activeTabId;
+        const show = shouldShow(id);
         const rect = slot?.getBoundingClientRect();
         const rectOk =
           !!rect && rect.width > 0 && rect.height > 0 && !baseDegenerate;
@@ -397,8 +432,8 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
           ? `${Math.round(rect.width)}x${Math.round(rect.height)}`
           : "none";
 
-        // ===== ACTIVE-TAB INVARIANT: always show, never park. =====
-        if (onActiveTab) {
+        // ===== ELIGIBLE INVARIANT: show, never park for a transient rect. =====
+        if (show) {
           // Best geometry: a healthy fresh rect wins; otherwise hold last-good.
           if (slot && rectOk && rect) {
             const offsetX = rect.left - base.left;
@@ -412,30 +447,30 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
             const transform = `translate(${offsetX}px, ${offsetY}px)`;
             tlog(
               "pool",
-              `sync(${trigger}) SHOW ${id} (active): rect ${rectStr} @ (${Math.round(
+              `sync(${trigger}) SHOW ${id} (eligible): rect ${rectStr} @ (${Math.round(
                 offsetX,
               )},${Math.round(offsetY)}) base ${Math.round(
                 base.width,
-              )}x${Math.round(base.height)} activeTab=${activeTabId}`,
+              )}x${Math.round(base.height)} activeTab=${activeTabId} fs=${fsId ?? "none"}`,
             );
             applyVisible(wrap, transform, rect.width, rect.height, id);
             // A real measure landed -> layout has settled for this id; reset the
             // deferred retry budget so future transient reflows get a fresh chain.
             deferredRetriesRef.current = 0;
-            // First healthy active SHOW: the startup hydration window is over, so
-            // the muted-flash guard can stop topping up the deferred budget.
+            // First healthy eligible SHOW: the startup hydration window is over,
+            // so the muted-flash guard can stop topping up the deferred budget.
             firstPaintSettledRef.current = true;
             continue;
           }
 
           // Transient/zero rect or degenerate base: HOLD at last-good (stay
           // visible) and schedule a deferred re-sync to land the settled
-          // position. Per the invariant we do NOT park an active terminal.
+          // position. Per the invariant we do NOT park an eligible terminal.
           const lastGood = lastGoodRectRef.current.get(id);
           if (lastGood) {
             tlog(
               "pool",
-              `sync(${trigger}) HOLD ${id} (active): degenerate rect=${rectStr} ` +
+              `sync(${trigger}) HOLD ${id} (eligible): degenerate rect=${rectStr} ` +
                 `baseDegenerate=${baseDegenerate}; pinning to last-good ` +
                 `${Math.round(lastGood.width)}x${Math.round(
                   lastGood.height,
@@ -453,10 +488,10 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
           // mounted before its first layout). Keep it VISIBLE (invariant) but it
           // has no geometry to place — leave whatever transform it has and let
           // the deferred re-sync land a real position next frame. We deliberately
-          // do NOT park it offscreen, since the active tab must never go blank.
+          // do NOT park it offscreen, since an eligible terminal must never blank.
           tlog(
             "pool",
-            `sync(${trigger}) WAIT ${id} (active): no rect (${rectStr}) and no ` +
+            `sync(${trigger}) WAIT ${id} (eligible): no rect (${rectStr}) and no ` +
               `last-good yet; keeping visible, scheduling re-sync activeTab=${activeTabId}`,
           );
           wrap.style.visibility = "visible";
@@ -465,13 +500,16 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
           continue;
         }
 
-        // ===== INACTIVE-TAB: park offscreen + hidden. =====
-        // Keep mounted but invisible + inert, parked offscreen so it never
-        // overlaps the active grid. Park at the last known size so a hidden tab's
-        // xterm isn't forced to 0x0 (which would refit to 0 cols).
+        // ===== NOT ELIGIBLE: park offscreen + hidden. =====
+        // Inactive tab, a non-terminal panel tab (Files/Preview/Dev showing in
+        // the tile body), or eclipsed by another tile's fullscreen. Keep mounted
+        // but invisible + inert, parked offscreen so it never overlaps the active
+        // grid (or the in-tile surface). Park at the last known size so a hidden
+        // terminal's xterm isn't forced to 0x0 (which would refit to 0 cols).
         tlog(
           "pool",
-          `sync(${trigger}) PARK ${id} (inactive): rect=${rectStr} activeTab=${activeTabId}`,
+          `sync(${trigger}) PARK ${id} (not-eligible): rect=${rectStr} ` +
+            `tab=${tabMap[id] ?? "terminal"} activeTab=${activeTabId} fs=${fsId ?? "none"}`,
         );
         wrap.style.visibility = "hidden";
         wrap.style.pointerEvents = "none";
@@ -505,17 +543,36 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
         }
       }
     },
-    [containerRef, slotsRef, tabOfId, activeTabId, applyVisible, scheduleDeferredSync],
+    // panelTab + fullscreenId are dependencies even though sync reads the LIVE
+    // store via getState(): including them regenerates `sync` when a tile's tab
+    // or the fullscreen target changes, which cascades to the position layout-
+    // effect (it depends on `sync`) so visibility re-syncs immediately on a
+    // tab/fullscreen toggle. tabOfId/activeTabId stay for the workspace-tab gate.
+    [
+      containerRef,
+      slotsRef,
+      tabOfId,
+      activeTabId,
+      panelTab,
+      fullscreenId,
+      applyVisible,
+      scheduleDeferredSync,
+    ],
   );
 
   // Keep `syncRef` pointing at the latest `sync` so the deferred scheduler and
   // abort paths always invoke the current closure (no useCallback dep cycle).
   syncRef.current = sync;
 
-  // Re-sync on every dependency that can move a placeholder: the placeholder set
-  // (version), the active tab, and the tabs array (order/sizes changes all
-  // produce a new `tabs` reference via the store). useLayoutEffect lands the
-  // position before paint so a tab switch / move shows no transient mis-place.
+  // Re-sync on every dependency that can move a placeholder OR change a
+  // terminal's visibility: the placeholder set (version), the active workspace
+  // tab, the tabs array (order/sizes changes all produce a new `tabs` reference
+  // via the store), AND the per-tile panel state (a tile's panel tab or the
+  // fullscreen target — both gate `shouldShow`). useLayoutEffect lands the
+  // position/visibility before paint so a tab switch / move / panel-tab switch /
+  // fullscreen toggle shows no transient mis-place or flash. (`sync` already
+  // depends on panelTab/fullscreenId so it changes identity on those, but we
+  // also list them here so the intent is explicit and robust.)
   //
   // A same-tab REORDER (moveTile) produces a new `tabs` reference (it drops
   // manual sizes), so this fires and re-measures -- confirming the reorder path
@@ -530,7 +587,7 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
     sync("layout-effect");
     const raf = requestAnimationFrame(() => sync("layout-rAF"));
     return () => cancelAnimationFrame(raf);
-  }, [sync, version, tabs, activeTabId]);
+  }, [sync, version, tabs, activeTabId, panelTab, fullscreenId]);
 
   // Re-sync after a FOCUS/SELECTION change (mutedbug fix). Clicking a tile header
   // calls setFocus, which mutates ONLY `focusedId` — not `tabs`/`activeTabId` —
@@ -604,7 +661,21 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       // two. The container is click-through (pointer-events:none) so headers and
       // gutters stay grabbable; each pooled terminal re-enables pointer events on
       // itself so it's interactive.
-      className="pointer-events-none absolute inset-0 z-0"
+      //
+      // FULLSCREEN: when a tile is fullscreen, Canvas renders that tile in a
+      // full-window `fixed z-40` layer with an empty body placeholder; the pool
+      // positions the fullscreen terminal over it (negative offsets relative to
+      // the container reach up to the viewport origin). For the xterm to paint
+      // OVER the fullscreen tile's body we lift the whole overlay above that
+      // layer (z-50) while fullscreen is active — every OTHER terminal is parked
+      // offscreen/hidden so only the fullscreen one is visible, and the overlay
+      // stays pointer-events:none except over the terminal itself, so the
+      // fullscreen header/tab bar (below the terminal body, in the z-40 layer)
+      // stays clickable.
+      className={
+        "pointer-events-none absolute inset-0 " +
+        (fullscreenId != null ? "z-50" : "z-0")
+      }
       aria-hidden={false}
     >
       {poolIds.map((id) => (
