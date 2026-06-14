@@ -60,11 +60,16 @@ impl From<TmuxError> for String {
 fn tmux(args: &[&str]) -> Command {
     #[cfg(windows)]
     let mut cmd = {
+        use std::os::windows::process::CommandExt;
         // `--cd ~` roots the tmux server (and each new session's pane) at the WSL
         // home, so new terminals open in ~ (native ext4) instead of the app's
         // /mnt/c launch dir -- matching the user's normal `~` terminal view.
         let mut c = Command::new("wsl.exe");
         c.arg("--cd").arg("~").arg("--").arg("tmux");
+        // CREATE_NO_WINDOW: every tmux control command routes through `wsl.exe`,
+        // and each `wsl.exe` spawn would otherwise flash a console (CMD) window
+        // for a split second. Suppress it so terminal spawns stay invisible.
+        c.creation_flags(0x0800_0000);
         c
     };
     #[cfg(unix)]

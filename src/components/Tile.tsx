@@ -22,6 +22,7 @@ import { useTheme } from "../store/theme";
 import { killTerminal } from "../ipc/client";
 import { TerminalView } from "./Terminal";
 import { startPointerDrag } from "../lib/pointerDrag";
+import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 
 export interface TileProps {
   terminalId: TerminalId;
@@ -102,14 +103,24 @@ export function Tile({
     if (e.button !== 0) return; // primary (left) button only
     onFocus(); // pressing the header selects the tile right away
     const sourceId = terminalId;
+    let ghost: DragGhost | null = null;
     startPointerDrag(e.clientX, e.clientY, {
       onBegin: () => {
         setDraggingTile(sourceId);
         // Make terminals pointer-inert for the drag (index.css) so the gesture
         // tracks over them and elementFromPoint resolves to tiles, not canvases.
         document.body.dataset.thDragging = "1";
+        // A floating frame of the tile that follows the cursor (clear "I'm
+        // carrying this tile" feedback the dimmed source alone doesn't give).
+        ghost = createDragGhost({
+          title,
+          subtitle: cwd || undefined,
+          width: 240,
+          bodyHeight: 120,
+        });
       },
       onMove: (x, y) => {
+        ghost?.move(x, y);
         const { tileId, tabId } = dropTargetAt(x, y);
         setDropTab(tabId);
         setDropTile(tileId && tileId !== sourceId ? tileId : null);
@@ -118,6 +129,8 @@ export function Tile({
         const target = committed
           ? dropTargetAt(x, y)
           : { tileId: null, tabId: null };
+        ghost?.destroy();
+        ghost = null;
         delete document.body.dataset.thDragging;
         setDraggingTile(null);
         setDropTile(null);

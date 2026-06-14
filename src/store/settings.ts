@@ -1,82 +1,73 @@
 // The settings store holds TermHub's *general app settings* — the non-theme
-// knobs of the shell (PRD §5.5 settings surface). It is deliberately separate
-// from the theme store: the theme store owns the look (colors/sizes written as
-// CSS vars), whereas this store owns behavior flags + the transient open/closed
-// state of the settings panel itself.
+// knobs of the shell (PRD §5.5 settings surface) — kept separate from the theme
+// store: the theme store owns the look (CSS vars), this owns behavior flags plus
+// the transient open/closed state of the settings panel itself.
 //
-// Like the theme + workspace stores, persistence is localStorage for now
-// (SQLite lands later): we persist ONLY the behavior flags, best-effort, under a
-// versioned key. Transient UI state (whether the panel is open) is never
-// persisted — a reopen of the app should start with the panel closed.
+// Persistence is localStorage for now (SQLite lands later): we persist ONLY the
+// behavior flags, best-effort, under a versioned key. Transient UI state (panel
+// open) is never persisted — a reopen of the app starts with the panel closed.
 import { create } from "zustand";
-
-// ---------------------------------------------------------------------------
-// Persistence (localStorage) — behavior flags only
-// ---------------------------------------------------------------------------
 
 const PERSIST_KEY = "termhub.settings.v1";
 
-/** Default for `revealPushesContent` (titlebar auto-reveal pushes body down). */
-const DEFAULT_REVEAL_PUSHES_CONTENT = true;
+/** Persisted flag defaults. */
+const DEFAULTS = {
+  /** Titlebar auto-reveal pushes the body down (vs. overlays it). */
+  revealPushesContent: true,
+  /** Auto-hide the titlebar when the window is maximized (opt-in). Default OFF
+   *  so maximize/restore is always reachable; the user can enable it. */
+  autoHideTitlebarMaximized: false,
+} as const;
 
-/** The subset of settings we persist across UI reopens (flags only). */
 interface PersistedSettings {
   revealPushesContent: boolean;
+  autoHideTitlebarMaximized: boolean;
 }
 
 function loadPersisted(): PersistedSettings {
-  if (typeof localStorage === "undefined") {
-    return { revealPushesContent: DEFAULT_REVEAL_PUSHES_CONTENT };
-  }
+  if (typeof localStorage === "undefined") return { ...DEFAULTS };
   try {
     const raw = localStorage.getItem(PERSIST_KEY);
-    if (!raw) return { revealPushesContent: DEFAULT_REVEAL_PUSHES_CONTENT };
-    const parsed = JSON.parse(raw) as Partial<PersistedSettings>;
+    if (!raw) return { ...DEFAULTS };
+    const p = JSON.parse(raw) as Partial<PersistedSettings>;
     return {
       revealPushesContent:
-        typeof parsed.revealPushesContent === "boolean"
-          ? parsed.revealPushesContent
-          : DEFAULT_REVEAL_PUSHES_CONTENT,
+        typeof p.revealPushesContent === "boolean"
+          ? p.revealPushesContent
+          : DEFAULTS.revealPushesContent,
+      autoHideTitlebarMaximized:
+        typeof p.autoHideTitlebarMaximized === "boolean"
+          ? p.autoHideTitlebarMaximized
+          : DEFAULTS.autoHideTitlebarMaximized,
     };
   } catch {
-    return { revealPushesContent: DEFAULT_REVEAL_PUSHES_CONTENT };
+    return { ...DEFAULTS };
   }
 }
 
-function savePersisted(settings: PersistedSettings): void {
+function savePersisted(s: PersistedSettings): void {
   if (typeof localStorage === "undefined") return;
   try {
-    localStorage.setItem(PERSIST_KEY, JSON.stringify(settings));
+    localStorage.setItem(PERSIST_KEY, JSON.stringify(s));
   } catch {
-    // localStorage full / unavailable — non-fatal; setting stays in memory.
+    // localStorage full / unavailable — non-fatal; settings stay in memory.
   }
 }
 
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
-
 interface SettingsState {
-  /**
-   * Whether the settings panel is open. Transient UI state — NOT persisted, so
-   * the app always boots with the panel closed.
-   */
+  /** Whether the settings panel is open. Transient — NOT persisted. */
   settingsOpen: boolean;
-  /** Open the settings panel. */
   openSettings: () => void;
-  /** Close the settings panel. */
   closeSettings: () => void;
-  /** Toggle the settings panel open/closed (the Ctrl/Cmd+, handler). */
   toggleSettings: () => void;
 
-  /**
-   * When the titlebar auto-reveals in maximized mode, whether it pushes body
-   * content down via a layout shift (true) vs. overlaying it (false). Persisted;
-   * the flag + setter live here, the titlebar reveal behavior consumes it.
-   */
+  /** Titlebar auto-reveal pushes content down (true) vs. overlays it (false). */
   revealPushesContent: boolean;
-  /** Set whether the titlebar reveal pushes content down (persisted). */
   setRevealPushesContent: (v: boolean) => void;
+
+  /** Auto-hide the titlebar when maximized (opt-in; default false). */
+  autoHideTitlebarMaximized: boolean;
+  setAutoHideTitlebarMaximized: (v: boolean) => void;
 }
 
 const initial = loadPersisted();
@@ -90,6 +81,18 @@ export const useSettings = create<SettingsState>((set, get) => ({
   revealPushesContent: initial.revealPushesContent,
   setRevealPushesContent: (v) => {
     set({ revealPushesContent: v });
-    savePersisted({ revealPushesContent: v });
+    savePersisted({
+      revealPushesContent: v,
+      autoHideTitlebarMaximized: get().autoHideTitlebarMaximized,
+    });
+  },
+
+  autoHideTitlebarMaximized: initial.autoHideTitlebarMaximized,
+  setAutoHideTitlebarMaximized: (v) => {
+    set({ autoHideTitlebarMaximized: v });
+    savePersisted({
+      revealPushesContent: get().revealPushesContent,
+      autoHideTitlebarMaximized: v,
+    });
   },
 }));
