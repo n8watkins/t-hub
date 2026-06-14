@@ -92,16 +92,14 @@ function parseBlocks(source: string): Block[] {
       continue;
     }
 
-    // Indented code block (4+ spaces), only as a standalone block.
+    // Indented code block (4+ spaces). A blank line ends the block and is left
+    // for the outer loop to skip as a separator.
     if (/^ {4}\S/.test(line)) {
       const body: string[] = [];
-      while (i < lines.length && (/^ {4}/.test(lines[i]) || lines[i].trim() === "")) {
-        if (i + 1 >= lines.length && lines[i].trim() === "") break;
+      while (i < lines.length && /^ {4}/.test(lines[i])) {
         body.push(lines[i].replace(/^ {4}/, ""));
         i++;
       }
-      // Trim trailing blank lines captured by the loop.
-      while (body.length && body[body.length - 1].trim() === "") body.pop();
       blocks.push({ kind: "code", lang: "", text: body.join("\n") });
       continue;
     }
