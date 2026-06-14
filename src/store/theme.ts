@@ -758,6 +758,8 @@ interface ThemeStore {
   setTerminalToken: (patch: Partial<TerminalPalette>) => void;
   /** Patch a single ANSI color. */
   setAnsiColor: (key: keyof AnsiPalette, value: string) => void;
+  /** Restore the active theme's terminal palette to the default (ANSI + base). */
+  resetTerminalPalette: () => void;
 
   /** Save the current active theme as a named preset. */
   saveAsPreset: (name: string) => void;
@@ -822,6 +824,19 @@ export const useTheme = create<ThemeStore>((set, get) => ({
     const next: Theme = {
       ...cur,
       terminal: { ...base, ansi: { ...base.ansi, [key]: value } },
+    };
+    get().setTheme(next);
+  },
+
+  resetTerminalPalette: () => {
+    const cur = get().active;
+    // Restore the active theme's terminal palette to the default (deep-cloned so
+    // later edits don't mutate DEFAULT_THEME). Routes through setTheme so it
+    // applies + persists + echoes to the backend like every other edit.
+    const def = DEFAULT_THEME.terminal!;
+    const next: Theme = {
+      ...cur,
+      terminal: { ...def, ansi: { ...def.ansi } },
     };
     get().setTheme(next);
   },
