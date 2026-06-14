@@ -12,5 +12,11 @@
          (live theme application + backend/MCP bridge + Ctrl/Cmd+, editor) into
          its own React root, so it needs no hook in App.tsx / main.tsx. -->
     <script type="module" src="/src/themeBootstrap.tsx"></script>
+    <!-- MCP control bridge: a side-effect module that subscribes to the
+         backend's `control://apply` event (emitted when an MCP Organization
+         tool — focus_session / move_tile / rename_tab — is dispatched) and
+         applies the mutation to the workspace store. No React render; runs its
+         subscription on import, mirroring themeBootstrap above. -->
+    <script type="module" src="/src/ipc/controlBridge.ts"></script>
   </body>
 </html>

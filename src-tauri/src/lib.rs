@@ -108,7 +108,32 @@ fn spawn_agent_connect(state: &AppState) {
 /// it is written to the handshake file alongside the bound port so `termhub-mcp`
 /// can discover + authenticate to the channel. An explicit `TERMHUB_CONTROL_TOKEN`
 /// overrides the generated token (useful for test harnesses).
-fn start_control_listener(state: &AppState) {
+// --- MCP control://apply forwarder (feat/mcp2) -----------------------------
+// The Organization-tier MCP tools (`focus_session`, `move_tile`, `rename_tab`)
+// apply a pure UI mutation. The control listener accepts + audits them, then
+// forwards `{command, args}` to the frontend via this sink, which emits a Tauri
+// `control://apply` event; `src/ipc/controlBridge.ts` subscribes and dispatches
+// it into the workspace store. Kept here (a clearly separate block) so the sink
+// stays out of `control.rs`'s tauri-free surface.
+const CONTROL_APPLY_EVENT: &str = "control://apply";
+
+struct AppHandleApplySink {
+    app: tauri::AppHandle,
+}
+
+impl control::ApplySink for AppHandleApplySink {
+    fn apply(&self, command: &str, args: &serde_json::Value) -> Result<(), String> {
+        use tauri::Emitter;
+        self.app
+            .emit(
+                CONTROL_APPLY_EVENT,
+                serde_json::json!({ "command": command, "args": args }),
+            )
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn start_control_listener(state: &AppState, app: &tauri::AppHandle) {
     let token = std::env::var("TERMHUB_CONTROL_TOKEN")
         .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
 
@@ -121,7 +146,12 @@ fn start_control_listener(state: &AppState) {
         bridge.with_supervisor(|s| f(s));
     });
 
-    let ctx = control::ControlContext::new(state.status.clone(), supervisor, token);
+    // Forward Organization-tier UI mutations to the frontend via control://apply.
+    let apply_sink: std::sync::Arc<dyn control::ApplySink> =
+        std::sync::Arc::new(AppHandleApplySink { app: app.clone() });
+
+    let ctx = control::ControlContext::new(state.status.clone(), supervisor, token)
+        .with_apply_sink(apply_sink);
     match control::start(ctx) {
         Ok(h) => eprintln!(
             "termhub: control listener on {} (handshake: {})",
@@ -159,7 +189,7 @@ pub fn run() {
             // `tools/call` over the local control channel (PRD §9.6). A bind
             // failure is logged and does not abort startup (the channel is
             // optional, like the agent bridge).
-            start_control_listener(&state);
+            start_control_listener(&state, app.handle());
             // Install the system-tray icon + menu (#17). A tray build failure is
             // logged and does not abort startup; the app remains usable via its
             // window (close-to-tray still works regardless via on_window_event).
