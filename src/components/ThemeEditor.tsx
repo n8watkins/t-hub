@@ -1,16 +1,17 @@
-// ThemeEditor — the live "settings" surface the app was missing (PRD §5.5).
+// ThemeEditor — the live Settings surface the app was missing (PRD §5.5).
 //
 // The whole user-facing promise of the theming system lives here: a person
 // customizes TermHub's look WITHOUT editing config files, and every change is
 // instant (each control writes a token into the theme store, which writes a CSS
 // var, which re-renders the chrome). It is a fully self-contained overlay:
-//   - It owns its own open/closed state and a global `Ctrl/Cmd+,` keydown
-//     listener to toggle itself, so App.tsx never has to know it exists.
+//   - Its open/closed state lives in the settings store (so other surfaces can
+//     open it too); a global `Ctrl/Cmd+,` keydown listener toggles it via the
+//     store, so App.tsx never has to know it exists.
 //   - It renders nothing until opened (a fixed, right-anchored panel + scrim).
 //   - Esc closes it; a click on the scrim closes it.
 //
-// Controls are grouped (Presets, Colors, Layout, Typography, Terminal) and each
-// is bound straight to the store's per-token setters, so editing is live. The
+// Controls are grouped (Behavior, Presets, Colors, Layout, Typography, Terminal)
+// and each is bound straight to a store's setters, so editing is live. The
 // Presets group also does Save-as-preset, preset switching, and Import/Export
 // JSON (themes are shareable text, like VS Code).
 import { useEffect, useRef, useState } from "react";
@@ -20,40 +21,43 @@ import {
   type ChromeTokens,
   type AnsiPalette,
 } from "../store/theme";
+import { useSettings } from "../store/settings";
 
-/** Toggle the editor with Ctrl/Cmd+, (and let Esc close it). Self-contained. */
-function useEditorToggle(): [boolean, (open: boolean) => void] {
-  const [open, setOpen] = useState(false);
+/**
+ * Wire the global `Ctrl/Cmd+,` toggle (and Esc-to-close) onto the settings
+ * store, so the panel's open state is shared rather than component-local.
+ */
+function useEditorHotkeys(): void {
+  const toggleSettings = useSettings((s) => s.toggleSettings);
+  const closeSettings = useSettings((s) => s.closeSettings);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
-      // Ctrl/Cmd+, opens/closes the editor (matches the conventional "settings"
+      // Ctrl/Cmd+, opens/closes the panel (matches the conventional "settings"
       // shortcut). `e.key` is "," regardless of layout shifts for this combo.
       if (mod && e.key === "," && !e.altKey && !e.shiftKey) {
         e.preventDefault();
-        setOpen((v) => !v);
+        toggleSettings();
       } else if (e.key === "Escape") {
         // Only consume Escape when we're actually open (don't swallow it
         // globally — terminals/inputs may want it when the panel is closed).
-        setOpen((v) => {
-          if (v) {
-            e.preventDefault();
-            return false;
-          }
-          return v;
-        });
+        if (useSettings.getState().settingsOpen) {
+          e.preventDefault();
+          closeSettings();
+        }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
-  return [open, setOpen];
+  }, [toggleSettings, closeSettings]);
 }
 
 export function ThemeEditor() {
-  const [open, setOpen] = useEditorToggle();
+  useEditorHotkeys();
+  const open = useSettings((s) => s.settingsOpen);
+  const closeSettings = useSettings((s) => s.closeSettings);
   if (!open) return null;
-  return <ThemeEditorPanel onClose={() => setOpen(false)} />;
+  return <ThemeEditorPanel onClose={closeSettings} />;
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +73,9 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
   const exportJSON = useTheme((s) => s.exportJSON);
   const importJSON = useTheme((s) => s.importJSON);
   const resetToDefault = useTheme((s) => s.resetToDefault);
+
+  const revealPushesContent = useSettings((s) => s.revealPushesContent);
+  const setRevealPushesContent = useSettings((s) => s.setRevealPushesContent);
 
   const c = active.chrome;
   const presetNames = [
@@ -103,13 +110,13 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
           className="flex shrink-0 items-center justify-between border-b px-4 py-3"
           style={{ borderColor: "var(--th-border)" }}
         >
-          <div className="text-sm font-semibold">Theme</div>
+          <div className="text-sm font-semibold">Settings</div>
           <button
             type="button"
             onClick={onClose}
             className="rounded px-1.5 leading-none hover:bg-neutral-700/40"
             title="Close (Esc · Ctrl/Cmd+,)"
-            aria-label="Close theme editor"
+            aria-label="Close settings"
             style={{ color: "var(--th-fg-muted)" }}
           >
             ×
@@ -118,6 +125,15 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
 
         {/* Scrollable body of grouped controls */}
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+          {/* --- Behavior (general app settings, not theme tokens) --- */}
+          <Group title="Behavior">
+            <SettingToggleRow
+              label="Titlebar reveal pushes content down"
+              value={revealPushesContent}
+              onChange={setRevealPushesContent}
+            />
+          </Group>
+
           {/* --- Presets / share --- */}
           <Group title="Preset">
             <Row label="Active">
@@ -572,6 +588,33 @@ function ToggleRow({
         type="checkbox"
         checked={value}
         onChange={(e) => set(k, e.target.checked as ChromeTokens[typeof k])}
+        className="h-3.5 w-3.5 cursor-pointer"
+        style={{ accentColor: "var(--th-accent)" }}
+      />
+    </label>
+  );
+}
+
+/**
+ * A boolean toggle wired to a plain callback (used for settings-store flags,
+ * which aren't chrome tokens). Same visual style as {@link ToggleRow}.
+ */
+function SettingToggleRow({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label className="flex cursor-pointer items-center justify-between gap-3 text-xs">
+      <span style={{ color: "var(--th-fg)" }}>{label}</span>
+      <input
+        type="checkbox"
+        checked={value}
+        onChange={(e) => onChange(e.target.checked)}
         className="h-3.5 w-3.5 cursor-pointer"
         style={{ accentColor: "var(--th-accent)" }}
       />
