@@ -50,10 +50,9 @@ export function RecentList({ onRecall }: RecentListProps) {
   const [loaded, setLoaded] = useState(false);
 
   const refresh = useCallback(() => {
-    // Skip work when the window is hidden (matches Canvas's cwd poll guard).
-    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
-      return;
-    }
+    // NB: no visibility guard here. The fetch is cheap (the backend reads only a
+    // 32KB prefix per transcript) and an early return before setLoaded(true) on a
+    // mounted-while-hidden window could stick the list on "Loading..." forever.
     void recentSessions()
       .then((list) => {
         setSessions(list);

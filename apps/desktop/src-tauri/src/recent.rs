@@ -75,6 +75,10 @@ pub async fn recent_sessions() -> Result<Vec<RecentSession>, String> {
 /// error inside the platform reader degrades to an empty list.
 fn collect_recent() -> Vec<RecentSession> {
     let mut sessions = read_sessions();
+    crate::diag::diag_log(format!(
+        "{{\"t\":\"recent\",\"m\":\"collect_recent: {} sessions before cap\"}}",
+        sessions.len()
+    ));
     // Newest first by last-seen, then cap.
     sessions.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
     sessions.truncate(RECENT_LIMIT);
@@ -246,6 +250,14 @@ fn read_sessions_unix() -> Vec<RecentSession> {
 /// header; `<byte-length>` lets us slice exactly the file's bytes regardless of
 /// embedded newlines. Control chars chosen because they never appear in paths or
 /// JSON text. Best-effort: a failed spawn / non-zero exit yields an empty list.
+/// The WSL distro to shell into (mirrors files.rs::host_distro so Recent and the
+/// file index agree on which distro holds `~/.claude`). Overridable via
+/// TERMHUB_DISTRO; defaults to the dev distro.
+#[cfg(windows)]
+fn host_distro() -> String {
+    std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+}
+
 #[cfg(windows)]
 fn read_sessions_windows() -> Vec<RecentSession> {
     use std::os::windows::process::CommandExt;
@@ -281,20 +293,49 @@ done
     );
 
     let mut cmd = Command::new("wsl.exe");
-    // `--cd ~` so $HOME resolves to the distro home; `bash -lc` for a login shell
-    // (matches how the agent + tmux cross the boundary).
-    cmd.arg("--cd").arg("~").arg("--").arg("bash").arg("-lc").arg(&script);
+    // Target the distro EXPLICITLY (-d), matching files.rs's working pattern,
+    // rather than relying on the default distro. The script reaches the catalog
+    // via $HOME (set by the `bash -l` login shell), so we don't need `--cd`.
+    let distro = host_distro();
+    cmd.arg("-d")
+        .arg(&distro)
+        .arg("--")
+        .arg("bash")
+        .arg("-lc")
+        .arg(&script);
     // CREATE_NO_WINDOW: suppress the brief console flash every `wsl.exe` spawn
     // would otherwise show (same flag tmux.rs uses).
     cmd.creation_flags(0x0800_0000);
 
-    let Ok(output) = cmd.output() else {
-        return Vec::new();
+    // DIAG: this path is best-effort and used to swallow every failure silently,
+    // which made an empty Recent list impossible to debug from a release build.
+    // Log the spawn result, exit status, and byte counts so the file diag log
+    // shows exactly why Recent is empty (no wsl / non-zero exit / zero stdout).
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            crate::diag::diag_log(format!(
+                "{{\"t\":\"recent\",\"m\":\"wsl.exe spawn FAILED (distro={distro}): {e}\"}}"
+            ));
+            return Vec::new();
+        }
     };
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        crate::diag::diag_log(format!(
+            "{{\"t\":\"recent\",\"m\":\"wsl.exe exit {:?} (distro={distro}); stderr={}\"}}",
+            output.status.code(),
+            stderr.trim().replace('"', "'").chars().take(300).collect::<String>()
+        ));
         return Vec::new();
     }
-    parse_framed(&output.stdout)
+    let sessions = parse_framed(&output.stdout);
+    crate::diag::diag_log(format!(
+        "{{\"t\":\"recent\",\"m\":\"wsl.exe OK (distro={distro}): {} stdout bytes -> {} sessions parsed\"}}",
+        output.stdout.len(),
+        sessions.len()
+    ));
+    sessions
 }
 
 /// Parse the framed `\x1e id \t mtime \t len \x1f <bytes>` stream the Windows WSL
