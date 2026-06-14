@@ -71,11 +71,15 @@ export function HookInstallPanel({ agentBin }: HookInstallPanelProps) {
         <StatusPill installed={installed} />
       </div>
       <p className="text-xs text-neutral-500">
-        TermHub installs handlers into{" "}
-        <code className="text-neutral-400">~/.claude/settings.json</code> for the
-        15 lifecycle hooks so it can track session status, subagents, and
-        questions. Your existing hooks and settings are preserved; uninstall
-        removes only TermHub&apos;s entries.
+        This installs Claude Code hooks{" "}
+        <span className="text-neutral-400">globally</span> by editing your{" "}
+        <code className="text-neutral-400">~/.claude/settings.json</code>. It
+        adds handlers for the 15 lifecycle hooks so TermHub can track session
+        status, subagents, and questions. Because the file is global, the hooks
+        apply to every Claude Code session on this machine &mdash; all projects
+        and all terminals, not only the focused terminal and not only TermHub.
+        Your existing hooks and settings are preserved; uninstall removes only
+        TermHub&apos;s entries.
       </p>
 
       {!installed && (
@@ -85,7 +89,9 @@ export function HookInstallPanel({ agentBin }: HookInstallPanelProps) {
             checked={consent}
             onChange={(e) => setConsent(e.target.checked)}
           />
-          I consent to TermHub editing my <code>~/.claude/settings.json</code>.
+          I consent to TermHub editing my global{" "}
+          <code>~/.claude/settings.json</code>, affecting all Claude Code
+          sessions on this machine.
         </label>
       )}
 
