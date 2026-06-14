@@ -18,7 +18,26 @@ export const PersistenceCommands = {
   saveWorkspaceSnapshot: "save_workspace_snapshot",
   /** Read the durable workspace layout JSON back (null if none/unavailable). */
   loadWorkspaceSnapshot: "load_workspace_snapshot",
+  /** List recent layout-snapshot history (Recovery review), newest first. */
+  listSnapshots: "list_snapshots",
+  /** Fetch one history snapshot's full layout JSON by id (Recovery review). */
+  getSnapshot: "get_snapshot",
 } as const;
+
+/**
+ * Lightweight metadata for one entry in the recovery snapshot history, mirroring
+ * the Rust `SnapshotMeta` (`#[serde(rename_all = "camelCase")]`). The full layout
+ * JSON is fetched separately via {@link getSnapshot} only when a row is previewed
+ * or restored, so a list of these stays cheap.
+ */
+export interface SnapshotMeta {
+  /** Stable row id; passed back to {@link getSnapshot}. */
+  id: number;
+  /** Unix epoch SECONDS the snapshot was captured. */
+  ts: number;
+  /** Human summary like `"5 tabs · 12 terminals"`, derived backend-side. */
+  summary: string;
+}
 
 /**
  * Persist the workspace layout `json` to the SQLite durable copy. Best-effort:
@@ -38,5 +57,25 @@ export async function loadWorkspaceSnapshot(): Promise<string | null> {
   const v = await invoke<string | null>(
     PersistenceCommands.loadWorkspaceSnapshot,
   );
+  return v ?? null;
+}
+
+/**
+ * List the recent workspace-layout snapshots (Recovery review, #recovery),
+ * newest first. Returns lightweight metadata only; call {@link getSnapshot} for
+ * the full JSON of a chosen entry. Resolves to `[]` when there's no history yet
+ * or the backend is absent (the caller swallows that as "nothing to recover").
+ */
+export function listSnapshots(): Promise<SnapshotMeta[]> {
+  return invoke<SnapshotMeta[]>(PersistenceCommands.listSnapshots);
+}
+
+/**
+ * Fetch one history snapshot's full layout JSON by id, or `null` if it has aged
+ * out of the ring / the backend is unavailable. The same v2-snapshot string the
+ * boot hydration path parses — the Recovery UI runs it through that same parser.
+ */
+export async function getSnapshot(id: number): Promise<string | null> {
+  const v = await invoke<string | null>(PersistenceCommands.getSnapshot, { id });
   return v ?? null;
 }
