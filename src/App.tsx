@@ -5,6 +5,13 @@ import { Canvas } from "./components/Canvas";
 import { Sidebar } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { useSettings } from "./store/settings";
+import { initWindowSync, isSatellite } from "./lib/windows";
+
+// Multi-window tear-off (#21): a window opened with `?tab=<id>` is a SATELLITE
+// rendering only that one tab (the workspace store scopes itself at boot). The
+// main window (no `?tab=`) renders everything except popped-out tabs. Captured
+// once at module load so it's stable for this window's lifetime.
+const SATELLITE = isSatellite();
 
 // 0.5/0.3 shell: a Chrome-style top bar, then the body row (the read-only
 // supervision sidebar + the terminal canvas). The sidebar is collapsible
@@ -126,9 +133,30 @@ function useTitlebarReveal(enabled: boolean): {
 }
 
 export default function App() {
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  // A satellite starts with the supervision sidebar collapsed — it's a focused
+  // terminal canvas, not the full command center. The main window opens it.
+  const [sidebarOpen, setSidebarOpen] = useState(!SATELLITE);
   const [, setSelectedSession] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
+
+  // Wire cross-window tear-off resync once for this window (#21): the main window
+  // hides/re-adopts tabs as satellites open/close; a satellite self-closes if its
+  // tab is reclaimed. Best-effort — a failure just disables live cross-window
+  // sync (persistence still keeps a fresh launch consistent).
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void initWindowSync()
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error("initWindowSync failed", err));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   const maximized = useWindowMaximized();
   const revealPushesContent = useSettings((s) => s.revealPushesContent);
@@ -221,7 +249,7 @@ export default function App() {
           onPointerEnter={reveal}
           onPointerLeave={() => scheduleHide(HIDE_AFTER_LEAVE_MS)}
         >
-          <Titlebar />
+          <Titlebar satellite={SATELLITE} />
         </div>
       ) : (
         <div
@@ -232,7 +260,7 @@ export default function App() {
           }}
           {...barHover}
         >
-          <Titlebar />
+          <Titlebar satellite={SATELLITE} />
         </div>
       )}
 
