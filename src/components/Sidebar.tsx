@@ -284,7 +284,12 @@ function SidebarFull({
         {/* Workspaces (#2) — the user's tabs with tile counts; click activates a
             tab, the chevron peeks into a tab's terminals. (Tabs also live in the
             titlebar strip, so this section starts collapsed in the accordion.) */}
-        <CollapsibleSection title="Workspaces" {...acc("workspaces")} className="border-b">
+        <CollapsibleSection
+          title="Workspaces"
+          {...acc("workspaces")}
+          className="border-b"
+          headerExtra={<CountBadge n={tabs.length} />}
+        >
           <WorkspaceList
             tabs={tabs}
             activeTabId={activeTabId}
@@ -296,7 +301,12 @@ function SidebarFull({
 
         {/* Attention queue — sessions wanting input (question/permission/failure)
             or rate-limited. Now collapsible like the rest (#sidebar-fit). */}
-        <CollapsibleSection title="Attention" {...acc("attention")} className="border-b">
+        <CollapsibleSection
+          title="Attention"
+          {...acc("attention")}
+          className="border-b"
+          headerExtra={<CountBadge n={queue.length} />}
+        >
           {queue.length === 0 ? (
             <Muted>Nothing needs you.</Muted>
           ) : (
@@ -328,7 +338,8 @@ function SidebarFull({
         <CollapsibleSection
           title="Sessions"
           {...acc("sessions")}
-          className="max-h-44 overflow-y-auto border-b"
+          className="th-scroll max-h-60 overflow-y-auto border-b"
+          headerExtra={<CountBadge n={treeList.length} />}
         >
           {treeList.length === 0 ? (
             <Muted>
@@ -1395,5 +1406,18 @@ function Muted({ children }: { children: React.ReactNode }) {
     >
       {children}
     </div>
+  );
+}
+
+/** A small count chip shown in a section header (workspaces / attention /
+ *  sessions), so the count is visible without expanding. */
+function CountBadge({ n }: { n: number }) {
+  return (
+    <span
+      className="shrink-0 rounded-full px-1.5 text-[10px] tabular-nums"
+      style={{ backgroundColor: "var(--th-tile-bg)", color: "var(--th-fg-muted)" }}
+    >
+      {n}
+    </span>
   );
 }

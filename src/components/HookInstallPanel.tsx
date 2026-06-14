@@ -199,6 +199,15 @@ export function HookInstallPanel({
               <span className="text-[11px] leading-snug" style={{ color: "var(--th-fg-muted)" }}>
                 {desc}
               </span>
+              {/* The exact command this hook runs, so you can see what gets put
+                  in settings.json (Claude Code runs it on the event). */}
+              <code
+                className="mt-0.5 block truncate text-[10px]"
+                style={{ color: "var(--th-fg-muted)", opacity: 0.85 }}
+                title={`${agentBin} --hook ${event}`}
+              >
+                {agentBin} --hook {event}
+              </code>
             </span>
           </label>
         ))}
