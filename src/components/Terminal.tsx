@@ -272,10 +272,58 @@ export function TerminalView({
       });
     });
 
+    // Force xterm's renderer to repaint the whole viewport. The WebGL (and
+    // canvas) renderers don't redraw a frame when the element merely goes
+    // hidden->visible (or the window settles after a resize) at the SAME size,
+    // because nothing wrote new cells and no fit/SIGWINCH fired -- so the
+    // backing canvas shows a stale/blank frame until something dirties it (e.g.
+    // a click). `term.refresh(0, rows-1)` marks every line dirty and forces a
+    // fresh frame. Cheap and idempotent; safe to call whenever the box reappears.
+    const forceRepaint = () => {
+      if (disposed) return;
+      const t = termRef.current;
+      if (!t) return;
+      try {
+        t.refresh(0, t.rows - 1);
+      } catch {
+        // Renderer detached mid-call; ignore.
+      }
+    };
+
+    // The pool parks inactive/cross-tab terminals offscreen (translate
+    // -100000px) + visibility:hidden, and brings the active tab's terminal back
+    // onscreen on a tab switch. That offscreen<->onscreen move is a geometric
+    // change an IntersectionObserver reports (visibility:hidden alone is not,
+    // but the transform park is), so this fires exactly when a pooled terminal
+    // becomes the visible active tab again -- the moment its WebGL canvas would
+    // otherwise read blank. We repaint on the NEXT frame so it lands after the
+    // pool's useLayoutEffect has settled the box. ADDITIVE: this never fits or
+    // attaches, so it can't perturb the first-fit/prompt cascade timing.
+    let visObserver: IntersectionObserver | null = null;
+    if (typeof IntersectionObserver !== "undefined") {
+      visObserver = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (entry.isIntersecting) {
+              requestAnimationFrame(forceRepaint);
+            }
+          }
+        },
+        { threshold: 0 },
+      );
+      visObserver.observe(container);
+    }
+
     // Debounced resize → keep PTY columns/rows in sync with the tile size.
+    // After the fit settles we also force a repaint: a window/grid resize can
+    // leave the WebGL canvas torn/garbled (the renderer reuses the prior frame
+    // buffer at the new geometry), and a plain fit doesn't always clear it.
     resizeObserver = new ResizeObserver(() => {
       if (resizeTimer) clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(pushResize, 50);
+      resizeTimer = setTimeout(() => {
+        pushResize();
+        forceRepaint();
+      }, 50);
     });
     resizeObserver.observe(container);
 
@@ -288,6 +336,8 @@ export function TerminalView({
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeObserver?.disconnect();
       resizeObserver = null;
+      visObserver?.disconnect();
+      visObserver = null;
 
       dataSub.dispose();
       webglContextLoss?.dispose();

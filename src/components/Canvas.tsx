@@ -267,8 +267,34 @@ function EmptyTab({ onSpawn }: { onSpawn: () => void }) {
 // row) adjusts their flex-grow weights, which are persisted on the tab.
 // ---------------------------------------------------------------------------
 
-/** Smallest flex weight a row/column may shrink to while dragging a gutter. */
-const MIN_FLEX = 0.15;
+/**
+ * Smallest flex weight a row/column may shrink to while dragging a gutter, and a
+ * hard pixel floor so a tile can never be dragged uselessly small regardless of
+ * how many tiles share the axis. The effective minimum a side may shrink to is
+ * the LARGER of MIN_FLEX (a relative floor) and the weight equivalent of
+ * MIN_TILE_PX (an absolute floor, computed per-drag from the measured extent).
+ */
+const MIN_FLEX = 0.35;
+/** Absolute minimum tile edge in CSS px enforced during a gutter/cross drag. */
+const MIN_TILE_PX = 160;
+
+/**
+ * Per-drag minimum weight for ONE side of a two-element split. `extentPx` is the
+ * pixel span the pair's weights are distributed over and `pairWeight` is the
+ * pair's combined weight (so weight/pairWeight is the side's fraction of the
+ * span). Returns the larger of MIN_FLEX and the weight that maps to MIN_TILE_PX,
+ * but never more than just under the whole pair (so the other side keeps a sliver
+ * even if the span itself is below 2*MIN_TILE_PX).
+ */
+function minSideWeight(extentPx: number, pairWeight: number): number {
+  let floor = MIN_FLEX;
+  if (extentPx > 0 && pairWeight > 0) {
+    const pxFloor = (MIN_TILE_PX / extentPx) * pairWeight;
+    if (pxFloor > floor) floor = pxFloor;
+  }
+  // Keep both sides representable: never let one side's floor exceed the pair.
+  return Math.min(floor, pairWeight * 0.49);
+}
 
 interface TabGridProps {
   tab: WorkspaceTab;
@@ -341,19 +367,19 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
     | {
         axis: "cross";
         r: number; // top row index (seam is between r and r+1)
-        c: number; // left column index of the shared column pair
         startX: number;
         startY: number;
         rowExtentPx: number; // grid height (vertical extent)
         colExtentPx: number; // row width (horizontal extent)
         rowAStart: number; // rows[r]
         rowBStart: number; // rows[r+1]
-        topRowSum: number; // sum of cols[r] (full top row weight)
-        botRowSum: number; // sum of cols[r+1] (full bottom row weight)
-        colTopA: number; // cols[r][c]
-        colTopB: number; // cols[r][c+1]
-        colBotA: number; // cols[r+1][c]
-        colBotB: number; // cols[r+1][c+1]
+        // Each row's column split at the junction is OPTIONAL: a 4-tile junction
+        // has a real boundary in BOTH rows; a 3-tile junction has one in only the
+        // row that has a seam there (the other row's cell spans across the seam,
+        // so dragging horizontally must not disturb it). `top`/`bot` are null when
+        // that row spans the junction.
+        top: CrossAxis | null; // cols[r]   split, if the top row has one here
+        bot: CrossAxis | null; // cols[r+1] split, if the bottom row has one here
       };
   const dragRef = useRef<DragState | null>(null);
 
@@ -365,10 +391,11 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
       // --- Vertical: trade rows[r]/rows[r+1] (same math as a row gutter). ---
       if (d.rowExtentPx > 0) {
         const rowTotal = d.rowAStart + d.rowBStart;
+        const rowMin = minSideWeight(d.rowExtentPx, rowTotal);
         let rDelta = ((e.clientY - d.startY) / d.rowExtentPx) * rowTotal;
         rDelta = Math.max(
-          -(d.rowAStart - MIN_FLEX),
-          Math.min(d.rowBStart - MIN_FLEX, rDelta),
+          -(d.rowAStart - rowMin),
+          Math.min(d.rowBStart - rowMin, rDelta),
         );
         const next = rowsRef.current.slice();
         next[d.r] = d.rowAStart + rDelta;
@@ -377,36 +404,38 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
         setRows(next);
       }
 
-      // --- Horizontal: slide the shared column seam to the same PIXEL position
-      // in both rows so they stay visually aligned. Both rows fill the same row
-      // width, so a target x maps to the same pixel offset for each. Within each
-      // row the seam only redistributes its own pair (cells c, c+1) -- the pair's
-      // combined weight (and thus its left/right pixel edges) is fixed -- so we
-      // recompute each pair's split from the target offset and clamp every cell
-      // to MIN_FLEX independently. Equal column counts + equal starting fraction
-      // is guaranteed by the alignment check that gates this handle. ---
-      if (d.colExtentPx > 0) {
-        const topSum = d.colTopA + d.colTopB;
-        const botSum = d.colBotA + d.colBotB;
+      // --- Horizontal: slide the column seam to the same PIXEL position in
+      // whichever adjacent row(s) own a seam here. Both rows fill the same row
+      // width, so a target x maps to the same pixel offset for each; a 4-tile
+      // junction drives both (keeping them visually aligned as they were at
+      // pointer-down), a 3-tile junction drives only the side that has a seam
+      // (the spanning side is left untouched). See `slide` below for the per-row
+      // math. ---
+      if (d.colExtentPx > 0 && (d.top || d.bot)) {
         const dxFrac = (e.clientX - d.startX) / d.colExtentPx; // delta as fraction of row width
         const next = colsRef.current.map((row) => row.slice());
 
-        // Top row: pair occupies topSum/topRowSum of the width; convert the
-        // row-width-fraction delta into a delta within the pair's own span.
-        const topPairFrac = topSum / d.topRowSum;
-        let fTop = d.colTopA / topSum + (topPairFrac > 0 ? dxFrac / topPairFrac : 0);
-        const minFTop = MIN_FLEX / topSum;
-        fTop = Math.max(minFTop, Math.min(1 - minFTop, fTop));
-        next[d.r][d.c] = fTop * topSum;
-        next[d.r][d.c + 1] = (1 - fTop) * topSum;
+        // Slide ONE row's column pair. Each row's pair occupies pairSum/rowSum of
+        // the full row width, so a row-width-fraction delta maps into a delta
+        // within the pair's own span (dxFrac / pairFrac). The pair's combined
+        // weight (and thus its outer pixel edges) is fixed, so we only redivide
+        // it. Each cell is floored at the larger of MIN_FLEX and MIN_TILE_PX
+        // (converted to a fraction of the pair span). A 3-tile junction calls
+        // this for just the side that has a seam; the spanning side is untouched.
+        const slide = (rowIdx: number, ax: CrossAxis) => {
+          const pairSum = ax.aStart + ax.bStart;
+          if (pairSum <= 0 || ax.rowSum <= 0) return;
+          const pairFrac = pairSum / ax.rowSum; // pair's share of the row width
+          const pairSpanPx = pairFrac * d.colExtentPx;
+          let f = ax.aStart / pairSum + (pairFrac > 0 ? dxFrac / pairFrac : 0);
+          const minF = minSideWeight(pairSpanPx, pairSum) / pairSum;
+          f = Math.max(minF, Math.min(1 - minF, f));
+          next[rowIdx][ax.c] = f * pairSum;
+          next[rowIdx][ax.c + 1] = (1 - f) * pairSum;
+        };
 
-        // Bottom row: same construction over its own pair span.
-        const botPairFrac = botSum / d.botRowSum;
-        let fBot = d.colBotA / botSum + (botPairFrac > 0 ? dxFrac / botPairFrac : 0);
-        const minFBot = MIN_FLEX / botSum;
-        fBot = Math.max(minFBot, Math.min(1 - minFBot, fBot));
-        next[d.r + 1][d.c] = fBot * botSum;
-        next[d.r + 1][d.c + 1] = (1 - fBot) * botSum;
+        if (d.top) slide(d.r, d.top);
+        if (d.bot) slide(d.r + 1, d.bot);
 
         colsRef.current = next;
         setCols(next);
@@ -419,9 +448,11 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
     const total = d.aStart + d.bStart;
     // Convert px delta to weight delta (weights here sum to `total`).
     let delta = ((pos - d.startPos) / d.extentPx) * total;
-    // Clamp so neither side drops below MIN_FLEX.
-    const maxDelta = d.bStart - MIN_FLEX;
-    const minDelta = -(d.aStart - MIN_FLEX);
+    // Clamp so neither side drops below the effective minimum (the larger of
+    // MIN_FLEX and the MIN_TILE_PX pixel floor for this pair's span).
+    const minSide = minSideWeight(d.extentPx, total);
+    const maxDelta = d.bStart - minSide;
+    const minDelta = -(d.aStart - minSide);
     delta = Math.max(minDelta, Math.min(maxDelta, delta));
     const a = d.aStart + delta;
     const b = d.bStart - delta;
@@ -494,11 +525,17 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
     window.addEventListener("pointerup", endDrag);
   };
 
-  // Intersection drag: r = top row of the seam, c = left column of the shared
-  // pair. Vertical extent is the grid container's height; horizontal extent is
-  // the width of the row immediately above the seam (the gutter's previous
-  // sibling), which both adjacent rows share.
-  const beginCrossDrag = (r: number, c: number, e: ReactPointerEvent) => {
+  // Intersection drag: r = top row of the seam. `topC`/`botC` are each that
+  // row's left column index of the dragged pair, or null when that row spans the
+  // seam (a 3-tile junction). Vertical extent is the grid container's height;
+  // horizontal extent is the width of the row immediately above the seam (the
+  // gutter's previous sibling), which both adjacent rows share.
+  const beginCrossDrag = (
+    r: number,
+    topC: number | null,
+    botC: number | null,
+    e: ReactPointerEvent,
+  ) => {
     const grid = containerRef.current;
     if (!grid) return;
     const rowAbove = (e.currentTarget as HTMLElement).closest(
@@ -509,22 +546,19 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
     const top = colsRef.current[r] ?? [];
     const bot = colsRef.current[r + 1] ?? [];
     const sum = (arr: number[]) => arr.reduce((a, b) => a + b, 0) || 1;
+    const axis = (row: number[], c: number | null): CrossAxis | null =>
+      c === null ? null : { c, rowSum: sum(row), aStart: row[c] ?? 1, bStart: row[c + 1] ?? 1 };
     dragRef.current = {
       axis: "cross",
       r,
-      c,
       startX: e.clientX,
       startY: e.clientY,
       rowExtentPx: grid.getBoundingClientRect().height,
       colExtentPx: (rowAbove ?? grid).getBoundingClientRect().width,
       rowAStart: rowsRef.current[r] ?? 1,
       rowBStart: rowsRef.current[r + 1] ?? 1,
-      topRowSum: sum(top),
-      botRowSum: sum(bot),
-      colTopA: top[c] ?? 1,
-      colTopB: top[c + 1] ?? 1,
-      colBotA: bot[c] ?? 1,
-      colBotB: bot[c + 1] ?? 1,
+      top: axis(top, topC),
+      bot: axis(bot, botC),
     };
     document.body.style.cursor = "nwse-resize";
     document.body.style.userSelect = "none";
@@ -606,7 +640,9 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
             key={`rg-${r}`}
             onPointerDown={(e) => beginRowDrag(r - 1, e)}
             crossPoints={crossPoints}
-            onCrossPointerDown={(c, e) => beginCrossDrag(r - 1, c, e)}
+            onCrossPointerDown={(topC, botC, e) =>
+              beginCrossDrag(r - 1, topC, botC, e)
+            }
           />
         );
         return [gutter, rowEl];
@@ -631,7 +667,9 @@ function ColGutter({
       role="separator"
       aria-orientation="vertical"
       onPointerDown={onPointerDown}
-      className="group relative z-10 -mx-[3.5px] w-2 shrink-0 cursor-col-resize"
+      // 14px-wide hit zone (was 8px) for an easier grab; negative margins keep
+      // the visible gap ~1px while the zone overhangs both neighbors further.
+      className="group relative z-10 -mx-[6.5px] w-[14px] shrink-0 cursor-col-resize"
     >
       <div className="th-gutter-line absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-neutral-700/60 transition-colors" />
     </div>
@@ -657,7 +695,11 @@ function RowGutter({
 }: {
   onPointerDown: (e: ReactPointerEvent) => void;
   crossPoints?: CrossPoint[];
-  onCrossPointerDown?: (c: number, e: ReactPointerEvent) => void;
+  onCrossPointerDown?: (
+    topC: number | null,
+    botC: number | null,
+    e: ReactPointerEvent,
+  ) => void;
 }) {
   return (
     <div
@@ -665,14 +707,15 @@ function RowGutter({
       aria-orientation="horizontal"
       data-row-gutter=""
       onPointerDown={onPointerDown}
-      className="group relative z-10 -my-[3.5px] h-2 shrink-0 cursor-row-resize"
+      // 14px-tall hit zone (was 8px) to match the wider column gutter.
+      className="group relative z-10 -my-[6.5px] h-[14px] shrink-0 cursor-row-resize"
     >
       <div className="th-gutter-line absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-neutral-700/60 transition-colors" />
       {crossPoints?.map((cp) => (
         <IntersectionHandle
-          key={`xh-${cp.c}`}
+          key={cp.key}
           fraction={cp.fraction}
-          onPointerDown={(e) => onCrossPointerDown?.(cp.c, e)}
+          onPointerDown={(e) => onCrossPointerDown?.(cp.topC, cp.botC, e)}
         />
       ))}
     </div>
@@ -698,61 +741,96 @@ function IntersectionHandle({
       role="separator"
       aria-label="Resize rows and columns"
       onPointerDown={onPointerDown}
-      // 12px square transparent hit zone centered on the crosspoint, above the
-      // single-axis gutter lines so it wins the pointer at the junction.
-      className="group/xh absolute top-1/2 z-20 h-3 w-3 -translate-x-1/2 -translate-y-1/2 cursor-nwse-resize"
+      // 20px square transparent hit zone (was 12px) centered on the crosspoint,
+      // above the single-axis gutter lines so it wins the pointer at the
+      // junction. The visible dot stays small; only the grab target grows.
+      className="group/xh absolute top-1/2 z-20 h-5 w-5 -translate-x-1/2 -translate-y-1/2 cursor-nwse-resize"
       style={{ left: `${fraction * 100}%` }}
     >
-      <div className="absolute left-1/2 top-1/2 h-[5px] w-[5px] -translate-x-1/2 -translate-y-1/2 rounded-[1px] bg-neutral-600/70 transition-colors group-hover/xh:bg-[var(--th-accent)]" />
+      <div className="absolute left-1/2 top-1/2 h-[6px] w-[6px] -translate-x-1/2 -translate-y-1/2 rounded-[1px] bg-neutral-600/70 transition-colors group-hover/xh:bg-[var(--th-accent)]" />
     </div>
   );
 }
 
-/** A crosspoint where a column seam aligns across two vertically adjacent rows. */
+/**
+ * A junction between two vertically adjacent rows where at least one row has an
+ * internal column seam. Drives a 2-axis (row split + column split) handle. When
+ * BOTH rows have a seam at the same fraction it's a 4-tile junction; when only
+ * one does it's a 3-tile junction (the other row's cell spans the seam, and the
+ * handle only drags the column split on the side that has one).
+ */
 interface CrossPoint {
-  /** Left column index of the shared pair (seam is between cell c and c+1). */
-  c: number;
   /** Horizontal position of the seam as a fraction (0..1) of the row width. */
   fraction: number;
+  /** Left column index of the top row's pair at this seam, or null if it spans. */
+  topC: number | null;
+  /** Left column index of the bottom row's pair at this seam, or null if it spans. */
+  botC: number | null;
+  /** Stable identity for React keying (one handle per fraction). */
+  key: string;
+}
+
+/** One row's column-split geometry captured at a cross-drag's pointer-down. */
+interface CrossAxis {
+  c: number; // left column index of the dragged pair
+  rowSum: number; // sum of the whole row's weights
+  aStart: number; // cols[row][c]
+  bStart: number; // cols[row][c+1]
 }
 
 /**
- * Internal column boundaries shared by two vertically adjacent rows. A boundary
- * qualifies when both rows have a split at the same cumulative width fraction
- * (so the crosspoint is a true 4-tile junction). Returns each shared boundary's
- * left column index and its fraction of the row width, for positioning a handle.
- * Non-aligned seams (different column counts, or splits at different fractions —
- * e.g. after one row's columns were dragged) are skipped; the single-axis
- * gutters still handle those.
+ * Internal column boundaries between two vertically adjacent rows that warrant a
+ * 2-axis (row-split + column-split) handle. EVERY internal boundary in EITHER
+ * row qualifies, because the other row always either has an aligned boundary
+ * there (a 4-tile junction — drag both column splits) or a cell that spans it (a
+ * 3-tile junction — drag only the row that has the seam). The returned
+ * `topC`/`botC` carry each row's left column index of the pair to drag at that
+ * fraction, or null when that row spans the seam. We collect each row's boundary
+ * fractions, then merge near-coincident ones (within EPS) into a single 4-tile
+ * handle so we don't stack two handles on top of each other.
  */
 function alignedCrossPoints(top: number[], bot: number[]): CrossPoint[] {
-  const out: CrossPoint[] = [];
-  if (top.length < 2 || bot.length < 2) return out;
-  const topSum = top.reduce((a, b) => a + b, 0);
-  const botSum = bot.reduce((a, b) => a + b, 0);
-  if (topSum <= 0 || botSum <= 0) return out;
-  // Tolerance is generous enough to treat a freshly-even uniform grid (and small
-  // float drift) as aligned, but tight enough that a deliberately dragged column
-  // split in only one row reads as misaligned.
+  // Internal boundaries of one row as (fraction, leftColIndex) pairs.
+  const boundaries = (row: number[]): { f: number; c: number }[] => {
+    const sum = row.reduce((a, b) => a + b, 0);
+    if (sum <= 0 || row.length < 2) return [];
+    const out: { f: number; c: number }[] = [];
+    let cum = 0;
+    for (let c = 0; c < row.length - 1; c++) {
+      cum += row[c];
+      out.push({ f: cum / sum, c });
+    }
+    return out;
+  };
+
+  const topB = boundaries(top);
+  const botB = boundaries(bot);
+  // Tolerance treats a freshly-even uniform grid (and small float drift) as
+  // aligned, but a deliberately dragged split in only one row reads as
+  // misaligned (a 3-tile junction).
   const EPS = 0.02;
-  let topCum = 0;
-  let botCum = 0;
+
+  const out: CrossPoint[] = [];
   let ti = 0;
   let bi = 0;
-  // Walk both rows' internal boundaries in fraction order; a crosspoint exists
-  // only where a top boundary and a bottom boundary coincide in fraction.
-  while (ti < top.length - 1 && bi < bot.length - 1) {
-    topCum += top[ti];
-    botCum += bot[bi];
-    const tf = topCum / topSum;
-    const bf = botCum / botSum;
-    if (Math.abs(tf - bf) <= EPS) {
-      out.push({ c: ti, fraction: (tf + bf) / 2 });
+  // Merge-walk both rows' boundary lists in fraction order. Coincident
+  // boundaries (|df| <= EPS) fuse into one 4-tile handle; a lone boundary in one
+  // row becomes a 3-tile handle (other side null).
+  while (ti < topB.length || bi < botB.length) {
+    const t = ti < topB.length ? topB[ti] : null;
+    const b = bi < botB.length ? botB[bi] : null;
+    if (t && b && Math.abs(t.f - b.f) <= EPS) {
+      const f = (t.f + b.f) / 2;
+      out.push({ fraction: f, topC: t.c, botC: b.c, key: `x-${f.toFixed(4)}` });
       ti += 1;
       bi += 1;
-    } else if (tf < bf) {
-      ti += 1; // advance the row whose boundary is further left
+    } else if (b === null || (t !== null && t.f < b.f)) {
+      // Top-only boundary: 3-tile junction, bottom row spans it.
+      out.push({ fraction: t!.f, topC: t!.c, botC: null, key: `t-${t!.f.toFixed(4)}` });
+      ti += 1;
     } else {
+      // Bottom-only boundary: 3-tile junction, top row spans it.
+      out.push({ fraction: b!.f, topC: null, botC: b!.c, key: `b-${b!.f.toFixed(4)}` });
       bi += 1;
     }
   }
