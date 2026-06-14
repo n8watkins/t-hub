@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #050812;
+  --foreground: #e8eefb;
+}
+
+* {
+  scroll-behavior: smooth;
+}
+
+html {
+  scroll-padding-top: 90px;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  overflow-x: hidden;
+}
+
+::selection {
+  background: rgba(34, 211, 238, 0.25);
+  color: #fff;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: #050812;
+}
+::-webkit-scrollbar-thumb {
+  background: #1f3157;
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2f4a82;
+}
+
+@layer components {
+  .container-page {
+    @apply mx-auto w-full max-w-6xl px-5 sm:px-8;
+  }
+
+  .gradient-text {
+    @apply bg-gradient-to-r from-cyan-300 via-sky-400 to-blue-500 bg-clip-text text-transparent;
+  }
+
+  .eyebrow {
+    @apply text-[0.7rem] font-bold uppercase tracking-[0.18em] text-cyan-400;
+  }
+
+  .glass {
+    @apply border border-white/[0.08] bg-white/[0.035] backdrop-blur-sm;
+  }
+
+  .glass-hover {
+    @apply transition-all duration-300 hover:border-cyan-400/30 hover:bg-white/[0.06];
+  }
+}
+
+@layer utilities {
+  .bg-grid {
+    background-image: linear-gradient(
+        to right,
+        rgba(255, 255, 255, 0.045) 1px,
+        transparent 1px
+      ),
+      linear-gradient(to bottom, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+    background-size: 52px 52px;
+  }
+
+  .bg-dots {
+    background-image: radial-gradient(
+      rgba(255, 255, 255, 0.08) 1px,
+      transparent 1px
+    );
+    background-size: 22px 22px;
+  }
+
+  .mask-fade-b {
+    -webkit-mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+    mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+  }
+
+  .text-shimmer {
+    background: linear-gradient(
+      110deg,
+      #9cadc5 35%,
+      #ffffff 50%,
+      #9cadc5 65%
+    );
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
