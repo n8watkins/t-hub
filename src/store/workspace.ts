@@ -70,11 +70,16 @@ interface WorkspaceState {
   focusedId: TerminalId | null;
   /** Global terminal font size in px, applied to every tile equally (persisted). */
   fontSize: number;
-  /** The tile (terminal id) currently being drag-moved, or null. While set,
-   *  each tile renders a transparent drop overlay above its xterm so HTML5
-   *  drop events fire reliably (the WebView's canvas/textarea otherwise eat
-   *  them). NOT persisted — purely transient drag UI state. */
+  /** Pointer-drag state (transient, never persisted). TermHub's drag-and-drop is
+   *  built on pointer events + `elementFromPoint` rather than HTML5 DnD, which is
+   *  unreliable over xterm's WebGL canvas in WebView2. `draggingTileId` /
+   *  `draggingTabId` is the active drag SOURCE (a tile being moved, or a tab being
+   *  reordered); `dropTileId` / `dropTabId` is the element currently under the
+   *  pointer, used purely to highlight the live drop target. */
   draggingTileId: TerminalId | null;
+  draggingTabId: string | null;
+  dropTileId: TerminalId | null;
+  dropTabId: string | null;
 
   /** Replace the live set from a listTerminals() result, reconciling tabs/order/focus. */
   setTerminals: (list: TerminalInfo[]) => void;
@@ -110,6 +115,16 @@ interface WorkspaceState {
   moveTile: (id: TerminalId, targetId: TerminalId) => void;
   /** Mark a tile as the active drag source (or null to clear at drag end). */
   setDraggingTile: (id: TerminalId | null) => void;
+  /** Move a tile to a DIFFERENT tab (drag-a-tile-onto-a-tab): pull it from its
+   *  current tab and append it to `tabId`. The terminal/agent stay attached and
+   *  alive; the active tab and (where possible) focus are left untouched. */
+  moveTileToTab: (id: TerminalId, tabId: string) => void;
+  /** Mark a tab as the active drag source (reorder), or null to clear. */
+  setDraggingTab: (id: string | null) => void;
+  /** Set the tile currently under the drag pointer (highlight only), or null. */
+  setDropTile: (id: TerminalId | null) => void;
+  /** Set the tab currently under the drag pointer (highlight only), or null. */
+  setDropTab: (id: string | null) => void;
   /** Persist manual size ratios for a tab. */
   setTabSizes: (id: string, sizes: TabSizes) => void;
 
@@ -316,6 +331,9 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     focusedId: initial.focusedId,
     fontSize: initial.fontSize,
     draggingTileId: null,
+    draggingTabId: null,
+    dropTileId: null,
+    dropTabId: null,
 
     setTerminals: (list) => {
       const terminals: Record<TerminalId, TerminalInfo> = {};
@@ -526,9 +544,56 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
     setDraggingTile: (id) => {
       // Transient drag UI only — never persisted. No-op if unchanged so a
-      // dragover-driven re-set doesn't thrash subscribers.
+      // pointermove-driven re-set doesn't thrash subscribers.
       if (get().draggingTileId === id) return;
       set({ draggingTileId: id });
+    },
+
+    moveTileToTab: (id, tabId) => {
+      const { tabs, activeTabId, focusedId } = get();
+      const source = tabOf(tabs, id);
+      if (!source || source.id === tabId) return; // unknown, or already there
+      if (!tabs.some((t) => t.id === tabId)) return; // unknown target tab
+
+      // Pull the tile from its source tab and append it to the target tab. Both
+      // tabs' manual size ratios are dropped (their grid shapes changed).
+      const nextTabs = tabs.map((t) => {
+        if (t.id === source.id) {
+          return {
+            ...t,
+            order: t.order.filter((x) => x !== id),
+            sizes: undefined,
+          };
+        }
+        if (t.id === tabId) {
+          return { ...t, order: [...t.order, id], sizes: undefined };
+        }
+        return t;
+      });
+
+      // If the moved tile was the focused tile of the (still-active) source tab,
+      // hand focus to a neighbor; otherwise leave focus + active tab untouched.
+      let nextFocus = focusedId;
+      if (source.id === activeTabId && focusedId === id) {
+        const newOrder = source.order.filter((x) => x !== id);
+        nextFocus = neighborFocus(source.order, newOrder, id, focusedId);
+      }
+
+      set({ tabs: nextTabs, focusedId: nextFocus });
+      persist();
+    },
+
+    setDraggingTab: (id) => {
+      if (get().draggingTabId === id) return;
+      set({ draggingTabId: id });
+    },
+    setDropTile: (id) => {
+      if (get().dropTileId === id) return;
+      set({ dropTileId: id });
+    },
+    setDropTab: (id) => {
+      if (get().dropTabId === id) return;
+      set({ dropTabId: id });
     },
 
     setTabSizes: (id, sizes) => {
