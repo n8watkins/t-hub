@@ -171,3 +171,24 @@ body {
 .th-scroll::-webkit-scrollbar-thumb:hover {
   background: var(--th-fg-muted);
 }
+
+/*
+ * Thin themed scrollbar (#4) for the workspace tab strip, which is
+ * `overflow-x-auto` and gets a default chrome bar once enough tabs accumulate.
+ * Same on-brand colors as `.th-scroll` but ~6px so it stays subtle in the 32px
+ * titlebar. Horizontal-only in practice (the strip never scrolls vertically).
+ */
+.th-scroll-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.th-scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.th-scroll-thin::-webkit-scrollbar-thumb {
+  background: var(--th-border);
+  border-radius: 9999px;
+}
+.th-scroll-thin::-webkit-scrollbar-thumb:hover {
+  background: var(--th-fg-muted);
+}
