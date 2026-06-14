@@ -424,9 +424,26 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
     updateState: (id, state) => {
       const existing = get().terminals[id];
-      if (!existing || existing.state === state) return;
+      if (existing) {
+        if (existing.state === state) return;
+        set({
+          terminals: { ...get().terminals, [id]: { ...existing, state } },
+        });
+        return;
+      }
+      // No record yet, but the terminal lives in a tab (it was restored from a
+      // persisted layout): a terminal://state event raced ahead of the
+      // listTerminals() seed. Upsert a minimal record so the transition isn't
+      // dropped -- otherwise an attach's `live` event arriving before setTerminals
+      // is lost and the tile stays stuck on the amber "starting" fallback (#16).
+      // Ignore states for ids we don't track at all (no tab, no record).
+      const { tabs } = get();
+      if (!tabs.some((t) => t.order.includes(id))) return;
       set({
-        terminals: { ...get().terminals, [id]: { ...existing, state } },
+        terminals: {
+          ...get().terminals,
+          [id]: { id, tmuxSession: `th_${id}`, cwd: "", title: id, state },
+        },
       });
     },
 
