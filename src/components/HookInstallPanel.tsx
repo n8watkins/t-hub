@@ -92,10 +92,11 @@ export function HookInstallPanel({ agentBin }: HookInstallPanelProps) {
         <StatusPill installed={installed} />
       </div>
       <p className="text-xs leading-snug" style={{ color: "var(--th-fg-muted)" }}>
-        Adds 15 lifecycle hook handlers to{" "}
-        <code>~/.claude/settings.json</code> &mdash;{" "}
-        <span style={{ color: "var(--th-fg)" }}>global</span>, so it affects
-        every Claude Code session on this machine, not just the focused
+        Adds 15 lifecycle hook handlers to your{" "}
+        <span style={{ color: "var(--th-fg)" }}>WSL</span>{" "}
+        <code>~/.claude/settings.json</code> (where Claude Code actually reads
+        them) &mdash; <span style={{ color: "var(--th-fg)" }}>global</span>, so
+        it affects every Claude Code session in the distro, not just the focused
         terminal. Existing settings are preserved; uninstall removes only
         TermHub&apos;s entries.
       </p>
@@ -134,7 +135,7 @@ export function HookInstallPanel({ agentBin }: HookInstallPanelProps) {
           />
           <span>
             I consent to editing my global{" "}
-            <code>~/.claude/settings.json</code>.
+            <code>~/.claude/settings.json</code> (inside WSL).
           </span>
         </label>
       )}
@@ -161,16 +162,54 @@ export function HookInstallPanel({ agentBin }: HookInstallPanelProps) {
         )}
       </div>
 
+      {/* Why is the install button doing nothing? Make the consent gate obvious. */}
+      {!installed && !consent && (
+        <p className="text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
+          Tick the consent box above to enable the install button — TermHub will
+          not touch your Claude settings without it.
+        </p>
+      )}
+
       {report && (
-        <div className="rounded border border-neutral-800 bg-neutral-950 p-2 text-xs text-neutral-400">
-          <div>{report.message}</div>
-          <div className="mt-1 text-neutral-600">
+        <div
+          className="rounded border p-2 text-xs"
+          style={{
+            borderColor: "var(--th-accent, #34d399)",
+            background: "var(--th-bg-elevated, #0a0a0a)",
+            color: "var(--th-fg)",
+          }}
+        >
+          <div className="font-medium" style={{ color: "var(--th-accent, #34d399)" }}>
+            {installed
+              ? `Installed to ${report.settingsPath}`
+              : "Hooks removed"}
+          </div>
+          <div className="mt-0.5" style={{ color: "var(--th-fg-muted)" }}>
+            {report.managedEvents} hook{report.managedEvents === 1 ? "" : "s"}{" "}
+            {installed ? "active" : "remaining"}
+            {report.backedUp && " · existing settings backed up"}
+          </div>
+          <div
+            className="mt-1 break-all font-mono text-[11px]"
+            style={{ color: "var(--th-fg-faint, #6b7280)" }}
+          >
             {report.settingsPath}
-            {report.backedUp && " · backed up"}
           </div>
         </div>
       )}
-      {error && <div className="text-xs text-red-400">{error}</div>}
+      {error && (
+        <div
+          className="rounded border p-2 text-xs"
+          style={{
+            borderColor: "var(--th-danger, #f87171)",
+            background: "var(--th-bg-elevated, #0a0a0a)",
+            color: "var(--th-danger, #f87171)",
+          }}
+        >
+          <span className="font-medium">Hook install failed: </span>
+          <span className="break-all">{error}</span>
+        </div>
+      )}
     </div>
   );
 }

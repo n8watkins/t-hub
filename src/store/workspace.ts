@@ -81,10 +81,25 @@ interface WorkspaceState {
   focusedId: TerminalId | null;
   /** Global terminal font size in px, applied to every tile equally (persisted). */
   fontSize: number;
-  /** User-set per-terminal labels keyed by id (#labels, persisted). A friendly
-   *  display name is derived via `deriveLabel`; this map is the highest-priority
-   *  input (an explicit rename). Empty until the user labels something. */
+  /** The EFFECTIVE per-terminal label map the display reads (#labels). It merges
+   *  two sources, user rename winning:
+   *    - an explicit user rename (`setTerminalLabel`, persisted), and
+   *    - a Claude-derived title fed live from the hooks (`setClaudeTitle`, NOT
+   *      persisted — see `claudeTitles`).
+   *  A friendly display name is derived via `deriveLabel`, which treats this map
+   *  as its highest-priority input. Empty until something names a terminal. */
   labels: Record<TerminalId, string>;
+  /** Claude-suggested titles keyed by terminal id, fed live by the working hooks
+   *  (`setClaudeTitle`). This is the raw Claude signal; `labels` is the effective
+   *  merge (a user rename always overrides it). NOT persisted: it is re-derived
+   *  from live hook events each session, so it must never masquerade as a saved
+   *  user rename across reloads. */
+  claudeTitles: Record<TerminalId, string>;
+  /** Explicit user renames keyed by terminal id — the persisted source of truth
+   *  behind the effective `labels` map. `setTerminalLabel` writes here; `labels`
+   *  is recomputed as `{...claudeTitles, ...userLabels}` (rename wins). Loading a
+   *  saved snapshot restores this (the persisted `labels` key holds renames). */
+  userLabels: Record<TerminalId, string>;
   /** Full records of tabs popped out into their own window (#21), removed from
    *  `tabs` so they don't render here. The main window holds the popped-out tabs
    *  while a satellite renders each; resynced live across windows via windows.ts
@@ -116,6 +131,11 @@ interface WorkspaceState {
    *  A blank/whitespace value removes the override so the derived label takes over
    *  again; the trimmed value is stored otherwise. Persisted. */
   setTerminalLabel: (id: TerminalId, label: string) => void;
+  /** Feed a Claude-suggested title for a terminal (from the working lifecycle
+   *  hooks). Stored in `claudeTitles` and merged into the effective `labels` map
+   *  ONLY when the user has not explicitly renamed the terminal — an explicit
+   *  rename always wins. Blank/whitespace clears the Claude title. NOT persisted. */
+  setClaudeTitle: (id: TerminalId, title: string) => void;
 
   // --- Tabs (PRD §5.2) ---
   /** Create a new empty tab (auto-named) and activate it; returns its id. */
@@ -201,14 +221,18 @@ function shortenId(id: string): string {
 /**
  * Inputs `deriveLabel` reads to build a friendly terminal name. This is a thin
  * shape over what the store already knows about a session (`TerminalInfo` plus
- * the optional user label) — the single extension point for richer signals: when
- * the backend starts reporting a live foreground command / status payload, add
- * the field here and read it in `deriveLabel`; no display site changes.
+ * the optional effective label) — the single extension point for richer signals.
+ *
+ * The richer signal is now wired: a Claude-suggested title arrives live from the
+ * lifecycle hooks (`setClaudeTitle`) and is merged into the effective `labels`
+ * map, which the display passes here as `label`. So `label` carries, in order of
+ * preference: an explicit user rename, else the latest Claude-suggested title.
  */
 export interface LabelSource {
   /** The 8-char tmux session id (the raw value we're replacing in the UI). */
   id: TerminalId;
-  /** Explicit user label (highest priority), if the user renamed this terminal. */
+  /** The effective label (highest priority): an explicit user rename if present,
+   *  otherwise the live Claude-suggested title fed from the hooks. */
   label?: string;
   /** Backend `TerminalInfo.title`: the spawn preset/command/name at spawn, but on
    *  a reload it degrades to the tmux session name (`th_<id>`) or the generic
@@ -271,6 +295,16 @@ function cleanLabels(value: unknown): Record<TerminalId, string> {
     if (typeof v === "string" && v.trim()) out[shortenId(k)] = v.trim();
   }
   return out;
+}
+
+/** Compute the effective display label map from its two sources: Claude-suggested
+ *  titles overlaid by explicit user renames (a rename always wins). This is what
+ *  the display reads as `labels`. */
+function mergeLabels(
+  userLabels: Record<TerminalId, string>,
+  claudeTitles: Record<TerminalId, string>,
+): Record<TerminalId, string> {
+  return { ...claudeTitles, ...userLabels };
 }
 
 /** Sanitize an arbitrary parsed value into a clean order array of string ids. */
@@ -592,14 +626,16 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
   // clobber the shared snapshot the main window owns.
   const persist = () => {
     if (SATELLITE_TAB) return;
-    const { tabs, activeTabId, focusedId, fontSize, labels, poppedOutTabs } =
+    const { tabs, activeTabId, focusedId, fontSize, userLabels, poppedOutTabs } =
       get();
     savePersisted({
       tabs,
       activeTabId,
       focusedId,
       fontSize,
-      labels,
+      // Persist ONLY explicit user renames (the `labels` key); Claude-derived
+      // titles are live-only and must not survive a reload as fake renames.
+      labels: userLabels,
       poppedOutTabs,
     });
   };
@@ -616,7 +652,12 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     activeTabId: initial.activeTabId,
     focusedId: initial.focusedId,
     fontSize: initial.fontSize,
+    // `initial.labels` is the persisted user-rename set. The effective `labels`
+    // starts equal to it (no Claude titles yet this session); `claudeTitles`
+    // fills in live as the hooks fire.
     labels: initial.labels,
+    userLabels: initial.labels,
+    claudeTitles: {},
     poppedOutTabs: initial.poppedOutTabs,
     draggingTileId: null,
     draggingTabId: null,
@@ -751,19 +792,42 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
     setTerminalLabel: (id, label) => {
       const trimmed = label.trim();
-      const { labels } = get();
-      // Blank clears the override (derived label takes back over); no-op if the
-      // value is unchanged so a redundant set doesn't thrash subscribers/persist.
+      const { userLabels, claudeTitles } = get();
+      // Blank clears the override (the Claude title / derived label takes back
+      // over); no-op if unchanged so a redundant set doesn't thrash persist.
+      let nextUser: Record<TerminalId, string>;
       if (!trimmed) {
-        if (!(id in labels)) return;
-        const next = { ...labels };
-        delete next[id];
-        set({ labels: next });
+        if (!(id in userLabels)) return;
+        nextUser = { ...userLabels };
+        delete nextUser[id];
       } else {
-        if (labels[id] === trimmed) return;
-        set({ labels: { ...labels, [id]: trimmed } });
+        if (userLabels[id] === trimmed) return;
+        nextUser = { ...userLabels, [id]: trimmed };
       }
+      // Recompute the effective map the display reads (rename overlays Claude).
+      set({ userLabels: nextUser, labels: mergeLabels(nextUser, claudeTitles) });
       persist();
+    },
+
+    setClaudeTitle: (id, title) => {
+      const trimmed = title.trim();
+      const { userLabels, claudeTitles } = get();
+      let nextClaude: Record<TerminalId, string>;
+      if (!trimmed) {
+        if (!(id in claudeTitles)) return;
+        nextClaude = { ...claudeTitles };
+        delete nextClaude[id];
+      } else {
+        if (claudeTitles[id] === trimmed) return;
+        nextClaude = { ...claudeTitles, [id]: trimmed };
+      }
+      // Update the live Claude signal and the effective map. A user rename (in
+      // `userLabels`) still wins via mergeLabels, so we never clobber a rename.
+      // Not persisted: Claude titles are re-derived from hooks each session.
+      set({
+        claudeTitles: nextClaude,
+        labels: mergeLabels(userLabels, nextClaude),
+      });
     },
 
     addTab: () => {
@@ -1059,15 +1123,22 @@ async function hydrateFromBackend(): Promise<void> {
     if (!snapshot) {
       // Nothing durable yet: seed SQLite once from the current (localStorage-
       // derived) layout so subsequent boots can prefer the durable copy.
-      const { tabs, activeTabId, focusedId, fontSize, labels, poppedOutTabs } =
-        useWorkspace.getState();
+      const {
+        tabs,
+        activeTabId,
+        focusedId,
+        fontSize,
+        userLabels,
+        poppedOutTabs,
+      } = useWorkspace.getState();
       saveToBackend(
         JSON.stringify({
           tabs,
           activeTabId,
           focusedId,
           fontSize,
-          labels,
+          // Persist only explicit user renames; Claude titles are live-only.
+          labels: userLabels,
           poppedOutTabs,
         }),
       );
@@ -1084,12 +1155,16 @@ async function hydrateFromBackend(): Promise<void> {
     // we still refresh the durable copy from that state via the next persist().
     if (Object.keys(useWorkspace.getState().terminals).length > 0) return;
 
+    // `layout.labels` is the persisted user-rename set: adopt it as userLabels
+    // and recompute the effective `labels` over any live Claude titles.
+    const claudeTitles = useWorkspace.getState().claudeTitles;
     useWorkspace.setState({
       tabs: layout.tabs,
       activeTabId: layout.activeTabId,
       focusedId: layout.focusedId,
       fontSize: layout.fontSize,
-      labels: layout.labels,
+      userLabels: layout.labels,
+      labels: mergeLabels(layout.labels, claudeTitles),
       poppedOutTabs: layout.poppedOutTabs,
     });
     // Re-mirror to localStorage so both copies agree after adopting SQLite.
@@ -1108,3 +1183,69 @@ async function hydrateFromBackend(): Promise<void> {
 
 // Kick off durable hydration once, fire-and-forget. Never blocks module load.
 void hydrateFromBackend();
+
+// ---------------------------------------------------------------------------
+// GOAL NAMES: feed Claude-suggested titles from the lifecycle hooks into the
+// label map. The backend emits `agent://title` ({ sessionId, cwd, title }) when
+// a hook (UserPromptSubmit / SessionStart) yields a usable summary. TermHub
+// terminals are keyed by their own tmux id, not the Claude session id, so we
+// correlate by working directory (both are WSL-side paths). The matched
+// terminal's Claude title is then merged into `labels` (a user rename always
+// wins) so `deriveLabel` prefers what Claude is doing over the raw command·cwd.
+//
+// Subscribed here (not via client05) to keep the wiring inside the label region
+// this store owns. Satellite windows also listen; setClaudeTitle is a no-op for
+// ids they don't render, so the extra entries are inert.
+// ---------------------------------------------------------------------------
+
+/** Normalize a cwd for correlation: strip trailing separators, lower-case (WSL
+ *  paths are case-sensitive but our match is a best-effort heuristic). */
+function normCwd(cwd: string | undefined): string {
+  if (!cwd) return "";
+  return cwd.replace(/[/\\]+$/, "").toLowerCase();
+}
+
+/** Find the terminal whose cwd best matches a hook event's cwd: an exact
+ *  (normalized) path match first, then a unique cwd-basename match as a looser
+ *  fallback. Returns the terminal id, or null if there is no unambiguous match. */
+function terminalForCwd(
+  terminals: Record<TerminalId, TerminalInfo>,
+  hookCwd: string | undefined,
+): TerminalId | null {
+  const target = normCwd(hookCwd);
+  if (!target) return null;
+  const entries = Object.values(terminals);
+  const exact = entries.filter((t) => normCwd(t.cwd) === target);
+  if (exact.length === 1) return exact[0].id;
+  if (exact.length > 1) return null; // ambiguous: don't mislabel
+  // Looser fallback: a single terminal sharing the basename (e.g. /mnt/c vs
+  // /home symlink skew). Only when it is unambiguous.
+  const base = cwdBasename(hookCwd);
+  if (!base) return null;
+  const byBase = entries.filter((t) => cwdBasename(t.cwd) === base);
+  return byBase.length === 1 ? byBase[0].id : null;
+}
+
+/** Subscribe to `agent://title` and route each Claude-derived title onto the
+ *  matching terminal's label. Fire-and-forget; a missing Tauri runtime (e.g. a
+ *  test/SSR context) is tolerated. */
+async function subscribeClaudeTitles(): Promise<void> {
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    await listen<{ sessionId: string; cwd?: string; title: string }>(
+      "agent://title",
+      (ev) => {
+        const { cwd, title } = ev.payload;
+        if (!title) return;
+        const id = terminalForCwd(useWorkspace.getState().terminals, cwd);
+        // TODO(claude-title): when the backend can map a Claude session id to a
+        // terminal directly (shared layer), prefer that over cwd correlation.
+        if (id) useWorkspace.getState().setClaudeTitle(id, title);
+      },
+    );
+  } catch {
+    // No Tauri event runtime — titles simply won't stream (non-fatal).
+  }
+}
+
+void subscribeClaudeTitles();
