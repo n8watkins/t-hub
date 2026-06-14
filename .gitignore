@@ -1,5 +1,9 @@
 # Dependencies
 node_modules/
+# Also ignore a `node_modules` SYMLINK (worktrees symlink it); the trailing
+# slash above only matches a real directory, so the symlink would otherwise be
+# picked up by `git add -A` and committed with a machine-specific target.
+node_modules
 .pnpm-store/
 
 # Build output
