@@ -1,217 +1,276 @@
 # TermHub — Session Handoff
 
-**Last updated:** 2026-06-13 · **Branch:** `main` @ `240c646` (clean, pushed to `origin/main`)
+**Last updated:** 2026-06-14 · **Branch:** `main` @ `5fb33c2` (clean, pushed to `origin/main`) · **App version:** `0.1.5`
 
-> Read this whole file + [PLAN.md](./PLAN.md), [MCP.md](./MCP.md),
-> [SESSION_AWARENESS.md](./SESSION_AWARENESS.md), and the repo `README.md`
-> before doing anything. Do **not** re-ask the user anything answered here.
+> Read this whole file first, plus [PLAN.md](./PLAN.md), [MCP.md](./MCP.md),
+> [SESSION_AWARENESS.md](./SESSION_AWARENESS.md), and the repo `README.md`.
+> Do **not** re-ask the user anything answered here — many decisions below are
+> already made.
 
 ---
 
 ## 0. The one thing to do next
 
-The user dumped a large batch of UX feedback (the "shell-v3" list in §5). A
-worktree is already prepared: **`/home/natkins/n8builds/th-shell3`** on branch
-**`feat/shell-v3`** (branched from `main` @ `240c646`, no commits yet). Start
-there. The **#1 recurring bug: tile drag does not work** — the current
-implementation uses HTML5 drag-and-drop, which dies over xterm's WebGL canvas
-in WebView2. **Rebuild it with POINTER events** (`pointerdown`/`move`/`up` +
-`document.elementFromPoint`), not HTML5 DnD.
+The shell, terminals, theming, tabs, drag, multi-window, MCP, SQLite, hooks,
+file tree, lifecycle controls, and the persistent-pool muted bug are all **done
+and deployed** (v0.1.5). What remains is a short punch-list of UX fixes from the
+user's live testing (§5). Start with **#1: clicking a session/terminal in the
+sidebar should switch to and focus that terminal** — today the Sessions-list
+click calls `setSelectedSession`, whose state is **never read**, so it does
+nothing. The user expects it to reveal the terminal.
+
+The single most important tool you now have: **a file-based diagnostic log the
+running Windows app writes to, which you can read from WSL** (§2). Use it
+instead of guessing — it is how every hard bug this session got fixed.
 
 ---
 
 ## 1. What this is
 
-**TermHub** — a terminal-first command center for running/supervising many
-persistent Claude Code sessions at once. Target: **Windows 11 + WSL2 (Ubuntu
-24.04) + zsh**. Tauri 2 (Rust) shell + React/TS/Tailwind frontend + xterm.js,
-with a `portable-pty` (ConPTY) → `wsl.exe` → **`tmux -L termhub`** spine.
+**TermHub** — a terminal-first cockpit for running/supervising many persistent
+Claude Code sessions. Target: **Windows 11 + WSL2 (Ubuntu-24.04) + zsh**. Tauri
+2 (Rust, frameless WebView2) + React/TS/Tailwind + xterm.js, with a
+`portable-pty` (ConPTY) → `wsl.exe` → **`tmux -L termhub`** spine. Every xterm is
+rendered once into a persistent overlay pool (`TerminalPool.tsx`) positioned
+over placeholder cells, so moving tiles never reloads a terminal.
 
 - **GitHub:** `github.com/n8watkins/termhub` (private; `gh` authed in WSL as `n8watkins`).
-- **WSL repo (edit + commit here):** `/home/natkins/n8builds/tools` (ext4).
-- **Windows build mirror (never edit):** `C:\Users\natha\termhub`.
+- **WSL repo (edit + commit here):** `/home/natkins/n8builds/tools` (ext4). `main` is the integration branch.
+- **Windows build mirror (NEVER edit):** `C:\Users\natha\termhub` — the deploy script `git reset --hard`s it to `origin/main`.
 - **Env:** WSL user `natkins`, Windows user `natha`. `/mnt/c` ↔ `C:\`.
-- The product spec is `PRD.md`; the technical review is `REVIEW.md`; the
-  forward plan is `docs/PLAN.md`.
+- Spec: `PRD.md`; technical review: `REVIEW.md`; forward plan: `docs/PLAN.md`.
 
-## 2. Build / run / deploy (CRITICAL — the app only runs on Windows)
+## 2. Build / verify / deploy / DEBUG (CRITICAL)
 
-The app is a **Windows** binary (WebView2 + ConPTY + `wsl.exe`). It **cannot
-run in WSL/Linux**. You (agents) **cannot launch the GUI** — the user is the
-only one who sees it. So:
+The app is a **Windows** binary; it **cannot run in WSL**, and **you cannot
+launch the GUI** — the user is the only one who sees it.
 
-**To verify code (in WSL):**
+**Verify code (in WSL):**
 ```
-pnpm typecheck                                                   # frontend
-cargo check --manifest-path src-tauri/Cargo.toml --workspace     # backend (webkit IS installed here)
-cargo test  --manifest-path src-tauri/Cargo.toml --workspace     # tests
+npx tsc --noEmit                              # frontend (run from repo root; node_modules is symlinked from th-shell3 if missing)
+cd src-tauri && cargo check -p termhub        # backend — Linux target only
 ```
+> `cargo check` on Linux does NOT compile `#[cfg(windows)]` code (the `wsl.exe`
+> path translation in `files.rs`, the WSL-home resolver in `claude/install.rs`,
+> `win_snap.rs`, etc.). Those are only truly compiled by the **Windows build at
+> deploy**. Keep windows-gated code self-contained and correct; the deploy is
+> the real cross-check.
 
-**To deploy a change so the user sees it:**
-1. Commit + push to `origin/main` from `/home/natkins/n8builds/tools`.
-2. Clear stale sessions: `tmux -L termhub kill-server`.
-3. Run the rebuild+relaunch script (force-syncs the Windows mirror to
-   `origin/main`, `pnpm install`, `pnpm tauri build`, launches the exe):
-   ```
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\Users\natha\Downloads\termhub_relaunch.ps1'
-   ```
-   It prints `BUILD_EXIT=0` + `LAUNCHED ...` on success. First build of a clean
-   target is ~15-25 min; incremental ~1-3 min. (The script sets
-   `CARGO_PROFILE_RELEASE_LTO=false` for speed.) **Filter the noisy PowerShell
-   stderr** by piping through `grep -vE 'RemoteException|CategoryInfo|FullyQualified|At C:|^\s*\+|NotSpecified'`.
-   The "RemoteException" lines are just git's progress text — not errors.
+**Deploy (so the user sees a change):**
+```
+./scripts/bump-version.sh                     # STANDING RULE: bump version EVERY deploy (patch). Prints new version.
+cd src-tauri && cargo check -p termhub        # sync Cargo.lock to the bumped version
+git add -A && git commit ...                  # ASCII-only message + Co-Authored-By trailer (§7)
+git push origin main
+: > /mnt/c/Users/natha/.termhub/diag.log       # OPTIONAL: clear the diag log for a clean post-deploy read
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\Users\natha\Downloads\termhub_relaunch.ps1'
+```
+The relaunch script (run it `run_in_background: true`; it takes minutes):
+`Stop-Process termhub` → `cd %USERPROFILE%\termhub` → `git fetch + reset --hard
+origin/main` → `pnpm install` → `pnpm tauri build --bundles nsis` → launches the
+exe. Prints `BUILD_EXIT=0` + `LAUNCHED ...` on success (grep `/tmp/...out` for
+those). **It kills `termhub.exe` itself** (close-to-tray keeps a stale instance
+alive — this is why the kill matters). **Do NOT `tmux -L termhub kill-server`** —
+that destroys the user's running Claude sessions; the default deploy must
+preserve them.
 
-> Windows toolchain is fully present (Rust MSVC, VS Build Tools 2022, Node 22,
-> pnpm 10, WebView2 149). The Windows clone is a **mirror**: the script does
-> `git reset --hard origin/main`, so never edit it directly.
+**DEBUG (the key capability — you can read the running app's logs):**
+- The app appends runtime logs to **`C:\Users\natha\.termhub\diag.log`**, which
+  you read from WSL at **`/mnt/c/Users/natha/.termhub/diag.log`**.
+- `tlog(tag, ...)` in `src/lib/diag.ts` writes compact JSON lines; `console.warn`/
+  `error` + window `error`/`unhandledrejection` are mirrored in. Backend command
+  `diag_log`/`diag_clear` in `src-tauri/src/diag.rs`.
+- **F12 devtools are enabled in the release build** (the `devtools` feature on
+  the `tauri` dep in `src-tauri/Cargo.toml`).
+- Tags in use: `pool` (every show/park decision — id, rect, SHOW/PARK + reason,
+  activeTab), `files` (every `list_dir` call + OK count / ERROR), `attach`
+  (subscribe/attach/flush/teardown), `focus`, plus `error`/`warn`.
+- Useful greps: `grep -E 'PARK [0-9a-f]+ \(active\)'` = the muted-bug regression
+  signature (must be **0**); note `(inactive)` and `activeTab=` both contain the
+  substring "active", so a naive `grep active` false-matches.
 
-## 3. State — everything below is MERGED to `main` and builds green
+## 3. State — DONE this session (all merged to `main`, deployed, version-tagged)
 
-This session built the 0.1 nucleus → a large v1 slice via **8 parallel agent
-branches, all merged with (near) zero conflicts** thanks to strict disjoint
-file ownership. Key commit anchors (newest first):
+Built as **two waves of parallel Opus agents on disjoint git worktrees** (the
+orchestrator merges + verifies + deploys), then several hotfix deploys.
 
-| Area | Commit(s) | Notes |
-|---|---|---|
-| Terminal palette → live xterm | `240c646` | theme recolors terminals too |
-| Theming system | `4ca194b`/`15badb8` | tokens→CSS vars, `Ctrl/Cmd+,` editor, presets, get/set_theme + `theme://changed` |
-| MCP server | `6f4b1f1`/`ef16c56` | `termhub-mcp` binary + app control listener, 13 tools, `.mcp.json`, e2e-tested |
-| Fresh-prompt cascade fix | `ad523df` | fresh spawn = empty seed + frontend Ctrl-L |
-| Shell v2 (Chrome top bar) | `65aad1b`/`b75c569` | persistent top bar, custom min/max/close, drag regions, tab fixes, **fixed-but-still-broken** tile drag |
-| Files (index/search/reader) | `2245028` | backend + `FilePanel` (NOT mounted — see §6) |
-| Session awareness (live sidebar) | `dd5ab95`/`fbf762d` | emit spine wired; needs runtime agent connection (§6) |
-| Workspace tabs | `f14e00b` | tabs, per-tab persistence (localStorage `termhub.workspace.v2`, v1-migration) |
-| Frameless window | `8701e6d` | `decorations:false` + (old) auto-hide titlebar |
-| 0.5 personal-alpha base | `239cf61` | protocol crate, agent, supervision reducer, sidebar |
-| Windows runtime fixes | `9469305`/`ba43a80`/`6303ec4`/`1fb8a8d`/`b7876d0` | wsl.exe-tmux routing, open-in-`~`, Cascadia Mono, copy/paste, no green dirs, no tmux status bar/mouse |
-| 0.1 nucleus + global zoom | `e10eb79` and earlier | xterm tiles, PTY/tmux, auto-grid, Ctrl+/-/0 |
+**Wave 1 (`ee5e097`, ~v0.1.0):** native-speed file tree; **the muted/blank-pool
+bug REAL fix** (active-tab terminals are never parked + header-click now triggers
+a pool re-sync — root cause was `setFocus` changing only `focusedId`, which the
+pool layout-effect didn't depend on); the diagnostic logger + F12; friendly
+session labels; spawn presets (Claude/Shell/Resume/Custom); notification sounds;
+6 new MCP tools (`read_terminal`/`capture_pane`, `send_text`, `send_keys`,
+`close_terminal`, `new_tab`, `focus_tab`).
 
-**Verified:** all merges compile (`typecheck` + `cargo check --workspace`);
-agent test suites pass in their worktrees (session-awareness 76, MCP 37, files
-13, theme 4). **Not verified:** the Windows GUI — only the user can confirm
-visuals/interactions.
+**Wave 2 (`4fee9e9`, v0.1.2):** hooks install to the real **WSL** `~/.claude`;
+Claude-derived terminal titles; file/web **preview overlay**; **recovery-review**
+screen (SQLite snapshot history); **terminal lifecycle** (X = detach/keep
+session, trash = confirmed delete, `Ctrl+Shift+W` = fast-delete); **startup-race
+fix** (subscribe before attach + one shared `EventHub` per channel — killed a
+16k-line orphaned-callback storm, verified 0 after); muted-flicker re-arm;
+Win11 max/restore toggle.
 
-## 4. Live UX state the user has tested (and reactions)
+**Hotfixes:**
+- `dea410a` **v0.1.3** — hooks resolve the real absolute `termhub-agent` path
+  (`~/.local/bin`, via login-shell `command -v`); file-tree `tlog` instrumentation.
+- `0e2b53f` **v0.1.4** — file tree was rendering at **0px height** (only `grow`
+  section, squeezed by the tall default-open Hooks panel); gave it `min-h-[180px]`
+  and collapsed Hooks by default. `list_dir` itself was already returning 16
+  entries — the data was fine, there was no room to draw it.
+- `5fb33c2` **v0.1.5** — tmux **`mouse on`** (global) so the wheel scrolls inside
+  Claude/full-screen apps instead of sending arrows (selection now = Shift+drag);
+  `tmux::pane_info()` reads per-session foreground command + live cwd, so
+  `list_terminals` labels tiles `claude · tools` / `zsh · …` and the Files tree
+  follows the focused terminal's real cwd.
 
-Working: terminals spawn (WSL zsh via tmux, open in `~`, Cascadia Mono, no
-green dirs, no scrollbar, arrow cursor), `Ctrl+C/V` copy-paste, global zoom,
-tabs (switch with no terminal reload), gutters, the theme editor (`Ctrl+,`).
-Cascade ("bunch of cmds on spawn") — fixed in `ad523df`, user not re-confirmed.
+**Verified working** (user-confirmed or log-confirmed): muted bug gone (move-tile
+→ click no longer blanks; `PARK (active)` = 0); cold-start no longer freezes
+(0 callback storms, typing works); file tree shows 16 entries / has height;
+hooks install to WSL and Sessions populate; `mouse on` is set (`show-options -g
+mouse → on`); label data flows from tmux.
 
-## 5. NEXT STEPS — `feat/shell-v3` (the user's latest feedback, verbatim intent)
+**Live config touched (with backup):** `~/.claude/settings.json` had 15 hook
+entries pointing at a stale `/usr/bin/termhub-agent`; corrected to
+`/home/natkins/.local/bin/termhub-agent` (backup at `…settings.json.termhub-bak`).
 
-Do these in `/home/natkins/n8builds/th-shell3`. They all touch the shell
-(`Canvas.tsx`, `Tile.tsx`, `Titlebar.tsx`, `App.tsx`, `store/workspace.ts`,
-`Sidebar.tsx`, `index.css`) — theming is already merged, so build on the
-themed components and consume the `--th-*` CSS vars / `useTheme` store.
+## 4. State — IN FLIGHT / known cosmetic, NOT yet fixed
 
-1. **Tile drag is STILL broken — top priority.** Rebuild with **pointer events
-   + `elementFromPoint`** (HTML5 DnD fails over the WebGL canvas). Must support:
-   drag a tile onto **any** other tile to **swap/reposition in any direction
-   incl. diagonal**; and **drag a tile onto a workspace tab to move it to that
-   tab**.
-2. **Resizable sidebar** — let the user drag the sidebar's right edge to resize
-   its width (clamp to a sane range).
-3. **Visible Settings button** — a settings entry (gear) somewhere in the top
-   bar that opens the theme/settings editor (today it's only `Ctrl/Cmd+,`).
-4. **Wider workspace tabs** — increase each tab's width. (User retracted the
-   "tabs further right" idea — ignore that part.)
-5. **Status dots are confusing** — the green circles next to terminals/tabs
-   read as "selected?". Either explain them (they're terminal **lifecycle
-   state**: starting/live/detached/exited/error — see `DOT_CLASS` in `Tile.tsx`)
-   or de-emphasize. The user wants **selection** to just be a **subtle
-   theme-accent "lit up"**, not a hard ring/circle.
-6. **Rename TermHub → "T-Hub"** in the **top-left** of the title bar (the user
-   prefers "T-Hub"). (Product name change; window title can stay or change too.)
-7. **Window controls visibility:**
-   - **Not maximized →** min/maximize/close **always visible** (never hide).
-   - **Maximized →** controls **auto-hide after ~2s**; hovering the top edge
-     **persists them ~3s** then hides again.
-8. **Titlebar reveal should PUSH content down (layout shift), not overlay** —
-   like the content getting shoved down when you touch the top; only on
-   touching the very top; **make this toggleable in Settings**.
-9. **Settings panel** (ties to #3) — a real settings surface (theme editor is
-   the start; add the toggles like #8).
-10. **Claude-hooks panel is confusing** (`HookInstallPanel` in the sidebar) —
-    clarify copy: it installs Claude Code hooks **globally** in
-    `~/.claude/settings.json` (affects **all** Claude sessions, not the focused
-    terminal). Say so in the panel.
-11. **Drag terminal ↔ workspace** (covered by #1's drag-to-tab).
-12. **Drag-reorder workspace tabs** — `shell-v2` added `moveTab`; verify it
-    actually works (likely same HTML5-DnD problem → pointer-ify it).
-13. **(BIG / future) Multi-window:** pull a workspace **out into a new window**,
-    and drag workspaces **between windows**. This is a real architecture effort
-    (Tauri multi-window + cross-window DnD) — scope/plan it separately; PRD-level.
+- **Startup content flash** ("muted bug back"): on launch the terminals are
+  positioned correctly (pool log clean) but xterm hasn't painted the seeded
+  scrollback for ~a moment, then it does. Self-healing, cosmetic. The pool's
+  first-paint guard handles position, not content paint.
+- **Win11 Snap-Layouts hover flyout:** max/restore *toggles* now, but hovering
+  the maximize button does NOT show the Windows 11 snap-arrangement flyout. The
+  click is intercepted in `win_snap.rs` (HTMAXBUTTON → `WM_SYSCOMMAND`); the
+  DWM hover path for the flyout still needs work.
+- **Label accuracy:** labels now derive from `pane_current_command` + cwd
+  (accurate); the earlier Claude-prompt-derived titles (`agent://title`, matched
+  by cwd) can be ambiguous when terminals share a cwd.
 
-## 6. Deferred (owned by integrator, not the agents) — see TaskList #21/#22
+## 5. NEXT STEPS (the user's open punch-list, ordered)
 
-- **Sidebar shows no live data (#21).** The emit spine is merged, but the
-  Windows app spawns **non-login** `wsl.exe -- termhub-agent`, which won't find
-  `termhub-agent` (installed at `~/.local/bin`, only on the interactive PATH).
-  Fix: make it reachable (install to `/usr/local/bin` w/ sudo, or use an
-  absolute path / `TERMHUB_AGENT_BIN`). Also: the sidebar only shows anything
-  when a **real Claude Code session is running** (hooks fire → journal → emit).
-  See `docs/SESSION_AWARENESS.md`.
-- **FilePanel not mounted (#22).** `src/components/FilePanel.tsx` is built but
-  unmounted; mount it (toggle / sidebar tab) and route its index through WSL
-  paths (the Rust index runs Windows-side; pass a `\\wsl.localhost\...` or
-  WSL-agent path). Backend commands exist (`index_project`, `search_files`,
-  `list_dir`, `read_text_file`).
-- **MCP stubs:** `list_tabs` returns empty (no tab read-API yet); the UI-mutating
-  tools (`focus_session`/`move_tile`/`rename_tab`) return `applied:false`
-  (need frontend-facing commands). See `docs/MCP.md`.
+1. **Click a session/terminal in the sidebar → switch to + focus that terminal.**
+   Today `onSelectSession` → `App.tsx` `setSelectedSession`, and `selectedSession`
+   is **never read** (dead state) — so nothing happens. Wire it to find the tab
+   containing that terminal and call `setActiveTab` + `setFocus`. Note the
+   "Sessions" accordion = Claude **supervision** nodes (session ids from hooks,
+   correlated to a terminal by cwd); the user's **terminals** are under
+   "Workspaces" (`TerminalRow`). Decide which the click should target (likely:
+   make BOTH the Workspaces terminal rows and the Sessions rows reveal/focus the
+   matching tile). Acceptance: clicking a row switches to its tab and lights up
+   that tile.
+2. **Startup content-flash polish** — force an xterm repaint the instant the pool
+   places each terminal on first paint (`TerminalPool.tsx` fires `th-pool-moved`;
+   `Terminal.tsx` listens). Acceptance: no visible blank-then-fill on cold start.
+3. **Win11 Snap-Layouts hover flyout** — make hovering the maximize button show
+   the snap flyout (`win_snap.rs` DWM hover handling). Windows-only; verify via
+   the deploy build. Acceptance: hover shows the snap grid.
+4. **Label accuracy** — confirm `claude · tools` / `zsh · …` reads right after
+   0.1.5; refine `deriveLabel` (`store/workspace.ts`) / the cwd correlation if
+   the user reports wrong tiles labeled.
+5. **Notification sounds** are now firing (hooks work). User can mute in
+   Settings → General → Notifications; soften/tune if they ask.
+6. **Desktop notification toasts** — sounds work; the OS toast needs the Tauri
+   notification plugin added (`@tauri-apps/plugin-notification` + Rust
+   `tauri-plugin-notification` init + `notification:default` capability).
 
-## 7. Conventions & gotchas (hard-won this session)
+## 5b. Questions asked this session → the user's answers (DECIDED — do NOT re-ask)
 
-- **Commit trailer (required):** end every commit with
+- **Q: Scroll — flip tmux `mouse on` so the wheel scrolls in Claude (trade-off:
+  text selection then needs Shift+drag)?** → **YES, do it.** ("I gotta be able to
+  scroll in a terminal session with Claude.") Shipped in v0.1.5; Shift+drag for
+  selection is accepted.
+- **Q: When you click the maximize/restore button, what happens — (a) nothing,
+  (b) maximizes but covers taskbar, (c) maximizes but won't restore?** → "It works
+  but only basically; **on hover it should display all the different ways it could
+  be formatted**." = the toggle works; the real ask is the **Windows 11
+  Snap-Layouts hover flyout** (§4, §5.3).
+- **Q: What does the muted bug look like, and what triggers it?** → "Inside the
+  terminals, just like before." First answered "on startup, then settles," then
+  found the trigger is **clicking a Session row**. BUT the pool log shows
+  `PARK (active)` = 0 and the session-click handler is dead state — so the old
+  pool muted bug is genuinely gone; what's left is the transient **startup
+  content paint** (§4) that coincided. Do not chase a pool regression.
+- **Q (implied): should clicking a session do something?** → "I figured clicking
+  the session would open that Claude Code instance in the terminal… it doesn't,
+  but it should, or there should be a way to do that." → that's §5.1.
+- **Icon:** the user pasted a microphone "scribe" PNG, then said **ignore it** —
+  it was the wrong asset. No final icon yet; leave the Tauri default (§6).
+
+## 6. Conventions & gotchas (hard-won)
+
+- **Commits:** ASCII-only messages (no em-dashes — they break PowerShell/`.ps1`
+  parsing). End every commit with
   `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`. Commit after each
-  logical change; push when sane. Use the `cmX.txt` heredoc pattern for multi-
-  line messages (PowerShell/zsh hate em-dashes — keep commit + **`.ps1` files
-  ASCII-only**; a `—` in a script breaks PowerShell parsing).
-- **Parallel agents pattern that worked:** give each agent its **own git
-  worktree + branch**, **strict disjoint file ownership**, "don't touch
-  package.json/Cargo.toml unless adding a dep", "don't commit shared files",
-  push the branch; the integrator merges sequentially. This produced ~zero
-  merge conflicts across 8 branches. Shared merge points to expect: `lib.rs`
-  (handler/registration appends), `src/ipc/types.ts` (appends), `App.tsx`.
-- **The cascade ("bunch of cmds on spawn")** was fit/resize timing, not the
-  shell. `Terminal.tsx`: the first `fit()` is deferred to a double-`rAF` and
-  attach runs inside it; fresh spawns are **not seeded** (`commands.rs`
-  `attach_terminal` returns empty for `has_live`), and the frontend sends one
-  `Ctrl-L` to draw a single clean prompt. Don't reintroduce a synchronous fit
-  or a fresh-spawn capture.
-- **tmux is inside WSL.** On Windows, ALL `tmux` control commands AND the attach
-  are routed through `wsl.exe` (`tmux.rs` `tmux()` is `#[cfg(windows)]` ->
-  `wsl.exe --cd ~ -- tmux -L termhub …`). New terminals open in `~` (WSL home).
-  TermHub sets `status off` + `mouse off` per session (so xterm owns selection →
-  `Ctrl+C` copies; no tmux right-click menu).
-- **Frameless window:** `tauri.conf.json` `decorations:false`. Window perms are
-  in `capabilities/default.json` (minimize/maximize/unmaximize/close/start-dragging).
-  Drag regions use `data-tauri-drag-region`.
-- **The user's `~/.zshrc` was edited** (one additive line: `LS_COLORS` `ow`/`tw`
-  → blue so `/mnt/c` dirs aren't green). Don't undo it.
-- **Theming = CSS vars.** `:root` defaults live in `src/index.css`; the active
-  theme overwrites `--th-*` vars from `src/store/theme.ts` (`useTheme` store);
-  `ThemeEditor` mounts via `src/themeBootstrap.tsx` (its own React root, no
-  App.tsx hook) + a `<script>` in `index.html`. Consume vars via Tailwind
-  arbitrary values, e.g. `bg-[var(--th-app-bg)]`.
+  logical change.
+- **Version:** run `./scripts/bump-version.sh` before EVERY deploy (bumps patch
+  across `package.json`, `tauri.conf.json`, `Cargo.toml`; About in Settings shows
+  it via `getVersion()`). The user explicitly wants a fresh version each update.
+- **Parallel-agent orchestration (the user STRONGLY prefers this for batches):**
+  one git worktree + branch per agent off `main`
+  (`git worktree add -b feat/x /home/natkins/n8builds/th-x main`), symlink
+  `node_modules` from `th-shell3`, strict **disjoint file ownership**, agents run
+  `npx tsc --noEmit` but NOT cargo (orchestrator compiles Rust once at
+  integration), agents commit on their branch. Merge sequentially; the only
+  recurring conflict hotspots are `workspace.ts` (keep label-region vs
+  actions-region edits separate), `Sidebar.tsx` (Files-section vs
+  Workspaces/Sessions regions), and `lib.rs`/`Cargo.toml` (command registration /
+  feature flags — orchestrator reconciles). Clean up worktrees after merge
+  (`git worktree remove --force` + `git branch -D`).
+- **tmux `#{...}` format gotcha:** over `wsl.exe`, a bare `#{...}` argv word is
+  eaten as a shell comment (this broke `list-sessions -F '#{session_name}'` →
+  "-F expects an argument", which silently broke the whole live terminal list /
+  cwd / labels). Fixes: either avoid `-F` (parse default output, as
+  `list_sessions` now does) OR wrap the tmux call in `bash -lc '<script with the
+  format SINGLE-QUOTED>'` (as `pane_info()` does — single quotes make `#`
+  literal). See `src-tauri/src/tmux.rs`.
+- **WSL path translation:** file commands run Windows-side; `files.rs`
+  `to_host_path` maps `/home/...` → `\\wsl.localhost\<distro>\...` UNC.
+  `normalize()` must NOT `canonicalize()` a WSL UNC path (it rewrites it to the
+  `\\?\UNC\` verbatim form that `unc_to_posix` didn't recognize → silently fell
+  back to the slow std::fs UNC read). The fast path shells `list_dir`/index
+  natively inside WSL (`find` / `rg`).
+- **tmux is preserved across deploys.** Do not kill the server. New terminals
+  open in `~`. `mouse on` is global now (selection = Shift+drag).
+- **Frameless window:** `tauri.conf.json` `decorations:false`; window perms in
+  `capabilities/default.json` (incl. `core:window:allow-toggle-maximize`).
+- **Icon:** the user has NOT supplied a final app icon (they said to ignore the
+  microphone "scribe" icon). Taskbar icon is still the Tauri default. Do not
+  swap it until they hand over a real asset.
+- **Memory:** the orchestrator keeps auto-memory at
+  `~/.claude/projects/-home-natkins-n8builds-tools/memory/` (deploy flow, diag
+  log, parallel-agent pattern).
 
-## 8. File map (for the shell-v3 work)
+## 7. File map (current, for the next steps)
 
-- `src/App.tsx` — top-level shell (Titlebar + sidebar + canvas column).
-- `src/components/Titlebar.tsx` — the persistent top bar (tab strip + window controls + drag regions).
-- `src/components/Canvas.tsx` — tab rendering (all tabs mounted, `display:none` inactive), grid, gutters, FAB.
-- `src/components/Tile.tsx` — tile chrome, status dot (`DOT_CLASS`), the drag source/target (HTML5 — **pointer-ify**).
-- `src/components/Terminal.tsx` — xterm wrapper (fit/attach/cascade/zoom/copy-paste/palette). Integrator-owned.
-- `src/store/workspace.ts` — tabs/order/focus/fontSize + `moveTile`/`moveTab`/`addTab`/`cycleTab` + persistence.
-- `src/store/theme.ts` + `src/components/ThemeEditor.tsx` + `src/index.css` — theming.
-- `src/components/Sidebar.tsx` + `HookInstallPanel.tsx` — supervision sidebar + hooks UI.
-- `src-tauri/src/{commands,pty,tmux,commands_05,theme,control,files}.rs`, `agent/`, `crates/{termhub-protocol,termhub-agent,termhub-mcp}`.
+- `src/App.tsx` — shell root; `onSelectSession={setSelectedSession}` (the dead
+  wiring to fix in §5.1); mounts `LifecycleKeybinds`.
+- `src/components/Sidebar.tsx` — accordion (Workspaces / Files / Sessions /
+  Hooks); `filesRootFor()` (Files root follows focused terminal cwd); Files
+  section has `min-h-[180px]`; Hooks `defaultOpen={false}`.
+- `src/components/TerminalPool.tsx` — the pool; `sync()`; active-never-parked
+  invariant + first-paint re-arm; `tlog('pool', …)`.
+- `src/components/Terminal.tsx` — xterm wrapper; subscribe-before-attach +
+  buffer/flush; `th-pool-moved`/IntersectionObserver repaint. Integrator-owned.
+- `src/ipc/client.ts` — the shared `EventHub` (one listener per channel,
+  fans out); `writeTerminal` (input), attach/seed.
+- `src/store/workspace.ts` — tabs/order/focus, `labels`/`deriveLabel`,
+  `detachTile`/`deleteTerminal`, `agent://title` subscription, SQLite mirror.
+- `src/components/{SpawnMenu,ConfirmDialog,PreviewOverlay,WebPreview,RecoveryReview,HookInstallPanel,FileTree,FilePanel,Tile,Titlebar}.tsx`.
+- `src/lib/{diag,notify,notifyMount}.ts`, `src/lib/useLifecycleKeybinds.tsx`.
+- `src-tauri/src/tmux.rs` — `list_sessions` (no `-F`), `pane_info()` (foreground
+  cmd + cwd), `new_session` (mouse on), capture/send helpers.
+- `src-tauri/src/commands.rs` — `list_terminals` (uses `pane_info` for title+cwd),
+  spawn/attach.
+- `src-tauri/src/{diag,db,control,win_snap,files}.rs`, `claude/install.rs`
+  (WSL settings path + `resolve_agent_bin`), `commands_05.rs`, `agent/`,
+  `crates/{termhub-protocol,termhub-agent,termhub-mcp}`.
 
-## 9. Worktrees / branches
+## 8. Worktrees
 
-`main` is the integration branch. Already-merged feature branches still have
-worktrees (can be removed with `git worktree remove`): `feat/0.5-personal-alpha`,
-`feat/tabs`, `feat/session-awareness`, `feat/files`, `feat/shell-v2`, `feat/mcp`,
-`feat/theming`. **Active:** `feat/shell-v3` @ `/home/natkins/n8builds/th-shell3`
-(empty, start here).
+`main` is the integration branch (this session worked directly on `main` for
+hotfixes and merged agent branches into it). Stale leftover worktrees from older
+sessions may linger (`feat/files`, `feat/mcp`, `feat/shell-v2`, `feat/tabs`,
+`feat/theming`, `feat/session-awareness`, `feat/0.5-personal-alpha`,
+`feat/shell-v3`) — removable with `git worktree remove`. This session's wave
+worktrees were already cleaned up.
