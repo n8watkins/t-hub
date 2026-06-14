@@ -103,10 +103,11 @@ fn initialize_result() -> Value {
             "version": env!("CARGO_PKG_VERSION")
         },
         "instructions": "TermHub MCP server. Read tools (list_terminals, get_status, \
-            supervision_tree, wsl_health, search_files, list_tabs) are allowed. \
-            Organization tools (focus_session, move_tile, rename_tab, open_file) are \
-            audited. Process-changing tools (spawn_terminal) require confirmation. \
-            Calls are forwarded to the running TermHub app over a local control channel."
+            supervision_tree, wsl_health, search_files, list_tabs, read_terminal) are \
+            allowed. Organization tools (focus_session, move_tile, rename_tab, new_tab, \
+            focus_tab, open_file) are audited. Process-changing tools (spawn_terminal, \
+            send_text, send_keys, close_terminal) require confirmation. Calls are \
+            forwarded to the running TermHub app over a local control channel."
     })
 }
 

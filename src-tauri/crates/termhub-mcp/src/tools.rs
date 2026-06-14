@@ -164,6 +164,86 @@ fn schema_rename_tab() -> Value {
     })
 }
 
+/// `read_terminal` schema: read a session's recent visible output (plain text).
+fn schema_read_terminal() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sessionId":    { "type": "string", "description": "Session/terminal id whose pane to read (the tmux target is th_<id>)." },
+            "historyLines": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Lines of scrollback to include above the visible screen (default 0 = visible screen only)." }
+        },
+        "required": ["sessionId"],
+        "additionalProperties": false
+    })
+}
+
+/// `send_text` schema: type literal text (optionally submitting it) into a session.
+fn schema_send_text() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sessionId": { "type": "string", "description": "Session/terminal id to type into (tmux target th_<id>)." },
+            "text":      { "type": "string", "description": "Literal text to type into the session's pane." },
+            "enter":     { "type": "boolean", "description": "Send a trailing Enter to submit the text (default true)." }
+        },
+        "required": ["sessionId", "text"],
+        "additionalProperties": false
+    })
+}
+
+/// `send_keys` schema: send named control keys (e.g. C-c, Up, Escape) to a session.
+fn schema_send_keys() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sessionId": { "type": "string", "description": "Session/terminal id to send keys to (tmux target th_<id>)." },
+            "keys": {
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1,
+                "description": "tmux key names to send in order, e.g. [\"C-c\"], [\"Up\",\"Enter\"], [\"Escape\"]."
+            }
+        },
+        "required": ["sessionId", "keys"],
+        "additionalProperties": false
+    })
+}
+
+/// `close_terminal` schema: kill a session/pane.
+fn schema_close_terminal() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sessionId": { "type": "string", "description": "Session/terminal id to close (kills the tmux session th_<id> and its process tree)." }
+        },
+        "required": ["sessionId"],
+        "additionalProperties": false
+    })
+}
+
+/// `new_tab` schema.
+fn schema_new_tab() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "Optional name for the new workspace tab (auto-named if omitted)." }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// `focus_tab` schema.
+fn schema_focus_tab() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tabId": { "type": "string", "description": "Workspace tab id to activate." }
+        },
+        "required": ["tabId"],
+        "additionalProperties": false
+    })
+}
+
 /// `spawn_terminal` schema.
 fn schema_spawn_terminal() -> Value {
     json!({
@@ -229,6 +309,12 @@ pub fn catalog() -> Vec<ToolDef> {
             summary: "List the workspace tabs.",
             input_schema: schema_empty,
         },
+        ToolDef {
+            name: "read_terminal",
+            tier: Tier::Read,
+            summary: "Read a session's recent visible output (plain text; optional scrollback) so you can see what it currently shows.",
+            input_schema: schema_read_terminal,
+        },
         // ---- Organization tier -----------------------------------------
         ToolDef {
             name: "focus_session",
@@ -249,12 +335,42 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_rename_tab,
         },
         ToolDef {
+            name: "new_tab",
+            tier: Tier::Organization,
+            summary: "Create a new (empty) workspace tab and switch to it.",
+            input_schema: schema_new_tab,
+        },
+        ToolDef {
+            name: "focus_tab",
+            tier: Tier::Organization,
+            summary: "Activate a workspace tab by id.",
+            input_schema: schema_focus_tab,
+        },
+        ToolDef {
             // Spawning a process is the process-changing subset of the
             // organization actions; it carries the confirmation contract.
             name: "spawn_terminal",
             tier: Tier::ProcessChanging,
             summary: "Spawn a new terminal in a directory.",
             input_schema: schema_spawn_terminal,
+        },
+        ToolDef {
+            name: "send_text",
+            tier: Tier::ProcessChanging,
+            summary: "Type literal text into a session's terminal (optionally pressing Enter to submit it).",
+            input_schema: schema_send_text,
+        },
+        ToolDef {
+            name: "send_keys",
+            tier: Tier::ProcessChanging,
+            summary: "Send named control keys (e.g. C-c, Up, Escape) to a session's terminal.",
+            input_schema: schema_send_keys,
+        },
+        ToolDef {
+            name: "close_terminal",
+            tier: Tier::ProcessChanging,
+            summary: "Close a terminal: kill its tmux session and process tree.",
+            input_schema: schema_close_terminal,
         },
         ToolDef {
             name: "open_file",
@@ -298,16 +414,40 @@ mod tests {
             "wsl_health",
             "search_files",
             "list_tabs",
+            "read_terminal",
             "focus_session",
             "move_tile",
             "rename_tab",
+            "new_tab",
+            "focus_tab",
             "spawn_terminal",
+            "send_text",
+            "send_keys",
+            "close_terminal",
             "open_file",
             "get_theme",
             "set_theme",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
+    }
+
+    #[test]
+    fn new_process_changing_tools_demand_confirmation() {
+        for name in ["send_text", "send_keys", "close_terminal"] {
+            let mcp = find(name).unwrap().to_mcp();
+            let desc = mcp["description"].as_str().unwrap();
+            assert!(desc.contains("CONFIRMATION REQUIRED"), "{name} desc: {desc}");
+            assert_eq!(mcp["annotations"]["confirmationRequired"], true, "{name}");
+            assert_eq!(mcp["annotations"]["termhubTier"], "process-changing", "{name}");
+        }
+    }
+
+    #[test]
+    fn read_terminal_is_read_tier_and_unconfirmed() {
+        let mcp = find("read_terminal").unwrap().to_mcp();
+        assert_eq!(mcp["annotations"]["termhubTier"], "read");
+        assert_eq!(mcp["annotations"]["confirmationRequired"], false);
     }
 
     #[test]
