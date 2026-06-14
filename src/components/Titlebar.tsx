@@ -26,6 +26,7 @@ import { useSettings } from "../store/settings";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { popOutTab, closeSatellite, readSatelliteTab } from "../lib/windows";
+import { closeTerminal } from "../ipc/client";
 
 /** Minimize the window, swallowing any IPC rejection. */
 function minimize(): void {
@@ -91,8 +92,9 @@ export function Titlebar({ satellite = false }: { satellite?: boolean }) {
       <SettingsButton onClick={toggleSettings} />
 
       {/* Window controls (top-right). No drag-region, or clicks would drag. In a
-          satellite the close button returns the tab to the main window (destroy +
-          pop-in) instead of the main window's close-to-tray hide. */}
+          satellite (#6) the redundant close (×) is dropped — the SatelliteBar's
+          "Return" button is the single affordance that hands the tab back and
+          destroys the window — so only minimize/maximize show there. */}
       <WindowControls satellite={satellite} />
     </div>
   );
@@ -196,16 +198,16 @@ function SettingsButton({ onClick }: { onClick: () => void }) {
 }
 
 // ---------------------------------------------------------------------------
-// Window controls: minimize, maximize/restore, close. Fixed-width hover targets
-// matching the bar height; close goes red on hover.
+// Window controls: minimize, maximize/restore, and (main window only) close.
+// Fixed-width hover targets matching the bar height; close goes red on hover.
 //
-// In a SATELLITE window (#21) the close button doesn't use the main window's
-// close-to-tray hide — it returns the tab to the main window and force-destroys
-// the satellite (closeSatellite), so closing a popped-out window cleanly hands
-// its tab back rather than leaving a hidden, still-attached client.
+// In a SATELLITE window (#6) the close (×) is intentionally omitted: it would be
+// a second control duplicating the SatelliteBar's "Return to main window" button
+// (both call closeSatellite). The satellite keeps only minimize/maximize here;
+// "Return" is the single affordance that hands the tab back and destroys the
+// window.
 // ---------------------------------------------------------------------------
 function WindowControls({ satellite = false }: { satellite?: boolean }) {
-  const onClose = satellite ? () => void closeSatellite() : closeWindow;
   return (
     <div className="flex shrink-0 items-stretch">
       <button
@@ -250,24 +252,27 @@ function WindowControls({ satellite = false }: { satellite?: boolean }) {
           />
         </svg>
       </button>
-      <button
-        type="button"
-        aria-label="Close"
-        title="Close"
-        onClick={onClose}
-        className="flex h-8 w-11 items-center justify-center text-neutral-300 transition-colors hover:bg-red-600 hover:text-white"
-      >
-        <svg
-          width="10"
-          height="10"
-          viewBox="0 0 10 10"
-          aria-hidden
-          className="pointer-events-none"
+      {/* Close (×) — main window only. A satellite returns via "Return" (#6). */}
+      {!satellite && (
+        <button
+          type="button"
+          aria-label="Close"
+          title="Close"
+          onClick={closeWindow}
+          className="flex h-8 w-11 items-center justify-center text-neutral-300 transition-colors hover:bg-red-600 hover:text-white"
         >
-          <line x1="1" y1="1" x2="9" y2="9" stroke="currentColor" strokeWidth="1" />
-          <line x1="9" y1="1" x2="1" y2="9" stroke="currentColor" strokeWidth="1" />
-        </svg>
-      </button>
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 10 10"
+            aria-hidden
+            className="pointer-events-none"
+          >
+            <line x1="1" y1="1" x2="9" y2="9" stroke="currentColor" strokeWidth="1" />
+            <line x1="9" y1="1" x2="1" y2="9" stroke="currentColor" strokeWidth="1" />
+          </svg>
+        </button>
+      )}
     </div>
   );
 }
@@ -296,11 +301,13 @@ function TabStrip() {
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
 
-  // Tracks the previous pointerdown for manual double-click detection. We rename
-  // only when the second click of a pair lands on a tab that was ALREADY active
-  // at the FIRST click — so renaming an unfocused tab takes three clicks total
-  // (one to focus, then a double-click). Prevents accidental renames.
-  const clickRef = useRef<{ id: string; time: number; wasActiveAtFirst: boolean } | null>(null);
+  // Tracks the previous pointerdown for manual double-click detection. A tab is
+  // renamed when two quick clicks land on the SAME tab that was ALREADY the
+  // active tab when this pair started — i.e. double-clicking the currently-active
+  // tab renames it, while double-clicking an inactive tab only activates it (the
+  // first click makes it active, the pair doesn't qualify because it wasn't
+  // active when the pair began). Prevents accidental renames on tab switches.
+  const clickRef = useRef<{ id: string; time: number; wasActive: boolean } | null>(null);
 
   const startRename = (id: string, name: string) => {
     setEditing(id);
@@ -311,6 +318,27 @@ function TabStrip() {
     setEditing(null);
   };
 
+  // Close a workspace tab (#5). An EMPTY tab closes immediately. A NON-EMPTY tab
+  // is closed behind a confirm; on confirm we DETACH (not kill) each of its
+  // terminals via closeTerminal — tmux survives, so the work is reachable again
+  // by relaunching/respawning — then drop the tab. closeTab returns the removed
+  // tile ids and also guards the last-tab case (returns [] without closing).
+  const requestCloseTab = (id: string) => {
+    const tab = tabs.find((t) => t.id === id);
+    if (!tab) return;
+    if (tab.order.length > 0) {
+      const n = tab.order.length;
+      const ok = window.confirm(
+        `Close "${tab.name}"? Its ${n} terminal${n === 1 ? "" : "s"} will be ` +
+          `detached (the tmux session${n === 1 ? "" : "s"} keep running and ` +
+          `can be reattached later).`,
+      );
+      if (!ok) return;
+    }
+    const removed = closeTab(id);
+    for (const tid of removed) void closeTerminal(tid).catch(() => {});
+  };
+
   // Pointer-based reorder: pressing a tab activates it; dragging past the
   // threshold reorders it onto whichever tab is released over (moveTab).
   const onTabPointerDown = (tabId: string, e: ReactPointerEvent) => {
@@ -319,18 +347,22 @@ function TabStrip() {
     const name = tabs.find((t) => t.id === tabId)?.name ?? "Workspace";
     const wasActive = tabId === activeTabId;
     const now = Date.now();
-    // Second click of a pair on an already-active tab => rename, no drag.
+    // Second click of a quick pair on the SAME tab => inline rename, but ONLY if
+    // that tab was already active when the FIRST click of the pair landed (the
+    // `wasActive` flag recorded then). So double-clicking an INACTIVE tab just
+    // activates it (the first click had wasActive=false), while double-clicking
+    // the CURRENTLY-ACTIVE tab renames it.
     if (
       clickRef.current &&
       clickRef.current.id === tabId &&
       now - clickRef.current.time < 400 &&
-      clickRef.current.wasActiveAtFirst
+      clickRef.current.wasActive
     ) {
       startRename(tabId, name);
       clickRef.current = null;
       return;
     }
-    clickRef.current = { id: tabId, time: now, wasActiveAtFirst: wasActive };
+    clickRef.current = { id: tabId, time: now, wasActive };
     setActiveTab(tabId);
     let ghost: DragGhost | null = null;
     startPointerDrag(e.clientX, e.clientY, {
@@ -360,10 +392,15 @@ function TabStrip() {
     // The strip scrolls horizontally if there are many tabs; it never grows past
     // the available width, so the flexible drag region + controls stay reachable.
     // `overflow-y-hidden` clips the scrollbar gutter so it can't steal the row.
-    <div className="flex min-w-0 items-stretch gap-1 overflow-x-auto overflow-y-hidden pl-4 pr-1">
+    // `th-scroll-thin` gives that horizontal bar a thin, on-brand look (#4).
+    <div className="th-scroll-thin flex min-w-0 items-stretch gap-1 overflow-x-auto overflow-y-hidden pl-4 pr-1">
       {tabs.map((tab) => {
         const active = tab.id === activeTabId;
-        const closable = tabs.length > 1 && tab.order.length === 0;
+        // Any tab can be closed as long as it isn't the last one. A non-empty tab
+        // closes behind a confirm (#5); the close × is always rendered (its space
+        // reserved) and only its visibility toggles on hover so the tab never
+        // resizes.
+        const closable = tabs.length > 1;
         // Highlighted as a drop target by EITHER a tab reorder or a tile being
         // dragged onto it; never highlight the tab being dragged itself.
         const isDropTarget = dropTabId === tab.id && draggingTabId !== tab.id;
@@ -374,8 +411,12 @@ function TabStrip() {
             // data-tab-id: the drop target a tab reorder / a tile drag resolves to.
             data-tab-id={tab.id}
             onPointerDown={(e) => onTabPointerDown(tab.id, e)}
+            // Fixed width (#3): a comfortably wide tab whose size NEVER changes on
+            // hover. The pop-out + close buttons always occupy their space (their
+            // visibility toggles, not their layout), so revealing them on hover
+            // can't shift or resize the tab.
             className={[
-              "group flex min-w-[8.5rem] shrink-0 cursor-pointer touch-none select-none items-center gap-1.5 rounded px-3",
+              "group flex w-44 shrink-0 cursor-pointer touch-none select-none items-center gap-1.5 rounded px-3",
               active
                 ? "bg-neutral-800 text-neutral-100"
                 : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200",
@@ -422,18 +463,21 @@ function TabStrip() {
                 {tab.order.length}
               </span>
             )}
-            {/* Pop-out (#21): tear this tab off into its own window. Shown on
-                hover next to the close ×. Available for any tab (the point is to
-                pop out a tab WITH terminals); pointerDown is stopped so it never
-                starts a tab drag/reorder. */}
+            {/* Pop-out (#21): tear this tab off into its own window. Its space is
+                always reserved; only its visibility toggles on hover (#3), so the
+                tab never resizes. Available for any tab (the point is to pop out a
+                tab WITH terminals); pointerDown is stopped so it never starts a
+                tab drag/reorder. When hidden it's also un-clickable (invisible
+                drops pointer events) so it can't be hit on a non-hovered tab. */}
             <button
               type="button"
+              tabIndex={-1}
               onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => {
                 e.stopPropagation();
                 void popOutTab(tab.id);
               }}
-              className="ml-0.5 hidden shrink-0 rounded p-0.5 leading-none text-neutral-500 hover:bg-neutral-600 hover:text-neutral-100 group-hover:inline-flex"
+              className="ml-0.5 inline-flex shrink-0 rounded p-0.5 leading-none text-neutral-500 invisible hover:bg-neutral-600 hover:text-neutral-100 group-hover:visible"
               title="Pop out into a new window"
               aria-label={`Pop out ${tab.name} into a new window`}
             >
@@ -442,13 +486,14 @@ function TabStrip() {
             {closable && (
               <button
                 type="button"
+                tabIndex={-1}
                 onPointerDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation();
-                  closeTab(tab.id);
+                  requestCloseTab(tab.id);
                 }}
-                className="ml-0.5 hidden shrink-0 rounded px-0.5 leading-none text-neutral-500 hover:bg-neutral-600 hover:text-neutral-100 group-hover:inline"
-                title="Close empty tab"
+                className="ml-0.5 inline-flex shrink-0 rounded px-0.5 leading-none text-neutral-500 invisible hover:bg-neutral-600 hover:text-neutral-100 group-hover:visible"
+                title={tab.order.length > 0 ? "Close tab" : "Close empty tab"}
                 aria-label={`Close ${tab.name}`}
               >
                 ×

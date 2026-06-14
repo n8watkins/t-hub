@@ -109,8 +109,12 @@ interface WorkspaceState {
   addTab: () => string;
   /** Rename a tab (no-op on blank/unknown id). */
   renameTab: (id: string, name: string) => void;
-  /** Close an *empty* tab; refuses if it has tiles or is the last tab. */
-  closeTab: (id: string) => void;
+  /** Close a tab and drop its tiles from this window's layout; refuses only if
+   *  it is the last tab. An EMPTY tab closes outright; a NON-EMPTY tab is closed
+   *  too (the caller is responsible for confirming + detaching its terminals via
+   *  closeTerminal first — tmux survives, the sessions are not killed). The
+   *  removed tile ids are returned so the caller can detach them. */
+  closeTab: (id: string) => TerminalId[];
   /** Activate a tab (moves focus onto one of its tiles). */
   setActiveTab: (id: string) => void;
   /** Activate the tab at strip index `i` (0-based); no-op if out of range. */
@@ -631,10 +635,15 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     },
 
     closeTab: (id) => {
-      const { tabs, activeTabId, focusedId } = get();
-      if (tabs.length <= 1) return; // keep at least one tab
+      const { tabs, activeTabId, focusedId, terminals } = get();
+      if (tabs.length <= 1) return []; // keep at least one tab
       const target = tabs.find((t) => t.id === id);
-      if (!target || target.order.length > 0) return; // only close-empty
+      if (!target) return [];
+
+      // Tiles this tab held; returned so the caller can detach their terminals
+      // (closeTerminal — tmux survives). Also dropped from the live map here so
+      // the canvas stops rendering them once the tab is gone.
+      const removed = target.order.slice();
 
       const idx = tabs.findIndex((t) => t.id === id);
       const nextTabs = tabs.filter((t) => t.id !== id);
@@ -647,8 +656,18 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         nextActive = neighbor.id;
         nextFocus = neighbor.order[0] ?? null;
       }
-      set({ tabs: nextTabs, activeTabId: nextActive, focusedId: nextFocus });
+
+      const nextTerminals = { ...terminals };
+      for (const tid of removed) delete nextTerminals[tid];
+
+      set({
+        terminals: nextTerminals,
+        tabs: nextTabs,
+        activeTabId: nextActive,
+        focusedId: nextFocus,
+      });
       persist();
+      return removed;
     },
 
     setActiveTab: (id) => {
