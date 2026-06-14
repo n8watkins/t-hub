@@ -15,13 +15,14 @@
 // data arrives via the agent bridge's event emit spine (agent://journal →
 // supervision://tree / session://status / status://snapshot); the telemetry hook
 // subscribes and feeds the store.
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import {
   useSupervision,
   attentionSessions,
   displayStatus,
 } from "../store/supervision";
+import { claudeHooksInstalled } from "../ipc/client05";
 import { useAgentTelemetry } from "../store/telemetry";
 import { useSettings } from "../store/settings";
 import { useWorkspace, deriveLabel, type WorkspaceTab } from "../store/workspace";
@@ -262,9 +263,34 @@ function SidebarFull({
   );
   const queue = attentionSessions(displayStatuses);
 
+  // Accordion (#sidebar-fit): exactly ONE section is open at a time, so the
+  // sidebar always fits even in a small (non-maximized) window — expanding Hooks
+  // collapses Files, etc. The single open id persists across launches. Defaults
+  // to Files (the primary browse surface; the workspace tabs also live in the
+  // titlebar strip). Clicking the open section's header collapses it (null).
+  const [openSection, setOpenSection] = useAccordion("files");
+  const acc = (id: string) => ({
+    open: openSection === id,
+    onToggle: () => setOpenSection(openSection === id ? null : id),
+  });
+
+  // Hooks-installed state is checked ONCE here (the sidebar is always mounted),
+  // not inside HookInstallPanel — so expanding the collapsed Hooks section shows
+  // the result immediately instead of a "checking…" flash each time it re-mounts.
+  const [hooksInstalled, setHooksInstalled] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    claudeHooksInstalled()
+      .then((v) => alive && setHooksInstalled(v))
+      .catch(() => alive && setHooksInstalled(false));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   return (
     <aside
-      className="flex h-full shrink-0 flex-col border-r"
+      className="flex h-full shrink-0 flex-col overflow-hidden border-r"
       style={{
         width,
         backgroundColor: "var(--th-sidebar-bg)",
@@ -277,120 +303,125 @@ function SidebarFull({
           The PRIMARY gear + window controls live in the titlebar. */}
       <SidebarHeader onToggleSidebar={onToggleSidebar} />
 
-      {/* 0. Workspaces (#2) — the user's tabs with tile counts, active one
-          highlighted; a click activates the tab. Each row expands to that tab's
-          terminals so the user can peek into OTHER workspaces without switching.
-          Collapsible (#3); open by default. */}
-      <CollapsibleSection
-        id="workspaces"
-        title="Workspaces"
-        defaultOpen
-        className="border-b"
-      >
-        <WorkspaceList
-          tabs={tabs}
-          activeTabId={activeTabId}
-          setActiveTab={setActiveTab}
-          terminals={terminals}
-          setFocus={setFocus}
-        />
-      </CollapsibleSection>
+      {/* The accordion body scrolls as a whole if the one open section is taller
+          than the sidebar (safety net under the single-open rule). */}
+      <div className="th-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
+        {/* Workspaces (#2) — the user's tabs with tile counts; click activates a
+            tab, the chevron peeks into a tab's terminals. (Tabs also live in the
+            titlebar strip, so this section starts collapsed in the accordion.) */}
+        <CollapsibleSection title="Workspaces" {...acc("workspaces")} className="border-b">
+          <WorkspaceList
+            tabs={tabs}
+            activeTabId={activeTabId}
+            setActiveTab={setActiveTab}
+            terminals={terminals}
+            setFocus={setFocus}
+          />
+        </CollapsibleSection>
 
-      {/* 1. Attention queue (always shown; not part of the accordion). */}
-      <section
-        className="shrink-0 border-b"
-        style={{ borderColor: "var(--th-border)" }}
-      >
-        <Header>Attention</Header>
-        {queue.length === 0 ? (
-          <Muted>Nothing needs you.</Muted>
-        ) : (
-          <ul>
-            {queue.map(({ sessionId, status }) => (
-              <li key={sessionId}>
-                <button
-                  type="button"
-                  onClick={() => onSelectSession?.(sessionId)}
-                  className="flex w-full items-center gap-2 px-2 py-1 text-left text-sm hover:bg-neutral-900"
-                  title={`${statusLabel(status)} — ${sessionId}`}
-                >
-                  <StatusBadge status={status} dotOnly />
-                  <span
-                    className="min-w-0 flex-1 truncate"
-                    style={{ color: "var(--th-fg)" }}
+        {/* Attention queue — sessions wanting input (question/permission/failure)
+            or rate-limited. Now collapsible like the rest (#sidebar-fit). */}
+        <CollapsibleSection title="Attention" {...acc("attention")} className="border-b">
+          {queue.length === 0 ? (
+            <Muted>Nothing needs you.</Muted>
+          ) : (
+            <ul>
+              {queue.map(({ sessionId, status }) => (
+                <li key={sessionId}>
+                  <button
+                    type="button"
+                    onClick={() => onSelectSession?.(sessionId)}
+                    className="flex w-full items-center gap-2 px-2 py-1 text-left text-sm hover:bg-neutral-900"
+                    title={`${statusLabel(status)} — ${sessionId}`}
                   >
-                    {sessionId}
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+                    <StatusBadge status={status} dotOnly />
+                    <span
+                      className="min-w-0 flex-1 truncate"
+                      style={{ color: "var(--th-fg)" }}
+                    >
+                      {sessionId}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </CollapsibleSection>
 
-      {/* 2. Sessions = the Claude supervision tree (NOT the user's terminals —
-          those are under Workspaces). Fills in once Claude hooks are installed.
-          Collapsible (#3); collapsed by default. */}
-      <CollapsibleSection
-        id="sessions"
-        title="Sessions"
-        defaultOpen={false}
-        className="max-h-44 overflow-y-auto border-b"
-      >
-        {treeList.length === 0 ? (
-          <Muted>
-            Claude sessions appear here once hooks are installed — your terminals
-            are under Workspaces.
-          </Muted>
-        ) : (
-          <div className="divide-y divide-neutral-800">
-            {treeList.map((tree) => (
-              <SessionRow
-                key={tree.sessionId}
-                tree={tree}
-                displayStatus={displayStatuses[tree.sessionId] ?? tree.status}
-                snapshot={snapshots[tree.sessionId]}
-                onSelect={() => onSelectSession?.(tree.sessionId)}
-              />
-            ))}
+        {/* Sessions = the Claude supervision tree (NOT the user's terminals —
+            those are under Workspaces). Fills in once Claude hooks are installed. */}
+        <CollapsibleSection
+          title="Sessions"
+          {...acc("sessions")}
+          className="max-h-44 overflow-y-auto border-b"
+        >
+          {treeList.length === 0 ? (
+            <Muted>
+              Claude sessions appear here once hooks are installed — your terminals
+              are under Workspaces.
+            </Muted>
+          ) : (
+            <div className="divide-y divide-neutral-800">
+              {treeList.map((tree) => (
+                <SessionRow
+                  key={tree.sessionId}
+                  tree={tree}
+                  displayStatus={displayStatuses[tree.sessionId] ?? tree.status}
+                  snapshot={snapshots[tree.sessionId]}
+                  onSelect={() => onSelectSession?.(tree.sessionId)}
+                />
+              ))}
+            </div>
+          )}
+        </CollapsibleSection>
+
+        {/* Files — browse the project file tree (self-contained in FileTree.tsx).
+            Clicking a file opens it in a centered preview OVERLAY; the search bar
+            also exposes a "Web preview" affordance. The root FOLLOWS the active
+            terminal's cwd. Grows to fill while it's the open section. */}
+        <CollapsibleSection title="Files" grow {...acc("files")} className="border-b">
+          <div className="min-h-[180px] flex-1 overflow-hidden">
+            <FileTree root={filesRoot} className="h-full" />
           </div>
-        )}
-      </CollapsibleSection>
+        </CollapsibleSection>
 
-      {/* Files — browse the project file tree (the tree is self-contained in
-          FileTree.tsx). Clicking a file opens it in a large, centered preview
-          OVERLAY (like Settings) via FileTree's built-in PreviewOverlay; the
-          search bar also exposes a "Web preview" affordance that frames a URL
-          (e.g. a local dev server) in that same overlay. The root FOLLOWS the
-          active terminal's cwd (filesRoot), so the tree tracks the project
-          you're working in. Collapsible (#3); open by default, grows to fill. */}
-      <CollapsibleSection
-        id="files"
-        title="Files"
-        defaultOpen
-        grow
-        className="border-b"
-      >
-        <div className="min-h-[180px] flex-1 overflow-hidden">
-          <FileTree root={filesRoot} className="h-full" />
-        </div>
-      </CollapsibleSection>
+        {/* Claude hooks (consent-gated install/uninstall). The header shows the
+            installed/not pill so status is visible without expanding. */}
+        <CollapsibleSection
+          title="Hooks"
+          {...acc("hooks")}
+          className="border-b"
+          headerExtra={<HookHeaderPill installed={hooksInstalled} />}
+        >
+          <HookInstallPanel
+            agentBin={agentBin}
+            installed={hooksInstalled}
+            setInstalled={setHooksInstalled}
+          />
+        </CollapsibleSection>
 
-      {/* 3. Claude hooks (consent-gated install/uninstall). Collapsible (#3). */}
-      <CollapsibleSection
-        id="hooks"
-        title="Hooks"
-        defaultOpen={false}
-        className="border-b"
-      >
-        <HookInstallPanel agentBin={agentBin} />
-      </CollapsibleSection>
-
-      {/* 4. Utility area (low priority). Collapsible (#3); collapsed by default. */}
-      <CollapsibleSection id="wsl" title="WSL" defaultOpen={false}>
-        <WslHealth metrics={metrics} connection={agent?.connection} />
-      </CollapsibleSection>
+        {/* Utility area (low priority). */}
+        <CollapsibleSection title="WSL" {...acc("wsl")}>
+          <WslHealth metrics={metrics} connection={agent?.connection} />
+        </CollapsibleSection>
+      </div>
     </aside>
+  );
+}
+
+/** Tiny installed/not dot for the Hooks section header (so status shows without
+ *  expanding). Mirrors HookInstallPanel's StatusPill but compact. */
+function HookHeaderPill({ installed }: { installed: boolean | null }) {
+  if (installed === null) return null; // checked once at sidebar mount; brief
+  return (
+    <span
+      className="h-1.5 w-1.5 shrink-0 rounded-full"
+      style={{
+        backgroundColor: installed ? "var(--th-dot-live)" : "var(--th-dot-exited)",
+      }}
+      title={installed ? "Hooks installed" : "Hooks not installed"}
+      aria-hidden
+    />
   );
 }
 
@@ -1126,61 +1157,56 @@ function UsageLine({ snapshot }: { snapshot: StatusSnapshot }) {
 // localStorage under its OWN key (so the user's layout sticks across launches).
 // ===========================================================================
 
-/** Per-section localStorage key prefix; each section appends its own id. */
-const SECTION_KEY_PREFIX = "termhub.sidebar.section.";
+/** localStorage key for the single open accordion section id. */
+const ACCORDION_KEY = "termhub.sidebar.openSection.v1";
 
 /**
- * Persisted open/closed state for one accordion section. `defaultOpen` is used
- * only when nothing has been stored yet, so the requested defaults (Workspaces +
- * Files open; Sessions + WSL collapsed) apply on a fresh install but a user's
- * later choice always wins. The setter writes through to localStorage.
+ * The accordion's single open-section id (or null = all collapsed), persisted so
+ * the user's choice sticks across launches. `defaultId` applies only on a fresh
+ * install. An empty stored string means "all collapsed".
  */
-function useSectionCollapse(
-  id: string,
-  defaultOpen: boolean,
-): [boolean, () => void] {
-  const [open, setOpen] = useState<boolean>(() => {
-    if (typeof localStorage === "undefined") return defaultOpen;
-    const raw = localStorage.getItem(SECTION_KEY_PREFIX + id);
-    return raw === null ? defaultOpen : raw === "1";
+function useAccordion(defaultId: string): [string | null, (id: string | null) => void] {
+  const [open, setOpenState] = useState<string | null>(() => {
+    if (typeof localStorage === "undefined") return defaultId;
+    const raw = localStorage.getItem(ACCORDION_KEY);
+    return raw === null ? defaultId : raw === "" ? null : raw;
   });
-  const toggle = () => {
-    setOpen((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem(SECTION_KEY_PREFIX + id, next ? "1" : "0");
-      } catch {
-        /* ignore quota/availability */
-      }
-      return next;
-    });
+  const setOpen = (id: string | null) => {
+    setOpenState(id);
+    try {
+      localStorage.setItem(ACCORDION_KEY, id ?? "");
+    } catch {
+      /* ignore quota/availability */
+    }
   };
-  return [open, toggle];
+  return [open, setOpen];
 }
 
 /**
- * A collapsible sidebar section: a clickable header (chevron + uppercase title)
- * that toggles its body. The open/closed state persists per `id` (#3). When
- * `grow` is set the section flexes to fill the remaining height while OPEN (used
- * by the Files section so the FileTree gets room); collapsed it shrinks to just
- * its header. The outer `className` carries the section's border styling.
+ * A collapsible sidebar section (CONTROLLED): the parent owns `open`/`onToggle`
+ * so the sidebar can enforce single-open accordion behavior (#sidebar-fit). A
+ * clickable header (chevron + uppercase title + optional `headerExtra`) toggles
+ * the body. When `grow` is set the section flexes to fill the remaining height
+ * while OPEN (the Files section, so the FileTree gets room); collapsed it shrinks
+ * to just its header. The outer `className` carries the section's border styling.
  */
 function CollapsibleSection({
-  id,
   title,
-  defaultOpen,
+  open,
+  onToggle,
   grow = false,
   className,
+  headerExtra,
   children,
 }: {
-  id: string;
   title: string;
-  defaultOpen: boolean;
+  open: boolean;
+  onToggle: () => void;
   grow?: boolean;
   className?: string;
+  headerExtra?: React.ReactNode;
   children: React.ReactNode;
 }) {
-  const [open, toggle] = useSectionCollapse(id, defaultOpen);
   return (
     <section
       className={[
@@ -1192,22 +1218,25 @@ function CollapsibleSection({
       ].join(" ")}
       style={{ borderColor: "var(--th-border)" }}
     >
-      <SectionHeader title={title} open={open} onToggle={toggle} />
+      <SectionHeader title={title} open={open} onToggle={onToggle} extra={headerExtra} />
       {open && children}
     </section>
   );
 }
 
 /** The clickable header for a CollapsibleSection: a chevron that rotates with
- *  the open state, then the uppercase section title. Full-width hit target. */
+ *  the open state, the uppercase section title, then any `extra` (e.g. a status
+ *  pill) pinned to the right. Full-width hit target. */
 function SectionHeader({
   title,
   open,
   onToggle,
+  extra,
 }: {
   title: string;
   open: boolean;
   onToggle: () => void;
+  extra?: React.ReactNode;
 }) {
   return (
     <button
@@ -1220,6 +1249,7 @@ function SectionHeader({
     >
       <ChevronIcon open={open} />
       <span className="min-w-0 flex-1 truncate">{title}</span>
+      {extra}
     </button>
   );
 }
@@ -1242,17 +1272,6 @@ function ChevronIcon({ open }: { open: boolean }) {
     >
       <path d="M9 6l6 6-6 6" />
     </svg>
-  );
-}
-
-function Header({ children }: { children: React.ReactNode }) {
-  return (
-    <div
-      className="px-2 pt-2 pb-1 text-xs font-semibold uppercase tracking-wide"
-      style={{ color: "var(--th-fg-muted)" }}
-    >
-      {children}
-    </div>
   );
 }
 

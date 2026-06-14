@@ -1,14 +1,11 @@
-// The spawn-preset popover for the "+" new-terminal affordance. Instead of the
-// "+" always opening a bare login shell, it now anchors this small themed menu
-// with four presets:
-//   - Claude         → start `claude` in the new terminal
-//   - Shell          → a plain login shell (today's behavior; no startup command)
+// The spawn-preset popover for the "+" new-terminal affordance. It anchors a
+// small themed menu with two presets (per the user's call — a fresh `claude` in
+// ~ and a free-text "Custom" line were dropped as low-value clutter):
+//   - Shell          → a plain login shell in ~ (today's default behavior)
 //   - Resume Claude… → opens a NEW terminal running `claude --resume`, which shows
 //                      Claude's interactive session PICKER in that terminal so the
 //                      user chooses which past session to resume. It does NOT
-//                      resume every session, and it always opens a fresh tile (the
-//                      old "Resume Claude" label left this ambiguous — #lifecycle).
-//   - Custom…        → a free-text command the user types
+//                      resume every session, and it always opens a fresh tile.
 //
 // Selecting a preset calls back with an optional `startupCommand` string (None
 // for Shell), which Canvas threads into spawnTerminal({ startupCommand }) → the
@@ -18,12 +15,11 @@
 // Chrome matches the rest of TermHub: it reads the `--th-*` theme tokens
 // (surface/border/fg/accent/radius) so it tracks the active theme like the FAB
 // and the ThemeEditor panels do.
-import { useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 
 /** `claude --resume` lets Claude show its interactive session picker. (`--continue`
  *  / `-c` would silently resume the MOST RECENT session instead; the picker is the
  *  intended "Resume" UX, so we default to `--resume`.) */
-const CLAUDE_CMD = "claude";
 const CLAUDE_RESUME_CMD = "claude --resume";
 
 export interface SpawnMenuProps {
@@ -47,8 +43,7 @@ interface Preset {
 }
 
 const PRESETS: Preset[] = [
-  { key: "claude", label: "Claude", hint: "Start claude", command: CLAUDE_CMD },
-  { key: "shell", label: "Shell", hint: "Plain login shell", command: undefined },
+  { key: "shell", label: "Shell", hint: "New login shell in ~", command: undefined },
   {
     key: "resume",
     label: "Resume Claude…",
@@ -60,19 +55,7 @@ const PRESETS: Preset[] = [
 ];
 
 export function SpawnMenu({ onClose, onSpawn }: SpawnMenuProps) {
-  // When true the Custom… row expands into a free-text command input.
-  const [customOpen, setCustomOpen] = useState(false);
-  const [customCmd, setCustomCmd] = useState("");
-  const inputRef = useRef<HTMLInputElement | null>(null);
-  const rootRef = useRef<HTMLDivElement | null>(null);
-
-  // Autofocus the custom input the moment it's revealed.
-  useEffect(() => {
-    if (customOpen) inputRef.current?.focus();
-  }, [customOpen]);
-
-  // Escape closes the whole menu (when not mid-typing in the custom field, where
-  // Escape just collapses the field — handled on the input itself).
+  // Escape closes the menu.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -89,12 +72,6 @@ export function SpawnMenu({ onClose, onSpawn }: SpawnMenuProps) {
     onClose();
   };
 
-  const submitCustom = () => {
-    const cmd = customCmd.trim();
-    if (!cmd) return; // empty custom = no-op; user can hit Shell for a bare shell
-    pick(cmd);
-  };
-
   return (
     // Full-viewport backdrop: a click anywhere outside the popover dismisses it.
     // Transparent (not dimmed) so it reads as a lightweight menu, not a modal.
@@ -104,7 +81,6 @@ export function SpawnMenu({ onClose, onSpawn }: SpawnMenuProps) {
       aria-hidden={false}
     >
       <div
-        ref={rootRef}
         role="menu"
         aria-label="New terminal preset"
         // Anchored just above the "+" FAB (which sits at bottom-3 right-3, h-9).
@@ -147,69 +123,6 @@ export function SpawnMenu({ onClose, onSpawn }: SpawnMenuProps) {
             </span>
           </button>
         ))}
-
-        {/* Custom… — a button that reveals a free-text command input. */}
-        {!customOpen ? (
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => setCustomOpen(true)}
-            className="flex flex-col items-start gap-0.5 border-t px-3 py-2 text-left transition-colors hover:bg-neutral-700/30"
-            style={{ borderColor: "var(--th-border)" }}
-          >
-            <span className="text-sm" style={{ color: "var(--th-fg)" }}>
-              Custom…
-            </span>
-            <span className="text-xs" style={{ color: "var(--th-fg-muted)" }}>
-              Run a command you type
-            </span>
-          </button>
-        ) : (
-          <div
-            className="flex flex-col gap-2 border-t px-3 py-2.5"
-            style={{ borderColor: "var(--th-border)" }}
-          >
-            <input
-              ref={inputRef}
-              value={customCmd}
-              placeholder="e.g. npm run dev"
-              spellCheck={false}
-              autoCapitalize="off"
-              autoComplete="off"
-              onChange={(e) => setCustomCmd(e.target.value)}
-              onKeyDown={(e) => {
-                e.stopPropagation();
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  submitCustom();
-                } else if (e.key === "Escape") {
-                  e.preventDefault();
-                  // Collapse the field first; a second Escape closes the menu.
-                  setCustomOpen(false);
-                }
-              }}
-              className="w-full rounded border bg-transparent px-2 py-1.5 font-mono text-sm outline-none"
-              style={{
-                borderColor: "var(--th-border)",
-                color: "var(--th-fg)",
-                borderRadius: "var(--th-radius)",
-              }}
-            />
-            <button
-              type="button"
-              onClick={submitCustom}
-              disabled={!customCmd.trim()}
-              className="th-accent-hover self-end rounded border px-3 py-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40"
-              style={{
-                borderColor: "var(--th-border)",
-                color: "var(--th-fg)",
-                borderRadius: "var(--th-radius)",
-              }}
-            >
-              Run
-            </button>
-          </div>
-        )}
       </div>
     </div>
   );

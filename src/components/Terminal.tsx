@@ -241,6 +241,13 @@ export function TerminalView({
       pushResize();
       const widthChanged = term.cols !== before || term.cols !== lastCols;
       lastCols = term.cols;
+      // DIAG (#blank): trace every settle so a fresh repro of "spawn blanks the
+      // grid" shows whether each terminal resized + whether width-change cleared
+      // scrollback (the suspected blank window while tmux re-renders).
+      tlog(
+        "resize",
+        `${terminalId} settle cols ${before}->${term.cols} rows=${term.rows} widthChanged=${widthChanged}`,
+      );
       // Defer clear + repaint to the next frame so tmux's post-SIGWINCH redraw
       // has a chance to land first; clearing only removes scrollback above the
       // live line, and the forced repaint then shows a clean, single frame.
@@ -252,6 +259,7 @@ export function TerminalView({
           } catch {
             // Renderer/buffer detached mid-call; ignore.
           }
+          tlog("resize", `${terminalId} cleared scrollback + repaint (rows=${term.rows})`);
           forceRepaint();
         });
       } else {

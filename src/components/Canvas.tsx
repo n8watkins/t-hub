@@ -36,6 +36,7 @@ import { Tile } from "./Tile";
 import { TerminalPoolProvider } from "./TerminalPool";
 import { SpawnMenu } from "./SpawnMenu";
 import { repaintAllTerminals } from "../lib/repaint";
+import { tlog } from "../lib/diag";
 import type { TerminalId } from "../ipc/types";
 
 /**
@@ -124,6 +125,13 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
       try {
         const info = await spawnTerminal(
           startupCommand ? { startupCommand } : {},
+        );
+        // DIAG (#blank): record the spawn so a fresh repro correlates "grid went
+        // blank" with the new-terminal id + which preset drove it.
+        tlog(
+          "spawn",
+          `spawned ${info.id} cmd=${startupCommand ?? "(shell)"} ` +
+            `tiles-before=${useWorkspace.getState().tabs.reduce((n, t) => n + t.order.length, 0)}`,
         );
         addAfterFocused(info);
       } catch (err) {

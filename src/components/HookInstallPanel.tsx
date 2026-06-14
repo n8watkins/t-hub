@@ -6,17 +6,19 @@
 //
 // `agentBin` is the resolved WSL path to the termhub-agent binary (the hook
 // entrypoint, `termhub-agent --hook <EVENT>`). The caller supplies it.
-import { useCallback, useEffect, useState } from "react";
-import {
-  claudeHooksInstalled,
-  installClaudeHooks,
-  uninstallClaudeHooks,
-} from "../ipc/client05";
+import { useCallback, useState } from "react";
+import { installClaudeHooks, uninstallClaudeHooks } from "../ipc/client05";
 import type { InstallReport } from "../ipc/model";
 
 export interface HookInstallPanelProps {
   /** Resolved WSL path to the termhub-agent binary (hook entrypoint). */
   agentBin: string;
+  /** Installed state, owned by the parent (Sidebar) so it's checked ONCE at
+   *  sidebar mount — not each time this collapsed panel re-mounts on expand,
+   *  which used to flash "checking…". `null` only during that initial check. */
+  installed: boolean | null;
+  /** Update the parent's installed state after an install/uninstall. */
+  setInstalled: (v: boolean) => void;
 }
 
 // The 15 Claude Code lifecycle events TermHub registers. Each event gets a
@@ -39,23 +41,16 @@ const HOOK_EVENTS = [
   "WorktreeRemove",
 ] as const;
 
-export function HookInstallPanel({ agentBin }: HookInstallPanelProps) {
-  const [installed, setInstalled] = useState<boolean | null>(null);
+export function HookInstallPanel({
+  agentBin,
+  installed,
+  setInstalled,
+}: HookInstallPanelProps) {
   const [consent, setConsent] = useState(false);
   const [busy, setBusy] = useState(false);
   const [report, setReport] = useState<InstallReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showDetails, setShowDetails] = useState(false);
-
-  const refresh = useCallback(() => {
-    claudeHooksInstalled()
-      .then(setInstalled)
-      .catch((e) => setError(String(e)));
-  }, []);
-
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
 
   const doInstall = useCallback(async () => {
     setBusy(true);
@@ -69,7 +64,7 @@ export function HookInstallPanel({ agentBin }: HookInstallPanelProps) {
     } finally {
       setBusy(false);
     }
-  }, [agentBin, consent]);
+  }, [agentBin, consent, setInstalled]);
 
   const doUninstall = useCallback(async () => {
     setBusy(true);
@@ -83,7 +78,7 @@ export function HookInstallPanel({ agentBin }: HookInstallPanelProps) {
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [setInstalled]);
 
   return (
     <div className="flex flex-col gap-1.5 p-2 text-sm text-neutral-200">

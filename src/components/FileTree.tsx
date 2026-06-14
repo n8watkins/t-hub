@@ -347,7 +347,7 @@ function SearchBar({
 }) {
   return (
     <div
-      className="flex items-center gap-2 border-b p-2"
+      className="flex items-center gap-1.5 border-b px-2 py-1"
       style={{ borderColor: "var(--th-border)" }}
     >
       <div className="relative min-w-0 flex-1">
@@ -358,7 +358,7 @@ function SearchBar({
           spellCheck={false}
           autoCorrect="off"
           autoCapitalize="off"
-          className="w-full px-2.5 py-1.5 pr-7 text-sm focus:outline-none"
+          className="w-full px-2 py-1 pr-7 text-xs focus:outline-none"
           style={{
             borderRadius: "var(--th-radius)",
             border: "1px solid var(--th-border)",
@@ -793,7 +793,7 @@ function Row({
       type="button"
       onClick={onClick}
       title={title}
-      className="block w-full py-1 pr-2 text-left text-sm"
+      className="block w-full py-0.5 pr-2 text-left text-[13px] leading-5"
       style={{
         background: active ? "var(--th-tile-bg)" : "transparent",
         ...style,
