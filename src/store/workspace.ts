@@ -146,10 +146,24 @@ function newTabId(): string {
   return `tab-${Date.now().toString(36)}-${tabSeq.toString(36)}`;
 }
 
+/**
+ * Migrate a pre-#16 terminal id to the id the backend now uses. Before #16,
+ * spawn minted a full 36-char UUID while tmux/list keyed off its first 8 chars;
+ * #16 made spawn use that same 8-char id. A layout persisted before #16 holds
+ * full-UUID ids that no longer match live sessions, so shorten them to the
+ * 8-char form -- otherwise a saved arrangement stops matching and every tile
+ * gets dumped into the active tab on the first load after the fix.
+ */
+function shortenId(id: string): string {
+  return id.length > 8 && id.includes("-") ? id.slice(0, 8) : id;
+}
+
 /** Sanitize an arbitrary parsed value into a clean order array of string ids. */
 function cleanOrder(value: unknown): TerminalId[] {
   return Array.isArray(value)
-    ? value.filter((id): id is TerminalId => typeof id === "string")
+    ? value
+        .filter((id): id is TerminalId => typeof id === "string")
+        .map(shortenId)
     : [];
 }
 
@@ -229,7 +243,9 @@ function loadPersisted(): PersistedLayout {
         activeTabId:
           typeof parsed.activeTabId === "string" ? parsed.activeTabId : "",
         focusedId:
-          typeof parsed.focusedId === "string" ? parsed.focusedId : null,
+          typeof parsed.focusedId === "string"
+            ? shortenId(parsed.focusedId)
+            : null,
         fontSize:
           typeof parsed.fontSize === "number"
             ? parsed.fontSize
@@ -259,7 +275,9 @@ function loadPersisted(): PersistedLayout {
         tabs: [tab],
         activeTabId: tab.id,
         focusedId:
-          typeof parsed.focusedId === "string" ? parsed.focusedId : null,
+          typeof parsed.focusedId === "string"
+            ? shortenId(parsed.focusedId)
+            : null,
         fontSize:
           typeof parsed.fontSize === "number"
             ? parsed.fontSize
@@ -424,9 +442,26 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
     updateState: (id, state) => {
       const existing = get().terminals[id];
-      if (!existing || existing.state === state) return;
+      if (existing) {
+        if (existing.state === state) return;
+        set({
+          terminals: { ...get().terminals, [id]: { ...existing, state } },
+        });
+        return;
+      }
+      // No record yet, but the terminal lives in a tab (it was restored from a
+      // persisted layout): a terminal://state event raced ahead of the
+      // listTerminals() seed. Upsert a minimal record so the transition isn't
+      // dropped -- otherwise an attach's `live` event arriving before setTerminals
+      // is lost and the tile stays stuck on the amber "starting" fallback (#16).
+      // Ignore states for ids we don't track at all (no tab, no record).
+      const { tabs } = get();
+      if (!tabs.some((t) => t.order.includes(id))) return;
       set({
-        terminals: { ...get().terminals, [id]: { ...existing, state } },
+        terminals: {
+          ...get().terminals,
+          [id]: { id, tmuxSession: `th_${id}`, cwd: "", title: id, state },
+        },
       });
     },
 

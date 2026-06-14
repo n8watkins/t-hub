@@ -99,8 +99,16 @@ pub async fn spawn_terminal(
     state: tauri::State<'_, TerminalManager>,
     opts: SpawnOptions,
 ) -> Result<TerminalInfo, String> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let tmux_session = format!("th_{}", &id[..8]);
+    // The terminal id IS the tmux session's own suffix, so the id is stable and
+    // identical no matter who produces it: `spawn_terminal` here, `list_terminals`
+    // after a reload (which strips `th_` off the session name), and the
+    // `attach_terminal`/`kill_terminal` reconstructions. If id and session name
+    // disagree, a reloaded tile renders under an id that has no record in the
+    // store and its dot falls back to the amber "starting" placeholder forever
+    // (bug #16). Using the session suffix as the id keeps them in lockstep.
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let id = suffix[..8].to_string();
+    let tmux_session = format!("th_{id}");
     let cwd = resolve_cwd(&opts);
     let title = resolve_title(&opts);
 
@@ -188,13 +196,6 @@ pub async fn attach_terminal(
             let session =
                 pty::spawn_attach_client(&app, &id, &tmux_session, &cwd, cols, rows)?;
             state.sessions.lock().insert(id.clone(), session);
-            let _ = app.emit(
-                events::STATE,
-                &StateEvent {
-                    id: id.clone(),
-                    state: TerminalState::Live,
-                },
-            );
         } else {
             // Already streaming — make sure the geometry matches the freshly
             // mounted xterm so the pane isn't stale.
@@ -203,6 +204,21 @@ pub async fn attach_terminal(
             }
         }
     }
+
+    // A successful attach means a PTY client is now bound to this session, so the
+    // terminal is unambiguously Live. Emit on BOTH paths (fresh client AND an
+    // already-streaming reattach): after a reload the frontend may have seeded
+    // this terminal from `list_terminals` as Detached (no in-memory client at
+    // list time) or never seeded it at all, and without this transition the tile
+    // would stay stuck on its initial dot (bug #16). Idempotent for a tile that
+    // was already Live.
+    let _ = app.emit(
+        events::STATE,
+        &StateEvent {
+            id: id.clone(),
+            state: TerminalState::Live,
+        },
+    );
 
     // Seed xterm. A true reattach replays full scrollback history. A FRESH spawn
     // is NOT seeded (empty): the pane's prompt may not be drawn yet (zsh startup
