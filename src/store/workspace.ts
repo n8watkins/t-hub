@@ -394,6 +394,23 @@ function scopeToSatellite(layout: PersistedLayout, tabId: string): PersistedLayo
 }
 
 /**
+ * On a fresh MAIN-window launch, satellites from a previous run no longer exist
+ * (they are runtime-created by pop-out and never respawned at boot), so any tab
+ * left in `poppedOutTabs` is orphaned -- it would render in no window at all.
+ * Re-adopt every popped tab back into `tabs` so its terminals stay reachable.
+ * Net effect: pop-out is a within-session split; a restart/redeploy returns every
+ * popped tab to the main window (#21 phase 1). No-op when nothing is popped.
+ */
+function adoptOrphans(layout: PersistedLayout): PersistedLayout {
+  if (layout.poppedOutTabs.length === 0) return layout;
+  return {
+    ...layout,
+    tabs: [...layout.tabs, ...layout.poppedOutTabs],
+    poppedOutTabs: [],
+  };
+}
+
+/**
  * Pick a sensible focus target after `removedId` leaves `prevOrder`.
  * Prefers the next tile, then the previous, then null. `nextOrder` is the
  * order with `removedId` already removed.
@@ -427,7 +444,7 @@ const SATELLITE_TAB = satelliteTabId();
 const loaded = loadPersisted();
 const initial = SATELLITE_TAB
   ? scopeToSatellite(loaded, SATELLITE_TAB)
-  : loaded;
+  : adoptOrphans(loaded);
 
 export const useWorkspace = create<WorkspaceState>((set, get) => {
   // Persist the current (tabs, activeTabId, focusedId, fontSize, poppedOutTabs).
