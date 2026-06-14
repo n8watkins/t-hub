@@ -37,7 +37,13 @@ function splitRows<T>(ids: T[]): T[][] {
   return out;
 }
 
-export function Canvas() {
+export interface CanvasProps {
+  /** Toggle the 0.5 supervision sidebar (Ctrl/Cmd+B). Optional so the 0.1
+   *  nucleus canvas still works standalone. */
+  onToggleSidebar?: () => void;
+}
+
+export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
   const order = useWorkspace((s) => s.order);
   const focusedId = useWorkspace((s) => s.focusedId);
   const setTerminals = useWorkspace((s) => s.setTerminals);
@@ -99,7 +105,8 @@ export function Canvas() {
     [remove],
   );
 
-  // Global keybindings: Ctrl/Cmd+T = new terminal, Ctrl/Cmd+W = close focused.
+  // Global keybindings: Ctrl/Cmd+T = new terminal, Ctrl/Cmd+W = close focused,
+  // Ctrl/Cmd+B = toggle the 0.5 supervision sidebar.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
@@ -120,11 +127,14 @@ export function Canvas() {
       } else if (key === "0") {
         e.preventDefault();
         zoomReset();
+      } else if (key === "b" && onToggleSidebar) {
+        e.preventDefault();
+        onToggleSidebar();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [spawn, closeFocused, zoomIn, zoomOut, zoomReset]);
+  }, [spawn, closeFocused, zoomIn, zoomOut, zoomReset, onToggleSidebar]);
 
   // Empty state: a single centered call-to-action.
   if (order.length === 0) {

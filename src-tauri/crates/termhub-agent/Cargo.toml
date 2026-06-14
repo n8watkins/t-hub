@@ -1,0 +1,19 @@
+[package]
+name = "termhub-agent"
+version = "0.5.0"
+description = "TermHub WSL-side control agent: NDJSON-over-stdio bridge, append-only event journal, tmux/git/metrics RPCs."
+edition = "2021"
+rust-version = "1.77"
+
+# A single binary launched by the core as `wsl.exe -d <distro> -- termhub-agent
+# --stdio` (or directly on a unix dev box).
+[[bin]]
+name = "termhub-agent"
+path = "src/main.rs"
+
+[dependencies]
+termhub-protocol = { path = "../termhub-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+base64 = "0.22"

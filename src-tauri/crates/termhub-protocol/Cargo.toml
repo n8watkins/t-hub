@@ -1,0 +1,13 @@
+[package]
+name = "termhub-protocol"
+version = "0.5.0"
+description = "Shared, versioned NDJSON-over-stdio protocol between the TermHub core (Windows) and the WSL-side termhub-agent."
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "termhub_protocol"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
