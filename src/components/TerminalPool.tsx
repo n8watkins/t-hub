@@ -47,6 +47,15 @@ import { tlog } from "../lib/diag";
 // lands (see deferredRetriesRef).
 const MAX_DEFERRED_RETRIES = 10;
 
+// Absolute ceiling on the first-paint re-arm chain (BUG 2). Before the first
+// healthy active SHOW we keep the deferred budget topped up so the startup
+// hydration window (no container / zero rects for a few frames) always resolves
+// to a real measure and the muted flash can't persist. This caps that
+// keep-trying at ~60 frames (~1s) so a genuinely pathological layout (active
+// terminals whose placeholders never lay out at all) still stops spinning a
+// re-sync every frame forever, rather than relying solely on firstPaintSettled.
+const MAX_FIRST_PAINT_RETRIES = 60;
+
 // ---------------------------------------------------------------------------
 // Placeholder registry (context). Each Tile registers the empty body box it
 // renders, keyed by terminal id; the pool reads the registry to know where to
@@ -259,19 +268,30 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // bailing on an abort and waiting for an external trigger), so the active
   // terminals snap on as soon as their rects exist — collapsing the flash.
   const firstPaintSettledRef = useRef(false);
+  // Counts first-paint re-arms so the keep-trying window is itself bounded (see
+  // MAX_FIRST_PAINT_RETRIES) and can't spin forever on a pathological layout.
+  const firstPaintRetriesRef = useRef(0);
 
   // Schedule (or re-arm) the deferred next-frame re-sync. Coalesced to one
-  // pending rAF. Bounded by the same retry budget as sync()'s own deferral so a
-  // permanently-degenerate layout can't spin forever; before the first healthy
-  // paint we keep the budget topped up so the initial hydration window (which
-  // can span several frames) always resolves to a real measure.
+  // pending rAF. Bounded by the retry budget so a permanently-degenerate layout
+  // can't spin forever; before the first healthy paint we keep the budget topped
+  // up (within MAX_FIRST_PAINT_RETRIES) so the initial hydration window — which
+  // can span several frames — always resolves to a real measure.
   const scheduleDeferredSync = useCallback((reason: string) => {
-    if (deferredRetriesRef.current >= MAX_DEFERRED_RETRIES) return;
     // During the very first paint window, don't let the budget run dry: each
     // healthy SHOW resets it to 0 anyway, so this only matters while rects are
     // still degenerate (no visible terminal yet) — exactly when we must keep
-    // trying so the muted flash can't persist.
-    if (!firstPaintSettledRef.current) deferredRetriesRef.current = 0;
+    // trying so the muted flash can't persist. Reset BEFORE the exhaustion guard
+    // so a slow multi-frame hydration never stalls before the first real measure,
+    // but stop once the absolute first-paint ceiling is hit so a layout that
+    // never lays out at all doesn't re-arm a frame forever.
+    if (!firstPaintSettledRef.current) {
+      if (firstPaintRetriesRef.current < MAX_FIRST_PAINT_RETRIES) {
+        firstPaintRetriesRef.current += 1;
+        deferredRetriesRef.current = 0;
+      }
+    }
+    if (deferredRetriesRef.current >= MAX_DEFERRED_RETRIES) return;
     deferredRetriesRef.current += 1;
     if (deferredRafRef.current) cancelAnimationFrame(deferredRafRef.current);
     deferredRafRef.current = requestAnimationFrame(() => {
