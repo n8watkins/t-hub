@@ -1,0 +1,8 @@
+# T-Hub pnpm workspace.
+#
+# Only the desktop app is managed by pnpm for now. apps/site is the npm-based
+# marketing site (it keeps its own package-lock.json) and is intentionally left
+# OUT of the pnpm workspace until it's migrated to pnpm — listing it here would
+# make pnpm fight its npm lockfile.
+packages:
+  - "apps/desktop"

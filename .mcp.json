@@ -18,7 +18,7 @@
   ],
   "mcpServers": {
     "termhub": {
-      "command": "./src-tauri/target/debug/termhub-mcp",
+      "command": "./apps/desktop/src-tauri/target/debug/termhub-mcp",
       "args": [],
       "env": {}
     }

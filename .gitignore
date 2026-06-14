@@ -11,9 +11,9 @@ dist/
 dist-ssr/
 *.local
 
-# Rust / Tauri
-src-tauri/target/
-src-tauri/gen/
+# Rust / Tauri (now nested under the desktop app in the monorepo)
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
 
 # Editor / OS
 .vscode/*
