@@ -8,6 +8,7 @@ mod tmux;
 mod agent; // core-side agent bridge (Workstream A, core half)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
+mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6)
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
 mod model; // data-model structs (PRD §8)
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
@@ -58,6 +59,37 @@ fn spawn_agent_connect(state: &AppState) {
         .ok();
 }
 
+/// Build the [`control::ControlContext`] from app state and start the loopback
+/// control listener (PRD §9.6 MCP). The context shares the status bridge and a
+/// supervisor-visitor closure (so `control` reads supervision snapshots without
+/// reaching into `AgentBridge` internals). The per-launch token is a fresh UUID;
+/// it is written to the handshake file alongside the bound port so `termhub-mcp`
+/// can discover + authenticate to the channel. An explicit `TERMHUB_CONTROL_TOKEN`
+/// overrides the generated token (useful for test harnesses).
+fn start_control_listener(state: &AppState) {
+    let token = std::env::var("TERMHUB_CONTROL_TOKEN")
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+
+    // A visitor closure that locks the bridge's Supervisor and runs `f`. Capturing
+    // a clone of the bridge keeps `control` decoupled from `agent` internals.
+    let bridge = state.agent.clone();
+    let supervisor: std::sync::Arc<
+        dyn Fn(&mut dyn FnMut(&supervision::Supervisor)) + Send + Sync,
+    > = std::sync::Arc::new(move |f: &mut dyn FnMut(&supervision::Supervisor)| {
+        bridge.with_supervisor(|s| f(s));
+    });
+
+    let ctx = control::ControlContext::new(state.status.clone(), supervisor, token);
+    match control::start(ctx) {
+        Ok(h) => eprintln!(
+            "termhub: control listener on {} (handshake: {})",
+            h.addr,
+            control::handshake_path().display()
+        ),
+        Err(e) => eprintln!("termhub: control listener failed to start: {e}"),
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(TerminalManager::default())
@@ -77,6 +109,11 @@ pub fn run() {
             state.agent.set_status_bridge(state.status.clone());
             // Kick off the agent connection in the background once state exists.
             spawn_agent_connect(&state);
+            // Start the MCP control listener so `termhub-mcp` can forward
+            // `tools/call` over the local control channel (PRD §9.6). A bind
+            // failure is logged and does not abort startup (the channel is
+            // optional, like the agent bridge).
+            start_control_listener(&state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -556,6 +556,40 @@ fn read_text_capped(path: &Path) -> Result<FileContents, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Control-channel entry points (additive; reuse the private helpers above)
+// ---------------------------------------------------------------------------
+//
+// These let the MCP control listener (`crate::control`) drive file search +
+// reading without going through the Tauri `#[command]` wrappers, which require a
+// `tauri::State` borrow that only exists inside the invoke handler. They are thin
+// re-exports of the exact same `normalize` + `build_index` + `search_index` +
+// `read_text_capped` logic the commands use — no behavior of the existing
+// commands changes.
+
+/// Control-channel fuzzy search: normalize `root`, index it (cached on `state`),
+/// and rank `query`. Mirrors the `search_files` command body.
+pub fn control_search(
+    state: &FileIndexState,
+    root: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<FileHit>, String> {
+    let root = normalize(root);
+    let index = match state.get(&root) {
+        Some(i) => i,
+        None => state.put(build_index(&root)?),
+    };
+    Ok(search_index(&index, query, limit.clamp(1, 1000)))
+}
+
+/// Control-channel capped text read: normalize `path` and read it through the
+/// same size-capped, binary-rejecting reader the `read_text_file` command uses.
+pub fn control_read_text(_state: &FileIndexState, path: &str) -> Result<FileContents, String> {
+    let p = normalize(path);
+    read_text_capped(&p)
+}
+
+// ---------------------------------------------------------------------------
 // Tauri commands (registered in lib.rs; mirrored in src/ipc/files.ts)
 // ---------------------------------------------------------------------------
 
