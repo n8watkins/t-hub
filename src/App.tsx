@@ -163,16 +163,6 @@ export default function App() {
   const [, setSelectedSession] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
 
-  // Persist a chosen sidebar mode (shared by the cycle + the explicit setters).
-  const applySidebarMode = useCallback((next: SidebarMode) => {
-    setSidebarMode(next);
-    try {
-      localStorage.setItem(SIDEBAR_MODE_KEY, next);
-    } catch {
-      /* ignore quota/availability */
-    }
-  }, []);
-
   // Cycle the collapse state (full -> rail -> hidden -> full) and persist it.
   // This is exactly what App hands to Canvas as onToggleSidebar, so Canvas's
   // unchanged Ctrl/Cmd+B keybinding now advances through all three states.
@@ -187,15 +177,6 @@ export default function App() {
       return next;
     });
   }, []);
-
-  // Reopen the sidebar to its full state — the chrome (brand + gear + window
-  // controls) now lives in the sidebar header, so when the sidebar is HIDDEN the
-  // titlebar renders a minimal fallback control cluster whose "show sidebar"
-  // button calls this. Guarantees the controls are always reachable.
-  const reopenSidebar = useCallback(
-    () => applySidebarMode("full"),
-    [applySidebarMode],
-  );
 
   // Wire cross-window tear-off resync once for this window (#21): the main window
   // hides/re-adopts tabs as satellites open/close; a satellite self-closes if its
@@ -329,12 +310,7 @@ export default function App() {
           onPointerEnter={reveal}
           onPointerLeave={() => scheduleHide(hideDelayMs)}
         >
-          <Titlebar
-            satellite={SATELLITE}
-            tabStripOffset={sidebarOffset}
-            sidebarHidden={sidebarMode === "hidden"}
-            onReopenSidebar={reopenSidebar}
-          />
+          <Titlebar satellite={SATELLITE} tabStripOffset={sidebarOffset} />
         </div>
       ) : (
         <div
@@ -345,12 +321,7 @@ export default function App() {
           }}
           {...barHover}
         >
-          <Titlebar
-            satellite={SATELLITE}
-            tabStripOffset={sidebarOffset}
-            sidebarHidden={sidebarMode === "hidden"}
-            onReopenSidebar={reopenSidebar}
-          />
+          <Titlebar satellite={SATELLITE} tabStripOffset={sidebarOffset} />
         </div>
       )}
 

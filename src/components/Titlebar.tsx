@@ -1,21 +1,14 @@
 // Persistent Chrome-style top bar for the frameless (decorations:false) main
-// window — one half of the window chrome (the other half is the SIDEBAR header).
+// window — the primary window chrome.
 //
-// The window's top-left chrome (the T-Hub brand, the settings gear, and the
-// window controls) now lives at the TOP of the SIDEBAR (see Sidebar.tsx). The
-// MAIN titlebar therefore renders ONLY the workspace tab strip + a draggable
-// region, so "when the sidebar is closed you don't see T-Hub".
+// The window controls (minimize / maximize-restore / close) AND the primary
+// settings gear live at the TOP-RIGHT of this titlebar (where they always were).
+// They are ALWAYS in the titlebar regardless of the sidebar's collapse state, so
+// they're never unreachable — no fallback plumbing is needed.
 //
 // Main layout, left -> right:
 //   [tab-strip spacer (drag)] · [workspace tab strip + "＋"] · [flexible drag
-//   region] · [fallback window controls — ONLY when the sidebar is hidden]
-//
-// HARD CONSTRAINT: the window controls must always be reachable. When the
-// sidebar is FULL or RAIL the controls live in its header; but when the sidebar
-// is HIDDEN (the 3rd collapse state) App skips <Sidebar> entirely, so this
-// titlebar renders a minimal fallback cluster (minimize / maximize-restore /
-// close + a "show sidebar" button) at its top-right. Never leave the user
-// unable to minimize/close/restore.
+//   region] · [settings gear] · [window controls: min / max-restore / close]
 //
 // The spacer + the flexible stretch carry `data-tauri-drag-region`, so grabbing
 // the empty areas moves the window (like Chrome). The bar is always visible
@@ -27,13 +20,14 @@
 // it a drop target for BOTH reordering a tab and dropping a *tile* onto it (the
 // tile's drag resolves tabs via elementFromPoint + closest).
 //
-// Window controls (minimize / maximize-restore / close) — in the fallback
-// cluster and the satellite variant — use the Tauri window API and must NOT
-// carry data-tauri-drag-region, or a click would start a window drag instead.
+// Window controls (minimize / maximize-restore / close) and the settings gear
+// use the Tauri window API / settings store and must NOT carry
+// data-tauri-drag-region, or a click would start a window drag instead.
 import { useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useWorkspace } from "../store/workspace";
+import { useSettings } from "../store/settings";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { popOutTab, closeSatellite, readSatelliteTab } from "../lib/windows";
@@ -91,8 +85,6 @@ function droppedOutsideStrip(y: number): boolean {
 export function Titlebar({
   satellite = false,
   tabStripOffset = 0,
-  sidebarHidden = false,
-  onReopenSidebar,
 }: {
   satellite?: boolean;
   /**
@@ -100,20 +92,12 @@ export function Titlebar({
    * begin — set by App to the sidebar's current effective width so the leftmost
    * tab aligns with the canvas's left edge (TASK 1). A draggable spacer before
    * the strip widens to fill the gap. Updates live as the sidebar mode/width
-   * changes. Ignored in a satellite (no tab strip there). With the brand gone
-   * (now in the sidebar) the spacer simply equals the offset. Defaults to 0.
+   * changes. Ignored in a satellite (no tab strip there). With the brand in the
+   * sidebar the spacer simply equals the offset. Defaults to 0.
    */
   tabStripOffset?: number;
-  /**
-   * Whether the sidebar is HIDDEN (its 3rd collapse state). When true the chrome
-   * that normally lives in the sidebar header is unreachable, so the titlebar
-   * renders a fallback control cluster (min/max/close + a "show sidebar"
-   * button). Ignored in a satellite (it keeps its own controls). Defaults false.
-   */
-  sidebarHidden?: boolean;
-  /** Reopen the hidden sidebar — wired to the fallback cluster's button. */
-  onReopenSidebar?: () => void;
 }) {
+  const toggleSettings = useSettings((s) => s.toggleSettings);
   return (
     <div
       className="flex h-8 shrink-0 items-stretch border-b text-xs"
@@ -124,8 +108,8 @@ export function Titlebar({
     >
       {satellite ? (
         // Satellite (no sidebar / one tab): it keeps its OWN chrome — the brand,
-        // the popped-out tab's name + a return control, the settings gear, and
-        // its window controls (minimize/maximize; "Return" replaces close).
+        // the popped-out tab's name + a return control, and its window controls
+        // (minimize/maximize; "Return" replaces close).
         <>
           <Brand />
           <SatelliteBar />
@@ -134,17 +118,15 @@ export function Titlebar({
       ) : (
         // Main: a draggable spacer that pushes the tab strip out to the sidebar's
         // right edge (TASK 1), then the workspace tabs (+ the new-tab button),
-        // then a flexible drag region. The brand + gear + window controls now
-        // live in the SIDEBAR header — so when the sidebar is visible this row is
-        // just tabs. ONLY when the sidebar is HIDDEN do we render a fallback
-        // control cluster here so the window stays controllable.
+        // then a flexible drag region, and finally the PRIMARY chrome at the
+        // top-right: the settings gear + the window controls (min / max-restore /
+        // close). These are ALWAYS here, independent of the sidebar's state.
         <>
           <TabStripSpacer offset={tabStripOffset} />
           <TabStrip />
           <div data-tauri-drag-region className="min-w-0 flex-1" aria-hidden />
-          {sidebarHidden && (
-            <FallbackControls onReopenSidebar={onReopenSidebar} />
-          )}
+          <SettingsButton onClick={toggleSettings} />
+          <WindowControls />
         </>
       )}
     </div>
@@ -152,33 +134,22 @@ export function Titlebar({
 }
 
 /**
- * The minimal control cluster rendered in the titlebar's top-right ONLY when the
- * sidebar is HIDDEN (so the sidebar-header chrome is unreachable). A "show
- * sidebar" button (which brings the relocated brand/gear/controls back) plus the
- * window controls (minimize / maximize-restore / close). This is the HARD
- * CONSTRAINT safety net: the user is never left unable to minimize/close/restore
- * or to get the chrome back.
+ * The primary settings gear — opens the settings/theme surface (also
+ * Ctrl/Cmd+,). Lives in the titlebar's top-right, just left of the window
+ * controls. Must NOT carry data-tauri-drag-region or the click would start a
+ * window drag.
  */
-function FallbackControls({
-  onReopenSidebar,
-}: {
-  onReopenSidebar?: () => void;
-}) {
+function SettingsButton({ onClick }: { onClick: () => void }) {
   return (
-    <div className="flex shrink-0 items-stretch">
-      {onReopenSidebar && (
-        <button
-          type="button"
-          aria-label="Show sidebar"
-          title="Show sidebar"
-          onClick={onReopenSidebar}
-          className="flex h-8 w-11 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
-        >
-          <ShowSidebarIcon />
-        </button>
-      )}
-      <WindowControls />
-    </div>
+    <button
+      type="button"
+      aria-label="Settings"
+      title="Settings (Ctrl/Cmd+,)"
+      onClick={onClick}
+      className="flex h-8 w-11 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
+    >
+      <GearIcon />
+    </button>
   );
 }
 
@@ -271,7 +242,8 @@ function Brand() {
 
 // ---------------------------------------------------------------------------
 // Window controls: minimize, maximize/restore, and (main window only) close.
-// Fixed-width hover targets matching the bar height; close goes red on hover.
+// Always live at the titlebar's top-right. Fixed-width hover targets matching
+// the bar height; close goes red on hover.
 //
 // In a SATELLITE window (#6) the close (×) is intentionally omitted: it would be
 // a second control duplicating the SatelliteBar's "Return to main window" button
@@ -608,14 +580,12 @@ function TabStrip() {
 // the tab text; they inherit `currentColor` so they follow the button's hover.
 // ---------------------------------------------------------------------------
 
-/** Sidebar glyph (a panel with a divider) — the fallback "show sidebar" button
- *  shown in the titlebar when the sidebar is hidden, bringing the relocated
- *  brand/gear/controls back into view. */
-function ShowSidebarIcon() {
+/** Settings gear (the primary titlebar settings control). */
+function GearIcon() {
   return (
     <svg
-      width="14"
-      height="14"
+      width="15"
+      height="15"
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -625,8 +595,8 @@ function ShowSidebarIcon() {
       className="pointer-events-none"
       aria-hidden
     >
-      <rect x="3" y="4" width="18" height="16" rx="2" />
-      <line x1="9" y1="4" x2="9" y2="20" />
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
     </svg>
   );
 }

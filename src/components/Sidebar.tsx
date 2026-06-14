@@ -17,7 +17,6 @@
 // subscribes and feeds the store.
 import { useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   useSupervision,
   attentionSessions,
@@ -40,34 +39,12 @@ import type {
   TerminalState,
 } from "../ipc/types";
 
-// --- Frameless window controls -------------------------------------------
-// The brand + settings gear + window controls (minimize / maximize-restore /
-// close) now live at the TOP of the sidebar instead of the titlebar, so the
-// titlebar can be a clean tab-strip row. These call the Tauri window API and
-// MUST NOT carry data-tauri-drag-region, or a click would start a window drag.
-// (The titlebar keeps an identical fallback cluster for the sidebar-hidden
-// state — see Titlebar.tsx — so the controls are never unreachable.)
-
-/** Minimize the window, swallowing any IPC rejection. */
-function minimizeWindow(): void {
-  void getCurrentWindow()
-    .minimize()
-    .catch(() => {});
-}
-
-/** Toggle maximize/restore, swallowing any IPC rejection. */
-function toggleMaximizeWindow(): void {
-  void getCurrentWindow()
-    .toggleMaximize()
-    .catch(() => {});
-}
-
-/** Close the window, swallowing any IPC rejection. */
-function closeWindow(): void {
-  void getCurrentWindow()
-    .close()
-    .catch(() => {});
-}
+// --- Sidebar header chrome -------------------------------------------------
+// The window controls (minimize / maximize-restore / close) and the PRIMARY
+// settings gear live in the TITLEBAR (see Titlebar.tsx) — always reachable
+// regardless of the sidebar's collapse state. The sidebar header keeps only the
+// T-Hub brand (a window-drag handle), the collapse button (the Ctrl/Cmd+B
+// cycle), and a small SECONDARY settings gear for convenience.
 
 /** The workspace-row id under a viewport point, or null (drag resolution). Each
  *  WorkspaceRow header carries `data-ws-id`; elementFromPoint returns the topmost
@@ -246,20 +223,21 @@ function SidebarFull({
         color: "var(--th-fg)",
       }}
     >
-      {/* Top chrome header (moved out of the titlebar): the T-Hub brand on the
-          left; the settings gear + window controls (min / max-restore / close)
-          on the right. The brand area is a window-drag handle. */}
+      {/* Top chrome header: the T-Hub brand (window-drag handle) on the left,
+          the collapse button + a small secondary settings gear on the right.
+          The PRIMARY gear + window controls live in the titlebar. */}
       <SidebarHeader onToggleSidebar={onToggleSidebar} />
 
       {/* 0. Workspaces (#2) — the user's tabs with tile counts, active one
           highlighted; a click activates the tab. Each row expands to that tab's
           terminals so the user can peek into OTHER workspaces without switching.
-          Gives the otherwise-empty sidebar immediate utility. */}
-      <section
+          Collapsible (#3); open by default. */}
+      <CollapsibleSection
+        id="workspaces"
+        title="Workspaces"
+        defaultOpen
         className="border-b"
-        style={{ borderColor: "var(--th-border)" }}
       >
-        <Header>Workspaces</Header>
         <WorkspaceList
           tabs={tabs}
           activeTabId={activeTabId}
@@ -267,11 +245,11 @@ function SidebarFull({
           terminals={terminals}
           setFocus={setFocus}
         />
-      </section>
+      </CollapsibleSection>
 
-      {/* 1. Attention queue */}
+      {/* 1. Attention queue (always shown; not part of the accordion). */}
       <section
-        className="border-b"
+        className="shrink-0 border-b"
         style={{ borderColor: "var(--th-border)" }}
       >
         <Header>Attention</Header>
@@ -301,11 +279,20 @@ function SidebarFull({
         )}
       </section>
 
-      {/* 2. Session / supervision tree */}
-      <section className="max-h-44 shrink-0 overflow-y-auto">
-        <Header>Sessions</Header>
+      {/* 2. Sessions = the Claude supervision tree (NOT the user's terminals —
+          those are under Workspaces). Fills in once Claude hooks are installed.
+          Collapsible (#3); collapsed by default. */}
+      <CollapsibleSection
+        id="sessions"
+        title="Sessions"
+        defaultOpen={false}
+        className="max-h-44 overflow-y-auto border-b"
+      >
         {treeList.length === 0 ? (
-          <Muted>No supervised sessions.</Muted>
+          <Muted>
+            Claude sessions appear here once hooks are installed — your terminals
+            are under Workspaces.
+          </Muted>
         ) : (
           <div className="divide-y divide-neutral-800">
             {treeList.map((tree) => (
@@ -319,15 +306,18 @@ function SidebarFull({
             ))}
           </div>
         )}
-      </section>
+      </CollapsibleSection>
 
       {/* Files — browse the project file tree (the tree + reader are
-          self-contained in FileTree.tsx; rooted at the projects dir for now). */}
-      <section
-        className="flex min-h-0 flex-1 flex-col border-t"
-        style={{ borderColor: "var(--th-border)" }}
+          self-contained in FileTree.tsx; rooted at the projects dir for now).
+          Collapsible (#3); open by default and grows to fill the height. */}
+      <CollapsibleSection
+        id="files"
+        title="Files"
+        defaultOpen
+        grow
+        className="border-b"
       >
-        <Header>Files</Header>
         <div className="min-h-0 flex-1 overflow-hidden">
           <FileTree
             root="/home/natkins/n8builds"
@@ -335,24 +325,22 @@ function SidebarFull({
             className="h-full"
           />
         </div>
-      </section>
+      </CollapsibleSection>
 
-      {/* 3. Claude hooks (consent-gated install/uninstall) */}
-      <section
-        className="border-t"
-        style={{ borderColor: "var(--th-border)" }}
+      {/* 3. Claude hooks (consent-gated install/uninstall). Collapsible (#3). */}
+      <CollapsibleSection
+        id="hooks"
+        title="Hooks"
+        defaultOpen
+        className="border-b"
       >
         <HookInstallPanel agentBin={agentBin} />
-      </section>
+      </CollapsibleSection>
 
-      {/* 4. Utility area (low priority) */}
-      <section
-        className="border-t"
-        style={{ borderColor: "var(--th-border)" }}
-      >
-        <Header>WSL</Header>
+      {/* 4. Utility area (low priority). Collapsible (#3); collapsed by default. */}
+      <CollapsibleSection id="wsl" title="WSL" defaultOpen={false}>
         <WslHealth metrics={metrics} connection={agent?.connection} />
-      </section>
+      </CollapsibleSection>
     </aside>
   );
 }
@@ -466,22 +454,20 @@ function WorkspaceList({
   ) => {
     if (e.button !== 0) return;
     suppressClickRef.current = false;
-    // Ghost details captured at press time: the terminal's title + lifecycle
-    // state, mirroring the TerminalRow tooltip (`${title} — ${state}`).
+    // Ghost details captured at press time: just the terminal's title (no
+    // lifecycle-state subtitle — the ghost shows the terminal name only).
     const info = terminals[terminalId];
     const termTitle = info?.title?.trim() || terminalId;
-    const termState = info?.state ?? "starting";
     let ghost: DragGhost | null = null;
     startPointerDrag(e.clientX, e.clientY, {
       onBegin: () => {
         actions.setDraggingTile(terminalId);
         document.body.dataset.thDragging = "1";
-        // Small chip with a faded subtitle line showing the lifecycle state.
+        // Single-line chip with just the terminal name (no subtitle).
         ghost = createDragGhost({
           title: termTitle,
-          subtitle: termState,
           width: 180,
-          bodyHeight: 22,
+          bodyHeight: 0,
         });
       },
       onMove: (x, y) => {
@@ -836,20 +822,19 @@ function SidebarRail({
 }
 
 // ===========================================================================
-// Sidebar chrome header — the window's top-left chrome, relocated here from the
-// titlebar. FULL mode: a single 32px row with the T-Hub brand on the left and
-// the settings gear + window controls on the right. RAIL mode: a compact
-// stacked version. When the sidebar is HIDDEN entirely, App skips <Sidebar>, so
-// the titlebar renders a fallback control cluster instead (see Titlebar.tsx) —
-// the controls are therefore always reachable.
+// Sidebar chrome header — the brand + collapse control. FULL mode: a single
+// 32px row with the T-Hub brand on the left and the collapse button + a small
+// secondary settings gear on the right. RAIL mode: a compact stacked version.
+// The window controls + the PRIMARY settings gear live in the titlebar (see
+// Titlebar.tsx) and are intentionally NOT duplicated here.
 // ===========================================================================
 
 /**
  * The full-mode sidebar header: a 32px row matching the titlebar height. The
- * left holds the brand (a window-drag handle); the right holds a collapse
- * button (cycles full -> rail -> hidden), the settings gear, and the window
- * controls (minimize / maximize-restore / close). The empty middle is also a
- * drag handle so the window can still be moved by grabbing the header.
+ * left holds the brand (a window-drag handle); the right holds the collapse
+ * button (cycles full -> rail -> hidden, the Ctrl/Cmd+B action) plus a small
+ * secondary settings gear. The empty middle is also a drag handle so the window
+ * can still be moved by grabbing the header.
  */
 function SidebarHeader({ onToggleSidebar }: { onToggleSidebar?: () => void }) {
   const toggleSettings = useSettings((s) => s.toggleSettings);
@@ -865,15 +850,15 @@ function SidebarHeader({ onToggleSidebar }: { onToggleSidebar?: () => void }) {
         <CollapseButton onClick={onToggleSidebar} />
       )}
       <SidebarSettingsButton onClick={toggleSettings} />
-      <SidebarWindowControls />
     </div>
   );
 }
 
 /**
- * The rail-mode header: the brand mark and window controls stacked vertically so
- * they fit the thin (~48px) strip. The brand square doubles as a window-drag
- * handle; the collapse button expands the rail back to full (or on to hidden).
+ * The rail-mode header: the brand mark over the collapse button, stacked
+ * vertically so they fit the thin (~48px) strip. The brand square doubles as a
+ * window-drag handle; the collapse button expands the rail back to full (or on
+ * to hidden). The window controls live in the titlebar, not here.
  */
 function SidebarRailHeader({ onToggleSidebar }: { onToggleSidebar?: () => void }) {
   return (
@@ -881,7 +866,7 @@ function SidebarRailHeader({ onToggleSidebar }: { onToggleSidebar?: () => void }
       className="flex w-full flex-col items-center gap-1 border-b pb-1.5 pt-1.5"
       style={{ borderColor: "var(--th-border)" }}
     >
-      {/* Only the brand mark is a drag handle; the control buttons must NOT be
+      {/* Only the brand mark is a drag handle; the control button must NOT be
           inside a drag region or a click would start a window drag instead. */}
       <span
         data-tauri-drag-region
@@ -901,33 +886,6 @@ function SidebarRailHeader({ onToggleSidebar }: { onToggleSidebar?: () => void }
           <SidebarToggleIcon />
         </button>
       )}
-      <button
-        type="button"
-        onClick={minimizeWindow}
-        aria-label="Minimize"
-        title="Minimize"
-        className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700"
-      >
-        <MinimizeIcon />
-      </button>
-      <button
-        type="button"
-        onClick={toggleMaximizeWindow}
-        aria-label="Maximize"
-        title="Maximize / Restore"
-        className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700"
-      >
-        <MaximizeIcon />
-      </button>
-      <button
-        type="button"
-        onClick={closeWindow}
-        aria-label="Close"
-        title="Close"
-        className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-red-600 hover:text-white"
-      >
-        <CloseIcon />
-      </button>
     </div>
   );
 }
@@ -984,41 +942,6 @@ function SidebarSettingsButton({ onClick }: { onClick: () => void }) {
   );
 }
 
-/** Window controls (minimize / maximize-restore / close) for the full header. */
-function SidebarWindowControls() {
-  return (
-    <div className="flex shrink-0 items-stretch">
-      <button
-        type="button"
-        aria-label="Minimize"
-        title="Minimize"
-        onClick={minimizeWindow}
-        className="flex h-8 w-9 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
-      >
-        <MinimizeIcon />
-      </button>
-      <button
-        type="button"
-        aria-label="Maximize"
-        title="Maximize / Restore"
-        onClick={toggleMaximizeWindow}
-        className="flex h-8 w-9 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
-      >
-        <MaximizeIcon />
-      </button>
-      <button
-        type="button"
-        aria-label="Close"
-        title="Close"
-        onClick={closeWindow}
-        className="flex h-8 w-9 items-center justify-center text-neutral-300 transition-colors hover:bg-red-600 hover:text-white"
-      >
-        <CloseIcon />
-      </button>
-    </div>
-  );
-}
-
 // --- Shared chrome icons (sized to sit in the 32px header) -----------------
 
 /** Settings gear. */
@@ -1038,60 +961,6 @@ function GearIcon() {
     >
       <circle cx="12" cy="12" r="3" />
       <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-    </svg>
-  );
-}
-
-/** Minimize (horizontal line). */
-function MinimizeIcon() {
-  return (
-    <svg
-      width="10"
-      height="10"
-      viewBox="0 0 10 10"
-      aria-hidden
-      className="pointer-events-none"
-    >
-      <line x1="1" y1="5" x2="9" y2="5" stroke="currentColor" strokeWidth="1" />
-    </svg>
-  );
-}
-
-/** Maximize / restore (square). */
-function MaximizeIcon() {
-  return (
-    <svg
-      width="10"
-      height="10"
-      viewBox="0 0 10 10"
-      aria-hidden
-      className="pointer-events-none"
-    >
-      <rect
-        x="1"
-        y="1"
-        width="8"
-        height="8"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1"
-      />
-    </svg>
-  );
-}
-
-/** Close (×). */
-function CloseIcon() {
-  return (
-    <svg
-      width="10"
-      height="10"
-      viewBox="0 0 10 10"
-      aria-hidden
-      className="pointer-events-none"
-    >
-      <line x1="1" y1="1" x2="9" y2="9" stroke="currentColor" strokeWidth="1" />
-      <line x1="9" y1="1" x2="1" y2="9" stroke="currentColor" strokeWidth="1" />
     </svg>
   );
 }
@@ -1165,6 +1034,132 @@ function UsageLine({ snapshot }: { snapshot: StatusSnapshot }) {
     >
       {parts.join(" · ")}
     </div>
+  );
+}
+
+// ===========================================================================
+// Collapsible (accordion) sections (#3). Each major sidebar section —
+// Workspaces, Sessions, Files, WSL, Hooks — is an expand/collapse panel whose
+// header carries a chevron and whose open/closed state persists per section in
+// localStorage under its OWN key (so the user's layout sticks across launches).
+// ===========================================================================
+
+/** Per-section localStorage key prefix; each section appends its own id. */
+const SECTION_KEY_PREFIX = "termhub.sidebar.section.";
+
+/**
+ * Persisted open/closed state for one accordion section. `defaultOpen` is used
+ * only when nothing has been stored yet, so the requested defaults (Workspaces +
+ * Files open; Sessions + WSL collapsed) apply on a fresh install but a user's
+ * later choice always wins. The setter writes through to localStorage.
+ */
+function useSectionCollapse(
+  id: string,
+  defaultOpen: boolean,
+): [boolean, () => void] {
+  const [open, setOpen] = useState<boolean>(() => {
+    if (typeof localStorage === "undefined") return defaultOpen;
+    const raw = localStorage.getItem(SECTION_KEY_PREFIX + id);
+    return raw === null ? defaultOpen : raw === "1";
+  });
+  const toggle = () => {
+    setOpen((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(SECTION_KEY_PREFIX + id, next ? "1" : "0");
+      } catch {
+        /* ignore quota/availability */
+      }
+      return next;
+    });
+  };
+  return [open, toggle];
+}
+
+/**
+ * A collapsible sidebar section: a clickable header (chevron + uppercase title)
+ * that toggles its body. The open/closed state persists per `id` (#3). When
+ * `grow` is set the section flexes to fill the remaining height while OPEN (used
+ * by the Files section so the FileTree gets room); collapsed it shrinks to just
+ * its header. The outer `className` carries the section's border styling.
+ */
+function CollapsibleSection({
+  id,
+  title,
+  defaultOpen,
+  grow = false,
+  className,
+  children,
+}: {
+  id: string;
+  title: string;
+  defaultOpen: boolean;
+  grow?: boolean;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  const [open, toggle] = useSectionCollapse(id, defaultOpen);
+  return (
+    <section
+      className={[
+        "flex flex-col",
+        // Only grow (and allow its body to scroll/shrink) while OPEN; collapsed
+        // it must not claim flex space or it'd leave a dead gap.
+        grow && open ? "min-h-0 flex-1" : "shrink-0",
+        className ?? "",
+      ].join(" ")}
+      style={{ borderColor: "var(--th-border)" }}
+    >
+      <SectionHeader title={title} open={open} onToggle={toggle} />
+      {open && children}
+    </section>
+  );
+}
+
+/** The clickable header for a CollapsibleSection: a chevron that rotates with
+ *  the open state, then the uppercase section title. Full-width hit target. */
+function SectionHeader({
+  title,
+  open,
+  onToggle,
+}: {
+  title: string;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={open}
+      title={open ? `Collapse ${title}` : `Expand ${title}`}
+      className="flex w-full items-center gap-1 px-2 pt-2 pb-1 text-left text-xs font-semibold uppercase tracking-wide hover:text-neutral-200"
+      style={{ color: "var(--th-fg-muted)" }}
+    >
+      <ChevronIcon open={open} />
+      <span className="min-w-0 flex-1 truncate">{title}</span>
+    </button>
+  );
+}
+
+/** A small disclosure chevron that points right when collapsed, down when open. */
+function ChevronIcon({ open }: { open: boolean }) {
+  return (
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="3"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="pointer-events-none shrink-0 transition-transform"
+      style={{ transform: open ? "rotate(90deg)" : "rotate(0deg)" }}
+      aria-hidden
+    >
+      <path d="M9 6l6 6-6 6" />
+    </svg>
   );
 }
 
