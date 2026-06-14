@@ -15,14 +15,13 @@
 // data arrives via the agent bridge's event emit spine (agent://journal →
 // supervision://tree / session://status / status://snapshot); the telemetry hook
 // subscribes and feeds the store.
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import {
   useSupervision,
   attentionSessions,
   displayStatus,
 } from "../store/supervision";
-import { claudeHooksInstalled } from "../ipc/client05";
 import { useAgentTelemetry } from "../store/telemetry";
 import { useSettings } from "../store/settings";
 import { useWorkspace, deriveLabel, type WorkspaceTab } from "../store/workspace";
@@ -31,7 +30,6 @@ import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { SupervisionTreeBody } from "./SupervisionTree";
 import { StatusBadge, statusLabel } from "./StatusBadge";
 import { WslHealth } from "./WslHealth";
-import { HookInstallPanel } from "./HookInstallPanel";
 import { FileTree } from "./FileTree";
 import type { StatusSnapshot, SupervisionTree } from "../ipc/model";
 import type { HostMetrics, ConnectionState } from "../ipc/protocol";
@@ -133,12 +131,6 @@ export interface SidebarProps {
    * the sidebar can drive the same Ctrl/Cmd+B cycle App owns.
    */
   onToggleSidebar?: () => void;
-  /**
-   * Resolved path to the termhub-agent binary used as the hook entrypoint
-   * (`<agentBin> --hook <EVENT>`). Inside WSL `termhub-agent` is on PATH, so the
-   * bare name is the right default; a dev box can override it.
-   */
-  agentBin?: string;
 }
 
 export function Sidebar({
@@ -146,7 +138,6 @@ export function Sidebar({
   mode = "full",
   width = 256,
   onToggleSidebar,
-  agentBin = "termhub-agent",
 }: SidebarProps) {
   // Workspace tabs (read-only, #2): list every tab with its tile count and let
   // a click activate it. Each tab also expands to its terminals (looked up in
@@ -187,7 +178,6 @@ export function Sidebar({
     <SidebarFull
       onSelectSession={onSelectSession}
       width={width}
-      agentBin={agentBin}
       tabs={tabs}
       activeTabId={activeTabId}
       setActiveTab={setActiveTab}
@@ -220,7 +210,6 @@ function useWorkspaceDragActions() {
 interface FullProps {
   onSelectSession?: (sessionId: string) => void;
   width: number;
-  agentBin: string;
   tabs: WorkspaceTab[];
   activeTabId: string;
   setActiveTab: (id: string) => void;
@@ -234,7 +223,6 @@ interface FullProps {
 function SidebarFull({
   onSelectSession,
   width,
-  agentBin,
   tabs,
   activeTabId,
   setActiveTab,
@@ -274,20 +262,6 @@ function SidebarFull({
     open: openSection === id,
     onToggle: () => setOpenSection(openSection === id ? null : id),
   });
-
-  // Hooks-installed state is checked ONCE here (the sidebar is always mounted),
-  // not inside HookInstallPanel — so expanding the collapsed Hooks section shows
-  // the result immediately instead of a "checking…" flash each time it re-mounts.
-  const [hooksInstalled, setHooksInstalled] = useState<boolean | null>(null);
-  useEffect(() => {
-    let alive = true;
-    claudeHooksInstalled()
-      .then((v) => alive && setHooksInstalled(v))
-      .catch(() => alive && setHooksInstalled(false));
-    return () => {
-      alive = false;
-    };
-  }, []);
 
   return (
     <aside
@@ -386,21 +360,7 @@ function SidebarFull({
           </div>
         </CollapsibleSection>
 
-        {/* Claude hooks (consent-gated install/uninstall). The header shows the
-            installed/not pill so status is visible without expanding. */}
-        <CollapsibleSection
-          title="Hooks"
-          {...acc("hooks")}
-          className="border-b"
-          headerExtra={<HookHeaderPill installed={hooksInstalled} />}
-        >
-          <HookInstallPanel
-            agentBin={agentBin}
-            installed={hooksInstalled}
-            setInstalled={setHooksInstalled}
-          />
-        </CollapsibleSection>
-
+        {/* Hooks moved to Settings → Hooks (install/uninstall + which events). */}
       </div>
 
       {/* Pinned to the very bottom (outside the accordion): a status strip that
@@ -560,22 +520,6 @@ function UsageSummary({
         <span className="tabular-nums" style={{ color: "var(--th-fg)" }}>${cost.toFixed(2)}</span>
       </div>
     </div>
-  );
-}
-
-/** Tiny installed/not dot for the Hooks section header (so status shows without
- *  expanding). Mirrors HookInstallPanel's StatusPill but compact. */
-function HookHeaderPill({ installed }: { installed: boolean | null }) {
-  if (installed === null) return null; // checked once at sidebar mount; brief
-  return (
-    <span
-      className="h-1.5 w-1.5 shrink-0 rounded-full"
-      style={{
-        backgroundColor: installed ? "var(--th-dot-live)" : "var(--th-dot-exited)",
-      }}
-      title={installed ? "Hooks installed" : "Hooks not installed"}
-      aria-hidden
-    />
   );
 }
 

@@ -1,7 +1,7 @@
 {
   "name": "termhub",
   "private": true,
-  "version": "0.1.11",
+  "version": "0.1.12",
   "type": "module",
   "description": "TermHub — terminal-first command center for supervising many persistent Claude Code sessions in WSL2.",
   "scripts": {

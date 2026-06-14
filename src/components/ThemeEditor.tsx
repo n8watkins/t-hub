@@ -40,6 +40,9 @@ import pkg from "../../package.json";
 // Recovery review (#recovery): a self-contained modal opened from a button in the
 // General section. It renders its own scrim/panel above this one (z-[60] > z-50).
 import { RecoveryReview } from "./RecoveryReview";
+// Claude hooks install/uninstall now lives in Settings (moved out of the sidebar).
+import { HookInstallPanel } from "./HookInstallPanel";
+import { claudeHooksInstalled } from "../ipc/client05";
 
 /**
  * Wire the global `Ctrl/Cmd+,` toggle (and Esc-to-close) onto the settings
@@ -86,6 +89,7 @@ export function ThemeEditor() {
 type SectionId =
   | "general"
   | "hotkeys"
+  | "hooks"
   | "about"
   | "preset"
   | "colors"
@@ -169,6 +173,7 @@ function SectionNav({
       items: [
         { id: "general", label: "General", hint: "App behavior" },
         { id: "hotkeys", label: "Hotkeys", hint: "Keyboard shortcuts" },
+        { id: "hooks", label: "Hooks", hint: "Claude Code lifecycle hooks" },
         { id: "about", label: "About & Setup", hint: "What it is + how to use it" },
       ],
     },
@@ -230,6 +235,8 @@ function SectionContent({ section }: { section: SectionId }) {
       return <GeneralSection />;
     case "hotkeys":
       return <HotkeysSection />;
+    case "hooks":
+      return <HooksSection />;
     case "about":
       return <AboutSetupSection />;
     case "preset":
@@ -471,6 +478,27 @@ function HotkeysSection() {
       ))}
     </>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Hooks — Claude Code lifecycle hook install/uninstall (moved here from the
+// sidebar). The installed check runs when this section mounts (a deliberate
+// navigation), so there's no repeated "checking..." flash.
+// ---------------------------------------------------------------------------
+function HooksSection() {
+  const [installed, setInstalled] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    claudeHooksInstalled()
+      .then((v) => alive && setInstalled(v))
+      .catch(() => alive && setInstalled(false));
+    return () => {
+      alive = false;
+    };
+  }, []);
+  // HookInstallPanel is self-contained (its own header/description/buttons), so
+  // it's rendered directly rather than wrapped in a Group.
+  return <HookInstallPanel agentBin="termhub-agent" installed={installed} setInstalled={setInstalled} />;
 }
 
 // ---------------------------------------------------------------------------
