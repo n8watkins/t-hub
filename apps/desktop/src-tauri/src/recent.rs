@@ -168,6 +168,21 @@ fn read_sessions() -> Vec<RecentSession> {
 
 /// unix reader: walk `~/.claude/projects/*/*.jsonl`, stat each for its mtime, and
 /// parse its cwd/summary. Self-contained and dependency-free.
+/// Read at most `cap` bytes from the START of a file as lossy UTF-8. The recent
+/// catalog only needs the early lines (cwd ~line 3; an early summary if present),
+/// so we never read whole multi-MB transcripts.
+#[cfg(not(windows))]
+fn read_prefix(path: &std::path::Path, cap: usize) -> String {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut buf = vec![0u8; cap];
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf.truncate(n);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 #[cfg(not(windows))]
 fn read_sessions_unix() -> Vec<RecentSession> {
     use std::time::UNIX_EPOCH;
@@ -202,7 +217,9 @@ fn read_sessions_unix() -> Vec<RecentSession> {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            // PERF: only the first 32KB (cwd is ~line 3; an early summary if any).
+            // Whole transcripts can be 10MB+; we never need the body.
+            let text = read_prefix(&path, 32 * 1024);
             let (cwd, summary) = parse_transcript(&text);
             if let Some(s) = make_session(id, last_seen, cwd, summary) {
                 out.push(s);
@@ -241,6 +258,13 @@ fn read_sessions_windows() -> Vec<RecentSession> {
     // `stat -c %Y` = mtime epoch secs; `%s` = byte size. `ls -t` orders newest
     // first; `head` caps the count. Quoting keeps paths with spaces intact.
     let limit = RECENT_LIMIT;
+    // PERF: read only the first 32KB of each transcript, NOT the whole file. The
+    // session cwd is on the first user line (~line 3, under 1KB in) and a summary,
+    // when present, sits near the top too. Some transcripts are 10MB+; cat-ing the
+    // newest 40 was ~160MB over the wsl.exe pipe and made Recent take many seconds
+    // (effectively "not loading"). The prefix is all we need; `size` is the byte
+    // count the frame declares so the parser slices exactly what we sent.
+    let cap = 32 * 1024;
     let script = format!(
         r#"
 dir="$HOME/.claude/projects"
@@ -248,9 +272,10 @@ dir="$HOME/.claude/projects"
 ls -t "$dir"/*/*.jsonl 2>/dev/null | head -n {limit} | while IFS= read -r f; do
   id=$(basename "$f" .jsonl)
   mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
-  size=$(stat -c %s "$f" 2>/dev/null || echo 0)
+  fsize=$(stat -c %s "$f" 2>/dev/null || echo 0)
+  size=$fsize; [ "$fsize" -gt {cap} ] && size={cap}
   printf '\036%s\t%s\t%s\037' "$id" "$mtime" "$size"
-  cat "$f"
+  head -c "$size" "$f" 2>/dev/null
 done
 "#
     );
