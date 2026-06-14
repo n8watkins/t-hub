@@ -181,7 +181,10 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
   ]);
 
   return (
-    <div className="relative flex h-full w-full flex-col bg-neutral-950">
+    <div
+      className="relative flex h-full w-full flex-col"
+      style={{ backgroundColor: "var(--th-app-bg)" }}
+    >
       <div className="relative min-h-0 flex-1">
         {/* Shell v2: every tab stays mounted with visible=true so its xterm/PTY
             clients persist in the background; only the active tab is displayed,
@@ -217,7 +220,14 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
         onClick={() => void spawn()}
         title="New terminal (Ctrl/Cmd+T)"
         aria-label="New terminal"
-        className="absolute bottom-3 right-3 z-30 flex h-9 w-9 cursor-pointer items-center justify-center rounded-full border border-neutral-700 bg-neutral-900/90 text-lg leading-none text-neutral-200 shadow-lg hover:border-emerald-600 hover:text-white"
+        // Themed FAB: tile-surface bg + themed border/text; the hover border
+        // picks up the accent so the primary affordance follows the theme.
+        className="th-accent-hover absolute bottom-3 right-3 z-30 flex h-9 w-9 cursor-pointer items-center justify-center rounded-full border text-lg leading-none shadow-lg"
+        style={{
+          backgroundColor: "var(--th-tile-bg)",
+          borderColor: "var(--th-border)",
+          color: "var(--th-fg)",
+        }}
       >
         +
       </button>
@@ -228,7 +238,10 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
 /** Centered call-to-action shown when the active tab has no tiles. */
 function EmptyTab({ onSpawn }: { onSpawn: () => void }) {
   return (
-    <div className="flex h-full w-full items-center justify-center bg-neutral-950">
+    <div
+      className="flex h-full w-full items-center justify-center"
+      style={{ backgroundColor: "var(--th-app-bg)" }}
+    >
       <button
         type="button"
         onClick={onSpawn}
@@ -397,13 +410,21 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
   // display:contents wrappers, so every gutter's parentElement is a real flex
   // container with a measurable box (needed for the drag math).
   return (
-    <div ref={containerRef} className="flex h-full w-full flex-col gap-1 p-1">
+    <div
+      ref={containerRef}
+      className="flex h-full w-full flex-col"
+      style={{ gap: "var(--th-grid-gap)", padding: "var(--th-grid-gap)" }}
+    >
       {layout.flatMap((row, r) => {
         const rowEl = (
           <div
             key={`row-${r}`}
-            className="flex min-h-0 gap-1"
-            style={{ flexGrow: rows[r] ?? 1, flexBasis: 0 }}
+            className="flex min-h-0"
+            style={{
+              flexGrow: rows[r] ?? 1,
+              flexBasis: 0,
+              gap: "var(--th-grid-gap)",
+            }}
           >
             {row.flatMap((id, c) => {
               const cell = (
@@ -470,7 +491,7 @@ function ColGutter({
       onPointerDown={onPointerDown}
       className="group relative z-10 -mx-[3.5px] w-2 shrink-0 cursor-col-resize"
     >
-      <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-neutral-700/60 transition-colors group-hover:bg-emerald-500" />
+      <div className="th-gutter-line absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-neutral-700/60 transition-colors" />
     </div>
   );
 }
@@ -491,7 +512,7 @@ function RowGutter({
       onPointerDown={onPointerDown}
       className="group relative z-10 -my-[3.5px] h-2 shrink-0 cursor-row-resize"
     >
-      <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-neutral-700/60 transition-colors group-hover:bg-emerald-500" />
+      <div className="th-gutter-line absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-neutral-700/60 transition-colors" />
     </div>
   );
 }

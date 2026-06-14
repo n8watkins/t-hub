@@ -14,3 +14,109 @@ body,
 #root {
   overflow: hidden;
 }
+
+/* The themed UI font + base size cascade from the body so we never touch
+ * App.tsx. Components that pin their own text size (e.g. xterm) are unaffected;
+ * the rest inherit, so the font dropdown + base-size slider apply app-wide. */
+body {
+  font-family: var(--th-font);
+  font-size: var(--th-font-size);
+  color: var(--th-fg);
+  background-color: var(--th-app-bg);
+}
+
+/*
+ * Theme tokens — the live-customization spine (see src/store/theme.ts).
+ *
+ * These :root defaults mirror the "Midnight" preset so the UI looks correct on
+ * the very first paint, BEFORE the theme store's applyTheme() runs (no flash of
+ * un-themed chrome). At runtime the store overwrites each of these on :root from
+ * the active theme; because every chrome component reads the *variable* (via
+ * Tailwind arbitrary values like `bg-[var(--th-app-bg)]`), changing one token
+ * re-renders instantly with no reload. Keep these keys in lockstep with
+ * CHROME_VAR in src/store/theme.ts.
+ */
+:root {
+  /* Accent + focus */
+  --th-accent: #10b981;
+  --th-focus-ring: #10b981;
+  --th-focus-ring-w: 1px;
+
+  /* Background layers */
+  --th-app-bg: #0a0a0a;
+  --th-tile-bg: #171717;
+  --th-header-bg: #0a0a0a99;
+  --th-sidebar-bg: #0a0a0a;
+  --th-titlebar-bg: #171717;
+
+  /* Text */
+  --th-fg: #e5e5e5;
+  --th-fg-muted: #737373;
+
+  /* Borders */
+  --th-border: #262626;
+
+  /* Tile header */
+  --th-tile-header-h: 22px;
+  --th-show-tile-header: 1;
+  --th-header-on-hover: 0;
+  --th-show-cwd: 1;
+
+  /* Grid + shape */
+  --th-grid-gap: 4px;
+  --th-radius: 2px;
+
+  /* Typography */
+  --th-font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    sans-serif;
+  --th-font-size: 12px;
+
+  /* Status dots */
+  --th-dot-starting: #f59e0b;
+  --th-dot-live: #10b981;
+  --th-dot-detached: #a3a3a3;
+  --th-dot-exited: #525252;
+  --th-dot-error: #ef4444;
+
+  /* Terminal palette mirror (xterm ITheme is owned by Terminal.tsx; published
+   * here for any future CSS hook). */
+  --th-term-bg: #0a0a0a;
+  --th-term-fg: #e5e5e5;
+  --th-term-cursor: #10b981;
+}
+
+/*
+ * Tile header sizing/visibility — owned by the stylesheet (NOT inline styles) so
+ * the hover-reveal rule can override the height by specificity (an inline height
+ * would always win). The Tile root carries two data attributes the theme drives:
+ *   data-tile-header  "1" => header shown · "0" => header removed entirely
+ *   data-header-hover "1" => compact: header collapsed, revealed on tile hover
+ */
+.th-tile-header {
+  height: var(--th-tile-header-h);
+  overflow: hidden;
+}
+/* Fully hidden header. */
+[data-tile-header="0"] .th-tile-header {
+  display: none;
+}
+/* Compact (hover-reveal) header: collapsed by default, full height on hover. */
+[data-header-hover="1"] .th-tile-header {
+  height: 0;
+  opacity: 0;
+  transition: height 120ms ease, opacity 120ms ease;
+}
+[data-header-hover="1"]:hover .th-tile-header {
+  height: var(--th-tile-header-h);
+  opacity: 1;
+}
+
+/* Accent-following hover for the resize gutters' indicator line + the new-
+ * terminal FAB, so the primary accent affordances track the active theme. */
+.group:hover > .th-gutter-line {
+  background-color: var(--th-accent);
+}
+.th-accent-hover:hover {
+  border-color: var(--th-accent);
+  color: var(--th-fg);
+}

@@ -11,6 +11,7 @@ mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
 mod model; // data-model structs (PRD §8)
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
+mod theme; // live theming contract: get_theme/set_theme + theme://changed (MCP-facing)
 
 use agent::AgentBridge;
 use claude::StatusBridge;
@@ -63,6 +64,10 @@ pub fn run() {
         .manage(TerminalManager::default())
         .manage(AppState::default())
         .manage(files::FileIndexState::new())
+        // Live theming state, seeded from the persisted theme file if present.
+        // get_theme reads this; set_theme updates it, persists, and emits
+        // theme://changed (the surface MCP forwards so Claude can retheme).
+        .manage(theme::ThemeState::load())
         .setup(|app| {
             // Wire the live UI event sink now that the AppHandle exists (the
             // bridge + status bridge were built earlier in AppState::default(),
@@ -105,6 +110,10 @@ pub fn run() {
             files::search_files,
             files::list_dir,
             files::read_text_file,
+            // Theming contract (MCP-facing): read/write the active theme + emit
+            // theme://changed.
+            theme::get_theme,
+            theme::set_theme,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TermHub");

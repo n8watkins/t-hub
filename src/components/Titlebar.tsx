@@ -45,7 +45,13 @@ const TAB_DND_MIME = "application/x-termhub-tab";
 
 export function Titlebar() {
   return (
-    <div className="flex h-8 shrink-0 items-stretch border-b border-neutral-800 bg-neutral-900 text-xs">
+    <div
+      className="flex h-8 shrink-0 items-stretch border-b text-xs"
+      style={{
+        backgroundColor: "var(--th-titlebar-bg)",
+        borderColor: "var(--th-border)",
+      }}
+    >
       {/* Short left drag handle so the window can be grabbed left of the tabs. */}
       <div data-tauri-drag-region className="w-3 shrink-0" aria-hidden />
 
@@ -223,8 +229,9 @@ function TabStrip() {
           >
             <span
               className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                active ? "bg-emerald-500" : "bg-neutral-600"
+                active ? "" : "bg-neutral-600"
               }`}
+              style={active ? { backgroundColor: "var(--th-accent)" } : undefined}
             />
             {editing === tab.id ? (
               <input
