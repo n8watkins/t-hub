@@ -46,6 +46,9 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 # Filesystem walking with .gitignore semantics for the file index (files.rs).
 ignore = "0.4"
+# Durable SQLite persistence for the workspace layout (db.rs). `bundled` compiles
+# SQLite in, so no system libsqlite3 is needed inside WSL or on a clean CI box.
+rusqlite = { version = "0.32", features = ["bundled"] }
 # The shared agent⇄core NDJSON contract (workspace member).
 termhub-protocol = { path = "crates/termhub-protocol" }
 

@@ -9,6 +9,7 @@ mod agent; // core-side agent bridge (Workstream A, core half)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.
+mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
 mod model; // data-model structs (PRD §8)
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
@@ -206,6 +207,11 @@ pub fn run() {
                     eprintln!("termhub: failed to install Snap-Layouts hit-test hook: {e}");
                 }
             }
+            // --- #sqlite: open the durable workspace DB (app_data_dir/termhub.db,
+            // WAL+NORMAL) and manage it so save/load_workspace_snapshot share one
+            // handle. A failure resolves to a no-op Db (logged inside), never
+            // aborting startup — the frontend keeps its localStorage mirror.
+            app.manage(db::init(&app.handle().clone()));
             Ok(())
         })
         // Closing the main window hides it to the tray instead of quitting; only
@@ -241,6 +247,9 @@ pub fn run() {
             // theme://changed.
             theme::get_theme,
             theme::set_theme,
+            // #sqlite: durable workspace-layout persistence (mirrors localStorage).
+            db::save_workspace_snapshot,
+            db::load_workspace_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TermHub");
