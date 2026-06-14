@@ -199,6 +199,12 @@ export function TerminalView({
       return true;
     });
 
+    // Tracks the column count we last reported to the PTY. A width change is the
+    // only thing that makes xterm REFLOW (re-wrap) its buffer, so we use a
+    // before/after column comparison in the settle handler to decide whether the
+    // garbled reflowed scrollback needs clearing (see settleResize).
+    let lastCols = 0;
+
     const pushResize = () => {
       if (disposed) return;
       try {
@@ -206,6 +212,45 @@ export function TerminalView({
         void resizeTerminal(terminalId, term.cols, term.rows);
       } catch {
         // Container may be detached mid-resize; ignore.
+      }
+    };
+
+    // Runs ONCE after a resize has settled (debounced). A continuous window/grid
+    // drag fires the ResizeObserver many times; we only get here after motion
+    // stops, so the PTY sees a single resize/SIGWINCH instead of a stream.
+    //
+    // The corruption fix: the terminals draw inline (not alt-screen), so the
+    // TUI's prior frames live in xterm's scrollback. On a WIDTH change xterm
+    // reflows that whole buffer and those frames re-wrap into a duplicated,
+    // scrambled mess. After the settle-fit, tmux gets the SIGWINCH and redraws
+    // the CURRENT screen cleanly at the new width -- so the old reflowed history
+    // is pure garbage we can safely drop. term.clear() discards the entire
+    // scrollback while KEEPING the cursor's line as the new first line, i.e. it
+    // leaves the live screen the user is reading intact and only kills the
+    // duplicated history above it. We only clear when the column count actually
+    // changed (height-only changes / re-shows at the same width don't reflow),
+    // so a pure vertical resize never throws away readable scrollback.
+    const settleResize = () => {
+      if (disposed) return;
+      const before = term.cols;
+      pushResize();
+      const widthChanged = term.cols !== before || term.cols !== lastCols;
+      lastCols = term.cols;
+      // Defer clear + repaint to the next frame so tmux's post-SIGWINCH redraw
+      // has a chance to land first; clearing only removes scrollback above the
+      // live line, and the forced repaint then shows a clean, single frame.
+      if (widthChanged) {
+        requestAnimationFrame(() => {
+          if (disposed) return;
+          try {
+            term.clear();
+          } catch {
+            // Renderer/buffer detached mid-call; ignore.
+          }
+          forceRepaint();
+        });
+      } else {
+        forceRepaint();
       }
     };
 
@@ -314,16 +359,19 @@ export function TerminalView({
       visObserver.observe(container);
     }
 
-    // Debounced resize → keep PTY columns/rows in sync with the tile size.
-    // After the fit settles we also force a repaint: a window/grid resize can
-    // leave the WebGL canvas torn/garbled (the renderer reuses the prior frame
-    // buffer at the new geometry), and a plain fit doesn't always clear it.
+    // Debounced resize -> keep PTY columns/rows in sync with the tile size, but
+    // only ONCE the drag SETTLES. A continuous window/gutter drag fires this
+    // observer (and the pool's per-placeholder one) rapidly; firing a PTY resize
+    // per step sends a stream of SIGWINCHs, each making the inline TUI redraw a
+    // full frame into the scrollback -- those frames then reflow into the
+    // duplicated/scrambled mess on every width step and compound. A ~250ms tail
+    // coalesces the whole drag into a single resize + single tmux redraw, and
+    // settleResize then drops the reflowed garbage (see its comment). 250ms is
+    // long enough that a fast continuous drag never trips it mid-motion yet
+    // short enough to feel immediate once the user lets go.
     resizeObserver = new ResizeObserver(() => {
       if (resizeTimer) clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => {
-        pushResize();
-        forceRepaint();
-      }, 50);
+      resizeTimer = setTimeout(settleResize, 250);
     });
     resizeObserver.observe(container);
 

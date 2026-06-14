@@ -81,7 +81,10 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
       style={{ backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "auto" }}
     >
       <div
-        className="flex max-h-[85vh] w-[680px] max-w-[92vw] flex-col overflow-hidden rounded-lg border shadow-2xl"
+        // Fixed height (capped at 85vh on short viewports) so switching between
+        // the General and Theme sections never resizes the frame - only the
+        // scrollable body inside changes. The panel stays the same size always.
+        className="flex h-[640px] max-h-[85vh] w-[680px] max-w-[92vw] flex-col overflow-hidden rounded-lg border shadow-2xl"
         onMouseDown={(e) => e.stopPropagation()}
         style={{
           backgroundColor: "var(--th-sidebar-bg)",
@@ -99,12 +102,12 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
           <button
             type="button"
             onClick={onClose}
-            className="rounded px-1.5 leading-none hover:bg-neutral-700/40"
+            className="-mr-1 flex h-8 w-8 items-center justify-center rounded transition-colors hover:bg-neutral-700/40"
             title="Close (Esc · Ctrl/Cmd+,)"
             aria-label="Close settings"
             style={{ color: "var(--th-fg-muted)" }}
           >
-            ×
+            <CloseIcon />
           </button>
         </div>
 
@@ -427,7 +430,7 @@ function PresetActions({
 
   return (
     <div className="mt-1 flex flex-col gap-2">
-      <div className="flex gap-1.5">
+      <div className="flex items-center gap-1.5">
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
@@ -435,25 +438,24 @@ function PresetActions({
           className="min-w-0 flex-1 rounded border bg-transparent px-2 py-1 text-xs"
           style={{ borderColor: "var(--th-border)" }}
         />
-        <Btn onClick={() => onSave(name)} title="Save the current theme as a named preset">
-          Save
-        </Btn>
+        {/* Compact icon actions (same behavior as the old text buttons). */}
+        <IconBtn onClick={() => onSave(name)} title="Save the current theme as a named preset" label="Save preset">
+          <SaveIcon />
+        </IconBtn>
+        <IconBtn onClick={doExport} title="Export: copy the active theme as JSON to the clipboard" label="Export theme">
+          <ExportIcon />
+        </IconBtn>
+        <IconBtn onClick={() => fileRef.current?.click()} title="Import a theme from a JSON file" label="Import theme">
+          <ImportIcon />
+        </IconBtn>
+        <IconBtn onClick={onReset} title="Reset to the Midnight default" label="Reset theme">
+          <ResetIcon />
+        </IconBtn>
         {canDelete && (
           <Btn onClick={onDelete} title="Delete this user preset">
             Delete
           </Btn>
         )}
-      </div>
-      <div className="flex gap-1.5">
-        <Btn onClick={doExport} title="Copy the active theme as JSON to the clipboard">
-          Export
-        </Btn>
-        <Btn onClick={() => fileRef.current?.click()} title="Load a theme from a JSON file">
-          Import
-        </Btn>
-        <Btn onClick={onReset} title="Reset to the Midnight default">
-          Reset
-        </Btn>
         <input
           ref={fileRef}
           type="file"
@@ -482,7 +484,11 @@ function TerminalGroup() {
   const active = useTheme((s) => s.active);
   const setTerminalToken = useTheme((s) => s.setTerminalToken);
   const setAnsiColor = useTheme((s) => s.setAnsiColor);
+  const resetTerminalPalette = useTheme((s) => s.resetTerminalPalette);
   const term = active.terminal;
+  // Collapsed by default so the advanced ANSI slots stay tucked away and the
+  // section doesn't read as front-and-center.
+  const [showAnsi, setShowAnsi] = useState(false);
   if (!term) return null;
 
   const ansiKeys = Object.keys(term.ansi) as (keyof AnsiPalette)[];
@@ -516,30 +522,63 @@ function TerminalGroup() {
         hint="Highlight color for selected terminal text."
       />
 
-      {/* ANSI palette: the 16 fixed slots terminal programs draw with. The slot
-          names (black, red, ...) are not editable — only the colors are. */}
-      <div className="mt-3">
-        <div
-          className="text-[10px] font-semibold uppercase tracking-wide"
-          style={{ color: "var(--th-fg-muted)" }}
+      {/* Advanced ANSI palette: tucked behind a collapsible row so it isn't
+          front-and-center. The 16 slots are fixed ANSI roles; only the colors
+          are editable, and a Reset restores the theme default. */}
+      <div
+        className="mt-3 rounded border"
+        style={{ borderColor: "var(--th-border)" }}
+      >
+        <button
+          type="button"
+          onClick={() => setShowAnsi((v) => !v)}
+          className="flex w-full items-center gap-1.5 px-2 py-1.5 text-left"
+          aria-expanded={showAnsi}
+          title="Advanced: the 16 base ANSI terminal colors"
         >
-          ANSI palette
-        </div>
-        <p className="mt-0.5 text-[10px] leading-snug" style={{ color: "var(--th-fg-muted)" }}>
-          The 16 base colors terminal programs use. The slot names (black, red,
-          …) are fixed ANSI roles — only their colors are editable.
-        </p>
-        <div className="mt-1.5 grid grid-cols-2 gap-x-3">
-          {ansiKeys.map((k) => (
-            <ColorInputRow
-              key={k}
-              label={k}
-              value={term.ansi[k]}
-              onChange={(v) => setAnsiColor(k, v)}
-              labelTitle={`ANSI "${k}" slot — a fixed role name; only its color is editable`}
-            />
-          ))}
-        </div>
+          <Chevron open={showAnsi} />
+          <span
+            className="text-[10px] font-semibold uppercase tracking-wide"
+            style={{ color: "var(--th-fg-muted)" }}
+          >
+            ANSI palette
+          </span>
+          <span className="text-[10px]" style={{ color: "var(--th-fg-muted)" }}>
+            (advanced)
+          </span>
+        </button>
+        {showAnsi && (
+          <div className="px-2 pb-2">
+            <p
+              className="text-[10px] leading-snug"
+              style={{ color: "var(--th-fg-muted)" }}
+            >
+              These are the 16 base colors terminal programs use to draw text.
+              The slot names (black, red, ...) are fixed ANSI roles - only
+              their colors are editable. Use Reset palette to restore the
+              defaults.
+            </p>
+            <div className="mt-1.5 flex justify-end">
+              <Btn
+                onClick={resetTerminalPalette}
+                title="Restore the default terminal background, foreground, cursor, selection, and all 16 ANSI colors"
+              >
+                Reset palette
+              </Btn>
+            </div>
+            <div className="mt-1.5 grid grid-cols-2 gap-x-3">
+              {ansiKeys.map((k) => (
+                <ColorInputRow
+                  key={k}
+                  label={k}
+                  value={term.ansi[k]}
+                  onChange={(v) => setAnsiColor(k, v)}
+                  labelTitle={`ANSI "${k}" slot - a fixed role name; only its color is editable`}
+                />
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </Group>
   );
@@ -808,12 +847,10 @@ function ToggleRow({
       title={hint}
     >
       <span style={{ color: "var(--th-fg)" }}>{label}</span>
-      <input
-        type="checkbox"
+      <Switch
         checked={value}
-        onChange={(e) => set(k, e.target.checked as ChromeTokens[typeof k])}
-        className="h-3.5 w-3.5 cursor-pointer"
-        style={{ accentColor: "var(--th-accent)" }}
+        onChange={(v) => set(k, v as ChromeTokens[typeof k])}
+        label={label}
       />
     </label>
   );
@@ -851,13 +888,9 @@ function SettingToggleRow({
           </span>
         )}
       </span>
-      <input
-        type="checkbox"
-        checked={value}
-        onChange={(e) => onChange(e.target.checked)}
-        className="mt-0.5 h-3.5 w-3.5 shrink-0 cursor-pointer"
-        style={{ accentColor: "var(--th-accent)" }}
-      />
+      <span className="mt-0.5 shrink-0">
+        <Switch checked={value} onChange={onChange} label={label} />
+      </span>
     </label>
   );
 }
@@ -881,5 +914,181 @@ function Btn({
     >
       {children}
     </button>
+  );
+}
+
+/** A compact, square icon button (themed) used for the preset actions. */
+function IconBtn({
+  children,
+  onClick,
+  title,
+  label,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  title?: string;
+  /** Accessible name (the icon carries no text). */
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-label={label}
+      className="flex h-7 w-7 shrink-0 items-center justify-center rounded border transition-colors hover:bg-neutral-700/30"
+      style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+    >
+      {children}
+    </button>
+  );
+}
+
+/**
+ * A small switch-style toggle drawn from theme vars (no external CSS). Behaves
+ * exactly like a checkbox: a hidden native checkbox carries focus/accessibility
+ * while the pill + knob render the visual state. The track tints to the accent
+ * when on.
+ */
+function Switch({
+  checked,
+  onChange,
+  label,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+}) {
+  return (
+    <span
+      className="relative inline-flex h-[14px] w-[26px] shrink-0 items-center rounded-full transition-colors"
+      style={{
+        backgroundColor: checked ? "var(--th-accent)" : "var(--th-border)",
+      }}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        aria-label={label}
+        className="absolute inset-0 m-0 cursor-pointer opacity-0"
+      />
+      <span
+        className="pointer-events-none absolute h-[10px] w-[10px] rounded-full transition-transform"
+        style={{
+          backgroundColor: "var(--th-fg)",
+          left: 2,
+          transform: checked ? "translateX(12px)" : "translateX(0)",
+        }}
+      />
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Inline SVG icons (stroke uses currentColor so they inherit the themed fg).
+// ---------------------------------------------------------------------------
+function Svg({ children }: { children: React.ReactNode }) {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
+
+/** Larger X for the modal close button. */
+function CloseIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M18 6 6 18" />
+      <path d="m6 6 12 12" />
+    </svg>
+  );
+}
+
+/** Floppy-disk / save. */
+function SaveIcon() {
+  return (
+    <Svg>
+      <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" />
+      <path d="M17 21v-8H7v8" />
+      <path d="M7 3v5h8" />
+    </Svg>
+  );
+}
+
+/** Up-arrow into a tray - export. */
+function ExportIcon() {
+  return (
+    <Svg>
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <path d="M12 3v12" />
+      <path d="m7 8 5-5 5 5" />
+    </Svg>
+  );
+}
+
+/** Down-arrow into a tray - import. */
+function ImportIcon() {
+  return (
+    <Svg>
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <path d="M12 3v12" />
+      <path d="m7 10 5 5 5-5" />
+    </Svg>
+  );
+}
+
+/** Circular arrow - reset. */
+function ResetIcon() {
+  return (
+    <Svg>
+      <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+      <path d="M3 3v5h5" />
+    </Svg>
+  );
+}
+
+/** A small disclosure chevron; rotates when open. */
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      className="shrink-0 transition-transform"
+      style={{
+        color: "var(--th-fg-muted)",
+        transform: open ? "rotate(90deg)" : "rotate(0deg)",
+      }}
+    >
+      <path d="m9 18 6-6-6-6" />
+    </svg>
   );
 }
