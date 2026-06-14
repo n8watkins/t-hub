@@ -38,3 +38,8 @@ export function listDir(path: string): Promise<DirEntry[]> {
 export function readTextFile(path: string): Promise<FileContents> {
   return invoke(CommandsFiles.readTextFile, { path });
 }
+
+/** Overwrite a text file with new contents (the editor's save). */
+export function writeTextFile(path: string, contents: string): Promise<void> {
+  return invoke(CommandsFiles.writeTextFile, { path, contents });
+}

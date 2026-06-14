@@ -250,6 +250,7 @@ pub fn run() {
             files::search_files,
             files::list_dir,
             files::read_text_file,
+            files::write_text_file,
             // Theming contract (MCP-facing): read/write the active theme + emit
             // theme://changed.
             theme::get_theme,

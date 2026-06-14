@@ -18,6 +18,7 @@ import {
   listDir,
   readTextFile,
   searchFiles,
+  writeTextFile,
 } from "../ipc/files";
 import type { DirEntry, FileContents, FileHit } from "../ipc/types";
 import { Markdown } from "./Markdown";
@@ -129,6 +130,16 @@ export function FilePanel({
       });
   }, []);
 
+  // After the editor saves, reflect the new text (and byte size) in the open
+  // reader so the view + the next edit's baseline match what's now on disk.
+  const onSaved = useCallback((path: string, text: string) => {
+    setReader((r) =>
+      r.status === "ready" && r.contents.path === path
+        ? { ...r, contents: { ...r.contents, text, size: new Blob([text]).size } }
+        : r,
+    );
+  }, []);
+
   // Open the initial file. In reader-only mode there is no index, so open it
   // immediately; otherwise wait until the index is ready (so the surrounding
   // search/tree are live by the time the reader fills).
@@ -180,6 +191,7 @@ export function FilePanel({
           onSetMode={(mode) =>
             setReader((r) => (r.status === "ready" ? { ...r, mode } : r))
           }
+          onSaved={onSaved}
         />
       </PanelShell>
     );
@@ -250,9 +262,13 @@ export function FilePanel({
 
         {/* Right pane: the reader. */}
         <div className="min-h-0 min-w-0 flex-1">
-          <Reader reader={reader} onSetMode={(mode) =>
-            setReader((r) => (r.status === "ready" ? { ...r, mode } : r))
-          } />
+          <Reader
+            reader={reader}
+            onSetMode={(mode) =>
+              setReader((r) => (r.status === "ready" ? { ...r, mode } : r))
+            }
+            onSaved={onSaved}
+          />
         </div>
       </div>
     </PanelShell>
@@ -568,10 +584,33 @@ function TreeFile({
 function Reader({
   reader,
   onSetMode,
+  onSaved,
 }: {
   reader: ReaderState;
   onSetMode: (mode: ReaderMode) => void;
+  /** Called after a successful save so the host can refresh the open contents. */
+  onSaved?: (path: string, text: string) => void;
 }) {
+  // Edit state lives here (hooks must precede the early returns below). Editing
+  // swaps the read-only <pre>/markdown view for a textarea; Save writes back via
+  // writeTextFile. Reset whenever the shown file changes.
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const shownPath =
+    reader.status === "ready"
+      ? reader.contents.path
+      : reader.status === "loading" || reader.status === "error"
+        ? reader.path
+        : null;
+  useEffect(() => {
+    setEditing(false);
+    setSaving(false);
+    setSaveError(null);
+  }, [shownPath]);
+
   if (reader.status === "empty") {
     return (
       <div
@@ -610,10 +649,38 @@ function Reader({
 
   const { contents, mode } = reader;
   const isMd = MARKDOWN_EXTS.has(contents.ext);
+  // A truncated (capped) read must NOT be editable — saving would write back the
+  // partial buffer and lose the rest of the file.
+  const canEdit = !contents.truncated;
+  const dirty = editing && draft !== contents.text;
+
+  const startEdit = () => {
+    setDraft(contents.text);
+    setSaveError(null);
+    setEditing(true);
+  };
+  const cancelEdit = () => {
+    setEditing(false);
+    setSaveError(null);
+  };
+  const save = () => {
+    setSaving(true);
+    setSaveError(null);
+    writeTextFile(contents.path, draft)
+      .then(() => {
+        setSaving(false);
+        setEditing(false);
+        onSaved?.(contents.path, draft);
+      })
+      .catch((e) => {
+        setSaving(false);
+        setSaveError(String(e));
+      });
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* Reader toolbar: filename, size, and a Rendered/Source toggle for md. */}
+      {/* Reader toolbar: filename, size/dirty, and edit/save controls. */}
       <div
         className="flex items-center justify-between gap-3 border-b px-3 py-1.5"
         style={{ borderColor: "var(--th-border)" }}
@@ -628,17 +695,28 @@ function Reader({
             <span
               className="ml-2"
               style={{ color: "var(--th-dot-starting)" }}
-              title="file exceeded the read cap"
+              title="file exceeded the read cap; editing is disabled to avoid saving a partial file"
             >
               (truncated)
             </span>
           )}
+          {dirty && (
+            <span
+              className="ml-2"
+              style={{ color: "var(--th-dot-starting)" }}
+              title="unsaved changes"
+            >
+              ●
+            </span>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <span className="text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
-            {formatBytes(contents.size)}
-          </span>
-          {isMd && (
+          {!editing && (
+            <span className="text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
+              {formatBytes(contents.size)}
+            </span>
+          )}
+          {!editing && isMd && (
             <div
               className="flex overflow-hidden text-[11px]"
               style={{
@@ -658,12 +736,51 @@ function Reader({
               />
             </div>
           )}
+          {!editing && canEdit && <EditBtn onClick={startEdit} label="Edit" />}
+          {editing && (
+            <>
+              <EditBtn
+                onClick={save}
+                label={saving ? "Saving…" : "Save"}
+                disabled={saving || !dirty}
+                primary
+              />
+              <EditBtn onClick={cancelEdit} label="Cancel" disabled={saving} />
+            </>
+          )}
         </div>
       </div>
 
-      {/* Body. */}
+      {saveError && (
+        <div
+          className="border-b px-3 py-1 text-[11px]"
+          style={{ borderColor: "var(--th-border)", color: "var(--th-dot-error)" }}
+          title={saveError}
+        >
+          Save failed: {saveError}
+        </div>
+      )}
+
+      {/* Body: an editable textarea while editing, else the read-only view. */}
       <div className="th-scroll min-h-0 flex-1 overflow-auto">
-        {isMd && mode === "rendered" ? (
+        {editing ? (
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
+            className="h-full w-full resize-none bg-transparent px-4 py-3 font-mono text-[12.5px] leading-relaxed outline-none"
+            style={{ color: "var(--th-fg)" }}
+            onKeyDown={(e) => {
+              // Ctrl/Cmd+S saves without leaving the editor.
+              if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+                e.preventDefault();
+                if (dirty && !saving) save();
+              }
+            }}
+          />
+        ) : isMd && mode === "rendered" ? (
           <div className="px-5 py-4">
             <Markdown source={contents.text} />
           </div>
@@ -677,6 +794,34 @@ function Reader({
         )}
       </div>
     </div>
+  );
+}
+
+/** A small toolbar button for the editor (Edit / Save / Cancel). */
+function EditBtn({
+  onClick,
+  label,
+  disabled,
+  primary,
+}: {
+  onClick: () => void;
+  label: string;
+  disabled?: boolean;
+  primary?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="rounded border px-2 py-0.5 text-[11px] transition-colors hover:bg-neutral-700/30 disabled:cursor-not-allowed disabled:opacity-40"
+      style={{
+        borderColor: primary ? "var(--th-accent)" : "var(--th-border)",
+        color: "var(--th-fg)",
+      }}
+    >
+      {label}
+    </button>
   );
 }
 

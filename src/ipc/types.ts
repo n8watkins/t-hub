@@ -149,6 +149,8 @@ export const CommandsFiles = {
   listDir: "list_dir",
   /** Read a text file for the reader (capped, rejects binary). → FileContents */
   readTextFile: "read_text_file",
+  /** Overwrite a file with new text (the editor's save). → void */
+  writeTextFile: "write_text_file",
 } as const;
 
 /** Summary returned by `index_project` (the index itself stays in the backend). */

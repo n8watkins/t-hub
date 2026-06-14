@@ -954,6 +954,22 @@ pub async fn read_text_file(path: String) -> Result<FileContents, String> {
     read_text_capped(&p)
 }
 
+/// Overwrite `path` with `contents` (the editor's save). Routes through the same
+/// `normalize` path translation as the reader, so a WSL path saves to the right
+/// place. Refuses to clobber a directory; otherwise creates/overwrites the file.
+/// The frontend only enables editing for non-truncated text files, so this never
+/// writes back a capped/partial buffer.
+#[tauri::command]
+pub async fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    let p = normalize(&path);
+    if let Ok(meta) = std::fs::metadata(&p) {
+        if meta.is_dir() {
+            return Err(format!("is a directory: {}", p.display()));
+        }
+    }
+    std::fs::write(&p, contents.as_bytes()).map_err(|e| format!("write failed: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
