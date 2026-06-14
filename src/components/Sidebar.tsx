@@ -31,6 +31,8 @@ import type { StatusSnapshot, SupervisionTree } from "../ipc/model";
 export interface SidebarProps {
   /** Called when the user clicks an attention-queue row or a tree header. */
   onSelectSession?: (sessionId: string) => void;
+  /** Sidebar width in px (resizable, #2). Defaults to 256 (the old fixed w-64). */
+  width?: number;
   /**
    * Resolved path to the termhub-agent binary used as the hook entrypoint
    * (`<agentBin> --hook <EVENT>`). Inside WSL `termhub-agent` is on PATH, so the
@@ -39,7 +41,11 @@ export interface SidebarProps {
   agentBin?: string;
 }
 
-export function Sidebar({ onSelectSession, agentBin = "termhub-agent" }: SidebarProps) {
+export function Sidebar({
+  onSelectSession,
+  width = 256,
+  agentBin = "termhub-agent",
+}: SidebarProps) {
   const { metrics, agent } = useAgentTelemetry();
   const trees = useSupervision((s) => s.trees);
   const statuses = useSupervision((s) => s.statuses);
@@ -63,8 +69,9 @@ export function Sidebar({ onSelectSession, agentBin = "termhub-agent" }: Sidebar
 
   return (
     <aside
-      className="flex h-full w-64 shrink-0 flex-col border-r"
+      className="flex h-full shrink-0 flex-col border-r"
       style={{
+        width,
         backgroundColor: "var(--th-sidebar-bg)",
         borderColor: "var(--th-border)",
         color: "var(--th-fg)",
