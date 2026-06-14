@@ -86,9 +86,11 @@ pub async fn status_snapshot(
 }
 
 /// Ingest a raw statusline JSON payload for a session (the status bridge entry
-/// point invokable from the frontend or a future native statusline hook).
+/// point invokable from the frontend or a future native statusline hook). Emits
+/// `status://snapshot` live so the UI's usage display updates without a poll.
 #[tauri::command]
 pub async fn ingest_status(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     session_id: String,
     payload: serde_json::Value,
@@ -97,7 +99,12 @@ pub async fn ingest_status(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    Ok(state.status.ingest(&session_id, &payload, now_ms))
+    let snap = state.status.ingest(&session_id, &payload, now_ms);
+    // Live emit: the same channel the journal `StatusSnapshot` path uses, so a
+    // statusline pushed directly from the UI/native hook surfaces immediately.
+    use tauri::Emitter;
+    let _ = app.emit(crate::agent::emit::EVT_STATUS_SNAPSHOT, snap.clone());
+    Ok(snap)
 }
 
 // --- Claude hook installer (Workstream B; consent-gated, non-destructive) ---

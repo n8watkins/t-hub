@@ -15,7 +15,9 @@ import {
   hostMetrics,
   onAgentState,
   onSessionStatus,
+  onStatus,
   onSupervision,
+  statusSnapshot,
   supervisionSessionIds,
   supervisionTree,
 } from "../ipc/client05";
@@ -41,6 +43,7 @@ export function useAgentTelemetry(): AgentTelemetry {
   const setTree = useSupervision((s) => s.setTree);
   const setTrees = useSupervision((s) => s.setTrees);
   const setStatus = useSupervision((s) => s.setStatus);
+  const setSnapshot = useSupervision((s) => s.setSnapshot);
 
   useEffect(() => {
     let disposed = false;
@@ -65,6 +68,12 @@ export function useAgentTelemetry(): AgentTelemetry {
       .then((fn) => (disposed ? fn() : unlisteners.push(fn)))
       .catch(() => {});
 
+    void onStatus((snap) => {
+      if (!disposed) setSnapshot(snap);
+    })
+      .then((fn) => (disposed ? fn() : unlisteners.push(fn)))
+      .catch(() => {});
+
     // Initial pulls: connection state + a one-shot supervision snapshot.
     void agentState()
       .then((s) => !disposed && setAgent(s))
@@ -72,13 +81,13 @@ export function useAgentTelemetry(): AgentTelemetry {
 
     void supervisionSessionIds()
       .then(async (ids) => {
-        const trees = await Promise.all(
-          ids.map((id) =>
-            supervisionTree(id).catch(() => null),
-          ),
-        );
+        const [trees, snaps] = await Promise.all([
+          Promise.all(ids.map((id) => supervisionTree(id).catch(() => null))),
+          Promise.all(ids.map((id) => statusSnapshot(id).catch(() => null))),
+        ]);
         if (!disposed) {
           setTrees(trees.filter((t): t is NonNullable<typeof t> => t != null));
+          for (const snap of snaps) if (snap) setSnapshot(snap);
         }
       })
       .catch(() => {});
@@ -97,7 +106,7 @@ export function useAgentTelemetry(): AgentTelemetry {
       clearInterval(timer);
       for (const fn of unlisteners) fn();
     };
-  }, [setTree, setTrees, setStatus]);
+  }, [setTree, setTrees, setStatus, setSnapshot]);
 
   return { metrics, agent };
 }

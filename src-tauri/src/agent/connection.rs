@@ -366,4 +366,157 @@ mod transport_tests {
 
         eprintln!("live_round_trip: all assertions passed");
     }
+
+    /// **The live-emit demo** (deliverable item 4): drive the REAL hook→journal→
+    /// agent→core→emit spine end-to-end and prove a live `supervision://tree`
+    /// emit emerges from a `SessionStart → … → Stop` hook sequence.
+    ///
+    /// Hermetic: a private `$HOME` so the journal lives under a temp dir, shared
+    /// by both the `--hook` ingest processes and the `--stdio` agent the bridge
+    /// spawns. Skips when the binary isn't built (so CI never fails spuriously).
+    ///
+    /// Exercises BOTH emit paths:
+    ///   - **replay**: hooks fired *before* connect → bridge replays the journal
+    ///     on handshake → each replayed entry emits.
+    ///   - **live tail**: a hook fired *after* connect → agent's tail thread
+    ///     streams it → bridge consumes it → emits.
+    #[test]
+    fn live_emit_demo_hook_sequence_to_supervision_tree() {
+        use parking_lot::Mutex as PMutex;
+        use std::process::Command;
+        use std::sync::Arc;
+
+        let bin_path: PathBuf = {
+            let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            manifest.join("target/debug/termhub-agent")
+        };
+        if !bin_path.exists() {
+            eprintln!(
+                "live_emit_demo: binary not found at {bin_path:?} — skipping \
+                 (run `cargo build -p termhub-agent` first)"
+            );
+            return;
+        }
+
+        // Hermetic private HOME → journal at $HOME/.termhub/journal, shared by the
+        // hook processes and the stdio agent (both honor $HOME).
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let home = std::env::temp_dir().join(format!("termhub-live-emit-demo-{ts}"));
+        std::fs::create_dir_all(&home).unwrap();
+
+        // The exact production hook entrypoint: `termhub-agent --hook <EVENT>`,
+        // feeding the hook's JSON stdin (session_id + subagent base fields).
+        let fire_hook = |event: &str, stdin_json: &str| {
+            use std::io::Write;
+            let mut child = Command::new(&bin_path)
+                .arg("--hook")
+                .arg(event)
+                .env("HOME", &home)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn --hook");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(stdin_json.as_bytes())
+                .unwrap();
+            let status = child.wait().expect("hook wait");
+            assert!(status.success(), "hook {event} must exit 0 (never fail Claude)");
+        };
+
+        // --- Phase 1: fire a hook sequence BEFORE connect (replay path) ---
+        let sid = "demo-session-1";
+        fire_hook("SessionStart", &format!(r#"{{"session_id":"{sid}","cwd":"/w"}}"#));
+        fire_hook("UserPromptSubmit", &format!(r#"{{"session_id":"{sid}"}}"#));
+        fire_hook(
+            "SubagentStart",
+            &format!(r#"{{"session_id":"{sid}","agent_id":"sub-a","agent_type":"general-purpose"}}"#),
+        );
+        // Main agent Stop while the subagent is still running → WaitingOnSubagents.
+        fire_hook("Stop", &format!(r#"{{"session_id":"{sid}"}}"#));
+
+        // --- Connect the core bridge to a real --stdio agent (same HOME) ---
+        std::env::set_var("TERMHUB_AGENT_BIN", &bin_path);
+        std::env::set_var("HOME", &home); // the spawned --stdio child inherits this
+
+        // Recording emitter to capture the live UI events.
+        #[derive(Default, Clone)]
+        struct Rec {
+            events: Arc<PMutex<Vec<(String, serde_json::Value)>>>,
+        }
+        impl crate::agent::EventEmitter for Rec {
+            fn emit_json(&self, channel: &str, payload: &serde_json::Value) {
+                self.events.lock().push((channel.to_string(), payload.clone()));
+            }
+        }
+        let rec = Rec::default();
+
+        let bridge = AgentBridge::new();
+        bridge.set_emitter(Arc::new(rec.clone()));
+        bridge.connect("ignored").expect("connect must succeed");
+
+        // Give the reader thread a moment to finish replay + emit.
+        std::thread::sleep(Duration::from_millis(300));
+
+        // The replayed Stop must have produced a supervision://tree emit with
+        // WaitingOnSubagents for our session.
+        let waiting_tree = rec.events.lock().iter().any(|(ch, p)| {
+            ch == super::super::emit::EVT_SUPERVISION
+                && p["sessionId"] == sid
+                && p["status"] == "waitingOnSubagents"
+        });
+        assert!(
+            waiting_tree,
+            "replay must emit a supervision://tree with waitingOnSubagents; got {:?}",
+            *rec.events.lock()
+        );
+
+        // Also: agent://journal must have been emitted for the replayed entries.
+        let journal_emits = rec
+            .events
+            .lock()
+            .iter()
+            .filter(|(ch, _)| ch == super::super::emit::EVT_JOURNAL)
+            .count();
+        assert!(journal_emits >= 4, "expected >=4 journal emits, got {journal_emits}");
+
+        eprintln!("live_emit_demo: replay path emitted waitingOnSubagents ✓");
+
+        // --- Phase 2: fire a LIVE hook AFTER connect (tail-streaming path) ---
+        rec.events.lock().clear();
+        // The subagent finishes → with main already stopped, the orchestrator
+        // transitions WaitingOnSubagents → Completed.
+        fire_hook(
+            "SubagentStop",
+            &format!(r#"{{"session_id":"{sid}","agent_id":"sub-a"}}"#),
+        );
+
+        // Wait for the agent's ~200ms tail poll + stream + core consume + emit.
+        let mut completed = false;
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(100));
+            if rec.events.lock().iter().any(|(ch, p)| {
+                ch == super::super::emit::EVT_SESSION_STATUS
+                    && p["sessionId"] == sid
+                    && p["status"] == "completed"
+            }) {
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "live tail path must stream SubagentStop and emit completed; got {:?}",
+            *rec.events.lock()
+        );
+        eprintln!("live_emit_demo: live tail path emitted completed ✓");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
