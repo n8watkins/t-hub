@@ -13,6 +13,7 @@
 // one instance and toggles it from file clicks / the Web-preview button).
 
 import { type ReactNode, useEffect } from "react";
+import { repaintAllTerminals } from "../lib/repaint";
 
 export interface PreviewOverlayProps {
   /** Whether the overlay is shown. When false this renders nothing. */
@@ -59,6 +60,14 @@ export function PreviewOverlay({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
+
+  // Opening/closing this overlay adds/removes a full-screen `fixed` layer over
+  // the DOM-rendered terminals, which WebView2 can leave on a stale/blank frame.
+  // Repaint every terminal on each toggle so the grid never stays muted (same
+  // class of bug as the spawn-preset menu). See src/lib/repaint.ts.
+  useEffect(() => {
+    repaintAllTerminals();
+  }, [open]);
 
   if (!open) return null;
 

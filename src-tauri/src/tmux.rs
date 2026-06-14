@@ -166,6 +166,28 @@ pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), T
     Ok(())
 }
 
+/// Force `mouse on` for the whole server AND every existing session.
+///
+/// `new_session` sets `-g mouse on`, but a GLOBAL option is overridden by any
+/// SESSION-LOCAL `mouse` value. Sessions created by older TermHub builds (before
+/// the mouse-on change) carry a session-local `mouse off`, and the tmux server is
+/// preserved across deploys — so the later global flip never reached them and the
+/// wheel still sent Up/Down arrow keys in those panes (e.g. zsh history) instead
+/// of scrolling. Here we (1) set the global default and (2) explicitly set
+/// `mouse on` on each LIVE session so a stale per-session `off` can't win.
+///
+/// Best-effort and side-effect-free on failure: every error is swallowed so this
+/// can run at startup (off-thread) without ever aborting the app or disturbing a
+/// running session (toggling the option does not perturb the pane's process).
+pub fn ensure_mouse_on() {
+    let _ = run("set-option", &["set-option", "-g", "mouse", "on"]);
+    if let Ok(sessions) = list_sessions() {
+        for s in &sessions {
+            let _ = run("set-option", &["set-option", "-t", s.as_str(), "mouse", "on"]);
+        }
+    }
+}
+
 /// Returns true if a session named `name` exists on the `termhub` socket.
 ///
 /// `has-session` exits 0 when the session exists and non-zero otherwise

@@ -35,6 +35,7 @@ import {
 import { Tile } from "./Tile";
 import { TerminalPoolProvider } from "./TerminalPool";
 import { SpawnMenu } from "./SpawnMenu";
+import { repaintAllTerminals } from "../lib/repaint";
 import type { TerminalId } from "../ipc/types";
 
 /**
@@ -105,6 +106,15 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
 
   // Whether the "+" spawn-preset menu is open (anchored to the FAB).
   const [spawnMenuOpen, setSpawnMenuOpen] = useState(false);
+
+  // Opening/closing the spawn-preset menu adds/removes a full-screen `fixed`
+  // overlay over the DOM-rendered terminals; WebView2 leaves them on a stale
+  // blank ("muted") frame until something dirties them (the user's "clicking the
+  // + button blanks all terminals" bug). Force every terminal to repaint on each
+  // toggle so the grid never stays muted. See src/lib/repaint.ts.
+  useEffect(() => {
+    repaintAllTerminals();
+  }, [spawnMenuOpen]);
 
   // Spawn a terminal, optionally running a startup command in it (the "+"
   // presets: Claude / Resume Claude / Custom…). An undefined startupCommand is

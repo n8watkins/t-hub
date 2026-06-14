@@ -44,6 +44,7 @@ import type { TerminalId } from "../ipc/types";
 import { useWorkspace } from "../store/workspace";
 import { useTheme, type TerminalPalette } from "../store/theme";
 import { tlog } from "../lib/diag";
+import { REPAINT_ALL_EVENT } from "../lib/repaint";
 import type { ITheme } from "@xterm/xterm";
 import "./Terminal.css";
 
@@ -429,6 +430,15 @@ export function TerminalView({
     const onPoolMoved = () => requestAnimationFrame(forceRepaint);
     wrapEl?.addEventListener("th-pool-moved", onPoolMoved);
 
+    // Repaint when ANY full-screen overlay (spawn-preset menu, file/web preview,
+    // Settings) opens or closes. WebView2 leaves the DOM-rendered terminals on a
+    // stale/blank frame when a new `fixed` layer is added over them or removed,
+    // and nothing moves or resizes — so the two repaint paths above never fire.
+    // repaintAllTerminals() broadcasts on every overlay toggle; we redraw on the
+    // next frame, after that overlay change has painted. See src/lib/repaint.ts.
+    const onRepaintAll = () => requestAnimationFrame(forceRepaint);
+    window.addEventListener(REPAINT_ALL_EVENT, onRepaintAll);
+
     // Debounced resize -> keep PTY columns/rows in sync with the tile size, but
     // only ONCE the drag SETTLES. A continuous window/gutter drag fires this
     // observer (and the pool's per-placeholder one) rapidly; firing a PTY resize
@@ -457,6 +467,7 @@ export function TerminalView({
       visObserver?.disconnect();
       visObserver = null;
       wrapEl?.removeEventListener("th-pool-moved", onPoolMoved);
+      window.removeEventListener(REPAINT_ALL_EVENT, onRepaintAll);
 
       dataSub.dispose();
 

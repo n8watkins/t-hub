@@ -208,6 +208,12 @@ pub fn run() {
                     eprintln!("termhub: failed to install Snap-Layouts hit-test hook: {e}");
                 }
             }
+            // Force `mouse on` server-wide AND on every already-running session
+            // (a session-local `mouse off` left by an older build overrides the
+            // global flip, so the wheel still sent arrow keys in old panes). Run
+            // off-thread: it spawns one `wsl.exe tmux` per live session, which we
+            // never want to block the window's first paint on. Best-effort.
+            std::thread::spawn(|| tmux::ensure_mouse_on());
             // --- #sqlite: open the durable workspace DB (app_data_dir/termhub.db,
             // WAL+NORMAL) and manage it so save/load_workspace_snapshot share one
             // handle. A failure resolves to a no-op Db (logged inside), never

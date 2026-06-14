@@ -34,6 +34,7 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useRef,
   useState,
 } from "react";
 import { listDir, searchFiles } from "../ipc/files";
@@ -571,35 +572,57 @@ type DirEntriesState =
 
 function useDirEntries(path: string, enabled = true): DirEntriesState | null {
   const [state, setState] = useState<DirEntriesState | null>(null);
-  // Which path the current `state` describes. A mismatch means we've been
-  // remounted/reused for a different dir and must refetch; an equal path that's
-  // already loaded must NOT refetch (so collapse→re-expand is free — PRD §9.7).
-  const [loadedPath, setLoadedPath] = useState<string | null>(null);
+  // Which path the current `state` describes. State (not a ref) so the returned
+  // value re-renders when it changes; deliberately NOT an effect dependency
+  // (see the effect note below).
+  const [statePath, setStatePath] = useState<string | null>(null);
+  // Paths we already have a SETTLED (ready/error) result for, so a
+  // collapse → re-expand of the SAME folder is free (PRD §9.7) without
+  // re-listing. A ref so reading it never re-triggers the effect.
+  const settledRef = useRef<Set<string>>(new Set());
 
+  // STUCK-LOADING FIX: depend ONLY on [path, enabled]. The previous version also
+  // listed `state` and `loadedPath`; because the effect itself calls
+  // setState({loading}) + setLoadedPath(path), those deps changed the instant
+  // the effect ran, which RE-RAN the effect — its cleanup set `cancelled = true`
+  // on the in-flight listDir, and the cache guard then returned early without
+  // re-fetching. The listDir result was silently dropped and the tree stuck on
+  // "loading…" forever (the backend logged "list_dir OK N entries" but the UI
+  // never updated — exactly the symptom in the diag log).
   useEffect(() => {
     if (!enabled) return;
-    if (loadedPath === path && state !== null) return; // cached for this path
+    // Skip only when we already have a settled result AND `state` already
+    // describes this path; otherwise (path changed, or never loaded) fetch.
+    if (settledRef.current.has(path) && statePath === path) return;
     let cancelled = false;
-    setLoadedPath(path);
+    setStatePath(path);
     setState({ status: "loading" });
     tlog("files", `list_dir -> ${path}`);
     listDir(path)
       .then((entries) => {
         tlog("files", `list_dir OK ${path}: ${entries.length} entries`);
-        if (!cancelled) setState({ status: "ready", entries });
+        if (cancelled) return;
+        settledRef.current.add(path);
+        setState({ status: "ready", entries });
       })
       .catch((e) => {
         tlog("files", `list_dir ERROR ${path}: ${String(e)}`);
-        if (!cancelled) setState({ status: "error", message: String(e) });
+        if (cancelled) return;
+        settledRef.current.add(path);
+        setState({ status: "error", message: String(e) });
       });
     return () => {
       cancelled = true;
     };
-  }, [path, enabled, loadedPath, state]);
+    // statePath is read for the cache guard but intentionally omitted from the
+    // deps — it is SET inside this effect, so depending on it reintroduces the
+    // self-cancelling loop described above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path, enabled]);
 
   // While a brand-new path is loading but `state` still holds the prior path's
   // entries, hide the stale data.
-  return loadedPath === path ? state : null;
+  return statePath === path ? state : null;
 }
 
 /** Render the body of a directory: loading/error/empty hints, then its dirs and
