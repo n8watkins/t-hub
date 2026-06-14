@@ -19,12 +19,33 @@ export interface HookInstallPanelProps {
   agentBin: string;
 }
 
+// The 15 Claude Code lifecycle events TermHub registers. Each event gets a
+// handler that runs `<agentBin> --hook <EVENT>` in ~/.claude/settings.json.
+const HOOK_EVENTS = [
+  "SessionStart",
+  "SessionEnd",
+  "UserPromptSubmit",
+  "Stop",
+  "StopFailure",
+  "PermissionRequest",
+  "Notification",
+  "Elicitation",
+  "SubagentStart",
+  "SubagentStop",
+  "TaskCreated",
+  "TaskCompleted",
+  "CwdChanged",
+  "WorktreeCreate",
+  "WorktreeRemove",
+] as const;
+
 export function HookInstallPanel({ agentBin }: HookInstallPanelProps) {
   const [installed, setInstalled] = useState<boolean | null>(null);
   const [consent, setConsent] = useState(false);
   const [busy, setBusy] = useState(false);
   const [report, setReport] = useState<InstallReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showDetails, setShowDetails] = useState(false);
 
   const refresh = useCallback(() => {
     claudeHooksInstalled()
@@ -65,22 +86,44 @@ export function HookInstallPanel({ agentBin }: HookInstallPanelProps) {
   }, []);
 
   return (
-    <div className="flex flex-col gap-2 p-3 text-sm text-neutral-200">
+    <div className="flex flex-col gap-1.5 p-2 text-sm text-neutral-200">
       <div className="flex items-center gap-2">
         <span className="font-semibold">Claude hooks</span>
         <StatusPill installed={installed} />
       </div>
-      <p className="text-xs text-neutral-500">
-        This installs Claude Code hooks{" "}
-        <span className="text-neutral-400">globally</span> by editing your{" "}
-        <code className="text-neutral-400">~/.claude/settings.json</code>. It
-        adds handlers for the 15 lifecycle hooks so TermHub can track session
-        status, subagents, and questions. Because the file is global, the hooks
-        apply to every Claude Code session on this machine &mdash; all projects
-        and all terminals, not only the focused terminal and not only TermHub.
-        Your existing hooks and settings are preserved; uninstall removes only
+      <p className="text-xs leading-snug" style={{ color: "var(--th-fg-muted)" }}>
+        Adds 15 lifecycle hook handlers to{" "}
+        <code>~/.claude/settings.json</code> &mdash;{" "}
+        <span style={{ color: "var(--th-fg)" }}>global</span>, so it affects
+        every Claude Code session on this machine, not just the focused
+        terminal. Existing settings are preserved; uninstall removes only
         TermHub&apos;s entries.
       </p>
+
+      <button
+        type="button"
+        onClick={() => setShowDetails((v) => !v)}
+        className="self-start text-[11px] text-neutral-500 hover:text-neutral-300"
+      >
+        {showDetails ? "Hide details" : "View details"}
+      </button>
+      {showDetails && (
+        <div
+          className="rounded border border-neutral-800 bg-neutral-950 p-2 text-[11px]"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          <ul className="flex flex-col gap-0.5 font-mono">
+            {HOOK_EVENTS.map((event) => (
+              <li key={event} className="truncate">
+                {agentBin} --hook {event}
+              </li>
+            ))}
+          </ul>
+          <div className="mt-1.5 font-sans text-neutral-600">
+            Written to <code>~/.claude/settings.json</code>.
+          </div>
+        </div>
+      )}
 
       {!installed && (
         <label className="flex items-center gap-2 text-xs text-neutral-400">
@@ -89,9 +132,10 @@ export function HookInstallPanel({ agentBin }: HookInstallPanelProps) {
             checked={consent}
             onChange={(e) => setConsent(e.target.checked)}
           />
-          I consent to TermHub editing my global{" "}
-          <code>~/.claude/settings.json</code>, affecting all Claude Code
-          sessions on this machine.
+          <span>
+            I consent to editing my global{" "}
+            <code>~/.claude/settings.json</code>.
+          </span>
         </label>
       )}
 
