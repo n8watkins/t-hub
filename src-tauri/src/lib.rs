@@ -251,6 +251,9 @@ pub fn run() {
             // #sqlite: durable workspace-layout persistence (mirrors localStorage).
             db::save_workspace_snapshot,
             db::load_workspace_snapshot,
+            // #recovery: snapshot-history read commands for the Recovery review UI.
+            db::list_snapshots,
+            db::get_snapshot,
             // feat/diag: runtime diagnostics sink (mirrors frontend logs to a file
             // the WSL-side orchestrator can read from a RELEASE build).
             diag::diag_log,

@@ -37,6 +37,9 @@ import {
 // as the fallback / "build" version; the live Tauri runtime version is fetched
 // at runtime via getVersion() in the About group.
 import pkg from "../../package.json";
+// Recovery review (#recovery): a self-contained modal opened from a button in the
+// General section. It renders its own scrim/panel above this one (z-[60] > z-50).
+import { RecoveryReview } from "./RecoveryReview";
 
 /**
  * Wire the global `Ctrl/Cmd+,` toggle (and Esc-to-close) onto the settings
@@ -200,6 +203,9 @@ function GeneralSection() {
   const setSoundsEnabled = useSettings((s) => s.setSoundsEnabled);
   const notificationsEnabled = useSettings((s) => s.notificationsEnabled);
   const setNotificationsEnabled = useSettings((s) => s.setNotificationsEnabled);
+  // Recovery review modal open state (#recovery) — local to this section; the
+  // modal is fully self-contained and renders its own overlay above the panel.
+  const [recoveryOpen, setRecoveryOpen] = useState(false);
 
   return (
     <>
@@ -253,7 +259,24 @@ function GeneralSection() {
         />
       </Group>
 
+      <Group
+        title="Recovery"
+        description="Roll the workspace back to a recent layout from the durable snapshot history (tabs, tile arrangement, focus). Live terminals are reconciled, never killed."
+      >
+        <Row label="Workspace layout">
+          <Btn
+            onClick={() => setRecoveryOpen(true)}
+            title="Open the recovery review to preview and restore a recent workspace layout"
+          >
+            Recovery review…
+          </Btn>
+        </Row>
+      </Group>
+
       <AboutGroup />
+
+      {/* The recovery modal renders its own scrim/panel above this one. */}
+      <RecoveryReview open={recoveryOpen} onClose={() => setRecoveryOpen(false)} />
     </>
   );
 }
