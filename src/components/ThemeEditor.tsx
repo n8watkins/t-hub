@@ -76,6 +76,12 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
 
   const revealPushesContent = useSettings((s) => s.revealPushesContent);
   const setRevealPushesContent = useSettings((s) => s.setRevealPushesContent);
+  const autoHideTitlebarMaximized = useSettings(
+    (s) => s.autoHideTitlebarMaximized,
+  );
+  const setAutoHideTitlebarMaximized = useSettings(
+    (s) => s.setAutoHideTitlebarMaximized,
+  );
 
   const c = active.chrome;
   const presetNames = [
@@ -89,14 +95,14 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
     // Scrim: a click anywhere outside the panel closes the editor. The panel
     // itself stops propagation so inner clicks don't bubble to the scrim.
     <div
-      className="fixed inset-0 z-50 flex justify-end"
+      className="fixed inset-0 z-50 flex items-center justify-center p-6"
       onMouseDown={onClose}
       // The bootstrap host is pointer-events:none (so it's inert when closed);
       // re-enable events on the open overlay so the scrim + panel are clickable.
-      style={{ backgroundColor: "rgba(0,0,0,0.35)", pointerEvents: "auto" }}
+      style={{ backgroundColor: "rgba(0,0,0,0.5)", pointerEvents: "auto" }}
     >
       <div
-        className="flex h-full w-[360px] flex-col border-l shadow-2xl"
+        className="flex max-h-[85vh] w-[560px] max-w-[92vw] flex-col overflow-hidden rounded-lg border shadow-2xl"
         onMouseDown={(e) => e.stopPropagation()}
         style={{
           backgroundColor: "var(--th-sidebar-bg)",
@@ -124,9 +130,14 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
         </div>
 
         {/* Scrollable body of grouped controls */}
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+        <div className="th-scroll min-h-0 flex-1 overflow-y-auto px-4 py-3">
           {/* --- Behavior (general app settings, not theme tokens) --- */}
           <Group title="Behavior">
+            <SettingToggleRow
+              label="Auto-hide titlebar when maximized"
+              value={autoHideTitlebarMaximized}
+              onChange={setAutoHideTitlebarMaximized}
+            />
             <SettingToggleRow
               label="Titlebar reveal pushes content down"
               value={revealPushesContent}
@@ -166,7 +177,7 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
           </Group>
 
           {/* --- Colors --- */}
-          <Group title="Colors">
+          <Group title="Colors" cols={2}>
             <ColorRow label="Accent" k="accent" value={c.accent} set={setChromeToken} />
             <ColorRow label="Focus ring" k="focusRing" value={c.focusRing} set={setChromeToken} />
             <ColorRow label="App background" k="appBg" value={c.appBg} set={setChromeToken} />
@@ -180,7 +191,7 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
           </Group>
 
           {/* --- Status dots --- */}
-          <Group title="Status dots">
+          <Group title="Status dots" cols={2}>
             <ColorRow label="Starting" k="dotStarting" value={c.dotStarting} set={setChromeToken} />
             <ColorRow label="Live" k="dotLive" value={c.dotLive} set={setChromeToken} />
             <ColorRow label="Detached" k="dotDetached" value={c.dotDetached} set={setChromeToken} />
@@ -438,7 +449,15 @@ const FONT_OPTIONS: { label: string; value: string }[] = [
   { label: "Inter", value: 'Inter, ui-sans-serif, system-ui, sans-serif' },
 ];
 
-function Group({ title, children }: { title: string; children: React.ReactNode }) {
+function Group({
+  title,
+  children,
+  cols = 1,
+}: {
+  title: string;
+  children: React.ReactNode;
+  cols?: 1 | 2;
+}) {
   return (
     <section className="mb-4">
       <div
@@ -447,7 +466,15 @@ function Group({ title, children }: { title: string; children: React.ReactNode }
       >
         {title}
       </div>
-      <div className="flex flex-col gap-1.5">{children}</div>
+      <div
+        className={
+          cols === 2
+            ? "grid grid-cols-2 gap-x-4 gap-y-1.5"
+            : "flex flex-col gap-1.5"
+        }
+      >
+        {children}
+      </div>
     </section>
   );
 }
