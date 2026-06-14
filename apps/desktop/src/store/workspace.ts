@@ -14,6 +14,26 @@
 // mount via listTerminals() and reconciled back onto the persisted tabs.
 import { create } from "zustand";
 import type { TerminalInfo, TerminalId, TerminalState } from "../ipc/types";
+import { usePanels } from "./panels";
+
+/**
+ * Clean up the per-tile side state that lives OUTSIDE this store when a
+ * terminal's tile goes away for good (detach / delete / close-tab):
+ *   - the per-tile panel state (active view, detected/typed URLs) in usePanels;
+ *   - any managed dev server the Dev tab started for it (a fire-and-forget Tauri
+ *     call, dynamically imported so the store stays web/test-safe — a no-op if
+ *     there's no dev server for this id or no Tauri runtime).
+ * Called from `remove` (which funnels detach + delete) and `closeTab`. NOT called
+ * on a tab MOVE — a moved tile keeps its panel state.
+ */
+function cleanupTileSideState(id: TerminalId): void {
+  usePanels.getState().forget(id);
+  void import("../ipc/devserver")
+    .then((m) => m.stopDevServer(id))
+    .catch(() => {
+      /* no dev server for this id, or no Tauri runtime — nothing to stop */
+    });
+}
 
 /**
  * localStorage key for the workspace snapshot. v2 introduced workspace tabs;
@@ -812,6 +832,10 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     },
 
     remove: (id) => {
+      // The tile is going away (detach + delete both funnel here) -> drop its
+      // external per-tile state (panel view + any managed dev server). Not
+      // reached by a tab MOVE, so a moved tile keeps its panel state.
+      cleanupTileSideState(id);
       const { tabs, focusedId, terminals, activeTabId } = get();
       const owner = tabOf(tabs, id);
       const nextTabs = tabs.map((t) =>
@@ -981,7 +1005,10 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       }
 
       const nextTerminals = { ...terminals };
-      for (const tid of removed) delete nextTerminals[tid];
+      for (const tid of removed) {
+        delete nextTerminals[tid];
+        cleanupTileSideState(tid); // closing the tab takes its tiles with it
+      }
 
       set({
         terminals: nextTerminals,
