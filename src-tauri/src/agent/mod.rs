@@ -48,19 +48,57 @@ use emit::{
 /// On Windows the agent runs inside the distro via `wsl.exe`; on unix (dev) it
 /// is spawned directly so the whole spine is exercisable in this shell.
 ///
-/// Called by SUBAGENT(agent-bridge)'s transport when it spawns the child; not
-/// yet referenced elsewhere in the crate.
+/// ## Windows agent resolution
+///
+/// The bundled `termhub-agent` is installed to `~/.local/bin/termhub-agent`
+/// inside the distro. A bare `wsl.exe -d <distro> -- termhub-agent` runs a
+/// **non-login, non-interactive** shell, so the user's profile is never sourced
+/// and `~/.local/bin` is *not* on `PATH` — the spawn fails and no live WSL
+/// health / agent state ever reaches the sidebar. To make resolution robust we
+/// launch through a **login shell** (`bash -lc`), which sources the profile and
+/// puts `~/.local/bin` on `PATH`:
+///
+/// ```text
+/// wsl.exe -d <distro> --cd ~ -- bash -lc "exec termhub-agent --stdio"
+/// ```
+///
+/// `exec` replaces the login shell with the agent so there's no extra process
+/// in the tree and stdio is wired straight through. The `--cd ~` lands the
+/// child in the user's home, matching the profile-relative `~/.local/bin`.
+///
+/// The `TERMHUB_AGENT_BIN` escape hatch (honored here on Windows and in
+/// [`connection::spawn_child`] on every platform) bypasses the login-shell hop
+/// entirely: when set, its value is used **verbatim** as the program to spawn,
+/// so a developer can point the bridge at an arbitrary binary without touching
+/// PATH or the distro.
+///
+/// Called by SUBAGENT(agent-bridge)'s transport when it spawns the child.
 #[allow(dead_code)]
 pub fn launch_argv(distro: &str) -> Vec<String> {
     #[cfg(windows)]
     {
+        // Escape hatch: if TERMHUB_AGENT_BIN is set, spawn it verbatim (no
+        // wsl.exe / login-shell hop). This keeps the override usable on Windows
+        // where it would otherwise be misapplied as wsl.exe's argv[0].
+        if let Some(bin) = std::env::var("TERMHUB_AGENT_BIN")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            return vec![bin, "--stdio".to_string()];
+        }
+        // Login shell so the user's profile is sourced and `~/.local/bin`
+        // (where the orchestrator installs the agent) is on PATH. `exec` so the
+        // agent replaces the shell rather than running as a child of it.
         vec![
             "wsl.exe".to_string(),
             "-d".to_string(),
             distro.to_string(),
+            "--cd".to_string(),
+            "~".to_string(),
             "--".to_string(),
-            "termhub-agent".to_string(),
-            "--stdio".to_string(),
+            "bash".to_string(),
+            "-lc".to_string(),
+            "exec termhub-agent --stdio".to_string(),
         ]
     }
     #[cfg(unix)]
@@ -529,14 +567,37 @@ mod tests {
 
     #[test]
     fn launch_argv_shape() {
-        let argv = launch_argv("Ubuntu-24.04");
         #[cfg(unix)]
-        assert_eq!(argv, vec!["termhub-agent", "--stdio"]);
+        {
+            let argv = launch_argv("Ubuntu-24.04");
+            assert_eq!(argv, vec!["termhub-agent", "--stdio"]);
+        }
         #[cfg(windows)]
-        assert_eq!(
-            argv,
-            vec!["wsl.exe", "-d", "Ubuntu-24.04", "--", "termhub-agent", "--stdio"]
-        );
+        {
+            // Default Windows path: a login shell so `~/.local/bin` is on PATH.
+            std::env::remove_var("TERMHUB_AGENT_BIN");
+            let argv = launch_argv("Ubuntu-24.04");
+            assert_eq!(
+                argv,
+                vec![
+                    "wsl.exe",
+                    "-d",
+                    "Ubuntu-24.04",
+                    "--cd",
+                    "~",
+                    "--",
+                    "bash",
+                    "-lc",
+                    "exec termhub-agent --stdio",
+                ]
+            );
+
+            // Escape hatch: TERMHUB_AGENT_BIN is spawned verbatim (no wsl.exe).
+            std::env::set_var("TERMHUB_AGENT_BIN", "C:/tmp/termhub-agent.exe");
+            let argv = launch_argv("Ubuntu-24.04");
+            assert_eq!(argv, vec!["C:/tmp/termhub-agent.exe", "--stdio"]);
+            std::env::remove_var("TERMHUB_AGENT_BIN");
+        }
     }
 
     #[test]

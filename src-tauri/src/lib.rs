@@ -77,8 +77,25 @@ fn spawn_agent_connect(state: &AppState) {
     std::thread::Builder::new()
         .name("termhub-agent-connect".into())
         .spawn(move || {
+            // Log the resolved launch argv up front so a missing/unresolvable
+            // agent binary is diagnosable from the core's stderr. On Windows
+            // this is the `wsl.exe -d <distro> --cd ~ -- bash -lc "exec
+            // termhub-agent --stdio"` login-shell form (or the verbatim
+            // TERMHUB_AGENT_BIN override); on unix it's the direct spawn.
+            let argv = agent::launch_argv(&distro);
+            eprintln!(
+                "termhub: connecting agent bridge (distro={distro:?}) via {argv:?}"
+            );
             if let Err(e) = bridge.connect(&distro) {
-                eprintln!("termhub: agent bridge connect failed: {e}");
+                // A failure here never aborts startup: the bridge degrades to a
+                // Failed/Disconnected state the sidebar renders. The most common
+                // cause is the agent binary not being on the login-shell PATH
+                // (install it to ~/.local/bin) — surface that hint.
+                eprintln!(
+                    "termhub: agent bridge connect failed: {e} \
+                     (is `termhub-agent` installed to ~/.local/bin inside the \
+                     distro, or TERMHUB_AGENT_BIN set?)"
+                );
             }
         })
         .ok();

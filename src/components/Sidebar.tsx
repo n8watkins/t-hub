@@ -17,12 +17,14 @@
 // subscribes and feeds the store.
 import { useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   useSupervision,
   attentionSessions,
   displayStatus,
 } from "../store/supervision";
 import { useAgentTelemetry } from "../store/telemetry";
+import { useSettings } from "../store/settings";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
@@ -30,12 +32,42 @@ import { SupervisionTreeBody } from "./SupervisionTree";
 import { StatusBadge, statusLabel } from "./StatusBadge";
 import { WslHealth } from "./WslHealth";
 import { HookInstallPanel } from "./HookInstallPanel";
+import { FileTree } from "./FileTree";
 import type { StatusSnapshot, SupervisionTree } from "../ipc/model";
 import type {
   TerminalId,
   TerminalInfo,
   TerminalState,
 } from "../ipc/types";
+
+// --- Frameless window controls -------------------------------------------
+// The brand + settings gear + window controls (minimize / maximize-restore /
+// close) now live at the TOP of the sidebar instead of the titlebar, so the
+// titlebar can be a clean tab-strip row. These call the Tauri window API and
+// MUST NOT carry data-tauri-drag-region, or a click would start a window drag.
+// (The titlebar keeps an identical fallback cluster for the sidebar-hidden
+// state — see Titlebar.tsx — so the controls are never unreachable.)
+
+/** Minimize the window, swallowing any IPC rejection. */
+function minimizeWindow(): void {
+  void getCurrentWindow()
+    .minimize()
+    .catch(() => {});
+}
+
+/** Toggle maximize/restore, swallowing any IPC rejection. */
+function toggleMaximizeWindow(): void {
+  void getCurrentWindow()
+    .toggleMaximize()
+    .catch(() => {});
+}
+
+/** Close the window, swallowing any IPC rejection. */
+function closeWindow(): void {
+  void getCurrentWindow()
+    .close()
+    .catch(() => {});
+}
 
 /** The workspace-row id under a viewport point, or null (drag resolution). Each
  *  WorkspaceRow header carries `data-ws-id`; elementFromPoint returns the topmost
@@ -83,6 +115,12 @@ export interface SidebarProps {
   /** Sidebar width in px (resizable, #2). Defaults to 256 (the old fixed w-64). */
   width?: number;
   /**
+   * Cycle the sidebar collapse state (full -> rail -> hidden -> full). The
+   * sidebar header's collapse button uses this so the chrome that now lives in
+   * the sidebar can drive the same Ctrl/Cmd+B cycle App owns.
+   */
+  onToggleSidebar?: () => void;
+  /**
    * Resolved path to the termhub-agent binary used as the hook entrypoint
    * (`<agentBin> --hook <EVENT>`). Inside WSL `termhub-agent` is on PATH, so the
    * bare name is the right default; a dev box can override it.
@@ -94,6 +132,7 @@ export function Sidebar({
   onSelectSession,
   mode = "full",
   width = 256,
+  onToggleSidebar,
   agentBin = "termhub-agent",
 }: SidebarProps) {
   // Workspace tabs (read-only, #2): list every tab with its tile count and let
@@ -116,6 +155,7 @@ export function Sidebar({
         tabs={tabs}
         activeTabId={activeTabId}
         setActiveTab={setActiveTab}
+        onToggleSidebar={onToggleSidebar}
       />
     );
   }
@@ -129,6 +169,7 @@ export function Sidebar({
       setActiveTab={setActiveTab}
       terminals={terminals}
       setFocus={setFocus}
+      onToggleSidebar={onToggleSidebar}
     />
   );
 }
@@ -160,6 +201,7 @@ interface FullProps {
   setActiveTab: (id: string) => void;
   terminals: Record<TerminalId, TerminalInfo>;
   setFocus: (id: TerminalId) => void;
+  onToggleSidebar?: () => void;
 }
 
 function SidebarFull({
@@ -171,6 +213,7 @@ function SidebarFull({
   setActiveTab,
   terminals,
   setFocus,
+  onToggleSidebar,
 }: FullProps) {
   const { metrics, agent } = useAgentTelemetry();
   const trees = useSupervision((s) => s.trees);
@@ -203,6 +246,11 @@ function SidebarFull({
         color: "var(--th-fg)",
       }}
     >
+      {/* Top chrome header (moved out of the titlebar): the T-Hub brand on the
+          left; the settings gear + window controls (min / max-restore / close)
+          on the right. The brand area is a window-drag handle. */}
+      <SidebarHeader onToggleSidebar={onToggleSidebar} />
+
       {/* 0. Workspaces (#2) — the user's tabs with tile counts, active one
           highlighted; a click activates the tab. Each row expands to that tab's
           terminals so the user can peek into OTHER workspaces without switching.
@@ -253,8 +301,8 @@ function SidebarFull({
         )}
       </section>
 
-      {/* 2. Session / supervision tree (scrolls) */}
-      <section className="min-h-0 flex-1 overflow-y-auto">
+      {/* 2. Session / supervision tree */}
+      <section className="max-h-44 shrink-0 overflow-y-auto">
         <Header>Sessions</Header>
         {treeList.length === 0 ? (
           <Muted>No supervised sessions.</Muted>
@@ -271,6 +319,22 @@ function SidebarFull({
             ))}
           </div>
         )}
+      </section>
+
+      {/* Files — browse the project file tree (the tree + reader are
+          self-contained in FileTree.tsx; rooted at the projects dir for now). */}
+      <section
+        className="flex min-h-0 flex-1 flex-col border-t"
+        style={{ borderColor: "var(--th-border)" }}
+      >
+        <Header>Files</Header>
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <FileTree
+            root="/home/natkins/n8builds"
+            embedReader
+            className="h-full"
+          />
+        </div>
       </section>
 
       {/* 3. Claude hooks (consent-gated install/uninstall) */}
@@ -690,15 +754,17 @@ function SidebarRail({
   tabs,
   activeTabId,
   setActiveTab,
+  onToggleSidebar,
 }: {
   width: number;
   tabs: WorkspaceTab[];
   activeTabId: string;
   setActiveTab: (id: string) => void;
+  onToggleSidebar?: () => void;
 }) {
   return (
     <aside
-      className="flex h-full shrink-0 flex-col items-center gap-1 border-r py-2"
+      className="flex h-full shrink-0 flex-col items-center gap-1 border-r"
       style={{
         width,
         backgroundColor: "var(--th-sidebar-bg)",
@@ -706,6 +772,11 @@ function SidebarRail({
         color: "var(--th-fg)",
       }}
     >
+      {/* Compact header for the rail: the brand mark (also a drag handle) stacked
+          over the window controls, so the chrome is reachable even in the thin
+          strip. The collapse button cycles to full/hidden. */}
+      <SidebarRailHeader onToggleSidebar={onToggleSidebar} />
+      <div className="flex flex-col items-center gap-1 pt-1">
       {tabs.map((tab) => {
         const active = tab.id === activeTabId;
         const count = tab.order.length;
@@ -748,9 +819,10 @@ function SidebarRail({
           —
         </div>
       )}
+      </div>
       {/* Section hints: glyphs standing in for the full sidebar's sections. */}
       <div
-        className="mt-auto flex flex-col items-center gap-1 pt-2 text-sm"
+        className="mt-auto flex flex-col items-center gap-1 px-1 pb-2 pt-2 text-sm"
         style={{ color: "var(--th-fg-muted)" }}
         aria-hidden
       >
@@ -760,6 +832,288 @@ function SidebarRail({
         <span title="WSL">◷</span>
       </div>
     </aside>
+  );
+}
+
+// ===========================================================================
+// Sidebar chrome header — the window's top-left chrome, relocated here from the
+// titlebar. FULL mode: a single 32px row with the T-Hub brand on the left and
+// the settings gear + window controls on the right. RAIL mode: a compact
+// stacked version. When the sidebar is HIDDEN entirely, App skips <Sidebar>, so
+// the titlebar renders a fallback control cluster instead (see Titlebar.tsx) —
+// the controls are therefore always reachable.
+// ===========================================================================
+
+/**
+ * The full-mode sidebar header: a 32px row matching the titlebar height. The
+ * left holds the brand (a window-drag handle); the right holds a collapse
+ * button (cycles full -> rail -> hidden), the settings gear, and the window
+ * controls (minimize / maximize-restore / close). The empty middle is also a
+ * drag handle so the window can still be moved by grabbing the header.
+ */
+function SidebarHeader({ onToggleSidebar }: { onToggleSidebar?: () => void }) {
+  const toggleSettings = useSettings((s) => s.toggleSettings);
+  return (
+    <div
+      className="flex h-8 shrink-0 items-stretch border-b"
+      style={{ borderColor: "var(--th-border)" }}
+    >
+      <SidebarBrand />
+      {/* Draggable filler so the header itself moves the window. */}
+      <div data-tauri-drag-region className="min-w-0 flex-1" aria-hidden />
+      {onToggleSidebar && (
+        <CollapseButton onClick={onToggleSidebar} />
+      )}
+      <SidebarSettingsButton onClick={toggleSettings} />
+      <SidebarWindowControls />
+    </div>
+  );
+}
+
+/**
+ * The rail-mode header: the brand mark and window controls stacked vertically so
+ * they fit the thin (~48px) strip. The brand square doubles as a window-drag
+ * handle; the collapse button expands the rail back to full (or on to hidden).
+ */
+function SidebarRailHeader({ onToggleSidebar }: { onToggleSidebar?: () => void }) {
+  return (
+    <div
+      className="flex w-full flex-col items-center gap-1 border-b pb-1.5 pt-1.5"
+      style={{ borderColor: "var(--th-border)" }}
+    >
+      {/* Only the brand mark is a drag handle; the control buttons must NOT be
+          inside a drag region or a click would start a window drag instead. */}
+      <span
+        data-tauri-drag-region
+        className="inline-block h-3 w-3 rounded-[2px]"
+        style={{ backgroundColor: "var(--th-accent)" }}
+        title="T-Hub"
+        aria-hidden
+      />
+      {onToggleSidebar && (
+        <button
+          type="button"
+          onClick={onToggleSidebar}
+          aria-label="Expand sidebar"
+          title="Expand sidebar"
+          className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700"
+        >
+          <SidebarToggleIcon />
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={minimizeWindow}
+        aria-label="Minimize"
+        title="Minimize"
+        className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700"
+      >
+        <MinimizeIcon />
+      </button>
+      <button
+        type="button"
+        onClick={toggleMaximizeWindow}
+        aria-label="Maximize"
+        title="Maximize / Restore"
+        className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700"
+      >
+        <MaximizeIcon />
+      </button>
+      <button
+        type="button"
+        onClick={closeWindow}
+        aria-label="Close"
+        title="Close"
+        className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-red-600 hover:text-white"
+      >
+        <CloseIcon />
+      </button>
+    </div>
+  );
+}
+
+/** "T-Hub" wordmark with a small accent glyph; a window-drag handle. */
+function SidebarBrand() {
+  return (
+    <div
+      data-tauri-drag-region
+      className="flex shrink-0 select-none items-center gap-1.5 pl-2.5 pr-2"
+    >
+      <span
+        className="inline-block h-2.5 w-2.5 rounded-[2px]"
+        style={{ backgroundColor: "var(--th-accent)" }}
+        aria-hidden
+      />
+      <span
+        className="text-xs font-semibold tracking-tight"
+        style={{ color: "var(--th-fg)" }}
+      >
+        T-Hub
+      </span>
+    </div>
+  );
+}
+
+/** Collapse button — cycles the sidebar (full -> rail -> hidden). */
+function CollapseButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label="Collapse sidebar"
+      title="Collapse sidebar (Ctrl/Cmd+B)"
+      className="flex h-8 w-9 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
+    >
+      <SidebarToggleIcon />
+    </button>
+  );
+}
+
+/** Settings gear — opens the settings/theme surface (also Ctrl/Cmd+,). */
+function SidebarSettingsButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      aria-label="Settings"
+      title="Settings (Ctrl/Cmd+,)"
+      onClick={onClick}
+      className="flex h-8 w-9 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
+    >
+      <GearIcon />
+    </button>
+  );
+}
+
+/** Window controls (minimize / maximize-restore / close) for the full header. */
+function SidebarWindowControls() {
+  return (
+    <div className="flex shrink-0 items-stretch">
+      <button
+        type="button"
+        aria-label="Minimize"
+        title="Minimize"
+        onClick={minimizeWindow}
+        className="flex h-8 w-9 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
+      >
+        <MinimizeIcon />
+      </button>
+      <button
+        type="button"
+        aria-label="Maximize"
+        title="Maximize / Restore"
+        onClick={toggleMaximizeWindow}
+        className="flex h-8 w-9 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
+      >
+        <MaximizeIcon />
+      </button>
+      <button
+        type="button"
+        aria-label="Close"
+        title="Close"
+        onClick={closeWindow}
+        className="flex h-8 w-9 items-center justify-center text-neutral-300 transition-colors hover:bg-red-600 hover:text-white"
+      >
+        <CloseIcon />
+      </button>
+    </div>
+  );
+}
+
+// --- Shared chrome icons (sized to sit in the 32px header) -----------------
+
+/** Settings gear. */
+function GearIcon() {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="pointer-events-none"
+      aria-hidden
+    >
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+    </svg>
+  );
+}
+
+/** Minimize (horizontal line). */
+function MinimizeIcon() {
+  return (
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 10 10"
+      aria-hidden
+      className="pointer-events-none"
+    >
+      <line x1="1" y1="5" x2="9" y2="5" stroke="currentColor" strokeWidth="1" />
+    </svg>
+  );
+}
+
+/** Maximize / restore (square). */
+function MaximizeIcon() {
+  return (
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 10 10"
+      aria-hidden
+      className="pointer-events-none"
+    >
+      <rect
+        x="1"
+        y="1"
+        width="8"
+        height="8"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1"
+      />
+    </svg>
+  );
+}
+
+/** Close (×). */
+function CloseIcon() {
+  return (
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 10 10"
+      aria-hidden
+      className="pointer-events-none"
+    >
+      <line x1="1" y1="1" x2="9" y2="9" stroke="currentColor" strokeWidth="1" />
+      <line x1="9" y1="1" x2="1" y2="9" stroke="currentColor" strokeWidth="1" />
+    </svg>
+  );
+}
+
+/** Sidebar collapse/expand glyph (a panel with a divider). */
+function SidebarToggleIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="pointer-events-none"
+      aria-hidden
+    >
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <line x1="9" y1="4" x2="9" y2="20" />
+    </svg>
   );
 }
 

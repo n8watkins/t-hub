@@ -160,7 +160,10 @@ export function FilePanel({
   if (!root) {
     return (
       <PanelShell className={className}>
-        <div className="flex h-full items-center justify-center px-6 text-center text-sm text-neutral-500">
+        <div
+          className="flex h-full items-center justify-center px-6 text-center text-sm"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
           No project selected. Select a terminal/worktree to browse its files.
         </div>
       </PanelShell>
@@ -174,8 +177,14 @@ export function FilePanel({
 
       <div className="flex min-h-0 flex-1">
         {/* Left rail: search + results, or the tree when no query. */}
-        <div className="flex w-72 shrink-0 flex-col border-r border-neutral-800">
-          <div className="border-b border-neutral-800 p-2">
+        <div
+          className="flex w-72 shrink-0 flex-col border-r"
+          style={{ borderColor: "var(--th-border)" }}
+        >
+          <div
+            className="border-b p-2"
+            style={{ borderColor: "var(--th-border)" }}
+          >
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
@@ -183,10 +192,16 @@ export function FilePanel({
               spellCheck={false}
               autoCorrect="off"
               autoCapitalize="off"
-              className="w-full rounded-md border border-neutral-800 bg-neutral-900 px-2.5 py-1.5 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-neutral-600 focus:outline-none"
+              className="w-full px-2.5 py-1.5 text-sm focus:outline-none"
+              style={{
+                borderRadius: "var(--th-radius)",
+                border: "1px solid var(--th-border)",
+                background: "var(--th-tile-bg)",
+                color: "var(--th-fg)",
+              }}
             />
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          <div className="th-scroll min-h-0 flex-1 overflow-y-auto">
             {query.trim() ? (
               <SearchResults
                 hits={hits}
@@ -227,10 +242,8 @@ function PanelShell({
 }) {
   return (
     <div
-      className={
-        "flex h-full min-h-0 w-full flex-col bg-neutral-950 text-neutral-100 " +
-        (className ?? "")
-      }
+      className={"flex h-full min-h-0 w-full flex-col " + (className ?? "")}
+      style={{ background: "var(--th-sidebar-bg)", color: "var(--th-fg)" }}
     >
       {children}
     </div>
@@ -250,24 +263,35 @@ function Header({
 }) {
   const label = basename(root) || root;
   return (
-    <div className="flex items-center justify-between gap-3 border-b border-neutral-800 px-3 py-2">
+    <div
+      className="flex items-center justify-between gap-3 border-b px-3 py-2"
+      style={{ borderColor: "var(--th-border)" }}
+    >
       <div className="min-w-0">
-        <div className="truncate text-sm font-medium text-neutral-200" title={root}>
+        <div
+          className="truncate text-sm font-medium"
+          style={{ color: "var(--th-fg)" }}
+          title={root}
+        >
           {label}
         </div>
-        <div className="truncate text-[11px] text-neutral-600" title={root}>
+        <div
+          className="truncate text-[11px]"
+          style={{ color: "var(--th-fg-muted)" }}
+          title={root}
+        >
           {root}
         </div>
       </div>
-      <div className="shrink-0 text-[11px] text-neutral-500">
+      <div className="shrink-0 text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
         {indexState.status === "indexing" && (
-          <span className="text-amber-400">indexing…</span>
+          <span style={{ color: "var(--th-dot-starting)" }}>indexing…</span>
         )}
         {indexState.status === "ready" && (
           <span title="files indexed">{indexState.count} files</span>
         )}
         {indexState.status === "error" && (
-          <span className="text-red-400" title={indexState.message}>
+          <span style={{ color: "var(--th-dot-error)" }} title={indexState.message}>
             index error
           </span>
         )}
@@ -293,7 +317,9 @@ function SearchResults({
 }) {
   if (!searching && hits.length === 0) {
     return (
-      <div className="px-3 py-2 text-xs text-neutral-600">No matching files.</div>
+      <div className="px-3 py-2 text-xs" style={{ color: "var(--th-fg-muted)" }}>
+        No matching files.
+      </div>
     );
   }
   return (
@@ -309,18 +335,29 @@ function SearchResults({
             <button
               type="button"
               onClick={() => onOpen(abs)}
-              className={
-                "flex w-full items-baseline gap-2 px-3 py-1 text-left text-sm hover:bg-neutral-900 " +
-                (active ? "bg-neutral-900" : "")
-              }
+              className="flex w-full items-baseline gap-2 px-3 py-1 text-left text-sm"
+              style={{ background: active ? "var(--th-tile-bg)" : "transparent" }}
+              onMouseEnter={(e) => {
+                if (!active) e.currentTarget.style.background = "var(--th-tile-bg)";
+              }}
+              onMouseLeave={(e) => {
+                if (!active) e.currentTarget.style.background = "transparent";
+              }}
               title={hit.relPath}
             >
-              <span className="truncate text-neutral-200">
-                {hit.isKeyFile && <span className="mr-1 text-amber-400">★</span>}
+              <span className="truncate" style={{ color: "var(--th-fg)" }}>
+                {hit.isKeyFile && (
+                  <span className="mr-1" style={{ color: "var(--th-accent)" }}>
+                    ★
+                  </span>
+                )}
                 {hit.basename}
               </span>
               {dir && (
-                <span className="min-w-0 flex-1 truncate text-[11px] text-neutral-600">
+                <span
+                  className="min-w-0 flex-1 truncate text-[11px]"
+                  style={{ color: "var(--th-fg-muted)" }}
+                >
                   {dir}
                 </span>
               )}
@@ -407,23 +444,34 @@ function TreeDir({
         type="button"
         onClick={() => setOpen((v) => !v)}
         style={indent}
-        className="flex w-full items-center gap-1.5 py-1 pr-2 text-left text-sm text-neutral-300 hover:bg-neutral-900"
+        className="flex w-full items-center gap-1.5 py-1 pr-2 text-left text-sm"
+        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--th-tile-bg)")}
+        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
         title={path}
       >
-        <span className="w-3 shrink-0 text-[10px] text-neutral-500">
+        <span className="w-3 shrink-0 text-[10px]" style={{ color: "var(--th-fg-muted)" }}>
           {open ? "▾" : "▸"}
         </span>
-        <span className="truncate">{name}</span>
+        <span className="truncate" style={{ color: "var(--th-fg)" }}>
+          {name}
+        </span>
       </button>
       {open && (
         <div>
           {loading && (
-            <div style={{ paddingLeft: `${(depth + 1) * 12 + 14}px` }} className="py-0.5 text-[11px] text-neutral-600">
+            <div
+              style={{ paddingLeft: `${(depth + 1) * 12 + 14}px`, color: "var(--th-fg-muted)" }}
+              className="py-0.5 text-[11px]"
+            >
               loading…
             </div>
           )}
           {error && (
-            <div style={{ paddingLeft: `${(depth + 1) * 12 + 14}px` }} className="py-0.5 text-[11px] text-red-400" title={error}>
+            <div
+              style={{ paddingLeft: `${(depth + 1) * 12 + 14}px`, color: "var(--th-dot-error)" }}
+              className="py-0.5 text-[11px]"
+              title={error}
+            >
               error
             </div>
           )}
@@ -468,11 +516,18 @@ function TreeFile({
     <button
       type="button"
       onClick={() => onOpen(entry.path)}
-      style={{ paddingLeft: `${depth * 12 + 22}px` }}
-      className={
-        "flex w-full items-center py-1 pr-2 text-left text-sm hover:bg-neutral-900 " +
-        (active ? "bg-neutral-900 text-neutral-100" : "text-neutral-400")
-      }
+      style={{
+        paddingLeft: `${depth * 12 + 22}px`,
+        background: active ? "var(--th-tile-bg)" : "transparent",
+        color: active ? "var(--th-fg)" : "var(--th-fg-muted)",
+      }}
+      className="flex w-full items-center py-1 pr-2 text-left text-sm"
+      onMouseEnter={(e) => {
+        if (!active) e.currentTarget.style.background = "var(--th-tile-bg)";
+      }}
+      onMouseLeave={(e) => {
+        if (!active) e.currentTarget.style.background = "transparent";
+      }}
       title={entry.path}
     >
       <span className="truncate">{entry.name}</span>
@@ -491,14 +546,20 @@ function Reader({
 }) {
   if (reader.status === "empty") {
     return (
-      <div className="flex h-full items-center justify-center px-6 text-center text-sm text-neutral-600">
+      <div
+        className="flex h-full items-center justify-center px-6 text-center text-sm"
+        style={{ color: "var(--th-fg-muted)" }}
+      >
         Select a file to read.
       </div>
     );
   }
   if (reader.status === "loading") {
     return (
-      <div className="flex h-full items-center justify-center text-sm text-neutral-600">
+      <div
+        className="flex h-full items-center justify-center text-sm"
+        style={{ color: "var(--th-fg-muted)" }}
+      >
         loading {basename(reader.path)}…
       </div>
     );
@@ -506,8 +567,13 @@ function Reader({
   if (reader.status === "error") {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-1 px-6 text-center">
-        <div className="text-sm text-red-400">Could not open file</div>
-        <div className="max-w-md break-words text-xs text-neutral-600">
+        <div className="text-sm" style={{ color: "var(--th-dot-error)" }}>
+          Could not open file
+        </div>
+        <div
+          className="max-w-md break-words text-xs"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
           {reader.message}
         </div>
       </div>
@@ -520,19 +586,38 @@ function Reader({
   return (
     <div className="flex h-full min-h-0 flex-col">
       {/* Reader toolbar: filename, size, and a Rendered/Source toggle for md. */}
-      <div className="flex items-center justify-between gap-3 border-b border-neutral-800 px-3 py-1.5">
-        <div className="min-w-0 truncate text-xs text-neutral-400" title={contents.path}>
+      <div
+        className="flex items-center justify-between gap-3 border-b px-3 py-1.5"
+        style={{ borderColor: "var(--th-border)" }}
+      >
+        <div
+          className="min-w-0 truncate text-xs"
+          style={{ color: "var(--th-fg)" }}
+          title={contents.path}
+        >
           {basename(contents.path)}
           {contents.truncated && (
-            <span className="ml-2 text-amber-400" title="file exceeded the read cap">
+            <span
+              className="ml-2"
+              style={{ color: "var(--th-dot-starting)" }}
+              title="file exceeded the read cap"
+            >
               (truncated)
             </span>
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <span className="text-[11px] text-neutral-600">{formatBytes(contents.size)}</span>
+          <span className="text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
+            {formatBytes(contents.size)}
+          </span>
           {isMd && (
-            <div className="flex overflow-hidden rounded border border-neutral-800 text-[11px]">
+            <div
+              className="flex overflow-hidden text-[11px]"
+              style={{
+                borderRadius: "var(--th-radius)",
+                border: "1px solid var(--th-border)",
+              }}
+            >
               <ToggleButton
                 active={mode === "rendered"}
                 onClick={() => onSetMode("rendered")}
@@ -549,13 +634,16 @@ function Reader({
       </div>
 
       {/* Body. */}
-      <div className="min-h-0 flex-1 overflow-auto">
+      <div className="th-scroll min-h-0 flex-1 overflow-auto">
         {isMd && mode === "rendered" ? (
           <div className="px-5 py-4">
             <Markdown source={contents.text} />
           </div>
         ) : (
-          <pre className="px-4 py-3 font-mono text-[12.5px] leading-relaxed text-neutral-300">
+          <pre
+            className="px-4 py-3 font-mono text-[12.5px] leading-relaxed"
+            style={{ color: "var(--th-fg)" }}
+          >
             <code>{contents.text}</code>
           </pre>
         )}
@@ -577,12 +665,11 @@ function ToggleButton({
     <button
       type="button"
       onClick={onClick}
-      className={
-        "px-2 py-0.5 " +
-        (active
-          ? "bg-neutral-700 text-neutral-100"
-          : "bg-neutral-900 text-neutral-500 hover:text-neutral-300")
-      }
+      className="px-2 py-0.5"
+      style={{
+        background: active ? "var(--th-tile-bg)" : "transparent",
+        color: active ? "var(--th-fg)" : "var(--th-fg-muted)",
+      }}
     >
       {label}
     </button>
