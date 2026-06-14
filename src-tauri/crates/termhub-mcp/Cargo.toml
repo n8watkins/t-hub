@@ -1,0 +1,18 @@
+[package]
+name = "termhub-mcp"
+version = "0.5.0"
+description = "TermHub's local MCP server: speaks the MCP protocol (JSON-RPC over stdio) and forwards tools/call to the running TermHub app over the loopback control channel (PRD §9.6)."
+edition = "2021"
+rust-version = "1.77"
+
+# A single binary launched by the MCP client (Claude) over stdio. It is
+# deliberately dependency-light: no async runtime, no MCP SDK — the MCP protocol
+# subset we need (initialize / tools/list / tools/call) is small enough to
+# implement directly over line-delimited JSON-RPC on stdin/stdout.
+[[bin]]
+name = "termhub-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

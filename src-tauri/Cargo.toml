@@ -5,7 +5,13 @@
 # WSL-side `termhub-agent` binary. Shared dep versions are pinned in
 # `[workspace.dependencies]` so the agent and core never drift.
 [workspace]
-members = ["crates/termhub-protocol", "crates/termhub-agent"]
+members = [
+    "crates/termhub-protocol",
+    "crates/termhub-agent",
+    # The local MCP server binary: speaks MCP JSON-RPC on stdio and forwards
+    # tools/call to the running app over the loopback control channel (PRD §9.6).
+    "crates/termhub-mcp",
+]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
