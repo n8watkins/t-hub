@@ -220,11 +220,64 @@ impl FileIndexState {
 }
 
 /// Normalize a user-supplied path to an absolute, lexically-clean form. We
-/// canonicalize when the path exists (resolves symlinks/`..`); otherwise we
-/// fall back to the path as given so error messages stay meaningful.
+/// first route it through [`to_host_path`] (a no-op on unix; WSL→UNC on Windows)
+/// so a native Linux project path is reachable from the Windows-side process,
+/// then canonicalize when the path exists (resolves symlinks/`..`); otherwise we
+/// fall back to the host path as given so error messages stay meaningful.
 fn normalize(path: &str) -> PathBuf {
-    let p = Path::new(path);
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    let host = to_host_path(path);
+    std::fs::canonicalize(&host).unwrap_or(host)
+}
+
+/// The WSL distro projects live in, as seen from the Windows host. Mirrors the
+/// agent bridge's `default_distro` (lib.rs): overridable via `TERMHUB_DISTRO`,
+/// defaulting to the dev distro. Only consulted on Windows.
+#[cfg(windows)]
+fn host_distro() -> String {
+    std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+}
+
+/// Translate a path so the *Windows-side* file commands can reach a project that
+/// physically lives on WSL's ext4 filesystem.
+///
+/// The PTY/agent layers pass native WSL paths (`/home/natkins/...`) straight to
+/// `wsl.exe`, which resolves them inside the distro. These file commands instead
+/// use `std::fs` directly on the Windows host, where a bare POSIX absolute path
+/// is meaningless. WSL exposes every distro's root over the
+/// `\\wsl.localhost\<distro>\` UNC share, so we rewrite a leading-`/` absolute
+/// POSIX path into that UNC form (with `/`→`\`). Paths that are already
+/// Windows-shaped (`C:\...`, `\\wsl.localhost\...`, UNC) or relative are passed
+/// through untouched.
+///
+/// On unix this is the identity function: a native path already *is* the Linux
+/// path, so the project is indexed directly (see the module-level scope note).
+fn to_host_path(path: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        // Already a Windows/UNC path (drive-letter, `\\server\...`, or a
+        // `\\wsl.localhost\...` / `\\wsl$\...` share) — leave it alone.
+        let is_windows_shaped = path.starts_with("\\\\")
+            || path
+                .as_bytes()
+                .get(1)
+                .map(|&b| b == b':')
+                .unwrap_or(false);
+        // A POSIX-absolute path ("/home/...") that is NOT already a forward-slash
+        // UNC ("//wsl.localhost/...") is a WSL path we must map onto the share.
+        let is_posix_abs = path.starts_with('/') && !path.starts_with("//");
+        if !is_windows_shaped && is_posix_abs {
+            let distro = host_distro();
+            // `\\wsl.localhost\<distro>` + the POSIX path with `/`→`\`.
+            let tail = path.replace('/', "\\");
+            let unc = format!("\\\\wsl.localhost\\{distro}{tail}");
+            return PathBuf::from(unc);
+        }
+        PathBuf::from(path)
+    }
+    #[cfg(unix)]
+    {
+        PathBuf::from(path)
+    }
 }
 
 /// Build (or rebuild) the index for `root`, honoring `.gitignore` + pruned dirs
@@ -945,6 +998,31 @@ mod tests {
                 println!("    {:>5}  {}", h.score, h.rel_path);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn to_host_path_is_identity_on_unix() {
+        // On unix a native POSIX path is already the Linux path: no rewrite.
+        assert_eq!(to_host_path("/home/natkins/proj"), PathBuf::from("/home/natkins/proj"));
+        assert_eq!(to_host_path("relative/dir"), PathBuf::from("relative/dir"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn to_host_path_maps_wsl_to_unc_on_windows() {
+        std::env::set_var("TERMHUB_DISTRO", "Ubuntu-24.04");
+        // A POSIX-absolute WSL path is mapped onto the \\wsl.localhost\ share.
+        assert_eq!(
+            to_host_path("/home/natkins/proj"),
+            PathBuf::from("\\\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\proj"),
+        );
+        // Already-Windows paths pass through untouched.
+        assert_eq!(to_host_path("C:\\Users\\natha"), PathBuf::from("C:\\Users\\natha"));
+        assert_eq!(
+            to_host_path("\\\\wsl.localhost\\Ubuntu-24.04\\home\\x"),
+            PathBuf::from("\\\\wsl.localhost\\Ubuntu-24.04\\home\\x"),
+        );
     }
 
     #[test]
