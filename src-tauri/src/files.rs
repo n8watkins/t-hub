@@ -280,9 +280,217 @@ fn to_host_path(path: &str) -> PathBuf {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Windows: native-in-WSL fast paths (avoid the slow `\\wsl.localhost\` UNC/9P
+// bridge for directory listing + indexing by shelling into the distro itself).
+// ---------------------------------------------------------------------------
+
+/// Recover a POSIX/WSL path from a path that [`to_host_path`] mapped onto the
+/// `\\wsl.localhost\<distro>\...` (or legacy `\\wsl$\<distro>\...`) UNC share,
+/// or that is already a bare POSIX path. Returns `None` for genuine Windows
+/// paths (a `C:\...` drive path), which must keep using `std::fs`.
+///
+/// e.g. `\\wsl.localhost\Ubuntu-24.04\home\natkins\proj` → `/home/natkins/proj`.
+#[cfg(windows)]
+fn unc_to_posix(path: &Path) -> Option<String> {
+    let s = path.to_string_lossy();
+    // Already a bare POSIX path (shouldn't usually reach here post-normalize,
+    // but be lenient): pass through.
+    if s.starts_with('/') {
+        return Some(s.into_owned());
+    }
+    // Strip a `\\wsl.localhost\<distro>` or `\\wsl$\<distro>` prefix.
+    for prefix in ["\\\\wsl.localhost\\", "\\\\wsl$\\"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            // `rest` is `<distro>\home\natkins\...`; drop the distro segment.
+            let tail = match rest.split_once('\\') {
+                Some((_distro, tail)) => tail,
+                // `\\wsl.localhost\<distro>` with no trailing path → distro root.
+                None => "",
+            };
+            let posix = format!("/{}", tail.replace('\\', "/"));
+            return Some(posix);
+        }
+    }
+    None
+}
+
+/// Build a `wsl.exe -d <distro> -- bash -lc '<script>'` command with the console
+/// window suppressed (`CREATE_NO_WINDOW`, copying tmux.rs's pattern), so shelling
+/// into the distro never flashes a CMD window. `script` runs under the WSL
+/// login shell; pass the target path to it via `$1` (argv) — not interpolation —
+/// so paths with shell metacharacters are safe.
+#[cfg(windows)]
+fn wsl_bash(distro: &str, script: &str, arg: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    let mut c = Command::new("wsl.exe");
+    c.arg("-d")
+        .arg(distro)
+        .arg("--")
+        .arg("bash")
+        .arg("-lc")
+        .arg(script)
+        // `bash -lc <script> <arg0> <arg1>`: the first trailing word becomes
+        // `$0`, so pass a label there and the real path as `$1`.
+        .arg("termhub")
+        .arg(arg);
+    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (see tmux.rs)
+    c
+}
+
+/// Shallow directory listing performed natively inside WSL. Prints one line per
+/// entry as `name\t<d|f>` and parses it into [`DirEntry`]s (dirs first, then
+/// files, alphabetical — matching [`read_dir_shallow_fs`]). The absolute `path`
+/// of each entry is rebuilt as a POSIX path so the UI can drill in / open it.
+#[cfg(windows)]
+fn wsl_list_dir(dir: &str) -> Result<Vec<DirEntry>, String> {
+    let distro = host_distro();
+    // `find -maxdepth 1` lists immediate children only (shallow); `-printf` emits
+    // `name\t<type>` where type is `d` for dirs and `f` for everything else.
+    // GNU find's `%y` is the file type letter; map non-`d` to `f`. We skip `.`
+    // (the dir itself) by starting from `*` is unreliable for hidden files, so we
+    // filter `.` out in the parse loop instead.
+    const SCRIPT: &str = r#"
+cd "$1" 2>/dev/null || { echo "__TH_NODIR__" >&2; exit 2; }
+find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null
+"#;
+    let output = wsl_bash(&distro, SCRIPT, dir)
+        .output()
+        .map_err(|e| format!("failed to spawn wsl.exe: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("__TH_NODIR__") {
+            return Err(format!("not a directory: {dir}"));
+        }
+        return Err(format!("wsl list_dir failed: {}", stderr.trim()));
+    }
+
+    let base = dir.trim_end_matches('/');
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let (name, ty) = match line.split_once('\t') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        // GNU find `%y`: `d` for a directory; `l` is a symlink (we treat as file
+        // unless it resolves to a dir — `%y` shows the link itself, so we re-stat
+        // symlinks below). Treat `d` as dir, everything else as file.
+        let is_dir = ty == "d";
+        if is_dir && PRUNED_DIRS.contains(&name) {
+            continue; // prune dependency/build dirs from the tree (PRD §9.7)
+        }
+        out.push(DirEntry {
+            name: name.to_string(),
+            path: format!("{base}/{name}"),
+            is_dir,
+            // Size is not surfaced in the tree UI; computing it would cost an
+            // extra stat per entry. Report 0 (dirs already report 0 on the fs
+            // path too); the reader stats the real size on open.
+            size: 0,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+    });
+    Ok(out)
+}
+
+/// Enumerate every indexable file under `root` natively inside WSL, returning
+/// `/`-separated paths RELATIVE to `root`. Uses `rg --files` (ripgrep: honors
+/// `.gitignore`, extremely fast), falling back to `git ls-files` then `find` if
+/// ripgrep is unavailable in the distro. This replaces walking the tree over the
+/// slow UNC bridge. Pruned dependency/build dirs are excluded in-script so the
+/// result matches the `std::fs` walker's shape.
+#[cfg(windows)]
+fn wsl_list_files(root: &str) -> Result<Vec<String>, String> {
+    let distro = host_distro();
+    // Build the find-fallback prune expression from PRUNED_DIRS so all three
+    // enumeration strategies agree with the std::fs walker.
+    let prune = PRUNED_DIRS
+        .iter()
+        .map(|d| format!("-name '{d}'"))
+        .collect::<Vec<_>>()
+        .join(" -o ");
+    // `rg --files` already honors .gitignore and skips .git; we still drop the
+    // always-pruned dirs explicitly (rg via --glob) so node_modules/target/etc
+    // never appear even when not gitignored. The git + find fallbacks prune too.
+    let globs = PRUNED_DIRS
+        .iter()
+        .map(|d| format!("--glob '!{d}/**'"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let script = format!(
+        r#"
+cd "$1" 2>/dev/null || {{ echo "__TH_NODIR__" >&2; exit 2; }}
+if command -v rg >/dev/null 2>&1; then
+  rg --files --hidden --no-messages {globs} --glob '!.git/**' .
+elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git ls-files --cached --others --exclude-standard
+else
+  find . \( {prune} \) -prune -o -type f -print
+fi
+"#
+    );
+    let output = wsl_bash(&distro, &script, root)
+        .output()
+        .map_err(|e| format!("failed to spawn wsl.exe: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("__TH_NODIR__") {
+            return Err(format!("not a directory: {root}"));
+        }
+        return Err(format!("wsl index failed: {}", stderr.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut rels: Vec<String> = stdout
+        .lines()
+        .map(|l| l.trim().trim_start_matches("./"))
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    rels.sort();
+    rels.dedup();
+    Ok(rels)
+}
+
+/// Build a [`ProjectIndex`] from a precomputed relative-path list (the WSL fast
+/// path on Windows). Mirrors the metadata the `std::fs` walker derives per file
+/// ([`FileEntry::from_rel`]), keeping the index shape identical so `search_files`
+/// and the frontend are unaffected. No per-file open/sniff: the enumeration
+/// already excluded VCS/build dirs, and re-reading every file's first bytes over
+/// the bridge would defeat the point of the native enumeration.
+#[cfg(windows)]
+fn build_index_from_rels(root: &Path, rels: Vec<String>) -> ProjectIndex {
+    let mut entries: Vec<FileEntry> = rels.into_iter().map(FileEntry::from_rel).collect();
+    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    ProjectIndex {
+        root: root.to_path_buf(),
+        entries,
+    }
+}
+
 /// Build (or rebuild) the index for `root`, honoring `.gitignore` + pruned dirs
 /// + a binary sniff, and walk it into a flat [`ProjectIndex`].
 fn build_index(root: &Path) -> Result<ProjectIndex, String> {
+    // Windows fast path: a native WSL project lives on ext4 behind the slow
+    // `\\wsl.localhost\` UNC/9P bridge. Walking it with `std::fs` is painfully
+    // slow, so enumerate the file list natively inside the distro instead (rg →
+    // git ls-files → find). The resulting index has the same shape as the walker.
+    #[cfg(windows)]
+    {
+        if let Some(posix) = unc_to_posix(root) {
+            let rels = wsl_list_files(&posix)?;
+            return Ok(build_index_from_rels(root, rels));
+        }
+    }
+
     if !root.is_dir() {
         return Err(format!("not a directory: {}", root.display()));
     }
@@ -534,8 +742,32 @@ fn search_index(index: &ProjectIndex, query: &str, limit: usize) -> Vec<FileHit>
     scored
 }
 
-/// Shallow directory listing: directories first, then files, each alphabetical.
+/// Shallow directory listing for the tree view.
+///
+/// On Windows, when the caller hands us a native POSIX/WSL path (`/home/...`),
+/// we list it **natively inside WSL** via [`wsl_list_dir`] rather than reading it
+/// over the `\\wsl.localhost\` UNC bridge. Cold UNC directory reads over the 9P
+/// bridge take seconds each; a native `wsl.exe` listing is essentially instant.
+/// Anything else (a real Windows path on Windows, or any path on unix) falls
+/// through to the native [`read_dir_shallow_fs`] over `std::fs`.
 fn read_dir_shallow(dir: &Path) -> Result<Vec<DirEntry>, String> {
+    #[cfg(windows)]
+    {
+        // Detect a POSIX-absolute path the way `to_host_path` does. The path
+        // arrives here already routed through `normalize`/`to_host_path`, so a
+        // WSL path is now in UNC form (`\\wsl.localhost\<distro>\home\...`). We
+        // peel the UNC prefix back off to a POSIX path and list it inside WSL.
+        if let Some(posix) = unc_to_posix(dir) {
+            return wsl_list_dir(&posix);
+        }
+    }
+    read_dir_shallow_fs(dir)
+}
+
+/// Native `std::fs` shallow listing: directories first, then files, each
+/// alphabetical. The instant path on unix; the UNC-over-9P (slow) path on
+/// Windows for any non-WSL Windows path.
+fn read_dir_shallow_fs(dir: &Path) -> Result<Vec<DirEntry>, String> {
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()));
     }
