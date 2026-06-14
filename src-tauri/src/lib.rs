@@ -13,6 +13,7 @@ mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.
 mod model; // data-model structs (PRD §8)
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
 mod theme; // live theming contract: get_theme/set_theme + theme://changed (MCP-facing)
+mod tray; // system-tray icon + close-to-tray (hide instead of quit) (#17)
 
 use agent::AgentBridge;
 use claude::StatusBridge;
@@ -141,8 +142,17 @@ pub fn run() {
             // failure is logged and does not abort startup (the channel is
             // optional, like the agent bridge).
             start_control_listener(&state);
+            // Install the system-tray icon + menu (#17). A tray build failure is
+            // logged and does not abort startup; the app remains usable via its
+            // window (close-to-tray still works regardless via on_window_event).
+            if let Err(e) = tray::build(app.handle()) {
+                eprintln!("termhub: failed to build system tray: {e}");
+            }
             Ok(())
         })
+        // Closing the main window hides it to the tray instead of quitting; only
+        // the tray's "Quit" exits the app (#17).
+        .on_window_event(tray::on_window_event)
         .invoke_handler(tauri::generate_handler![
             // 0.1 nucleus
             commands::spawn_terminal,
