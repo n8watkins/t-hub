@@ -21,7 +21,7 @@
 // session and any agent stay attached and alive.
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { TerminalId, TerminalState } from "../ipc/types";
-import { useWorkspace } from "../store/workspace";
+import { useWorkspace, deriveLabel } from "../store/workspace";
 import { useTheme } from "../store/theme";
 import { killTerminal } from "../ipc/client";
 import { useTerminalSlot } from "./TerminalPool";
@@ -82,6 +82,9 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
   const slotRef = useTerminalSlot(terminalId);
   // Subscribe to just this terminal's record so the header reflects live state.
   const info = useWorkspace((s) => s.terminals[terminalId]);
+  // The user-set label (if any) for this terminal; the highest-priority input to
+  // the friendly display name. Subscribed so an inline rename re-renders the head.
+  const userLabel = useWorkspace((s) => s.labels[terminalId]);
   const moveTile = useWorkspace((s) => s.moveTile);
   const moveTileToTab = useWorkspace((s) => s.moveTileToTab);
   const setDraggingTile = useWorkspace((s) => s.setDraggingTile);
@@ -97,8 +100,18 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
   const showTileHeader = useTheme((s) => s.active.chrome.showTileHeader);
 
   const state: TerminalState = info?.state ?? "starting";
-  const title = info?.title ?? terminalId;
   const cwd = info?.cwd ?? "";
+  // Friendly display name (user label > derived preset·cwd > short id). The short
+  // id (terminalId) is always shown as a dimmed secondary detail beside it.
+  const label = deriveLabel({
+    id: terminalId,
+    label: userLabel,
+    title: info?.title,
+    cwd: info?.cwd,
+  });
+  // True when the friendly label IS just the short id (no preset/cwd/label to go
+  // on) — then we don't repeat the id as a secondary detail.
+  const showShortId = label !== terminalId;
 
   const isSelfDragging = draggingTileId === terminalId;
   const isDropTarget = dropTileId === terminalId && draggingTileId !== terminalId;
@@ -118,7 +131,7 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
         // A floating frame of the tile that follows the cursor (clear "I'm
         // carrying this tile" feedback the dimmed source alone doesn't give).
         ghost = createDragGhost({
-          title,
+          title: label,
           subtitle: cwd || undefined,
           width: 240,
           bodyHeight: 120,
@@ -210,9 +223,21 @@ export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
           aria-label={state}
           title={`Terminal state: ${state}`}
         />
+        {/* Friendly label, prominent; the raw 8-char id follows it faint as a
+            secondary detail so the session id stays discoverable without being
+            the headline (only shown when the label isn't already just that id). */}
         <span className="truncate" style={{ color: "var(--th-fg)" }}>
-          {title}
+          {label}
         </span>
+        {showShortId && (
+          <span
+            className="shrink-0 font-mono text-[0.85em]"
+            style={{ color: "var(--th-fg-muted)" }}
+            title={`Session ${terminalId}`}
+          >
+            {terminalId}
+          </span>
+        )}
         {showCwd && cwd && (
           <span
             className="min-w-0 flex-1 truncate"

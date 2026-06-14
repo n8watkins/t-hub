@@ -57,6 +57,11 @@ interface PersistedLayout {
   activeTabId: string;
   focusedId: TerminalId | null;
   fontSize: number;
+  /** User-set per-terminal labels (#labels), keyed by terminal id. Frontend-only
+   *  state — NOT part of the backend TerminalInfo contract — so it is persisted
+   *  here alongside the layout rather than re-fetched. Absent ids fall back to a
+   *  derived label (see deriveLabel). */
+  labels: Record<TerminalId, string>;
   /** Full records of tabs torn off into their own satellite window (#21). They
    *  are removed from `tabs` (so the strip + canvas don't render them — exactly
    *  one window renders a given tab; two attached tmux clients would interleave)
@@ -76,6 +81,10 @@ interface WorkspaceState {
   focusedId: TerminalId | null;
   /** Global terminal font size in px, applied to every tile equally (persisted). */
   fontSize: number;
+  /** User-set per-terminal labels keyed by id (#labels, persisted). A friendly
+   *  display name is derived via `deriveLabel`; this map is the highest-priority
+   *  input (an explicit rename). Empty until the user labels something. */
+  labels: Record<TerminalId, string>;
   /** Full records of tabs popped out into their own window (#21), removed from
    *  `tabs` so they don't render here. The main window holds the popped-out tabs
    *  while a satellite renders each; resynced live across windows via windows.ts
@@ -103,6 +112,10 @@ interface WorkspaceState {
   setFocus: (id: TerminalId) => void;
   /** Update a terminal's lifecycle state from a terminal://state event. */
   updateState: (id: TerminalId, state: TerminalState) => void;
+  /** Set (or, with a blank value, clear) the user label for a terminal (#labels).
+   *  A blank/whitespace value removes the override so the derived label takes over
+   *  again; the trimmed value is stored otherwise. Persisted. */
+  setTerminalLabel: (id: TerminalId, label: string) => void;
 
   // --- Tabs (PRD §5.2) ---
   /** Create a new empty tab (auto-named) and activate it; returns its id. */
@@ -185,6 +198,81 @@ function shortenId(id: string): string {
   return id.length > 8 && id.includes("-") ? id.slice(0, 8) : id;
 }
 
+/**
+ * Inputs `deriveLabel` reads to build a friendly terminal name. This is a thin
+ * shape over what the store already knows about a session (`TerminalInfo` plus
+ * the optional user label) — the single extension point for richer signals: when
+ * the backend starts reporting a live foreground command / status payload, add
+ * the field here and read it in `deriveLabel`; no display site changes.
+ */
+export interface LabelSource {
+  /** The 8-char tmux session id (the raw value we're replacing in the UI). */
+  id: TerminalId;
+  /** Explicit user label (highest priority), if the user renamed this terminal. */
+  label?: string;
+  /** Backend `TerminalInfo.title`: the spawn preset/command/name at spawn, but on
+   *  a reload it degrades to the tmux session name (`th_<id>`) or the generic
+   *  "terminal"/id — so it is only used when it carries real signal (see below). */
+  title?: string;
+  /** Backend working directory; its basename is the cwd part of a derived label. */
+  cwd?: string;
+}
+
+/** Final path segment of a (possibly trailing-slashed) cwd, or "" if none. POSIX
+ *  and Windows separators both split so a WSL or native path yields a basename. */
+function cwdBasename(cwd: string | undefined): string {
+  if (!cwd) return "";
+  const parts = cwd.replace(/[/\\]+$/, "").split(/[/\\]+/);
+  const last = parts[parts.length - 1] ?? "";
+  return last === "~" ? "" : last;
+}
+
+/**
+ * The "command/preset" part of a derived label, drawn from the backend title.
+ * Returns "" when the title carries no real signal — i.e. when it is empty, the
+ * raw id, the tmux session name (`th_<id>`, which `list_terminals` uses as the
+ * title on reload), or the generic spawn fallback "terminal". Otherwise the title
+ * IS a meaningful preset/command/name (e.g. `claude`, `zsh`) and is used as-is.
+ */
+function commandPart(id: TerminalId, title: string | undefined): string {
+  const t = (title ?? "").trim();
+  if (!t) return "";
+  if (t === id || t === `th_${id}` || t.toLowerCase() === "terminal") return "";
+  return t;
+}
+
+/**
+ * Derive a human-friendly terminal label from what the store knows, in priority
+ * order (PRD #labels):
+ *   1. an explicit user label (a rename), used verbatim;
+ *   2. a label derived from the spawn preset/command and/or the cwd basename,
+ *      e.g. `claude · tools`, `zsh · n8builds`, or just one part if only one is
+ *      known;
+ *   3. the short 8-char id as a last resort.
+ * Pure + exported so the display sites (Tile/Titlebar/Sidebar) and any test share
+ * one definition; the short id is always available separately for the dimmed
+ * secondary detail, so callers render `deriveLabel(src)` prominently with `src.id`
+ * faint next to it.
+ */
+export function deriveLabel(src: LabelSource): string {
+  const user = (src.label ?? "").trim();
+  if (user) return user;
+  const cmd = commandPart(src.id, src.title);
+  const dir = cwdBasename(src.cwd);
+  if (cmd && dir) return `${cmd} · ${dir}`;
+  return cmd || dir || src.id;
+}
+
+/** Sanitize a parsed labels map: keep only string→non-empty-string pairs. */
+function cleanLabels(value: unknown): Record<TerminalId, string> {
+  if (!value || typeof value !== "object") return {};
+  const out: Record<TerminalId, string> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof v === "string" && v.trim()) out[shortenId(k)] = v.trim();
+  }
+  return out;
+}
+
 /** Sanitize an arbitrary parsed value into a clean order array of string ids. */
 function cleanOrder(value: unknown): TerminalId[] {
   return Array.isArray(value)
@@ -238,6 +326,7 @@ function defaultLayout(): PersistedLayout {
     activeTabId: "",
     focusedId: null,
     fontSize: DEFAULT_FONT_SIZE,
+    labels: {},
     poppedOutTabs: [],
   };
 }
@@ -297,6 +386,7 @@ function parseV2Snapshot(raw: string | null | undefined): PersistedLayout | null
         typeof parsed.fontSize === "number"
           ? parsed.fontSize
           : DEFAULT_FONT_SIZE,
+      labels: cleanLabels(parsed.labels),
       poppedOutTabs: cleanTabs(parsed.poppedOutTabs),
     });
   } catch {
@@ -349,6 +439,7 @@ function loadPersisted(): PersistedLayout {
           typeof parsed.fontSize === "number"
             ? parsed.fontSize
             : DEFAULT_FONT_SIZE,
+        labels: {},
         poppedOutTabs: [],
       });
     }
@@ -435,6 +526,9 @@ function scopeToSatellite(layout: PersistedLayout, tabId: string): PersistedLayo
     activeTabId: own.id,
     focusedId: own.order[0] ?? null,
     fontSize: layout.fontSize,
+    // Carry the full label map: it's tiny metadata and the satellite only renders
+    // its own terminals, so the extra entries are inert but keep labels consistent.
+    labels: layout.labels,
     poppedOutTabs: [], // a satellite tracks only its own (visible) tab
   };
 }
@@ -498,8 +592,16 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
   // clobber the shared snapshot the main window owns.
   const persist = () => {
     if (SATELLITE_TAB) return;
-    const { tabs, activeTabId, focusedId, fontSize, poppedOutTabs } = get();
-    savePersisted({ tabs, activeTabId, focusedId, fontSize, poppedOutTabs });
+    const { tabs, activeTabId, focusedId, fontSize, labels, poppedOutTabs } =
+      get();
+    savePersisted({
+      tabs,
+      activeTabId,
+      focusedId,
+      fontSize,
+      labels,
+      poppedOutTabs,
+    });
   };
 
   /** The active tab (always present: the store guarantees >=1 tab). */
@@ -514,6 +616,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     activeTabId: initial.activeTabId,
     focusedId: initial.focusedId,
     fontSize: initial.fontSize,
+    labels: initial.labels,
     poppedOutTabs: initial.poppedOutTabs,
     draggingTileId: null,
     draggingTabId: null,
@@ -644,6 +747,23 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
           [id]: { id, tmuxSession: `th_${id}`, cwd: "", title: id, state },
         },
       });
+    },
+
+    setTerminalLabel: (id, label) => {
+      const trimmed = label.trim();
+      const { labels } = get();
+      // Blank clears the override (derived label takes back over); no-op if the
+      // value is unchanged so a redundant set doesn't thrash subscribers/persist.
+      if (!trimmed) {
+        if (!(id in labels)) return;
+        const next = { ...labels };
+        delete next[id];
+        set({ labels: next });
+      } else {
+        if (labels[id] === trimmed) return;
+        set({ labels: { ...labels, [id]: trimmed } });
+      }
+      persist();
     },
 
     addTab: () => {
@@ -939,10 +1059,17 @@ async function hydrateFromBackend(): Promise<void> {
     if (!snapshot) {
       // Nothing durable yet: seed SQLite once from the current (localStorage-
       // derived) layout so subsequent boots can prefer the durable copy.
-      const { tabs, activeTabId, focusedId, fontSize, poppedOutTabs } =
+      const { tabs, activeTabId, focusedId, fontSize, labels, poppedOutTabs } =
         useWorkspace.getState();
       saveToBackend(
-        JSON.stringify({ tabs, activeTabId, focusedId, fontSize, poppedOutTabs }),
+        JSON.stringify({
+          tabs,
+          activeTabId,
+          focusedId,
+          fontSize,
+          labels,
+          poppedOutTabs,
+        }),
       );
       return;
     }
@@ -962,6 +1089,7 @@ async function hydrateFromBackend(): Promise<void> {
       activeTabId: layout.activeTabId,
       focusedId: layout.focusedId,
       fontSize: layout.fontSize,
+      labels: layout.labels,
       poppedOutTabs: layout.poppedOutTabs,
     });
     // Re-mirror to localStorage so both copies agree after adopting SQLite.
@@ -970,6 +1098,7 @@ async function hydrateFromBackend(): Promise<void> {
       activeTabId: layout.activeTabId,
       focusedId: layout.focusedId,
       fontSize: layout.fontSize,
+      labels: layout.labels,
       poppedOutTabs: layout.poppedOutTabs,
     });
   } catch {
