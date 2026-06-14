@@ -8,11 +8,20 @@
 //! stdin EOF). Every reply preserves the request's [`Channel`].
 //!
 //! ## Live journal streaming
-//! A dedicated tail thread polls `journal.head_seq()` every ~200 ms. When the
-//! head advances past `streamed_cursor` it calls `journal.replay(streamed_cursor)`
-//! and emits new entries as `AgentFrame { channel: Events, msg: Journal { … } }`
-//! frames. `streamed_cursor` is initialised to the head_seq at startup so we
-//! stream ONLY new entries (the core uses ReplayJournal for historical backfill).
+//! A dedicated tail thread polls `journal.head_seq_on_disk()` every ~200 ms.
+//! When the head advances past `streamed_cursor` it calls
+//! `journal.replay(streamed_cursor)` and emits new entries as
+//! `AgentFrame { channel: Events, msg: Journal { … } }` frames. `streamed_cursor`
+//! is initialised to the head seq at startup so we stream ONLY new entries (the
+//! core uses ReplayJournal for historical backfill).
+//!
+//! **Why `head_seq_on_disk`, not `head_seq`:** the journal's in-memory head is
+//! only bumped by *this* process's appends, but the live event spine's writers
+//! are the short-lived `--hook` ingest processes, which append to the file
+//! out-of-process. The tail must therefore observe the file's growth, or it
+//! would never stream a single hook event live (it would only ever see them on
+//! the core's next reconnect+replay). Re-scanning a small append-only NDJSON
+//! file every 200 ms is cheap and, unlike inotify, reliable on WSL2.
 //!
 //! Both the request/response path and the tail thread write through a single
 //! shared mpsc sender. A dedicated writer thread owns stdout and serialises all
@@ -79,8 +88,10 @@ pub fn serve_stdio(journal: Arc<Journal>) -> Result<()> {
         let journal_arc = Arc::clone(&journal);
         let tail_tx = tx.clone();
         let stop = Arc::clone(&tail_stop);
-        // Start streaming from NOW (core does ReplayJournal for historical backfill).
-        let initial_cursor = journal_arc.head_seq();
+        // Start streaming from NOW (core does ReplayJournal for historical
+        // backfill). Use the on-disk head so we account for any hook entries
+        // already on disk at startup and don't re-stream them.
+        let initial_cursor = journal_arc.head_seq_on_disk();
 
         std::thread::spawn(move || {
             let mut streamed_cursor = initial_cursor;
@@ -89,7 +100,9 @@ pub fn serve_stdio(journal: Arc<Journal>) -> Result<()> {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let head = journal_arc.head_seq();
+                // Observe the FILE (cross-process hook appends), not just our
+                // in-memory head — otherwise live hook events never stream.
+                let head = journal_arc.head_seq_on_disk();
                 if head <= streamed_cursor {
                     continue;
                 }

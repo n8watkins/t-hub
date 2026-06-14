@@ -115,8 +115,32 @@ impl Journal {
     }
 
     /// The current head sequence (highest appended seq; 0 when empty).
+    ///
+    /// This is the **in-memory** head, bumped only by this process's
+    /// [`Journal::append`] calls. It does NOT observe entries appended to the
+    /// file by *other* processes (notably the short-lived `--hook` ingest
+    /// processes, which are the live event spine's primary writers). For live
+    /// tailing of cross-process appends use [`Journal::head_seq_on_disk`].
     pub fn head_seq(&self) -> u64 {
         self.inner.lock().expect("journal mutex poisoned").head_seq
+    }
+
+    /// The head sequence as observed **on disk**, re-scanning the file to count
+    /// complete, parseable lines — so it sees entries appended by *other*
+    /// processes (the `--hook` ingest path). Advances the in-memory `head_seq`
+    /// to match (never backwards) so a subsequent [`Journal::replay`] /
+    /// [`Journal::head_seq`] is consistent with what the tail just observed.
+    ///
+    /// This is what makes the hook → journal → agent → core spine truly *live*:
+    /// a hook fired by Claude is a separate process that appends to the file; the
+    /// long-lived `--stdio` agent's tail thread polls this to notice the growth.
+    pub fn head_seq_on_disk(&self) -> u64 {
+        let on_disk = Self::recover_head_seq(&self.path).unwrap_or(0);
+        let mut guard = self.inner.lock().expect("journal mutex poisoned");
+        if on_disk > guard.head_seq {
+            guard.head_seq = on_disk;
+        }
+        guard.head_seq
     }
 
     /// The on-disk path of the log file (for diagnostics / `--hook` ingest path).
@@ -264,6 +288,36 @@ mod tests {
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].seq, 4);
         assert_eq!(tail[1].seq, 5);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn head_seq_on_disk_observes_other_process_appends() {
+        // Two separate Journal handles on the same dir model the two processes:
+        // `writer` is a short-lived --hook process; `tailer` is the long-lived
+        // --stdio agent. The tailer's in-memory head must NOT see the writer's
+        // appends, but head_seq_on_disk() must.
+        let dir = temp_dir("disk-head");
+        let tailer = Journal::open(&dir).unwrap();
+        assert_eq!(tailer.head_seq(), 0);
+        assert_eq!(tailer.head_seq_on_disk(), 0);
+
+        {
+            let writer = Journal::open(&dir).unwrap();
+            writer.append(entry(JournalEventType::SessionStart, "s1")).unwrap();
+            writer.append(entry(JournalEventType::Stop, "s1")).unwrap();
+        }
+
+        // In-memory head is stale (this handle never appended).
+        assert_eq!(tailer.head_seq(), 0, "in-memory head must not see other-process appends");
+        // On-disk head observes the file growth...
+        assert_eq!(tailer.head_seq_on_disk(), 2, "disk head must see the 2 appended entries");
+        // ...and advances the in-memory head so a follow-up replay is consistent.
+        assert_eq!(tailer.head_seq(), 2);
+        let streamed = tailer.replay(0).unwrap();
+        assert_eq!(streamed.len(), 2);
+        assert_eq!(streamed[1].event_type, JournalEventType::Stop);
 
         std::fs::remove_dir_all(&dir).ok();
     }
