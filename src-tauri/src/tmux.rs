@@ -210,7 +210,15 @@ pub fn kill_session(name: &str) -> Result<(), TmuxError> {
 /// or the last one was killed and the server exited) by returning an empty Vec
 /// rather than an error.
 pub fn list_sessions() -> Result<Vec<String>, TmuxError> {
-    let output = tmux(&["list-sessions", "-F", "#{session_name}"])
+    // NB: we deliberately do NOT use `-F '#{session_name}'`. On Windows every
+    // tmux command is routed through `wsl.exe`, where the leading `#` of a tmux
+    // format string is swallowed as a shell comment — leaving `list-sessions -F`
+    // with no argument ("-F expects an argument") and breaking the whole live
+    // terminal list (cwd/labels/status). The default `list-sessions` output is
+    // `<name>: <window/size info>`; tmux forbids `:` in session names, so the
+    // name is everything before the first colon. This needs no format argument
+    // and survives the wsl.exe round-trip intact.
+    let output = tmux(&["list-sessions"])
         .output()
         .map_err(|e| TmuxError {
             op: "list-sessions",
@@ -221,8 +229,18 @@ pub fn list_sessions() -> Result<Vec<String>, TmuxError> {
     if output.status.success() {
         let names = String::from_utf8_lossy(&output.stdout)
             .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
+            .filter_map(|l| {
+                let l = l.trim();
+                if l.is_empty() {
+                    return None;
+                }
+                let name = l.split_once(':').map(|(n, _)| n).unwrap_or(l).trim();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                }
+            })
             .collect();
         return Ok(names);
     }

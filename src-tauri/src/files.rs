@@ -226,6 +226,20 @@ impl FileIndexState {
 /// fall back to the host path as given so error messages stay meaningful.
 fn normalize(path: &str) -> PathBuf {
     let host = to_host_path(path);
+    // On Windows, do NOT canonicalize a WSL UNC path. `std::fs::canonicalize`
+    // rewrites `\\wsl.localhost\<distro>\...` into the verbatim extended form
+    // `\\?\UNC\wsl.localhost\<distro>\...`, which the fast-path detector
+    // (`unc_to_posix`) doesn't recognize — silently forcing list_dir/index back
+    // onto the slow `std::fs` UNC read. Keep the clean `\\wsl.localhost\` form so
+    // the native-WSL fast path stays in play. (canonicalize only resolved
+    // symlinks/`..`, which the WSL-side `find`/`rg` handle themselves.)
+    #[cfg(windows)]
+    {
+        let s = host.to_string_lossy();
+        if s.starts_with("\\\\wsl.localhost\\") || s.starts_with("\\\\wsl$\\") {
+            return host;
+        }
+    }
     std::fs::canonicalize(&host).unwrap_or(host)
 }
 
@@ -299,6 +313,17 @@ fn unc_to_posix(path: &Path) -> Option<String> {
     if s.starts_with('/') {
         return Some(s.into_owned());
     }
+    // Peel a verbatim extended-length prefix first (`std::fs::canonicalize`
+    // emits these): `\\?\UNC\wsl.localhost\...` -> `\\wsl.localhost\...`, and a
+    // plain `\\?\C:\...` -> `C:\...` (which then won't match the WSL prefixes
+    // below and correctly returns None for a real drive path).
+    let s: std::borrow::Cow<str> = if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
+        std::borrow::Cow::Owned(format!("\\\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix("\\\\?\\") {
+        std::borrow::Cow::Owned(rest.to_string())
+    } else {
+        s
+    };
     // Strip a `\\wsl.localhost\<distro>` or `\\wsl$\<distro>` prefix.
     for prefix in ["\\\\wsl.localhost\\", "\\\\wsl$\\"] {
         if let Some(rest) = s.strip_prefix(prefix) {

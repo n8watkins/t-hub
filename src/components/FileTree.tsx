@@ -36,7 +36,7 @@ import {
   useEffect,
   useState,
 } from "react";
-import { indexProject, listDir, searchFiles } from "../ipc/files";
+import { listDir, searchFiles } from "../ipc/files";
 import type { DirEntry, FileHit } from "../ipc/types";
 import { FilePanel } from "./FilePanel";
 
@@ -100,36 +100,19 @@ export function FileTree({
     indexState.status === "ready" ? indexState.root : (root ?? "");
   const selectedPath = activePath ?? (onOpenFile ? null : internalPath);
 
-  // Reset transient UI when the root changes, and kick the index off in the
-  // BACKGROUND. We do NOT block the tree on this — the tree renders straight
-  // from list_dir below. The index exists purely to power search.
+  // Reset transient UI when the root changes. We deliberately do NOT index here.
+  // The tree renders straight from shallow list_dir calls (instant, per-folder);
+  // a full-tree index only exists to power SEARCH, and walking a big root (e.g.
+  // all of ~/n8builds) on every mount made the panel feel like it was "indexing
+  // everything at once". So indexing is now lazy — it runs on the FIRST search
+  // (searchFiles builds the index on demand server-side; see the search effect),
+  // not on mount. Browsing folders never triggers it.
   useEffect(() => {
-    let cancelled = false;
     setQuery("");
     setHits([]);
     setSearching(false);
     setInternalPath(null);
-    if (!root) {
-      setIndexState({ status: "idle" });
-      return;
-    }
-    setIndexState({ status: "indexing" });
-    indexProject(root)
-      .then((summary) => {
-        if (cancelled) return;
-        setIndexState({
-          status: "ready",
-          count: summary.count,
-          root: summary.root,
-        });
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        setIndexState({ status: "error", message: String(e) });
-      });
-    return () => {
-      cancelled = true;
-    };
+    setIndexState({ status: "idle" });
   }, [root]);
 
   // Open a file: hand it to the host, or track it internally for the embedded
