@@ -196,9 +196,28 @@ function GeneralSection() {
   const setTitlebarHideDelayMs = useSettings((s) => s.setTitlebarHideDelayMs);
   const titlebarRevealAnimMs = useSettings((s) => s.titlebarRevealAnimMs);
   const setTitlebarRevealAnimMs = useSettings((s) => s.setTitlebarRevealAnimMs);
+  const soundsEnabled = useSettings((s) => s.soundsEnabled);
+  const setSoundsEnabled = useSettings((s) => s.setSoundsEnabled);
+  const notificationsEnabled = useSettings((s) => s.notificationsEnabled);
+  const setNotificationsEnabled = useSettings((s) => s.setNotificationsEnabled);
 
   return (
     <>
+      <Group title="Notifications">
+        <SettingToggleRow
+          label="Notification sounds"
+          hint="Play a short chime on key session events — a soft cue when a session needs your input or finishes, and an alert when one errors out."
+          value={soundsEnabled}
+          onChange={setSoundsEnabled}
+        />
+        <SettingToggleRow
+          label="Desktop notifications"
+          hint="Show an OS notification for the same session events. Requires the notification plugin; falls back to sound-only if it isn't available."
+          value={notificationsEnabled}
+          onChange={setNotificationsEnabled}
+        />
+      </Group>
+
       <Group title="Titlebar">
         <SettingToggleRow
           label="Auto-hide titlebar when maximized"
