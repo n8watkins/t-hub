@@ -9,10 +9,13 @@
 //     ratios, persisted per tab (PRD §5.3 resize). Each gutter has a wide,
 //     invisible hit zone with a thin visible indicator for easy grabbing.
 //   - Shell v2 tab persistence: EVERY tab stays mounted at all times. The active
-//     tab is shown and inactive tabs are hidden with CSS `display:none`, while
-//     ALL tiles render with visible=true — so xterm/PTY clients stay attached in
-//     the background and switching tabs never tears down / reloads a terminal.
-//     Terminal.tsx's ResizeObserver refits a tile when its tab is shown again.
+//     tab is shown and inactive tabs are hidden with CSS `display:none`.
+//   - #20 terminal pool: each terminal's xterm is rendered ONCE in a persistent,
+//     never-reparented overlay (TerminalPoolProvider) and positioned over its
+//     tile's empty body placeholder. Switching tabs, reordering, resizing, or
+//     moving a tile to another tab only REPOSITIONS the pooled terminal — it is
+//     never unmounted/reattached, so there's no reload/flash. Terminal.tsx's own
+//     ResizeObserver refits a terminal when its positioned box changes size.
 import {
   useCallback,
   useEffect,
@@ -30,6 +33,7 @@ import {
   onState,
 } from "../ipc/client";
 import { Tile } from "./Tile";
+import { TerminalPoolProvider } from "./TerminalPool";
 import type { TerminalId } from "../ipc/types";
 
 /**
@@ -186,32 +190,36 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
       style={{ backgroundColor: "var(--th-app-bg)" }}
     >
       <div className="relative min-h-0 flex-1">
-        {/* Shell v2: every tab stays mounted with visible=true so its xterm/PTY
-            clients persist in the background; only the active tab is displayed,
-            inactive tabs are hidden with display:none (no unmount → no reload). */}
-        {tabs.map((tab) => {
-          const active = tab.id === activeTabId;
-          return (
-            <div
-              key={tab.id}
-              className="absolute inset-0"
-              style={{ display: active ? undefined : "none" }}
-              aria-hidden={!active}
-            >
-              {tab.order.length === 0 ? (
-                <EmptyTab onSpawn={() => void spawn()} />
-              ) : (
-                <TabGrid
-                  tab={tab}
-                  active={active}
-                  focusedId={focusedId}
-                  onFocus={setFocus}
-                  onClose={close}
-                />
-              )}
-            </div>
-          );
-        })}
+        {/* Shell v2 + #20 pool: every tab stays mounted; only the active tab is
+            displayed (inactive tabs are display:none). The tile bodies are EMPTY
+            placeholders — each terminal's xterm is rendered once in the persistent
+            pool overlay (TerminalPoolProvider) and positioned over its current
+            placeholder, so a tab switch / move never unmounts or reloads it. */}
+        <TerminalPoolProvider>
+          {tabs.map((tab) => {
+            const active = tab.id === activeTabId;
+            return (
+              <div
+                key={tab.id}
+                className="absolute inset-0"
+                style={{ display: active ? undefined : "none" }}
+                aria-hidden={!active}
+              >
+                {tab.order.length === 0 ? (
+                  <EmptyTab onSpawn={() => void spawn()} />
+                ) : (
+                  <TabGrid
+                    tab={tab}
+                    active={active}
+                    focusedId={focusedId}
+                    onFocus={setFocus}
+                    onClose={close}
+                  />
+                )}
+              </div>
+            );
+          })}
+        </TerminalPoolProvider>
       </div>
 
       {/* Persistent affordance to add more terminals to the active tab. */}
@@ -562,9 +570,8 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
                   <Tile
                     terminalId={id}
                     focused={active && id === focusedId}
-                    // Shell v2: keep xterm mounted even on inactive tabs so
-                    // switching tabs never reloads a terminal.
-                    visible={true}
+                    // #20: the xterm body lives in the persistent pool overlay,
+                    // not in the tile — the tile renders header + placeholder.
                     onFocus={() => onFocus(id)}
                     onClose={() => onClose(id)}
                   />

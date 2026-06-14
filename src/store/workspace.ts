@@ -57,6 +57,12 @@ interface PersistedLayout {
   activeTabId: string;
   focusedId: TerminalId | null;
   fontSize: number;
+  /** Full records of tabs torn off into their own satellite window (#21). They
+   *  are removed from `tabs` (so the strip + canvas don't render them — exactly
+   *  one window renders a given tab; two attached tmux clients would interleave)
+   *  but kept here so their name/order/sizes survive and can be re-adopted when
+   *  the satellite closes. Empty in the common single-window case. */
+  poppedOutTabs: WorkspaceTab[];
 }
 
 interface WorkspaceState {
@@ -70,6 +76,12 @@ interface WorkspaceState {
   focusedId: TerminalId | null;
   /** Global terminal font size in px, applied to every tile equally (persisted). */
   fontSize: number;
+  /** Full records of tabs popped out into their own window (#21), removed from
+   *  `tabs` so they don't render here. The main window holds the popped-out tabs
+   *  while a satellite renders each; resynced live across windows via windows.ts
+   *  + persisted so a relaunch restores the split. Empty in the single-window
+   *  case and (effectively) in a satellite, which only knows its own tab. */
+  poppedOutTabs: WorkspaceTab[];
   /** Pointer-drag state (transient, never persisted). TermHub's drag-and-drop is
    *  built on pointer events + `elementFromPoint` rather than HTML5 DnD, which is
    *  unreliable over xterm's WebGL canvas in WebView2. `draggingTileId` /
@@ -107,6 +119,17 @@ interface WorkspaceState {
   cycleTab: (dir: 1 | -1) => void;
   /** Reorder the tab strip: move tab `id` to occupy `targetId`'s slot. */
   moveTab: (id: string, targetId: string) => void;
+
+  // --- Multi-window tear-off (#21) ---
+  /** Pop a tab out into its own window: move its record from `tabs` into
+   *  `poppedOutTabs`, so this (main) window stops rendering it. Idempotent.
+   *  Re-points activeTabId to a still-visible tab if the popped one was active.
+   *  Callers (windows.ts) also spawn the satellite + broadcast the resync. */
+  popOutTab: (id: string) => void;
+  /** Re-adopt a popped-out tab back into `tabs` (e.g. when its satellite closes).
+   *  Restores the provided record (the satellite's latest order/name), or the
+   *  stashed one if `tab` is omitted. Idempotent; no-op for an unknown id. */
+  popInTab: (id: string, tab?: WorkspaceTab) => void;
 
   // --- Manual layout (PRD §5.3) ---
   /** Reorder tiles within the active tab: pull `id` out and re-insert it at
@@ -185,6 +208,25 @@ function cleanSizes(value: unknown): TabSizes | undefined {
   return { rows, cols };
 }
 
+/** Sanitize one parsed tab record (id/name/order/sizes) into a clean WorkspaceTab. */
+function cleanTab(t: Partial<WorkspaceTab>): WorkspaceTab {
+  return {
+    id: typeof t.id === "string" && t.id ? t.id : newTabId(),
+    name: typeof t.name === "string" && t.name ? t.name : "Workspace",
+    order: cleanOrder(t.order),
+    sizes: cleanSizes(t.sizes),
+  };
+}
+
+/** Sanitize a parsed array of tab records (drops non-objects). */
+function cleanTabs(value: unknown): WorkspaceTab[] {
+  return Array.isArray(value)
+    ? value
+        .filter((t): t is Partial<WorkspaceTab> => !!t && typeof t === "object")
+        .map(cleanTab)
+    : [];
+}
+
 /** Build the default single-tab layout (empty canvas). */
 function defaultLayout(): PersistedLayout {
   return {
@@ -192,6 +234,7 @@ function defaultLayout(): PersistedLayout {
     activeTabId: "",
     focusedId: null,
     fontSize: DEFAULT_FONT_SIZE,
+    poppedOutTabs: [],
   };
 }
 
@@ -209,8 +252,21 @@ function loadPersisted(): PersistedLayout {
   }
 
   const finalize = (layout: PersistedLayout): PersistedLayout => {
+    // A popped-out tab id must never also appear in `tabs` (it would render in
+    // two places). Drop any popped record whose id collides with a visible tab.
+    const visibleIds = new Set(layout.tabs.map((t) => t.id));
+    layout.poppedOutTabs = (layout.poppedOutTabs ?? []).filter(
+      (t) => !visibleIds.has(t.id),
+    );
+    // Keep >=1 tab. If EVERY tab is currently popped out (all windows are
+    // satellites of the same set), re-adopt the first popped one so the main
+    // window still has a canvas; its satellite's resync will hide it again.
     if (layout.tabs.length === 0) {
-      layout.tabs = [{ id: newTabId(), name: DEFAULT_TAB_NAME, order: [] }];
+      if (layout.poppedOutTabs.length > 0) {
+        layout.tabs = [layout.poppedOutTabs.shift()!];
+      } else {
+        layout.tabs = [{ id: newTabId(), name: DEFAULT_TAB_NAME, order: [] }];
+      }
     }
     if (!layout.tabs.some((t) => t.id === layout.activeTabId)) {
       layout.activeTabId = layout.tabs[0].id;
@@ -228,18 +284,8 @@ function loadPersisted(): PersistedLayout {
     const raw = localStorage.getItem(PERSIST_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<PersistedLayout>;
-      const tabs: WorkspaceTab[] = Array.isArray(parsed.tabs)
-        ? parsed.tabs
-            .filter((t): t is WorkspaceTab => !!t && typeof t === "object")
-            .map((t) => ({
-              id: typeof t.id === "string" && t.id ? t.id : newTabId(),
-              name: typeof t.name === "string" && t.name ? t.name : "Workspace",
-              order: cleanOrder(t.order),
-              sizes: cleanSizes(t.sizes),
-            }))
-        : [];
       return finalize({
-        tabs,
+        tabs: cleanTabs(parsed.tabs),
         activeTabId:
           typeof parsed.activeTabId === "string" ? parsed.activeTabId : "",
         focusedId:
@@ -250,6 +296,7 @@ function loadPersisted(): PersistedLayout {
           typeof parsed.fontSize === "number"
             ? parsed.fontSize
             : DEFAULT_FONT_SIZE,
+        poppedOutTabs: cleanTabs(parsed.poppedOutTabs),
       });
     }
   } catch {
@@ -282,6 +329,7 @@ function loadPersisted(): PersistedLayout {
           typeof parsed.fontSize === "number"
             ? parsed.fontSize
             : DEFAULT_FONT_SIZE,
+        poppedOutTabs: [],
       });
     }
   } catch {
@@ -299,6 +347,67 @@ function savePersisted(layout: PersistedLayout): void {
   } catch {
     /* ignore */
   }
+}
+
+/**
+ * The tab id this window was opened to render in isolation (the `?tab=<id>` URL
+ * param), or null for the main window (#21). Read directly here — rather than
+ * importing src/lib/windows.ts — to avoid an import cycle (windows.ts imports
+ * this store). A SATELLITE window:
+ *   - keeps ONLY its own tab in `tabs`, so the shared Canvas renders just that
+ *     one canvas and only its terminals attach (the main window renders the
+ *     rest; two tmux clients on one session would interleave); and
+ *   - does NOT persist, so its pruned 1-tab view never clobbers the shared
+ *     localStorage snapshot the MAIN window owns.
+ */
+function satelliteTabId(): string | null {
+  if (typeof location === "undefined") return null;
+  try {
+    const id = new URLSearchParams(location.search).get("tab");
+    return id && id.trim() ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Narrow a freshly-loaded layout to a single tab for a satellite window. If the
+ * tab isn't in the snapshot yet (persistence lagged the spawn), synthesize an
+ * empty one so the satellite still has a valid canvas to attach terminals into;
+ * setTerminals() will reconcile the real tile order from the backend.
+ */
+function scopeToSatellite(layout: PersistedLayout, tabId: string): PersistedLayout {
+  // The tab may live in `tabs` or (if the main window already popped it out and
+  // persisted before we booted) in `poppedOutTabs`; check both. Fall back to an
+  // empty tab so the satellite still has a canvas (setTerminals reconciles tiles).
+  const own =
+    layout.tabs.find((t) => t.id === tabId) ??
+    layout.poppedOutTabs.find((t) => t.id === tabId) ??
+    ({ id: tabId, name: "Workspace", order: [] } as WorkspaceTab);
+  return {
+    tabs: [own],
+    activeTabId: own.id,
+    focusedId: own.order[0] ?? null,
+    fontSize: layout.fontSize,
+    poppedOutTabs: [], // a satellite tracks only its own (visible) tab
+  };
+}
+
+/**
+ * On a fresh MAIN-window launch, satellites from a previous run no longer exist
+ * (they are runtime-created by pop-out and never respawned at boot), so any tab
+ * left in `poppedOutTabs` is orphaned -- it would render in no window at all.
+ * Re-adopt every popped tab back into `tabs` so its terminals stay reachable.
+ * Net effect: pop-out is a within-session split; a restart/redeploy returns every
+ * popped tab to the main window (#21 phase 1). No-op when nothing is popped.
+ */
+function adoptOrphans(layout: PersistedLayout): PersistedLayout {
+  if (layout.poppedOutTabs.length === 0) return layout;
+  return {
+    ...layout,
+    tabs: [...layout.tabs, ...layout.poppedOutTabs],
+    poppedOutTabs: [],
+  };
 }
 
 /**
@@ -327,13 +436,24 @@ function tabOf(tabs: WorkspaceTab[], id: TerminalId): WorkspaceTab | undefined {
   return tabs.find((t) => t.order.includes(id));
 }
 
-const initial = loadPersisted();
+// The satellite tab id for THIS window (null in the main window). Captured once
+// at module load: a satellite scopes its initial layout to that one tab and
+// never persists (so it can't overwrite the main window's full snapshot).
+const SATELLITE_TAB = satelliteTabId();
+
+const loaded = loadPersisted();
+const initial = SATELLITE_TAB
+  ? scopeToSatellite(loaded, SATELLITE_TAB)
+  : adoptOrphans(loaded);
 
 export const useWorkspace = create<WorkspaceState>((set, get) => {
-  // Persist the current (tabs, activeTabId, focusedId, fontSize).
+  // Persist the current (tabs, activeTabId, focusedId, fontSize, poppedOutTabs).
+  // Suppressed in a satellite window: it holds only its own tab, so writing would
+  // clobber the shared snapshot the main window owns.
   const persist = () => {
-    const { tabs, activeTabId, focusedId, fontSize } = get();
-    savePersisted({ tabs, activeTabId, focusedId, fontSize });
+    if (SATELLITE_TAB) return;
+    const { tabs, activeTabId, focusedId, fontSize, poppedOutTabs } = get();
+    savePersisted({ tabs, activeTabId, focusedId, fontSize, poppedOutTabs });
   };
 
   /** The active tab (always present: the store guarantees >=1 tab). */
@@ -348,6 +468,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     activeTabId: initial.activeTabId,
     focusedId: initial.focusedId,
     fontSize: initial.fontSize,
+    poppedOutTabs: initial.poppedOutTabs,
     draggingTileId: null,
     draggingTabId: null,
     dropTileId: null,
@@ -358,7 +479,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       for (const t of list) terminals[t.id] = t;
       const liveIds = new Set(list.map((t) => t.id));
 
-      const { tabs, activeTabId } = get();
+      const { tabs, activeTabId, poppedOutTabs } = get();
       // Keep each tab's ordering for ids that still exist; prune dead ids.
       const placed = new Set<TerminalId>();
       const nextTabs = tabs.map((t) => {
@@ -367,10 +488,24 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         return { ...t, order };
       });
 
+      // Popped-out tabs live in other windows but their terminals are still in
+      // the backend's list. Prune their orders to live ids and count them as
+      // PLACED so they aren't yanked back onto this window's active tab below.
+      const nextPopped = poppedOutTabs.map((t) => {
+        const order = t.order.filter((id) => liveIds.has(id));
+        for (const id of order) placed.add(id);
+        return { ...t, order };
+      });
+
       // Any live terminal not already placed in some tab is appended to the
       // active tab (covers first load with pre-existing sessions, or sessions
-      // spawned out-of-band by another surface).
-      const appended = list.map((t) => t.id).filter((id) => !placed.has(id));
+      // spawned out-of-band by another surface). NOT in a satellite window: its
+      // unplaced terminals belong to the OTHER windows' tabs, so adopting them
+      // would drag every session into the satellite. A satellite shows exactly
+      // the tiles its own tab record lists.
+      const appended = SATELLITE_TAB
+        ? []
+        : list.map((t) => t.id).filter((id) => !placed.has(id));
       if (appended.length > 0) {
         const activeIdx = nextTabs.findIndex((t) => t.id === activeTabId);
         const idx = activeIdx >= 0 ? activeIdx : 0;
@@ -386,7 +521,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
           ? get().focusedId
           : active.order[0] ?? null;
 
-      set({ terminals, tabs: nextTabs, focusedId });
+      set({ terminals, tabs: nextTabs, poppedOutTabs: nextPopped, focusedId });
       persist();
     },
 
@@ -554,6 +689,57 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       next.splice(to, 0, moved);
       // Reordering doesn't change which tab is active; activeTabId is untouched.
       set({ tabs: next });
+      persist();
+    },
+
+    popOutTab: (id) => {
+      const { tabs, poppedOutTabs, activeTabId, focusedId } = get();
+      const tab = tabs.find((t) => t.id === id);
+      if (!tab) return; // unknown / already popped out
+      // Move the record out of the rendered set so the strip + canvas drop it.
+      const nextTabs = tabs.filter((t) => t.id !== id);
+      const nextPopped = poppedOutTabs.some((t) => t.id === id)
+        ? poppedOutTabs
+        : [...poppedOutTabs, tab];
+
+      // Keep >=1 rendered tab. If this was the only tab, leave a fresh empty one
+      // so the main window still has a canvas to work with.
+      const renderedTabs =
+        nextTabs.length > 0
+          ? nextTabs
+          : [{ id: newTabId(), name: DEFAULT_TAB_NAME, order: [] }];
+
+      // If the popped tab was active, hand activeness to a still-rendered tab.
+      let nextActive = activeTabId;
+      let nextFocus = focusedId;
+      if (activeTabId === id) {
+        nextActive = renderedTabs[0].id;
+        nextFocus = renderedTabs[0].order[0] ?? null;
+      }
+      set({
+        tabs: renderedTabs,
+        poppedOutTabs: nextPopped,
+        activeTabId: nextActive,
+        focusedId: nextFocus,
+      });
+      persist();
+    },
+
+    popInTab: (id, tab) => {
+      const { tabs, poppedOutTabs } = get();
+      const stashed = poppedOutTabs.find((t) => t.id === id);
+      // Nothing to re-adopt, or it's somehow already visible: clear any stash.
+      if (!stashed && !tab) return;
+      if (tabs.some((t) => t.id === id)) {
+        set({ poppedOutTabs: poppedOutTabs.filter((t) => t.id !== id) });
+        persist();
+        return;
+      }
+      const record = tab ?? stashed!;
+      set({
+        tabs: [...tabs, record],
+        poppedOutTabs: poppedOutTabs.filter((t) => t.id !== id),
+      });
       persist();
     },
 
