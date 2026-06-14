@@ -196,7 +196,12 @@ export function TerminalView({
               term.rows,
             );
             if (disposed) return;
-            term.write(decodeBase64(scrollback));
+            // Empty seed => fresh spawn (backend skips capture); non-empty =>
+            // reattach history to restore. Only write a real seed; a fresh
+            // prompt is drawn by the forced redraw below.
+            const seed = decodeBase64(scrollback);
+            const freshSpawn = seed.length === 0;
+            if (!freshSpawn) term.write(seed);
 
             const offOutput = await onOutput((e) => {
               if (e.id === terminalId) term.write(decodeBase64(e.base64));
@@ -216,14 +221,15 @@ export function TerminalView({
             }
             unlisteners.push(offExit);
 
-            // A fresh pane's prompt may have been printed before we subscribed
-            // (so it never streamed to us), and a tiny resize-redraw trail can
-            // leave duplicate prompts. Now that we're attached + subscribed,
-            // nudge zsh to clear+redraw one clean prompt. Ctrl-L (\x0c) only
-            // redraws on an otherwise-empty fresh terminal.
-            promptTimer = setTimeout(() => {
-              if (!disposed) void writeTerminal(terminalId, "\x0c");
-            }, 350);
+            // On a fresh spawn we seeded nothing, so draw one clean prompt: send
+            // Ctrl-L (\x0c) once subscribed. If zsh is still loading it buffers
+            // the keystroke and redraws when ready, so the prompt always appears
+            // -- with no seed reflow cascade. Reattach already restored history.
+            if (freshSpawn) {
+              promptTimer = setTimeout(() => {
+                if (!disposed) void writeTerminal(terminalId, "\x0c");
+              }, 250);
+            }
           } catch {
             // attach failed (e.g. session gone); leave the tile rendered but inert.
           }

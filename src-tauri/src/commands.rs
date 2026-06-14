@@ -204,15 +204,17 @@ pub async fn attach_terminal(
         }
     }
 
-    // Seed xterm. A fresh spawn (has_live -- the client was created by
-    // spawn_terminal) takes only the visible screen so the tile shows one clean
-    // prompt; a true reattach takes full scrollback history to restore context.
-    let scrollback = if has_live {
-        tmux::capture_visible(&tmux_session)
+    // Seed xterm. A true reattach replays full scrollback history. A FRESH spawn
+    // is NOT seeded (empty): the pane's prompt may not be drawn yet (zsh startup
+    // races attach) and any visible reflow from the 80x24 -> real-size resize
+    // would replay as a "cascade" of duplicate prompts. The frontend instead
+    // forces a single clean redraw (Ctrl-L) once it has subscribed.
+    let scrollback: Vec<u8> = if has_live {
+        Vec::new()
     } else {
         tmux::capture_pane(&tmux_session)
-    }
-    .map_err(|e| format!("failed to capture scrollback: {e}"))?;
+            .map_err(|e| format!("failed to capture scrollback: {e}"))?
+    };
     Ok(STANDARD.encode(scrollback))
 }
 

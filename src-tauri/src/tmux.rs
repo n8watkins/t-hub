@@ -254,6 +254,7 @@ pub fn capture_pane(name: &str) -> Result<Vec<u8>, TmuxError> {
 /// preserved. Used to seed a freshly spawned tile with a single clean prompt
 /// rather than the 80x24-then-resize redraw trail that full-history capture
 /// would replay.
+#[allow(dead_code)] // retained for potential visible-only reattach seeding
 pub fn capture_visible(name: &str) -> Result<Vec<u8>, TmuxError> {
     let output = run("capture-pane", &["capture-pane", "-p", "-e", "-t", name])?;
     Ok(output.stdout)
