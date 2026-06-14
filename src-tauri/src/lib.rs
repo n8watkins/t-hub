@@ -62,9 +62,18 @@ pub fn run() {
         .manage(TerminalManager::default())
         .manage(AppState::default())
         .setup(|app| {
-            // Kick off the agent connection in the background once state exists.
+            // Wire the live UI event sink now that the AppHandle exists (the
+            // bridge + status bridge were built earlier in AppState::default(),
+            // before any AppHandle). This closes the #1 0.5 gap: the frontend
+            // subscribes to agent://journal / supervision://tree / session://status
+            // / agent://state / status://snapshot, and from here on the backend
+            // actually emits on them.
             use tauri::Manager;
             let state = app.state::<AppState>().inner().clone();
+            let emitter = std::sync::Arc::new(agent::TauriEmitter::new(app.handle().clone()));
+            state.agent.set_emitter(emitter);
+            state.agent.set_status_bridge(state.status.clone());
+            // Kick off the agent connection in the background once state exists.
             spawn_agent_connect(&state);
             Ok(())
         })
