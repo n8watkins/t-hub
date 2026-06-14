@@ -70,6 +70,11 @@ interface WorkspaceState {
   focusedId: TerminalId | null;
   /** Global terminal font size in px, applied to every tile equally (persisted). */
   fontSize: number;
+  /** The tile (terminal id) currently being drag-moved, or null. While set,
+   *  each tile renders a transparent drop overlay above its xterm so HTML5
+   *  drop events fire reliably (the WebView's canvas/textarea otherwise eat
+   *  them). NOT persisted — purely transient drag UI state. */
+  draggingTileId: TerminalId | null;
 
   /** Replace the live set from a listTerminals() result, reconciling tabs/order/focus. */
   setTerminals: (list: TerminalInfo[]) => void;
@@ -103,6 +108,8 @@ interface WorkspaceState {
    *  `targetId`'s position, so a tile can be dropped onto ANY other tile
    *  (including a diagonal grid neighbor), not just an adjacent one. */
   moveTile: (id: TerminalId, targetId: TerminalId) => void;
+  /** Mark a tile as the active drag source (or null to clear at drag end). */
+  setDraggingTile: (id: TerminalId | null) => void;
   /** Persist manual size ratios for a tab. */
   setTabSizes: (id: string, sizes: TabSizes) => void;
 
@@ -308,6 +315,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     activeTabId: initial.activeTabId,
     focusedId: initial.focusedId,
     fontSize: initial.fontSize,
+    draggingTileId: null,
 
     setTerminals: (list) => {
       const terminals: Record<TerminalId, TerminalInfo> = {};
@@ -514,6 +522,13 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       );
       set({ tabs: nextTabs, focusedId: id });
       persist();
+    },
+
+    setDraggingTile: (id) => {
+      // Transient drag UI only — never persisted. No-op if unchanged so a
+      // dragover-driven re-set doesn't thrash subscribers.
+      if (get().draggingTileId === id) return;
+      set({ draggingTileId: id });
     },
 
     setTabSizes: (id, sizes) => {

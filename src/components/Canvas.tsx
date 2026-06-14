@@ -1,16 +1,18 @@
 // The canvas renders the active workspace tab as a responsive auto-grid of
 // terminal tiles (PRD §5.2 tabs, §5.3 layout):
 //   - On mount: listTerminals() seeds the store; onState() keeps tile chrome live.
-//   - A thin tab strip lists every workspace tab; Ctrl/Cmd+Tab cycles, and tabs
-//     can be created / renamed (double-click) / closed-when-empty.
+//   - The workspace tab strip lives in the top bar (Titlebar) now, not here.
 //   - Each tab is a deterministic near-square grid sized from its tile count.
 //   - Spawn (+ button, empty-state button, Ctrl/Cmd+T) inserts after the focused
 //     tile in the active tab; Ctrl/Cmd+W detaches the focused tile.
 //   - Manual mode: draggable gutters between rows/columns adjust their flex
-//     ratios, persisted per tab (PRD §5.3 resize).
-//   - Only the active tab's tiles render with visible=true; inactive tabs keep
-//     their tiles mounted but visible=false, so xterm/PTY tears down while the
-//     tmux session keeps running (fast reactivation, no resource churn).
+//     ratios, persisted per tab (PRD §5.3 resize). Each gutter has a wide,
+//     invisible hit zone with a thin visible indicator for easy grabbing.
+//   - Shell v2 tab persistence: EVERY tab stays mounted at all times. The active
+//     tab is shown and inactive tabs are hidden with CSS `display:none`, while
+//     ALL tiles render with visible=true — so xterm/PTY clients stay attached in
+//     the background and switching tabs never tears down / reloads a terminal.
+//     Terminal.tsx's ResizeObserver refits a tile when its tab is shown again.
 import {
   useCallback,
   useEffect,
@@ -69,6 +71,7 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
   const setFocus = useWorkspace((s) => s.setFocus);
   const updateState = useWorkspace((s) => s.updateState);
   const cycleTab = useWorkspace((s) => s.cycleTab);
+  const setActiveTabByIndex = useWorkspace((s) => s.setActiveTabByIndex);
   const zoomIn = useWorkspace((s) => s.zoomIn);
   const zoomOut = useWorkspace((s) => s.zoomOut);
   const zoomReset = useWorkspace((s) => s.zoomReset);
@@ -125,7 +128,7 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
 
   // Global keybindings: Ctrl/Cmd+T = new terminal, Ctrl/Cmd+W = close focused,
   // Ctrl/Cmd+B = toggle the supervision sidebar, Ctrl/Cmd+Tab = cycle tabs
-  // (Shift reverses).
+  // (Shift reverses), Ctrl/Cmd+1..9 = jump to the tab at that index.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
@@ -137,6 +140,12 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
         return;
       }
       if (e.altKey) return;
+      // Ctrl/Cmd+1..9 jumps straight to that tab (1-based -> 0-based index).
+      if (e.key >= "1" && e.key <= "9") {
+        e.preventDefault();
+        setActiveTabByIndex(Number(e.key) - 1);
+        return;
+      }
       const key = e.key.toLowerCase();
       if (key === "t") {
         e.preventDefault();
@@ -160,21 +169,30 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [spawn, closeFocused, cycleTab, zoomIn, zoomOut, zoomReset, onToggleSidebar]);
+  }, [
+    spawn,
+    closeFocused,
+    cycleTab,
+    setActiveTabByIndex,
+    zoomIn,
+    zoomOut,
+    zoomReset,
+    onToggleSidebar,
+  ]);
 
   return (
     <div className="relative flex h-full w-full flex-col bg-neutral-950">
-      <TabStrip />
-
       <div className="relative min-h-0 flex-1">
-        {/* Every tab stays mounted so inactive tiles keep visible=false (xterm
-            torn down, tmux alive). Only the active tab is displayed. */}
+        {/* Shell v2: every tab stays mounted with visible=true so its xterm/PTY
+            clients persist in the background; only the active tab is displayed,
+            inactive tabs are hidden with display:none (no unmount → no reload). */}
         {tabs.map((tab) => {
           const active = tab.id === activeTabId;
           return (
             <div
               key={tab.id}
-              className={active ? "absolute inset-0" : "hidden"}
+              className="absolute inset-0"
+              style={{ display: active ? undefined : "none" }}
               aria-hidden={!active}
             >
               {tab.order.length === 0 ? (
@@ -217,108 +235,6 @@ function EmptyTab({ onSpawn }: { onSpawn: () => void }) {
         className="rounded-md border border-neutral-700 bg-neutral-900 px-5 py-3 text-base text-neutral-200 hover:border-emerald-600 hover:text-white"
       >
         ＋ New terminal
-      </button>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Workspace tab strip (PRD §5.2). Thin top strip listing every tab; click to
-// activate, double-click to rename inline, × to close an empty tab, + to add.
-// ---------------------------------------------------------------------------
-function TabStrip() {
-  const tabs = useWorkspace((s) => s.tabs);
-  const activeTabId = useWorkspace((s) => s.activeTabId);
-  const setActiveTab = useWorkspace((s) => s.setActiveTab);
-  const addTab = useWorkspace((s) => s.addTab);
-  const renameTab = useWorkspace((s) => s.renameTab);
-  const closeTab = useWorkspace((s) => s.closeTab);
-
-  // id of the tab currently being renamed inline (null = none).
-  const [editing, setEditing] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
-
-  const startRename = (id: string, name: string) => {
-    setEditing(id);
-    setDraft(name);
-  };
-  const commitRename = () => {
-    if (editing) renameTab(editing, draft);
-    setEditing(null);
-  };
-
-  return (
-    <div className="flex h-8 shrink-0 items-stretch gap-1 border-b border-neutral-800 bg-neutral-950 px-1 text-xs">
-      <div className="flex min-w-0 flex-1 items-stretch gap-1 overflow-x-auto">
-        {tabs.map((tab) => {
-          const active = tab.id === activeTabId;
-          const closable = tabs.length > 1 && tab.order.length === 0;
-          return (
-            <div
-              key={tab.id}
-              onMouseDown={() => setActiveTab(tab.id)}
-              onDoubleClick={() => startRename(tab.id, tab.name)}
-              className={[
-                "group flex shrink-0 cursor-pointer select-none items-center gap-1.5 rounded-t border-x border-t px-2.5",
-                active
-                  ? "border-neutral-700 bg-neutral-900 text-neutral-100"
-                  : "border-transparent text-neutral-400 hover:bg-neutral-900/60 hover:text-neutral-200",
-              ].join(" ")}
-              title={tab.name}
-            >
-              <span
-                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                  active ? "bg-emerald-500" : "bg-neutral-600"
-                }`}
-              />
-              {editing === tab.id ? (
-                <input
-                  autoFocus
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onBlur={commitRename}
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") commitRename();
-                    else if (e.key === "Escape") setEditing(null);
-                  }}
-                  className="w-24 bg-neutral-800 px-1 text-neutral-100 outline-none ring-1 ring-emerald-600"
-                />
-              ) : (
-                <span className="max-w-[12rem] truncate">{tab.name}</span>
-              )}
-              {tab.order.length > 0 && (
-                <span className="text-[10px] text-neutral-500">
-                  {tab.order.length}
-                </span>
-              )}
-              {closable && (
-                <button
-                  type="button"
-                  onMouseDown={(e) => e.stopPropagation()}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    closeTab(tab.id);
-                  }}
-                  className="ml-0.5 hidden shrink-0 rounded px-0.5 leading-none text-neutral-500 hover:bg-neutral-700 hover:text-neutral-100 group-hover:inline"
-                  title="Close empty tab"
-                  aria-label={`Close ${tab.name}`}
-                >
-                  ×
-                </button>
-              )}
-            </div>
-          );
-        })}
-      </div>
-      <button
-        type="button"
-        onClick={() => addTab()}
-        className="my-1 shrink-0 rounded px-2 leading-none text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100"
-        title="New workspace tab"
-        aria-label="New workspace tab"
-      >
-        +
       </button>
     </div>
   );
@@ -449,6 +365,8 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
   };
 
   const beginColDrag = (rowIdx: number, i: number, e: ReactPointerEvent) => {
+    // Walk up to the row flex container (the gutter's immediate parent), whose
+    // measured width is the extent the column weights are distributed over.
     const rowEl = (e.currentTarget as HTMLElement).parentElement;
     if (!rowEl) return;
     e.preventDefault();
@@ -497,44 +415,83 @@ function TabGrid({ tab, active, focusedId, onFocus, onClose }: TabGridProps) {
                   <Tile
                     terminalId={id}
                     focused={active && id === focusedId}
-                    visible={active}
+                    // Shell v2: keep xterm mounted even on inactive tabs so
+                    // switching tabs never reloads a terminal.
+                    visible={true}
                     onFocus={() => onFocus(id)}
                     onClose={() => onClose(id)}
                   />
                 </div>
               );
               if (c === 0) return [cell];
-              // Column gutter (drag to resize the two adjacent tiles' widths).
+              // Column gutter: a wide (8px), invisible-but-grabbable hit zone
+              // straddling the seam, with a thin centered indicator that
+              // brightens on hover. Negative margins keep the visible gap at 1px
+              // while the hit zone overhangs both neighbors for easy grabbing.
               const gutter = (
-                <div
+                <ColGutter
                   key={`cg-${r}-${c}`}
-                  role="separator"
-                  aria-orientation="vertical"
                   onPointerDown={(e) => beginColDrag(r, c - 1, e)}
-                  className="group relative z-10 -mx-0.5 w-1 shrink-0 cursor-col-resize"
-                >
-                  <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-transparent group-hover:bg-emerald-600/70" />
-                </div>
+                />
               );
               return [gutter, cell];
             })}
           </div>
         );
         if (r === 0) return [rowEl];
-        // Row gutter (drag to resize the two adjacent rows' heights).
+        // Row gutter: same wide invisible hit zone, horizontal orientation.
         const gutter = (
-          <div
+          <RowGutter
             key={`rg-${r}`}
-            role="separator"
-            aria-orientation="horizontal"
             onPointerDown={(e) => beginRowDrag(r - 1, e)}
-            className="group relative z-10 -my-0.5 h-1 shrink-0 cursor-row-resize"
-          >
-            <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-transparent group-hover:bg-emerald-600/70" />
-          </div>
+          />
         );
         return [gutter, rowEl];
       })}
+    </div>
+  );
+}
+
+/**
+ * Column resize gutter. The outer element is a wide (8px) transparent hit zone
+ * with `col-resize` cursor; negative horizontal margins let it overhang its
+ * neighbors so the actual visible gap stays ~1px. The inner 1px line is the
+ * visible indicator: faint by default, emerald on hover.
+ */
+function ColGutter({
+  onPointerDown,
+}: {
+  onPointerDown: (e: ReactPointerEvent) => void;
+}) {
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      onPointerDown={onPointerDown}
+      className="group relative z-10 -mx-[3.5px] w-2 shrink-0 cursor-col-resize"
+    >
+      <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-neutral-700/60 transition-colors group-hover:bg-emerald-500" />
+    </div>
+  );
+}
+
+/**
+ * Row resize gutter — the horizontal twin of ColGutter (8px tall hit zone,
+ * `row-resize` cursor, negative vertical margins, 1px visible indicator).
+ */
+function RowGutter({
+  onPointerDown,
+}: {
+  onPointerDown: (e: ReactPointerEvent) => void;
+}) {
+  return (
+    <div
+      role="separator"
+      aria-orientation="horizontal"
+      onPointerDown={onPointerDown}
+      className="group relative z-10 -my-[3.5px] h-2 shrink-0 cursor-row-resize"
+    >
+      <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-neutral-700/60 transition-colors group-hover:bg-emerald-500" />
     </div>
   );
 }

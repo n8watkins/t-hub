@@ -2,12 +2,18 @@
 // It fills its grid cell and surfaces focus via a ring. Header click focuses the
 // tile; the × detaches (closeTerminal); shift-clicking the × stops it (killTerminal).
 //
-// Drag-to-move/swap (PRD §5.3 manual mode): the header is a drag handle. Dragging
-// it onto another tile reorders this tile into that tile's slot (a swap/insert
-// within the active tab). The source terminal id rides along in the drag's
-// dataTransfer, so no shared drag state is needed; the drop target reads it and
-// calls the store's moveTile. The drag never touches the backend — only the
-// visual order changes; the tmux session and any agent stay attached and alive.
+// Drag-to-move (PRD §5.3 manual mode): the header is a drag handle. Dragging it
+// onto ANY other tile (including a diagonal grid neighbor) pulls this tile out of
+// the order and re-inserts it at the target's slot. The source terminal id rides
+// along in the drag's dataTransfer, so the drop target reads it and calls the
+// store's moveTile. The drag never touches the backend — only the visual order
+// changes; the tmux session and any agent stay attached and alive.
+//
+// Reliability note: xterm's WebGL canvas / hidden textarea cover the tile body
+// and, in the WebView, swallow HTML5 drag events so a naive drop never fires.
+// While ANY tile drag is in progress (store.draggingTileId set), each tile lays
+// a transparent overlay over its body that owns dragover/drop above xterm, so
+// dropping onto a terminal works.
 import { useState } from "react";
 import type { DragEvent } from "react";
 import type { TerminalId, TerminalState } from "../ipc/types";
@@ -21,8 +27,9 @@ const TILE_DND_MIME = "application/x-termhub-tile";
 export interface TileProps {
   terminalId: TerminalId;
   focused: boolean;
-  /** Render the terminal only when its tab is active; inactive tiles unmount
-   *  the xterm/PTY client (tmux keeps running) per PRD §5.3 hidden tabs. */
+  /** Render the terminal only when visible. Shell v2 keeps every tile visible
+   *  (even on inactive tabs) so xterm stays mounted and tab switches never
+   *  reload a terminal; the canvas hides inactive tabs with CSS display. */
   visible: boolean;
   onFocus: () => void;
   onClose: () => void;
@@ -47,26 +54,34 @@ export function Tile({
   // Subscribe to just this terminal's record so the header reflects live state.
   const info = useWorkspace((s) => s.terminals[terminalId]);
   const moveTile = useWorkspace((s) => s.moveTile);
+  const setDraggingTile = useWorkspace((s) => s.setDraggingTile);
+  // Is SOME tile being dragged right now? (Drives the drop overlay on every
+  // tile so drops land above xterm.)
+  const draggingTileId = useWorkspace((s) => s.draggingTileId);
 
   // True while another tile is being dragged over this one (drop highlight).
   const [dropTarget, setDropTarget] = useState(false);
-  // True while *this* tile is the one being dragged (dim it).
-  const [dragging, setDragging] = useState(false);
 
   const state: TerminalState = info?.state ?? "starting";
   const title = info?.title ?? terminalId;
   const cwd = info?.cwd ?? "";
+
+  const dragActive = draggingTileId !== null;
+  const isSelfDragging = draggingTileId === terminalId;
 
   // --- Drag source (the header) ---
   const onDragStart = (e: DragEvent) => {
     e.dataTransfer.setData(TILE_DND_MIME, terminalId);
     e.dataTransfer.setData("text/plain", terminalId); // some platforms need text
     e.dataTransfer.effectAllowed = "move";
-    setDragging(true);
+    setDraggingTile(terminalId);
   };
-  const onDragEnd = () => setDragging(false);
+  const onDragEnd = () => {
+    setDraggingTile(null);
+    setDropTarget(false);
+  };
 
-  // --- Drop target (the whole tile) ---
+  // --- Drop target (the overlay; falls back to the tile for non-xterm areas) ---
   const isTileDrag = (e: DragEvent) =>
     e.dataTransfer.types.includes(TILE_DND_MIME);
 
@@ -74,7 +89,7 @@ export function Tile({
     if (!isTileDrag(e)) return;
     e.preventDefault(); // allow the drop
     e.dataTransfer.dropEffect = "move";
-    if (!dropTarget) setDropTarget(true);
+    if (!dropTarget && !isSelfDragging) setDropTarget(true);
   };
   const onDragLeave = (e: DragEvent) => {
     // Ignore leave events bubbling from children; only clear when truly leaving.
@@ -91,18 +106,15 @@ export function Tile({
 
   return (
     <div
-      onDragOver={onDragOver}
-      onDragLeave={onDragLeave}
-      onDrop={onDrop}
       className={[
-        "flex h-full min-h-0 w-full flex-col overflow-hidden rounded-sm bg-neutral-900",
+        "relative flex h-full min-h-0 w-full flex-col overflow-hidden rounded-sm bg-neutral-900",
         focused ? "ring-1 ring-emerald-500" : "border border-neutral-800",
         dropTarget ? "ring-2 ring-emerald-400" : "",
-        dragging ? "opacity-40" : "",
+        isSelfDragging ? "opacity-40" : "",
       ].join(" ")}
     >
       {/* Header (~22px). Clicking anywhere here focuses the tile; it is also the
-          drag handle for move/swap. */}
+          drag handle for move. */}
       <div
         draggable
         onDragStart={onDragStart}
@@ -141,11 +153,30 @@ export function Tile({
         </button>
       </div>
 
-      {/* Body fills the rest of the cell; xterm fits to this box. Inactive tabs
-          pass visible={false}, fully tearing down xterm while tmux lives on. */}
+      {/* Body fills the rest of the cell; xterm fits to this box. Shell v2 keeps
+          visible=true on every tile so xterm stays mounted across tab switches. */}
       <div className="min-h-0 flex-1 overflow-hidden">
         <TerminalView terminalId={terminalId} visible={visible} />
       </div>
+
+      {/* Drop overlay — only present while SOME tile is being dragged. It covers
+          the whole tile (incl. the xterm canvas) so HTML5 dragover/drop fire
+          reliably; without it the WebView's canvas swallows them. The source
+          tile's own overlay is click/drop-through (pointer-events-none) so it
+          never blocks the tiles beneath the cursor. */}
+      {dragActive && (
+        <div
+          className={[
+            "absolute inset-0 z-20",
+            isSelfDragging ? "pointer-events-none" : "",
+            dropTarget ? "bg-emerald-400/10" : "",
+          ].join(" ")}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={onDrop}
+          aria-hidden
+        />
+      )}
     </div>
   );
 }
