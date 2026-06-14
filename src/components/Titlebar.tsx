@@ -1,11 +1,23 @@
 // Persistent Chrome-style top bar for the frameless (decorations:false) main
-// window — the ONLY window chrome (shell v2/v3).
+// window — one half of the window chrome (the other half is the SIDEBAR header).
 //
-// Layout, left -> right:
-//   [T-Hub brand] · [workspace tab strip + "＋" new-tab button] · [flexible
-//   draggable region] · [settings gear] · [window controls]
+// The window's top-left chrome (the T-Hub brand, the settings gear, and the
+// window controls) now lives at the TOP of the SIDEBAR (see Sidebar.tsx). The
+// MAIN titlebar therefore renders ONLY the workspace tab strip + a draggable
+// region, so "when the sidebar is closed you don't see T-Hub".
 //
-// The brand + the flexible stretch carry `data-tauri-drag-region`, so grabbing
+// Main layout, left -> right:
+//   [tab-strip spacer (drag)] · [workspace tab strip + "＋"] · [flexible drag
+//   region] · [fallback window controls — ONLY when the sidebar is hidden]
+//
+// HARD CONSTRAINT: the window controls must always be reachable. When the
+// sidebar is FULL or RAIL the controls live in its header; but when the sidebar
+// is HIDDEN (the 3rd collapse state) App skips <Sidebar> entirely, so this
+// titlebar renders a minimal fallback cluster (minimize / maximize-restore /
+// close + a "show sidebar" button) at its top-right. Never leave the user
+// unable to minimize/close/restore.
+//
+// The spacer + the flexible stretch carry `data-tauri-drag-region`, so grabbing
 // the empty areas moves the window (like Chrome). The bar is always visible
 // (~32px) with a subtle 1px bottom border and participates in layout.
 //
@@ -15,14 +27,13 @@
 // it a drop target for BOTH reordering a tab and dropping a *tile* onto it (the
 // tile's drag resolves tabs via elementFromPoint + closest).
 //
-// Window controls (minimize / maximize-restore / close) and the settings gear
-// use the Tauri window API / the settings store and must NOT carry
-// data-tauri-drag-region, or a click would start a window drag instead.
-import { useLayoutEffect, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent, Ref, RefObject } from "react";
+// Window controls (minimize / maximize-restore / close) — in the fallback
+// cluster and the satellite variant — use the Tauri window API and must NOT
+// carry data-tauri-drag-region, or a click would start a window drag instead.
+import { useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useWorkspace } from "../store/workspace";
-import { useSettings } from "../store/settings";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { popOutTab, closeSatellite, readSatelliteTab } from "../lib/windows";
@@ -80,23 +91,29 @@ function droppedOutsideStrip(y: number): boolean {
 export function Titlebar({
   satellite = false,
   tabStripOffset = 0,
+  sidebarHidden = false,
+  onReopenSidebar,
 }: {
   satellite?: boolean;
   /**
    * How far (px) from the window's left edge the workspace tab strip should
    * begin — set by App to the sidebar's current effective width so the leftmost
-   * tab aligns with the canvas's left edge (TASK 1). The brand stays pinned at
-   * the far left; a draggable spacer between the brand and the strip widens to
-   * fill the gap. Updates live as the sidebar mode/width changes. Ignored in a
-   * satellite (no tab strip there). Defaults to 0 (brand-hugging strip).
+   * tab aligns with the canvas's left edge (TASK 1). A draggable spacer before
+   * the strip widens to fill the gap. Updates live as the sidebar mode/width
+   * changes. Ignored in a satellite (no tab strip there). With the brand gone
+   * (now in the sidebar) the spacer simply equals the offset. Defaults to 0.
    */
   tabStripOffset?: number;
+  /**
+   * Whether the sidebar is HIDDEN (its 3rd collapse state). When true the chrome
+   * that normally lives in the sidebar header is unreachable, so the titlebar
+   * renders a fallback control cluster (min/max/close + a "show sidebar"
+   * button). Ignored in a satellite (it keeps its own controls). Defaults false.
+   */
+  sidebarHidden?: boolean;
+  /** Reopen the hidden sidebar — wired to the fallback cluster's button. */
+  onReopenSidebar?: () => void;
 }) {
-  const toggleSettings = useSettings((s) => s.toggleSettings);
-  // Measure the brand so the tab-strip spacer can offset by the sidebar width
-  // minus the brand's own footprint (TASK 1). Unused in a satellite (no strip).
-  const brandRef = useRef<HTMLDivElement | null>(null);
-  const brandWidth = useMeasuredWidth(brandRef);
   return (
     <div
       className="flex h-8 shrink-0 items-stretch border-b text-xs"
@@ -105,32 +122,62 @@ export function Titlebar({
         borderColor: "var(--th-border)",
       }}
     >
-      {/* Brand, top-left (#6). Doubles as a left drag handle. */}
-      <Brand innerRef={brandRef} />
-
       {satellite ? (
-        // Satellite: show the popped-out tab's name + a return control, then a
-        // draggable stretch. No tab strip / new-tab button.
-        <SatelliteBar />
+        // Satellite (no sidebar / one tab): it keeps its OWN chrome — the brand,
+        // the popped-out tab's name + a return control, the settings gear, and
+        // its window controls (minimize/maximize; "Return" replaces close).
+        <>
+          <Brand />
+          <SatelliteBar />
+          <WindowControls satellite />
+        </>
       ) : (
         // Main: a draggable spacer that pushes the tab strip out to the sidebar's
-        // right edge (TASK 1), then the workspace tabs (+ the new-tab button at
-        // the right of the strip), then a flexible drag region.
+        // right edge (TASK 1), then the workspace tabs (+ the new-tab button),
+        // then a flexible drag region. The brand + gear + window controls now
+        // live in the SIDEBAR header — so when the sidebar is visible this row is
+        // just tabs. ONLY when the sidebar is HIDDEN do we render a fallback
+        // control cluster here so the window stays controllable.
         <>
-          <TabStripSpacer offset={tabStripOffset} brandWidth={brandWidth} />
+          <TabStripSpacer offset={tabStripOffset} />
           <TabStrip />
           <div data-tauri-drag-region className="min-w-0 flex-1" aria-hidden />
+          {sidebarHidden && (
+            <FallbackControls onReopenSidebar={onReopenSidebar} />
+          )}
         </>
       )}
+    </div>
+  );
+}
 
-      {/* Settings (#3): opens the settings/theme surface (also Ctrl/Cmd+,). */}
-      <SettingsButton onClick={toggleSettings} />
-
-      {/* Window controls (top-right). No drag-region, or clicks would drag. In a
-          satellite (#6) the redundant close (×) is dropped — the SatelliteBar's
-          "Return" button is the single affordance that hands the tab back and
-          destroys the window — so only minimize/maximize show there. */}
-      <WindowControls satellite={satellite} />
+/**
+ * The minimal control cluster rendered in the titlebar's top-right ONLY when the
+ * sidebar is HIDDEN (so the sidebar-header chrome is unreachable). A "show
+ * sidebar" button (which brings the relocated brand/gear/controls back) plus the
+ * window controls (minimize / maximize-restore / close). This is the HARD
+ * CONSTRAINT safety net: the user is never left unable to minimize/close/restore
+ * or to get the chrome back.
+ */
+function FallbackControls({
+  onReopenSidebar,
+}: {
+  onReopenSidebar?: () => void;
+}) {
+  return (
+    <div className="flex shrink-0 items-stretch">
+      {onReopenSidebar && (
+        <button
+          type="button"
+          aria-label="Show sidebar"
+          title="Show sidebar"
+          onClick={onReopenSidebar}
+          className="flex h-8 w-11 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
+        >
+          <ShowSidebarIcon />
+        </button>
+      )}
+      <WindowControls />
     </div>
   );
 }
@@ -180,53 +227,30 @@ function SatelliteBar() {
 }
 
 /**
- * Draggable filler between the brand and the tab strip (TASK 1). It widens so
- * the strip begins `offset` px from the window's left edge — i.e. at the
- * sidebar's right / the canvas's left edge — making the leftmost tab align with
- * the canvas. The brand precedes it, so the spacer takes the offset minus the
- * brand's measured width; when the sidebar is hidden (offset 0) or narrower than
- * the brand, the spacer collapses to 0 and the strip simply hugs the brand. The
- * brand width is measured live (a ResizeObserver on the real brand box, via the
- * forwarded ref) so this stays correct across theme/font changes, and the offset
- * itself updates live from App. Carries data-tauri-drag-region so grabbing this
- * gap still moves the window like the rest of the empty bar.
+ * Draggable filler before the tab strip (TASK 1). It widens so the strip begins
+ * `offset` px from the window's left edge — i.e. at the sidebar's right / the
+ * canvas's left edge — making the leftmost tab align with the canvas. With the
+ * brand now in the sidebar (not the titlebar), the spacer simply equals the
+ * offset; when the sidebar is hidden (offset 0) the strip hugs the left edge.
+ * The offset updates live from App as the sidebar mode/width changes. Carries
+ * data-tauri-drag-region so grabbing this gap still moves the window.
  */
-function TabStripSpacer({ offset, brandWidth }: { offset: number; brandWidth: number }) {
-  const width = Math.max(0, offset - brandWidth);
+function TabStripSpacer({ offset }: { offset: number }) {
   return (
     <div
       data-tauri-drag-region
       aria-hidden
       className="shrink-0"
-      style={{ width }}
+      style={{ width: Math.max(0, offset) }}
     />
   );
 }
 
-/**
- * Live pixel width of an element via ResizeObserver. Used to measure the brand
- * box so TabStripSpacer can subtract it from the sidebar offset without hard-
- * coding a magic number that would drift with the wordmark/theme/font.
- */
-function useMeasuredWidth(ref: RefObject<HTMLElement | null>): number {
-  const [width, setWidth] = useState(0);
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const measure = () => setWidth(el.getBoundingClientRect().width);
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [ref]);
-  return width;
-}
-
-/** "T-Hub" wordmark with a small accent glyph, anchored top-left (#6). */
-function Brand({ innerRef }: { innerRef?: Ref<HTMLDivElement> }) {
+/** "T-Hub" wordmark with a small accent glyph (satellite titlebar only — the
+ *  main window's brand now lives in the sidebar header). A drag handle. */
+function Brand() {
   return (
     <div
-      ref={innerRef}
       data-tauri-drag-region
       className="flex shrink-0 select-none items-center gap-1.5 pl-2.5 pr-2"
     >
@@ -242,37 +266,6 @@ function Brand({ innerRef }: { innerRef?: Ref<HTMLDivElement> }) {
         T-Hub
       </span>
     </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Settings gear (#3) — opens the settings surface via the settings store.
-// ---------------------------------------------------------------------------
-function SettingsButton({ onClick }: { onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      aria-label="Settings"
-      title="Settings (Ctrl/Cmd+,)"
-      onClick={onClick}
-      className="flex h-8 w-11 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
-    >
-      <svg
-        width="15"
-        height="15"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className="pointer-events-none"
-        aria-hidden
-      >
-        <circle cx="12" cy="12" r="3" />
-        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-      </svg>
-    </button>
   );
 }
 
@@ -614,6 +607,29 @@ function TabStrip() {
 // Small inline icons for the tear-off controls (#21). Sized to sit inline with
 // the tab text; they inherit `currentColor` so they follow the button's hover.
 // ---------------------------------------------------------------------------
+
+/** Sidebar glyph (a panel with a divider) — the fallback "show sidebar" button
+ *  shown in the titlebar when the sidebar is hidden, bringing the relocated
+ *  brand/gear/controls back into view. */
+function ShowSidebarIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="pointer-events-none"
+      aria-hidden
+    >
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <line x1="9" y1="4" x2="9" y2="20" />
+    </svg>
+  );
+}
 
 /** "Open in new window" arrow (pop a tab out). */
 function PopOutIcon() {
