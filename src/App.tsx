@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Canvas } from "./components/Canvas";
-import { Sidebar } from "./components/Sidebar";
+import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { useSettings } from "./store/settings";
 import { initWindowSync, isSatellite } from "./lib/windows";
@@ -14,8 +14,9 @@ import { initWindowSync, isSatellite } from "./lib/windows";
 const SATELLITE = isSatellite();
 
 // 0.5/0.3 shell: a Chrome-style top bar, then the body row (the read-only
-// supervision sidebar + the terminal canvas). The sidebar is collapsible
-// (Ctrl/Cmd+B, handled in Canvas) and its width is user-resizable (#2).
+// supervision sidebar + the terminal canvas). The sidebar has a 3-state collapse
+// (Ctrl/Cmd+B, handled in Canvas) cycling full -> rail -> hidden -> full (#1),
+// and in its full state its width is user-resizable (#2).
 //
 // The OS window is frameless (decorations:false); <Titlebar/> is the only window
 // chrome. By default the bar is ALWAYS a visible layout row (so maximize/restore
@@ -31,6 +32,24 @@ const SIDEBAR_MIN = 180;
 const SIDEBAR_MAX = 360;
 const SIDEBAR_DEFAULT = 256; // matches the old fixed w-64 (16rem)
 const SIDEBAR_KEY = "termhub.sidebar.v1";
+
+// 3-state collapse (#1): the sidebar cycles full -> rail -> hidden -> full via
+// onToggleSidebar (Ctrl/Cmd+B, fired by Canvas). "full" keeps the resizable
+// width; "rail" is a thin iconic strip; "hidden" drops it entirely. The chosen
+// mode is persisted to its OWN localStorage key (independent of the width key).
+const SIDEBAR_MODE_KEY = "termhub.sidebar.mode.v1";
+const SIDEBAR_MODES: SidebarMode[] = ["full", "rail", "hidden"];
+
+function loadSidebarMode(): SidebarMode {
+  if (typeof localStorage === "undefined") return "full";
+  const raw = localStorage.getItem(SIDEBAR_MODE_KEY);
+  return raw === "full" || raw === "rail" || raw === "hidden" ? raw : "full";
+}
+/** Advance full -> rail -> hidden -> full (the Ctrl/Cmd+B cycle). */
+function nextSidebarMode(m: SidebarMode): SidebarMode {
+  const i = SIDEBAR_MODES.indexOf(m);
+  return SIDEBAR_MODES[(i + 1) % SIDEBAR_MODES.length];
+}
 
 /** Titlebar height in px (matches <Titlebar/>'s h-8); used for the reveal shift. */
 const TITLEBAR_H = 32;
@@ -133,11 +152,29 @@ function useTitlebarReveal(enabled: boolean): {
 }
 
 export default function App() {
-  // A satellite starts with the supervision sidebar collapsed — it's a focused
-  // terminal canvas, not the full command center. The main window opens it.
-  const [sidebarOpen, setSidebarOpen] = useState(!SATELLITE);
+  // A satellite starts with the supervision sidebar hidden — it's a focused
+  // terminal canvas, not the full command center. The main window restores the
+  // user's persisted collapse mode (#1: full / rail / hidden).
+  const [sidebarMode, setSidebarMode] = useState<SidebarMode>(() =>
+    SATELLITE ? "hidden" : loadSidebarMode(),
+  );
   const [, setSelectedSession] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
+
+  // Cycle the collapse state (full -> rail -> hidden -> full) and persist it.
+  // This is exactly what App hands to Canvas as onToggleSidebar, so Canvas's
+  // unchanged Ctrl/Cmd+B keybinding now advances through all three states.
+  const cycleSidebarMode = useCallback(() => {
+    setSidebarMode((m) => {
+      const next = nextSidebarMode(m);
+      try {
+        localStorage.setItem(SIDEBAR_MODE_KEY, next);
+      } catch {
+        /* ignore quota/availability */
+      }
+      return next;
+    });
+  }, []);
 
   // Wire cross-window tear-off resync once for this window (#21): the main window
   // hides/re-adopts tabs as satellites open/close; a satellite self-closes if its
@@ -265,14 +302,21 @@ export default function App() {
       )}
 
       <div className="flex min-h-0 flex-1">
-        {sidebarOpen && (
+        {sidebarMode !== "hidden" && (
           <>
-            <Sidebar width={sidebarWidth} onSelectSession={setSelectedSession} />
-            <SidebarResizer onPointerDown={beginResize} />
+            <Sidebar
+              mode={sidebarMode}
+              width={sidebarMode === "rail" ? SIDEBAR_RAIL_WIDTH : sidebarWidth}
+              onSelectSession={setSelectedSession}
+            />
+            {/* Drag-resize only applies to the full state; the rail is fixed. */}
+            {sidebarMode === "full" && (
+              <SidebarResizer onPointerDown={beginResize} />
+            )}
           </>
         )}
         <div className="relative min-w-0 flex-1">
-          <Canvas onToggleSidebar={() => setSidebarOpen((v) => !v)} />
+          <Canvas onToggleSidebar={cycleSidebarMode} />
         </div>
       </div>
     </div>
