@@ -135,6 +135,17 @@ body {
 [data-th-dragging="1"] .xterm-helper-textarea {
   pointer-events: none !important;
 }
+/*
+ * #20: the pooled terminals live in an overlay ABOVE the grid (a sibling, not a
+ * child of the tile). During a tile drag the whole pooled-terminal wrapper must
+ * be click-through too, so document.elementFromPoint falls past it to the grid
+ * cell underneath (which carries data-tile-id) and the drop resolves to the tile
+ * — not to the floating terminal. The .xterm rule above only covers xterm's own
+ * nodes; this covers the wrapper element itself.
+ */
+[data-th-dragging="1"] [data-th-pool-tile] {
+  pointer-events: none !important;
+}
 [data-th-dragging="1"] {
   cursor: grabbing;
 }

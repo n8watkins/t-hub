@@ -1,5 +1,9 @@
-// A tile is a thin header (status dot, title, cwd, close) wrapping a TerminalView.
-// It fills its grid cell and surfaces selection as a subtle theme-accent glow.
+// A tile is a thin header (status dot, title, cwd, close) above an EMPTY body
+// placeholder. It fills its grid cell and surfaces selection as a subtle theme-
+// accent glow. The terminal's xterm body is NOT a child of the tile: #20 renders
+// each terminal once in a persistent pool overlay (TerminalPool.tsx) and
+// positions it over this tile's placeholder, so moving/resizing the tile only
+// repositions the pooled terminal — it is never remounted/reattached (no flash).
 // Pressing the header focuses the tile; the × detaches (closeTerminal), and
 // shift-clicking the × stops it (killTerminal).
 //
@@ -20,17 +24,19 @@ import type { TerminalId, TerminalState } from "../ipc/types";
 import { useWorkspace } from "../store/workspace";
 import { useTheme } from "../store/theme";
 import { killTerminal } from "../ipc/client";
-import { TerminalView } from "./Terminal";
+import { useTerminalSlot } from "./TerminalPool";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 
 export interface TileProps {
   terminalId: TerminalId;
   focused: boolean;
-  /** Render the terminal only when visible. Shell v2 keeps every tile visible
-   *  (even on inactive tabs) so xterm stays mounted and tab switches never
-   *  reload a terminal; the canvas hides inactive tabs with CSS display. */
-  visible: boolean;
+  /** Retained for API compatibility; the xterm body no longer lives in the tile.
+   *  #20 pools every terminal in a persistent, never-reparented overlay (see
+   *  TerminalPool.tsx); the tile renders only its header chrome plus a ref'd
+   *  placeholder the pool positions the pooled terminal over. The pool decides
+   *  visibility (active tab + real placeholder rect), so this prop is unused. */
+  visible?: boolean;
   onFocus: () => void;
   onClose: () => void;
 }
@@ -68,13 +74,12 @@ function dropTargetAt(
   return { tileId: null, tabId: null };
 }
 
-export function Tile({
-  terminalId,
-  focused,
-  visible,
-  onFocus,
-  onClose,
-}: TileProps) {
+export function Tile({ terminalId, focused, onFocus, onClose }: TileProps) {
+  // Register this tile's body box with the terminal pool: the pooled (persistent)
+  // <TerminalView> for this id is positioned over this placeholder. Moving the
+  // tile to another tab/slot just repositions the pooled terminal — it is never
+  // remounted, so there's no reload/flash (#20).
+  const slotRef = useTerminalSlot(terminalId);
   // Subscribe to just this terminal's record so the header reflects live state.
   const info = useWorkspace((s) => s.terminals[terminalId]);
   const moveTile = useWorkspace((s) => s.moveTile);
@@ -236,11 +241,12 @@ export function Tile({
         </button>
       </div>
 
-      {/* Body fills the rest of the cell; xterm fits to this box. Shell v2 keeps
-          visible=true on every tile so xterm stays mounted across tab switches. */}
-      <div className="min-h-0 flex-1 overflow-hidden">
-        <TerminalView terminalId={terminalId} visible={visible} />
-      </div>
+      {/* Body placeholder: an empty box marking where the terminal should sit.
+          The actual xterm is rendered ONCE in the persistent pool overlay
+          (TerminalPool.tsx) and positioned over this box, so moving/resizing the
+          tile never remounts or reattaches it (#20). Kept data-tile-id-covered by
+          the parent so drag drop-resolution (elementFromPoint) still lands here. */}
+      <div ref={slotRef} className="min-h-0 flex-1 overflow-hidden" />
     </div>
   );
 }
