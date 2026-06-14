@@ -97,6 +97,12 @@ class EventHub<T> {
         }
       }
     });
+    // If registration ever fails (e.g. Tauri IPC not present), clear `backing`
+    // so a later subscribe can retry, and swallow the rejection so it never
+    // surfaces as an unhandled promise rejection.
+    this.backing.catch(() => {
+      this.backing = null;
+    });
   }
 
   /** Register a subscriber; returns an unsubscribe fn (synchronous removal). */
