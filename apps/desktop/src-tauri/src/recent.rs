@@ -101,13 +101,75 @@ fn cwd_basename(cwd: &str) -> &str {
         .unwrap_or(cwd)
 }
 
-/// Extract `(cwd, summary)` from a transcript's JSONL text. We scan lines for the
-/// FIRST `"cwd"` we can find (every working line carries the same project dir) and
-/// the LAST `"summary"` (Claude refines it over the conversation; the latest wins).
-/// Either may be absent. Kept tolerant: malformed lines are skipped, not fatal.
-fn parse_transcript(text: &str) -> (Option<String>, Option<String>) {
+/// What we extract from a transcript to describe a session in the Recent list.
+struct Parsed {
+    /// Project directory the session ran in (`--resume` lands here).
+    cwd: Option<String>,
+    /// Claude's own conversation summary, when one exists (best title).
+    summary: Option<String>,
+    /// The session's FIRST real user prompt — the most useful human description
+    /// when there's no summary (e.g. "fix the recent bug"). Tool wrappers,
+    /// slash-command/caveat blocks, and empty messages are skipped.
+    first_prompt: Option<String>,
+}
+
+/// Pull the plain text out of a user message's `content`, which is either a bare
+/// string or an array of content blocks (we concatenate the `text` blocks).
+fn user_message_text(v: &serde_json::Value) -> Option<String> {
+    let content = v.get("message")?.get("content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = content.as_array() {
+        let joined = arr
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !joined.trim().is_empty() {
+            return Some(joined);
+        }
+    }
+    None
+}
+
+/// True for a first-prompt candidate that is real user intent — NOT a tool result,
+/// a slash-command/caveat wrapper (`<local-command-caveat>`, `<command-name>`…),
+/// or a system reminder. Those are noise we skip when picking a description.
+fn is_real_prompt(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // XML-ish wrapper blocks the CLI injects (command runs, caveats, reminders).
+    if t.starts_with('<') {
+        return false;
+    }
+    true
+}
+
+/// Collapse whitespace/newlines and cap a description to a sane single-line length
+/// for the sidebar row (the full text isn't needed there).
+fn tidy_label(s: &str, max: usize) -> String {
+    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > max {
+        let mut out: String = one_line.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    } else {
+        one_line
+    }
+}
+
+/// Extract `(cwd, summary, first_prompt)` from a transcript's JSONL text. The
+/// FIRST `"cwd"` (every working line carries the same project dir), the LAST
+/// `"summary"` (Claude refines it; latest wins), and the FIRST real user prompt
+/// (skipping wrapper/tool noise). Any may be absent. Malformed lines are skipped.
+fn parse_transcript(text: &str) -> Parsed {
     let mut cwd: Option<String> = None;
     let mut summary: Option<String> = None;
+    let mut first_prompt: Option<String> = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -123,24 +185,43 @@ fn parse_transcript(text: &str) -> (Option<String>, Option<String>) {
                 }
             }
         }
+        let ty = v.get("type").and_then(|t| t.as_str());
         // A dedicated summary line (type:"summary") carries Claude's title.
-        if v.get("type").and_then(|t| t.as_str()) == Some("summary") {
+        if ty == Some("summary") {
             if let Some(s) = v.get("summary").and_then(|s| s.as_str()) {
                 if !s.trim().is_empty() {
                     summary = Some(s.trim().to_string());
                 }
             }
         }
+        // First real user prompt = the best fallback description.
+        if ty == Some("user") && first_prompt.is_none() {
+            if let Some(text) = user_message_text(&v) {
+                if is_real_prompt(&text) {
+                    first_prompt = Some(text.trim().to_string());
+                }
+            }
+        }
     }
-    (cwd, summary)
+    Parsed {
+        cwd,
+        summary,
+        first_prompt,
+    }
 }
 
-/// Build a [`RecentSession`] from a transcript's id + mtime + parsed cwd/summary.
+/// Build a [`RecentSession`] from a transcript's id + mtime + parsed fields.
 /// Returns `None` when there is no usable cwd (we can't recall a session we don't
 /// know the directory for — `claude --resume` would land in the wrong place).
-fn make_session(id: String, last_seen: i64, cwd: Option<String>, summary: Option<String>) -> Option<RecentSession> {
-    let cwd = cwd?;
-    let label = summary.unwrap_or_else(|| cwd_basename(&cwd).to_string());
+/// The label prefers Claude's summary, then the first real user prompt, and only
+/// falls back to the bare folder name when the transcript yields neither.
+fn make_session(id: String, last_seen: i64, parsed: Parsed) -> Option<RecentSession> {
+    let cwd = parsed.cwd?;
+    let label = parsed
+        .summary
+        .or(parsed.first_prompt)
+        .map(|s| tidy_label(&s, 80))
+        .unwrap_or_else(|| cwd_basename(&cwd).to_string());
     Some(RecentSession {
         id,
         cwd,
@@ -215,8 +296,8 @@ fn read_sessions_from_dir(projects: &std::path::Path) -> Vec<RecentSession> {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let text = read_prefix(&path, 32 * 1024);
-            let (cwd, summary) = parse_transcript(&text);
-            if let Some(s) = make_session(id, last_seen, cwd, summary) {
+            let parsed = parse_transcript(&text);
+            if let Some(s) = make_session(id, last_seen, parsed) {
                 out.push(s);
             }
         }
@@ -327,38 +408,64 @@ mod tests {
     }
 
     #[test]
-    fn parse_transcript_extracts_first_cwd_and_last_summary() {
+    fn parse_transcript_extracts_cwd_summary_and_first_prompt() {
         let text = r#"
 {"type":"mode","sessionId":"s1"}
-{"type":"user","cwd":"/home/u/proj","sessionId":"s1"}
+{"type":"user","cwd":"/home/u/proj","message":{"role":"user","content":"fix the recent bug"}}
 {"type":"summary","summary":"early title"}
-{"type":"user","cwd":"/home/u/proj"}
+{"type":"user","cwd":"/home/u/proj","message":{"role":"user","content":"second prompt"}}
 {"type":"summary","summary":"final title"}
 "#;
-        let (cwd, summary) = parse_transcript(text);
-        assert_eq!(cwd.as_deref(), Some("/home/u/proj"));
-        assert_eq!(summary.as_deref(), Some("final title"));
+        let p = parse_transcript(text);
+        assert_eq!(p.cwd.as_deref(), Some("/home/u/proj"));
+        assert_eq!(p.summary.as_deref(), Some("final title")); // latest wins
+        assert_eq!(p.first_prompt.as_deref(), Some("fix the recent bug")); // first wins
+    }
+
+    #[test]
+    fn parse_transcript_skips_wrapper_first_messages() {
+        // The first user message is a slash-command/caveat wrapper; the first REAL
+        // prompt is the next one. Content can also be a block array.
+        let text = r#"
+{"type":"user","cwd":"/x","message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}
+{"type":"user","cwd":"/x","message":{"role":"user","content":[{"type":"text","text":"actually do this"}]}}
+"#;
+        let p = parse_transcript(text);
+        assert_eq!(p.first_prompt.as_deref(), Some("actually do this"));
     }
 
     #[test]
     fn parse_transcript_tolerates_garbage_lines() {
         let text = "not json\n{\"cwd\":\"/x\"}\nalso bad";
-        let (cwd, summary) = parse_transcript(text);
-        assert_eq!(cwd.as_deref(), Some("/x"));
-        assert_eq!(summary, None);
+        let p = parse_transcript(text);
+        assert_eq!(p.cwd.as_deref(), Some("/x"));
+        assert_eq!(p.summary, None);
+        assert_eq!(p.first_prompt, None);
     }
 
     #[test]
-    fn make_session_requires_a_cwd() {
-        // No cwd → unrecallable → dropped.
-        assert!(make_session("id".into(), 1, None, None).is_none());
-        // With a cwd but no summary, the label falls back to the cwd basename.
-        let s = make_session("id".into(), 5, Some("/home/u/proj".into()), None).unwrap();
+    fn make_session_label_prefers_summary_then_prompt_then_basename() {
+        // No cwd -> unrecallable -> dropped.
+        assert!(make_session("id".into(), 1, Parsed { cwd: None, summary: None, first_prompt: None }).is_none());
+        // No summary, no prompt -> label falls back to the cwd basename.
+        let s = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: None, first_prompt: None }).unwrap();
         assert_eq!(s.label, "proj");
         assert_eq!(s.last_seen, 5);
-        // A summary, when present, wins as the label.
-        let s2 = make_session("id".into(), 5, Some("/home/u/proj".into()), Some("Do a thing".into())).unwrap();
-        assert_eq!(s2.label, "Do a thing");
+        // First prompt beats the basename when there's no summary.
+        let s2 = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: None, first_prompt: Some("add auth".into()) }).unwrap();
+        assert_eq!(s2.label, "add auth");
+        // Summary wins over everything.
+        let s3 = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: Some("Do a thing".into()), first_prompt: Some("add auth".into()) }).unwrap();
+        assert_eq!(s3.label, "Do a thing");
+    }
+
+    #[test]
+    fn tidy_label_collapses_and_caps() {
+        assert_eq!(tidy_label("  fix   the\nbug  ", 80), "fix the bug");
+        let long = "a".repeat(200);
+        let capped = tidy_label(&long, 80);
+        assert_eq!(capped.chars().count(), 80);
+        assert!(capped.ends_with('…'));
     }
 
     #[test]

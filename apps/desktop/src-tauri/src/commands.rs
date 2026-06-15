@@ -128,11 +128,16 @@ fn resolve_pane_command(opts: &SpawnOptions) -> Option<String> {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
-    // Run the startup command, then exec back into an interactive login shell so
-    // the tile survives the command exiting. `$SHELL` is the user's login shell
-    // (matching the plain-shell path); fall back to /bin/sh if it is unset.
+    // Run the startup command in a LOGIN shell, then exec back into an interactive
+    // login shell so the tile survives the command exiting. The login shell is
+    // critical: tools like `claude` live on a PATH set by the user's shell rc
+    // (e.g. `~/.npm-global/bin` exported in ~/.zshrc), which a bare `sh -c` does
+    // NOT load -- so `claude --resume ...` failed with "command not found" and
+    // immediately dropped to the fallback shell (the "recall/Resume opens a plain
+    // terminal, not Claude" bug). Running via `"$SHELL" -lc` loads that PATH, so
+    // the startup command resolves exactly as it does when typed interactively.
     Some(format!(
-        "sh -c {}",
+        "exec \"${{SHELL:-/bin/sh}}\" -lc {}",
         sh_single_quote(&format!(
             "{startup}; exec \"${{SHELL:-/bin/sh}}\" -l"
         ))
