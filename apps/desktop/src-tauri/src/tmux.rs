@@ -186,6 +186,19 @@ pub fn ensure_mouse_on() {
             let _ = run("set-option", &["set-option", "-t", s.as_str(), "mouse", "on"]);
         }
     }
+    // Disable tmux's built-in MOUSE CONTEXT MENUS. With `mouse on`, a right-click
+    // pops tmux's own pane menu (Horizontal/Vertical Split, Kill, Respawn, Mark,
+    // Zoom...) and status menus — confusing inside TermHub, which has its own tile
+    // chrome for split/kill/etc. Unbinding these root-table mouse keys is
+    // server-global (covers existing + future sessions). Best-effort.
+    for ev in [
+        "MouseDown3Pane",
+        "MouseDown3Status",
+        "MouseDown3StatusLeft",
+        "MouseDown3StatusRight",
+    ] {
+        let _ = run("unbind", &["unbind", "-n", ev]);
+    }
 }
 
 /// Returns true if a session named `name` exists on the `termhub` socket.

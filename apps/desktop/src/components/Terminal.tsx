@@ -26,7 +26,7 @@
 // Lifecycle is keyed on [terminalId, visible]. Hidden tiles fully tear down their
 // xterm instance + PTY-client subscriptions so a wall of tiles stays cheap; the
 // tmux session keeps running backend-side, and re-attaching replays scrollback.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
@@ -124,10 +124,6 @@ export function TerminalView({
 }: TerminalViewProps): JSX.Element | null {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
-  // Right-click clipboard menu position (null = closed). The tmux mouse-mode
-  // makes a plain drag NOT select (you'd need Shift+drag), so a discoverable
-  // Copy / Paste / Select All menu is the reliable path.
-  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   // Guards against a second init for the same (id, visible) effect run even
   // though main.tsx omits StrictMode — belt-and-braces against double `open()`.
   const initializedRef = useRef(false);
@@ -594,97 +590,15 @@ export function TerminalView({
     return () => cancelAnimationFrame(raf);
   }, [focusedId, terminalId, visible]);
 
-  // Clipboard actions for the right-click menu (operate on the live xterm).
-  const doCopy = () => {
-    const t = termRef.current;
-    if (t?.hasSelection()) {
-      void clipboardWrite(t.getSelection());
-      t.clearSelection();
-    }
-    setCtxMenu(null);
-  };
-  const doPaste = () => {
-    const t = termRef.current;
-    void clipboardRead().then((text) => {
-      if (text && t) t.paste(text);
-    });
-    setCtxMenu(null);
-  };
-  const doSelectAll = () => {
-    termRef.current?.selectAll();
-    setCtxMenu(null);
-  };
-
+  // No custom right-click menu (per request). preventDefault only suppresses the
+  // WebView's own context menu; tmux's mouse menu (split/kill/respawn/mark/zoom)
+  // is disabled server-side in tmux.rs (unbind MouseDown3Pane). Copy = Shift+drag
+  // to select, then Ctrl+C (clipboard plugin); Ctrl+V pastes.
   return (
-    <>
-      <div
-        ref={containerRef}
-        className="termhub-terminal h-full w-full"
-        // Right-click -> Copy / Paste / Select All. preventDefault so neither the
-        // OS menu nor xterm's own handling fires; the tile still focuses first.
-        onContextMenu={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          useWorkspace.getState().setFocus(terminalId);
-          setCtxMenu({ x: e.clientX, y: e.clientY });
-        }}
-      />
-      {ctxMenu && (
-        <>
-          <div
-            className="fixed inset-0 z-50"
-            onMouseDown={() => setCtxMenu(null)}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              setCtxMenu(null);
-            }}
-          />
-          <div
-            className="fixed z-50 min-w-[160px] overflow-hidden rounded-md border py-1 shadow-2xl"
-            style={{
-              left: ctxMenu.x,
-              top: ctxMenu.y,
-              background:
-                "linear-gradient(var(--th-header-bg), var(--th-header-bg)), #0b0b0c",
-              borderColor: "var(--th-border)",
-              color: "var(--th-fg)",
-              fontFamily: "var(--th-font)",
-            }}
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <TermMenuItem label="Copy" hint="⌃C · selection" onClick={doCopy} />
-            <TermMenuItem label="Paste" hint="⌃V" onClick={doPaste} />
-            <TermMenuItem label="Select all" onClick={doSelectAll} />
-          </div>
-        </>
-      )}
-    </>
-  );
-}
-
-/** One row in the terminal right-click clipboard menu. */
-function TermMenuItem({
-  label,
-  hint,
-  onClick,
-}: {
-  label: string;
-  hint?: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="flex w-full items-center justify-between gap-4 px-3 py-1.5 text-left text-sm transition-colors hover:bg-neutral-700/40"
-      style={{ color: "var(--th-fg)" }}
-    >
-      <span>{label}</span>
-      {hint && (
-        <span className="text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
-          {hint}
-        </span>
-      )}
-    </button>
+    <div
+      ref={containerRef}
+      className="termhub-terminal h-full w-full"
+      onContextMenu={(e) => e.preventDefault()}
+    />
   );
 }
