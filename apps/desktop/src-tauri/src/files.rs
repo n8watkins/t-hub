@@ -371,45 +371,56 @@ fn wsl_bash(distro: &str, script: &str, cwd: &str) -> std::process::Command {
 /// files, alphabetical — matching [`read_dir_shallow_fs`]). The absolute `path`
 /// of each entry is rebuilt as a POSIX path so the UI can drill in / open it.
 ///
-/// **Honors `.gitignore`** to match [`read_dir_shallow_fs`] and the search index:
-/// when the dir is inside a git work tree we run the shallow `find` output back
-/// through `git check-ignore --stdin` and drop every ignored child, so the tree
-/// hides the same files `search_files` hides (the previous raw `find` showed ALL
-/// files, gitignored or not). Outside a git work tree we fall back to the bare
-/// `find` listing (nothing to ignore against). The always-prune dirs are dropped
-/// by name in the parse loop on top of this.
+/// **Directory-only gitignore rule** (mirrors [`read_dir_shallow_fs`]): when the
+/// dir is inside a git work tree we run only the *directory* children through
+/// `git check-ignore --stdin` and drop the ignored ones — ignored DIRECTORIES
+/// (`node_modules`, `dist`, …) are hidden, but FILES are always emitted, so
+/// gitignored config like `.env`/`.env.local` stays visible while browsing. The
+/// earlier script ran files through `check-ignore` too and so hid `.env`. Outside
+/// a git work tree there's nothing to ignore against (the bare listing). The
+/// always-prune dirs are dropped by name in the parse loop on top of this.
+///
+/// When `show_ignored` is true the filter is skipped: every child is emitted,
+/// ignored dirs included (the parse loop still drops `.git`).
 #[cfg(windows)]
-fn wsl_list_dir(dir: &str) -> Result<Vec<DirEntry>, String> {
+fn wsl_list_dir(dir: &str, show_ignored: bool) -> Result<Vec<DirEntry>, String> {
     let distro = host_distro();
     // `find -maxdepth 1` lists immediate children only (shallow); `-printf` emits
     // `name\t<type>` where type is `d` for dirs and `f` for everything else.
     // GNU find's `%y` is the file type letter; map non-`d` to `f`. We filter `.`
     // / `..` out in the parse loop.
     //
-    // .gitignore filtering: when inside a work tree, feed the entry names to
-    // `git check-ignore --stdin` (dirs get a trailing `/` so directory-only
-    // patterns like `build/` match), collect the ignored set, and print only the
-    // entries NOT in it. `check-ignore` exits 1 when nothing matches, so the `||
-    // true` keeps the pipeline alive. Already in `dir` via wsl.exe --cd, so we
-    // operate on `.` (no `cd "$1"`).
-    const SCRIPT: &str = r#"
+    // Directory-only gitignore: when inside a work tree, feed ONLY the directory
+    // entries to `git check-ignore --stdin` (with a trailing `/` so directory
+    // patterns like `build/` match), collect the ignored dir set, then emit every
+    // file plus only the dirs NOT in that set. `check-ignore` exits 1 when nothing
+    // matches, so `|| true` keeps the pipeline alive. Already in `dir` via wsl.exe
+    // --cd, so we operate on `.` (no `cd "$1"`).
+    const SCRIPT_FILTER: &str = r#"
 emit() { find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null; }
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   ign=$(emit | while IFS=$'\t' read -r f y; do
-          [ "$y" = d ] && printf '%s/\n' "$f" || printf '%s\n' "$f"
+          [ "$y" = d ] && printf '%s/\n' "$f"
         done | git check-ignore --stdin 2>/dev/null | sed 's#/$##' || true)
   emit | while IFS=$'\t' read -r f y; do
-    skip=
-    while IFS= read -r ig; do [ "$f" = "$ig" ] && skip=1 && break; done <<EOF
+    if [ "$y" = d ]; then
+      skip=
+      while IFS= read -r ig; do [ "$f" = "$ig" ] && skip=1 && break; done <<EOF
 $ign
 EOF
-    [ -z "$skip" ] && printf '%s\t%s\n' "$f" "$y"
+      [ -z "$skip" ] && printf '%s\t%s\n' "$f" "$y"
+    else
+      printf '%s\t%s\n' "$f" "$y"
+    fi
   done
 else
   emit
 fi
 "#;
-    let output = wsl_bash(&distro, SCRIPT, dir)
+    // "Show ignored": no filtering — list every child (ignored dirs included).
+    const SCRIPT_ALL: &str = r#"find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null"#;
+    let script = if show_ignored { SCRIPT_ALL } else { SCRIPT_FILTER };
+    let output = wsl_bash(&distro, script, dir)
         .output()
         .map_err(|e| format!("failed to spawn wsl.exe: {e}"))?;
     if !output.status.success() {
@@ -804,7 +815,11 @@ fn search_index(index: &ProjectIndex, query: &str, limit: usize) -> Vec<FileHit>
 /// bridge take seconds each; a native `wsl.exe` listing is essentially instant.
 /// Anything else (a real Windows path on Windows, or any path on unix) falls
 /// through to the native [`read_dir_shallow_fs`] over `std::fs`.
-fn read_dir_shallow(dir: &Path) -> Result<Vec<DirEntry>, String> {
+///
+/// `show_ignored` is forwarded to both paths: false (default) applies the
+/// directory-only gitignore rule (hide ignored dirs, always show ignored files);
+/// true lists everything (ignored dirs included), only ever pruning `.git`.
+fn read_dir_shallow(dir: &Path, show_ignored: bool) -> Result<Vec<DirEntry>, String> {
     #[cfg(windows)]
     {
         // Detect a POSIX-absolute path the way `to_host_path` does. The path
@@ -812,35 +827,53 @@ fn read_dir_shallow(dir: &Path) -> Result<Vec<DirEntry>, String> {
         // WSL path is now in UNC form (`\\wsl.localhost\<distro>\home\...`). We
         // peel the UNC prefix back off to a POSIX path and list it inside WSL.
         if let Some(posix) = unc_to_posix(dir) {
-            return wsl_list_dir(&posix);
+            return wsl_list_dir(&posix, show_ignored);
         }
     }
-    read_dir_shallow_fs(dir)
+    read_dir_shallow_fs(dir, show_ignored)
 }
 
 /// Native shallow listing: directories first, then files, each alphabetical.
 /// The instant path on unix; the UNC-over-9P (slow) path on Windows for any
 /// non-WSL Windows path.
 ///
-/// **Honors `.gitignore`** so the tree matches the search index (PRD §9.7:
-/// "honoring `.gitignore`"). Previously this used a raw `std::fs::read_dir` that
-/// only dropped [`PRUNED_DIRS`] by name — so every gitignored file (`.env`,
-/// generated output, coverage dirs, `*.log`, …) showed in the tree even though
-/// `search_files` correctly hid them, which read as "the tree displays ALL
-/// files". We now do a depth-1 [`ignore::WalkBuilder`] walk with the SAME ignore
-/// settings as [`build_index`] (gitignore + global gitignore + `.git/info/
-/// exclude` + parent gitignores), so a folder's children in the tree are exactly
-/// the children the index would keep. The always-prune dirs are still dropped by
-/// name on top (covers `.git`, `node_modules`, etc. even when not gitignored).
-fn read_dir_shallow_fs(dir: &Path) -> Result<Vec<DirEntry>, String> {
+/// **Gitignore rule (the refinement over plain "respect `.gitignore`"):** the
+/// gitignore filter applies to **directories only**. Ignored *directories*
+/// (`node_modules`, `dist`, `build`, `target`, `.next`, `coverage`, …) are
+/// hidden so the tree isn't drowned in bulk noise; ignored *files* are always
+/// SHOWN, so config that's conventionally gitignored — `.env`, `.env.local`,
+/// `.env.*`, and friends — is visible while browsing (the user wants `.env`
+/// visible for sure). The earlier version filtered files too and so hid `.env`.
+///
+/// We get this in two passes:
+///   1. A depth-1 [`ignore::WalkBuilder`] walk with the SAME ignore stack as
+///      [`build_index`] (gitignore + global gitignore + `.git/info/exclude` +
+///      parent gitignores). Because the walk prunes ignored *and* always-prune
+///      directories during descent, the dirs it yields are exactly the dirs we
+///      want — ignored dirs never appear. (Its non-ignored *files* are kept too.)
+///   2. A raw [`std::fs::read_dir`] of just this directory that adds back any
+///      **file** entries the walk dropped as gitignored. Only files are added
+///      (never dirs), so ignored directories stay hidden while ignored files
+///      reappear. `.git` files are still skipped (VCS plumbing).
+///
+/// When `show_ignored` is true the rule is bypassed entirely: every entry is
+/// listed (raw `read_dir`, ignored dirs included) except `.git`, which is always
+/// pruned as un-browsable VCS internals.
+fn read_dir_shallow_fs(dir: &Path, show_ignored: bool) -> Result<Vec<DirEntry>, String> {
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()));
+    }
+
+    // "Show ignored" ON: a plain shallow listing of everything, ignored dirs
+    // (node_modules/target/…) and ignored files alike — only `.git` is pruned.
+    if show_ignored {
+        return read_dir_raw(dir, |_name, _is_dir| true);
     }
 
     // Depth-1 walk: the root itself arrives at depth 0 (skipped), its immediate
     // children at depth 1. `filter_entry` prunes the always-skip dirs by name so
     // they never even descend; the ignore settings mirror `build_index` exactly
-    // so the tree and the search index agree on what's hidden.
+    // so the tree's DIRECTORIES match what the search index would keep.
     let walker = WalkBuilder::new(dir)
         .max_depth(Some(1))
         .hidden(false) // keep dotfiles like .env.example; .git is pruned by name
@@ -861,6 +894,7 @@ fn read_dir_shallow_fs(dir: &Path) -> Result<Vec<DirEntry>, String> {
         .build();
 
     let mut out = Vec::new();
+    let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
     for result in walker {
         let dent = match result {
             Ok(d) => d,
@@ -876,6 +910,9 @@ fn read_dir_shallow_fs(dir: &Path) -> Result<Vec<DirEntry>, String> {
             None => continue,
         };
         let is_dir = dent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            seen_files.insert(name.clone());
+        }
         // `metadata()` here is cheap (the walker already stat'd the entry); fall
         // back to 0 if it's somehow unavailable. Dirs always report 0.
         let size = if is_dir {
@@ -890,11 +927,62 @@ fn read_dir_shallow_fs(dir: &Path) -> Result<Vec<DirEntry>, String> {
             size,
         });
     }
+
+    // Second pass: add back gitignored FILES the walk omitted, so `.env` & co.
+    // show. Only files are added (a `false` for dirs in the closure), so ignored
+    // directories stay hidden — the gitignore filter remains directory-only.
+    let extras = read_dir_raw(dir, |name, is_dir| !is_dir && !seen_files.contains(name))?;
+    out.extend(extras);
+
     out.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir) // dirs (true) before files (false)
             .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
     });
+    Ok(out)
+}
+
+/// Raw shallow `std::fs::read_dir` of `dir`, keeping each entry for which
+/// `keep(name, is_dir)` returns true. `.git` is ALWAYS skipped (un-browsable VCS
+/// plumbing). Used both for the "Show ignored" listing and to add gitignored
+/// files back onto the directory-only-filtered listing. Not sorted here — the
+/// caller merges + sorts.
+fn read_dir_raw(
+    dir: &Path,
+    keep: impl Fn(&str, bool) -> bool,
+) -> Result<Vec<DirEntry>, String> {
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir failed: {e}"))?;
+    let mut out = Vec::new();
+    for ent in rd.flatten() {
+        let name = match ent.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue, // non-UTF-8 name: skip
+        };
+        if name == ".git" {
+            continue;
+        }
+        // `file_type()` avoids a follow-symlink stat; fall back to a full stat
+        // only if it's unavailable. Treat anything we can't classify as a file.
+        let is_dir = match ent.file_type() {
+            Ok(ft) => ft.is_dir(),
+            Err(_) => ent.metadata().map(|m| m.is_dir()).unwrap_or(false),
+        };
+        if !keep(&name, is_dir) {
+            continue;
+        }
+        let path = ent.path();
+        let size = if is_dir {
+            0
+        } else {
+            ent.metadata().map(|m| m.len()).unwrap_or(0)
+        };
+        out.push(DirEntry {
+            name,
+            path: path.to_string_lossy().into_owned(),
+            is_dir,
+            size,
+        });
+    }
     Ok(out)
 }
 
@@ -1011,10 +1099,15 @@ pub async fn search_files(
 
 /// Shallow directory listing for the tree view (no recursion; folder expansion
 /// is a follow-up `list_dir` call, per PRD §9.7).
+///
+/// `show_ignored` (optional, default false) toggles the directory-only gitignore
+/// rule: false hides ignored DIRECTORIES (`node_modules`, …) while always showing
+/// ignored FILES (`.env`, …); true lists everything except `.git`. Wired to the
+/// Files panel's "Show ignored" toggle.
 #[tauri::command]
-pub async fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
+pub async fn list_dir(path: String, show_ignored: Option<bool>) -> Result<Vec<DirEntry>, String> {
     let dir = normalize(&path);
-    let res = read_dir_shallow(&dir);
+    let res = read_dir_shallow(&dir, show_ignored.unwrap_or(false));
     // DIAG: file tree "not loading" was undiagnosable from the release build.
     // Log the incoming path, the normalized host path, and the outcome so the
     // diag log shows exactly where the tree breaks (bad/empty path vs wsl/fs read
@@ -1075,11 +1168,16 @@ mod tests {
         root.push(format!("termhub-files-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
 
-        // A gitignore that hides `secret.txt` and the `ignored/` dir.
-        fs::write(root.join(".gitignore"), "secret.txt\nignored/\n*.log\n").unwrap();
+        // A gitignore that hides `secret.txt`, the `ignored/` dir, `*.log`, and
+        // `.env` (the conventional secret-config case the directory-only rule must
+        // still SHOW in the tree).
+        fs::write(root.join(".gitignore"), "secret.txt\nignored/\n*.log\n.env\n").unwrap();
 
         fs::write(root.join("README.md"), "# Title\n\nhello").unwrap();
         fs::write(root.join("package.json"), "{}").unwrap();
+        // A gitignored config FILE — must still appear in the tree (directory-only
+        // gitignore rule), even though the search index legitimately omits it.
+        fs::write(root.join(".env"), "SECRET=1").unwrap();
 
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
@@ -1128,9 +1226,13 @@ mod tests {
         assert!(rels.contains(&"src/lib.rs".to_string()));
         assert!(rels.contains(&"src/utils.ts".to_string()));
 
-        // Excluded by .gitignore.
+        // Excluded by .gitignore. (The SEARCH INDEX still honors gitignore fully —
+        // only the TREE relaxes it to a directory-only rule; see
+        // `list_dir_is_shallow_dirs_first_and_prunes`. So a gitignored `.env`
+        // is correctly absent here while still showing in the tree.)
         assert!(!rels.contains(&"secret.txt".to_string()), "gitignored file leaked");
         assert!(!rels.contains(&"debug.log".to_string()), "*.log leaked");
+        assert!(!rels.contains(&".env".to_string()), "gitignored .env leaked into index");
         assert!(
             !rels.iter().any(|r| r.starts_with("ignored/")),
             "gitignored dir leaked"
@@ -1257,27 +1359,38 @@ mod tests {
     #[test]
     fn list_dir_is_shallow_dirs_first_and_prunes() {
         let root = make_fixture();
-        let entries = read_dir_shallow(&root).unwrap();
+        let entries = read_dir_shallow(&root, false).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
 
         // Shallow: src is listed as a dir, but src/main.rs is not present.
         assert!(names.contains(&"src"));
         assert!(!names.contains(&"main.rs"));
 
-        // node_modules is pruned from the tree.
+        // node_modules is pruned from the tree (an always-prune dir).
         assert!(!names.contains(&"node_modules"));
 
-        // .gitignore is honored by the TREE too (not just the search index): the
-        // tree must hide the same files `search_files` hides, so a gitignored
-        // file/dir never appears while browsing. (Regression guard for the bug
-        // where the tree's raw read_dir showed ALL files regardless of
-        // .gitignore — "displays all files".)
-        assert!(!names.contains(&"secret.txt"), "gitignored file leaked into tree");
-        assert!(!names.contains(&"debug.log"), "*.log leaked into tree");
+        // DIRECTORY-only gitignore rule: ignored *directories* stay hidden …
         assert!(!names.contains(&"ignored"), "gitignored dir leaked into tree");
+        // … but ignored *files* are SHOWN. The headline case: a gitignored `.env`
+        // (and other gitignored files like secret.txt / *.log) must appear while
+        // browsing, even though the search index legitimately omits them.
+        assert!(
+            names.contains(&".env"),
+            "gitignored .env must show in the tree by default"
+        );
+        assert!(
+            names.contains(&"secret.txt"),
+            "gitignored file should show (files are never filtered)"
+        );
+        assert!(
+            names.contains(&"debug.log"),
+            "gitignored *.log file should show (files are never filtered)"
+        );
         // Tracked files are still listed.
         assert!(names.contains(&"README.md"));
         assert!(names.contains(&"package.json"));
+        // .git is never browsable — pruned regardless.
+        assert!(!names.contains(&".git"), ".git must never appear in the tree");
 
         // Dirs come before files: the first non-pruned entry should be a dir.
         let first_dir_idx = entries.iter().position(|e| e.is_dir);
@@ -1290,6 +1403,34 @@ mod tests {
         let src = entries.iter().find(|e| e.name == "src").unwrap();
         assert!(src.is_dir);
         assert_eq!(src.size, 0);
+        // The .env we added back via the raw pass must report a real (non-dir)
+        // size, not 0 — i.e. it's classified as a file.
+        let env = entries.iter().find(|e| e.name == ".env").unwrap();
+        assert!(!env.is_dir);
+        assert!(env.size > 0, "added-back .env should carry its byte size");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn list_dir_show_ignored_reveals_ignored_dirs() {
+        let root = make_fixture();
+        // With show_ignored = true, ignored DIRECTORIES come back too: the
+        // gitignored `ignored/` dir and the pruned `node_modules` both appear,
+        // alongside the files. Only `.git` stays hidden.
+        let entries = read_dir_shallow(&root, true).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"ignored"), "show_ignored should reveal ignored dirs");
+        assert!(
+            names.contains(&"node_modules"),
+            "show_ignored should reveal node_modules"
+        );
+        assert!(names.contains(&".env"), "show_ignored still shows ignored files");
+        assert!(names.contains(&"src"));
+        assert!(names.contains(&"README.md"));
+        // .git is never browsable, even with show_ignored on.
+        assert!(!names.contains(&".git"), ".git stays hidden even with show_ignored");
 
         cleanup(&root);
     }

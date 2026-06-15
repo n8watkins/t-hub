@@ -37,6 +37,17 @@ import {
   useRef,
   useState,
 } from "react";
+import {
+  File,
+  FileCode,
+  FileCog,
+  FileJson,
+  FileText,
+  Folder,
+  FolderOpen,
+  Image as ImageIcon,
+  type LucideIcon,
+} from "lucide-react";
 import { listDir, searchFiles } from "../ipc/files";
 import { tlog } from "../lib/diag";
 import type { DirEntry, FileHit } from "../ipc/types";
@@ -77,6 +88,13 @@ export interface FileTreeProps {
   previewInOverlay?: boolean;
   /** The currently-open file (absolute path), to highlight its row. Optional. */
   activePath?: string | null;
+  /**
+   * Show gitignored DIRECTORIES too (node_modules, build output, …). Default
+   * false applies the backend's directory-only gitignore rule: ignored dirs are
+   * hidden while ignored FILES (`.env`, `.env.local`, …) always show. When this
+   * flips the tree remounts (its `key` includes it) so every folder re-lists.
+   */
+  showIgnored?: boolean;
   /** Max results for a search query (default 50). */
   searchLimit?: number;
   className?: string;
@@ -103,6 +121,7 @@ export function FileTree({
   embedReader = false,
   previewInOverlay = true,
   activePath,
+  showIgnored = false,
   searchLimit = 50,
   className,
 }: FileTreeProps) {
@@ -226,8 +245,12 @@ export function FileTree({
           />
         ) : (
           <TreeRoot
+            // Remount when the root OR the show-ignored flag changes, so every
+            // folder re-lists with the new flag (the tree caches per-folder).
+            key={`${root}:${showIgnored ? 1 : 0}`}
             root={root}
             activePath={selectedPath}
+            showIgnored={showIgnored}
             onOpenFile={open}
           />
         )}
@@ -539,16 +562,18 @@ function SearchResults({
 function TreeRoot({
   root,
   activePath,
+  showIgnored,
   onOpenFile,
 }: {
   root: string;
   activePath: string | null;
+  showIgnored: boolean;
   onOpenFile: (absPath: string) => void;
 }) {
   // Load the root's children immediately on mount (and whenever the root
   // changes) — this is the "instant tree". Keyed by `root` so a new root
   // refetches from scratch.
-  const children = useDirEntries(root);
+  const children = useDirEntries(root, true, showIgnored);
 
   return (
     <div className="py-1">
@@ -556,6 +581,7 @@ function TreeRoot({
         state={children}
         depth={0}
         activePath={activePath}
+        showIgnored={showIgnored}
         onOpenFile={onOpenFile}
       />
     </div>
@@ -570,7 +596,11 @@ type DirEntriesState =
   | { status: "ready"; entries: DirEntry[] }
   | { status: "error"; message: string };
 
-function useDirEntries(path: string, enabled = true): DirEntriesState | null {
+function useDirEntries(
+  path: string,
+  enabled = true,
+  showIgnored = false,
+): DirEntriesState | null {
   const [state, setState] = useState<DirEntriesState | null>(null);
   // Which path the current `state` describes. State (not a ref) so the returned
   // value re-renders when it changes; deliberately NOT an effect dependency
@@ -598,7 +628,11 @@ function useDirEntries(path: string, enabled = true): DirEntriesState | null {
     setStatePath(path);
     setState({ status: "loading" });
     tlog("files", `list_dir -> ${path}`);
-    listDir(path)
+    // `showIgnored` is read here but NOT an effect dep: the tree remounts when it
+    // flips (TreeRoot's key includes it), so it's constant for this hook's life —
+    // adding it would risk the self-cancel documented above. (Same as [path,
+    // enabled] only.)
+    listDir(path, showIgnored)
       .then((entries) => {
         tlog("files", `list_dir OK ${path}: ${entries.length} entries`);
         if (cancelled) return;
@@ -631,11 +665,13 @@ function DirChildren({
   state,
   depth,
   activePath,
+  showIgnored,
   onOpenFile,
 }: {
   state: DirEntriesState | null;
   depth: number;
   activePath: string | null;
+  showIgnored: boolean;
   onOpenFile: (absPath: string) => void;
 }) {
   if (state === null || state.status === "loading") {
@@ -661,6 +697,7 @@ function DirChildren({
             name={entry.name}
             depth={depth}
             activePath={activePath}
+            showIgnored={showIgnored}
             onOpenFile={onOpenFile}
           />
         ) : (
@@ -682,19 +719,22 @@ function TreeDir({
   name,
   depth,
   activePath,
+  showIgnored,
   onOpenFile,
 }: {
   path: string;
   name: string;
   depth: number;
   activePath: string | null;
+  showIgnored: boolean;
   onOpenFile: (absPath: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   // Only list children once the folder has been opened (lazy + cached). Once
   // loaded the result is kept across collapse/re-expand — collapsing is pure UI
-  // state, never a rescan (PRD §9.7).
-  const children = useDirEntries(path, open);
+  // state, never a rescan (PRD §9.7). `showIgnored` is constant per mount (the
+  // tree remounts when it flips), so it's just forwarded — not a refetch trigger.
+  const children = useDirEntries(path, open, showIgnored);
 
   return (
     <div>
@@ -719,6 +759,7 @@ function TreeDir({
           state={children}
           depth={depth + 1}
           activePath={activePath}
+          showIgnored={showIgnored}
           onOpenFile={onOpenFile}
         />
       )}
@@ -775,55 +816,37 @@ function Chevron({ open }: { open: boolean }) {
   );
 }
 
-// --- Row icons (inline SVG; no icon dependency) ----------------------------
+// --- Row icons (lucide-react, mapped by name/extension) --------------------
 //
-// Small (13px) themed glyphs so folders vs files are unmistakable at a glance,
-// plus a light extension hint that tints the file glyph by category (code /
-// web / data / docs / image …). All stroke/fill via `currentColor` so the
-// surrounding `color` drives them — kept on `var(--th-*)` tokens. Duplicated in
-// FilePanel.tsx (its compact tree) on purpose: these two tree components are
-// independent, self-contained surfaces and the file-ownership boundary keeps a
-// shared icon module out of scope.
+// Clean, tree-shakeable lucide glyphs at ~14px, themed via `currentColor` so the
+// wrapper's `color` (a `var(--th-*)` token + a light per-category tint) drives
+// them. Folder/FolderOpen for dirs; FileCode / FileJson / FileText / Image /
+// FileCog (config) / File map by extension or name. Duplicated in FilePanel.tsx
+// (its compact tree) on purpose: the two tree components are independent,
+// self-contained surfaces and the file-ownership boundary keeps a shared icon
+// module out of scope.
 
-/** Folder glyph — a subtly different shape when open vs closed so an expanded
- *  folder reads as "open". Tinted with the accent so folders pop over files. */
+const ICON_PX = 14;
+
+/** Folder glyph — `FolderOpen` when expanded, `Folder` when closed. Accent-
+ *  tinted so folders pop over files. */
 function FolderIcon({ open }: { open: boolean }) {
+  const Icon = open ? FolderOpen : Folder;
   return (
     <span
       className="flex w-3.5 shrink-0 items-center justify-center"
       style={{ color: "var(--th-accent)" }}
       aria-hidden
     >
-      <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
-        {open ? (
-          // Open folder: back flap + an angled front face.
-          <>
-            <path
-              d="M1.5 4.2c0-.5.4-.9.9-.9h3.1l1.2 1.2h6.9c.5 0 .9.4.9.9v1.1H2.6c-.5 0-1 .35-1.1.85V4.2z"
-              fill="currentColor"
-              opacity="0.45"
-            />
-            <path
-              d="M2.5 7.4h12l-1.3 4.4c-.1.4-.5.7-.9.7H2.4c-.5 0-.9-.45-.85-.95l.6-3.45c.05-.4.4-.7.35-.7z"
-              fill="currentColor"
-            />
-          </>
-        ) : (
-          // Closed folder: a tab + body.
-          <path
-            d="M1.5 4.2c0-.5.4-.9.9-.9h3.1l1.2 1.2h6.9c.5 0 .9.4.9.9v6c0 .5-.4.9-.9.9H2.4c-.5 0-.9-.4-.9-.9V4.2z"
-            fill="currentColor"
-          />
-        )}
-      </svg>
+      <Icon size={ICON_PX} strokeWidth={2} />
     </span>
   );
 }
 
-/** File glyph: a page outline (with a folded corner) tinted by the file's
- *  category. The tint is the only "type hint" — the shape stays consistent so
- *  rows read as a tidy column. */
+/** File glyph chosen by extension/name (code / json / docs / image / config /
+ *  default), tinted by the file's category so the tree has light type cues. */
 function FileIcon({ name }: { name: string }) {
+  const Icon = fileIconFor(name);
   const color = fileIconColor(name);
   return (
     <span
@@ -831,28 +854,59 @@ function FileIcon({ name }: { name: string }) {
       style={{ color }}
       aria-hidden
     >
-      <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
-        <path
-          d="M4 1.5h5.2L13 5.3V14a.5.5 0 0 1-.5.5h-8A.5.5 0 0 1 4 14V2a.5.5 0 0 1 .5-.5z"
-          fill="currentColor"
-          opacity="0.18"
-        />
-        <path
-          d="M4 1.5h5.2L13 5.3V14a.5.5 0 0 1-.5.5h-8A.5.5 0 0 1 4 14V2a.5.5 0 0 1 .5-.5z"
-          stroke="currentColor"
-          strokeWidth="1"
-          strokeLinejoin="round"
-        />
-        <path
-          d="M9 1.7V5.3h3.4"
-          stroke="currentColor"
-          strokeWidth="1"
-          strokeLinejoin="round"
-          fill="none"
-        />
-      </svg>
+      <Icon size={ICON_PX} strokeWidth={2} />
     </span>
   );
+}
+
+/** Lowercased extension of a filename (no dot), or "" if none. */
+function extOf(name: string): string {
+  const lower = name.toLowerCase();
+  const dot = lower.lastIndexOf(".");
+  return dot >= 0 ? lower.slice(dot + 1) : "";
+}
+
+/** True for conventional config / dotfiles (`.env`, `.env.*`, `.*rc`, and the
+ *  usual config basenames) — these get the `FileCog` glyph. */
+function isConfigName(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    lower === ".env" ||
+    lower.startsWith(".env.") ||
+    lower.endsWith("rc") || // .npmrc, .babelrc, .zshrc, .bashrc, eslintrc, …
+    lower.endsWith(".config.js") ||
+    lower.endsWith(".config.ts") ||
+    lower.endsWith(".config.mjs") ||
+    lower.endsWith(".config.cjs") ||
+    lower === "tsconfig.json" ||
+    lower === "tauri.conf.json" ||
+    lower === "dockerfile" ||
+    lower === "makefile" ||
+    lower === ".gitignore" ||
+    lower === ".gitattributes" ||
+    lower === ".editorconfig"
+  );
+}
+
+const CODE_EXTS = new Set([
+  "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "go", "py", "sh", "bash", "zsh",
+  "c", "h", "cpp", "hpp", "java", "rb", "php", "html", "css", "scss",
+]);
+const TEXT_EXTS = new Set(["md", "mdx", "markdown", "txt", "rst", "log"]);
+const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "svg", "gif", "webp", "ico", "bmp", "avif"]);
+const DATA_EXTS = new Set(["toml", "yaml", "yml"]);
+
+/** Pick the lucide icon component for a filename. Config/dotfiles first (so
+ *  `.env` reads as config, not a generic file), then by extension. */
+function fileIconFor(name: string): LucideIcon {
+  if (isConfigName(name)) return FileCog;
+  const ext = extOf(name);
+  if (ext === "json") return FileJson;
+  if (IMAGE_EXTS.has(ext)) return ImageIcon;
+  if (CODE_EXTS.has(ext)) return FileCode;
+  if (TEXT_EXTS.has(ext)) return FileText;
+  if (DATA_EXTS.has(ext)) return FileText; // toml/yaml: doc-ish config
+  return File;
 }
 
 /** Map a filename to a category tint for its [`FileIcon`]. Themed token first
@@ -876,9 +930,7 @@ function fileIconColor(name: string): string {
   ) {
     return "var(--th-accent)";
   }
-  const dot = lower.lastIndexOf(".");
-  const ext = dot >= 0 ? lower.slice(dot + 1) : "";
-  return EXT_TINT[ext] ?? "var(--th-fg-muted)";
+  return EXT_TINT[extOf(name)] ?? "var(--th-fg-muted)";
 }
 
 /** Extension → tint. Muted, category-grouped hues; intentionally small. */
@@ -909,6 +961,8 @@ const EXT_TINT: Record<string, string> = {
   txt: "#9aa0a6",
   // Python.
   py: "#5a9fd4",
+  // Shell.
+  sh: "#89c07a",
   // Images (still shown in the tree even if the reader rejects them).
   png: "#b48ead",
   jpg: "#b48ead",
