@@ -25,7 +25,6 @@ import { useSettings } from "../store/settings";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import { WslHealth } from "./WslHealth";
 import { WorkspacesList } from "./WorkspacesList";
-import { ProjectsList } from "./ProjectsList";
 import { RecentList } from "./RecentList";
 import type { HostMetrics, ConnectionState } from "../ipc/protocol";
 import type { TerminalId } from "../ipc/types";
@@ -51,9 +50,6 @@ export type SidebarMode = "full" | "rail" | "hidden";
 export const SIDEBAR_RAIL_WIDTH = 48;
 
 export interface SidebarProps {
-  /** Reveal + focus a PROJECT (a terminal in the active tab). App resolves the
-   *  tab that owns the id and runs setActiveTab + setFocus. */
-  onSelectProject?: (id: TerminalId) => void;
   /** RECALL a past Claude session: spawn `claude --resume <id>` in `cwd`, add the
    *  tile to the active tab, and focus it. App wires this to the store's recall. */
   onRecall?: (sessionId: string, cwd: string) => void;
@@ -71,7 +67,6 @@ export interface SidebarProps {
 }
 
 export function Sidebar({
-  onSelectProject,
   onRecall,
   mode = "full",
   width = 256,
@@ -100,7 +95,6 @@ export function Sidebar({
   return (
     <SidebarFull
       width={width}
-      onSelectProject={onSelectProject}
       onRecall={onRecall}
       onToggleSidebar={onToggleSidebar}
     />
@@ -109,28 +103,16 @@ export function Sidebar({
 
 interface FullProps {
   width: number;
-  onSelectProject?: (id: TerminalId) => void;
   onRecall?: (sessionId: string, cwd: string) => void;
   onToggleSidebar?: () => void;
 }
 
-function SidebarFull({
-  width,
-  onSelectProject,
-  onRecall,
-  onToggleSidebar,
-}: FullProps) {
+function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
   const { metrics, agent } = useAgentTelemetry();
 
-  // The active tab's tile order + the live records / labels / focus drive the
-  // Projects list. Read straight from the store (no supervision plumbing).
+  // Only the tab list is needed here now (the Workspaces section count); the
+  // Workspaces list itself reads everything else from the store directly.
   const tabs = useWorkspace((s) => s.tabs);
-  const activeTabId = useWorkspace((s) => s.activeTabId);
-  const terminals = useWorkspace((s) => s.terminals);
-  const labels = useWorkspace((s) => s.labels);
-  const focusedId = useWorkspace((s) => s.focusedId);
-  const activeTab = tabs.find((t) => t.id === activeTabId);
-  const order = activeTab?.order ?? [];
 
   return (
     <aside
@@ -142,38 +124,24 @@ function SidebarFull({
         color: "var(--th-fg)",
       }}
     >
-      {/* Top chrome header: the T-Hub brand (window-drag handle) on the left,
-          the collapse button + a small secondary settings gear on the right.
-          The PRIMARY gear + window controls live in the titlebar. */}
-      <SidebarHeader onToggleSidebar={onToggleSidebar} />
+      {/* The sidebar's top chrome (brand + collapse + settings) now lives in the
+          titlebar's LEFT cluster (see Titlebar.tsx LeftChrome), so the sidebar
+          starts straight at its content and reclaims that vertical space. */}
 
-      {/* Body: three stacked sections — Workspaces (EVERY tab + its terminals),
-          Projects (just the active tab's terminals), and Recent (recallable past
-          Claude sessions). Each grows and scrolls internally; the whole body
-          scrolls as a safety net on a short window. */}
+      {/* Body: two stacked sections — Workspaces (EVERY tab + its terminals; the
+          one navigation surface now) and Recent (recallable past Claude
+          sessions). Each grows and scrolls internally; the whole body scrolls as
+          a safety net on a short window. The old separate "Projects" section is
+          gone — a workspace's terminals live under it in Workspaces. */}
       <div className="th-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
         {/* Workspaces — every workspace tab as a collapsible row over its
-            terminals. Clicking a row switches tabs; clicking a nested terminal
-            switches tabs AND focuses it. Self-contained: it reads the store
-            directly, so there's no extra Sidebar/App wiring. */}
+            terminals: switch workspace/terminal, rename, close. Self-contained
+            (reads the store directly). */}
         <Section title="Workspaces" count={tabs.length} className="border-b">
           <WorkspacesList />
         </Section>
 
-        {/* Projects — the terminals in the ACTIVE workspace tab. Clicking reveals
-            + focuses the tile (App: setActiveTab(owner) + setFocus). */}
-        <Section title="Projects" count={order.length} className="border-b">
-          <ProjectsList
-            order={order}
-            terminals={terminals}
-            labels={labels}
-            focusedId={focusedId}
-            onSelect={(id) => onSelectProject?.(id)}
-          />
-        </Section>
-
-        {/* Recent — past Claude sessions to recall. Clicking re-spawns a terminal
-            in the session's cwd and resumes it (`claude --resume <id>`). */}
+        {/* Recent — past Claude sessions to resume. */}
         <Section title="Recent" className="border-b">
           <RecentList onRecall={(id, cwd) => onRecall?.(id, cwd)} />
         </Section>

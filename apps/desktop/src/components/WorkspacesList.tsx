@@ -1,37 +1,29 @@
-// The sidebar's "Workspaces" list (feat/workspaces-lifecycle).
+// The sidebar's "Workspaces" list — the ONLY navigation surface now.
 //
-// In the product model a WORKSPACE is a top tab and a PROJECT is one terminal
-// tile inside it. The existing "Projects" section only ever shows the ACTIVE
-// workspace's terminals; this section sits ABOVE it and shows EVERY workspace as
-// a collapsible row, with the terminals nested inside each. It's the global
-// "switch to any tab / any tile from one place" surface the user asked for.
+// In the product model a WORKSPACE is a top tab; a terminal lives inside one.
+// (The old separate "Projects" section is gone — workspaces are the unit.) This
+// shows EVERY workspace as a collapsible row over its terminals, the single place
+// to switch to any workspace / any terminal, rename a workspace, and close a
+// terminal.
 //
 // Behavior:
-//   - Click a workspace row header  -> switch to that workspace (setActiveTab).
-//     The active workspace is marked with a SUBTLE accent tint + thin accent left
-//     bar (matching ProjectsList's focused-row treatment), not a bright fill.
-//   - Expand/collapse a workspace   -> reveal/hide its terminals. The ACTIVE
-//     workspace is expanded by default; the rest start collapsed. This is purely
-//     local UI state (a per-tab open flag), not persisted.
-//   - Click a nested terminal       -> switch to its owning workspace AND focus
-//     it (setActiveTab(owner) + setFocus(id)).
-//   - Each workspace row shows a count of the terminals it holds.
+//   - Click a workspace row     -> switch to it (setActiveTab). Active workspace
+//     gets a SUBTLE accent tint + thin accent left bar (not a bright fill).
+//   - Double-click the name     -> rename the workspace inline (renameTab).
+//   - Chevron                   -> expand/collapse its terminals (active expanded
+//     by default; local UI state, not persisted).
+//   - Click a terminal          -> switch to its workspace AND focus it.
+//   - X on a terminal           -> kill it (deleteTerminal) — close what you're
+//     working on right from here.
 //
-// This is pure navigation over the workspace store: it reads tabs/terminals/
-// labels/focus and calls setActiveTab/setFocus, never mutating layout. The row
-// look (lifecycle dot + derived label) deliberately mirrors ProjectsList so the
-// two sections read as one family; we re-derive it here rather than importing
-// ProjectsList's private row (kept untouched per the build split).
-import { useState } from "react";
+// Reads the workspace store directly (no props), so App needs no extra wiring.
+import { useEffect, useRef, useState } from "react";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
 import type { TerminalId, TerminalInfo, TerminalState } from "../ipc/types";
 
-/**
- * Lifecycle-dot color per terminal state — the SAME `--th-dot-*` palette
- * ProjectsList / Tile use, so a terminal reads identically wherever it appears
- * (amber=starting / green=live / gray=detached / dim=exited / red=error).
- */
+/** Lifecycle-dot color per terminal state — the SAME `--th-dot-*` palette Tile
+ *  uses, so a terminal reads identically wherever it appears. */
 const DOT_VAR: Record<TerminalState, string> = {
   starting: "var(--th-dot-starting)",
   live: "var(--th-dot-live)",
@@ -40,9 +32,6 @@ const DOT_VAR: Record<TerminalState, string> = {
   error: "var(--th-dot-error)",
 };
 
-/** The full list of workspaces, each a collapsible row over its terminals. Reads
- *  the store directly (no props) so it stays self-contained and App needs no new
- *  wiring. Empty-state hint when there are somehow no workspaces. */
 export function WorkspacesList() {
   const tabs = useWorkspace((s) => s.tabs);
   const activeTabId = useWorkspace((s) => s.activeTabId);
@@ -51,13 +40,12 @@ export function WorkspacesList() {
   const focusedId = useWorkspace((s) => s.focusedId);
   const setActiveTab = useWorkspace((s) => s.setActiveTab);
   const setFocus = useWorkspace((s) => s.setFocus);
+  const renameTab = useWorkspace((s) => s.renameTab);
+  const deleteTerminal = useWorkspace((s) => s.deleteTerminal);
 
-  // Local expand/collapse state, keyed by tab id. Undefined = "use the default"
-  // (expanded iff this is the active workspace); an explicit boolean overrides
-  // it once the user toggles a row. Not persisted — a fresh launch re-derives.
+  // Local expand/collapse, keyed by tab id. Undefined = default (open iff active).
   const [openMap, setOpenMap] = useState<Record<string, boolean>>({});
-  const isOpen = (tab: WorkspaceTab) =>
-    openMap[tab.id] ?? tab.id === activeTabId;
+  const isOpen = (tab: WorkspaceTab) => openMap[tab.id] ?? tab.id === activeTabId;
   const toggleOpen = (tab: WorkspaceTab) =>
     setOpenMap((m) => ({ ...m, [tab.id]: !isOpen(tab) }));
 
@@ -81,23 +69,19 @@ export function WorkspacesList() {
           labels={labels}
           focusedId={focusedId}
           onToggle={() => toggleOpen(tab)}
-          // Header click: switch to this workspace (no-op if already active).
           onActivate={() => setActiveTab(tab.id)}
-          // Terminal click: switch to the owning workspace, then focus the tile.
+          onRename={(name) => renameTab(tab.id, name)}
           onSelectTerminal={(id) => {
             setActiveTab(tab.id);
             setFocus(id);
           }}
+          onCloseTerminal={(id) => deleteTerminal(id)}
         />
       ))}
     </ul>
   );
 }
 
-/** One workspace: a header row (expand chevron + name + tile count) over its
- *  nested terminals when expanded. The header is split into two hit targets —
- *  the chevron toggles expand/collapse, the rest of the row switches to the
- *  workspace — so the two affordances don't fight. */
 function WorkspaceRow({
   tab,
   active,
@@ -107,7 +91,9 @@ function WorkspaceRow({
   focusedId,
   onToggle,
   onActivate,
+  onRename,
   onSelectTerminal,
+  onCloseTerminal,
 }: {
   tab: WorkspaceTab;
   active: boolean;
@@ -117,16 +103,38 @@ function WorkspaceRow({
   focusedId: TerminalId | null;
   onToggle: () => void;
   onActivate: () => void;
+  onRename: (name: string) => void;
   onSelectTerminal: (id: TerminalId) => void;
+  onCloseTerminal: (id: TerminalId) => void;
 }) {
   const count = tab.order.length;
+  // Inline rename state: double-click the name to edit; Enter/blur commits,
+  // Esc cancels. Seeded from the current name each time editing starts.
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(tab.name);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing) {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }
+  }, [editing]);
+
+  const startEdit = () => {
+    setDraft(tab.name);
+    setEditing(true);
+  };
+  const commit = () => {
+    const name = draft.trim();
+    if (name && name !== tab.name) onRename(name);
+    setEditing(false);
+  };
+
   return (
     <li>
-      {/* Header row. Rounded + subtle hover to match ProjectsList rows; the
-          ACTIVE workspace gets the same SUBTLE accent tint + thin accent left
-          bar the focused project row uses (not a bright fill). */}
       <div
-        className="flex w-full items-center gap-1 rounded-lg pr-2 transition-colors hover:bg-neutral-800/40"
+        className="flex w-full items-center gap-1 rounded-lg pr-1 transition-colors hover:bg-neutral-800/40"
         style={{
           color: "var(--th-fg)",
           ...(active
@@ -138,7 +146,6 @@ function WorkspaceRow({
             : {}),
         }}
       >
-        {/* Disclosure chevron — toggles expand/collapse only. */}
         <button
           type="button"
           onClick={onToggle}
@@ -149,28 +156,46 @@ function WorkspaceRow({
         >
           <ChevronIcon open={open} />
         </button>
-        {/* Name + count — switches to this workspace. */}
-        <button
-          type="button"
-          onClick={onActivate}
-          aria-current={active ? "true" : undefined}
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-1.5 pr-1 text-left text-sm"
-          title={`${tab.name} — ${count} project${count === 1 ? "" : "s"}`}
-        >
-          <span className="min-w-0 flex-1 truncate font-medium">{tab.name}</span>
-          <CountBadge n={count} />
-        </button>
+
+        {editing ? (
+          <input
+            ref={inputRef}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit();
+              else if (e.key === "Escape") setEditing(false);
+            }}
+            spellCheck={false}
+            className="min-w-0 flex-1 rounded bg-transparent px-1 py-1 text-sm outline-none"
+            style={{
+              color: "var(--th-fg)",
+              border: "1px solid var(--th-focus-ring, var(--th-accent))",
+            }}
+          />
+        ) : (
+          <button
+            type="button"
+            onClick={onActivate}
+            onDoubleClick={startEdit}
+            aria-current={active ? "true" : undefined}
+            className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-1.5 pr-1 text-left text-sm"
+            title={`${tab.name} — ${count} terminal${count === 1 ? "" : "s"} · double-click to rename`}
+          >
+            <span className="min-w-0 flex-1 truncate font-medium">{tab.name}</span>
+            <CountBadge n={count} />
+          </button>
+        )}
       </div>
 
-      {/* Nested terminals (only when expanded). Indented under the header so the
-          hierarchy reads; each uses the same dot + derived-label row as Projects. */}
       {open &&
         (count === 0 ? (
           <div
             className="py-1 pl-7 pr-2 text-sm"
             style={{ color: "var(--th-fg-muted)" }}
           >
-            No projects here yet.
+            Nothing open here yet.
           </div>
         ) : (
           <ul className="flex flex-col gap-0.5 py-0.5 pl-5">
@@ -182,6 +207,7 @@ function WorkspaceRow({
                 userLabel={labels[id]}
                 active={id === focusedId}
                 onClick={() => onSelectTerminal(id)}
+                onClose={() => onCloseTerminal(id)}
               />
             ))}
           </ul>
@@ -190,22 +216,24 @@ function WorkspaceRow({
   );
 }
 
-/** One nested terminal row: a themed lifecycle dot + the project's friendly name
- *  (with the short id faint beside it when the name isn't already the id) — the
- *  same look ProjectsList uses. The focused tile (of the active workspace) gets
- *  the subtle accent tint + left bar. */
+/** One nested terminal row: a themed lifecycle dot + the friendly "what's
+ *  running" label (e.g. "claude · tools" from deriveLabel — the command + dir,
+ *  NOT the opaque session id, which isn't useful here), and an X to close it. The
+ *  focused tile (of the active workspace) gets the subtle accent tint + left bar. */
 function TerminalRow({
   id,
   info,
   userLabel,
   active,
   onClick,
+  onClose,
 }: {
   id: TerminalId;
   info?: TerminalInfo;
   userLabel?: string;
   active: boolean;
   onClick: () => void;
+  onClose: () => void;
 }) {
   const state: TerminalState = info?.state ?? "starting";
   const label = deriveLabel({
@@ -214,25 +242,27 @@ function TerminalRow({
     title: info?.title,
     cwd: info?.cwd,
   });
-  const showShortId = label !== id;
+  const cwd = info?.cwd ?? "";
   return (
-    <li>
+    <li
+      className="group flex items-center gap-2 rounded-lg pr-1 transition-colors hover:bg-neutral-800/40"
+      style={{
+        color: "var(--th-fg)",
+        ...(active
+          ? {
+              backgroundColor:
+                "color-mix(in srgb, var(--th-accent) 16%, transparent)",
+              boxShadow: "inset 2px 0 0 0 var(--th-accent)",
+            }
+          : {}),
+      }}
+    >
       <button
         type="button"
         onClick={onClick}
         aria-current={active ? "true" : undefined}
-        className="flex w-full cursor-pointer items-center gap-2 rounded-lg py-1.5 pr-2 pl-2.5 text-left text-sm transition-colors hover:bg-neutral-800/40"
-        style={{
-          color: "var(--th-fg)",
-          ...(active
-            ? {
-                backgroundColor:
-                  "color-mix(in srgb, var(--th-accent) 16%, transparent)",
-                boxShadow: "inset 2px 0 0 0 var(--th-accent)",
-              }
-            : {}),
-        }}
-        title={`${showShortId ? `${label} · ${id}` : label} — ${state}`}
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-1.5 pl-2.5 text-left text-sm"
+        title={cwd ? `${label} — ${cwd} (${state})` : `${label} — ${state}`}
       >
         <span
           className="h-2 w-2 shrink-0 rounded-full"
@@ -240,20 +270,26 @@ function TerminalRow({
           aria-hidden
         />
         <span className="min-w-0 flex-1 truncate">{label}</span>
-        {showShortId && (
-          <span
-            className="shrink-0 font-mono text-[0.9em]"
-            style={{ color: "var(--th-fg-muted)" }}
-          >
-            {id}
-          </span>
-        )}
+      </button>
+      {/* Close (kill) this terminal — "close what we're working on from the
+          workspace". Reveals on row hover so it doesn't clutter the list. */}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+        className="shrink-0 rounded px-1 leading-none opacity-0 transition-opacity hover:bg-neutral-700/40 group-hover:opacity-100"
+        style={{ color: "var(--th-fg-muted)" }}
+        title="Close this terminal (kills its session)"
+        aria-label="Close terminal"
+      >
+        ×
       </button>
     </li>
   );
 }
 
-/** A small count chip (mirrors the sidebar Section's CountBadge styling). */
 function CountBadge({ n }: { n: number }) {
   return (
     <span
@@ -265,8 +301,6 @@ function CountBadge({ n }: { n: number }) {
   );
 }
 
-/** Disclosure chevron — points right when collapsed, down when open (mirrors the
- *  sidebar's own ChevronIcon). */
 function ChevronIcon({ open }: { open: boolean }) {
   return (
     <svg

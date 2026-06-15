@@ -8,7 +8,6 @@ import { useSettings } from "./store/settings";
 import { useWorkspace } from "./store/workspace";
 import { initWindowSync, isSatellite } from "./lib/windows";
 import { LifecycleKeybinds } from "./lib/useLifecycleKeybinds";
-import type { TerminalId } from "./ipc/types";
 
 // Multi-window tear-off (#21): a window opened with `?tab=<id>` is a SATELLITE
 // rendering only that one tab (the workspace store scopes itself at boot). The
@@ -174,14 +173,6 @@ export default function App() {
   //   - onRecall(id, cwd): re-spawn `claude --resume <id>` in `cwd` and focus it,
   //     via the workspace store's recall action (it reuses the normal spawn path).
   const recall = useWorkspace((s) => s.recall);
-  const selectProject = useCallback((id: TerminalId) => {
-    const { tabs, setActiveTab, setFocus } = useWorkspace.getState();
-    const owner = tabs.find((t) => t.order.includes(id));
-    // Activate the owning tab first (so its canvas is visible), then focus the
-    // tile. setActiveTab is a no-op if it's already active, so focus still lands.
-    if (owner) setActiveTab(owner.id);
-    setFocus(id);
-  }, []);
   const onRecall = useCallback(
     (sessionId: string, cwd: string) => {
       void recall(sessionId, cwd);
@@ -297,19 +288,6 @@ export default function App() {
     };
   }, [onResizeMove, onResizeEnd]);
 
-  // The sidebar's current effective on-screen width (TASK 1). The titlebar uses
-  // this to indent its tab strip so the leftmost tab aligns with the canvas's
-  // left edge (the sidebar's right edge): 0 when hidden, the rail width when
-  // railed, the resizable width when full. The SidebarResizer itself has a net-
-  // zero layout footprint (-mx-[3px] on a w-1.5 box), so the canvas's left edge
-  // sits exactly this many px from the window's left. Updates live as the mode/
-  // width changes because it's derived straight from the state each render.
-  const sidebarOffset =
-    sidebarMode === "hidden"
-      ? 0
-      : sidebarMode === "rail"
-        ? SIDEBAR_RAIL_WIDTH
-        : sidebarWidth;
 
   return (
     <div className="relative flex h-full w-full flex-col bg-neutral-950 text-neutral-100">
@@ -340,7 +318,7 @@ export default function App() {
           onPointerEnter={reveal}
           onPointerLeave={() => scheduleHide(hideDelayMs)}
         >
-          <Titlebar satellite={SATELLITE} tabStripOffset={sidebarOffset} />
+          <Titlebar satellite={SATELLITE} onToggleSidebar={cycleSidebarMode} />
         </div>
       ) : (
         <div
@@ -351,7 +329,7 @@ export default function App() {
           }}
           {...barHover}
         >
-          <Titlebar satellite={SATELLITE} tabStripOffset={sidebarOffset} />
+          <Titlebar satellite={SATELLITE} onToggleSidebar={cycleSidebarMode} />
         </div>
       )}
 
@@ -361,7 +339,6 @@ export default function App() {
             <Sidebar
               mode={sidebarMode}
               width={sidebarMode === "rail" ? SIDEBAR_RAIL_WIDTH : sidebarWidth}
-              onSelectProject={selectProject}
               onRecall={onRecall}
               onToggleSidebar={cycleSidebarMode}
             />

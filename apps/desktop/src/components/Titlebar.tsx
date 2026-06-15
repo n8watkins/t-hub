@@ -127,18 +127,13 @@ function droppedOutsideStrip(y: number): boolean {
  */
 export function Titlebar({
   satellite = false,
-  tabStripOffset = 0,
+  onToggleSidebar,
 }: {
   satellite?: boolean;
-  /**
-   * How far (px) from the window's left edge the workspace tab strip should
-   * begin — set by App to the sidebar's current effective width so the leftmost
-   * tab aligns with the canvas's left edge (TASK 1). A draggable spacer before
-   * the strip widens to fill the gap. Updates live as the sidebar mode/width
-   * changes. Ignored in a satellite (no tab strip there). With the brand in the
-   * sidebar the spacer simply equals the offset. Defaults to 0.
-   */
-  tabStripOffset?: number;
+  /** Cycle the sidebar collapse state (full -> rail -> hidden). The collapse
+   *  button now lives here in the titlebar's left chrome cluster, so it stays
+   *  reachable even when the sidebar is fully hidden. */
+  onToggleSidebar?: () => void;
 }) {
   const toggleSettings = useSettings((s) => s.toggleSettings);
   return (
@@ -159,16 +154,17 @@ export function Titlebar({
           <WindowControls satellite />
         </>
       ) : (
-        // Main: a draggable spacer that pushes the tab strip out to the sidebar's
-        // right edge (TASK 1), then the workspace tabs (+ the new-tab button),
-        // then a flexible drag region, and finally the PRIMARY chrome at the
-        // top-right: the settings gear + the window controls (min / max-restore /
-        // close). These are ALWAYS here, independent of the sidebar's state.
+        // Main: the LEFT chrome cluster (brand + collapse + settings) fills what
+        // used to be dead space to the left of the first tab, so the sidebar no
+        // longer needs its own header row. Then the workspace tabs (+ new-tab),
+        // a flexible drag region, and the window controls at the top-right.
         <>
-          <TabStripSpacer offset={tabStripOffset} />
+          <LeftChrome
+            onToggleSidebar={onToggleSidebar}
+            onSettings={toggleSettings}
+          />
           <TabStrip />
           <div data-tauri-drag-region className="min-w-0 flex-1" aria-hidden />
-          <SettingsButton onClick={toggleSettings} />
           <WindowControls />
         </>
       )}
@@ -177,10 +173,64 @@ export function Titlebar({
 }
 
 /**
- * The primary settings gear — opens the settings/theme surface (also
- * Ctrl/Cmd+,). Lives in the titlebar's top-right, just left of the window
- * controls. Must NOT carry data-tauri-drag-region or the click would start a
- * window drag.
+ * The titlebar's LEFT chrome cluster: the T-Hub brand (a window-drag handle),
+ * the sidebar collapse toggle, and the settings gear. This replaces the old
+ * empty drag spacer + the sidebar's own header row, so the dead space left of the
+ * first workspace tab is now useful and the sidebar reclaims that vertical space.
+ * The collapse button stays here even when the sidebar is hidden, so it's always
+ * reachable. Buttons must NOT carry data-tauri-drag-region (clicks would drag).
+ */
+function LeftChrome({
+  onToggleSidebar,
+  onSettings,
+}: {
+  onToggleSidebar?: () => void;
+  onSettings: () => void;
+}) {
+  return (
+    <div className="flex shrink-0 items-stretch">
+      <Brand />
+      {onToggleSidebar && (
+        <button
+          type="button"
+          aria-label="Toggle sidebar"
+          title="Toggle sidebar (Ctrl/Cmd+B)"
+          onClick={onToggleSidebar}
+          className="flex h-8 w-9 items-center justify-center text-neutral-300 transition-colors hover:bg-neutral-700"
+        >
+          <SidebarToggleIcon />
+        </button>
+      )}
+      <SettingsButton onClick={onSettings} />
+    </div>
+  );
+}
+
+/** A simple sidebar/panel glyph for the collapse toggle. */
+function SidebarToggleIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="pointer-events-none"
+      aria-hidden
+    >
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M9 4v16" />
+    </svg>
+  );
+}
+
+/**
+ * The settings gear — opens the settings/theme surface (also Ctrl/Cmd+,). Now in
+ * the left chrome cluster. Must NOT carry data-tauri-drag-region or the click
+ * would start a window drag.
  */
 function SettingsButton({ onClick }: { onClick: () => void }) {
   return (
