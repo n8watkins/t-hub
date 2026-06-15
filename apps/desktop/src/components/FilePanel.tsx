@@ -20,6 +20,7 @@ import {
   searchFiles,
   writeTextFile,
 } from "../ipc/files";
+import { type GitInfo, gitCommit, gitInfo } from "../ipc/git";
 import type { DirEntry, FileContents, FileHit } from "../ipc/types";
 import { Markdown } from "./Markdown";
 import { tlog } from "../lib/diag";
@@ -75,6 +76,31 @@ export function FilePanel({
   const [searching, setSearching] = useState(false);
   const [reader, setReader] = useState<ReaderState>({ status: "empty" });
   const [activePath, setActivePath] = useState<string | null>(null);
+
+  // --- Git awareness (feat/git-panel): branch/worktree + commit. ----------
+  // `git` is the latest GitInfo for the panel's root; `null` until first load /
+  // when there's no root. `refreshGit` re-queries (root change + post-commit so
+  // the dirty count resets). Reader-only mode skips git entirely (no header).
+  const [git, setGit] = useState<GitInfo | null>(null);
+  const refreshGit = useCallback(() => {
+    if (!root) {
+      setGit(null);
+      return;
+    }
+    const target = root;
+    gitInfo(target)
+      .then((info) => {
+        // Ignore a stale response if the root changed while in flight.
+        if (target === root) setGit(info);
+      })
+      .catch(() => {
+        if (target === root) setGit(null);
+      });
+  }, [root]);
+  useEffect(() => {
+    if (readerOnly) return;
+    refreshGit();
+  }, [refreshGit, readerOnly]);
 
   // --- Indexing: (re)index whenever the root changes. --------------------
   // Skipped entirely in reader-only mode — the host owns navigation/search, so
@@ -218,8 +244,13 @@ export function FilePanel({
 
   return (
     <PanelShell className={className}>
-      {/* Header: root + index status. */}
-      <Header root={root} indexState={indexState} />
+      {/* Header: root + index status + git branch/worktree + commit. */}
+      <Header
+        root={root}
+        indexState={indexState}
+        git={git}
+        onCommitted={refreshGit}
+      />
 
       <div className="flex min-h-0 flex-1">
         {/* Left rail: search + results, or the tree when no query. */}
@@ -303,6 +334,8 @@ function PanelShell({
 function Header({
   root,
   indexState,
+  git,
+  onCommitted,
 }: {
   root: string;
   indexState:
@@ -310,42 +343,230 @@ function Header({
     | { status: "indexing" }
     | { status: "ready"; count: number; root: string }
     | { status: "error"; message: string };
+  /** Latest git facts for `root`, or null (no root / not a repo / loading). */
+  git: GitInfo | null;
+  /** Called after a successful commit so the host can refresh git info. */
+  onCommitted: () => void;
 }) {
   const label = basename(root) || root;
   return (
-    <div
-      className="flex items-center justify-between gap-3 border-b px-3 py-2"
-      style={{ borderColor: "var(--th-border)" }}
-    >
-      <div className="min-w-0">
-        <div
-          className="truncate text-sm font-medium"
-          style={{ color: "var(--th-fg)" }}
-          title={root}
-        >
-          {label}
+    <div className="border-b" style={{ borderColor: "var(--th-border)" }}>
+      <div className="flex items-center justify-between gap-3 px-3 py-2">
+        <div className="min-w-0">
+          <div
+            className="truncate text-sm font-medium"
+            style={{ color: "var(--th-fg)" }}
+            title={root}
+          >
+            {label}
+          </div>
+          <div
+            className="truncate text-[11px]"
+            style={{ color: "var(--th-fg-muted)" }}
+            title={root}
+          >
+            {root}
+          </div>
         </div>
+        <div className="shrink-0 text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
+          {indexState.status === "indexing" && (
+            <span style={{ color: "var(--th-dot-starting)" }}>indexing…</span>
+          )}
+          {indexState.status === "ready" && (
+            <span title="files indexed">{indexState.count} files</span>
+          )}
+          {indexState.status === "error" && (
+            <span style={{ color: "var(--th-dot-error)" }} title={indexState.message}>
+              index error
+            </span>
+          )}
+        </div>
+      </div>
+      {/* feat/git-panel: branch/worktree row + inline commit form. Renders only
+          when `root` is inside a git repo; otherwise stays hidden. */}
+      <GitBar root={root} git={git} onCommitted={onCommitted} />
+    </div>
+  );
+}
+
+// --- Git bar (feat/git-panel) ----------------------------------------------
+
+/**
+ * The branch + worktree display plus a "Commit…" affordance, shown under the
+ * FilePanel header. Hidden entirely when `root` isn't a git repo (git is null or
+ * `isRepo: false`). The commit form stages all changes (`git add -A`) and commits
+ * a message, then calls `onCommitted` so the host re-queries git (dirty resets).
+ */
+function GitBar({
+  root,
+  git,
+  onCommitted,
+}: {
+  root: string;
+  git: GitInfo | null;
+  onCommitted: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [message, setMessage] = useState("");
+  const [committing, setCommitting] = useState(false);
+  const [result, setResult] = useState<
+    { kind: "ok"; hash: string } | { kind: "error"; message: string } | null
+  >(null);
+
+  // Not a repo (or still loading / no root): render nothing.
+  if (!git || !git.isRepo) return null;
+
+  const commit = () => {
+    const msg = message.trim();
+    if (!msg || committing) return;
+    setCommitting(true);
+    setResult(null);
+    gitCommit(root, msg)
+      .then((hash) => {
+        setCommitting(false);
+        setResult({ kind: "ok", hash });
+        setMessage("");
+        setOpen(false);
+        onCommitted(); // refresh git info (dirty count resets)
+      })
+      .catch((e) => {
+        setCommitting(false);
+        setResult({ kind: "error", message: String(e) });
+      });
+  };
+
+  return (
+    <div className="px-3 pb-2">
+      <div className="flex items-center justify-between gap-3">
         <div
-          className="truncate text-[11px]"
+          className="flex min-w-0 items-center gap-2 text-[11px]"
           style={{ color: "var(--th-fg-muted)" }}
-          title={root}
         >
-          {root}
-        </div>
-      </div>
-      <div className="shrink-0 text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
-        {indexState.status === "indexing" && (
-          <span style={{ color: "var(--th-dot-starting)" }}>indexing…</span>
-        )}
-        {indexState.status === "ready" && (
-          <span title="files indexed">{indexState.count} files</span>
-        )}
-        {indexState.status === "error" && (
-          <span style={{ color: "var(--th-dot-error)" }} title={indexState.message}>
-            index error
+          {/* Branch name. */}
+          <span
+            className="flex min-w-0 items-center gap-1"
+            title={
+              git.worktreeRoot
+                ? `worktree: ${git.worktreeRoot}`
+                : "current branch"
+            }
+          >
+            <span style={{ color: "var(--th-fg-muted)" }}>⎇</span>
+            <span className="truncate" style={{ color: "var(--th-fg)" }}>
+              {git.branch ?? "detached"}
+            </span>
           </span>
+          {/* Linked-worktree badge. */}
+          {git.isLinkedWorktree && (
+            <span
+              className="rounded px-1 py-0.5 text-[10px]"
+              style={{
+                border: "1px solid var(--th-border)",
+                color: "var(--th-fg-muted)",
+              }}
+              title={
+                git.worktreeRoot
+                  ? `linked worktree at ${git.worktreeRoot}`
+                  : "linked worktree"
+              }
+            >
+              worktree
+            </span>
+          )}
+          {/* Dirty file count. */}
+          <span
+            title={
+              git.dirtyCount === 0
+                ? "working tree clean"
+                : `${git.dirtyCount} changed file(s)`
+            }
+            style={{
+              color:
+                git.dirtyCount > 0 ? "var(--th-dot-starting)" : "var(--th-fg-muted)",
+            }}
+          >
+            {git.dirtyCount === 0
+              ? "clean"
+              : `${git.dirtyCount} change${git.dirtyCount === 1 ? "" : "s"}`}
+          </span>
+        </div>
+        {!open && (
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(true);
+              setResult(null);
+            }}
+            className="shrink-0 rounded border px-2 py-0.5 text-[11px] transition-colors hover:bg-neutral-700/30"
+            style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+          >
+            Commit…
+          </button>
         )}
       </div>
+
+      {/* Inline commit form: a message field + Commit / Cancel. */}
+      {open && (
+        <div className="mt-2 flex items-center gap-2">
+          <input
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            placeholder="Commit message…"
+            spellCheck={false}
+            autoFocus
+            className="min-w-0 flex-1 px-2 py-1 text-[12px] focus:outline-none"
+            style={{
+              borderRadius: "var(--th-radius)",
+              border: "1px solid var(--th-border)",
+              background: "var(--th-tile-bg)",
+              color: "var(--th-fg)",
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commit();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                setOpen(false);
+              }
+            }}
+          />
+          <button
+            type="button"
+            onClick={commit}
+            disabled={committing || !message.trim()}
+            className="shrink-0 rounded border px-2 py-1 text-[11px] transition-colors hover:bg-neutral-700/30 disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ borderColor: "var(--th-accent)", color: "var(--th-fg)" }}
+          >
+            {committing ? "Committing…" : "Commit"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setOpen(false)}
+            disabled={committing}
+            className="shrink-0 rounded border px-2 py-1 text-[11px] transition-colors hover:bg-neutral-700/30 disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {/* Inline success/failure feedback. */}
+      {result?.kind === "ok" && (
+        <div className="mt-1 text-[11px]" style={{ color: "var(--th-dot-running)" }}>
+          Committed {result.hash}
+        </div>
+      )}
+      {result?.kind === "error" && (
+        <div
+          className="mt-1 break-words text-[11px]"
+          style={{ color: "var(--th-dot-error)" }}
+          title={result.message}
+        >
+          {result.message}
+        </div>
+      )}
     </div>
   );
 }
