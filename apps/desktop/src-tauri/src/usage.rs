@@ -65,15 +65,25 @@ fn run_usage() -> ClaudeUsage {
     parsed
 }
 
-/// Build the `claude -p /usage` invocation. Windows: through WSL + the user's
-/// interactive login shell (so `claude` is on PATH). unix: the same login shell.
+/// The shell command that runs `/usage` and prints the full readout.
+///
+/// TWO things are needed or `/usage` prints nothing useful:
+///   1. claude must be on PATH — it lives in `~/.npm-global/bin` exported in
+///      ~/.zshrc, which only an INTERACTIVE login shell sources -> `$SHELL -ilc`.
+///   2. A PSEUDO-TTY — `claude -p /usage` only prints the session/week numbers
+///      when attached to a terminal; piped (our captured stdout) it prints just
+///      the intro line. `script -qec '<cmd>' /dev/null` runs `<cmd>` under a pty,
+///      so the numbers appear. (Verified: piped = intro only; under `script` =
+///      full output.)
+const USAGE_SHELL_CMD: &str =
+    "script -qec 'exec \"${SHELL:-/bin/sh}\" -ilc \"claude -p /usage\"' /dev/null";
+
+/// Build the invocation. Windows: through WSL. unix (dev): a login shell.
 #[cfg(windows)]
 fn usage_command() -> std::process::Command {
     use std::os::windows::process::CommandExt;
     let mut c = std::process::Command::new("wsl.exe");
     let distro = std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string());
-    // bash -lc execs into $SHELL -ilc so ~/.zshrc (which exports claude's PATH) is
-    // sourced; the inner command is fixed (no path arg), so no wsl.exe mangling.
     c.arg("-d")
         .arg(distro)
         .arg("--cd")
@@ -81,7 +91,7 @@ fn usage_command() -> std::process::Command {
         .arg("--")
         .arg("bash")
         .arg("-lc")
-        .arg("exec \"${SHELL:-/bin/sh}\" -ilc 'claude -p /usage 2>&1'");
+        .arg(USAGE_SHELL_CMD);
     c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     c
 }
@@ -89,8 +99,7 @@ fn usage_command() -> std::process::Command {
 #[cfg(not(windows))]
 fn usage_command() -> std::process::Command {
     let mut c = std::process::Command::new("sh");
-    c.arg("-lc")
-        .arg("exec \"${SHELL:-/bin/sh}\" -ilc 'claude -p /usage 2>&1'");
+    c.arg("-lc").arg(USAGE_SHELL_CMD);
     c
 }
 

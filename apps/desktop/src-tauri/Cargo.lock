@@ -3983,7 +3983,7 @@ dependencies = [
 
 [[package]]
 name = "termhub"
-version = "0.1.41"
+version = "0.1.43"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
