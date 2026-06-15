@@ -317,14 +317,26 @@ export function FilePanel({
             </div>
           </div>
         ) : (
-          // Just the tree — no search box (removed per request). Browsing only.
-          <div className="th-scroll min-h-0 flex-1 overflow-y-auto">
-            <FileTree
-              key={reloadKey}
-              root={root}
-              activePath={activePath}
-              onOpenFile={openFile}
-            />
+          <div className="flex min-h-0 flex-1 flex-col">
+            <SearchBox query={query} onQuery={setQuery} searching={searching} />
+            <div className="th-scroll min-h-0 flex-1 overflow-y-auto">
+              {query.trim() ? (
+                <SearchResults
+                  hits={hits}
+                  searching={searching}
+                  activePath={activePath}
+                  root={indexState.status === "ready" ? indexState.root : root}
+                  onOpen={openFile}
+                />
+              ) : (
+                <FileTree
+                  key={reloadKey}
+                  root={root}
+                  activePath={activePath}
+                  onOpenFile={openFile}
+                />
+              )}
+            </div>
           </div>
         )}
       </PanelShell>
@@ -343,18 +355,29 @@ export function FilePanel({
       />
 
       <div className="flex min-h-0 flex-1">
-        {/* Left rail: the tree (no search box — removed per request). */}
+        {/* Left rail: search box + the tree (or ranked results while searching). */}
         <div
           className="flex w-72 shrink-0 flex-col border-r"
           style={{ borderColor: "var(--th-border)" }}
         >
+          <SearchBox query={query} onQuery={setQuery} searching={searching} />
           <div className="th-scroll min-h-0 flex-1 overflow-y-auto">
-            <FileTree
-              key={reloadKey}
-              root={root}
-              activePath={activePath}
-              onOpenFile={openFile}
-            />
+            {query.trim() ? (
+              <SearchResults
+                hits={hits}
+                searching={searching}
+                activePath={activePath}
+                root={indexState.status === "ready" ? indexState.root : root}
+                onOpen={openFile}
+              />
+            ) : (
+              <FileTree
+                key={reloadKey}
+                root={root}
+                activePath={activePath}
+                onOpenFile={openFile}
+              />
+            )}
           </div>
         </div>
 
@@ -736,6 +759,53 @@ function SearchBar({
 }
 
 // --- Search results --------------------------------------------------------
+
+/** Always-visible search input above the tree. Typing filters via fuzzy search
+ *  (the index builds lazily on the first query); clearing it falls back to the
+ *  tree. A small "…" shows while a search is in flight. */
+function SearchBox({
+  query,
+  onQuery,
+  searching,
+}: {
+  query: string;
+  onQuery: (q: string) => void;
+  searching: boolean;
+}) {
+  return (
+    <div className="border-b p-2" style={{ borderColor: "var(--th-border)" }}>
+      <div className="relative">
+        <input
+          value={query}
+          onChange={(e) => onQuery(e.target.value)}
+          placeholder="Search files…"
+          spellCheck={false}
+          autoCorrect="off"
+          autoCapitalize="off"
+          className="w-full px-2.5 py-1.5 pr-7 text-sm focus:outline-none"
+          style={{
+            borderRadius: "var(--th-radius)",
+            border: "1px solid var(--th-border)",
+            background: "var(--th-tile-bg)",
+            color: "var(--th-fg)",
+          }}
+        />
+        {query && (
+          <button
+            type="button"
+            onClick={() => onQuery("")}
+            className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded px-1 leading-none hover:bg-neutral-700/40"
+            style={{ color: "var(--th-fg-muted)" }}
+            title="Clear search"
+            aria-label="Clear search"
+          >
+            {searching ? "…" : "×"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function SearchResults({
   hits,
