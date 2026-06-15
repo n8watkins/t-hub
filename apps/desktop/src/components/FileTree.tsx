@@ -705,6 +705,7 @@ function TreeDir({
       >
         <span className="flex items-center gap-1.5">
           <Chevron open={open} />
+          <FolderIcon open={open} />
           <span
             className="truncate"
             style={{ color: "var(--th-fg)", fontWeight: 500 }}
@@ -744,9 +745,10 @@ function TreeFile({
       style={{ paddingLeft: `${depth * 12 + 8}px` }}
     >
       <span className="flex items-center gap-1.5">
-        {/* Spacer matching the folder chevron's width so a file name lines up
-            directly under its sibling folders' names (shared column). */}
+        {/* Spacer matching the folder chevron's width so a file's type icon
+            lines up directly under its sibling folders' icons (shared column). */}
         <span className="w-3 shrink-0" aria-hidden />
+        <FileIcon name={entry.name} />
         <span
           className="truncate"
           style={{ color: active ? "var(--th-fg)" : "var(--th-fg-muted)" }}
@@ -772,6 +774,149 @@ function Chevron({ open }: { open: boolean }) {
     </span>
   );
 }
+
+// --- Row icons (inline SVG; no icon dependency) ----------------------------
+//
+// Small (13px) themed glyphs so folders vs files are unmistakable at a glance,
+// plus a light extension hint that tints the file glyph by category (code /
+// web / data / docs / image …). All stroke/fill via `currentColor` so the
+// surrounding `color` drives them — kept on `var(--th-*)` tokens. Duplicated in
+// FilePanel.tsx (its compact tree) on purpose: these two tree components are
+// independent, self-contained surfaces and the file-ownership boundary keeps a
+// shared icon module out of scope.
+
+/** Folder glyph — a subtly different shape when open vs closed so an expanded
+ *  folder reads as "open". Tinted with the accent so folders pop over files. */
+function FolderIcon({ open }: { open: boolean }) {
+  return (
+    <span
+      className="flex w-3.5 shrink-0 items-center justify-center"
+      style={{ color: "var(--th-accent)" }}
+      aria-hidden
+    >
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+        {open ? (
+          // Open folder: back flap + an angled front face.
+          <>
+            <path
+              d="M1.5 4.2c0-.5.4-.9.9-.9h3.1l1.2 1.2h6.9c.5 0 .9.4.9.9v1.1H2.6c-.5 0-1 .35-1.1.85V4.2z"
+              fill="currentColor"
+              opacity="0.45"
+            />
+            <path
+              d="M2.5 7.4h12l-1.3 4.4c-.1.4-.5.7-.9.7H2.4c-.5 0-.9-.45-.85-.95l.6-3.45c.05-.4.4-.7.35-.7z"
+              fill="currentColor"
+            />
+          </>
+        ) : (
+          // Closed folder: a tab + body.
+          <path
+            d="M1.5 4.2c0-.5.4-.9.9-.9h3.1l1.2 1.2h6.9c.5 0 .9.4.9.9v6c0 .5-.4.9-.9.9H2.4c-.5 0-.9-.4-.9-.9V4.2z"
+            fill="currentColor"
+          />
+        )}
+      </svg>
+    </span>
+  );
+}
+
+/** File glyph: a page outline (with a folded corner) tinted by the file's
+ *  category. The tint is the only "type hint" — the shape stays consistent so
+ *  rows read as a tidy column. */
+function FileIcon({ name }: { name: string }) {
+  const color = fileIconColor(name);
+  return (
+    <span
+      className="flex w-3.5 shrink-0 items-center justify-center"
+      style={{ color }}
+      aria-hidden
+    >
+      <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+        <path
+          d="M4 1.5h5.2L13 5.3V14a.5.5 0 0 1-.5.5h-8A.5.5 0 0 1 4 14V2a.5.5 0 0 1 .5-.5z"
+          fill="currentColor"
+          opacity="0.18"
+        />
+        <path
+          d="M4 1.5h5.2L13 5.3V14a.5.5 0 0 1-.5.5h-8A.5.5 0 0 1 4 14V2a.5.5 0 0 1 .5-.5z"
+          stroke="currentColor"
+          strokeWidth="1"
+          strokeLinejoin="round"
+        />
+        <path
+          d="M9 1.7V5.3h3.4"
+          stroke="currentColor"
+          strokeWidth="1"
+          strokeLinejoin="round"
+          fill="none"
+        />
+      </svg>
+    </span>
+  );
+}
+
+/** Map a filename to a category tint for its [`FileIcon`]. Themed token first
+ *  (key/doc files lean on `--th-accent`); a few common code/web/data/image
+ *  families get a distinct but muted hue so the tree has light type cues without
+ *  becoming a rainbow. Unknown types fall back to the muted foreground. */
+function fileIconColor(name: string): string {
+  const lower = name.toLowerCase();
+  // High-signal project files share the accent (they're the ones you reach for).
+  if (
+    lower === "package.json" ||
+    lower === "cargo.toml" ||
+    lower === "tsconfig.json" ||
+    lower === "tauri.conf.json" ||
+    lower === "dockerfile" ||
+    lower === "makefile" ||
+    lower.startsWith("readme") ||
+    lower.startsWith("license") ||
+    lower.startsWith("licence") ||
+    lower.startsWith("changelog")
+  ) {
+    return "var(--th-accent)";
+  }
+  const dot = lower.lastIndexOf(".");
+  const ext = dot >= 0 ? lower.slice(dot + 1) : "";
+  return EXT_TINT[ext] ?? "var(--th-fg-muted)";
+}
+
+/** Extension → tint. Muted, category-grouped hues; intentionally small. */
+const EXT_TINT: Record<string, string> = {
+  // TypeScript / JS family.
+  ts: "#4f9cf0",
+  tsx: "#4f9cf0",
+  js: "#e2b93d",
+  jsx: "#e2b93d",
+  mjs: "#e2b93d",
+  cjs: "#e2b93d",
+  // Rust / systems.
+  rs: "#d08770",
+  go: "#4dc4d6",
+  // Web markup / styles.
+  html: "#e06c4f",
+  css: "#56a3e0",
+  scss: "#cf649a",
+  // Data / config.
+  json: "#d6a84d",
+  toml: "#9aa0a6",
+  yaml: "#9aa0a6",
+  yml: "#9aa0a6",
+  // Docs.
+  md: "#7fb37f",
+  mdx: "#7fb37f",
+  markdown: "#7fb37f",
+  txt: "#9aa0a6",
+  // Python.
+  py: "#5a9fd4",
+  // Images (still shown in the tree even if the reader rejects them).
+  png: "#b48ead",
+  jpg: "#b48ead",
+  jpeg: "#b48ead",
+  gif: "#b48ead",
+  svg: "#b48ead",
+  webp: "#b48ead",
+};
 
 /** A clickable, hover-highlighting, full-width row used across the tree +
  * search results. Active rows get the tile background; hover uses it too. */
