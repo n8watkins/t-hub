@@ -813,13 +813,15 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       if (!id) return null;
       try {
         const { spawnTerminal } = await import("../ipc/client");
-        // Spawn rooted at the session's cwd, resuming THAT session by id. Quoting
-        // the id keeps a defensive guard even though Claude session ids are plain
-        // UUIDs. `claude --resume <id>` resumes the conversation directly (vs. the
-        // "+" menu's bare `claude --resume`, which shows the interactive picker).
+        const { useSettings } = await import("./settings");
+        // Spawn rooted at the session's cwd. Whether we actually launch Claude is
+        // a SETTING (resumeStartsClaude, default on): on -> `claude --resume <id>`
+        // resumes that conversation directly; off -> just a terminal in the dir
+        // (no Claude). Quoting the id is a defensive guard (ids are plain UUIDs).
+        const startClaude = useSettings.getState().resumeStartsClaude;
         const info = await spawnTerminal({
           cwd: dir || undefined,
-          startupCommand: `claude --resume '${id}'`,
+          startupCommand: startClaude ? `claude --resume '${id}'` : undefined,
         });
         // Insert after the focused tile in the active tab and focus it — exactly
         // how a "+" spawn lands. Persistence + reconcile come for free.

@@ -38,6 +38,10 @@ const DEFAULTS = {
   /** Silently download + install a found update on launch, then relaunch. Only
    *  acted on when autoUpdateCheckEnabled is also on. */
   autoInstallUpdates: true,
+  /** When resuming a session from the Recent list, start Claude Code in it
+   *  (`claude --resume <id>`). When false, Resume just opens a terminal in the
+   *  session's directory (no Claude). Default on — Recent is a Claude library. */
+  resumeStartsClaude: true,
 } as const;
 
 interface PersistedSettings {
@@ -49,6 +53,7 @@ interface PersistedSettings {
   notificationsEnabled: boolean;
   autoUpdateCheckEnabled: boolean;
   autoInstallUpdates: boolean;
+  resumeStartsClaude: boolean;
 }
 
 /** Clamp a persisted/incoming number into a range, falling back to a default
@@ -102,6 +107,10 @@ function loadPersisted(): PersistedSettings {
         typeof p.autoInstallUpdates === "boolean"
           ? p.autoInstallUpdates
           : DEFAULTS.autoInstallUpdates,
+      resumeStartsClaude:
+        typeof p.resumeStartsClaude === "boolean"
+          ? p.resumeStartsClaude
+          : DEFAULTS.resumeStartsClaude,
     };
   } catch {
     return { ...DEFAULTS };
@@ -163,6 +172,11 @@ interface SettingsState {
    *  is on). Respected by lib/updateMount.ts. */
   autoInstallUpdates: boolean;
   setAutoInstallUpdates: (v: boolean) => void;
+
+  /** Resume from Recent starts Claude Code (vs. just opening a terminal in the
+   *  session's dir). Read by workspace.ts `recall`. */
+  resumeStartsClaude: boolean;
+  setResumeStartsClaude: (v: boolean) => void;
 }
 
 const initial = loadPersisted();
@@ -182,6 +196,7 @@ export const useSettings = create<SettingsState>((set, get) => {
       notificationsEnabled: s.notificationsEnabled,
       autoUpdateCheckEnabled: s.autoUpdateCheckEnabled,
       autoInstallUpdates: s.autoInstallUpdates,
+      resumeStartsClaude: s.resumeStartsClaude,
     });
   };
 
@@ -252,6 +267,12 @@ export const useSettings = create<SettingsState>((set, get) => {
     autoInstallUpdates: initial.autoInstallUpdates,
     setAutoInstallUpdates: (v) => {
       set({ autoInstallUpdates: v });
+      persistAll();
+    },
+
+    resumeStartsClaude: initial.resumeStartsClaude,
+    setResumeStartsClaude: (v) => {
+      set({ resumeStartsClaude: v });
       persistAll();
     },
   };

@@ -121,9 +121,9 @@ export function RecentList({ onRecall }: RecentListProps) {
   );
 }
 
-/** One project row: [Resume] · name + latest session · [▾ sessions]. The Resume
- *  button is intentionally understated (not the bright accent). The ▾ opens a
- *  fixed-position popup listing every session of this project to resume. */
+/** One project row: [Resume] · name + SELECTED session · [▾ sessions]. The ▾
+ *  dropdown only SELECTS which session this row targets (it does NOT resume); the
+ *  understated Resume button is what actually launches `claude --resume`. */
 function ProjectRow({
   group,
   onRecall,
@@ -131,10 +131,15 @@ function ProjectRow({
   group: FolderGroup;
   onRecall: (sessionId: string, cwd: string) => void;
 }) {
-  const latest = group.sessions[0];
   const [menuOpen, setMenuOpen] = useState(false);
+  // Which session Resume will resume. Defaults to the project's most-recent;
+  // the dropdown changes it. Keyed reset if the group's sessions change identity.
+  const [selectedId, setSelectedId] = useState(group.sessions[0]?.id);
   const btnRef = useRef<HTMLButtonElement>(null);
   const hasMore = group.sessions.length > 1;
+
+  const selected =
+    group.sessions.find((s) => s.id === selectedId) ?? group.sessions[0];
 
   return (
     <div
@@ -142,38 +147,39 @@ function ProjectRow({
       style={{ color: "var(--th-fg)" }}
       title={group.cwd}
     >
-      {/* LEFT: understated Resume (resumes the project's most-recent session). */}
+      {/* LEFT: understated Resume — resumes the SELECTED session (only this
+          launches Claude; picking in the dropdown does not). */}
       <button
         type="button"
-        onClick={() => onRecall(latest.id, latest.cwd)}
+        onClick={() => selected && onRecall(selected.id, selected.cwd)}
         className="shrink-0 rounded-md border px-2.5 py-1 text-[11px] font-medium transition-colors hover:bg-neutral-700/40"
         style={{
-          // Darker / subtle (per feedback): tile surface + border, NOT the bright
-          // accent — a quiet affordance, not a call-to-action.
           background: "var(--th-tile-bg)",
           borderColor: "var(--th-border)",
           color: "var(--th-fg-muted)",
         }}
-        title={`Resume the latest session: claude --resume in ${group.cwd}`}
+        title={`Resume the selected session: claude --resume in ${group.cwd}`}
       >
         Resume
       </button>
 
-      {/* MIDDLE: project name over the latest session's description. */}
+      {/* MIDDLE: project name over the SELECTED session's description. */}
       <div className="min-w-0 flex-1">
         <div className="truncate text-[13px] font-medium">{group.name}</div>
         <div
           className="truncate text-[11px]"
           style={{ color: "var(--th-fg-muted)" }}
-          title={latest.label}
+          title={selected?.label}
         >
-          {latest.label}
-          {relativeTime(latest.lastSeen) && ` · ${relativeTime(latest.lastSeen)}`}
+          {selected?.label}
+          {selected && relativeTime(selected.lastSeen)
+            ? ` · ${relativeTime(selected.lastSeen)}`
+            : ""}
         </div>
       </div>
 
-      {/* RIGHT: session dropdown — pick any of this project's sessions. Only
-          shown when there's more than one (otherwise Resume already covers it). */}
+      {/* RIGHT: session dropdown — SELECT any of this project's sessions (does not
+          resume). Only shown when there's more than one. */}
       {hasMore && (
         <button
           ref={btnRef}
@@ -181,7 +187,7 @@ function ProjectRow({
           onClick={() => setMenuOpen((v) => !v)}
           className="shrink-0 rounded-md px-1.5 py-1 text-[11px] transition-colors hover:bg-neutral-700/40"
           style={{ color: "var(--th-fg-muted)" }}
-          title={`${group.sessions.length} sessions — pick one to resume`}
+          title={`${group.sessions.length} sessions — pick which one Resume targets`}
           aria-haspopup="menu"
           aria-expanded={menuOpen}
         >
@@ -193,9 +199,10 @@ function ProjectRow({
         <SessionMenu
           anchor={btnRef.current}
           sessions={group.sessions}
+          selectedId={selected?.id}
           onPick={(s) => {
+            setSelectedId(s.id); // SELECT only — Resume runs it
             setMenuOpen(false);
-            onRecall(s.id, s.cwd);
           }}
           onClose={() => setMenuOpen(false)}
         />
@@ -204,17 +211,21 @@ function ProjectRow({
   );
 }
 
-/** Fixed-position popup of a project's sessions (newest first), anchored under
- *  the ▾ button. Fixed (not inline) so the scrollable/narrow sidebar can't clip
- *  it; scrolls internally when a project has many sessions. */
+/** Fixed-position popup to SELECT one of a project's sessions (newest first),
+ *  anchored under the ▾ button. Fixed (not inline) so the narrow/scrollable
+ *  sidebar can't clip it. OPAQUE (composited over a solid base so a translucent
+ *  theme surface doesn't show the app through it) and compact + scrollable
+ *  (capped height) so a project with many sessions doesn't fill the screen. */
 function SessionMenu({
   anchor,
   sessions,
+  selectedId,
   onPick,
   onClose,
 }: {
   anchor: HTMLElement | null;
   sessions: RecentSession[];
+  selectedId?: string;
   onPick: (s: RecentSession) => void;
   onClose: () => void;
 }) {
@@ -222,8 +233,6 @@ function SessionMenu({
     null,
   );
 
-  // Anchor the menu to the button's on-screen rect, opening to the LEFT (the
-  // button sits at the sidebar's right edge) and below it.
   useLayoutEffect(() => {
     if (!anchor) return;
     const r = anchor.getBoundingClientRect();
@@ -232,7 +241,6 @@ function SessionMenu({
     setPos({ left, top: r.bottom + 4, width });
   }, [anchor]);
 
-  // Close on Esc.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -249,39 +257,63 @@ function SessionMenu({
       <div className="fixed inset-0 z-40" onPointerDown={onClose} aria-hidden />
       <div
         role="menu"
-        className="fixed z-50 max-h-[60vh] overflow-y-auto rounded-lg border py-1 shadow-2xl"
+        // Compact + scrollable: ~9 rows tall then scrolls (not a giant dropdown).
+        className="th-scroll fixed z-50 max-h-72 overflow-y-auto rounded-lg border py-1 shadow-2xl"
         style={{
           left: pos.left,
           top: pos.top,
           width: pos.width,
-          background: "var(--th-header-bg)",
+          // OPAQUE: layer the (possibly translucent) themed surface over a solid
+          // dark base so nothing behind the menu shows through.
+          background:
+            "linear-gradient(var(--th-header-bg), var(--th-header-bg)), #0b0b0c",
           borderColor: "var(--th-border)",
           color: "var(--th-fg)",
           fontFamily: "var(--th-font)",
         }}
         onPointerDown={(e) => e.stopPropagation()}
       >
-        {sessions.map((s) => (
-          <button
-            key={s.id}
-            type="button"
-            role="menuitem"
-            onClick={() => onPick(s)}
-            className="flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors hover:bg-neutral-700/40"
-          >
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-[12.5px]" title={s.label}>
-                {s.label}
-              </span>
-            </span>
-            <span
-              className="shrink-0 text-[10px] tabular-nums"
-              style={{ color: "var(--th-fg-muted)" }}
+        {sessions.map((s) => {
+          const active = s.id === selectedId;
+          return (
+            <button
+              key={s.id}
+              type="button"
+              role="menuitemradio"
+              aria-checked={active}
+              onClick={() => onPick(s)}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors hover:bg-neutral-700/40"
+              style={
+                active
+                  ? {
+                      background:
+                        "color-mix(in srgb, var(--th-accent) 16%, transparent)",
+                    }
+                  : undefined
+              }
             >
-              {relativeTime(s.lastSeen)}
-            </span>
-          </button>
-        ))}
+              {/* Selection check so it's clear which session Resume targets. */}
+              <span
+                className="w-3 shrink-0 text-[11px]"
+                style={{ color: "var(--th-accent)" }}
+                aria-hidden
+              >
+                {active ? "✓" : ""}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-[12.5px]" title={s.label}>
+                  {s.label}
+                </span>
+              </span>
+              <span
+                className="shrink-0 text-[10px] tabular-nums"
+                style={{ color: "var(--th-fg-muted)" }}
+              >
+                {relativeTime(s.lastSeen)}
+              </span>
+            </button>
+          );
+        })}
       </div>
     </>
   );

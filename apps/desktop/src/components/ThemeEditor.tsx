@@ -274,12 +274,23 @@ function GeneralSection() {
   const setSoundsEnabled = useSettings((s) => s.setSoundsEnabled);
   const notificationsEnabled = useSettings((s) => s.notificationsEnabled);
   const setNotificationsEnabled = useSettings((s) => s.setNotificationsEnabled);
+  const resumeStartsClaude = useSettings((s) => s.resumeStartsClaude);
+  const setResumeStartsClaude = useSettings((s) => s.setResumeStartsClaude);
   // Recovery review modal open state (#recovery) — local to this section; the
   // modal is fully self-contained and renders its own overlay above the panel.
   const [recoveryOpen, setRecoveryOpen] = useState(false);
 
   return (
     <>
+      <Group title="Sessions">
+        <SettingToggleRow
+          label="Resume starts Claude Code"
+          hint="When you Resume a session from the sidebar's Recent list, run `claude --resume` to reopen that conversation. Turn off to just open a terminal in the session's directory instead."
+          value={resumeStartsClaude}
+          onChange={setResumeStartsClaude}
+        />
+      </Group>
+
       <Group title="Notifications">
         <SettingToggleRow
           label="Notification sounds"
