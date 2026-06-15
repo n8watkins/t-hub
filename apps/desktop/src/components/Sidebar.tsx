@@ -24,6 +24,7 @@ import { useAgentTelemetry } from "../store/telemetry";
 import { useSettings } from "../store/settings";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import { WslHealth } from "./WslHealth";
+import { UsageStrip } from "./UsageStrip";
 import { WorkspacesList } from "./WorkspacesList";
 import { RecentList } from "./RecentList";
 import type { HostMetrics, ConnectionState } from "../ipc/protocol";
@@ -147,9 +148,19 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
         </Section>
       </div>
 
-      {/* Pinned to the very bottom: the WSL/host-metrics health strip, collapsible
-          to a single row. Lives outside the scroll body so it's always bottom-left
-          regardless of how long the lists above grow (#wsl-bottom). */}
+      {/* Pinned to the very bottom: the Claude USAGE readout (cost/context/rate
+          limits, from the supervision snapshots) then the WSL/host-metrics health
+          strip. Both live outside the scroll body so they stay bottom-left
+          regardless of how long the lists above grow. */}
+      <div className="shrink-0 border-t" style={{ borderColor: "var(--th-border)" }}>
+        <span
+          className="block px-2 pt-1 text-xs font-semibold uppercase tracking-wide"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          Usage
+        </span>
+        <UsageStrip />
+      </div>
       <BottomStatus metrics={metrics} connection={agent?.connection} />
     </aside>
   );
