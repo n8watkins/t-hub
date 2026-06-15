@@ -124,7 +124,18 @@ export function onAgentState(
   return listen<AgentStateInfo>(Events05.agentState, (ev) => cb(ev.payload));
 }
 
-/** Subscribe to new statusline snapshots. */
-export function onStatus(cb: (e: StatusSnapshot) => void): Promise<UnlistenFn> {
-  return listen<StatusSnapshot>(Events05.status, (ev) => cb(ev.payload));
+/**
+ * A status snapshot as it arrives on the wire, WITH the session `cwd` the
+ * backend now includes on it (src/claude/status.rs). Declared here as an
+ * augmentation rather than widening the shared `StatusSnapshot` in ipc/model.ts,
+ * so the per-tile context meter that needs cwd stays self-contained and
+ * revertible. `cwd` is optional (absent when the statusline omitted it).
+ */
+export type StatusSnapshotWire = StatusSnapshot & { cwd?: string };
+
+/** Subscribe to new statusline snapshots (carrying the session cwd). */
+export function onStatus(
+  cb: (e: StatusSnapshotWire) => void,
+): Promise<UnlistenFn> {
+  return listen<StatusSnapshotWire>(Events05.status, (ev) => cb(ev.payload));
 }

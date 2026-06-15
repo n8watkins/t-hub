@@ -32,6 +32,8 @@ import { useTheme } from "../store/theme";
 import { usePanels, type PanelTab } from "../store/panels";
 import { useTerminalSlot } from "./TerminalPool";
 import { TilePanel } from "./TilePanel";
+import { ContextMeter } from "./ContextMeter";
+import { useContextPctForCwd } from "../store/sessionContext";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -176,6 +178,12 @@ export function Tile({
 
   const state: TerminalState = info?.state ?? "starting";
   const cwd = info?.cwd ?? "";
+  // Context-window fullness for the Claude session running in THIS tile, matched
+  // by cwd (store/sessionContext.ts). null when no session is matched — then the
+  // <ContextMeter> renders nothing, so non-Claude / not-yet-reported tiles are
+  // unchanged. Best-effort by design (the frontend has no terminal→session id
+  // bridge; cwd is the only correlation available).
+  const contextUsedPct = useContextPctForCwd(info?.cwd);
   // Display path: strip the home prefix (`/home/<user>` -> `~`) so the header
   // shows `~/n8builds/tools` instead of the noisy `/home/natkins/n8builds/tools`.
   // The full path stays in the title tooltip.
@@ -349,6 +357,11 @@ export function Tile({
           </span>
         )}
         {(!showCwd || !cwd) && <span className="flex-1" />}
+
+        {/* Context-window meter: how full THIS tile's Claude session context is
+            (matched by cwd). Renders nothing when no session is matched, so the
+            header is unchanged for plain shells / sessions yet to report. */}
+        <ContextMeter usedPct={contextUsedPct} />
 
         {/* Per-tile view switcher: Terminal / Files / Preview / Dev. Clicking a
             tab sets THIS tile's usePanels tab; the body (below) swaps to that
