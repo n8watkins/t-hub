@@ -196,10 +196,6 @@ export function Tile({
     title: info?.title,
     cwd: info?.cwd,
   });
-  // True when the friendly label IS just the short id (no preset/cwd/label to go
-  // on) — then we don't repeat the id as a secondary detail.
-  const showShortId = label !== terminalId;
-
   const isSelfDragging = draggingTileId === terminalId;
   const isDropTarget = dropTileId === terminalId && draggingTileId !== terminalId;
 
@@ -316,7 +312,7 @@ export function Tile({
         // stylesheet's hover rule can override the height — an inline height
         // would win by specificity and break the reveal. Only the per-instance
         // colors/font live inline here.
-        className="th-tile-header flex shrink-0 cursor-grab touch-none select-none items-center gap-2 border-b px-2 active:cursor-grabbing"
+        className="th-tile-header relative flex shrink-0 cursor-grab touch-none select-none items-center gap-2 border-b px-2 active:cursor-grabbing"
         style={{
           backgroundColor: "var(--th-header-bg)",
           borderColor: "var(--th-border)",
@@ -332,21 +328,13 @@ export function Tile({
           aria-label={state}
           title={`Terminal state: ${state}`}
         />
-        {/* Friendly label, prominent; the raw 8-char id follows it faint as a
-            secondary detail so the session id stays discoverable without being
-            the headline (only shown when the label isn't already just that id). */}
+        {/* Friendly label, prominent. The raw Claude session id is intentionally
+            NOT surfaced here (per request) — it added noise to the header without
+            being something the user wants to read. The id is still available in
+            tooltips/the kill confirm where it's actually needed. */}
         <span className="truncate" style={{ color: "var(--th-fg)" }}>
           {label}
         </span>
-        {showShortId && (
-          <span
-            className="shrink-0 font-mono text-[0.85em]"
-            style={{ color: "var(--th-fg-muted)" }}
-            title={`Session ${terminalId}`}
-          >
-            {terminalId}
-          </span>
-        )}
         {showCwd && cwd && (
           <span
             className="min-w-0 flex-1 truncate"
@@ -368,9 +356,17 @@ export function Tile({
             surface and the terminal pool re-syncs (it subscribes to the tab) so
             the pooled xterm is shown only on the Terminal tab and parked
             otherwise. pointerDown is stopped so a tab click doesn't start the
-            header's drag-to-move gesture. */}
+            header's drag-to-move gesture.
+
+            Positioned ABSOLUTELY and centered (left-1/2 + -translate-x-1/2) so
+            the tab bar reads as centered OVER THE TILE rather than getting shoved
+            to the right by the label/cwd/meter that share the flex row. It stays
+            put as those left/right items change width; pointer-events stay on so
+            the tabs remain clickable, and the surrounding flex items keep their
+            own pointer area (the absolute layer is only as wide as the tabs). */}
         <div
-          className="flex shrink-0 items-center gap-0.5"
+          className="absolute left-1/2 z-10 flex shrink-0 -translate-x-1/2 items-center gap-0.5 rounded px-1"
+          style={{ backgroundColor: "var(--th-header-bg)" }}
           onPointerDown={(e) => e.stopPropagation()}
         >
           {PANEL_TABS.map((t) => {
