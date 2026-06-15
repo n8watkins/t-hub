@@ -45,12 +45,26 @@ pub struct StatusSnapshot {
     /// The exact session id this snapshot is for.
     pub session_id: String,
     /// The session's working directory, lifted straight from the statusline
-    /// payload's `cwd`. The frontend has NO terminal-id→session-id bridge, so the
-    /// per-tile context meter matches a tile to its session by cwd (see
-    /// `store/sessionContext.ts`); carrying it here is what makes that match
-    /// possible. Absent when the statusline omitted it (degrades to no meter).
+    /// payload's `cwd`. Carried so the per-tile context meter has a FALLBACK
+    /// correlation when the robust tmux binding below is unavailable (e.g. an
+    /// un-upgraded agent that doesn't stamp the pane). Absent when the statusline
+    /// omitted it. See `store/sessionContext.ts`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The tmux PANE id (`$TMUX_PANE`, e.g. `%37`) the statusline ran inside, as
+    /// stamped by `termhub-agent --statusline`. Diagnostic / future-proofing; the
+    /// frontend binds on `tmux_session` below (which it can compute for a tile),
+    /// but the pane id is the underlying robust signal the agent reads. Absent
+    /// when not under tmux (or an un-upgraded agent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tmux_pane: Option<String>,
+    /// The tmux SESSION NAME that owns the pane the statusline ran inside (e.g.
+    /// `th_<terminalId>`), resolved by the agent from `$TMUX_PANE`. This is the
+    /// ROBUST tile↔session key: TermHub names every session `th_<terminalId>`, so
+    /// a tile computes its own session name and looks itself up by it — no cwd
+    /// guessing. Absent ⇒ frontend degrades to the `cwd` match above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tmux_session: Option<String>,
     /// Context window used %, derived from `context_window.*` (0..=100).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_used_pct: Option<f32>,
@@ -75,10 +89,22 @@ impl StatusSnapshot {
     /// `session_id`. Tolerant of missing fields/blocks (returns a snapshot with
     /// `None`s rather than failing). `now_ms` is injected for testability.
     pub fn from_statusline(session_id: &str, raw: &serde_json::Value, now_ms: u64) -> Self {
-        // Statusline `cwd` is a top-level string; kept verbatim so the frontend
-        // can correlate this snapshot to the tile sharing that working directory.
+        // Statusline `cwd` is a top-level string; kept verbatim as the FALLBACK
+        // correlation when the tmux binding below is absent.
         let cwd = raw
             .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        // Robust tile binding: the agent stamps the owning tmux pane + session
+        // (`tmux_pane`/`tmux_session`) onto the statusline before journaling. Lift
+        // both verbatim; the frontend keys context by `tmux_session` and falls
+        // back to `cwd` when these are absent (un-upgraded agent / not under tmux).
+        let tmux_pane = raw
+            .get("tmux_pane")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let tmux_session = raw
+            .get("tmux_session")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let context_used_pct = context_used_pct(raw);
@@ -95,6 +121,8 @@ impl StatusSnapshot {
         Self {
             session_id: session_id.to_string(),
             cwd,
+            tmux_pane,
+            tmux_session,
             context_used_pct,
             cost_usd,
             five_hour,
@@ -199,6 +227,9 @@ mod tests {
         });
         let snap = StatusSnapshot::from_statusline("s1", &raw, 999);
         assert_eq!(snap.cwd.as_deref(), Some("/home/u/proj"));
+        // No tmux binding in this payload (un-upgraded agent / not under tmux).
+        assert!(snap.tmux_pane.is_none());
+        assert!(snap.tmux_session.is_none());
         assert_eq!(snap.context_used_pct, Some(42.5));
         assert_eq!(snap.cost_usd, Some(1.23));
         assert!(snap.rate_limits_present);
@@ -221,6 +252,24 @@ mod tests {
         assert!(!snap.near_limit(50.0), "absent block must not read as near-limit");
         // context derived from used/total.
         assert_eq!(snap.context_used_pct, Some(25.0));
+    }
+
+    #[test]
+    fn lifts_tmux_pane_and_session_for_robust_binding() {
+        // The agent stamps the owning tmux pane + session onto the statusline;
+        // both must be lifted so the frontend can bind the snapshot to the exact
+        // tile (`th_<id>`) rather than guessing by cwd.
+        let raw = serde_json::json!({
+            "cwd": "/work",
+            "context_window": { "used_percentage": 12.0 },
+            "tmux_pane": "%37",
+            "tmux_session": "th_abcd1234"
+        });
+        let snap = StatusSnapshot::from_statusline("s1", &raw, 1);
+        assert_eq!(snap.tmux_pane.as_deref(), Some("%37"));
+        assert_eq!(snap.tmux_session.as_deref(), Some("th_abcd1234"));
+        // cwd still carried as the fallback correlation.
+        assert_eq!(snap.cwd.as_deref(), Some("/work"));
     }
 
     #[test]

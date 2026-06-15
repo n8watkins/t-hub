@@ -125,13 +125,27 @@ export function onAgentState(
 }
 
 /**
- * A status snapshot as it arrives on the wire, WITH the session `cwd` the
- * backend now includes on it (src/claude/status.rs). Declared here as an
+ * A status snapshot as it arrives on the wire, WITH the extra correlation fields
+ * the backend now includes on it (src/claude/status.rs). Declared here as an
  * augmentation rather than widening the shared `StatusSnapshot` in ipc/model.ts,
- * so the per-tile context meter that needs cwd stays self-contained and
- * revertible. `cwd` is optional (absent when the statusline omitted it).
+ * so the per-tile context meter that needs them stays self-contained + revertible.
+ *
+ * Binding fields (all optional — absent ones degrade the meter, never break it):
+ *   - `tmuxSession`: the tmux session NAME (`th_<terminalId>`) that owns the pane
+ *     the statusline ran inside, resolved by the agent from `$TMUX_PANE`. This is
+ *     the ROBUST tile↔session key — a tile computes its own `th_<id>` and looks
+ *     itself up by it (see store/sessionContext.ts), so two tiles in the same
+ *     directory no longer collide.
+ *   - `tmuxPane`: the raw `$TMUX_PANE` id (e.g. `%37`); diagnostic / underlying
+ *     signal the session name was resolved from.
+ *   - `cwd`: the session's working directory — the FALLBACK match used only when
+ *     `tmuxSession` is absent (un-upgraded agent / not under tmux).
  */
-export type StatusSnapshotWire = StatusSnapshot & { cwd?: string };
+export type StatusSnapshotWire = StatusSnapshot & {
+  cwd?: string;
+  tmuxPane?: string;
+  tmuxSession?: string;
+};
 
 /** Subscribe to new statusline snapshots (carrying the session cwd). */
 export function onStatus(

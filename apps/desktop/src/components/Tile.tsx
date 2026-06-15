@@ -33,7 +33,7 @@ import { usePanels, type PanelTab } from "../store/panels";
 import { useTerminalSlot } from "./TerminalPool";
 import { TilePanel } from "./TilePanel";
 import { ContextMeter } from "./ContextMeter";
-import { useContextPctForCwd } from "../store/sessionContext";
+import { useContextPctForTile } from "../store/sessionContext";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -178,12 +178,15 @@ export function Tile({
 
   const state: TerminalState = info?.state ?? "starting";
   const cwd = info?.cwd ?? "";
-  // Context-window fullness for the Claude session running in THIS tile, matched
-  // by cwd (store/sessionContext.ts). null when no session is matched — then the
-  // <ContextMeter> renders nothing, so non-Claude / not-yet-reported tiles are
-  // unchanged. Best-effort by design (the frontend has no terminal→session id
-  // bridge; cwd is the only correlation available).
-  const contextUsedPct = useContextPctForCwd(info?.cwd);
+  // Context-window fullness for the Claude session running in THIS tile. Bound
+  // ROBUSTLY by tmux session name: the agent stamps each statusline with the
+  // owning tmux session (`th_<id>`), and this tile looks itself up by its own
+  // `th_<terminalId>` (store/sessionContext.ts) — precise even when two tiles
+  // share a directory. Falls back to a cwd match when the snapshot carries no
+  // session (un-upgraded agent / not under tmux). null when nothing matches —
+  // then <ContextMeter> renders nothing, so non-Claude / not-yet-reported tiles
+  // are unchanged.
+  const contextUsedPct = useContextPctForTile(terminalId, info?.cwd);
   // Display path: strip the home prefix (`/home/<user>` -> `~`) so the header
   // shows `~/n8builds/tools` instead of the noisy `/home/natkins/n8builds/tools`.
   // The full path stays in the title tooltip.
