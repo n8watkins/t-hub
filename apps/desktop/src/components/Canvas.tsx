@@ -4,7 +4,7 @@
 //   - The workspace tab strip lives in the top bar (Titlebar) now, not here.
 //   - Each tab is a deterministic near-square grid sized from its tile count.
 //   - Spawn (+ button, empty-state button, Ctrl/Cmd+T) inserts after the focused
-//     tile in the active tab; Ctrl/Cmd+W detaches the focused tile.
+//     tile in the active tab; Ctrl/Cmd+W KILLS the focused tile's session.
 //   - Manual mode: draggable gutters between rows/columns adjust their flex
 //     ratios, persisted per tab (PRD §5.3 resize). Each gutter has a wide,
 //     invisible hit zone with a thin visible indicator for easy grabbing.
@@ -27,12 +27,7 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { useWorkspace } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
 import { usePanels } from "../store/panels";
-import {
-  spawnTerminal,
-  listTerminals,
-  closeTerminal,
-  onState,
-} from "../ipc/client";
+import { spawnTerminal, listTerminals, onState } from "../ipc/client";
 import { Tile } from "./Tile";
 import { TerminalPoolProvider } from "./TerminalPool";
 import { SpawnMenu } from "./SpawnMenu";
@@ -76,7 +71,13 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
   const setTerminals = useWorkspace((s) => s.setTerminals);
   const updateTerminalsMeta = useWorkspace((s) => s.updateTerminalsMeta);
   const addAfterFocused = useWorkspace((s) => s.addAfterFocused);
-  const remove = useWorkspace((s) => s.remove);
+  // The tile × / Ctrl-W now KILL the session (feat/workspaces-lifecycle): durable
+  // Claude session history makes the old non-destructive detach unnecessary.
+  // deleteTerminal kills the tmux session (killTerminal) AND drops the tile
+  // (remove, which also stops any dev server + clears panel state). The Tile
+  // itself busy-gates the confirm before calling onClose; Canvas just performs
+  // the kill. detachTile stays in the store but is no longer wired to the × here.
+  const deleteTerminal = useWorkspace((s) => s.deleteTerminal);
   const setFocus = useWorkspace((s) => s.setFocus);
   const updateState = useWorkspace((s) => s.updateState);
   const cycleTab = useWorkspace((s) => s.cycleTab);
@@ -179,23 +180,21 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
   const closeFocused = useCallback(() => {
     const id = useWorkspace.getState().focusedId;
     if (!id) return;
-    void closeTerminal(id).catch((err) =>
-      console.error("closeTerminal failed", err),
-    );
-    remove(id);
-  }, [remove]);
+    // Ctrl/Cmd+W kills the focused session (kill + drop tile) — no busy gate here
+    // (the keybind is an explicit, deliberate action).
+    deleteTerminal(id);
+  }, [deleteTerminal]);
 
+  // The tile's onClose: kill this session (kill tmux + drop tile + cleanup). The
+  // Tile already showed the busy confirm (if needed) before calling this.
   const close = useCallback(
     (id: string) => {
-      void closeTerminal(id).catch((err) =>
-        console.error("closeTerminal failed", err),
-      );
-      remove(id);
+      deleteTerminal(id);
     },
-    [remove],
+    [deleteTerminal],
   );
 
-  // Global keybindings: Ctrl/Cmd+T = new terminal, Ctrl/Cmd+W = close focused,
+  // Global keybindings: Ctrl/Cmd+T = new terminal, Ctrl/Cmd+W = kill focused,
   // Ctrl/Cmd+B = toggle the supervision sidebar, Ctrl/Cmd+Tab = cycle tabs
   // (Shift reverses), Ctrl/Cmd+1..9 = jump to the tab at that index.
   useEffect(() => {
@@ -337,8 +336,9 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
                 focused={fullscreenId === focusedId}
                 onFocus={() => setFocus(fullscreenId)}
                 onClose={() => {
-                  // Closing the fullscreen tile detaches it AND drops fullscreen
-                  // so we don't leave an empty full-window layer up.
+                  // Closing the fullscreen tile KILLS its session AND drops
+                  // fullscreen so we don't leave an empty full-window layer up.
+                  // (The fullscreen Tile copy busy-gates the confirm before this.)
                   setFullscreen(null);
                   close(fullscreenId);
                 }}
