@@ -128,16 +128,19 @@ fn resolve_pane_command(opts: &SpawnOptions) -> Option<String> {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
-    // Run the startup command in a LOGIN shell, then exec back into an interactive
-    // login shell so the tile survives the command exiting. The login shell is
-    // critical: tools like `claude` live on a PATH set by the user's shell rc
-    // (e.g. `~/.npm-global/bin` exported in ~/.zshrc), which a bare `sh -c` does
-    // NOT load -- so `claude --resume ...` failed with "command not found" and
-    // immediately dropped to the fallback shell (the "recall/Resume opens a plain
-    // terminal, not Claude" bug). Running via `"$SHELL" -lc` loads that PATH, so
-    // the startup command resolves exactly as it does when typed interactively.
+    // Run the startup command in an INTERACTIVE LOGIN shell, then exec back into
+    // an interactive login shell so the tile survives the command exiting.
+    //
+    // `-ilc` (interactive + login + command), NOT `-lc`, is the load-bearing
+    // detail: tools like `claude` live on a PATH set in the user's shell rc
+    // (e.g. `~/.npm-global/bin` exported in ~/.zshrc). zsh sources ~/.zshrc only
+    // for INTERACTIVE shells -- a login-but-non-interactive `zsh -lc` skips it, so
+    // `claude --resume ...` failed with "command not found: claude" and dropped
+    // straight to the fallback shell (the "Resume opens a plain terminal, not
+    // Claude" bug). `-i` forces ~/.zshrc to load, so the command resolves exactly
+    // as when typed by hand. Verified in a clean env (no inherited PATH).
     Some(format!(
-        "exec \"${{SHELL:-/bin/sh}}\" -lc {}",
+        "exec \"${{SHELL:-/bin/sh}}\" -ilc {}",
         sh_single_quote(&format!(
             "{startup}; exec \"${{SHELL:-/bin/sh}}\" -l"
         ))
