@@ -40,6 +40,7 @@ import {
   TITLEBAR_REVEAL_ANIM_MIN,
   TITLEBAR_REVEAL_ANIM_MAX,
 } from "../store/settings";
+import { FILE_ICON_THEMES } from "../lib/fileIcons";
 // Build-time app version/name from package.json (resolveJsonModule is on). Used
 // as the fallback / "build" version; the live Tauri runtime version is fetched
 // at runtime via getVersion() in the About group.
@@ -279,6 +280,8 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
   const setTitlebarRevealAnimMs = useSettings((s) => s.setTitlebarRevealAnimMs);
   const resumeStartsClaude = useSettings((s) => s.resumeStartsClaude);
   const setResumeStartsClaude = useSettings((s) => s.setResumeStartsClaude);
+  const fileIconTheme = useSettings((s) => s.fileIconTheme);
+  const setFileIconTheme = useSettings((s) => s.setFileIconTheme);
   // Recovery review modal open state (#recovery) — local to this section; the
   // modal is fully self-contained and renders its own overlay above the panel.
   const [recoveryOpen, setRecoveryOpen] = useState(false);
@@ -292,6 +295,25 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
           value={resumeStartsClaude}
           onChange={setResumeStartsClaude}
         />
+      </Group>
+
+      <Group
+        title="Files"
+        description="How the Files panel draws file & folder icons."
+      >
+        <Row label="Icon theme">
+          <ThemeSelect
+            value={fileIconTheme}
+            onChange={setFileIconTheme}
+            title="Pick the icon set used in the Files tree"
+          >
+            {FILE_ICON_THEMES.map((t) => (
+              <Opt key={t.id} value={t.id}>
+                {t.label}
+              </Opt>
+            ))}
+          </ThemeSelect>
+        </Row>
       </Group>
 
       {/* The notification sound + desktop-notification toggles moved into

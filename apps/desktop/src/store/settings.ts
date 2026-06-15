@@ -46,6 +46,9 @@ const DEFAULTS = {
    *  (per-tile). Set to an absolute path (e.g. /home/natkins) to ALWAYS start the
    *  file tree there. The header shows paths relative to this / the home dir. */
   filesRootDir: "",
+  /** File-tree icon theme: "lucide" (minimal, default), "vscode" (colorful), or
+   *  "seti" (muted). Read + validated by lib/fileIcons.tsx. */
+  fileIconTheme: "lucide",
 } as const;
 
 interface PersistedSettings {
@@ -58,6 +61,7 @@ interface PersistedSettings {
   autoUpdateCheckEnabled: boolean;
   autoInstallUpdates: boolean;
   resumeStartsClaude: boolean;
+  fileIconTheme: string;
 }
 
 /** Clamp a persisted/incoming number into a range, falling back to a default
@@ -115,6 +119,10 @@ function loadPersisted(): PersistedSettings {
         typeof p.resumeStartsClaude === "boolean"
           ? p.resumeStartsClaude
           : DEFAULTS.resumeStartsClaude,
+      fileIconTheme:
+        typeof p.fileIconTheme === "string"
+          ? p.fileIconTheme
+          : DEFAULTS.fileIconTheme,
     };
   } catch {
     return { ...DEFAULTS };
@@ -181,6 +189,10 @@ interface SettingsState {
    *  session's dir). Read by workspace.ts `recall`. */
   resumeStartsClaude: boolean;
   setResumeStartsClaude: (v: boolean) => void;
+
+  /** File-tree icon theme ("lucide" | "vscode" | "seti"). Read by lib/fileIcons. */
+  fileIconTheme: string;
+  setFileIconTheme: (v: string) => void;
 }
 
 const initial = loadPersisted();
@@ -201,6 +213,7 @@ export const useSettings = create<SettingsState>((set, get) => {
       autoUpdateCheckEnabled: s.autoUpdateCheckEnabled,
       autoInstallUpdates: s.autoInstallUpdates,
       resumeStartsClaude: s.resumeStartsClaude,
+      fileIconTheme: s.fileIconTheme,
     });
   };
 
@@ -277,6 +290,12 @@ export const useSettings = create<SettingsState>((set, get) => {
     resumeStartsClaude: initial.resumeStartsClaude,
     setResumeStartsClaude: (v) => {
       set({ resumeStartsClaude: v });
+      persistAll();
+    },
+
+    fileIconTheme: initial.fileIconTheme,
+    setFileIconTheme: (v) => {
+      set({ fileIconTheme: v });
       persistAll();
     },
   };

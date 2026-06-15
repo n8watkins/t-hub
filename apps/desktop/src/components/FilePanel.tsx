@@ -13,17 +13,7 @@
 // PRD §6.8.1). With no root it shows a gentle empty state.
 
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import {
-  File,
-  FileCode,
-  FileCog,
-  FileJson,
-  FileText,
-  Folder,
-  FolderOpen,
-  Image as ImageIcon,
-  type LucideIcon,
-} from "lucide-react";
+import { FileTypeIcon, FolderTypeIcon } from "../lib/fileIcons";
 import {
   indexProject,
   listDir,
@@ -1108,7 +1098,7 @@ function TreeDir({
         <span className="w-3 shrink-0 text-[10px]" style={{ color: "var(--th-fg-muted)" }}>
           {open ? "▾" : "▸"}
         </span>
-        <FolderIcon open={open} />
+        <FolderTypeIcon name={name} open={open} />
         <span className="truncate" style={{ color: "var(--th-fg)" }}>
           {name}
         </span>
@@ -1207,154 +1197,12 @@ function TreeFile({
       {/* Chevron-width spacer (matches the folder row's expander) so file icons
           sit in the same column as folder icons. */}
       <span className="w-3 shrink-0" aria-hidden />
-      <FileIcon name={entry.name} />
+      <FileTypeIcon name={entry.name} />
       <span className="truncate">{entry.name}</span>
     </button>
   );
 }
 
-// --- Row icons (lucide-react, mapped by name/extension) --------------------
-//
-// Clean, tree-shakeable lucide glyphs at ~14px, themed via `currentColor` so the
-// wrapper's `color` (a `var(--th-*)` token + a light per-category tint) drives
-// them. Folder/FolderOpen for dirs; FileCode / FileJson / FileText / Image /
-// FileCog (config) / File map by extension or name. Kept in sync with the copies
-// in FileTree.tsx — the two tree components are independent surfaces and the
-// file-ownership boundary keeps a shared icon module out of scope.
-
-const ICON_PX = 14;
-
-/** Folder glyph — `FolderOpen` when expanded, `Folder` when closed (accent). */
-function FolderIcon({ open }: { open: boolean }) {
-  const Icon = open ? FolderOpen : Folder;
-  return (
-    <span
-      className="flex w-3.5 shrink-0 items-center justify-center"
-      style={{ color: "var(--th-accent)" }}
-      aria-hidden
-    >
-      <Icon size={ICON_PX} strokeWidth={2} />
-    </span>
-  );
-}
-
-/** File glyph chosen by extension/name (code / json / docs / image / config /
- *  default), tinted by the file's category. */
-function FileIcon({ name }: { name: string }) {
-  const Icon = fileIconFor(name);
-  const color = fileIconColor(name);
-  return (
-    <span
-      className="flex w-3.5 shrink-0 items-center justify-center"
-      style={{ color }}
-      aria-hidden
-    >
-      <Icon size={ICON_PX} strokeWidth={2} />
-    </span>
-  );
-}
-
-/** Lowercased extension of a filename (no dot), or "" if none. */
-function extOf(name: string): string {
-  const lower = name.toLowerCase();
-  const dot = lower.lastIndexOf(".");
-  return dot >= 0 ? lower.slice(dot + 1) : "";
-}
-
-/** True for conventional config / dotfiles (`.env`, `.env.*`, `.*rc`, and the
- *  usual config basenames) — these get the `FileCog` glyph. */
-function isConfigName(name: string): boolean {
-  const lower = name.toLowerCase();
-  return (
-    lower === ".env" ||
-    lower.startsWith(".env.") ||
-    lower.endsWith("rc") || // .npmrc, .babelrc, .zshrc, .bashrc, eslintrc, …
-    lower.endsWith(".config.js") ||
-    lower.endsWith(".config.ts") ||
-    lower.endsWith(".config.mjs") ||
-    lower.endsWith(".config.cjs") ||
-    lower === "tsconfig.json" ||
-    lower === "tauri.conf.json" ||
-    lower === "dockerfile" ||
-    lower === "makefile" ||
-    lower === ".gitignore" ||
-    lower === ".gitattributes" ||
-    lower === ".editorconfig"
-  );
-}
-
-const CODE_EXTS = new Set([
-  "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "go", "py", "sh", "bash", "zsh",
-  "c", "h", "cpp", "hpp", "java", "rb", "php", "html", "css", "scss",
-]);
-const TEXT_EXTS = new Set(["md", "mdx", "markdown", "txt", "rst", "log"]);
-const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "svg", "gif", "webp", "ico", "bmp", "avif"]);
-const DATA_EXTS = new Set(["toml", "yaml", "yml"]);
-
-/** Pick the lucide icon component for a filename. Config/dotfiles first (so
- *  `.env` reads as config, not a generic file), then by extension. */
-function fileIconFor(name: string): LucideIcon {
-  if (isConfigName(name)) return FileCog;
-  const ext = extOf(name);
-  if (ext === "json") return FileJson;
-  if (IMAGE_EXTS.has(ext)) return ImageIcon;
-  if (CODE_EXTS.has(ext)) return FileCode;
-  if (TEXT_EXTS.has(ext)) return FileText;
-  if (DATA_EXTS.has(ext)) return FileText; // toml/yaml: doc-ish config
-  return File;
-}
-
-/** Filename → category tint for [`FileIcon`] (key/doc files use `--th-accent`;
- *  a few common families get a muted hue; unknown → muted foreground). */
-function fileIconColor(name: string): string {
-  const lower = name.toLowerCase();
-  if (
-    lower === "package.json" ||
-    lower === "cargo.toml" ||
-    lower === "tsconfig.json" ||
-    lower === "tauri.conf.json" ||
-    lower === "dockerfile" ||
-    lower === "makefile" ||
-    lower.startsWith("readme") ||
-    lower.startsWith("license") ||
-    lower.startsWith("licence") ||
-    lower.startsWith("changelog")
-  ) {
-    return "var(--th-accent)";
-  }
-  return EXT_TINT[extOf(name)] ?? "var(--th-fg-muted)";
-}
-
-/** Extension → tint. Muted, category-grouped; intentionally small. */
-const EXT_TINT: Record<string, string> = {
-  ts: "#4f9cf0",
-  tsx: "#4f9cf0",
-  js: "#e2b93d",
-  jsx: "#e2b93d",
-  mjs: "#e2b93d",
-  cjs: "#e2b93d",
-  rs: "#d08770",
-  go: "#4dc4d6",
-  html: "#e06c4f",
-  css: "#56a3e0",
-  scss: "#cf649a",
-  json: "#d6a84d",
-  toml: "#9aa0a6",
-  yaml: "#9aa0a6",
-  yml: "#9aa0a6",
-  md: "#7fb37f",
-  mdx: "#7fb37f",
-  markdown: "#7fb37f",
-  txt: "#9aa0a6",
-  py: "#5a9fd4",
-  sh: "#89c07a",
-  png: "#b48ead",
-  jpg: "#b48ead",
-  jpeg: "#b48ead",
-  gif: "#b48ead",
-  svg: "#b48ead",
-  webp: "#b48ead",
-};
 
 // --- Reader ----------------------------------------------------------------
 
