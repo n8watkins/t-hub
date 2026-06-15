@@ -20,7 +20,7 @@ anyhow = "1"
 
 [package]
 name = "termhub"
-version = "0.1.48"
+version = "0.1.49"
 description = "TermHub — terminal-first command center for Claude Code sessions in WSL2"
 authors = ["Nathan Watkins"]
 edition = "2021"

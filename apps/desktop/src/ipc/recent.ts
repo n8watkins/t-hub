@@ -24,6 +24,9 @@ export interface RecentSession {
   cwd: string;
   /** A friendly label: Claude's own summary when known, else the cwd basename. */
   label: string;
+  /** The session's most-recent message text (read from the transcript tail) — the
+   *  Recent row's "what we were last doing" subtitle. Empty when none was found. */
+  lastText: string;
   /** Unix epoch SECONDS of last activity (transcript mtime); the list sorts
    *  newest-first by this. */
   lastSeen: number;

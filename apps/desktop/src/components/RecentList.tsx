@@ -1,29 +1,18 @@
 // The sidebar's "Recent" list — a resumable session library, one row per PROJECT.
 //
-// Recent = past Claude Code sessions the user can RESUME. The backend
-// (`recent_sessions` -> recent.rs) returns a flat, newest-first list of sessions,
-// each with its directory (`cwd`), a human description (`label` = Claude's
-// summary, else the session's first real prompt, else the folder name), and a
-// last-seen time.
+// Recent = past Claude Code sessions you can RESUME. The backend (`recent_sessions`
+// -> recent.rs) returns a flat, newest-first list with ONE session per project (its
+// most recent), each carrying its directory (`cwd`), a folder `name`/`label`, the
+// session's most-recent message text (`lastText`), and a last-seen time.
 //
-// The user's model (2026-06-14): NO accordion. Show each PROJECT (folder) once,
-// in a flat SCROLLABLE list (there can be hundreds). Each row shows the project's
-// most-recent session, with an explicit (deliberately understated) "Resume"
-// button on the LEFT and a session DROPDOWN on the RIGHT to pick any of that
-// project's other sessions. Resuming spawns a terminal in the session's cwd
-// running `claude --resume <id>` (App wires `onRecall` -> the store's `recall`).
-//
-// Fetched once on mount + on window focus (cheap: the backend stats every file
-// but only reads a 32KB prefix of the newest N). Best-effort: an IPC failure
-// degrades to a muted empty state.
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+// Per the 2026-06-15 redesign: NO Resume button, NO session dropdown. Each row is
+// one PROJECT (folder) showing the folder name over the latest activity text. On
+// row hover, two understated controls appear on the RIGHT: a → that RESUMES (spawns
+// a terminal in the cwd running `claude --resume <id>`, via onRecall) and an × that
+// HIDES the row from Recent. Hiding is persisted locally and does NOT delete the
+// transcript; a project resurfaces if it later gets a newer session. Fetched on
+// mount + window focus; an IPC failure degrades to a muted empty state.
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { recentSessions, type RecentSession } from "../ipc/recent";
 
 export interface RecentListProps {
@@ -31,8 +20,8 @@ export interface RecentListProps {
   onRecall: (sessionId: string, cwd: string) => void;
 }
 
-/** Final path segment of a cwd (POSIX or Windows separators), or the whole
- *  string if it has none — the folder name shown on a row. */
+/** Final path segment of a cwd (POSIX or Windows separators), or the whole string
+ *  if it has none — the folder name shown on a row. */
 function cwdBasename(cwd: string): string {
   const parts = cwd.replace(/[/\\]+$/, "").split(/[/\\]+/);
   return parts[parts.length - 1] || cwd;
@@ -49,34 +38,51 @@ function relativeTime(epochSecs: number): string {
   return `${Math.floor(diff / 2592000)}mo`;
 }
 
-/** One project's sessions, newest-first. `newest` drives row ordering + the
- *  header time; `sessions[0]` is what Resume targets by default. */
+// --- Hidden rows: a persisted set of dismissed session ids (the × button). Keyed
+// by the row's most-recent session id, so dismissing hides THIS project now but it
+// resurfaces if a newer session appears (its newest id changes -> no longer hidden).
+const HIDDEN_KEY = "th.recent.hidden.v1";
+function loadHidden(): Set<string> {
+  try {
+    const raw = localStorage.getItem(HIDDEN_KEY);
+    return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+  } catch {
+    return new Set();
+  }
+}
+function saveHidden(ids: Set<string>): void {
+  try {
+    localStorage.setItem(HIDDEN_KEY, JSON.stringify([...ids]));
+  } catch {
+    /* localStorage unavailable — dismissals just won't persist */
+  }
+}
+
+/** One project's row: its most-recent session plus the folder display name. */
 interface FolderGroup {
   cwd: string;
   name: string;
-  sessions: RecentSession[];
-  newest: number;
+  session: RecentSession;
 }
 
-/** Group a flat, newest-first session list by `cwd`, preserving newest-first
- *  order for both the projects (by most-recent session) and within each. */
+/** Reduce the flat, newest-first session list to one row per cwd (newest wins).
+ *  The backend already caps to one session per project, but we dedupe defensively
+ *  in case a cwd shows up twice; newest-first order is preserved. */
 function groupByFolder(sessions: RecentSession[]): FolderGroup[] {
-  const byCwd = new Map<string, FolderGroup>();
+  const seen = new Set<string>();
+  const out: FolderGroup[] = [];
   for (const s of sessions) {
-    let g = byCwd.get(s.cwd);
-    if (!g) {
-      g = { cwd: s.cwd, name: cwdBasename(s.cwd), sessions: [], newest: s.lastSeen };
-      byCwd.set(s.cwd, g);
-    }
-    g.sessions.push(s);
-    if (s.lastSeen > g.newest) g.newest = s.lastSeen;
+    if (seen.has(s.cwd)) continue;
+    seen.add(s.cwd);
+    out.push({ cwd: s.cwd, name: cwdBasename(s.cwd), session: s });
   }
-  return [...byCwd.values()].sort((a, b) => b.newest - a.newest);
+  return out;
 }
 
 export function RecentList({ onRecall }: RecentListProps) {
   const [sessions, setSessions] = useState<RecentSession[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [hidden, setHidden] = useState<Set<string>>(() => loadHidden());
 
   const refresh = useCallback(() => {
     void recentSessions()
@@ -93,7 +99,19 @@ export function RecentList({ onRecall }: RecentListProps) {
     return () => window.removeEventListener("focus", refresh);
   }, [refresh]);
 
-  const groups = useMemo(() => groupByFolder(sessions), [sessions]);
+  const hide = useCallback((sessionId: string) => {
+    setHidden((prev) => {
+      const next = new Set(prev);
+      next.add(sessionId);
+      saveHidden(next);
+      return next;
+    });
+  }, []);
+
+  const groups = useMemo(
+    () => groupByFolder(sessions).filter((g) => !hidden.has(g.session.id)),
+    [sessions, hidden],
+  );
 
   if (!loaded) {
     return (
@@ -110,211 +128,74 @@ export function RecentList({ onRecall }: RecentListProps) {
     );
   }
 
-  // Flat, scrollable list of projects (no accordion). The parent section already
-  // scrolls; this just stacks rows.
+  // Flat, scrollable list of projects. The parent section already scrolls; this
+  // just stacks rows.
   return (
     <div className="flex flex-col gap-0.5 px-2 py-1">
       {groups.map((g) => (
-        <ProjectRow key={g.cwd} group={g} onRecall={onRecall} />
+        <ProjectRow key={g.cwd} group={g} onRecall={onRecall} onHide={hide} />
       ))}
     </div>
   );
 }
 
-/** One project row: [Resume] · name + SELECTED session · [▾ sessions]. The ▾
- *  dropdown only SELECTS which session this row targets (it does NOT resume); the
- *  understated Resume button is what actually launches `claude --resume`. */
+/** One project row: folder name over the session's latest activity text. On hover,
+ *  a → to RESUME and an × to HIDE appear on the right (both understated). */
 function ProjectRow({
   group,
   onRecall,
+  onHide,
 }: {
   group: FolderGroup;
   onRecall: (sessionId: string, cwd: string) => void;
+  onHide: (sessionId: string) => void;
 }) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  // Which session Resume will resume. Defaults to the project's most-recent;
-  // the dropdown changes it. Keyed reset if the group's sessions change identity.
-  const [selectedId, setSelectedId] = useState(group.sessions[0]?.id);
-  const btnRef = useRef<HTMLButtonElement>(null);
-  const hasMore = group.sessions.length > 1;
-
-  const selected =
-    group.sessions.find((s) => s.id === selectedId) ?? group.sessions[0];
+  const s = group.session;
+  // Prefer the session's most-recent text; fall back to its summary/first-prompt
+  // label when the transcript tail yielded nothing usable.
+  const subtitle = s.lastText || s.label;
+  const rel = relativeTime(s.lastSeen);
 
   return (
     <div
-      className="flex items-center gap-2 rounded-lg px-2 py-1.5 transition-colors hover:bg-neutral-800/40"
+      className="group flex items-center gap-2 rounded-lg px-2 py-1.5 transition-colors hover:bg-neutral-800/40"
       style={{ color: "var(--th-fg)" }}
       title={group.cwd}
     >
-      {/* LEFT: understated Resume — resumes the SELECTED session (only this
-          launches Claude; picking in the dropdown does not). */}
-      <button
-        type="button"
-        onClick={() => selected && onRecall(selected.id, selected.cwd)}
-        className="shrink-0 rounded-md border px-2.5 py-1 text-[11px] font-medium transition-colors hover:bg-neutral-700/40"
-        style={{
-          background: "var(--th-tile-bg)",
-          borderColor: "var(--th-border)",
-          color: "var(--th-fg-muted)",
-        }}
-        title={`Resume the selected session: claude --resume in ${group.cwd}`}
-      >
-        Resume
-      </button>
-
-      {/* MIDDLE: project name over the SELECTED session's description. */}
+      {/* LEFT: folder name over the session's most-recent text. */}
       <div className="min-w-0 flex-1">
         <div className="truncate text-[13px] font-medium">{group.name}</div>
         <div
           className="truncate text-[11px]"
           style={{ color: "var(--th-fg-muted)" }}
-          title={selected?.label}
+          title={subtitle}
         >
-          {selected?.label}
-          {selected && relativeTime(selected.lastSeen)
-            ? ` · ${relativeTime(selected.lastSeen)}`
-            : ""}
+          {subtitle}
+          {rel ? ` · ${rel}` : ""}
         </div>
       </div>
 
-      {/* RIGHT: session dropdown — SELECT any of this project's sessions (does not
-          resume). Only shown when there's more than one. */}
-      {hasMore && (
-        <button
-          ref={btnRef}
-          type="button"
-          onClick={() => setMenuOpen((v) => !v)}
-          className="shrink-0 rounded-md px-1.5 py-1 text-[11px] transition-colors hover:bg-neutral-700/40"
-          style={{ color: "var(--th-fg-muted)" }}
-          title={`${group.sessions.length} sessions — pick which one Resume targets`}
-          aria-haspopup="menu"
-          aria-expanded={menuOpen}
-        >
-          {group.sessions.length}&nbsp;▾
-        </button>
-      )}
-
-      {menuOpen && (
-        <SessionMenu
-          anchor={btnRef.current}
-          sessions={group.sessions}
-          selectedId={selected?.id}
-          onPick={(s) => {
-            setSelectedId(s.id); // SELECT only — Resume runs it
-            setMenuOpen(false);
-          }}
-          onClose={() => setMenuOpen(false)}
-        />
-      )}
-    </div>
-  );
-}
-
-/** Fixed-position popup to SELECT one of a project's sessions (newest first),
- *  anchored under the ▾ button. Fixed (not inline) so the narrow/scrollable
- *  sidebar can't clip it. OPAQUE (composited over a solid base so a translucent
- *  theme surface doesn't show the app through it) and compact + scrollable
- *  (capped height) so a project with many sessions doesn't fill the screen. */
-function SessionMenu({
-  anchor,
-  sessions,
-  selectedId,
-  onPick,
-  onClose,
-}: {
-  anchor: HTMLElement | null;
-  sessions: RecentSession[];
-  selectedId?: string;
-  onPick: (s: RecentSession) => void;
-  onClose: () => void;
-}) {
-  const [pos, setPos] = useState<{ left: number; top: number; width: number } | null>(
-    null,
-  );
-
-  useLayoutEffect(() => {
-    if (!anchor) return;
-    const r = anchor.getBoundingClientRect();
-    const width = 280;
-    const left = Math.max(8, Math.min(r.right - width, window.innerWidth - width - 8));
-    setPos({ left, top: r.bottom + 4, width });
-  }, [anchor]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  if (!pos) return null;
-
-  return (
-    <>
-      {/* Click-away backdrop. */}
-      <div className="fixed inset-0 z-40" onPointerDown={onClose} aria-hidden />
-      <div
-        role="menu"
-        // Compact + scrollable: ~9 rows tall then scrolls (not a giant dropdown).
-        className="th-scroll fixed z-50 max-h-72 overflow-y-auto rounded-lg border py-1 shadow-2xl"
-        style={{
-          left: pos.left,
-          top: pos.top,
-          width: pos.width,
-          // OPAQUE: layer the (possibly translucent) themed surface over a solid
-          // dark base so nothing behind the menu shows through.
-          background:
-            "linear-gradient(var(--th-header-bg), var(--th-header-bg)), #0b0b0c",
-          borderColor: "var(--th-border)",
-          color: "var(--th-fg)",
-          fontFamily: "var(--th-font)",
-        }}
-        onPointerDown={(e) => e.stopPropagation()}
+      {/* RIGHT (revealed on row hover or keyboard focus): resume arrow, then hide ×. */}
+      <button
+        type="button"
+        onClick={() => onRecall(s.id, s.cwd)}
+        className="shrink-0 rounded-md px-1.5 py-1 text-[13px] leading-none opacity-0 transition-opacity hover:bg-neutral-700/40 focus:opacity-100 group-hover:opacity-100"
+        style={{ color: "var(--th-fg-muted)" }}
+        title={`Resume: claude --resume in ${group.cwd}`}
+        aria-label="Resume session"
       >
-        {sessions.map((s) => {
-          const active = s.id === selectedId;
-          return (
-            <button
-              key={s.id}
-              type="button"
-              role="menuitemradio"
-              aria-checked={active}
-              onClick={() => onPick(s)}
-              className="flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors hover:bg-neutral-700/40"
-              style={
-                active
-                  ? {
-                      background:
-                        "color-mix(in srgb, var(--th-accent) 16%, transparent)",
-                    }
-                  : undefined
-              }
-            >
-              {/* Selection check so it's clear which session Resume targets. */}
-              <span
-                className="w-3 shrink-0 text-[11px]"
-                style={{ color: "var(--th-accent)" }}
-                aria-hidden
-              >
-                {active ? "✓" : ""}
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-[12.5px]" title={s.label}>
-                  {s.label}
-                </span>
-              </span>
-              <span
-                className="shrink-0 text-[10px] tabular-nums"
-                style={{ color: "var(--th-fg-muted)" }}
-              >
-                {relativeTime(s.lastSeen)}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-    </>
+        →
+      </button>
+      <button
+        type="button"
+        onClick={() => onHide(s.id)}
+        className="shrink-0 rounded-md px-1.5 py-1 text-[13px] leading-none opacity-0 transition-opacity hover:bg-neutral-700/40 focus:opacity-100 group-hover:opacity-100"
+        style={{ color: "var(--th-fg-muted)" }}
+        title="Hide from Recent (does not delete the transcript)"
+        aria-label="Hide from Recent"
+      >
+        ×
+      </button>
+    </div>
   );
 }

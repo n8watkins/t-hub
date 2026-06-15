@@ -42,10 +42,11 @@ use serde::Serialize;
 /// dozens of times) can't devour the whole window and evict every other project.
 const PROJECT_LIMIT: usize = 80;
 
-/// How many of each project's newest sessions to keep — the row's default Resume
-/// target plus the session dropdown. Bounds the per-project 32KB prefix reads so a
-/// folder with hundreds of sessions doesn't dominate the (slower, UNC) read phase.
-const PER_PROJECT_LIMIT: usize = 8;
+/// How many of each project's newest sessions to surface. The Recent list now
+/// shows ONE row per project (its most-recent session — the session dropdown was
+/// removed in the 2026-06-15 redesign), so we only need the newest. Kept as a
+/// constant (not inlined) so a multi-session affordance is trivial to restore.
+const PER_PROJECT_LIMIT: usize = 1;
 
 /// One recallable past Claude session, mirrored by `src/ipc/recent.ts`
 /// (`rename_all = "camelCase"`).
@@ -60,6 +61,10 @@ pub struct RecentSession {
     pub cwd: String,
     /// A friendly label: Claude's own summary when known, else the cwd basename.
     pub label: String,
+    /// The session's most-recent message text (Claude's or your last turn), read
+    /// from the transcript TAIL — the Recent row's "what we were last doing"
+    /// subtitle. Empty string when the tail had no parseable conversational text.
+    pub last_text: String,
     /// Unix epoch SECONDS of last activity (the transcript mtime). Drives the
     /// newest-first ordering; the frontend may also render it as a relative time.
     pub last_seen: i64,
@@ -120,9 +125,10 @@ struct Parsed {
     first_prompt: Option<String>,
 }
 
-/// Pull the plain text out of a user message's `content`, which is either a bare
-/// string or an array of content blocks (we concatenate the `text` blocks).
-fn user_message_text(v: &serde_json::Value) -> Option<String> {
+/// Pull the plain text out of a message's `content` (user OR assistant), which is
+/// either a bare string or an array of content blocks (we concatenate the `text`
+/// blocks; tool-use / tool-result blocks have no `text` and are skipped).
+fn message_text(v: &serde_json::Value) -> Option<String> {
     let content = v.get("message")?.get("content")?;
     if let Some(s) = content.as_str() {
         return Some(s.to_string());
@@ -203,7 +209,7 @@ fn parse_transcript(text: &str) -> Parsed {
         }
         // First real user prompt = the best fallback description.
         if ty == Some("user") && first_prompt.is_none() {
-            if let Some(text) = user_message_text(&v) {
+            if let Some(text) = message_text(&v) {
                 if is_real_prompt(&text) {
                     first_prompt = Some(text.trim().to_string());
                 }
@@ -222,17 +228,24 @@ fn parse_transcript(text: &str) -> Parsed {
 /// know the directory for — `claude --resume` would land in the wrong place).
 /// The label prefers Claude's summary, then the first real user prompt, and only
 /// falls back to the bare folder name when the transcript yields neither.
-fn make_session(id: String, last_seen: i64, parsed: Parsed) -> Option<RecentSession> {
+fn make_session(
+    id: String,
+    last_seen: i64,
+    parsed: Parsed,
+    last_text: Option<String>,
+) -> Option<RecentSession> {
     let cwd = parsed.cwd?;
     let label = parsed
         .summary
         .or(parsed.first_prompt)
         .map(|s| tidy_label(&s, 80))
         .unwrap_or_else(|| cwd_basename(&cwd).to_string());
+    let last_text = last_text.map(|s| tidy_label(&s, 100)).unwrap_or_default();
     Some(RecentSession {
         id,
         cwd,
         label,
+        last_text,
         last_seen,
     })
 }
@@ -263,6 +276,55 @@ fn read_prefix(path: &std::path::Path, cap: usize) -> String {
     let n = f.read(&mut buf).unwrap_or(0);
     buf.truncate(n);
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Read at most `cap` bytes from the END of a file as lossy UTF-8 — the Recent
+/// row's subtitle wants the session's LAST message, which lives at the tail. The
+/// first line of the returned slice may be a partial JSON line (we cut mid-file);
+/// [`parse_last_text`] tolerates that by skipping unparseable lines. Platform-agnostic.
+fn read_suffix(path: &std::path::Path, cap: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(cap as u64);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Extract the text of the LAST real conversational message (user or assistant)
+/// from transcript JSONL — the Recent row's "what we were last doing" subtitle.
+/// Scans every parseable line and keeps the last one with non-empty, non-wrapper
+/// text (tool results, slash-command/caveat blocks, and empty turns are skipped,
+/// reusing [`is_real_prompt`]). Returns None when nothing usable is found.
+fn parse_last_text(text: &str) -> Option<String> {
+    let mut last: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let ty = v.get("type").and_then(|t| t.as_str());
+        if ty == Some("user") || ty == Some("assistant") {
+            if let Some(t) = message_text(&v) {
+                let t = t.trim();
+                if !t.is_empty() && is_real_prompt(t) {
+                    last = Some(t.to_string());
+                }
+            }
+        }
+    }
+    last
 }
 
 /// Read the most-recent `~/.claude/projects/<project>/<id>.jsonl` transcripts under
@@ -340,12 +402,13 @@ fn read_sessions_from_dir(
     let metas: Vec<(String, std::path::PathBuf, i64)> =
         buckets.into_iter().flat_map(|(_, sessions)| sessions).collect();
 
-    // Phase 2: read + parse the 32KB prefix of just the survivors.
+    // Phase 2: read the 32KB PREFIX (cwd/summary live near the top) AND the 32KB
+    // SUFFIX (the last message text) of just the survivors.
     let mut out = Vec::new();
     for (id, path, last_seen) in metas {
-        let text = read_prefix(&path, 32 * 1024);
-        let parsed = parse_transcript(&text);
-        if let Some(s) = make_session(id, last_seen, parsed) {
+        let parsed = parse_transcript(&read_prefix(&path, 32 * 1024));
+        let last_text = parse_last_text(&read_suffix(&path, 32 * 1024));
+        if let Some(s) = make_session(id, last_seen, parsed, last_text) {
             out.push(s);
         }
     }
@@ -499,17 +562,19 @@ mod tests {
     #[test]
     fn make_session_label_prefers_summary_then_prompt_then_basename() {
         // No cwd -> unrecallable -> dropped.
-        assert!(make_session("id".into(), 1, Parsed { cwd: None, summary: None, first_prompt: None }).is_none());
+        assert!(make_session("id".into(), 1, Parsed { cwd: None, summary: None, first_prompt: None }, None).is_none());
         // No summary, no prompt -> label falls back to the cwd basename.
-        let s = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: None, first_prompt: None }).unwrap();
+        let s = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: None, first_prompt: None }, None).unwrap();
         assert_eq!(s.label, "proj");
         assert_eq!(s.last_seen, 5);
+        assert_eq!(s.last_text, ""); // no tail text supplied -> empty
         // First prompt beats the basename when there's no summary.
-        let s2 = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: None, first_prompt: Some("add auth".into()) }).unwrap();
+        let s2 = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: None, first_prompt: Some("add auth".into()) }, None).unwrap();
         assert_eq!(s2.label, "add auth");
-        // Summary wins over everything.
-        let s3 = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: Some("Do a thing".into()), first_prompt: Some("add auth".into()) }).unwrap();
+        // Summary wins for the label; the tail text becomes last_text (tidied).
+        let s3 = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: Some("Do a thing".into()), first_prompt: Some("add auth".into()) }, Some("  the   last line  ".into())).unwrap();
         assert_eq!(s3.label, "Do a thing");
+        assert_eq!(s3.last_text, "the last line");
     }
 
     #[test]
@@ -594,5 +659,33 @@ mod tests {
         let s = read_prefix(&p, 1024);
         std::fs::remove_file(&p).ok();
         assert_eq!(s.len(), 1024);
+    }
+
+    #[test]
+    fn read_suffix_reads_the_tail() {
+        use std::io::Write;
+        let p = std::env::temp_dir().join(format!("th_suffix_{}.txt", std::process::id()));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(b"HEAD").unwrap();
+        f.write_all(&vec![b'x'; 100_000]).unwrap();
+        f.write_all(b"TAILEND").unwrap();
+        let s = read_suffix(&p, 16);
+        std::fs::remove_file(&p).ok();
+        assert_eq!(s.len(), 16);
+        assert!(s.ends_with("TAILEND"));
+    }
+
+    #[test]
+    fn parse_last_text_picks_last_real_message() {
+        // The LAST real conversational text wins (the assistant's final reply);
+        // a partial leading line, command-wrapper noise, and tool blocks are all
+        // skipped. Mirrors a tail slice cut mid-file.
+        let text = r#"garbage partial line {oops
+{"type":"user","message":{"role":"user","content":"first prompt"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"middle reply"}]}}
+{"type":"user","message":{"role":"user","content":"<command-name>noise</command-name>"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"the last thing said"}]}}"#;
+        assert_eq!(parse_last_text(text).as_deref(), Some("the last thing said"));
+        assert_eq!(parse_last_text("only garbage\nmore garbage"), None);
     }
 }
