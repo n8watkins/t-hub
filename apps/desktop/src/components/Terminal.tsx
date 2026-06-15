@@ -31,6 +31,8 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   attachTerminal,
@@ -41,6 +43,7 @@ import {
   writeTerminal,
 } from "../ipc/client";
 import type { TerminalId } from "../ipc/types";
+import { usePanels } from "../store/panels";
 import { useWorkspace } from "../store/workspace";
 import { useTheme, type TerminalPalette } from "../store/theme";
 import { tlog } from "../lib/diag";
@@ -80,6 +83,38 @@ async function clipboardRead(): Promise<string> {
     return "";
   }
 }
+
+// Hand a URL to the OS default browser. MIRRORS WebPreview.tsx's openExternal():
+// the Tauri shell plugin's open() is the primary path (already a JS dependency),
+// falling back to window.open only if the native plugin isn't registered. This
+// is why the WebLinksAddon below uses a CUSTOM click handler rather than the
+// addon's default one — the addon's default is plain window.open, which is
+// unreliable in WebView2, so a clicked terminal link could silently do nothing.
+async function openExternal(url: string): Promise<void> {
+  try {
+    await shellOpen(url);
+  } catch {
+    try {
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch {
+      /* nothing more we can do from the frontend */
+    }
+  }
+}
+
+// Matches a localhost-style URL printed in terminal output so we can surface it
+// as a one-click Preview chip for the tile (Claude/Vite/Next/etc. announce the
+// dev server this way). Intentionally narrow — only loopback hosts, with an
+// optional :port and path — so we never offer to preview an arbitrary internet
+// link the user didn't start. `g` so one chunk can yield several matches.
+const LOCALHOST_URL_RE =
+  /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?(?:\/[^\s"'<>]*)?/gi;
+
+// How many trailing chars of one output chunk we prepend to the next before
+// scanning, so a URL split across two PTY writes is still matched whole. A URL
+// here is well under this; the tail just has to outspan the longest plausible
+// split point. Kept small — it runs on every output chunk.
+const URL_SCAN_TAIL = 256;
 
 /** Default xterm theme when the active theme carries no terminal palette. */
 const DEFAULT_TERM_THEME: ITheme = { background: "#0a0a0a" };
@@ -173,6 +208,15 @@ export function TerminalView({
     fitRef.current = fit;
     const search = new SearchAddon();
     term.loadAddon(search);
+
+    // Clickable web links: underline URLs on hover, open the OS default browser
+    // on click. We pass a CUSTOM click handler (not the addon's default, which is
+    // plain window.open — unreliable in WebView2) that routes through the Tauri
+    // shell plugin via openExternal(); loaded before term.open() like the others.
+    const webLinks = new WebLinksAddon((_event: MouseEvent, uri: string) => {
+      void openExternal(uri);
+    });
+    term.loadAddon(webLinks);
 
     // No WebGL addon: xterm uses its default DOM renderer. See the file header
     // (mutedbug fix) for why -- a per-terminal WebGL context hits WebView2's
@@ -370,9 +414,38 @@ export function TerminalView({
             let seeded = false;
             const liveBuffer: Uint8Array[] = [];
 
+            // LOCALHOST-URL DETECTION: scan the LIVE PTY stream for dev-server
+            // URLs and publish each NEW one to the panels store, where the tile's
+            // Preview tab renders them as one-click chips. Decoupled from xterm's
+            // write path so it can't perturb rendering. A streaming TextDecoder
+            // carries multi-byte UTF-8 across chunk boundaries; a rolling tail of
+            // the previous chunk is prepended so a URL split across two writes is
+            // still matched whole. We dedupe against the last few URLs we pushed
+            // so a server logging its URL on every request doesn't spam the store
+            // (addDetectedUrl also dedupes, but this avoids the regex+set churn).
+            const urlDecoder = new TextDecoder("utf-8");
+            let scanTail = "";
+            const recentUrls: string[] = [];
+            const scanForUrls = (bytes: Uint8Array): void => {
+              // `stream: true` keeps a trailing partial code point for next time.
+              const text = scanTail + urlDecoder.decode(bytes, { stream: true });
+              LOCALHOST_URL_RE.lastIndex = 0;
+              for (const m of text.matchAll(LOCALHOST_URL_RE)) {
+                const url = m[0];
+                if (recentUrls.includes(url)) continue;
+                recentUrls.push(url);
+                if (recentUrls.length > 16) recentUrls.shift();
+                usePanels.getState().addDetectedUrl(terminalId, url);
+              }
+              // Carry the tail so a URL spanning this chunk and the next is caught.
+              scanTail =
+                text.length > URL_SCAN_TAIL ? text.slice(-URL_SCAN_TAIL) : text;
+            };
+
             const offOutput = await onOutput((e) => {
               if (e.id !== terminalId || disposed) return;
               const bytes = decodeBase64(e.base64);
+              scanForUrls(bytes);
               if (seeded) term.write(bytes);
               else liveBuffer.push(bytes);
             });

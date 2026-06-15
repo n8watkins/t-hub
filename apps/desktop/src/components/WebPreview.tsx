@@ -68,9 +68,15 @@ type LoadState =
 export interface WebPreviewProps {
   /** Optional starting URL (defaults to the local dev server). */
   initialUrl?: string;
+  /** localhost URLs scraped from the tile's terminal output (newest-first).
+   *  Rendered as one-click chips under the URL bar; clicking one navigates. */
+  detectedUrls?: string[];
 }
 
-export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps): ReactElement {
+export function WebPreview({
+  initialUrl = DEFAULT_URL,
+  detectedUrls = [],
+}: WebPreviewProps): ReactElement {
   // `url` is the committed (submitted) address driving the iframe; `draft` is
   // the editable input value. Splitting them means typing doesn't reload on
   // every keystroke — only Enter / the Go button navigates.
@@ -129,6 +135,24 @@ export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps): React
     // `navigate` is stable (useCallback); `url` is read to avoid a redundant
     // reload when we're already on the incoming URL.
   }, [initialUrl, navigate, url]);
+
+  // Seed the preview from the newest DETECTED URL, but only as a last resort:
+  // when no real dev-server URL was ever passed in (so the bar is still sitting
+  // on the untouched DEFAULT_URL) and the user hasn't navigated. This makes the
+  // first localhost URL a terminal prints auto-load, without ever clobbering a
+  // URL the user typed/is viewing — once `url` diverges from the adopted initial
+  // value the guard below is false forever, and this is one-shot regardless.
+  const detectedSeededRef = useRef(false);
+  const newestDetected = detectedUrls[0];
+  useEffect(() => {
+    if (detectedSeededRef.current) return; // only auto-seed once
+    if (!newestDetected) return; // nothing detected yet
+    // Don't seed if a real dev URL was supplied, or if the user has navigated:
+    // in both cases the committed `url` no longer equals the adopted initial.
+    if (url !== adoptedInitialRef.current) return;
+    detectedSeededRef.current = true;
+    navigate(newestDetected);
+  }, [newestDetected, navigate, url]);
 
   // Resolve the reachable load URL whenever the committed `url` (or a manual
   // retry via `nav`) changes. On Windows this swaps a WSL `localhost` for the
@@ -210,10 +234,14 @@ export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps): React
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* URL bar: address input + Go + an always-available external-open. */}
-      <form
-        className="flex shrink-0 items-center gap-2 border-b px-3 py-2"
+      {/* URL bar: address input + Go + an always-available external-open. The
+          detected-URL chips (if any) wrap onto a row directly under it. */}
+      <div
+        className="shrink-0 border-b"
         style={{ borderColor: "var(--th-border)" }}
+      >
+      <form
+        className="flex shrink-0 items-center gap-2 px-3 py-2"
         onSubmit={(e) => {
           e.preventDefault();
           navigate(draft);
@@ -283,6 +311,43 @@ export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps): React
           Open externally
         </button>
       </form>
+
+      {/* Detected-URL chips: localhost URLs the tile's terminal printed (e.g. a
+          dev server announcing itself). Click to navigate the preview there.
+          Newest-first; only shown when there are any. */}
+      {detectedUrls.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2">
+          <span
+            className="text-[11px]"
+            style={{ color: "var(--th-fg-muted)" }}
+          >
+            Detected:
+          </span>
+          {detectedUrls.map((u) => {
+            const active = u === url;
+            return (
+              <button
+                key={u}
+                type="button"
+                onClick={() => navigate(u)}
+                title={`Preview ${u}`}
+                className="max-w-[16rem] truncate px-2 py-0.5 text-[11px]"
+                style={{
+                  borderRadius: "var(--th-radius)",
+                  border: "1px solid var(--th-border)",
+                  // The currently-shown URL reads as selected; the rest are
+                  // muted "jump to it" affordances.
+                  background: active ? "var(--th-tile-bg)" : "transparent",
+                  color: active ? "var(--th-fg)" : "var(--th-fg-muted)",
+                }}
+              >
+                {u}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      </div>
 
       {/* Body: the framed page, with overlays for the blocked/error cases. The
           iframe stays mounted under a blocked/error notice so a successful late

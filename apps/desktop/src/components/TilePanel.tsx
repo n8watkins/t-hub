@@ -58,12 +58,20 @@ export function TilePanel({
   // level (hooks can't sit inside the switch) but only consumed by Preview.
   const devUrl = usePanels((s) => s.devUrl[terminalId]);
   const previewUrl = usePanels((s) => s.previewUrl[terminalId]);
+  // localhost URLs scraped from this tile's terminal output, surfaced as
+  // one-click chips in the Preview bar. Guard undefined (no detections yet) -> [].
+  const detectedUrls = usePanels((s) => s.detectedUrls[terminalId]) ?? [];
 
   switch (tab) {
     case "files":
       return <FilePanel root={cwd || undefined} compact={compact} />;
     case "preview":
-      return <WebPreview initialUrl={devUrl ?? previewUrl ?? undefined} />;
+      return (
+        <WebPreview
+          initialUrl={devUrl ?? previewUrl ?? undefined}
+          detectedUrls={detectedUrls}
+        />
+      );
     case "dev":
       // Mount-only: Agent C implements DevTab's body. Keep props stable.
       return <DevTab terminalId={terminalId} cwd={cwd} />;
