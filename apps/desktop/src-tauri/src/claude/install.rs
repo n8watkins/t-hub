@@ -327,13 +327,32 @@ pub fn install_hooks_at_events(
     let cleaned = hooks::remove_from_settings(&existing);
     let event_refs: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
     let merged = hooks::merge_into_settings_for(&cleaned, agent_bin, &event_refs);
+    // Also install the Claude `statusLine` (the USAGE data source). The hooks
+    // alone never feed the status bridge — Claude's statusline is a SEPARATE
+    // setting that runs `termhub-agent --statusline`, which journals a
+    // StatusSnapshot the core re-emits on `status://snapshot`. Without this,
+    // the sidebar USAGE strip shows only dashes. Respects a user-authored
+    // statusLine (merge_statusline_into_settings leaves a non-managed one alone).
+    let merged = hooks::merge_statusline_into_settings(&merged, agent_bin);
     write_settings_atomic(path, &merged)?;
     let managed = count_managed(&merged);
+    let statusline_on = hooks::statusline_managed(&merged);
+    crate::diag::diag_log(format!(
+        "claude/install: wrote {} (hooks={managed}, statusLine={statusline_on}, agent_bin={agent_bin})",
+        path.display()
+    ));
     Ok(InstallReport {
         settings_path: path.display().to_string(),
         backed_up,
         managed_events: managed,
-        message: format!("Installed TermHub handlers for {managed} hook events."),
+        message: if statusline_on {
+            format!("Installed TermHub handlers for {managed} hook events + usage statusline.")
+        } else {
+            format!(
+                "Installed TermHub handlers for {managed} hook events. \
+                 (Kept your existing Claude statusLine — usage may not report.)"
+            )
+        },
     })
 }
 
@@ -347,12 +366,14 @@ pub fn uninstall_hooks() -> Result<InstallReport> {
 pub fn uninstall_hooks_at(path: &Path) -> Result<InstallReport> {
     let existing = read_settings(path)?;
     let cleaned = hooks::remove_from_settings(&existing);
+    // Also remove our managed statusLine (leaves a user-authored one intact).
+    let cleaned = hooks::remove_statusline_from_settings(&cleaned);
     write_settings_atomic(path, &cleaned)?;
     Ok(InstallReport {
         settings_path: path.display().to_string(),
         backed_up: false,
         managed_events: count_managed(&cleaned),
-        message: "Removed TermHub hook handlers.".to_string(),
+        message: "Removed TermHub hook handlers + usage statusline.".to_string(),
     })
 }
 
@@ -440,6 +461,47 @@ mod tests {
         assert!(pre
             .iter()
             .any(|g| serde_json::to_string(g).unwrap().contains("user-hook")));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn install_writes_statusline_and_uninstall_removes_it() {
+        let path = temp_settings("statusline");
+        install_hooks_at(&path, "/usr/bin/termhub-agent", true).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // statusLine installed and points at --statusline.
+        assert!(hooks::statusline_managed(&written), "statusLine must be installed");
+        assert!(written["statusLine"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("--statusline"));
+
+        uninstall_hooks_at(&path).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(after.get("statusLine").is_none(), "statusLine must be removed on uninstall");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn install_does_not_steal_user_statusline() {
+        let path = temp_settings("user-statusline");
+        let seed = serde_json::json!({
+            "statusLine": { "type": "command", "command": "my-own.sh" }
+        });
+        write_settings_atomic(&path, &seed).unwrap();
+        install_hooks_at(&path, "/usr/bin/termhub-agent", true).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // User's statusLine survives; ours is NOT forced in.
+        assert_eq!(written["statusLine"]["command"].as_str(), Some("my-own.sh"));
+        assert!(!hooks::statusline_managed(&written));
+        // Uninstall must NOT remove the user's statusLine.
+        uninstall_hooks_at(&path).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after["statusLine"]["command"].as_str(), Some("my-own.sh"));
         cleanup(&path);
     }
 

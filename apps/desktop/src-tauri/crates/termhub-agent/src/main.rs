@@ -18,7 +18,11 @@
 //! - Ingest the Claude hook → journal spine: `--hook <EVENT>` mode reads the
 //!   hook's JSON from stdin, appends a durable journal entry, and exits 0 so
 //!   Claude's turn is never blocked ([`hook`]).
-//! - Stream new journal entries live to the connected core ([`transport`]).
+//! - Ingest Claude's **statusline** JSON: `--statusline` mode reads the
+//!   statusline payload from stdin, appends a durable `StatusSnapshot` journal
+//!   entry, prints a one-line readout to stdout (so it's a valid statusline
+//!   command), and exits 0 ([`hook::run_statusline`]). This is the data source
+//!   for the sidebar's Claude USAGE strip (cost / context % / rate limits).
 //!
 //! ## Concurrency / head-of-line blocking
 //! The protocol tags every frame with a [`termhub_protocol::Channel`] and every
@@ -43,6 +47,9 @@ use std::sync::Arc;
 /// - `--stdio`         Run the NDJSON bridge on stdin/stdout (long-lived agent).
 /// - `--hook <EVENT>`  Hook ingest: read one JSON object from stdin, append it
 ///                     to the journal, exit 0.  Never blocks; never fails Claude.
+/// - `--statusline`    Statusline ingest: read Claude's statusline JSON from
+///                     stdin, append a `StatusSnapshot` journal entry, echo a
+///                     short readout to stdout, exit 0. Never blocks Claude.
 ///
 /// ## Shared flags
 /// - `--journal-dir <PATH>`  Override the journal directory (default:
@@ -58,6 +65,9 @@ struct Args {
 enum Mode {
     Stdio,
     Hook { event: String },
+    /// Statusline ingest: read Claude's statusline JSON from stdin, journal a
+    /// `StatusSnapshot`, echo a readout, exit 0.
+    Statusline,
     None,
 }
 
@@ -77,6 +87,7 @@ fn parse_args() -> Args {
                     }
                 }
             }
+            "--statusline" => mode = Mode::Statusline,
             "--journal-dir" => journal_dir = it.next(),
             "--version" | "-V" => {
                 println!("termhub-agent {}", env!("CARGO_PKG_VERSION"));
@@ -111,6 +122,18 @@ fn main() {
         }
 
         // ------------------------------------------------------------------
+        // --statusline: short-lived statusline ingest.  MUST exit 0 always so
+        // it stays a well-behaved Claude statusline command.
+        // ------------------------------------------------------------------
+        Mode::Statusline => {
+            if let Err(e) = hook::run_statusline(args.journal_dir.as_deref()) {
+                eprintln!("termhub-agent --statusline: unexpected error: {e:#}");
+            }
+            // Always exit 0 — never fail Claude's statusline render.
+            std::process::exit(0);
+        }
+
+        // ------------------------------------------------------------------
         // --stdio: long-lived NDJSON bridge.
         // ------------------------------------------------------------------
         Mode::Stdio => {
@@ -140,7 +163,7 @@ fn main() {
         // ------------------------------------------------------------------
         Mode::None => {
             eprintln!(
-                "termhub-agent {}: no mode selected; pass --stdio or --hook <EVENT>.",
+                "termhub-agent {}: no mode selected; pass --stdio, --hook <EVENT>, or --statusline.",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(2);

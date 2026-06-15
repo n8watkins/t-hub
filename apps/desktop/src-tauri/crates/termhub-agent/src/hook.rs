@@ -137,6 +137,134 @@ pub fn run(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Statusline ingest (`--statusline`)
+// ---------------------------------------------------------------------------
+//
+// Claude Code's `statusLine` setting runs a command on every status refresh and
+// pipes a JSON object to its stdin (session_id, cwd, model, cost, context_window,
+// rate_limits, ...). We journal that raw payload as a `StatusSnapshot` entry; the
+// core's `consume_journal_entry` routes `StatusSnapshot` entries through the
+// status bridge and emits `status://snapshot`, which the sidebar USAGE strip
+// reads. This is the missing data source that left USAGE showing dashes: hooks
+// were installed but no statusline ever fed the bridge.
+//
+// The entry payload wraps the raw statusline under `status` and lifts
+// `session_id` to the top so it matches the core's ingest contract (see
+// `AgentBridge::ingest_status_from_journal`, which reads `payload.status` and
+// `entity_id`/`payload.session_id`).
+
+/// Build a `StatusSnapshot` journal entry from a parsed statusline JSON payload.
+/// Pure (no I/O) so it is unit-tested directly. `entity_id` + `payload.session_id`
+/// are the statusline's `session_id`; the raw statusline rides under
+/// `payload.status` for the core's status bridge to parse.
+pub fn build_status_entry(statusline: &serde_json::Value) -> EventJournalEntry {
+    let session_id = statusline
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "status": statusline.clone(),
+    });
+
+    EventJournalEntry {
+        seq: 0,
+        timestamp_ms: now_ms(),
+        source: JournalSource::Status,
+        entity_id: session_id,
+        event_type: JournalEventType::StatusSnapshot,
+        payload,
+        result: None,
+    }
+}
+
+/// A compact one-line readout for the actual Claude statusline (stdout), so the
+/// command is a well-behaved statusline AND our journal ingest happens as a side
+/// effect. Best-effort string assembly; empty when nothing useful is present.
+fn statusline_readout(statusline: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(model) = statusline
+        .get("model")
+        .and_then(|m| m.get("display_name"))
+        .and_then(|v| v.as_str())
+    {
+        parts.push(model.to_string());
+    }
+    if let Some(pct) = statusline
+        .get("context_window")
+        .and_then(|c| c.get("used_percentage"))
+        .and_then(|v| v.as_f64())
+    {
+        parts.push(format!("ctx {}%", pct.round() as i64));
+    }
+    if let Some(cost) = statusline
+        .get("cost")
+        .and_then(|c| c.get("total_cost_usd"))
+        .and_then(|v| v.as_f64())
+    {
+        parts.push(format!("${cost:.2}"));
+    }
+    parts.join(" · ")
+}
+
+/// Run the `--statusline` ingest path.
+///
+/// 1. Read statusline JSON from stdin to EOF.
+/// 2. Parse as `serde_json::Value` (tolerate failure — journal nothing, print "").
+/// 3. Append a `StatusSnapshot` journal entry.
+/// 4. Print a one-line readout to stdout so this is a valid statusline command.
+/// 5. Exit 0 always (never block Claude's statusline render).
+pub fn run_statusline(journal_dir: Option<&str>) -> anyhow::Result<()> {
+    // 1. Read stdin to EOF.
+    let mut raw = String::new();
+    {
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        if let Err(e) = handle.read_to_string(&mut raw) {
+            eprintln!("termhub-agent --statusline: failed reading stdin: {e:#}");
+        }
+    }
+
+    // 2. Parse JSON. On failure we have nothing to ingest; print an empty line.
+    let statusline: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("termhub-agent --statusline: failed parsing statusline JSON: {e:#}");
+            println!();
+            return Ok(());
+        }
+    };
+
+    // 3. Build + append the StatusSnapshot entry.
+    let entry = build_status_entry(&statusline);
+    let session_id = entry.entity_id.clone().unwrap_or_default();
+    let dir: PathBuf = crate::journal::resolve_journal_dir(journal_dir);
+    match crate::journal::Journal::open(&dir) {
+        Ok(journal) => {
+            if let Err(e) = journal.append(entry) {
+                eprintln!("termhub-agent --statusline: failed to append journal entry: {e:#}");
+            } else {
+                // Diagnostic on stderr only (stdout is the statusline render): a
+                // grep-able marker the orchestrator can correlate with the core
+                // emitting status://snapshot for this session.
+                eprintln!(
+                    "termhub-agent --statusline: journaled StatusSnapshot for session {session_id}"
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("termhub-agent --statusline: failed to open journal at {dir:?}: {e:#}");
+        }
+    }
+
+    // 4. Print the one-line readout so this stays a valid statusline command.
+    println!("{}", statusline_readout(&statusline));
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -228,6 +356,45 @@ mod tests {
         let entry = build_entry("Notification", &serde_json::Value::Null);
         assert_eq!(entry.event_type, JournalEventType::Notification);
         assert!(entry.entity_id.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_status_entry — statusline ingest (pure)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_status_entry_wraps_raw_statusline_and_lifts_session_id() {
+        let statusline = serde_json::json!({
+            "session_id": "sess-9",
+            "cwd": "/work",
+            "model": { "display_name": "Opus" },
+            "cost": { "total_cost_usd": 1.23 },
+            "context_window": { "used_percentage": 42 },
+            "rate_limits": {
+                "five_hour": { "used_percentage": 80.0, "resets_at": 1_700_000_000 }
+            }
+        });
+        let entry = build_status_entry(&statusline);
+
+        assert_eq!(entry.source, JournalSource::Status);
+        assert_eq!(entry.event_type, JournalEventType::StatusSnapshot);
+        assert_eq!(entry.entity_id.as_deref(), Some("sess-9"));
+        // session_id lifted to the top of the payload.
+        assert_eq!(entry.payload["session_id"], "sess-9");
+        // Raw statusline preserved under payload.status (what the core parses).
+        assert_eq!(entry.payload["status"]["context_window"]["used_percentage"], 42);
+        assert_eq!(entry.payload["status"]["cost"]["total_cost_usd"], 1.23);
+        assert!(entry.timestamp_ms > 0);
+        assert_eq!(entry.seq, 0, "seq is assigned by Journal::append");
+    }
+
+    #[test]
+    fn build_status_entry_tolerates_missing_session_id() {
+        let statusline = serde_json::json!({ "cwd": "/x" });
+        let entry = build_status_entry(&statusline);
+        assert!(entry.entity_id.is_none());
+        assert_eq!(entry.event_type, JournalEventType::StatusSnapshot);
+        assert!(entry.payload["session_id"].is_null());
     }
 
     #[test]

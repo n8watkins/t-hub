@@ -7,6 +7,7 @@
 // caches the latest snapshot per session for rendering the tree view + queue.
 import { create } from "zustand";
 import type { SessionStatus, StatusSnapshot, SupervisionTree } from "../ipc/model";
+import { tlog } from "../lib/diag";
 
 /**
  * Usage % at/above which a session is surfaced as `rateLimited` in the UI. The
@@ -72,9 +73,16 @@ export const useSupervision = create<SupervisionState>((set) => ({
     }),
 
   setSnapshot: (snap) =>
-    set((s) => ({
-      snapshots: { ...s.snapshots, [snap.sessionId]: snap },
-    })),
+    set((s) => {
+      // Diag: a statusline snapshot reached the store — the orchestrator can
+      // confirm the full chain (statusline -> agent -> core -> status://snapshot
+      // -> here) by grepping the diag log for `usage` lines.
+      tlog(
+        "usage",
+        `setSnapshot ${snap.sessionId} ctx=${snap.contextUsedPct ?? "-"} cost=${snap.costUsd ?? "-"} rl5h=${snap.fiveHour?.usedPercentage ?? "-"}`,
+      );
+      return { snapshots: { ...s.snapshots, [snap.sessionId]: snap } };
+    }),
 
   remove: (sessionId) =>
     set((s) => {

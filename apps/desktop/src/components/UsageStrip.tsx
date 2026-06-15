@@ -56,9 +56,18 @@ export function UsageStrip() {
   const agg = aggregate(snapshots);
 
   if (agg.sessions === 0) {
+    // No snapshots yet. This is normal until a Claude session's statusline
+    // reports — but it's ALSO what you see if the statusline was never installed
+    // into ~/.claude/settings.json (the data source). Surface the actionable
+    // hint rather than a bare "no usage" so the user knows where to look.
     return (
-      <div className="px-2 py-1 text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
-        No Claude usage yet.
+      <div
+        className="px-2 py-1 text-[11px] leading-snug"
+        style={{ color: "var(--th-fg-muted)" }}
+        title="Usage is fed by Claude Code's statusline. Install hooks + statusline from Settings > Hooks, then run a Claude turn."
+      >
+        Usage appears once a Claude session reports. If it stays blank, install
+        the statusline in Settings &gt; Hooks.
       </div>
     );
   }
