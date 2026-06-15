@@ -43,6 +43,7 @@ import {
   writeTerminal,
 } from "../ipc/client";
 import type { TerminalId } from "../ipc/types";
+import { stripAnsi } from "../lib/ansi";
 import { usePanels } from "../store/panels";
 import { useWorkspace } from "../store/workspace";
 import { useTheme, type TerminalPalette } from "../store/theme";
@@ -428,7 +429,14 @@ export function TerminalView({
             const recentUrls: string[] = [];
             const scanForUrls = (bytes: Uint8Array): void => {
               // `stream: true` keeps a trailing partial code point for next time.
-              const text = scanTail + urlDecoder.decode(bytes, { stream: true });
+              const raw = scanTail + urlDecoder.decode(bytes, { stream: true });
+              // Strip ANSI/VT escapes BEFORE matching: the raw pty stream
+              // interleaves color/cursor/erase codes with the text, and without
+              // this they get captured into the URL (e.g. ".../preview\x1b[K\x1b[m
+              // \x1b[28;1H"). Match on the cleaned text; carry the RAW tail so an
+              // escape — or a URL — split across two writes still resolves on the
+              // next chunk.
+              const text = stripAnsi(raw);
               LOCALHOST_URL_RE.lastIndex = 0;
               for (const m of text.matchAll(LOCALHOST_URL_RE)) {
                 const url = m[0];
@@ -439,7 +447,7 @@ export function TerminalView({
               }
               // Carry the tail so a URL spanning this chunk and the next is caught.
               scanTail =
-                text.length > URL_SCAN_TAIL ? text.slice(-URL_SCAN_TAIL) : text;
+                raw.length > URL_SCAN_TAIL ? raw.slice(-URL_SCAN_TAIL) : raw;
             };
 
             const offOutput = await onOutput((e) => {

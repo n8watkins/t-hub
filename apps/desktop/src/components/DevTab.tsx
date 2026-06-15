@@ -29,6 +29,7 @@ import {
 } from "../ipc/devserver";
 import { listDir } from "../ipc/files";
 import type { TerminalId } from "../ipc/types";
+import { stripAnsi } from "../lib/ansi";
 
 export interface DevTabProps {
   /** The project/terminal this dev runner belongs to. */
@@ -51,7 +52,9 @@ const MAX_LINES = 2000;
  * Returns the first match in `line`, or null.
  */
 function detectUrl(line: string): string | null {
-  const m = line.match(
+  // Strip ANSI first — dev servers colorize their startup banner, so the raw
+  // line carries escape codes that would otherwise be captured into the URL.
+  const m = stripAnsi(line).match(
     /https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?:\/[^\s)]*)?/i,
   );
   return m ? m[0] : null;
