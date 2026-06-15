@@ -166,11 +166,12 @@ export function Tile({
   const setTab = usePanels((s) => s.setTab);
   const toggleFullscreen = usePanels((s) => s.toggleFullscreen);
   const isFullscreen = usePanels((s) => s.fullscreenId === terminalId);
-  // Split vs expanded: when a non-terminal tab is active the body SPLITS into the
-  // terminal + the panel. `panelExpanded` true means the panel fills the tile
-  // (terminal hidden); false = the split. The pool keys terminal visibility off
-  // this (see TerminalPool.shouldShow).
-  const panelExpanded = usePanels((s) => s.panelExpanded[terminalId] ?? false);
+  // Expanded vs split. DEFAULT is EXPANDED (true): opening a non-terminal tab
+  // fills the tile with the panel and PARKS the terminal — clean and reliable
+  // (no pooled-xterm overlay competing with / covering the panel, which made
+  // files render invisibly in the split). The ⇿ control switches to the SPLIT
+  // (terminal beside the panel) for those who want both at once.
+  const panelExpanded = usePanels((s) => s.panelExpanded[terminalId] ?? true);
   const togglePanelExpanded = usePanels((s) => s.togglePanelExpanded);
 
   const state: TerminalState = info?.state ?? "starting";

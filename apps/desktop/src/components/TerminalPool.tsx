@@ -378,15 +378,16 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       const panels = usePanels.getState();
       const fsId = panels.fullscreenId;
       const expandedMap = panels.panelExpanded;
-      // Eligibility: the terminal is shown on the Terminal tab (fills the tile)
-      // AND in SPLIT mode (a non-terminal tab open but not expanded — the xterm
-      // sits in the split's terminal half over its placeholder). It's HIDDEN only
-      // when its panel is EXPANDED to fill the whole tile. Then the usual gates:
-      // a fullscreen tile shows only itself; otherwise only active-workspace-tab
-      // terminals show. The placeholder rect (from Tile) is what positions/sizes
-      // it, so in split mode the xterm automatically fills just the terminal half.
+      const tabMap = panels.tab;
+      // Eligibility. On a NON-terminal tab the panel is EXPANDED by DEFAULT (fills
+      // the tile) -> the terminal is PARKED (no overlay covering the panel). Only
+      // when the user switches that tile to the SPLIT (panelExpanded === false)
+      // does the terminal show, in its half over the placeholder. On the Terminal
+      // tab it always shows. Then the usual gates: a fullscreen tile shows only
+      // itself; otherwise only active-workspace-tab terminals show.
       const shouldShow = (id: TerminalId): boolean => {
-        if (expandedMap[id]) return false; // panel fills the tile -> no terminal
+        const onNonTerminal = (tabMap[id] ?? "terminal") !== "terminal";
+        if (onNonTerminal && (expandedMap[id] ?? true)) return false;
         if (fsId != null) return id === fsId;
         return tabOfId.get(id) === activeTabId;
       };

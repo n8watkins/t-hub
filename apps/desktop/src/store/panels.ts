@@ -79,7 +79,9 @@ export const usePanels = create<PanelState>((set, get) => ({
     })),
   togglePanelExpanded: (id) =>
     set((s) => ({
-      panelExpanded: { ...s.panelExpanded, [id]: !s.panelExpanded[id] },
+      // Default is EXPANDED (true) — see Tile/TerminalPool — so the first toggle
+      // flips to the split.
+      panelExpanded: { ...s.panelExpanded, [id]: !(s.panelExpanded[id] ?? true) },
     })),
   toggleFullscreen: (id) =>
     set((s) => ({ fullscreenId: s.fullscreenId === id ? null : id })),
