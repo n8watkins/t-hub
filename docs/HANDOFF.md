@@ -1,6 +1,6 @@
 # T-Hub — Session Handoff
 
-**Last updated:** 2026-06-15 · **Branch:** `main` (clean, pushed to `origin/main`) · **App version:** `0.1.52`
+**Last updated:** 2026-06-15 · **Branch:** `main` (clean, pushed to `origin/main`) · **App version:** `0.1.53`
 
 > Read this whole file first, plus `PRD.md` and `README.md`. Many decisions below
 > are already made — **do not re-ask the user anything answered here.**
@@ -104,6 +104,13 @@ binary. Done this session for the context-meter `$TMUX_PANE` change.
 
 Releases, newest first (the merge commits per feature are in `git log`):
 
+- **v0.1.53** (`9332fce`): **Clickable terminal links** (`ce0488f`) via
+  `@xterm/addon-web-links` — clicks open in the OS browser through the Tauri shell
+  plugin (window.open fallback). **Localhost URLs → Preview** (`3a21a72`): the live
+  PTY stream is scanned (rolling-tail aware, deduped) for `localhost`/`127.0.0.1`/
+  `0.0.0.0` URLs into `store/panels.ts` `detectedUrls`, surfaced as one-click chips
+  in the tile's Preview tab (`WebPreview` `detectedUrls` prop → `navigate` →
+  `reachablePreviewUrl`); seeds an untouched preview bar with the newest one.
 - **v0.1.52** (`78749d6`):
   - **Files — `.env` visible** (`2e0f91f` backend, `18844ce` frontend): the file
     TREE now applies `.gitignore` to **directories only**, so ignored *files*
@@ -150,20 +157,10 @@ manual worktrees, disjoint file ownership, **zero merge conflicts**.
    once on v0.1.52; a plain app restart (§2) cleared it (transient focus glitch,
    not code) and the user confirmed typing works. The split-ratio change (`9eb5288`)
    is fine — **do NOT revert it.** Breadcrumb only.
-2. **Clickable links in the terminal** (user request, 2026-06-15). Add
-   `@xterm/addon-web-links` to the xterm in `Terminal.tsx` (the app already uses
-   `@xterm/addon-{fit,search,webgl,unicode11}`); open matched URLs externally via
-   the Tauri shell plugin (`@tauri-apps/plugin-shell` is already a dep — used by
-   the preview "Open externally"). Acceptance: a URL printed in a terminal is
-   clickable and opens in the default browser.
-3. **Claude's localhost URLs → Preview** (user request, 2026-06-15). When a
-   `localhost:<port>` / `127.0.0.1:<port>` URL appears in terminal output, surface
-   it as an available Preview target. Preview already knows how to make a WSL URL
-   reachable (`reachablePreviewUrl()` in `ipc/devserver.ts`) and `devserver.rs`
-   already detects a managed dev server's URL — the gap is DETECTING ad-hoc
-   localhost URLs from arbitrary terminal output (scan PTY output per terminal,
-   reuse the web-links URL matcher from #2), then list them in the Preview tab /
-   `store/preview.ts` so the user can open one. Pairs naturally with #2.
+2. ✅ **DONE (v0.1.53)** — Clickable terminal links (`@xterm/addon-web-links` +
+   shell-plugin open). Commit `ce0488f`.
+3. ✅ **DONE (v0.1.53)** — Claude's localhost URLs detected from terminal output
+   and surfaced as one-click chips in the Preview tab. Commit `3a21a72`.
 4. **Confirm the context meter shows.** Robust binding deployed + agent rebuilt; it
    appears on a tile running an active Claude session (its `NN%` from the
    statusline). Data flows (diag showed sessions at 16–68% ctx); just needs on-
