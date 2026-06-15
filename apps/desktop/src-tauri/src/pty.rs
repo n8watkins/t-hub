@@ -132,7 +132,7 @@ pub fn attach_argv(name: &str, _cwd: &str) -> Vec<String> {
             "--".to_string(),
             "tmux".to_string(),
             "-L".to_string(),
-            tmux::SOCKET.to_string(),
+            tmux::socket().to_string(),
             "attach".to_string(),
             "-t".to_string(),
             name.to_string(),
@@ -143,7 +143,7 @@ pub fn attach_argv(name: &str, _cwd: &str) -> Vec<String> {
         vec![
             "tmux".to_string(),
             "-L".to_string(),
-            tmux::SOCKET.to_string(),
+            tmux::socket().to_string(),
             "attach".to_string(),
             "-t".to_string(),
             name.to_string(),

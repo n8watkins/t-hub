@@ -22,12 +22,26 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Resolve the fixed diagnostics log path for this OS. Windows points at the
-/// user's `C:\Users\natha\.termhub\diag.log`; unix at the WSL home. Hard-coded by
-/// design (the orchestrator reads the same path); not configurable.
-fn diag_log_path() -> PathBuf {
+/// The diagnostics log path, resolved ONCE at startup.
+///
+/// If `$TERMHUB_DIAG_FILE` is set, it is used VERBATIM; otherwise the fixed
+/// per-OS default below. The env hook exists so a side-by-side **DEV** instance
+/// can write to its OWN diag log (e.g. `TERMHUB_DIAG_FILE=.../diag-dev.log`)
+/// instead of appending into — and `diag_clear`-truncating — production's log.
+/// With NO env var set the path is exactly the previous hard-coded default, so
+/// default behavior is byte-for-byte unchanged.
+static DIAG_FILE: LazyLock<PathBuf> = LazyLock::new(|| match std::env::var("TERMHUB_DIAG_FILE") {
+    Ok(p) if !p.is_empty() => PathBuf::from(p),
+    _ => default_diag_log_path(),
+});
+
+/// The fixed per-OS diagnostics log path (the default when `$TERMHUB_DIAG_FILE`
+/// is unset). Windows points at the user's `C:\Users\natha\.termhub\diag.log`;
+/// unix at the WSL home. The orchestrator reads this same path.
+fn default_diag_log_path() -> PathBuf {
     #[cfg(windows)]
     {
         PathBuf::from(r"C:\Users\natha\.termhub\diag.log")
@@ -36,6 +50,12 @@ fn diag_log_path() -> PathBuf {
     {
         PathBuf::from("/home/natkins/.termhub/diag.log")
     }
+}
+
+/// The resolved diagnostics log path (`$TERMHUB_DIAG_FILE` or the per-OS
+/// default). Read once at startup; cheap to call on the hot logging path.
+fn diag_log_path() -> PathBuf {
+    DIAG_FILE.clone()
 }
 
 /// Best-effort ISO-8601 (UTC) timestamp, e.g. `2026-06-14T17:04:05.123Z`. Pure
