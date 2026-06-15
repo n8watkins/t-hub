@@ -340,26 +340,28 @@ fn unc_to_posix(path: &Path) -> Option<String> {
     None
 }
 
-/// Build a `wsl.exe -d <distro> -- bash -lc '<script>'` command with the console
-/// window suppressed (`CREATE_NO_WINDOW`, copying tmux.rs's pattern), so shelling
-/// into the distro never flashes a CMD window. `script` runs under the WSL
-/// login shell; pass the target path to it via `$1` (argv) — not interpolation —
-/// so paths with shell metacharacters are safe.
+/// Build a `wsl.exe -d <distro> --cd <cwd> -- bash -lc '<script>'` command with
+/// the console window suppressed (`CREATE_NO_WINDOW`). The target dir is passed
+/// via wsl.exe's OWN `--cd` flag, NOT as a trailing `bash -lc` argv word: wsl.exe
+/// MANGLES a trailing arg when combined with a `-lc` script (proven in recent.rs
+/// — the arg arrived EMPTY in the GUI-spawned process, so `cd "$1"` ran in an
+/// empty dir and listing/indexing silently returned nothing → "Files not loading
+/// at all"). With `--cd`, the shell already starts in `cwd`, so the scripts just
+/// operate on `.` and never touch `$1`. (claude/install.rs + git.rs use the same
+/// `--cd` form for the same reason.)
 #[cfg(windows)]
-fn wsl_bash(distro: &str, script: &str, arg: &str) -> std::process::Command {
+fn wsl_bash(distro: &str, script: &str, cwd: &str) -> std::process::Command {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
     let mut c = Command::new("wsl.exe");
     c.arg("-d")
         .arg(distro)
+        .arg("--cd")
+        .arg(cwd)
         .arg("--")
         .arg("bash")
         .arg("-lc")
-        .arg(script)
-        // `bash -lc <script> <arg0> <arg1>`: the first trailing word becomes
-        // `$0`, so pass a label there and the real path as `$1`.
-        .arg("termhub")
-        .arg(arg);
+        .arg(script);
     c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (see tmux.rs)
     c
 }
@@ -376,8 +378,8 @@ fn wsl_list_dir(dir: &str) -> Result<Vec<DirEntry>, String> {
     // GNU find's `%y` is the file type letter; map non-`d` to `f`. We skip `.`
     // (the dir itself) by starting from `*` is unreliable for hidden files, so we
     // filter `.` out in the parse loop instead.
+    // Already in `dir` via wsl.exe --cd, so operate on `.` (no `cd "$1"`).
     const SCRIPT: &str = r#"
-cd "$1" 2>/dev/null || { echo "__TH_NODIR__" >&2; exit 2; }
 find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null
 "#;
     let output = wsl_bash(&distro, SCRIPT, dir)
@@ -451,9 +453,9 @@ fn wsl_list_files(root: &str) -> Result<Vec<String>, String> {
         .map(|d| format!("--glob '!{d}/**'"))
         .collect::<Vec<_>>()
         .join(" ");
+    // Already in `root` via wsl.exe --cd, so operate on `.` (no `cd "$1"`).
     let script = format!(
         r#"
-cd "$1" 2>/dev/null || {{ echo "__TH_NODIR__" >&2; exit 2; }}
 if command -v rg >/dev/null 2>&1; then
   rg --files --hidden --no-messages {globs} --glob '!.git/**' .
 elif git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
