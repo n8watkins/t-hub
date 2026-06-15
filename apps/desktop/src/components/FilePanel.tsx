@@ -45,6 +45,14 @@ export interface FilePanelProps {
    * avoiding a duplicate search box + tree. Requires `initialFile`.
    */
   readerOnly?: boolean;
+  /**
+   * Compact (narrow) layout: instead of the wide side-by-side tree+reader rail,
+   * STACK them — show the tree full-width, and when a file is opened show the
+   * reader full-width with a "back to files" control. Used in the per-tile split
+   * (a half-tile is too narrow for side-by-side). Defaults to false (the roomy
+   * side-by-side layout, e.g. the expanded panel).
+   */
+  compact?: boolean;
   className?: string;
 }
 
@@ -62,6 +70,7 @@ export function FilePanel({
   initialFile,
   searchLimit = 50,
   readerOnly = false,
+  compact = false,
   className,
 }: FilePanelProps) {
   const [indexState, setIndexState] = useState<
@@ -102,41 +111,19 @@ export function FilePanel({
     refreshGit();
   }, [refreshGit, readerOnly]);
 
-  // --- Indexing: (re)index whenever the root changes. --------------------
-  // Skipped entirely in reader-only mode — the host owns navigation/search, so
-  // this instance is a pure reader and never builds its own index.
+  // --- Reset navigation when the root changes. ---------------------------
+  // NOTE: we deliberately do NOT index the whole project on mount anymore. The
+  // file TREE is lazy (shallow `listDir` per folder, ~0.1s each), so browsing is
+  // instant; the fuzzy-search index (a full project walk) is built ON DEMAND the
+  // first time the user actually types a query (see the search effect). Indexing
+  // up front was pure latency for the common case of "just open a file".
   useEffect(() => {
-    let cancelled = false;
     if (readerOnly) return;
-    if (!root) {
-      setIndexState({ status: "idle" });
-      setHits([]);
-      setQuery("");
-      setReader({ status: "empty" });
-      setActivePath(null);
-      return;
-    }
-    setIndexState({ status: "indexing" });
+    setIndexState({ status: "idle" });
+    setHits([]);
+    setQuery("");
     setReader({ status: "empty" });
     setActivePath(null);
-    setQuery("");
-    setHits([]);
-    indexProject(root)
-      .then((summary) => {
-        if (cancelled) return;
-        setIndexState({
-          status: "ready",
-          count: summary.count,
-          root: summary.root,
-        });
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        setIndexState({ status: "error", message: String(e) });
-      });
-    return () => {
-      cancelled = true;
-    };
   }, [root, readerOnly]);
 
   // --- Open a file into the reader. --------------------------------------
@@ -177,36 +164,47 @@ export function FilePanel({
   // search/tree are live by the time the reader fills).
   const openedInitial = useRef(false);
   useEffect(() => {
-    if (
-      !openedInitial.current &&
-      initialFile &&
-      (readerOnly || indexState.status === "ready")
-    ) {
+    if (!openedInitial.current && initialFile) {
       openedInitial.current = true;
       openFile(initialFile);
     }
-  }, [initialFile, indexState.status, openFile, readerOnly]);
+  }, [initialFile, openFile]);
 
-  // --- Debounced fuzzy search. -------------------------------------------
+  // --- Debounced fuzzy search (LAZY index). ------------------------------
+  // No query -> show the tree, do nothing (and never index). On the first query
+  // we build the index on demand (cheap, ~0.1s), then search; subsequent queries
+  // reuse it. So browsing never pays the index cost — only an actual search does.
   useEffect(() => {
-    if (!root || indexState.status !== "ready") {
+    const q = query.trim();
+    if (!root || !q) {
       setHits([]);
       return;
     }
     let cancelled = false;
     setSearching(true);
-    const handle = setTimeout(() => {
-      searchFiles(root, query, searchLimit)
-        .then((res) => {
-          if (!cancelled) setHits(res);
-        })
-        .catch(() => {
-          if (!cancelled) setHits([]);
-        })
-        .finally(() => {
-          if (!cancelled) setSearching(false);
-        });
-    }, 90);
+    const handle = setTimeout(async () => {
+      try {
+        if (indexState.status !== "ready") {
+          setIndexState({ status: "indexing" });
+          const summary = await indexProject(root);
+          if (cancelled) return;
+          setIndexState({
+            status: "ready",
+            count: summary.count,
+            root: summary.root,
+          });
+        }
+        const res = await searchFiles(root, q, searchLimit);
+        if (!cancelled) setHits(res);
+      } catch (e) {
+        if (!cancelled) {
+          setHits([]);
+          setIndexState({ status: "error", message: String(e) });
+        }
+      } finally {
+        if (!cancelled) setSearching(false);
+      }
+    }, 120);
     return () => {
       cancelled = true;
       clearTimeout(handle);
@@ -238,6 +236,80 @@ export function FilePanel({
         >
           No project selected. Select a terminal/worktree to browse its files.
         </div>
+      </PanelShell>
+    );
+  }
+
+  // Compact (narrow split): STACK tree/reader instead of side-by-side. Show the
+  // reader full-width when a file is open (with a back-to-files control), else the
+  // search box + tree full-width. Fits a half-tile where the 288px rail can't.
+  if (compact) {
+    const fileOpen = reader.status !== "empty";
+    return (
+      <PanelShell className={className}>
+        <Header
+          root={root}
+          indexState={indexState}
+          git={git}
+          onCommitted={refreshGit}
+        />
+        {fileOpen ? (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <button
+              type="button"
+              onClick={() => {
+                setReader({ status: "empty" });
+                setActivePath(null);
+              }}
+              className="flex shrink-0 items-center gap-1 border-b px-3 py-1.5 text-left text-xs hover:bg-neutral-800/40"
+              style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
+            >
+              ← Files
+            </button>
+            <div className="min-h-0 flex-1">
+              <Reader
+                reader={reader}
+                onSetMode={(mode) =>
+                  setReader((r) => (r.status === "ready" ? { ...r, mode } : r))
+                }
+                onSaved={onSaved}
+              />
+            </div>
+          </div>
+        ) : (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <div className="border-b p-2" style={{ borderColor: "var(--th-border)" }}>
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search files…"
+                spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="off"
+                className="w-full px-2.5 py-1.5 text-sm focus:outline-none"
+                style={{
+                  borderRadius: "var(--th-radius)",
+                  border: "1px solid var(--th-border)",
+                  background: "var(--th-tile-bg)",
+                  color: "var(--th-fg)",
+                }}
+              />
+            </div>
+            <div className="th-scroll min-h-0 flex-1 overflow-y-auto">
+              {query.trim() ? (
+                <SearchResults
+                  hits={hits}
+                  searching={searching}
+                  activePath={activePath}
+                  root={indexState.status === "ready" ? indexState.root : root}
+                  onOpen={openFile}
+                />
+              ) : (
+                <FileTree root={root} activePath={activePath} onOpenFile={openFile} />
+              )}
+            </div>
+          </div>
+        )}
       </PanelShell>
     );
   }

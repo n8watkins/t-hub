@@ -36,6 +36,9 @@ export interface TilePanelProps {
   cwd: string;
   /** Which non-terminal view to render (the tile's active panel tab). */
   tab: Exclude<PanelTab, "terminal">;
+  /** Narrow (split) container -> use FilePanel's compact stacked layout. False
+   *  when the panel is expanded to fill the tile (roomy side-by-side). */
+  compact?: boolean;
 }
 
 /**
@@ -43,7 +46,12 @@ export interface TilePanelProps {
  * Each branch is a self-contained surface; only the Preview tab reaches into the
  * panels store (for the live/last URL) — the others are driven purely by props.
  */
-export function TilePanel({ terminalId, cwd, tab }: TilePanelProps): ReactElement {
+export function TilePanel({
+  terminalId,
+  cwd,
+  tab,
+  compact = false,
+}: TilePanelProps): ReactElement {
   // Live dev-server URL (published by the Dev runner) preferred over the last
   // URL the user typed in this tile's Preview bar. Subscribed narrowly so only
   // a change to THIS tile's URLs re-renders the Preview surface. Read at the top
@@ -53,7 +61,7 @@ export function TilePanel({ terminalId, cwd, tab }: TilePanelProps): ReactElemen
 
   switch (tab) {
     case "files":
-      return <FilePanel root={cwd || undefined} />;
+      return <FilePanel root={cwd || undefined} compact={compact} />;
     case "preview":
       return <WebPreview initialUrl={devUrl ?? previewUrl ?? undefined} />;
     case "dev":

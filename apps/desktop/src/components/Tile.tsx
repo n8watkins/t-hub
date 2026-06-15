@@ -640,7 +640,8 @@ function PanelPane({
         </button>
       </div>
       <div className="min-h-0 flex-1 overflow-hidden">
-        <TilePanel terminalId={terminalId} cwd={cwd} tab={tab} />
+        {/* Split (not expanded) is narrow -> FilePanel uses its compact layout. */}
+        <TilePanel terminalId={terminalId} cwd={cwd} tab={tab} compact={!expanded} />
       </div>
     </div>
   );
