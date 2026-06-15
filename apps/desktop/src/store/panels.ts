@@ -34,11 +34,19 @@ interface PanelState {
   /** Last URL the user committed in a terminal's Preview tab, so it survives a
    *  tab switch. The Preview tab prefers a live `devUrl` over this. */
   previewUrl: Record<TerminalId, string | null>;
+  /** Per-tile: when a non-terminal tab is active the tile SPLITS (terminal +
+   *  panel). `panelExpanded[id]` true means the panel is EXPANDED to fill the
+   *  whole tile (terminal hidden); false/absent => the split. */
+  panelExpanded: Record<TerminalId, boolean>;
 
   /** Active view for a terminal, defaulted. */
   getTab: (id: TerminalId) => PanelTab;
-  /** Switch a terminal's active view. */
+  /** Switch a terminal's active view. Switching to a non-terminal tab leaves the
+   *  expand state as-is; switching to "terminal" clears expand (back to a clean
+   *  terminal). */
   setTab: (id: TerminalId, tab: PanelTab) => void;
+  /** Toggle whether this tile's panel is expanded (fills the tile) vs split. */
+  togglePanelExpanded: (id: TerminalId) => void;
   /** Toggle fullscreen for a terminal (clears it if it's already fullscreen). */
   toggleFullscreen: (id: TerminalId) => void;
   /** Set (or clear, with null) the fullscreen tile explicitly. */
@@ -56,9 +64,23 @@ export const usePanels = create<PanelState>((set, get) => ({
   fullscreenId: null,
   devUrl: {},
   previewUrl: {},
+  panelExpanded: {},
 
   getTab: (id) => get().tab[id] ?? DEFAULT_PANEL_TAB,
-  setTab: (id, tab) => set((s) => ({ tab: { ...s.tab, [id]: tab } })),
+  setTab: (id, tab) =>
+    set((s) => ({
+      tab: { ...s.tab, [id]: tab },
+      // Returning to the terminal clears any expanded panel so the next time you
+      // open a panel you get the split, not a surprise full-takeover.
+      panelExpanded:
+        tab === "terminal"
+          ? { ...s.panelExpanded, [id]: false }
+          : s.panelExpanded,
+    })),
+  togglePanelExpanded: (id) =>
+    set((s) => ({
+      panelExpanded: { ...s.panelExpanded, [id]: !s.panelExpanded[id] },
+    })),
   toggleFullscreen: (id) =>
     set((s) => ({ fullscreenId: s.fullscreenId === id ? null : id })),
   setFullscreen: (id) => set({ fullscreenId: id }),
@@ -70,13 +92,16 @@ export const usePanels = create<PanelState>((set, get) => ({
       const tab = { ...s.tab };
       const devUrl = { ...s.devUrl };
       const previewUrl = { ...s.previewUrl };
+      const panelExpanded = { ...s.panelExpanded };
       delete tab[id];
       delete devUrl[id];
       delete previewUrl[id];
+      delete panelExpanded[id];
       return {
         tab,
         devUrl,
         previewUrl,
+        panelExpanded,
         fullscreenId: s.fullscreenId === id ? null : s.fullscreenId,
       };
     }),

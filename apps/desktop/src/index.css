@@ -57,7 +57,7 @@ body {
   --th-border: #262626;
 
   /* Tile header */
-  --th-tile-header-h: 22px;
+  --th-tile-header-h: 40px;
   --th-show-tile-header: 1;
   --th-header-on-hover: 0;
   --th-show-cwd: 1;

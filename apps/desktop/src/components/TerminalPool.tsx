@@ -188,6 +188,9 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // any tile's tab changes (see panels.setTab), so this is a sufficient trigger.
   const panelTab = usePanels((s) => s.tab);
   const fullscreenId = usePanels((s) => s.fullscreenId);
+  // Also re-sync when any tile's panel is expanded/collapsed: that flips whether
+  // the terminal half exists, so its xterm must show (split) or park (expanded).
+  const panelExpanded = usePanels((s) => s.panelExpanded);
 
   // THE FIX (mutedbug): poolIds must be a STABLE DOM order that does NOT change
   // when a tile is reordered or moved between tabs. Positioning is absolute
@@ -374,12 +377,16 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       // list), so a tab/fullscreen toggle always triggers a fresh sync.
       const panels = usePanels.getState();
       const fsId = panels.fullscreenId;
-      const tabMap = panels.tab;
-      // Eligibility: see the long comment above. The fullscreen tile shows only
-      // its own terminal (and only if its panel tab is "terminal"); with no
-      // fullscreen, every active-tab terminal-on-Terminal shows.
+      const expandedMap = panels.panelExpanded;
+      // Eligibility: the terminal is shown on the Terminal tab (fills the tile)
+      // AND in SPLIT mode (a non-terminal tab open but not expanded — the xterm
+      // sits in the split's terminal half over its placeholder). It's HIDDEN only
+      // when its panel is EXPANDED to fill the whole tile. Then the usual gates:
+      // a fullscreen tile shows only itself; otherwise only active-workspace-tab
+      // terminals show. The placeholder rect (from Tile) is what positions/sizes
+      // it, so in split mode the xterm automatically fills just the terminal half.
       const shouldShow = (id: TerminalId): boolean => {
-        if ((tabMap[id] ?? "terminal") !== "terminal") return false;
+        if (expandedMap[id]) return false; // panel fills the tile -> no terminal
         if (fsId != null) return id === fsId;
         return tabOfId.get(id) === activeTabId;
       };
@@ -509,7 +516,7 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
         tlog(
           "pool",
           `sync(${trigger}) PARK ${id} (not-eligible): rect=${rectStr} ` +
-            `tab=${tabMap[id] ?? "terminal"} activeTab=${activeTabId} fs=${fsId ?? "none"}`,
+            `expanded=${expandedMap[id] ?? false} activeTab=${activeTabId} fs=${fsId ?? "none"}`,
         );
         wrap.style.visibility = "hidden";
         wrap.style.pointerEvents = "none";
@@ -554,6 +561,7 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       tabOfId,
       activeTabId,
       panelTab,
+      panelExpanded,
       fullscreenId,
       applyVisible,
       scheduleDeferredSync,
@@ -587,7 +595,7 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
     sync("layout-effect");
     const raf = requestAnimationFrame(() => sync("layout-rAF"));
     return () => cancelAnimationFrame(raf);
-  }, [sync, version, tabs, activeTabId, panelTab, fullscreenId]);
+  }, [sync, version, tabs, activeTabId, panelTab, panelExpanded, fullscreenId]);
 
   // Re-sync after a FOCUS/SELECTION change (mutedbug fix). Clicking a tile header
   // calls setFocus, which mutates ONLY `focusedId` — not `tabs`/`activeTabId` —

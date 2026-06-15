@@ -166,9 +166,19 @@ export function Tile({
   const setTab = usePanels((s) => s.setTab);
   const toggleFullscreen = usePanels((s) => s.toggleFullscreen);
   const isFullscreen = usePanels((s) => s.fullscreenId === terminalId);
+  // Split vs expanded: when a non-terminal tab is active the body SPLITS into the
+  // terminal + the panel. `panelExpanded` true means the panel fills the tile
+  // (terminal hidden); false = the split. The pool keys terminal visibility off
+  // this (see TerminalPool.shouldShow).
+  const panelExpanded = usePanels((s) => s.panelExpanded[terminalId] ?? false);
+  const togglePanelExpanded = usePanels((s) => s.togglePanelExpanded);
 
   const state: TerminalState = info?.state ?? "starting";
   const cwd = info?.cwd ?? "";
+  // Display path: strip the home prefix (`/home/<user>` -> `~`) so the header
+  // shows `~/n8builds/tools` instead of the noisy `/home/natkins/n8builds/tools`.
+  // The full path stays in the title tooltip.
+  const shortCwd = shortenHomePath(cwd);
   // Friendly display name (user label > derived preset·cwd > short id). The short
   // id (terminalId) is always shown as a dimmed secondary detail beside it.
   const label = deriveLabel({
@@ -332,8 +342,9 @@ export function Tile({
           <span
             className="min-w-0 flex-1 truncate"
             style={{ color: "var(--th-fg-muted)" }}
+            title={cwd}
           >
-            {cwd}
+            {shortCwd}
           </span>
         )}
         {(!showCwd || !cwd) && <span className="flex-1" />}
@@ -514,42 +525,138 @@ export function Tile({
         </>
       )}
 
-      {/* Body. On the Terminal tab this is the EMPTY placeholder box marking
-          where the pooled xterm should sit: the actual xterm is rendered ONCE in
-          the persistent pool overlay (TerminalPool.tsx) and positioned over this
-          box, so moving/resizing the tile never remounts/reattaches it (#20).
-          On the other tabs we render the chosen surface (Files/Preview/Dev) in
-          the body INSTEAD, and the pool parks this terminal (hidden offscreen)
-          because it only SHOWs a terminal whose tile is on the Terminal tab —
-          see TerminalPool.sync(). The placeholder must stay MOUNTED on the
-          terminal tab so the pool has a rect to position over; we don't render it
-          at all on the other tabs (the pool keys "show" off the active tab, not
-          off the placeholder's presence). */}
+      {/* Body. The pooled xterm is rendered ONCE in the overlay (TerminalPool)
+          and positioned over the placeholder DIV below; whichever placeholder is
+          mounted (full tile on the Terminal tab, or just the terminal HALF in a
+          split) is where the xterm lands + sizes itself. The non-terminal tabs
+          render their surface (Files/Preview/Dev) via <TilePanel>:
+            - SPLIT (default for a non-terminal tab): terminal half + panel half
+              side by side; the pool keeps showing the xterm in its half.
+            - EXPANDED: the panel fills the tile; no placeholder is mounted, so
+              the pool parks the xterm (TerminalPool.shouldShow keys off
+              panelExpanded). */}
       {isFullscreen && !slotActive ? (
-        // This is the COVERED grid copy of the fullscreen tile (the fullscreen
-        // layer renders the visible copy). It's entirely hidden behind the
-        // fullscreen layer, so render an empty body: don't register a placeholder
-        // (slotActive is already false) and don't duplicate the Files/Preview/Dev
-        // surface (which would double-index/double-iframe needlessly). The Tile
-        // chrome above still renders so its drop target (data-tile-id) stays in
-        // the grid for drag resolution.
+        // COVERED grid copy of a fullscreen tile (fullscreen layer renders the
+        // visible copy): empty body, no placeholder (slotActive=false), no panel.
         <div className="min-h-0 flex-1 overflow-hidden" />
       ) : activeTab === "terminal" ? (
-        // Attach the pool placeholder ref ONLY when this instance owns the slot
-        // (slotActive). When a fullscreen tile is also rendered in its hidden
-        // grid cell, that grid copy passes slotActive={false} so it doesn't
-        // re-register and steal the placeholder from the fullscreen copy.
+        // Terminal-only: the placeholder fills the whole body. slotActive guards
+        // the fullscreen double-render (the hidden grid copy doesn't re-register).
         <div
           ref={slotActive ? slotRef : undefined}
           className="min-h-0 flex-1 overflow-hidden"
         />
-      ) : (
+      ) : panelExpanded ? (
+        // Panel EXPANDED: it fills the tile; the pool parks the terminal.
         <div className="min-h-0 flex-1 overflow-hidden">
-          <TilePanel terminalId={terminalId} cwd={cwd} tab={activeTab} />
+          <PanelPane
+            terminalId={terminalId}
+            cwd={cwd}
+            tab={activeTab}
+            expanded
+            onClose={() => setTab(terminalId, "terminal")}
+            onToggleExpand={() => togglePanelExpanded(terminalId)}
+          />
+        </div>
+      ) : (
+        // SPLIT: terminal half (placeholder) + panel half, side by side.
+        <div className="flex min-h-0 flex-1">
+          <div
+            ref={slotActive ? slotRef : undefined}
+            className="min-h-0 min-w-0 flex-1 overflow-hidden"
+          />
+          <div
+            className="min-h-0 w-1/2 max-w-[60%] shrink-0 overflow-hidden border-l"
+            style={{ borderColor: "var(--th-border)" }}
+          >
+            <PanelPane
+              terminalId={terminalId}
+              cwd={cwd}
+              tab={activeTab}
+              expanded={false}
+              onClose={() => setTab(terminalId, "terminal")}
+              onToggleExpand={() => togglePanelExpanded(terminalId)}
+            />
+          </div>
         </div>
       )}
     </div>
   );
+}
+
+/**
+ * The panel half of a split (or the full panel when expanded): a thin toolbar
+ * (the view name + expand/collapse + close) over the TilePanel surface. Close
+ * returns the tile to the terminal; expand toggles fill-the-tile vs split.
+ */
+function PanelPane({
+  terminalId,
+  cwd,
+  tab,
+  expanded,
+  onClose,
+  onToggleExpand,
+}: {
+  terminalId: TerminalId;
+  cwd: string;
+  tab: Exclude<PanelTab, "terminal">;
+  expanded: boolean;
+  onClose: () => void;
+  onToggleExpand: () => void;
+}) {
+  const title = tab.charAt(0).toUpperCase() + tab.slice(1);
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div
+        className="flex shrink-0 items-center gap-2 border-b px-2 py-1"
+        style={{
+          backgroundColor: "var(--th-header-bg)",
+          borderColor: "var(--th-border)",
+          fontSize: "var(--th-font-size)",
+        }}
+      >
+        <span className="min-w-0 flex-1 truncate" style={{ color: "var(--th-fg-muted)" }}>
+          {title}
+        </span>
+        <button
+          type="button"
+          onClick={onToggleExpand}
+          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
+          style={{ color: "var(--th-fg-muted)" }}
+          title={expanded ? "Back to split" : "Expand panel (hide terminal)"}
+          aria-label={expanded ? "Back to split" : "Expand panel"}
+        >
+          {expanded ? "⇔" : "⇿"}
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
+          style={{ color: "var(--th-fg-muted)" }}
+          title="Close panel (back to terminal)"
+          aria-label="Close panel"
+        >
+          ×
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-hidden">
+        <TilePanel terminalId={terminalId} cwd={cwd} tab={tab} />
+      </div>
+    </div>
+  );
+}
+
+/** Shorten a WSL/POSIX path for display: collapse `/home/<user>` to `~` so the
+ *  header reads `~/n8builds/tools` instead of `/home/natkins/n8builds/tools`.
+ *  Leaves non-home paths untouched. The full path is kept in tooltips. */
+function shortenHomePath(p: string): string {
+  if (!p) return p;
+  const m = p.match(/^\/home\/[^/]+(\/.*)?$/);
+  if (m) return "~" + (m[1] ?? "");
+  // Windows-style home, just in case.
+  const w = p.match(/^[A-Za-z]:[\\/]Users[\\/][^\\/]+([\\/].*)?$/);
+  if (w) return "~" + (w[1] ?? "");
+  return p;
 }
 
 /** One row in the tile right-click context menu. */
