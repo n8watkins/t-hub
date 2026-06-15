@@ -178,6 +178,7 @@ pub fn run() {
         // browser (web-preview "Open externally"). Without it the JS open() is a
         // no-op. Paired with the `shell:allow-open` capability.
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         // --- Auto-updater (feat/auto-updater) ------------------------------
         // The updater plugin powers the in-app "Updates" settings section and
         // the on-launch silent install: it reads `latest.json` from the

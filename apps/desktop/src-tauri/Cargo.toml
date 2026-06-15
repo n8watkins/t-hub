@@ -20,7 +20,7 @@ anyhow = "1"
 
 [package]
 name = "termhub"
-version = "0.1.45"
+version = "0.1.46"
 description = "TermHub — terminal-first command center for Claude Code sessions in WSL2"
 authors = ["Nathan Watkins"]
 edition = "2021"
@@ -43,6 +43,10 @@ tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
 # button + external links). The JS @tauri-apps/plugin-shell needs this Rust side
 # registered + the `shell:allow-open` capability or its open() is a no-op.
 tauri-plugin-shell = "2"
+# Reliable clipboard read/write for terminal copy/paste (navigator.clipboard is
+# blocked/unreliable in WebView2). Used by Terminal.tsx Ctrl+C/V + the right-click
+# menu; needs the `clipboard-manager:allow-read-text/-write-text` capabilities.
+tauri-plugin-clipboard-manager = "2"
 # --- Auto-updater (feat/auto-updater) --------------------------------------
 # The official Tauri updater: checks the `latest.json` endpoint (a GitHub
 # Releases asset), downloads + verifies the signed NSIS artifact, and installs
