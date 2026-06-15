@@ -58,6 +58,27 @@ function saveHidden(ids: Set<string>): void {
   }
 }
 
+// --- Cached list: the last sessions we fetched, so a reopen / window-focus
+// renders the previous Recent INSTANTLY (no "Loading…" flash) while a fresh
+// fetch runs in the background; we only re-render if the result actually changed
+// (stale-while-revalidate).
+const CACHE_KEY = "th.recent.cache.v1";
+function loadCache(): RecentSession[] {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    return raw ? (JSON.parse(raw) as RecentSession[]) : [];
+  } catch {
+    return [];
+  }
+}
+function saveCache(list: RecentSession[]): void {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify(list));
+  } catch {
+    /* localStorage unavailable — Recent just refetches next time */
+  }
+}
+
 /** One project's row: its most-recent session plus the folder display name. */
 interface FolderGroup {
   cwd: string;
@@ -80,15 +101,22 @@ function groupByFolder(sessions: RecentSession[]): FolderGroup[] {
 }
 
 export function RecentList({ onRecall }: RecentListProps) {
-  const [sessions, setSessions] = useState<RecentSession[]>([]);
-  const [loaded, setLoaded] = useState(false);
+  // Seed from cache so we render the previous Recent immediately; `loaded` is
+  // true when a cache existed, so "Loading…" only shows on the very first run.
+  const [sessions, setSessions] = useState<RecentSession[]>(loadCache);
+  const [loaded, setLoaded] = useState(() => loadCache().length > 0);
   const [hidden, setHidden] = useState<Set<string>>(() => loadHidden());
 
   const refresh = useCallback(() => {
     void recentSessions()
       .then((list) => {
-        setSessions(list);
         setLoaded(true);
+        // Only swap state when the list actually changed — an unchanged refetch
+        // keeps the same array ref, so React skips the re-render (no flash).
+        setSessions((prev) =>
+          JSON.stringify(prev) === JSON.stringify(list) ? prev : list,
+        );
+        saveCache(list);
       })
       .catch(() => setLoaded(true));
   }, []);
