@@ -478,7 +478,7 @@ export function Tile({
                   onFocus();
                   setTab(terminalId, t.id);
                 }}
-                className="rounded-full px-2.5 py-0.5 text-[0.9em] leading-none transition-colors"
+                className="rounded-full px-2.5 py-1.5 text-[0.9em] leading-none transition-colors"
                 style={{
                   color: selected ? "var(--th-fg)" : "var(--th-fg-muted)",
                   backgroundColor: selected
