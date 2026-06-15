@@ -228,6 +228,50 @@ function statusToNotification(
  *  entry). Keyed by session id → last notified status. */
 const lastNotifiedStatus = new Map<string, SessionStatus>();
 
+// ---------------------------------------------------------------------------
+// Startup warmup — swallow the journal-replay burst
+//
+// On the FIRST connect, the agent replays its event journal: every existing
+// session re-emits its last status, and historical exits/errors fire too. With
+// many sessions that was a wall of chimes at launch. We treat the launch window
+// as "warmup": events are recorded (so the dedup baseline is seeded) but NOT
+// sounded. The window ends a short, quiet interval after the last startup event
+// (so a slow connect's burst is still covered), or after a hard cap if no events
+// arrive. Reconnects don't re-burst because `lastNotifiedStatus` already knows
+// every session, so replayed statuses dedup out.
+// ---------------------------------------------------------------------------
+
+/** Hard cap so warmup always ends even if the agent never connects / emits. */
+const WARMUP_INITIAL_MS = 6000;
+/** Quiet interval after the last startup event before we consider events live. */
+const WARMUP_GRACE_MS = 1500;
+
+let warmupActive = true;
+let warmupTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Begin (or re-arm) the warmup-end timer. Called once at install (initial cap)
+ *  and again on each event seen during warmup (short grace), so a startup burst
+ *  keeps the window open until it settles. */
+function armWarmupEnd(ms: number): void {
+  if (typeof window === "undefined") {
+    warmupActive = false;
+    return;
+  }
+  if (warmupTimer) clearTimeout(warmupTimer);
+  warmupTimer = setTimeout(() => {
+    warmupActive = false;
+  }, ms);
+}
+
+/** True while we're still swallowing the startup replay. When true, callers
+ *  should record their dedup state but skip the actual chime/notification, and
+ *  re-arm the grace window. */
+function inWarmup(): boolean {
+  if (!warmupActive) return false;
+  armWarmupEnd(WARMUP_GRACE_MS);
+  return true;
+}
+
 /** Subscribe to the backend session events and fire notifications. Returns an
  *  unlisten that tears down every subscription. Safe to call once at startup. */
 export async function installSessionNotifications(): Promise<() => void> {
@@ -235,10 +279,16 @@ export async function installSessionNotifications(): Promise<() => void> {
 
   // Primary signal: FR-012 session status (needs-question / completed / failed
   // / rate-limited). This is the richest event and carries the asks-signal.
+  // Kick off the warmup window so the journal-replay burst at first connect is
+  // seeded (for dedup) but silent. Re-armed by `inWarmup()` on each startup event.
+  armWarmupEnd(WARMUP_INITIAL_MS);
+
   unlisteners.push(
     await onSessionStatus(({ sessionId, status }) => {
       if (lastNotifiedStatus.get(sessionId) === status) return;
       lastNotifiedStatus.set(sessionId, status);
+      // Warmup: record the baseline but don't sound the replayed status.
+      if (inWarmup()) return;
       const n = statusToNotification(status);
       if (n) notify(n.kind, n.title, n.body);
     }),
@@ -251,6 +301,7 @@ export async function installSessionNotifications(): Promise<() => void> {
     await onSupervision((tree) => {
       if (lastNotifiedStatus.get(tree.sessionId) === tree.status) return;
       lastNotifiedStatus.set(tree.sessionId, tree.status);
+      if (inWarmup()) return;
       const n = statusToNotification(tree.status);
       if (n) notify(n.kind, n.title, n.body);
     }),
@@ -261,6 +312,7 @@ export async function installSessionNotifications(): Promise<() => void> {
   unlisteners.push(
     await onState(({ state }) => {
       if (state === "error") {
+        if (inWarmup()) return; // swallow replayed historical errors at launch
         notify("error", "Terminal error", "A terminal entered an error state.");
       }
     }),
@@ -270,6 +322,7 @@ export async function installSessionNotifications(): Promise<() => void> {
   unlisteners.push(
     await onExit(({ code }) => {
       if (code != null && code !== 0) {
+        if (inWarmup()) return; // swallow replayed historical exits at launch
         notify(
           "error",
           "Terminal exited",

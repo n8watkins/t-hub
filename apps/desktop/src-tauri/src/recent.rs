@@ -36,10 +36,11 @@
 
 use serde::Serialize;
 
-/// How many recent sessions to return at most. The sidebar shows a scrollable
-/// list; a couple dozen is plenty for "recall something I was just doing" without
-/// shelling out to read hundreds of stale transcripts.
-const RECENT_LIMIT: usize = 40;
+/// How many recent sessions to return at most. The sidebar groups these by folder
+/// and lets you scroll/drill into a project's sessions, so we return a generous
+/// window. We only read the (cheap) mtime of every transcript and then read the
+/// full 32KB prefix of just the newest `RECENT_LIMIT`, so raising this is cheap.
+const RECENT_LIMIT: usize = 150;
 
 /// One recallable past Claude session, mirrored by `src/ipc/recent.ts`
 /// (`rename_all = "camelCase"`).
@@ -258,13 +259,17 @@ fn read_prefix(path: &std::path::Path, cap: usize) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Read every `~/.claude/projects/<project>/<id>.jsonl` transcript under
-/// `projects` into [`RecentSession`]s. Shared by both platforms (only the root
-/// path differs); uses plain `std::fs` so it works identically over a Linux FS
-/// and over the Windows `\\wsl.localhost\` UNC share. Best-effort: an unreadable
-/// dir/entry is skipped, never fatal. PERF: only the first 32KB of each file is
-/// read (the cwd/summary live near the top; bodies can be 10MB+).
-fn read_sessions_from_dir(projects: &std::path::Path) -> Vec<RecentSession> {
+/// Read up to `limit` of the most-recent `~/.claude/projects/<project>/<id>.jsonl`
+/// transcripts under `projects` into [`RecentSession`]s, newest first. Shared by
+/// both platforms (only the root differs); plain `std::fs` so it works over a
+/// Linux FS and the Windows `\\wsl.localhost\` UNC share. Best-effort.
+///
+/// PERF (two-phase): the catalog can hold hundreds of transcripts and the UNC
+/// bridge is slow. Phase 1 only STATS every file (cheap) to get its mtime; we
+/// sort by that and keep the newest `limit`. Phase 2 reads + parses the 32KB
+/// prefix of ONLY those survivors (the cwd/summary/first-prompt live near the
+/// top). So cost scales with `limit`, not the whole history.
+fn read_sessions_from_dir(projects: &std::path::Path, limit: usize) -> Vec<RecentSession> {
     use std::time::UNIX_EPOCH;
 
     let Ok(project_dirs) = std::fs::read_dir(projects) else {
@@ -275,7 +280,8 @@ fn read_sessions_from_dir(projects: &std::path::Path) -> Vec<RecentSession> {
         return Vec::new();
     };
 
-    let mut out = Vec::new();
+    // Phase 1: cheap stat-only pass over the whole catalog -> (id, path, mtime).
+    let mut metas: Vec<(String, std::path::PathBuf, i64)> = Vec::new();
     for project in project_dirs.flatten() {
         let Ok(files) = std::fs::read_dir(project.path()) else {
             continue;
@@ -295,16 +301,28 @@ fn read_sessions_from_dir(projects: &std::path::Path) -> Vec<RecentSession> {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let text = read_prefix(&path, 32 * 1024);
-            let parsed = parse_transcript(&text);
-            if let Some(s) = make_session(id, last_seen, parsed) {
-                out.push(s);
-            }
+            metas.push((id, path, last_seen));
+        }
+    }
+    let total = metas.len();
+    // Keep only the newest `limit` before the expensive prefix reads.
+    metas.sort_by(|a, b| b.2.cmp(&a.2));
+    metas.truncate(limit);
+
+    // Phase 2: read + parse the 32KB prefix of just the survivors.
+    let mut out = Vec::new();
+    for (id, path, last_seen) in metas {
+        let text = read_prefix(&path, 32 * 1024);
+        let parsed = parse_transcript(&text);
+        if let Some(s) = make_session(id, last_seen, parsed) {
+            out.push(s);
         }
     }
     crate::diag::diag_log(format!(
-        "{{\"t\":\"recent\",\"m\":\"read_sessions_from_dir({}) -> {} sessions\"}}",
+        "{{\"t\":\"recent\",\"m\":\"read_sessions_from_dir({}): {} total -> read {} prefixes -> {} sessions\"}}",
         projects.display().to_string().replace('"', "'"),
+        total,
+        out.len().min(limit),
         out.len()
     ));
     out
@@ -323,7 +341,7 @@ fn read_sessions() -> Vec<RecentSession> {
         let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
             return Vec::new();
         };
-        read_sessions_from_dir(&home.join(".claude").join("projects"))
+        read_sessions_from_dir(&home.join(".claude").join("projects"), RECENT_LIMIT)
     }
 }
 
@@ -392,7 +410,7 @@ fn read_sessions_windows() -> Vec<RecentSession> {
         "{{\"t\":\"recent\",\"m\":\"windows reader: home={home} -> {}\"}}",
         projects.display().to_string().replace('"', "'")
     ));
-    read_sessions_from_dir(&projects)
+    read_sessions_from_dir(&projects, RECENT_LIMIT)
 }
 
 #[cfg(test)]
@@ -490,7 +508,7 @@ mod tests {
         // A non-jsonl file that must be ignored.
         std::fs::File::create(proj_b.join("notes.txt")).unwrap();
 
-        let mut got = read_sessions_from_dir(&tmp);
+        let mut got = read_sessions_from_dir(&tmp, 100);
         got.sort_by(|a, b| a.id.cmp(&b.id));
         std::fs::remove_dir_all(&tmp).ok();
 

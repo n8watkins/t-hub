@@ -1,4 +1,4 @@
-// The sidebar's "Recent" list — a session library, GROUPED BY FOLDER.
+// The sidebar's "Recent" list — a resumable session library, one row per PROJECT.
 //
 // Recent = past Claude Code sessions the user can RESUME. The backend
 // (`recent_sessions` -> recent.rs) returns a flat, newest-first list of sessions,
@@ -6,16 +6,24 @@
 // summary, else the session's first real prompt, else the folder name), and a
 // last-seen time.
 //
-// The user's model (2026-06-14): don't show the same folder over and over. Show
-// each FOLDER once; expand it to scroll that folder's sessions. Resuming is an
-// EXPLICIT button on a session row (not an accidental row click): it spawns a
-// terminal in the session's cwd running `claude --resume <id>` (App wires
-// `onRecall` -> the workspace store's `recall`).
+// The user's model (2026-06-14): NO accordion. Show each PROJECT (folder) once,
+// in a flat SCROLLABLE list (there can be hundreds). Each row shows the project's
+// most-recent session, with an explicit (deliberately understated) "Resume"
+// button on the LEFT and a session DROPDOWN on the RIGHT to pick any of that
+// project's other sessions. Resuming spawns a terminal in the session's cwd
+// running `claude --resume <id>` (App wires `onRecall` -> the store's `recall`).
 //
-// Fetched once on mount and on window focus (cheap: the backend reads only a
-// 32KB prefix per transcript). Best-effort: an IPC failure degrades to a muted
-// empty state, never an error surface.
-import { useCallback, useEffect, useMemo, useState } from "react";
+// Fetched once on mount + on window focus (cheap: the backend stats every file
+// but only reads a 32KB prefix of the newest N). Best-effort: an IPC failure
+// degrades to a muted empty state.
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { recentSessions, type RecentSession } from "../ipc/recent";
 
 export interface RecentListProps {
@@ -24,7 +32,7 @@ export interface RecentListProps {
 }
 
 /** Final path segment of a cwd (POSIX or Windows separators), or the whole
- *  string if it has none — the folder name shown on a group header. */
+ *  string if it has none — the folder name shown on a row. */
 function cwdBasename(cwd: string): string {
   const parts = cwd.replace(/[/\\]+$/, "").split(/[/\\]+/);
   return parts[parts.length - 1] || cwd;
@@ -41,8 +49,8 @@ function relativeTime(epochSecs: number): string {
   return `${Math.floor(diff / 2592000)}mo`;
 }
 
-/** One folder's sessions, in newest-first order (the order the backend returned
- *  them, preserved). `newest` drives folder ordering + the header's time. */
+/** One project's sessions, newest-first. `newest` drives row ordering + the
+ *  header time; `sessions[0]` is what Resume targets by default. */
 interface FolderGroup {
   cwd: string;
   name: string;
@@ -51,8 +59,7 @@ interface FolderGroup {
 }
 
 /** Group a flat, newest-first session list by `cwd`, preserving newest-first
- *  order for both the folders (by their most-recent session) and the sessions
- *  within each folder. */
+ *  order for both the projects (by most-recent session) and within each. */
 function groupByFolder(sessions: RecentSession[]): FolderGroup[] {
   const byCwd = new Map<string, FolderGroup>();
   for (const s of sessions) {
@@ -64,21 +71,14 @@ function groupByFolder(sessions: RecentSession[]): FolderGroup[] {
     g.sessions.push(s);
     if (s.lastSeen > g.newest) g.newest = s.lastSeen;
   }
-  // Map insertion order already follows newest-first (the input is sorted), but
-  // sort defensively so a folder always sits at its most-recent session.
   return [...byCwd.values()].sort((a, b) => b.newest - a.newest);
 }
 
 export function RecentList({ onRecall }: RecentListProps) {
   const [sessions, setSessions] = useState<RecentSession[]>([]);
   const [loaded, setLoaded] = useState(false);
-  // Which folders are expanded (collapsed by default — the user wants to see a
-  // clean list of folders, then expand the one they want to scroll).
-  const [open, setOpen] = useState<Record<string, boolean>>({});
 
   const refresh = useCallback(() => {
-    // No visibility guard: the fetch is cheap and an early return before
-    // setLoaded(true) could stick the list on "Loading..." (see prior bug).
     void recentSessions()
       .then((list) => {
         setSessions(list);
@@ -95,11 +95,6 @@ export function RecentList({ onRecall }: RecentListProps) {
 
   const groups = useMemo(() => groupByFolder(sessions), [sessions]);
 
-  const toggle = useCallback(
-    (cwd: string) => setOpen((o) => ({ ...o, [cwd]: !o[cwd] })),
-    [],
-  );
-
   if (!loaded) {
     return (
       <div className="px-3 py-2 text-sm" style={{ color: "var(--th-fg-muted)" }}>
@@ -115,126 +110,179 @@ export function RecentList({ onRecall }: RecentListProps) {
     );
   }
 
+  // Flat, scrollable list of projects (no accordion). The parent section already
+  // scrolls; this just stacks rows.
   return (
-    <div className="flex flex-col gap-1 px-2 py-1">
+    <div className="flex flex-col gap-0.5 px-2 py-1">
       {groups.map((g) => (
-        <FolderRow
-          key={g.cwd}
-          group={g}
-          open={!!open[g.cwd]}
-          onToggle={() => toggle(g.cwd)}
-          onRecall={onRecall}
-        />
+        <ProjectRow key={g.cwd} group={g} onRecall={onRecall} />
       ))}
     </div>
   );
 }
 
-/** A collapsible folder: header (name + session count + newest time) over its
- *  sessions when expanded. Rounded card styling for the bigger, softer sidebar. */
-function FolderRow({
+/** One project row: [Resume] · name + latest session · [▾ sessions]. The Resume
+ *  button is intentionally understated (not the bright accent). The ▾ opens a
+ *  fixed-position popup listing every session of this project to resume. */
+function ProjectRow({
   group,
-  open,
-  onToggle,
   onRecall,
 }: {
   group: FolderGroup;
-  open: boolean;
-  onToggle: () => void;
   onRecall: (sessionId: string, cwd: string) => void;
 }) {
+  const latest = group.sessions[0];
+  const [menuOpen, setMenuOpen] = useState(false);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const hasMore = group.sessions.length > 1;
+
   return (
     <div
-      className="overflow-hidden rounded-lg"
-      style={{ background: open ? "var(--th-tile-bg)" : "transparent" }}
+      className="flex items-center gap-2 rounded-lg px-2 py-1.5 transition-colors hover:bg-neutral-800/40"
+      style={{ color: "var(--th-fg)" }}
+      title={group.cwd}
     >
+      {/* LEFT: understated Resume (resumes the project's most-recent session). */}
       <button
         type="button"
-        onClick={onToggle}
-        className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-neutral-800/40"
-        style={{ color: "var(--th-fg)" }}
-        title={group.cwd}
+        onClick={() => onRecall(latest.id, latest.cwd)}
+        className="shrink-0 rounded-md border px-2.5 py-1 text-[11px] font-medium transition-colors hover:bg-neutral-700/40"
+        style={{
+          // Darker / subtle (per feedback): tile surface + border, NOT the bright
+          // accent — a quiet affordance, not a call-to-action.
+          background: "var(--th-tile-bg)",
+          borderColor: "var(--th-border)",
+          color: "var(--th-fg-muted)",
+        }}
+        title={`Resume the latest session: claude --resume in ${group.cwd}`}
       >
-        <span
-          className="w-3 shrink-0 text-[11px] transition-transform"
-          style={{ color: "var(--th-fg-muted)" }}
-        >
-          {open ? "▾" : "▸"}
-        </span>
-        <span className="min-w-0 flex-1">
-          <span className="block truncate text-[13px] font-medium">{group.name}</span>
-          <span
-            className="block truncate text-[11px]"
-            style={{ color: "var(--th-fg-muted)" }}
-          >
-            {group.cwd}
-          </span>
-        </span>
-        {/* Session-count pill so a busy folder reads as "many sessions" at a glance. */}
-        <span
-          className="shrink-0 rounded-full px-2 py-0.5 text-[10px] tabular-nums"
-          style={{ background: "var(--th-header-bg)", color: "var(--th-fg-muted)" }}
-          title={`${group.sessions.length} session${group.sessions.length === 1 ? "" : "s"}`}
-        >
-          {group.sessions.length}
-        </span>
-        <span
-          className="shrink-0 text-[10px] tabular-nums"
-          style={{ color: "var(--th-fg-muted)" }}
-        >
-          {relativeTime(group.newest)}
-        </span>
+        Resume
       </button>
 
-      {open && (
-        <ul className="flex flex-col gap-0.5 px-1.5 pb-1.5">
-          {group.sessions.map((s) => (
-            <SessionRow key={s.id} session={s} onRecall={onRecall} />
-          ))}
-        </ul>
+      {/* MIDDLE: project name over the latest session's description. */}
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-[13px] font-medium">{group.name}</div>
+        <div
+          className="truncate text-[11px]"
+          style={{ color: "var(--th-fg-muted)" }}
+          title={latest.label}
+        >
+          {latest.label}
+          {relativeTime(latest.lastSeen) && ` · ${relativeTime(latest.lastSeen)}`}
+        </div>
+      </div>
+
+      {/* RIGHT: session dropdown — pick any of this project's sessions. Only
+          shown when there's more than one (otherwise Resume already covers it). */}
+      {hasMore && (
+        <button
+          ref={btnRef}
+          type="button"
+          onClick={() => setMenuOpen((v) => !v)}
+          className="shrink-0 rounded-md px-1.5 py-1 text-[11px] transition-colors hover:bg-neutral-700/40"
+          style={{ color: "var(--th-fg-muted)" }}
+          title={`${group.sessions.length} sessions — pick one to resume`}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+        >
+          {group.sessions.length}&nbsp;▾
+        </button>
+      )}
+
+      {menuOpen && (
+        <SessionMenu
+          anchor={btnRef.current}
+          sessions={group.sessions}
+          onPick={(s) => {
+            setMenuOpen(false);
+            onRecall(s.id, s.cwd);
+          }}
+          onClose={() => setMenuOpen(false)}
+        />
       )}
     </div>
   );
 }
 
-/** One session under a folder: its description + last-seen time, with an EXPLICIT
- *  "Resume" button (the deliberate affordance the user asked for, so a stray row
- *  click can't launch a session). */
-function SessionRow({
-  session,
-  onRecall,
+/** Fixed-position popup of a project's sessions (newest first), anchored under
+ *  the ▾ button. Fixed (not inline) so the scrollable/narrow sidebar can't clip
+ *  it; scrolls internally when a project has many sessions. */
+function SessionMenu({
+  anchor,
+  sessions,
+  onPick,
+  onClose,
 }: {
-  session: RecentSession;
-  onRecall: (sessionId: string, cwd: string) => void;
+  anchor: HTMLElement | null;
+  sessions: RecentSession[];
+  onPick: (s: RecentSession) => void;
+  onClose: () => void;
 }) {
-  const when = relativeTime(session.lastSeen);
+  const [pos, setPos] = useState<{ left: number; top: number; width: number } | null>(
+    null,
+  );
+
+  // Anchor the menu to the button's on-screen rect, opening to the LEFT (the
+  // button sits at the sidebar's right edge) and below it.
+  useLayoutEffect(() => {
+    if (!anchor) return;
+    const r = anchor.getBoundingClientRect();
+    const width = 280;
+    const left = Math.max(8, Math.min(r.right - width, window.innerWidth - width - 8));
+    setPos({ left, top: r.bottom + 4, width });
+  }, [anchor]);
+
+  // Close on Esc.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  if (!pos) return null;
+
   return (
-    <li
-      className="group flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-neutral-800/50"
-      style={{ color: "var(--th-fg)" }}
-    >
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-[12.5px]" title={session.label}>
-          {session.label}
-        </span>
-        {when && (
-          <span className="text-[10px]" style={{ color: "var(--th-fg-muted)" }}>
-            {when} ago
-          </span>
-        )}
-      </span>
-      <button
-        type="button"
-        onClick={() => onRecall(session.id, session.cwd)}
-        className="shrink-0 rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors"
+    <>
+      {/* Click-away backdrop. */}
+      <div className="fixed inset-0 z-40" onPointerDown={onClose} aria-hidden />
+      <div
+        role="menu"
+        className="fixed z-50 max-h-[60vh] overflow-y-auto rounded-lg border py-1 shadow-2xl"
         style={{
-          background: "var(--th-accent)",
-          color: "var(--th-accent-fg, #fff)",
+          left: pos.left,
+          top: pos.top,
+          width: pos.width,
+          background: "var(--th-header-bg)",
+          borderColor: "var(--th-border)",
+          color: "var(--th-fg)",
+          fontFamily: "var(--th-font)",
         }}
-        title={`Resume this session: claude --resume in ${session.cwd}`}
+        onPointerDown={(e) => e.stopPropagation()}
       >
-        Resume
-      </button>
-    </li>
+        {sessions.map((s) => (
+          <button
+            key={s.id}
+            type="button"
+            role="menuitem"
+            onClick={() => onPick(s)}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors hover:bg-neutral-700/40"
+          >
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-[12.5px]" title={s.label}>
+                {s.label}
+              </span>
+            </span>
+            <span
+              className="shrink-0 text-[10px] tabular-nums"
+              style={{ color: "var(--th-fg-muted)" }}
+            >
+              {relativeTime(s.lastSeen)}
+            </span>
+          </button>
+        ))}
+      </div>
+    </>
   );
 }

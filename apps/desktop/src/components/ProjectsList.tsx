@@ -57,7 +57,7 @@ export function ProjectsList({
     );
   }
   return (
-    <ul>
+    <ul className="flex flex-col gap-0.5 px-2 py-1">
       {order.map((id) => (
         <ProjectRow
           key={id}
@@ -103,10 +103,18 @@ function ProjectRow({
         type="button"
         onClick={onClick}
         aria-current={active ? "true" : undefined}
-        className="flex w-full cursor-pointer items-center gap-2 py-1 pr-2 pl-2 text-left text-sm hover:bg-neutral-900"
+        className="flex w-full cursor-pointer items-center gap-2 rounded-lg py-1.5 pr-2 pl-2.5 text-left text-sm transition-colors hover:bg-neutral-800/40"
         style={{
           color: "var(--th-fg)",
-          ...(active ? { backgroundColor: "var(--th-accent)" } : {}),
+          // Focused project: a SUBTLE accent tint + thin accent left bar, not the
+          // full bright accent fill (per feedback it was too bright).
+          ...(active
+            ? {
+                backgroundColor:
+                  "color-mix(in srgb, var(--th-accent) 16%, transparent)",
+                boxShadow: "inset 2px 0 0 0 var(--th-accent)",
+              }
+            : {}),
         }}
         title={`${showShortId ? `${label} · ${id}` : label} — ${state}`}
       >
