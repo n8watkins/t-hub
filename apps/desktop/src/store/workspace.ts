@@ -15,6 +15,7 @@
 import { create } from "zustand";
 import type { TerminalInfo, TerminalId, TerminalState } from "../ipc/types";
 import { usePanels } from "./panels";
+import { useTheme } from "./theme";
 
 /**
  * Clean up the per-tile side state that lives OUTSIDE this store when a
@@ -28,6 +29,8 @@ import { usePanels } from "./panels";
  */
 function cleanupTileSideState(id: TerminalId): void {
   usePanels.getState().forget(id);
+  // Drop any per-terminal color override so a recycled id can't inherit it.
+  useTheme.getState().clearTermOverride(id);
   void import("../ipc/devserver")
     .then((m) => m.stopDevServer(id))
     .catch(() => {

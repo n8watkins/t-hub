@@ -777,6 +777,14 @@ interface ThemeStore {
   /** Restore the active theme's terminal palette to the default (ANSI + base). */
   resetTerminalPalette: () => void;
 
+  /** Per-terminal palette overrides, keyed by terminalId (sparse patches that
+   *  win over the active theme's terminal palette for that one terminal). */
+  termOverrides: Record<string, Partial<TerminalPalette>>;
+  /** Merge a palette patch into a single terminal's override. */
+  setTermOverride: (id: string, patch: Partial<TerminalPalette>) => void;
+  /** Drop a terminal's override so it follows the global theme again. */
+  clearTermOverride: (id: string) => void;
+
   /** Save the current active theme as a named preset. */
   saveAsPreset: (name: string) => void;
   /** Delete a user preset by name (built-ins can't be deleted). */
@@ -791,6 +799,41 @@ interface ThemeStore {
 
   /** Reset the active theme back to the Midnight default. */
   resetToDefault: () => void;
+}
+
+// ---------------------------------------------------------------------------
+// Per-terminal palette overrides
+//
+// A terminal can override the *global* theme's terminal palette with its own
+// colors (set from the tile's ⋯ menu) so the user can visually tell apart what
+// they're working on. Stored as a SPARSE patch per terminalId — only the keys
+// the user actually changed — merged over the active theme at render time.
+// Keyed by terminalId, persisted in its own localStorage slot (kept out of the
+// theme/preset blob). Cleared when the terminal is removed (see workspace's
+// cleanupTileSideState) so a recycled id can't inherit stale colors.
+// ---------------------------------------------------------------------------
+const TERM_OVERRIDES_KEY = "termhub.theme.termOverrides";
+
+function loadTermOverrides(): Record<string, Partial<TerminalPalette>> {
+  try {
+    if (typeof localStorage === "undefined") return {};
+    const raw = localStorage.getItem(TERM_OVERRIDES_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object"
+      ? (parsed as Record<string, Partial<TerminalPalette>>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveTermOverrides(m: Record<string, Partial<TerminalPalette>>): void {
+  try {
+    localStorage.setItem(TERM_OVERRIDES_KEY, JSON.stringify(m));
+  } catch {
+    /* ignore */
+  }
 }
 
 const initial = loadPersisted();
@@ -811,6 +854,7 @@ function pushToBackend(theme: Theme): void {
 export const useTheme = create<ThemeStore>((set, get) => ({
   active: initial.active,
   presets: initial.presets,
+  termOverrides: loadTermOverrides(),
 
   setTheme: (theme, fromBackend = false) => {
     applyTheme(theme);
@@ -855,6 +899,21 @@ export const useTheme = create<ThemeStore>((set, get) => ({
       terminal: { ...def, ansi: { ...def.ansi } },
     };
     get().setTheme(next);
+  },
+
+  setTermOverride: (id, patch) => {
+    const cur = get().termOverrides[id] ?? {};
+    const next = { ...get().termOverrides, [id]: { ...cur, ...patch } };
+    saveTermOverrides(next);
+    set({ termOverrides: next });
+  },
+
+  clearTermOverride: (id) => {
+    if (!(id in get().termOverrides)) return;
+    const next = { ...get().termOverrides };
+    delete next[id];
+    saveTermOverrides(next);
+    set({ termOverrides: next });
   },
 
   saveAsPreset: (name) => {

@@ -52,6 +52,16 @@ const PANEL_TABS: { id: PanelTab; label: string }[] = [
   { id: "dev", label: "Dev" },
 ];
 
+/** Terminal-palette keys editable from the per-tile ⋯ color menu. */
+type TermColorKey = "background" | "foreground" | "cursor";
+/** Fallbacks when neither the override nor the global theme sets a color
+ *  (mirror the :root --th-term-* defaults in index.css). */
+const TERM_COLOR_FALLBACK: Record<TermColorKey, string> = {
+  background: "#0a0a0a",
+  foreground: "#e5e5e5",
+  cursor: "#10b981",
+};
+
 export interface TileProps {
   terminalId: TerminalId;
   focused: boolean;
@@ -171,6 +181,16 @@ export function Tile({
   const setTab = usePanels((s) => s.setTab);
   const toggleFullscreen = usePanels((s) => s.toggleFullscreen);
   const isFullscreen = usePanels((s) => s.fullscreenId === terminalId);
+  // Per-terminal color override (the ⋯ menu): the effective color comes from
+  // this terminal's override first, then the global theme, then a fallback.
+  const termPalette = useTheme((s) => s.active.terminal);
+  const termOverride = useTheme((s) => s.termOverrides[terminalId]);
+  const setTermOverride = useTheme((s) => s.setTermOverride);
+  const clearTermOverride = useTheme((s) => s.clearTermOverride);
+  const effColor = (k: TermColorKey): string =>
+    termOverride?.[k] ?? termPalette?.[k] ?? TERM_COLOR_FALLBACK[k];
+  const setColor = (k: TermColorKey, value: string): void =>
+    setTermOverride(terminalId, { [k]: value });
   // Expanded vs split. DEFAULT is EXPANDED (true): opening a non-terminal tab
   // fills the tile with the panel and PARKS the terminal — clean and reliable
   // (no pooled-xterm overlay competing with / covering the panel, which made
@@ -221,6 +241,12 @@ export function Tile({
   // Right-click context menu position (null = closed). Right-clicking the header
   // opens a single "Kill session" action at the pointer.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
+  // Per-terminal color popover position (null = closed). Right-aligned under the
+  // ⋯ button so it never spills off the tile's right edge.
+  const [colorMenu, setColorMenu] = useState<{
+    right: number;
+    top: number;
+  } | null>(null);
 
   // The ONE close path for this tile's × and the context-menu action: kill the
   // session, but confirm first if it looks busy. Idle -> kill now; busy -> ask.
@@ -465,6 +491,30 @@ export function Tile({
           })}
         </div>
 
+        {/* ⋯ menu: per-terminal color overrides so you can tell this terminal
+            apart from the rest. Opens a small popover anchored under the button;
+            edits apply live and persist (see store/theme termOverrides). */}
+        <button
+          type="button"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            onFocus();
+            const r = e.currentTarget.getBoundingClientRect();
+            setColorMenu((m) =>
+              m ? null : { right: window.innerWidth - r.right, top: r.bottom + 4 },
+            );
+          }}
+          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
+          style={{ color: "var(--th-fg-muted)" }}
+          title="Terminal colors"
+          aria-label="Terminal colors"
+          aria-haspopup="menu"
+          aria-expanded={colorMenu != null}
+        >
+          ⋯
+        </button>
+
         {/* Fullscreen toggle (⤢): blow THIS tile up to fill the window; other
             tiles keep running underneath. Toggling (or Esc — handled in Canvas)
             returns to the grid. Kept next to the × so the two chrome controls
@@ -598,6 +648,80 @@ export function Tile({
                 requestKill();
               }}
             />
+          </div>
+        </>
+      )}
+
+      {/* Per-terminal color popover (⋯). Mirrors the context-menu pattern: a
+          full-window backdrop to dismiss, plus a small fixed panel anchored under
+          the button. Editing a swatch writes straight to the store, which
+          live-applies to THIS terminal's xterm (store/theme termOverrides). */}
+      {colorMenu && (
+        <>
+          <div
+            className="fixed inset-0 z-40"
+            onPointerDown={() => setColorMenu(null)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setColorMenu(null);
+            }}
+          />
+          <div
+            className="fixed z-50 w-[210px] overflow-hidden rounded-md border p-2 shadow-2xl"
+            style={{
+              right: colorMenu.right,
+              top: colorMenu.top,
+              backgroundColor: "var(--th-header-bg)",
+              borderColor: "var(--th-border)",
+              color: "var(--th-fg)",
+              fontFamily: "var(--th-font)",
+              fontSize: "var(--th-font-size)",
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <div
+              className="mb-1.5 px-0.5 text-xs font-semibold uppercase tracking-wide"
+              style={{ color: "var(--th-fg-muted)" }}
+            >
+              Terminal colors
+            </div>
+            {(
+              [
+                ["Background", "background"],
+                ["Foreground", "foreground"],
+                ["Cursor", "cursor"],
+              ] as [string, TermColorKey][]
+            ).map(([label, key]) => (
+              <label
+                key={key}
+                className="flex items-center justify-between gap-2 px-0.5 py-1"
+              >
+                <span>{label}</span>
+                <input
+                  type="color"
+                  value={effColor(key)}
+                  onChange={(e) => setColor(key, e.target.value)}
+                  className="h-6 w-9 shrink-0 cursor-pointer rounded bg-transparent p-0"
+                  title={`${label} color`}
+                />
+              </label>
+            ))}
+            <button
+              type="button"
+              onClick={() => {
+                clearTermOverride(terminalId);
+                setColorMenu(null);
+              }}
+              disabled={!termOverride}
+              className="mt-1.5 w-full rounded border px-2 py-1 text-xs hover:bg-neutral-800 disabled:opacity-40"
+              style={{
+                borderColor: "var(--th-border)",
+                color: "var(--th-fg-muted)",
+              }}
+              title="Clear this terminal's colors and follow the global theme"
+            >
+              Reset to theme
+            </button>
           </div>
         </>
       )}

@@ -46,7 +46,7 @@ import type { TerminalId } from "../ipc/types";
 import { stripAnsi } from "../lib/ansi";
 import { usePanels } from "../store/panels";
 import { useWorkspace } from "../store/workspace";
-import { useTheme, type TerminalPalette } from "../store/theme";
+import { useTheme, DEFAULT_THEME, type TerminalPalette } from "../store/theme";
 import { tlog } from "../lib/diag";
 import { REPAINT_ALL_EVENT } from "../lib/repaint";
 import type { ITheme } from "@xterm/xterm";
@@ -148,6 +148,25 @@ function toXtermTheme(p: TerminalPalette | undefined): ITheme {
   };
 }
 
+/**
+ * Merge a per-terminal override (a sparse patch set from the tile's ⋯ menu) over
+ * the global terminal palette. Returns the base unchanged when there's no
+ * override, so terminals without one stay referentially stable (the live-apply
+ * effect below won't needlessly re-theme xterm).
+ */
+function mergeTermPalette(
+  base: TerminalPalette | undefined,
+  override: Partial<TerminalPalette> | undefined,
+): TerminalPalette | undefined {
+  if (!override || Object.keys(override).length === 0) return base;
+  const b = base ?? DEFAULT_THEME.terminal!;
+  return {
+    ...b,
+    ...override,
+    ansi: { ...b.ansi, ...(override.ansi ?? {}) },
+  };
+}
+
 export interface TerminalViewProps {
   terminalId: TerminalId;
   /** Mount xterm only when visible; hidden tiles detach their PTY client. */
@@ -173,6 +192,10 @@ export function TerminalView({
   const focusedId = useWorkspace((s) => s.focusedId);
   // Live terminal palette from the active theme (undefined => xterm defaults).
   const termPalette = useTheme((s) => s.active.terminal);
+  // This terminal's own color override, if any (set via the tile's ⋯ menu). The
+  // selector returns a stable ref unless THIS id's override changes, so other
+  // terminals' edits don't re-render us.
+  const termOverride = useTheme((s) => s.termOverrides[terminalId]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -194,7 +217,12 @@ export function TerminalView({
       fontSize: useWorkspace.getState().fontSize,
       cursorBlink: true,
       scrollback: 5000,
-      theme: toXtermTheme(useTheme.getState().active.terminal),
+      theme: toXtermTheme(
+        mergeTermPalette(
+          useTheme.getState().active.terminal,
+          useTheme.getState().termOverrides[terminalId],
+        ),
+      ),
     });
     termRef.current = term;
 
@@ -669,10 +697,14 @@ export function TerminalView({
     }
   }, [fontSize, terminalId]);
 
-  // Live-apply terminal palette changes (theme editor / MCP set_theme).
+  // Live-apply terminal palette changes — global (theme editor / MCP set_theme)
+  // or this terminal's own ⋯-menu override — without recreating the terminal.
   useEffect(() => {
-    if (termRef.current) termRef.current.options.theme = toXtermTheme(termPalette);
-  }, [termPalette]);
+    if (termRef.current)
+      termRef.current.options.theme = toXtermTheme(
+        mergeTermPalette(termPalette, termOverride),
+      );
+  }, [termPalette, termOverride]);
 
   // When this terminal becomes the focused tile, put the KEYBOARD into its xterm
   // (not just the tile highlight) so the user can type right away — e.g. the
