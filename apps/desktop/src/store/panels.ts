@@ -23,6 +23,11 @@ export type PanelTab = "terminal" | "files" | "preview" | "dev";
 /** The view a tile shows until the user switches it. */
 export const DEFAULT_PANEL_TAB: PanelTab = "terminal";
 
+/** Max localhost URLs kept per terminal in `detectedUrls`. Newest-first; older
+ *  ones fall off the end. Small on purpose — these are quick "jump to it" chips,
+ *  not a history, and the list re-renders the Preview URL bar. */
+export const MAX_DETECTED_URLS = 8;
+
 /**
  * Split-ratio bounds for the draggable terminal|panel divider (SPLIT mode). The
  * ratio is the TERMINAL half's fraction of the tile width (0..1); the panel gets
@@ -84,6 +89,10 @@ interface PanelState {
   /** Last URL the user committed in a terminal's Preview tab, so it survives a
    *  tab switch. The Preview tab prefers a live `devUrl` over this. */
   previewUrl: Record<TerminalId, string | null>;
+  /** localhost-ish URLs scraped from a terminal's LIVE output (newest-first,
+   *  deduped, capped). Written by Terminal.tsx as Claude/dev servers print their
+   *  URLs; surfaced as one-click chips in that tile's Preview tab. Absent => []. */
+  detectedUrls: Record<TerminalId, string[]>;
   /** Per-tile: when a non-terminal tab is active the tile SPLITS (terminal +
    *  panel). `panelExpanded[id]` true means the panel is EXPANDED to fill the
    *  whole tile (terminal hidden); false/absent => the split. */
@@ -112,6 +121,10 @@ interface PanelState {
   setFullscreen: (id: TerminalId | null) => void;
   /** Record the dev-server URL detected for a terminal (null clears it). */
   setDevUrl: (id: TerminalId, url: string | null) => void;
+  /** Add a localhost URL scraped from a terminal's output. Prepended (newest
+   *  first), deduped, and capped at MAX_DETECTED_URLS so a server logging its
+   *  URL on every request can't grow the list unbounded. */
+  addDetectedUrl: (id: TerminalId, url: string) => void;
   /** Remember the user-typed Preview URL for a terminal. */
   setPreviewUrl: (id: TerminalId, url: string | null) => void;
   /** Drop all panel state for a terminal (call when its tile is deleted). */
@@ -123,6 +136,7 @@ export const usePanels = create<PanelState>((set, get) => ({
   fullscreenId: null,
   devUrl: {},
   previewUrl: {},
+  detectedUrls: {},
   panelExpanded: {},
   splitRatio: loadSplitRatios(),
 
@@ -155,6 +169,19 @@ export const usePanels = create<PanelState>((set, get) => ({
     set((s) => ({ fullscreenId: s.fullscreenId === id ? null : id })),
   setFullscreen: (id) => set({ fullscreenId: id }),
   setDevUrl: (id, url) => set((s) => ({ devUrl: { ...s.devUrl, [id]: url } })),
+  addDetectedUrl: (id, url) =>
+    set((s) => {
+      const prev = s.detectedUrls[id] ?? [];
+      // No-op if it's already the newest entry — the common case is a server
+      // re-logging the same URL, and skipping the set() avoids needless renders.
+      if (prev[0] === url) return s;
+      // Newest-first, drop any earlier occurrence (move-to-front), then cap.
+      const next = [url, ...prev.filter((u) => u !== url)].slice(
+        0,
+        MAX_DETECTED_URLS,
+      );
+      return { detectedUrls: { ...s.detectedUrls, [id]: next } };
+    }),
   setPreviewUrl: (id, url) =>
     set((s) => ({ previewUrl: { ...s.previewUrl, [id]: url } })),
   forget: (id) =>
@@ -162,11 +189,13 @@ export const usePanels = create<PanelState>((set, get) => ({
       const tab = { ...s.tab };
       const devUrl = { ...s.devUrl };
       const previewUrl = { ...s.previewUrl };
+      const detectedUrls = { ...s.detectedUrls };
       const panelExpanded = { ...s.panelExpanded };
       const splitRatio = { ...s.splitRatio };
       delete tab[id];
       delete devUrl[id];
       delete previewUrl[id];
+      delete detectedUrls[id];
       delete panelExpanded[id];
       const hadRatio = id in splitRatio;
       delete splitRatio[id];
@@ -176,6 +205,7 @@ export const usePanels = create<PanelState>((set, get) => ({
         tab,
         devUrl,
         previewUrl,
+        detectedUrls,
         panelExpanded,
         splitRatio,
         fullscreenId: s.fullscreenId === id ? null : s.fullscreenId,
