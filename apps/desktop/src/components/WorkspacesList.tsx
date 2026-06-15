@@ -189,29 +189,39 @@ function WorkspaceRow({
         )}
       </div>
 
-      {open &&
-        (count === 0 ? (
-          <div
-            className="py-1 pl-7 pr-2 text-sm"
-            style={{ color: "var(--th-fg-muted)" }}
-          >
-            Nothing open here yet.
-          </div>
-        ) : (
-          <ul className="flex flex-col gap-0.5 py-0.5 pl-5">
-            {tab.order.map((id) => (
-              <TerminalRow
-                key={id}
-                id={id}
-                info={terminals[id]}
-                userLabel={labels[id]}
-                active={id === focusedId}
-                onClick={() => onSelectTerminal(id)}
-                onClose={() => onCloseTerminal(id)}
-              />
-            ))}
-          </ul>
-        ))}
+      {/* Smooth expand/collapse via a 0fr↔1fr grid row (rows stay mounted). */}
+      <div
+        className="grid"
+        style={{
+          gridTemplateRows: open ? "1fr" : "0fr",
+          transition: "grid-template-rows 200ms ease",
+        }}
+      >
+        <div style={{ overflow: "hidden", minHeight: 0 }}>
+          {count === 0 ? (
+            <div
+              className="py-1 pl-7 pr-2 text-sm"
+              style={{ color: "var(--th-fg-muted)" }}
+            >
+              Nothing open here yet.
+            </div>
+          ) : (
+            <ul className="flex flex-col gap-0.5 py-0.5 pl-5">
+              {tab.order.map((id) => (
+                <TerminalRow
+                  key={id}
+                  id={id}
+                  info={terminals[id]}
+                  userLabel={labels[id]}
+                  active={id === focusedId}
+                  onClick={() => onSelectTerminal(id)}
+                  onClose={() => onCloseTerminal(id)}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
     </li>
   );
 }

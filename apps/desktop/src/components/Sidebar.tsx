@@ -565,14 +565,25 @@ function Section({
           {count != null && <CountBadge n={count} />}
         </div>
       )}
-      {isOpen &&
-        (bodyClassName || bodyStyle ? (
-          <div className={bodyClassName} style={bodyStyle}>
-            {children}
-          </div>
-        ) : (
-          children
-        ))}
+      {/* Animate open/close by transitioning the grid row 0fr↔1fr; the body
+          stays mounted and the inner wrapper clips it as it collapses. */}
+      <div
+        className="grid"
+        style={{
+          gridTemplateRows: isOpen ? "1fr" : "0fr",
+          transition: "grid-template-rows 200ms ease",
+        }}
+      >
+        <div style={{ overflow: "hidden", minHeight: 0 }}>
+          {bodyClassName || bodyStyle ? (
+            <div className={bodyClassName} style={bodyStyle}>
+              {children}
+            </div>
+          ) : (
+            children
+          )}
+        </div>
+      </div>
     </section>
   );
 }
