@@ -1,90 +1,42 @@
-// UsageStrip — the sidebar's bottom-pinned Claude USAGE readout.
+// UsageStrip — the sidebar's bottom-pinned Claude plan-usage readout.
 //
-// What the user cares about is how much of their plan they have LEFT — chiefly
-// the WEEKLY (7-day) rate-limit window — not cost. So this leads with "Weekly
-// left: N%" (and "5h left: N%"), derived from the statusline snapshots the status
-// bridge records (useSupervision().snapshots: contextUsedPct, costUsd, and the
-// fiveHour/sevenDay rate-limit windows with used_percentage + resets_at).
-//
-// Caveats: the rate_limits block is Claude.ai Pro/Max only AND only appears after
-// the first API response of a session, so "left" reads "—" until then. Cost is
-// kept as a small secondary line.
-import { useSupervision } from "../store/supervision";
-import type { StatusSnapshot, RateLimitWindow } from "../ipc/model";
+// Data source: `claude -p /usage` (parsed in src-tauri/src/usage.rs), polled from
+// here. This is far more reliable than the statusline rate_limits (which only
+// exist on Pro/Max + after the first turn): `/usage` always prints the plan
+// usage. We LEAD with what the user watches — WEEKLY remaining — then session,
+// each as "left" (100 - used) with the reset hint Claude reports.
+import { useCallback, useEffect, useState } from "react";
+import { claudeUsage, type ClaudeUsage } from "../ipc/usage";
 
-interface WindowAgg {
-  used: number | null; // highest used% across sessions (most constrained)
-  resetsAt: number | null;
-}
+/** Poll cadence: /usage is a quick local Claude command; every 5 min (plus on
+ *  mount + window focus) keeps the numbers fresh without spamming it. */
+const POLL_MS = 5 * 60 * 1000;
 
-interface Agg {
-  totalCost: number;
-  haveCost: boolean;
-  maxContext: number | null;
-  weekly: WindowAgg;
-  fiveHour: WindowAgg;
-  sessions: number;
-}
-
-function foldWindow(agg: WindowAgg, w: RateLimitWindow | undefined): WindowAgg {
-  if (!w || typeof w.usedPercentage !== "number") return agg;
-  // Account-level windows should agree across sessions; take the max used (= the
-  // least remaining) to be safe, and carry that window's reset time.
-  if (agg.used == null || w.usedPercentage > agg.used) {
-    return { used: w.usedPercentage, resetsAt: w.resetsAt ?? agg.resetsAt };
-  }
-  return agg;
-}
-
-function aggregate(snaps: Record<string, StatusSnapshot>): Agg {
-  let totalCost = 0;
-  let haveCost = false;
-  let maxContext: number | null = null;
-  let weekly: WindowAgg = { used: null, resetsAt: null };
-  let fiveHour: WindowAgg = { used: null, resetsAt: null };
-  const list = Object.values(snaps);
-  for (const s of list) {
-    if (typeof s.costUsd === "number") {
-      totalCost += s.costUsd;
-      haveCost = true;
-    }
-    if (typeof s.contextUsedPct === "number") {
-      maxContext = Math.max(maxContext ?? 0, s.contextUsedPct);
-    }
-    weekly = foldWindow(weekly, s.sevenDay);
-    fiveHour = foldWindow(fiveHour, s.fiveHour);
-  }
-  return { totalCost, haveCost, maxContext, weekly, fiveHour, sessions: list.length };
-}
-
-/** Color by REMAINING %: red when nearly out, amber when low, green otherwise. */
+/** Color by REMAINING %: red nearly out, amber low, green healthy. */
 function leftColor(left: number): string {
   if (left <= 10) return "text-red-400";
   if (left <= 30) return "text-amber-400";
   return "text-emerald-400";
 }
 
-/** Compact "resets in 3d" / "in 4h" / "in 25m" from an epoch-seconds reset time. */
-function resetsIn(epochSecs: number | null): string {
-  if (!epochSecs) return "";
-  const diff = epochSecs - Math.floor(Date.now() / 1000);
-  if (diff <= 0) return "now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
-  return `${Math.floor(diff / 86400)}d`;
-}
-
-/** One "X left" row for a rate-limit window. */
-function WindowRow({ label, w }: { label: string; w: WindowAgg }) {
-  const left = w.used != null ? Math.max(0, Math.round(100 - w.used)) : null;
-  const reset = resetsIn(w.resetsAt);
+/** One "X left: N%" row from a used-percentage + reset hint. */
+function Row({
+  label,
+  usedPct,
+  resets,
+}: {
+  label: string;
+  usedPct: number | null;
+  resets: string | null;
+}) {
+  const left = usedPct != null ? Math.max(0, Math.round(100 - usedPct)) : null;
   return (
     <div className="flex items-center justify-between gap-2">
       <span>{label} left</span>
       <span className="flex items-center gap-1.5">
-        {reset && (
-          <span className="text-[10px] text-neutral-600" title="resets in">
-            {reset}
+        {resets && (
+          <span className="truncate text-[10px] text-neutral-600" title={`resets ${resets}`}>
+            {resets}
           </span>
         )}
         <span className={left != null ? leftColor(left) : "text-neutral-500"}>
@@ -96,55 +48,57 @@ function WindowRow({ label, w }: { label: string; w: WindowAgg }) {
 }
 
 export function UsageStrip() {
-  const snapshots = useSupervision((s) => s.snapshots);
-  const agg = aggregate(snapshots);
+  const [usage, setUsage] = useState<ClaudeUsage | null>(null);
+  const [loaded, setLoaded] = useState(false);
 
-  if (agg.sessions === 0) {
+  const refresh = useCallback(() => {
+    void claudeUsage()
+      .then((u) => {
+        setUsage(u);
+        setLoaded(true);
+      })
+      .catch(() => setLoaded(true));
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const id = window.setInterval(refresh, POLL_MS);
+    window.addEventListener("focus", refresh);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener("focus", refresh);
+    };
+  }, [refresh]);
+
+  if (!loaded) {
     return (
-      <div
-        className="px-2 py-1 text-[11px] leading-snug"
-        style={{ color: "var(--th-fg-muted)" }}
-        title="Usage is fed by Claude Code's statusline. Install hooks + statusline from Settings > Hooks, then run a Claude turn."
-      >
-        Usage appears once a Claude session reports. If it stays blank, install the
-        statusline in Settings &gt; Hooks.
+      <div className="px-2 py-1 text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
+        Loading usage…
       </div>
     );
   }
 
-  const noLimits = agg.weekly.used == null && agg.fiveHour.used == null;
+  if (!usage || !usage.ok) {
+    return (
+      <div
+        className="px-2 py-1 text-[11px] leading-snug"
+        style={{ color: "var(--th-fg-muted)" }}
+        title="Runs `claude -p /usage`. Make sure you're logged into Claude in WSL."
+      >
+        Usage unavailable. Ensure you're logged into Claude.
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-0.5 px-2 py-1 text-[11px] text-neutral-500">
-      {/* Weekly first — the number the user actually watches. */}
-      <WindowRow label="Weekly" w={agg.weekly} />
-      <WindowRow label="5h" w={agg.fiveHour} />
-      {noLimits && (
-        <div className="text-[10px] leading-snug text-neutral-600">
-          Rate-limit % is Pro/Max only, after the first turn.
-        </div>
-      )}
-      {agg.maxContext != null && (
-        <div className="flex items-center justify-between gap-2">
-          <span>Context</span>
-          <span className={pctColorUp(agg.maxContext)}>
-            {Math.round(agg.maxContext)}%
-          </span>
-        </div>
-      )}
-      {agg.haveCost && (
-        <div className="flex items-center justify-between gap-2 text-neutral-600">
-          <span>Cost</span>
-          <span>${agg.totalCost.toFixed(2)}</span>
-        </div>
-      )}
+      {/* Weekly first — the number that actually matters. */}
+      <Row label="Weekly" usedPct={usage.weekUsedPct} resets={usage.weekResets} />
+      <Row
+        label="Session"
+        usedPct={usage.sessionUsedPct}
+        resets={usage.sessionResets}
+      />
     </div>
   );
-}
-
-/** Color by USED % (context fills up): red high, amber medium. */
-function pctColorUp(pct: number): string {
-  if (pct >= 90) return "text-red-400";
-  if (pct >= 75) return "text-amber-400";
-  return "text-neutral-400";
 }
