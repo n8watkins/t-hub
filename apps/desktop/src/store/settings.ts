@@ -42,6 +42,10 @@ const DEFAULTS = {
    *  (`claude --resume <id>`). When false, Resume just opens a terminal in the
    *  session's directory (no Claude). Default on — Recent is a Claude library. */
   resumeStartsClaude: true,
+  /** Fixed root directory for the Files panel. Empty = use the project's own cwd
+   *  (per-tile). Set to an absolute path (e.g. /home/natkins) to ALWAYS start the
+   *  file tree there. The header shows paths relative to this / the home dir. */
+  filesRootDir: "",
 } as const;
 
 interface PersistedSettings {

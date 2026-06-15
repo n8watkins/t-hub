@@ -60,17 +60,46 @@ function Row({
   );
 }
 
+/** Persist the last GOOD usage so the strip never flashes "unavailable" on a
+ *  transient failed poll or right after launch — it shows the last-known weekly +
+ *  5h until a fresh reading lands. */
+const CACHE_KEY = "termhub.usage.v1";
+
+function loadCachedUsage(): ClaudeUsage | null {
+  if (typeof localStorage === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const u = JSON.parse(raw) as ClaudeUsage;
+    return u && u.ok ? u : null;
+  } catch {
+    return null;
+  }
+}
+
 export function UsageStrip() {
-  const [usage, setUsage] = useState<ClaudeUsage | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  // Seed from the cached last-good reading so usage is visible immediately on
+  // launch and never blanks while a poll is in flight.
+  const [usage, setUsage] = useState<ClaudeUsage | null>(loadCachedUsage);
 
   const refresh = useCallback(() => {
     void claudeUsage()
       .then((u) => {
-        setUsage(u);
-        setLoaded(true);
+        // Only ADOPT a good reading. A failed/unavailable poll must NOT wipe the
+        // last-known values (the "usage keeps disappearing" fix) — we keep
+        // showing the cached weekly + 5h until a fresh good reading replaces it.
+        if (u && u.ok) {
+          setUsage(u);
+          try {
+            localStorage.setItem(CACHE_KEY, JSON.stringify(u));
+          } catch {
+            /* ignore quota */
+          }
+        }
       })
-      .catch(() => setLoaded(true));
+      .catch(() => {
+        /* transient — keep the last-known values */
+      });
   }, []);
 
   useEffect(() => {
@@ -83,14 +112,8 @@ export function UsageStrip() {
     };
   }, [refresh]);
 
-  if (!loaded) {
-    return (
-      <div className="px-2 py-1 text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
-        Loading usage…
-      </div>
-    );
-  }
-
+  // Only show the empty hint when we have NEVER had a reading (no cache, first
+  // poll not yet good). Once we've had data, it stays put across failed polls.
   if (!usage || !usage.ok) {
     return (
       <div
@@ -98,7 +121,7 @@ export function UsageStrip() {
         style={{ color: "var(--th-fg-muted)" }}
         title="Runs `claude -p /usage`. Make sure you're logged into Claude in WSL."
       >
-        Usage unavailable. Ensure you're logged into Claude.
+        Usage loading… (ensure you're logged into Claude)
       </div>
     );
   }

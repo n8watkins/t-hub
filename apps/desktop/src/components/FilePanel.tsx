@@ -317,36 +317,14 @@ export function FilePanel({
             </div>
           </div>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col">
-            {/* SECONDARY search: a slim toggle row (browsing is primary). When
-                opened it reveals the input; it never sits between the user and
-                the tree by default, and the tree (below) renders regardless. */}
-            <SearchBar
-              open={searchOpen}
-              query={query}
-              onQuery={setQuery}
-              onOpen={() => setSearchOpen(true)}
-              onClose={closeSearch}
-              compact
+          // Just the tree — no search box (removed per request). Browsing only.
+          <div className="th-scroll min-h-0 flex-1 overflow-y-auto">
+            <FileTree
+              key={reloadKey}
+              root={root}
+              activePath={activePath}
+              onOpenFile={openFile}
             />
-            <div className="th-scroll min-h-0 flex-1 overflow-y-auto">
-              {searchOpen && query.trim() ? (
-                <SearchResults
-                  hits={hits}
-                  searching={searching}
-                  activePath={activePath}
-                  root={indexState.status === "ready" ? indexState.root : root}
-                  onOpen={openFile}
-                />
-              ) : (
-                <FileTree
-                  key={reloadKey}
-                  root={root}
-                  activePath={activePath}
-                  onOpenFile={openFile}
-                />
-              )}
-            </div>
           </div>
         )}
       </PanelShell>
@@ -365,36 +343,18 @@ export function FilePanel({
       />
 
       <div className="flex min-h-0 flex-1">
-        {/* Left rail: the tree (primary), with a secondary collapsible search
-            above it. There's room here, so the bar shows its input inline. */}
+        {/* Left rail: the tree (no search box — removed per request). */}
         <div
           className="flex w-72 shrink-0 flex-col border-r"
           style={{ borderColor: "var(--th-border)" }}
         >
-          <SearchBar
-            open={searchOpen}
-            query={query}
-            onQuery={setQuery}
-            onOpen={() => setSearchOpen(true)}
-            onClose={closeSearch}
-          />
           <div className="th-scroll min-h-0 flex-1 overflow-y-auto">
-            {searchOpen && query.trim() ? (
-              <SearchResults
-                hits={hits}
-                searching={searching}
-                activePath={activePath}
-                root={indexState.status === "ready" ? indexState.root : root}
-                onOpen={openFile}
-              />
-            ) : (
-              <FileTree
-                key={reloadKey}
-                root={indexState.status === "ready" ? indexState.root : root}
-                activePath={activePath}
-                onOpenFile={openFile}
-              />
-            )}
+            <FileTree
+              key={reloadKey}
+              root={root}
+              activePath={activePath}
+              onOpenFile={openFile}
+            />
           </div>
         </div>
 
@@ -469,7 +429,7 @@ function Header({
             style={{ color: "var(--th-fg-muted)" }}
             title={root}
           >
-            {root}
+            {shortPath(root)}
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2 text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
@@ -927,15 +887,24 @@ function TreeDir({
 
   // Lazily load children the first time the dir is opened (PRD §9.7: folder
   // expansion is UI state + a shallow list, not a full rescan).
+  //
+  // DEPS ARE [open, path] ONLY — NOT entries/loading. Including `loading` made
+  // `setLoading(true)` below re-run this effect, whose cleanup set cancelled=true
+  // on the in-flight listDir; the guard then blocked a refetch, so `loading` got
+  // stuck true forever and the folder showed "loading…" with the entries never
+  // applied (the bug that left source-engine perpetually loading). With [open,
+  // path] the effect only re-fires when the folder is opened or its path changes.
   useEffect(() => {
-    if (!open || entries !== null || loading) return;
+    if (!open || entries !== null) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
     listDir(path)
       .then((res) => {
-        tlog("files", `TreeDir ${path} -> ${res.length} entries (rendering)`);
-        if (!cancelled) setEntries(res);
+        if (!cancelled) {
+          tlog("files", `TreeDir ${path} -> ${res.length} entries (applied)`);
+          setEntries(res);
+        }
       })
       .catch((e) => {
         tlog("files", `TreeDir ${path} ERR ${String(e)}`);
@@ -947,7 +916,8 @@ function TreeDir({
     return () => {
       cancelled = true;
     };
-  }, [open, path, entries, loading]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, path]);
 
   // Collapse-through single-child chains: when this dir is open, loaded, and its
   // sole entry is a directory, auto-open it. The child renders with the same
@@ -1346,6 +1316,15 @@ function basename(p: string): string {
   const norm = p.replace(/\\/g, "/").replace(/\/+$/, "");
   const idx = norm.lastIndexOf("/");
   return idx >= 0 ? norm.slice(idx + 1) : norm;
+}
+
+/** Shorten a path for display: collapse `/home/<user>` to `~` so the header
+ *  shows `~/appturnity/site-forge` instead of `/home/natkins/appturnity/...`.
+ *  Full path stays in the title tooltip. */
+function shortPath(p: string): string {
+  const m = p.match(/^\/home\/[^/]+(\/.*)?$/);
+  if (m) return "~" + (m[1] ?? "");
+  return p;
 }
 
 /** Join an absolute root with a `/`-separated relative path. */
