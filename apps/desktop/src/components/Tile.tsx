@@ -24,12 +24,17 @@
 // point resolves to the owning tile (data-tile-id) rather than the canvas. The
 // drag never touches the backend — only the visual order changes; the tmux
 // session and any agent stay attached and alive.
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { TerminalId, TerminalState } from "../ipc/types";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import { useTheme } from "../store/theme";
-import { usePanels, type PanelTab } from "../store/panels";
+import {
+  usePanels,
+  type PanelTab,
+  DEFAULT_SPLIT_RATIO,
+  clampSplitRatio,
+} from "../store/panels";
 import { useTerminalSlot } from "./TerminalPool";
 import { TilePanel } from "./TilePanel";
 import { ContextMeter } from "./ContextMeter";
@@ -175,6 +180,15 @@ export function Tile({
   // (terminal beside the panel) for those who want both at once.
   const panelExpanded = usePanels((s) => s.panelExpanded[terminalId] ?? true);
   const togglePanelExpanded = usePanels((s) => s.togglePanelExpanded);
+  // SPLIT divider position: the terminal half's width fraction (the panel gets
+  // the rest). Persisted per tile; defaulted+clamped by the store. The divider
+  // below is a pointer-drag handle that writes this live.
+  const splitRatio = usePanels(
+    (s) => s.splitRatio[terminalId] ?? DEFAULT_SPLIT_RATIO,
+  );
+  const setSplitRatio = usePanels((s) => s.setSplitRatio);
+  // The split flex row, measured during a divider drag to map pointer-x → ratio.
+  const splitRowRef = useRef<HTMLDivElement | null>(null);
 
   const state: TerminalState = info?.state ?? "starting";
   const cwd = info?.cwd ?? "";
@@ -215,6 +229,55 @@ export function Tile({
   const requestKill = () => {
     if (busy) setConfirmKill(true);
     else onClose();
+  };
+
+  // --- SPLIT divider drag: resize the terminal|panel halves ---
+  // Pointer-based (not HTML5 DnD) like every other TermHub drag, with pointer
+  // CAPTURE so the gesture keeps tracking even as it crosses the xterm canvas /
+  // panel (whose own pointer handlers would otherwise steal events). On each move
+  // we map the pointer's x within the split row to the terminal-half fraction and
+  // write it live; the store clamps it to a sane min/max and persists it.
+  const onDividerPointerDown = (e: ReactPointerEvent) => {
+    if (e.button !== 0) return; // primary button only
+    e.preventDefault();
+    e.stopPropagation(); // don't bubble to the tile/header (focus/move) handlers
+    const row = splitRowRef.current;
+    if (!row) return;
+    const handle = e.currentTarget as HTMLElement;
+    try {
+      handle.setPointerCapture(e.pointerId);
+    } catch {
+      /* capture is best-effort; the move handler still works without it */
+    }
+    // Suppress text selection + show the resize cursor for the whole gesture.
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+
+    const applyFromClientX = (clientX: number) => {
+      const rect = row.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const frac = (clientX - rect.left) / rect.width;
+      setSplitRatio(terminalId, clampSplitRatio(frac));
+    };
+
+    const onMove = (ev: PointerEvent) => applyFromClientX(ev.clientX);
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("pointercancel", onUp, true);
+      document.body.style.removeProperty("user-select");
+      document.body.style.removeProperty("cursor");
+      try {
+        handle.releasePointerCapture(e.pointerId);
+      } catch {
+        /* already released */
+      }
+    };
+    const onUp = () => cleanup();
+
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onUp, true);
   };
 
   // --- Drag source (the header), pointer-based ---
@@ -572,15 +635,40 @@ export function Tile({
           />
         </div>
       ) : (
-        // SPLIT: terminal half (placeholder) + panel half, side by side.
-        <div className="flex min-h-0 flex-1">
+        // SPLIT: terminal half (placeholder) + DRAGGABLE divider + panel half,
+        // side by side. The terminal half's width is `splitRatio` of the row and
+        // the panel takes the rest; the divider between them is a pointer-drag
+        // handle (onDividerPointerDown) that rewrites the ratio live, clamped +
+        // persisted per tile. flex-basis (not flex-1) so the ratio is honored.
+        <div ref={splitRowRef} className="flex min-h-0 flex-1">
           <div
             ref={slotActive ? slotRef : undefined}
-            className="min-h-0 min-w-0 flex-1 overflow-hidden"
+            className="min-h-0 min-w-0 shrink-0 grow-0 overflow-hidden"
+            style={{ flexBasis: `${splitRatio * 100}%` }}
           />
+          {/* Divider: a thin themed bar with a wider invisible hit area, so it's
+              easy to grab without a fat visible seam. col-resize cursor signals
+              draggability; touch-none keeps touch/pen from scrolling mid-drag. */}
           <div
-            className="min-h-0 w-1/2 max-w-[60%] shrink-0 overflow-hidden border-l"
-            style={{ borderColor: "var(--th-border)" }}
+            onPointerDown={onDividerPointerDown}
+            // Double-click snaps back to an even split (a common resizer nicety).
+            onDoubleClick={(e) => {
+              e.stopPropagation();
+              setSplitRatio(terminalId, DEFAULT_SPLIT_RATIO);
+            }}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize terminal and panel"
+            title="Drag to resize · double-click to reset"
+            className="relative z-10 w-px shrink-0 cursor-col-resize touch-none select-none"
+            style={{ backgroundColor: "var(--th-border)" }}
+          >
+            {/* Invisible padded grab zone straddling the 1px seam. */}
+            <span className="absolute inset-y-0 -left-1.5 -right-1.5 block" />
+          </div>
+          <div
+            className="min-h-0 min-w-0 flex-1 overflow-hidden"
+            style={{ flexBasis: `${(1 - splitRatio) * 100}%` }}
           >
             <PanelPane
               terminalId={terminalId}
