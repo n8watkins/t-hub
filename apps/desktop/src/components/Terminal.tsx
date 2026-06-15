@@ -31,6 +31,8 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   attachTerminal,
@@ -78,6 +80,24 @@ async function clipboardRead(): Promise<string> {
     return await navigator.clipboard.readText();
   } catch {
     return "";
+  }
+}
+
+// Hand a URL to the OS default browser. MIRRORS WebPreview.tsx's openExternal():
+// the Tauri shell plugin's open() is the primary path (already a JS dependency),
+// falling back to window.open only if the native plugin isn't registered. This
+// is why the WebLinksAddon below uses a CUSTOM click handler rather than the
+// addon's default one — the addon's default is plain window.open, which is
+// unreliable in WebView2, so a clicked terminal link could silently do nothing.
+async function openExternal(url: string): Promise<void> {
+  try {
+    await shellOpen(url);
+  } catch {
+    try {
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch {
+      /* nothing more we can do from the frontend */
+    }
   }
 }
 
@@ -173,6 +193,15 @@ export function TerminalView({
     fitRef.current = fit;
     const search = new SearchAddon();
     term.loadAddon(search);
+
+    // Clickable web links: underline URLs on hover, open the OS default browser
+    // on click. We pass a CUSTOM click handler (not the addon's default, which is
+    // plain window.open — unreliable in WebView2) that routes through the Tauri
+    // shell plugin via openExternal(); loaded before term.open() like the others.
+    const webLinks = new WebLinksAddon((_event: MouseEvent, uri: string) => {
+      void openExternal(uri);
+    });
+    term.loadAddon(webLinks);
 
     // No WebGL addon: xterm uses its default DOM renderer. See the file header
     // (mutedbug fix) for why -- a per-terminal WebGL context hits WebView2's
