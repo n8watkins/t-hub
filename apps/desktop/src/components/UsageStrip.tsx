@@ -60,6 +60,58 @@ function Row({
   );
 }
 
+/** Minimized usage (the collapsed view): just the weekly + session bars and the
+ *  remaining %, side by side — no labels-as-rows, no reset hints. */
+function CompactUsage({ usage }: { usage: ClaudeUsage }) {
+  return (
+    <div className="flex items-center gap-3 px-2 pb-1.5 pt-0.5 text-[10px] text-neutral-500">
+      <MiniBar label="W" usedPct={usage.weekUsedPct} resets={usage.weekResets} />
+      <MiniBar label="S" usedPct={usage.sessionUsedPct} resets={usage.sessionResets} />
+    </div>
+  );
+}
+
+function MiniBar({
+  label,
+  usedPct,
+  resets,
+}: {
+  label: string;
+  usedPct: number | null;
+  resets: string | null;
+}) {
+  const known = usedPct != null;
+  const used = known ? Math.max(0, Math.min(100, usedPct)) : 0;
+  const left = known ? Math.max(0, Math.round(100 - used)) : null;
+  return (
+    <div
+      className="flex min-w-0 flex-1 items-center gap-1.5"
+      title={
+        left != null
+          ? `${label === "W" ? "Weekly" : "Session"}: ${left}% left${resets ? ` · resets ${resets}` : ""}`
+          : "unknown"
+      }
+    >
+      <span className="shrink-0 text-neutral-400">{label}</span>
+      <div
+        className="h-1 min-w-0 flex-1 overflow-hidden rounded-full"
+        style={{ backgroundColor: "color-mix(in srgb, var(--th-fg-muted) 25%, transparent)" }}
+      >
+        <div
+          className="h-full rounded-full"
+          style={{ width: `${used}%`, backgroundColor: known ? fillColor(left!) : "transparent" }}
+        />
+      </div>
+      <span
+        className="shrink-0 tabular-nums"
+        style={{ color: known ? fillColor(left!) : "var(--th-fg-muted)" }}
+      >
+        {left != null ? `${left}%` : "—"}
+      </span>
+    </div>
+  );
+}
+
 /** Persist the last GOOD usage so the strip never flashes "unavailable" on a
  *  transient failed poll or right after launch — it shows the last-known weekly +
  *  5h until a fresh reading lands. */
@@ -77,7 +129,7 @@ function loadCachedUsage(): ClaudeUsage | null {
   }
 }
 
-export function UsageStrip() {
+export function UsageStrip({ compact = false }: { compact?: boolean }) {
   // Seed from the cached last-good reading so usage is visible immediately on
   // launch and never blanks while a poll is in flight.
   const [usage, setUsage] = useState<ClaudeUsage | null>(loadCachedUsage);
@@ -115,6 +167,7 @@ export function UsageStrip() {
   // Only show the empty hint when we have NEVER had a reading (no cache, first
   // poll not yet good). Once we've had data, it stays put across failed polls.
   if (!usage || !usage.ok) {
+    if (compact) return null; // collapsed view stays empty until a reading lands
     return (
       <div
         className="px-2 py-1 text-[11px] leading-snug"
@@ -125,6 +178,8 @@ export function UsageStrip() {
       </div>
     );
   }
+
+  if (compact) return <CompactUsage usage={usage} />;
 
   return (
     <div className="flex flex-col gap-2 px-2 py-1.5 text-[11px] text-neutral-500">

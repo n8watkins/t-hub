@@ -161,15 +161,7 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
           limits, from the supervision snapshots) then the WSL/host-metrics health
           strip. Both live outside the scroll body so they stay bottom-left
           regardless of how long the lists above grow. */}
-      <div className="shrink-0 border-t" style={{ borderColor: "var(--th-border)" }}>
-        <span
-          className="block px-2 pt-1 text-xs font-semibold uppercase tracking-wide"
-          style={{ color: "var(--th-fg-muted)" }}
-        >
-          Usage
-        </span>
-        <UsageStrip />
-      </div>
+      <UsageSection />
       <BottomStatus metrics={metrics} connection={agent?.connection} />
     </aside>
   );
@@ -233,6 +225,49 @@ function BottomStatus({
           <WslHealth metrics={metrics} connection={connection} />
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * Bottom-pinned Claude USAGE: a collapse chevron + "Usage" label. Expanded shows
+ * the full weekly/session rows; collapsed MINIMIZES to just the two bars + %.
+ * Open/collapsed persists to localStorage.
+ */
+function UsageSection() {
+  const [open, setOpen] = useState<boolean>(() => {
+    if (typeof localStorage === "undefined") return true;
+    return localStorage.getItem("termhub.sidebar.usage.open") !== "0";
+  });
+  const persistOpen = (v: boolean) => {
+    setOpen(v);
+    try {
+      localStorage.setItem("termhub.sidebar.usage.open", v ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  };
+  return (
+    <div className="shrink-0 border-t" style={{ borderColor: "var(--th-border)" }}>
+      <div className="flex items-stretch">
+        <button
+          type="button"
+          onClick={() => persistOpen(!open)}
+          className="flex h-7 w-6 shrink-0 items-center justify-center opacity-70 hover:opacity-100"
+          aria-expanded={open}
+          title={open ? "Collapse" : "Expand"}
+        >
+          <ChevronIcon open={open} />
+        </button>
+        <span
+          className="flex items-center px-1 py-1 text-xs font-semibold uppercase tracking-wide"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          Usage
+        </span>
+      </div>
+      {/* Collapsed = minimized bars + %; expanded = full weekly/session rows. */}
+      <UsageStrip compact={!open} />
     </div>
   );
 }
