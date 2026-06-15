@@ -29,9 +29,16 @@ export function searchFiles(
   return invoke(CommandsFiles.searchFiles, { root, query, limit });
 }
 
-/** Shallow directory listing for the tree (dirs first; no recursion). */
-export function listDir(path: string): Promise<DirEntry[]> {
-  return invoke(CommandsFiles.listDir, { path });
+/**
+ * Shallow directory listing for the tree (dirs first; no recursion).
+ *
+ * `showIgnored` (default false) toggles the backend's directory-only gitignore
+ * rule: false hides ignored DIRECTORIES (`node_modules`, `dist`, …) while always
+ * showing ignored FILES (`.env`, `.env.local`, …); true lists everything except
+ * `.git`. Maps to the `show_ignored` arg of the `list_dir` command.
+ */
+export function listDir(path: string, showIgnored = false): Promise<DirEntry[]> {
+  return invoke(CommandsFiles.listDir, { path, showIgnored });
 }
 
 /** Read a text file for the reader (capped; rejects binary blobs). */
