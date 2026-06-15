@@ -9,8 +9,8 @@ export const site = {
   description:
     "T-Hub is a free, open-source, 100% local session-first terminal IDE for agentic coding — an opinionated cockpit to run and supervise many Claude Code / agent terminal sessions at once. See every session and its files in one tree, click any file, jump to any session. By n8builds.",
   // PLACEHOLDER: repo is private today. Make public (or update link) before publishing.
-  github: "https://github.com/n8watkins/termhub",
-  releases: "https://github.com/n8watkins/termhub/releases",
+  github: "https://github.com/n8watkins/t-hub",
+  releases: "https://github.com/n8watkins/t-hub/releases",
   // PLACEHOLDER: confirm the real Ko-fi handle.
   kofi: "https://ko-fi.com/n8watkins",
   x: "https://x.com/n8watkins",

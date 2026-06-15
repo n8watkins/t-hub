@@ -19,7 +19,7 @@ import { check } from "@tauri-apps/plugin-updater";
 import { getVersion } from "@tauri-apps/api/app";
 
 /** The GitHub releases list — the changelog the user can always reference. */
-export const RELEASES_URL = "https://github.com/n8watkins/termhub/releases";
+export const RELEASES_URL = "https://github.com/n8watkins/t-hub/releases";
 
 export interface UpdateCheckResult {
   /** True when a newer signed release is available at the endpoint. */

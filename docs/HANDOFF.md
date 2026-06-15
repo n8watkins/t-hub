@@ -34,7 +34,7 @@ Claude Code sessions. Target: **Windows 11 + WSL2 (Ubuntu-24.04) + zsh**. Tauri
 rendered once into a persistent overlay pool (`TerminalPool.tsx`) positioned
 over placeholder cells, so moving tiles never reloads a terminal.
 
-- **GitHub:** `github.com/n8watkins/termhub` (private; `gh` authed in WSL as `n8watkins`).
+- **GitHub:** `github.com/n8watkins/t-hub` (private; `gh` authed in WSL as `n8watkins`).
 - **WSL repo (edit + commit here):** `/home/natkins/n8builds/tools` (ext4). `main` is the integration branch.
 - **Windows build mirror (NEVER edit):** `C:\Users\natha\termhub` — the deploy script `git reset --hard`s it to `origin/main`.
 - **Env:** WSL user `natkins`, Windows user `natha`. `/mnt/c` ↔ `C:\`.

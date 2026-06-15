@@ -108,7 +108,7 @@ Two **real** T-Hub screenshots are in place; the third row is an animated mock:
 
 ## Placeholders the human must replace / confirm
 
-1. **GitHub repo** — `https://github.com/n8watkins/termhub` (`lib/site.ts`). Repo
+1. **GitHub repo** — `https://github.com/n8watkins/t-hub` (`lib/site.ts`). Repo
    is **private today** and uses the old `termhub` slug. Make it public (and/or
    rename to a `t-hub` slug). The Download CTA points at `.../termhub/releases` —
    confirm a releases page with downloadable builds exists before launch.
