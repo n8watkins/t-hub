@@ -20,6 +20,13 @@
 // straight to a store's setters, so editing is live.
 import { useEffect, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+// --- feat/auto-updater: in-app "Updates" section -------------------------------
+// check() resolves the signed update package (same call the on-launch mount and
+// the manual Install button use); relaunch() restarts the app after install;
+// detectUpdate() is the tolerant availability probe over latest.json.
+import { check as checkUpdaterPackage } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { detectUpdate, RELEASES_URL, type UpdateCheckResult } from "../lib/updates";
 import {
   useTheme,
   BUILTIN_PRESETS,
@@ -90,6 +97,7 @@ type SectionId =
   | "general"
   | "hotkeys"
   | "hooks"
+  | "updates"
   | "about"
   | "setup"
   | "theme";
@@ -174,6 +182,7 @@ function SectionNav({
         { id: "general", label: "General", hint: "App behavior" },
         { id: "hotkeys", label: "Hotkeys", hint: "Keyboard shortcuts" },
         { id: "hooks", label: "Hooks", hint: "Claude Code lifecycle hooks" },
+        { id: "updates", label: "Updates", hint: "Check for + install app updates" },
         { id: "about", label: "About", hint: "What T-Hub is + version" },
         { id: "setup", label: "Setup", hint: "How to use it" },
       ],
@@ -234,6 +243,8 @@ function SectionContent({ section }: { section: SectionId }) {
       return <HotkeysSection />;
     case "hooks":
       return <HooksSection />;
+    case "updates":
+      return <UpdatesSection />;
     case "about":
       return <AboutSection />;
     case "setup":
@@ -558,6 +569,201 @@ function HooksSection() {
   // HookInstallPanel is self-contained (its own header/description/buttons), so
   // it's rendered directly rather than wrapped in a Group.
   return <HookInstallPanel agentBin="termhub-agent" installed={installed} setInstalled={setInstalled} />;
+}
+
+// ---------------------------------------------------------------------------
+// Updates — in-app auto-updater surface (feat/auto-updater).
+//
+// Mirrors the sibling "scribe" app's About → Updates UI: current version, a
+// status line, Check / Install / View-releases buttons, a "last checked" line,
+// and the two persisted toggles (auto-check + auto-install, the latter disabled
+// when auto-check is off). The actual download/verify/install is the official
+// Tauri updater plugin; relaunch() restarts the app afterward.
+// ---------------------------------------------------------------------------
+
+/** Hand a URL to the OS default browser. Primary path is the shell plugin's
+ *  open() (already a dep + capability); on failure fall back to window.open,
+ *  which WebView2 routes externally for a _blank target. Mirrors WebPreview. */
+async function openReleasesPage(url: string): Promise<void> {
+  try {
+    const { open } = await import("@tauri-apps/plugin-shell");
+    await open(url);
+  } catch {
+    try {
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch {
+      /* nothing more we can do from the frontend */
+    }
+  }
+}
+
+function UpdatesSection() {
+  const autoCheckEnabled = useSettings((s) => s.autoUpdateCheckEnabled);
+  const setAutoCheckEnabled = useSettings((s) => s.setAutoUpdateCheckEnabled);
+  const autoInstallUpdates = useSettings((s) => s.autoInstallUpdates);
+  const setAutoInstallUpdates = useSettings((s) => s.setAutoInstallUpdates);
+
+  const [version, setVersion] = useState<string>(pkg.version);
+  const [checking, setChecking] = useState(false);
+  const [installing, setInstalling] = useState(false);
+  const [result, setResult] = useState<UpdateCheckResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [installStatus, setInstallStatus] = useState<string | null>(null);
+  const [lastChecked, setLastChecked] = useState<number | null>(null);
+
+  // Live runtime version (falls back to the build-time package.json version when
+  // not running inside Tauri).
+  useEffect(() => {
+    let disposed = false;
+    getVersion()
+      .then((v) => {
+        if (!disposed) setVersion(v);
+      })
+      .catch(() => {
+        // Not inside Tauri — keep the package.json fallback.
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const handleCheck = async () => {
+    if (checking) return;
+    setChecking(true);
+    setError(null);
+    setResult(null);
+    try {
+      const r = await detectUpdate();
+      setResult(r);
+      setLastChecked(Date.now());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const handleInstall = async () => {
+    if (installing) return;
+    setInstalling(true);
+    setError(null);
+    setInstallStatus("Contacting the release server...");
+    try {
+      const update = await checkUpdaterPackage();
+      if (!update) {
+        setInstallStatus(null);
+        setError(
+          "The latest release has no signed update package — use View releases to download the installer.",
+        );
+        return;
+      }
+      let downloaded = 0;
+      let total: number | null = null;
+      await update.downloadAndInstall((event) => {
+        switch (event.event) {
+          case "Started":
+            total = event.data.contentLength ?? null;
+            setInstallStatus("Downloading update...");
+            break;
+          case "Progress":
+            downloaded += event.data.chunkLength;
+            setInstallStatus(
+              total
+                ? `Downloading update... ${Math.round((downloaded / total) * 100)}%`
+                : "Downloading update...",
+            );
+            break;
+          case "Finished":
+            setInstallStatus("Installing... the app will restart.");
+            break;
+        }
+      });
+      // On Windows the installer typically restarts the app itself, so execution
+      // rarely gets past downloadAndInstall; relaunch covers the paths where it
+      // does (and other platforms).
+      await relaunch();
+    } catch (cause) {
+      setInstallStatus(null);
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  const status =
+    error ??
+    installStatus ??
+    (result
+      ? result.updateAvailable
+        ? `You're on an old version — v${result.latestVersion} is available.`
+        : "You're on the latest version."
+      : "Check this install against the latest GitHub release.");
+
+  return (
+    <>
+      <Group title="Updates" description="Which build of T-Hub you're running, and how to get the newest one.">
+        <Row label="Version">
+          <span className="font-mono text-xs" style={{ color: "var(--th-fg)" }}>
+            {version}
+          </span>
+        </Row>
+
+        <div className="text-sm" style={{ color: "var(--th-fg-muted)" }}>
+          {status}
+        </div>
+        <div className="text-xs" style={{ color: "var(--th-fg-muted)" }}>
+          {autoCheckEnabled ? "Checks automatically" : "Automatic checks are off"}
+          {lastChecked
+            ? ` · last checked ${new Date(lastChecked).toLocaleTimeString()}`
+            : ""}
+        </div>
+
+        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+          {result?.updateAvailable && (
+            <PrimaryBtn
+              onClick={() => void handleInstall()}
+              disabled={installing}
+              title={`Download and install v${result.latestVersion}, then restart`}
+            >
+              {installing ? "Installing…" : `Install v${result.latestVersion}`}
+            </PrimaryBtn>
+          )}
+          <Btn
+            onClick={() => void handleCheck()}
+            title="Check GitHub Releases for a newer version"
+          >
+            {checking ? "Checking…" : "Check for updates"}
+          </Btn>
+          <Btn
+            onClick={() => void openReleasesPage(RELEASES_URL)}
+            title="Open the GitHub releases page (every version + its notes)"
+          >
+            View releases
+          </Btn>
+        </div>
+      </Group>
+
+      <Group title="Automatic updates">
+        <SettingToggleRow
+          label="Automatically check for updates"
+          hint="Periodically and on launch, look for a newer signed release. Manual 'Check for updates' still works when this is off."
+          value={autoCheckEnabled}
+          onChange={setAutoCheckEnabled}
+        />
+        <SettingToggleRow
+          label="Install updates automatically"
+          hint="When a new version is found on launch, download and install it silently, then restart — no Windows installer popups. Requires automatic checks."
+          value={autoInstallUpdates}
+          onChange={(v) => {
+            // Inert while auto-check is off (the toggle is also visually
+            // disabled below), so the two settings can't contradict.
+            if (autoCheckEnabled) setAutoInstallUpdates(v);
+          }}
+          disabled={!autoCheckEnabled}
+        />
+      </Group>
+    </>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,14 +1521,21 @@ function SettingToggleRow({
   value,
   onChange,
   hint,
+  disabled = false,
 }: {
   label: string;
   value: boolean;
   onChange: (v: boolean) => void;
   hint?: string;
+  /** Dim the row + make the switch inert (e.g. a dependent setting whose parent
+   *  toggle is off). */
+  disabled?: boolean;
 }) {
   return (
-    <div className="flex items-start justify-between gap-3 text-sm">
+    <div
+      className="flex items-start justify-between gap-3 text-sm"
+      style={disabled ? { opacity: 0.5 } : undefined}
+    >
       <span className="flex min-w-0 flex-col">
         <span style={{ color: "var(--th-fg)" }}>{label}</span>
         {hint && (
@@ -1335,7 +1548,12 @@ function SettingToggleRow({
         )}
       </span>
       <span className="mt-0.5 shrink-0">
-        <Switch checked={value} onChange={onChange} label={label} />
+        <Switch
+          checked={value}
+          onChange={onChange}
+          label={label}
+          disabled={disabled}
+        />
       </span>
     </div>
   );
@@ -1407,18 +1625,48 @@ function Btn({
   children,
   onClick,
   title,
+  disabled = false,
 }: {
   children: React.ReactNode;
   onClick: () => void;
   title?: string;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       title={title}
-      className="rounded border px-2.5 py-1.5 text-sm hover:bg-neutral-700/30"
+      disabled={disabled}
+      className="rounded border px-2.5 py-1.5 text-sm hover:bg-neutral-700/30 disabled:cursor-not-allowed disabled:opacity-50"
       style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** An accent-filled call-to-action button (e.g. "Install vX"). Same shape as
+ *  {@link Btn} but tinted with the theme accent to read as the primary action. */
+function PrimaryBtn({
+  children,
+  onClick,
+  title,
+  disabled = false,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  title?: string;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      disabled={disabled}
+      className="rounded px-2.5 py-1.5 text-sm font-medium transition-colors hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+      style={{ backgroundColor: "var(--th-accent)", color: "var(--th-fg)" }}
     >
       {children}
     </button>
@@ -1462,10 +1710,12 @@ function Switch({
   checked,
   onChange,
   label,
+  disabled = false,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   label: string;
+  disabled?: boolean;
 }) {
   return (
     <span
@@ -1477,9 +1727,12 @@ function Switch({
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
         aria-label={label}
-        className="absolute inset-0 m-0 cursor-pointer opacity-0"
+        className={`absolute inset-0 m-0 opacity-0 ${
+          disabled ? "cursor-not-allowed" : "cursor-pointer"
+        }`}
       />
       <span
         className="pointer-events-none absolute h-[13px] w-[13px] rounded-full transition-transform"

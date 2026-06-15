@@ -1,0 +1,103 @@
+name: Release
+
+# Builds + signs the Windows installer on a v* tag (or manual dispatch),
+# generates the updater manifest (latest.json) from the signed NSIS artifact,
+# and uploads everything to the GitHub Release. The in-app auto-updater fetches
+# latest.json from this release's assets (see plugins.updater in
+# apps/desktop/src-tauri/tauri.conf.json).
+#
+# Adapted from the sibling "scribe" app's release.yml to T-Hub's pnpm monorepo:
+# all build steps run in `apps/desktop`, and dependencies are installed with pnpm
+# at the workspace root.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm must be set up BEFORE setup-node's pnpm cache can resolve.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      # Install the whole pnpm workspace from the lockfile (the desktop app is the
+      # only workspace member). Run at the repo root so the workspace resolves.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build installers
+        working-directory: apps/desktop
+        env:
+          # Signs the NSIS updater artifact (createUpdaterArtifacts is on in
+          # tauri.conf.json). These are repo secrets the orchestrator sets after
+          # running `tauri signer generate`; the matching PUBLIC key is the
+          # `plugins.updater.pubkey` in tauri.conf.json (currently REPLACE_ME).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build
+
+      # The in-app updater fetches latest.json from the latest release; it points
+      # at the signed NSIS installer of this release.
+      - name: Generate updater manifest (latest.json)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $nsisDir = "apps/desktop/src-tauri/target/release/bundle/nsis"
+          $setup = Get-ChildItem -Path $nsisDir -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "No NSIS setup exe found" }
+          $sigFile = "$($setup.FullName).sig"
+          if (-not (Test-Path $sigFile)) { throw "No updater signature next to $($setup.Name); is TAURI_SIGNING_PRIVATE_KEY set?" }
+          $tag = "${{ github.ref_name }}"
+          $manifest = [ordered]@{
+            version  = $tag.TrimStart("v")
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = @{
+              "windows-x86_64" = @{
+                signature = (Get-Content $sigFile -Raw).Trim()
+                url = "https://github.com/${{ github.repository }}/releases/download/$tag/$($setup.Name)"
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content "$nsisDir/latest.json" -Encoding utf8
+          Get-Content "$nsisDir/latest.json"
+
+      - name: Attach installers to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+            apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+            apps/desktop/src-tauri/target/release/bundle/nsis/latest.json
+          generate_release_notes: true
+
+      - name: Upload installers as workflow artifacts
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: termhub-installers
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+            apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe.sig

@@ -33,6 +33,11 @@ const DEFAULTS = {
   soundsEnabled: true,
   /** Show desktop (OS) notifications for key session events. */
   notificationsEnabled: true,
+  /** Periodically check GitHub Releases for a newer signed build (feat/auto-updater). */
+  autoUpdateCheckEnabled: true,
+  /** Silently download + install a found update on launch, then relaunch. Only
+   *  acted on when autoUpdateCheckEnabled is also on. */
+  autoInstallUpdates: true,
 } as const;
 
 interface PersistedSettings {
@@ -42,6 +47,8 @@ interface PersistedSettings {
   titlebarRevealAnimMs: number;
   soundsEnabled: boolean;
   notificationsEnabled: boolean;
+  autoUpdateCheckEnabled: boolean;
+  autoInstallUpdates: boolean;
 }
 
 /** Clamp a persisted/incoming number into a range, falling back to a default
@@ -87,6 +94,14 @@ function loadPersisted(): PersistedSettings {
         typeof p.notificationsEnabled === "boolean"
           ? p.notificationsEnabled
           : DEFAULTS.notificationsEnabled,
+      autoUpdateCheckEnabled:
+        typeof p.autoUpdateCheckEnabled === "boolean"
+          ? p.autoUpdateCheckEnabled
+          : DEFAULTS.autoUpdateCheckEnabled,
+      autoInstallUpdates:
+        typeof p.autoInstallUpdates === "boolean"
+          ? p.autoInstallUpdates
+          : DEFAULTS.autoInstallUpdates,
     };
   } catch {
     return { ...DEFAULTS };
@@ -138,6 +153,16 @@ interface SettingsState {
   /** Show desktop notifications for key session events. Respected by notify.ts. */
   notificationsEnabled: boolean;
   setNotificationsEnabled: (v: boolean) => void;
+
+  /** Periodically check for app updates. Respected by lib/updateMount.ts and the
+   *  Updates settings section. */
+  autoUpdateCheckEnabled: boolean;
+  setAutoUpdateCheckEnabled: (v: boolean) => void;
+
+  /** Silently install a found update on launch (only when autoUpdateCheckEnabled
+   *  is on). Respected by lib/updateMount.ts. */
+  autoInstallUpdates: boolean;
+  setAutoInstallUpdates: (v: boolean) => void;
 }
 
 const initial = loadPersisted();
@@ -155,6 +180,8 @@ export const useSettings = create<SettingsState>((set, get) => {
       titlebarRevealAnimMs: s.titlebarRevealAnimMs,
       soundsEnabled: s.soundsEnabled,
       notificationsEnabled: s.notificationsEnabled,
+      autoUpdateCheckEnabled: s.autoUpdateCheckEnabled,
+      autoInstallUpdates: s.autoInstallUpdates,
     });
   };
 
@@ -213,6 +240,18 @@ export const useSettings = create<SettingsState>((set, get) => {
     notificationsEnabled: initial.notificationsEnabled,
     setNotificationsEnabled: (v) => {
       set({ notificationsEnabled: v });
+      persistAll();
+    },
+
+    autoUpdateCheckEnabled: initial.autoUpdateCheckEnabled,
+    setAutoUpdateCheckEnabled: (v) => {
+      set({ autoUpdateCheckEnabled: v });
+      persistAll();
+    },
+
+    autoInstallUpdates: initial.autoInstallUpdates,
+    setAutoInstallUpdates: (v) => {
+      set({ autoInstallUpdates: v });
       persistAll();
     },
   };

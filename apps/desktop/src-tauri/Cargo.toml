@@ -43,6 +43,16 @@ tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
 # button + external links). The JS @tauri-apps/plugin-shell needs this Rust side
 # registered + the `shell:allow-open` capability or its open() is a no-op.
 tauri-plugin-shell = "2"
+# --- Auto-updater (feat/auto-updater) --------------------------------------
+# The official Tauri updater: checks the `latest.json` endpoint (a GitHub
+# Releases asset), downloads + verifies the signed NSIS artifact, and installs
+# it. `process` provides relaunch() so the app can restart itself after an
+# install. Both are cross-platform crates (they compile on Linux/CI; the actual
+# install path is Windows here). Paired with the `updater:default` /
+# `process:default` capabilities and the `plugins.updater` block in
+# tauri.conf.json. Versions match the sibling "scribe" app.
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 portable-pty = "0.8"
