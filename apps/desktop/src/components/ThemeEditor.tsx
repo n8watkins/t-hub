@@ -155,7 +155,7 @@ function ThemeEditorPanel({ onClose }: { onClose: () => void }) {
         <div className="flex min-h-0 flex-1">
           <SectionNav active={section} onSelect={setSection} />
           <div className="th-scroll min-h-0 flex-1 overflow-y-auto px-5 py-4">
-            <SectionContent section={section} />
+            <SectionContent section={section} onNavigate={setSection} />
           </div>
         </div>
       </div>
@@ -234,11 +234,18 @@ function SectionNav({
   );
 }
 
-/** Render the panel for the selected nav section. */
-function SectionContent({ section }: { section: SectionId }) {
+/** Render the panel for the selected nav section. `onNavigate` lets a section
+ *  jump the panel to another section in place (e.g. General → Hooks). */
+function SectionContent({
+  section,
+  onNavigate,
+}: {
+  section: SectionId;
+  onNavigate: (s: SectionId) => void;
+}) {
   switch (section) {
     case "general":
-      return <GeneralSection />;
+      return <GeneralSection onNavigate={onNavigate} />;
     case "hotkeys":
       return <HotkeysSection />;
     case "hooks":
@@ -257,7 +264,7 @@ function SectionContent({ section }: { section: SectionId }) {
 // ---------------------------------------------------------------------------
 // General section — app behavior flags (settings store, not theme tokens).
 // ---------------------------------------------------------------------------
-function GeneralSection() {
+function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) {
   const revealPushesContent = useSettings((s) => s.revealPushesContent);
   const setRevealPushesContent = useSettings((s) => s.setRevealPushesContent);
   const autoHideTitlebarMaximized = useSettings(
@@ -270,10 +277,6 @@ function GeneralSection() {
   const setTitlebarHideDelayMs = useSettings((s) => s.setTitlebarHideDelayMs);
   const titlebarRevealAnimMs = useSettings((s) => s.titlebarRevealAnimMs);
   const setTitlebarRevealAnimMs = useSettings((s) => s.setTitlebarRevealAnimMs);
-  const soundsEnabled = useSettings((s) => s.soundsEnabled);
-  const setSoundsEnabled = useSettings((s) => s.setSoundsEnabled);
-  const notificationsEnabled = useSettings((s) => s.notificationsEnabled);
-  const setNotificationsEnabled = useSettings((s) => s.setNotificationsEnabled);
   const resumeStartsClaude = useSettings((s) => s.resumeStartsClaude);
   const setResumeStartsClaude = useSettings((s) => s.setResumeStartsClaude);
   // Recovery review modal open state (#recovery) — local to this section; the
@@ -291,19 +294,21 @@ function GeneralSection() {
         />
       </Group>
 
-      <Group title="Notifications">
-        <SettingToggleRow
-          label="Notification sounds"
-          hint="Play a short chime on key session events — a soft cue when a session needs your input or finishes, and an alert when one errors out."
-          value={soundsEnabled}
-          onChange={setSoundsEnabled}
-        />
-        <SettingToggleRow
-          label="Desktop notifications"
-          hint="Show an OS notification for the same session events. Requires the notification plugin; falls back to sound-only if it isn't available."
-          value={notificationsEnabled}
-          onChange={setNotificationsEnabled}
-        />
+      {/* The notification sound + desktop-notification toggles moved into
+          Hooks → "Attention & notifications", next to the events that trigger
+          them. Leave a pointer here so they're still discoverable from General. */}
+      <Group
+        title="Notifications"
+        description="Notification sounds and desktop notifications now live with the attention hooks that fire them."
+      >
+        <Row label="Sounds & desktop alerts">
+          <Btn
+            onClick={() => onNavigate("hooks")}
+            title="Open Hooks → Attention & notifications, where the sound and desktop-notification toggles live"
+          >
+            Open in Hooks →
+          </Btn>
+        </Row>
       </Group>
 
       <Group title="Titlebar">
