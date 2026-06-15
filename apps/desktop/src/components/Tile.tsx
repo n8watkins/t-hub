@@ -4,12 +4,13 @@
 // each terminal once in a persistent pool overlay (TerminalPool.tsx) and
 // positions it over this tile's placeholder, so moving/resizing the tile only
 // repositions the pooled terminal — it is never remounted/reattached (no flash).
-// Pressing the header focuses the tile. The header carries TWO lifecycle
-// affordances (feat/lifecycle): the × DETACHES the tile (closeTerminal) while
-// KEEPING the tmux session alive so it can be re-adopted later — the default,
-// non-destructive close. A separate trash control DELETES the session for good
-// (killTerminal), gated behind a themed confirm dialog; shift-clicking the × is
-// a shortcut to that same confirmed delete.
+// Pressing the header focuses the tile. The header's × KILLS this terminal's
+// tmux session (feat/workspaces-lifecycle): durable Claude session history makes
+// the old "detach + keep tmux alive" duality unnecessary, so the single close
+// control now ends the session for good (deleteTerminal -> killTerminal). It is
+// confirmed FIRST only when the session looks BUSY (a running dev server, see the
+// busy note below); an idle session is killed immediately with no dialog. The
+// conversation is still recoverable afterward from the Recent list.
 //
 // Drag-to-move (PRD §5.3 manual mode): the header is a drag HANDLE built on
 // POINTER events (not HTML5 drag-and-drop, which dies over xterm's WebGL canvas
@@ -34,7 +35,6 @@ import { TilePanel } from "./TilePanel";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { useShiftHeld } from "../lib/useShiftHeld";
 
 /** The tile-header tab bar order + labels. Terminal is the default view. */
 const PANEL_TABS: { id: PanelTab; label: string }[] = [
@@ -121,9 +121,12 @@ export function Tile({
   const userLabel = useWorkspace((s) => s.labels[terminalId]);
   const moveTile = useWorkspace((s) => s.moveTile);
   const moveTileToTab = useWorkspace((s) => s.moveTileToTab);
-  // Lifecycle: deleting a terminal KILLS its tmux session for good — gated behind
-  // a themed confirm (the trash control / shift-click on the ×).
-  const deleteTerminal = useWorkspace((s) => s.deleteTerminal);
+  // Lifecycle: the × KILLS this terminal's tmux session for good. The actual kill
+  // is the `onClose` prop, which Canvas wires to deleteTerminal -> killTerminal
+  // (and, for the fullscreen copy, also drops the fullscreen layer). We confirm
+  // first only when the session looks BUSY (see `busy` below); killed immediately
+  // when idle. Kept on `onClose` (not a direct store call) so the grid and
+  // fullscreen close paths both run their full cleanup.
   const setDraggingTile = useWorkspace((s) => s.setDraggingTile);
   const setDropTile = useWorkspace((s) => s.setDropTile);
   const setDropTab = useWorkspace((s) => s.setDropTab);
@@ -135,10 +138,24 @@ export function Tile({
   const showCwd = useTheme((s) => s.active.chrome.showCwd);
   const headerOnHover = useTheme((s) => s.active.chrome.headerOnHover);
   const showTileHeader = useTheme((s) => s.active.chrome.showTileHeader);
-  // Hold Shift -> the close (×) control morphs into a delete (kill-session)
-  // control across every tile, with a destructive look + label. Shared tracker
-  // (one window listener) so a wall of tiles doesn't each bind keydown/keyup.
-  const shiftHeld = useShiftHeld();
+
+  // BUSY detection for the kill (×) confirm gate. A tile is "busy" when there is
+  // a managed dev server running for it — usePanels.devUrl[id] is a non-null URL
+  // (set by the Dev runner, cleared when the server stops). Subscribed so the
+  // gate is always current.
+  //
+  // NOTE (kill confirm scope): the spec also wants an ACTIVE Claude turn
+  // (working / needsQuestion / needsPermission / waitingOnSubagents) to count as
+  // busy. That status lives in the supervision store keyed by CLAUDE SESSION ID,
+  // and the frontend has no reliable terminal-id -> session-id bridge (the only
+  // correlation, in workspace.ts, is a best-effort cwd match driven off the
+  // agent://title EVENT payload, and the stored statuses carry no cwd at all). A
+  // cwd guess here could mis-gate the kill on the wrong tile, so per the task's
+  // documented fallback we treat busy = (dev server running) only and kill idle
+  // sessions without a dialog. When a real terminal<->session mapping lands,
+  // fold the working/waiting statuses into `busy` here.
+  const devUrl = usePanels((s) => s.devUrl[terminalId]);
+  const busy = typeof devUrl === "string" && devUrl.length > 0;
 
   // Per-tile panel state (the Terminal / Files / Preview / Dev workbench). Kept
   // in usePanels — NOT workspace.ts — so this presentational state doesn't
@@ -167,13 +184,20 @@ export function Tile({
   const isSelfDragging = draggingTileId === terminalId;
   const isDropTarget = dropTileId === terminalId && draggingTileId !== terminalId;
 
-  // Whether the "delete session" confirm is up for this tile. The destructive
-  // kill only runs once the user confirms (button / Enter); cancel/Esc/backdrop
-  // dismiss it. Detach (the plain ×) needs no confirm — tmux survives.
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  // Whether the kill confirm is up for this tile. Only shown when the session is
+  // BUSY (a dev server running) — an idle session is killed immediately. Once up,
+  // the kill runs on confirm (button / Enter); cancel/Esc/backdrop dismiss it.
+  const [confirmKill, setConfirmKill] = useState(false);
   // Right-click context menu position (null = closed). Right-clicking the header
-  // opens Close / Delete actions at the pointer.
+  // opens a single "Kill session" action at the pointer.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
+
+  // The ONE close path for this tile's × and the context-menu action: kill the
+  // session, but confirm first if it looks busy. Idle -> kill now; busy -> ask.
+  const requestKill = () => {
+    if (busy) setConfirmKill(true);
+    else onClose();
+  };
 
   // --- Drag source (the header), pointer-based ---
   const onHeaderPointerDown = (e: ReactPointerEvent) => {
@@ -404,76 +428,57 @@ export function Tile({
           )}
         </button>
 
-        {/* ONE lifecycle control that MORPHS with Shift (per the user's model):
-            - default  →  "×"  : CLOSE the terminal (detach; tmux session lives on)
-            - Shift    →  trash: DELETE the terminal from the session (kills tmux),
-                          gated behind a confirm. Holding Shift recolors it to the
-                          error tone + swaps the glyph + tooltip so it's obvious the
-                          next click destroys. The actual action keys off the real
-                          event modifier (e.shiftKey), so it's correct even if the
-                          tracked state lags by a frame. */}
+        {/* ONE lifecycle control: × KILLS this terminal's tmux session. Idle ->
+            kill now; busy (a dev server running) -> confirm first (requestKill).
+            Durable Claude session history means the conversation is still
+            recoverable from Recent afterward, so there's no separate "detach"
+            affordance anymore. */}
         <button
           type="button"
           onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation();
-            if (e.shiftKey) setConfirmDelete(true);
-            else onClose();
+            requestKill();
           }}
           className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
-          style={{ color: shiftHeld ? "var(--th-dot-error)" : "var(--th-fg-muted)" }}
+          style={{ color: "var(--th-fg-muted)" }}
           title={
-            shiftHeld
-              ? "Delete terminal from session (kills tmux — asks first)"
-              : "Close terminal (keeps the session alive; hold Shift to delete)"
+            busy
+              ? "Kill session (looks busy — asks first)"
+              : "Kill session (resume later from Recent)"
           }
-          aria-label={shiftHeld ? "Delete terminal from session" : "Close terminal"}
+          aria-label="Kill session"
         >
-          {shiftHeld ? (
-            // Inline trash glyph; inherits currentColor so it follows the theme.
-            <svg
-              viewBox="0 0 16 16"
-              width="0.9em"
-              height="0.9em"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.3"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden
-            >
-              <path d="M2.5 4h11M6 4V2.5h4V4M5 4l.5 9.5h5L11 4M6.5 6.5v5M9.5 6.5v5" />
-            </svg>
-          ) : (
-            "×"
-          )}
+          ×
         </button>
       </div>
 
-      {/* Destructive confirm for deleting (killing) this terminal's session. */}
+      {/* Kill confirm — shown ONLY when the session looks busy (requestKill).
+          An idle kill skips this entirely. */}
       <ConfirmDialog
-        open={confirmDelete}
-        title="Delete session?"
+        open={confirmKill}
+        title="Kill this session?"
         body={
           <>
-            This permanently kills the tmux session{" "}
+            This session looks busy (Claude is working / a dev server is running).
+            Killing the tmux session{" "}
             <span className="font-mono" style={{ color: "var(--th-fg)" }}>
               {terminalId}
             </span>{" "}
-            and everything running in it. This can't be undone. To just close the
-            tile and keep the session running, use Detach (×) instead.
+            ends everything running in it. You can resume the conversation later
+            from Recent.
           </>
         }
-        confirmLabel="Delete session"
+        confirmLabel="Kill it anyway"
         onConfirm={() => {
-          setConfirmDelete(false);
-          deleteTerminal(terminalId);
+          setConfirmKill(false);
+          onClose();
         }}
-        onCancel={() => setConfirmDelete(false)}
+        onCancel={() => setConfirmKill(false)}
       />
 
-      {/* Right-click context menu: Close (detach, session lives on in the
-          background) or Delete (kill the session, behind the confirm). */}
+      {/* Right-click context menu: a single "Kill session" action that runs the
+          same busy-gated kill the × does (confirm only if busy). */}
       {ctxMenu && (
         <>
           <div
@@ -497,20 +502,12 @@ export function Tile({
             onPointerDown={(e) => e.stopPropagation()}
           >
             <CtxItem
-              label="Close terminal"
-              hint="Detach — keeps the session running in the background"
-              onClick={() => {
-                setCtxMenu(null);
-                onClose();
-              }}
-            />
-            <CtxItem
-              label="Delete session"
-              hint="Kills the tmux session — can't be undone"
+              label="Kill session"
+              hint="Ends the tmux session — resume later from Recent (asks first if busy)"
               danger
               onClick={() => {
                 setCtxMenu(null);
-                setConfirmDelete(true);
+                requestKill();
               }}
             />
           </div>
