@@ -285,6 +285,12 @@ pub fn run() {
             // Streams output on `devserver://<terminal_id>`.
             devserver::start_dev_server,
             devserver::stop_dev_server,
+            // feat/preview: WSL2 preview-reachability helpers. `preview_host`
+            // returns the Windows-reachable host to substitute for a WSL
+            // `localhost`; `probe_tcp` reports whether a host:port accepts a
+            // connection (precise preview errors). See devserver.rs.
+            devserver::preview_host,
+            devserver::probe_tcp,
             // Theming contract (MCP-facing): read/write the active theme + emit
             // theme://changed.
             theme::get_theme,

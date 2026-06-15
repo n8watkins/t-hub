@@ -19,6 +19,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
+import {
+  reachablePreviewUrl,
+  probePreviewReachable,
+} from "../ipc/devserver";
+import { popOutPreview } from "../store/preview";
 
 /**
  * Hand a URL to the OS default browser. Primary path is the Tauri shell
@@ -52,9 +57,12 @@ type LoadState =
   | { status: "idle" }
   | { status: "loading" }
   | { status: "loaded" }
-  // "blocked": the watchdog fired with no load — almost always framing refusal.
+  // "blocked": the watchdog fired with no load. Could be framing refusal OR the
+  // server being unreachable; a TCP probe (below) refines which. `reachable`
+  // is filled in after the probe resolves: false => the server isn't accepting
+  // connections (the WSL2 case), true/undefined => it's up but refused framing.
   // "error": the iframe fired an explicit error (bad URL / connection refused).
-  | { status: "blocked" }
+  | { status: "blocked"; reachable?: boolean }
   | { status: "error" };
 
 export interface WebPreviewProps {
@@ -72,6 +80,13 @@ export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps): React
   // Bumped on every (re)navigation so the iframe remounts and the watchdog
   // effect re-runs even when the same URL is re-submitted (a manual retry).
   const [nav, setNav] = useState(0);
+  // `loadUrl` is the URL the iframe ACTUALLY loads — `url` with any WSL
+  // `localhost`/`127.0.0.1` rewritten to a Windows-reachable host (the core
+  // connection fix). It lags `url` by one async tick (the host lookup); until it
+  // resolves we don't mount the iframe so we never flash a load against the
+  // unreachable loopback. On unix / no backend the rewrite is a no-op and this
+  // just equals `url`. See ipc/devserver.ts `reachablePreviewUrl`.
+  const [loadUrl, setLoadUrl] = useState<string>("");
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
   // Normalize a typed address into a loadable URL: bare hosts/ports get an
@@ -115,21 +130,83 @@ export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps): React
     // reload when we're already on the incoming URL.
   }, [initialUrl, navigate, url]);
 
+  // Resolve the reachable load URL whenever the committed `url` (or a manual
+  // retry via `nav`) changes. On Windows this swaps a WSL `localhost` for the
+  // WSL interface IP so the Windows-side iframe can reach the dev server; on unix
+  // / plain-browser it's a no-op. We mount the iframe only AFTER this resolves
+  // (loadUrl set), so the first load already targets the reachable host.
+  useEffect(() => {
+    let cancelled = false;
+    if (!url) {
+      setLoadUrl("");
+      return;
+    }
+    void reachablePreviewUrl(url).then((resolved) => {
+      if (cancelled) return;
+      setLoadUrl(resolved);
+      // Ensure the watchdog can arm for the FIRST load too: on mount `url` is
+      // seeded directly (not via navigate, which sets "loading"), so without
+      // this a silent initial failure (the WSL case) would sit in "idle" and
+      // never surface a notice. Move to "loading" unless the iframe already
+      // reported a terminal state for this nav.
+      setLoad((cur) => (cur.status === "idle" ? { status: "loading" } : cur));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [url, nav]);
+
   // Watchdog: when a navigation starts, assume framing was refused if no `load`
   // event lands within the window. The iframe's onLoad clears this by moving us
   // to "loaded" (which cancels the timer on the next effect run).
   useEffect(() => {
     if (load.status !== "loading") return;
     const handle = window.setTimeout(() => {
-      setLoad((cur) => (cur.status === "loading" ? { status: "blocked" } : cur));
+      setLoad((cur) =>
+        cur.status === "loading" ? { status: "blocked" } : cur,
+      );
     }, LOAD_WATCHDOG_MS);
     return () => window.clearTimeout(handle);
   }, [load.status, nav]);
 
+  // When we land in "blocked" (the watchdog fired with no load), TCP-probe the
+  // target to tell the two causes apart: a refused/timed-out connection means the
+  // server isn't up / isn't reachable (the WSL2 localhost case) — a precise,
+  // actionable message — whereas a successful connect means it's up but refused
+  // framing. We probe `loadUrl` (the address the iframe used) and stash the
+  // result on the load state so the notice can specialize. Best-effort: if we
+  // can't probe (no backend) we leave `reachable` undefined (generic notice).
+  useEffect(() => {
+    if (load.status !== "blocked" || load.reachable !== undefined) return;
+    if (!loadUrl) return;
+    let cancelled = false;
+    void probePreviewReachable(loadUrl).then((ok) => {
+      if (cancelled || ok === null) return;
+      setLoad((cur) =>
+        cur.status === "blocked" ? { status: "blocked", reachable: ok } : cur,
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [load, loadUrl]);
+
   const openInBrowser = useCallback(() => {
-    if (url) void openExternal(url);
+    // The external browser is ALSO a Windows process, so it hits the same
+    // unreachable WSL loopback — hand it the reachable URL, not the raw one.
+    if (!url) return;
+    void reachablePreviewUrl(url).then((u) => openExternal(u || url));
   }, [url]);
   // (openExternal is async with its own internal fallback; we fire-and-forget.)
+
+  // Pop the current preview out into its own OS window (TASK 3). The window is a
+  // top-level load of the (reachable) dev URL — no iframe, so framing CSPs don't
+  // apply — and each call opens a NEW window, so multiple previews can coexist
+  // (TASK 2). We resolve the reachable URL first for the same WSL reason.
+  const popOut = useCallback(() => {
+    if (!url) return;
+    void reachablePreviewUrl(url).then((u) => popOutPreview(u || url));
+  }, [url]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -179,6 +256,20 @@ export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps): React
         </button>
         <button
           type="button"
+          onClick={popOut}
+          className="shrink-0 px-3 py-1.5 text-sm"
+          style={{
+            borderRadius: "var(--th-radius)",
+            border: "1px solid var(--th-border)",
+            background: "transparent",
+            color: "var(--th-fg-muted)",
+          }}
+          title="Open this preview in its own window"
+        >
+          Pop out
+        </button>
+        <button
+          type="button"
           onClick={openInBrowser}
           className="shrink-0 px-3 py-1.5 text-sm"
           style={{
@@ -197,13 +288,14 @@ export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps): React
           iframe stays mounted under a blocked/error notice so a successful late
           load can still clear it; the notice just covers it until then. */}
       <div className="relative min-h-0 flex-1" style={{ background: "#fff" }}>
-        {url ? (
+        {url && loadUrl ? (
           <iframe
             // Remount on each navigation so a refused load doesn't leave a stale
-            // frame and the watchdog effect re-arms cleanly.
+            // frame and the watchdog effect re-arms cleanly. `loadUrl` is the
+            // reachable (host-rewritten) address; see the resolve effect above.
             key={nav}
             ref={iframeRef}
-            src={url}
+            src={loadUrl}
             title="Web preview"
             className="h-full w-full border-0"
             // Permissive enough for typical dev servers (scripts, same-origin,
@@ -223,8 +315,16 @@ export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps): React
 
         {(load.status === "blocked" || load.status === "error") && (
           <FramingNotice
-            kind={load.status}
+            // A blocked load whose TCP probe came back unreachable is the
+            // "server isn't up / not reachable" case (incl. the WSL2 one), not a
+            // framing refusal — show that precise message instead.
+            kind={
+              load.status === "blocked" && load.reachable === false
+                ? "unreachable"
+                : load.status
+            }
             url={url}
+            loadUrl={loadUrl}
             onOpenExternal={openInBrowser}
             onRetry={() => navigate(url)}
           />
@@ -235,37 +335,56 @@ export function WebPreview({ initialUrl = DEFAULT_URL }: WebPreviewProps): React
 }
 
 /**
- * The friendly fallback shown when a page won't frame (blocked by
- * X-Frame-Options/CSP) or failed to load. Offers the external-browser open and a
- * retry. Themed to sit over the (white) iframe surface.
+ * The friendly fallback shown when a preview can't load. Three cases:
+ *   - "unreachable": the TCP probe confirmed nothing is accepting connections at
+ *     the address (server not started, wrong port, or — the WSL2 case — a server
+ *     bound to a loopback the Windows WebView can't reach). The most actionable.
+ *   - "blocked": the watchdog fired but the server IS up → it refused framing
+ *     (X-Frame-Options / CSP), as many production sites do.
+ *   - "error": the iframe fired an explicit error (bad URL).
+ * Offers the external-browser open and a retry. Themed over the (white) iframe.
  */
 function FramingNotice({
   kind,
   url,
+  loadUrl,
   onOpenExternal,
   onRetry,
 }: {
-  kind: "blocked" | "error";
+  kind: "blocked" | "error" | "unreachable";
   url: string;
+  /** The reachable address actually loaded (may differ from `url` on Windows). */
+  loadUrl: string;
   onOpenExternal: () => void;
   onRetry: () => void;
 }) {
-  const blocked = kind === "blocked";
+  // Whether the iframe loaded a rewritten host (Windows/WSL); surfaced in the
+  // unreachable case so the user can see we already tried the reachable address.
+  const rewritten = !!loadUrl && loadUrl !== url;
+  const title =
+    kind === "unreachable"
+      ? "Couldn’t reach this server"
+      : kind === "blocked"
+        ? "This page can’t be previewed here"
+        : "Couldn’t load this page";
   return (
     <div
       className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-8 text-center"
       style={{ background: "var(--th-sidebar-bg)", color: "var(--th-fg)" }}
     >
-      <div className="text-sm font-semibold">
-        {blocked
-          ? "This page can’t be previewed here"
-          : "Couldn’t load this page"}
-      </div>
+      <div className="text-sm font-semibold">{title}</div>
       <div
         className="max-w-md text-xs leading-relaxed"
         style={{ color: "var(--th-fg-muted)" }}
       >
-        {blocked ? (
+        {kind === "unreachable" ? (
+          <>
+            Nothing is accepting connections at this address. Make sure the dev
+            server is running on this port. If it’s running inside WSL, bind it to{" "}
+            <code>0.0.0.0</code> (not <code>127.0.0.1</code>) so the preview can
+            reach it — e.g. Vite needs <code>--host</code>.
+          </>
+        ) : kind === "blocked" ? (
           <>
             The site refused to be embedded (it sets{" "}
             <code>X-Frame-Options</code> or a framing <code>CSP</code>). Many
@@ -282,9 +401,9 @@ function FramingNotice({
       <div
         className="max-w-md truncate text-[11px]"
         style={{ color: "var(--th-fg-muted)" }}
-        title={url}
+        title={rewritten ? `${url}  →  ${loadUrl}` : url}
       >
-        {url}
+        {rewritten ? loadUrl : url}
       </div>
       <div className="flex items-center gap-2 pt-1">
         <button

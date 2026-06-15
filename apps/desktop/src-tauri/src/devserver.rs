@@ -154,6 +154,31 @@ fn unc_to_posix(path: &str) -> Option<String> {
     None
 }
 
+/// Wrap the user's dev command so the server binds to ALL interfaces
+/// (`0.0.0.0`) rather than only the WSL loopback (`127.0.0.1`).
+///
+/// WHY (the core WSL2 preview bug): the dev server runs INSIDE WSL, but the
+/// preview (a Windows WebView2 iframe) is a Windows process. With
+/// `networkingMode=mirrored` — and, differently, with NAT's localhost relay —
+/// a server bound to `127.0.0.1` listens only on WSL's loopback, which is a
+/// SEPARATE loopback from Windows'. The Windows-side iframe then can't reach
+/// `localhost:<port>` ("refuses to connect even on a host that exists"). A
+/// server bound to `0.0.0.0` also listens on the shared/mirrored interface, so
+/// the Windows iframe (pointed at the WSL interface IP, see [`preview_host`])
+/// can reach it.
+///
+/// We do this WITHOUT mangling the command string: we `export` the bind-host env
+/// vars the common frameworks read BEFORE running the user's command, so e.g.
+/// `pnpm dev` runs verbatim afterwards. `HOST` is honoured by CRA, Next, Nuxt,
+/// Remix, Astro, Gatsby and many custom servers; the framework-specific aliases
+/// cover the rest. A tool that ignores all of them (notably Vite, which binds to
+/// `127.0.0.1` unless `--host`/`server.host` is set) still works: the iframe URL
+/// is rewritten to a reachable host (see [`preview_host`] + the frontend), which
+/// is the safety net. Setting these vars is harmless where ignored.
+fn host_binding_prefix() -> &'static str {
+    "export HOST=0.0.0.0 HOSTNAME=0.0.0.0 NUXT_HOST=0.0.0.0 ASTRO_HOST=0.0.0.0; "
+}
+
 /// Build the OS command that runs `command` inside `cwd`, with stdout+stderr piped
 /// so we can drain them line-by-line.
 ///
@@ -163,7 +188,11 @@ fn unc_to_posix(path: &str) -> Option<String> {
 /// '<command>'` with the cwd set on the `Command` directly. The login shell
 /// (`-lc`) ensures the user's PATH (nvm/volta/etc.) is loaded so `npm`/`pnpm`
 /// resolve, matching how the rest of TermHub shells in.
+///
+/// Both platforms prepend [`host_binding_prefix`] so the server binds to all
+/// interfaces (reachable from the Windows-side preview iframe — see that fn).
 fn build_command(cwd: &str, command: &str) -> Command {
+    let command = format!("{}{command}", host_binding_prefix());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -175,7 +204,7 @@ fn build_command(cwd: &str, command: &str) -> Command {
         if !posix_cwd.is_empty() {
             c.arg("--cd").arg(&posix_cwd);
         }
-        c.arg("--").arg("bash").arg("-lc").arg(command);
+        c.arg("--").arg("bash").arg("-lc").arg(&command);
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (see tmux.rs / files.rs)
         c.stdout(Stdio::piped());
         c.stderr(Stdio::piped());
@@ -185,7 +214,7 @@ fn build_command(cwd: &str, command: &str) -> Command {
     #[cfg(not(windows))]
     {
         let mut c = Command::new("sh");
-        c.arg("-lc").arg(command);
+        c.arg("-lc").arg(&command);
         if !cwd.is_empty() {
             c.current_dir(cwd);
         }
@@ -356,6 +385,111 @@ pub async fn stop_dev_server(terminal_id: String) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Preview reachability (the WSL2 localhost fix, host-resolution half).
+//
+// A dev server runs INSIDE WSL; the preview iframe is a WINDOWS process. The
+// frontend asks the backend, once, for the host it should substitute for a
+// detected/typed `localhost`/`127.0.0.1` URL so the iframe actually reaches the
+// server. On unix (the WSL dev build, and Linux/macOS native) `localhost` is
+// already correct, so we return None and the frontend leaves the URL alone.
+// On Windows we return the WSL distro's interface IP (its `eth0` address as
+// seen on the shared/mirrored network), which IS reachable from Windows for a
+// server bound to `0.0.0.0` (see `host_binding_prefix`).
+// ---------------------------------------------------------------------------
+
+/// The WSL distro's primary IPv4 address as seen from the Windows host (the
+/// shared interface in mirrored mode; the NAT'd `eth0` otherwise). Queried via
+/// `wsl.exe -- hostname -I` and trimmed to the first address. `None` if the
+/// lookup fails (the frontend then keeps `localhost`, which is still correct in
+/// mirrored mode for a `0.0.0.0`-bound server).
+#[cfg(windows)]
+fn wsl_host_ip() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let mut c = Command::new("wsl.exe");
+    c.arg("-d")
+        .arg(host_distro())
+        .arg("--")
+        .arg("bash")
+        .arg("-lc")
+        // `hostname -I` lists this host's addresses (space-separated); the first
+        // is the primary interface. `ip route get 1` would also work but this is
+        // simpler and matches how the rest of TermHub probes WSL.
+        .arg("hostname -I");
+    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let out = c.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let first = text.split_whitespace().next()?.trim();
+    // Sanity: looks like a dotted IPv4 and isn't loopback (which wouldn't help).
+    if first.is_empty() || first.starts_with("127.") || !first.contains('.') {
+        return None;
+    }
+    Some(first.to_string())
+}
+
+/// Return the host the preview iframe should use in place of `localhost` /
+/// `127.0.0.1` to reach a WSL-bound dev server, or `None` when no rewrite is
+/// needed (unix builds, where the WebView and the server share a loopback).
+///
+/// On Windows this is the WSL interface IP. Cached for the process lifetime —
+/// the address is stable for a WSL session and the lookup spawns `wsl.exe`.
+#[tauri::command]
+pub async fn preview_host() -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        use std::sync::OnceLock;
+        static CACHE: OnceLock<Option<String>> = OnceLock::new();
+        Ok(CACHE.get_or_init(wsl_host_ip).clone())
+    }
+    #[cfg(not(windows))]
+    {
+        // Linux/macOS (incl. the WSL dev build): the dev server and the WebView
+        // are on the same loopback; `localhost` already reaches it.
+        Ok(None)
+    }
+}
+
+/// Core of [`probe_tcp`]: does `host:port` accept a TCP connection within
+/// `timeout_ms`? Split out (sync) so the command is a thin wrapper and the unit
+/// test can exercise it without an async runtime.
+fn tcp_reachable(host: &str, port: u16, timeout_ms: u64) -> Result<bool, String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("empty host".to_string());
+    }
+    // Resolve the host:port to socket addresses (handles "localhost", IPv4, and
+    // IPv6); try each until one connects within the budget.
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("could not resolve {host}:{port}: {e}"))?;
+    let budget = Duration::from_millis(timeout_ms.clamp(50, 10_000));
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, budget).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Probe whether `host:port` accepts a TCP connection within `timeout_ms`,
+/// from the SAME process/host as the WebView (so the result reflects what the
+/// preview iframe would see). Lets the frontend tell "connection refused / not
+/// up" apart from "up but refused framing", and surface a precise message
+/// instead of the silent watchdog "blocked".
+///
+/// Returns `Ok(true)` if the TCP handshake succeeds, `Ok(false)` if it is
+/// refused or times out. A malformed `host`/`port` is an `Err`.
+#[tauri::command]
+pub async fn probe_tcp(host: String, port: u16, timeout_ms: u64) -> Result<bool, String> {
+    tcp_reachable(&host, port, timeout_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,7 +521,8 @@ mod tests {
 
     /// On unix the command runner builds a `sh -lc` invocation; spawning a quick
     /// `echo` and stopping it should round-trip through the registry without
-    /// error. (Requires a real `sh`, present in the WSL dev shell.)
+    /// error. (Requires a real `sh`, present in the WSL dev shell.) The host-
+    /// binding prefix must not break a plain command.
     #[cfg(not(windows))]
     #[test]
     fn build_command_runs_sh_on_unix() {
@@ -396,5 +531,37 @@ mod tests {
         assert!(out.status.success());
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains("termhub-devserver-test"), "got: {text:?}");
+    }
+
+    /// The host-binding prefix exports HOST=0.0.0.0 (the WSL2 preview fix) and is
+    /// a syntactically complete statement that leaves the user's command intact —
+    /// running it as `sh -lc` and echoing $HOST must see the override.
+    #[cfg(not(windows))]
+    #[test]
+    fn host_binding_prefix_sets_host_for_the_command() {
+        let mut cmd = build_command("/tmp", "printf '%s' \"$HOST\"");
+        let out = cmd.output().expect("sh -lc should run");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(text.trim(), "0.0.0.0", "HOST should be forced to all-ifaces");
+    }
+
+    /// The TCP probe should connect to a port we open and report it refused once
+    /// closed. Uses an ephemeral listener so the test is hermetic.
+    #[test]
+    fn tcp_reachable_detects_open_then_closed() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let port = listener.local_addr().unwrap().port();
+        // Open: a listener is accepting, so the handshake succeeds.
+        assert!(
+            tcp_reachable("127.0.0.1", port, 500).unwrap(),
+            "expected the open port to accept a connection"
+        );
+        // Closed: drop the listener, then a fresh probe must be refused.
+        drop(listener);
+        assert!(
+            !tcp_reachable("127.0.0.1", port, 500).unwrap(),
+            "expected the closed port to refuse"
+        );
     }
 }
