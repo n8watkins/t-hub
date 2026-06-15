@@ -86,6 +86,18 @@ export function FilePanel({
   const [reader, setReader] = useState<ReaderState>({ status: "empty" });
   const [activePath, setActivePath] = useState<string | null>(null);
 
+  // --- Reload + collapsible search state ---------------------------------
+  // `reloadKey` is bumped by the header's Reload control; it's threaded into the
+  // tree's React `key` so the WHOLE tree remounts and re-lists every open dir
+  // from scratch (answers the user's "should I reload it?" — yes, here's the
+  // button). `searchOpen` keeps the fuzzy-search box SECONDARY: collapsed by
+  // default so browsing is the primary, bulletproof path and the search box can
+  // never sit between the user and the tree. Search is index-only/lazy, so the
+  // tree never depends on it either way. (`reload`/`closeSearch` are defined
+  // below, after `refreshGit`, to avoid a TDZ on it.)
+  const [reloadKey, setReloadKey] = useState(0);
+  const [searchOpen, setSearchOpen] = useState(false);
+
   // --- Git awareness (feat/git-panel): branch/worktree + commit. ----------
   // `git` is the latest GitInfo for the panel's root; `null` until first load /
   // when there's no root. `refreshGit` re-queries (root change + post-commit so
@@ -111,6 +123,20 @@ export function FilePanel({
     refreshGit();
   }, [refreshGit, readerOnly]);
 
+  // Reload the tree: remount it (re-list every open dir), drop the stale search
+  // index, and refresh git. Defined here so the `refreshGit` dep is initialized.
+  const reload = useCallback(() => {
+    tlog("files", `reload requested root=${root ?? "(none)"}`);
+    setIndexState({ status: "idle" });
+    setReloadKey((k) => k + 1);
+    refreshGit();
+  }, [root, refreshGit]);
+  // Closing the search box clears the query so we fall back to the tree cleanly.
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setQuery("");
+  }, []);
+
   // --- Reset navigation when the root changes. ---------------------------
   // NOTE: we deliberately do NOT index the whole project on mount anymore. The
   // file TREE is lazy (shallow `listDir` per folder, ~0.1s each), so browsing is
@@ -126,6 +152,7 @@ export function FilePanel({
     setIndexState({ status: "idle" });
     setHits([]);
     setQuery("");
+    setSearchOpen(false);
     setReader({ status: "empty" });
     setActivePath(null);
   }, [root, readerOnly, compact]);
@@ -246,7 +273,15 @@ export function FilePanel({
 
   // Compact (narrow split): STACK tree/reader instead of side-by-side. Show the
   // reader full-width when a file is open (with a back-to-files control), else the
-  // search box + tree full-width. Fits a half-tile where the 288px rail can't.
+  // tree full-width with a SECONDARY, collapsible search. Fits a half-tile where
+  // the 288px rail can't.
+  //
+  // Height chain (the prime "blank tree" suspect — a broken chain renders the
+  // tree at 0px): PanelShell is `h-full min-h-0 flex-col`; this branch's content
+  // wrapper is `min-h-0 flex-1 flex-col`; the header/search rows are `shrink-0`
+  // (they must NOT eat the tree's space or be squeezed to nothing); the tree's
+  // own viewport is `min-h-0 flex-1 overflow-y-auto`. Every flex parent has
+  // `min-h-0` so a tall tree scrolls instead of collapsing the column.
   if (compact) {
     const fileOpen = reader.status !== "empty";
     return (
@@ -256,6 +291,7 @@ export function FilePanel({
           indexState={indexState}
           git={git}
           onCommitted={refreshGit}
+          onReload={reload}
         />
         {fileOpen ? (
           <div className="flex min-h-0 flex-1 flex-col">
@@ -282,25 +318,19 @@ export function FilePanel({
           </div>
         ) : (
           <div className="flex min-h-0 flex-1 flex-col">
-            <div className="border-b p-2" style={{ borderColor: "var(--th-border)" }}>
-              <input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search files…"
-                spellCheck={false}
-                autoCorrect="off"
-                autoCapitalize="off"
-                className="w-full px-2.5 py-1.5 text-sm focus:outline-none"
-                style={{
-                  borderRadius: "var(--th-radius)",
-                  border: "1px solid var(--th-border)",
-                  background: "var(--th-tile-bg)",
-                  color: "var(--th-fg)",
-                }}
-              />
-            </div>
+            {/* SECONDARY search: a slim toggle row (browsing is primary). When
+                opened it reveals the input; it never sits between the user and
+                the tree by default, and the tree (below) renders regardless. */}
+            <SearchBar
+              open={searchOpen}
+              query={query}
+              onQuery={setQuery}
+              onOpen={() => setSearchOpen(true)}
+              onClose={closeSearch}
+              compact
+            />
             <div className="th-scroll min-h-0 flex-1 overflow-y-auto">
-              {query.trim() ? (
+              {searchOpen && query.trim() ? (
                 <SearchResults
                   hits={hits}
                   searching={searching}
@@ -309,7 +339,12 @@ export function FilePanel({
                   onOpen={openFile}
                 />
               ) : (
-                <FileTree root={root} activePath={activePath} onOpenFile={openFile} />
+                <FileTree
+                  key={reloadKey}
+                  root={root}
+                  activePath={activePath}
+                  onOpenFile={openFile}
+                />
               )}
             </div>
           </div>
@@ -320,42 +355,31 @@ export function FilePanel({
 
   return (
     <PanelShell className={className}>
-      {/* Header: root + index status + git branch/worktree + commit. */}
+      {/* Header: root + index status + reload + git branch/worktree + commit. */}
       <Header
         root={root}
         indexState={indexState}
         git={git}
         onCommitted={refreshGit}
+        onReload={reload}
       />
 
       <div className="flex min-h-0 flex-1">
-        {/* Left rail: search + results, or the tree when no query. */}
+        {/* Left rail: the tree (primary), with a secondary collapsible search
+            above it. There's room here, so the bar shows its input inline. */}
         <div
           className="flex w-72 shrink-0 flex-col border-r"
           style={{ borderColor: "var(--th-border)" }}
         >
-          <div
-            className="border-b p-2"
-            style={{ borderColor: "var(--th-border)" }}
-          >
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Fuzzy search files…"
-              spellCheck={false}
-              autoCorrect="off"
-              autoCapitalize="off"
-              className="w-full px-2.5 py-1.5 text-sm focus:outline-none"
-              style={{
-                borderRadius: "var(--th-radius)",
-                border: "1px solid var(--th-border)",
-                background: "var(--th-tile-bg)",
-                color: "var(--th-fg)",
-              }}
-            />
-          </div>
+          <SearchBar
+            open={searchOpen}
+            query={query}
+            onQuery={setQuery}
+            onOpen={() => setSearchOpen(true)}
+            onClose={closeSearch}
+          />
           <div className="th-scroll min-h-0 flex-1 overflow-y-auto">
-            {query.trim() ? (
+            {searchOpen && query.trim() ? (
               <SearchResults
                 hits={hits}
                 searching={searching}
@@ -365,6 +389,7 @@ export function FilePanel({
               />
             ) : (
               <FileTree
+                key={reloadKey}
                 root={indexState.status === "ready" ? indexState.root : root}
                 activePath={activePath}
                 onOpenFile={openFile}
@@ -412,6 +437,7 @@ function Header({
   indexState,
   git,
   onCommitted,
+  onReload,
 }: {
   root: string;
   indexState:
@@ -423,6 +449,8 @@ function Header({
   git: GitInfo | null;
   /** Called after a successful commit so the host can refresh git info. */
   onCommitted: () => void;
+  /** Re-list the tree (remount it) + refresh git. Wired to the Reload control. */
+  onReload: () => void;
 }) {
   const label = basename(root) || root;
   return (
@@ -444,7 +472,7 @@ function Header({
             {root}
           </div>
         </div>
-        <div className="shrink-0 text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
+        <div className="flex shrink-0 items-center gap-2 text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
           {indexState.status === "indexing" && (
             <span style={{ color: "var(--th-dot-starting)" }}>indexing…</span>
           )}
@@ -456,6 +484,18 @@ function Header({
               index error
             </span>
           )}
+          {/* Reload: re-list the whole tree (re-fetch list_dir for open dirs)
+              and refresh git. The answer to "should I reload it?" — one click. */}
+          <button
+            type="button"
+            onClick={onReload}
+            className="shrink-0 rounded border px-1.5 py-0.5 leading-none transition-colors hover:bg-neutral-700/30"
+            style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+            title="Reload the file tree"
+            aria-label="Reload files"
+          >
+            ↻ Reload
+          </button>
         </div>
       </div>
       {/* feat/git-panel: branch/worktree row + inline commit form. Renders only
@@ -647,6 +687,94 @@ function GitBar({
   );
 }
 
+// --- Search bar (secondary, collapsible) -----------------------------------
+
+/**
+ * The fuzzy-search affordance, deliberately SECONDARY to browsing. Collapsed it
+ * is a slim "Search files…" button; opening it reveals the input (auto-focused)
+ * with a × to close. Browsing the tree is the primary path and never depends on
+ * this — search is a lazy, index-only overlay — so a confused user can always
+ * just close it and keep clicking folders. The closed row is `shrink-0` so it
+ * never steals height from the tree below it.
+ */
+function SearchBar({
+  open,
+  query,
+  onQuery,
+  onOpen,
+  onClose,
+  compact,
+}: {
+  open: boolean;
+  query: string;
+  onQuery: (q: string) => void;
+  onOpen: () => void;
+  onClose: () => void;
+  /** Tighter copy/padding for the narrow stacked layout. */
+  compact?: boolean;
+}) {
+  if (!open) {
+    return (
+      <div className="shrink-0 border-b p-2" style={{ borderColor: "var(--th-border)" }}>
+        <button
+          type="button"
+          onClick={onOpen}
+          className="flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-sm transition-colors hover:bg-neutral-700/20"
+          style={{
+            borderRadius: "var(--th-radius)",
+            border: "1px solid var(--th-border)",
+            background: "transparent",
+            color: "var(--th-fg-muted)",
+          }}
+          title="Fuzzy-search files (browsing the tree works without this)"
+        >
+          <span aria-hidden>⌕</span>
+          <span>Search files…</span>
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="shrink-0 border-b p-2" style={{ borderColor: "var(--th-border)" }}>
+      <div className="flex items-center gap-1.5">
+        <input
+          value={query}
+          onChange={(e) => onQuery(e.target.value)}
+          placeholder={compact ? "Search files…" : "Fuzzy search files…"}
+          spellCheck={false}
+          autoCorrect="off"
+          autoCapitalize="off"
+          autoFocus
+          className="min-w-0 flex-1 px-2.5 py-1.5 text-sm focus:outline-none"
+          style={{
+            borderRadius: "var(--th-radius)",
+            border: "1px solid var(--th-border)",
+            background: "var(--th-tile-bg)",
+            color: "var(--th-fg)",
+          }}
+          onKeyDown={(e) => {
+            // Escape closes search and drops back to the tree.
+            if (e.key === "Escape") {
+              e.preventDefault();
+              onClose();
+            }
+          }}
+        />
+        <button
+          type="button"
+          onClick={onClose}
+          className="shrink-0 rounded px-1.5 py-1 leading-none transition-colors hover:bg-neutral-700/30"
+          style={{ color: "var(--th-fg-muted)" }}
+          title="Close search (back to browsing)"
+          aria-label="Close search"
+        >
+          ×
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // --- Search results --------------------------------------------------------
 
 function SearchResults({
@@ -727,13 +855,40 @@ function FileTree({
   activePath: string | null;
   onOpenFile: (absPath: string) => void;
 }) {
+  // DIAG: the "blank tree" reports hinge on whether this container actually has
+  // pixels — a collapsed flex/min-h-0 chain renders the tree at 0 height and it
+  // reads as "files not loading". Measure our own rendered box (and the parent's,
+  // which is the scroll viewport) once mounted + on root change so the
+  // orchestrator can confirm from the diag file that the tree got real height.
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    // Defer one frame so layout has settled before we read offsetHeight.
+    const id = requestAnimationFrame(() => {
+      const parent = el.parentElement;
+      tlog(
+        "files",
+        `FileTree mounted root=${root} treeH=${el.offsetHeight} viewportH=${parent?.offsetHeight ?? "?"}`,
+      );
+    });
+    return () => cancelAnimationFrame(id);
+  }, [root]);
+
   return (
-    <div className="py-1">
+    <div ref={wrapRef} className="py-1">
       <TreeDir
+        // Key on the root so changing the project (new terminal/worktree) fully
+        // remounts the tree — otherwise the same TreeDir instance keeps the old
+        // root's cached `entries` and never re-lists (stale-tree bug).
+        key={root}
         path={root}
         name={basename(root) || root}
         depth={0}
         defaultOpen
+        // The root participates in single-child collapse-through so a project
+        // whose root holds exactly one folder shows its files immediately.
+        autoExpandSingle
         activePath={activePath}
         onOpenFile={onOpenFile}
       />
@@ -746,6 +901,7 @@ function TreeDir({
   name,
   depth,
   defaultOpen,
+  autoExpandSingle,
   activePath,
   onOpenFile,
 }: {
@@ -753,6 +909,14 @@ function TreeDir({
   name: string;
   depth: number;
   defaultOpen?: boolean;
+  /**
+   * When true and this dir's ONLY child is itself a single directory, auto-open
+   * that child so a "root with one folder" (e.g. site-forge -> source-engine)
+   * doesn't read as empty/confusing — we collapse-through single-child chains so
+   * the user lands on real files immediately. Propagated to each auto-opened
+   * child so the whole chain unfolds. The user can still collapse any level.
+   */
+  autoExpandSingle?: boolean;
   activePath: string | null;
   onOpenFile: (absPath: string) => void;
 }) {
@@ -784,6 +948,14 @@ function TreeDir({
       cancelled = true;
     };
   }, [open, path, entries, loading]);
+
+  // Collapse-through single-child chains: when this dir is open, loaded, and its
+  // sole entry is a directory, auto-open it. The child renders with the same
+  // `autoExpandSingle` flag, so a deep single-folder chain (foo/bar/baz/...)
+  // unfolds in one pass and the reader-side tree shows real files at once. Only
+  // fires while the user hasn't manually touched this node.
+  const onlyChildDir =
+    entries && entries.length === 1 && entries[0].isDir ? entries[0] : null;
 
   const indent = { paddingLeft: `${depth * 12 + 8}px` };
 
@@ -824,6 +996,14 @@ function TreeDir({
               error
             </div>
           )}
+          {entries && entries.length === 0 && !loading && !error && (
+            <div
+              style={{ paddingLeft: `${(depth + 1) * 12 + 14}px`, color: "var(--th-fg-muted)" }}
+              className="py-0.5 text-[11px]"
+            >
+              empty folder
+            </div>
+          )}
           {entries?.map((entry) =>
             entry.isDir ? (
               <TreeDir
@@ -831,6 +1011,11 @@ function TreeDir({
                 path={entry.path}
                 name={entry.name}
                 depth={depth + 1}
+                // Auto-open this child when it's the lone entry of a node that is
+                // itself unfolding a single-child chain — so site-forge ->
+                // source-engine -> ... lands on real files without clicking.
+                defaultOpen={!!autoExpandSingle && entry.path === onlyChildDir?.path}
+                autoExpandSingle={autoExpandSingle}
                 activePath={activePath}
                 onOpenFile={onOpenFile}
               />
