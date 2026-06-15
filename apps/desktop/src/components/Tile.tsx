@@ -641,8 +641,10 @@ function PanelPane({
         </button>
       </div>
       <div className="min-h-0 flex-1 overflow-hidden">
-        {/* Split (not expanded) is narrow -> FilePanel uses its compact layout. */}
-        <TilePanel terminalId={terminalId} cwd={cwd} tab={tab} compact={!expanded} />
+        {/* ALWAYS compact: a tile cell (split half OR full tile in a multi-tile
+            grid) is never wide enough for FilePanel's 288px side-by-side rail —
+            that cramped the tree to nothing. Compact = stacked tree/reader. */}
+        <TilePanel terminalId={terminalId} cwd={cwd} tab={tab} compact />
       </div>
     </div>
   );

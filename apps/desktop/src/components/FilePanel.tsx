@@ -770,9 +770,11 @@ function TreeDir({
     setError(null);
     listDir(path)
       .then((res) => {
+        tlog("files", `TreeDir ${path} -> ${res.length} entries (rendering)`);
         if (!cancelled) setEntries(res);
       })
       .catch((e) => {
+        tlog("files", `TreeDir ${path} ERR ${String(e)}`);
         if (!cancelled) setError(String(e));
       })
       .finally(() => {
