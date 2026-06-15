@@ -194,6 +194,27 @@ export function TerminalView({
     // window handler from double-firing.
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
+
+      // PageUp/PageDown scroll the xterm VIEWPORT by a page (not the shell).
+      // Without this the keys fall through to the PTY, where most shells/TUIs do
+      // nothing useful with them — so the user can't page through scrollback. We
+      // only hijack the BARE keys (no Ctrl/Alt/Meta/Shift) so Shift+PageUp and
+      // any modified variants still reach the app. preventDefault keeps the keys
+      // out of the shell; stopPropagation stops the Canvas window handler from
+      // double-firing. Returning false tells xterm not to forward to the PTY.
+      if (
+        (e.key === "PageUp" || e.key === "PageDown") &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        !e.shiftKey
+      ) {
+        term.scrollPages(e.key === "PageUp" ? -1 : 1);
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+      }
+
       const mod = e.ctrlKey || e.metaKey;
       if (!mod || e.altKey) return true;
       const key = e.key.toLowerCase();
