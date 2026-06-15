@@ -12,14 +12,16 @@ import { claudeUsage, type ClaudeUsage } from "../ipc/usage";
  *  mount + window focus) keeps the numbers fresh without spamming it. */
 const POLL_MS = 5 * 60 * 1000;
 
-/** Color by REMAINING %: red nearly out, amber low, green healthy. */
-function leftColor(left: number): string {
-  if (left <= 10) return "text-red-400";
-  if (left <= 30) return "text-amber-400";
-  return "text-emerald-400";
+/** Fill color by REMAINING %: red nearly out, amber low, green healthy. */
+function fillColor(left: number): string {
+  if (left <= 10) return "var(--th-dot-error, #f87171)";
+  if (left <= 30) return "var(--th-dot-starting, #fbbf24)";
+  return "var(--th-dot-live, #34d399)";
 }
 
-/** One "X left: N%" row from a used-percentage + reset hint. */
+/** One usage row: a label, a remaining-% number, and a horizontal BAR whose fill
+ *  shows how much is USED (it fills up as you consume), colored by how much is
+ *  LEFT. A reset hint sits under it. "—" when the value is unknown. */
 function Row({
   label,
   usedPct,
@@ -29,20 +31,31 @@ function Row({
   usedPct: number | null;
   resets: string | null;
 }) {
-  const left = usedPct != null ? Math.max(0, Math.round(100 - usedPct)) : null;
+  const known = usedPct != null;
+  const used = known ? Math.max(0, Math.min(100, usedPct)) : 0;
+  const left = known ? Math.max(0, Math.round(100 - used)) : null;
   return (
-    <div className="flex items-center justify-between gap-2">
-      <span>{label} left</span>
-      <span className="flex items-center gap-1.5">
-        {resets && (
-          <span className="truncate text-[10px] text-neutral-600" title={`resets ${resets}`}>
-            {resets}
-          </span>
-        )}
-        <span className={left != null ? leftColor(left) : "text-neutral-500"}>
-          {left != null ? `${left}%` : "—"}
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-neutral-400">{label}</span>
+        <span className="tabular-nums" style={{ color: known ? fillColor(left!) : "var(--th-fg-muted)" }}>
+          {left != null ? `${left}% left` : "—"}
         </span>
-      </span>
+      </div>
+      {/* Bar: track + fill (fill width = used%). */}
+      <div
+        className="h-1.5 w-full overflow-hidden rounded-full"
+        style={{ backgroundColor: "color-mix(in srgb, var(--th-fg-muted) 25%, transparent)" }}
+        title={left != null ? `${left}% left${resets ? ` · resets ${resets}` : ""}` : "unknown"}
+      >
+        <div
+          className="h-full rounded-full transition-[width] duration-300"
+          style={{ width: `${used}%`, backgroundColor: known ? fillColor(left!) : "transparent" }}
+        />
+      </div>
+      {resets && (
+        <span className="truncate text-[10px] text-neutral-600">resets {resets}</span>
+      )}
     </div>
   );
 }
@@ -91,7 +104,7 @@ export function UsageStrip() {
   }
 
   return (
-    <div className="flex flex-col gap-0.5 px-2 py-1 text-[11px] text-neutral-500">
+    <div className="flex flex-col gap-2 px-2 py-1.5 text-[11px] text-neutral-500">
       {/* Weekly first — the number that actually matters. */}
       <Row label="Weekly" usedPct={usage.weekUsedPct} resets={usage.weekResets} />
       <Row
