@@ -31,6 +31,7 @@ function cleanupTileSideState(id: TerminalId): void {
   usePanels.getState().forget(id);
   // Drop any per-terminal color override so a recycled id can't inherit it.
   useTheme.getState().clearTermOverride(id);
+  useTheme.getState().clearTermFocusRing(id);
   void import("../ipc/devserver")
     .then((m) => m.stopDevServer(id))
     .catch(() => {

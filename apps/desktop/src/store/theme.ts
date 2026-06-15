@@ -785,6 +785,12 @@ interface ThemeStore {
   /** Drop a terminal's override so it follows the global theme again. */
   clearTermOverride: (id: string) => void;
 
+  /** Per-terminal focus-ring color (terminalId → color); falls back to the
+   *  global --th-focus-ring when unset. */
+  termFocusRing: Record<string, string>;
+  setTermFocusRing: (id: string, color: string) => void;
+  clearTermFocusRing: (id: string) => void;
+
   /** Save the current active theme as a named preset. */
   saveAsPreset: (name: string) => void;
   /** Delete a user preset by name (built-ins can't be deleted). */
@@ -836,6 +842,30 @@ function saveTermOverrides(m: Record<string, Partial<TerminalPalette>>): void {
   }
 }
 
+// Per-terminal focus-ring color (terminalId → color), in its own slot. Falls
+// back to the global --th-focus-ring when a terminal has no override.
+const TERM_FOCUS_KEY = "termhub.theme.termFocusRing";
+function loadTermFocusRing(): Record<string, string> {
+  try {
+    if (typeof localStorage === "undefined") return {};
+    const raw = localStorage.getItem(TERM_FOCUS_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object"
+      ? (parsed as Record<string, string>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+function saveTermFocusRing(m: Record<string, string>): void {
+  try {
+    localStorage.setItem(TERM_FOCUS_KEY, JSON.stringify(m));
+  } catch {
+    /* ignore */
+  }
+}
+
 const initial = loadPersisted();
 
 /**
@@ -855,6 +885,7 @@ export const useTheme = create<ThemeStore>((set, get) => ({
   active: initial.active,
   presets: initial.presets,
   termOverrides: loadTermOverrides(),
+  termFocusRing: loadTermFocusRing(),
 
   setTheme: (theme, fromBackend = false) => {
     applyTheme(theme);
@@ -914,6 +945,20 @@ export const useTheme = create<ThemeStore>((set, get) => ({
     delete next[id];
     saveTermOverrides(next);
     set({ termOverrides: next });
+  },
+
+  setTermFocusRing: (id, color) => {
+    const next = { ...get().termFocusRing, [id]: color };
+    saveTermFocusRing(next);
+    set({ termFocusRing: next });
+  },
+
+  clearTermFocusRing: (id) => {
+    if (!(id in get().termFocusRing)) return;
+    const next = { ...get().termFocusRing };
+    delete next[id];
+    saveTermFocusRing(next);
+    set({ termFocusRing: next });
   },
 
   saveAsPreset: (name) => {

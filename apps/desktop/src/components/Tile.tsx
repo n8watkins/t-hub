@@ -187,6 +187,12 @@ export function Tile({
   const termOverride = useTheme((s) => s.termOverrides[terminalId]);
   const setTermOverride = useTheme((s) => s.setTermOverride);
   const clearTermOverride = useTheme((s) => s.clearTermOverride);
+  const termFocusRing = useTheme((s) => s.termFocusRing[terminalId]);
+  const setTermFocusRing = useTheme((s) => s.setTermFocusRing);
+  const clearTermFocusRing = useTheme((s) => s.clearTermFocusRing);
+  const themeFocusRing = useTheme((s) => s.active.chrome.focusRing);
+  // Focused-tile ring color: this terminal's override, else the global token.
+  const focusRing = termFocusRing ?? "var(--th-focus-ring)";
   const effColor = (k: TermColorKey): string =>
     termOverride?.[k] ?? termPalette?.[k] ?? TERM_COLOR_FALLBACK[k];
   const setColor = (k: TermColorKey, value: string): void =>
@@ -376,12 +382,12 @@ export function Tile({
         borderColor: isDropTarget
           ? "var(--th-accent)"
           : focused
-            ? "color-mix(in srgb, var(--th-focus-ring) 55%, var(--th-border))"
+            ? `color-mix(in srgb, ${focusRing} 55%, var(--th-border))`
             : "var(--th-border)",
         boxShadow: isDropTarget
           ? "inset 0 0 0 2px var(--th-accent)"
           : focused
-            ? "0 0 0 1px color-mix(in srgb, var(--th-focus-ring) 40%, transparent), 0 0 16px -4px color-mix(in srgb, var(--th-focus-ring) 60%, transparent)"
+            ? `0 0 0 1px color-mix(in srgb, ${focusRing} 40%, transparent), 0 0 16px -4px color-mix(in srgb, ${focusRing} 60%, transparent)`
             : "none",
       }}
     >
@@ -710,13 +716,24 @@ export function Tile({
                 />
               </label>
             ))}
+            <label className="flex items-center justify-between gap-2 px-0.5 py-1">
+              <span>Focus ring</span>
+              <input
+                type="color"
+                value={termFocusRing ?? themeFocusRing}
+                onChange={(e) => setTermFocusRing(terminalId, e.target.value)}
+                className="h-6 w-9 shrink-0 cursor-pointer rounded bg-transparent p-0"
+                title="Focus-ring color when this terminal is focused"
+              />
+            </label>
             <button
               type="button"
               onClick={() => {
                 clearTermOverride(terminalId);
+                clearTermFocusRing(terminalId);
                 setColorMenu(null);
               }}
-              disabled={!termOverride}
+              disabled={!termOverride && !termFocusRing}
               className="mt-1.5 w-full rounded border px-2 py-1 text-xs hover:bg-neutral-800 disabled:opacity-40"
               style={{
                 borderColor: "var(--th-border)",
