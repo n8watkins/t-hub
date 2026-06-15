@@ -151,7 +151,7 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
           collapsible
           storageKey="termhub.sidebar.recent.open"
           bodyClassName="th-scroll overflow-y-auto"
-          bodyStyle={{ maxHeight: "50vh" }}
+          bodyStyle={{ maxHeight: "38vh" }}
         >
           <RecentList onRecall={(id, cwd) => onRecall?.(id, cwd)} />
         </Section>

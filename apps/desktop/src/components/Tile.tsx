@@ -458,8 +458,11 @@ export function Tile({
             the tabs remain clickable, and the surrounding flex items keep their
             own pointer area (the absolute layer is only as wide as the tabs). */}
         <div
-          className="absolute left-1/2 z-10 flex shrink-0 -translate-x-1/2 items-center gap-0.5 rounded px-1"
-          style={{ backgroundColor: "var(--th-header-bg)" }}
+          className="absolute left-1/2 z-10 flex shrink-0 -translate-x-1/2 items-center rounded-full border p-0.5"
+          style={{
+            backgroundColor: "var(--th-app-bg)",
+            borderColor: "var(--th-border)",
+          }}
           onPointerDown={(e) => e.stopPropagation()}
         >
           {PANEL_TABS.map((t) => {
@@ -475,12 +478,13 @@ export function Tile({
                   onFocus();
                   setTab(terminalId, t.id);
                 }}
-                className="rounded px-2 py-0.5 text-[0.95em] leading-none transition-colors"
+                className="rounded-full px-2.5 py-0.5 text-[0.9em] leading-none transition-colors"
                 style={{
                   color: selected ? "var(--th-fg)" : "var(--th-fg-muted)",
                   backgroundColor: selected
-                    ? "color-mix(in srgb, var(--th-accent) 22%, transparent)"
+                    ? "color-mix(in srgb, var(--th-accent) 28%, var(--th-tile-bg))"
                     : "transparent",
+                  fontWeight: selected ? 600 : 400,
                 }}
                 title={`${t.label} view`}
                 aria-pressed={selected}
