@@ -15,14 +15,10 @@ This session ran **v0.1.47 → v0.1.52**, a long live-iteration burst driven by
 **Preview**, **tile chrome**, and added a **per-tile context meter** with a robust
 tmux binding. All shipped + on `main`.
 
-**OPEN / UNVERIFIED — START HERE (§4.1):** at the very end the user reported
-**"can't type in the terminal"** on v0.1.52. I restarted the app on the existing
-build (tmux sessions preserved) — likely a transient focus glitch. The
-`Terminal.tsx` custom-key handler was inspected and is correct (plain keys
-`return true` → typed normally). **If it persists**, the prime suspect is the
-**split-ratio layout/z-index in `Tile.tsx` (commit `9eb5288`)**; revert that in
-isolation and rebuild. **Ask the user whether typing works before building
-anything else.**
+**RESOLVED this session:** the user briefly reported **"can't type in the
+terminal"** on v0.1.52; a plain **app restart fixed it** (a transient focus glitch,
+NOT the code — the user confirmed typing works after the restart). The split-ratio
+change (`9eb5288`) is good — **do NOT revert it.** (Quick-restart command in §2.)
 
 **The single most valuable debugging tool:** the running Windows app writes a diag
 log readable from WSL at **`/mnt/c/Users/natha/.termhub/diag.log`** (F12 devtools
@@ -150,13 +146,10 @@ manual worktrees, disjoint file ownership, **zero merge conflicts**.
 
 ## 4. NEXT STEPS (ordered)
 
-1. **VERIFY the "can't type in terminal" report (v0.1.52).** I restarted the app
-   (no rebuild). If still broken: `Terminal.tsx`'s custom-key handler is fine
-   (returns `true` for plain keys), so suspect the **split-ratio layout/z-index**
-   in `Tile.tsx` (`9eb5288`) — the divider is `relative z-10`, the centered tab bar
-   is `absolute z-10`; verify nothing overlays/steals focus from the pooled xterm.
-   Fastest safe fix: `git revert 9eb5288` + rebuild, then reintroduce the split
-   more carefully. **Confirm with the user first.**
+1. **(RESOLVED) "Can't type in terminal" — a restart fixed it.** The user hit this
+   once on v0.1.52; a plain app restart (§2) cleared it (transient focus glitch,
+   not code) and the user confirmed typing works. The split-ratio change (`9eb5288`)
+   is fine — **do NOT revert it.** Breadcrumb only.
 2. **Clickable links in the terminal** (user request, 2026-06-15). Add
    `@xterm/addon-web-links` to the xterm in `Terminal.tsx` (the app already uses
    `@xterm/addon-{fit,search,webgl,unicode11}`); open matched URLs externally via
