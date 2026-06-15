@@ -44,6 +44,13 @@ pub struct RateLimitWindow {
 pub struct StatusSnapshot {
     /// The exact session id this snapshot is for.
     pub session_id: String,
+    /// The session's working directory, lifted straight from the statusline
+    /// payload's `cwd`. The frontend has NO terminal-id→session-id bridge, so the
+    /// per-tile context meter matches a tile to its session by cwd (see
+    /// `store/sessionContext.ts`); carrying it here is what makes that match
+    /// possible. Absent when the statusline omitted it (degrades to no meter).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Context window used %, derived from `context_window.*` (0..=100).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_used_pct: Option<f32>,
@@ -68,6 +75,12 @@ impl StatusSnapshot {
     /// `session_id`. Tolerant of missing fields/blocks (returns a snapshot with
     /// `None`s rather than failing). `now_ms` is injected for testability.
     pub fn from_statusline(session_id: &str, raw: &serde_json::Value, now_ms: u64) -> Self {
+        // Statusline `cwd` is a top-level string; kept verbatim so the frontend
+        // can correlate this snapshot to the tile sharing that working directory.
+        let cwd = raw
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let context_used_pct = context_used_pct(raw);
         let cost_usd = raw
             .get("cost")
@@ -81,6 +94,7 @@ impl StatusSnapshot {
 
         Self {
             session_id: session_id.to_string(),
+            cwd,
             context_used_pct,
             cost_usd,
             five_hour,
@@ -175,6 +189,7 @@ mod tests {
     #[test]
     fn ingests_full_promax_payload() {
         let raw = serde_json::json!({
+            "cwd": "/home/u/proj",
             "context_window": { "used_percentage": 42.5 },
             "cost": { "total_cost_usd": 1.23 },
             "rate_limits": {
@@ -183,6 +198,7 @@ mod tests {
             }
         });
         let snap = StatusSnapshot::from_statusline("s1", &raw, 999);
+        assert_eq!(snap.cwd.as_deref(), Some("/home/u/proj"));
         assert_eq!(snap.context_used_pct, Some(42.5));
         assert_eq!(snap.cost_usd, Some(1.23));
         assert!(snap.rate_limits_present);
@@ -198,6 +214,7 @@ mod tests {
             "context_window": { "used": 50000, "total": 200000 }
         });
         let snap = StatusSnapshot::from_statusline("s1", &raw, 1);
+        assert!(snap.cwd.is_none(), "absent cwd must stay None");
         assert!(!snap.rate_limits_present);
         assert!(snap.five_hour.is_none());
         assert!(snap.seven_day.is_none());
