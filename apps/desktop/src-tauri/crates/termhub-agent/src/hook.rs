@@ -153,6 +153,44 @@ pub fn run(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
 // `AgentBridge::ingest_status_from_journal`, which reads `payload.status` and
 // `entity_id`/`payload.session_id`).
 
+/// Resolve the tmux pane + session this statusline process is running inside, so
+/// the core/frontend can bind a STATUS SNAPSHOT to the exact terminal tile that
+/// owns the pane — a ROBUST replacement for the fragile cwd correlation (two
+/// tiles in the same directory are indistinguishable by cwd; their tmux session
+/// names are not).
+///
+/// Claude runs its statusline command INSIDE the tile's tmux pane, so tmux sets
+/// `$TMUX_PANE` (e.g. `%37`) in our environment. From that pane id we ask tmux
+/// (on the isolated `termhub` socket) for the owning `#{session_name}` — TermHub
+/// names every session `th_<terminalId>`, which the frontend can compute for a
+/// tile directly and key context by. Returns `(pane, session)`:
+///   - `pane`:    the raw `$TMUX_PANE` value, or `None` if unset (not under tmux).
+///   - `session`: the resolved session name, or `None` if tmux can't resolve it
+///     (server gone, pane vanished) — the frontend then degrades to cwd matching.
+///
+/// Best-effort and side-effect-free on failure: a missing tmux / unset env / a
+/// non-zero exit all collapse to `None` so a statusline render is never blocked.
+fn resolve_tmux_pane() -> (Option<String>, Option<String>) {
+    // `$TMUX_PANE` is the pane the statusline runs in (set by tmux for any process
+    // it spawned). Absent ⇒ not running under tmux; nothing to resolve.
+    let pane = match std::env::var("TMUX_PANE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => return (None, None),
+    };
+
+    // Resolve the owning session NAME from the pane id on the termhub socket.
+    // `-t <pane>` targets that exact pane; `-p` prints the formatted value.
+    let session = std::process::Command::new("tmux")
+        .args(["-L", "termhub", "display", "-p", "-t", &pane, "#{session_name}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    (Some(pane), session)
+}
+
 /// Build a `StatusSnapshot` journal entry from a parsed statusline JSON payload.
 /// Pure (no I/O) so it is unit-tested directly. `entity_id` + `payload.session_id`
 /// are the statusline's `session_id`; the raw statusline rides under
@@ -227,7 +265,7 @@ pub fn run_statusline(journal_dir: Option<&str>) -> anyhow::Result<()> {
     }
 
     // 2. Parse JSON. On failure we have nothing to ingest; print an empty line.
-    let statusline: serde_json::Value = match serde_json::from_str(&raw) {
+    let mut statusline: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("termhub-agent --statusline: failed parsing statusline JSON: {e:#}");
@@ -235,6 +273,22 @@ pub fn run_statusline(journal_dir: Option<&str>) -> anyhow::Result<()> {
             return Ok(());
         }
     };
+
+    // 2b. Stamp the tmux pane + session this statusline runs inside onto the
+    //     payload, so the core/frontend can bind the snapshot to the EXACT tile
+    //     that owns the pane (robust) instead of correlating by cwd (fragile).
+    //     Only set when actually under tmux + resolvable; absent keys degrade the
+    //     frontend to its cwd fallback (so an un-upgraded agent still works).
+    let (tmux_pane, tmux_session) = resolve_tmux_pane();
+    if statusline.is_object() {
+        let obj = statusline.as_object_mut().expect("checked is_object");
+        if let Some(pane) = tmux_pane {
+            obj.insert("tmux_pane".into(), serde_json::Value::String(pane));
+        }
+        if let Some(session) = tmux_session {
+            obj.insert("tmux_session".into(), serde_json::Value::String(session));
+        }
+    }
 
     // 3. Build + append the StatusSnapshot entry.
     let entry = build_status_entry(&statusline);
@@ -386,6 +440,24 @@ mod tests {
         assert_eq!(entry.payload["status"]["cost"]["total_cost_usd"], 1.23);
         assert!(entry.timestamp_ms > 0);
         assert_eq!(entry.seq, 0, "seq is assigned by Journal::append");
+    }
+
+    #[test]
+    fn build_status_entry_carries_tmux_pane_and_session() {
+        // The statusline value as run_statusline stamps it: the resolved tmux pane
+        // + session are injected as top-level keys before journaling. They must
+        // survive under payload.status so the core's from_statusline can read them
+        // and bind the snapshot to the owning tile.
+        let statusline = serde_json::json!({
+            "session_id": "sess-1",
+            "cwd": "/work",
+            "context_window": { "used_percentage": 33 },
+            "tmux_pane": "%37",
+            "tmux_session": "th_abcd1234"
+        });
+        let entry = build_status_entry(&statusline);
+        assert_eq!(entry.payload["status"]["tmux_pane"], "%37");
+        assert_eq!(entry.payload["status"]["tmux_session"], "th_abcd1234");
     }
 
     #[test]
