@@ -396,7 +396,10 @@ export function Tile({
             NOT surfaced here (per request) — it added noise to the header without
             being something the user wants to read. The id is still available in
             tooltips/the kill confirm where it's actually needed. */}
-        <span className="truncate" style={{ color: "var(--th-fg)" }}>
+        <span
+          className="truncate"
+          style={{ color: "var(--th-fg)", fontSize: "1.05em" }}
+        >
           {label}
         </span>
         {showCwd && cwd && (
@@ -446,7 +449,7 @@ export function Tile({
                   onFocus();
                   setTab(terminalId, t.id);
                 }}
-                className="rounded px-1.5 py-0.5 text-[0.85em] leading-none transition-colors"
+                className="rounded px-2 py-0.5 text-[0.95em] leading-none transition-colors"
                 style={{
                   color: selected ? "var(--th-fg)" : "var(--th-fg-muted)",
                   backgroundColor: selected
