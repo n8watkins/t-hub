@@ -161,7 +161,9 @@ pub fn run(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
 ///
 /// Claude runs its statusline command INSIDE the tile's tmux pane, so tmux sets
 /// `$TMUX_PANE` (e.g. `%37`) in our environment. From that pane id we ask tmux
-/// (on the isolated `termhub` socket) for the owning `#{session_name}` — TermHub
+/// (the CURRENT server via `$TMUX`, NOT a hardcoded `-L` socket — so it resolves
+/// on production `termhub` AND a side-by-side dev `termhub-dev`) for the owning
+/// `#{session_name}` — TermHub
 /// names every session `th_<terminalId>`, which the frontend can compute for a
 /// tile directly and key context by. Returns `(pane, session)`:
 ///   - `pane`:    the raw `$TMUX_PANE` value, or `None` if unset (not under tmux).
@@ -178,10 +180,12 @@ fn resolve_tmux_pane() -> (Option<String>, Option<String>) {
         _ => return (None, None),
     };
 
-    // Resolve the owning session NAME from the pane id on the termhub socket.
+    // Resolve the owning session NAME from the pane id. NO `-L <socket>`: running
+    // inside the pane, tmux uses `$TMUX` to reach the CURRENT server, so this
+    // resolves on ANY socket (production `termhub` AND a dev `termhub-dev`).
     // `-t <pane>` targets that exact pane; `-p` prints the formatted value.
     let session = std::process::Command::new("tmux")
-        .args(["-L", "termhub", "display", "-p", "-t", &pane, "#{session_name}"])
+        .args(["display", "-p", "-t", &pane, "#{session_name}"])
         .output()
         .ok()
         .filter(|o| o.status.success())
