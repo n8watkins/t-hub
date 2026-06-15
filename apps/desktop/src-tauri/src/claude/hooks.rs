@@ -46,6 +46,96 @@ pub const HOOK_EVENTS: &[&str] = &[
 /// uninstaller can remove exactly our entries and leave the user's intact.
 pub const TERMHUB_HOOK_MARKER: &str = "__termhub_managed__";
 
+// ---------------------------------------------------------------------------
+// statusLine install (the Claude USAGE data source)
+// ---------------------------------------------------------------------------
+//
+// Claude Code's `statusLine` is a SEPARATE setting from `hooks`: a single
+// command Claude runs on every status refresh, piping a JSON payload (cost,
+// context_window, rate_limits, ...) to its stdin. TermHub installs a statusline
+// that execs `termhub-agent --statusline`, which journals a `StatusSnapshot`;
+// the core then emits `status://snapshot` and the sidebar USAGE strip lights up.
+//
+// Without this, the 15 lifecycle hooks fire but NO statusline ever feeds the
+// status bridge, so USAGE shows only dashes. We manage exactly one statusLine
+// entry, tagged with the same marker (in `command`) so uninstall removes only
+// ours and leaves a user-authored statusLine intact (we never clobber one).
+
+/// Build the `statusLine` object value TermHub installs. The marker is embedded
+/// in the command string so [`statusline_is_termhub`] / uninstall can identify
+/// (and only remove) our entry. `refreshInterval` keeps cost/rate-limit numbers
+/// fresh even between assistant messages (e.g. while a turn is running).
+pub fn termhub_statusline(agent_bin: &str) -> serde_json::Value {
+    let command = format!(
+        "{bin} --statusline # {marker}",
+        bin = agent_bin,
+        marker = TERMHUB_HOOK_MARKER,
+    );
+    serde_json::json!({
+        "type": "command",
+        "command": command,
+        "padding": 0,
+        "refreshInterval": 5
+    })
+}
+
+/// True when a `statusLine` value is TermHub-managed (its `command` carries the
+/// marker). Used to avoid clobbering a user's own statusLine and to drive a
+/// clean uninstall.
+pub fn statusline_is_termhub(statusline: &serde_json::Value) -> bool {
+    statusline
+        .get("command")
+        .and_then(|c| c.as_str())
+        .map(|s| s.contains(TERMHUB_HOOK_MARKER))
+        .unwrap_or(false)
+}
+
+/// Whether `settings` currently has a TermHub-managed `statusLine` installed.
+pub fn statusline_managed(settings: &serde_json::Value) -> bool {
+    settings
+        .get("statusLine")
+        .map(statusline_is_termhub)
+        .unwrap_or(false)
+}
+
+/// Merge TermHub's `statusLine` into `settings`, returning the new value.
+///
+/// Respects a user-authored statusLine: if `settings.statusLine` exists and is
+/// NOT marker-tagged, we leave it untouched (the user chose their own). We only
+/// set/overwrite our own (or an absent) statusLine — so re-install is idempotent
+/// and never steals the slot from the user.
+pub fn merge_statusline_into_settings(
+    existing: &serde_json::Value,
+    agent_bin: &str,
+) -> serde_json::Value {
+    let mut root: serde_json::Map<String, serde_json::Value> =
+        existing.as_object().cloned().unwrap_or_default();
+
+    let user_owns = root
+        .get("statusLine")
+        .map(|sl| !statusline_is_termhub(sl))
+        .unwrap_or(false);
+    if !user_owns {
+        root.insert("statusLine".to_string(), termhub_statusline(agent_bin));
+    }
+    serde_json::Value::Object(root)
+}
+
+/// Remove a TermHub-managed `statusLine` from `settings` (clean uninstall),
+/// leaving a user-authored statusLine intact. Idempotent.
+pub fn remove_statusline_from_settings(existing: &serde_json::Value) -> serde_json::Value {
+    let mut root: serde_json::Map<String, serde_json::Value> =
+        existing.as_object().cloned().unwrap_or_default();
+    if root
+        .get("statusLine")
+        .map(statusline_is_termhub)
+        .unwrap_or(false)
+    {
+        root.remove("statusLine");
+    }
+    serde_json::Value::Object(root)
+}
+
 /// Map a Claude hook event name to the journal event type we record. Returns
 /// `None` for an unrecognized name (forward-compat: a future hook we don't model
 /// yet is journaled as `Unknown` by the caller).
@@ -340,6 +430,67 @@ mod tests {
         );
         // Stop must NOT have a hint (supervision owns its classification).
         assert_eq!(status_hint_for_hook("Stop"), None);
+    }
+
+    // ---------------------------------------------------------------------------
+    // statusLine install / merge / remove
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn termhub_statusline_is_command_with_marker_and_flag() {
+        let sl = termhub_statusline("/usr/local/bin/termhub-agent");
+        assert_eq!(sl["type"].as_str(), Some("command"));
+        let cmd = sl["command"].as_str().expect("command string");
+        assert!(cmd.contains(TERMHUB_HOOK_MARKER), "must carry marker");
+        assert!(cmd.contains("--statusline"), "must invoke --statusline");
+        assert!(statusline_is_termhub(&sl));
+    }
+
+    #[test]
+    fn merge_statusline_into_empty_installs_ours() {
+        let bin = "/usr/local/bin/termhub-agent";
+        let out = merge_statusline_into_settings(&serde_json::json!({}), bin);
+        assert!(statusline_managed(&out));
+        assert!(out["statusLine"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("--statusline"));
+    }
+
+    #[test]
+    fn merge_statusline_preserves_user_statusline() {
+        let bin = "/usr/local/bin/termhub-agent";
+        let existing = serde_json::json!({
+            "statusLine": { "type": "command", "command": "my-own-status.sh" }
+        });
+        let out = merge_statusline_into_settings(&existing, bin);
+        // User's statusLine must be left intact (not stolen).
+        assert_eq!(out["statusLine"]["command"].as_str(), Some("my-own-status.sh"));
+        assert!(!statusline_managed(&out));
+    }
+
+    #[test]
+    fn merge_statusline_is_idempotent_over_ours() {
+        let bin = "/usr/local/bin/termhub-agent";
+        let once = merge_statusline_into_settings(&serde_json::json!({}), bin);
+        let twice = merge_statusline_into_settings(&once, bin);
+        assert_eq!(once, twice);
+        assert!(statusline_managed(&twice));
+    }
+
+    #[test]
+    fn remove_statusline_strips_ours_keeps_user() {
+        let bin = "/usr/local/bin/termhub-agent";
+        // Ours is removed.
+        let ours = merge_statusline_into_settings(&serde_json::json!({}), bin);
+        let cleaned = remove_statusline_from_settings(&ours);
+        assert!(cleaned.get("statusLine").is_none());
+        // User's is kept.
+        let user = serde_json::json!({
+            "statusLine": { "type": "command", "command": "my-own-status.sh" }
+        });
+        let kept = remove_statusline_from_settings(&user);
+        assert_eq!(kept["statusLine"]["command"].as_str(), Some("my-own-status.sh"));
     }
 
     #[test]
