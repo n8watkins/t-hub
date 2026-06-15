@@ -96,6 +96,37 @@ export const useSupervision = create<SupervisionState>((set) => ({
     }),
 }));
 
+/** The reducer statuses that mean a session is MID-TURN — killing its tile should
+ *  confirm first. An idle / completed / failed / detached session kills now. */
+const ACTIVE_TURN: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
+  "working",
+  "needsQuestion",
+  "needsPermission",
+  "waitingOnSubagents",
+]);
+
+/**
+ * True when the Claude session bound to `tmuxSession` (e.g. `th_<terminalId>`) is
+ * MID-TURN, so killing its tile should ask first. Bridges the tile<->session gap
+ * via the statusline snapshot, which now carries its owning tmux session: find the
+ * snapshot whose `tmuxSession` matches, then read that session's reducer status.
+ * Best-effort — false when nothing matches (no Claude here / un-upgraded agent /
+ * the session is idle).
+ */
+export function tmuxSessionMidTurn(
+  state: Pick<SupervisionState, "statuses" | "snapshots">,
+  tmuxSession: string,
+): boolean {
+  if (!tmuxSession) return false;
+  for (const snap of Object.values(state.snapshots)) {
+    if (snap.tmuxSession === tmuxSession) {
+      const st = state.statuses[snap.sessionId];
+      return st !== undefined && ACTIVE_TURN.has(st);
+    }
+  }
+  return false;
+}
+
 /**
  * True when a statusline snapshot reports either rate-limit window at/over
  * {@link RATE_LIMIT_THRESHOLD}. False when the `rate_limits` block is absent

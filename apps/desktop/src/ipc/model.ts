@@ -152,4 +152,13 @@ export interface StatusSnapshot {
   sevenDay?: RateLimitWindow;
   rateLimitsPresent: boolean;
   ingestedAtMs: number;
+  /** The session's cwd, lifted from the statusline (a fallback tile<->session key
+   *  by directory). Optional — older snapshots / un-upgraded agents omit it. */
+  cwd?: string;
+  /** The tmux pane the statusline ran in (`%N`), when resolvable. */
+  tmuxPane?: string;
+  /** The owning tmux session name (`th_<terminalId>`) — the ROBUST tile<->session
+   *  key, so a tile can look itself up by `th_<its id>`. Absent on un-upgraded
+   *  agents (consumers then fall back to the cwd match). */
+  tmuxSession?: string;
 }

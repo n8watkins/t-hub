@@ -38,7 +38,8 @@ import {
 import { useTerminalSlot } from "./TerminalPool";
 import { TilePanel } from "./TilePanel";
 import { ContextMeter } from "./ContextMeter";
-import { useContextPctForTile } from "../store/sessionContext";
+import { useContextPctForTile, sessionNameForTerminal } from "../store/sessionContext";
+import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -146,23 +147,20 @@ export function Tile({
   const headerOnHover = useTheme((s) => s.active.chrome.headerOnHover);
   const showTileHeader = useTheme((s) => s.active.chrome.showTileHeader);
 
-  // BUSY detection for the kill (×) confirm gate. A tile is "busy" when there is
-  // a managed dev server running for it — usePanels.devUrl[id] is a non-null URL
-  // (set by the Dev runner, cleared when the server stops). Subscribed so the
-  // gate is always current.
-  //
-  // NOTE (kill confirm scope): the spec also wants an ACTIVE Claude turn
-  // (working / needsQuestion / needsPermission / waitingOnSubagents) to count as
-  // busy. That status lives in the supervision store keyed by CLAUDE SESSION ID,
-  // and the frontend has no reliable terminal-id -> session-id bridge (the only
-  // correlation, in workspace.ts, is a best-effort cwd match driven off the
-  // agent://title EVENT payload, and the stored statuses carry no cwd at all). A
-  // cwd guess here could mis-gate the kill on the wrong tile, so per the task's
-  // documented fallback we treat busy = (dev server running) only and kill idle
-  // sessions without a dialog. When a real terminal<->session mapping lands,
-  // fold the working/waiting statuses into `busy` here.
+  // BUSY detection for the kill (×) confirm gate. A tile is "busy" — so its ×
+  // confirms before killing — when a managed dev server is running for it
+  // (usePanels.devUrl) OR its Claude session is MID-TURN (working / needsQuestion
+  // / needsPermission / waitingOnSubagents). The mid-turn status lives in the
+  // supervision store keyed by CLAUDE SESSION ID; the robust tmux-session binding
+  // (the statusline now stamps its owning `th_<terminalId>`) finally gives us the
+  // tile -> session link the old cwd-guess lacked, so we can gate on a live turn —
+  // see `tmuxSessionMidTurn`. An idle / finished session still kills immediately.
   const devUrl = usePanels((s) => s.devUrl[terminalId]);
-  const busy = typeof devUrl === "string" && devUrl.length > 0;
+  const claudeMidTurn = useSupervision((s) =>
+    tmuxSessionMidTurn(s, sessionNameForTerminal(terminalId)),
+  );
+  const busy =
+    (typeof devUrl === "string" && devUrl.length > 0) || claudeMidTurn;
 
   // Per-tile panel state (the Terminal / Files / Preview / Dev workbench). Kept
   // in usePanels — NOT workspace.ts — so this presentational state doesn't
