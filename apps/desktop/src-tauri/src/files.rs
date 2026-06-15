@@ -946,7 +946,26 @@ pub async fn search_files(
 #[tauri::command]
 pub async fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
     let dir = normalize(&path);
-    read_dir_shallow(&dir)
+    let res = read_dir_shallow(&dir);
+    // DIAG: file tree "not loading" was undiagnosable from the release build.
+    // Log the incoming path, the normalized host path, and the outcome so the
+    // diag log shows exactly where the tree breaks (bad/empty path vs wsl/fs read
+    // returning nothing vs an error).
+    match &res {
+        Ok(v) => crate::diag::diag_log(format!(
+            "{{\"t\":\"files\",\"m\":\"list_dir OK: in='{}' host='{}' -> {} entries\"}}",
+            path.replace('\'', " "),
+            dir.display().to_string().replace('\'', " "),
+            v.len()
+        )),
+        Err(e) => crate::diag::diag_log(format!(
+            "{{\"t\":\"files\",\"m\":\"list_dir ERR: in='{}' host='{}' -> {}\"}}",
+            path.replace('\'', " "),
+            dir.display().to_string().replace('\'', " "),
+            e.replace('\'', " ")
+        )),
+    }
+    res
 }
 
 /// Read a (text) file for the reader, capped at [`MAX_READ_BYTES`].

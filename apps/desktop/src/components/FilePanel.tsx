@@ -119,12 +119,16 @@ export function FilePanel({
   // up front was pure latency for the common case of "just open a file".
   useEffect(() => {
     if (readerOnly) return;
+    // DIAG: surface the root the panel actually received — an empty/undefined
+    // root means the tile passed no cwd (the "No project selected" empty state),
+    // which reads as "files not loading".
+    tlog("files", `FilePanel root=${root ?? "(none)"} compact=${compact}`);
     setIndexState({ status: "idle" });
     setHits([]);
     setQuery("");
     setReader({ status: "empty" });
     setActivePath(null);
-  }, [root, readerOnly]);
+  }, [root, readerOnly, compact]);
 
   // --- Open a file into the reader. --------------------------------------
   const openFile = useCallback((path: string) => {
