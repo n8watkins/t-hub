@@ -1,9 +1,13 @@
-// The sidebar — pure Projects navigation + Recent recall (feat/projects-sidebar).
+// The sidebar — Workspaces + Projects navigation + Recent recall.
 //
-// In the new product model the sidebar is ONLY two lists:
-//   1. Projects — the projects (terminals) open in the CURRENT (active) workspace
+// In the product model the sidebar is three lists:
+//   1. Workspaces — EVERY workspace tab as a collapsible row over the terminals
+//      inside it (feat/workspaces-lifecycle). Clicking a row switches to that
+//      workspace; clicking a nested terminal switches to it AND focuses it. The
+//      active workspace is expanded + subtly highlighted.
+//   2. Projects — the projects (terminals) open in the CURRENT (active) workspace
 //      tab, named by directory. Clicking one reveals + focuses that tile.
-//   2. Recent  — past Claude sessions you can RECALL: clicking re-spawns a
+//   3. Recent  — past Claude sessions you can RECALL: clicking re-spawns a
 //      terminal in that session's directory and resumes it (`claude --resume`).
 //
 // Gone (vs. the old 0.5 supervision sidebar): the Workspaces list (tabs live in
@@ -20,6 +24,7 @@ import { useAgentTelemetry } from "../store/telemetry";
 import { useSettings } from "../store/settings";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import { WslHealth } from "./WslHealth";
+import { WorkspacesList } from "./WorkspacesList";
 import { ProjectsList } from "./ProjectsList";
 import { RecentList } from "./RecentList";
 import type { HostMetrics, ConnectionState } from "../ipc/protocol";
@@ -142,10 +147,19 @@ function SidebarFull({
           The PRIMARY gear + window controls live in the titlebar. */}
       <SidebarHeader onToggleSidebar={onToggleSidebar} />
 
-      {/* Body: two stacked sections — Projects (this workspace's terminals) and
-          Recent (recallable past Claude sessions). Each grows and scrolls
-          internally; the whole body scrolls as a safety net on a short window. */}
+      {/* Body: three stacked sections — Workspaces (EVERY tab + its terminals),
+          Projects (just the active tab's terminals), and Recent (recallable past
+          Claude sessions). Each grows and scrolls internally; the whole body
+          scrolls as a safety net on a short window. */}
       <div className="th-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
+        {/* Workspaces — every workspace tab as a collapsible row over its
+            terminals. Clicking a row switches tabs; clicking a nested terminal
+            switches tabs AND focuses it. Self-contained: it reads the store
+            directly, so there's no extra Sidebar/App wiring. */}
+        <Section title="Workspaces" count={tabs.length} className="border-b">
+          <WorkspacesList />
+        </Section>
+
         {/* Projects — the terminals in the ACTIVE workspace tab. Clicking reveals
             + focuses the tile (App: setActiveTab(owner) + setFocus). */}
         <Section title="Projects" count={order.length} className="border-b">
