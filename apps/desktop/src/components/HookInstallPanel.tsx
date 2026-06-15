@@ -117,6 +117,44 @@ function categoryEvents(cat: HookCategory): string[] {
   return cat.events.map((e) => e.event);
 }
 
+/** The marker TermHub embeds in every command string it writes to settings.json,
+ *  mirroring `TERMHUB_HOOK_MARKER` in `src-tauri/src/claude/hooks.rs`; the
+ *  uninstaller scans for it to remove exactly our entries. */
+const TERMHUB_HOOK_MARKER = "__termhub_managed__";
+
+/** Build the EXACT settings.json fragment TermHub merges into
+ *  `~/.claude/settings.json` for the given selection, client-side. This mirrors
+ *  the Rust `termhub_hooks_fragment_for` + `termhub_statusline` shapes in
+ *  `src-tauri/src/claude/hooks.rs` so the user sees the real code, not a
+ *  paraphrase. `events` is ordered in backend HOOK_EVENTS order (ALL_EVENTS) and
+ *  filtered to the current selection; an empty selection still shows the
+ *  statusLine (TermHub always installs it). */
+function buildHooksJson(agentBin: string, events: string[]): Record<string, unknown> {
+  const hooks: Record<string, unknown> = {};
+  for (const event of events) {
+    hooks[event] = [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: `${agentBin} --hook ${event} # ${TERMHUB_HOOK_MARKER}`,
+          },
+        ],
+      },
+    ];
+  }
+  return {
+    hooks,
+    statusLine: {
+      type: "command",
+      command: `${agentBin} --statusline # ${TERMHUB_HOOK_MARKER}`,
+      padding: 0,
+      refreshInterval: 5,
+    },
+  };
+}
+
 export function HookInstallPanel({
   agentBin,
   installed,
@@ -135,6 +173,10 @@ export function HookInstallPanel({
   // category's disclosure), so it's clear what's live vs. what you're about to
   // change.
   const [installedEvents, setInstalledEvents] = useState<Set<string>>(new Set());
+  // Whether the "View raw JSON" modal is open — it shows the literal settings.json
+  // fragment TermHub writes for the *current* selection (the real code, not a
+  // description), built client-side and updated live as categories toggle.
+  const [showRawJson, setShowRawJson] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -205,6 +247,18 @@ export function HookInstallPanel({
       <div className="flex items-center gap-2">
         <span className="font-semibold">Claude hooks</span>
         <StatusPill installed={installed} />
+        {/* "View raw JSON" — opens the literal settings.json fragment TermHub
+            writes for the current selection, so nothing is hidden behind the
+            outcome blurbs. Pushed to the right so it reads as a peek action. */}
+        <button
+          type="button"
+          onClick={() => setShowRawJson(true)}
+          className="ml-auto rounded border px-2 py-0.5 text-[11px]"
+          style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
+          title="Show the exact JSON TermHub writes to ~/.claude/settings.json for your current selection"
+        >
+          View raw JSON
+        </button>
       </div>
       <p className="text-xs leading-snug" style={{ color: "var(--th-fg-muted)" }}>
         Adds lifecycle hook handlers to your{" "}
@@ -310,6 +364,119 @@ export function HookInstallPanel({
           <span className="break-all">{error}</span>
         </div>
       )}
+
+      {showRawJson && (
+        <RawJsonModal
+          agentBin={agentBin}
+          events={ALL_EVENTS.filter((e) => selected.has(e))}
+          onClose={() => setShowRawJson(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Modal showing the literal settings.json fragment TermHub writes for the
+ *  current selection — the real config (built by `buildHooksJson`, mirroring the
+ *  Rust shapes), pretty-printed in a scrollable monospace block with a Copy
+ *  button. `events` is the live, backend-ordered, selection-filtered event list,
+ *  so the JSON reflects exactly what Apply would install right now. */
+function RawJsonModal({
+  agentBin,
+  events,
+  onClose,
+}: {
+  agentBin: string;
+  events: string[];
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const json = JSON.stringify(buildHooksJson(agentBin, events), null, 2);
+
+  // Close on Escape, matching the rest of the app's modals.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const copy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(json);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard can reject (permissions); silently no-op rather than throw.
+    }
+  }, [json]);
+
+  return (
+    // Backdrop: click outside the card closes; the card stops propagation.
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: "color-mix(in srgb, var(--th-bg) 70%, transparent)" }}
+      onClick={onClose}
+      role="presentation"
+    >
+      <div
+        className="flex max-h-[80vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border shadow-xl"
+        style={{ borderColor: "var(--th-border)", background: "var(--th-bg-elevated, #0a0a0a)" }}
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Raw hook configuration JSON"
+      >
+        <div
+          className="flex items-center gap-2 border-b px-3 py-2"
+          style={{ borderColor: "var(--th-border)" }}
+        >
+          <span className="text-sm font-medium" style={{ color: "var(--th-fg)" }}>
+            settings.json
+          </span>
+          <span className="text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
+            {events.length} hook{events.length === 1 ? "" : "s"} + statusLine
+          </span>
+          <button
+            type="button"
+            onClick={() => void copy()}
+            className="ml-auto rounded border px-2 py-0.5 text-[11px]"
+            style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
+            title="Copy this JSON to the clipboard"
+          >
+            {copied ? "Copied" : "Copy"}
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded border px-2 py-0.5 text-[11px]"
+            style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
+            aria-label="Close"
+          >
+            Close
+          </button>
+        </div>
+        <p className="px-3 pt-2 text-[11px] leading-snug" style={{ color: "var(--th-fg-muted)" }}>
+          The exact entries TermHub merges into your{" "}
+          <code>~/.claude/settings.json</code> for the current selection (your
+          other settings are preserved). Updates live as you toggle categories.
+        </p>
+        {/* Opaque, scrollable monospace block so the real config is readable and
+            copyable without truncation. */}
+        <pre
+          className="m-3 mt-2 overflow-auto rounded border p-3 text-[11px] leading-relaxed"
+          style={{
+            borderColor: "var(--th-border)",
+            background: "var(--th-bg, #0a0a0a)",
+            color: "var(--th-fg)",
+            fontFamily:
+              "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+          }}
+        >
+          {json}
+        </pre>
+      </div>
     </div>
   );
 }
