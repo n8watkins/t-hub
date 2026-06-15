@@ -151,31 +151,21 @@ fn make_session(id: String, last_seen: i64, cwd: Option<String>, summary: Option
 
 // ===========================================================================
 // Platform readers.
+//
+// Both platforms now use the SAME std::fs core ([`read_sessions_from_dir`]); the
+// only difference is the ROOT path. unix points at `$HOME/.claude/projects`;
+// Windows resolves the WSL `$HOME` once (via `wsl.exe -- bash -lc 'echo $HOME'`,
+// the one thing that reliably works) and reads the transcripts directly over the
+// `\\wsl.localhost\<distro>\...` UNC share. We deliberately do NOT pass a complex
+// multi-line script to `wsl.exe`: the diag log showed `wsl.exe` mangling a
+// trailing path argument (it arrived empty, `$1`-based reads found nothing), so
+// reading the share with std::fs sidesteps that entire class of arg-quoting bug.
+// We only read ~40 small (32KB) prefixes, so the slower UNC bridge is fine here.
 // ===========================================================================
 
-/// Read the transcript catalog for this platform. Windows shells into WSL (where
-/// `~/.claude` actually lives); unix reads the filesystem directly.
-fn read_sessions() -> Vec<RecentSession> {
-    #[cfg(windows)]
-    {
-        read_sessions_windows()
-    }
-    #[cfg(not(windows))]
-    {
-        read_sessions_unix()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// unix (dev / WSL build): read ~/.claude/projects directly.
-// ---------------------------------------------------------------------------
-
-/// unix reader: walk `~/.claude/projects/*/*.jsonl`, stat each for its mtime, and
-/// parse its cwd/summary. Self-contained and dependency-free.
 /// Read at most `cap` bytes from the START of a file as lossy UTF-8. The recent
 /// catalog only needs the early lines (cwd ~line 3; an early summary if present),
-/// so we never read whole multi-MB transcripts.
-#[cfg(not(windows))]
+/// so we never read whole multi-MB transcripts. Platform-agnostic.
 fn read_prefix(path: &std::path::Path, cap: usize) -> String {
     use std::io::Read;
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -187,15 +177,20 @@ fn read_prefix(path: &std::path::Path, cap: usize) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-#[cfg(not(windows))]
-fn read_sessions_unix() -> Vec<RecentSession> {
+/// Read every `~/.claude/projects/<project>/<id>.jsonl` transcript under
+/// `projects` into [`RecentSession`]s. Shared by both platforms (only the root
+/// path differs); uses plain `std::fs` so it works identically over a Linux FS
+/// and over the Windows `\\wsl.localhost\` UNC share. Best-effort: an unreadable
+/// dir/entry is skipped, never fatal. PERF: only the first 32KB of each file is
+/// read (the cwd/summary live near the top; bodies can be 10MB+).
+fn read_sessions_from_dir(projects: &std::path::Path) -> Vec<RecentSession> {
     use std::time::UNIX_EPOCH;
 
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-        return Vec::new();
-    };
-    let projects = home.join(".claude").join("projects");
-    let Ok(project_dirs) = std::fs::read_dir(&projects) else {
+    let Ok(project_dirs) = std::fs::read_dir(projects) else {
+        crate::diag::diag_log(format!(
+            "{{\"t\":\"recent\",\"m\":\"read_dir FAILED: {}\"}}",
+            projects.display().to_string().replace('"', "'")
+        ));
         return Vec::new();
     };
 
@@ -206,14 +201,12 @@ fn read_sessions_unix() -> Vec<RecentSession> {
         };
         for entry in files.flatten() {
             let path = entry.path();
-            // Only `<session-id>.jsonl` transcripts.
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
             let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
                 continue;
             };
-            // mtime (epoch seconds) as the last-seen stamp.
             let last_seen = entry
                 .metadata()
                 .ok()
@@ -221,8 +214,6 @@ fn read_sessions_unix() -> Vec<RecentSession> {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            // PERF: only the first 32KB (cwd is ~line 3; an early summary if any).
-            // Whole transcripts can be 10MB+; we never need the body.
             let text = read_prefix(&path, 32 * 1024);
             let (cwd, summary) = parse_transcript(&text);
             if let Some(s) = make_session(id, last_seen, cwd, summary) {
@@ -230,38 +221,47 @@ fn read_sessions_unix() -> Vec<RecentSession> {
             }
         }
     }
+    crate::diag::diag_log(format!(
+        "{{\"t\":\"recent\",\"m\":\"read_sessions_from_dir({}) -> {} sessions\"}}",
+        projects.display().to_string().replace('"', "'"),
+        out.len()
+    ));
     out
 }
 
+/// Read the transcript catalog for this platform. unix reads
+/// `$HOME/.claude/projects` directly; Windows resolves the WSL home and reads the
+/// same dir over the UNC share.
+fn read_sessions() -> Vec<RecentSession> {
+    #[cfg(windows)]
+    {
+        read_sessions_windows()
+    }
+    #[cfg(not(windows))]
+    {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return Vec::new();
+        };
+        read_sessions_from_dir(&home.join(".claude").join("projects"))
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Windows: the transcripts live inside the WSL distro, so cross with `wsl.exe`.
+// Windows: the transcripts live inside the WSL distro. Resolve the WSL $HOME via
+// wsl.exe once, then read the catalog over the `\\wsl.localhost\` UNC share.
 // ---------------------------------------------------------------------------
 
-/// Windows reader: ask WSL to enumerate + stat the transcripts and stream their
-/// contents back in one shot, then parse the result here. We emit a per-file
-/// record framed so each one's id, mtime, and raw JSONL are unambiguous even
-/// though the JSONL itself contains newlines.
-///
-/// Frame format (printed by the `bash -lc` script, one block per transcript):
-/// ```text
-/// \x1e<session-id>\t<mtime-epoch-secs>\t<byte-length>\x1f<raw jsonl bytes>
-/// ```
-/// `\x1e` (record separator) starts a block; `\x1f` (unit separator) ends the
-/// header; `<byte-length>` lets us slice exactly the file's bytes regardless of
-/// embedded newlines. Control chars chosen because they never appear in paths or
-/// JSON text. Best-effort: a failed spawn / non-zero exit yields an empty list.
-/// The WSL distro to shell into (mirrors files.rs::host_distro so Recent and the
-/// file index agree on which distro holds `~/.claude`). Overridable via
-/// TERMHUB_DISTRO; defaults to the dev distro.
+/// The WSL distro to read from (mirrors files.rs::host_distro so Recent and the
+/// file index agree). Overridable via TERMHUB_DISTRO; defaults to the dev distro.
 #[cfg(windows)]
 fn host_distro() -> String {
     std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
 }
 
 /// Resolve the WSL `$HOME` for `distro` by shelling a login bash once (the proven
-/// pattern from claude/install.rs::wsl_home). Returns None on failure/empty so the
-/// caller degrades to an empty Recent list. `echo $HOME` is the one thing that
-/// reliably resolves the distro home from a Windows GUI spawn.
+/// pattern from claude/install.rs::wsl_home). `echo $HOME` is a SINGLE simple arg,
+/// so it doesn't trip the wsl.exe multi-arg mangling that broke the old reader.
+/// Returns None on failure/empty so the caller degrades to an empty list.
 #[cfg(windows)]
 fn wsl_home(distro: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
@@ -286,154 +286,32 @@ fn wsl_home(distro: &str) -> Option<String> {
     }
 }
 
+/// Map a WSL POSIX home (`/home/natkins`) onto the Windows UNC share path for the
+/// projects dir: `\\wsl.localhost\<distro>\home\natkins\.claude\projects`. Same
+/// mapping files.rs::to_host_path uses for its std::fs fallback.
 #[cfg(windows)]
-fn read_sessions_windows() -> Vec<RecentSession> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-
-    // List the most-recently-modified transcripts first and cap how many we read
-    // so we never slurp hundreds of stale conversations. For each, print the
-    // framed header (id, mtime, byte length) followed by the raw file bytes.
-    //
-    // `stat -c %Y` = mtime epoch secs; `%s` = byte size. `ls -t` orders newest
-    // first; `head` caps the count. Quoting keeps paths with spaces intact.
-    let limit = RECENT_LIMIT;
-    // PERF: read only the first 32KB of each transcript, NOT the whole file. The
-    // session cwd is on the first user line (~line 3, under 1KB in) and a summary,
-    // when present, sits near the top too. Some transcripts are 10MB+; cat-ing the
-    // newest 40 was ~160MB over the wsl.exe pipe and made Recent take many seconds
-    // (effectively "not loading"). The prefix is all we need; `size` is the byte
-    // count the frame declares so the parser slices exactly what we sent.
-    let cap = 32 * 1024;
-    // The projects dir is passed as $1 (an ABSOLUTE path resolved in Rust below),
-    // NOT derived from $HOME inside the script: `echo $HOME` works, but the empty
-    // result we saw in the diag log means relying on $HOME mid-script was fragile,
-    // so we mirror files.rs (which passes absolute paths as $1 and works). We also
-    // enumerate with `find` instead of a shell glob (`"$dir"/*/*.jsonl`), since a
-    // glob that expands to nothing silently yields zero output; `find` is robust.
-    // Diagnostics go to STDERR (TH_NODIR / TH_DIR_OK / TH_COUNT) and are logged
-    // unconditionally, so a future empty list is self-explaining.
-    let script = format!(
-        r#"
-dir="$1"
-if [ ! -d "$dir" ]; then echo "TH_NODIR:$dir HOME=$HOME" >&2; exit 0; fi
-echo "TH_DIR_OK:$dir" >&2
-count=$(find "$dir" -mindepth 2 -maxdepth 2 -name '*.jsonl' 2>/dev/null | wc -l)
-echo "TH_COUNT:$count" >&2
-find "$dir" -mindepth 2 -maxdepth 2 -name '*.jsonl' -printf '%T@\t%p\n' 2>/dev/null \
-  | sort -rn | head -n {limit} | while IFS=$'\t' read -r mt f; do
-  id=$(basename "$f" .jsonl)
-  mtime=${{mt%.*}}
-  fsize=$(stat -c %s "$f" 2>/dev/null || echo 0)
-  size=$fsize; [ "$fsize" -gt {cap} ] && size={cap}
-  printf '\036%s\t%s\t%s\037' "$id" "$mtime" "$size"
-  head -c "$size" "$f" 2>/dev/null
-done
-"#
-    );
-
-    let mut cmd = Command::new("wsl.exe");
-    // Target the distro EXPLICITLY (-d), matching files.rs's working pattern.
-    // Resolve the WSL $HOME once (the proven install.rs approach) and pass the
-    // absolute projects dir as $1 ($0 is a label, like files.rs's wsl_bash).
-    let distro = host_distro();
-    let projects_dir = match wsl_home(&distro) {
-        Some(home) => format!("{}/.claude/projects", home.trim_end_matches('/')),
-        None => {
-            crate::diag::diag_log(format!(
-                "{{\"t\":\"recent\",\"m\":\"wsl_home FAILED (distro={distro}); cannot locate ~/.claude\"}}"
-            ));
-            return Vec::new();
-        }
-    };
-    cmd.arg("-d")
-        .arg(&distro)
-        .arg("--")
-        .arg("bash")
-        .arg("-lc")
-        .arg(&script)
-        .arg("termhub")
-        .arg(&projects_dir);
-    // CREATE_NO_WINDOW: suppress the brief console flash every `wsl.exe` spawn
-    // would otherwise show (same flag tmux.rs uses).
-    cmd.creation_flags(0x0800_0000);
-
-    // DIAG: this path is best-effort and used to swallow every failure silently,
-    // which made an empty Recent list impossible to debug from a release build.
-    // Log the spawn result, exit status, and byte counts so the file diag log
-    // shows exactly why Recent is empty (no wsl / non-zero exit / zero stdout).
-    let output = match cmd.output() {
-        Ok(o) => o,
-        Err(e) => {
-            crate::diag::diag_log(format!(
-                "{{\"t\":\"recent\",\"m\":\"wsl.exe spawn FAILED (distro={distro}): {e}\"}}"
-            ));
-            return Vec::new();
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        crate::diag::diag_log(format!(
-            "{{\"t\":\"recent\",\"m\":\"wsl.exe exit {:?} (distro={distro}); stderr={}\"}}",
-            output.status.code(),
-            stderr.trim().replace('"', "'").chars().take(300).collect::<String>()
-        ));
-        return Vec::new();
-    }
-    // Always surface the script's stderr diagnostics (TH_DIR_OK / TH_NODIR /
-    // TH_COUNT) so a zero result is explained even on a "success" exit.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.trim().is_empty() {
-        crate::diag::diag_log(format!(
-            "{{\"t\":\"recent\",\"m\":\"script stderr: {}\"}}",
-            stderr.trim().replace('"', "'").chars().take(300).collect::<String>()
-        ));
-    }
-    let sessions = parse_framed(&output.stdout);
-    crate::diag::diag_log(format!(
-        "{{\"t\":\"recent\",\"m\":\"wsl.exe OK (distro={distro}): {} stdout bytes -> {} sessions parsed\"}}",
-        output.stdout.len(),
-        sessions.len()
-    ));
-    sessions
+fn projects_unc(distro: &str, wsl_home: &str) -> std::path::PathBuf {
+    let home_rel = wsl_home.trim_start_matches('/').replace('/', "\\");
+    std::path::PathBuf::from(format!(
+        "\\\\wsl.localhost\\{distro}\\{home_rel}\\.claude\\projects"
+    ))
 }
 
-/// Parse the framed `\x1e id \t mtime \t len \x1f <bytes>` stream the Windows WSL
-/// script prints into [`RecentSession`]s. Lives only on Windows (the unix reader
-/// has no frame), kept here next to its producer.
 #[cfg(windows)]
-fn parse_framed(bytes: &[u8]) -> Vec<RecentSession> {
-    const RS: u8 = 0x1e; // record separator: starts a per-file block
-    const US: u8 = 0x1f; // unit separator: ends the header
-
-    let mut out = Vec::new();
-    // Split on the record separator; the first chunk before any RS is preamble.
-    for block in bytes.split(|&b| b == RS).skip(1) {
-        // Header (id \t mtime \t len) up to the unit separator, then the bytes.
-        let Some(us_pos) = block.iter().position(|&b| b == US) else {
-            continue;
-        };
-        let header = String::from_utf8_lossy(&block[..us_pos]);
-        let mut parts = header.split('\t');
-        let (Some(id), Some(mtime), Some(len)) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        let id = id.trim().to_string();
-        if id.is_empty() {
-            continue;
-        }
-        let last_seen = mtime.trim().parse::<i64>().unwrap_or(0);
-        let len = len.trim().parse::<usize>().unwrap_or(0);
-        let body = &block[us_pos + 1..];
-        // Slice exactly the file's bytes (guards against any trailing framing).
-        let body = if len <= body.len() { &body[..len] } else { body };
-        let text = String::from_utf8_lossy(body);
-        let (cwd, summary) = parse_transcript(&text);
-        if let Some(s) = make_session(id, last_seen, cwd, summary) {
-            out.push(s);
-        }
-    }
-    out
+fn read_sessions_windows() -> Vec<RecentSession> {
+    let distro = host_distro();
+    let Some(home) = wsl_home(&distro) else {
+        crate::diag::diag_log(format!(
+            "{{\"t\":\"recent\",\"m\":\"wsl_home FAILED (distro={distro}); cannot locate ~/.claude\"}}"
+        ));
+        return Vec::new();
+    };
+    let projects = projects_unc(&distro, &home);
+    crate::diag::diag_log(format!(
+        "{{\"t\":\"recent\",\"m\":\"windows reader: home={home} -> {}\"}}",
+        projects.display().to_string().replace('"', "'")
+    ));
+    read_sessions_from_dir(&projects)
 }
 
 #[cfg(test)]
@@ -483,32 +361,49 @@ mod tests {
         assert_eq!(s2.label, "Do a thing");
     }
 
-    #[cfg(windows)]
     #[test]
-    fn parse_framed_decodes_blocks_with_embedded_newlines() {
-        // Two framed blocks; the JSONL bodies contain newlines that must NOT be
-        // mistaken for record boundaries (we slice by the declared byte length).
-        let body1 = "{\"cwd\":\"/a\"}\n{\"type\":\"summary\",\"summary\":\"A\"}\n";
-        let body2 = "{\"cwd\":\"/b\"}\n";
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"preamble noise");
-        buf.push(0x1e);
-        buf.extend_from_slice(format!("id1\t100\t{}", body1.len()).as_bytes());
-        buf.push(0x1f);
-        buf.extend_from_slice(body1.as_bytes());
-        buf.push(0x1e);
-        buf.extend_from_slice(format!("id2\t200\t{}", body2.len()).as_bytes());
-        buf.push(0x1f);
-        buf.extend_from_slice(body2.as_bytes());
+    fn read_sessions_from_dir_reads_transcripts_and_prefixes() {
+        // Build a fake ~/.claude/projects with two project dirs holding transcripts,
+        // then assert the shared std::fs reader extracts id/cwd/label and ignores
+        // non-jsonl files. This is the SAME code path Windows uses over UNC.
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("th_recent_test_{}", std::process::id()));
+        let proj_a = tmp.join("proj-a");
+        let proj_b = tmp.join("proj-b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
 
-        let sessions = parse_framed(&buf);
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].id, "id1");
-        assert_eq!(sessions[0].cwd, "/a");
-        assert_eq!(sessions[0].label, "A");
-        assert_eq!(sessions[0].last_seen, 100);
-        assert_eq!(sessions[1].id, "id2");
-        assert_eq!(sessions[1].cwd, "/b");
-        assert_eq!(sessions[1].label, "b"); // basename fallback
+        let mut f = std::fs::File::create(proj_a.join("aaaa.jsonl")).unwrap();
+        writeln!(f, "{{\"type\":\"mode\"}}").unwrap();
+        writeln!(f, "{{\"type\":\"user\",\"cwd\":\"/home/u/alpha\"}}").unwrap();
+        writeln!(f, "{{\"type\":\"summary\",\"summary\":\"Alpha work\"}}").unwrap();
+
+        let mut g = std::fs::File::create(proj_b.join("bbbb.jsonl")).unwrap();
+        writeln!(g, "{{\"type\":\"user\",\"cwd\":\"/home/u/beta\"}}").unwrap();
+        // A non-jsonl file that must be ignored.
+        std::fs::File::create(proj_b.join("notes.txt")).unwrap();
+
+        let mut got = read_sessions_from_dir(&tmp);
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        std::fs::remove_dir_all(&tmp).ok();
+
+        assert_eq!(got.len(), 2, "two transcripts, txt ignored");
+        assert_eq!(got[0].id, "aaaa");
+        assert_eq!(got[0].cwd, "/home/u/alpha");
+        assert_eq!(got[0].label, "Alpha work"); // summary wins
+        assert_eq!(got[1].id, "bbbb");
+        assert_eq!(got[1].cwd, "/home/u/beta");
+        assert_eq!(got[1].label, "beta"); // basename fallback
+    }
+
+    #[test]
+    fn read_prefix_caps_at_n_bytes() {
+        use std::io::Write;
+        let p = std::env::temp_dir().join(format!("th_prefix_{}.txt", std::process::id()));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(&vec![b'x'; 100_000]).unwrap();
+        let s = read_prefix(&p, 1024);
+        std::fs::remove_file(&p).ok();
+        assert_eq!(s.len(), 1024);
     }
 }
