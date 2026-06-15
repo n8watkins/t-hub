@@ -99,6 +99,9 @@ export function TerminalView({
   const zoomMountRef = useRef(true);
   // Global zoom: every tile reads the same font size so they scale together.
   const fontSize = useWorkspace((s) => s.fontSize);
+  // The focused tile id — when it becomes THIS terminal, we pull keyboard focus
+  // into the xterm (see the focus effect below).
+  const focusedId = useWorkspace((s) => s.focusedId);
   // Live terminal palette from the active theme (undefined => xterm defaults).
   const termPalette = useTheme((s) => s.active.terminal);
 
@@ -538,6 +541,24 @@ export function TerminalView({
   useEffect(() => {
     if (termRef.current) termRef.current.options.theme = toXtermTheme(termPalette);
   }, [termPalette]);
+
+  // When this terminal becomes the focused tile, put the KEYBOARD into its xterm
+  // (not just the tile highlight) so the user can type right away — e.g. the
+  // instant a Recall/spawn lands and `claude --resume` shows its picker, no extra
+  // click to focus the terminal. rAF defers until after the pool positions/shows
+  // the tile this frame; guarded by `visible` + a live term instance. Also fires
+  // on mount (first effect run) so a freshly-spawned focused tile grabs focus.
+  useEffect(() => {
+    if (!visible || focusedId !== terminalId) return;
+    const raf = requestAnimationFrame(() => {
+      try {
+        termRef.current?.focus();
+      } catch {
+        /* container detached mid-focus; ignore */
+      }
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [focusedId, terminalId, visible]);
 
   return <div ref={containerRef} className="termhub-terminal h-full w-full" />;
 }
