@@ -13,6 +13,9 @@ mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
 mod devserver; // feat/dev-runner: managed `npm run dev` per-project runner (Dev tab)
 mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/diag)
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
+// --- feat/git-panel ---
+mod git; // git awareness for the Files panel: branch/worktree info + commit
+// ----------------------
 mod model; // data-model structs (PRD §8)
 // --- feat/projects-sidebar (Agent A) ---------------------------------------
 mod recent; // recent recallable Claude sessions for the sidebar "Recent" list
@@ -270,6 +273,11 @@ pub fn run() {
             files::list_dir,
             files::read_text_file,
             files::write_text_file,
+            // --- feat/git-panel ---
+            // Git awareness for the Files panel: branch/worktree info + commit.
+            git::git_info,
+            git::git_commit,
+            // ----------------------
             // feat/dev-runner: managed per-project dev server (Dev tab). Self-
             // contained (its own process-global registry; no .manage() needed).
             // Streams output on `devserver://<terminal_id>`.
