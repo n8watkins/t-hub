@@ -16,9 +16,24 @@
 //!   - `capture_pane(name) -> Vec<u8>`   (scrollback to seed xterm on attach)
 
 use std::process::Command;
+use std::sync::LazyLock;
 
-/// The isolated tmux socket name; always passed as `tmux -L termhub`.
-pub const SOCKET: &str = "termhub";
+/// The isolated tmux socket name; always passed as `tmux -L <socket>`.
+///
+/// Resolved ONCE at startup from `$TERMHUB_TMUX_SOCKET`, defaulting to
+/// `"termhub"`. The env hook exists so a second, side-by-side **DEV** instance
+/// can run alongside the production app on its OWN tmux socket (e.g.
+/// `TERMHUB_TMUX_SOCKET=termhub-dev`) without ever sharing sessions with — or
+/// killing — production's terminals. With NO env var set the value is exactly
+/// `"termhub"`, so default behavior is byte-for-byte unchanged.
+static SOCKET_NAME: LazyLock<String> =
+    LazyLock::new(|| std::env::var("TERMHUB_TMUX_SOCKET").unwrap_or_else(|_| "termhub".into()));
+
+/// The resolved tmux socket name (`$TERMHUB_TMUX_SOCKET` or `"termhub"`),
+/// always passed as `tmux -L <socket>`. Read once; cheap to call repeatedly.
+pub fn socket() -> &'static str {
+    &SOCKET_NAME
+}
 
 /// How many lines of scrollback history we capture to seed xterm on attach.
 const SCROLLBACK_LINES: i64 = 2000;
@@ -74,7 +89,7 @@ fn tmux(args: &[&str]) -> Command {
     };
     #[cfg(unix)]
     let mut cmd = Command::new("tmux");
-    cmd.arg("-L").arg(SOCKET);
+    cmd.arg("-L").arg(socket());
     cmd.args(args);
     cmd
 }
@@ -315,9 +330,14 @@ pub struct PaneInfo {
 /// quotes `#` is literal, so it survives intact. Best-effort: a missing server
 /// (no sessions) returns an empty Vec rather than erroring.
 pub fn pane_info() -> Result<Vec<PaneInfo>, TmuxError> {
-    const SCRIPT: &str =
-        "tmux -L termhub list-panes -a -F '#{session_name}|#{pane_current_command}|#{pane_current_path}'";
-    let output = pane_info_command(SCRIPT).output().map_err(|e| TmuxError {
+    // Built from the resolved socket name (not a hardcoded `termhub`) so a DEV
+    // instance with `$TERMHUB_TMUX_SOCKET` set reads ITS panes; with no env var
+    // the socket is `termhub`, reproducing the previous literal exactly.
+    let script = format!(
+        "tmux -L {} list-panes -a -F '#{{session_name}}|#{{pane_current_command}}|#{{pane_current_path}}'",
+        socket()
+    );
+    let output = pane_info_command(&script).output().map_err(|e| TmuxError {
         op: "list-panes",
         code: None,
         message: format!("failed to spawn tmux: {e}"),

@@ -51,7 +51,7 @@
 //! commands share one open handle (cheap upserts, no per-call open cost).
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -68,7 +68,15 @@ pub const SNAPSHOT_HISTORY_CAP: i64 = 20;
 pub const WORKSPACE_KEY: &str = "workspace.v2";
 
 /// Database filename inside the app data dir.
-const DB_FILE: &str = "termhub.db";
+///
+/// Resolved ONCE at startup from `$TERMHUB_DB_NAME`, defaulting to
+/// `"termhub.db"`. The env hook exists so a side-by-side **DEV** instance can
+/// keep its workspace state in a SEPARATE SQLite file (e.g.
+/// `TERMHUB_DB_NAME=termhub-dev.db`) within the same app data dir, instead of
+/// reading/writing production's `termhub.db`. With NO env var set the filename
+/// is exactly `"termhub.db"`, so default behavior is byte-for-byte unchanged.
+static DB_FILE: LazyLock<String> =
+    LazyLock::new(|| std::env::var("TERMHUB_DB_NAME").unwrap_or_else(|_| "termhub.db".into()));
 
 /// Tauri-managed state: the open SQLite connection behind a mutex. A `None`
 /// connection means the DB could not be opened/initialized at startup; the two
@@ -92,7 +100,7 @@ impl Db {
                 eprintln!(
                     "db: failed to open SQLite at {}: {e} (workspace falls back \
                      to localStorage only)",
-                    dir.join(DB_FILE).display()
+                    dir.join(&*DB_FILE).display()
                 );
                 Db {
                     conn: Mutex::new(None),
@@ -109,7 +117,7 @@ impl Db {
                 Some(format!("create {}: {e}", dir.display())),
             )
         })?;
-        let conn = Connection::open(dir.join(DB_FILE))?;
+        let conn = Connection::open(dir.join(&*DB_FILE))?;
         // WAL: readers don't block the writer and a crash leaves a recoverable
         // log; NORMAL: fsync only at checkpoint, durable across app crashes.
         conn.pragma_update(None, "journal_mode", "WAL")?;
