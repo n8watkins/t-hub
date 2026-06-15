@@ -142,8 +142,17 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
           <WorkspacesList />
         </Section>
 
-        {/* Recent — past Claude sessions to resume. */}
-        <Section title="Recent" className="border-b">
+        {/* Recent — past Claude sessions to resume. Collapsible, and capped to
+            half the viewport with its own scroll so a long history can't swallow
+            the whole sidebar; the list scrolls inside this region, not the page. */}
+        <Section
+          title="Recent"
+          className="border-b"
+          collapsible
+          storageKey="termhub.sidebar.recent.open"
+          bodyClassName="th-scroll overflow-y-auto"
+          bodyStyle={{ maxHeight: "50vh" }}
+        >
           <RecentList onRecall={(id, cwd) => onRecall?.(id, cwd)} />
         </Section>
       </div>
@@ -495,25 +504,75 @@ function Section({
   count,
   className,
   children,
+  collapsible = false,
+  storageKey,
+  bodyClassName,
+  bodyStyle,
 }: {
   title: string;
   count?: number;
   className?: string;
   children: React.ReactNode;
+  /** When true, the header becomes a chevron toggle that shows/hides the body. */
+  collapsible?: boolean;
+  /** localStorage key to persist the collapsed state across launches. */
+  storageKey?: string;
+  /** Optional wrapper around the body — e.g. a height-capped, internally
+   *  scrolling region so a long list can't consume the whole sidebar. */
+  bodyClassName?: string;
+  bodyStyle?: React.CSSProperties;
 }) {
+  const [open, setOpen] = useState<boolean>(() => {
+    if (!storageKey || typeof localStorage === "undefined") return true;
+    return localStorage.getItem(storageKey) !== "0";
+  });
+  const isOpen = collapsible ? open : true;
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (!storageKey) return;
+    try {
+      localStorage.setItem(storageKey, next ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  };
+
   return (
     <section
       className={["flex flex-col", className ?? ""].join(" ")}
       style={{ borderColor: "var(--th-border)" }}
     >
-      <div
-        className="flex w-full items-center gap-1 px-2 pt-2 pb-1 text-xs font-semibold uppercase tracking-wide"
-        style={{ color: "var(--th-fg-muted)" }}
-      >
-        <span className="min-w-0 flex-1 truncate">{title}</span>
-        {count != null && <CountBadge n={count} />}
-      </div>
-      {children}
+      {collapsible ? (
+        <button
+          type="button"
+          onClick={toggle}
+          aria-expanded={isOpen}
+          title={isOpen ? "Collapse" : "Expand"}
+          className="flex w-full items-center gap-1 px-2 pt-2 pb-1 text-xs font-semibold uppercase tracking-wide opacity-80 hover:opacity-100"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          <ChevronIcon open={isOpen} />
+          <span className="min-w-0 flex-1 truncate text-left">{title}</span>
+          {count != null && <CountBadge n={count} />}
+        </button>
+      ) : (
+        <div
+          className="flex w-full items-center gap-1 px-2 pt-2 pb-1 text-xs font-semibold uppercase tracking-wide"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          <span className="min-w-0 flex-1 truncate">{title}</span>
+          {count != null && <CountBadge n={count} />}
+        </div>
+      )}
+      {isOpen &&
+        (bodyClassName || bodyStyle ? (
+          <div className={bodyClassName} style={bodyStyle}>
+            {children}
+          </div>
+        ) : (
+          children
+        ))}
     </section>
   );
 }

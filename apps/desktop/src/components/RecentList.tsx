@@ -128,8 +128,8 @@ export function RecentList({ onRecall }: RecentListProps) {
     );
   }
 
-  // Flat, scrollable list of projects. The parent section already scrolls; this
-  // just stacks rows.
+  // Flat list of projects. The parent "Recent" Section caps the height and owns
+  // the scroll for this region, so here we just stack the rows.
   return (
     <div className="flex flex-col gap-0.5 px-2 py-1">
       {groups.map((g) => (
