@@ -174,6 +174,16 @@ pub fn run() {
         // browser (web-preview "Open externally"). Without it the JS open() is a
         // no-op. Paired with the `shell:allow-open` capability.
         .plugin(tauri_plugin_shell::init())
+        // --- Auto-updater (feat/auto-updater) ------------------------------
+        // The updater plugin powers the in-app "Updates" settings section and
+        // the on-launch silent install: it reads `latest.json` from the
+        // GitHub Releases endpoint (see plugins.updater in tauri.conf.json),
+        // verifies the signed NSIS artifact against the configured pubkey, and
+        // downloads/installs it. The process plugin's relaunch() restarts the
+        // app after an update is applied. Both are gated by the
+        // `updater:default` / `process:default` capabilities.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(TerminalManager::default())
         .manage(AppState::default())
         .manage(files::FileIndexState::new())
