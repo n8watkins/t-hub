@@ -763,8 +763,12 @@ function TerminalRow({
             e.stopPropagation();
             onToggleColorMenu();
           }}
+          // Hover-only: hidden until the row is hovered (group-hover), and kept
+          // visible only while its own picker is open. The row already shows the
+          // assigned color as its tint/accent bar, so the swatch button itself
+          // doesn't need to persist when a color is set.
           className={`flex h-5 w-5 items-center justify-center rounded transition-opacity hover:bg-neutral-700/40 group-hover:opacity-100${
-            colorMenuOpen || ownColor ? " opacity-100" : " opacity-0"
+            colorMenuOpen ? " opacity-100" : " opacity-0"
           }`}
           title="Terminal color"
           aria-label="Set terminal color"
