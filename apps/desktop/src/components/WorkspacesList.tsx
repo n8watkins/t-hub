@@ -473,10 +473,7 @@ function WorkspaceRow({
           {colorMenu && (
             <ColorPicker
               current={color}
-              onPick={(c) => {
-                onSetColor(c);
-                setColorMenu(false);
-              }}
+              onPick={(c) => onSetColor(c)}
               onClear={() => {
                 onClearColor();
                 setColorMenu(false);
@@ -576,10 +573,7 @@ function WorkspaceRow({
                     setTermColorMenuId((cur) => (cur === id ? null : id))
                   }
                   onCloseColorMenu={() => setTermColorMenuId(null)}
-                  onSetColor={(c) => {
-                    onSetTerminalColor(id, c);
-                    setTermColorMenuId(null);
-                  }}
+                  onSetColor={(c) => onSetTerminalColor(id, c)}
                   onClearColor={() => {
                     onClearTerminalColor(id);
                     setTermColorMenuId(null);
@@ -858,7 +852,14 @@ function ColorPicker({
               <button
                 key={c}
                 type="button"
-                onClick={() => onPick(c)}
+                // A palette swatch is a discrete choice: set AND close. The
+                // custom <input type="color"> below only calls onPick (no close)
+                // so the native picker can stay open and be dragged live — onPick
+                // must therefore be set-only at every call site.
+                onClick={() => {
+                  onPick(c);
+                  onClose();
+                }}
                 className="flex h-6 w-full items-center justify-center rounded"
                 style={{
                   backgroundColor: c,

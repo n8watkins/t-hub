@@ -259,6 +259,9 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
       /* idempotent on the backend; nothing to surface */
     });
     update(terminalId, { status: "idle" });
+    // Clear the published URL: the server is gone, so Preview must stop loading
+    // it and the tile's busy-gate (devUrl present => "looks busy") must release.
+    usePanels.getState().setDevUrl(terminalId, null);
   }, [terminalId]);
 
   const running = status === "running";
@@ -421,6 +424,9 @@ function handleEvent(id: TerminalId, e: DevServerEvent): void {
     case "exited":
       if (e.line) appendLine(id, `[termhub] ${e.line}`);
       update(id, { status: "exited" });
+      // The server died, so drop its URL: Preview stops loading a dead address
+      // and the tile's busy-gate (devUrl present) releases.
+      usePanels.getState().setDevUrl(id, null);
       break;
     case "line":
     default: {

@@ -70,8 +70,13 @@ function useGitInfo(cwd: string): GitInfo | null {
     window.addEventListener("focus", load);
     // Poll so a branch switch in the SAME directory (`git switch` without a cwd
     // change) is reflected — the cwd-keyed effect alone wouldn't re-fire, leaving
-    // the chip stuck on the old branch until the window regained focus.
-    const poll = window.setInterval(load, 5000);
+    // the chip stuck on the old branch until the window regained focus. Skip the
+    // poll while the window is hidden/minimized so a wall of tiles doesn't spawn
+    // a `git` process each every 5s in the background (focus re-runs load on
+    // return, so the chip is still fresh the moment the user comes back).
+    const poll = window.setInterval(() => {
+      if (!document.hidden) load();
+    }, 5000);
     return () => {
       alive = false;
       window.removeEventListener("focus", load);

@@ -50,8 +50,11 @@ pub async fn claude_usage() -> Result<ClaudeUsage, String> {
 /// flaky: the session/week percentages arrive after a network round-trip and the
 /// process frequently exits having printed only the intro line, so a single run
 /// succeeds well under half the time. Re-running until a parse yields numbers
-/// makes the sidebar reliably populate. Bounded so a genuinely logged-out / down
-/// state still returns promptly with `ok:false`.
+/// makes the sidebar reliably populate. Bounded to 3 so a persistently-failing
+/// state (logged out / Claude down) settles after a few tries instead of looping
+/// — note this means the failure path DOES run all 3 attempts (it only short-
+/// circuits on a successful parse); acceptable because usage is polled at a long
+/// interval (UsageStrip POLL_MS), not on a hot path.
 const USAGE_ATTEMPTS: usize = 3;
 
 fn run_usage() -> ClaudeUsage {
