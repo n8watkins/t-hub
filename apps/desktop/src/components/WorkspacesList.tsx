@@ -342,6 +342,9 @@ function TerminalRow({
     cwd: info?.cwd,
   });
   const cwd = info?.cwd ?? "";
+  // The user's cosmetic "work name" for this project (keyed by cwd) — shown as the
+  // primary line when set, with the derived command·dir label as a muted subtitle.
+  const workName = useTheme((s) => (cwd ? s.workNames[cwd] : undefined));
   return (
     <li
       className="group flex items-center gap-2 rounded-lg pr-1 transition-colors hover:bg-neutral-800/40"
@@ -368,7 +371,17 @@ function TerminalRow({
           style={{ backgroundColor: DOT_VAR[state] }}
           aria-hidden
         />
-        <span className="min-w-0 flex-1 truncate">{label}</span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate">{workName ?? label}</span>
+          {workName && (
+            <span
+              className="block truncate text-[11px]"
+              style={{ color: "var(--th-fg-muted)" }}
+            >
+              {label}
+            </span>
+          )}
+        </span>
       </button>
       {/* Close (kill) this terminal — "close what we're working on from the
           workspace". Reveals on row hover so it doesn't clutter the list. */}

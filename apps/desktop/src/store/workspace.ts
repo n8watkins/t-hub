@@ -32,8 +32,8 @@ function cleanupTileSideState(id: TerminalId): void {
   // Drop any per-terminal color override so a recycled id can't inherit it.
   useTheme.getState().clearTermOverride(id);
   useTheme.getState().clearTermFocusRing(id);
-  // Drop the per-terminal cosmetic work name too (same reason).
-  useTheme.getState().clearTermWorkName(id);
+  // (The cosmetic work name is keyed by CWD, not terminal id, so it is durable —
+  // intentionally NOT cleared here; it persists with the project.)
   void import("../ipc/devserver")
     .then((m) => m.stopDevServer(id))
     .catch(() => {

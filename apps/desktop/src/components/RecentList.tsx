@@ -14,6 +14,8 @@
 // mount + window focus; an IPC failure degrades to a muted empty state.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { recentSessions, type RecentSession } from "../ipc/recent";
+import { useTheme } from "../store/theme";
+import { useWorkspace } from "../store/workspace";
 
 export interface RecentListProps {
   /** Resume a past session: spawn `claude --resume <id>` in `cwd`, focus it. */
@@ -141,6 +143,27 @@ export function RecentList({ onRecall }: RecentListProps) {
     [sessions, hidden],
   );
 
+  // Cosmetic per-project work names (keyed by cwd) — surfaced as the row title.
+  const workNames = useTheme((s) => s.workNames);
+  // Tint a Recent row with the color of the workspace that currently has a
+  // terminal open in that project's cwd (best-effort: only currently-open,
+  // colored workspaces tint; past-only projects use the default).
+  const tabs = useWorkspace((s) => s.tabs);
+  const terminals = useWorkspace((s) => s.terminals);
+  const workspaceColors = useTheme((s) => s.workspaceColors);
+  const cwdColor = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const t of tabs) {
+      const color = workspaceColors[t.id];
+      if (!color) continue;
+      for (const id of t.order) {
+        const c = terminals[id]?.cwd;
+        if (c && !(c in m)) m[c] = color;
+      }
+    }
+    return m;
+  }, [tabs, terminals, workspaceColors]);
+
   if (!loaded) {
     return (
       <div className="px-3 py-2 text-sm" style={{ color: "var(--th-fg-muted)" }}>
@@ -161,7 +184,14 @@ export function RecentList({ onRecall }: RecentListProps) {
   return (
     <div className="flex flex-col gap-0.5 px-2 py-1">
       {groups.map((g) => (
-        <ProjectRow key={g.cwd} group={g} onRecall={onRecall} onHide={hide} />
+        <ProjectRow
+          key={g.cwd}
+          group={g}
+          workName={workNames[g.cwd]}
+          color={cwdColor[g.cwd]}
+          onRecall={onRecall}
+          onHide={hide}
+        />
       ))}
     </div>
   );
@@ -171,10 +201,18 @@ export function RecentList({ onRecall }: RecentListProps) {
  *  a → to RESUME and an × to HIDE appear on the right (both understated). */
 function ProjectRow({
   group,
+  workName,
+  color,
   onRecall,
   onHide,
 }: {
   group: FolderGroup;
+  /** The user's cosmetic "work name" for this project (keyed by cwd), if set —
+   *  shown as the row title in place of the bare folder name. */
+  workName?: string;
+  /** The owning workspace's color, when this project is open in a colored
+   *  workspace — tints the row's left bar. */
+  color?: string;
   onRecall: (sessionId: string, cwd: string) => void;
   onHide: (sessionId: string) => void;
 }) {
@@ -183,21 +221,28 @@ function ProjectRow({
   // label when the transcript tail yielded nothing usable.
   const subtitle = s.lastText || s.label;
   const rel = relativeTime(s.lastSeen);
+  // The named work wins the title; the folder name then moves into the subtitle so
+  // it's still visible.
+  const title = workName || group.name;
 
   return (
     <div
       className="group flex items-center gap-2 rounded-lg px-2 py-1.5 transition-colors hover:bg-neutral-800/40"
-      style={{ color: "var(--th-fg)" }}
+      style={{
+        color: "var(--th-fg)",
+        ...(color ? { boxShadow: `inset 2px 0 0 0 ${color}` } : {}),
+      }}
       title={group.cwd}
     >
-      {/* LEFT: folder name over the session's most-recent text. */}
+      {/* LEFT: work name (or folder) over the session's most-recent text. */}
       <div className="min-w-0 flex-1">
-        <div className="truncate text-[13px] font-medium">{group.name}</div>
+        <div className="truncate text-[13px] font-medium">{title}</div>
         <div
           className="truncate text-[11px]"
           style={{ color: "var(--th-fg-muted)" }}
           title={subtitle}
         >
+          {workName ? `${group.name} · ` : ""}
           {subtitle}
           {rel ? ` · ${rel}` : ""}
         </div>

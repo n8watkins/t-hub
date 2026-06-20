@@ -794,13 +794,14 @@ interface ThemeStore {
   setTermFocusRing: (id: string, color: string) => void;
   clearTermFocusRing: (id: string) => void;
 
-  /** Per-terminal "what are you working on" name (terminalId → name). A purely
-   *  cosmetic header label the user types ("name this work…") — NOT a branch and
-   *  NOT the tab/derived label. Persisted in its own localStorage slot, mirroring
-   *  the per-terminal color overrides. Cleared when the terminal goes away. */
-  termWorkNames: Record<string, string>;
-  setTermWorkName: (id: string, name: string) => void;
-  clearTermWorkName: (id: string) => void;
+  /** "What are you working on" name, keyed by the terminal's CWD (project path) —
+   *  NOT the ephemeral terminal id — so it's durable: it shows in the tile header,
+   *  the sidebar Workspaces list, AND the Recent row for that project, and it
+   *  survives relaunch/resume. Free-text + cosmetic ("name this work…"); NOT a
+   *  branch and NOT the tab/derived label. Own localStorage slot. */
+  workNames: Record<string, string>;
+  setWorkName: (cwd: string, name: string) => void;
+  clearWorkName: (cwd: string) => void;
 
   /** Per-workspace color identity (tabId → color). A workspace's color cascades
    *  to its tiles (the tile focus ring, sidebar accent, tab dot). A per-terminal
@@ -886,13 +887,14 @@ function saveTermFocusRing(m: Record<string, string>): void {
   }
 }
 
-// Per-terminal work name (terminalId → name), in its own slot. The free-text
-// "what are you working on" header label; same sparse-map-in-localStorage shape.
-const TERM_WORKNAME_KEY = "termhub.theme.termWorkNames";
-function loadTermWorkNames(): Record<string, string> {
+// Work name keyed by CWD (project path → name), in its own slot. Keyed by cwd
+// (not terminal id) so it's durable across spawns/resumes and can surface on the
+// project's Recent row. Same sparse-map-in-localStorage shape.
+const WORKNAME_KEY = "termhub.theme.workNames";
+function loadWorkNames(): Record<string, string> {
   try {
     if (typeof localStorage === "undefined") return {};
-    const raw = localStorage.getItem(TERM_WORKNAME_KEY);
+    const raw = localStorage.getItem(WORKNAME_KEY);
     if (!raw) return {};
     const parsed: unknown = JSON.parse(raw);
     return parsed && typeof parsed === "object"
@@ -902,9 +904,9 @@ function loadTermWorkNames(): Record<string, string> {
     return {};
   }
 }
-function saveTermWorkNames(m: Record<string, string>): void {
+function saveWorkNames(m: Record<string, string>): void {
   try {
-    localStorage.setItem(TERM_WORKNAME_KEY, JSON.stringify(m));
+    localStorage.setItem(WORKNAME_KEY, JSON.stringify(m));
   } catch {
     /* ignore */
   }
@@ -972,7 +974,7 @@ export const useTheme = create<ThemeStore>((set, get) => ({
   presets: initial.presets,
   termOverrides: loadTermOverrides(),
   termFocusRing: loadTermFocusRing(),
-  termWorkNames: loadTermWorkNames(),
+  workNames: loadWorkNames(),
   workspaceColors: loadWorkspaceColors(),
 
   setTheme: (theme, fromBackend = false) => {
@@ -1049,25 +1051,26 @@ export const useTheme = create<ThemeStore>((set, get) => ({
     set({ termFocusRing: next });
   },
 
-  setTermWorkName: (id, name) => {
+  setWorkName: (cwd, name) => {
+    if (!cwd) return;
     const trimmed = name.trim();
     // A blank value clears the slot (back to the placeholder); no-op if unchanged.
     if (!trimmed) {
-      get().clearTermWorkName(id);
+      get().clearWorkName(cwd);
       return;
     }
-    if (get().termWorkNames[id] === trimmed) return;
-    const next = { ...get().termWorkNames, [id]: trimmed };
-    saveTermWorkNames(next);
-    set({ termWorkNames: next });
+    if (get().workNames[cwd] === trimmed) return;
+    const next = { ...get().workNames, [cwd]: trimmed };
+    saveWorkNames(next);
+    set({ workNames: next });
   },
 
-  clearTermWorkName: (id) => {
-    if (!(id in get().termWorkNames)) return;
-    const next = { ...get().termWorkNames };
-    delete next[id];
-    saveTermWorkNames(next);
-    set({ termWorkNames: next });
+  clearWorkName: (cwd) => {
+    if (!(cwd in get().workNames)) return;
+    const next = { ...get().workNames };
+    delete next[cwd];
+    saveWorkNames(next);
+    set({ workNames: next });
   },
 
   setWorkspaceColor: (tabId, color) => {

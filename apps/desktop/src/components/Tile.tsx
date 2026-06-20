@@ -234,12 +234,12 @@ export function Tile({
   // The split flex row, measured during a divider drag to map pointer-x → ratio.
   const splitRowRef = useRef<HTMLDivElement | null>(null);
 
-  // Per-terminal cosmetic "work name" (Feature 1): a free-text label the user
-  // types to say what they're working on. Persisted in the theme store, mirroring
-  // the color overrides (NOT the tab/derived label). Subscribed so an inline edit
-  // re-renders the header.
-  const workName = useTheme((s) => s.termWorkNames[terminalId]);
-  const setTermWorkName = useTheme((s) => s.setTermWorkName);
+  // Cosmetic "work name" (Feature 1): a free-text label the user types to say what
+  // they're working on. Keyed by CWD (project path), not the terminal id, so it's
+  // durable — it also shows in the sidebar Workspaces list + the project's Recent
+  // row and survives relaunch/resume. Subscribed so an inline edit re-renders.
+  const workName = useTheme((s) => s.workNames[info?.cwd ?? ""]);
+  const setWorkName = useTheme((s) => s.setWorkName);
 
   const state: TerminalState = info?.state ?? "starting";
   const cwd = info?.cwd ?? "";
@@ -287,7 +287,8 @@ export function Tile({
   const [nameDraft, setNameDraft] = useState<string | null>(null);
   const startNameEdit = () => setNameDraft(workName ?? "");
   const commitName = () => {
-    if (nameDraft !== null) setTermWorkName(terminalId, nameDraft);
+    // Keyed by cwd: a blank draft clears it (setWorkName handles that).
+    if (nameDraft !== null && cwd) setWorkName(cwd, nameDraft);
     setNameDraft(null);
   };
 
@@ -489,10 +490,11 @@ export function Tile({
         </span>
 
         {/* Editable "what are you working on" name (Feature 1). Click to edit
-            inline; Enter commits, Esc cancels. Persisted per-terminal (theme
-            store termWorkNames). Stops the header drag on pointer-down. Kept
-            COMPACT (sized to content with a sensible cap) rather than spanning
-            the full tile width, so the right-aligned view-tab bar has room. */}
+            inline; Enter commits, Esc cancels. Persisted per-PROJECT (theme store
+            workNames, keyed by cwd — so it also shows in the sidebar + Recent).
+            Stops the header drag on pointer-down. Kept COMPACT (sized to content
+            with a sensible cap) rather than spanning the full tile width, so the
+            right-aligned view-tab bar has room. */}
         {nameDraft !== null ? (
           <input
             autoFocus
