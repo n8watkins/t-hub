@@ -212,6 +212,83 @@ impl Journal {
         }
         Ok(out)
     }
+
+    /// The current on-disk size of the journal file in bytes (0 if absent).
+    ///
+    /// O(1) (a `stat`). Used by the live tail to seed its byte cursor at the
+    /// current EOF so it streams only entries appended afterwards. See
+    /// [`Journal::tail_from`].
+    pub fn byte_len(&self) -> u64 {
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Incrementally read the complete entries appended *after* byte `offset`,
+    /// numbering each as the next sequence after `last_seq`. Returns `(entries,
+    /// new_offset, new_head_seq)` — feed `new_offset`/`new_head_seq` back in on
+    /// the next call.
+    ///
+    /// This is the live-tail hot path. It seeks straight to `offset` and reads
+    /// only the new bytes, so its cost is O(new data) no matter how large the
+    /// journal has grown — unlike [`Journal::head_seq_on_disk`] / [`Journal::replay`],
+    /// which re-scan and re-parse the *whole* file every call. (A bloated journal
+    /// — e.g. one flooded with high-frequency statusline snapshots — makes that
+    /// O(file) rescan saturate the tail thread and starve live delivery; reading
+    /// only new bytes does not.) A torn final line (no trailing newline yet) is
+    /// left unconsumed so a later call re-reads it once complete. If the file has
+    /// shrunk below `offset` (compaction / rotation / truncation), reading
+    /// restarts from the top with a fresh sequence so the renumbered contents are
+    /// not skipped.
+    pub fn tail_from(
+        &self,
+        offset: u64,
+        last_seq: u64,
+    ) -> Result<(Vec<EventJournalEntry>, u64, u64)> {
+        let _guard = self.inner.lock().expect("journal mutex poisoned");
+        let file = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), 0, 0));
+            }
+            Err(e) => return Err(e).context("opening journal for tail"),
+        };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        // Compaction/rotation/truncation: the file is smaller than where we were,
+        // so our byte offset is stale — restart from the top with a fresh seq.
+        let (mut pos, mut seq) = if len < offset { (0, 0) } else { (offset, last_seq) };
+
+        let mut reader = BufReader::new(file);
+        reader
+            .seek(SeekFrom::Start(pos))
+            .with_context(|| format!("seeking journal to {pos}"))?;
+
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf)?;
+            if n == 0 {
+                break; // EOF
+            }
+            // Only consume a line terminated by '\n'; leave a partial trailing
+            // line for the next call (don't advance past it).
+            if buf.last() != Some(&b'\n') {
+                break;
+            }
+            pos += n as u64;
+            let line = std::str::from_utf8(&buf[..n - 1]).unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Skip torn/garbage lines but still advance past them (same tolerance
+            // as recovery/replay); only count parseable entries toward `seq`.
+            if let Ok(mut e) = serde_json::from_str::<EventJournalEntry>(line) {
+                seq += 1;
+                e.seq = seq;
+                out.push(e);
+            }
+        }
+        Ok((out, pos, seq))
+    }
 }
 
 #[cfg(test)]
@@ -318,6 +395,44 @@ mod tests {
         let streamed = tailer.replay(0).unwrap();
         assert_eq!(streamed.len(), 2);
         assert_eq!(streamed[1].event_type, JournalEventType::Stop);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tail_from_reads_incrementally_and_handles_shrink() {
+        let dir = temp_dir("tail-from");
+        let j = Journal::open(&dir).unwrap();
+
+        // Seed two entries; tailing from the start sees both and reaches EOF.
+        j.append(entry(JournalEventType::SessionStart, "s1")).unwrap();
+        j.append(entry(JournalEventType::Stop, "s1")).unwrap();
+        let (batch1, off1, seq1) = j.tail_from(0, 0).unwrap();
+        assert_eq!(batch1.len(), 2);
+        assert_eq!(seq1, 2);
+        assert_eq!(off1, j.byte_len(), "offset must reach EOF");
+
+        // No new data → empty result, cursor unchanged (the cheap hot path).
+        let (none, off_none, seq_none) = j.tail_from(off1, seq1).unwrap();
+        assert!(none.is_empty());
+        assert_eq!((off_none, seq_none), (off1, seq1));
+
+        // One more append → only that entry streams, seq continues.
+        j.append(entry(JournalEventType::SessionEnd, "s1")).unwrap();
+        let (batch2, off2, seq2) = j.tail_from(off1, seq1).unwrap();
+        assert_eq!(batch2.len(), 1);
+        assert_eq!(batch2[0].event_type, JournalEventType::SessionEnd);
+        assert_eq!(seq2, 3);
+        assert!(off2 > off1);
+
+        // Shrink (compaction/rotation): a stale offset past the new EOF restarts
+        // from the top rather than skipping the renumbered contents.
+        std::fs::write(dir.join(JOURNAL_FILE), b"").unwrap();
+        let fresh = Journal::open(&dir).unwrap();
+        fresh.append(entry(JournalEventType::Notification, "s2")).unwrap();
+        let (batch3, _off3, seq3) = j.tail_from(off2, seq2).unwrap();
+        assert_eq!(batch3.len(), 1, "shrink must restart the read from the top");
+        assert_eq!(seq3, 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -8,20 +8,23 @@
 //! stdin EOF). Every reply preserves the request's [`Channel`].
 //!
 //! ## Live journal streaming
-//! A dedicated tail thread polls `journal.head_seq_on_disk()` every ~200 ms.
-//! When the head advances past `streamed_cursor` it calls
-//! `journal.replay(streamed_cursor)` and emits new entries as
-//! `AgentFrame { channel: Events, msg: Journal { … } }` frames. `streamed_cursor`
-//! is initialised to the head seq at startup so we stream ONLY new entries (the
-//! core uses ReplayJournal for historical backfill).
+//! A dedicated tail thread reads the journal incrementally every ~200 ms via
+//! `journal.tail_from(offset, last_seq)`, which seeks straight to the last byte
+//! offset and parses ONLY the bytes appended since, emitting new entries as
+//! `AgentFrame { channel: Events, msg: Journal { … } }` frames. The cursor (byte
+//! offset + head seq) is initialised to the current EOF at startup so we stream
+//! ONLY new entries (the core uses ReplayJournal for historical backfill).
 //!
-//! **Why `head_seq_on_disk`, not `head_seq`:** the journal's in-memory head is
-//! only bumped by *this* process's appends, but the live event spine's writers
-//! are the short-lived `--hook` ingest processes, which append to the file
-//! out-of-process. The tail must therefore observe the file's growth, or it
-//! would never stream a single hook event live (it would only ever see them on
-//! the core's next reconnect+replay). Re-scanning a small append-only NDJSON
-//! file every 200 ms is cheap and, unlike inotify, reliable on WSL2.
+//! **Why incremental, not a re-scan:** the journal is appended out-of-process by
+//! the short-lived `--hook`/`--statusline` ingest processes, so the tail must
+//! observe the *file's* growth (an in-memory head would never see them). The
+//! previous design re-counted and re-parsed the WHOLE file every poll
+//! (`head_seq_on_disk` + `replay`) — fine for a small journal, but O(file): once
+//! the journal bloats (e.g. high-frequency statusline snapshots), a
+//! multi-hundred-MB rescan 5×/s saturates this thread and starves live status
+//! delivery (the per-tile context-meter symptom). Reading only the new bytes is
+//! O(new data) regardless of journal size; a shrink (compaction/rotation) is
+//! detected and restarts the read from the top.
 //!
 //! Both the request/response path and the tail thread write through a single
 //! shared mpsc sender. A dedicated writer thread owns stdout and serialises all
@@ -88,29 +91,27 @@ pub fn serve_stdio(journal: Arc<Journal>) -> Result<()> {
         let journal_arc = Arc::clone(&journal);
         let tail_tx = tx.clone();
         let stop = Arc::clone(&tail_stop);
-        // Start streaming from NOW (core does ReplayJournal for historical
-        // backfill). Use the on-disk head so we account for any hook entries
-        // already on disk at startup and don't re-stream them.
-        let initial_cursor = journal_arc.head_seq_on_disk();
+        // Start streaming from NOW: seed the byte cursor at the current EOF and
+        // the head seq at the on-disk count (core does ReplayJournal for
+        // historical backfill). From here the tail reads ONLY new bytes, so it
+        // stays O(new data) no matter how large the journal grows.
+        let initial_offset = journal_arc.byte_len();
+        let initial_seq = journal_arc.head_seq_on_disk();
 
         std::thread::spawn(move || {
-            let mut streamed_cursor = initial_cursor;
+            let mut offset = initial_offset;
+            let mut last_seq = initial_seq;
             loop {
                 std::thread::sleep(TAIL_POLL_INTERVAL);
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                // Observe the FILE (cross-process hook appends), not just our
-                // in-memory head — otherwise live hook events never stream.
-                let head = journal_arc.head_seq_on_disk();
-                if head <= streamed_cursor {
-                    continue;
-                }
-                // New entries available — fetch and stream them.
-                match journal_arc.replay(streamed_cursor) {
-                    Ok(entries) => {
+                // Read only the bytes appended (cross-process) since `offset` —
+                // never a full-file rescan. Cheap (a seek + read of the new
+                // tail) when there is nothing new.
+                match journal_arc.tail_from(offset, last_seq) {
+                    Ok((entries, new_offset, new_seq)) => {
                         for entry in entries {
-                            let seq = entry.seq;
                             let frame = AgentFrame {
                                 channel: Channel::Events,
                                 msg: AgentToCore::Journal { seq: entry.seq, entry },
@@ -119,12 +120,13 @@ pub fn serve_stdio(journal: Arc<Journal>) -> Result<()> {
                                 // Writer thread has exited (main loop shut down). Quit.
                                 return;
                             }
-                            streamed_cursor = seq;
                         }
+                        offset = new_offset;
+                        last_seq = new_seq;
                     }
                     Err(e) => {
-                        eprintln!("termhub-agent: tail thread replay error: {e:#}");
-                        // Don't update streamed_cursor; retry next poll.
+                        eprintln!("termhub-agent: tail thread read error: {e:#}");
+                        // Leave the cursor put; retry next poll.
                     }
                 }
             }
@@ -386,7 +388,8 @@ mod tests {
         let pre = build_entry("SessionStart", &serde_json::json!({"session_id":"pre"}));
         journal.append(pre).unwrap();
 
-        let initial_cursor = journal.head_seq(); // = 1
+        let initial_offset = journal.byte_len();
+        let initial_seq = journal.head_seq_on_disk(); // = 1
 
         // Spawn the tail thread manually (same logic as in serve_stdio).
         let (tail_tx, tail_rx) = mpsc::channel::<AgentFrame>();
@@ -396,20 +399,16 @@ mod tests {
             let tx = tail_tx.clone();
             let stop_flag = Arc::clone(&stop);
             std::thread::spawn(move || {
-                let mut streamed_cursor = initial_cursor;
+                let mut offset = initial_offset;
+                let mut last_seq = initial_seq;
                 loop {
                     std::thread::sleep(TAIL_POLL_INTERVAL);
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
-                    let head = journal_arc.head_seq();
-                    if head <= streamed_cursor {
-                        continue;
-                    }
-                    match journal_arc.replay(streamed_cursor) {
-                        Ok(entries) => {
+                    match journal_arc.tail_from(offset, last_seq) {
+                        Ok((entries, new_offset, new_seq)) => {
                             for entry in entries {
-                                let seq = entry.seq;
                                 let frame = AgentFrame {
                                     channel: Channel::Events,
                                     msg: AgentToCore::Journal { seq: entry.seq, entry },
@@ -417,8 +416,9 @@ mod tests {
                                 if tx.send(frame).is_err() {
                                     return;
                                 }
-                                streamed_cursor = seq;
                             }
+                            offset = new_offset;
+                            last_seq = new_seq;
                         }
                         Err(_) => {}
                     }
