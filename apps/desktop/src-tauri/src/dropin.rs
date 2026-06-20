@@ -56,9 +56,10 @@ fn read_clipboard_image_to_temp(app: &tauri::AppHandle) -> Result<Option<String>
     let buf = image::RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| "clipboard image buffer size mismatch".to_string())?;
 
-    // Opportunistically reap PNGs from earlier pastes so the temp dir doesn't
+    // Opportunistically reap PNGs from earlier pastes so our paste dir doesn't
     // grow without bound (nothing else deletes them, and %TEMP% isn't auto-purged
-    // on Windows). Pastes are user-paced, so a small dir scan per save is cheap.
+    // on Windows). This scans only our dedicated subdir, so it's cheap regardless
+    // of how cluttered the OS temp dir is.
     prune_old_pastes();
 
     let path = temp_png_path();
@@ -73,11 +74,28 @@ fn read_clipboard_image_to_temp(app: &tauri::AppHandle) -> Result<Option<String>
 /// them, while still bounding accumulation to roughly a day's worth.
 const PASTE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// Delete `termhub-paste-*.png` files in the temp dir older than [`PASTE_MAX_AGE`].
+/// Dedicated subdirectory of the OS temp dir that holds ONLY our paste PNGs.
+///
+/// Isolating our files here means the reaper scans a handful of our own entries
+/// instead of stat-ing every file in `%TEMP%` (which on Windows routinely holds
+/// thousands), so neither the save nor the prune does an O(N-of-whole-temp) sweep.
+///
+/// We `create_dir_all` the subdir but FALL BACK to the temp root if that fails:
+/// a paste must never fail just because the housekeeping subdir couldn't be made.
+fn paste_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("termhub-paste");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => dir,
+        Err(_) => std::env::temp_dir(),
+    }
+}
+
+/// Delete `termhub-paste-*.png` files older than [`PASTE_MAX_AGE`]. Scans ONLY our
+/// dedicated [`paste_dir`], not the whole temp dir, so this stays O(our files).
 /// Best-effort: any error (unreadable dir, file vanished, no mtime) is ignored —
 /// reaping is housekeeping, never the caller's concern.
 fn prune_old_pastes() {
-    let dir = std::env::temp_dir();
+    let dir = paste_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
@@ -101,12 +119,13 @@ fn prune_old_pastes() {
     }
 }
 
-/// A unique `termhub-paste-<millis>-<seq>.png` path in the OS temp dir.
+/// A unique `termhub-paste-<millis>-<seq>.png` path in our dedicated [`paste_dir`]
+/// (falling back to the temp root if the subdir couldn't be created).
 fn temp_png_path() -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let seq = PASTE_SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("termhub-paste-{millis}-{seq}.png"))
+    paste_dir().join(format!("termhub-paste-{millis}-{seq}.png"))
 }
