@@ -24,7 +24,14 @@ import { useSettings } from "../store/settings";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import { useTheme } from "../store/theme";
 import { WslHealth, gib, usedFraction } from "./WslHealth";
-import { UsageStrip, UsageInline, useClaudeUsage } from "./UsageStrip";
+import {
+  UsageStrip,
+  UsageInline,
+  useClaudeUsage,
+  CodexUsageStrip,
+  CodexUsageInline,
+  useCodexUsage,
+} from "./UsageStrip";
 import { WorkspacesList } from "./WorkspacesList";
 import { RecentList } from "./RecentList";
 import { ChevronIcon, CountBadge } from "./SidebarChrome";
@@ -268,8 +275,11 @@ function WslMiniSummary({ metrics }: { metrics: HostMetrics | null }) {
  */
 function UsageSection() {
   const [open, persistOpen] = usePersistedToggle("termhub.sidebar.usage.open");
-  // One poller here drives both the collapsed inline summary and the full strip.
+  // One poller each drives both the collapsed inline summary and the full strip,
+  // for Claude and (when present) Codex.
   const usage = useClaudeUsage();
+  const codex = useCodexUsage();
+  const hasCodex = !!codex?.ok;
   return (
     <div className="shrink-0 border-t" style={{ borderColor: "var(--th-border)" }}>
       <div className="flex items-stretch">
@@ -288,11 +298,42 @@ function UsageSection() {
         >
           Usage
         </span>
-        {/* Collapsed: keep the key percentages visible inline in the bar. */}
-        {!open && <UsageInline usage={usage} />}
+        {/* Collapsed: key percentages inline — Claude (ml-auto pushes it right),
+            then Codex right after it when present. */}
+        {!open && (
+          <>
+            <UsageInline usage={usage} />
+            {hasCodex && <CodexUsageInline usage={codex} />}
+          </>
+        )}
       </div>
-      {/* Expanded: the full weekly/session rows. */}
-      {open && <UsageStrip usage={usage} />}
+      {/* Expanded: the full weekly/session rows. With Codex present, label each
+          provider so the two readouts are unambiguous. */}
+      {open && (
+        <>
+          {hasCodex && <ProviderLabel name="Claude" />}
+          <UsageStrip usage={usage} />
+          {hasCodex && (
+            <>
+              <ProviderLabel name="Codex" />
+              <CodexUsageStrip usage={codex} />
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** A small provider sub-header shown above each usage block when both Claude and
+ *  Codex usage are present, so the weekly/session rows are unambiguous. */
+function ProviderLabel({ name }: { name: string }) {
+  return (
+    <div
+      className="px-2 pt-1 text-[10px] font-semibold uppercase tracking-wide"
+      style={{ color: "var(--th-fg-muted)" }}
+    >
+      {name}
     </div>
   );
 }

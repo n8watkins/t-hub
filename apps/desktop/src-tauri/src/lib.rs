@@ -25,6 +25,7 @@ mod supervision; // orchestrator->subagent tree + status (Workstream C)
 mod theme; // live theming contract: get_theme/set_theme + theme://changed (MCP-facing)
 mod tray; // system-tray icon + close-to-tray (hide instead of quit) (#17)
 mod usage; // Claude plan usage via `claude -p /usage` (sidebar Usage strip)
+mod codex; // Codex plan usage, read from ~/.codex/sessions rollout files (sidebar)
 mod win_snap; // Windows 11 Snap Layouts + native edge-resize on the frameless window (no-op on unix)
 
 use agent::AgentBridge;
@@ -310,6 +311,7 @@ pub fn run() {
             recent::recent_sessions,
             // Claude plan usage (`claude -p /usage`) for the sidebar Usage strip.
             usage::claude_usage,
+            codex::codex_usage,
             // -------------------------------------------------------------------
             // feat/diag: runtime diagnostics sink (mirrors frontend logs to a file
             // the WSL-side orchestrator can read from a RELEASE build).

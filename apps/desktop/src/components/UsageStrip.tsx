@@ -7,6 +7,7 @@
 // each as "left" (100 - used) with the reset hint Claude reports.
 import { useCallback, useEffect, useState } from "react";
 import { claudeUsage, type ClaudeUsage } from "../ipc/usage";
+import { codexUsage, type CodexUsage } from "../ipc/codex";
 
 /** Poll cadence: /usage is a quick local Claude command; every 5 min (plus on
  *  mount + window focus) keeps the numbers fresh without spamming it. */
@@ -187,6 +188,117 @@ export function useClaudeUsage(): ClaudeUsage | null {
   }, [refresh]);
 
   return usage;
+}
+
+// ============================ Codex usage ===================================
+// Codex has no `/usage` command; src-tauri/src/codex.rs reads its newest session
+// rollout for the same rate-limit windows (primary ≈ 5h, secondary ≈ weekly).
+// We reuse Row / InlinePct / usageStat above; the only difference is Codex
+// reports `resetsAt` as a Unix epoch, so we format it to a short local string.
+
+/** Format a Unix-epoch reset time to a short local "Jun 20, 9:00 PM" hint. */
+function fmtReset(epoch: number | null | undefined): string | null {
+  if (epoch == null) return null;
+  try {
+    return new Date(epoch * 1000).toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  } catch {
+    return null;
+  }
+}
+
+const CODEX_CACHE_KEY = "termhub.codexUsage.v1";
+
+function loadCachedCodexUsage(): CodexUsage | null {
+  if (typeof localStorage === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(CODEX_CACHE_KEY);
+    if (!raw) return null;
+    const u = JSON.parse(raw) as CodexUsage;
+    return u && u.ok ? u : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Poll Codex usage (same cadence + last-good caching as {@link useClaudeUsage}).
+ *  Returns null until the first good reading; never blanks on a failed poll. */
+export function useCodexUsage(): CodexUsage | null {
+  const [usage, setUsage] = useState<CodexUsage | null>(loadCachedCodexUsage);
+
+  const refresh = useCallback(() => {
+    void codexUsage()
+      .then((u) => {
+        if (u && u.ok) {
+          setUsage(u);
+          try {
+            localStorage.setItem(CODEX_CACHE_KEY, JSON.stringify(u));
+          } catch {
+            /* ignore quota */
+          }
+        }
+      })
+      .catch(() => {
+        /* transient — keep the last-known values */
+      });
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const id = window.setInterval(refresh, POLL_MS);
+    window.addEventListener("focus", refresh);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener("focus", refresh);
+    };
+  }, [refresh]);
+
+  return usage;
+}
+
+/** Expanded Codex rows (weekly = secondary window, session = primary). Renders
+ *  nothing when there's no Codex usage, so non-Codex users see no empty block. */
+export function CodexUsageStrip({ usage }: { usage: CodexUsage | null }) {
+  if (!usage || !usage.ok) return null;
+  return (
+    <div className="flex flex-col gap-2 px-2 py-1.5 text-[11px] text-neutral-500">
+      <Row
+        label="Weekly"
+        usedPct={usage.secondary?.usedPercent ?? null}
+        resets={fmtReset(usage.secondary?.resetsAt)}
+      />
+      <Row
+        label="Session"
+        usedPct={usage.primary?.usedPercent ?? null}
+        resets={fmtReset(usage.primary?.resetsAt)}
+      />
+    </div>
+  );
+}
+
+/** Collapsed Codex inline (weekly + 5h remaining). No `ml-auto` — it sits right
+ *  after the Claude inline group in the section header. */
+export function CodexUsageInline({ usage }: { usage: CodexUsage | null }) {
+  if (!usage || !usage.ok) return null;
+  return (
+    <span className="flex items-center gap-2 pr-2 text-[10px] tabular-nums">
+      <span style={{ color: "var(--th-fg-muted)" }}>cx</span>
+      <InlinePct
+        label="wk"
+        usedPct={usage.secondary?.usedPercent ?? null}
+        resets={fmtReset(usage.secondary?.resetsAt)}
+      />
+      <InlinePct
+        label="5h"
+        usedPct={usage.primary?.usedPercent ?? null}
+        resets={fmtReset(usage.primary?.resetsAt)}
+      />
+    </span>
+  );
 }
 
 /**
