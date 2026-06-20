@@ -19,7 +19,6 @@
 // WSL health strip, the secondary settings gear, and the public exports
 // (SIDEBAR_RAIL_WIDTH, SidebarMode, the Sidebar props) App/Titlebar compile
 // against. Telemetry is still read for the bottom WSL/host-metrics strip.
-import { useState } from "react";
 import { useAgentTelemetry } from "../store/telemetry";
 import { useSettings } from "../store/settings";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
@@ -28,6 +27,8 @@ import { WslHealth, gib, usedFraction } from "./WslHealth";
 import { UsageStrip, UsageInline, useClaudeUsage } from "./UsageStrip";
 import { WorkspacesList } from "./WorkspacesList";
 import { RecentList } from "./RecentList";
+import { ChevronIcon, CountBadge } from "./SidebarChrome";
+import { usePersistedToggle } from "../hooks/usePersistedToggle";
 import type { HostMetrics, ConnectionState } from "../ipc/protocol";
 import type { TerminalId } from "../ipc/types";
 
@@ -189,18 +190,7 @@ function BottomStatus({
   metrics: HostMetrics | null;
   connection?: ConnectionState;
 }) {
-  const [open, setOpen] = useState<boolean>(() => {
-    if (typeof localStorage === "undefined") return true;
-    return localStorage.getItem("termhub.sidebar.bottom.open") !== "0";
-  });
-  const persistOpen = (v: boolean) => {
-    setOpen(v);
-    try {
-      localStorage.setItem("termhub.sidebar.bottom.open", v ? "1" : "0");
-    } catch {
-      /* ignore */
-    }
-  };
+  const [open, persistOpen] = usePersistedToggle("termhub.sidebar.bottom.open");
 
   return (
     <div className="shrink-0 border-t" style={{ borderColor: "var(--th-border)" }}>
@@ -277,18 +267,7 @@ function WslMiniSummary({ metrics }: { metrics: HostMetrics | null }) {
  * Open/collapsed persists to localStorage.
  */
 function UsageSection() {
-  const [open, setOpen] = useState<boolean>(() => {
-    if (typeof localStorage === "undefined") return true;
-    return localStorage.getItem("termhub.sidebar.usage.open") !== "0";
-  });
-  const persistOpen = (v: boolean) => {
-    setOpen(v);
-    try {
-      localStorage.setItem("termhub.sidebar.usage.open", v ? "1" : "0");
-    } catch {
-      /* ignore */
-    }
-  };
+  const [open, persistOpen] = usePersistedToggle("termhub.sidebar.usage.open");
   // One poller here drives both the collapsed inline summary and the full strip.
   const usage = useClaudeUsage();
   return (
@@ -612,21 +591,9 @@ function Section({
   bodyClassName?: string;
   bodyStyle?: React.CSSProperties;
 }) {
-  const [open, setOpen] = useState<boolean>(() => {
-    if (!storageKey || typeof localStorage === "undefined") return true;
-    return localStorage.getItem(storageKey) !== "0";
-  });
+  const [open, setOpen] = usePersistedToggle(storageKey);
   const isOpen = collapsible ? open : true;
-  const toggle = () => {
-    const next = !open;
-    setOpen(next);
-    if (!storageKey) return;
-    try {
-      localStorage.setItem(storageKey, next ? "1" : "0");
-    } catch {
-      /* ignore */
-    }
-  };
+  const toggle = () => setOpen(!open);
 
   return (
     <section
@@ -675,38 +642,5 @@ function Section({
         </div>
       </div>
     </section>
-  );
-}
-
-/** A small disclosure chevron that points right when collapsed, down when open. */
-function ChevronIcon({ open }: { open: boolean }) {
-  return (
-    <svg
-      width="10"
-      height="10"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="3"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="pointer-events-none shrink-0 transition-transform"
-      style={{ transform: open ? "rotate(90deg)" : "rotate(0deg)" }}
-      aria-hidden
-    >
-      <path d="M9 6l6 6-6 6" />
-    </svg>
-  );
-}
-
-/** A small count chip shown in a section header. */
-function CountBadge({ n }: { n: number }) {
-  return (
-    <span
-      className="shrink-0 rounded-full px-1.5 text-[10px] tabular-nums"
-      style={{ backgroundColor: "var(--th-tile-bg)", color: "var(--th-fg-muted)" }}
-    >
-      {n}
-    </span>
   );
 }

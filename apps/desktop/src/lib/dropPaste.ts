@@ -15,6 +15,8 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { writeTerminal } from "../ipc/client";
 import type { TerminalId } from "../ipc/types";
+import { usePanels } from "../store/panels";
+import { resolveDropTarget } from "./dropTarget";
 
 /**
  * Translate a native Windows path to the WSL mount path the terminals live in:
@@ -24,6 +26,17 @@ import type { TerminalId } from "../ipc/types";
  * unchanged; anything else we can't classify gets separators normalized only.
  */
 export function toWslPath(p: string): string {
+  // Windows VERBATIM ("\\?\") prefixes first (#7): the extended-length syntax
+  // Explorer / some apps hand out. Strip it so the remainder flows through the
+  // existing UNC / drive-letter logic:
+  //   `\\?\UNC\server\share\…` -> `\\server\share\…`  (then UNC handling), and
+  //   `\\?\C:\…`               -> `C:\…`              (then drive-letter handling).
+  const verbatimUnc = /^\\\\\?\\UNC\\(.*)$/i.exec(p);
+  if (verbatimUnc) p = "\\\\" + verbatimUnc[1];
+  else {
+    const verbatim = /^\\\\\?\\(.*)$/.exec(p);
+    if (verbatim) p = verbatim[1];
+  }
   // WSL UNC path (dragging a file FROM a distro folder shown in Explorer):
   // `\\wsl$\Ubuntu\home\me\f` or `\\wsl.localhost\Ubuntu\home\me\f`. The segment
   // after the prefix is the DISTRO name; everything past it is already the rootfs
@@ -96,15 +109,23 @@ export function formatPathsForInsert(paths: string[]): string {
  *     terminal id.
  *
  * Pool wrapper wins when both are ancestors (it's the inner one over the body).
- * Returns null when the point isn't over any tile.
+ * Returns null when the point isn't over any tile, else the terminal id plus
+ * `viaPool` — true when the live terminal BODY was hit (data-th-pool-tile), false
+ * when only the tile CHROME was (data-tile-id). The #1 panel-drop guard uses
+ * `viaPool` to refuse a drop onto a non-terminal panel (where the terminal is
+ * parked offscreen but the tile chrome still resolves).
  */
-function terminalAt(x: number, y: number): TerminalId | null {
-  const el = document.elementFromPoint(x, y) as HTMLElement | null;
-  const hit = el?.closest<HTMLElement>("[data-th-pool-tile], [data-tile-id]");
-  if (!hit) return null;
-  return (
-    hit.getAttribute("data-th-pool-tile") ?? hit.getAttribute("data-tile-id")
-  );
+function terminalAt(
+  x: number,
+  y: number,
+): { id: TerminalId; viaPool: boolean } | null {
+  // Pool wrapper wins when both are ancestors, so try it FIRST (its nearest
+  // match), then fall back to the tile chrome — preserving the prior precedence.
+  const pool = resolveDropTarget(x, y, ["[data-th-pool-tile]"]);
+  if (pool?.value) return { id: pool.value, viaPool: true };
+  const tile = resolveDropTarget(x, y, ["[data-tile-id]"]);
+  if (tile?.value) return { id: tile.value, viaPool: false };
+  return null;
 }
 
 let dropInstalled = false;
@@ -134,11 +155,28 @@ export function installFileDropOnce(): void {
       const x = payload.position.x / dpr;
       const y = payload.position.y / dpr;
 
-      const id = terminalAt(x, y);
-      if (!id) return; // dropped on chrome/sidebar/empty space — ignore
+      const hit = terminalAt(x, y);
+      if (!hit) return; // dropped on chrome/sidebar/empty space — ignore
+
+      // #1 PANEL-DROP GUARD: the path must go into a VISIBLE terminal. A hit via
+      // the pool wrapper (data-th-pool-tile) IS the live terminal body, so always
+      // proceed. A hit via tile chrome ONLY (data-tile-id) can be a tile showing
+      // a Files/Preview/Dev panel — the terminal is PARKED offscreen but the
+      // panel renders inside the tile div, so typing the path would feed the
+      // HIDDEN terminal. So when not viaPool, proceed only if the terminal is NOT
+      // parked. Parked iff a non-terminal tab is active AND the panel is expanded
+      // (mirrors TerminalPool.shouldShow / panels.ts) — i.e. NOT a split view,
+      // where the terminal half is still visible.
+      if (!hit.viaPool) {
+        const panels = usePanels.getState();
+        const parked =
+          (panels.tab[hit.id] ?? "terminal") !== "terminal" &&
+          (panels.panelExpanded[hit.id] ?? true);
+        if (parked) return; // dropped on a panel, not the terminal — ignore
+      }
 
       const text = formatPathsForInsert(paths);
-      if (text) void writeTerminal(id, text);
+      if (text) void writeTerminal(hit.id, text);
     })
     .catch(() => {
       // Not running under Tauri (e.g. plain `pnpm dev` in a browser) — no native

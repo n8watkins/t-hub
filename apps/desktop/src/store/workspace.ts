@@ -1311,6 +1311,50 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
   };
 });
 
+// ---------------------------------------------------------------------------
+// Memoized terminal -> owning-tab lookup (#5). Building the tile chrome, every
+// Tile used to subscribe to the whole `tabs` array and run
+// `tabs.find(t => t.order.includes(id))` per render — O(tabs × order) PER TILE on
+// every tabs change. Instead we cache one `terminalId -> tabId` Map and rebuild
+// it ONLY when the `tabs` reference changes (the store always replaces `tabs`
+// immutably, so a reference check is exact). Each tile then does an O(1) Map get
+// against the same memoized result, with the IDENTICAL tabId outcome.
+// ---------------------------------------------------------------------------
+let tileTabCacheRef: WorkspaceTab[] | null = null;
+let tileTabMap: Map<TerminalId, string> = new Map();
+
+/** The `terminalId -> tabId` map for the current `tabs`, rebuilt only when the
+ *  `tabs` array reference changes. The FIRST tab containing an id wins (the
+ *  `!has` guard), exactly matching `tabs.find(t => t.order.includes(id))` if an
+ *  id somehow appeared in two tabs — though ids are unique across tabs in
+ *  practice. */
+function tileTabLookup(tabs: WorkspaceTab[]): Map<TerminalId, string> {
+  if (tabs !== tileTabCacheRef) {
+    const next = new Map<TerminalId, string>();
+    // Iterate so the FIRST tab containing an id wins, exactly matching the old
+    // `tabs.find(t => t.order.includes(id))` semantics.
+    for (const t of tabs) {
+      for (const id of t.order) {
+        if (!next.has(id)) next.set(id, t.id);
+      }
+    }
+    tileTabMap = next;
+    tileTabCacheRef = tabs;
+  }
+  return tileTabMap;
+}
+
+/** The id of the tab that owns `terminalId`, or undefined. Use as a selector
+ *  (`useWorkspace((s) => tabIdForTerminal(s, id))`): it subscribes to `tabs` but
+ *  returns a stable string, so a tile only re-renders when ITS tab id changes —
+ *  and the per-call work is an O(1) Map get off the memoized lookup. */
+export function tabIdForTerminal(
+  s: WorkspaceState,
+  terminalId: TerminalId,
+): string | undefined {
+  return tileTabLookup(s.tabs).get(terminalId);
+}
+
 /**
  * Hydrate the live store from the durable SQLite snapshot (#sqlite phase 1),
  * preferring it over the localStorage copy the store already booted from. Runs

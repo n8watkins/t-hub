@@ -23,8 +23,10 @@ import { useWorkspace, deriveLabel } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
 import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
 import type { TerminalId, TerminalInfo, TerminalState } from "../ipc/types";
-import { startPointerDrag } from "../lib/pointerDrag";
+import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
+import { resolveDropTarget } from "../lib/dropTarget";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
+import { ChevronIcon, CountBadge } from "./SidebarChrome";
 
 /** Lifecycle-dot color per terminal state — the SAME `--th-dot-*` palette Tile
  *  uses, so a terminal reads identically wherever it appears. */
@@ -80,15 +82,23 @@ export function WorkspacesList() {
   // OWN workspace as a (no-op) drop target. Captured ONCE when the drag begins
   // (it can't change mid-gesture), not re-derived on every move-driven re-render.
   const sourceTabRef = useRef<string | null>(null);
+  // Canceller for an in-flight terminal-row drag (#3): set while a drag is live,
+  // nulled when it ends, and invoked from the unmount cleanup below so the list
+  // unmounting mid-drag can't leak window listeners or a stuck `data-th-dragging`
+  // body flag that leaves every terminal pointer-inert.
+  const dragCancelRef = useRef<PointerDragCanceller | null>(null);
+  useEffect(() => {
+    return () => {
+      dragCancelRef.current?.();
+      dragCancelRef.current = null;
+    };
+  }, []);
 
   // Resolve which workspace row sits under a viewport point. Terminals are made
   // pointer-inert during the drag (data-th-dragging), so elementFromPoint lands
   // on the sidebar chrome; we walk up to the owning workspace row.
-  const workspaceRowAt = (x: number, y: number): string | null => {
-    const el = document.elementFromPoint(x, y) as HTMLElement | null;
-    const row = el?.closest<HTMLElement>("[data-th-ws-row]");
-    return row?.getAttribute("data-th-ws-row") ?? null;
-  };
+  const workspaceRowAt = (x: number, y: number): string | null =>
+    resolveDropTarget(x, y, ["[data-th-ws-row]"])?.value ?? null;
 
   // `onSettled(committed)` lets the source row neutralize the synthetic click
   // that can follow a committed drag, so a drag never doubles as a select.
@@ -99,7 +109,11 @@ export function WorkspacesList() {
   ) => {
     if (e.button !== 0) return; // primary (left) button only
     let ghost: DragGhost | null = null;
-    startPointerDrag(e.clientX, e.clientY, {
+    // The drag controller now OWNS the `data-th-dragging` body flag
+    // (manageBodyDragFlag), so this handler no longer sets/clears it by hand; the
+    // stashed canceller lets the unmount cleanup above abort a live drag (#3).
+    dragCancelRef.current = startPointerDrag(e.clientX, e.clientY, {
+      manageBodyDragFlag: true,
       onBegin: () => {
         // The source workspace is fixed for the whole gesture — resolve it once.
         sourceTabRef.current =
@@ -107,9 +121,6 @@ export function WorkspacesList() {
         setDragTerminalId(id);
         // Mark the terminal as dragged app-wide so its canvas tile dims too.
         setDraggingTile(id);
-        // Make terminals pointer-inert so the gesture tracks over them and
-        // elementFromPoint resolves to sidebar rows, not xterm canvases.
-        document.body.dataset.thDragging = "1";
         ghost = createDragGhost({
           title: deriveLabel({
             id,
@@ -128,7 +139,7 @@ export function WorkspacesList() {
         const targetTab = committed ? workspaceRowAt(x, y) : null;
         ghost?.destroy();
         ghost = null;
-        delete document.body.dataset.thDragging;
+        dragCancelRef.current = null;
         setDraggingTile(null);
         setDragTerminalId(null);
         setDropTabId(null);
@@ -645,36 +656,5 @@ function ColorPicker({
         </div>
       </div>
     </>
-  );
-}
-
-function CountBadge({ n }: { n: number }) {
-  return (
-    <span
-      className="shrink-0 rounded-full px-1.5 text-[10px] tabular-nums"
-      style={{ backgroundColor: "var(--th-tile-bg)", color: "var(--th-fg-muted)" }}
-    >
-      {n}
-    </span>
-  );
-}
-
-function ChevronIcon({ open }: { open: boolean }) {
-  return (
-    <svg
-      width="10"
-      height="10"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="3"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="pointer-events-none shrink-0 transition-transform"
-      style={{ transform: open ? "rotate(90deg)" : "rotate(0deg)" }}
-      aria-hidden
-    >
-      <path d="M9 6l6 6-6 6" />
-    </svg>
   );
 }

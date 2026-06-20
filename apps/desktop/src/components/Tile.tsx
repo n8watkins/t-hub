@@ -27,7 +27,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { TerminalId, TerminalState } from "../ipc/types";
-import { useWorkspace, deriveLabel } from "../store/workspace";
+import { useWorkspace, deriveLabel, tabIdForTerminal } from "../store/workspace";
 import { useTheme } from "../store/theme";
 import {
   usePanels,
@@ -43,7 +43,8 @@ import { clientForTerminal } from "../store/clientType";
 import { ContextMeter } from "./ContextMeter";
 import { useContextPctForTile, sessionNameForTerminal } from "../store/sessionContext";
 import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
-import { startPointerDrag } from "../lib/pointerDrag";
+import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
+import { resolveDropTarget } from "../lib/dropTarget";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { gitInfo, type GitInfo } from "../ipc/git";
@@ -143,12 +144,13 @@ function dropTargetAt(
   x: number,
   y: number,
 ): { tileId: string | null; tabId: string | null } {
-  const el = document.elementFromPoint(x, y) as HTMLElement | null;
-  if (!el) return { tileId: null, tabId: null };
-  const tabEl = el.closest<HTMLElement>("[data-tab-id]");
-  if (tabEl) return { tileId: null, tabId: tabEl.getAttribute("data-tab-id") };
-  const tileEl = el.closest<HTMLElement>("[data-tile-id]");
-  if (tileEl) return { tileId: tileEl.getAttribute("data-tile-id"), tabId: null };
+  // Precedence is tab-over-tile: a workspace tab wins even when it's a deeper
+  // ancestor than a tile, so resolve each anchor separately and take the tab
+  // first (one combined closest() would pick the DOM-nearest, not this order).
+  const tab = resolveDropTarget(x, y, ["[data-tab-id]"]);
+  if (tab) return { tileId: null, tabId: tab.value };
+  const tile = resolveDropTarget(x, y, ["[data-tile-id]"]);
+  if (tile) return { tileId: tile.value, tabId: null };
   return { tileId: null, tabId: null };
 }
 
@@ -232,7 +234,7 @@ export function Tile({
   // its color is looked up in the theme store. The workspace color cascades to
   // the tile's focus ring (below).
   const workspaceTabId = useWorkspace((s) =>
-    s.tabs.find((t) => t.order.includes(terminalId))?.id,
+    tabIdForTerminal(s, terminalId),
   );
   const workspaceColor = useTheme((s) =>
     workspaceTabId ? s.workspaceColors[workspaceTabId] : undefined,
@@ -268,6 +270,11 @@ export function Tile({
   const setSplitRatio = usePanels((s) => s.setSplitRatio);
   // The split flex row, measured during a divider drag to map pointer-x → ratio.
   const splitRowRef = useRef<HTMLDivElement | null>(null);
+  // Canceller for an in-flight header drag (#3): set while a drag is live, nulled
+  // when it ends, and invoked from the unmount cleanup below so a tile removed
+  // mid-drag (close / tab switch) can't leak window listeners or a stuck
+  // `data-th-dragging` body flag.
+  const dragCancelRef = useRef<PointerDragCanceller | null>(null);
 
   // Cosmetic "work name" (Feature 1): a free-text label the user types to say what
   // they're working on. Keyed by CWD (project path), not the terminal id, so it's
@@ -347,6 +354,17 @@ export function Tile({
     else onClose();
   };
 
+  // Abort any in-flight header drag if this tile unmounts mid-gesture (#3): the
+  // canceller runs the controller's full cleanup (listeners + grabbing cursor +
+  // the owned `data-th-dragging` flag) and fires onEnd(committed=false), so a
+  // tile closed/moved while being dragged never leaves the app stuck pointer-inert.
+  useEffect(() => {
+    return () => {
+      dragCancelRef.current?.();
+      dragCancelRef.current = null;
+    };
+  }, []);
+
   // --- SPLIT divider drag: resize the terminal|panel halves ---
   // Pointer-based (not HTML5 DnD) like every other TermHub drag, with pointer
   // CAPTURE so the gesture keeps tracking even as it crosses the xterm canvas /
@@ -402,12 +420,15 @@ export function Tile({
     onFocus(); // pressing the header selects the tile right away
     const sourceId = terminalId;
     let ghost: DragGhost | null = null;
-    startPointerDrag(e.clientX, e.clientY, {
+    // Stash the canceller so an unmount mid-drag (#3) can abort the gesture —
+    // clearing the listeners, the body drag flag, and the drag state — rather
+    // than leaking a stuck `data-th-dragging` that leaves every terminal
+    // pointer-inert. The drag controller now OWNS that body flag
+    // (manageBodyDragFlag), so this handler no longer sets/clears it by hand.
+    dragCancelRef.current = startPointerDrag(e.clientX, e.clientY, {
+      manageBodyDragFlag: true,
       onBegin: () => {
         setDraggingTile(sourceId);
-        // Make terminals pointer-inert for the drag (index.css) so the gesture
-        // tracks over them and elementFromPoint resolves to tiles, not canvases.
-        document.body.dataset.thDragging = "1";
         // A floating frame of the tile that follows the cursor (clear "I'm
         // carrying this tile" feedback the dimmed source alone doesn't give).
         ghost = createDragGhost({
@@ -429,7 +450,7 @@ export function Tile({
           : { tileId: null, tabId: null };
         ghost?.destroy();
         ghost = null;
-        delete document.body.dataset.thDragging;
+        dragCancelRef.current = null;
         setDraggingTile(null);
         setDropTile(null);
         setDropTab(null);

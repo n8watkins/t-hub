@@ -30,6 +30,7 @@ import { useWorkspace, deriveLabel } from "../store/workspace";
 import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
 import { useSettings } from "../store/settings";
 import { startPointerDrag } from "../lib/pointerDrag";
+import { resolveDropTarget } from "../lib/dropTarget";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { popOutTab, closeSatellite, readSatelliteTab } from "../lib/windows";
 import { closeTerminal } from "../ipc/client";
@@ -95,8 +96,7 @@ function closeWindow(): void {
 
 /** The workspace-tab id under a viewport point, or null (drag resolution). */
 function tabUnder(x: number, y: number): string | null {
-  const el = document.elementFromPoint(x, y) as HTMLElement | null;
-  return el?.closest<HTMLElement>("[data-tab-id]")?.getAttribute("data-tab-id") ?? null;
+  return resolveDropTarget(x, y, ["[data-tab-id]"])?.value ?? null;
 }
 
 /** Height (px) of the titlebar row (matches the bar's h-8); a drop below this is
