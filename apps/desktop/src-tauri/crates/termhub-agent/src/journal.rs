@@ -24,12 +24,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use termhub_protocol::EventJournalEntry;
+use termhub_protocol::{EventJournalEntry, JournalSource};
 
 /// Default journal location relative to `$HOME`: `~/.termhub/journal`.
 const JOURNAL_SUBDIR: &str = ".termhub/journal";
 /// The append-only log file name within the journal directory.
 const JOURNAL_FILE: &str = "events.ndjson";
+
+/// At agent startup, compact the journal once it exceeds this size. The
+/// incremental tail (see [`Journal::tail_from`]) keeps live delivery cheap at
+/// ANY size, so this only bounds *disk* growth from the high-frequency
+/// statusline-snapshot stream. See [`Journal::compact_dropping_status`].
+pub const COMPACT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Resolve the journal directory: an explicit override, else `$HOME/.termhub/
 /// journal`, else a process-relative fallback.
@@ -289,6 +295,87 @@ impl Journal {
         }
         Ok((out, pos, seq))
     }
+
+    /// Rewrite the journal keeping every entry EXCEPT ephemeral `Status`
+    /// snapshots, shrinking it back down. Returns `(before_bytes, after_bytes,
+    /// kept_entries)`.
+    ///
+    /// **When to call:** this renumbers sequences (they are 1-based line
+    /// positions), so it MUST run while no core is attached — i.e. at agent
+    /// startup, before [`crate::transport::serve_stdio`]. Running it
+    /// mid-connection would push subsequent seqs *below* the core's replay cursor
+    /// and silently stall delivery. At startup there is no cursor yet, so the
+    /// core simply handshakes against the freshly-compacted head.
+    ///
+    /// A handful of entries appended by another process during the rewrite window
+    /// may be dropped — acceptable here (status is re-emitted within seconds;
+    /// durable hook events are sparse) and callers only invoke it over the cap,
+    /// so it is rare. Unparseable lines are KEPT (never silently drop unknown
+    /// durable data).
+    pub fn compact_dropping_status(&self) -> Result<(u64, u64, u64)> {
+        let mut guard = self.inner.lock().expect("journal mutex poisoned");
+        let before = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+
+        let src = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0, 0)),
+            Err(e) => return Err(e).context("opening journal for compaction"),
+        };
+        // Unique, pid-tagged temp name so a concurrent compaction in another
+        // process can't clobber ours; the atomic rename publishes the result.
+        let tmp = self
+            .path
+            .with_file_name(format!("{JOURNAL_FILE}.compact.{}", std::process::id()));
+
+        let mut kept: u64 = 0;
+        {
+            let mut out = std::io::BufWriter::new(
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)
+                    .with_context(|| format!("creating compaction temp {tmp:?}"))?,
+            );
+            for line in BufReader::new(src).lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break, // torn tail — stop, keep the consistent prefix
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let is_status = serde_json::from_str::<EventJournalEntry>(&line)
+                    .map(|e| e.source == JournalSource::Status)
+                    .unwrap_or(false);
+                if !is_status {
+                    out.write_all(line.as_bytes())?;
+                    out.write_all(b"\n")?;
+                    kept += 1;
+                }
+            }
+            let mut f = out.into_inner().context("flushing compaction temp")?;
+            f.flush().ok();
+            f.sync_data().ok();
+        }
+
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("publishing compacted journal {:?}", self.path))?;
+
+        // The old append handle now points at the unlinked pre-compaction inode;
+        // reopen onto the freshly-published file so future appends land in it,
+        // and resync the in-memory head to the kept count.
+        guard.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&self.path)
+            .with_context(|| format!("reopening journal after compaction {:?}", self.path))?;
+        guard.head_seq = kept;
+
+        let after = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        Ok((before, after, kept))
+    }
 }
 
 #[cfg(test)]
@@ -433,6 +520,43 @@ mod tests {
         let (batch3, _off3, seq3) = j.tail_from(off2, seq2).unwrap();
         assert_eq!(batch3.len(), 1, "shrink must restart the read from the top");
         assert_eq!(seq3, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compact_drops_status_keeps_durable_entries() {
+        let status = |entity: &str| EventJournalEntry {
+            seq: 0,
+            timestamp_ms: 1,
+            source: JournalSource::Status,
+            entity_id: Some(entity.to_string()),
+            event_type: JournalEventType::Unknown,
+            payload: serde_json::json!({"status": {"context_window": {"used_percentage": 42}}}),
+            result: None,
+        };
+
+        let dir = temp_dir("compact");
+        let j = Journal::open(&dir).unwrap();
+        // Interleave durable (Hook) and ephemeral (Status) entries.
+        j.append(entry(JournalEventType::SessionStart, "s1")).unwrap();
+        j.append(status("s1")).unwrap();
+        j.append(entry(JournalEventType::Stop, "s1")).unwrap();
+        j.append(status("s1")).unwrap();
+        let before_len = j.byte_len();
+
+        let (before, after, kept) = j.compact_dropping_status().unwrap();
+        assert_eq!(before, before_len);
+        assert!(after < before, "file must shrink after dropping status");
+        assert_eq!(kept, 2, "only the 2 durable entries remain");
+        assert_eq!(j.head_seq(), 2, "in-memory head resyncs to the kept count");
+
+        // The reopened handle still appends correctly, and no Status survives.
+        let next = j.append(entry(JournalEventType::SessionEnd, "s1")).unwrap();
+        assert_eq!(next.seq, 3);
+        let remaining = j.replay(0).unwrap();
+        assert_eq!(remaining.len(), 3);
+        assert!(remaining.iter().all(|e| e.source != JournalSource::Status));
 
         std::fs::remove_dir_all(&dir).ok();
     }

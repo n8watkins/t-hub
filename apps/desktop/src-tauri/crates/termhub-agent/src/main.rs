@@ -148,6 +148,24 @@ fn main() {
                 }
             };
 
+            // Startup compaction: trim ephemeral status snapshots if the journal
+            // has grown past the cap. Done HERE — before the core connects —
+            // because compaction renumbers line-position sequences, and doing it
+            // mid-connection would push new seqs below the core's cursor and
+            // silently stall delivery. The incremental tail keeps live delivery
+            // cheap at any size; this only bounds disk between restarts.
+            if journal.byte_len() > journal::COMPACT_THRESHOLD_BYTES {
+                match journal.compact_dropping_status() {
+                    Ok((before, after, kept)) => eprintln!(
+                        "termhub-agent: compacted journal on startup: {before} -> {after} bytes \
+                         ({kept} durable entries kept; dropped ephemeral status snapshots)"
+                    ),
+                    Err(e) => eprintln!(
+                        "termhub-agent: startup journal compaction failed (continuing): {e:#}"
+                    ),
+                }
+            }
+
             if let Err(e) = transport::serve_stdio(Arc::new(journal)) {
                 // A clean EOF on stdin (core closed the pipe) is a normal
                 // shutdown, not an error; `serve_stdio` returns Ok in that
