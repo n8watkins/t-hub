@@ -56,11 +56,49 @@ fn read_clipboard_image_to_temp(app: &tauri::AppHandle) -> Result<Option<String>
     let buf = image::RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| "clipboard image buffer size mismatch".to_string())?;
 
+    // Opportunistically reap PNGs from earlier pastes so the temp dir doesn't
+    // grow without bound (nothing else deletes them, and %TEMP% isn't auto-purged
+    // on Windows). Pastes are user-paced, so a small dir scan per save is cheap.
+    prune_old_pastes();
+
     let path = temp_png_path();
     buf.save_with_format(&path, image::ImageFormat::Png)
         .map_err(|e| format!("failed to write paste image: {e}"))?;
 
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Age beyond which a leftover paste PNG is reaped. Generous so an image the user
+/// pasted but hasn't submitted to the agent yet is never deleted out from under
+/// them, while still bounding accumulation to roughly a day's worth.
+const PASTE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Delete `termhub-paste-*.png` files in the temp dir older than [`PASTE_MAX_AGE`].
+/// Best-effort: any error (unreadable dir, file vanished, no mtime) is ignored —
+/// reaping is housekeeping, never the caller's concern.
+fn prune_old_pastes() {
+    let dir = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !(name.starts_with("termhub-paste-") && name.ends_with(".png")) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .map(|age| age > PASTE_MAX_AGE)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// A unique `termhub-paste-<millis>-<seq>.png` path in the OS temp dir.

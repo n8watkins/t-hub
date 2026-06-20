@@ -97,14 +97,19 @@ async function pasteIntoTerminal(
   terminalId: TerminalId,
   term: Terminal,
 ): Promise<void> {
+  // Probe for an image first. Only the PROBE is guarded — once we know there's an
+  // image we commit to inserting its path and must NOT fall through to a text
+  // paste (a failed image write should not also dump clipboard text into the
+  // PTY). A null/throw here means "no image" -> normal text paste.
+  let imgPath: string | null = null;
   try {
-    const imgPath = await clipboardImageToTemp();
-    if (imgPath) {
-      await writeTerminal(terminalId, formatPathsForInsert([imgPath]));
-      return;
-    }
+    imgPath = await clipboardImageToTemp();
   } catch {
-    /* image read failed / not under Tauri — fall through to text paste */
+    imgPath = null;
+  }
+  if (imgPath) {
+    await writeTerminal(terminalId, formatPathsForInsert([imgPath]));
+    return;
   }
   const text = await clipboardRead();
   if (text) term.paste(text);
