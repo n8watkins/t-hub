@@ -360,9 +360,24 @@ pub fn pane_info() -> Result<Vec<PaneInfo>, TmuxError> {
     // Built from the resolved socket name (not a hardcoded `termhub`) so a DEV
     // instance with `$TERMHUB_TMUX_SOCKET` set reads ITS panes; with no env var
     // the socket is `termhub`, reproducing the previous literal exactly.
+    // We emit `session|command|cwd`, BUT `pane_current_command` only reports the
+    // foreground process's comm — which is the RUNTIME (e.g. `node`) for agents
+    // shipped as scripts: the Codex CLI is `node …/codex`, so it'd read as "node"
+    // and never be detected as Codex (Claude runs as `claude`, so it's fine). So
+    // when the foreground is a runtime, we resolve the real agent from the pane
+    // pid's child argv (`/proc/<kid>/cmdline`) and substitute `codex`/`claude` as
+    // the command. Output shape is unchanged, so the parser/callers don't change.
+    // Best-effort: no pgrep / no match leaves the original command intact.
     let script = format!(
-        "tmux -L {} list-panes -a -F '#{{session_name}}|#{{pane_current_command}}|#{{pane_current_path}}'",
-        socket()
+        "tmux -L {sock} list-panes -a -F \
+'#{{session_name}}|#{{pane_current_command}}|#{{pane_current_path}}|#{{pane_pid}}' \
+| while IFS='|' read -r s cmd path pid; do eff=\"$cmd\"; \
+case \"$cmd\" in node|bun|deno|python|python3) \
+for kid in $(pgrep -P \"$pid\" 2>/dev/null); do \
+line=$(tr '\\0' ' ' < /proc/$kid/cmdline 2>/dev/null); \
+case \"$line\" in *codex*) eff=codex; break;; *claude*) eff=claude; break;; esac; \
+done;; esac; printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done",
+        sock = socket()
     );
     let output = pane_info_command(&script).output().map_err(|e| TmuxError {
         op: "list-panes",
