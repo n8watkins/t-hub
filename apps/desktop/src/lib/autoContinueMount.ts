@@ -16,7 +16,9 @@ import { useSupervision } from "../store/supervision";
 import { useAutoContinue } from "../store/autoContinue";
 import { useSettings } from "../store/settings";
 import { sessionNameForTerminal } from "../store/sessionContext";
+import { clientForTerminal } from "../store/clientType";
 import { writeTerminal } from "../ipc/client";
+import { codexUsage, type CodexUsage } from "../ipc/codex";
 import type { StatusSnapshot } from "../ipc/model";
 import type { TerminalId } from "../ipc/types";
 import { tlog } from "./diag";
@@ -56,6 +58,39 @@ function exhaustedReset(snap: StatusSnapshot | undefined): number | null {
   return resets.length ? Math.min(...resets) : null;
 }
 
+/** Latest account-level Codex usage, refreshed by a poll in installAutoContinue
+ *  (Codex has no event stream like Claude's statusline). null until first poll. */
+let latestCodex: CodexUsage | null = null;
+
+/** Soonest reset (unix s) among EXHAUSTED Codex windows, or null. Codex usage is
+ *  account-wide, so every Codex tile shares this reading. */
+function codexExhaustedReset(): number | null {
+  const u = latestCodex;
+  if (!u || !u.ok) return null;
+  const resets: number[] = [];
+  for (const w of [u.primary, u.secondary]) {
+    if (
+      w &&
+      (w.usedPercent ?? 0) >= EXHAUSTED_PCT &&
+      typeof w.resetsAt === "number"
+    ) {
+      resets.push(w.resetsAt);
+    }
+  }
+  return resets.length ? Math.min(...resets) : null;
+}
+
+/** The reset time to wait on for terminal `id`, resolved by WHICH agent it runs:
+ *  a Codex tile uses the account-level Codex usage; everything else (Claude) uses
+ *  its statusline snapshot. The continue INJECTION is agent-agnostic (just typing
+ *  into the PTY) — only this "ran out + resets when" detection differs by agent. */
+function resetForTerminal(id: TerminalId): number | null {
+  if (clientForTerminal(id) === "codex") return codexExhaustedReset();
+  const sup = useSupervision.getState();
+  const sessionId = sup.sessionIdByTmux[sessionNameForTerminal(id)];
+  return exhaustedReset(sessionId ? sup.snapshots[sessionId] : undefined);
+}
+
 function cancel(id: TerminalId): void {
   const p = pending.get(id);
   if (p) {
@@ -80,7 +115,6 @@ function fire(id: TerminalId, resetsAt: number): void {
 }
 
 function evaluate(): void {
-  const sup = useSupervision.getState();
   const enabled = useAutoContinue.getState().enabled;
 
   // Drop any armed wait for a terminal that's no longer opted in.
@@ -89,9 +123,7 @@ function evaluate(): void {
   }
 
   for (const id of Object.keys(enabled)) {
-    const sessionId = sup.sessionIdByTmux[sessionNameForTerminal(id)];
-    const snap = sessionId ? sup.snapshots[sessionId] : undefined;
-    const resetsAt = exhaustedReset(snap);
+    const resetsAt = resetForTerminal(id);
 
     if (resetsAt === null) {
       // Not exhausted (cleared, resumed, or never hit) — drop any pending wait and
@@ -119,9 +151,28 @@ let installed = false;
 function installAutoContinue(): void {
   if (installed) return;
   installed = true;
-  // Re-evaluate whenever a snapshot/status lands or the opt-in set changes.
+  // Claude is event-driven: re-evaluate whenever a snapshot/status lands or the
+  // opt-in set changes.
   useSupervision.subscribe(evaluate);
   useAutoContinue.subscribe(evaluate);
+  // Codex has NO event stream (its usage lives in session files), so poll it and
+  // re-evaluate. The precise wait is still a per-window timer; this poll only has
+  // to be frequent enough to NOTICE a Codex session ran out. Adopt only good
+  // readings (keep last-known on a failed poll), like the sidebar usage strip.
+  const pollCodex = (): void => {
+    void codexUsage()
+      .then((u) => {
+        if (u && u.ok) {
+          latestCodex = u;
+          evaluate();
+        }
+      })
+      .catch(() => {
+        /* transient — keep last-known */
+      });
+  };
+  pollCodex();
+  setInterval(pollCodex, 2 * 60 * 1000);
   evaluate(); // initial pass (covers app-restart-mid-wait)
 }
 
