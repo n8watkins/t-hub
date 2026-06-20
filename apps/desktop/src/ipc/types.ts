@@ -82,6 +82,9 @@ export const Commands05 = {
   tmuxScroll: "tmux_scroll",
   /** Exit a tile's tmux copy-mode (back to the live prompt). */
   tmuxExitScroll: "tmux_exit_scroll",
+  /** Save a pasted clipboard image to a temp PNG; returns its native path (or
+   *  null when the clipboard holds no image). */
+  clipboardImageToTemp: "clipboard_image_to_temp",
   /** Read-only orchestrator→subagent tree for one session. */
   supervisionTree: "supervision_tree",
   /** All supervised session ids. */

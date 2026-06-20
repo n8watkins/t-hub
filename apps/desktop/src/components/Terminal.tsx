@@ -42,9 +42,10 @@ import {
   resizeTerminal,
   writeTerminal,
 } from "../ipc/client";
-import { tmuxScroll, tmuxExitScroll } from "../ipc/client05";
+import { tmuxScroll, tmuxExitScroll, clipboardImageToTemp } from "../ipc/client05";
 import type { TerminalId } from "../ipc/types";
 import { stripAnsi } from "../lib/ansi";
+import { installFileDropOnce, formatPathsForInsert } from "../lib/dropPaste";
 import { usePanels } from "../store/panels";
 import { useWorkspace } from "../store/workspace";
 import { useTheme, DEFAULT_THEME, type TerminalPalette } from "../store/theme";
@@ -84,6 +85,29 @@ async function clipboardRead(): Promise<string> {
   } catch {
     return "";
   }
+}
+
+// Paste into a terminal, preferring an IMAGE on the clipboard over text. When the
+// clipboard holds an image (a screenshot, a copied picture), the Rust side saves
+// it to a temp PNG and returns that file's native path; we translate it to a WSL
+// path and type it into the PTY, because Claude/Codex read images by file path,
+// not from a raw bitmap. With no image we fall back to the normal bracketed text
+// paste (term.paste), so ordinary copy/paste is completely unchanged.
+async function pasteIntoTerminal(
+  terminalId: TerminalId,
+  term: Terminal,
+): Promise<void> {
+  try {
+    const imgPath = await clipboardImageToTemp();
+    if (imgPath) {
+      await writeTerminal(terminalId, formatPathsForInsert([imgPath]));
+      return;
+    }
+  } catch {
+    /* image read failed / not under Tauri — fall through to text paste */
+  }
+  const text = await clipboardRead();
+  if (text) term.paste(text);
 }
 
 // Hand a URL to the OS default browser. MIRRORS WebPreview.tsx's openExternal():
@@ -206,6 +230,12 @@ export function TerminalView({
     const container = containerRef.current;
     if (!visible || !container || initializedRef.current) return;
     initializedRef.current = true;
+
+    // Window-level file-drop -> type the dropped path into the tile under the
+    // cursor (C1). Idempotent + global: installs on the first terminal mount and
+    // lives for the app's lifetime, resolving the target tile itself via
+    // data-tile-id, so it's independent of any single terminal instance.
+    installFileDropOnce();
 
     // Disposables collected during async setup; cleanup awaits/runs them all
     // even if the effect is torn down before setup finishes (fast tab flips).
@@ -342,9 +372,7 @@ export function TerminalView({
         return true; // no selection -> let Ctrl+C reach the shell as SIGINT
       }
       if (key === "v") {
-        void clipboardRead().then((t) => {
-          if (t) term.paste(t);
-        });
+        void pasteIntoTerminal(terminalId, term);
         e.preventDefault();
         e.stopPropagation();
         return false;

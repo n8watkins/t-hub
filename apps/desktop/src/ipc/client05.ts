@@ -47,6 +47,13 @@ export function tmuxExitScroll(session: string): Promise<void> {
   return invoke(Commands05.tmuxExitScroll, { session });
 }
 
+/** If the clipboard holds an image, save it to a temp PNG and resolve to that
+ *  file's NATIVE path (a Windows path in the packaged app); resolves to null
+ *  when there's no image, so the caller can fall back to a text paste. */
+export function clipboardImageToTemp(): Promise<string | null> {
+  return invoke(Commands05.clipboardImageToTemp);
+}
+
 /** Read-only orchestrator→subagent tree for one session (null if unseen). */
 export function supervisionTree(
   sessionId: string,
