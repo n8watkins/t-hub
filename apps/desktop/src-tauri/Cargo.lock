@@ -4106,6 +4106,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "ignore",
+ "image",
  "parking_lot",
  "portable-pty",
  "rusqlite",

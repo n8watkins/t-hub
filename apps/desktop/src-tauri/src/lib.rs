@@ -12,6 +12,7 @@ pub mod control; // MCP control listener: dispatches `{command,args}` over loopb
 mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
 mod devserver; // feat/dev-runner: managed `npm run dev` per-project runner (Dev tab)
 mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/diag)
+mod dropin; // feat/terminal-input (Lane C): clipboard-image -> temp PNG for image paste
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
 // --- feat/git-panel ---
 mod git; // git awareness for the Files panel: branch/worktree info + commit
@@ -262,6 +263,7 @@ pub fn run() {
             commands_05::git_branch,
             commands_05::tmux_scroll,
             commands_05::tmux_exit_scroll,
+            dropin::clipboard_image_to_temp,
             commands_05::supervision_tree,
             commands_05::supervision_session_ids,
             commands_05::session_status,

@@ -64,6 +64,10 @@ anyhow = { workspace = true }
 parking_lot = "0.12"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
+# PNG-encode a pasted clipboard image to a temp file (dropin.rs / Lane C). Only
+# the png codec is enabled to keep the build lean; `image` is already in the tree
+# transitively, so this just turns on the encoder we need.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Filesystem walking with .gitignore semantics for the file index (files.rs).
 ignore = "0.4"
 # Durable SQLite persistence for the workspace layout (db.rs). `bundled` compiles
