@@ -49,6 +49,11 @@ const DEFAULTS = {
   /** File-tree icon theme: "lucide" (minimal, default), "vscode" (colorful), or
    *  "seti" (muted). Read + validated by lib/fileIcons.tsx. */
   fileIconTheme: "lucide",
+  /** Hide dotfiles (entries whose name starts with ".", e.g. .git, .cargo,
+   *  .claude) in the Files panel/tree. Default ON — the file tree is a lot
+   *  quieter without them; a header toggle reveals them. Read by FileTree.tsx
+   *  and FilePanel.tsx, which filter entries at render at every level. */
+  hideDotfiles: true,
 } as const;
 
 interface PersistedSettings {
@@ -62,6 +67,7 @@ interface PersistedSettings {
   autoInstallUpdates: boolean;
   resumeStartsClaude: boolean;
   fileIconTheme: string;
+  hideDotfiles: boolean;
 }
 
 /** Clamp a persisted/incoming number into a range, falling back to a default
@@ -123,6 +129,10 @@ function loadPersisted(): PersistedSettings {
         typeof p.fileIconTheme === "string"
           ? p.fileIconTheme
           : DEFAULTS.fileIconTheme,
+      hideDotfiles:
+        typeof p.hideDotfiles === "boolean"
+          ? p.hideDotfiles
+          : DEFAULTS.hideDotfiles,
     };
   } catch {
     return { ...DEFAULTS };
@@ -193,6 +203,11 @@ interface SettingsState {
   /** File-tree icon theme ("lucide" | "vscode" | "seti"). Read by lib/fileIcons. */
   fileIconTheme: string;
   setFileIconTheme: (v: string) => void;
+
+  /** Hide dotfiles (".*") in the Files panel/tree (default true). Read by
+   *  FileTree.tsx and FilePanel.tsx; flipped by the Files header toggle. */
+  hideDotfiles: boolean;
+  setHideDotfiles: (v: boolean) => void;
 }
 
 const initial = loadPersisted();
@@ -214,6 +229,7 @@ export const useSettings = create<SettingsState>((set, get) => {
       autoInstallUpdates: s.autoInstallUpdates,
       resumeStartsClaude: s.resumeStartsClaude,
       fileIconTheme: s.fileIconTheme,
+      hideDotfiles: s.hideDotfiles,
     });
   };
 
@@ -296,6 +312,12 @@ export const useSettings = create<SettingsState>((set, get) => {
     fileIconTheme: initial.fileIconTheme,
     setFileIconTheme: (v) => {
       set({ fileIconTheme: v });
+      persistAll();
+    },
+
+    hideDotfiles: initial.hideDotfiles,
+    setHideDotfiles: (v) => {
+      set({ hideDotfiles: v });
       persistAll();
     },
   };

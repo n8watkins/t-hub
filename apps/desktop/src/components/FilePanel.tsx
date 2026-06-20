@@ -25,6 +25,7 @@ import { type GitInfo, gitCommit, gitInfo } from "../ipc/git";
 import type { DirEntry, FileContents, FileHit } from "../ipc/types";
 import { Markdown } from "./Markdown";
 import { tlog } from "../lib/diag";
+import { useSettings } from "../store/settings";
 
 const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx", "mdown", "markdn"]);
 
@@ -486,6 +487,10 @@ function Header({
   onToggleShowIgnored: () => void;
 }) {
   const label = basename(root) || root;
+  // Dotfile visibility lives in the settings store (persisted; default hidden).
+  // The toggle flips it for the whole app — the tree re-filters live.
+  const hideDotfiles = useSettings((s) => s.hideDotfiles);
+  const setHideDotfiles = useSettings((s) => s.setHideDotfiles);
   return (
     <div className="border-b" style={{ borderColor: "var(--th-border)" }}>
       <div className="flex items-center justify-between gap-3 px-3 py-2">
@@ -517,6 +522,27 @@ function Header({
               index error
             </span>
           )}
+          {/* Show hidden: dotfiles (.git, .cargo, .claude, …) are hidden by
+              default to keep the tree quiet; flip to reveal them. Persisted in the
+              settings store; the tree re-filters live (no reload needed). */}
+          <button
+            type="button"
+            onClick={() => setHideDotfiles(!hideDotfiles)}
+            aria-pressed={!hideDotfiles}
+            className="shrink-0 rounded border px-1.5 py-0.5 leading-none transition-colors hover:bg-neutral-700/30"
+            style={{
+              borderColor: !hideDotfiles ? "var(--th-accent)" : "var(--th-border)",
+              color: !hideDotfiles ? "var(--th-fg)" : "var(--th-fg-muted)",
+              background: !hideDotfiles ? "var(--th-tile-bg)" : "transparent",
+            }}
+            title={
+              hideDotfiles
+                ? "Hiding dotfiles (.git, .cargo, .claude, …). Click to show them."
+                : "Showing dotfiles (.git, .cargo, .claude, …). Click to hide them."
+            }
+          >
+            {hideDotfiles ? "Show hidden" : "Hide hidden"}
+          </button>
           {/* Show ignored: OFF = directory-only gitignore (ignored dirs like
               node_modules hidden, .env & other ignored FILES shown); ON = show
               everything including ignored dirs. Persisted to localStorage. */}
@@ -1035,6 +1061,10 @@ function TreeDir({
   const [entries, setEntries] = useState<DirEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Hide dotfiles (".*") when the setting is on (persisted; default on). Applied
+  // to the rendered entries below, so it takes effect at EVERY level of the tree
+  // and re-filters live when toggled (the cached `entries` are untouched).
+  const hideDotfiles = useSettings((s) => s.hideDotfiles);
 
   // Lazily load children the first time the dir is opened (PRD §9.7: folder
   // expansion is UI state + a shallow list, not a full rescan).
@@ -1074,13 +1104,26 @@ function TreeDir({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, path]);
 
+  // The entries we actually render: drop dotfiles when the setting is on. Done
+  // here (not in the listDir cache) so a toggle re-filters live and the filter
+  // holds at every level of the tree.
+  const visibleEntries = entries
+    ? hideDotfiles
+      ? entries.filter((e) => !e.name.startsWith("."))
+      : entries
+    : null;
+
   // Collapse-through single-child chains: when this dir is open, loaded, and its
   // sole entry is a directory, auto-open it. The child renders with the same
   // `autoExpandSingle` flag, so a deep single-folder chain (foo/bar/baz/...)
   // unfolds in one pass and the reader-side tree shows real files at once. Only
-  // fires while the user hasn't manually touched this node.
+  // fires while the user hasn't manually touched this node. Based on the VISIBLE
+  // entries so a folder whose lone non-dotfile child is a dir still collapses
+  // through.
   const onlyChildDir =
-    entries && entries.length === 1 && entries[0].isDir ? entries[0] : null;
+    visibleEntries && visibleEntries.length === 1 && visibleEntries[0].isDir
+      ? visibleEntries[0]
+      : null;
 
   const indent = { paddingLeft: `${depth * 12 + 8}px` };
 
@@ -1122,7 +1165,7 @@ function TreeDir({
               error
             </div>
           )}
-          {entries && entries.length === 0 && !loading && !error && (
+          {visibleEntries && visibleEntries.length === 0 && !loading && !error && (
             <div
               style={{ paddingLeft: `${(depth + 1) * 12 + 14}px`, color: "var(--th-fg-muted)" }}
               className="py-0.5 text-[11px]"
@@ -1130,7 +1173,7 @@ function TreeDir({
               empty folder
             </div>
           )}
-          {entries?.map((entry) =>
+          {visibleEntries?.map((entry) =>
             entry.isDir ? (
               <TreeDir
                 key={entry.path}

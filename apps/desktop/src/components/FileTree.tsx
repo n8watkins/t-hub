@@ -40,6 +40,7 @@ import {
 import { FileTypeIcon, FolderTypeIcon } from "../lib/fileIcons";
 import { listDir, searchFiles } from "../ipc/files";
 import { tlog } from "../lib/diag";
+import { useSettings } from "../store/settings";
 import type { DirEntry, FileHit } from "../ipc/types";
 import { FilePanel } from "./FilePanel";
 import { PreviewOverlay } from "./PreviewOverlay";
@@ -664,6 +665,8 @@ function DirChildren({
   showIgnored: boolean;
   onOpenFile: (absPath: string) => void;
 }) {
+  // Whether to hide dotfiles (".*"); persisted in the settings store (default on).
+  const hideDotfiles = useSettings((s) => s.hideDotfiles);
   if (state === null || state.status === "loading") {
     return <Hint depth={depth}>loading…</Hint>;
   }
@@ -677,9 +680,19 @@ function DirChildren({
   if (state.entries.length === 0) {
     return <Hint depth={depth}>empty</Hint>;
   }
+  // Hide dotfiles (".*") when the setting is on. Filtering happens HERE — the one
+  // render point shared by the root and every expanded folder — so the filter
+  // applies at every level without re-listing (the cached entries stay intact, we
+  // just render the visible subset, so toggling the setting re-filters live).
+  const visible = hideDotfiles
+    ? state.entries.filter((e) => !e.name.startsWith("."))
+    : state.entries;
+  if (visible.length === 0) {
+    return <Hint depth={depth}>empty</Hint>;
+  }
   return (
     <>
-      {state.entries.map((entry) =>
+      {visible.map((entry) =>
         entry.isDir ? (
           <TreeDir
             key={entry.path}
