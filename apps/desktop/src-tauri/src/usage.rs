@@ -46,23 +46,38 @@ pub async fn claude_usage() -> Result<ClaudeUsage, String> {
         .unwrap_or_default())
 }
 
+/// How many times to (re)run `/usage` before giving up. `claude -p /usage` is
+/// flaky: the session/week percentages arrive after a network round-trip and the
+/// process frequently exits having printed only the intro line, so a single run
+/// succeeds well under half the time. Re-running until a parse yields numbers
+/// makes the sidebar reliably populate. Bounded so a genuinely logged-out / down
+/// state still returns promptly with `ok:false`.
+const USAGE_ATTEMPTS: usize = 3;
+
 fn run_usage() -> ClaudeUsage {
-    let out = match usage_command().output() {
-        Ok(o) => o,
-        Err(e) => {
-            crate::diag::diag_log(format!(
-                "{{\"t\":\"usage\",\"m\":\"claude -p /usage spawn FAILED: {e}\"}}"
-            ));
-            return ClaudeUsage::default();
+    let mut last = ClaudeUsage::default();
+    for attempt in 1..=USAGE_ATTEMPTS {
+        let out = match usage_command().output() {
+            Ok(o) => o,
+            Err(e) => {
+                crate::diag::diag_log(format!(
+                    "{{\"t\":\"usage\",\"m\":\"claude -p /usage spawn FAILED: {e}\"}}"
+                ));
+                return ClaudeUsage::default();
+            }
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let parsed = parse_usage(&text);
+        crate::diag::diag_log(format!(
+            "{{\"t\":\"usage\",\"m\":\"claude -p /usage attempt={}/{} ok={} week={:?} session={:?}\"}}",
+            attempt, USAGE_ATTEMPTS, parsed.ok, parsed.week_used_pct, parsed.session_used_pct
+        ));
+        if parsed.ok {
+            return parsed;
         }
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let parsed = parse_usage(&text);
-    crate::diag::diag_log(format!(
-        "{{\"t\":\"usage\",\"m\":\"claude -p /usage ok={} week={:?} session={:?}\"}}",
-        parsed.ok, parsed.week_used_pct, parsed.session_used_pct
-    ));
-    parsed
+        last = parsed;
+    }
+    last
 }
 
 /// The shell command that runs `/usage` and prints the full readout.

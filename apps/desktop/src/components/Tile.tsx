@@ -68,9 +68,14 @@ function useGitInfo(cwd: string): GitInfo | null {
     };
     load();
     window.addEventListener("focus", load);
+    // Poll so a branch switch in the SAME directory (`git switch` without a cwd
+    // change) is reflected — the cwd-keyed effect alone wouldn't re-fire, leaving
+    // the chip stuck on the old branch until the window regained focus.
+    const poll = window.setInterval(load, 5000);
     return () => {
       alive = false;
       window.removeEventListener("focus", load);
+      window.clearInterval(poll);
     };
   }, [cwd]);
   return info;
@@ -135,21 +140,32 @@ const DOT_VAR: Record<TerminalState, string> = {
 };
 
 /**
- * Resolve which TermHub drop target sits under a viewport point mid-drag. A
- * workspace tab (data-tab-id) wins over a tile (data-tile-id); elementFromPoint
- * returns the topmost element (often xterm's canvas), so we walk up to the
- * owning tile/tab with `closest`.
+ * Resolve which TermHub drop target sits under a viewport point mid-drag.
+ * Precedence: a workspace tab (titlebar `data-tab-id`) or sidebar workspace row
+ * (`data-th-ws-row`) — both move the tile to that workspace — win over a grid
+ * tile; elementFromPoint returns the topmost element (often xterm's canvas), so
+ * we walk up to the owning target with `closest`.
+ *
+ * A grid tile is matched by EITHER its chrome (`data-tile-id`) OR the live
+ * terminal body wrapper (`data-th-pool-tile`, a sibling overlay over the body —
+ * see TerminalPool). Accepting the pool wrapper is what lets a drop land anywhere
+ * over a tile, not just its header: the body is covered by that wrapper, and we
+ * must resolve it regardless of whether the `data-th-dragging` pointer-inert flag
+ * is still set at resolution time (the drag controller clears it during cleanup).
+ * Both attributes carry the terminal id, which is also the tile id.
  */
 function dropTargetAt(
   x: number,
   y: number,
 ): { tileId: string | null; tabId: string | null } {
-  // Precedence is tab-over-tile: a workspace tab wins even when it's a deeper
-  // ancestor than a tile, so resolve each anchor separately and take the tab
-  // first (one combined closest() would pick the DOM-nearest, not this order).
+  // Move-to-workspace targets first: a titlebar tab, then a sidebar workspace row
+  // (its data-th-ws-row value IS the tab/workspace id, so it reuses the tab path).
   const tab = resolveDropTarget(x, y, ["[data-tab-id]"]);
   if (tab) return { tileId: null, tabId: tab.value };
-  const tile = resolveDropTarget(x, y, ["[data-tile-id]"]);
+  const wsRow = resolveDropTarget(x, y, ["[data-th-ws-row]"]);
+  if (wsRow) return { tileId: null, tabId: wsRow.value };
+  // Grid tile: chrome or live-terminal body (either anchor → the terminal id).
+  const tile = resolveDropTarget(x, y, ["[data-tile-id]", "[data-th-pool-tile]"]);
   if (tile) return { tileId: tile.value, tabId: null };
   return { tileId: null, tabId: null };
 }
@@ -670,10 +686,11 @@ export function Tile({
             of the header (the tabs used to be absolutely centered). */}
         <div className="min-w-0 flex-1" />
 
-        {/* Context-window meter: how full THIS tile's Claude session context is
-            (matched by cwd). Renders nothing when no session is matched, so the
-            header is unchanged for plain shells / sessions yet to report. */}
-        <ContextMeter usedPct={contextUsedPct} />
+        {/* Context-window meter: how full THIS tile's Claude session context is.
+            Shown ONLY when the tile is actually running Claude — the cwd-matched
+            reading can otherwise leak onto a plain shell that shares a directory
+            with a (past) Claude session, so gate on the client being claude. */}
+        <ContextMeter usedPct={client === "claude" ? contextUsedPct : null} />
 
         {/* Per-tile view switcher: Terminal / Files / Preview. Clicking a tab
             sets THIS tile's usePanels tab; the body (below) swaps to that surface
