@@ -24,8 +24,8 @@ import { useAgentTelemetry } from "../store/telemetry";
 import { useSettings } from "../store/settings";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import { useTheme } from "../store/theme";
-import { WslHealth } from "./WslHealth";
-import { UsageStrip } from "./UsageStrip";
+import { WslHealth, gib, usedFraction } from "./WslHealth";
+import { UsageStrip, UsageInline, useClaudeUsage } from "./UsageStrip";
 import { WorkspacesList } from "./WorkspacesList";
 import { RecentList } from "./RecentList";
 import type { HostMetrics, ConnectionState } from "../ipc/protocol";
@@ -174,6 +174,10 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
  * metrics + the agent connection state). Pinned to the sidebar's bottom-left,
  * independent of the lists above. Open/collapsed persists to localStorage.
  *
+ * When COLLAPSED the bar still carries a one-line summary (RAM used/total + the
+ * 1-minute load average) so the strip stays useful without expanding — it reads
+ * the same `metrics` the expanded body does. Expanded shows the full WslHealth.
+ *
  * The old Usage view (Claude context/cost aggregated across supervised sessions)
  * was dropped here: the sidebar no longer reads the supervision store. WSL health
  * is host telemetry and stays.
@@ -216,6 +220,8 @@ function BottomStatus({
         >
           WSL
         </span>
+        {/* Collapsed: keep a live RAM + load readout in the bar itself. */}
+        {!open && <WslMiniSummary metrics={metrics} />}
       </div>
       {open && (
         // FIXED height so the strip never jumps; the view scrolls within it.
@@ -231,8 +237,43 @@ function BottomStatus({
 }
 
 /**
+ * The collapsed WSL bar's inline readout: RAM used/total (GiB) + the 1-minute
+ * load average, right-aligned in the bar. Uses the SAME thresholds as the
+ * expanded WslHealth (gib/usedFraction shared from there) so the colors agree.
+ * Renders nothing until the first metrics snapshot lands.
+ */
+function WslMiniSummary({ metrics }: { metrics: HostMetrics | null }) {
+  if (!metrics) return null;
+  const memUsed = usedFraction(metrics.mem_total_kib, metrics.mem_available_kib);
+  const memColor =
+    memUsed >= 0.9 ? "text-red-400" : memUsed >= 0.75 ? "text-amber-400" : undefined;
+  const load1 = metrics.load_avg?.[0] ?? 0;
+  // Load relative to core count: >=1.0 per core is saturation (matches WslHealth).
+  const loadWarn = metrics.cpu_count > 0 && load1 / metrics.cpu_count >= 1.0;
+  return (
+    <span
+      className="ml-auto flex items-center gap-2 pr-2 text-[10px] tabular-nums"
+      style={{ color: "var(--th-fg-muted)" }}
+    >
+      <span className={memColor} title={`RAM ${(memUsed * 100).toFixed(0)}% used`}>
+        {gib(metrics.mem_total_kib - metrics.mem_available_kib)}/
+        {gib(metrics.mem_total_kib)}G
+      </span>
+      <span
+        className={loadWarn ? "text-amber-400" : undefined}
+        title={`Load ${metrics.load_avg.map((l) => l.toFixed(2)).join(" ")} · ${metrics.cpu_count} cores`}
+      >
+        {load1.toFixed(2)}
+      </span>
+    </span>
+  );
+}
+
+/**
  * Bottom-pinned Claude USAGE: a collapse chevron + "Usage" label. Expanded shows
- * the full weekly/session rows; collapsed MINIMIZES to just the two bars + %.
+ * the full weekly/session rows; collapsed keeps the key REMAINING percentages
+ * (weekly + 5-hour) inline in the bar itself, so the strip stays useful without
+ * expanding. A single poller (useClaudeUsage) feeds both states.
  * Open/collapsed persists to localStorage.
  */
 function UsageSection() {
@@ -248,6 +289,8 @@ function UsageSection() {
       /* ignore */
     }
   };
+  // One poller here drives both the collapsed inline summary and the full strip.
+  const usage = useClaudeUsage();
   return (
     <div className="shrink-0 border-t" style={{ borderColor: "var(--th-border)" }}>
       <div className="flex items-stretch">
@@ -266,9 +309,11 @@ function UsageSection() {
         >
           Usage
         </span>
+        {/* Collapsed: keep the key percentages visible inline in the bar. */}
+        {!open && <UsageInline usage={usage} />}
       </div>
-      {/* Collapsed = minimized bars + %; expanded = full weekly/session rows. */}
-      <UsageStrip compact={!open} />
+      {/* Expanded: the full weekly/session rows. */}
+      {open && <UsageStrip usage={usage} />}
     </div>
   );
 }
