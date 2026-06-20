@@ -18,10 +18,13 @@
 //
 // Reads the workspace store directly (no props), so App needs no extra wiring.
 import { useEffect, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
 import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
 import type { TerminalId, TerminalInfo, TerminalState } from "../ipc/types";
+import { startPointerDrag } from "../lib/pointerDrag";
+import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 
 /** Lifecycle-dot color per terminal state — the SAME `--th-dot-*` palette Tile
  *  uses, so a terminal reads identically wherever it appears. */
@@ -45,6 +48,9 @@ export function WorkspacesList() {
   const setFocusRegion = useWorkspace((s) => s.setFocusRegion);
   const renameTab = useWorkspace((s) => s.renameTab);
   const deleteTerminal = useWorkspace((s) => s.deleteTerminal);
+  // Moving a terminal into another workspace by dragging its row (D2) reuses the
+  // same store action the tile-header drag uses.
+  const moveTileToTab = useWorkspace((s) => s.moveTileToTab);
   // Per-workspace color identity (feat/workspace-colors): the dot + a quick color
   // picker live on each workspace row. Read from the theme store (mirrors the
   // per-terminal override slots).
@@ -60,6 +66,64 @@ export function WorkspacesList() {
   const isOpen = (tab: WorkspaceTab) => openMap[tab.id] ?? tab.id === activeTabId;
   const toggleOpen = (tab: WorkspaceTab) =>
     setOpenMap((m) => ({ ...m, [tab.id]: !isOpen(tab) }));
+
+  // --- D2: drag a terminal row into another workspace --------------------
+  // The terminal being dragged (its row dims) and the workspace row currently
+  // under the pointer (it lights up as a drop target). Pointer-based, like every
+  // other TermHub drag — HTML5 DnD dies over xterm (see lib/pointerDrag.ts).
+  const [dragTerminalId, setDragTerminalId] = useState<TerminalId | null>(null);
+  const [dropTabId, setDropTabId] = useState<string | null>(null);
+  // The workspace the dragged terminal currently lives in — so we never flag its
+  // OWN workspace as a (no-op) drop target.
+  const sourceTabId =
+    dragTerminalId != null
+      ? tabs.find((t) => t.order.includes(dragTerminalId))?.id ?? null
+      : null;
+
+  // Resolve which workspace row sits under a viewport point. Terminals are made
+  // pointer-inert during the drag (data-th-dragging), so elementFromPoint lands
+  // on the sidebar chrome; we walk up to the owning workspace row.
+  const workspaceRowAt = (x: number, y: number): string | null => {
+    const el = document.elementFromPoint(x, y) as HTMLElement | null;
+    const row = el?.closest<HTMLElement>("[data-th-ws-row]");
+    return row?.getAttribute("data-th-ws-row") ?? null;
+  };
+
+  const startTerminalDrag = (id: TerminalId, e: ReactPointerEvent) => {
+    if (e.button !== 0) return; // primary (left) button only
+    let ghost: DragGhost | null = null;
+    startPointerDrag(e.clientX, e.clientY, {
+      onBegin: () => {
+        setDragTerminalId(id);
+        // Make terminals pointer-inert so the gesture tracks over them and
+        // elementFromPoint resolves to sidebar rows, not xterm canvases.
+        document.body.dataset.thDragging = "1";
+        ghost = createDragGhost({
+          title: deriveLabel({
+            id,
+            label: labels[id],
+            title: terminals[id]?.title,
+            cwd: terminals[id]?.cwd,
+          }),
+          width: 200,
+        });
+      },
+      onMove: (x, y) => {
+        ghost?.move(x, y);
+        setDropTabId(workspaceRowAt(x, y));
+      },
+      onEnd: (x, y, committed) => {
+        const targetTab = committed ? workspaceRowAt(x, y) : null;
+        ghost?.destroy();
+        ghost = null;
+        delete document.body.dataset.thDragging;
+        setDragTerminalId(null);
+        setDropTabId(null);
+        // moveTileToTab no-ops on same/unknown tab, so an in-place drop is safe.
+        if (targetTab) moveTileToTab(id, targetTab);
+      },
+    });
+  };
 
   if (tabs.length === 0) {
     return (
@@ -84,6 +148,15 @@ export function WorkspacesList() {
           // The active row is the keyboard-nav focus target while the sidebar
           // region is focused (Ctrl+B), so highlight it then.
           navFocused={sidebarFocused && tab.id === activeTabId}
+          // D2 drag: light this row up as a drop target only when a terminal from
+          // a DIFFERENT workspace is hovering it; its terminals are drag sources.
+          isDropTarget={
+            dragTerminalId != null &&
+            dropTabId === tab.id &&
+            tab.id !== sourceTabId
+          }
+          draggingTerminalId={dragTerminalId}
+          onTerminalDragStart={startTerminalDrag}
           onToggle={() => toggleOpen(tab)}
           onActivate={() => {
             // Activating from the sidebar keeps nav focus IN the sidebar so a
@@ -116,6 +189,9 @@ function WorkspaceRow({
   focusedId,
   color,
   navFocused,
+  isDropTarget,
+  draggingTerminalId,
+  onTerminalDragStart,
   onToggle,
   onActivate,
   onRename,
@@ -134,6 +210,13 @@ function WorkspaceRow({
   color?: string;
   /** True when this row is the sidebar's keyboard-nav focus target (Ctrl+B). */
   navFocused: boolean;
+  /** True when a terminal from another workspace is being dragged over this row
+   *  (D2) — drives the drop affordance. */
+  isDropTarget: boolean;
+  /** The terminal currently being dragged (its row dims), or null. */
+  draggingTerminalId: TerminalId | null;
+  /** Begin dragging one of this row's terminals into another workspace. */
+  onTerminalDragStart: (id: TerminalId, e: ReactPointerEvent) => void;
   onToggle: () => void;
   onActivate: () => void;
   onRename: (name: string) => void;
@@ -175,7 +258,9 @@ function WorkspaceRow({
   };
 
   return (
-    <li>
+    // data-th-ws-row marks this whole workspace block as a D2 drop target: a
+    // dragged terminal resolves to it via elementFromPoint + closest.
+    <li data-th-ws-row={tab.id}>
       <div
         className="flex w-full items-center gap-1 rounded-lg pr-1 transition-colors hover:bg-neutral-800/40"
         style={{
@@ -189,6 +274,15 @@ function WorkspaceRow({
           // A clear focus ring when this row is the sidebar's keyboard target.
           ...(navFocused
             ? { outline: `1px solid ${accent}`, outlineOffset: "-1px" }
+            : {}),
+          // A drop terminal is hovering this workspace: a crisp accent ring +
+          // tint so the target reads clearly (wins over active/nav styling).
+          ...(isDropTarget
+            ? {
+                backgroundColor: `color-mix(in srgb, ${accent} 24%, transparent)`,
+                outline: `2px dashed ${accent}`,
+                outlineOffset: "-2px",
+              }
             : {}),
         }}
       >
@@ -303,6 +397,8 @@ function WorkspaceRow({
                   info={terminals[id]}
                   userLabel={labels[id]}
                   active={id === focusedId}
+                  dragging={draggingTerminalId === id}
+                  onDragStart={onTerminalDragStart}
                   onClick={() => onSelectTerminal(id)}
                   onClose={() => onCloseTerminal(id)}
                 />
@@ -324,6 +420,8 @@ function TerminalRow({
   info,
   userLabel,
   active,
+  dragging,
+  onDragStart,
   onClick,
   onClose,
 }: {
@@ -331,6 +429,10 @@ function TerminalRow({
   info?: TerminalInfo;
   userLabel?: string;
   active: boolean;
+  /** True while THIS terminal is the one being dragged (the row dims). */
+  dragging: boolean;
+  /** Begin a pointer-drag of this terminal into another workspace (D2). */
+  onDragStart: (id: TerminalId, e: ReactPointerEvent) => void;
   onClick: () => void;
   onClose: () => void;
 }) {
@@ -350,6 +452,8 @@ function TerminalRow({
       className="group flex items-center gap-2 rounded-lg pr-1 transition-colors hover:bg-neutral-800/40"
       style={{
         color: "var(--th-fg)",
+        // Dim the source row while it's being dragged into another workspace.
+        opacity: dragging ? 0.4 : undefined,
         ...(active
           ? {
               backgroundColor:
@@ -362,6 +466,9 @@ function TerminalRow({
       <button
         type="button"
         onClick={onClick}
+        // Press-and-drag this row to move the terminal into another workspace
+        // (D2). A plain click (no movement past the threshold) still selects it.
+        onPointerDown={(e) => onDragStart(id, e)}
         aria-current={active ? "true" : undefined}
         className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-1.5 pl-2.5 text-left text-sm"
         title={cwd ? `${label} — ${cwd} (${state})` : `${label} — ${state}`}
