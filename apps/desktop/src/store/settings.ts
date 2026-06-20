@@ -54,6 +54,10 @@ const DEFAULTS = {
    *  quieter without them; a header toggle reveals them. Read by FileTree.tsx
    *  and FilePanel.tsx, which filter entries at render at every level. */
   hideDotfiles: true,
+  /** The command auto-continue injects when an opted-in terminal's Claude session
+   *  hits its usage limit and the window resets (see lib/autoContinueMount). The
+   *  text is typed + Enter; default "continue". */
+  autoContinueText: "continue",
 } as const;
 
 interface PersistedSettings {
@@ -68,6 +72,7 @@ interface PersistedSettings {
   resumeStartsClaude: boolean;
   fileIconTheme: string;
   hideDotfiles: boolean;
+  autoContinueText: string;
 }
 
 /** Clamp a persisted/incoming number into a range, falling back to a default
@@ -133,6 +138,10 @@ function loadPersisted(): PersistedSettings {
         typeof p.hideDotfiles === "boolean"
           ? p.hideDotfiles
           : DEFAULTS.hideDotfiles,
+      autoContinueText:
+        typeof p.autoContinueText === "string"
+          ? p.autoContinueText
+          : DEFAULTS.autoContinueText,
     };
   } catch {
     return { ...DEFAULTS };
@@ -208,6 +217,11 @@ interface SettingsState {
    *  FileTree.tsx and FilePanel.tsx; flipped by the Files header toggle. */
   hideDotfiles: boolean;
   setHideDotfiles: (v: boolean) => void;
+
+  /** Command auto-continue types when an opted-in session resets (default
+   *  "continue"). See store/autoContinue + lib/autoContinueMount. */
+  autoContinueText: string;
+  setAutoContinueText: (v: string) => void;
 }
 
 const initial = loadPersisted();
@@ -230,6 +244,7 @@ export const useSettings = create<SettingsState>((set, get) => {
       resumeStartsClaude: s.resumeStartsClaude,
       fileIconTheme: s.fileIconTheme,
       hideDotfiles: s.hideDotfiles,
+      autoContinueText: s.autoContinueText,
     });
   };
 
@@ -318,6 +333,12 @@ export const useSettings = create<SettingsState>((set, get) => {
     hideDotfiles: initial.hideDotfiles,
     setHideDotfiles: (v) => {
       set({ hideDotfiles: v });
+      persistAll();
+    },
+
+    autoContinueText: initial.autoContinueText,
+    setAutoContinueText: (v) => {
+      set({ autoContinueText: v });
       persistAll();
     },
   };

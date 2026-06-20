@@ -13,6 +13,11 @@ import "./lib/statusMount";
 // user opted in, a silent install + relaunch). Idempotent + best-effort — see
 // src/lib/updateMount.ts.
 import "./lib/updateMount";
+// Side-effect import: arms "auto-continue on usage reset" — for terminals the
+// user opted into, waits for a rate-limited Claude session's window to reset and
+// injects the continue command so it resumes on its own. Idempotent. See
+// src/lib/autoContinueMount.ts.
+import "./lib/autoContinueMount";
 
 // Note: React.StrictMode is intentionally omitted. Its double-invoke of effects
 // in development breaks xterm.js terminals (double `open()` / disposed addons).

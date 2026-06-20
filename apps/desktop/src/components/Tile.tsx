@@ -40,6 +40,7 @@ import { TilePanel } from "./TilePanel";
 import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
 import { clientForTerminal } from "../store/clientType";
+import { useAutoContinue } from "../store/autoContinue";
 import { ContextMeter } from "./ContextMeter";
 import { useContextPctForTile, sessionNameForTerminal } from "../store/sessionContext";
 import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
@@ -252,6 +253,12 @@ export function Tile({
   const setTermFocusRing = useTheme((s) => s.setTermFocusRing);
   const clearTermFocusRing = useTheme((s) => s.clearTermFocusRing);
   const themeFocusRing = useTheme((s) => s.active.chrome.focusRing);
+  // Auto-continue on usage reset (the ⋯ menu): when ON, if this session runs out
+  // of usage, lib/autoContinueMount waits for the window to reset and types the
+  // continue command. A primitive boolean selector, so the tile only re-renders
+  // when THIS terminal's opt-in flips.
+  const autoContinueOn = useAutoContinue((s) => s.enabled[terminalId] === true);
+  const toggleAutoContinue = useAutoContinue((s) => s.toggle);
   // The workspace (tab) this tile belongs to, and that workspace's color identity
   // (feat/workspace-colors). The tab id is derived from the live tab list, then
   // its color is looked up in the theme store. The workspace color cascades to
@@ -990,6 +997,45 @@ export function Tile({
               title="Clear this terminal's colors and follow the global theme"
             >
               Reset to theme
+            </button>
+
+            {/* Auto-continue on usage reset (per-terminal opt-in). When this
+                session runs out of usage, TermHub waits for the limit window to
+                reset and types the continue command so the agent resumes. */}
+            <div
+              className="my-2 border-t"
+              style={{ borderColor: "var(--th-border)" }}
+            />
+            <button
+              type="button"
+              role="menuitemcheckbox"
+              aria-checked={autoContinueOn}
+              onClick={() => toggleAutoContinue(terminalId)}
+              className="flex w-full items-center justify-between gap-2 rounded px-0.5 py-1 text-xs hover:bg-neutral-800/40"
+              title="When this session runs out of usage, wait for the limit to reset and type the continue command automatically"
+            >
+              <span className="text-left leading-tight">
+                Auto-continue on usage reset
+              </span>
+              <span
+                className="ml-2 inline-flex h-4 w-7 shrink-0 items-center rounded-full px-0.5 transition-colors"
+                style={{
+                  backgroundColor: autoContinueOn
+                    ? "var(--th-accent)"
+                    : "var(--th-border)",
+                }}
+                aria-hidden
+              >
+                <span
+                  className="h-3 w-3 rounded-full transition-transform"
+                  style={{
+                    backgroundColor: "#fff",
+                    transform: autoContinueOn
+                      ? "translateX(12px)"
+                      : "translateX(0)",
+                  }}
+                />
+              </span>
             </button>
           </div>
         </>
