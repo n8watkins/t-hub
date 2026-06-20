@@ -39,8 +39,9 @@ TermHub names each terminal's tmux session **`th_<terminalId>`** (see `tmux.rs`/
 `pty.rs`) — this id is now also how the context meter binds a tile to its session.
 
 - **GitHub:** `github.com/n8watkins/t-hub` (PUBLIC, renamed from `termhub`).
-- **WSL repo (edit + commit here):** `/home/natkins/n8builds/tools` (the local
-  folder stays `tools`; the repo *is* the t-hub monorepo). `main` is integration.
+- **WSL repo (edit + commit here):** `/home/natkins/n8builds/tools/t-hub` (the
+  repo lives in its own `t-hub` folder under the `tools` container; the repo *is*
+  the t-hub monorepo). `main` is integration.
 - **Monorepo layout:** the Tauri app is at **`apps/desktop/`**; the marketing
   site at `apps/site/` (Next.js, npm, NOT in the pnpm workspace). The pnpm
   workspace manages only `apps/desktop`. Root `package.json` name = `t-hub`.
@@ -68,7 +69,7 @@ paths) — the Windows build at deploy is the real cross-check. Two lib tests
 ```
 cd apps/desktop && ./scripts/bump-version.sh          # STANDING RULE: bump EVERY deploy
 ( cd src-tauri && cargo check -p termhub )            # sync Cargo.lock to the bump
-cd /home/natkins/n8builds/tools && git add -A && git commit ...   # ASCII-only msg + Co-Authored-By trailer
+cd /home/natkins/n8builds/tools/t-hub && git add -A && git commit ...   # ASCII-only msg + Co-Authored-By trailer
 git push origin main
 : > /mnt/c/Users/natha/.termhub/diag.log              # optional: clean diag read
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\Users\natha\Downloads\termhub_relaunch.ps1'

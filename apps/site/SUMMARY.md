@@ -140,7 +140,7 @@ https://termhub-site.vercel.app.
 
 ## Notes
 
-- The live app at `/home/natkins/n8builds/tools` and the Remotion project at
+- The live app at `/home/natkins/n8builds/tools/t-hub` and the Remotion project at
   `/home/natkins/n8builds/termhub-videos` were **not** touched.
 - `npm audit` advisories live in the Next.js 14.x framework itself (DoS /
   cache-poisoning classes relevant to self-hosted servers handling untrusted
