@@ -791,6 +791,23 @@ interface ThemeStore {
   setTermFocusRing: (id: string, color: string) => void;
   clearTermFocusRing: (id: string) => void;
 
+  /** Per-terminal "what are you working on" name (terminalId → name). A purely
+   *  cosmetic header label the user types ("name this work…") — NOT a branch and
+   *  NOT the tab/derived label. Persisted in its own localStorage slot, mirroring
+   *  the per-terminal color overrides. Cleared when the terminal goes away. */
+  termWorkNames: Record<string, string>;
+  setTermWorkName: (id: string, name: string) => void;
+  clearTermWorkName: (id: string) => void;
+
+  /** Per-workspace color identity (tabId → color). A workspace's color cascades
+   *  to its tiles (the tile focus ring, sidebar accent, tab dot). A per-terminal
+   *  override (termFocusRing) still LAYERS ON TOP; the workspace color only beats
+   *  the global blue default. Persisted in its own localStorage slot, mirroring
+   *  the per-terminal override pattern. */
+  workspaceColors: Record<string, string>;
+  setWorkspaceColor: (tabId: string, color: string) => void;
+  clearWorkspaceColor: (tabId: string) => void;
+
   /** Save the current active theme as a named preset. */
   saveAsPreset: (name: string) => void;
   /** Delete a user preset by name (built-ins can't be deleted). */
@@ -866,6 +883,72 @@ function saveTermFocusRing(m: Record<string, string>): void {
   }
 }
 
+// Per-terminal work name (terminalId → name), in its own slot. The free-text
+// "what are you working on" header label; same sparse-map-in-localStorage shape.
+const TERM_WORKNAME_KEY = "termhub.theme.termWorkNames";
+function loadTermWorkNames(): Record<string, string> {
+  try {
+    if (typeof localStorage === "undefined") return {};
+    const raw = localStorage.getItem(TERM_WORKNAME_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object"
+      ? (parsed as Record<string, string>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+function saveTermWorkNames(m: Record<string, string>): void {
+  try {
+    localStorage.setItem(TERM_WORKNAME_KEY, JSON.stringify(m));
+  } catch {
+    /* ignore */
+  }
+}
+
+// Per-workspace color (tabId → color), in its own slot. A workspace's color is
+// the per-tab identity that cascades to its tiles (focus ring / sidebar accent /
+// tab dot). Same sparse-map-in-localStorage shape as the per-terminal overrides.
+const WORKSPACE_COLORS_KEY = "termhub.theme.workspaceColors";
+function loadWorkspaceColors(): Record<string, string> {
+  try {
+    if (typeof localStorage === "undefined") return {};
+    const raw = localStorage.getItem(WORKSPACE_COLORS_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object"
+      ? (parsed as Record<string, string>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+function saveWorkspaceColors(m: Record<string, string>): void {
+  try {
+    localStorage.setItem(WORKSPACE_COLORS_KEY, JSON.stringify(m));
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * A small, tasteful palette of workspace colors offered in the color picker
+ * (the workspace tab's ⋯ menu / sidebar dot). Picked to read clearly on the dark
+ * chrome and to be distinguishable from one another. Free-form colors are also
+ * allowed (the `<input type="color">` swatch), so this is just the quick menu.
+ */
+export const WORKSPACE_COLOR_PALETTE: readonly string[] = [
+  "#38bdf8", // sky
+  "#34d399", // emerald
+  "#a78bfa", // violet
+  "#f472b6", // pink
+  "#fbbf24", // amber
+  "#fb7185", // rose
+  "#22d3ee", // cyan
+  "#a3e635", // lime
+];
+
 const initial = loadPersisted();
 
 /**
@@ -886,6 +969,8 @@ export const useTheme = create<ThemeStore>((set, get) => ({
   presets: initial.presets,
   termOverrides: loadTermOverrides(),
   termFocusRing: loadTermFocusRing(),
+  termWorkNames: loadTermWorkNames(),
+  workspaceColors: loadWorkspaceColors(),
 
   setTheme: (theme, fromBackend = false) => {
     applyTheme(theme);
@@ -959,6 +1044,41 @@ export const useTheme = create<ThemeStore>((set, get) => ({
     delete next[id];
     saveTermFocusRing(next);
     set({ termFocusRing: next });
+  },
+
+  setTermWorkName: (id, name) => {
+    const trimmed = name.trim();
+    // A blank value clears the slot (back to the placeholder); no-op if unchanged.
+    if (!trimmed) {
+      get().clearTermWorkName(id);
+      return;
+    }
+    if (get().termWorkNames[id] === trimmed) return;
+    const next = { ...get().termWorkNames, [id]: trimmed };
+    saveTermWorkNames(next);
+    set({ termWorkNames: next });
+  },
+
+  clearTermWorkName: (id) => {
+    if (!(id in get().termWorkNames)) return;
+    const next = { ...get().termWorkNames };
+    delete next[id];
+    saveTermWorkNames(next);
+    set({ termWorkNames: next });
+  },
+
+  setWorkspaceColor: (tabId, color) => {
+    const next = { ...get().workspaceColors, [tabId]: color };
+    saveWorkspaceColors(next);
+    set({ workspaceColors: next });
+  },
+
+  clearWorkspaceColor: (tabId) => {
+    if (!(tabId in get().workspaceColors)) return;
+    const next = { ...get().workspaceColors };
+    delete next[tabId];
+    saveWorkspaceColors(next);
+    set({ workspaceColors: next });
   },
 
   saveAsPreset: (name) => {

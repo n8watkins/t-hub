@@ -180,9 +180,21 @@ export default function App() {
     [recall],
   );
 
+  // Persist a chosen collapse mode (#1). Shared by the manual cycle (the rail /
+  // collapse button) and the "reveal for focus" path (Ctrl+B onto the sidebar).
+  const setSidebarModePersisted = useCallback((next: SidebarMode) => {
+    setSidebarMode(next);
+    try {
+      localStorage.setItem(SIDEBAR_MODE_KEY, next);
+    } catch {
+      /* ignore quota/availability */
+    }
+  }, []);
+
   // Cycle the collapse state (full -> rail -> hidden -> full) and persist it.
-  // This is exactly what App hands to Canvas as onToggleSidebar, so Canvas's
-  // unchanged Ctrl/Cmd+B keybinding now advances through all three states.
+  // This is now driven by the sidebar's collapse button / rail click — NOT by
+  // Ctrl/Cmd+B, which instead toggles keyboard FOCUS between the sidebar and the
+  // terminal area (feat/keyboard-nav, handled in Canvas).
   const cycleSidebarMode = useCallback(() => {
     setSidebarMode((m) => {
       const next = nextSidebarMode(m);
@@ -194,6 +206,17 @@ export default function App() {
       return next;
     });
   }, []);
+
+  // Ensure the sidebar is at least visible (used when Ctrl/Cmd+B moves focus onto
+  // it): a HIDDEN sidebar is revealed (to "full"); "full"/"rail" are left as-is so
+  // we never widen a deliberately-narrow rail. Returns true if a sidebar is (now)
+  // visible, so the caller knows whether focusing it is meaningful.
+  const ensureSidebarVisible = useCallback((): boolean => {
+    if (sidebarMode === "hidden") {
+      setSidebarModePersisted("full");
+    }
+    return true;
+  }, [sidebarMode, setSidebarModePersisted]);
 
   // Wire cross-window tear-off resync once for this window (#21): the main window
   // hides/re-adopts tabs as satellites open/close; a satellite self-closes if its
@@ -349,7 +372,7 @@ export default function App() {
           </>
         )}
         <div className="relative min-w-0 flex-1">
-          <Canvas onToggleSidebar={cycleSidebarMode} />
+          <Canvas onFocusSidebar={ensureSidebarVisible} />
         </div>
       </div>
     </div>

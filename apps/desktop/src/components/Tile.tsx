@@ -151,9 +151,10 @@ export function Tile({
   // Which tile is the drag source / current drop target (for visual state).
   const draggingTileId = useWorkspace((s) => s.draggingTileId);
   const dropTileId = useWorkspace((s) => s.dropTileId);
-  // Themed header behavior: hide the cwd, and/or collapse the header to a
-  // hover-reveal hairline. Subscribed so a live toggle in the editor re-renders.
-  const showCwd = useTheme((s) => s.active.chrome.showCwd);
+  // Themed header behavior: collapse the header to a hover-reveal hairline.
+  // Subscribed so a live toggle in the editor re-renders. (The cwd is no longer
+  // shown in the header — Feature 1 replaced the path with folder + Claude chip —
+  // so chrome.showCwd is intentionally not read here anymore.)
   const headerOnHover = useTheme((s) => s.active.chrome.headerOnHover);
   const showTileHeader = useTheme((s) => s.active.chrome.showTileHeader);
 
@@ -191,8 +192,22 @@ export function Tile({
   const setTermFocusRing = useTheme((s) => s.setTermFocusRing);
   const clearTermFocusRing = useTheme((s) => s.clearTermFocusRing);
   const themeFocusRing = useTheme((s) => s.active.chrome.focusRing);
-  // Focused-tile ring color: this terminal's override, else the global token.
-  const focusRing = termFocusRing ?? "var(--th-focus-ring)";
+  // The workspace (tab) this tile belongs to, and that workspace's color identity
+  // (feat/workspace-colors). The tab id is derived from the live tab list, then
+  // its color is looked up in the theme store. The workspace color cascades to
+  // the tile's focus ring (below).
+  const workspaceTabId = useWorkspace((s) =>
+    s.tabs.find((t) => t.order.includes(terminalId))?.id,
+  );
+  const workspaceColor = useTheme((s) =>
+    workspaceTabId ? s.workspaceColors[workspaceTabId] : undefined,
+  );
+  // Focused-tile ring color, in priority order (each beats the next):
+  //   1. this terminal's own override (the ⋯ menu) — most specific;
+  //   2. the owning workspace's color — the per-tab identity cascade;
+  //   3. the global --th-focus-ring token (the blue default).
+  const focusRing =
+    termFocusRing ?? workspaceColor ?? "var(--th-focus-ring)";
   const effColor = (k: TermColorKey): string =>
     termOverride?.[k] ?? termPalette?.[k] ?? TERM_COLOR_FALLBACK[k];
   const setColor = (k: TermColorKey, value: string): void =>
@@ -214,6 +229,13 @@ export function Tile({
   // The split flex row, measured during a divider drag to map pointer-x → ratio.
   const splitRowRef = useRef<HTMLDivElement | null>(null);
 
+  // Per-terminal cosmetic "work name" (Feature 1): a free-text label the user
+  // types to say what they're working on. Persisted in the theme store, mirroring
+  // the color overrides (NOT the tab/derived label). Subscribed so an inline edit
+  // re-renders the header.
+  const workName = useTheme((s) => s.termWorkNames[terminalId]);
+  const setTermWorkName = useTheme((s) => s.setTermWorkName);
+
   const state: TerminalState = info?.state ?? "starting";
   const cwd = info?.cwd ?? "";
   // Context-window fullness for the Claude session running in THIS tile. Bound
@@ -228,9 +250,11 @@ export function Tile({
   // Display path: strip the home prefix (`/home/<user>` -> `~`) so the header
   // shows `~/n8builds/tools` instead of the noisy `/home/natkins/n8builds/tools`.
   // The full path stays in the title tooltip.
-  const shortCwd = shortenHomePath(cwd);
-  // Friendly display name (user label > derived preset·cwd > short id). The short
-  // id (terminalId) is always shown as a dimmed secondary detail beside it.
+  // The folder name shown in the header: the cwd basename (e.g. `t-hub`). Falls
+  // back to the derived label when there's no cwd yet, so the header is never empty.
+  const folderName = cwdBasename(cwd) || null;
+  // Friendly display name (user label > derived preset·cwd > short id). Kept for
+  // the drag ghost / fallbacks; the header chrome itself now shows folder+Claude.
   const label = deriveLabel({
     id: terminalId,
     label: userLabel,
@@ -253,6 +277,14 @@ export function Tile({
     right: number;
     top: number;
   } | null>(null);
+  // Inline work-name editor (Feature 1): null = display mode; a string = the live
+  // draft while editing. Enter commits, Esc cancels. Seeded from the saved name.
+  const [nameDraft, setNameDraft] = useState<string | null>(null);
+  const startNameEdit = () => setNameDraft(workName ?? "");
+  const commitName = () => {
+    if (nameDraft !== null) setTermWorkName(terminalId, nameDraft);
+    setNameDraft(null);
+  };
 
   // The ONE close path for this tile's × and the context-menu action: kill the
   // session, but confirm first if it looks busy. Idle -> kill now; busy -> ask.
@@ -424,26 +456,75 @@ export function Tile({
           aria-label={state}
           title={`Terminal state: ${state}`}
         />
-        {/* Friendly label, prominent. The raw Claude session id is intentionally
-            NOT surfaced here (per request) — it added noise to the header without
-            being something the user wants to read. The id is still available in
-            tooltips/the kill confirm where it's actually needed. */}
-        <span
-          className="truncate"
-          style={{ color: "var(--th-fg)", fontSize: "1.05em" }}
-        >
-          {label}
-        </span>
-        {showCwd && cwd && (
+        {/* Folder name + the "Claude" client chip (Feature 1). The path display
+            is gone — the folder basename is enough to place the work, and the
+            chip marks this as a Claude session. The full cwd stays in the header
+            tooltip (the header's `title={cwd}`). */}
+        {folderName && (
           <span
-            className="min-w-0 flex-1 truncate"
-            style={{ color: "var(--th-fg-muted)" }}
-            title={cwd}
+            className="shrink-0 truncate"
+            style={{ color: "var(--th-fg)", fontSize: "1.05em" }}
+            title={cwd || undefined}
           >
-            {shortCwd}
+            {folderName}
           </span>
         )}
-        {(!showCwd || !cwd) && <span className="flex-1" />}
+        <span
+          className="inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[0.85em] leading-none"
+          style={{
+            backgroundColor: "color-mix(in srgb, var(--th-accent) 16%, transparent)",
+            color: "var(--th-fg-muted)",
+          }}
+          title="Claude session"
+        >
+          <ClaudeSpark />
+          Claude
+        </span>
+
+        {/* Editable "what are you working on" name (Feature 1). Click to edit
+            inline; Enter commits, Esc cancels. Persisted per-terminal (theme
+            store termWorkNames). Stops the header drag on pointer-down. Takes the
+            remaining flex space so the centered view-tab bar stays centered. */}
+        {nameDraft !== null ? (
+          <input
+            autoFocus
+            value={nameDraft}
+            onChange={(e) => setNameDraft(e.target.value)}
+            onBlur={commitName}
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") commitName();
+              else if (e.key === "Escape") setNameDraft(null);
+            }}
+            placeholder="name this work…"
+            spellCheck={false}
+            className="min-w-0 flex-1 rounded bg-transparent px-1 py-0.5 outline-none"
+            style={{
+              color: "var(--th-fg)",
+              border: `1px solid ${focusRing}`,
+            }}
+          />
+        ) : (
+          <button
+            type="button"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onFocus();
+              startNameEdit();
+            }}
+            className="min-w-0 flex-1 truncate rounded px-1 py-0.5 text-left hover:bg-neutral-800/50"
+            style={{
+              color: workName ? "var(--th-fg)" : "var(--th-fg-muted)",
+              fontStyle: workName ? undefined : "italic",
+            }}
+            title={workName ? "Click to rename this work" : "Name what you're working on"}
+          >
+            {workName ?? "name this work…"}
+          </button>
+        )}
 
         {/* Context-window meter: how full THIS tile's Claude session context is
             (matched by cwd). Renders nothing when no session is matched, so the
@@ -896,17 +977,36 @@ function PanelPane({
   );
 }
 
-/** Shorten a WSL/POSIX path for display: collapse `/home/<user>` to `~` so the
- *  header reads `~/n8builds/tools` instead of `/home/natkins/n8builds/tools`.
- *  Leaves non-home paths untouched. The full path is kept in tooltips. */
-function shortenHomePath(p: string): string {
-  if (!p) return p;
-  const m = p.match(/^\/home\/[^/]+(\/.*)?$/);
-  if (m) return "~" + (m[1] ?? "");
-  // Windows-style home, just in case.
-  const w = p.match(/^[A-Za-z]:[\\/]Users[\\/][^\\/]+([\\/].*)?$/);
-  if (w) return "~" + (w[1] ?? "");
-  return p;
+/** Final path segment of a (possibly trailing-slashed) cwd, or "" when none.
+ *  POSIX and Windows separators both split, so a WSL or native path yields a
+ *  basename; the literal home tilde collapses to "". Used for the header folder
+ *  name (Feature 1). */
+function cwdBasename(cwd: string): string {
+  if (!cwd) return "";
+  const parts = cwd.replace(/[/\\]+$/, "").split(/[/\\]+/);
+  const last = parts[parts.length - 1] ?? "";
+  return last === "~" ? "" : last;
+}
+
+// TODO: real Claude icon — replace this inline "spark" SVG with the official
+// Anthropic/Claude mark asset once one is bundled. The spark below is a tasteful
+// placeholder (a four-pointed star) that reads as a small accent glyph and
+// inherits currentColor so it follows the chip's text color.
+function ClaudeSpark() {
+  return (
+    <svg
+      width="0.9em"
+      height="0.9em"
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      aria-hidden
+      className="shrink-0"
+    >
+      {/* A four-point spark: two crossed tapered diamonds. */}
+      <path d="M8 0.5c.4 2.8 1.7 4.6 4.5 5.5C9.7 6.9 8.4 8.7 8 11.5 7.6 8.7 6.3 6.9 3.5 6 6.3 5.1 7.6 3.3 8 0.5Z" />
+      <path d="M12.5 9.5c.2 1.5.9 2.4 2.5 3-1.6.5-2.3 1.5-2.5 3-.2-1.5-.9-2.5-2.5-3 1.6-.6 2.3-1.5 2.5-3Z" opacity="0.7" />
+    </svg>
+  );
 }
 
 /** One row in the tile right-click context menu. */

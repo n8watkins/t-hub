@@ -23,6 +23,7 @@ import { useState } from "react";
 import { useAgentTelemetry } from "../store/telemetry";
 import { useSettings } from "../store/settings";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
+import { useTheme } from "../store/theme";
 import { WslHealth } from "./WslHealth";
 import { UsageStrip } from "./UsageStrip";
 import { WorkspacesList } from "./WorkspacesList";
@@ -291,6 +292,8 @@ function SidebarRail({
   setActiveTab: (id: string) => void;
   onToggleSidebar?: () => void;
 }) {
+  // Per-workspace color identity (feat/workspace-colors) — tints the rail squares.
+  const railColors = useTheme((s) => s.workspaceColors);
   return (
     <aside
       className="flex h-full shrink-0 flex-col items-center gap-1 border-r"
@@ -309,6 +312,9 @@ function SidebarRail({
           const active = tab.id === activeTabId;
           const count = tab.order.length;
           const initial = (tab.name.trim()[0] ?? "?").toUpperCase();
+          // The workspace color identity: fills the active square, and tints an
+          // inactive square's border so each workspace is recognizable in the rail.
+          const color = railColors[tab.id];
           return (
             <button
               key={tab.id}
@@ -318,9 +324,13 @@ function SidebarRail({
               aria-current={active ? "true" : undefined}
               className="relative flex h-8 w-8 items-center justify-center rounded text-xs font-semibold hover:opacity-90"
               style={{
-                backgroundColor: active ? "var(--th-accent)" : "transparent",
+                backgroundColor: active
+                  ? color ?? "var(--th-accent)"
+                  : "transparent",
                 color: active ? "var(--th-fg)" : "var(--th-fg-muted)",
-                border: active ? undefined : "1px solid var(--th-border)",
+                border: active
+                  ? undefined
+                  : `1px solid ${color ?? "var(--th-border)"}`,
               }}
             >
               {initial}

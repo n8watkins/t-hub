@@ -32,6 +32,8 @@ function cleanupTileSideState(id: TerminalId): void {
   // Drop any per-terminal color override so a recycled id can't inherit it.
   useTheme.getState().clearTermOverride(id);
   useTheme.getState().clearTermFocusRing(id);
+  // Drop the per-terminal cosmetic work name too (same reason).
+  useTheme.getState().clearTermWorkName(id);
   void import("../ipc/devserver")
     .then((m) => m.stopDevServer(id))
     .catch(() => {
@@ -94,6 +96,12 @@ interface PersistedLayout {
   poppedOutTabs: WorkspaceTab[];
 }
 
+/** Which UI region currently has keyboard focus for navigation (left-hand nav,
+ *  feat/keyboard-nav). Ctrl+B toggles between them; Ctrl+Tab cycles WITHIN the
+ *  focused region (terminals when "terminal", workspace tabs when "sidebar").
+ *  Transient — never persisted; a relaunch always starts on the terminal area. */
+export type FocusRegion = "terminal" | "sidebar";
+
 interface WorkspaceState {
   /** Live terminal set, keyed by id (re-fetched from the backend, not persisted). */
   terminals: Record<TerminalId, TerminalInfo>;
@@ -103,6 +111,10 @@ interface WorkspaceState {
   activeTabId: string;
   /** Currently focused tile across the active tab, or null (persisted). */
   focusedId: TerminalId | null;
+  /** Which region keyboard navigation targets (terminal area vs sidebar). NOT
+   *  persisted — always starts on the terminal area. Ctrl+B toggles it; Ctrl+Tab
+   *  cycles within it. See `setFocusRegion` / `toggleFocusRegion`. */
+  focusedRegion: FocusRegion;
   /** Global terminal font size in px, applied to every tile equally (persisted). */
   fontSize: number;
   /** The EFFECTIVE per-terminal label map the display reads (#labels). It merges
@@ -163,8 +175,16 @@ interface WorkspaceState {
    *  `kill_terminal`, terminating the process tree) then drop the tile via
    *  `remove`. Destructive; callers gate this behind a confirm. */
   deleteTerminal: (id: TerminalId) => void;
-  /** Set the focused tile. */
+  /** Set the focused tile. Focusing a tile also returns navigation focus to the
+   *  terminal region (a click/keypress on a terminal implies you're working in
+   *  the canvas, not the sidebar). */
   setFocus: (id: TerminalId) => void;
+  /** Set which region keyboard navigation targets (terminal area vs sidebar). */
+  setFocusRegion: (region: FocusRegion) => void;
+  /** Toggle navigation focus between the terminal area and the sidebar (Ctrl+B).
+   *  Returns the region now focused so the caller can reveal/blur the right
+   *  surface (App reveals a hidden sidebar; Canvas refocuses the live xterm). */
+  toggleFocusRegion: () => FocusRegion;
   /** Update a terminal's lifecycle state from a terminal://state event. */
   updateState: (id: TerminalId, state: TerminalState) => void;
   /** Set (or, with a blank value, clear) the user label for a terminal (#labels).
@@ -205,6 +225,10 @@ interface WorkspaceState {
   setActiveTabByIndex: (i: number) => void;
   /** Cycle to the next (+1) / previous (-1) tab, wrapping. */
   cycleTab: (dir: 1 | -1) => void;
+  /** Cycle the FOCUSED TILE within the active tab (+1 next / -1 previous,
+   *  wrapping). Used by Ctrl+Tab while the terminal region is focused. No-op when
+   *  the active tab has fewer than two tiles. */
+  cycleTile: (dir: 1 | -1) => void;
   /** Reorder the tab strip: move tab `id` to occupy `targetId`'s slot. */
   moveTab: (id: string, targetId: string) => void;
 
@@ -702,6 +726,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     tabs: initial.tabs,
     activeTabId: initial.activeTabId,
     focusedId: initial.focusedId,
+    focusedRegion: "terminal",
     fontSize: initial.fontSize,
     // `initial.labels` is the persisted user-rename set. The effective `labels`
     // starts equal to it (no Claude titles yet this session); `claudeTitles`
@@ -887,9 +912,29 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     },
 
     setFocus: (id) => {
-      if (get().focusedId === id) return;
-      set({ focusedId: id });
+      // Focusing a tile implies the user is working in the canvas, so navigation
+      // focus returns to the terminal region (so a subsequent Ctrl+Tab cycles
+      // terminals, and Ctrl+B toggles back to the sidebar). Only `focusedId` is
+      // persisted; the region is transient.
+      const cur = get();
+      if (cur.focusedId === id) {
+        if (cur.focusedRegion !== "terminal") set({ focusedRegion: "terminal" });
+        return;
+      }
+      set({ focusedId: id, focusedRegion: "terminal" });
       persist();
+    },
+
+    setFocusRegion: (region) => {
+      if (get().focusedRegion === region) return;
+      set({ focusedRegion: region });
+    },
+
+    toggleFocusRegion: () => {
+      const next: FocusRegion =
+        get().focusedRegion === "sidebar" ? "terminal" : "sidebar";
+      set({ focusedRegion: next });
+      return next;
     },
 
     updateState: (id, state) => {
@@ -1015,6 +1060,9 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         delete nextTerminals[tid];
         cleanupTileSideState(tid); // closing the tab takes its tiles with it
       }
+      // The tab is gone for good — drop its color identity so a recycled tab id
+      // can't inherit it. (A POP-OUT keeps the record, so popOutTab must NOT.)
+      useTheme.getState().clearWorkspaceColor(id);
 
       set({
         terminals: nextTerminals,
@@ -1051,6 +1099,19 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       const next = tabs[nextIdx];
       set({ activeTabId: next.id, focusedId: next.order[0] ?? null });
       persist();
+    },
+
+    cycleTile: (dir) => {
+      const order = activeTab().order;
+      if (order.length <= 1) return;
+      const { focusedId } = get();
+      const cur = focusedId ? order.indexOf(focusedId) : -1;
+      const base = cur >= 0 ? cur : 0;
+      const nextIdx = (base + dir + order.length) % order.length;
+      const nextId = order[nextIdx];
+      if (nextId === focusedId) return;
+      // Reuse setFocus so navigation focus snaps back to the terminal region.
+      get().setFocus(nextId);
     },
 
     moveTab: (id, targetId) => {

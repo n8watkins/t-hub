@@ -178,7 +178,41 @@ pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), T
     // applies to already-running sessions, not just this new one. Trade-off:
     // mouse text-selection now needs Shift+drag (which bypasses tmux's capture).
     let _ = run("set-option", &["set-option", "-g", "mouse", "on"]);
+    // Re-apply the server-global keybinds (prefix-disable + right-click unbinds).
+    // `ensure_mouse_on()` already does this at startup, but it runs ONCE and may
+    // fire before any tmux server exists (fresh boot), so its unbinds silently
+    // no-op. Re-running here — once a server is guaranteed to exist — makes them
+    // stick. Root-table (`-n`) bindings are server-global, so this is idempotent.
+    apply_global_keybinds();
     Ok(())
+}
+
+/// Disable tmux's Ctrl+B prefix and its right-click context menus, server-global.
+///
+/// Both are root-table (`-n`) / GLOBAL (`-g`) operations, so applying them once
+/// covers existing AND future sessions — re-running per-session is harmless.
+///
+/// 1. Prefix OFF: the user uses NO tmux keybindings and wants `C-b` to reach the
+///    app (it becomes an app-level shortcut). `prefix None` takes a VALUE (so it's
+///    a `set-option`, not an `unbind`); we also unbind `C-b` in both the root
+///    table (`-n`, what actually fires it) and the prefix table for good measure.
+/// 2. Right-click menus OFF: with `mouse on`, a right-click pops tmux's own pane /
+///    status menus (Split/Kill/Respawn/Zoom...) — confusing inside TermHub, which
+///    has its own tile chrome. Unbind the four root-table MouseDown3 events.
+///
+/// Best-effort: every error is swallowed (no server yet, etc.).
+fn apply_global_keybinds() {
+    let _ = run("set-option", &["set-option", "-g", "prefix", "None"]);
+    let _ = run("unbind", &["unbind", "-n", "C-b"]);
+    let _ = run("unbind", &["unbind", "C-b"]);
+    for ev in [
+        "MouseDown3Pane",
+        "MouseDown3Status",
+        "MouseDown3StatusLeft",
+        "MouseDown3StatusRight",
+    ] {
+        let _ = run("unbind", &["unbind", "-n", ev]);
+    }
 }
 
 /// Force `mouse on` for the whole server AND every existing session.
@@ -201,19 +235,12 @@ pub fn ensure_mouse_on() {
             let _ = run("set-option", &["set-option", "-t", s.as_str(), "mouse", "on"]);
         }
     }
-    // Disable tmux's built-in MOUSE CONTEXT MENUS. With `mouse on`, a right-click
-    // pops tmux's own pane menu (Horizontal/Vertical Split, Kill, Respawn, Mark,
-    // Zoom...) and status menus — confusing inside TermHub, which has its own tile
-    // chrome for split/kill/etc. Unbinding these root-table mouse keys is
-    // server-global (covers existing + future sessions). Best-effort.
-    for ev in [
-        "MouseDown3Pane",
-        "MouseDown3Status",
-        "MouseDown3StatusLeft",
-        "MouseDown3StatusRight",
-    ] {
-        let _ = run("unbind", &["unbind", "-n", ev]);
-    }
+    // Disable the C-b prefix and tmux's built-in mouse context menus,
+    // server-global (covers existing + future sessions). See the helper for why.
+    // Note: at fresh boot this may run before any tmux server exists, so the
+    // unbinds silently no-op here; `new_session()` re-applies them once a server
+    // is guaranteed to exist.
+    apply_global_keybinds();
 }
 
 /// Returns true if a session named `name` exists on the `termhub` socket.

@@ -20,6 +20,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
+import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
 import type { TerminalId, TerminalInfo, TerminalState } from "../ipc/types";
 
 /** Lifecycle-dot color per terminal state — the SAME `--th-dot-*` palette Tile
@@ -38,10 +39,21 @@ export function WorkspacesList() {
   const terminals = useWorkspace((s) => s.terminals);
   const labels = useWorkspace((s) => s.labels);
   const focusedId = useWorkspace((s) => s.focusedId);
+  const focusedRegion = useWorkspace((s) => s.focusedRegion);
   const setActiveTab = useWorkspace((s) => s.setActiveTab);
   const setFocus = useWorkspace((s) => s.setFocus);
+  const setFocusRegion = useWorkspace((s) => s.setFocusRegion);
   const renameTab = useWorkspace((s) => s.renameTab);
   const deleteTerminal = useWorkspace((s) => s.deleteTerminal);
+  // Per-workspace color identity (feat/workspace-colors): the dot + a quick color
+  // picker live on each workspace row. Read from the theme store (mirrors the
+  // per-terminal override slots).
+  const workspaceColors = useTheme((s) => s.workspaceColors);
+  const setWorkspaceColor = useTheme((s) => s.setWorkspaceColor);
+  const clearWorkspaceColor = useTheme((s) => s.clearWorkspaceColor);
+  // The sidebar region being focused (Ctrl+B) highlights the ACTIVE workspace row
+  // so keyboard nav reads clearly.
+  const sidebarFocused = focusedRegion === "sidebar";
 
   // Local expand/collapse, keyed by tab id. Undefined = default (open iff active).
   const [openMap, setOpenMap] = useState<Record<string, boolean>>({});
@@ -68,10 +80,23 @@ export function WorkspacesList() {
           terminals={terminals}
           labels={labels}
           focusedId={focusedId}
+          color={workspaceColors[tab.id]}
+          // The active row is the keyboard-nav focus target while the sidebar
+          // region is focused (Ctrl+B), so highlight it then.
+          navFocused={sidebarFocused && tab.id === activeTabId}
           onToggle={() => toggleOpen(tab)}
-          onActivate={() => setActiveTab(tab.id)}
+          onActivate={() => {
+            // Activating from the sidebar keeps nav focus IN the sidebar so a
+            // following Ctrl+Tab keeps cycling workspaces.
+            setActiveTab(tab.id);
+            setFocusRegion("sidebar");
+          }}
           onRename={(name) => renameTab(tab.id, name)}
+          onSetColor={(c) => setWorkspaceColor(tab.id, c)}
+          onClearColor={() => clearWorkspaceColor(tab.id)}
           onSelectTerminal={(id) => {
+            // Clicking a terminal jumps to the canvas (setFocus moves nav focus to
+            // the terminal region).
             setActiveTab(tab.id);
             setFocus(id);
           }}
@@ -89,9 +114,13 @@ function WorkspaceRow({
   terminals,
   labels,
   focusedId,
+  color,
+  navFocused,
   onToggle,
   onActivate,
   onRename,
+  onSetColor,
+  onClearColor,
   onSelectTerminal,
   onCloseTerminal,
 }: {
@@ -101,9 +130,15 @@ function WorkspaceRow({
   terminals: Record<TerminalId, TerminalInfo>;
   labels: Record<TerminalId, string>;
   focusedId: TerminalId | null;
+  /** This workspace's assigned color (undefined => follow the default accent). */
+  color?: string;
+  /** True when this row is the sidebar's keyboard-nav focus target (Ctrl+B). */
+  navFocused: boolean;
   onToggle: () => void;
   onActivate: () => void;
   onRename: (name: string) => void;
+  onSetColor: (color: string) => void;
+  onClearColor: () => void;
   onSelectTerminal: (id: TerminalId) => void;
   onCloseTerminal: (id: TerminalId) => void;
 }) {
@@ -113,6 +148,9 @@ function WorkspaceRow({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(tab.name);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Color-picker popover open state (the dot). Anchored under the dot button.
+  const [colorMenu, setColorMenu] = useState(false);
+  const activateRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (editing) {
@@ -120,6 +158,11 @@ function WorkspaceRow({
       inputRef.current?.select();
     }
   }, [editing]);
+
+  // The active-workspace accent: the workspace color if set, else the global
+  // theme accent. Drives the active row tint + left bar so the sidebar reflects
+  // the workspace identity.
+  const accent = color ?? "var(--th-accent)";
 
   const startEdit = () => {
     setDraft(tab.name);
@@ -139,10 +182,13 @@ function WorkspaceRow({
           color: "var(--th-fg)",
           ...(active
             ? {
-                backgroundColor:
-                  "color-mix(in srgb, var(--th-accent) 16%, transparent)",
-                boxShadow: "inset 2px 0 0 0 var(--th-accent)",
+                backgroundColor: `color-mix(in srgb, ${accent} 16%, transparent)`,
+                boxShadow: `inset 2px 0 0 0 ${accent}`,
               }
+            : {}),
+          // A clear focus ring when this row is the sidebar's keyboard target.
+          ...(navFocused
+            ? { outline: `1px solid ${accent}`, outlineOffset: "-1px" }
             : {}),
         }}
       >
@@ -156,6 +202,45 @@ function WorkspaceRow({
         >
           <ChevronIcon open={open} />
         </button>
+
+        {/* Workspace color dot — click to open a small palette + custom picker.
+            The dot shows the assigned color (or the muted default when unset). */}
+        <div className="relative shrink-0">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setColorMenu((v) => !v);
+            }}
+            className="flex h-5 w-5 items-center justify-center rounded hover:bg-neutral-700/40"
+            title="Workspace color"
+            aria-label="Set workspace color"
+            aria-haspopup="menu"
+            aria-expanded={colorMenu}
+          >
+            <span
+              className="h-2.5 w-2.5 rounded-full"
+              style={{
+                backgroundColor: color ?? "var(--th-fg-muted)",
+                boxShadow: color ? `0 0 5px -1px ${color}` : undefined,
+              }}
+            />
+          </button>
+          {colorMenu && (
+            <ColorPicker
+              current={color}
+              onPick={(c) => {
+                onSetColor(c);
+                setColorMenu(false);
+              }}
+              onClear={() => {
+                onClearColor();
+                setColorMenu(false);
+              }}
+              onClose={() => setColorMenu(false)}
+            />
+          )}
+        </div>
 
         {editing ? (
           <input
@@ -171,16 +256,20 @@ function WorkspaceRow({
             className="min-w-0 flex-1 rounded bg-transparent px-1 py-1 text-sm outline-none"
             style={{
               color: "var(--th-fg)",
-              border: "1px solid var(--th-focus-ring, var(--th-accent))",
+              border: `1px solid ${accent}`,
             }}
           />
         ) : (
           <button
+            ref={activateRef}
             type="button"
+            // The active row is the sidebar's keyboard-nav focus target (Ctrl+B
+            // focuses this; Ctrl+Tab then cycles workspaces).
+            data-th-sidebar-focus={active ? "" : undefined}
             onClick={onActivate}
             onDoubleClick={startEdit}
             aria-current={active ? "true" : undefined}
-            className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-1.5 pr-1 text-left text-sm"
+            className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-1.5 pr-1 text-left text-sm outline-none"
             title={`${tab.name} — ${count} terminal${count === 1 ? "" : "s"} · double-click to rename`}
           >
             <span className="min-w-0 flex-1 truncate font-medium">{tab.name}</span>
@@ -297,6 +386,97 @@ function TerminalRow({
         ×
       </button>
     </li>
+  );
+}
+
+/**
+ * A small workspace-color picker popover: a row of palette swatches, a custom
+ * `<input type="color">`, and a "default" reset. Anchored under the dot button. A
+ * full-window backdrop dismisses it (mirrors the tile ⋯ color popover pattern).
+ */
+function ColorPicker({
+  current,
+  onPick,
+  onClear,
+  onClose,
+}: {
+  current?: string;
+  onPick: (color: string) => void;
+  onClear: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-40"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+      />
+      <div
+        className="absolute left-0 top-6 z-50 w-[176px] rounded-md border p-2 shadow-2xl"
+        style={{
+          backgroundColor: "var(--th-header-bg)",
+          borderColor: "var(--th-border)",
+          color: "var(--th-fg)",
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div
+          className="mb-1.5 px-0.5 text-[10px] font-semibold uppercase tracking-wide"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          Workspace color
+        </div>
+        <div className="grid grid-cols-4 gap-1.5">
+          {WORKSPACE_COLOR_PALETTE.map((c) => {
+            const selected =
+              !!current && current.toLowerCase() === c.toLowerCase();
+            return (
+              <button
+                key={c}
+                type="button"
+                onClick={() => onPick(c)}
+                className="flex h-6 w-full items-center justify-center rounded"
+                style={{
+                  backgroundColor: c,
+                  outline: selected ? "2px solid var(--th-fg)" : undefined,
+                  outlineOffset: "1px",
+                }}
+                title={c}
+                aria-label={`Use ${c}`}
+              />
+            );
+          })}
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <label
+            className="flex flex-1 cursor-pointer items-center gap-1.5 text-xs"
+            style={{ color: "var(--th-fg-muted)" }}
+            title="Custom color"
+          >
+            <input
+              type="color"
+              value={current ?? "#38bdf8"}
+              onChange={(e) => onPick(e.target.value)}
+              className="h-6 w-9 shrink-0 cursor-pointer rounded bg-transparent p-0"
+            />
+            Custom
+          </label>
+          <button
+            type="button"
+            onClick={onClear}
+            disabled={!current}
+            className="rounded border px-2 py-1 text-xs hover:bg-neutral-800 disabled:opacity-40"
+            style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
+            title="Clear (follow the default accent)"
+          >
+            Default
+          </button>
+        </div>
+      </div>
+    </>
   );
 }
 

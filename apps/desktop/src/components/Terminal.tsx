@@ -190,6 +190,10 @@ export function TerminalView({
   // The focused tile id — when it becomes THIS terminal, we pull keyboard focus
   // into the xterm (see the focus effect below).
   const focusedId = useWorkspace((s) => s.focusedId);
+  // Which region navigation targets (feat/keyboard-nav). When it flips back to
+  // "terminal" (e.g. Ctrl+B from the sidebar), the focused tile pulls keyboard
+  // focus back into its xterm even though `focusedId` itself didn't change.
+  const focusedRegion = useWorkspace((s) => s.focusedRegion);
   // Live terminal palette from the active theme (undefined => xterm defaults).
   const termPalette = useTheme((s) => s.active.terminal);
   // This terminal's own color override, if any (set via the tile's ⋯ menu). The
@@ -216,7 +220,10 @@ export function TerminalView({
       fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "JetBrains Mono", monospace',
       fontSize: useWorkspace.getState().fontSize,
       cursorBlink: true,
-      scrollback: 5000,
+      scrollback: 20000,
+      // Animate viewport paging (PageUp/PageDown, wheel) over ~125ms instead of
+      // jumping, so repeated paging reads as a continuous smooth scroll.
+      smoothScrollDuration: 125,
       theme: toXtermTheme(
         mergeTermPalette(
           useTheme.getState().active.terminal,
@@ -275,6 +282,11 @@ export function TerminalView({
       // any modified variants still reach the app. preventDefault keeps the keys
       // out of the shell; stopPropagation stops the Canvas window handler from
       // double-firing. Returning false tells xterm not to forward to the PTY.
+      //
+      // Repeated paging stays put: xterm preserves the user's scroll position on
+      // new term.write() output (it only auto-follows the tail when the viewport
+      // is ALREADY at the bottom), and forceRepaint() merely refreshes — neither
+      // yanks the viewport back down — so paging up doesn't snap to the prompt.
       if (
         (e.key === "PageUp" || e.key === "PageDown") &&
         !e.ctrlKey &&
@@ -714,6 +726,11 @@ export function TerminalView({
   // on mount (first effect run) so a freshly-spawned focused tile grabs focus.
   useEffect(() => {
     if (!visible || focusedId !== terminalId) return;
+    // Only steal focus when navigation is on the terminal region — when the
+    // sidebar region is focused (Ctrl+B), the user is keyboard-driving the
+    // sidebar and this effect must not yank focus back into the xterm. Returning
+    // to "terminal" re-runs this effect (focusedRegion is a dep) and refocuses.
+    if (focusedRegion !== "terminal") return;
     const raf = requestAnimationFrame(() => {
       try {
         termRef.current?.focus();
@@ -722,7 +739,7 @@ export function TerminalView({
       }
     });
     return () => cancelAnimationFrame(raf);
-  }, [focusedId, terminalId, visible]);
+  }, [focusedId, terminalId, visible, focusedRegion]);
 
   // No custom right-click menu (per request). preventDefault only suppresses the
   // WebView's own context menu; tmux's mouse menu (split/kill/respawn/mark/zoom)

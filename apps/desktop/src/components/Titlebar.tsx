@@ -27,6 +27,7 @@ import { useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useWorkspace, deriveLabel } from "../store/workspace";
+import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
 import { useSettings } from "../store/settings";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
@@ -474,10 +475,21 @@ function TabStrip() {
   const setDropTab = useWorkspace((s) => s.setDropTab);
   const draggingTabId = useWorkspace((s) => s.draggingTabId);
   const dropTabId = useWorkspace((s) => s.dropTabId);
+  // Per-workspace color identity (feat/workspace-colors): the active tab's dot +
+  // an accent on the tab read the workspace color; a right-click menu sets it.
+  const workspaceColors = useTheme((s) => s.workspaceColors);
+  const setWorkspaceColor = useTheme((s) => s.setWorkspaceColor);
+  const clearWorkspaceColor = useTheme((s) => s.clearWorkspaceColor);
 
   // id of the tab currently being renamed inline (null = none).
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  // Right-click color menu for a tab: which tab + the pointer position (null off).
+  const [colorMenu, setColorMenu] = useState<{
+    tabId: string;
+    x: number;
+    y: number;
+  } | null>(null);
 
   // Tracks the previous pointerdown for manual double-click detection. A tab is
   // renamed when two quick clicks land on the SAME tab that was ALREADY the
@@ -585,6 +597,7 @@ function TabStrip() {
     // pl-1: the strip box starts at the sidebar's right edge (via the spacer); a
     // 4px hair of inset keeps the rounded leftmost tab off the seam while still
     // aligning it with the canvas's left edge (TASK 1).
+    <>
     <div className="th-scroll-thin flex min-w-0 items-stretch gap-1 overflow-x-auto overflow-y-hidden pl-1 pr-1">
       {tabs.map((tab) => {
         const active = tab.id === activeTabId;
@@ -617,12 +630,20 @@ function TabStrip() {
         const tabLabel = termLabel ?? tab.name;
         // The faint short id, shown only when the label isn't already that id.
         const tabShortId = soleId && termLabel !== soleId ? soleId : null;
+        // This workspace's color identity (undefined => the default accent).
+        const color = workspaceColors[tab.id];
+        const accent = color ?? "var(--th-accent)";
         return (
           <div
             key={tab.id}
             // data-tab-id: the drop target a tab reorder / a tile drag resolves to.
             data-tab-id={tab.id}
             onPointerDown={(e) => onTabPointerDown(tab.id, e)}
+            // Right-click a tab to set its workspace color (or reset to default).
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setColorMenu({ tabId: tab.id, x: e.clientX, y: e.clientY });
+            }}
             // Fixed width (#3): a comfortably wide tab whose size NEVER changes on
             // hover. The pop-out + close buttons always occupy their space (their
             // visibility toggles, not their layout), so revealing them on hover
@@ -636,16 +657,28 @@ function TabStrip() {
             ].join(" ")}
             style={
               isDropTarget
-                ? { boxShadow: "0 0 0 1px var(--th-accent)" }
-                : undefined
+                ? { boxShadow: `0 0 0 1px ${accent}` }
+                : active && color
+                  ? // A subtle colored bottom accent so the active tab reflects
+                    // its workspace color without overwhelming the chrome.
+                    { boxShadow: `inset 0 -2px 0 0 ${color}` }
+                  : undefined
             }
             title={tabShortId ? `${tabLabel} · ${tabShortId}` : tabLabel}
           >
             <span
               className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                active ? "" : "bg-neutral-600"
+                active || color ? "" : "bg-neutral-600"
               }`}
-              style={active ? { backgroundColor: "var(--th-accent)" } : undefined}
+              // The dot shows the workspace color when set (active or not); else
+              // the theme accent on the active tab, or a muted gray otherwise.
+              style={
+                color
+                  ? { backgroundColor: color }
+                  : active
+                    ? { backgroundColor: "var(--th-accent)" }
+                    : undefined
+              }
             />
             {editing === tab.id ? (
               <input
@@ -736,6 +769,124 @@ function TabStrip() {
         ＋
       </button>
     </div>
+
+    {/* Right-click color menu for a workspace tab: a palette + custom picker +
+        reset, anchored at the pointer. A full-window backdrop dismisses it. */}
+    {colorMenu && (
+      <TabColorMenu
+        x={colorMenu.x}
+        y={colorMenu.y}
+        current={workspaceColors[colorMenu.tabId]}
+        onPick={(c) => {
+          setWorkspaceColor(colorMenu.tabId, c);
+          setColorMenu(null);
+        }}
+        onClear={() => {
+          clearWorkspaceColor(colorMenu.tabId);
+          setColorMenu(null);
+        }}
+        onClose={() => setColorMenu(null)}
+      />
+    )}
+    </>
+  );
+}
+
+/**
+ * The workspace-tab right-click color menu: a fixed popover at the pointer with
+ * the palette swatches, a custom `<input type="color">`, and a reset-to-default.
+ * Mirrors the tile ⋯ color popover (a full-window backdrop dismisses it).
+ */
+function TabColorMenu({
+  x,
+  y,
+  current,
+  onPick,
+  onClear,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  current?: string;
+  onPick: (color: string) => void;
+  onClear: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-40"
+        onPointerDown={onClose}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onClose();
+        }}
+      />
+      <div
+        className="fixed z-50 w-[184px] rounded-md border p-2 shadow-2xl"
+        style={{
+          left: x,
+          top: y,
+          backgroundColor: "var(--th-header-bg)",
+          borderColor: "var(--th-border)",
+          color: "var(--th-fg)",
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        <div
+          className="mb-1.5 px-0.5 text-[10px] font-semibold uppercase tracking-wide"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          Workspace color
+        </div>
+        <div className="grid grid-cols-4 gap-1.5">
+          {WORKSPACE_COLOR_PALETTE.map((c) => {
+            const selected =
+              !!current && current.toLowerCase() === c.toLowerCase();
+            return (
+              <button
+                key={c}
+                type="button"
+                onClick={() => onPick(c)}
+                className="h-6 w-full rounded"
+                style={{
+                  backgroundColor: c,
+                  outline: selected ? "2px solid var(--th-fg)" : undefined,
+                  outlineOffset: "1px",
+                }}
+                title={c}
+                aria-label={`Use ${c}`}
+              />
+            );
+          })}
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <label
+            className="flex flex-1 cursor-pointer items-center gap-1.5 text-xs"
+            style={{ color: "var(--th-fg-muted)" }}
+            title="Custom color"
+          >
+            <input
+              type="color"
+              value={current ?? "#38bdf8"}
+              onChange={(e) => onPick(e.target.value)}
+              className="h-6 w-9 shrink-0 cursor-pointer rounded bg-transparent p-0"
+            />
+            Custom
+          </label>
+          <button
+            type="button"
+            onClick={onClear}
+            disabled={!current}
+            className="rounded border px-2 py-1 text-xs hover:bg-neutral-800 disabled:opacity-40"
+            style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
+            title="Clear (follow the default accent)"
+          >
+            Default
+          </button>
+        </div>
+      </div>
+    </>
   );
 }
 

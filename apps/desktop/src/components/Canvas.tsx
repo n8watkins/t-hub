@@ -59,12 +59,29 @@ function splitRows<T>(ids: T[]): T[][] {
 }
 
 export interface CanvasProps {
-  /** Toggle the 0.5 supervision sidebar (Ctrl/Cmd+B). Optional so the 0.1
-   *  nucleus canvas still works standalone. */
-  onToggleSidebar?: () => void;
+  /** Ensure the sidebar is visible so Ctrl/Cmd+B can move keyboard focus onto it
+   *  (App reveals a HIDDEN sidebar to "full"; returns true once one is visible).
+   *  Optional so the 0.1 nucleus canvas still works standalone. */
+  onFocusSidebar?: () => boolean;
 }
 
-export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
+/**
+ * Move keyboard focus to the sidebar's nav surface. The sidebar marks its active
+ * workspace row with `data-th-sidebar-focus`; we focus that so arrow-less nav
+ * (Ctrl+Tab cycles workspaces while the sidebar region is focused) has a real DOM
+ * focus to read from and the user sees a focus ring. Best-effort: no element yet
+ * (sidebar still revealing) just means the region flag alone drives the next
+ * Ctrl+Tab.
+ */
+function focusSidebarTarget(): void {
+  // Defer a frame so a just-revealed sidebar has mounted its focus target.
+  requestAnimationFrame(() => {
+    const el = document.querySelector<HTMLElement>("[data-th-sidebar-focus]");
+    el?.focus();
+  });
+}
+
+export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   const tabs = useWorkspace((s) => s.tabs);
   const activeTabId = useWorkspace((s) => s.activeTabId);
   const focusedId = useWorkspace((s) => s.focusedId);
@@ -81,6 +98,8 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
   const setFocus = useWorkspace((s) => s.setFocus);
   const updateState = useWorkspace((s) => s.updateState);
   const cycleTab = useWorkspace((s) => s.cycleTab);
+  const cycleTile = useWorkspace((s) => s.cycleTile);
+  const toggleFocusRegion = useWorkspace((s) => s.toggleFocusRegion);
   const setActiveTabByIndex = useWorkspace((s) => s.setActiveTabByIndex);
   const zoomIn = useWorkspace((s) => s.zoomIn);
   const zoomOut = useWorkspace((s) => s.zoomOut);
@@ -195,16 +214,46 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
   );
 
   // Global keybindings: Ctrl/Cmd+T = new terminal, Ctrl/Cmd+W = kill focused,
-  // Ctrl/Cmd+B = toggle the supervision sidebar, Ctrl/Cmd+Tab = cycle tabs
-  // (Shift reverses), Ctrl/Cmd+1..9 = jump to the tab at that index.
+  // Ctrl/Cmd+B = toggle nav FOCUS between the terminal area and the sidebar,
+  // Ctrl/Cmd+Tab = cycle WITHIN the focused region (terminals when the terminal
+  // area is focused, workspaces when the sidebar is focused; Shift reverses),
+  // Ctrl/Cmd+1..9 = jump to the tab at that index.
+  //
+  // Registered on `document` in the CAPTURE phase (the third `true` arg) so it
+  // fires BEFORE a focused xterm's own key handler
+  // (term.attachCustomKeyEventHandler runs in the bubbling target phase). Without
+  // capture, Ctrl+B / Ctrl+Tab would be swallowed by the terminal while it has
+  // focus and never reach the app. tmux's Ctrl+B prefix is also disabled
+  // server-side (tmux.rs) so the key is free to mean "switch region" here.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
       if (!mod) return;
-      // Ctrl/Cmd+Tab cycles workspace tabs (Shift => previous).
+      // Ctrl/Cmd+B: toggle nav focus between the terminal area and the sidebar.
+      // Moving to the sidebar reveals it (if hidden) and focuses its nav target;
+      // moving back to the terminal lets Terminal.tsx refocus the focused xterm
+      // (it watches focusedRegion). Handled before the Tab branch.
+      if ((e.key === "b" || e.key === "B") && !e.altKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        const region = toggleFocusRegion();
+        if (region === "sidebar") {
+          // Reveal the sidebar if hidden, then focus its nav surface.
+          const visible = onFocusSidebar ? onFocusSidebar() : false;
+          if (visible) focusSidebarTarget();
+        }
+        return;
+      }
+      // Ctrl/Cmd+Tab cycles WITHIN the focused region (Shift => previous).
       if (e.key === "Tab" && !e.altKey) {
         e.preventDefault();
-        cycleTab(e.shiftKey ? -1 : 1);
+        e.stopPropagation();
+        const dir = e.shiftKey ? -1 : 1;
+        if (useWorkspace.getState().focusedRegion === "sidebar") {
+          cycleTab(dir);
+        } else {
+          cycleTile(dir);
+        }
         return;
       }
       if (e.altKey) return;
@@ -230,22 +279,22 @@ export function Canvas({ onToggleSidebar }: CanvasProps = {}) {
       } else if (key === "0") {
         e.preventDefault();
         zoomReset();
-      } else if (key === "b" && onToggleSidebar) {
-        e.preventDefault();
-        onToggleSidebar();
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    // Capture phase on the document so we beat the focused xterm's key handler.
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
   }, [
     spawn,
     closeFocused,
     cycleTab,
+    cycleTile,
+    toggleFocusRegion,
     setActiveTabByIndex,
     zoomIn,
     zoomOut,
     zoomReset,
-    onToggleSidebar,
+    onFocusSidebar,
   ]);
 
   // Clear a STALE fullscreen target. The fullscreen tile can be removed out from
