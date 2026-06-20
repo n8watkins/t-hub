@@ -78,6 +78,10 @@ export const Commands05 = {
   hostMetrics: "host_metrics",
   /** Derive the current git branch for a cwd (statusline lacks it). */
   gitBranch: "git_branch",
+  /** Scroll a tile's tmux scrollback by a page (copy-mode). */
+  tmuxScroll: "tmux_scroll",
+  /** Exit a tile's tmux copy-mode (back to the live prompt). */
+  tmuxExitScroll: "tmux_exit_scroll",
   /** Read-only orchestrator→subagent tree for one session. */
   supervisionTree: "supervision_tree",
   /** All supervised session ids. */

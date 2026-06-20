@@ -36,6 +36,17 @@ export function gitBranch(cwd: string): Promise<string | null> {
   return invoke(Commands05.gitBranch, { cwd });
 }
 
+/** Page a tile's tmux scrollback (copy-mode). `session` is the tmux session name
+ *  (`th_<terminalId>`); `down` pages toward the live prompt. */
+export function tmuxScroll(session: string, down: boolean): Promise<void> {
+  return invoke(Commands05.tmuxScroll, { session, down });
+}
+
+/** Exit a tile's tmux copy-mode (back to the live prompt). */
+export function tmuxExitScroll(session: string): Promise<void> {
+  return invoke(Commands05.tmuxExitScroll, { session });
+}
+
 /** Read-only orchestrator→subagent tree for one session (null if unseen). */
 export function supervisionTree(
   sessionId: string,

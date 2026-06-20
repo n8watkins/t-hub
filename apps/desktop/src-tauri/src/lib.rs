@@ -260,6 +260,8 @@ pub fn run() {
             commands_05::agent_state,
             commands_05::host_metrics,
             commands_05::git_branch,
+            commands_05::tmux_scroll,
+            commands_05::tmux_exit_scroll,
             commands_05::supervision_tree,
             commands_05::supervision_session_ids,
             commands_05::session_status,

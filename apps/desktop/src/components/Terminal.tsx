@@ -42,6 +42,7 @@ import {
   resizeTerminal,
   writeTerminal,
 } from "../ipc/client";
+import { tmuxScroll, tmuxExitScroll } from "../ipc/client05";
 import type { TerminalId } from "../ipc/types";
 import { stripAnsi } from "../lib/ansi";
 import { usePanels } from "../store/panels";
@@ -272,21 +273,19 @@ export function TerminalView({
     // before they reach the window-level handler. Returning false stops xterm
     // from sending the key to the PTY; stopPropagation prevents the Canvas
     // window handler from double-firing.
+    // Tracks whether THIS pane is in tmux copy-mode after a Page Up (set below).
+    // A closure flag living for the terminal's lifetime; only ever true after a
+    // scroll, so ordinary typing is unaffected while it's false.
+    let scrolled = false;
+    const sessionName = `th_${terminalId}`;
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
 
-      // PageUp/PageDown scroll the xterm VIEWPORT by a page (not the shell).
-      // Without this the keys fall through to the PTY, where most shells/TUIs do
-      // nothing useful with them — so the user can't page through scrollback. We
-      // only hijack the BARE keys (no Ctrl/Alt/Meta/Shift) so Shift+PageUp and
-      // any modified variants still reach the app. preventDefault keeps the keys
-      // out of the shell; stopPropagation stops the Canvas window handler from
-      // double-firing. Returning false tells xterm not to forward to the PTY.
-      //
-      // Repeated paging stays put: xterm preserves the user's scroll position on
-      // new term.write() output (it only auto-follows the tail when the viewport
-      // is ALREADY at the bottom), and forceRepaint() merely refreshes — neither
-      // yanks the viewport back down — so paging up doesn't snap to the prompt.
+      // PageUp/PageDown scroll the tmux pane's REAL history via copy-mode — the
+      // only way to page back when an alt-screen app (claude/vim) owns the pane
+      // (xterm's local scrollback is shallow and the C-b prefix is disabled). We
+      // hijack only the BARE keys so Shift+Page* etc. still reach the app. The
+      // backend enters copy-mode + pages, and auto-exits at the bottom.
       if (
         (e.key === "PageUp" || e.key === "PageDown") &&
         !e.ctrlKey &&
@@ -294,7 +293,35 @@ export function TerminalView({
         !e.metaKey &&
         !e.shiftKey
       ) {
-        term.scrollPages(e.key === "PageUp" ? -1 : 1);
+        scrolled = true;
+        void tmuxScroll(sessionName, e.key === "PageDown");
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+      }
+
+      // After a scroll the pane is in copy-mode (output frozen). The first
+      // ORDINARY key returns to the live prompt AND is preserved: exit copy-mode,
+      // then re-send the character to the PTY so "page up, then just type" works.
+      // Arrows / Home / End / Page* stay with copy-mode for native navigation.
+      // Guarded by `scrolled`, so normal typing never enters this path.
+      if (scrolled) {
+        const navKeys = ["PageUp", "PageDown", "ArrowUp", "ArrowDown", "Home", "End"];
+        if (navKeys.includes(e.key)) return true;
+        scrolled = false;
+        const ch =
+          e.key === "Enter"
+            ? "\r"
+            : e.key === "Backspace"
+              ? "\x7f"
+              : e.key === "Tab"
+                ? "\t"
+                : e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey
+                  ? e.key
+                  : null;
+        void tmuxExitScroll(sessionName).then(() => {
+          if (ch !== null) void writeTerminal(terminalId, ch);
+        });
         e.preventDefault();
         e.stopPropagation();
         return false;

@@ -501,6 +501,45 @@ pub fn send_keys(name: &str, keys: &[&str]) -> Result<(), TmuxError> {
     Ok(())
 }
 
+/// Read a pane format (e.g. `#{pane_in_mode}`, `#{scroll_position}`) for session
+/// `name`'s active pane. Returns the trimmed value, or None on any failure.
+fn pane_format(name: &str, fmt: &str) -> Option<String> {
+    let out = run("display-message", &["display-message", "-p", "-t", name, fmt]).ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Page session `name`'s scrollback history up/down by driving tmux **copy-mode**.
+///
+/// This is the only way to scroll a pane's history when an alternate-screen app
+/// (claude / vim) owns it — xterm's local scrollback only holds what streamed, not
+/// tmux's history, and the `C-b` prefix is disabled. We enter copy-mode (only when
+/// the pane isn't already in a mode, so a repeated page-up keeps climbing instead
+/// of snapping to the bottom) and send a copy-mode page command. `down == true`
+/// pages toward the live prompt; once it reaches the bottom we EXIT copy-mode so
+/// the pane resumes showing live output (copy-mode freezes it). Best-effort.
+pub fn scroll_history(name: &str, down: bool) -> Result<(), TmuxError> {
+    let in_mode = pane_format(name, "#{pane_in_mode}").as_deref() == Some("1");
+    if !in_mode {
+        run("copy-mode", &["copy-mode", "-t", name])?;
+    }
+    let cmd = if down { "page-down" } else { "page-up" };
+    run("send-keys", &["send-keys", "-X", "-t", name, cmd])?;
+    // Paging back to the bottom returns to the LIVE pane; copy-mode otherwise
+    // freezes output, so leave it once we're at scroll_position 0.
+    if down && pane_format(name, "#{scroll_position}").as_deref() == Some("0") {
+        let _ = exit_copy_mode(name);
+    }
+    Ok(())
+}
+
+/// Exit copy-mode for `name` (back to the live prompt). Best-effort — a harmless
+/// no-op when the pane isn't in a mode. Used to return to typing the instant the
+/// user types after scrolling.
+pub fn exit_copy_mode(name: &str) -> Result<(), TmuxError> {
+    run("send-keys", &["send-keys", "-X", "-t", name, "cancel"])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

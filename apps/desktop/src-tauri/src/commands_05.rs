@@ -54,6 +54,22 @@ pub async fn git_branch(
     state.agent.git_branch(&cwd)
 }
 
+/// Scroll a tile's tmux scrollback by a page via copy-mode. `session` is the tmux
+/// session name (`th_<terminalId>`); `down` pages toward the live prompt (and
+/// auto-exits copy-mode at the bottom). The only way to scroll history when an
+/// alt-screen app (claude/vim) owns the pane.
+#[tauri::command]
+pub async fn tmux_scroll(session: String, down: bool) -> Result<(), String> {
+    crate::tmux::scroll_history(&session, down).map_err(|e| e.to_string())
+}
+
+/// Exit tmux copy-mode for a tile (back to the live prompt). Called the instant
+/// the user types after scrolling, so paging up reads as a peek, not a mode.
+#[tauri::command]
+pub async fn tmux_exit_scroll(session: String) -> Result<(), String> {
+    crate::tmux::exit_copy_mode(&session).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn supervision_tree(
     state: tauri::State<'_, AppState>,
