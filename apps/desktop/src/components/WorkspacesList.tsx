@@ -193,6 +193,11 @@ export function WorkspacesList() {
     let ghost: DragGhost | null = null;
     wsDragCancelRef.current = startPointerDrag(e.clientX, e.clientY, {
       manageBodyDragFlag: true,
+      // The workspace name is BOTH the reorder drag handle and the
+      // double-click-to-rename target, so use a larger move threshold than the
+      // default (4px): a quick double-click that drifts a few px must NOT begin a
+      // reorder. A deliberate drag easily clears this.
+      threshold: 10,
       onBegin: () => {
         setDragWsId(id);
         ghost = createDragGhost({

@@ -917,7 +917,13 @@ function SearchResults({
   root: string;
   onOpen: (absPath: string) => void;
 }) {
-  if (!searching && hits.length === 0) {
+  // Respect "hide dotfiles" in search too (same as the tree): drop hits with any
+  // dot-segment in their path so the toggle quiets dotfile noise everywhere.
+  const hideDotfiles = useSettings((s) => s.hideDotfiles);
+  const shown = hideDotfiles
+    ? hits.filter((h) => !h.relPath.split("/").some((s) => s.startsWith(".")))
+    : hits;
+  if (!searching && shown.length === 0) {
     return (
       <div className="px-3 py-2 text-xs" style={{ color: "var(--th-fg-muted)" }}>
         No matching files.
@@ -926,7 +932,7 @@ function SearchResults({
   }
   return (
     <ul className="py-1">
-      {hits.map((hit) => {
+      {shown.map((hit) => {
         const abs = joinPath(root, hit.relPath);
         const dir = hit.relPath.includes("/")
           ? hit.relPath.slice(0, hit.relPath.lastIndexOf("/"))

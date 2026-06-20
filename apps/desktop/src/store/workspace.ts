@@ -1158,7 +1158,13 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       if (from < 0 || to < 0) return;
       const next = tabs.slice();
       const [moved] = next.splice(from, 1);
-      next.splice(to, 0, moved);
+      // Insert at the TARGET's slot regardless of drag direction. Removing an
+      // earlier source (from < to) shifts the target down one, so without this
+      // adjustment a downward move would land one slot PAST the target (the
+      // off-by-one the insertion highlight didn't match). Upward moves are
+      // unaffected (from > to => adj === to).
+      const adj = from < to ? to - 1 : to;
+      next.splice(adj, 0, moved);
       // Reordering doesn't change which tab is active; activeTabId is untouched.
       set({ tabs: next });
       persist();
