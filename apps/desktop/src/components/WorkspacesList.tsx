@@ -22,6 +22,8 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
 import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
+import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
+import { sessionNameForTerminal } from "../store/sessionContext";
 import type { TerminalId, TerminalInfo, TerminalState } from "../ipc/types";
 import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
 import { resolveDropTarget } from "../lib/dropTarget";
@@ -56,12 +58,22 @@ export function WorkspacesList() {
   // affordance a tile-header drag gives), keeping the two entry points consistent.
   const moveTileToTab = useWorkspace((s) => s.moveTileToTab);
   const setDraggingTile = useWorkspace((s) => s.setDraggingTile);
+  // Reorder WHOLE workspaces in the sidebar by dragging a workspace row header.
+  // moveTab(id, targetId) moves `id` into `targetId`'s slot and persists via the
+  // same snapshot mechanism every other tab edit uses.
+  const moveTab = useWorkspace((s) => s.moveTab);
   // Per-workspace color identity (feat/workspace-colors): the dot + a quick color
   // picker live on each workspace row. Read from the theme store (mirrors the
   // per-terminal override slots).
   const workspaceColors = useTheme((s) => s.workspaceColors);
   const setWorkspaceColor = useTheme((s) => s.setWorkspaceColor);
   const clearWorkspaceColor = useTheme((s) => s.clearWorkspaceColor);
+  // Per-terminal color identity (the SAME slot the tile ⋯ menu writes): setting a
+  // terminal's color here recolors its canvas tile too, and wins over the
+  // workspace color on that terminal's sidebar row.
+  const termFocusRing = useTheme((s) => s.termFocusRing);
+  const setTermFocusRing = useTheme((s) => s.setTermFocusRing);
+  const clearTermFocusRing = useTheme((s) => s.clearTermFocusRing);
   // The sidebar region being focused (Ctrl+B) highlights the ACTIVE workspace row
   // so keyboard nav reads clearly.
   const sidebarFocused = focusedRegion === "sidebar";
@@ -78,6 +90,20 @@ export function WorkspacesList() {
   // other TermHub drag — HTML5 DnD dies over xterm (see lib/pointerDrag.ts).
   const [dragTerminalId, setDragTerminalId] = useState<TerminalId | null>(null);
   const [dropTabId, setDropTabId] = useState<string | null>(null);
+  // --- Reorder workspaces -------------------------------------------------
+  // Dragging a WORKSPACE ROW reorders the workspace list. `dragWsId` is the row
+  // being moved (it dims); `wsDropTabId` is the workspace row currently under the
+  // pointer (it lights up as the insertion target). Mirrors the terminal-row drag
+  // above, resolving the target via the same `data-th-ws-row` anchor.
+  const [dragWsId, setDragWsId] = useState<string | null>(null);
+  const [wsDropTabId, setWsDropTabId] = useState<string | null>(null);
+  const wsDragCancelRef = useRef<PointerDragCanceller | null>(null);
+  useEffect(() => {
+    return () => {
+      wsDragCancelRef.current?.();
+      wsDragCancelRef.current = null;
+    };
+  }, []);
   // The workspace the dragged terminal currently lives in — so we never flag its
   // OWN workspace as a (no-op) drop target. Captured ONCE when the drag begins
   // (it can't change mid-gesture), not re-derived on every move-driven re-render.
@@ -153,6 +179,45 @@ export function WorkspacesList() {
     });
   };
 
+  // Begin dragging a WHOLE workspace row to reorder it. Same pointer-drag spine
+  // as the terminal-row drag; the drop target is the workspace row under the
+  // pointer (resolved off `data-th-ws-row`). `onSettled(committed)` lets the row
+  // suppress the synthetic click that trails a committed drag (so a reorder never
+  // also switches to that workspace).
+  const startWorkspaceDrag = (
+    id: string,
+    e: ReactPointerEvent,
+    onSettled?: (committed: boolean) => void,
+  ) => {
+    if (e.button !== 0) return; // primary (left) button only
+    let ghost: DragGhost | null = null;
+    wsDragCancelRef.current = startPointerDrag(e.clientX, e.clientY, {
+      manageBodyDragFlag: true,
+      onBegin: () => {
+        setDragWsId(id);
+        ghost = createDragGhost({
+          title: tabs.find((t) => t.id === id)?.name ?? "Workspace",
+          width: 200,
+        });
+      },
+      onMove: (x, y) => {
+        ghost?.move(x, y);
+        setWsDropTabId(workspaceRowAt(x, y));
+      },
+      onEnd: (x, y, committed) => {
+        const target = committed ? workspaceRowAt(x, y) : null;
+        ghost?.destroy();
+        ghost = null;
+        wsDragCancelRef.current = null;
+        setDragWsId(null);
+        setWsDropTabId(null);
+        onSettled?.(committed);
+        // moveTab no-ops on same/unknown id, so an in-place drop is safe.
+        if (target && target !== id) moveTab(id, target);
+      },
+    });
+  };
+
   if (tabs.length === 0) {
     return (
       <div className="px-2 py-1 text-sm" style={{ color: "var(--th-fg-muted)" }}>
@@ -173,6 +238,7 @@ export function WorkspacesList() {
           labels={labels}
           focusedId={focusedId}
           color={workspaceColors[tab.id]}
+          termFocusRing={termFocusRing}
           // The active row is the keyboard-nav focus target while the sidebar
           // region is focused (Ctrl+B), so highlight it then.
           navFocused={sidebarFocused && tab.id === activeTabId}
@@ -185,6 +251,13 @@ export function WorkspacesList() {
           }
           draggingTerminalId={dragTerminalId}
           onTerminalDragStart={startTerminalDrag}
+          // Reorder drag: this row is a drag SOURCE (header) and a drop target for
+          // another workspace row being dragged over it.
+          isWsDragging={dragWsId === tab.id}
+          isWsDropTarget={
+            dragWsId != null && wsDropTabId === tab.id && dragWsId !== tab.id
+          }
+          onWorkspaceDragStart={startWorkspaceDrag}
           onToggle={() => toggleOpen(tab)}
           onActivate={() => {
             // Activating from the sidebar keeps nav focus IN the sidebar so a
@@ -195,6 +268,10 @@ export function WorkspacesList() {
           onRename={(name) => renameTab(tab.id, name)}
           onSetColor={(c) => setWorkspaceColor(tab.id, c)}
           onClearColor={() => clearWorkspaceColor(tab.id)}
+          // Per-terminal color writes the SAME slot the tile ⋯ menu uses, so a
+          // color set here recolors that terminal's canvas tile too.
+          onSetTerminalColor={(id, c) => setTermFocusRing(id, c)}
+          onClearTerminalColor={(id) => clearTermFocusRing(id)}
           onSelectTerminal={(id) => {
             // Clicking a terminal jumps to the canvas (setFocus moves nav focus to
             // the terminal region).
@@ -216,15 +293,21 @@ function WorkspaceRow({
   labels,
   focusedId,
   color,
+  termFocusRing,
   navFocused,
   isDropTarget,
   draggingTerminalId,
   onTerminalDragStart,
+  isWsDragging,
+  isWsDropTarget,
+  onWorkspaceDragStart,
   onToggle,
   onActivate,
   onRename,
   onSetColor,
   onClearColor,
+  onSetTerminalColor,
+  onClearTerminalColor,
   onSelectTerminal,
   onCloseTerminal,
 }: {
@@ -236,6 +319,9 @@ function WorkspaceRow({
   focusedId: TerminalId | null;
   /** This workspace's assigned color (undefined => follow the default accent). */
   color?: string;
+  /** Per-terminal override colors (terminalId → color) — a terminal's OWN color
+   *  beats the workspace color on its sidebar row. */
+  termFocusRing: Record<string, string>;
   /** True when this row is the sidebar's keyboard-nav focus target (Ctrl+B). */
   navFocused: boolean;
   /** True when a terminal from another workspace is being dragged over this row
@@ -251,11 +337,25 @@ function WorkspaceRow({
     e: ReactPointerEvent,
     onSettled?: (committed: boolean) => void,
   ) => void;
+  /** True while THIS workspace row is the one being dragged to reorder (it dims). */
+  isWsDragging: boolean;
+  /** True when ANOTHER workspace row is being dragged over this one (drop target). */
+  isWsDropTarget: boolean;
+  /** Begin dragging this whole workspace row to reorder it. `onSettled(committed)`
+   *  fires on release so the row can suppress the trailing click. */
+  onWorkspaceDragStart: (
+    id: string,
+    e: ReactPointerEvent,
+    onSettled?: (committed: boolean) => void,
+  ) => void;
   onToggle: () => void;
   onActivate: () => void;
   onRename: (name: string) => void;
   onSetColor: (color: string) => void;
   onClearColor: () => void;
+  /** Set/clear a single terminal's color (writes the per-terminal theme slot). */
+  onSetTerminalColor: (id: TerminalId, color: string) => void;
+  onClearTerminalColor: (id: TerminalId) => void;
   onSelectTerminal: (id: TerminalId) => void;
   onCloseTerminal: (id: TerminalId) => void;
 }) {
@@ -267,7 +367,12 @@ function WorkspaceRow({
   const inputRef = useRef<HTMLInputElement>(null);
   // Color-picker popover open state (the dot). Anchored under the dot button.
   const [colorMenu, setColorMenu] = useState(false);
+  // Which terminal row's color picker is open (its id), or null. Only one at a time.
+  const [termColorMenuId, setTermColorMenuId] = useState<TerminalId | null>(null);
   const activateRef = useRef<HTMLButtonElement>(null);
+  // Swallows the synthetic click that trails a committed workspace-row drag, so a
+  // reorder gesture never also activates this workspace. Cleared on each press.
+  const wsSuppressClickRef = useRef(false);
 
   useEffect(() => {
     if (editing) {
@@ -299,6 +404,8 @@ function WorkspaceRow({
         className="flex w-full items-center gap-1 rounded-lg pr-1 transition-colors hover:bg-neutral-800/40"
         style={{
           color: "var(--th-fg)",
+          // Dim this row while it is the workspace being dragged to reorder.
+          opacity: isWsDragging ? 0.4 : undefined,
           ...(active
             ? {
                 backgroundColor: `color-mix(in srgb, ${accent} 16%, transparent)`,
@@ -314,6 +421,15 @@ function WorkspaceRow({
           ...(isDropTarget
             ? {
                 backgroundColor: `color-mix(in srgb, ${accent} 24%, transparent)`,
+                outline: `2px dashed ${accent}`,
+                outlineOffset: "-2px",
+              }
+            : {}),
+          // Another workspace row is being dragged over this one (reorder): a
+          // dashed insertion ring so the drop slot reads clearly.
+          ...(isWsDropTarget
+            ? {
+                backgroundColor: `color-mix(in srgb, ${accent} 20%, transparent)`,
                 outline: `2px dashed ${accent}`,
                 outlineOffset: "-2px",
               }
@@ -394,11 +510,29 @@ function WorkspaceRow({
             // The active row is the sidebar's keyboard-nav focus target (Ctrl+B
             // focuses this; Ctrl+Tab then cycles workspaces).
             data-th-sidebar-focus={active ? "" : undefined}
-            onClick={onActivate}
+            onClick={() => {
+              // Swallow exactly the click that trails a committed reorder drag; a
+              // plain click (or keyboard activation) activates as normal.
+              if (wsSuppressClickRef.current) {
+                wsSuppressClickRef.current = false;
+                return;
+              }
+              onActivate();
+            }}
+            // Press-and-drag the name to reorder this workspace among the others.
+            // A plain click (no movement past the threshold) still activates it.
+            // touch-none/select-none keep touch/pen + text selection from stealing
+            // the gesture, matching the terminal-row drag handle.
+            onPointerDown={(e) => {
+              wsSuppressClickRef.current = false;
+              onWorkspaceDragStart(tab.id, e, (committed) => {
+                wsSuppressClickRef.current = committed;
+              });
+            }}
             onDoubleClick={startEdit}
             aria-current={active ? "true" : undefined}
-            className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-1.5 pr-1 text-left text-sm outline-none"
-            title={`${tab.name} — ${count} terminal${count === 1 ? "" : "s"} · double-click to rename`}
+            className="flex min-w-0 flex-1 cursor-pointer touch-none select-none items-center gap-2 py-1.5 pr-1 text-left text-sm outline-none"
+            title={`${tab.name} — ${count} terminal${count === 1 ? "" : "s"} · double-click to rename · drag to reorder`}
           >
             <span className="min-w-0 flex-1 truncate font-medium">{tab.name}</span>
             <CountBadge n={count} />
@@ -432,6 +566,24 @@ function WorkspaceRow({
                   userLabel={labels[id]}
                   active={id === focusedId}
                   dragging={draggingTerminalId === id}
+                  // The row's identity color: this terminal's OWN override wins;
+                  // otherwise the workspace color cascades down. Undefined => the
+                  // row follows the default (no tint).
+                  rowColor={termFocusRing[id] ?? color}
+                  ownColor={termFocusRing[id]}
+                  colorMenuOpen={termColorMenuId === id}
+                  onToggleColorMenu={() =>
+                    setTermColorMenuId((cur) => (cur === id ? null : id))
+                  }
+                  onCloseColorMenu={() => setTermColorMenuId(null)}
+                  onSetColor={(c) => {
+                    onSetTerminalColor(id, c);
+                    setTermColorMenuId(null);
+                  }}
+                  onClearColor={() => {
+                    onClearTerminalColor(id);
+                    setTermColorMenuId(null);
+                  }}
                   onDragStart={onTerminalDragStart}
                   onClick={() => onSelectTerminal(id)}
                   onClose={() => onCloseTerminal(id)}
@@ -455,6 +607,13 @@ function TerminalRow({
   userLabel,
   active,
   dragging,
+  rowColor,
+  ownColor,
+  colorMenuOpen,
+  onToggleColorMenu,
+  onCloseColorMenu,
+  onSetColor,
+  onClearColor,
   onDragStart,
   onClick,
   onClose,
@@ -465,6 +624,22 @@ function TerminalRow({
   active: boolean;
   /** True while THIS terminal is the one being dragged (the row dims). */
   dragging: boolean;
+  /** The row's effective identity color: this terminal's own override if set,
+   *  else the owning workspace's color. Undefined => no tint (default). */
+  rowColor?: string;
+  /** This terminal's OWN override color (drives the swatch fill + the clear
+   *  button's enabled state), undefined when it only inherits the workspace. */
+  ownColor?: string;
+  /** Whether this row's color picker popover is open. */
+  colorMenuOpen: boolean;
+  /** Toggle this row's color picker open/closed. */
+  onToggleColorMenu: () => void;
+  /** Close this row's color picker. */
+  onCloseColorMenu: () => void;
+  /** Set this terminal's color (writes the per-terminal theme slot). */
+  onSetColor: (color: string) => void;
+  /** Clear this terminal's color (follow the workspace / default again). */
+  onClearColor: () => void;
   /** Begin a pointer-drag of this terminal into another workspace (D2). */
   onDragStart: (
     id: TerminalId,
@@ -475,6 +650,13 @@ function TerminalRow({
   onClose: () => void;
 }) {
   const state: TerminalState = info?.state ?? "starting";
+  // ACTIVITY: pulse this row's lifecycle dot while the bound Claude session is
+  // mid-turn (working / waiting on subagents / needs*). Cheap CSS (animate-pulse),
+  // and nothing animates when the session is idle. Keyed by `th_<id>`, the same
+  // session name the tile uses (see store/sessionContext).
+  const working = useSupervision((s) =>
+    tmuxSessionMidTurn(s, sessionNameForTerminal(id)),
+  );
   const label = deriveLabel({
     id,
     label: userLabel,
@@ -493,16 +675,27 @@ function TerminalRow({
   const suppressClickRef = useRef(false);
   return (
     <li
-      className="group flex items-center gap-2 rounded-lg pr-1 transition-colors hover:bg-neutral-800/40"
+      className="group relative flex items-center gap-2 rounded-lg pr-1 transition-colors hover:bg-neutral-800/40"
       style={{
         color: "var(--th-fg)",
         // Dim the source row while it's being dragged into another workspace.
         opacity: dragging ? 0.4 : undefined,
+        // COLOR CASCADE: a subtle identity tint + a thin left accent bar drawn
+        // from the row's effective color (own override, else the workspace color).
+        // The same color-mix subtlety the canvas tiles use. The focused/active
+        // treatment below LAYERS ON TOP (a stronger tint + bar) so it still wins.
+        ...(rowColor
+          ? {
+              backgroundColor: `color-mix(in srgb, ${rowColor} 10%, transparent)`,
+              boxShadow: `inset 2px 0 0 0 color-mix(in srgb, ${rowColor} 70%, transparent)`,
+            }
+          : {}),
         ...(active
           ? {
-              backgroundColor:
-                "color-mix(in srgb, var(--th-accent) 16%, transparent)",
-              boxShadow: "inset 2px 0 0 0 var(--th-accent)",
+              backgroundColor: rowColor
+                ? `color-mix(in srgb, ${rowColor} 20%, transparent)`
+                : "color-mix(in srgb, var(--th-accent) 16%, transparent)",
+              boxShadow: `inset 2px 0 0 0 ${rowColor ?? "var(--th-accent)"}`,
             }
           : {}),
       }}
@@ -533,9 +726,15 @@ function TerminalRow({
         title={cwd ? `${label} — ${cwd} (${state})` : `${label} — ${state}`}
       >
         <span
-          className="h-2 w-2 shrink-0 rounded-full"
-          style={{ backgroundColor: DOT_VAR[state] }}
+          // ACTIVITY: pulse while the bound session is mid-turn; static when idle.
+          className={`h-2 w-2 shrink-0 rounded-full${working ? " animate-pulse" : ""}`}
+          style={{
+            backgroundColor: DOT_VAR[state],
+            // A soft glow while working makes the pulse read even on a tiny dot.
+            boxShadow: working ? `0 0 5px 0 ${DOT_VAR[state]}` : undefined,
+          }}
           aria-hidden
+          title={working ? "Working…" : undefined}
         />
         <span className="min-w-0 flex-1">
           <span className="block truncate">{workName ?? label}</span>
@@ -549,6 +748,45 @@ function TerminalRow({
           )}
         </span>
       </button>
+      {/* Per-terminal color circle — click to open a small palette + custom
+          picker. Writes THIS terminal's color (the same per-terminal theme slot
+          the tile ⋯ menu uses), so a change here recolors its canvas tile too.
+          Reveals on row hover (or stays visible while its menu is open / a color
+          is set) so it doesn't clutter the list. */}
+      <div className="relative shrink-0">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleColorMenu();
+          }}
+          className={`flex h-5 w-5 items-center justify-center rounded transition-opacity hover:bg-neutral-700/40 group-hover:opacity-100${
+            colorMenuOpen || ownColor ? " opacity-100" : " opacity-0"
+          }`}
+          title="Terminal color"
+          aria-label="Set terminal color"
+          aria-haspopup="menu"
+          aria-expanded={colorMenuOpen}
+        >
+          <span
+            className="h-2.5 w-2.5 rounded-full"
+            style={{
+              backgroundColor: ownColor ?? "var(--th-fg-muted)",
+              boxShadow: ownColor ? `0 0 5px -1px ${ownColor}` : undefined,
+              border: ownColor ? undefined : "1px solid var(--th-border)",
+            }}
+          />
+        </button>
+        {colorMenuOpen && (
+          <ColorPicker
+            title="Terminal color"
+            current={ownColor}
+            onPick={onSetColor}
+            onClear={onClearColor}
+            onClose={onCloseColorMenu}
+          />
+        )}
+      </div>
       {/* Close (kill) this terminal — "close what we're working on from the
           workspace". Reveals on row hover so it doesn't clutter the list. */}
       <button
@@ -569,20 +807,24 @@ function TerminalRow({
 }
 
 /**
- * A small workspace-color picker popover: a row of palette swatches, a custom
- * `<input type="color">`, and a "default" reset. Anchored under the dot button. A
- * full-window backdrop dismisses it (mirrors the tile ⋯ color popover pattern).
+ * A small color-picker popover: a row of palette swatches, a custom
+ * `<input type="color">`, and a "default" reset. Anchored under the swatch
+ * button. A full-window backdrop dismisses it (mirrors the tile ⋯ color popover
+ * pattern). Shared by the workspace dot and each terminal row's color circle —
+ * the `title` distinguishes the two (defaults to "Workspace color").
  */
 function ColorPicker({
   current,
   onPick,
   onClear,
   onClose,
+  title = "Workspace color",
 }: {
   current?: string;
   onPick: (color: string) => void;
   onClear: () => void;
   onClose: () => void;
+  title?: string;
 }) {
   return (
     <>
@@ -606,7 +848,7 @@ function ColorPicker({
           className="mb-1.5 px-0.5 text-[10px] font-semibold uppercase tracking-wide"
           style={{ color: "var(--th-fg-muted)" }}
         >
-          Workspace color
+          {title}
         </div>
         <div className="grid grid-cols-4 gap-1.5">
           {WORKSPACE_COLOR_PALETTE.map((c) => {
