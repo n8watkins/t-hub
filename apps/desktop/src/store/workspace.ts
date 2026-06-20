@@ -21,9 +21,9 @@ import { useTheme } from "./theme";
  * Clean up the per-tile side state that lives OUTSIDE this store when a
  * terminal's tile goes away for good (detach / delete / close-tab):
  *   - the per-tile panel state (active view, detected/typed URLs) in usePanels;
- *   - any managed dev server the Dev tab started for it (a fire-and-forget Tauri
- *     call, dynamically imported so the store stays web/test-safe — a no-op if
- *     there's no dev server for this id or no Tauri runtime).
+ *   - any managed dev server still running for it (a fire-and-forget Tauri call,
+ *     dynamically imported so the store stays web/test-safe — a no-op if there's
+ *     no dev server for this id or no Tauri runtime).
  * Called from `remove` (which funnels detach + delete) and `closeTab`. NOT called
  * on a tab MOVE — a moved tile keeps its panel state.
  */
@@ -226,9 +226,16 @@ interface WorkspaceState {
   /** Cycle to the next (+1) / previous (-1) tab, wrapping. */
   cycleTab: (dir: 1 | -1) => void;
   /** Cycle the FOCUSED TILE within the active tab (+1 next / -1 previous,
-   *  wrapping). Used by Ctrl+Tab while the terminal region is focused. No-op when
-   *  the active tab has fewer than two tiles. */
+   *  wrapping). No-op when the active tab has fewer than two tiles. */
   cycleTile: (dir: 1 | -1) => void;
+  /** Cycle the focused tile across EVERY workspace tab (+1 next / -1 previous,
+   *  wrapping over the flattened tile order of all tabs in strip order). Used by
+   *  Ctrl+Tab while the terminal region is focused so any terminal in any
+   *  workspace is reachable. Crosses a tab boundary by switching the active tab to
+   *  the one that owns the next terminal, then focusing it (which also snaps the
+   *  nav focus back to the terminal region). No-op when there are fewer than two
+   *  tiles total. */
+  cycleTileGlobal: (dir: 1 | -1) => void;
   /** Reorder the tab strip: move tab `id` to occupy `targetId`'s slot. */
   moveTab: (id: string, targetId: string) => void;
 
@@ -1112,6 +1119,35 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       if (nextId === focusedId) return;
       // Reuse setFocus so navigation focus snaps back to the terminal region.
       get().setFocus(nextId);
+    },
+
+    cycleTileGlobal: (dir) => {
+      const { tabs, activeTabId, focusedId } = get();
+      // Flatten EVERY tab's tile order (strip order) into one global ring, each
+      // entry tagged with its owning tab so we can switch tabs when we cross a
+      // boundary. Popped-out tabs live in other windows, so they're excluded.
+      const flat: { id: TerminalId; tabId: string }[] = [];
+      for (const t of tabs) {
+        for (const id of t.order) flat.push({ id, tabId: t.id });
+      }
+      if (flat.length <= 1) return;
+      // Locate the current focused tile in the global ring (prefer the entry in
+      // the ACTIVE tab when an id somehow appears twice; ids are unique across
+      // tabs in practice, but this keeps the step deterministic). Default to the
+      // start so an unset focus still cycles.
+      let cur = flat.findIndex(
+        (e) => e.id === focusedId && e.tabId === activeTabId,
+      );
+      if (cur < 0) cur = flat.findIndex((e) => e.id === focusedId);
+      const base = cur >= 0 ? cur : 0;
+      const next = flat[(base + dir + flat.length) % flat.length];
+      if (next.id === focusedId && next.tabId === activeTabId) return;
+      // Cross a workspace boundary by activating the owning tab first, then focus
+      // the tile. setActiveTab re-points focus to that tab's first tile; the
+      // following setFocus overrides it with the exact target AND snaps the nav
+      // focus back to the terminal region.
+      if (next.tabId !== activeTabId) get().setActiveTab(next.tabId);
+      get().setFocus(next.id);
     },
 
     moveTab: (id, targetId) => {

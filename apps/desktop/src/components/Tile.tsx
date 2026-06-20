@@ -37,6 +37,7 @@ import {
 } from "../store/panels";
 import { useTerminalSlot } from "./TerminalPool";
 import { TilePanel } from "./TilePanel";
+import { ClaudeIcon } from "./ClaudeIcon";
 import { ContextMeter } from "./ContextMeter";
 import { useContextPctForTile, sessionNameForTerminal } from "../store/sessionContext";
 import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
@@ -44,12 +45,13 @@ import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { ConfirmDialog } from "./ConfirmDialog";
 
-/** The tile-header tab bar order + labels. Terminal is the default view. */
+/** The tile-header tab bar order + labels. Terminal is the default view. (The
+ *  "Dev" view was removed; its pop-out / open-externally actions now live as
+ *  icon buttons inside the Preview view's toolbar.) */
 const PANEL_TABS: { id: PanelTab; label: string }[] = [
   { id: "terminal", label: "Terminal" },
   { id: "files", label: "Files" },
   { id: "preview", label: "Preview" },
-  { id: "dev", label: "Dev" },
 ];
 
 /** Terminal-palette keys editable from the per-tile ⋯ color menu. */
@@ -173,12 +175,15 @@ export function Tile({
   const busy =
     (typeof devUrl === "string" && devUrl.length > 0) || claudeMidTurn;
 
-  // Per-tile panel state (the Terminal / Files / Preview / Dev workbench). Kept
-  // in usePanels — NOT workspace.ts — so this presentational state doesn't
-  // contend with the workspace store. The active tab decides whether the body
-  // shows the pooled terminal (terminal) or an in-tile surface (files/preview/
-  // dev); fullscreen blows this one tile up to fill the window.
-  const activeTab = usePanels((s) => s.tab[terminalId] ?? "terminal");
+  // Per-tile panel state (the Terminal / Files / Preview workbench). Kept in
+  // usePanels — NOT workspace.ts — so this presentational state doesn't contend
+  // with the workspace store. The active tab decides whether the body shows the
+  // pooled terminal (terminal) or an in-tile surface (files/preview); fullscreen
+  // blows this one tile up to fill the window. A stale "dev" view (the removed
+  // tab) falls back to "terminal".
+  const rawTab = usePanels((s) => s.tab[terminalId]);
+  const activeTab: PanelTab =
+    rawTab === "files" || rawTab === "preview" ? rawTab : "terminal";
   const setTab = usePanels((s) => s.setTab);
   const toggleFullscreen = usePanels((s) => s.toggleFullscreen);
   const isFullscreen = usePanels((s) => s.fullscreenId === terminalId);
@@ -477,14 +482,17 @@ export function Tile({
           }}
           title="Claude session"
         >
-          <ClaudeSpark />
+          {/* The real Claude brand glyph, tinted Claude's brand clay (#D97757).
+              Replaces the old placeholder "spark" SVG. */}
+          <ClaudeIcon size="1em" className="shrink-0" style={{ color: "#D97757" }} />
           Claude
         </span>
 
         {/* Editable "what are you working on" name (Feature 1). Click to edit
             inline; Enter commits, Esc cancels. Persisted per-terminal (theme
-            store termWorkNames). Stops the header drag on pointer-down. Takes the
-            remaining flex space so the centered view-tab bar stays centered. */}
+            store termWorkNames). Stops the header drag on pointer-down. Kept
+            COMPACT (sized to content with a sensible cap) rather than spanning
+            the full tile width, so the right-aligned view-tab bar has room. */}
         {nameDraft !== null ? (
           <input
             autoFocus
@@ -500,7 +508,7 @@ export function Tile({
             }}
             placeholder="name this work…"
             spellCheck={false}
-            className="min-w-0 flex-1 rounded bg-transparent px-1 py-0.5 outline-none"
+            className="w-40 max-w-[40%] shrink rounded bg-transparent px-1 py-0.5 outline-none"
             style={{
               color: "var(--th-fg)",
               border: `1px solid ${focusRing}`,
@@ -515,7 +523,7 @@ export function Tile({
               onFocus();
               startNameEdit();
             }}
-            className="min-w-0 flex-1 truncate rounded px-1 py-0.5 text-left hover:bg-neutral-800/50"
+            className="max-w-[40%] shrink truncate rounded px-1 py-0.5 text-left hover:bg-neutral-800/50"
             style={{
               color: workName ? "var(--th-fg)" : "var(--th-fg-muted)",
               fontStyle: workName ? undefined : "italic",
@@ -526,26 +534,27 @@ export function Tile({
           </button>
         )}
 
+        {/* Flexible spacer: pushes the view-tab bar + controls to the RIGHT edge
+            of the header (the tabs used to be absolutely centered). */}
+        <div className="min-w-0 flex-1" />
+
         {/* Context-window meter: how full THIS tile's Claude session context is
             (matched by cwd). Renders nothing when no session is matched, so the
             header is unchanged for plain shells / sessions yet to report. */}
         <ContextMeter usedPct={contextUsedPct} />
 
-        {/* Per-tile view switcher: Terminal / Files / Preview / Dev. Clicking a
-            tab sets THIS tile's usePanels tab; the body (below) swaps to that
-            surface and the terminal pool re-syncs (it subscribes to the tab) so
-            the pooled xterm is shown only on the Terminal tab and parked
-            otherwise. pointerDown is stopped so a tab click doesn't start the
-            header's drag-to-move gesture.
+        {/* Per-tile view switcher: Terminal / Files / Preview. Clicking a tab
+            sets THIS tile's usePanels tab; the body (below) swaps to that surface
+            and the terminal pool re-syncs (it subscribes to the tab) so the
+            pooled xterm is shown only on the Terminal tab and parked otherwise.
+            pointerDown is stopped so a tab click doesn't start the header's
+            drag-to-move gesture.
 
-            Positioned ABSOLUTELY and centered (left-1/2 + -translate-x-1/2) so
-            the tab bar reads as centered OVER THE TILE rather than getting shoved
-            to the right by the label/cwd/meter that share the flex row. It stays
-            put as those left/right items change width; pointer-events stay on so
-            the tabs remain clickable, and the surrounding flex items keep their
-            own pointer area (the absolute layer is only as wide as the tabs). */}
+            RIGHT-ALIGNED: an in-flow flex item that the spacer above pushes to
+            the right edge of the header (it used to be absolutely centered). It
+            sits just left of the ⋯ / ⤢ / × controls. */}
         <div
-          className="absolute left-1/2 z-10 flex shrink-0 -translate-x-1/2 items-center rounded-full border p-0.5"
+          className="z-10 flex shrink-0 items-center rounded-full border p-0.5"
           style={{
             backgroundColor: "var(--th-app-bg)",
             borderColor: "var(--th-border)",
@@ -762,7 +771,10 @@ export function Tile({
             style={{
               right: colorMenu.right,
               top: colorMenu.top,
-              backgroundColor: "var(--th-header-bg)",
+              // FULLY OPAQUE surface (the header-bg token carries an alpha in
+              // some themes, which let the terminal bleed through). Use the solid
+              // tile-bg token so the color popover never shows transparency.
+              backgroundColor: "var(--th-tile-bg)",
               borderColor: "var(--th-border)",
               color: "var(--th-fg)",
               fontFamily: "var(--th-font)",
@@ -986,27 +998,6 @@ function cwdBasename(cwd: string): string {
   const parts = cwd.replace(/[/\\]+$/, "").split(/[/\\]+/);
   const last = parts[parts.length - 1] ?? "";
   return last === "~" ? "" : last;
-}
-
-// TODO: real Claude icon — replace this inline "spark" SVG with the official
-// Anthropic/Claude mark asset once one is bundled. The spark below is a tasteful
-// placeholder (a four-pointed star) that reads as a small accent glyph and
-// inherits currentColor so it follows the chip's text color.
-function ClaudeSpark() {
-  return (
-    <svg
-      width="0.9em"
-      height="0.9em"
-      viewBox="0 0 16 16"
-      fill="currentColor"
-      aria-hidden
-      className="shrink-0"
-    >
-      {/* A four-point spark: two crossed tapered diamonds. */}
-      <path d="M8 0.5c.4 2.8 1.7 4.6 4.5 5.5C9.7 6.9 8.4 8.7 8 11.5 7.6 8.7 6.3 6.9 3.5 6 6.3 5.1 7.6 3.3 8 0.5Z" />
-      <path d="M12.5 9.5c.2 1.5.9 2.4 2.5 3-1.6.5-2.3 1.5-2.5 3-.2-1.5-.9-2.5-2.5-3 1.6-.6 2.3-1.5 2.5-3Z" opacity="0.7" />
-    </svg>
-  );
 }
 
 /** One row in the tile right-click context menu. */

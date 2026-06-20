@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
+import { ExternalLink, SquareArrowOutUpRight } from "lucide-react";
 import {
   reachablePreviewUrl,
   probePreviewReachable,
@@ -117,8 +118,8 @@ export function WebPreview({
   );
 
   // Follow a LIVE `initialUrl`. The per-tile Preview tab passes the project's
-  // detected dev-server URL (usePanels.devUrl) as `initialUrl`; when the Dev
-  // runner detects/changes it, the prop changes and we should navigate there —
+  // detected dev-server URL (usePanels.devUrl) as `initialUrl`; when terminal
+  // output detection updates it, the prop changes and we should navigate there —
   // but ONLY when it's a genuinely new server URL, never clobbering an address
   // the user typed into the bar. We remember the last `initialUrl` we adopted
   // and re-navigate only when the incoming prop differs from BOTH that adopted
@@ -282,10 +283,13 @@ export function WebPreview({
         >
           Go
         </button>
+        {/* Pop out + open-externally as compact ICON buttons (these used to be
+            text buttons / a separate Dev panel). Both resolve the reachable URL
+            internally; the icons keep the toolbar tight on a narrow tile. */}
         <button
           type="button"
           onClick={popOut}
-          className="shrink-0 px-3 py-1.5 text-sm"
+          className="flex h-8 w-8 shrink-0 items-center justify-center"
           style={{
             borderRadius: "var(--th-radius)",
             border: "1px solid var(--th-border)",
@@ -293,13 +297,14 @@ export function WebPreview({
             color: "var(--th-fg-muted)",
           }}
           title="Open this preview in its own window"
+          aria-label="Pop out preview"
         >
-          Pop out
+          <SquareArrowOutUpRight size={16} aria-hidden />
         </button>
         <button
           type="button"
           onClick={openInBrowser}
-          className="shrink-0 px-3 py-1.5 text-sm"
+          className="flex h-8 w-8 shrink-0 items-center justify-center"
           style={{
             borderRadius: "var(--th-radius)",
             border: "1px solid var(--th-border)",
@@ -307,8 +312,9 @@ export function WebPreview({
             color: "var(--th-fg-muted)",
           }}
           title="Open this URL in your external browser"
+          aria-label="Open externally in browser"
         >
-          Open externally
+          <ExternalLink size={16} aria-hidden />
         </button>
       </form>
 

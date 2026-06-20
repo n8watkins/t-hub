@@ -191,7 +191,7 @@ const MIDNIGHT: Theme = {
     fgPrimary: "#e5e5e5", // neutral-200
     fgMuted: "#737373", // neutral-500
     border: "#262626", // neutral-800
-    tileHeaderHeight: 40,
+    tileHeaderHeight: 52,
     showTileHeader: true,
     headerOnHover: false,
     showCwd: true,
@@ -274,7 +274,7 @@ const PAPER: Theme = {
     fgPrimary: "#1c1917", // stone-900
     fgMuted: "#78716c", // stone-500
     border: "#d6d3d1", // stone-300
-    tileHeaderHeight: 40,
+    tileHeaderHeight: 52,
     showTileHeader: true,
     headerOnHover: false,
     showCwd: true,
@@ -722,17 +722,20 @@ function loadPersisted(): PersistedThemes {
 }
 
 /**
- * One-time nudge: the default tile-header height grew from the old 22/24px to
- * 40px (the header now carries a tab bar + controls and needed room). A theme
- * persisted before that bump keeps its old value via normalizeTheme, so a user
- * who never deliberately set the header height would be stuck at 22. Bump ONLY
- * those legacy default values; a height the user actually chose (anything else)
- * is left untouched.
+ * One-time nudge: the default tile-header height has grown over time (22/24px →
+ * 40px → now 52px) as the header gained a tab bar + controls and needed more
+ * breathing room. A theme persisted before a bump keeps its old value via
+ * normalizeTheme, so a user who never deliberately set the header height would be
+ * stuck at the old default. Bump ONLY those legacy default values to the current
+ * default; a height the user actually chose (anything else) is left untouched.
  */
 function migrateTileHeader(t: Theme): Theme {
   const h = t.chrome.tileHeaderHeight;
-  if (h === 22 || h === 24) {
-    return { ...t, chrome: { ...t.chrome, tileHeaderHeight: 40 } };
+  if (h === 22 || h === 24 || h === 40) {
+    return {
+      ...t,
+      chrome: { ...t.chrome, tileHeaderHeight: DEFAULT_THEME.chrome.tileHeaderHeight },
+    };
   }
   return t;
 }

@@ -98,7 +98,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   const setFocus = useWorkspace((s) => s.setFocus);
   const updateState = useWorkspace((s) => s.updateState);
   const cycleTab = useWorkspace((s) => s.cycleTab);
-  const cycleTile = useWorkspace((s) => s.cycleTile);
+  const cycleTileGlobal = useWorkspace((s) => s.cycleTileGlobal);
   const toggleFocusRegion = useWorkspace((s) => s.toggleFocusRegion);
   const setActiveTabByIndex = useWorkspace((s) => s.setActiveTabByIndex);
   const zoomIn = useWorkspace((s) => s.zoomIn);
@@ -215,9 +215,9 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
 
   // Global keybindings: Ctrl/Cmd+T = new terminal, Ctrl/Cmd+W = kill focused,
   // Ctrl/Cmd+B = toggle nav FOCUS between the terminal area and the sidebar,
-  // Ctrl/Cmd+Tab = cycle WITHIN the focused region (terminals when the terminal
-  // area is focused, workspaces when the sidebar is focused; Shift reverses),
-  // Ctrl/Cmd+1..9 = jump to the tab at that index.
+  // Ctrl/Cmd+Tab = cycle WITHIN the focused region (terminals across ALL
+  // workspaces when the terminal area is focused, workspaces when the sidebar is
+  // focused; Shift reverses), Ctrl/Cmd+1..9 = jump to the tab at that index.
   //
   // Registered on `document` in the CAPTURE phase (the third `true` arg) so it
   // fires BEFORE a focused xterm's own key handler
@@ -244,7 +244,10 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
         }
         return;
       }
-      // Ctrl/Cmd+Tab cycles WITHIN the focused region (Shift => previous).
+      // Ctrl/Cmd+Tab cycles WITHIN the focused region (Shift => previous): the
+      // sidebar region cycles WORKSPACES, the terminal region cycles TILES across
+      // EVERY workspace (so any terminal in any workspace is reachable — crossing
+      // a tab boundary switches the active workspace to the one that owns it).
       if (e.key === "Tab" && !e.altKey) {
         e.preventDefault();
         e.stopPropagation();
@@ -252,7 +255,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
         if (useWorkspace.getState().focusedRegion === "sidebar") {
           cycleTab(dir);
         } else {
-          cycleTile(dir);
+          cycleTileGlobal(dir);
         }
         return;
       }
@@ -288,7 +291,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     spawn,
     closeFocused,
     cycleTab,
-    cycleTile,
+    cycleTileGlobal,
     toggleFocusRegion,
     setActiveTabByIndex,
     zoomIn,

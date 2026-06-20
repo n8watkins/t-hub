@@ -1,24 +1,24 @@
 // Per-project panel state — the per-tile "workbench".
 //
-// Each project tile shows ONE of several views — Terminal / Files / Preview /
-// Dev — plus a fullscreen toggle. This store holds that purely-presentational,
+// Each project tile shows ONE of several views — Terminal / Files / Preview —
+// plus a fullscreen toggle. This store holds that purely-presentational,
 // per-terminal UI state. It is deliberately kept OUT of the workspace store so
-// the parallel panel + dev-runner work doesn't contend on workspace.ts.
+// the parallel panel work doesn't contend on workspace.ts.
 // In-memory only for v1 (not persisted): a fresh launch starts every tile on its
 // Terminal view, which is the safe default.
 //
 // CROSS-FEATURE CONTRACT (scaffolded for the parallel build — multiple
 // components import this; don't reshape it lightly):
 //   - The per-tile panel (Tile/TilePanel) reads/sets `tab` + `fullscreenId`.
-//   - The Dev runner (DevTab) publishes the detected dev-server URL via
-//     `setDevUrl`.
 //   - The Preview tab reads `devUrl[id]` (falling back to the user-typed
 //     `previewUrl[id]`), so a freshly-detected dev server loads automatically.
+//     `setDevUrl` remains for the terminal output URL-detection path.
 import { create } from "zustand";
 import type { TerminalId } from "../ipc/types";
 
-/** The selectable views inside a project tile. */
-export type PanelTab = "terminal" | "files" | "preview" | "dev";
+/** The selectable views inside a project tile. (The "dev" view was removed; a
+ *  persisted tab of "dev" falls back to "terminal" — see setTab/getTab.) */
+export type PanelTab = "terminal" | "files" | "preview";
 
 /** The view a tile shows until the user switches it. */
 export const DEFAULT_PANEL_TAB: PanelTab = "terminal";
@@ -83,8 +83,8 @@ interface PanelState {
   tab: Record<TerminalId, PanelTab>;
   /** The one tile expanded to fill the window, or null for the normal grid. */
   fullscreenId: TerminalId | null;
-  /** Dev-server URL detected for a terminal (null/absent => none yet). Written
-   *  by the Dev runner; read by the Preview tab. */
+  /** Dev-server URL detected for a terminal (null/absent => none yet). Read by
+   *  the Preview tab; fed from terminal-output URL detection. */
   devUrl: Record<TerminalId, string | null>;
   /** Last URL the user committed in a terminal's Preview tab, so it survives a
    *  tab switch. The Preview tab prefers a live `devUrl` over this. */
