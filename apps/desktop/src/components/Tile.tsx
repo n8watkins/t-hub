@@ -24,7 +24,7 @@
 // point resolves to the owning tile (data-tile-id) rather than the canvas. The
 // drag never touches the backend — only the visual order changes; the tmux
 // session and any agent stay attached and alive.
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { TerminalId, TerminalState } from "../ipc/types";
 import { useWorkspace, deriveLabel } from "../store/workspace";
@@ -44,6 +44,34 @@ import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
 import { startPointerDrag } from "../lib/pointerDrag";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { gitInfo, type GitInfo } from "../ipc/git";
+import { GitBranch } from "lucide-react";
+
+/** Poll git facts (branch / worktree / dirty count) for a tile's cwd. Refreshes
+ *  on mount and whenever the window regains focus (cheap; the backend best-efforts
+ *  a non-repo to isRepo:false). Returns null until the first result. */
+function useGitInfo(cwd: string): GitInfo | null {
+  const [info, setInfo] = useState<GitInfo | null>(null);
+  useEffect(() => {
+    if (!cwd) {
+      setInfo(null);
+      return;
+    }
+    let alive = true;
+    const load = () => {
+      gitInfo(cwd)
+        .then((g) => alive && setInfo(g))
+        .catch(() => alive && setInfo(null));
+    };
+    load();
+    window.addEventListener("focus", load);
+    return () => {
+      alive = false;
+      window.removeEventListener("focus", load);
+    };
+  }, [cwd]);
+  return info;
+}
 
 /** The tile-header tab bar order + labels. Terminal is the default view. (The
  *  "Dev" view was removed; its pop-out / open-externally actions now live as
@@ -243,6 +271,8 @@ export function Tile({
 
   const state: TerminalState = info?.state ?? "starting";
   const cwd = info?.cwd ?? "";
+  // Git facts for this tile's project (branch / worktree / dirty) — header chip.
+  const git = useGitInfo(cwd);
   // Context-window fullness for the Claude session running in THIS tile. Bound
   // ROBUSTLY by tmux session name: the agent stamps each statusline with the
   // owning tmux session (`th_<id>`), and this tile looks itself up by its own
@@ -534,6 +564,41 @@ export function Tile({
           >
             {workName ?? "name this work…"}
           </button>
+        )}
+
+        {/* Git chip: branch + worktree/dirty state for THIS tile's project (from
+            git_info on the cwd). Renders nothing for a non-repo. Lets you see at a
+            glance which branch/worktree a terminal is on. */}
+        {git?.isRepo && git.branch && (
+          <span
+            className="flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-[0.85em]"
+            style={{ color: "var(--th-fg-muted)" }}
+            title={`${git.isLinkedWorktree ? "worktree" : "branch"}: ${git.branch}${
+              git.dirtyCount > 0
+                ? ` · ${git.dirtyCount} uncommitted change${
+                    git.dirtyCount === 1 ? "" : "s"
+                  }`
+                : " · clean"
+            }`}
+          >
+            <GitBranch size="0.95em" aria-hidden />
+            <span className="max-w-[9rem] truncate">{git.branch}</span>
+            {git.isLinkedWorktree && (
+              <span
+                className="rounded px-1 text-[0.8em] uppercase leading-none"
+                style={{ backgroundColor: "var(--th-tile-bg)" }}
+              >
+                wt
+              </span>
+            )}
+            {git.dirtyCount > 0 && (
+              <span
+                className="h-1.5 w-1.5 shrink-0 rounded-full"
+                style={{ backgroundColor: "#eab308" }}
+                aria-hidden
+              />
+            )}
+          </span>
         )}
 
         {/* Flexible spacer: pushes the view-tab bar + controls to the RIGHT edge
