@@ -1,9 +1,13 @@
-# Lane C — Terminal Input (agent kickoff brief) · DEFERRED
+# Lane C — Terminal Input (agent kickoff brief) · ACTIVE (3rd parallel lane)
 
-> **DO NOT START until Lane A (`feat/tile-identity`) has merged to `main`.** This
-> lane's drop/paste target lives on the tile and would contend with Lane A's
-> `Tile.tsx` rework. Branch this worktree off `main` *after* Lane A lands, so you
-> build on its `Tile.tsx`.
+> **CONFLICT-FREE CONSTRAINT — do NOT edit `Tile.tsx`.** This lane now runs in
+> parallel with Lane A (which owns `Tile.tsx`). The file-drop is a **window-level**
+> Tauri event anyway, so resolve which tile received the drop via the EXISTING
+> `data-tile-id` DOM attributes (the same trick `src/lib/pointerDrag.ts` /
+> `document.elementFromPoint` already uses for tile-drag) — never by editing
+> `Tile.tsx`. Keep all drop/paste logic in `Terminal.tsx` (or a NEW small module)
+> + the backend. If you find yourself needing to touch `Tile.tsx`, STOP and
+> rethink — there's a window-level path that doesn't.
 
 **You are the agent for this lane.** Plan context:
 [../FEATURE-PLAN.md](../FEATURE-PLAN.md). Worktree `…/wt-terminal-input`, branch
