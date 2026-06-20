@@ -19,6 +19,26 @@ function fillColor(left: number): string {
   return "var(--th-dot-live, #34d399)";
 }
 
+/**
+ * The SINGLE source of truth for turning a raw `usedPct` into what the readouts
+ * show: whether the value is `known`, the clamped `used` fill %, the rounded
+ * `left` (remaining) %, and the `color` (by remaining, muted when unknown). Both
+ * the expanded {@link Row} and the collapsed {@link InlinePct} consume this so
+ * the two can never drift on rounding/"remaining vs used" convention.
+ */
+function usageStat(usedPct: number | null): {
+  known: boolean;
+  used: number;
+  left: number | null;
+  color: string;
+} {
+  const known = usedPct != null;
+  const used = known ? Math.max(0, Math.min(100, usedPct)) : 0;
+  const left = known ? Math.max(0, Math.round(100 - used)) : null;
+  const color = known ? fillColor(left!) : "var(--th-fg-muted)";
+  return { known, used, left, color };
+}
+
 /** One usage row: a label, a remaining-% number, and a horizontal BAR whose fill
  *  shows how much is USED (it fills up as you consume), colored by how much is
  *  LEFT. A reset hint sits under it. "—" when the value is unknown. */
@@ -31,14 +51,12 @@ function Row({
   usedPct: number | null;
   resets: string | null;
 }) {
-  const known = usedPct != null;
-  const used = known ? Math.max(0, Math.min(100, usedPct)) : 0;
-  const left = known ? Math.max(0, Math.round(100 - used)) : null;
+  const { known, used, left, color } = usageStat(usedPct);
   return (
     <div className="flex flex-col gap-0.5">
       <div className="flex items-center justify-between gap-2">
         <span className="text-neutral-400">{label}</span>
-        <span className="tabular-nums" style={{ color: known ? fillColor(left!) : "var(--th-fg-muted)" }}>
+        <span className="tabular-nums" style={{ color }}>
           {left != null ? `${left}% left` : "—"}
         </span>
       </div>
@@ -50,7 +68,7 @@ function Row({
       >
         <div
           className="h-full rounded-full transition-[width] duration-300"
-          style={{ width: `${used}%`, backgroundColor: known ? fillColor(left!) : "transparent" }}
+          style={{ width: `${used}%`, backgroundColor: known ? color : "transparent" }}
         />
       </div>
       {resets && (
@@ -91,9 +109,7 @@ function InlinePct({
   usedPct: number | null;
   resets: string | null;
 }) {
-  const known = usedPct != null;
-  const used = known ? Math.max(0, Math.min(100, usedPct)) : 0;
-  const left = known ? Math.max(0, Math.round(100 - used)) : null;
+  const { left, color } = usageStat(usedPct);
   return (
     <span
       className="flex items-center gap-1"
@@ -104,7 +120,7 @@ function InlinePct({
       }
     >
       <span style={{ color: "var(--th-fg-muted)" }}>{label}</span>
-      <span style={{ color: known ? fillColor(left!) : "var(--th-fg-muted)" }}>
+      <span style={{ color }}>
         {left != null ? `${left}%` : "—"}
       </span>
     </span>
