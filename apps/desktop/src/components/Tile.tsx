@@ -38,6 +38,8 @@ import {
 import { useTerminalSlot } from "./TerminalPool";
 import { TilePanel } from "./TilePanel";
 import { ClaudeIcon } from "./ClaudeIcon";
+import { CodexIcon } from "./CodexIcon";
+import { clientForTerminal } from "../store/clientType";
 import { ContextMeter } from "./ContextMeter";
 import { useContextPctForTile, sessionNameForTerminal } from "../store/sessionContext";
 import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
@@ -235,12 +237,17 @@ export function Tile({
   const workspaceColor = useTheme((s) =>
     workspaceTabId ? s.workspaceColors[workspaceTabId] : undefined,
   );
-  // Focused-tile ring color, in priority order (each beats the next):
+  // The tile's IDENTITY color (D1), in priority order (each beats the next):
   //   1. this terminal's own override (the ⋯ menu) — most specific;
   //   2. the owning workspace's color — the per-tab identity cascade;
-  //   3. the global --th-focus-ring token (the blue default).
-  const focusRing =
-    termFocusRing ?? workspaceColor ?? "var(--th-focus-ring)";
+  //   3. none (null) — fall back to the default chrome tokens.
+  // Unlike before (when only the FOCUS RING used it), this now cascades to ALL
+  // of the tile's chrome — header background + border below — for EVERY tile in
+  // the workspace, focused or not, and updates live as the workspace color
+  // changes (both inputs are subscribed via useTheme).
+  const tileColor: string | null = termFocusRing ?? workspaceColor ?? null;
+  // Focused-tile ring: the identity color when present, else the global default.
+  const focusRing = tileColor ?? "var(--th-focus-ring)";
   const effColor = (k: TermColorKey): string =>
     termOverride?.[k] ?? termPalette?.[k] ?? TERM_COLOR_FALLBACK[k];
   const setColor = (k: TermColorKey, value: string): void =>
@@ -296,6 +303,12 @@ export function Tile({
     title: info?.title,
     cwd: info?.cwd,
   });
+  // Which client runs in this tile — Claude / Codex / a plain shell — from the
+  // workspace store (spawn command/title + any live label). Drives the header
+  // client icon below. Recomputed each render; Tile already re-renders when the
+  // terminal record (`info`) or its label (`userLabel`) changes, which is
+  // exactly what clientForTerminal reads, so the icon tracks the client live.
+  const client = clientForTerminal(terminalId);
   const isSelfDragging = draggingTileId === terminalId;
   const isDropTarget = dropTileId === terminalId && draggingTileId !== terminalId;
 
@@ -451,7 +464,11 @@ export function Tile({
           ? "var(--th-accent)"
           : focused
             ? `color-mix(in srgb, ${focusRing} 55%, var(--th-border))`
-            : "var(--th-border)",
+            : tileColor
+              ? // Unfocused but in a colored workspace: a subtle identity tint
+                // (D1) so the color cascades to every tile, not just the focused.
+                `color-mix(in srgb, ${tileColor} 38%, var(--th-border))`
+              : "var(--th-border)",
         boxShadow: isDropTarget
           ? "inset 0 0 0 2px var(--th-accent)"
           : focused
@@ -478,8 +495,16 @@ export function Tile({
         // colors/font live inline here.
         className="th-tile-header relative flex shrink-0 cursor-grab touch-none select-none items-center gap-2 border-b px-2 active:cursor-grabbing"
         style={{
-          backgroundColor: "var(--th-header-bg)",
-          borderColor: "var(--th-border)",
+          // Header chrome carries the workspace/identity color too (D1): a
+          // subtle wash over the header bg + a stronger bottom border, so the
+          // whole tile — not just its focus ring — reads as part of its
+          // workspace. Falls back to the plain tokens when there's no color.
+          backgroundColor: tileColor
+            ? `color-mix(in srgb, ${tileColor} 14%, var(--th-header-bg))`
+            : "var(--th-header-bg)",
+          borderColor: tileColor
+            ? `color-mix(in srgb, ${tileColor} 30%, var(--th-border))`
+            : "var(--th-border)",
           fontSize: "var(--th-font-size)",
         }}
         title={cwd}
@@ -505,19 +530,33 @@ export function Tile({
             {folderName}
           </span>
         )}
-        <span
-          className="inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[0.85em] leading-none"
-          style={{
-            backgroundColor: "color-mix(in srgb, var(--th-accent) 16%, transparent)",
-            color: "var(--th-fg-muted)",
-          }}
-          title="Claude session"
-        >
-          {/* The real Claude brand glyph, tinted Claude's brand clay (#D97757).
-              Replaces the old placeholder "spark" SVG. */}
-          <ClaudeIcon size="1em" className="shrink-0" style={{ color: "#D97757" }} />
-          Claude
-        </span>
+        {/* Client identity glyph (A1/A2/A3): which agent runs in this tile. The
+            old always-on "Claude" TEXT chip over-claimed — a plain shell isn't
+            Claude — so we now DETECT the client (clientForTerminal) and show
+            JUST the matching icon, no word: Claude's clay spark, Codex's blue
+            `>_` mark, or nothing at all for a plain shell. The tooltip names it. */}
+        {client !== "shell" && (
+          <span
+            className="inline-flex shrink-0 items-center justify-center rounded-full p-1 leading-none"
+            style={{
+              backgroundColor:
+                "color-mix(in srgb, var(--th-accent) 16%, transparent)",
+            }}
+            title={client === "claude" ? "Claude" : "Codex"}
+          >
+            {client === "claude" ? (
+              // The real Claude brand glyph, tinted Claude's brand clay (#D97757).
+              <ClaudeIcon
+                size="1.1em"
+                className="shrink-0"
+                style={{ color: "#D97757" }}
+                title="Claude"
+              />
+            ) : (
+              <CodexIcon size="1.1em" className="shrink-0" title="Codex" />
+            )}
+          </span>
+        )}
 
         {/* Editable "what are you working on" name (Feature 1). Click to edit
             inline; Enter commits, Esc cancels. Persisted per-PROJECT (theme store
