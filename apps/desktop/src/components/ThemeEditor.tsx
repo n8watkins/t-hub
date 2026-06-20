@@ -203,12 +203,9 @@ function SectionNav({
     >
       {groups.map((g) => (
         <div key={g.label} className="flex flex-col gap-0.5">
-          <div
-            className="px-2.5 pb-1 text-[10px] font-semibold uppercase tracking-wider"
-            style={{ color: "var(--th-fg-muted)", opacity: 0.7 }}
-          >
-            {g.label}
-          </div>
+          {/* Group label ("App" / "Theme") intentionally omitted — the section
+              buttons below are self-explanatory and the headers just added
+              clutter. The grouping (+ the gap between groups) is kept. */}
           {g.items.map((it) => {
             const isActive = it.id === active;
             return (
