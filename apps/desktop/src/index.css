@@ -37,6 +37,12 @@ body {
  * CHROME_VAR in src/store/theme.ts.
  */
 :root {
+  /* Paint native controls (the <select> option popup, scrollbars) dark by
+     default so the first paint — before the theme store runs applyTheme — isn't
+     a white OS dropdown under near-white option text. applyTheme then sets this
+     per theme (light for Paper, dark otherwise). */
+  color-scheme: dark;
+
   /* Accent + focus */
   --th-accent: #10b981;
   --th-focus-ring: #10b981;

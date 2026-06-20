@@ -90,7 +90,9 @@ export function SpawnMenu({ onClose, onSpawn }: SpawnMenuProps) {
         onClick={(e) => e.stopPropagation()}
         className="absolute bottom-14 right-3 flex w-60 flex-col overflow-hidden rounded-lg border shadow-2xl"
         style={{
-          backgroundColor: "var(--th-header-bg)",
+          // Solid surface so the menu never bleeds the terminal through
+          // (--th-header-bg carries alpha in some themes).
+          backgroundColor: "var(--th-tile-bg)",
           borderColor: "var(--th-border)",
           color: "var(--th-fg)",
           fontFamily: "var(--th-font)",

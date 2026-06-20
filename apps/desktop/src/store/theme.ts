@@ -383,7 +383,7 @@ const NORD: Theme = {
     sidebarBg: "#2e3440",
     titlebarBg: "#3b4252",
     fgPrimary: "#eceff4", // nord6 (snow storm)
-    fgMuted: "#7b88a1", // muted frost/night blend
+    fgMuted: "#a9b3c9", // lightened frost so muted text clears AA on nord1 (was #7b88a1, 2.82:1)
     border: "#434c5e", // nord2
     cornerRadius: 6,
     dotStarting: "#ebcb8b", // aurora yellow
@@ -434,7 +434,7 @@ const SOLARIZED_DARK: Theme = {
     sidebarBg: "#002b36",
     titlebarBg: "#073642",
     fgPrimary: "#93a1a1", // base1
-    fgMuted: "#586e75", // base01
+    fgMuted: "#839496", // base0 — muted text clears AA on base02 (was base01 #586e75, 2.42:1)
     border: "#073642", // base02
     cornerRadius: 4,
     dotStarting: "#b58900", // yellow
@@ -600,10 +600,35 @@ export const DEFAULT_THEME: Theme = MIDNIGHT;
  * Tile mirrors onto data attributes). Idempotent and cheap — safe to call on
  * every token edit from the editor.
  */
+/** True when a hex color reads as a LIGHT surface. Parses #rgb / #rrggbb(/aa)
+ *  (alpha ignored) and thresholds perceptual luminance. */
+function isLightColor(hex: string): boolean {
+  const h = hex.replace("#", "");
+  const full =
+    h.length === 3
+      ? h
+          .split("")
+          .map((ch) => ch + ch)
+          .join("")
+      : h;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  if ([r, g, b].some(Number.isNaN)) return false;
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6;
+}
+
 export function applyTheme(theme: Theme): void {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
   const c = theme.chrome;
+
+  // Tell the engine which scheme to paint NATIVE controls in — the <select>
+  // option popup, scrollbars, etc. Without this, WebView2 draws the native
+  // dropdown list on a WHITE background while our <option> text is near-white,
+  // i.e. unreadable white-on-white in every dark theme. Derive from the app
+  // background's luminance so custom themes are handled too (Paper => light).
+  root.style.colorScheme = isLightColor(c.appBg) ? "light" : "dark";
 
   for (const key of Object.keys(CHROME_VAR) as (keyof ChromeTokens)[]) {
     const varName = CHROME_VAR[key];

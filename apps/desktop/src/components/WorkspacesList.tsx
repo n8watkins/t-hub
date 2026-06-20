@@ -841,7 +841,9 @@ function ColorPicker({
       <div
         className="absolute left-0 top-6 z-50 w-[176px] rounded-md border p-2 shadow-2xl"
         style={{
-          backgroundColor: "var(--th-header-bg)",
+          // Solid surface so the picker never bleeds content through
+          // (--th-header-bg carries alpha in some themes).
+          backgroundColor: "var(--th-tile-bg)",
           borderColor: "var(--th-border)",
           color: "var(--th-fg)",
         }}

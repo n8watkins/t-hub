@@ -827,7 +827,9 @@ function TabColorMenu({
         style={{
           left: x,
           top: y,
-          backgroundColor: "var(--th-header-bg)",
+          // Solid surface so the picker never bleeds content through
+          // (--th-header-bg carries alpha in some themes).
+          backgroundColor: "var(--th-tile-bg)",
           borderColor: "var(--th-border)",
           color: "var(--th-fg)",
         }}

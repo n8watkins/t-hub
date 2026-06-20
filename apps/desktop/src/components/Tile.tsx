@@ -894,7 +894,9 @@ export function Tile({
             style={{
               left: ctxMenu.x,
               top: ctxMenu.y,
-              backgroundColor: "var(--th-header-bg)",
+              // Solid surface (not --th-header-bg's alpha) so this floating menu
+              // never bleeds the terminal canvas through — see the ⋯ popover note.
+              backgroundColor: "var(--th-tile-bg)",
               borderColor: "var(--th-border)",
               color: "var(--th-fg)",
               fontFamily: "var(--th-font)",
