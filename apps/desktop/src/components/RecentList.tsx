@@ -6,13 +6,20 @@
 // session's most-recent message text (`lastText`), and a last-seen time.
 //
 // Per the 2026-06-15 redesign: NO Resume button, NO session dropdown. Each row is
-// one PROJECT (folder) showing the folder name over the latest activity text. On
-// row hover, two understated controls appear on the RIGHT: a → that RESUMES (spawns
-// a terminal in the cwd running `claude --resume <id>`, via onRecall) and an × that
-// HIDES the row from Recent. Hiding is persisted locally and does NOT delete the
-// transcript; a project resurfaces if it later gets a newer session. Fetched on
-// mount + window focus; an IPC failure degrades to a muted empty state.
+// one PROJECT (folder), led by the Claude glyph (these ARE Claude sessions), and
+// shows — so you can RECOGNIZE and recall it — the NAME you gave the work (the
+// per-project work name, joined in frontend-side from the theme store; falls back
+// to the folder name), the WORKTREE/branch context (derived here from the cwd: a
+// `wt-<branch>` worktree segment, else the parent project folder), and the latest
+// activity text. The worktree + name are joined on the FRONTEND so the backend
+// `RecentSession` contract is untouched. On row hover, two understated controls
+// appear on the RIGHT: a → that RESUMES (spawns a terminal in the cwd running
+// `claude --resume <id>`, via onRecall) and an × that HIDES the row from Recent.
+// Hiding is persisted locally and does NOT delete the transcript; a project
+// resurfaces if it later gets a newer session. Fetched on mount + window focus;
+// an IPC failure degrades to a muted empty state.
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { ClaudeIcon } from "./ClaudeIcon";
 import { recentSessions, type RecentSession } from "../ipc/recent";
 import { useTheme } from "../store/theme";
 import { useWorkspace } from "../store/workspace";
@@ -27,6 +34,32 @@ export interface RecentListProps {
 function cwdBasename(cwd: string): string {
   const parts = cwd.replace(/[/\\]+$/, "").split(/[/\\]+/);
   return parts[parts.length - 1] || cwd;
+}
+
+/** Derive the session's WORKTREE / git context from its cwd — purely from the path,
+ *  so no backend change is needed. We surface the worktree DIRECTORY the session
+ *  ran inside, which in this workflow maps 1:1 to the branch it was on:
+ *    - a sibling worktree folder named `wt-<branch>` (the project's convention) is
+ *      the strongest signal — we return its branch part (`wt-terminal-input` →
+ *      `terminal-input`); else
+ *    - the repo/worktree root: the nearest ancestor segment that sits ABOVE the
+ *      cwd basename when the session ran in a subdirectory (e.g. `apps/desktop` →
+ *      `desktop`'s parent project folder), so the row still shows where it lived.
+ *  Returns "" when the path is too shallow to add context beyond the folder name. */
+function cwdWorktree(cwd: string): string {
+  const parts = cwd
+    .replace(/[/\\]+$/, "")
+    .split(/[/\\]+/)
+    .filter(Boolean);
+  // Prefer an explicit `wt-*` worktree segment (the convention in this repo).
+  for (let i = parts.length - 1; i >= 0; i -= 1) {
+    const seg = parts[i];
+    if (/^wt-/.test(seg)) return seg.replace(/^wt-/, "");
+  }
+  // Otherwise, when the session ran in a SUBDIR, surface the parent project folder
+  // so the row still shows the worktree/repo it lived in (not just the leaf dir).
+  if (parts.length >= 2) return parts[parts.length - 2];
+  return "";
 }
 
 /** Compact relative time ("now", "3m", "2h", "5d", "3mo") from epoch SECONDS. */
@@ -81,10 +114,13 @@ function saveCache(list: RecentSession[]): void {
   }
 }
 
-/** One project's row: its most-recent session plus the folder display name. */
+/** One project's row: its most-recent session plus the folder display name and the
+ *  worktree/git context (both derived from the cwd — no backend change needed). */
 interface FolderGroup {
   cwd: string;
   name: string;
+  /** Worktree/branch context derived from the cwd (e.g. `terminal-input`), or "". */
+  worktree: string;
   session: RecentSession;
 }
 
@@ -97,7 +133,12 @@ function groupByFolder(sessions: RecentSession[]): FolderGroup[] {
   for (const s of sessions) {
     if (seen.has(s.cwd)) continue;
     seen.add(s.cwd);
-    out.push({ cwd: s.cwd, name: cwdBasename(s.cwd), session: s });
+    out.push({
+      cwd: s.cwd,
+      name: cwdBasename(s.cwd),
+      worktree: cwdWorktree(s.cwd),
+      session: s,
+    });
   }
   return out;
 }
@@ -197,8 +238,9 @@ export function RecentList({ onRecall }: RecentListProps) {
   );
 }
 
-/** One project row: folder name over the session's latest activity text. On hover,
- *  a → to RESUME and an × to HIDE appear on the right (both understated). */
+/** One project row: a Claude glyph, then the work name (or folder) over a subtitle
+ *  carrying the worktree/branch context + the session's latest activity text. On
+ *  hover, a → to RESUME and an × to HIDE appear on the right (both understated). */
 function ProjectRow({
   group,
   workName,
@@ -224,6 +266,10 @@ function ProjectRow({
   // The named work wins the title; the folder name then moves into the subtitle so
   // it's still visible.
   const title = workName || group.name;
+  // Worktree/branch context (from the cwd). Only show it when it adds signal beyond
+  // what the title already says — i.e. it isn't the same as the folder name shown.
+  const worktree =
+    group.worktree && group.worktree !== group.name ? group.worktree : "";
 
   return (
     <div
@@ -234,6 +280,14 @@ function ProjectRow({
       }}
       title={group.cwd}
     >
+      {/* Claude glyph: marks each row as a recallable Claude session. Tinted with
+          Claude's brand clay; sized to sit beside the row title. */}
+      <ClaudeIcon
+        size={14}
+        className="shrink-0 self-start mt-0.5"
+        style={{ color: "#D97757" }}
+      />
+
       {/* LEFT: work name (or folder) over the session's most-recent text. */}
       <div className="min-w-0 flex-1">
         <div className="truncate text-[13px] font-medium">{title}</div>
@@ -243,6 +297,7 @@ function ProjectRow({
           title={subtitle}
         >
           {workName ? `${group.name} · ` : ""}
+          {worktree ? `⎇ ${worktree} · ` : ""}
           {subtitle}
           {rel ? ` · ${rel}` : ""}
         </div>
