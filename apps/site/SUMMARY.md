@@ -70,7 +70,7 @@ Vercel-deployable. Dark navy + cyan/blue aesthetic matching the n8builds style
 ## How to run
 
 ```bash
-cd /home/natkins/n8builds/termhub-site
+cd /home/natkins/n8builds/tools/t-hub/t-hub-app/apps/site
 npm install
 npm run dev      # http://localhost:3000
 # or
@@ -140,8 +140,8 @@ https://termhub-site.vercel.app.
 
 ## Notes
 
-- The live app at `/home/natkins/n8builds/tools/t-hub` and the Remotion project at
-  `/home/natkins/n8builds/termhub-videos` were **not** touched.
+- The live app at `/home/natkins/n8builds/tools/t-hub/t-hub-app` and the Remotion
+  project at `/home/natkins/n8builds/tools/t-hub/t-hub-videos` were **not** touched.
 - `npm audit` advisories live in the Next.js 14.x framework itself (DoS /
   cache-poisoning classes relevant to self-hosted servers handling untrusted
   traffic — low risk for a static marketing page on Vercel). They only fully clear
