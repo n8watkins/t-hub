@@ -305,9 +305,14 @@ export function Tile({
   });
   // Which client runs in this tile — Claude / Codex / a plain shell — from the
   // workspace store (spawn command/title + any live label). Drives the header
-  // client icon below. Recomputed each render; Tile already re-renders when the
-  // terminal record (`info`) or its label (`userLabel`) changes, which is
-  // exactly what clientForTerminal reads, so the icon tracks the client live.
+  // client icon below. clientForTerminal reads three signals: the terminal
+  // record's title, the merged `labels` entry, and the Claude-suggested title.
+  // `info` + `userLabel` above subscribe to the first two; subscribe to the
+  // third here too, because once a tile has an explicit rename `labels[id]`
+  // stops tracking `claudeTitles[id]` (the rename wins in the merge), so without
+  // this the icon could miss a late Claude title. With it, the icon re-renders
+  // on any signal clientForTerminal reads and never goes stale.
+  useWorkspace((s) => s.claudeTitles[terminalId]);
   const client = clientForTerminal(terminalId);
   const isSelfDragging = draggingTileId === terminalId;
   const isDropTarget = dropTileId === terminalId && draggingTileId !== terminalId;
