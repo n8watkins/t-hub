@@ -126,102 +126,106 @@ export function WorkspacesList() {
   const workspaceRowAt = (x: number, y: number): string | null =>
     resolveDropTarget(x, y, ["[data-th-ws-row]"])?.value ?? null;
 
-  // `onSettled(committed)` lets the source row neutralize the synthetic click
-  // that can follow a committed drag, so a drag never doubles as a select.
-  const startTerminalDrag = (
-    id: TerminalId,
+  // Shared pointer-drag spine for BOTH sidebar drags (a terminal row into a
+  // workspace, and a workspace row reorder). It owns the parts both gestures had
+  // copied verbatim: the left-button guard, the floating ghost lifecycle, the
+  // drag controller (which owns the `data-th-dragging` body flag), the canceller
+  // stash (so the unmount cleanup above can abort a live drag, #3), the
+  // `data-th-ws-row` drop-target resolution on move/end, and the `onSettled`
+  // click-suppression. Each caller supplies only what differs: the ghost label,
+  // its drag/drop state setters, and the commit. `onSettled(committed)` lets the
+  // source neutralize the synthetic click that trails a committed drag.
+  const startSidebarDrag = (
     e: ReactPointerEvent,
-    onSettled?: (committed: boolean) => void,
+    cancelRef: React.MutableRefObject<PointerDragCanceller | null>,
+    opts: {
+      threshold?: number;
+      ghostTitle: string;
+      onBegin?: () => void;
+      setDropTarget: (target: string | null) => void;
+      onEnd?: () => void;
+      commit: (target: string) => void;
+      onSettled?: (committed: boolean) => void;
+    },
   ) => {
     if (e.button !== 0) return; // primary (left) button only
     let ghost: DragGhost | null = null;
-    // The drag controller now OWNS the `data-th-dragging` body flag
-    // (manageBodyDragFlag), so this handler no longer sets/clears it by hand; the
-    // stashed canceller lets the unmount cleanup above abort a live drag (#3).
-    dragCancelRef.current = startPointerDrag(e.clientX, e.clientY, {
+    cancelRef.current = startPointerDrag(e.clientX, e.clientY, {
       manageBodyDragFlag: true,
+      threshold: opts.threshold,
       onBegin: () => {
-        // The source workspace is fixed for the whole gesture — resolve it once.
-        sourceTabRef.current =
-          tabs.find((t) => t.order.includes(id))?.id ?? null;
-        setDragTerminalId(id);
-        // Mark the terminal as dragged app-wide so its canvas tile dims too.
-        setDraggingTile(id);
-        ghost = createDragGhost({
-          title: deriveLabel({
-            id,
-            label: labels[id],
-            title: terminals[id]?.title,
-            cwd: terminals[id]?.cwd,
-          }),
-          width: 200,
-        });
+        opts.onBegin?.();
+        ghost = createDragGhost({ title: opts.ghostTitle, width: 200 });
       },
       onMove: (x, y) => {
         ghost?.move(x, y);
-        setDropTabId(workspaceRowAt(x, y));
-      },
-      onEnd: (x, y, committed) => {
-        const targetTab = committed ? workspaceRowAt(x, y) : null;
-        ghost?.destroy();
-        ghost = null;
-        dragCancelRef.current = null;
-        setDraggingTile(null);
-        setDragTerminalId(null);
-        setDropTabId(null);
-        sourceTabRef.current = null;
-        // Tell the source row whether a drag actually happened (suppress its
-        // trailing click) BEFORE the browser dispatches that click.
-        onSettled?.(committed);
-        // moveTileToTab no-ops on same/unknown tab, so an in-place drop is safe.
-        if (targetTab) moveTileToTab(id, targetTab);
-      },
-    });
-  };
-
-  // Begin dragging a WHOLE workspace row to reorder it. Same pointer-drag spine
-  // as the terminal-row drag; the drop target is the workspace row under the
-  // pointer (resolved off `data-th-ws-row`). `onSettled(committed)` lets the row
-  // suppress the synthetic click that trails a committed drag (so a reorder never
-  // also switches to that workspace).
-  const startWorkspaceDrag = (
-    id: string,
-    e: ReactPointerEvent,
-    onSettled?: (committed: boolean) => void,
-  ) => {
-    if (e.button !== 0) return; // primary (left) button only
-    let ghost: DragGhost | null = null;
-    wsDragCancelRef.current = startPointerDrag(e.clientX, e.clientY, {
-      manageBodyDragFlag: true,
-      // The workspace name is BOTH the reorder drag handle and the
-      // double-click-to-rename target, so use a larger move threshold than the
-      // default (4px): a quick double-click that drifts a few px must NOT begin a
-      // reorder. A deliberate drag easily clears this.
-      threshold: 10,
-      onBegin: () => {
-        setDragWsId(id);
-        ghost = createDragGhost({
-          title: tabs.find((t) => t.id === id)?.name ?? "Workspace",
-          width: 200,
-        });
-      },
-      onMove: (x, y) => {
-        ghost?.move(x, y);
-        setWsDropTabId(workspaceRowAt(x, y));
+        opts.setDropTarget(workspaceRowAt(x, y));
       },
       onEnd: (x, y, committed) => {
         const target = committed ? workspaceRowAt(x, y) : null;
         ghost?.destroy();
         ghost = null;
-        wsDragCancelRef.current = null;
-        setDragWsId(null);
-        setWsDropTabId(null);
-        onSettled?.(committed);
-        // moveTab no-ops on same/unknown id, so an in-place drop is safe.
-        if (target && target !== id) moveTab(id, target);
+        cancelRef.current = null;
+        opts.onEnd?.();
+        opts.setDropTarget(null);
+        // Tell the source whether a drag happened (suppress its trailing click)
+        // BEFORE the browser dispatches that click, then commit.
+        opts.onSettled?.(committed);
+        if (target) opts.commit(target);
       },
     });
   };
+
+  const startTerminalDrag = (
+    id: TerminalId,
+    e: ReactPointerEvent,
+    onSettled?: (committed: boolean) => void,
+  ) =>
+    startSidebarDrag(e, dragCancelRef, {
+      ghostTitle: deriveLabel({
+        id,
+        label: labels[id],
+        title: terminals[id]?.title,
+        cwd: terminals[id]?.cwd,
+      }),
+      onBegin: () => {
+        // The source workspace is fixed for the whole gesture — resolve it once.
+        sourceTabRef.current = tabs.find((t) => t.order.includes(id))?.id ?? null;
+        setDragTerminalId(id);
+        // Mark the terminal as dragged app-wide so its canvas tile dims too.
+        setDraggingTile(id);
+      },
+      setDropTarget: setDropTabId,
+      onEnd: () => {
+        setDraggingTile(null);
+        setDragTerminalId(null);
+        sourceTabRef.current = null;
+      },
+      // moveTileToTab no-ops on same/unknown tab, so an in-place drop is safe.
+      commit: (target) => moveTileToTab(id, target),
+      onSettled,
+    });
+
+  // Reorder a WHOLE workspace row. Larger threshold (10px vs default 4) because
+  // the workspace name is BOTH the drag handle and the double-click-to-rename
+  // target — a quick double-click that drifts must NOT begin a reorder.
+  const startWorkspaceDrag = (
+    id: string,
+    e: ReactPointerEvent,
+    onSettled?: (committed: boolean) => void,
+  ) =>
+    startSidebarDrag(e, wsDragCancelRef, {
+      threshold: 10,
+      ghostTitle: tabs.find((t) => t.id === id)?.name ?? "Workspace",
+      onBegin: () => setDragWsId(id),
+      setDropTarget: setWsDropTabId,
+      onEnd: () => setDragWsId(null),
+      // moveTab no-ops on same/unknown id, so an in-place drop is safe.
+      commit: (target) => {
+        if (target !== id) moveTab(id, target);
+      },
+      onSettled,
+    });
 
   if (tabs.length === 0) {
     return (

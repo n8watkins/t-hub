@@ -25,6 +25,11 @@ interface SupervisionState {
   statuses: Record<string, SessionStatus>;
   /** Latest statusline snapshot per session id (context %, cost, rate limits). */
   snapshots: Record<string, StatusSnapshot>;
+  /** Reverse index: tmux session name (`th_<id>`) -> the session id of the LATEST
+   *  snapshot that reported it. Lets a tile/sidebar row resolve its session in
+   *  O(1) (tmuxSessionMidTurn) instead of scanning every snapshot on each
+   *  supervision event — it's read per tile AND per sidebar terminal row. */
+  sessionIdByTmux: Record<string, string>;
 
   /** Replace/insert a tree snapshot (from supervision:// event or a pull). */
   setTree: (tree: SupervisionTree) => void;
@@ -42,6 +47,7 @@ export const useSupervision = create<SupervisionState>((set) => ({
   trees: {},
   statuses: {},
   snapshots: {},
+  sessionIdByTmux: {},
 
   setTree: (tree) =>
     set((s) => ({
@@ -81,7 +87,14 @@ export const useSupervision = create<SupervisionState>((set) => ({
         "usage",
         `setSnapshot ${snap.sessionId} ctx=${snap.contextUsedPct ?? "-"} cost=${snap.costUsd ?? "-"} rl5h=${snap.fiveHour?.usedPercentage ?? "-"}`,
       );
-      return { snapshots: { ...s.snapshots, [snap.sessionId]: snap } };
+      return {
+        snapshots: { ...s.snapshots, [snap.sessionId]: snap },
+        // Keep the tmux->session index current (latest snapshot wins). Only when
+        // the snapshot carries its owning tmux session (un-upgraded agents omit it).
+        sessionIdByTmux: snap.tmuxSession
+          ? { ...s.sessionIdByTmux, [snap.tmuxSession]: snap.sessionId }
+          : s.sessionIdByTmux,
+      };
     }),
 
   remove: (sessionId) =>
@@ -92,7 +105,12 @@ export const useSupervision = create<SupervisionState>((set) => ({
       delete trees[sessionId];
       delete statuses[sessionId];
       delete snapshots[sessionId];
-      return { trees, statuses, snapshots };
+      // Drop any tmux->session index entries that pointed at the removed session.
+      const sessionIdByTmux = { ...s.sessionIdByTmux };
+      for (const [k, v] of Object.entries(sessionIdByTmux)) {
+        if (v === sessionId) delete sessionIdByTmux[k];
+      }
+      return { trees, statuses, snapshots, sessionIdByTmux };
     }),
 }));
 
@@ -114,17 +132,14 @@ const ACTIVE_TURN: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
  * the session is idle).
  */
 export function tmuxSessionMidTurn(
-  state: Pick<SupervisionState, "statuses" | "snapshots">,
+  state: Pick<SupervisionState, "statuses" | "sessionIdByTmux">,
   tmuxSession: string,
 ): boolean {
   if (!tmuxSession) return false;
-  for (const snap of Object.values(state.snapshots)) {
-    if (snap.tmuxSession === tmuxSession) {
-      const st = state.statuses[snap.sessionId];
-      return st !== undefined && ACTIVE_TURN.has(st);
-    }
-  }
-  return false;
+  const sessionId = state.sessionIdByTmux[tmuxSession];
+  if (sessionId === undefined) return false;
+  const st = state.statuses[sessionId];
+  return st !== undefined && ACTIVE_TURN.has(st);
 }
 
 /**
