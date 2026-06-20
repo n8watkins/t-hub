@@ -49,8 +49,11 @@ export function WorkspacesList() {
   const renameTab = useWorkspace((s) => s.renameTab);
   const deleteTerminal = useWorkspace((s) => s.deleteTerminal);
   // Moving a terminal into another workspace by dragging its row (D2) reuses the
-  // same store action the tile-header drag uses.
+  // same store action the tile-header drag uses. setDraggingTile marks the
+  // terminal as "being dragged" app-wide so its CANVAS tile dims too (the same
+  // affordance a tile-header drag gives), keeping the two entry points consistent.
   const moveTileToTab = useWorkspace((s) => s.moveTileToTab);
+  const setDraggingTile = useWorkspace((s) => s.setDraggingTile);
   // Per-workspace color identity (feat/workspace-colors): the dot + a quick color
   // picker live on each workspace row. Read from the theme store (mirrors the
   // per-terminal override slots).
@@ -74,11 +77,9 @@ export function WorkspacesList() {
   const [dragTerminalId, setDragTerminalId] = useState<TerminalId | null>(null);
   const [dropTabId, setDropTabId] = useState<string | null>(null);
   // The workspace the dragged terminal currently lives in — so we never flag its
-  // OWN workspace as a (no-op) drop target.
-  const sourceTabId =
-    dragTerminalId != null
-      ? tabs.find((t) => t.order.includes(dragTerminalId))?.id ?? null
-      : null;
+  // OWN workspace as a (no-op) drop target. Captured ONCE when the drag begins
+  // (it can't change mid-gesture), not re-derived on every move-driven re-render.
+  const sourceTabRef = useRef<string | null>(null);
 
   // Resolve which workspace row sits under a viewport point. Terminals are made
   // pointer-inert during the drag (data-th-dragging), so elementFromPoint lands
@@ -89,12 +90,23 @@ export function WorkspacesList() {
     return row?.getAttribute("data-th-ws-row") ?? null;
   };
 
-  const startTerminalDrag = (id: TerminalId, e: ReactPointerEvent) => {
+  // `onSettled(committed)` lets the source row neutralize the synthetic click
+  // that can follow a committed drag, so a drag never doubles as a select.
+  const startTerminalDrag = (
+    id: TerminalId,
+    e: ReactPointerEvent,
+    onSettled?: (committed: boolean) => void,
+  ) => {
     if (e.button !== 0) return; // primary (left) button only
     let ghost: DragGhost | null = null;
     startPointerDrag(e.clientX, e.clientY, {
       onBegin: () => {
+        // The source workspace is fixed for the whole gesture — resolve it once.
+        sourceTabRef.current =
+          tabs.find((t) => t.order.includes(id))?.id ?? null;
         setDragTerminalId(id);
+        // Mark the terminal as dragged app-wide so its canvas tile dims too.
+        setDraggingTile(id);
         // Make terminals pointer-inert so the gesture tracks over them and
         // elementFromPoint resolves to sidebar rows, not xterm canvases.
         document.body.dataset.thDragging = "1";
@@ -117,8 +129,13 @@ export function WorkspacesList() {
         ghost?.destroy();
         ghost = null;
         delete document.body.dataset.thDragging;
+        setDraggingTile(null);
         setDragTerminalId(null);
         setDropTabId(null);
+        sourceTabRef.current = null;
+        // Tell the source row whether a drag actually happened (suppress its
+        // trailing click) BEFORE the browser dispatches that click.
+        onSettled?.(committed);
         // moveTileToTab no-ops on same/unknown tab, so an in-place drop is safe.
         if (targetTab) moveTileToTab(id, targetTab);
       },
@@ -153,7 +170,7 @@ export function WorkspacesList() {
           isDropTarget={
             dragTerminalId != null &&
             dropTabId === tab.id &&
-            tab.id !== sourceTabId
+            tab.id !== sourceTabRef.current
           }
           draggingTerminalId={dragTerminalId}
           onTerminalDragStart={startTerminalDrag}
@@ -215,8 +232,14 @@ function WorkspaceRow({
   isDropTarget: boolean;
   /** The terminal currently being dragged (its row dims), or null. */
   draggingTerminalId: TerminalId | null;
-  /** Begin dragging one of this row's terminals into another workspace. */
-  onTerminalDragStart: (id: TerminalId, e: ReactPointerEvent) => void;
+  /** Begin dragging one of this row's terminals into another workspace.
+   *  `onSettled(committed)` fires on release so the row can suppress the click
+   *  that may trail a committed drag. */
+  onTerminalDragStart: (
+    id: TerminalId,
+    e: ReactPointerEvent,
+    onSettled?: (committed: boolean) => void,
+  ) => void;
   onToggle: () => void;
   onActivate: () => void;
   onRename: (name: string) => void;
@@ -432,7 +455,11 @@ function TerminalRow({
   /** True while THIS terminal is the one being dragged (the row dims). */
   dragging: boolean;
   /** Begin a pointer-drag of this terminal into another workspace (D2). */
-  onDragStart: (id: TerminalId, e: ReactPointerEvent) => void;
+  onDragStart: (
+    id: TerminalId,
+    e: ReactPointerEvent,
+    onSettled?: (committed: boolean) => void,
+  ) => void;
   onClick: () => void;
   onClose: () => void;
 }) {
@@ -447,6 +474,12 @@ function TerminalRow({
   // The user's cosmetic "work name" for this project (keyed by cwd) — shown as the
   // primary line when set, with the derived command·dir label as a muted subtitle.
   const workName = useTheme((s) => (cwd ? s.workNames[cwd] : undefined));
+
+  // A committed drag (pointerup after crossing the move threshold) can be
+  // followed by a synthetic click on this button; this ref lets us swallow that
+  // one click so a drag never also selects. Cleared at the start of every press,
+  // so it can't leak into a later, genuine click.
+  const suppressClickRef = useRef(false);
   return (
     <li
       className="group flex items-center gap-2 rounded-lg pr-1 transition-colors hover:bg-neutral-800/40"
@@ -465,12 +498,27 @@ function TerminalRow({
     >
       <button
         type="button"
-        onClick={onClick}
+        onClick={() => {
+          // Swallow exactly the click that trails a committed drag; a plain
+          // click (or keyboard activation) selects as normal.
+          if (suppressClickRef.current) {
+            suppressClickRef.current = false;
+            return;
+          }
+          onClick();
+        }}
         // Press-and-drag this row to move the terminal into another workspace
         // (D2). A plain click (no movement past the threshold) still selects it.
-        onPointerDown={(e) => onDragStart(id, e)}
+        // touch-none/select-none keep touch/pen + text selection from stealing
+        // the gesture, matching the tile-header drag handle.
+        onPointerDown={(e) => {
+          suppressClickRef.current = false;
+          onDragStart(id, e, (committed) => {
+            suppressClickRef.current = committed;
+          });
+        }}
         aria-current={active ? "true" : undefined}
-        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-1.5 pl-2.5 text-left text-sm"
+        className="flex min-w-0 flex-1 cursor-pointer touch-none select-none items-center gap-2 py-1.5 pl-2.5 text-left text-sm"
         title={cwd ? `${label} — ${cwd} (${state})` : `${label} — ${state}`}
       >
         <span
