@@ -24,6 +24,9 @@ import type { WorkspaceTab } from "../store/workspace";
 import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
 import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
 import { sessionNameForTerminal } from "../store/sessionContext";
+import { clientForTerminal } from "../store/clientType";
+import { ClaudeIcon } from "./ClaudeIcon";
+import { CodexIcon } from "./CodexIcon";
 import type { TerminalId, TerminalInfo, TerminalState } from "../ipc/types";
 import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
 import { resolveDropTarget } from "../lib/dropTarget";
@@ -660,6 +663,9 @@ function TerminalRow({
   const working = useSupervision((s) =>
     tmuxSessionMidTurn(s, sessionNameForTerminal(id)),
   );
+  // Which agent runs here (claude/codex/shell) — drives the leading icon so the
+  // sidebar row reads as the AGENT, not just a generic dot.
+  const client = clientForTerminal(id);
   const label = deriveLabel({
     id,
     label: userLabel,
@@ -728,6 +734,18 @@ function TerminalRow({
         className="flex min-w-0 flex-1 cursor-pointer touch-none select-none items-center gap-2 py-1.5 pl-2.5 text-left text-sm"
         title={cwd ? `${label} — ${cwd} (${state})` : `${label} — ${state}`}
       >
+        {/* Agent icon (claude/codex) so the row reads as the agent at a glance;
+            plain shells show no icon (just the dot). */}
+        {client === "claude" ? (
+          <ClaudeIcon
+            size={14}
+            className="shrink-0"
+            style={{ color: "#D97757" }}
+            title="Claude"
+          />
+        ) : client === "codex" ? (
+          <CodexIcon size={14} className="shrink-0" title="Codex" />
+        ) : null}
         <span
           // ACTIVITY: pulse while the bound session is mid-turn; static when idle.
           className={`h-2 w-2 shrink-0 rounded-full${working ? " animate-pulse" : ""}`}
