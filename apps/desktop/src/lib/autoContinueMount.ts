@@ -160,6 +160,14 @@ function installAutoContinue(): void {
   // to be frequent enough to NOTICE a Codex session ran out. Adopt only good
   // readings (keep last-known on a failed poll), like the sidebar usage strip.
   const pollCodex = (): void => {
+    // Only hit the (file-reading) codex_usage command when at least one opted-in
+    // terminal is actually a Codex tile — no point polling when the feature isn't
+    // armed for any Codex session.
+    const enabled = useAutoContinue.getState().enabled;
+    const anyCodex = Object.keys(enabled).some(
+      (id) => clientForTerminal(id) === "codex",
+    );
+    if (!anyCodex) return;
     void codexUsage()
       .then((u) => {
         if (u && u.ok) {
