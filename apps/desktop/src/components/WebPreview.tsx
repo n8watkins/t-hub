@@ -1,6 +1,8 @@
-// WebPreview — an in-overlay webpage viewer. A URL bar (defaulting to a local
-// dev server) drives an <iframe>; the main use case is previewing a localhost
-// dev server next to your terminals without leaving TermHub.
+// WebPreview — an in-overlay webpage viewer. A URL bar drives an <iframe>; the
+// main use case is previewing a localhost dev server next to your terminals
+// without leaving TermHub. With NO URL yet (nothing detected / typed / fed from
+// the Dev runner) it sits on a helpful empty state instead of pointing the
+// iframe at a dead default address — see the empty-body branch below.
 //
 // Framing reality: many production sites refuse to be embedded via
 // `X-Frame-Options: DENY/SAMEORIGIN` or a `frame-ancestors` CSP. The browser
@@ -46,8 +48,10 @@ async function openExternal(url: string): Promise<void> {
   }
 }
 
-/** Default URL — the conventional local dev server. */
-const DEFAULT_URL = "http://localhost:3000";
+/** Placeholder shown in the empty URL bar — the conventional local dev server.
+ *  This is ONLY a hint/quick-fill: it is never auto-loaded (see the empty-state
+ *  branch), so a tile with nothing running doesn't flash a connection error. */
+const URL_PLACEHOLDER = "http://localhost:3000";
 
 /** How long to wait for a `load` before assuming the site refused framing. A
  *  localhost page resolves in well under this; the watchdog is only the safety
@@ -67,7 +71,9 @@ type LoadState =
   | { status: "error" };
 
 export interface WebPreviewProps {
-  /** Optional starting URL (defaults to the local dev server). */
+  /** Optional starting URL (the Dev runner's detected URL, or the user's last
+   *  Preview URL). Absent/empty => no auto-load; we show the empty state with
+   *  the URL bar still available rather than loading a dead default address. */
   initialUrl?: string;
   /** localhost URLs scraped from the tile's terminal output (newest-first).
    *  Rendered as one-click chips under the URL bar; clicking one navigates. */
@@ -75,7 +81,7 @@ export interface WebPreviewProps {
 }
 
 export function WebPreview({
-  initialUrl = DEFAULT_URL,
+  initialUrl = "",
   detectedUrls = [],
 }: WebPreviewProps): ReactElement {
   // `url` is the committed (submitted) address driving the iframe; `draft` is
@@ -138,11 +144,11 @@ export function WebPreview({
   }, [initialUrl, navigate, url]);
 
   // Seed the preview from the newest DETECTED URL, but only as a last resort:
-  // when no real dev-server URL was ever passed in (so the bar is still sitting
-  // on the untouched DEFAULT_URL) and the user hasn't navigated. This makes the
-  // first localhost URL a terminal prints auto-load, without ever clobbering a
-  // URL the user typed/is viewing — once `url` diverges from the adopted initial
-  // value the guard below is false forever, and this is one-shot regardless.
+  // when no real dev-server URL was ever passed in (so the committed `url` is
+  // still the untouched empty initial) and the user hasn't navigated. This makes
+  // the first localhost URL a terminal prints auto-load, without ever clobbering
+  // a URL the user typed/is viewing — once `url` diverges from the adopted
+  // initial value the guard below is false forever, and this is one-shot anyway.
   const detectedSeededRef = useRef(false);
   const newestDetected = detectedUrls[0];
   useEffect(() => {
@@ -251,7 +257,7 @@ export function WebPreview({
         <input
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          placeholder="http://localhost:3000"
+          placeholder={URL_PLACEHOLDER}
           spellCheck={false}
           autoCorrect="off"
           autoCapitalize="off"
@@ -376,11 +382,21 @@ export function WebPreview({
             onError={() => setLoad({ status: "error" })}
           />
         ) : (
+          // Empty state: no URL detected / typed / fed from the Dev runner yet.
+          // We deliberately do NOT load a dead default address (which would flash
+          // a connection error) — instead point the user at the Dev tab or the
+          // URL bar above, both of which set a real URL when ready.
           <div
-            className="flex h-full items-center justify-center text-sm"
+            className="flex h-full flex-col items-center justify-center gap-1.5 px-8 text-center"
             style={{ color: "var(--th-fg-muted)" }}
           >
-            Enter a URL to preview.
+            <div className="text-sm font-medium" style={{ color: "var(--th-fg)" }}>
+              Nothing to preview yet
+            </div>
+            <div className="max-w-xs text-xs leading-relaxed">
+              Start a dev server (the <span className="font-medium">Dev</span>{" "}
+              tab) or enter a URL above to preview it here.
+            </div>
           </div>
         )}
 

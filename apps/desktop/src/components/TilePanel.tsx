@@ -1,21 +1,23 @@
 // TilePanel — the per-tile body SWITCHER for the non-terminal views.
 //
 // A project tile (Tile.tsx) is a little workbench with a Terminal / Files /
-// Preview tab bar. The Terminal view is special: its xterm is NOT a child
+// Preview / Dev tab bar. The Terminal view is special: its xterm is NOT a child
 // of the tile — the persistent pool (TerminalPool.tsx) renders each terminal
 // once in an overlay and positions it over the tile's empty placeholder, so a
-// move/resize never reloads it. The OTHER two views are ordinary React
+// move/resize never reloads it. The OTHER three views are ordinary React
 // surfaces that DO live inside the tile body; this component renders whichever
 // one the tile's `usePanels` tab selects.
 //
 // Mounting contract:
 //   - files   -> <FilePanel root={cwd} />            (this project's tree/reader)
 //   - preview -> <WebPreview initialUrl={devUrl ?? previewUrl} />
-//                 The Preview tab prefers the LIVE dev-server URL fed from
-//                 terminal-output detection (usePanels.devUrl), falling back to a
-//                 URL the user last committed in the bar (usePanels.previewUrl).
-//                 WebPreview follows a changing `initialUrl` (see its initialUrl
-//                 effect), so a freshly-detected dev server loads automatically.
+//                 The Preview tab prefers the LIVE dev-server URL the Dev runner
+//                 publishes (usePanels.devUrl), falling back to a URL the user
+//                 last committed in the bar (usePanels.previewUrl). WebPreview
+//                 follows a changing `initialUrl` (see its initialUrl effect), so
+//                 a freshly-started dev server loads automatically.
+//   - dev     -> <DevTab terminalId cwd/>            (the managed dev runner; it
+//                 publishes setDevUrl, which the Preview branch above consumes)
 //
 // Tile.tsx only renders TilePanel when the active tab is NOT "terminal" (for the
 // terminal tab it renders the pool placeholder instead), so this component never
@@ -25,6 +27,7 @@ import type { TerminalId } from "../ipc/types";
 import { usePanels, type PanelTab } from "../store/panels";
 import { FilePanel } from "./FilePanel";
 import { WebPreview } from "./WebPreview";
+import { DevTab } from "./DevTab";
 
 export interface TilePanelProps {
   /** The terminal/project this tile belongs to (keys all per-tile panel state). */
@@ -69,5 +72,10 @@ export function TilePanel({
           detectedUrls={detectedUrls}
         />
       );
+    case "dev":
+      // The managed dev runner. It publishes the detected server URL via
+      // usePanels.setDevUrl, which the Preview branch above reads as its
+      // initialUrl — so starting a server here auto-loads it in Preview.
+      return <DevTab terminalId={terminalId} cwd={cwd} />;
   }
 }

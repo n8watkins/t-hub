@@ -1,7 +1,7 @@
 // Per-project panel state — the per-tile "workbench".
 //
-// Each project tile shows ONE of several views — Terminal / Files / Preview —
-// plus a fullscreen toggle. This store holds that purely-presentational,
+// Each project tile shows ONE of several views — Terminal / Files / Preview /
+// Dev — plus a fullscreen toggle. This store holds that purely-presentational,
 // per-terminal UI state. It is deliberately kept OUT of the workspace store so
 // the parallel panel work doesn't contend on workspace.ts.
 // In-memory only for v1 (not persisted): a fresh launch starts every tile on its
@@ -10,15 +10,15 @@
 // CROSS-FEATURE CONTRACT (scaffolded for the parallel build — multiple
 // components import this; don't reshape it lightly):
 //   - The per-tile panel (Tile/TilePanel) reads/sets `tab` + `fullscreenId`.
-//   - The Preview tab reads `devUrl[id]` (falling back to the user-typed
-//     `previewUrl[id]`), so a freshly-detected dev server loads automatically.
-//     `setDevUrl` remains for the terminal output URL-detection path.
+//   - The Dev tab (DevTab) runs the project's dev server and publishes its
+//     URL via `setDevUrl`; the Preview tab reads `devUrl[id]` (falling back to
+//     the user-typed `previewUrl[id]`), so a freshly-started dev server loads
+//     automatically.
 import { create } from "zustand";
 import type { TerminalId } from "../ipc/types";
 
-/** The selectable views inside a project tile. (The "dev" view was removed; a
- *  persisted tab of "dev" falls back to "terminal" — see setTab/getTab.) */
-export type PanelTab = "terminal" | "files" | "preview";
+/** The selectable views inside a project tile. */
+export type PanelTab = "terminal" | "files" | "preview" | "dev";
 
 /** The view a tile shows until the user switches it. */
 export const DEFAULT_PANEL_TAB: PanelTab = "terminal";

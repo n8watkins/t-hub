@@ -2,6 +2,11 @@
 // (CC0 — https://simpleicons.org). Monochrome path drawn with `currentColor`, so
 // callers control the color (we tint it Claude's brand clay #D97757 in the tile
 // header). Claude brand hex: #D97757.
+//
+// Just the bare glyph — NO circular background / badge: the <svg> has a
+// transparent background and draws only the spark path, so it sits cleanly on
+// whatever surface the caller places it over (the tile header no longer wraps it
+// in an accent-tinted circle). The size/className/style/title API is unchanged.
 import type { CSSProperties } from "react";
 
 interface ClaudeIconProps {

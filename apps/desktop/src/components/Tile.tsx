@@ -81,13 +81,13 @@ function useGitInfo(cwd: string): GitInfo | null {
   return info;
 }
 
-/** The tile-header tab bar order + labels. Terminal is the default view. (The
- *  "Dev" view was removed; its pop-out / open-externally actions now live as
- *  icon buttons inside the Preview view's toolbar.) */
+/** The tile-header tab bar order + labels. Terminal is the default view. The
+ *  Dev view runs the project's dev server and feeds its URL to Preview. */
 const PANEL_TABS: { id: PanelTab; label: string }[] = [
   { id: "terminal", label: "Terminal" },
   { id: "files", label: "Files" },
   { id: "preview", label: "Preview" },
+  { id: "dev", label: "Dev" },
 ];
 
 /** Terminal-palette keys editable from the per-tile ⋯ color menu. */
@@ -223,15 +223,17 @@ export function Tile({
   const busy =
     (typeof devUrl === "string" && devUrl.length > 0) || claudeMidTurn;
 
-  // Per-tile panel state (the Terminal / Files / Preview workbench). Kept in
-  // usePanels — NOT workspace.ts — so this presentational state doesn't contend
-  // with the workspace store. The active tab decides whether the body shows the
-  // pooled terminal (terminal) or an in-tile surface (files/preview); fullscreen
-  // blows this one tile up to fill the window. A stale "dev" view (the removed
-  // tab) falls back to "terminal".
+  // Per-tile panel state (the Terminal / Files / Preview / Dev workbench). Kept
+  // in usePanels — NOT workspace.ts — so this presentational state doesn't
+  // contend with the workspace store. The active tab decides whether the body
+  // shows the pooled terminal (terminal) or an in-tile surface (files/preview/
+  // dev); fullscreen blows this one tile up to fill the window. Any unknown
+  // value (e.g. a tab dropped in a past build) falls back to "terminal".
   const rawTab = usePanels((s) => s.tab[terminalId]);
   const activeTab: PanelTab =
-    rawTab === "files" || rawTab === "preview" ? rawTab : "terminal";
+    rawTab === "files" || rawTab === "preview" || rawTab === "dev"
+      ? rawTab
+      : "terminal";
   const setTab = usePanels((s) => s.setTab);
   const toggleFullscreen = usePanels((s) => s.toggleFullscreen);
   const isFullscreen = usePanels((s) => s.fullscreenId === terminalId);
@@ -551,43 +553,22 @@ export function Tile({
         }}
         title={cwd}
       >
-        <span
-          // Lifecycle dot, intentionally small/low-key (#5) so it no longer
-          // reads as a "selected" marker; hover for the exact state.
-          className="h-1.5 w-1.5 shrink-0 rounded-full"
-          style={{ backgroundColor: DOT_VAR[state] }}
-          aria-label={state}
-          title={`Terminal state: ${state}`}
-        />
-        {/* Folder name + the "Claude" client chip (Feature 1). The path display
-            is gone — the folder basename is enough to place the work, and the
-            chip marks this as a Claude session. The full cwd stays in the header
-            tooltip (the header's `title={cwd}`). */}
-        {folderName && (
-          <span
-            className="shrink-0 truncate"
-            style={{ color: "var(--th-fg)", fontSize: "1.05em" }}
-            title={cwd || undefined}
-          >
-            {folderName}
-          </span>
-        )}
-        {/* Client identity glyph (A1/A2/A3): which agent runs in this tile. The
-            old always-on "Claude" TEXT chip over-claimed — a plain shell isn't
-            Claude — so we now DETECT the client (clientForTerminal) and show
-            JUST the matching icon, no word: Claude's clay spark, Codex's blue
-            `>_` mark, or nothing at all for a plain shell. The tooltip names it. */}
+        {/* Client identity glyph (A1/A2/A3): which agent runs in this tile,
+            pinned as far LEFT as possible — the FIRST item in the header row,
+            ahead of the lifecycle dot, folder name and other chrome. The old
+            always-on "Claude" TEXT chip over-claimed — a plain shell isn't
+            Claude — so we DETECT the client (clientForTerminal) and show JUST
+            the matching icon, no word and no circular badge: Claude's clay
+            spark, Codex's blue `>_` mark, or nothing for a plain shell. The
+            tooltip names it. */}
         {client !== "shell" && (
           <span
-            className="inline-flex shrink-0 items-center justify-center rounded-full p-1 leading-none"
-            style={{
-              backgroundColor:
-                "color-mix(in srgb, var(--th-accent) 16%, transparent)",
-            }}
+            className="inline-flex shrink-0 items-center justify-center leading-none"
             title={client === "claude" ? "Claude" : "Codex"}
           >
             {client === "claude" ? (
-              // The real Claude brand glyph, tinted Claude's brand clay (#D97757).
+              // The real Claude brand glyph, tinted Claude's brand clay
+              // (#D97757). No badge — just the bare glyph on the header bg.
               <ClaudeIcon
                 size="1.1em"
                 className="shrink-0"
@@ -597,6 +578,26 @@ export function Tile({
             ) : (
               <CodexIcon size="1.1em" className="shrink-0" title="Codex" />
             )}
+          </span>
+        )}
+        <span
+          // Lifecycle dot, intentionally small/low-key (#5) so it no longer
+          // reads as a "selected" marker; hover for the exact state.
+          className="h-1.5 w-1.5 shrink-0 rounded-full"
+          style={{ backgroundColor: DOT_VAR[state] }}
+          aria-label={state}
+          title={`Terminal state: ${state}`}
+        />
+        {/* Folder name (Feature 1). The path display is gone — the folder
+            basename is enough to place the work. The full cwd stays in the
+            header tooltip (the header's `title={cwd}`). */}
+        {folderName && (
+          <span
+            className="shrink-0 truncate"
+            style={{ color: "var(--th-fg)", fontSize: "1.05em" }}
+            title={cwd || undefined}
+          >
+            {folderName}
           </span>
         )}
 
