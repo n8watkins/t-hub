@@ -113,7 +113,7 @@ export async function popOutTab(tabId: string): Promise<void> {
   // the main window (its own <Titlebar/> is the chrome). Modest default size.
   const win = new WebviewWindow(label, {
     url: `index.html?tab=${encodeURIComponent(tabId)}`,
-    title: "TermHub",
+    title: "T-Hub",
     decorations: false,
     width: 1000,
     height: 700,

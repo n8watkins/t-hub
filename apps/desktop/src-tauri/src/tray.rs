@@ -34,12 +34,12 @@ fn show_main_window(app: &AppHandle) {
 /// the caller can decide how to surface it; startup should not abort on a tray
 /// failure (the app is still usable via its window).
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, "show", "Show TermHub", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, "show", "Show T-Hub", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
     let mut builder = TrayIconBuilder::new()
-        .tooltip("TermHub")
+        .tooltip("T-Hub")
         .menu(&menu)
         // Left-click toggles to showing the window (the menu handles the rest),
         // so don't pop the menu on a plain left click.
