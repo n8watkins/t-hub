@@ -102,11 +102,14 @@ fn usage_command() -> std::process::Command {
     use std::os::windows::process::CommandExt;
     let mut c = std::process::Command::new("wsl.exe");
     let distro = std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string());
+    // `-e` (exec) runs bash DIRECTLY. With a bare `--`, wsl.exe routes the command
+    // through the user's default login shell (e.g. zsh), not bash — see the detailed
+    // note on tmux.rs `pane_info_command`.
     c.arg("-d")
         .arg(distro)
         .arg("--cd")
         .arg("~")
-        .arg("--")
+        .arg("-e")
         .arg("bash")
         .arg("-lc")
         .arg(USAGE_SHELL_CMD);

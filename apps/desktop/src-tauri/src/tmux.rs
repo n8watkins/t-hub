@@ -421,11 +421,20 @@ done;; esac; printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done",
 /// goes through `wsl.exe` (CREATE_NO_WINDOW so no console flashes); on unix it
 /// runs `sh -c` directly. The single-quoted tmux format inside `script` is what
 /// protects `#{...}` from being eaten as a shell comment.
+///
+/// CRITICAL: pass `-e` (alias `--exec`) so wsl.exe runs `bash` DIRECTLY. Without
+/// it, `wsl.exe -- bash -lc <script>` does NOT run bash — wsl routes the command
+/// through the user's DEFAULT login shell (here `/usr/bin/zsh`). The script then
+/// runs under zsh, where `$path` is a special array tied to `$PATH`: the loop's
+/// `read -r s cmd path pid` clobbers PATH and `"$path"` expands to the entire
+/// PATH, so every pane came back as `||<PATH>` with an EMPTY session/command/cwd.
+/// That empty cwd/title is exactly what made the sidebar fall back to the raw 8-char
+/// id and the tile header go blank. `-e` makes the real bash run; the data is clean.
 #[cfg(windows)]
 fn pane_info_command(script: &str) -> Command {
     use std::os::windows::process::CommandExt;
     let mut c = Command::new("wsl.exe");
-    c.arg("--cd").arg("~").arg("--").arg("bash").arg("-lc").arg(script);
+    c.arg("--cd").arg("~").arg("-e").arg("bash").arg("-lc").arg(script);
     c.creation_flags(0x0800_0000);
     c
 }

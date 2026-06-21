@@ -354,11 +354,14 @@ fn wsl_bash(distro: &str, script: &str, cwd: &str) -> std::process::Command {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
     let mut c = Command::new("wsl.exe");
+    // `-e` (exec) runs bash DIRECTLY. A bare `--` makes wsl.exe route the command
+    // through the user's default login shell (e.g. zsh) instead of bash, which both
+    // changes shell semantics and mangles scripts — see tmux.rs `pane_info_command`.
     c.arg("-d")
         .arg(distro)
         .arg("--cd")
         .arg(cwd)
-        .arg("--")
+        .arg("-e")
         .arg("bash")
         .arg("-lc")
         .arg(script);
