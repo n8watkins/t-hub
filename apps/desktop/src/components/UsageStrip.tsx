@@ -8,6 +8,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { claudeUsage, type ClaudeUsage } from "../ipc/usage";
 import { codexUsage, type CodexUsage } from "../ipc/codex";
+import { ClaudeIcon } from "./ClaudeIcon";
+import { CodexIcon } from "./CodexIcon";
 
 /** Poll cadence: /usage is a quick local Claude command; every 5 min (plus on
  *  mount + window focus) keeps the numbers fresh without spamming it. */
@@ -90,6 +92,12 @@ export function UsageInline({ usage }: { usage: ClaudeUsage | null }) {
   if (!usage || !usage.ok) return null;
   return (
     <span className="ml-auto flex items-center gap-2 pr-2 text-[10px] tabular-nums">
+      <ClaudeIcon
+        size={11}
+        className="shrink-0"
+        style={{ color: "#D97757" }}
+        title="Claude usage"
+      />
       <InlinePct label="wk" usedPct={usage.weekUsedPct} resets={usage.weekResets} />
       <InlinePct
         label="5h"
@@ -286,7 +294,7 @@ export function CodexUsageInline({ usage }: { usage: CodexUsage | null }) {
   if (!usage || !usage.ok) return null;
   return (
     <span className="flex items-center gap-2 pr-2 text-[10px] tabular-nums">
-      <span style={{ color: "var(--th-fg-muted)" }}>cx</span>
+      <CodexIcon size={11} className="shrink-0" title="Codex usage" />
       <InlinePct
         label="wk"
         usedPct={usage.secondary?.usedPercent ?? null}

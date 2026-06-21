@@ -34,6 +34,8 @@ import {
 } from "./UsageStrip";
 import { WorkspacesList } from "./WorkspacesList";
 import { RecentList } from "./RecentList";
+import { ClaudeIcon } from "./ClaudeIcon";
+import { CodexIcon } from "./CodexIcon";
 import { ChevronIcon, CountBadge } from "./SidebarChrome";
 import { usePersistedToggle } from "../hooks/usePersistedToggle";
 import type { HostMetrics, ConnectionState } from "../ipc/protocol";
@@ -328,11 +330,18 @@ function UsageSection() {
 /** A small provider sub-header shown above each usage block when both Claude and
  *  Codex usage are present, so the weekly/session rows are unambiguous. */
 function ProviderLabel({ name }: { name: string }) {
+  const Icon = name === "Codex" ? CodexIcon : ClaudeIcon;
   return (
     <div
-      className="px-2 pt-1 text-[10px] font-semibold uppercase tracking-wide"
+      className="flex items-center gap-1.5 px-2 pt-1 text-[10px] font-semibold uppercase tracking-wide"
       style={{ color: "var(--th-fg-muted)" }}
     >
+      <Icon
+        size={11}
+        className="shrink-0"
+        style={name === "Claude" ? { color: "#D97757" } : undefined}
+        title={name}
+      />
       {name}
     </div>
   );
