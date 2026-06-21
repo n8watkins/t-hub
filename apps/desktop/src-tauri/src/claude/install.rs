@@ -180,6 +180,13 @@ pub struct InstallReport {
 
 /// Count how many top-level hook events contain a T-Hub-managed (marker)
 /// command after an op — for the report.
+///
+/// Routes through [`hooks::group_is_t_hub`], which recognizes BOTH the current
+/// `__t_hub_managed__` marker AND the legacy `__termhub_managed__` one. This is
+/// deliberate: a LEGACY-only install (a user who upgraded from a `termhub`
+/// build) must still count as "managed" so the startup reconcile detects it and
+/// migrates the stale entries. We only ever WRITE the current marker; this
+/// change affects detection only.
 fn count_managed(settings: &serde_json::Value) -> usize {
     let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else {
         return 0;
@@ -189,13 +196,7 @@ fn count_managed(settings: &serde_json::Value) -> usize {
         .filter(|groups| {
             groups
                 .as_array()
-                .map(|arr| {
-                    arr.iter().any(|g| {
-                        serde_json::to_string(g)
-                            .map(|s| s.contains(hooks::T_HUB_HOOK_MARKER))
-                            .unwrap_or(false)
-                    })
-                })
+                .map(|arr| arr.iter().any(hooks::group_is_t_hub))
                 .unwrap_or(false)
         })
         .count()
@@ -229,6 +230,50 @@ pub fn install_hooks_events(
     // inside WSL instead of trusting the passed value.
     let resolved = resolve_agent_bin(agent_bin);
     install_hooks_at_events(&settings_path()?, &resolved, consent, events)
+}
+
+/// Best-effort STARTUP RECONCILE: auto-migrate ALREADY-installed managed hooks
+/// (and the managed statusLine) to the current marker + resolved `t-hub-agent`
+/// path — WITHOUT installing where the user never had any (no silent new consent).
+///
+/// ## Why this exists
+/// When a user upgrades from an old `termhub` build, their settings.json still
+/// carries entries tagged `# __termhub_managed__` pointing at a removed
+/// `termhub-agent` binary — broken until they manually re-Apply in the Hook
+/// panel. This re-installs ONLY for users who already consented, healing the
+/// stale entries in place.
+///
+/// ## Consent invariant (do NOT install where nothing managed exists)
+/// We first probe [`hooks::any_managed`] (which recognizes the CURRENT and the
+/// LEGACY marker via `command_is_t_hub`). If NOTHING managed exists we return
+/// `Ok(())` and write nothing — the user never opted into T-Hub hooks, so adding
+/// them would be silent new consent. Only when managed entries are present do we
+/// re-install the currently-managed event set with `consent=true`. Because the
+/// strip predicate matches the legacy marker, that re-install removes the stale
+/// `termhub` entries and rewrites them under the current marker + resolved agent
+/// path (the migration). We never WRITE anything but the current marker.
+pub fn reconcile_managed_hooks() -> Result<()> {
+    // Same default the UI passes to the install command ("t-hub-agent"); the
+    // installer resolves it to a concrete absolute path inside WSL.
+    let agent_bin = resolve_agent_bin("t-hub-agent");
+    let path = settings_path()?;
+    let existing = read_settings(&path)?;
+
+    // Consent gate: only ever touch settings for a user who ALREADY has managed
+    // hooks / statusLine (current OR legacy marker). Never install fresh here.
+    if !hooks::any_managed(&existing) {
+        return Ok(());
+    }
+
+    // Re-install exactly the set we currently manage. If we somehow have a
+    // managed statusLine but no managed hook events (e.g. a partial legacy
+    // install), fall back to the full HOOK_EVENTS set so the statusLine still
+    // gets migrated via merge_statusline_into_settings.
+    let mut events = hooks::managed_events(&existing);
+    if events.is_empty() {
+        events = hooks::HOOK_EVENTS.iter().map(|s| s.to_string()).collect();
+    }
+    install_hooks_at_events(&path, &agent_bin, true, &events).map(|_| ())
 }
 
 /// The subset of T-Hub hook events currently installed in the user's

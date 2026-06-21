@@ -113,6 +113,32 @@ fn spawn_agent_connect(state: &AppState) {
         .ok();
 }
 
+/// Best-effort, off-the-main-path startup reconcile of Claude hooks. Mirrors
+/// [`spawn_agent_connect`]: a detached `std::thread` so app launch is never
+/// blocked on the WSL hop / settings.json write, and any error is swallowed +
+/// logged so it can NEVER abort startup.
+///
+/// [`claude::install::reconcile_managed_hooks`] is itself a no-op when the user
+/// has no T-Hub-managed hooks (so we never install without prior consent); when
+/// they DO (including stale `__termhub_managed__` entries from an upgraded
+/// `termhub` build), it migrates them to the current marker + resolved agent
+/// path. The outcome is summarized via `diag::diag_log`.
+fn spawn_reconcile_managed_hooks() {
+    std::thread::Builder::new()
+        .name("t-hub-claude-reconcile".into())
+        .spawn(|| match claude::install::reconcile_managed_hooks() {
+            Ok(()) => diag::diag_log(
+                "claude/reconcile: startup reconcile ok (migrated managed hooks if any; \
+                 no-op when none were installed)"
+                    .to_string(),
+            ),
+            Err(e) => diag::diag_log(format!(
+                "claude/reconcile: startup reconcile failed (non-fatal, launch continues): {e}"
+            )),
+        })
+        .ok();
+}
+
 /// Build the [`control::ControlContext`] from app state and start the loopback
 /// control listener (PRD §9.6 MCP). The context shares the status bridge and a
 /// supervisor-visitor closure (so `control` reads supervision snapshots without
@@ -248,6 +274,13 @@ pub fn run() {
             state.agent.set_status_bridge(state.status.clone());
             // Kick off the agent connection in the background once state exists.
             spawn_agent_connect(&state);
+            // Best-effort startup reconcile: if the user already has T-Hub-managed
+            // Claude hooks/statusLine (including stale `__termhub_managed__` ones
+            // from an upgraded `termhub` build), auto-migrate them to the current
+            // marker + resolved `t-hub-agent` path. It NEVER installs where nothing
+            // managed exists (no silent new consent). Detached + error-swallowed so
+            // it can never block or abort launch (a WSL hop / file write runs here).
+            spawn_reconcile_managed_hooks();
             // Start the MCP control listener so `t-hub-mcp` can forward
             // `tools/call` over the local control channel (PRD §9.6). A bind
             // failure is logged and does not abort startup (the channel is

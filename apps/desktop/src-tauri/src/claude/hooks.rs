@@ -282,11 +282,35 @@ pub fn managed_events(settings: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// True when `settings` contains ANY T-Hub-managed entry — a hook group OR a
+/// statusLine — under the CURRENT marker OR the legacy `termhub` one (via
+/// [`command_is_t_hub`]). This is the "has the user ever consented to T-Hub
+/// hooks?" probe the startup reconcile uses to decide whether to migrate stale
+/// `termhub` entries WITHOUT silently installing where none existed. Read-only.
+pub fn any_managed(settings: &serde_json::Value) -> bool {
+    if statusline_managed(settings) {
+        return true;
+    }
+    settings
+        .get("hooks")
+        .and_then(|h| h.as_object())
+        .map(|hooks| {
+            hooks.values().any(|groups| {
+                groups
+                    .as_array()
+                    .map(|arr| arr.iter().any(group_is_t_hub))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Return true if a matcher-group object contains any T-Hub-managed command.
 ///
 /// A group is T-Hub-managed when at least one of its inner `hooks[].command`
-/// strings contains [`T_HUB_HOOK_MARKER`].
-fn group_is_t_hub(group: &serde_json::Value) -> bool {
+/// strings contains [`T_HUB_HOOK_MARKER`] or the legacy `termhub` marker (via
+/// [`command_is_t_hub`]).
+pub fn group_is_t_hub(group: &serde_json::Value) -> bool {
     group
         .get("hooks")
         .and_then(|h| h.as_array())
