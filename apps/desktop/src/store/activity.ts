@@ -12,9 +12,10 @@
 import { create } from "zustand";
 
 /** No output for this long ⇒ the terminal is considered idle and the pulse stops.
- *  Long enough to bridge a brief mid-turn pause (e.g. a tool call running) without
- *  the animation flickering off and back on. */
-const IDLE_MS = 1500;
+ *  Long enough to bridge a mid-turn pause (e.g. Codex running a tool/command, which
+ *  emits no output for a few seconds) without the animation flickering off and back
+ *  on; short enough that the pulse settles soon after a turn really ends. */
+const IDLE_MS = 2500;
 
 interface ActivityState {
   /** terminalId → currently producing output. */
