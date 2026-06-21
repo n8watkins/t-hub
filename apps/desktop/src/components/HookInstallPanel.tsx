@@ -255,7 +255,7 @@ export function HookInstallPanel({
           onClick={() => setShowRawJson(true)}
           className="ml-auto rounded border px-2 py-0.5 text-[11px]"
           style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
-          title="Show the exact JSON TermHub writes to ~/.claude/settings.json for your current selection"
+          title="Show the exact JSON T-Hub writes to ~/.claude/settings.json for your current selection"
         >
           View raw JSON
         </button>
@@ -326,7 +326,7 @@ export function HookInstallPanel({
 
       {!consent && (
         <p className="text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
-          Tick the consent box to enable Apply — TermHub won't touch your Claude
+          Tick the consent box to enable Apply — T-Hub won't touch your Claude
           settings without it.
         </p>
       )}
@@ -458,7 +458,7 @@ function RawJsonModal({
           </button>
         </div>
         <p className="px-3 pt-2 text-[11px] leading-snug" style={{ color: "var(--th-fg-muted)" }}>
-          The exact entries TermHub merges into your{" "}
+          The exact entries T-Hub merges into your{" "}
           <code>~/.claude/settings.json</code> for the current selection (your
           other settings are preserved). Updates live as you toggle categories.
         </p>

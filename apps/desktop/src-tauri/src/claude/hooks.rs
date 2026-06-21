@@ -190,7 +190,7 @@ pub fn status_hint_for_hook(hook_name: &str) -> Option<SessionStatus> {
 pub fn handler_script(agent_bin: &str, hook_event: &str) -> String {
     format!(
         "#!/usr/bin/env bash\n\
-         # {marker} TermHub hook handler for {event}. Reads hook JSON on stdin,\n\
+         # {marker} T-Hub hook handler for {event}. Reads hook JSON on stdin,\n\
          # appends a journal entry via the agent, never blocks Claude.\n\
          set -eu\n\
          exec \"{bin}\" --hook {event}\n",

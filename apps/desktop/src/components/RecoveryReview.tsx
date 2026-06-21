@@ -561,7 +561,7 @@ function OrphanSection({
       </div>
       <p className="mb-2 mt-1 text-xs leading-snug" style={{ color: "var(--th-fg-muted)" }}>
         Running tmux sessions not placed in any current tab. They aren&apos;t lost:
-        TermHub re-adopts them onto the active tab automatically. Listed here so you
+        T-Hub re-adopts them onto the active tab automatically. Listed here so you
         know they survived.
       </p>
       <ul
