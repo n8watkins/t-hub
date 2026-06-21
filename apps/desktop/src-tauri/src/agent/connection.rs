@@ -8,7 +8,7 @@
 //! ```text
 //!  ┌──────────────┐   ChildStdin (Mutex)   ┌──────────────────┐
 //!  │  caller       │ ──write CoreFrame──→  │  child process   │
-//!  │  (any thread) │                        │  termhub-agent   │
+//!  │  (any thread) │                        │  t-hub-agent   │
 //!  │               │ ←─AgentFrame lines─── │  --stdio         │
 //!  └──────────────┘   reader thread        └──────────────────┘
 //!
@@ -29,17 +29,17 @@
 //! reader thread pops the entry and sends; the caller blocks on the receiver
 //! with a 10-second timeout.
 //!
-//! ## TERMHUB_AGENT_BIN escape hatch
+//! ## T_HUB_AGENT_BIN escape hatch
 //!
-//! When the env var `TERMHUB_AGENT_BIN` is set, its value overrides argv[0]
+//! When the env var `T_HUB_AGENT_BIN` is set, its value overrides argv[0]
 //! from [`super::launch_argv`]. This lets developers and tests point at a
-//! freshly built binary (e.g. `target/debug/termhub-agent`) without altering
+//! freshly built binary (e.g. `target/debug/t-hub-agent`) without altering
 //! `launch_argv` or PATH.
 //!
 //! ## Channel / Priority note
 //!
-//! Every [`termhub_protocol::CoreFrame`] written by [`write_frame`] carries the
-//! `channel` and every [`termhub_protocol::CoreToAgent::Request`] carries
+//! Every [`t_hub_protocol::CoreFrame`] written by [`write_frame`] carries the
+//! `channel` and every [`t_hub_protocol::CoreToAgent::Request`] carries
 //! `priority`. Both are fully serialized and echoed by the agent. A future
 //! priority scheduler can replace the direct `Mutex<ChildStdin>` write path
 //! with a bounded `BinaryHeap` feeding a dedicated writer thread — all the
@@ -59,7 +59,7 @@ use std::{
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use termhub_protocol::{
+use t_hub_protocol::{
     AgentResponse, AgentToCore, CoreFrame,
     encode_core, decode_agent,
 };
@@ -102,7 +102,7 @@ impl Default for ConnectionState {
 // Transport handles (private; stored in BridgeInner via TransportState)
 // ---------------------------------------------------------------------------
 
-/// Correlation map: maps a pending [`termhub_protocol::RequestId`] to the
+/// Correlation map: maps a pending [`t_hub_protocol::RequestId`] to the
 /// one-shot sender that will deliver the [`AgentResponse`] to the waiting
 /// caller.
 pub(crate) type CorrelationMap = Mutex<HashMap<u64, Sender<AgentResponse>>>;
@@ -149,13 +149,13 @@ pub(crate) fn write_frame(w: &mut impl Write, frame: &CoreFrame) -> std::io::Res
 
 /// Resolve the program to exec and the remaining arguments from `argv`.
 ///
-/// If the env var `TERMHUB_AGENT_BIN` is set, its value replaces `argv[0]`
-/// (the bare `termhub-agent` or `wsl.exe` that `launch_argv` returns). This
+/// If the env var `T_HUB_AGENT_BIN` is set, its value replaces `argv[0]`
+/// (the bare `t-hub-agent` or `wsl.exe` that `launch_argv` returns). This
 /// lets tests and developers point at a freshly built binary without touching
 /// PATH or `launch_argv`:
 ///
 /// ```sh
-/// TERMHUB_AGENT_BIN=/path/to/target/debug/termhub-agent cargo test
+/// T_HUB_AGENT_BIN=/path/to/target/debug/t-hub-agent cargo test
 /// ```
 pub(crate) fn spawn_child(argv: Vec<String>) -> std::io::Result<Child> {
     if argv.is_empty() {
@@ -165,8 +165,8 @@ pub(crate) fn spawn_child(argv: Vec<String>) -> std::io::Result<Child> {
         ));
     }
 
-    // TERMHUB_AGENT_BIN: optional override for argv[0], documented above.
-    let program = std::env::var("TERMHUB_AGENT_BIN")
+    // T_HUB_AGENT_BIN: optional override for argv[0], documented above.
+    let program = std::env::var("T_HUB_AGENT_BIN")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| argv[0].clone());
@@ -181,7 +181,7 @@ pub(crate) fn spawn_child(argv: Vec<String>) -> std::io::Result<Child> {
 
     // On Windows `program` is `wsl.exe` (from `launch_argv`); without
     // CREATE_NO_WINDOW that raw spawn flashes a console (CMD) window. Gate behind
-    // cfg(windows) so the unix dev build (which spawns termhub-agent directly) is
+    // cfg(windows) so the unix dev build (which spawns t-hub-agent directly) is
     // unaffected.
     #[cfg(windows)]
     {
@@ -312,12 +312,12 @@ mod transport_tests {
 
     use crate::agent::AgentBridge;
 
-    /// Integration test: spin up the real termhub-agent binary, send Hello,
+    /// Integration test: spin up the real t-hub-agent binary, send Hello,
     /// list sessions, and fetch metrics. Skips gracefully when the binary is
     /// absent so CI never fails spuriously without a built agent.
     #[test]
     fn live_round_trip_with_real_agent() {
-        // Locate the agent binary. We look for TERMHUB_AGENT_BIN first (already
+        // Locate the agent binary. We look for T_HUB_AGENT_BIN first (already
         // set by this test's environment if the caller ran build first), then
         // fall back to the workspace-relative debug build.
         let bin_path: PathBuf = {
@@ -325,20 +325,20 @@ mod transport_tests {
             // __FILE__ is inside src-tauri/src/agent/; target/ is a sibling of
             // src-tauri/.
             let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-            manifest.join("target/debug/termhub-agent")
+            manifest.join("target/debug/t-hub-agent")
         };
 
         if !bin_path.exists() {
             eprintln!(
                 "transport_tests::live_round_trip_with_real_agent: \
                  binary not found at {bin_path:?} — skipping (run \
-                 `cargo build -p termhub-agent` first or set TERMHUB_AGENT_BIN)"
+                 `cargo build -p t-hub-agent` first or set T_HUB_AGENT_BIN)"
             );
             return;
         }
 
         // Point the escape hatch at the known-good debug binary.
-        std::env::set_var("TERMHUB_AGENT_BIN", &bin_path);
+        std::env::set_var("T_HUB_AGENT_BIN", &bin_path);
 
         let bridge = AgentBridge::new();
         bridge.connect("ignored").expect("connect() must succeed");
@@ -348,10 +348,10 @@ mod transport_tests {
 
         // --- ListSessions ---
         let resp = bridge
-            .request(termhub_protocol::AgentRequest::ListSessions)
+            .request(t_hub_protocol::AgentRequest::ListSessions)
             .expect("ListSessions must return a response");
         match resp {
-            termhub_protocol::AgentResponse::Sessions { names } => {
+            t_hub_protocol::AgentResponse::Sessions { names } => {
                 // The agent may or may not have active tmux sessions; the
                 // important thing is that the response is the right variant.
                 eprintln!("live_round_trip: sessions={names:?}");
@@ -361,10 +361,10 @@ mod transport_tests {
 
         // --- Metrics ---
         let resp = bridge
-            .request(termhub_protocol::AgentRequest::Metrics)
+            .request(t_hub_protocol::AgentRequest::Metrics)
             .expect("Metrics must return a response");
         match resp {
-            termhub_protocol::AgentResponse::Metrics(m) => {
+            t_hub_protocol::AgentResponse::Metrics(m) => {
                 eprintln!(
                     "live_round_trip: metrics cpu_count={} mem_total_kib={}",
                     m.cpu_count, m.mem_total_kib
@@ -399,26 +399,26 @@ mod transport_tests {
 
         let bin_path: PathBuf = {
             let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-            manifest.join("target/debug/termhub-agent")
+            manifest.join("target/debug/t-hub-agent")
         };
         if !bin_path.exists() {
             eprintln!(
                 "live_emit_demo: binary not found at {bin_path:?} — skipping \
-                 (run `cargo build -p termhub-agent` first)"
+                 (run `cargo build -p t-hub-agent` first)"
             );
             return;
         }
 
-        // Hermetic private HOME → journal at $HOME/.termhub/journal, shared by the
+        // Hermetic private HOME → journal at $HOME/.t-hub/journal, shared by the
         // hook processes and the stdio agent (both honor $HOME).
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let home = std::env::temp_dir().join(format!("termhub-live-emit-demo-{ts}"));
+        let home = std::env::temp_dir().join(format!("t-hub-live-emit-demo-{ts}"));
         std::fs::create_dir_all(&home).unwrap();
 
-        // The exact production hook entrypoint: `termhub-agent --hook <EVENT>`,
+        // The exact production hook entrypoint: `t-hub-agent --hook <EVENT>`,
         // feeding the hook's JSON stdin (session_id + subagent base fields).
         let fire_hook = |event: &str, stdin_json: &str| {
             use std::io::Write;
@@ -453,7 +453,7 @@ mod transport_tests {
         fire_hook("Stop", &format!(r#"{{"session_id":"{sid}"}}"#));
 
         // --- Connect the core bridge to a real --stdio agent (same HOME) ---
-        std::env::set_var("TERMHUB_AGENT_BIN", &bin_path);
+        std::env::set_var("T_HUB_AGENT_BIN", &bin_path);
         std::env::set_var("HOME", &home); // the spawned --stdio child inherits this
 
         // Recording emitter to capture the live UI events.

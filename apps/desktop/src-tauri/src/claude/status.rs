@@ -52,7 +52,7 @@ pub struct StatusSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     /// The tmux PANE id (`$TMUX_PANE`, e.g. `%37`) the statusline ran inside, as
-    /// stamped by `termhub-agent --statusline`. Diagnostic / future-proofing; the
+    /// stamped by `t-hub-agent --statusline`. Diagnostic / future-proofing; the
     /// frontend binds on `tmux_session` below (which it can compute for a tile),
     /// but the pane id is the underlying robust signal the agent reads. Absent
     /// when not under tmux (or an un-upgraded agent).
@@ -60,7 +60,7 @@ pub struct StatusSnapshot {
     pub tmux_pane: Option<String>,
     /// The tmux SESSION NAME that owns the pane the statusline ran inside (e.g.
     /// `th_<terminalId>`), resolved by the agent from `$TMUX_PANE`. This is the
-    /// ROBUST tile↔session key: TermHub names every session `th_<terminalId>`, so
+    /// ROBUST tile↔session key: T-Hub names every session `th_<terminalId>`, so
     /// a tile computes its own session name and looks itself up by it — no cwd
     /// guessing. Absent ⇒ frontend degrades to the `cwd` match above.
     #[serde(skip_serializing_if = "Option::is_none")]

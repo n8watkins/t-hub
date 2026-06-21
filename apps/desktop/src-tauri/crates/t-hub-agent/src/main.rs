@@ -1,11 +1,11 @@
-//! `termhub-agent` — the WSL-side control agent (PLAN.md Workstream A).
+//! `t-hub-agent` — the WSL-side control agent (PLAN.md Workstream A).
 //!
-//! Launched by the TermHub core as:
+//! Launched by the T-Hub core as:
 //! ```text
-//! wsl.exe -d <distro> -- termhub-agent --stdio
+//! wsl.exe -d <distro> -- t-hub-agent --stdio
 //! ```
-//! or directly on a unix dev box (`termhub-agent --stdio`). It speaks the
-//! versioned NDJSON protocol from `termhub-protocol` over **stdin/stdout**
+//! or directly on a unix dev box (`t-hub-agent --stdio`). It speaks the
+//! versioned NDJSON protocol from `t-hub-protocol` over **stdin/stdout**
 //! (stderr is reserved for human-readable diagnostics so it never corrupts the
 //! frame stream).
 //!
@@ -25,8 +25,8 @@
 //!   for the sidebar's Claude USAGE strip (cost / context % / rate limits).
 //!
 //! ## Concurrency / head-of-line blocking
-//! The protocol tags every frame with a [`termhub_protocol::Channel`] and every
-//! request with a [`termhub_protocol::Priority`] so the writer can interleave
+//! The protocol tags every frame with a [`t_hub_protocol::Channel`] and every
+//! request with a [`t_hub_protocol::Priority`] so the writer can interleave
 //! control/metrics ahead of bulk payloads on the single pipe (REVIEW). The
 //! transport scheduler that exploits this is implemented in [`transport`]
 //! (filled in by a subagent); `main` wires the pieces together.
@@ -53,12 +53,12 @@ use std::sync::Arc;
 ///
 /// ## Shared flags
 /// - `--journal-dir <PATH>`  Override the journal directory (default:
-///                           `~/.termhub/journal`). Used by tests and by the
+///                           `~/.t-hub/journal`). Used by tests and by the
 ///                           core when it relocates the store.
 struct Args {
     /// Which mode to run in.
     mode: Mode,
-    /// Override the journal directory (default: `~/.termhub/journal`).
+    /// Override the journal directory (default: `~/.t-hub/journal`).
     journal_dir: Option<String>,
 }
 
@@ -82,7 +82,7 @@ fn parse_args() -> Args {
                 match it.next() {
                     Some(event) => mode = Mode::Hook { event },
                     None => {
-                        eprintln!("termhub-agent: --hook requires an EVENT name argument");
+                        eprintln!("t-hub-agent: --hook requires an EVENT name argument");
                         std::process::exit(1);
                     }
                 }
@@ -90,11 +90,11 @@ fn parse_args() -> Args {
             "--statusline" => mode = Mode::Statusline,
             "--journal-dir" => journal_dir = it.next(),
             "--version" | "-V" => {
-                println!("termhub-agent {}", env!("CARGO_PKG_VERSION"));
+                println!("t-hub-agent {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             other => {
-                eprintln!("termhub-agent: ignoring unknown argument {other:?}");
+                eprintln!("t-hub-agent: ignoring unknown argument {other:?}");
             }
         }
     }
@@ -103,7 +103,7 @@ fn parse_args() -> Args {
 
 /// Human-readable agent build string sent in the handshake.
 pub fn agent_version() -> String {
-    format!("termhub-agent {}", env!("CARGO_PKG_VERSION"))
+    format!("t-hub-agent {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn main() {
@@ -115,7 +115,7 @@ fn main() {
         // ------------------------------------------------------------------
         Mode::Hook { event } => {
             if let Err(e) = hook::run(&event, args.journal_dir.as_deref()) {
-                eprintln!("termhub-agent --hook {event}: unexpected error: {e:#}");
+                eprintln!("t-hub-agent --hook {event}: unexpected error: {e:#}");
             }
             // Always exit 0 — never fail Claude's turn.
             std::process::exit(0);
@@ -127,7 +127,7 @@ fn main() {
         // ------------------------------------------------------------------
         Mode::Statusline => {
             if let Err(e) = hook::run_statusline(args.journal_dir.as_deref()) {
-                eprintln!("termhub-agent --statusline: unexpected error: {e:#}");
+                eprintln!("t-hub-agent --statusline: unexpected error: {e:#}");
             }
             // Always exit 0 — never fail Claude's statusline render.
             std::process::exit(0);
@@ -142,7 +142,7 @@ fn main() {
                 Ok(j) => j,
                 Err(e) => {
                     eprintln!(
-                        "termhub-agent: failed to open journal at {journal_dir:?}: {e:#}"
+                        "t-hub-agent: failed to open journal at {journal_dir:?}: {e:#}"
                     );
                     std::process::exit(1);
                 }
@@ -157,11 +157,11 @@ fn main() {
             if journal.byte_len() > journal::COMPACT_THRESHOLD_BYTES {
                 match journal.compact_dropping_status() {
                     Ok((before, after, kept)) => eprintln!(
-                        "termhub-agent: compacted journal on startup: {before} -> {after} bytes \
+                        "t-hub-agent: compacted journal on startup: {before} -> {after} bytes \
                          ({kept} durable entries kept; dropped ephemeral status snapshots)"
                     ),
                     Err(e) => eprintln!(
-                        "termhub-agent: startup journal compaction failed (continuing): {e:#}"
+                        "t-hub-agent: startup journal compaction failed (continuing): {e:#}"
                     ),
                 }
             }
@@ -170,7 +170,7 @@ fn main() {
                 // A clean EOF on stdin (core closed the pipe) is a normal
                 // shutdown, not an error; `serve_stdio` returns Ok in that
                 // case. A real error here means the loop itself failed.
-                eprintln!("termhub-agent: stdio bridge exited with error: {e:#}");
+                eprintln!("t-hub-agent: stdio bridge exited with error: {e:#}");
                 let _ = std::io::stderr().flush();
                 std::process::exit(1);
             }
@@ -181,7 +181,7 @@ fn main() {
         // ------------------------------------------------------------------
         Mode::None => {
             eprintln!(
-                "termhub-agent {}: no mode selected; pass --stdio, --hook <EVENT>, or --statusline.",
+                "t-hub-agent {}: no mode selected; pass --stdio, --hook <EVENT>, or --statusline.",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(2);

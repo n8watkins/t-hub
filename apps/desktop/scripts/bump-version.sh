@@ -3,7 +3,7 @@
 #   - package.json                 (npm/pnpm + About fallback)
 #   - src-tauri/tauri.conf.json    (the version baked into the binary; About's
 #                                   getVersion() reads this; NSIS installer too)
-#   - src-tauri/Cargo.toml         ([package] version of the `termhub` crate)
+#   - src-tauri/Cargo.toml         ([package] version of the `t-hub` crate)
 #
 # Run from anywhere; it locates the repo root via this script's path. Prints the
 # new version. Standing policy: run this before EVERY deploy so each update ships

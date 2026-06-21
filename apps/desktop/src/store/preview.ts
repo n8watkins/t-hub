@@ -21,8 +21,8 @@
 // permissions; see the final hand-off note.
 //
 // We point the WebviewWindow's `url` straight at the (already host-rewritten)
-// dev URL rather than reloading the TermHub bundle: a preview wants the user's
-// app, not another TermHub shell, and a top-level load sidesteps the framing
+// dev URL rather than reloading the T-Hub bundle: a preview wants the user's
+// app, not another T-Hub shell, and a top-level load sidesteps the framing
 // refusals an iframe hits. The URL must already be reachable from the WINDOWS
 // host (see ipc/devserver.ts `reachablePreviewUrl`) since the WebView is a
 // Windows process — callers pass the resolved URL.
@@ -100,8 +100,8 @@ export async function popOutPreview(url: string, title?: string): Promise<string
     height: 800,
     minWidth: 360,
     minHeight: 240,
-    // Decorated on purpose (the preview isn't a TermHub surface; give it native
-    // window controls rather than relying on TermHub's <Titlebar/>).
+    // Decorated on purpose (the preview isn't a T-Hub surface; give it native
+    // window controls rather than relying on T-Hub's <Titlebar/>).
     decorations: true,
   });
 

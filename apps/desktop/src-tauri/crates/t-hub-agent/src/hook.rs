@@ -1,5 +1,5 @@
 //! `--hook <EVENT>` ingest mode: Claude Code invokes the installed handler
-//! script which execs `termhub-agent --hook <EVENT>`. This module reads the
+//! script which execs `t-hub-agent --hook <EVENT>`. This module reads the
 //! hook's JSON payload from stdin, builds a durable [`EventJournalEntry`], and
 //! appends it to the journal — closing the hook→journal half of the event spine.
 //!
@@ -12,7 +12,7 @@
 use std::io::Read;
 use std::path::PathBuf;
 
-use termhub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
+use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
 
 /// Map a Claude Code hook event name to the corresponding [`JournalEventType`].
 /// Returns `JournalEventType::Unknown` for an unrecognised name so future hooks
@@ -97,7 +97,7 @@ pub fn run(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
         let stdin = std::io::stdin();
         let mut handle = stdin.lock();
         if let Err(e) = handle.read_to_string(&mut raw) {
-            eprintln!("termhub-agent --hook {hook_name}: failed reading stdin: {e:#}");
+            eprintln!("t-hub-agent --hook {hook_name}: failed reading stdin: {e:#}");
             // raw stays empty; we continue with a null payload.
         }
     }
@@ -107,7 +107,7 @@ pub fn run(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
-                "termhub-agent --hook {hook_name}: failed parsing hook JSON: {e:#}; \
+                "t-hub-agent --hook {hook_name}: failed parsing hook JSON: {e:#}; \
                  journaling with empty payload"
             );
             serde_json::Value::Null
@@ -123,14 +123,14 @@ pub fn run(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
         Ok(j) => j,
         Err(e) => {
             eprintln!(
-                "termhub-agent --hook {hook_name}: failed to open journal at {dir:?}: {e:#}"
+                "t-hub-agent --hook {hook_name}: failed to open journal at {dir:?}: {e:#}"
             );
             // Return Ok so main exits 0.
             return Ok(());
         }
     };
     if let Err(e) = journal.append(entry) {
-        eprintln!("termhub-agent --hook {hook_name}: failed to append journal entry: {e:#}");
+        eprintln!("t-hub-agent --hook {hook_name}: failed to append journal entry: {e:#}");
     }
 
     Ok(())
@@ -162,8 +162,8 @@ pub fn run(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
 /// Claude runs its statusline command INSIDE the tile's tmux pane, so tmux sets
 /// `$TMUX_PANE` (e.g. `%37`) in our environment. From that pane id we ask tmux
 /// (the CURRENT server via `$TMUX`, NOT a hardcoded `-L` socket — so it resolves
-/// on production `termhub` AND a side-by-side dev `termhub-dev`) for the owning
-/// `#{session_name}` — TermHub
+/// on production `t-hub` AND a side-by-side dev `t-hub-dev`) for the owning
+/// `#{session_name}` — T-Hub
 /// names every session `th_<terminalId>`, which the frontend can compute for a
 /// tile directly and key context by. Returns `(pane, session)`:
 ///   - `pane`:    the raw `$TMUX_PANE` value, or `None` if unset (not under tmux).
@@ -182,7 +182,7 @@ fn resolve_tmux_pane() -> (Option<String>, Option<String>) {
 
     // Resolve the owning session NAME from the pane id. NO `-L <socket>`: running
     // inside the pane, tmux uses `$TMUX` to reach the CURRENT server, so this
-    // resolves on ANY socket (production `termhub` AND a dev `termhub-dev`).
+    // resolves on ANY socket (production `t-hub` AND a dev `t-hub-dev`).
     // `-t <pane>` targets that exact pane; `-p` prints the formatted value.
     let session = std::process::Command::new("tmux")
         .args(["display", "-p", "-t", &pane, "#{session_name}"])
@@ -264,7 +264,7 @@ pub fn run_statusline(journal_dir: Option<&str>) -> anyhow::Result<()> {
         let stdin = std::io::stdin();
         let mut handle = stdin.lock();
         if let Err(e) = handle.read_to_string(&mut raw) {
-            eprintln!("termhub-agent --statusline: failed reading stdin: {e:#}");
+            eprintln!("t-hub-agent --statusline: failed reading stdin: {e:#}");
         }
     }
 
@@ -272,7 +272,7 @@ pub fn run_statusline(journal_dir: Option<&str>) -> anyhow::Result<()> {
     let mut statusline: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("termhub-agent --statusline: failed parsing statusline JSON: {e:#}");
+            eprintln!("t-hub-agent --statusline: failed parsing statusline JSON: {e:#}");
             println!();
             return Ok(());
         }
@@ -301,18 +301,18 @@ pub fn run_statusline(journal_dir: Option<&str>) -> anyhow::Result<()> {
     match crate::journal::Journal::open(&dir) {
         Ok(journal) => {
             if let Err(e) = journal.append(entry) {
-                eprintln!("termhub-agent --statusline: failed to append journal entry: {e:#}");
+                eprintln!("t-hub-agent --statusline: failed to append journal entry: {e:#}");
             } else {
                 // Diagnostic on stderr only (stdout is the statusline render): a
                 // grep-able marker the orchestrator can correlate with the core
                 // emitting status://snapshot for this session.
                 eprintln!(
-                    "termhub-agent --statusline: journaled StatusSnapshot for session {session_id}"
+                    "t-hub-agent --statusline: journaled StatusSnapshot for session {session_id}"
                 );
             }
         }
         Err(e) => {
-            eprintln!("termhub-agent --statusline: failed to open journal at {dir:?}: {e:#}");
+            eprintln!("t-hub-agent --statusline: failed to open journal at {dir:?}: {e:#}");
         }
     }
 
@@ -329,7 +329,7 @@ pub fn run_statusline(journal_dir: Option<&str>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use termhub_protocol::{JournalEventType, JournalSource};
+    use t_hub_protocol::{JournalEventType, JournalSource};
 
     // -----------------------------------------------------------------------
     // event_type_for_hook mapping
@@ -497,7 +497,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("termhub-hook-test-{tag}-{ts}"))
+        std::env::temp_dir().join(format!("t-hub-hook-test-{tag}-{ts}"))
     }
 
     #[test]

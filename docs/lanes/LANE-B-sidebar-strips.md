@@ -6,7 +6,7 @@ context: [../FEATURE-PLAN.md](../FEATURE-PLAN.md). You work in the worktree
 Another agent runs **Lane A** (`feat/tile-identity`) in parallel — stay in YOUR
 files so the two never conflict.
 
-## What TermHub is
+## What T-Hub is
 A Tauri 2 + React 18 + TS + Tailwind + Zustand desktop app — a cockpit of xterm
 terminal tiles over a Rust PTY↔tmux engine. Frontend lives in `apps/desktop/src`.
 The left **sidebar** has: a **Workspaces** list (each workspace over its terminals),
@@ -28,7 +28,7 @@ checkout (not this worktree); verify here with typecheck.
 ```bash
 cd <this worktree>
 pnpm install
-pnpm --filter termhub typecheck    # baseline — should already pass
+pnpm --filter t-hub-desktop typecheck    # baseline — should already pass
 ```
 
 ## Tasks
@@ -53,7 +53,7 @@ workspace store — used by the tile-header drag). Use pointer-based drag (see
 the target workspace row.
 
 ## Verify · commit · land on main
-1. `pnpm --filter termhub typecheck` passes.
+1. `pnpm --filter t-hub-desktop typecheck` passes.
 2. Review your diff — ONLY your files changed.
 3. Commit in logical chunks; end messages with
    `Co-Authored-By: Claude <noreply@anthropic.com>`.

@@ -6,7 +6,7 @@
 //! it calls (`host`) are where the remaining `SUBAGENT(host)` work lives.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use termhub_protocol::{
+use t_hub_protocol::{
     AgentRequest, AgentResponse, EventJournalEntry, JournalEventType, JournalSource,
     ResponseErrorKind,
 };
@@ -99,7 +99,7 @@ fn record_command(
         result: Some(result),
     };
     if let Err(e) = journal.append(entry) {
-        eprintln!("termhub-agent: journal append failed for {op} on {entity}: {e:#}");
+        eprintln!("t-hub-agent: journal append failed for {op} on {entity}: {e:#}");
     }
 }
 
@@ -113,7 +113,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("termhub-dispatch-{tag}-{ts}"));
+        let dir = std::env::temp_dir().join(format!("t-hub-dispatch-{tag}-{ts}"));
         (Journal::open(&dir).unwrap(), dir)
     }
 

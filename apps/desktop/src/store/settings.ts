@@ -1,4 +1,4 @@
-// The settings store holds TermHub's *general app settings* — the non-theme
+// The settings store holds T-Hub's *general app settings* — the non-theme
 // knobs of the shell (PRD §5.5 settings surface) — kept separate from the theme
 // store: the theme store owns the look (CSS vars), this owns behavior flags plus
 // the transient open/closed state of the settings panel itself.
@@ -8,7 +8,7 @@
 // open) is never persisted — a reopen of the app starts with the panel closed.
 import { create } from "zustand";
 
-const PERSIST_KEY = "termhub.settings.v1";
+const PERSIST_KEY = "t-hub.settings.v1";
 
 /** Bounds for the configurable titlebar auto-hide timings (used by both the
  *  persistence clamp and the Settings sliders, so they can't drift apart). */

@@ -3,11 +3,11 @@
 //! This exercises the **real** pieces together, with no Tauri GUI:
 //!   1. a real [`Supervisor`] seeded with hook events + a real [`StatusBridge`]
 //!      with an ingested statusline snapshot;
-//!   2. a real `termhub` control listener ([`termhub_lib::control::start`]) on a
+//!   2. a real `t-hub` control listener ([`t_hub_lib::control::start`]) on a
 //!      loopback port, with the handshake written to a temp file;
-//!   3. a real tmux session (`th_*` on the isolated `termhub` socket) so
+//!   3. a real tmux session (`th_*` on the isolated `t-hub` socket) so
 //!      `list_terminals` has something to report;
-//!   4. the real compiled `termhub-mcp` binary, spawned as a subprocess and
+//!   4. the real compiled `t-hub-mcp` binary, spawned as a subprocess and
 //!      driven over its stdin/stdout with genuine MCP JSON-RPC.
 //!
 //! It then asserts the full JSON round-trip for `initialize`, `tools/list`, and
@@ -16,8 +16,8 @@
 //! → back.
 //!
 //! The test is resilient: if tmux isn't available it still runs every non-tmux
-//! assertion; if the `termhub-mcp` binary can't be located it fails with a clear
-//! message telling you to `cargo build -p termhub-mcp` first.
+//! assertion; if the `t-hub-mcp` binary can't be located it fails with a clear
+//! message telling you to `cargo build -p t-hub-mcp` first.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -28,15 +28,15 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
-use termhub_lib::control;
+use t_hub_lib::control;
 
 // The crate's internal types are reachable because we seed them through the
 // public test constructor; we only need the protocol event enum + the two
 // bridges, which are re-exported on the lib's public surface used by control.
-use termhub_protocol::JournalEventType;
+use t_hub_protocol::JournalEventType;
 
-/// Locate the compiled `termhub-mcp` binary. The integration test binary lives
-/// in `target/<profile>/deps/`, so the sibling binary is `../termhub-mcp`.
+/// Locate the compiled `t-hub-mcp` binary. The integration test binary lives
+/// in `target/<profile>/deps/`, so the sibling binary is `../t-hub-mcp`.
 fn locate_mcp_binary() -> PathBuf {
     let mut dir = std::env::current_exe().expect("current_exe");
     dir.pop(); // drop the test binary filename → .../deps
@@ -44,13 +44,13 @@ fn locate_mcp_binary() -> PathBuf {
         dir.pop(); // → .../<profile>
     }
     let candidate = dir.join(if cfg!(windows) {
-        "termhub-mcp.exe"
+        "t-hub-mcp.exe"
     } else {
-        "termhub-mcp"
+        "t-hub-mcp"
     });
     assert!(
         candidate.exists(),
-        "termhub-mcp binary not found at {} — run `cargo build -p termhub-mcp` first \
+        "t-hub-mcp binary not found at {} — run `cargo build -p t-hub-mcp` first \
          (the e2e test spawns the real binary)",
         candidate.display()
     );
@@ -70,15 +70,15 @@ impl McpProc {
         let mut child = Command::new(bin)
             // Point the binary's discovery at our temp handshake file so it
             // connects to the listener this test started.
-            .env("TERMHUB_CONTROL_FILE", handshake_file)
+            .env("T_HUB_CONTROL_FILE", handshake_file)
             // Make sure no stray addr/token override leaks in from the harness.
-            .env_remove("TERMHUB_CONTROL_ADDR")
-            .env_remove("TERMHUB_CONTROL_TOKEN")
+            .env_remove("T_HUB_CONTROL_ADDR")
+            .env_remove("T_HUB_CONTROL_TOKEN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("spawn termhub-mcp");
+            .expect("spawn t-hub-mcp");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Self {
@@ -100,7 +100,7 @@ impl McpProc {
         self.stdin.flush().unwrap();
         let mut resp = String::new();
         let n = self.stdout.read_line(&mut resp).expect("read mcp stdout");
-        assert!(n > 0, "termhub-mcp closed stdout without responding");
+        assert!(n > 0, "t-hub-mcp closed stdout without responding");
         println!("← {}", resp.trim_end());
         serde_json::from_str(resp.trim_end())
             .unwrap_or_else(|e| panic!("non-JSON response {resp:?}: {e}"))
@@ -138,7 +138,7 @@ fn end_to_end_mcp_round_trip() {
     let bin = locate_mcp_binary();
 
     // --- 1. Seed real supervision + status state -------------------------
-    let supervisor = Arc::new(Mutex::new(termhub_lib::supervision_for_test()));
+    let supervisor = Arc::new(Mutex::new(t_hub_lib::supervision_for_test()));
     {
         let mut s = supervisor.lock();
         // An orchestrator with a running subagent, then Stop → WaitingOnSubagents.
@@ -154,7 +154,7 @@ fn end_to_end_mcp_round_trip() {
         s.ingest(Some("sess-e2e"), None, None, JournalEventType::Stop, 4);
     }
 
-    let status = Arc::new(termhub_lib::status_bridge_for_test());
+    let status = Arc::new(t_hub_lib::status_bridge_for_test());
     status.ingest(
         "sess-e2e",
         &json!({ "context_window": { "used_percentage": 42.0 } }),
@@ -166,7 +166,7 @@ fn end_to_end_mcp_round_trip() {
     let tmp = std::env::temp_dir().join(format!("th-mcp-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let handshake_file = tmp.join("control.json");
-    std::env::set_var("TERMHUB_CONTROL_FILE", &handshake_file);
+    std::env::set_var("T_HUB_CONTROL_FILE", &handshake_file);
 
     let ctx = control::ControlContext::with_shared_supervisor(
         status.clone(),
@@ -182,7 +182,7 @@ fn end_to_end_mcp_round_trip() {
     let tmux_session = format!("th_e2e{}", std::process::id() % 100000);
     let tmux_ok = make_tmux_session(&tmux_session);
 
-    // --- 4. Spawn the real termhub-mcp binary + drive it -----------------
+    // --- 4. Spawn the real t-hub-mcp binary + drive it -----------------
     let mut mcp = McpProc::spawn(&bin, &handshake_file);
 
     // initialize
@@ -191,7 +191,7 @@ fn end_to_end_mcp_round_trip() {
         "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
     }));
     assert_eq!(init["id"], 1);
-    assert_eq!(init["result"]["serverInfo"]["name"], "termhub-mcp");
+    assert_eq!(init["result"]["serverInfo"]["name"], "t-hub-mcp");
     assert!(init["result"]["capabilities"]["tools"].is_object());
 
     // initialized notification (no response)
@@ -304,14 +304,14 @@ fn end_to_end_mcp_round_trip() {
     }
     drop(mcp);
     let _ = std::fs::remove_dir_all(&tmp);
-    std::env::remove_var("TERMHUB_CONTROL_FILE");
+    std::env::remove_var("T_HUB_CONTROL_FILE");
 }
 
-/// Create a detached tmux session on the isolated `termhub` socket. Returns
+/// Create a detached tmux session on the isolated `t-hub` socket. Returns
 /// false (and the test skips tmux-specific asserts) if tmux isn't usable here.
 fn make_tmux_session(name: &str) -> bool {
     Command::new("tmux")
-        .args(["-L", "termhub", "new-session", "-d", "-s", name, "sleep 300"])
+        .args(["-L", "t-hub", "new-session", "-d", "-s", name, "sleep 300"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -319,6 +319,6 @@ fn make_tmux_session(name: &str) -> bool {
 
 fn kill_tmux_session(name: &str) {
     let _ = Command::new("tmux")
-        .args(["-L", "termhub", "kill-session", "-t", name])
+        .args(["-L", "t-hub", "kill-session", "-t", name])
         .status();
 }

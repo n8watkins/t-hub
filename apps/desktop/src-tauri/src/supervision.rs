@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 
 use crate::model::{SessionStatus, SubagentNode, SubagentState, SupervisionTree};
-use termhub_protocol::JournalEventType;
+use t_hub_protocol::JournalEventType;
 
 /// Per-session supervision state.
 #[derive(Debug, Default, Clone)]

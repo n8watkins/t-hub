@@ -1,4 +1,4 @@
-# TermHub (T-Hub) — Audit & Next-Direction Analysis
+# T-Hub (T-Hub) — Audit & Next-Direction Analysis
 
 **Audited:** 2026-06-14 · **App version:** 0.1.16 · **Branch:** `audit/analysis` (isolated worktree)
 **Scope:** stale code / doc drift · correctness bugs (Rust + React/TS) · strategic next direction · competitive positioning.
@@ -11,7 +11,7 @@ dead user-facing feature) · **P2** (latent / low-blast-radius / polish).
 
 ## Executive summary
 
-TermHub is in genuinely good shape internally: the supervision reducer, hook install/uninstall, the
+T-Hub is in genuinely good shape internally: the supervision reducer, hook install/uninstall, the
 agent-bridge emit spine, the SQLite layer (WAL + history ring), and the files index are all well-factored
 and **heavily unit-tested**. The biggest problems are not crashes — they are **dead wiring** and **drift
 between what the app advertises and what it does**:
@@ -37,7 +37,7 @@ PRD promises.
 | # | Step | Why it's highest-leverage | Effort |
 |---|------|---------------------------|--------|
 | 1 | **Wire `onSelectSession`** → switch to the tab + focus the tile for a clicked Attention/Session row. | The entire supervision sidebar is *read-only-and-inert* today; this single fix makes the headline 0.5 surface actually drive navigation. The backend already correlates session↔terminal by cwd. | S |
-| 2 | **Repair the MCP↔control contract**: implement `get_theme`/`set_theme` control handlers (Tauri commands already exist) and decide `spawn_terminal` (implement-with-confirm or drop from advertised tools). | "Claude can drive TermHub" is a flagship claim; 15% of the toolset is dead. Either honor it or stop advertising it. | S–M |
+| 2 | **Repair the MCP↔control contract**: implement `get_theme`/`set_theme` control handlers (Tauri commands already exist) and decide `spawn_terminal` (implement-with-confirm or drop from advertised tools). | "Claude can drive T-Hub" is a flagship claim; 15% of the toolset is dead. Either honor it or stop advertising it. | S–M |
 | 3 | **Promote the Attention queue to a first-class, keyboard-driven surface** (global jump-to-next-attention hotkey, persistent badge, ack flow). | This is the actual job-to-be-done ("supervise many agents"); the data is already flowing (`session://status`, `attentionSessions`). | M |
 | 4 | **Cross-session usage dashboard** (aggregate context/cost/rate-limit across all sessions, with reset-time countdown). | The statusline data is ingested and per-session-rendered but never aggregated into the "are any of my agents about to stall?" view that justifies a multi-agent cockpit. | M |
 | 5 | **Bring the docs to v0.1.16 + add a lease-based liveness / duplicate-resume guard** (the PRD's exact-session-ID safety story, still unbuilt). | Docs drift is actively misleading the next agent; the duplicate-resume guard is the PRD's signature safety feature and a real footgun (interleaved transcripts) that is currently unaddressed. | M |
@@ -74,7 +74,7 @@ README's status + layout; stamp PLAN workstreams shipped/planned.
 
 ### 1b. MCP server advertises tools the control channel refuses (P1 — dead features)
 
-`src-tauri/crates/termhub-mcp/src/tools.rs` advertises **20** tools; `src-tauri/src/control.rs`'s
+`src-tauri/crates/t-hub-mcp/src/tools.rs` advertises **20** tools; `src-tauri/src/control.rs`'s
 `dispatch()` (line 297) is the real executor. Three advertised tools can never succeed:
 
 - **`get_theme` / `set_theme`** — `control.rs:333-336` returns *"the theme command handler is not wired
@@ -104,7 +104,7 @@ control-channel-has-no-store constraint; this would need a sink/read path like t
   `claude/hooks.rs` (line 20) / `claude/install.rs` (`install_hooks`, line 212) have function-level
   allows for the "subagent will wire this later" era that has since passed. Worth re-checking whether
   these are genuinely reachable now and removing the blanket allows so dead code surfaces again.
-- **`agent/mod.rs:300`** hardcodes `core_version: "termhub 0.5.0"` in the Hello handshake — drifts from
+- **`agent/mod.rs:300`** hardcodes `core_version: "t-hub 0.5.0"` in the Hello handshake — drifts from
   the real 0.1.16 version. Cosmetic, but it's the version the agent logs see.
 
 ### 1d. Recovery history ring is churned by trivial saves (P1 — feature half-defeated)
@@ -182,12 +182,12 @@ is not met by the current trigger frequency.
 ### 2e. Status/title correlation is cwd-based and silently ambiguous (P2 — known, by design)
 
 - **Where:** `src/store/workspace.ts:1265` `terminalForCwd` (and the `agent://title` subscription).
-- **Bug/limitation:** TermHub terminals are keyed by tmux id; Claude sessions by `session_id`. The only
+- **Bug/limitation:** T-Hub terminals are keyed by tmux id; Claude sessions by `session_id`. The only
   link is the working directory. When two terminals share a cwd (very common: two agents in the same
   repo — the literal core use case), the correlation returns `null` and **no title/status reaches the
   tile at all**. So in the multi-agent-in-one-repo scenario the product is built for, tile labels and
   the session↔tile link degrade to nothing. HANDOFF §4 acknowledges the ambiguity.
-- **Suggested fix:** capture the exact Claude `session_id` at spawn time. When TermHub spawns
+- **Suggested fix:** capture the exact Claude `session_id` at spawn time. When T-Hub spawns
   `claude`/`claude --resume`, it controls the pane; it can inject/recover the session id (e.g. read the
   newest `~/.claude/projects/<proj>/<id>.jsonl`, or have the `SessionStart` hook's cwd+pid map back to
   the tmux pane via `pane_info`). This is the substrate for the duplicate-resume guard too (§3).
@@ -244,7 +244,7 @@ The PRD's signature safety feature (interleaved-transcript footgun) is **not bui
 cwd-based and ambiguous (§2e). Capture the real `session_id` at spawn/resume, maintain a live-attachment
 **lease** (heartbeat + TTL + startup reconciliation vs tmux/PID, per REVIEW §5), and offer
 **Focus existing / Fork** instead of an unsafe second resume. This is both a correctness fix (§2e) and
-the thing that makes TermHub *safe* for the parallel-agent workflows the README pitches. Rationale:
+the thing that makes T-Hub *safe* for the parallel-agent workflows the README pitches. Rationale:
 highest *trust* leverage; everything downstream (night-mode resume, handoff policies) depends on it.
 
 ### P1-strategic — Cross-session usage dashboard
@@ -273,33 +273,33 @@ interactive surfaces above.
 
 ## 4. Competitive analysis
 
-TermHub sits in a crowded-but-unconsolidated space. What comparable tools do that TermHub doesn't, and
+T-Hub sits in a crowded-but-unconsolidated space. What comparable tools do that T-Hub doesn't, and
 where the differentiated opening is:
 
-| Tool / class | What it does well that TermHub lacks | Relevance to TermHub |
+| Tool / class | What it does well that T-Hub lacks | Relevance to T-Hub |
 |---|---|---|
-| **tmux / Zellij** | Battle-tested multiplexing, session persistence, plugins, broadcast-input to many panes, layouts-as-config. Zellij has a polished floating-pane/tab UX. | TermHub *rides* tmux, so it inherits persistence — but it lacks **broadcast input** (send one prompt to N agents) and **layout presets**, both natural for a multi-agent driver. Broadcast-prompt is a clear quick win the others can't match (they're not agent-aware). |
-| **VS Code + agent extensions (Cline, Roo, Copilot, Continue)** | Full editor, diff review, inline file edits, language servers, git UI, extension ecosystem, MCP support. | TermHub deliberately is *not an IDE* (good — don't chase this). But VS Code agent panels have **no multi-session supervision** — they're single-conversation. TermHub's tree/attention-queue is exactly what they lack. Keep the file viewer minimal; do not grow toward LSP/debugger (PRD non-goal). |
-| **Warp** | Best-in-class terminal UX: blocks, AI command suggestions, command palette, beautiful rendering, Warp Drive (shared workflows), now multi-agent "Warp Agents". | Warp is the closest competitor and is moving INTO multi-agent. Its weakness: it's its own terminal/agent, not a supervisor of *your* Claude Code sessions with *your* hooks/transcripts. TermHub's moat is **deep Claude Code integration** (real hooks, exact session IDs, transcript-aware resume, rate-limit/context from the real statusline). Lean into that — Warp can't supervise an external `claude` process's lifecycle. |
-| **Conductor / multi-agent orchestration UIs (Conductor, Crystal, Claude Squad, vibe-kanban)** | Worktree-per-agent automation, parallel-task kanban boards, spawn-N-agents-on-a-task, diff-review-and-merge flows, run agents on isolated git worktrees. | This is TermHub's *direct* competitive set and the fastest-moving. They typically **auto-create a git worktree per agent** and present a board/diff-merge workflow. TermHub has the supervision tree but **no worktree automation, no spawn-on-task, no diff/merge surface** (PLAN 2.0 defers worktree mapping). This is the biggest feature gap vs. the closest rivals. |
-| **Agent dashboards (LangSmith, Langfuse, Helicone, AgentOps)** | Cross-run cost/latency/token dashboards, traces, eval, alerting. | These are observability for *API* agents, not interactive terminal supervision. TermHub's per-session statusline data could become a lightweight **local** version of this (cost/context/rate-limit over time) without the cloud — a differentiator for privacy-conscious solo devs. |
+| **tmux / Zellij** | Battle-tested multiplexing, session persistence, plugins, broadcast-input to many panes, layouts-as-config. Zellij has a polished floating-pane/tab UX. | T-Hub *rides* tmux, so it inherits persistence — but it lacks **broadcast input** (send one prompt to N agents) and **layout presets**, both natural for a multi-agent driver. Broadcast-prompt is a clear quick win the others can't match (they're not agent-aware). |
+| **VS Code + agent extensions (Cline, Roo, Copilot, Continue)** | Full editor, diff review, inline file edits, language servers, git UI, extension ecosystem, MCP support. | T-Hub deliberately is *not an IDE* (good — don't chase this). But VS Code agent panels have **no multi-session supervision** — they're single-conversation. T-Hub's tree/attention-queue is exactly what they lack. Keep the file viewer minimal; do not grow toward LSP/debugger (PRD non-goal). |
+| **Warp** | Best-in-class terminal UX: blocks, AI command suggestions, command palette, beautiful rendering, Warp Drive (shared workflows), now multi-agent "Warp Agents". | Warp is the closest competitor and is moving INTO multi-agent. Its weakness: it's its own terminal/agent, not a supervisor of *your* Claude Code sessions with *your* hooks/transcripts. T-Hub's moat is **deep Claude Code integration** (real hooks, exact session IDs, transcript-aware resume, rate-limit/context from the real statusline). Lean into that — Warp can't supervise an external `claude` process's lifecycle. |
+| **Conductor / multi-agent orchestration UIs (Conductor, Crystal, Claude Squad, vibe-kanban)** | Worktree-per-agent automation, parallel-task kanban boards, spawn-N-agents-on-a-task, diff-review-and-merge flows, run agents on isolated git worktrees. | This is T-Hub's *direct* competitive set and the fastest-moving. They typically **auto-create a git worktree per agent** and present a board/diff-merge workflow. T-Hub has the supervision tree but **no worktree automation, no spawn-on-task, no diff/merge surface** (PLAN 2.0 defers worktree mapping). This is the biggest feature gap vs. the closest rivals. |
+| **Agent dashboards (LangSmith, Langfuse, Helicone, AgentOps)** | Cross-run cost/latency/token dashboards, traces, eval, alerting. | These are observability for *API* agents, not interactive terminal supervision. T-Hub's per-session statusline data could become a lightweight **local** version of this (cost/context/rate-limit over time) without the cloud — a differentiator for privacy-conscious solo devs. |
 
 ### Where the differentiated opportunity is
 
 1. **"Supervisor of your own Claude Code, not yet-another-agent."** Every competitor either *is* the
-   agent (Warp, Cline) or orchestrates API calls. TermHub uniquely supervises the *real* `claude`
+   agent (Warp, Cline) or orchestrates API calls. T-Hub uniquely supervises the *real* `claude`
    process with its *real* hooks, transcripts, rate limits, and resume semantics. No one else does
    exact-session-ID lifecycle + duplicate-resume safety + transcript-aware recovery. **This is the moat —
    and it's exactly the part that's least finished (§3 identity/lease).** Finishing it is both the
    bug-fix and the differentiator.
 
 2. **Attention-routing for many agents.** The Conductor-class tools focus on *spawning* parallel work;
-   TermHub's tree+attention-queue is better positioned for *supervising* long-running ones (which needs
+   T-Hub's tree+attention-queue is better positioned for *supervising* long-running ones (which needs
    you, which is blocked, which is burning rate limit). Make the attention queue great (§3 P1) and that's
    a distinct lane.
 
 3. **Worktree automation is the table-stakes gap to close.** To compete with Conductor/Crystal/Claude
-   Squad, TermHub needs at least "spawn an agent in a fresh worktree" and a place to see/merge its diff.
+   Squad, T-Hub needs at least "spawn an agent in a fresh worktree" and a place to see/merge its diff.
    The hooks already emit `WorktreeCreate/Remove` and the agent can run `git worktree`; the substrate is
    there, the UX isn't. This is the clearest "catch up to rivals" item, distinct from the "lean into the
    moat" items above.
@@ -313,7 +313,7 @@ where the differentiated opening is:
 
 - **Dead session click:** `src/App.tsx:164,339`; `src/components/Sidebar.tsx:308,346`;
   fix reuses logic in `src/ipc/controlBridge.ts:83` and `src/store/workspace.ts:1265`.
-- **MCP↔control drift:** `src-tauri/crates/termhub-mcp/src/tools.rs:277-392` (advertised) vs
+- **MCP↔control drift:** `src-tauri/crates/t-hub-mcp/src/tools.rs:277-392` (advertised) vs
   `src-tauri/src/control.rs:297-343` (executed); theme commands real at `src-tauri/src/lib.rs:261` /
   `src-tauri/src/theme.rs`.
 - **UTF-8 slice:** `src-tauri/src/commands.rs:222,344`.

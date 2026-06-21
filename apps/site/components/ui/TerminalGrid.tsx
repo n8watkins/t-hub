@@ -194,7 +194,7 @@ export default function TerminalGrid() {
       <div className="flex items-center justify-between border-t border-white/[0.07] bg-white/[0.02] px-3 py-2 font-mono text-[0.6rem] text-slate-500">
         <span className="flex items-center gap-1.5">
           <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-          wsl: healthy · tmux -L termhub
+          wsl: healthy · tmux -L t-hub
         </span>
         <span className="flex items-center gap-3">
           <span>ctx 41%</span>

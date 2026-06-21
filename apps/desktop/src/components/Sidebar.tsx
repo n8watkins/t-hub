@@ -158,7 +158,7 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
           title="Recent"
           className="border-b"
           collapsible
-          storageKey="termhub.sidebar.recent.open"
+          storageKey="t-hub.sidebar.recent.open"
           bodyClassName="th-scroll overflow-y-auto"
           bodyStyle={{ maxHeight: "38vh" }}
         >
@@ -197,7 +197,7 @@ function BottomStatus({
   metrics: HostMetrics | null;
   connection?: ConnectionState;
 }) {
-  const [open, persistOpen] = usePersistedToggle("termhub.sidebar.bottom.open");
+  const [open, persistOpen] = usePersistedToggle("t-hub.sidebar.bottom.open");
 
   return (
     <div className="shrink-0 border-t" style={{ borderColor: "var(--th-border)" }}>
@@ -274,7 +274,7 @@ function WslMiniSummary({ metrics }: { metrics: HostMetrics | null }) {
  * Open/collapsed persists to localStorage.
  */
 function UsageSection() {
-  const [open, persistOpen] = usePersistedToggle("termhub.sidebar.usage.open");
+  const [open, persistOpen] = usePersistedToggle("t-hub.sidebar.usage.open");
   // One poller each drives both the collapsed inline summary and the full strip,
   // for Claude and (when present) Codex.
   const usage = useClaudeUsage();

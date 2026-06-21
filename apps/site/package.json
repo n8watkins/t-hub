@@ -1,5 +1,5 @@
 {
-  "name": "termhub-site",
+  "name": "t-hub-site",
   "version": "0.1.0",
   "private": true,
   "description": "Promo site for T-Hub — a free, open-source, 100% local session-first terminal IDE for supervising many Claude Code / agent sessions. A tool by n8builds.",

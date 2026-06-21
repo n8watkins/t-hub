@@ -1,4 +1,4 @@
-# TermHub — Forward Build Plan (0.5 → 2.0)
+# T-Hub — Forward Build Plan (0.5 → 2.0)
 
 **Status:** Planning track (no code). Source of truth for product/architecture is [PRD.md](../PRD.md); technical risks and the verified Claude Code facts are in [REVIEW.md](../REVIEW.md). The 0.1 IPC contract is [src/ipc/types.ts](../src/ipc/types.ts).
 
@@ -11,8 +11,8 @@
 The 0.1 "playable proof" nucleus is being scaffolded in parallel and is the floor every later release builds on. It establishes:
 
 - **Tauri 2 + React/TS** desktop shell with a WebView canvas.
-- **PTY spine:** `portable-pty`/ConPTY spawning `wsl.exe` → `tmux -L termhub attach` (one client per visible tile).
-- **Isolated tmux server** (`-L termhub`), one named session per terminal, surviving UI close.
+- **PTY spine:** `portable-pty`/ConPTY spawning `wsl.exe` → `tmux -L t-hub attach` (one client per visible tile).
+- **Isolated tmux server** (`-L t-hub`), one named session per terminal, surviving UI close.
 - **Auto-grid canvas:** add/remove/focus tiles; deterministic insertion after the focused tile.
 - **The IPC contract** ([src/ipc/types.ts](../src/ipc/types.ts)): commands `spawn_terminal`, `attach_terminal` (returns base64 scrollback), `write_terminal`, `resize_terminal`, `close_terminal` (detach, keep process), `kill_terminal` (stop process), `list_terminals`; events `terminal://output` (base64 bytes), `terminal://state`, `terminal://exit`; `TerminalState = starting|live|detached|exited|error`.
 
@@ -20,7 +20,7 @@ The 0.1 "playable proof" nucleus is being scaffolded in parallel and is the floo
 
 > **Two carry-forward truths from REVIEW.md that shape every later phase.**
 > 1. **Process durability is app-close-only; conversation durability is reboot-survivable.** `wsl --shutdown` / Windows reboot tears down the WSL2 VM → tmux server, every shell, and every in-flight turn die. Only the **transcript on the VHDX** survives. "Recovery after restart" therefore means *resume Claude conversations by exact ID + restart shells*, never "reattach to a live `npm run dev`." (REVIEW §1.)
-> 2. **The event spine is: Claude hook → WSL-side journal → termhub-agent → Windows core → UI event.** The journal (not live process state) is the authority for reconstruction intent, and it survives the Windows app being closed. Build this spine in 0.5; everything else rides it.
+> 2. **The event spine is: Claude hook → WSL-side journal → t-hub-agent → Windows core → UI event.** The journal (not live process state) is the authority for reconstruction intent, and it survives the Windows app being closed. Build this spine in 0.5; everything else rides it.
 
 ### Conventions used below
 
@@ -41,13 +41,13 @@ A senior engineer can run a full workday with 6–12 visible Claude sessions and
 ## Workstreams
 
 ### A. WSL control agent + event spine
-- Build the bundled Linux binary `termhub-agent` and the long-lived `wsl.exe -d <distro> -- termhub-agent --stdio` bridge over newline-delimited JSON (NDJSON), versioned protocol messages.
+- Build the bundled Linux binary `t-hub-agent` and the long-lived `wsl.exe -d <distro> -- t-hub-agent --stdio` bridge over newline-delimited JSON (NDJSON), versioned protocol messages.
 - Implement the **hook → WSL journal → agent → core → UI** path end-to-end. Hooks append to a durable WSL-side append-only journal (`EventJournalEntry`) and notify the agent; the agent forwards to the Windows core; the core fans out to UI events. Journal survives Windows app closure and is replayed on reconnect.
 - Agent responsibilities for 0.5: tmux/session registry & commands, WSL metrics (RAM/swap/CPU/load/distro state/process counts), `git`/worktree queries, hook/status ingestion.
 - **Watch-item from REVIEW:** the single stdio NDJSON pipe can head-of-line block (a bulk read stalls a metrics ping). Design request prioritization or a separate channel for bulk reads vs. control/metrics **now**, even if minimally.
 
 ### B. Claude adapter — identity, status, hooks
-- Install TermHub hook handlers (with explicit consent — see Risks) for: `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Stop`, `StopFailure`, `PermissionRequest`, `Notification`, `Elicitation`, `SubagentStart`, `SubagentStop`, `TaskCreated`, `TaskCompleted`, `CwdChanged`, `WorktreeCreate`, `WorktreeRemove`.
+- Install T-Hub hook handlers (with explicit consent — see Risks) for: `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Stop`, `StopFailure`, `PermissionRequest`, `Notification`, `Elicitation`, `SubagentStart`, `SubagentStop`, `TaskCreated`, `TaskCompleted`, `CwdChanged`, `WorktreeCreate`, `WorktreeRemove`.
 - **Exact session-ID capture at `SessionStart`** (from `session_id` base field) → write/update `AgentSessionRecord`.
 - Install the **status bridge**: receive Claude's JSON status data and persist the latest snapshot keyed by exact session ID (context %, usage, rate-limit block when present).
 - Adapter exposes generic ops: discover, start-new, resume-exact, fork, get-status, get-context, get-rate-limits, verify-resumability. Use the Agent SDK for **import/resume/fork/verify only** — *not* as the metadata source (SDK returns enumeration + transcript but **not** summary/cwd/branch/first-prompt; derive those from the transcript or the local index).
@@ -75,7 +75,7 @@ Represent and surface: working · waiting-on-subagents · needs-question · need
 | expired | transcript missing on resumability check |
 
 ### E. Duplicate-resume guard — "lease, not latch" (priority hardening)
-- Maintain a **live-attachment registry** keyed by exact session ID. Because hooks are global, even a non-TermHub `claude` fires `SessionStart` into the journal → detect **Live externally** (PRD §8.3).
+- Maintain a **live-attachment registry** keyed by exact session ID. Because hooks are global, even a non-T-Hub `claude` fires `SessionStart` into the journal → detect **Live externally** (PRD §8.3).
 - On a spawn/resume attempt against a session already marked live, offer **Focus existing / Fork** (`--fork-session`) instead of a second unsafe resume; hide raw override behind an explicit interleave warning.
 - **Treat liveness as a lease** (REVIEW §5): heartbeat + TTL + **startup reconciliation against actual tmux/PID**. A crash with no `SessionEnd` must not strand a session as permanently "live" and block a legitimate resume. Make stale-liveness a first-class reconciliation case beside stale-PID.
 
@@ -87,7 +87,7 @@ Represent and surface: working · waiting-on-subagents · needs-question · need
 ### G. Persistence + recovery review
 - **Two-track persistence (§8.2):** active workspace snapshot vs. historical catalog kept distinct from day one (prevents reopen-floods-me).
 - **Transactional autosave** after every material state change; commit within 500 ms.
-- **App-reopen-while-alive (§6.5):** load snapshot, query the isolated tmux server, match by stable TermHub ID, reattach visible tiles, keep hidden-tab sessions detached, restore geometry/zoom/selection/sidebar/unread states.
+- **App-reopen-while-alive (§6.5):** load snapshot, query the isolated tmux server, match by stable T-Hub ID, reattach visible tiles, keep hidden-tab sessions detached, restore geometry/zoom/selection/sidebar/unread states.
 - **Reviewed recovery after WSL/Windows restart (§6.6):** a review screen (not auto-open-everything) listing only last-snapshot or auto-recovery sessions; per-entry project/worktree, previous process, exact session ID, transcript availability, last activity, policy; Apply-to-all / grouped / one-by-one; **every attempted command + result written to the crash/recovery journal.** Frame restart recovery honestly as resume-conversation + restart-shell (carry-forward truth #1).
 
 ### H. Keyboard navigation + WSL health
@@ -142,7 +142,7 @@ Files open instantly for the selected worktree from a hydrated index; small edit
 - Ignore `.git`, dependency/build dirs, binary blobs, configurable patterns. Precompute normalized path + basename + extension + key-file flags for search.
 
 ### B. Worktree context + truth hierarchy (§10.4)
-- Resolve the selected session's exact worktree/branch/cwd via: (1) Claude structured status + `CwdChanged`/`WorktreeCreate|Remove` hook events → (2) `git rev-parse` / `git branch --show-current` / `git worktree list --porcelain` verification in WSL → (3) optional TermHub/agent metadata for edge cases. A Claude-authored MD file is a *fallback* contract only, never primary.
+- Resolve the selected session's exact worktree/branch/cwd via: (1) Claude structured status + `CwdChanged`/`WorktreeCreate|Remove` hook events → (2) `git rev-parse` / `git branch --show-current` / `git worktree list --porcelain` verification in WSL → (3) optional T-Hub/agent metadata for edge cases. A Claude-authored MD file is a *fallback* contract only, never primary.
 - Selecting a terminal switches file context to that session's exact worktree + shallow default tree (§6.8).
 
 ### C. Search + tree views
@@ -156,7 +156,7 @@ Files open instantly for the selected worktree from a hydrated index; small edit
 
 ### E. Historical session catalog (§6.7)
 - Catalog UI separate from the active snapshot; filters: provider · project · worktree · active · resumable · expired · archived · context · last-activity.
-- Cheap metadata for **hundreds–thousands** of sessions; TermHub metadata may persist indefinitely; mark a session **non-resumable** if its transcript was cleaned up/moved (resumability check against `~/.claude/projects/.../<id>.jsonl`).
+- Cheap metadata for **hundreds–thousands** of sessions; T-Hub metadata may persist indefinitely; mark a session **non-resumable** if its transcript was cleaned up/moved (resumability check against `~/.claude/projects/.../<id>.jsonl`).
 
 ### F. Crash journal surfacing + notifications + settings
 - Surface the event/crash journal (from the 0.5 spine) as a reviewable recovery/audit log.
@@ -183,7 +183,7 @@ Files open instantly for the selected worktree from a hydrated index; small edit
 ## Exit criteria (PRD §14.3)
 - Selecting a terminal instantly loads the correct project/worktree file context from the hydrated index.
 - Search `md`, `.env`, or a multi-token path query → relevant files under the target latency (~100 ms post-hydration).
-- Open Markdown rendered + edit a config file in a TermHub editor window → atomic save visible to the running agent.
+- Open Markdown rendered + edit a config file in a T-Hub editor window → atomic save visible to the running agent.
 - Browse active/detached/resumable/expired historical Claude sessions across projects.
 - Usable at **12 visible, 24 live/background, ≥1,000 catalog records** in the fixture.
 
@@ -202,7 +202,7 @@ Files open instantly for the selected worktree from a hydrated index; small edit
 **PRD roadmap row:** "Resume opted-in work after subscription reset." Ships **after** core V1 reliability is trusted (locked decision §17).
 
 ## Goal
-A deliberately scheduled session resumes **exactly once, at the right time**, without duplicating a live session — surviving a TermHub restart and fully audited.
+A deliberately scheduled session resumes **exactly once, at the right time**, without duplicating a live session — surviving a T-Hub restart and fully audited.
 
 ## Workstreams
 
@@ -230,7 +230,7 @@ A deliberately scheduled session resumes **exactly once, at the right time**, wi
 
 ## Exit criteria (PRD §14.4)
 - A rate-limited session offers a scheduled resume at the structured reset time with a configurable buffer.
-- Restarting TermHub does **not** lose the schedule.
+- Restarting T-Hub does **not** lose the schedule.
 - The scheduler **refuses** to run when the session is already live, the transcript is unavailable, or the schedule was cancelled.
 - Successful continuation occurs **exactly once** and appears in the event journal.
 
@@ -247,7 +247,7 @@ A deliberately scheduled session resumes **exactly once, at the right time**, wi
 **PRD roadmap row:** "Integrate external browser and agent control." Gated on core reliability holding (locked §17).
 
 ## Goal
-One managed preview page per project/session is reused reliably with background reload; Claude can organize TermHub within permission boundaries via MCP; open-file context is injected safely; process attribution improves.
+One managed preview page per project/session is reused reliably with background reload; Claude can organize T-Hub within permission boundaries via MCP; open-file context is injected safely; process attribution improves.
 
 ## Workstreams
 
@@ -255,7 +255,7 @@ One managed preview page per project/session is reused reliably with background 
 - Launch a dedicated **Chrome for Testing / Chromium** profile (modern Chrome 136+ requires a **non-default user-data dir** for remote debugging — isolated profile, never the user's personal Chrome).
 - **On-demand Playwright/Node sidecar** (bundled, started only when needed so it adds no idle memory).
 - Maintain **one managed page per preview target**; store a stable preview-target ID + browser page/target ID; **reload in the background by default**, bring to foreground only on explicit Preview or opt-in rule.
-- Preview discovery priority (§6.9): explicit TermHub declaration → Claude/footer link metadata → terminal URL detection → process/port association → saved project setting.
+- Preview discovery priority (§6.9): explicit T-Hub declaration → Claude/footer link metadata → terminal URL detection → process/port association → saved project setting.
 
 ### B. MCP command surface
 - Local MCP server backed by the **same internal command bus** (no fragile UI automation).
@@ -265,7 +265,7 @@ One managed preview page per project/session is reused reliably with background 
 - Associate the open file + optional selection with the exact Claude session; inject **only path/selection metadata** via **`UserPromptSubmit` `hookSpecificOutput.additionalContext`** — never auto-copy file or secret contents, never rewrite CLAUDE.md.
 
 ### D. Process attribution improvements
-- Better association of TermHub/Claude/Node processes and ports to sessions (feeds preview discovery + WSL health), short of the full 2.0 worktree/subagent mapping.
+- Better association of T-Hub/Claude/Node processes and ports to sessions (feeds preview discovery + WSL health), short of the full 2.0 worktree/subagent mapping.
 
 ## Key Claude Code mechanisms to use (verified)
 - **`UserPromptSubmit` `additionalContext`** for open-file injection (verified supported); also available on `SessionStart`, `PreToolUse`/`PostToolUse`, `Stop`, etc. if seeding is wanted.
@@ -279,7 +279,7 @@ One managed preview page per project/session is reused reliably with background 
 
 ## Exit criteria (PRD §13)
 - One preview page per project/session is **reused reliably** (no duplicate launches; background reload works).
-- Claude can **organize TermHub within permission boundaries** (Read/Organization without prompts; Process-changing with confirmation; Destructive/Secret-bearing denied by default).
+- Claude can **organize T-Hub within permission boundaries** (Read/Organization without prompts; Process-changing with confirmation; Destructive/Secret-bearing denied by default).
 
 ## Risks / watch-items (REVIEW / PRD §11.3, §16)
 - **Terminal escape-sequence hardening** — beyond URL sanitization, explicitly gate **OSC 52 (clipboard write)** and **window-title injection** from untrusted agent output (real exfiltration/spoofing vectors in xterm.js).
@@ -295,7 +295,7 @@ One managed preview page per project/session is reused reliably with background 
 **PRD roadmap row:** "Handle deeper context and parallel structures." This is where the *deeper* parallel work lands — the read-only awareness was already pulled into 0.5/1.0 per the verified sequencing note.
 
 ## Goal
-TermHub can explain and transition complex parallel agent work **without relying on terminal motion** — context-threshold handoff policies, automated subagent/worktree mapping, additional provider adapters, and API-usage dashboards.
+T-Hub can explain and transition complex parallel agent work **without relying on terminal motion** — context-threshold handoff policies, automated subagent/worktree mapping, additional provider adapters, and API-usage dashboards.
 
 ## Workstreams
 
@@ -326,7 +326,7 @@ TermHub can explain and transition complex parallel agent work **without relying
 - Usage-aggregation rollups (period, provider, project, cost, context).
 
 ## Exit criteria (PRD §13)
-- TermHub can **explain and transition complex parallel agent work without relying on terminal motion** (handoffs, subagent/worktree map, dashboards all functional).
+- T-Hub can **explain and transition complex parallel agent work without relying on terminal motion** (handoffs, subagent/worktree map, dashboards all functional).
 
 ## Risks / watch-items (REVIEW / PRD §16)
 - **Scope creep into IDE** — context policies and dashboards must stay supervisory; keep language servers, Git UI, debugging, extension systems as hard non-goals (§3.3, §16).

@@ -49,7 +49,7 @@ export function clampSplitRatio(r: number): number {
  *  persisted from this otherwise in-memory store — it's a deliberate, sticky
  *  layout preference (a user who widened a tile's Files panel wants it to stay),
  *  unlike the transient active-tab/fullscreen/url state. */
-const SPLIT_PERSIST_KEY = "termhub.panels.splitRatio.v1";
+const SPLIT_PERSIST_KEY = "t-hub.panels.splitRatio.v1";
 
 /** Read the persisted split-ratio map (best-effort; {} on any error/absence). */
 function loadSplitRatios(): Record<TerminalId, number> {

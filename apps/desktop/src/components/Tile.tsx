@@ -146,7 +146,7 @@ const DOT_VAR: Record<TerminalState, string> = {
 };
 
 /**
- * Resolve which TermHub drop target sits under a viewport point mid-drag.
+ * Resolve which T-Hub drop target sits under a viewport point mid-drag.
  * Precedence: a workspace tab (titlebar `data-tab-id`) or sidebar workspace row
  * (`data-th-ws-row`) — both move the tile to that workspace — win over a grid
  * tile; elementFromPoint returns the topmost element (often xterm's canvas), so
@@ -396,7 +396,7 @@ export function Tile({
   }, []);
 
   // --- SPLIT divider drag: resize the terminal|panel halves ---
-  // Pointer-based (not HTML5 DnD) like every other TermHub drag, with pointer
+  // Pointer-based (not HTML5 DnD) like every other T-Hub drag, with pointer
   // CAPTURE so the gesture keeps tracking even as it crosses the xterm canvas /
   // panel (whose own pointer handlers would otherwise steal events). On each move
   // we map the pointer's x within the split row to the terminal-half fraction and
@@ -1002,7 +1002,7 @@ export function Tile({
             </button>
 
             {/* Auto-continue on usage reset (per-terminal opt-in). When this
-                session runs out of usage, TermHub waits for the limit window to
+                session runs out of usage, T-Hub waits for the limit window to
                 reset and types the continue command so the agent resumes. */}
             <div
               className="my-2 border-t"

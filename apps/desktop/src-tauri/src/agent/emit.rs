@@ -56,13 +56,13 @@ pub const EVT_TITLE: &str = "agent://title";
 /// shape matches `JournalEvent` in `src/ipc/protocol.ts` (`{ entry }`) and can
 /// grow without a breaking change.
 ///
-/// NOTE: the inner `EventJournalEntry` is the `termhub-protocol` type, which the
+/// NOTE: the inner `EventJournalEntry` is the `t-hub-protocol` type, which the
 /// core forwards to the UI verbatim — so it serializes with the protocol crate's
 /// default **snake_case** keys (matching `src/ipc/protocol.ts`), *not* the
 /// camelCase used by `model.rs`.
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalEventPayload<'a> {
-    pub entry: &'a termhub_protocol::EventJournalEntry,
+    pub entry: &'a t_hub_protocol::EventJournalEntry,
 }
 
 /// Payload of the `session://status` event (mirrors `SessionStatusEvent` in
@@ -77,7 +77,7 @@ pub struct SessionStatusPayload {
 /// Payload of the `agent://title` event (mirrors `SessionTitleEvent` in
 /// `src/ipc/protocol.ts`). A short, Claude-derived label for what a session is
 /// doing, plus the session's `cwd` so the UI can correlate the Claude session id
-/// to a TermHub terminal (terminals are keyed by their own tmux id, not the
+/// to a T-Hub terminal (terminals are keyed by their own tmux id, not the
 /// Claude session id, but they share a working directory). camelCase to match TS.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

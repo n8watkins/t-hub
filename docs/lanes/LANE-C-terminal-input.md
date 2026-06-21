@@ -14,7 +14,7 @@
 **`feat/terminal-input`**. This lane touches the **Rust backend** + the command
 registry, so it needs a one-time `cargo` build (the frontend lanes don't).
 
-## What TermHub is
+## What T-Hub is
 A Tauri 2 + React + Rust app; each tile is an xterm attached via PTY → `tmux` →
 the agent. Keystrokes/paste flow `xterm.onData → writeTerminal(id, data)` (see
 `apps/desktop/src/components/Terminal.tsx`). New Tauri commands are added in
@@ -34,8 +34,8 @@ the agent. Keystrokes/paste flow `xterm.onData → writeTerminal(id, data)` (see
 ```bash
 cd <this worktree>
 pnpm install
-pnpm --filter termhub typecheck
-( cd apps/desktop/src-tauri && cargo check -p termhub )   # one-time build
+pnpm --filter t-hub-desktop typecheck
+( cd apps/desktop/src-tauri && cargo check -p t-hub )   # one-time build
 ```
 
 ## Tasks
@@ -55,7 +55,7 @@ file under the project (or a temp dir), then insert that file's path into the PT
 already works — don't regress it.
 
 ## Verify · commit · land on main
-1. `pnpm --filter termhub typecheck` + `cargo check -p termhub` pass.
+1. `pnpm --filter t-hub-desktop typecheck` + `cargo check -p t-hub` pass.
 2. Review your diff — ONLY your files changed.
 3. Commit in logical chunks; `Co-Authored-By: Claude <noreply@anthropic.com>`.
 4. Land: `git fetch origin && git rebase origin/main`, re-verify, `git push origin HEAD:main`.

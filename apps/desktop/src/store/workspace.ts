@@ -45,8 +45,8 @@ function cleanupTileSideState(id: TerminalId): void {
  * localStorage key for the workspace snapshot. v2 introduced workspace tabs;
  * a v1 snapshot (flat order/focus) is migrated into a single tab on load.
  */
-const PERSIST_KEY = "termhub.workspace.v2";
-const LEGACY_KEY = "termhub.workspace.v1";
+const PERSIST_KEY = "t-hub.workspace.v2";
+const LEGACY_KEY = "t-hub.workspace.v1";
 
 /** Global terminal font size (px) bounds + default, shared by every tile. */
 const DEFAULT_FONT_SIZE = 13;
@@ -142,7 +142,7 @@ interface WorkspaceState {
    *  + persisted so a relaunch restores the split. Empty in the single-window
    *  case and (effectively) in a satellite, which only knows its own tab. */
   poppedOutTabs: WorkspaceTab[];
-  /** Pointer-drag state (transient, never persisted). TermHub's drag-and-drop is
+  /** Pointer-drag state (transient, never persisted). T-Hub's drag-and-drop is
    *  built on pointer events + `elementFromPoint` rather than HTML5 DnD, which is
    *  unreliable over xterm's WebGL canvas in WebView2. `draggingTileId` /
    *  `draggingTabId` is the active drag SOURCE (a tile being moved, or a tab being
@@ -1464,7 +1464,7 @@ void hydrateFromBackend();
 // ---------------------------------------------------------------------------
 // GOAL NAMES: feed Claude-suggested titles from the lifecycle hooks into the
 // label map. The backend emits `agent://title` ({ sessionId, cwd, title }) when
-// a hook (UserPromptSubmit / SessionStart) yields a usable summary. TermHub
+// a hook (UserPromptSubmit / SessionStart) yields a usable summary. T-Hub
 // terminals are keyed by their own tmux id, not the Claude session id, so we
 // correlate by working directory (both are WSL-side paths). The matched
 // terminal's Claude title is then merged into `labels` (a user rename always

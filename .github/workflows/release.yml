@@ -20,8 +20,8 @@ on:
         description: "Build variant"
         type: choice
         options:
-          - dev   # side-by-side "T-Hub Dev" (com.termhub.devbuild, isolated termhub-dev socket) — installs alongside production
-          - prod  # the real "T-Hub" (com.termhub.dev) — replaces/upgrades the production install
+          - dev   # side-by-side "T-Hub Dev" (com.t-hub.dev, isolated t-hub-dev socket) — installs alongside production
+          - prod  # the real "T-Hub" (com.t-hub.app) — replaces/upgrades the production install
         default: dev
 
 permissions:
@@ -66,14 +66,14 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         # Tag pushes (no dispatch input) always build PROD. A manual dispatch
-        # builds DEV by default: "T-Hub Dev" (com.termhub.devbuild) with the
+        # builds DEV by default: "T-Hub Dev" (com.t-hub.dev) with the
         # devbuild feature, installable ALONGSIDE production. See tauri.dev.conf.json.
         run: |
           if ("${{ github.event.inputs.variant }}" -eq "dev") {
-            Write-Host "Building DEV variant: T-Hub Dev (com.termhub.devbuild, isolated termhub-dev socket)"
+            Write-Host "Building DEV variant: T-Hub Dev (com.t-hub.dev, isolated t-hub-dev socket)"
             pnpm tauri build -f devbuild --config src-tauri/tauri.dev.conf.json
           } else {
-            Write-Host "Building PROD variant: T-Hub (com.termhub.dev)"
+            Write-Host "Building PROD variant: T-Hub (com.t-hub.app)"
             pnpm tauri build
           }
 

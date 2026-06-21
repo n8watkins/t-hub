@@ -1,4 +1,4 @@
-//! tmux session registry on the isolated `termhub` socket (agent side).
+//! tmux session registry on the isolated `t-hub` socket (agent side).
 //!
 //! Mirrors the core's `src-tauri/src/tmux.rs` surface, but runs *inside WSL*
 //! where tmux actually lives. The agent is the future single owner of tmux
@@ -14,13 +14,13 @@ use std::process::Command;
 
 use anyhow::{anyhow, Result};
 
-/// The isolated tmux socket name; always passed as `tmux -L termhub`.
-pub const SOCKET: &str = "termhub";
+/// The isolated tmux socket name; always passed as `tmux -L t-hub`.
+pub const SOCKET: &str = "t-hub";
 
 /// Lines of scrollback to capture when seeding xterm.
 const SCROLLBACK_LINES: i64 = 2000;
 
-/// Build a `tmux -L termhub` command with the given args.
+/// Build a `tmux -L t-hub` command with the given args.
 fn tmux(args: &[&str]) -> Command {
     let mut cmd = Command::new("tmux");
     cmd.arg("-L").arg(SOCKET);
@@ -38,7 +38,7 @@ fn is_already_gone(stderr: &str) -> bool {
         || stderr.contains("No such file or directory")
 }
 
-/// List session names on the `termhub` socket (empty when no server runs).
+/// List session names on the `t-hub` socket (empty when no server runs).
 pub fn list_sessions() -> Result<Vec<String>> {
     let out = tmux(&["list-sessions", "-F", "#{session_name}"])
         .output()

@@ -1,6 +1,6 @@
 // Shared pointer-drop-target resolver (#6).
 //
-// Every TermHub drag interaction is built on POINTER events + `document.
+// Every T-Hub drag interaction is built on POINTER events + `document.
 // elementFromPoint`, not HTML5 DnD (which is unreliable over xterm's WebGL canvas
 // in WebView2 — see src/lib/pointerDrag.ts). Each call site historically rolled
 // its OWN `elementFromPoint(x,y)?.closest("[data-...]")` plus an

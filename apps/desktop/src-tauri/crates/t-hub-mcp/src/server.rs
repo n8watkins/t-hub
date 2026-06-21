@@ -99,15 +99,15 @@ fn initialize_result() -> Value {
             "tools": { "listChanged": false }
         },
         "serverInfo": {
-            "name": "termhub-mcp",
+            "name": "t-hub-mcp",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "TermHub MCP server. Read tools (list_terminals, get_status, \
+        "instructions": "T-Hub MCP server. Read tools (list_terminals, get_status, \
             supervision_tree, wsl_health, search_files, list_tabs, read_terminal) are \
             allowed. Organization tools (focus_session, move_tile, rename_tab, new_tab, \
             focus_tab, open_file) are audited. Process-changing tools (spawn_terminal, \
             send_text, send_keys, close_terminal) require confirmation. Calls are \
-            forwarded to the running TermHub app over a local control channel."
+            forwarded to the running T-Hub app over a local control channel."
     })
 }
 
@@ -123,7 +123,7 @@ fn tools_list_result() -> Value {
 /// validate `name` against the catalog (rejecting unknown tools with a clear
 /// error), resolve the control endpoint, forward `{command: name, args:
 /// arguments}`, and wrap the result. Tool-level failures (e.g. the app gating a
-/// process-changing tool, or TermHub not running) are returned as MCP tool
+/// process-changing tool, or T-Hub not running) are returned as MCP tool
 /// results with `isError: true` rather than transport errors, which is how MCP
 /// surfaces tool failures to the model.
 fn tools_call(req: &RpcRequest, id: Value) -> Outbound {
@@ -153,7 +153,7 @@ fn tools_call(req: &RpcRequest, id: Value) -> Outbound {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // Resolve the control channel; if TermHub isn't running, surface it as a
+    // Resolve the control channel; if T-Hub isn't running, surface it as a
     // tool error (isError) so the model gets a readable message.
     let endpoint: ControlEndpoint = match control_client::resolve_endpoint() {
         Ok(ep) => ep,
@@ -212,7 +212,7 @@ mod tests {
         let r = &resp[0]["result"];
         assert_eq!(r["protocolVersion"], PROTOCOL_VERSION);
         assert!(r["capabilities"]["tools"].is_object());
-        assert_eq!(r["serverInfo"]["name"], "termhub-mcp");
+        assert_eq!(r["serverInfo"]["name"], "t-hub-mcp");
     }
 
     #[test]
@@ -269,9 +269,9 @@ mod tests {
         // Point discovery at a nonexistent handshake + clear env overrides so the
         // call cannot reach an app; the result must be a tool-level isError, not
         // a JSON-RPC transport error (so the model sees a readable message).
-        std::env::set_var("TERMHUB_CONTROL_FILE", "/nonexistent/th-control.json");
-        std::env::remove_var("TERMHUB_CONTROL_ADDR");
-        std::env::remove_var("TERMHUB_CONTROL_TOKEN");
+        std::env::set_var("T_HUB_CONTROL_FILE", "/nonexistent/th-control.json");
+        std::env::remove_var("T_HUB_CONTROL_ADDR");
+        std::env::remove_var("T_HUB_CONTROL_TOKEN");
 
         let resp = run_lines(
             r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_terminals","arguments":{}}}"#,
@@ -282,7 +282,7 @@ mod tests {
         let text = resp[0]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("control channel not found"), "text: {text}");
 
-        std::env::remove_var("TERMHUB_CONTROL_FILE");
+        std::env::remove_var("T_HUB_CONTROL_FILE");
     }
 
     #[test]

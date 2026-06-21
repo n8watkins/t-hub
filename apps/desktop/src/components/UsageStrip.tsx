@@ -131,7 +131,7 @@ function InlinePct({
 /** Persist the last GOOD usage so the strip never flashes "unavailable" on a
  *  transient failed poll or right after launch — it shows the last-known weekly +
  *  5h until a fresh reading lands. */
-const CACHE_KEY = "termhub.usage.v1";
+const CACHE_KEY = "t-hub.usage.v1";
 
 function loadCachedUsage(): ClaudeUsage | null {
   if (typeof localStorage === "undefined") return null;
@@ -211,7 +211,7 @@ function fmtReset(epoch: number | null | undefined): string | null {
   }
 }
 
-const CODEX_CACHE_KEY = "termhub.codexUsage.v1";
+const CODEX_CACHE_KEY = "t-hub.codexUsage.v1";
 
 function loadCachedCodexUsage(): CodexUsage | null {
   if (typeof localStorage === "undefined") return null;

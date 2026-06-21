@@ -17,7 +17,7 @@
 //!     when one has been produced;
 //!   - the file's **mtime** is a faithful "last activity" stamp.
 //!
-//! These files survive app restarts, WSL restarts, and TermHub never having
+//! These files survive app restarts, WSL restarts, and T-Hub never having
 //! touched the session — exactly the durable catalog "Recent" wants. We prefer
 //! this over the in-memory supervision/agent catalog (which only knows sessions
 //! observed live this run) so Recent is useful immediately on a cold launch.
@@ -449,10 +449,10 @@ fn read_sessions() -> Vec<RecentSession> {
 // ---------------------------------------------------------------------------
 
 /// The WSL distro to read from (mirrors files.rs::host_distro so Recent and the
-/// file index agree). Overridable via TERMHUB_DISTRO; defaults to the dev distro.
+/// file index agree). Overridable via T_HUB_DISTRO; defaults to the dev distro.
 #[cfg(windows)]
 fn host_distro() -> String {
-    std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
 }
 
 /// Resolve the WSL `$HOME` for `distro` by shelling a login bash once (the proven

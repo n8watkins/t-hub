@@ -12,7 +12,7 @@
 // backend runs it inside a login shell the pane execs back into (so quitting the
 // command drops to a live shell instead of closing the tile).
 //
-// Chrome matches the rest of TermHub: it reads the `--th-*` theme tokens
+// Chrome matches the rest of T-Hub: it reads the `--th-*` theme tokens
 // (surface/border/fg/accent/radius) so it tracks the active theme like the FAB
 // and the ThemeEditor panels do.
 import { useEffect } from "react";

@@ -1,9 +1,9 @@
 //! App-side **control listener** — the local control channel the MCP server
-//! ([`termhub-mcp`](../crates/termhub-mcp)) forwards `tools/call` requests to.
+//! ([`t-hub-mcp`](../crates/t-hub-mcp)) forwards `tools/call` requests to.
 //!
 //! ## Why this exists
 //! MCP servers are launched by the client (Claude) over stdio, as a separate
-//! short-lived process. They cannot share the running TermHub app's
+//! short-lived process. They cannot share the running T-Hub app's
 //! Tauri-managed state in-process. So the MCP binary speaks the MCP protocol on
 //! stdio and forwards each `tools/call` to **this** listener over a loopback TCP
 //! channel; the listener dispatches by command name against the app's state and
@@ -21,11 +21,11 @@
 //!
 //! ## Discovery + auth
 //! On startup we bind `127.0.0.1:0` (an ephemeral port), generate a per-launch
-//! token, and write both to a small handshake file (`~/.termhub/control.json`,
+//! token, and write both to a small handshake file (`~/.t-hub/control.json`,
 //! mode `0600` on unix). The MCP binary reads that file to learn where to connect
-//! and which token to present. `TERMHUB_CONTROL_ADDR` + `TERMHUB_CONTROL_TOKEN`
+//! and which token to present. `T_HUB_CONTROL_ADDR` + `T_HUB_CONTROL_TOKEN`
 //! override discovery for tests / harnesses. Binding to loopback keeps the
-//! channel host-local (PRD §11.3: expose only what TermHub needs).
+//! channel host-local (PRD §11.3: expose only what T-Hub needs).
 //!
 //! ## Permission tiers (PRD §11.2)
 //! Read + Organization tools are dispatched here. Process-changing and
@@ -95,7 +95,7 @@ impl ControlResponse {
 }
 
 /// The handshake record written so the MCP binary can find + authenticate to the
-/// listener. Serialized to `~/.termhub/control.json`.
+/// listener. Serialized to `~/.t-hub/control.json`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ControlHandshake {
     /// `127.0.0.1:<port>` the listener bound to.
@@ -167,17 +167,17 @@ impl ControlContext {
     }
 }
 
-/// Resolve the handshake file path: `$TERMHUB_CONTROL_FILE` if set, else
-/// `~/.termhub/control.json` (or the process dir as a last resort).
+/// Resolve the handshake file path: `$T_HUB_CONTROL_FILE` if set, else
+/// `~/.t-hub/control.json` (or the process dir as a last resort).
 pub fn handshake_path() -> PathBuf {
-    if let Ok(p) = std::env::var("TERMHUB_CONTROL_FILE") {
+    if let Ok(p) = std::env::var("T_HUB_CONTROL_FILE") {
         return PathBuf::from(p);
     }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".termhub").join("control.json")
+    home.join(".t-hub").join("control.json")
 }
 
 /// Write the handshake file (best-effort `0600` on unix) so the MCP binary can
@@ -216,7 +216,7 @@ pub fn start(ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     write_handshake(&handshake)?;
 
     std::thread::Builder::new()
-        .name("termhub-control".into())
+        .name("t-hub-control".into())
         .spawn(move || serve(listener, ctx))
         .ok();
 
@@ -233,12 +233,12 @@ fn serve(listener: TcpListener, ctx: ControlContext) {
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = handle_conn(stream, &ctx) {
-                        eprintln!("termhub-control: connection error: {e}");
+                        eprintln!("t-hub-control: connection error: {e}");
                     }
                 });
             }
             Err(e) => {
-                eprintln!("termhub-control: accept failed: {e}");
+                eprintln!("t-hub-control: accept failed: {e}");
             }
         }
     }
@@ -348,7 +348,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
 // ---------------------------------------------------------------------------
 
 /// `list_terminals`: reconstruct the terminal list from the tmux source of truth
-/// on the isolated `termhub` socket. Mirrors `commands::list_terminals`, minus
+/// on the isolated `t-hub` socket. Mirrors `commands::list_terminals`, minus
 /// the in-memory Live/Detached refinement (the control channel does not own the
 /// UI's PTY map; everything tmux reports is a live tmux session).
 fn list_terminals() -> Result<Value, String> {
@@ -404,7 +404,7 @@ fn supervision_tree(ctx: &ControlContext, args: &Value) -> Result<Value, String>
 /// `wsl_health`: a compact WSL host snapshot. We synthesize it from the locally
 /// observable system (so the read tool works on this dev box without the WSL
 /// agent connected) and additionally surface the supervised-session count. The
-/// schema mirrors `termhub_protocol::HostMetrics`.
+/// schema mirrors `t_hub_protocol::HostMetrics`.
 fn wsl_health(ctx: &ControlContext) -> Result<Value, String> {
     let metrics = collect_host_metrics();
     let supervised = ctx.with_supervisor(|s| s.session_ids().len());
@@ -444,7 +444,7 @@ fn list_tabs() -> Result<Value, String> {
 
 /// `read_terminal` / `capture_pane`: return a session's recent visible output as
 /// plain text so an external Claude can SEE what the session shows. Talks to tmux
-/// directly (`tmux -L termhub capture-pane -p [-S -N] -t th_<id>`), no UI round
+/// directly (`tmux -L t-hub capture-pane -p [-S -N] -t th_<id>`), no UI round
 /// trip. Args: `sessionId` (required), `historyLines` (optional, default 0 =
 /// visible screen only; clamped to keep responses bounded).
 fn read_terminal(args: &Value) -> Result<Value, String> {
@@ -497,7 +497,7 @@ fn organization_apply(ctx: &ControlContext, command: &str, args: &Value) -> Resu
             // A forward failure is non-fatal: the action is still accepted +
             // audited. Surface the reason in the note but keep the response `ok`.
             Err(e) => {
-                eprintln!("termhub-control: failed to forward '{command}' to the UI: {e}");
+                eprintln!("t-hub-control: failed to forward '{command}' to the UI: {e}");
                 false
             }
         },
@@ -612,7 +612,7 @@ fn close_terminal(args: &Value) -> Result<Value, String> {
     }))
 }
 
-/// Resolve a caller-supplied session id to its tmux target name on the `termhub`
+/// Resolve a caller-supplied session id to its tmux target name on the `t-hub`
 /// socket. The control listener lists terminals by stripping the `th_` prefix
 /// (see [`list_terminals`]), so a bare id maps back to `th_<id>`. We also accept a
 /// caller that already passed the full `th_`-prefixed name (idempotent).
@@ -775,7 +775,7 @@ impl ControlContext {
     /// Test/proof constructor: build a context directly over a shared
     /// `Mutex<Supervisor>` (and a status bridge), wiring the visitor closure
     /// internally. Lets the end-to-end integration test seed real supervision +
-    /// status state, start a real listener, and exercise the real `termhub-mcp`
+    /// status state, start a real listener, and exercise the real `t-hub-mcp`
     /// binary against it — without standing up the whole Tauri app.
     #[doc(hidden)]
     pub fn with_shared_supervisor(
@@ -1050,7 +1050,7 @@ mod tests {
     fn search_files_searches_a_real_tree() {
         // Build a tiny fixture and search it end-to-end through dispatch.
         let mut root = std::env::temp_dir();
-        root.push(format!("termhub-control-files-{}", uuid::Uuid::new_v4()));
+        root.push(format!("t-hub-control-files-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
         std::fs::write(root.join("README.md"), "# hi").unwrap();
@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn open_file_reads_text_contents() {
         let mut root = std::env::temp_dir();
-        root.push(format!("termhub-control-open-{}", uuid::Uuid::new_v4()));
+        root.push(format!("t-hub-control-open-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("notes.md");
         std::fs::write(&file, "# Title\n\nbody").unwrap();

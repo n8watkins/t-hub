@@ -4,9 +4,9 @@
   "version": "0.0.0",
   "description": "T-Hub monorepo by n8builds. apps/desktop = the Tauri terminal cockpit for supervising Claude Code sessions in WSL2; apps/site = the marketing site. Promo videos live as assets outside the repo.",
   "scripts": {
-    "dev": "pnpm --filter termhub dev",
-    "build": "pnpm --filter termhub build",
-    "typecheck": "pnpm --filter termhub typecheck",
-    "tauri": "pnpm --filter termhub tauri"
+    "dev": "pnpm --filter t-hub-desktop dev",
+    "build": "pnpm --filter t-hub-desktop build",
+    "typecheck": "pnpm --filter t-hub-desktop typecheck",
+    "tauri": "pnpm --filter t-hub-desktop tauri"
   }
 }

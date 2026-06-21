@@ -65,10 +65,10 @@ impl GitInfo {
 
 /// The WSL distro projects live in, as seen from the Windows host. Mirrors
 /// `files.rs::host_distro` (replicated locally to stay in-lane this batch):
-/// overridable via `TERMHUB_DISTRO`, defaulting to the dev distro. Windows only.
+/// overridable via `T_HUB_DISTRO`, defaulting to the dev distro. Windows only.
 #[cfg(windows)]
 fn host_distro() -> String {
-    std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
 }
 
 /// Run `git <args...>` against `cwd` and return `(success, stdout, stderr)`.

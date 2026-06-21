@@ -2,7 +2,7 @@
 //!
 //! Today the workspace snapshot (tabs/order/sizes/focus/poppedOutTabs/fontSize)
 //! lives only in the webview's `localStorage` (`src/store/workspace.ts`, key
-//! `termhub.workspace.v2`). That is fine for round-tripping a single window but
+//! `t-hub.workspace.v2`). That is fine for round-tripping a single window but
 //! is fragile: a cleared web cache, a corrupt profile, or a crash mid-write can
 //! lose the arrangement, and there is no out-of-process copy to recover from.
 //!
@@ -11,7 +11,7 @@
 //! and the recovery-review UI lands in a later phase.
 //!
 //! Design:
-//!   - A single SQLite database under Tauri's `app_data_dir` (`termhub.db`).
+//!   - A single SQLite database under Tauri's `app_data_dir` (`t-hub.db`).
 //!   - **WAL** journal mode + `synchronous=NORMAL`: durable across app crashes
 //!     (a power loss can lose only the last in-flight commit), with far less
 //!     fsync cost than the default `FULL` — the right trade for best-effort UI
@@ -69,14 +69,14 @@ pub const WORKSPACE_KEY: &str = "workspace.v2";
 
 /// Database filename inside the app data dir.
 ///
-/// Resolved ONCE at startup from `$TERMHUB_DB_NAME`, defaulting to
-/// `"termhub.db"`. The env hook exists so a side-by-side **DEV** instance can
+/// Resolved ONCE at startup from `$T_HUB_DB_NAME`, defaulting to
+/// `"t-hub.db"`. The env hook exists so a side-by-side **DEV** instance can
 /// keep its workspace state in a SEPARATE SQLite file (e.g.
-/// `TERMHUB_DB_NAME=termhub-dev.db`) within the same app data dir, instead of
-/// reading/writing production's `termhub.db`. With NO env var set the filename
-/// is exactly `"termhub.db"`, so default behavior is byte-for-byte unchanged.
+/// `T_HUB_DB_NAME=t-hub-dev.db`) within the same app data dir, instead of
+/// reading/writing production's `t-hub.db`. With NO env var set the filename
+/// is exactly `"t-hub.db"`, so default behavior is byte-for-byte unchanged.
 static DB_FILE: LazyLock<String> =
-    LazyLock::new(|| std::env::var("TERMHUB_DB_NAME").unwrap_or_else(|_| "termhub.db".into()));
+    LazyLock::new(|| std::env::var("T_HUB_DB_NAME").unwrap_or_else(|_| "t-hub.db".into()));
 
 /// Tauri-managed state: the open SQLite connection behind a mutex. A `None`
 /// connection means the DB could not be opened/initialized at startup; the two
@@ -377,7 +377,7 @@ mod tests {
     /// A fresh DB in a unique temp dir, isolated per test (no env globals).
     fn temp_db() -> (Db, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "termhub-db-test-{}-{:?}",
+            "t-hub-db-test-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

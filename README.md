@@ -1,6 +1,6 @@
-# TermHub
+# T-Hub
 
-TermHub is a **terminal-first command center for running and supervising many persistent coding-agent (Claude Code) sessions at once**. The V1 target is a single personal setup: Windows 11 + WSL2 Ubuntu + zsh, with an adapter-based core so other terminal agents can be added later.
+T-Hub is a **terminal-first command center for running and supervising many persistent coding-agent (Claude Code) sessions at once**. The V1 target is a single personal setup: Windows 11 + WSL2 Ubuntu + zsh, with an adapter-based core so other terminal agents can be added later.
 
 ## Status — 0.1 "playable proof" nucleus (scaffolded)
 
@@ -8,7 +8,7 @@ The terminal nucleus is in place and compiles end to end:
 
 - **Tauri 2 + React 18 + TypeScript + Tailwind** desktop shell.
 - **xterm.js** terminal tiles (Fit + WebGL + Search + Unicode 11) in a responsive auto-grid with deterministic insertion, focus, and layout persistence.
-- **Rust PTY ↔ tmux backend:** `portable-pty` (ConPTY on Windows) drives a `tmux -L termhub` session per terminal — one PTY client per visible tile. Closing a tile **detaches** (the process survives); stop **kills** the session.
+- **Rust PTY ↔ tmux backend:** `portable-pty` (ConPTY on Windows) drives a `tmux -L t-hub` session per terminal — one PTY client per visible tile. Closing a tile **detaches** (the process survives); stop **kills** the session.
 - **Platform-abstracted attach:** `#[cfg(windows)]` spawns `wsl.exe … tmux attach`; `#[cfg(unix)]` attaches to tmux directly (so the nucleus is exercisable inside WSL today).
 
 **Verified:** `pnpm typecheck` + `vite build` pass; `cargo check` passes in-tree against real Tauri 2.11 (Linux + `x86_64-pc-windows-msvc`); the spawn → stream → resize → **detach-survives** → reattach-with-scrollback → kill cycle was runtime-tested against real `tmux`.
@@ -22,7 +22,7 @@ src/                 React frontend (xterm tiles, auto-grid canvas, Zustand stor
 src-tauri/           Rust/Tauri backend
   src/commands.rs    The 7 Tauri commands (mirrors ipc/types.ts)
   src/pty.rs         portable-pty ↔ tmux-attach bridge
-  src/tmux.rs        `tmux -L termhub` process wrappers (isolated socket)
+  src/tmux.rs        `tmux -L t-hub` process wrappers (isolated socket)
   src/events.rs      terminal://output | state | exit payloads
 docs/PLAN.md         Forward build plan (0.5 → 2.0)
 PRD.md               Product Requirements Document v1.0

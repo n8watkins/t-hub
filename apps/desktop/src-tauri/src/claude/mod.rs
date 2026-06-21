@@ -19,7 +19,7 @@
 //! discover/resume/fork/verify ops are SUBAGENT(claude-adapter)'s to implement.
 //!
 //! Boundary: SUBAGENT(claude-adapter) owns this directory (`claude/`). It must
-//! not change `termhub-protocol`, `model.rs`, or `supervision.rs`.
+//! not change `t-hub-protocol`, `model.rs`, or `supervision.rs`.
 
 pub mod hooks;
 pub mod install;

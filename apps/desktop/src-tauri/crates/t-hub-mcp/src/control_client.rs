@@ -1,9 +1,9 @@
 //! Client side of the loopback control channel: the bridge from `tools/call` to
-//! the running TermHub app.
+//! the running T-Hub app.
 //!
-//! Discovery: read the handshake file the app wrote (`$TERMHUB_CONTROL_FILE`, or
-//! `~/.termhub/control.json`) for the `addr` + `token`, or take both from
-//! `$TERMHUB_CONTROL_ADDR` + `$TERMHUB_CONTROL_TOKEN` (used by the test harness
+//! Discovery: read the handshake file the app wrote (`$T_HUB_CONTROL_FILE`, or
+//! `~/.t-hub/control.json`) for the `addr` + `token`, or take both from
+//! `$T_HUB_CONTROL_ADDR` + `$T_HUB_CONTROL_TOKEN` (used by the test harness
 //! and when the app's path differs). Each call opens a short-lived TCP
 //! connection to `addr`, sends one NDJSON request line, and reads one NDJSON
 //! response line. Connections are not pooled — `tools/call` is infrequent and a
@@ -17,7 +17,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value;
 
-/// How TermHub's control channel was located + authenticated.
+/// How T-Hub's control channel was located + authenticated.
 #[derive(Debug, Clone)]
 pub struct ControlEndpoint {
     pub addr: String,
@@ -34,13 +34,13 @@ struct Handshake {
 /// Resolve the control endpoint, env overrides first, then the handshake file.
 ///
 /// Returns a descriptive error (not a panic) when the app isn't running / the
-/// handshake file is missing, so the MCP server can surface "TermHub is not
+/// handshake file is missing, so the MCP server can surface "T-Hub is not
 /// running" as a tool error rather than crashing.
 pub fn resolve_endpoint() -> Result<ControlEndpoint, String> {
     // 1. Explicit env override (addr + token) — used by the proof harness.
     if let (Ok(addr), Ok(token)) = (
-        std::env::var("TERMHUB_CONTROL_ADDR"),
-        std::env::var("TERMHUB_CONTROL_TOKEN"),
+        std::env::var("T_HUB_CONTROL_ADDR"),
+        std::env::var("T_HUB_CONTROL_TOKEN"),
     ) {
         if !addr.is_empty() && !token.is_empty() {
             return Ok(ControlEndpoint { addr, token });
@@ -51,8 +51,8 @@ pub fn resolve_endpoint() -> Result<ControlEndpoint, String> {
     let path = handshake_path();
     let body = std::fs::read_to_string(&path).map_err(|e| {
         format!(
-            "TermHub control channel not found at {} ({e}). Is the TermHub app \
-             running? (set TERMHUB_CONTROL_ADDR + TERMHUB_CONTROL_TOKEN to override.)",
+            "T-Hub control channel not found at {} ({e}). Is the T-Hub app \
+             running? (set T_HUB_CONTROL_ADDR + T_HUB_CONTROL_TOKEN to override.)",
             path.display()
         )
     })?;
@@ -65,16 +65,16 @@ pub fn resolve_endpoint() -> Result<ControlEndpoint, String> {
 }
 
 /// The handshake file path (mirrors `crate::control::handshake_path` on the app
-/// side): `$TERMHUB_CONTROL_FILE`, else `~/.termhub/control.json`.
+/// side): `$T_HUB_CONTROL_FILE`, else `~/.t-hub/control.json`.
 fn handshake_path() -> PathBuf {
-    if let Ok(p) = std::env::var("TERMHUB_CONTROL_FILE") {
+    if let Ok(p) = std::env::var("T_HUB_CONTROL_FILE") {
         return PathBuf::from(p);
     }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".termhub").join("control.json")
+    home.join(".t-hub").join("control.json")
 }
 
 /// The app's response envelope: `{ok, result?, error?}`.
@@ -97,7 +97,7 @@ pub fn call(endpoint: &ControlEndpoint, command: &str, args: &Value) -> Result<V
     });
 
     let stream = TcpStream::connect(&endpoint.addr)
-        .map_err(|e| format!("failed to connect to TermHub control channel {}: {e}", endpoint.addr))?;
+        .map_err(|e| format!("failed to connect to T-Hub control channel {}: {e}", endpoint.addr))?;
     // Bounded timeouts so a hung app surfaces as a tool error, not a stuck MCP
     // server. The control handler answers a single round-trip quickly.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
@@ -121,7 +121,7 @@ pub fn call(endpoint: &ControlEndpoint, command: &str, args: &Value) -> Result<V
         .read_line(&mut resp_line)
         .map_err(|e| format!("failed to read control response: {e}"))?;
     if n == 0 {
-        return Err("TermHub control channel closed without responding".to_string());
+        return Err("T-Hub control channel closed without responding".to_string());
     }
 
     let resp: ControlResponse = serde_json::from_str(resp_line.trim_end())
@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn resolve_endpoint_reads_handshake_file() {
-        // Write a temp handshake and point TERMHUB_CONTROL_FILE at it. Clear the
+        // Write a temp handshake and point T_HUB_CONTROL_FILE at it. Clear the
         // addr/token env so the file path is exercised.
         let dir = std::env::temp_dir().join(format!("th-mcp-hs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -213,15 +213,15 @@ mod tests {
 
         // SAFETY: tests in this module run single-threaded per process by default
         // for env mutation; we set + remove around the call.
-        std::env::set_var("TERMHUB_CONTROL_FILE", &file);
-        std::env::remove_var("TERMHUB_CONTROL_ADDR");
-        std::env::remove_var("TERMHUB_CONTROL_TOKEN");
+        std::env::set_var("T_HUB_CONTROL_FILE", &file);
+        std::env::remove_var("T_HUB_CONTROL_ADDR");
+        std::env::remove_var("T_HUB_CONTROL_TOKEN");
 
         let ep = resolve_endpoint().unwrap();
         assert_eq!(ep.addr, "127.0.0.1:9999");
         assert_eq!(ep.token, "filetok");
 
-        std::env::remove_var("TERMHUB_CONTROL_FILE");
+        std::env::remove_var("T_HUB_CONTROL_FILE");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

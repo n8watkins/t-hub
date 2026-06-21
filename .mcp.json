@@ -1,24 +1,24 @@
 {
   "$comment": [
-    "Registers TermHub's local MCP server with Claude Code (and any MCP client",
-    "that reads .mcp.json). The client launches `termhub-mcp` over stdio; the",
-    "server forwards every tools/call to the RUNNING TermHub app over a loopback",
-    "control channel it discovers from ~/.termhub/control.json. So: the TermHub",
+    "Registers T-Hub's local MCP server with Claude Code (and any MCP client",
+    "that reads .mcp.json). The client launches `t-hub-mcp` over stdio; the",
+    "server forwards every tools/call to the RUNNING T-Hub app over a loopback",
+    "control channel it discovers from ~/.t-hub/control.json. So: the T-Hub",
     "app must be running for the tools to do anything (the server itself starts",
-    "fine without it and reports a clear 'TermHub is not running' tool error).",
+    "fine without it and reports a clear 'T-Hub is not running' tool error).",
     "",
     "The `command` below points at the debug build produced by",
-    "`cargo build -p termhub-mcp`. For a packaged install, point it at the",
-    "bundled `termhub-mcp` (e.g. the Tauri sidecar binary) instead. On Windows",
+    "`cargo build -p t-hub-mcp`. For a packaged install, point it at the",
+    "bundled `t-hub-mcp` (e.g. the Tauri sidecar binary) instead. On Windows",
     "use the .exe path. See docs/MCP.md.",
     "",
-    "Env overrides (optional): TERMHUB_CONTROL_ADDR + TERMHUB_CONTROL_TOKEN pin",
-    "the control endpoint explicitly (skips the handshake file); TERMHUB_CONTROL_FILE",
+    "Env overrides (optional): T_HUB_CONTROL_ADDR + T_HUB_CONTROL_TOKEN pin",
+    "the control endpoint explicitly (skips the handshake file); T_HUB_CONTROL_FILE",
     "points at a non-default handshake path."
   ],
   "mcpServers": {
-    "termhub": {
-      "command": "./apps/desktop/src-tauri/target/debug/termhub-mcp",
+    "t-hub": {
+      "command": "./apps/desktop/src-tauri/target/debug/t-hub-mcp",
       "args": [],
       "env": {}
     }

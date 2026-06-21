@@ -23,7 +23,7 @@ use serde::Serialize;
 use crate::claude::StatusSnapshot;
 use crate::model::{SessionStatus, SupervisionTree};
 use crate::AppState;
-use termhub_protocol::HostMetrics;
+use t_hub_protocol::HostMetrics;
 
 /// Current core↔agent connection state for the UI health area.
 #[derive(Debug, Clone, Serialize)]
@@ -125,7 +125,7 @@ pub async fn ingest_status(
 
 // --- Claude hook installer (Workstream B; consent-gated, non-destructive) ---
 
-/// Install TermHub's hook handlers into `~/.claude/settings.json`. `consent`
+/// Install T-Hub's hook handlers into `~/.claude/settings.json`. `consent`
 /// MUST be true (collected explicitly in the UI) or this refuses.
 #[tauri::command]
 pub async fn install_claude_hooks(
@@ -139,19 +139,19 @@ pub async fn install_claude_hooks(
         .map_err(|e| e.to_string())
 }
 
-/// Remove TermHub's hook handlers (clean uninstall), leaving user hooks intact.
+/// Remove T-Hub's hook handlers (clean uninstall), leaving user hooks intact.
 #[tauri::command]
 pub async fn uninstall_claude_hooks() -> Result<crate::claude::InstallReport, String> {
     crate::claude::install::uninstall_hooks().map_err(|e| e.to_string())
 }
 
-/// Whether TermHub hooks are currently installed (for the UI install state).
+/// Whether T-Hub hooks are currently installed (for the UI install state).
 #[tauri::command]
 pub async fn claude_hooks_installed() -> Result<bool, String> {
     crate::claude::install::hooks_installed().map_err(|e| e.to_string())
 }
 
-/// Which hook events TermHub currently manages (so the UI can pre-check them).
+/// Which hook events T-Hub currently manages (so the UI can pre-check them).
 #[tauri::command]
 pub async fn claude_hooks_managed() -> Result<Vec<String>, String> {
     crate::claude::install::managed_event_names().map_err(|e| e.to_string())

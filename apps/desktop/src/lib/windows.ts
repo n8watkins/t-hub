@@ -1,8 +1,8 @@
 // Multi-window tear-off plumbing (#21, PHASE 1).
 //
-// TermHub is normally a single frameless window with a strip of workspace tabs,
+// T-Hub is normally a single frameless window with a strip of workspace tabs,
 // each tab being a canvas of terminal tiles. This module lets the user "pop" a
-// tab out into a SECOND TermHub window:
+// tab out into a SECOND T-Hub window:
 //
 //   * The new window loads the SAME app bundle with `?tab=<id>` in the URL. On
 //     boot the workspace store reads that param: when present the window is a
@@ -88,7 +88,7 @@ function broadcast(kind: "out" | "in", tabId: string, tab?: WorkspaceTab): void 
 }
 
 /**
- * Pop a workspace tab out into its own TermHub window.
+ * Pop a workspace tab out into its own T-Hub window.
  *
  * Moves the tab into the popped-out set (so THIS — the main — window stops
  * rendering it), broadcasts, then creates the satellite window loading

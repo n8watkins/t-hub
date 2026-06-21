@@ -1,6 +1,6 @@
-# TermHub MCP server
+# T-Hub MCP server
 
-The local **MCP server** lets Claude drive TermHub — list terminals, read
+The local **MCP server** lets Claude drive T-Hub — list terminals, read
 session status + the supervision tree, check WSL health, search files, and
 perform safe organization actions — within the PRD §11.2 permission tiers
 (PRD §9.6, §13 "1.5 — Automation and preview").
@@ -15,7 +15,7 @@ the end-to-end proof on a dev box.
 
 MCP servers are launched **by the client** (Claude) as a short-lived subprocess
 that speaks JSON-RPC over **stdio**. Such a process can't share the running
-TermHub app's Tauri-managed state in-process, so TermHub splits the
+T-Hub app's Tauri-managed state in-process, so T-Hub splits the
 responsibility across two pieces joined by a tiny local control channel:
 
 ```
@@ -23,8 +23,8 @@ responsibility across two pieces joined by a tiny local control channel:
         │  MCP / JSON-RPC over stdio   (initialize · tools/list · tools/call)
         ▼
   ┌──────────────────────────┐      loopback TCP, NDJSON
-  │  termhub-mcp (binary)    │  ───────────────────────────►  ┌────────────────────────────┐
-  │  crates/termhub-mcp      │   {token, command, args}       │  TermHub app (Tauri/Rust)  │
+  │  t-hub-mcp (binary)    │  ───────────────────────────►  ┌────────────────────────────┐
+  │  crates/t-hub-mcp      │   {token, command, args}       │  T-Hub app (Tauri/Rust)  │
   │                          │  ◄───────────────────────────  │  src/control.rs listener   │
   │  • MCP protocol subset   │      {ok, result | error}      │                            │
   │  • static tool catalog   │                                │  • authenticates token     │
@@ -32,7 +32,7 @@ responsibility across two pieces joined by a tiny local control channel:
   └──────────────────────────┘                                │    name → existing surface │
                                                               │    (tmux · supervision ·   │
    discovers addr + token from                                 │     status · files)        │
-   ~/.termhub/control.json                                     └────────────────────────────┘
+   ~/.t-hub/control.json                                     └────────────────────────────┘
 ```
 
 Key property: **the MCP server has no compile-time knowledge of individual
@@ -45,15 +45,15 @@ shared types to keep in lockstep.
 
 | Piece | Path | Role |
 | --- | --- | --- |
-| MCP server binary | `src-tauri/crates/termhub-mcp/` | Speaks MCP JSON-RPC on stdio; owns the tool catalog; forwards `tools/call` to the app. |
-| `protocol.rs` | `…/termhub-mcp/src/protocol.rs` | Minimal JSON-RPC 2.0 framing (request/notification/response/error). |
-| `tools.rs` | `…/termhub-mcp/src/tools.rs` | The static tool catalog + tiers + JSON schemas. |
-| `control_client.rs` | `…/termhub-mcp/src/control_client.rs` | Discovers the app (handshake file / env) and forwards one command. |
-| `server.rs` | `…/termhub-mcp/src/server.rs` | The stdio loop: `initialize`, `tools/list`, `tools/call`, `ping`. |
+| MCP server binary | `src-tauri/crates/t-hub-mcp/` | Speaks MCP JSON-RPC on stdio; owns the tool catalog; forwards `tools/call` to the app. |
+| `protocol.rs` | `…/t-hub-mcp/src/protocol.rs` | Minimal JSON-RPC 2.0 framing (request/notification/response/error). |
+| `tools.rs` | `…/t-hub-mcp/src/tools.rs` | The static tool catalog + tiers + JSON schemas. |
+| `control_client.rs` | `…/t-hub-mcp/src/control_client.rs` | Discovers the app (handshake file / env) and forwards one command. |
+| `server.rs` | `…/t-hub-mcp/src/server.rs` | The stdio loop: `initialize`, `tools/list`, `tools/call`, `ping`. |
 | App control listener | `src-tauri/src/control.rs` | Loopback TCP listener; authenticates the token; dispatches by command name. |
 | Registration line | `src-tauri/src/lib.rs` (`start_control_listener`) | Starts the listener in `setup()` with a supervisor-visitor closure. |
 
-The listener uses **loopback TCP** (not a Unix socket) because TermHub's primary
+The listener uses **loopback TCP** (not a Unix socket) because T-Hub's primary
 target is Windows, where AF_UNIX support is inconsistent; loopback TCP behaves
 identically on Windows, WSL, Linux, and macOS.
 
@@ -83,16 +83,16 @@ or
 On startup the app binds `127.0.0.1:0` (ephemeral port), generates a per-launch
 token (a UUID), and writes both to a handshake file:
 
-- Path: `$TERMHUB_CONTROL_FILE`, else `~/.termhub/control.json` (mode `0600` on
+- Path: `$T_HUB_CONTROL_FILE`, else `~/.t-hub/control.json` (mode `0600` on
   unix).
 - Contents: `{ "addr": "127.0.0.1:<port>", "token": "<uuid>", "pid": <pid> }`.
 
-`termhub-mcp` reads that file to learn where to connect and which token to
+`t-hub-mcp` reads that file to learn where to connect and which token to
 present. Two env vars override discovery (used by the proof harness and packaged
 installs):
 
-- `TERMHUB_CONTROL_ADDR` + `TERMHUB_CONTROL_TOKEN` — pin the endpoint directly.
-- `TERMHUB_CONTROL_FILE` — point at a non-default handshake path.
+- `T_HUB_CONTROL_ADDR` + `T_HUB_CONTROL_TOKEN` — pin the endpoint directly.
+- `T_HUB_CONTROL_FILE` — point at a non-default handshake path.
 
 The token gates every request: a bad token is rejected **before** any command
 runs, and the listener only accepts loopback peers.
@@ -103,7 +103,7 @@ runs, and the listener only accepts loopback peers.
 
 | Tool | Tier | Default | Backed by |
 | --- | --- | --- | --- |
-| `list_terminals` | Read | allowed | tmux `list-sessions` on the isolated `termhub` socket |
+| `list_terminals` | Read | allowed | tmux `list-sessions` on the isolated `t-hub` socket |
 | `get_status` | Read | allowed | supervision status + statusline snapshot for a `sessionId` |
 | `supervision_tree` | Read | allowed | orchestrator→subagent tree for a `sessionId` |
 | `wsl_health` | Read | allowed | host metrics from `/proc` (+ supervised-session count) |
@@ -128,13 +128,13 @@ runs, and the listener only accepts loopback peers.
   on the app side — the listener refuses them with a clear error rather than
   spawning anything. The description is the user-facing contract; the app-side
   gate is the enforcement. Each tool also carries an
-  `annotations.confirmationRequired` boolean and an `annotations.termhubTier`
+  `annotations.confirmationRequired` boolean and an `annotations.t-hubTier`
   string so a permission-aware client can map it to its own policy.
 - **Destructive / secret-bearing** tools (PRD §11.2 lower tiers) are simply not
   in the catalog and not dispatchable — the listener's `match` has no arm for
   them, so an unknown command is refused.
 
-Tool failures (a gated tool, or "TermHub is not running") come back as MCP
+Tool failures (a gated tool, or "T-Hub is not running") come back as MCP
 **tool results with `isError: true`**, not transport errors — that's how MCP
 surfaces tool-level failures to the model.
 
@@ -143,7 +143,7 @@ surfaces tool-level failures to the model.
 ## 4. The theme-tool contract
 
 `get_theme` and `set_theme` are **forwarded by name, verbatim** over the control
-channel — `termhub-mcp` and `control.rs` do not depend on the theme
+channel — `t-hub-mcp` and `control.rs` do not depend on the theme
 implementation compiling. The contract for the parallel theme track:
 
 - **Command names:** `get_theme` (no args) and `set_theme` (`{ "theme": "<id>" }`).
@@ -154,7 +154,7 @@ implementation compiling. The contract for the parallel theme track:
   both commands — distinct from the generic "unknown command" path, so the
   forward seam is observable. The MCP tool surface already advertises both tools.
 
-When the handlers land, no change is needed in `termhub-mcp`: the names already
+When the handlers land, no change is needed in `t-hub-mcp`: the names already
 forward.
 
 ---
@@ -166,8 +166,8 @@ forward.
 ```json
 {
   "mcpServers": {
-    "termhub": {
-      "command": "./src-tauri/target/debug/termhub-mcp",
+    "t-hub": {
+      "command": "./src-tauri/target/debug/t-hub-mcp",
       "args": [],
       "env": {}
     }
@@ -175,23 +175,23 @@ forward.
 }
 ```
 
-- Build the binary first: `cargo build -p termhub-mcp --manifest-path src-tauri/Cargo.toml`.
-- For a **packaged install**, point `command` at the bundled `termhub-mcp`
+- Build the binary first: `cargo build -p t-hub-mcp --manifest-path src-tauri/Cargo.toml`.
+- For a **packaged install**, point `command` at the bundled `t-hub-mcp`
   (e.g. the Tauri sidecar binary). On Windows use the `.exe` path.
-- The **TermHub app must be running** for the tools to act on anything; the
+- The **T-Hub app must be running** for the tools to act on anything; the
   server starts fine regardless and reports a readable tool error when the app
   is down.
 - To pin the control endpoint explicitly (skip the handshake file), set
-  `env.TERMHUB_CONTROL_ADDR` + `env.TERMHUB_CONTROL_TOKEN`.
+  `env.T_HUB_CONTROL_ADDR` + `env.T_HUB_CONTROL_TOKEN`.
 
 You can also register it imperatively with the Claude CLI:
 ```
-claude mcp add termhub -- ./src-tauri/target/debug/termhub-mcp
+claude mcp add t-hub -- ./src-tauri/target/debug/t-hub-mcp
 ```
 
 Quick offline sanity check (no app needed) — dump the catalog:
 ```
-./src-tauri/target/debug/termhub-mcp --list-tools
+./src-tauri/target/debug/t-hub-mcp --list-tools
 ```
 
 ---
@@ -200,7 +200,7 @@ Quick offline sanity check (no app needed) — dump the catalog:
 
 `scripts/mcp_proof.sh` produces the round-trip evidence two ways:
 
-1. **Offline tool catalog** — runs `termhub-mcp --list-tools` (no app needed),
+1. **Offline tool catalog** — runs `t-hub-mcp --list-tools` (no app needed),
    printing every tool + tier + `confirmationRequired`.
 2. **Live round-trip** — runs the `mcp_e2e` integration test with `--nocapture`,
    which:
@@ -208,8 +208,8 @@ Quick offline sanity check (no app needed) — dump the catalog:
      `Stop` → `waitingOnSubagents`) + a real `StatusBridge` (a statusline
      snapshot at 42% context),
    - starts a **real** `control.rs` listener on a loopback port,
-   - creates a real tmux session on the `termhub` socket,
-   - spawns the **real** `termhub-mcp` binary and drives it with genuine MCP
+   - creates a real tmux session on the `t-hub` socket,
+   - spawns the **real** `t-hub-mcp` binary and drives it with genuine MCP
      JSON-RPC over stdio,
    - asserts the full round-trip for `initialize`, `tools/list`, and
      `tools/call` of `wsl_health`, `get_status`, `supervision_tree`,
@@ -248,19 +248,19 @@ snapshot, both fetched live through the control channel:
 
 | Scope | Where | Count |
 | --- | --- | --- |
-| MCP protocol framing | `crates/termhub-mcp/src/protocol.rs` | 4 |
-| Tool catalog + tiers | `crates/termhub-mcp/src/tools.rs` | 6 |
-| Control client (forwarding, discovery) | `crates/termhub-mcp/src/control_client.rs` | 4 |
-| MCP server dispatch (initialize/list/call) | `crates/termhub-mcp/src/server.rs` | 9 |
+| MCP protocol framing | `crates/t-hub-mcp/src/protocol.rs` | 4 |
+| Tool catalog + tiers | `crates/t-hub-mcp/src/tools.rs` | 6 |
+| Control client (forwarding, discovery) | `crates/t-hub-mcp/src/control_client.rs` | 4 |
+| MCP server dispatch (initialize/list/call) | `crates/t-hub-mcp/src/server.rs` | 9 |
 | App-side control dispatch + tiers | `src/control.rs` | 13 |
 | End-to-end (real binary ⇄ real listener) | `tests/mcp_e2e.rs` | 1 |
 
 Run them:
 ```
-cargo test --manifest-path src-tauri/Cargo.toml -p termhub-mcp          # MCP-side units
-cargo test --manifest-path src-tauri/Cargo.toml -p termhub --lib control # app-side units
-cargo build -p termhub-mcp --manifest-path src-tauri/Cargo.toml          # the binary the e2e spawns
-cargo test --manifest-path src-tauri/Cargo.toml -p termhub --test mcp_e2e # end-to-end
+cargo test --manifest-path src-tauri/Cargo.toml -p t-hub-mcp          # MCP-side units
+cargo test --manifest-path src-tauri/Cargo.toml -p t-hub --lib control # app-side units
+cargo build -p t-hub-mcp --manifest-path src-tauri/Cargo.toml          # the binary the e2e spawns
+cargo test --manifest-path src-tauri/Cargo.toml -p t-hub --test mcp_e2e # end-to-end
 ```
 
 ---

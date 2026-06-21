@@ -1,4 +1,4 @@
-//! The theme contract — the backend half of TermHub's live theming system, and
+//! The theme contract — the backend half of T-Hub's live theming system, and
 //! the surface a parallel MCP track forwards so Claude can retheme by talking.
 //!
 //! It is deliberately *opaque*: the rich `Theme` shape lives in the frontend
@@ -14,7 +14,7 @@
 //!     `theme://changed` with the new JSON so every window applies it live.
 //!   - event   `theme://changed` — payload is the theme JSON String.
 //!
-//! Persistence path: `~/.config/termhub/theme.json` (honoring `XDG_CONFIG_HOME`
+//! Persistence path: `~/.config/t-hub/theme.json` (honoring `XDG_CONFIG_HOME`
 //! / `CLAUDE_CONFIG_DIR`'s parent is not used — this is our own dir). We reuse
 //! the project's proven HOME-based resolution rather than the Tauri path plugin
 //! so it behaves identically inside WSL and in tests.
@@ -59,15 +59,15 @@ impl ThemeState {
     }
 }
 
-/// `~/.config/termhub` (honoring `XDG_CONFIG_HOME`), the dir we persist into.
+/// `~/.config/t-hub` (honoring `XDG_CONFIG_HOME`), the dir we persist into.
 /// Returns `None` only when neither `XDG_CONFIG_HOME` nor `HOME` is set.
 fn config_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return Some(Path::new(&xdg).join("termhub"));
+            return Some(Path::new(&xdg).join("t-hub"));
         }
     }
-    std::env::var_os("HOME").map(|h| Path::new(&h).join(".config").join("termhub"))
+    std::env::var_os("HOME").map(|h| Path::new(&h).join(".config").join("t-hub"))
 }
 
 /// Full path to the persisted theme file.
@@ -153,7 +153,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!(
-            "termhub-theme-test-{}-{n}",
+            "t-hub-theme-test-{}-{n}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);

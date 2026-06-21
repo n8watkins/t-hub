@@ -1,4 +1,4 @@
-// The theme store is TermHub's live-customization spine (PRD §5.5 settings/
+// The theme store is T-Hub's live-customization spine (PRD §5.5 settings/
 // themes). The whole point: people retheme the UI *without touching config
 // files* — and, in parallel, Claude can drive it over MCP. So a theme is just a
 // flat bag of "chrome tokens" (colors/sizes/fonts for the app shell) plus an
@@ -666,7 +666,7 @@ export function applyTheme(theme: Theme): void {
 // Persistence (localStorage) + safe merge
 // ---------------------------------------------------------------------------
 
-const PERSIST_KEY = "termhub.theme.v1";
+const PERSIST_KEY = "t-hub.theme.v1";
 
 interface PersistedThemes {
   active: Theme;
@@ -864,7 +864,7 @@ interface ThemeStore {
 // theme/preset blob). Cleared when the terminal is removed (see workspace's
 // cleanupTileSideState) so a recycled id can't inherit stale colors.
 // ---------------------------------------------------------------------------
-const TERM_OVERRIDES_KEY = "termhub.theme.termOverrides";
+const TERM_OVERRIDES_KEY = "t-hub.theme.termOverrides";
 
 function loadTermOverrides(): Record<string, Partial<TerminalPalette>> {
   try {
@@ -890,7 +890,7 @@ function saveTermOverrides(m: Record<string, Partial<TerminalPalette>>): void {
 
 // Per-terminal focus-ring color (terminalId → color), in its own slot. Falls
 // back to the global --th-focus-ring when a terminal has no override.
-const TERM_FOCUS_KEY = "termhub.theme.termFocusRing";
+const TERM_FOCUS_KEY = "t-hub.theme.termFocusRing";
 function loadTermFocusRing(): Record<string, string> {
   try {
     if (typeof localStorage === "undefined") return {};
@@ -915,7 +915,7 @@ function saveTermFocusRing(m: Record<string, string>): void {
 // Work name keyed by CWD (project path → name), in its own slot. Keyed by cwd
 // (not terminal id) so it's durable across spawns/resumes and can surface on the
 // project's Recent row. Same sparse-map-in-localStorage shape.
-const WORKNAME_KEY = "termhub.theme.workNames";
+const WORKNAME_KEY = "t-hub.theme.workNames";
 function loadWorkNames(): Record<string, string> {
   try {
     if (typeof localStorage === "undefined") return {};
@@ -940,7 +940,7 @@ function saveWorkNames(m: Record<string, string>): void {
 // Per-workspace color (tabId → color), in its own slot. A workspace's color is
 // the per-tab identity that cascades to its tiles (focus ring / sidebar accent /
 // tab dot). Same sparse-map-in-localStorage shape as the per-terminal overrides.
-const WORKSPACE_COLORS_KEY = "termhub.theme.workspaceColors";
+const WORKSPACE_COLORS_KEY = "t-hub.theme.workspaceColors";
 function loadWorkspaceColors(): Record<string, string> {
   try {
     if (typeof localStorage === "undefined") return {};

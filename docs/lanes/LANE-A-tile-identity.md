@@ -6,7 +6,7 @@ context: [../FEATURE-PLAN.md](../FEATURE-PLAN.md). You work in the worktree
 Another agent runs **Lane B** (`feat/sidebar-strips`) in parallel — stay in YOUR
 files so the two never conflict.
 
-## What TermHub is
+## What T-Hub is
 A Tauri 2 + React 18 + TS + Tailwind + Zustand desktop app — a cockpit of xterm
 terminal tiles (each running Claude Code / Codex / a shell) over a Rust PTY↔tmux
 engine. Frontend lives in `apps/desktop/src`. A dev instance may be running off the
@@ -27,7 +27,7 @@ anything under `src-tauri/`.
 ```bash
 cd <this worktree>
 pnpm install                       # if node_modules is missing (fast; hard-linked)
-pnpm --filter termhub typecheck    # baseline — should already pass
+pnpm --filter t-hub-desktop typecheck    # baseline — should already pass
 ```
 
 ## Tasks
@@ -64,7 +64,7 @@ workspace store (read-only). Priority: per-terminal override > workspace color >
 default.
 
 ## Verify · commit · land on main
-1. `pnpm --filter termhub typecheck` passes.
+1. `pnpm --filter t-hub-desktop typecheck` passes.
 2. Review your diff — ONLY your files changed.
 3. Commit in logical chunks; end messages with
    `Co-Authored-By: Claude <noreply@anthropic.com>`.

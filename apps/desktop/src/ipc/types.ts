@@ -33,7 +33,7 @@ export interface SpawnOptions {
 
 export interface TerminalInfo {
   id: TerminalId;
-  /** tmux session name on the isolated `termhub` socket. */
+  /** tmux session name on the isolated `t-hub` socket. */
   tmuxSession: string;
   cwd: string;
   title: string;
@@ -67,7 +67,7 @@ export const Events = {
 // These mirror `src-tauri/src/commands_05.rs` (command names) and the event
 // channels the core fans out from the WSL journal spine. Payload *types* live
 // in ./model and ./protocol (mirroring src-tauri/src/model.rs and the
-// termhub-protocol crate). Keep this in lockstep with those Rust files.
+// t-hub-protocol crate). Keep this in lockstep with those Rust files.
 // ---------------------------------------------------------------------------
 
 /** 0.5 Tauri command names (used with `invoke`). */
@@ -95,13 +95,13 @@ export const Commands05 = {
   statusSnapshot: "status_snapshot",
   /** Push a raw statusline payload into the status bridge. */
   ingestStatus: "ingest_status",
-  /** Install TermHub hooks into ~/.claude/settings.json (consent-gated). */
+  /** Install T-Hub hooks into ~/.claude/settings.json (consent-gated). */
   installClaudeHooks: "install_claude_hooks",
-  /** Remove TermHub hooks (clean uninstall). */
+  /** Remove T-Hub hooks (clean uninstall). */
   uninstallClaudeHooks: "uninstall_claude_hooks",
-  /** Whether TermHub hooks are currently installed. */
+  /** Whether T-Hub hooks are currently installed. */
   claudeHooksInstalled: "claude_hooks_installed",
-  /** Which hook events TermHub currently manages (for the install checklist). */
+  /** Which hook events T-Hub currently manages (for the install checklist). */
   claudeHooksManaged: "claude_hooks_managed",
 } as const;
 

@@ -18,7 +18,7 @@ const mono = JetBrains_Mono({
 });
 
 // Public alias for the deployed site.
-const siteUrl = "https://termhub-site.vercel.app";
+const siteUrl = "https://t-hub-site.vercel.app";
 
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),

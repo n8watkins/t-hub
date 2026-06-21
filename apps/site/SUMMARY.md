@@ -45,7 +45,7 @@ Copy rewritten around the session-first positioning above. Brand is **n8builds**
    old MISSING `theming.png` placeholder is replaced with a **CSS/Framer animated
    "GIF-style" mock** (`components/ui/ThemeShift.tsx`) cycling live themes across
    mini terminals + a file/preview rail — no real capture required.
-8. **CTAs:** "Download free on GitHub" links directly to `.../termhub/releases`;
+8. **CTAs:** "Download free on GitHub" links directly to `.../t-hub/releases`;
    a **Star on GitHub** button sits beside it (hero, final CTA, navbar).
 9. **Branding:** brand = **n8builds** everywhere. Footer swaps **Twitter → X**
    (inline X glyph) and adds a prominent **"n8builds.dev — more tools"** link.
@@ -109,28 +109,28 @@ Two **real** T-Hub screenshots are in place; the third row is an animated mock:
 ## Placeholders the human must replace / confirm
 
 1. **GitHub repo** — `https://github.com/n8watkins/t-hub` (`lib/site.ts`). Repo
-   is **private today** and uses the old `termhub` slug. Make it public (and/or
-   rename to a `t-hub` slug). The Download CTA points at `.../termhub/releases` —
+   is **private today** and uses the old `t-hub` slug. Make it public (and/or
+   rename to a `t-hub` slug). The Download CTA points at `.../t-hub/releases` —
    confirm a releases page with downloadable builds exists before launch.
 2. **Ko-fi handle** — `https://ko-fi.com/n8watkins` (`lib/site.ts`). **Confirm.**
 3. **X handle** — `https://x.com/n8watkins` (`lib/site.ts`). **Confirm.**
 4. **OG / social share image** — none yet. Add a 1200x630 image at
    `public/og.png` and uncomment the prepared `openGraph.images` /
    `twitter.images` lines in `app/layout.tsx`. `metadataBase` currently uses the
-   public alias `https://termhub-site.vercel.app`.
+   public alias `https://t-hub-site.vercel.app`.
 5. **Optional real "theming" screenshot** — the third Showcase row is an animated
    mock by design. To use a real capture, swap `ThemeShift` back to a `Screenshot`
    in `components/sections/Showcase.tsx`.
-6. **Project folder / package name** — still `termhub-site` on disk / in
+6. **Project folder / package name** — still `t-hub-site` on disk / in
    `package.json`. Cosmetic.
-7. **Custom domain** — currently the `termhub-site.vercel.app` alias; point a real
+7. **Custom domain** — currently the `t-hub-site.vercel.app` alias; point a real
    domain and update `siteUrl` in `app/layout.tsx` if desired.
 
 ## Deploy
 
-Deployed to Vercel (project `termhub-site`, org authed as natkins23) via
+Deployed to Vercel (project `t-hub-site`, org authed as natkins23) via
 `vercel deploy --prod --yes` from the project dir. Public alias:
-https://termhub-site.vercel.app.
+https://t-hub-site.vercel.app.
 
 ## Open questions
 

@@ -34,7 +34,7 @@ use commands::TerminalManager;
 
 // --- Test/proof seams (used by `tests/mcp_e2e.rs`) -------------------------
 // The end-to-end MCP proof seeds a real `Supervisor` + `StatusBridge`, starts a
-// real control listener, and drives the real `termhub-mcp` binary against it.
+// real control listener, and drives the real `t-hub-mcp` binary against it.
 // These thin constructors expose just enough of the otherwise-internal modules
 // for that integration test without widening the general public surface.
 
@@ -74,9 +74,9 @@ impl Default for AppState {
 }
 
 /// The default WSL distro to launch the agent in. Overridable via the
-/// `TERMHUB_DISTRO` env var; ignored on unix (the agent is launched directly).
+/// `T_HUB_DISTRO` env var; ignored on unix (the agent is launched directly).
 fn default_distro() -> String {
-    std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
 }
 
 /// Connect the agent bridge on startup, off the main thread so app launch is
@@ -87,16 +87,16 @@ fn spawn_agent_connect(state: &AppState) {
     let bridge = state.agent.clone();
     let distro = default_distro();
     std::thread::Builder::new()
-        .name("termhub-agent-connect".into())
+        .name("t-hub-agent-connect".into())
         .spawn(move || {
             // Log the resolved launch argv up front so a missing/unresolvable
             // agent binary is diagnosable from the core's stderr. On Windows
             // this is the `wsl.exe -d <distro> --cd ~ -- bash -lc "exec
-            // termhub-agent --stdio"` login-shell form (or the verbatim
-            // TERMHUB_AGENT_BIN override); on unix it's the direct spawn.
+            // t-hub-agent --stdio"` login-shell form (or the verbatim
+            // T_HUB_AGENT_BIN override); on unix it's the direct spawn.
             let argv = agent::launch_argv(&distro);
             eprintln!(
-                "termhub: connecting agent bridge (distro={distro:?}) via {argv:?}"
+                "t-hub: connecting agent bridge (distro={distro:?}) via {argv:?}"
             );
             if let Err(e) = bridge.connect(&distro) {
                 // A failure here never aborts startup: the bridge degrades to a
@@ -104,9 +104,9 @@ fn spawn_agent_connect(state: &AppState) {
                 // cause is the agent binary not being on the login-shell PATH
                 // (install it to ~/.local/bin) — surface that hint.
                 eprintln!(
-                    "termhub: agent bridge connect failed: {e} \
-                     (is `termhub-agent` installed to ~/.local/bin inside the \
-                     distro, or TERMHUB_AGENT_BIN set?)"
+                    "t-hub: agent bridge connect failed: {e} \
+                     (is `t-hub-agent` installed to ~/.local/bin inside the \
+                     distro, or T_HUB_AGENT_BIN set?)"
                 );
             }
         })
@@ -117,8 +117,8 @@ fn spawn_agent_connect(state: &AppState) {
 /// control listener (PRD §9.6 MCP). The context shares the status bridge and a
 /// supervisor-visitor closure (so `control` reads supervision snapshots without
 /// reaching into `AgentBridge` internals). The per-launch token is a fresh UUID;
-/// it is written to the handshake file alongside the bound port so `termhub-mcp`
-/// can discover + authenticate to the channel. An explicit `TERMHUB_CONTROL_TOKEN`
+/// it is written to the handshake file alongside the bound port so `t-hub-mcp`
+/// can discover + authenticate to the channel. An explicit `T_HUB_CONTROL_TOKEN`
 /// overrides the generated token (useful for test harnesses).
 // --- MCP control://apply forwarder (feat/mcp2) -----------------------------
 // The Organization-tier MCP tools (`focus_session`, `move_tile`, `rename_tab`)
@@ -146,7 +146,7 @@ impl control::ApplySink for AppHandleApplySink {
 }
 
 fn start_control_listener(state: &AppState, app: &tauri::AppHandle) {
-    let token = std::env::var("TERMHUB_CONTROL_TOKEN")
+    let token = std::env::var("T_HUB_CONTROL_TOKEN")
         .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
 
     // A visitor closure that locks the bridge's Supervisor and runs `f`. Capturing
@@ -166,39 +166,39 @@ fn start_control_listener(state: &AppState, app: &tauri::AppHandle) {
         .with_apply_sink(apply_sink);
     match control::start(ctx) {
         Ok(h) => eprintln!(
-            "termhub: control listener on {} (handshake: {})",
+            "t-hub: control listener on {} (handshake: {})",
             h.addr,
             control::handshake_path().display()
         ),
-        Err(e) => eprintln!("termhub: control listener failed to start: {e}"),
+        Err(e) => eprintln!("t-hub: control listener failed to start: {e}"),
     }
 }
 
 /// When built as the side-by-side DEV variant (`--features devbuild`), point the
 /// app's runtime state at an isolated namespace BEFORE anything reads it, so a
 /// dev build never collides with — or clobbers — a production T-Hub running at
-/// the same time: a separate tmux socket (`termhub-dev`, so dev terminals never
+/// the same time: a separate tmux socket (`t-hub-dev`, so dev terminals never
 /// appear in / kill prod's live sessions) and a separate state dir
-/// (`~/.termhub-dev`) for the MCP control channel + diag log. This reuses the
-/// existing `TERMHUB_*` env hooks (tmux.rs / control.rs / diag.rs all read them
+/// (`~/.t-hub-dev`) for the MCP control channel + diag log. This reuses the
+/// existing `T_HUB_*` env hooks (tmux.rs / control.rs / diag.rs all read them
 /// lazily on first use), so no path code changes; each var is set only when the
 /// user hasn't already overridden it. No-op in production builds.
 #[cfg(feature = "devbuild")]
 fn apply_devbuild_isolation() {
-    if std::env::var_os("TERMHUB_TMUX_SOCKET").is_none() {
-        std::env::set_var("TERMHUB_TMUX_SOCKET", "termhub-dev");
+    if std::env::var_os("T_HUB_TMUX_SOCKET").is_none() {
+        std::env::set_var("T_HUB_TMUX_SOCKET", "t-hub-dev");
     }
     let dev_home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)
-        .map(|h| h.join(".termhub-dev"));
+        .map(|h| h.join(".t-hub-dev"));
     if let Some(dir) = dev_home {
         let _ = std::fs::create_dir_all(&dir);
-        if std::env::var_os("TERMHUB_CONTROL_FILE").is_none() {
-            std::env::set_var("TERMHUB_CONTROL_FILE", dir.join("control.json"));
+        if std::env::var_os("T_HUB_CONTROL_FILE").is_none() {
+            std::env::set_var("T_HUB_CONTROL_FILE", dir.join("control.json"));
         }
-        if std::env::var_os("TERMHUB_DIAG_FILE").is_none() {
-            std::env::set_var("TERMHUB_DIAG_FILE", dir.join("diag.log"));
+        if std::env::var_os("T_HUB_DIAG_FILE").is_none() {
+            std::env::set_var("T_HUB_DIAG_FILE", dir.join("diag.log"));
         }
     }
 }
@@ -207,7 +207,7 @@ fn apply_devbuild_isolation() {
 fn apply_devbuild_isolation() {}
 
 pub fn run() {
-    // Must run before any `TERMHUB_*`-backed LazyLock (socket/control/diag) is
+    // Must run before any `T_HUB_*`-backed LazyLock (socket/control/diag) is
     // first touched — i.e. before the Tauri builder spawns anything.
     apply_devbuild_isolation();
 
@@ -248,7 +248,7 @@ pub fn run() {
             state.agent.set_status_bridge(state.status.clone());
             // Kick off the agent connection in the background once state exists.
             spawn_agent_connect(&state);
-            // Start the MCP control listener so `termhub-mcp` can forward
+            // Start the MCP control listener so `t-hub-mcp` can forward
             // `tools/call` over the local control channel (PRD §9.6). A bind
             // failure is logged and does not abort startup (the channel is
             // optional, like the agent bridge).
@@ -257,7 +257,7 @@ pub fn run() {
             // logged and does not abort startup; the app remains usable via its
             // window (close-to-tray still works regardless via on_window_event).
             if let Err(e) = tray::build(app.handle()) {
-                eprintln!("termhub: failed to build system tray: {e}");
+                eprintln!("t-hub: failed to build system tray: {e}");
             }
             // Restore Windows 11 Snap Layouts (hover-the-maximize-button flyout)
             // and native edge-resize on the frameless main window by subclassing
@@ -266,7 +266,7 @@ pub fn run() {
             // fully usable, just without the native snap flyout / edge resize.
             if let Some(main) = app.get_webview_window("main") {
                 if let Err(e) = win_snap::install(&main) {
-                    eprintln!("termhub: failed to install Snap-Layouts hit-test hook: {e}");
+                    eprintln!("t-hub: failed to install Snap-Layouts hit-test hook: {e}");
                 }
                 // DEV variant: distinguish the window (alt-tab / taskbar tooltip)
                 // from a production T-Hub that may be running alongside it.
@@ -281,7 +281,7 @@ pub fn run() {
             // off-thread: it spawns one `wsl.exe tmux` per live session, which we
             // never want to block the window's first paint on. Best-effort.
             std::thread::spawn(|| tmux::ensure_mouse_on());
-            // --- #sqlite: open the durable workspace DB (app_data_dir/termhub.db,
+            // --- #sqlite: open the durable workspace DB (app_data_dir/t-hub.db,
             // WAL+NORMAL) and manage it so save/load_workspace_snapshot share one
             // handle. A failure resolves to a no-op Db (logged inside), never
             // aborting startup — the frontend keeps its localStorage mirror.
@@ -361,5 +361,5 @@ pub fn run() {
             diag::diag_clear,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running TermHub");
+        .expect("error while running T-Hub");
 }

@@ -1,6 +1,6 @@
 // Persistent terminal pool (#20 — seamless moves).
 //
-// Problem: TermHub keeps every tab mounted, but a terminal's xterm instance is
+// Problem: T-Hub keeps every tab mounted, but a terminal's xterm instance is
 // created by <TerminalView> *inside* its grid cell. Moving a tile to another tab
 // reparents that TerminalView (tab A's grid -> tab B's grid), which remounts and
 // reattaches xterm — a visible reload/flash. Moving/resizing into a different

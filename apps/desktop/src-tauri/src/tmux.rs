@@ -1,7 +1,7 @@
-//! tmux control on the isolated `termhub` socket — the process-orchestration
+//! tmux control on the isolated `t-hub` socket — the process-orchestration
 //! layer beneath the PTY.
 //!
-//! Every call uses `tmux -L termhub ...` so TermHub never touches the user's
+//! Every call uses `tmux -L t-hub ...` so T-Hub never touches the user's
 //! default tmux server (PRD §9.4). This module is pure `std::process::Command`
 //! orchestration and is directly testable in WSL2 (tmux is installed),
 //! independent of Tauri.
@@ -20,16 +20,16 @@ use std::sync::LazyLock;
 
 /// The isolated tmux socket name; always passed as `tmux -L <socket>`.
 ///
-/// Resolved ONCE at startup from `$TERMHUB_TMUX_SOCKET`, defaulting to
-/// `"termhub"`. The env hook exists so a second, side-by-side **DEV** instance
+/// Resolved ONCE at startup from `$T_HUB_TMUX_SOCKET`, defaulting to
+/// `"t-hub"`. The env hook exists so a second, side-by-side **DEV** instance
 /// can run alongside the production app on its OWN tmux socket (e.g.
-/// `TERMHUB_TMUX_SOCKET=termhub-dev`) without ever sharing sessions with — or
+/// `T_HUB_TMUX_SOCKET=t-hub-dev`) without ever sharing sessions with — or
 /// killing — production's terminals. With NO env var set the value is exactly
-/// `"termhub"`, so default behavior is byte-for-byte unchanged.
+/// `"t-hub"`, so default behavior is byte-for-byte unchanged.
 static SOCKET_NAME: LazyLock<String> =
-    LazyLock::new(|| std::env::var("TERMHUB_TMUX_SOCKET").unwrap_or_else(|_| "termhub".into()));
+    LazyLock::new(|| std::env::var("T_HUB_TMUX_SOCKET").unwrap_or_else(|_| "t-hub".into()));
 
-/// The resolved tmux socket name (`$TERMHUB_TMUX_SOCKET` or `"termhub"`),
+/// The resolved tmux socket name (`$T_HUB_TMUX_SOCKET` or `"t-hub"`),
 /// always passed as `tmux -L <socket>`. Read once; cheap to call repeatedly.
 pub fn socket() -> &'static str {
     &SOCKET_NAME
@@ -67,11 +67,11 @@ impl From<TmuxError> for String {
     }
 }
 
-/// Build a `tmux -L termhub` command with the given args.
+/// Build a `tmux -L t-hub` command with the given args.
 ///
 /// tmux lives inside WSL, so on Windows every control command is routed through
 /// `wsl.exe -- tmux …`; on Unix (including the WSL dev build) tmux is invoked
-/// directly. Both then carry `-L termhub` plus the caller's args.
+/// directly. Both then carry `-L t-hub` plus the caller's args.
 fn tmux(args: &[&str]) -> Command {
     #[cfg(windows)]
     let mut cmd = {
@@ -104,7 +104,7 @@ fn is_no_server(stderr: &str) -> bool {
 /// the server isn't running, the named session doesn't exist, or the server is
 /// mid-teardown and can't resolve a target. Used to make kill/lookup idempotent.
 ///
-/// tmux 3.4 phrasings observed on the `termhub` socket:
+/// tmux 3.4 phrasings observed on the `t-hub` socket:
 ///   - `no server running on <socket>`                    (server down)
 ///   - `can't find session: <name>`                       (session absent)
 ///   - `can't find pane: <name>`                          (capture target absent)
@@ -168,7 +168,7 @@ pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), T
     // one (the session create above already succeeded).
     run("set-option", &["set-option", "-t", name, "window-size", "latest"])?;
 
-    // TermHub draws its own tile chrome, so suppress tmux's status bar (the green
+    // T-Hub draws its own tile chrome, so suppress tmux's status bar (the green
     // "0:zsh" line). Best-effort -- purely cosmetic, never fail the spawn.
     let _ = run("set-option", &["set-option", "-t", name, "status", "off"]);
     // Mouse ON (global): full-screen apps that request mouse mode (Claude Code,
@@ -197,7 +197,7 @@ pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), T
 ///    a `set-option`, not an `unbind`); we also unbind `C-b` in both the root
 ///    table (`-n`, what actually fires it) and the prefix table for good measure.
 /// 2. Right-click menus OFF: with `mouse on`, a right-click pops tmux's own pane /
-///    status menus (Split/Kill/Respawn/Zoom...) — confusing inside TermHub, which
+///    status menus (Split/Kill/Respawn/Zoom...) — confusing inside T-Hub, which
 ///    has its own tile chrome. Unbind the four root-table MouseDown3 events.
 ///
 /// Best-effort: every error is swallowed (no server yet, etc.).
@@ -218,7 +218,7 @@ fn apply_global_keybinds() {
 /// Force `mouse on` for the whole server AND every existing session.
 ///
 /// `new_session` sets `-g mouse on`, but a GLOBAL option is overridden by any
-/// SESSION-LOCAL `mouse` value. Sessions created by older TermHub builds (before
+/// SESSION-LOCAL `mouse` value. Sessions created by older T-Hub builds (before
 /// the mouse-on change) carry a session-local `mouse off`, and the tmux server is
 /// preserved across deploys — so the later global flip never reached them and the
 /// wheel still sent Up/Down arrow keys in those panes (e.g. zsh history) instead
@@ -243,7 +243,7 @@ pub fn ensure_mouse_on() {
     apply_global_keybinds();
 }
 
-/// Returns true if a session named `name` exists on the `termhub` socket.
+/// Returns true if a session named `name` exists on the `t-hub` socket.
 ///
 /// `has-session` exits 0 when the session exists and non-zero otherwise
 /// (including when no server is running at all), so the exit status is the
@@ -285,7 +285,7 @@ pub fn kill_session(name: &str) -> Result<(), TmuxError> {
     })
 }
 
-/// List all session names on the `termhub` socket.
+/// List all session names on the `t-hub` socket.
 ///
 /// Tolerates the "no server running" case (no sessions have ever been created,
 /// or the last one was killed and the server exited) by returning an empty Vec
@@ -357,9 +357,9 @@ pub struct PaneInfo {
 /// quotes `#` is literal, so it survives intact. Best-effort: a missing server
 /// (no sessions) returns an empty Vec rather than erroring.
 pub fn pane_info() -> Result<Vec<PaneInfo>, TmuxError> {
-    // Built from the resolved socket name (not a hardcoded `termhub`) so a DEV
-    // instance with `$TERMHUB_TMUX_SOCKET` set reads ITS panes; with no env var
-    // the socket is `termhub`, reproducing the previous literal exactly.
+    // Built from the resolved socket name (not a hardcoded `t-hub`) so a DEV
+    // instance with `$T_HUB_TMUX_SOCKET` set reads ITS panes; with no env var
+    // the socket is `t-hub`, reproducing the previous literal exactly.
     // We emit `session|command|cwd`, BUT `pane_current_command` only reports the
     // foreground process's comm — which is the RUNTIME (e.g. `node`) for agents
     // shipped as scripts: the Codex CLI is `node …/codex`, so it'd read as "node"
@@ -468,7 +468,7 @@ pub fn capture_visible(name: &str) -> Result<Vec<u8>, TmuxError> {
 /// This is the MCP/control-channel read path (`capture_pane`/`read_terminal`):
 /// an external Claude wants to *read* what a session currently shows, so we omit
 /// `-e` (no escape sequences — clean readable text) unlike [`capture_pane`],
-/// which preserves ANSI to seed xterm. `tmux -L termhub capture-pane -p [-S -N] -t <name>`.
+/// which preserves ANSI to seed xterm. `tmux -L t-hub capture-pane -p [-S -N] -t <name>`.
 ///
 /// `history_lines == 0` ⇒ visible screen only; `Some(n)` ⇒ start `n` lines into
 /// the scrollback (`-S -n`). Returns the captured text as a `String`.
@@ -486,7 +486,7 @@ pub fn capture_pane_text(name: &str, history_lines: u32) -> Result<String, TmuxE
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Send literal `text` to session `name` via `tmux -L termhub send-keys -l`, then
+/// Send literal `text` to session `name` via `tmux -L t-hub send-keys -l`, then
 /// (when `enter` is true) a trailing `Enter` keystroke to submit it.
 ///
 /// `-l` makes tmux treat the payload literally (no key-name interpretation), so
@@ -504,7 +504,7 @@ pub fn send_text(name: &str, text: &str, enter: bool) -> Result<(), TmuxError> {
 }
 
 /// Send one or more **named keys** (e.g. `C-c`, `Enter`, `Up`, `Escape`) to
-/// session `name` via `tmux -L termhub send-keys -t <name> <key>...`.
+/// session `name` via `tmux -L t-hub send-keys -t <name> <key>...`.
 ///
 /// Unlike [`send_text`], keys are *not* literal: tmux interprets each token as a
 /// key name, so this drives control sequences (Ctrl-C to interrupt, arrows to
@@ -618,13 +618,13 @@ mod tests {
         new_session(&name, "/tmp", None).expect("new_session should succeed");
 
         // Echo a sentinel so it lands in the visible pane, then submit it.
-        send_text(&name, "echo TERMHUB_MCP_SENTINEL_42", true).expect("send_text should succeed");
+        send_text(&name, "echo T_HUB_MCP_SENTINEL_42", true).expect("send_text should succeed");
         // Give the shell a beat to execute + render the echo output.
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let text = capture_pane_text(&name, 0).expect("capture_pane_text should succeed");
         assert!(
-            text.contains("TERMHUB_MCP_SENTINEL_42"),
+            text.contains("T_HUB_MCP_SENTINEL_42"),
             "captured plain text should echo the sentinel; got: {text:?}"
         );
         // Plain capture must not carry raw ANSI escape bytes.

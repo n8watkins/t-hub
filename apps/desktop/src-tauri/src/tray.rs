@@ -4,7 +4,7 @@
 //! Here we instead:
 //!   * intercept the window close request, prevent it, and hide the window;
 //!   * install a tray icon (using the app's default window icon) with a menu
-//!     ("Show TermHub" / "Quit");
+//!     ("Show T-Hub" / "Quit");
 //!   * left-clicking the tray icon shows + focuses the main window;
 //!   * "Quit" actually exits the process.
 //!
@@ -25,7 +25,7 @@ fn show_main_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     } else {
-        eprintln!("termhub: tray could not find the 'main' window to show");
+        eprintln!("t-hub: tray could not find the 'main' window to show");
     }
 }
 

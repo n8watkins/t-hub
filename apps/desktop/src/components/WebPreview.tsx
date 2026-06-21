@@ -1,6 +1,6 @@
 // WebPreview — an in-overlay webpage viewer. A URL bar drives an <iframe>; the
 // main use case is previewing a localhost dev server next to your terminals
-// without leaving TermHub. With NO URL yet (nothing detected / typed / fed from
+// without leaving T-Hub. With NO URL yet (nothing detected / typed / fed from
 // the Dev runner) it sits on a helpful empty state instead of pointing the
 // iframe at a dead default address — see the empty-body branch below.
 //

@@ -68,7 +68,7 @@ function detectUrl(line: string): string | null {
 // must track it — the log buffer, the run status, the editable command, the
 // detected URL — also lives OUTSIDE the component, in this module-level map. The
 // component subscribes to its slice and re-renders on change. This mirrors the
-// "process outlives the view" model the rest of TermHub uses (tmux sessions).
+// "process outlives the view" model the rest of T-Hub uses (tmux sessions).
 // ---------------------------------------------------------------------------
 
 interface DevState {
@@ -249,7 +249,7 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
     // Clear any stale detected URL for the Preview tab until the new run prints one.
     usePanels.getState().setDevUrl(terminalId, null);
     void startDevServer(terminalId, cwd, cmd).catch((err) => {
-      appendLine(terminalId, `[termhub] failed to start: ${String(err)}`);
+      appendLine(terminalId, `[t-hub] failed to start: ${String(err)}`);
       update(terminalId, { status: "exited" });
     });
   }, [draft, command, terminalId, cwd]);
@@ -422,7 +422,7 @@ function handleEvent(id: TerminalId, e: DevServerEvent): void {
       update(id, { status: "running" });
       break;
     case "exited":
-      if (e.line) appendLine(id, `[termhub] ${e.line}`);
+      if (e.line) appendLine(id, `[t-hub] ${e.line}`);
       update(id, { status: "exited" });
       // The server died, so drop its URL: Preview stops loading a dead address
       // and the tile's busy-gate (devUrl present) releases.

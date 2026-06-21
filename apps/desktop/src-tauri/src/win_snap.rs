@@ -1,6 +1,6 @@
 //! Windows 11 Snap Layouts + native edge-resize for the frameless main window.
 //!
-//! TermHub's main window is frameless (`decorations: false`, see
+//! T-Hub's main window is frameless (`decorations: false`, see
 //! `tauri.conf.json`) with a custom titlebar (`src/components/Titlebar.tsx`).
 //! Dropping the native frame also dropped two OS affordances that depend on the
 //! non-client area:
@@ -100,7 +100,7 @@ mod imp {
     const RESIZE_BORDER_LOGICAL: f64 = 6.0;
 
     /// A private, stable subclass id (any constant unique within this HWND's
-    /// subclass chain works; "THSN" = TermHub SNap, as ASCII bytes).
+    /// subclass chain works; "THSN" = T-Hub SNap, as ASCII bytes).
     const SUBCLASS_ID: usize = 0x5448_534E;
 
     /// Install the subclass + extend the DWM frame. Idempotent-ish: Tauri builds
@@ -128,7 +128,7 @@ mod imp {
             // rect. A failure here is logged but non-fatal (resize still works).
             extend_frame(hwnd);
             eprintln!(
-                "termhub: win_snap installed (subclass + DWM frame) on HWND {:?}",
+                "t-hub: win_snap installed (subclass + DWM frame) on HWND {:?}",
                 hwnd.0
             );
         }
@@ -151,7 +151,7 @@ mod imp {
             cyBottomHeight: 0,
         };
         if let Err(e) = DwmExtendFrameIntoClientArea(hwnd, &margins) {
-            eprintln!("termhub: win_snap DwmExtendFrameIntoClientArea failed: {e}");
+            eprintln!("t-hub: win_snap DwmExtendFrameIntoClientArea failed: {e}");
         }
     }
 

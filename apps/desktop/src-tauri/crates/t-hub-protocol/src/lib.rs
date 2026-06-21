@@ -1,5 +1,5 @@
-//! `termhub-protocol` — the versioned NDJSON-over-stdio contract between the
-//! TermHub **core** (the Tauri app, Windows side) and the **`termhub-agent`**
+//! `t-hub-protocol` — the versioned NDJSON-over-stdio contract between the
+//! T-Hub **core** (the Tauri app, Windows side) and the **`t-hub-agent`**
 //! (the WSL-side control binary).
 //!
 //! This crate is the *single source of truth* for the agent⇄core wire format.
@@ -183,7 +183,7 @@ pub enum CoreToAgent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol_version: u32,
-    /// Human-readable core build string (e.g. `"termhub 0.5.0"`).
+    /// Human-readable core build string (e.g. `"t-hub 0.5.0"`).
     pub core_version: String,
 }
 
@@ -194,7 +194,7 @@ pub struct Hello {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum AgentRequest {
     // --- tmux / session registry (Channel::Control) ---
-    /// List tmux sessions on the isolated `termhub` socket.
+    /// List tmux sessions on the isolated `t-hub` socket.
     ListSessions,
     /// Create a detached tmux session.
     NewSession {
@@ -264,7 +264,7 @@ pub enum AgentToCore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ready {
     pub protocol_version: u32,
-    /// Human-readable agent build string (e.g. `"termhub-agent 0.5.0"`).
+    /// Human-readable agent build string (e.g. `"t-hub-agent 0.5.0"`).
     pub agent_version: String,
     /// The distro name the agent is running in, when derivable (`/etc/os-release`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,7 +279,7 @@ pub struct Ready {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum AgentResponse {
-    /// `list_sessions` → tmux session names on the `termhub` socket.
+    /// `list_sessions` → tmux session names on the `t-hub` socket.
     Sessions { names: Vec<String> },
     /// `new_session` succeeded.
     SessionCreated,
@@ -516,7 +516,7 @@ mod tests {
             channel: Channel::Control,
             msg: CoreToAgent::Hello(Hello {
                 protocol_version: PROTOCOL_VERSION,
-                core_version: "termhub 0.5.0".into(),
+                core_version: "t-hub 0.5.0".into(),
             }),
         };
         let line = encode_core(&hello).unwrap();

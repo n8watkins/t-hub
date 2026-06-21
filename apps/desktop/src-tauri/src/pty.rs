@@ -1,5 +1,5 @@
 //! PTY management — bridges a `portable-pty` master to a tmux session on the
-//! isolated `termhub` socket, with one PTY client per visible tile.
+//! isolated `t-hub` socket, with one PTY client per visible tile.
 //!
 //! Each terminal tile is a PTY whose child process is a `tmux attach` client
 //! pointed at that terminal's tmux session. Output from the attach client is
@@ -8,9 +8,9 @@
 //! `terminal://state = Exited`.
 //!
 //! Platform model (the key abstraction that lets the nucleus run in WSL now):
-//!   - `#[cfg(unix)]`:    spawn `tmux -L termhub attach -t NAME` directly (this
+//!   - `#[cfg(unix)]`:    spawn `tmux -L t-hub attach -t NAME` directly (this
 //!     runs inside WSL2 and is testable now).
-//!   - `#[cfg(windows)]`: spawn `wsl.exe --cd CWD -- tmux -L termhub attach -t
+//!   - `#[cfg(windows)]`: spawn `wsl.exe --cd CWD -- tmux -L t-hub attach -t
 //!     NAME` (ConPTY fronting the WSL distro).
 //!
 //! `PtySession` holds only `Send` handles so it can live inside the
@@ -36,7 +36,7 @@ use crate::tmux;
 /// Size of the read buffer for draining the PTY (8 KiB).
 const READ_BUF: usize = 8 * 1024;
 
-/// A live terminal tile: its TermHub id, the backing tmux session name, and the
+/// A live terminal tile: its T-Hub id, the backing tmux session name, and the
 /// `Send` handles for the PTY attach client.
 ///
 /// All fields are `Send`, so `PtySession` is `Send` and can be stored in the
@@ -212,7 +212,7 @@ pub fn spawn_attach_client(
     let app_for_thread = app.clone();
     let id_for_thread = id.to_string();
     let handle = std::thread::Builder::new()
-        .name(format!("termhub-pty-reader-{id}"))
+        .name(format!("t-hub-pty-reader-{id}"))
         .spawn(move || {
             reader_loop(app_for_thread, id_for_thread, reader, child);
         })
@@ -289,7 +289,7 @@ mod tests {
         let argv = attach_argv("th_abc123", "/home/user");
         assert_eq!(
             argv,
-            vec!["tmux", "-L", "termhub", "attach", "-t", "th_abc123"]
+            vec!["tmux", "-L", "t-hub", "attach", "-t", "th_abc123"]
         );
     }
 
@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                "wsl.exe", "--", "tmux", "-L", "termhub", "attach", "-t", "th_abc123"
+                "wsl.exe", "--", "tmux", "-L", "t-hub", "attach", "-t", "th_abc123"
             ]
         );
     }

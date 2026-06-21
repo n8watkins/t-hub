@@ -3,7 +3,7 @@
 //
 // Why this exists: HTML5 drag-and-drop is unreliable over xterm's WebGL canvas
 // in WebView2 — the canvas/hidden-textarea swallow the drag events, so drops
-// never fire. So every TermHub drag interaction is built on POINTER events plus
+// never fire. So every T-Hub drag interaction is built on POINTER events plus
 // `document.elementFromPoint`, not native DnD. This module owns the fiddly,
 // easy-to-get-wrong parts so both call sites stay small and correct:
 //   - a small move-threshold, so a plain click still focuses/activates without

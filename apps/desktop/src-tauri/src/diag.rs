@@ -11,13 +11,13 @@
 //!
 //! The log path is fixed per-OS so the WSL-side orchestrator always knows where
 //! to read:
-//!   - Windows: `C:\Users\natha\.termhub\diag.log`
-//!     (readable from WSL at `/mnt/c/Users/natha/.termhub/diag.log`)
-//!   - unix:    `/home/natkins/.termhub/diag.log`
+//!   - Windows: `C:\Users\natha\.t-hub\diag.log`
+//!     (readable from WSL at `/mnt/c/Users/natha/.t-hub/diag.log`)
+//!   - unix:    `/home/natkins/.t-hub/diag.log`
 //!
 //! Everything here is BEST-EFFORT: we never panic and swallow every IO error, so
 //! a missing dir / locked file / full disk can never take down the app or a hot
-//! logging path. The `.termhub` dir is created on demand.
+//! logging path. The `.t-hub` dir is created on demand.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -27,32 +27,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The diagnostics log path, resolved ONCE at startup.
 ///
-/// If `$TERMHUB_DIAG_FILE` is set, it is used VERBATIM; otherwise the fixed
+/// If `$T_HUB_DIAG_FILE` is set, it is used VERBATIM; otherwise the fixed
 /// per-OS default below. The env hook exists so a side-by-side **DEV** instance
-/// can write to its OWN diag log (e.g. `TERMHUB_DIAG_FILE=.../diag-dev.log`)
+/// can write to its OWN diag log (e.g. `T_HUB_DIAG_FILE=.../diag-dev.log`)
 /// instead of appending into — and `diag_clear`-truncating — production's log.
 /// With NO env var set the path is exactly the previous hard-coded default, so
 /// default behavior is byte-for-byte unchanged.
-static DIAG_FILE: LazyLock<PathBuf> = LazyLock::new(|| match std::env::var("TERMHUB_DIAG_FILE") {
+static DIAG_FILE: LazyLock<PathBuf> = LazyLock::new(|| match std::env::var("T_HUB_DIAG_FILE") {
     Ok(p) if !p.is_empty() => PathBuf::from(p),
     _ => default_diag_log_path(),
 });
 
-/// The fixed per-OS diagnostics log path (the default when `$TERMHUB_DIAG_FILE`
-/// is unset). Windows points at the user's `C:\Users\natha\.termhub\diag.log`;
+/// The fixed per-OS diagnostics log path (the default when `$T_HUB_DIAG_FILE`
+/// is unset). Windows points at the user's `C:\Users\natha\.t-hub\diag.log`;
 /// unix at the WSL home. The orchestrator reads this same path.
 fn default_diag_log_path() -> PathBuf {
     #[cfg(windows)]
     {
-        PathBuf::from(r"C:\Users\natha\.termhub\diag.log")
+        PathBuf::from(r"C:\Users\natha\.t-hub\diag.log")
     }
     #[cfg(not(windows))]
     {
-        PathBuf::from("/home/natkins/.termhub/diag.log")
+        PathBuf::from("/home/natkins/.t-hub/diag.log")
     }
 }
 
-/// The resolved diagnostics log path (`$TERMHUB_DIAG_FILE` or the per-OS
+/// The resolved diagnostics log path (`$T_HUB_DIAG_FILE` or the per-OS
 /// default). Read once at startup; cheap to call on the hot logging path.
 fn diag_log_path() -> PathBuf {
     DIAG_FILE.clone()
@@ -96,7 +96,7 @@ fn iso8601_now() -> String {
 }
 
 /// Append `<ISO-8601 timestamp> <line>\n` to the diag log. Best-effort: creates
-/// the `.termhub` dir if missing and swallows every IO error so a hot logging
+/// the `.t-hub` dir if missing and swallows every IO error so a hot logging
 /// path can never panic or fail the app.
 #[tauri::command]
 pub fn diag_log(line: String) {

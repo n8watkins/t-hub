@@ -1,4 +1,4 @@
-//! TermHub 0.5 data model (PRD §8, PLAN.md "Data-model additions").
+//! T-Hub 0.5 data model (PRD §8, PLAN.md "Data-model additions").
 //!
 //! These are the persisted/serialized records the 0.5 features hang off. They
 //! mirror the TypeScript interfaces in `src/ipc/model.ts` field-for-field
@@ -83,15 +83,15 @@ impl Default for Resumability {
 
 /// The live-attachment lease state (PLAN.md §E "lease, not latch"). A crash with
 /// no `SessionEnd` must reconcile from [`LiveAttachmentState::LiveExternally`] /
-/// `LiveInTermhub` back to `Free`, not strand the session.
+/// `LiveInTHub` back to `Free`, not strand the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LiveAttachmentState {
     /// No live attachment known.
     Free,
-    /// A TermHub-owned terminal currently holds this session.
-    LiveInTermhub,
-    /// A non-TermHub `claude` fired `SessionStart` for this id (detected via the
+    /// A T-Hub-owned terminal currently holds this session.
+    LiveInTHub,
+    /// A non-T-Hub `claude` fired `SessionStart` for this id (detected via the
     /// global hook → journal path). Resume should offer Focus/Fork.
     LiveExternally,
     /// Lease expired / under reconciliation (heartbeat TTL elapsed).
@@ -114,7 +114,7 @@ pub struct AgentSessionRecord {
     pub provider: String,
     /// The exact session id captured at `SessionStart` (Claude's `session_id`).
     pub provider_session_id: String,
-    /// The TermHub terminal currently hosting it, if any.
+    /// The T-Hub terminal currently hosting it, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
     /// The owning project (anchor), if resolved.
@@ -296,7 +296,7 @@ impl Default for RecoveryPolicy {
 pub struct TerminalRecord {
     pub id: String,
     pub tab_id: String,
-    /// Always the isolated `termhub` socket in 0.5.
+    /// Always the isolated `t-hub` socket in 0.5.
     pub tmux_server: String,
     pub tmux_session: String,
     #[serde(skip_serializing_if = "Option::is_none")]

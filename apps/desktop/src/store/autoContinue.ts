@@ -1,7 +1,7 @@
 // Per-terminal "auto-continue on usage reset" opt-in.
 //
 // When a terminal's Claude session RUNS OUT of usage (a rate-limit window hits
-// its cap), TermHub can wait until that window RESETS and then inject a continue
+// its cap), T-Hub can wait until that window RESETS and then inject a continue
 // command so the agent picks the work back up on its own — for the terminals the
 // user has enabled this on. This store records WHICH terminals are opted in;
 // src/lib/autoContinueMount watches the statusline snapshots and does the timing
@@ -10,7 +10,7 @@
 import { create } from "zustand";
 import type { TerminalId } from "../ipc/types";
 
-const STORAGE_KEY = "termhub.autoContinue.v1";
+const STORAGE_KEY = "t-hub.autoContinue.v1";
 
 function load(): Record<TerminalId, boolean> {
   try {

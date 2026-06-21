@@ -1,4 +1,4 @@
-// TermHub 0.5 data-model types — the TypeScript mirror of
+// T-Hub 0.5 data-model types — the TypeScript mirror of
 // `src-tauri/src/model.rs` (and the status types from `src/claude/status.rs`).
 // All Rust structs use `rename_all = "camelCase"`, so these interfaces use
 // camelCase keys verbatim. Keep field-for-field in lockstep with the Rust side.
@@ -29,7 +29,7 @@ export type Resumability = "resumable" | "expired" | "unknown";
 
 export type LiveAttachmentState =
   | "free"
-  | "liveInTermhub"
+  | "liveInTHub"
   | "liveExternally"
   | "stale";
 

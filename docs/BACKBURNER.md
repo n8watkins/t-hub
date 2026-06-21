@@ -8,7 +8,7 @@ handoff / punch-list, not here.)
 **Status:** parked — the toggle works, the hover flyout does not.
 
 When you hover the Windows maximize button, Win11 normally pops a flyout letting
-you pick a snap arrangement (left/right halves, quadrants, etc.). TermHub's
+you pick a snap arrangement (left/right halves, quadrants, etc.). T-Hub's
 window is frameless, and despite `win_snap.rs` extending a DWM frame +
 reporting `HTMAXBUTTON`, the flyout still doesn't appear. Maximize/restore by
 click works fine. This is a deep frameless-window + DWM interaction; not worth

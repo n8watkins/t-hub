@@ -10,8 +10,8 @@
 //
 // ROBUST binding (this store): the agent now stamps the OWNING TMUX SESSION onto
 // each statusline before journaling — it reads `$TMUX_PANE` (the pane the
-// statusline runs in) and resolves `#{session_name}` on the `termhub` socket.
-// TermHub names every session `th_<terminalId>`, so the frontend keys context by
+// statusline runs in) and resolves `#{session_name}` on the `t-hub` socket.
+// T-Hub names every session `th_<terminalId>`, so the frontend keys context by
 // that session name and a tile looks itself up by its OWN `th_<id>` (which it can
 // compute directly). This is precise even when two tiles share a directory — the
 // old cwd match could not tell them apart.
@@ -37,7 +37,7 @@ export function normCwd(cwd: string | undefined | null): string {
   return cwd.replace(/[/\\]+$/, "").toLowerCase();
 }
 
-/** The tmux session name TermHub gives a terminal: `th_<terminalId>`. This is
+/** The tmux session name T-Hub gives a terminal: `th_<terminalId>`. This is
  *  the robust binding key — a tile computes it from its own id and looks up the
  *  context reading the agent reported for that exact session. Mirrors the
  *  backend (`tmux.rs` / `pty.rs` name every session `th_<id>`). */

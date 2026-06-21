@@ -86,7 +86,7 @@ export function ingestStatus(
   return invoke(Commands05.ingestStatus, { sessionId, payload });
 }
 
-/** Install TermHub hooks into ~/.claude/settings.json. `consent` must be true.
+/** Install T-Hub hooks into ~/.claude/settings.json. `consent` must be true.
  *  `events` is the chosen subset; the managed set is reconciled to exactly it
  *  (an empty array means "all"). */
 export function installClaudeHooks(
@@ -97,17 +97,17 @@ export function installClaudeHooks(
   return invoke(Commands05.installClaudeHooks, { agentBin, consent, events });
 }
 
-/** Remove TermHub hooks (clean uninstall). */
+/** Remove T-Hub hooks (clean uninstall). */
 export function uninstallClaudeHooks(): Promise<InstallReport> {
   return invoke(Commands05.uninstallClaudeHooks);
 }
 
-/** Whether TermHub hooks are currently installed. */
+/** Whether T-Hub hooks are currently installed. */
 export function claudeHooksInstalled(): Promise<boolean> {
   return invoke(Commands05.claudeHooksInstalled);
 }
 
-/** Which hook events TermHub currently manages (to pre-check the checklist). */
+/** Which hook events T-Hub currently manages (to pre-check the checklist). */
 export function claudeHooksManaged(): Promise<string[]> {
   return invoke(Commands05.claudeHooksManaged);
 }

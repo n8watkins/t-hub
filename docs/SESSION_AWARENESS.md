@@ -5,7 +5,7 @@ orchestrator→subagent tree, FR-012 status, WSL health, and statusline usage al
 update as Claude runs, driven by the event spine
 
 ```
-Claude hook → WSL journal → termhub-agent → core (Tauri) → UI
+Claude hook → WSL journal → t-hub-agent → core (Tauri) → UI
 ```
 
 ## The live event spine (what was wired)
@@ -38,57 +38,57 @@ reducer state** — it is a statusline *overlay*: the UI shows `rateLimited` whe
 working/waiting (`displayStatus()` in `src/store/supervision.ts`). The overlay is
 applied to the attention queue and the tree badges in the sidebar.
 
-## Installing `termhub-agent` (required for the bridge to connect)
+## Installing `t-hub-agent` (required for the bridge to connect)
 
 The core launches the agent over stdio. On **Windows** it runs inside WSL via
-`wsl.exe -d <distro> -- termhub-agent --stdio`; on a **unix dev box** it spawns
-`termhub-agent --stdio` directly. Either way the binary must be resolvable, or
-you can point at it explicitly with **`TERMHUB_AGENT_BIN`** (overrides argv[0]).
+`wsl.exe -d <distro> -- t-hub-agent --stdio`; on a **unix dev box** it spawns
+`t-hub-agent --stdio` directly. Either way the binary must be resolvable, or
+you can point at it explicitly with **`T_HUB_AGENT_BIN`** (overrides argv[0]).
 
 ### Build it
 
 ```sh
-cargo build --manifest-path src-tauri/Cargo.toml -p termhub-agent
-# → src-tauri/target/debug/termhub-agent
+cargo build --manifest-path src-tauri/Cargo.toml -p t-hub-agent
+# → src-tauri/target/debug/t-hub-agent
 ```
 
-### Windows path: install into the WSL distro (so `wsl.exe … termhub-agent` finds it)
+### Windows path: install into the WSL distro (so `wsl.exe … t-hub-agent` finds it)
 
 The agent runs **inside** the distro, so install the Linux build onto the
 distro's `PATH`. From the WSL distro shell:
 
 ```sh
 # Build the linux binary inside WSL (or copy a prebuilt one in), then:
-install -m 0755 src-tauri/target/debug/termhub-agent ~/.local/bin/termhub-agent
+install -m 0755 src-tauri/target/debug/t-hub-agent ~/.local/bin/t-hub-agent
 #   ~/.local/bin is on PATH in a default Ubuntu login shell. /usr/local/bin
 #   (sudo) also works and is visible to non-login `wsl.exe -- …` invocations.
-command -v termhub-agent     # must print a path
-termhub-agent --version      # termhub-agent 0.5.x
+command -v t-hub-agent     # must print a path
+t-hub-agent --version      # t-hub-agent 0.5.x
 ```
 
 If `~/.local/bin` is not on the non-interactive `wsl.exe` `PATH`, prefer
 `/usr/local/bin`, or set the escape hatch on the Windows side:
 
 ```powershell
-setx TERMHUB_AGENT_BIN "wsl.exe"   # not typical; usually just install on PATH
+setx T_HUB_AGENT_BIN "wsl.exe"   # not typical; usually just install on PATH
 ```
 
-The distro is `Ubuntu-24.04` by default; override with the `TERMHUB_DISTRO` env
+The distro is `Ubuntu-24.04` by default; override with the `T_HUB_DISTRO` env
 var (read in `lib.rs::default_distro`).
 
 ### Dev box (this repo, run inside WSL/Linux directly)
 
 ```sh
-install -m 0755 src-tauri/target/debug/termhub-agent ~/.local/bin/termhub-agent
-command -v termhub-agent      # /home/<you>/.local/bin/termhub-agent
+install -m 0755 src-tauri/target/debug/t-hub-agent ~/.local/bin/t-hub-agent
+command -v t-hub-agent      # /home/<you>/.local/bin/t-hub-agent
 ```
 
-Now `pnpm tauri dev` will connect: the bridge spawns `termhub-agent --stdio`,
+Now `pnpm tauri dev` will connect: the bridge spawns `t-hub-agent --stdio`,
 handshakes (Hello/Ready), replays the journal, and goes `live`. Escape hatch for
 a one-off without touching PATH:
 
 ```sh
-TERMHUB_AGENT_BIN=$PWD/src-tauri/target/debug/termhub-agent pnpm tauri dev
+T_HUB_AGENT_BIN=$PWD/src-tauri/target/debug/t-hub-agent pnpm tauri dev
 ```
 
 ## Installing the Claude hooks (consent-gated)
@@ -96,10 +96,10 @@ TERMHUB_AGENT_BIN=$PWD/src-tauri/target/debug/termhub-agent pnpm tauri dev
 The hooks are what *populate* the journal. The **HookInstallPanel** is mounted in
 the sidebar (consent checkbox → Install). It is non-destructive: it merges into
 `~/.claude/settings.json`, preserves your existing hooks + non-hook keys, makes a
-one-time `settings.json.termhub-bak`, and ships a clean uninstall that removes
-only TermHub's marker-tagged entries. It installs handlers for the 15 verified
+one-time `settings.json.t-hub-bak`, and ships a clean uninstall that removes
+only T-Hub's marker-tagged entries. It installs handlers for the 15 verified
 lifecycle hooks (`SessionStart … Stop … SubagentStart/Stop … Elicitation …`),
-each a `termhub-agent --hook <EVENT>` one-liner.
+each a `t-hub-agent --hook <EVENT>` one-liner.
 
 > Each hook is a separate short-lived process that appends to the journal file.
 > The long-lived `--stdio` agent's tail thread observes the **file's** growth
@@ -119,7 +119,7 @@ production hook entrypoint and asserts both emit paths:
   core emits `session://status` `{status: completed}`.
 
 ```sh
-cargo build --manifest-path src-tauri/Cargo.toml -p termhub-agent   # build first
+cargo build --manifest-path src-tauri/Cargo.toml -p t-hub-agent   # build first
 cargo test  --manifest-path src-tauri/Cargo.toml --lib live_emit_demo \
   -- --nocapture --test-threads=1
 # → live_emit_demo: replay path emitted waitingOnSubagents ✓

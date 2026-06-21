@@ -9,10 +9,10 @@
 // description and an expandable disclosure listing the exact event names and the
 // `agentBin --hook <EVENT>` command each registers. "Apply" reconciles the
 // managed set to the union of the enabled categories' events (turning a category
-// off uninstalls its events); "Uninstall all" removes every TermHub hook.
+// off uninstalls its events); "Uninstall all" removes every T-Hub hook.
 //
-// `agentBin` is the resolved WSL path to the termhub-agent binary (the hook
-// entrypoint, `termhub-agent --hook <EVENT>`). `installed`/`setInstalled` are
+// `agentBin` is the resolved WSL path to the t-hub-agent binary (the hook
+// entrypoint, `t-hub-agent --hook <EVENT>`). `installed`/`setInstalled` are
 // owned by the parent so the section shows status without a "checking…" flash.
 import { useCallback, useEffect, useState } from "react";
 import {
@@ -28,7 +28,7 @@ import type { InstallReport } from "../ipc/model";
 import { useSettings } from "../store/settings";
 
 export interface HookInstallPanelProps {
-  /** Resolved WSL path to the termhub-agent binary (hook entrypoint). */
+  /** Resolved WSL path to the t-hub-agent binary (hook entrypoint). */
   agentBin: string;
   /** Installed state (any hooks managed), owned by the parent — checked once at
    *  mount so the section never flashes "checking…". `null` only during that
@@ -38,7 +38,7 @@ export interface HookInstallPanelProps {
   setInstalled: (v: boolean) => void;
 }
 
-/** One lifecycle event TermHub can register, with a short description of what it
+/** One lifecycle event T-Hub can register, with a short description of what it
  *  powers. The per-event copy is reused inside each category's disclosure. */
 interface HookEvent {
   event: string;
@@ -117,18 +117,18 @@ function categoryEvents(cat: HookCategory): string[] {
   return cat.events.map((e) => e.event);
 }
 
-/** The marker TermHub embeds in every command string it writes to settings.json,
- *  mirroring `TERMHUB_HOOK_MARKER` in `src-tauri/src/claude/hooks.rs`; the
+/** The marker T-Hub embeds in every command string it writes to settings.json,
+ *  mirroring `T_HUB_HOOK_MARKER` in `src-tauri/src/claude/hooks.rs`; the
  *  uninstaller scans for it to remove exactly our entries. */
-const TERMHUB_HOOK_MARKER = "__termhub_managed__";
+const T_HUB_HOOK_MARKER = "__t_hub_managed__";
 
-/** Build the EXACT settings.json fragment TermHub merges into
+/** Build the EXACT settings.json fragment T-Hub merges into
  *  `~/.claude/settings.json` for the given selection, client-side. This mirrors
- *  the Rust `termhub_hooks_fragment_for` + `termhub_statusline` shapes in
+ *  the Rust `t_hub_hooks_fragment_for` + `t_hub_statusline` shapes in
  *  `src-tauri/src/claude/hooks.rs` so the user sees the real code, not a
  *  paraphrase. `events` is ordered in backend HOOK_EVENTS order (ALL_EVENTS) and
  *  filtered to the current selection; an empty selection still shows the
- *  statusLine (TermHub always installs it). */
+ *  statusLine (T-Hub always installs it). */
 function buildHooksJson(agentBin: string, events: string[]): Record<string, unknown> {
   const hooks: Record<string, unknown> = {};
   for (const event of events) {
@@ -138,7 +138,7 @@ function buildHooksJson(agentBin: string, events: string[]): Record<string, unkn
         hooks: [
           {
             type: "command",
-            command: `${agentBin} --hook ${event} # ${TERMHUB_HOOK_MARKER}`,
+            command: `${agentBin} --hook ${event} # ${T_HUB_HOOK_MARKER}`,
           },
         ],
       },
@@ -148,7 +148,7 @@ function buildHooksJson(agentBin: string, events: string[]): Record<string, unkn
     hooks,
     statusLine: {
       type: "command",
-      command: `${agentBin} --statusline # ${TERMHUB_HOOK_MARKER}`,
+      command: `${agentBin} --statusline # ${T_HUB_HOOK_MARKER}`,
       padding: 0,
       refreshInterval: 5,
     },
@@ -174,7 +174,7 @@ export function HookInstallPanel({
   // change.
   const [installedEvents, setInstalledEvents] = useState<Set<string>>(new Set());
   // Whether the "View raw JSON" modal is open — it shows the literal settings.json
-  // fragment TermHub writes for the *current* selection (the real code, not a
+  // fragment T-Hub writes for the *current* selection (the real code, not a
   // description), built client-side and updated live as categories toggle.
   const [showRawJson, setShowRawJson] = useState(false);
 
@@ -247,7 +247,7 @@ export function HookInstallPanel({
       <div className="flex items-center gap-2">
         <span className="font-semibold">Claude hooks</span>
         <StatusPill installed={installed} />
-        {/* "View raw JSON" — opens the literal settings.json fragment TermHub
+        {/* "View raw JSON" — opens the literal settings.json fragment T-Hub
             writes for the current selection, so nothing is hidden behind the
             outcome blurbs. Pushed to the right so it reads as a peek action. */}
         <button
@@ -376,7 +376,7 @@ export function HookInstallPanel({
   );
 }
 
-/** Modal showing the literal settings.json fragment TermHub writes for the
+/** Modal showing the literal settings.json fragment T-Hub writes for the
  *  current selection — the real config (built by `buildHooksJson`, mirroring the
  *  Rust shapes), pretty-printed in a scrollable monospace block with a Copy
  *  button. `events` is the live, backend-ordered, selection-filtered event list,

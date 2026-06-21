@@ -24,10 +24,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use termhub_protocol::{EventJournalEntry, JournalSource};
+use t_hub_protocol::{EventJournalEntry, JournalSource};
 
-/// Default journal location relative to `$HOME`: `~/.termhub/journal`.
-const JOURNAL_SUBDIR: &str = ".termhub/journal";
+/// Default journal location relative to `$HOME`: `~/.t-hub/journal`.
+const JOURNAL_SUBDIR: &str = ".t-hub/journal";
 /// The append-only log file name within the journal directory.
 const JOURNAL_FILE: &str = "events.ndjson";
 
@@ -37,7 +37,7 @@ const JOURNAL_FILE: &str = "events.ndjson";
 /// statusline-snapshot stream. See [`Journal::compact_dropping_status`].
 pub const COMPACT_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Resolve the journal directory: an explicit override, else `$HOME/.termhub/
+/// Resolve the journal directory: an explicit override, else `$HOME/.t-hub/
 /// journal`, else a process-relative fallback.
 pub fn resolve_journal_dir(override_dir: Option<&str>) -> PathBuf {
     if let Some(dir) = override_dir.filter(|d| !d.trim().is_empty()) {
@@ -381,14 +381,14 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use termhub_protocol::{JournalEventType, JournalSource};
+    use t_hub_protocol::{JournalEventType, JournalSource};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("termhub-journal-test-{tag}-{ts}"));
+        let dir = std::env::temp_dir().join(format!("t-hub-journal-test-{tag}-{ts}"));
         dir
     }
 

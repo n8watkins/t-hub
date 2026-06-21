@@ -32,7 +32,7 @@ const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx", "mdown", "markdn"]);
 // --- "Show ignored" persistence (localStorage, not the settings store) ------
 // A local browsing preference, deliberately kept out of store/settings.ts. Reads
 // are defensive (SSR/private-mode/quota): any failure falls back to OFF.
-const SHOW_IGNORED_KEY = "termhub.files.showIgnored";
+const SHOW_IGNORED_KEY = "t-hub.files.showIgnored";
 
 function readShowIgnored(): boolean {
   try {

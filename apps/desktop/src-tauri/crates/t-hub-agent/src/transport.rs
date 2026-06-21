@@ -51,7 +51,7 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::Result;
-use termhub_protocol::{
+use t_hub_protocol::{
     AgentFrame, AgentToCore, Channel, CoreToAgent, Hello, Ready, PROTOCOL_VERSION,
 };
 
@@ -125,7 +125,7 @@ pub fn serve_stdio(journal: Arc<Journal>) -> Result<()> {
                         last_seq = new_seq;
                     }
                     Err(e) => {
-                        eprintln!("termhub-agent: tail thread read error: {e:#}");
+                        eprintln!("t-hub-agent: tail thread read error: {e:#}");
                         // Leave the cursor put; retry next poll.
                     }
                 }
@@ -154,7 +154,7 @@ pub fn serve_stdio(journal: Arc<Journal>) -> Result<()> {
             }
         }
         Err(_) => {
-            eprintln!("termhub-agent: writer thread panicked");
+            eprintln!("t-hub-agent: writer thread panicked");
         }
     }
 
@@ -181,11 +181,11 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
             continue;
         }
 
-        let frame = match termhub_protocol::decode_core(trimmed) {
+        let frame = match t_hub_protocol::decode_core(trimmed) {
             Ok(f) => f,
             Err(e) => {
                 // A malformed line never desyncs the stream; report and continue.
-                eprintln!("termhub-agent: skipping malformed frame: {e}");
+                eprintln!("t-hub-agent: skipping malformed frame: {e}");
                 continue;
             }
         };
@@ -194,12 +194,12 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
             CoreToAgent::Hello(Hello { protocol_version, core_version }) => {
                 if protocol_version != PROTOCOL_VERSION {
                     eprintln!(
-                        "termhub-agent: protocol mismatch \
+                        "t-hub-agent: protocol mismatch \
                          (core={protocol_version}, agent={PROTOCOL_VERSION}); \
                          continuing best-effort"
                     );
                 }
-                eprintln!("termhub-agent: handshake with {core_version}");
+                eprintln!("t-hub-agent: handshake with {core_version}");
                 handshaken = true;
                 let ready = AgentFrame {
                     channel: Channel::Control,
@@ -219,7 +219,7 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
                 // SUBAGENT(transport): `priority` is currently ignored (strict
                 // arrival order). The scheduler enhancement uses it.
                 if !handshaken {
-                    eprintln!("termhub-agent: request {id} before handshake; serving anyway");
+                    eprintln!("t-hub-agent: request {id} before handshake; serving anyway");
                 }
                 let resp_body = dispatch::handle(journal, body);
                 let resp = AgentFrame {
@@ -248,7 +248,7 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
                 let entries = match journal.replay(after_seq) {
                     Ok(e) => e,
                     Err(e) => {
-                        eprintln!("termhub-agent: journal replay failed: {e:#}");
+                        eprintln!("t-hub-agent: journal replay failed: {e:#}");
                         Vec::new()
                     }
                 };
@@ -273,12 +273,12 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
             }
 
             CoreToAgent::Shutdown => {
-                eprintln!("termhub-agent: shutdown requested");
+                eprintln!("t-hub-agent: shutdown requested");
                 break;
             }
 
             CoreToAgent::Unknown => {
-                eprintln!("termhub-agent: ignoring unknown core message");
+                eprintln!("t-hub-agent: ignoring unknown core message");
             }
         }
     }
@@ -289,7 +289,7 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
 /// Encode `frame` as one NDJSON line + newline and flush so the core sees it
 /// promptly (no buffering across requests).
 fn write_frame(writer: &mut impl std::io::Write, frame: &AgentFrame) -> Result<()> {
-    let line = termhub_protocol::encode_agent(frame)?;
+    let line = t_hub_protocol::encode_agent(frame)?;
     writer.write_all(line.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()?;
@@ -314,7 +314,7 @@ fn detect_distro() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use termhub_protocol::{
+    use t_hub_protocol::{
         AgentToCore, Channel, CoreFrame, CoreToAgent, Hello, PROTOCOL_VERSION,
     };
 
@@ -323,7 +323,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("termhub-transport-test-{tag}-{ts}"))
+        std::env::temp_dir().join(format!("t-hub-transport-test-{tag}-{ts}"))
     }
 
     #[test]
@@ -339,7 +339,7 @@ mod tests {
         assert!(s.ends_with('\n'), "frame must end with newline");
         assert_eq!(s.matches('\n').count(), 1, "frame must be single-line NDJSON");
         // Must roundtrip.
-        let back = termhub_protocol::decode_agent(s.trim_end_matches('\n')).unwrap();
+        let back = t_hub_protocol::decode_agent(s.trim_end_matches('\n')).unwrap();
         match back.msg {
             AgentToCore::Pong { nonce } => assert_eq!(nonce, 42),
             other => panic!("expected Pong, got {other:?}"),
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn write_frame_journal_entry_roundtrips() {
-        use termhub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
+        use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
         let entry = EventJournalEntry {
             seq: 3,
             timestamp_ms: 1_000_000,
@@ -365,7 +365,7 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, &frame).unwrap();
         let s = String::from_utf8(buf).unwrap();
-        let back = termhub_protocol::decode_agent(s.trim_end_matches('\n')).unwrap();
+        let back = t_hub_protocol::decode_agent(s.trim_end_matches('\n')).unwrap();
         assert_eq!(back.channel, Channel::Events);
         match back.msg {
             AgentToCore::Journal { seq, entry } => {
@@ -442,13 +442,13 @@ mod tests {
 
         match &received[0].msg {
             AgentToCore::Journal { entry, .. } => {
-                assert_eq!(entry.event_type, termhub_protocol::JournalEventType::Stop);
+                assert_eq!(entry.event_type, t_hub_protocol::JournalEventType::Stop);
             }
             other => panic!("expected Journal, got {other:?}"),
         }
         match &received[1].msg {
             AgentToCore::Journal { entry, .. } => {
-                assert_eq!(entry.event_type, termhub_protocol::JournalEventType::SessionEnd);
+                assert_eq!(entry.event_type, t_hub_protocol::JournalEventType::SessionEnd);
             }
             other => panic!("expected Journal, got {other:?}"),
         }
@@ -465,16 +465,16 @@ mod tests {
             channel: Channel::Control,
             msg: CoreToAgent::Hello(Hello {
                 protocol_version: PROTOCOL_VERSION,
-                core_version: "termhub 0.5.0-test".into(),
+                core_version: "t-hub 0.5.0-test".into(),
             }),
         };
-        let line = termhub_protocol::encode_core(&hello).unwrap();
+        let line = t_hub_protocol::encode_core(&hello).unwrap();
         assert!(!line.contains('\n'));
-        let back = termhub_protocol::decode_core(&line).unwrap();
+        let back = t_hub_protocol::decode_core(&line).unwrap();
         match back.msg {
             CoreToAgent::Hello(h) => {
                 assert_eq!(h.protocol_version, PROTOCOL_VERSION);
-                assert_eq!(h.core_version, "termhub 0.5.0-test");
+                assert_eq!(h.core_version, "t-hub 0.5.0-test");
             }
             other => panic!("expected Hello, got {other:?}"),
         }

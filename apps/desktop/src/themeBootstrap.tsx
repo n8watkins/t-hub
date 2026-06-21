@@ -13,7 +13,7 @@
 import ReactDOM from "react-dom/client";
 import { ThemeProvider } from "./components/ThemeProvider";
 
-const CONTAINER_ID = "termhub-theme-root";
+const CONTAINER_ID = "t-hub-theme-root";
 
 function mount(): void {
   if (typeof document === "undefined") return;

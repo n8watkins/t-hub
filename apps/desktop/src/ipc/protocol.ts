@@ -1,12 +1,12 @@
-// TypeScript mirror of the subset of the `termhub-protocol` crate that the core
+// TypeScript mirror of the subset of the `t-hub-protocol` crate that the core
 // forwards to the UI: host metrics, worktree info, and the durable journal
 // entry. The frontend never speaks the NDJSON wire protocol directly (the core
 // does), but it renders these payloads, so they are part of the IPC contract.
 //
 // Rust side uses default serde naming for the protocol crate (snake_case keys),
 // EXCEPT the journal/host types below, which the core passes through verbatim.
-// These therefore use snake_case to match `termhub-protocol`'s on-wire shape.
-// Keep in lockstep with `src-tauri/crates/termhub-protocol/src/lib.rs`.
+// These therefore use snake_case to match `t-hub-protocol`'s on-wire shape.
+// Keep in lockstep with `src-tauri/crates/t-hub-protocol/src/lib.rs`.
 
 // --- Host metrics (HostMetrics) --------------------------------------------
 

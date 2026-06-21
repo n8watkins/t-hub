@@ -1,7 +1,7 @@
 // ThemeEditor — the live Settings surface the app was missing (PRD §5.5).
 //
 // The whole user-facing promise of the theming system lives here: a person
-// customizes TermHub's look WITHOUT editing config files, and every change is
+// customizes T-Hub's look WITHOUT editing config files, and every change is
 // instant (each control writes a token into the theme store, which writes a CSS
 // var, which re-renders the chrome). It is a fully self-contained overlay:
 //   - Its open/closed state lives in the settings store (so other surfaces can
@@ -603,7 +603,7 @@ function HooksSection() {
   }, []);
   // HookInstallPanel is self-contained (its own header/description/buttons), so
   // it's rendered directly rather than wrapped in a Group.
-  return <HookInstallPanel agentBin="termhub-agent" installed={installed} setInstalled={setInstalled} />;
+  return <HookInstallPanel agentBin="t-hub-agent" installed={installed} setInstalled={setInstalled} />;
 }
 
 // ---------------------------------------------------------------------------

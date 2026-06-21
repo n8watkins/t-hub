@@ -6,7 +6,7 @@
 //! core derives it (REVIEW / PLAN §10.4).
 
 use anyhow::Result;
-use termhub_protocol::{HostMetrics, WorktreeInfo};
+use t_hub_protocol::{HostMetrics, WorktreeInfo};
 
 /// Current epoch-millis on the agent clock.
 pub fn now_ms() -> u64 {
@@ -238,8 +238,8 @@ mod tests {
     }
 
     #[test]
-    fn git_branch_in_termhub_worktree() {
-        let branch = git_branch("/home/natkins/n8builds/termhub-05")
+    fn git_branch_in_t_hub_worktree() {
+        let branch = git_branch("/home/natkins/n8builds/t-hub-05")
             .expect("git_branch should not error in a valid git worktree");
         let branch = branch.expect("branch should be Some in feat/0.5-personal-alpha worktree");
         assert!(
@@ -263,8 +263,8 @@ mod tests {
     }
 
     #[test]
-    fn git_worktrees_in_termhub_repo() {
-        let worktrees = git_worktrees("/home/natkins/n8builds/termhub-05")
+    fn git_worktrees_in_t_hub_repo() {
+        let worktrees = git_worktrees("/home/natkins/n8builds/t-hub-05")
             .expect("git_worktrees should not error in a valid git repo");
         assert!(
             !worktrees.is_empty(),

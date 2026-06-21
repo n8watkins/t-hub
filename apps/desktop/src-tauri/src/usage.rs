@@ -101,7 +101,7 @@ const USAGE_SHELL_CMD: &str =
 fn usage_command() -> std::process::Command {
     use std::os::windows::process::CommandExt;
     let mut c = std::process::Command::new("wsl.exe");
-    let distro = std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string());
+    let distro = std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string());
     c.arg("-d")
         .arg(distro)
         .arg("--cd")

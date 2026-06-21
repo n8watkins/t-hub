@@ -14,17 +14,17 @@ This was a long live-iteration session. It (1) **merged 3 parallel lanes** (A ti
 **REPO LOCATION + LAYOUT:** the tree is at **`/home/natkins/projects/tools/t-hub/`** (was `…/n8builds/tools/t-hub` earlier in the session). It's now a **SINGLE repo** — work directly in **`/home/natkins/projects/tools/t-hub/t-hub-app`** on **`main`**. The parallel-lane worktrees (incl. `wt-terminal-input`) and their branches (`fix/post-merge-review` etc.) were **removed after merge** (cleanup 2026-06-20) — `git worktree list` should show only `t-hub-app [main]`, `git branch` only `main`. See [[t-hub-monorepo-structure]] memory.
 
 **Two dev surfaces — know the difference:**
-- **WSLg/Linux dev instance** (`TERMHUB_TMUX_SOCKET=termhub-dev pnpm tauri dev` from `apps/desktop`): fast hot-reload, but **cannot** exercise Windows-only features (OS file-drop, clipboard-image) — it's webkitgtk, not WebView2. Great for UI/logic; misleading for those two features.
+- **WSLg/Linux dev instance** (`T_HUB_TMUX_SOCKET=t-hub-dev pnpm tauri dev` from `apps/desktop`): fast hot-reload, but **cannot** exercise Windows-only features (OS file-drop, clipboard-image) — it's webkitgtk, not WebView2. Great for UI/logic; misleading for those two features.
 - **Windows installer** (`T-Hub_0.1.54_x64-setup.exe`, in `C:\Users\natha\Downloads\`): the REAL app (WebView2). This is what to install to test file-drop / image-paste / true titlebar.
-- **T-Hub Dev** (side-by-side Windows sandbox): a SEPARATE installable app (`com.termhub.devbuild`, isolated `termhub-dev` socket + `~/.termhub-dev` state) that coexists with production T-Hub and can't disturb its live sessions. Build via `gh workflow run release.yml --ref main -f variant=dev`. **See [docs/DEV-BUILD.md](DEV-BUILD.md)** for the full prod-vs-dev model, what's isolated/shared, and the complete `termhub`-identifier inventory.
+- **T-Hub Dev** (side-by-side Windows sandbox): a SEPARATE installable app (`com.t-hub.dev`, isolated `t-hub-dev` socket + `~/.t-hub-dev` state) that coexists with production T-Hub and can't disturb its live sessions. Build via `gh workflow run release.yml --ref main -f variant=dev`. **See [docs/DEV-BUILD.md](DEV-BUILD.md)** for the full prod-vs-dev model, what's isolated/shared, and the complete `t-hub`-identifier inventory.
 
-**Best debug tool:** the running app writes a diag log readable from WSL at **`/home/natkins/.termhub/diag.log`** (dev instance) and `/mnt/c/Users/natha/.termhub/diag.log` (Windows). Grep tags: `codex`, `autocontinue`, `usage`, `pool`, `resize`.
+**Best debug tool:** the running app writes a diag log readable from WSL at **`/home/natkins/.t-hub/diag.log`** (dev instance) and `/mnt/c/Users/natha/.t-hub/diag.log` (Windows). Grep tags: `codex`, `autocontinue`, `usage`, `pool`, `resize`.
 
 ---
 
 ## 1. What this is
 
-**T-Hub** (codebase/repo identifiers deliberately stay `termhub`) — a local cockpit for many persistent Claude Code + Codex + shell sessions on **Windows 11 + WSL2 (Ubuntu-24.04) + zsh**. Tauri 2 (Rust, frameless WebView2) + React/TS/Tailwind + xterm.js, over `portable-pty` (ConPTY) → `wsl.exe` → **`tmux -L termhub`** (dev: `termhub-dev`). Each xterm renders once into a persistent overlay pool (`TerminalPool.tsx`) positioned over per-tile placeholders. Each terminal's tmux session is **`th_<terminalId>`**.
+**T-Hub** (codebase/repo identifiers deliberately stay `t-hub`) — a local cockpit for many persistent Claude Code + Codex + shell sessions on **Windows 11 + WSL2 (Ubuntu-24.04) + zsh**. Tauri 2 (Rust, frameless WebView2) + React/TS/Tailwind + xterm.js, over `portable-pty` (ConPTY) → `wsl.exe` → **`tmux -L t-hub`** (dev: `t-hub-dev`). Each xterm renders once into a persistent overlay pool (`TerminalPool.tsx`) positioned over per-tile placeholders. Each terminal's tmux session is **`th_<terminalId>`**.
 
 ---
 
@@ -38,9 +38,9 @@ Merged lane work + fixes (oldest→newest): `e40c82d`…`99f3517` (lanes A/B/C c
 - `1930d8f`/`8ab42e6` **Codex usage** in the sidebar — reads the LIVE `~/.codex/logs_*.sqlite` (rollouts stopped June 10); extracts the embedded `rate_limits` block (`reset_at`/`resets_at`). **VERIFIED live**: a 2:16pm codex run logged 5h=1%/wk=0% and the sidebar updated on the next poll.
 - `6c6a29f`/`4de50f7` **Codex icon** = user PNG (`src/assets/codex.png`), white halo stripped to transparent; **sidebar rows lead with the agent icon** · `e77f42c` **detect node→codex**: `tmux.rs::pane_info` resolves runtime-wrapped agents via the pane pid's child `/proc/<kid>/cmdline` (Codex ships as `node …/codex`)
 - `49d0f4f` **theme contrast**: `color-scheme` per theme (fixes white-on-white native `<select>` dropdowns), solid menu bgs, AA muted text · `540636e` settings nav: drop "App"/"Theme" group headers
-- `417c8d1` **brand → "T-Hub"** (window title, productName, satellite title, tray). Identifiers (`com.termhub.dev`, crate, socket, MCP) unchanged.
+- `417c8d1` **brand → "T-Hub"** (window title, productName, satellite title, tray). (Internal ids were renamed later — see the full `t-hub` rename in §4.)
 
-**Verified:** `pnpm --filter termhub typecheck` + `cargo check -p termhub` green throughout (only pre-existing `TerminalState` dead-code warning). Codex usage end-to-end verified live. Drag/sidebar/contrast verified by review + types, NOT runtime-clicked.
+**Verified:** `pnpm --filter t-hub-desktop typecheck` + `cargo check -p t-hub` green throughout (only pre-existing `TerminalState` dead-code warning). Codex usage end-to-end verified live. Drag/sidebar/contrast verified by review + types, NOT runtime-clicked.
 
 ---
 
@@ -58,10 +58,10 @@ Merged lane work + fixes (oldest→newest): `e40c82d`…`99f3517` (lanes A/B/C c
 ## 4. Conventions & gotchas
 
 - **Commit + push cadence:** work on `main` in `t-hub-app`; commit after each logical change (trailer `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`) and `git push origin main`.
-- **Gates:** `pnpm --filter termhub typecheck` (from the repo root, `t-hub-app`) + `cargo check -p termhub` (from `apps/desktop/src-tauri`). The lone `TerminalState` dead-code warning is pre-existing.
-- **Windows build:** `gh workflow run release.yml --ref main` triggers a **`workflow_dispatch`** build = a downloadable **artifact** (NOT a public release; release/`latest.json` steps are gated on `v*` tags). Download with `gh run download <id> -n termhub-installers -D <dir>`. Installer name follows `productName` → now `T-Hub_<ver>_x64-setup.exe`.
-- **Brand:** `productName` is `T-Hub`, identifier stays `com.termhub.dev`, so the prod installer **upgrades the existing install in place** (matched by identifier). All user-VISIBLE "TermHub" strings are now "T-Hub" (commit `51f01f5` caught the last panel/tooltip stragglers the `417c8d1` rename missed). Technical ids stay `termhub` ON PURPOSE — full inventory in [docs/DEV-BUILD.md](DEV-BUILD.md).
-- **Two installable variants:** prod `T-Hub` (`com.termhub.dev`) and sandbox `T-Hub Dev` (`com.termhub.devbuild`) coexist; each replaces only its own prior install. Variant is a Cargo feature (`devbuild`) + the `tauri.dev.conf.json` overlay; CI selects it with the `variant` dispatch input. Details: [docs/DEV-BUILD.md](DEV-BUILD.md).
+- **Gates:** `pnpm --filter t-hub-desktop typecheck` (from the repo root, `t-hub-app`) + `cargo check -p t-hub` (from `apps/desktop/src-tauri`). The lone `TerminalState` dead-code warning is pre-existing.
+- **Windows build:** `gh workflow run release.yml --ref main` triggers a **`workflow_dispatch`** build = a downloadable **artifact** (NOT a public release; release/`latest.json` steps are gated on `v*` tags). Download with `gh run download <id> -n t-hub-installers -D <dir>`. Installer name follows `productName` → now `T-Hub_<ver>_x64-setup.exe`.
+- **Full `t-hub` rename (rollback tag `pre-thub-rename`):** the project is now **100% `t-hub`** (crate names, bundle ids, tmux socket, MCP server, `~/.t-hub` config dir, `T_HUB_*` env hooks, the `__t_hub_managed__` marker — all renamed). The prod **bundle id changed to `com.t-hub.app`**, so installing the renamed prod app is a **FRESH install** (any prior install stays until you uninstall it) and live tmux sessions restart on the new `t-hub` socket. Naming map + canonical ids: [docs/DEV-BUILD.md](DEV-BUILD.md).
+- **Two installable variants:** prod `T-Hub` (`com.t-hub.app`) and sandbox `T-Hub Dev` (`com.t-hub.dev`) coexist; each replaces only its own prior install. Variant is a Cargo feature (`devbuild`) + the `tauri.dev.conf.json` overlay; CI selects it with the `variant` dispatch input. Details: [docs/DEV-BUILD.md](DEV-BUILD.md).
 - **Codex detection:** Codex runs as a `node` process (`@openai/codex/bin/codex.js`), so `pane_current_command` = `node`. `tmux.rs::pane_info` now resolves it via `/proc/<child>/cmdline`. Claude runs as `claude` directly.
 - **Codex usage source:** `~/.codex/logs_*.sqlite` (live). The old `~/.codex/sessions/**/*.jsonl` rollouts STOPPED June 10 — don't read those. Cloud/web Codex writes NO local file, so only in-terminal Codex CLI usage is visible.
 - **MCP `list_terminals` is a red herring for cmd/cwd:** the control-channel handler (`control.rs`) hardcodes `title=tmux_session`, `cwd=""` — it does NOT call `pane_info`. The real UI uses the Tauri `commands::list_terminals` which does. Don't diagnose "empty command" from the MCP path.
@@ -79,4 +79,4 @@ Merged lane work + fixes (oldest→newest): `e40c82d`…`99f3517` (lanes A/B/C c
 - `apps/desktop/src/store/theme.ts` (+ `index.css`) — themes + `color-scheme`; `src/assets/codex.png` — the Codex icon.
 - `apps/desktop/src-tauri/tauri.conf.json` — `productName`/title (brand) + version.
 
-See also memories: [[t-hub-postmerge-feedback]] (the live backlog tracker), [[t-hub-monorepo-structure]] (paths/move), [[termhub-deploy-flow]], [[dev-instance-no-auto-deploy]].
+See also memories: [[t-hub-postmerge-feedback]] (the live backlog tracker), [[t-hub-monorepo-structure]] (paths/move), [[t-hub-deploy-flow]], [[dev-instance-no-auto-deploy]].

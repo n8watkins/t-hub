@@ -244,11 +244,11 @@ fn normalize(path: &str) -> PathBuf {
 }
 
 /// The WSL distro projects live in, as seen from the Windows host. Mirrors the
-/// agent bridge's `default_distro` (lib.rs): overridable via `TERMHUB_DISTRO`,
+/// agent bridge's `default_distro` (lib.rs): overridable via `T_HUB_DISTRO`,
 /// defaulting to the dev distro. Only consulted on Windows.
 #[cfg(windows)]
 fn host_distro() -> String {
-    std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
 }
 
 /// Translate a path so the *Windows-side* file commands can reach a project that
@@ -1165,7 +1165,7 @@ mod tests {
     /// Build a small fixture tree in a unique temp dir and return its root.
     fn make_fixture() -> PathBuf {
         let mut root = std::env::temp_dir();
-        root.push(format!("termhub-files-test-{}", uuid::Uuid::new_v4()));
+        root.push(format!("t-hub-files-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
 
         // A gitignore that hides `secret.txt`, the `ignored/` dir, `*.log`, and
@@ -1526,7 +1526,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn to_host_path_maps_wsl_to_unc_on_windows() {
-        std::env::set_var("TERMHUB_DISTRO", "Ubuntu-24.04");
+        std::env::set_var("T_HUB_DISTRO", "Ubuntu-24.04");
         // A POSIX-absolute WSL path is mapped onto the \\wsl.localhost\ share.
         assert_eq!(
             to_host_path("/home/natkins/proj"),
@@ -1543,7 +1543,7 @@ mod tests {
     #[test]
     fn build_index_errors_on_nonexistent_root() {
         let mut root = std::env::temp_dir();
-        root.push(format!("termhub-does-not-exist-{}", uuid::Uuid::new_v4()));
+        root.push(format!("t-hub-does-not-exist-{}", uuid::Uuid::new_v4()));
         let err = build_index(&root).unwrap_err();
         assert!(err.contains("not a directory"), "got: {err}");
     }

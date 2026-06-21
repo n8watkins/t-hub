@@ -33,13 +33,13 @@ const SATELLITE = isSatellite();
 const SIDEBAR_MIN = 180;
 const SIDEBAR_MAX = 360;
 const SIDEBAR_DEFAULT = 256; // matches the old fixed w-64 (16rem)
-const SIDEBAR_KEY = "termhub.sidebar.v1";
+const SIDEBAR_KEY = "t-hub.sidebar.v1";
 
 // 3-state collapse (#1): the sidebar cycles full -> rail -> hidden -> full via
 // onToggleSidebar (Ctrl/Cmd+B, fired by Canvas). "full" keeps the resizable
 // width; "rail" is a thin iconic strip; "hidden" drops it entirely. The chosen
 // mode is persisted to its OWN localStorage key (independent of the width key).
-const SIDEBAR_MODE_KEY = "termhub.sidebar.mode.v1";
+const SIDEBAR_MODE_KEY = "t-hub.sidebar.mode.v1";
 const SIDEBAR_MODES: SidebarMode[] = ["full", "rail", "hidden"];
 
 function loadSidebarMode(): SidebarMode {

@@ -112,11 +112,11 @@ static REGISTRY: LazyLock<Mutex<HashMap<String, DevProcess>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The WSL distro projects live in, as seen from the Windows host. Mirrors
-/// `files.rs`/`lib.rs`: overridable via `TERMHUB_DISTRO`, defaulting to the dev
+/// `files.rs`/`lib.rs`: overridable via `T_HUB_DISTRO`, defaulting to the dev
 /// distro. Only consulted on Windows.
 #[cfg(windows)]
 fn host_distro() -> String {
-    std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
 }
 
 /// Recover a POSIX/WSL path from a `\\wsl.localhost\<distro>\...` (or legacy
@@ -187,7 +187,7 @@ fn host_binding_prefix() -> &'static str {
 /// roots the dev server at the project's WSL directory. On unix we run `sh -lc
 /// '<command>'` with the cwd set on the `Command` directly. The login shell
 /// (`-lc`) ensures the user's PATH (nvm/volta/etc.) is loaded so `npm`/`pnpm`
-/// resolve, matching how the rest of TermHub shells in.
+/// resolve, matching how the rest of T-Hub shells in.
 ///
 /// Both platforms prepend [`host_binding_prefix`] so the server binds to all
 /// interfaces (reachable from the Windows-side preview iframe — see that fn).
@@ -297,7 +297,7 @@ pub async fn start_dev_server(
     let id_out = terminal_id.clone();
     let out_handle = stdout.map(|s| {
         std::thread::Builder::new()
-            .name(format!("termhub-devserver-out-{terminal_id}"))
+            .name(format!("t-hub-devserver-out-{terminal_id}"))
             .spawn(move || pump(&app_out, &id_out, s))
             .expect("spawn devserver stdout reader")
     });
@@ -308,7 +308,7 @@ pub async fn start_dev_server(
     let id_err = terminal_id.clone();
     if let Some(s) = stderr {
         std::thread::Builder::new()
-            .name(format!("termhub-devserver-err-{terminal_id}"))
+            .name(format!("t-hub-devserver-err-{terminal_id}"))
             .spawn(move || pump(&app_err, &id_err, s))
             .ok();
     }
@@ -334,7 +334,7 @@ pub async fn start_dev_server(
     let app_wait = app.clone();
     let id_wait = terminal_id.clone();
     std::thread::Builder::new()
-        .name(format!("termhub-devserver-wait-{terminal_id}"))
+        .name(format!("t-hub-devserver-wait-{terminal_id}"))
         .spawn(move || {
             // Poll for natural exit without holding the registry lock across the
             // wait. We can't `child.wait()` here (the registry owns the child), so
@@ -414,7 +414,7 @@ fn wsl_host_ip() -> Option<String> {
         .arg("-lc")
         // `hostname -I` lists this host's addresses (space-separated); the first
         // is the primary interface. `ip route get 1` would also work but this is
-        // simpler and matches how the rest of TermHub probes WSL.
+        // simpler and matches how the rest of T-Hub probes WSL.
         .arg("hostname -I");
     c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     let out = c.output().ok()?;
@@ -526,11 +526,11 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn build_command_runs_sh_on_unix() {
-        let mut cmd = build_command("/tmp", "echo termhub-devserver-test");
+        let mut cmd = build_command("/tmp", "echo t-hub-devserver-test");
         let out = cmd.output().expect("sh -lc echo should run");
         assert!(out.status.success());
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(text.contains("termhub-devserver-test"), "got: {text:?}");
+        assert!(text.contains("t-hub-devserver-test"), "got: {text:?}");
     }
 
     /// The host-binding prefix exports HOST=0.0.0.0 (the WSL2 preview fix) and is

@@ -90,7 +90,7 @@ export function WorkspacesList() {
   // --- D2: drag a terminal row into another workspace --------------------
   // The terminal being dragged (its row dims) and the workspace row currently
   // under the pointer (it lights up as a drop target). Pointer-based, like every
-  // other TermHub drag — HTML5 DnD dies over xterm (see lib/pointerDrag.ts).
+  // other T-Hub drag — HTML5 DnD dies over xterm (see lib/pointerDrag.ts).
   const [dragTerminalId, setDragTerminalId] = useState<TerminalId | null>(null);
   const [dropTabId, setDropTabId] = useState<string | null>(null);
   // --- Reorder workspaces -------------------------------------------------

@@ -1,4 +1,4 @@
-//! The static MCP tool catalog TermHub exposes (PRD §11.2 permission tiers).
+//! The static MCP tool catalog T-Hub exposes (PRD §11.2 permission tiers).
 //!
 //! Each tool maps 1:1 to a control-channel **command name**: `tools/call` takes
 //! the tool name + arguments and forwards `{command: <name>, args: <arguments>}`
@@ -62,7 +62,7 @@ impl ToolDef {
         if self.tier == Tier::ProcessChanging {
             description.push_str(
                 " — CONFIRMATION REQUIRED: this changes a running process. \
-                 It is gated on the TermHub side and will not execute without \
+                 It is gated on the T-Hub side and will not execute without \
                  explicit permission (PRD §11.2).",
             );
         }
@@ -76,7 +76,7 @@ impl ToolDef {
             // A non-standard annotation block clients may ignore; it carries the
             // tier so a permission-aware host can map it to its own policy.
             "annotations": {
-                "termhubTier": self.tier.label(),
+                "t-hubTier": self.tier.label(),
                 "confirmationRequired": self.tier == Tier::ProcessChanging,
             },
         })
@@ -93,7 +93,7 @@ fn schema_session_id() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "sessionId": { "type": "string", "description": "Exact Claude/TermHub session id." }
+            "sessionId": { "type": "string", "description": "Exact Claude/T-Hub session id." }
         },
         "required": ["sessionId"],
         "additionalProperties": false
@@ -276,7 +276,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "list_terminals",
             tier: Tier::Read,
-            summary: "List the live TermHub terminals (tmux-backed sessions on the isolated socket).",
+            summary: "List the live T-Hub terminals (tmux-backed sessions on the isolated socket).",
             input_schema: schema_empty,
         },
         ToolDef {
@@ -375,7 +375,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "open_file",
             tier: Tier::Organization,
-            summary: "Open a text file in TermHub's reader (returns capped contents + metadata).",
+            summary: "Open a text file in T-Hub's reader (returns capped contents + metadata).",
             input_schema: schema_open_file,
         },
         // ---- Theme ------------------------------------------------------
@@ -439,14 +439,14 @@ mod tests {
             let desc = mcp["description"].as_str().unwrap();
             assert!(desc.contains("CONFIRMATION REQUIRED"), "{name} desc: {desc}");
             assert_eq!(mcp["annotations"]["confirmationRequired"], true, "{name}");
-            assert_eq!(mcp["annotations"]["termhubTier"], "process-changing", "{name}");
+            assert_eq!(mcp["annotations"]["t-hubTier"], "process-changing", "{name}");
         }
     }
 
     #[test]
     fn read_terminal_is_read_tier_and_unconfirmed() {
         let mcp = find("read_terminal").unwrap().to_mcp();
-        assert_eq!(mcp["annotations"]["termhubTier"], "read");
+        assert_eq!(mcp["annotations"]["t-hubTier"], "read");
         assert_eq!(mcp["annotations"]["confirmationRequired"], false);
     }
 
@@ -457,7 +457,7 @@ mod tests {
         let desc = mcp["description"].as_str().unwrap();
         assert!(desc.contains("CONFIRMATION REQUIRED"), "desc: {desc}");
         assert_eq!(mcp["annotations"]["confirmationRequired"], true);
-        assert_eq!(mcp["annotations"]["termhubTier"], "process-changing");
+        assert_eq!(mcp["annotations"]["t-hubTier"], "process-changing");
     }
 
     #[test]

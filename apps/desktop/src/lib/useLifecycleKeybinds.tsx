@@ -1,6 +1,6 @@
 // Self-contained lifecycle keybindings + their confirm UI (feat/lifecycle).
 //
-// TermHub distinguishes three terminal-lifecycle actions; this module owns the
+// T-Hub distinguishes three terminal-lifecycle actions; this module owns the
 // keyboard surface for the two destructive-or-adjacent ones and the confirm
 // dialog the destructive one needs, so App.tsx only mounts <LifecycleKeybinds/>
 // (one line) and never has to know the details:

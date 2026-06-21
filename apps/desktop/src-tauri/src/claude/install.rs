@@ -15,7 +15,7 @@
 //!   - **Atomic write**: write to a temp file in the same dir, then rename over
 //!     the target, so a crash mid-write can't truncate the user's settings.
 //!   - **Backup**: before the first write we copy the existing file to
-//!     `settings.json.termhub-bak` so the user can always recover the pre-install
+//!     `settings.json.t-hub-bak` so the user can always recover the pre-install
 //!     state.
 
 use std::path::{Path, PathBuf};
@@ -42,14 +42,14 @@ fn claude_config_dir() -> Option<PathBuf> {
 
 /// Path to the user-scope `settings.json` (where global hooks live).
 ///
-/// **The Windows↔WSL gotcha (PROBLEM 1):** TermHub is a *Windows* process, but
+/// **The Windows↔WSL gotcha (PROBLEM 1):** T-Hub is a *Windows* process, but
 /// Claude Code runs *inside WSL* and reads `~/.claude/settings.json` at the WSL
 /// `$HOME` (e.g. `/home/<user>/.claude/...`). The Windows `HOME` env var (if set
 /// at all) points at `C:\Users\<user>`, so writing there has no effect on Claude.
 ///
 /// So on Windows we resolve the **WSL** home by shelling
 /// `wsl.exe -d <distro> -- bash -lc 'echo $HOME'` once (distro from
-/// `TERMHUB_DISTRO`, default `Ubuntu-24.04`), then target the file via its UNC
+/// `T_HUB_DISTRO`, default `Ubuntu-24.04`), then target the file via its UNC
 /// form `\\wsl.localhost\<distro>\home\<user>\.claude\settings.json`, which
 /// std::fs can read/write directly from Windows. On unix we keep the native
 /// `HOME` / `CLAUDE_CONFIG_DIR` behavior.
@@ -68,10 +68,10 @@ fn settings_path() -> Result<PathBuf> {
 }
 
 /// The WSL distro to target, mirroring `crate::default_distro` (env
-/// `TERMHUB_DISTRO`, default `Ubuntu-24.04`).
+/// `T_HUB_DISTRO`, default `Ubuntu-24.04`).
 #[cfg(windows)]
 fn wsl_distro() -> String {
-    std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
 }
 
 /// Resolve the WSL `$HOME` for `distro` by shelling a login bash once. Uses the
@@ -135,7 +135,7 @@ fn write_settings_atomic(path: &Path, value: &serde_json::Value) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {dir:?}"))?;
 
     let text = serde_json::to_string_pretty(value).context("serializing settings")?;
-    let tmp = path.with_extension("json.termhub-tmp");
+    let tmp = path.with_extension("json.t-hub-tmp");
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp).with_context(|| format!("creating {tmp:?}"))?;
@@ -155,7 +155,7 @@ fn backup_once(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(()); // nothing to back up (fresh install).
     }
-    let bak = path.with_extension("json.termhub-bak");
+    let bak = path.with_extension("json.t-hub-bak");
     if bak.exists() {
         return Ok(()); // keep the earliest backup; don't overwrite it.
     }
@@ -172,13 +172,13 @@ pub struct InstallReport {
     pub settings_path: String,
     /// Whether a backup was made (or already existed).
     pub backed_up: bool,
-    /// Number of hook events TermHub now manages (post-op).
+    /// Number of hook events T-Hub now manages (post-op).
     pub managed_events: usize,
     /// Human summary.
     pub message: String,
 }
 
-/// Count how many top-level hook events contain a TermHub-managed (marker)
+/// Count how many top-level hook events contain a T-Hub-managed (marker)
 /// command after an op — for the report.
 fn count_managed(settings: &serde_json::Value) -> usize {
     let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else {
@@ -192,7 +192,7 @@ fn count_managed(settings: &serde_json::Value) -> usize {
                 .map(|arr| {
                     arr.iter().any(|g| {
                         serde_json::to_string(g)
-                            .map(|s| s.contains(hooks::TERMHUB_HOOK_MARKER))
+                            .map(|s| s.contains(hooks::T_HUB_HOOK_MARKER))
                             .unwrap_or(false)
                     })
                 })
@@ -201,10 +201,10 @@ fn count_managed(settings: &serde_json::Value) -> usize {
         .count()
 }
 
-/// Install TermHub's hook handlers into `~/.claude/settings.json`.
+/// Install T-Hub's hook handlers into `~/.claude/settings.json`.
 ///
 /// `agent_bin` is the resolved WSL path to the hook entrypoint (the
-/// `termhub-agent` binary; it gains a `--hook <EVENT>` mode). Refuses without
+/// `t-hub-agent` binary; it gains a `--hook <EVENT>` mode). Refuses without
 /// `consent`. Non-destructive + atomic + backed up. Resolves the settings path
 /// from the environment; see [`install_hooks_at`] for the path-injected core.
 // Kept as the "install everything" convenience + a stable entry point; the
@@ -222,32 +222,32 @@ pub fn install_hooks_events(
     consent: bool,
     events: &[String],
 ) -> Result<InstallReport> {
-    // Resolve the REAL absolute path to termhub-agent. Claude Code runs hooks via
+    // Resolve the REAL absolute path to t-hub-agent. Claude Code runs hooks via
     // `/bin/sh` with a minimal PATH that does NOT include `~/.local/bin`, so a
-    // bare `termhub-agent` (the UI default) or a stale `/usr/bin/termhub-agent`
+    // bare `t-hub-agent` (the UI default) or a stale `/usr/bin/t-hub-agent`
     // fails with "not found" and no hook ever fires. We resolve a concrete path
     // inside WSL instead of trusting the passed value.
     let resolved = resolve_agent_bin(agent_bin);
     install_hooks_at_events(&settings_path()?, &resolved, consent, events)
 }
 
-/// The subset of TermHub hook events currently installed in the user's
+/// The subset of T-Hub hook events currently installed in the user's
 /// settings.json (so the UI can pre-check the right boxes).
 pub fn managed_event_names() -> Result<Vec<String>> {
     let existing = read_settings(&settings_path()?)?;
     Ok(hooks::managed_events(&existing))
 }
 
-/// Resolve the absolute path to the `termhub-agent` binary that the hooks will
+/// Resolve the absolute path to the `t-hub-agent` binary that the hooks will
 /// invoke. Prefers a login-shell `command -v` (finds wherever it's installed),
-/// then `~/.local/bin/termhub-agent` (the standard install location), then the
+/// then `~/.local/bin/t-hub-agent` (the standard install location), then the
 /// value the caller passed as a last resort.
 #[cfg(windows)]
 fn resolve_agent_bin(passed: &str) -> String {
     use std::os::windows::process::CommandExt;
     let distro = wsl_distro();
     if let Ok(out) = std::process::Command::new("wsl.exe")
-        .args(["-d", &distro, "--", "bash", "-lc", "command -v termhub-agent"])
+        .args(["-d", &distro, "--", "bash", "-lc", "command -v t-hub-agent"])
         .creation_flags(0x0800_0000)
         .output()
     {
@@ -259,7 +259,7 @@ fn resolve_agent_bin(passed: &str) -> String {
         }
     }
     if let Ok(home) = wsl_home(&distro) {
-        return format!("{home}/.local/bin/termhub-agent");
+        return format!("{home}/.local/bin/t-hub-agent");
     }
     passed.to_string()
 }
@@ -271,7 +271,7 @@ fn resolve_agent_bin(passed: &str) -> String {
         return passed.to_string();
     }
     if let Ok(out) = std::process::Command::new("bash")
-        .args(["-lc", "command -v termhub-agent"])
+        .args(["-lc", "command -v t-hub-agent"])
         .output()
     {
         if out.status.success() {
@@ -283,7 +283,7 @@ fn resolve_agent_bin(passed: &str) -> String {
     }
     if let Some(home) = std::env::var_os("HOME") {
         return Path::new(&home)
-            .join(".local/bin/termhub-agent")
+            .join(".local/bin/t-hub-agent")
             .to_string_lossy()
             .into_owned();
     }
@@ -299,7 +299,7 @@ pub fn install_hooks_at(path: &Path, agent_bin: &str, consent: bool) -> Result<I
 }
 
 /// Path-injected, subset-aware install. Reconciles the managed set to EXACTLY
-/// `events`: strips all TermHub hooks first, then merges the selection, so an
+/// `events`: strips all T-Hub hooks first, then merges the selection, so an
 /// unchecked event is removed. Empty `events` is treated as "all".
 pub fn install_hooks_at_events(
     path: &Path,
@@ -322,14 +322,14 @@ pub fn install_hooks_at_events(
     };
     let existing = read_settings(path)?;
     let backed_up = backup_once(path).is_ok();
-    // Strip every TermHub hook, then merge exactly the selection — the managed
+    // Strip every T-Hub hook, then merge exactly the selection — the managed
     // set ends up equal to `events` (deselecting an event uninstalls it).
     let cleaned = hooks::remove_from_settings(&existing);
     let event_refs: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
     let merged = hooks::merge_into_settings_for(&cleaned, agent_bin, &event_refs);
     // Also install the Claude `statusLine` (the USAGE data source). The hooks
     // alone never feed the status bridge — Claude's statusline is a SEPARATE
-    // setting that runs `termhub-agent --statusline`, which journals a
+    // setting that runs `t-hub-agent --statusline`, which journals a
     // StatusSnapshot the core re-emits on `status://snapshot`. Without this,
     // the sidebar USAGE strip shows only dashes. Respects a user-authored
     // statusLine (merge_statusline_into_settings leaves a non-managed one alone).
@@ -346,17 +346,17 @@ pub fn install_hooks_at_events(
         backed_up,
         managed_events: managed,
         message: if statusline_on {
-            format!("Installed TermHub handlers for {managed} hook events + usage statusline.")
+            format!("Installed T-Hub handlers for {managed} hook events + usage statusline.")
         } else {
             format!(
-                "Installed TermHub handlers for {managed} hook events. \
+                "Installed T-Hub handlers for {managed} hook events. \
                  (Kept your existing Claude statusLine — usage may not report.)"
             )
         },
     })
 }
 
-/// Remove TermHub's hook handlers (clean uninstall), leaving the user's own
+/// Remove T-Hub's hook handlers (clean uninstall), leaving the user's own
 /// hooks and all non-hook settings intact. Idempotent.
 pub fn uninstall_hooks() -> Result<InstallReport> {
     uninstall_hooks_at(&settings_path()?)
@@ -373,11 +373,11 @@ pub fn uninstall_hooks_at(path: &Path) -> Result<InstallReport> {
         settings_path: path.display().to_string(),
         backed_up: false,
         managed_events: count_managed(&cleaned),
-        message: "Removed TermHub hook handlers + usage statusline.".to_string(),
+        message: "Removed T-Hub hook handlers + usage statusline.".to_string(),
     })
 }
 
-/// Report whether TermHub hooks are currently installed (any marker present)
+/// Report whether T-Hub hooks are currently installed (any marker present)
 /// without modifying anything — for the UI to show install state.
 pub fn hooks_installed() -> Result<bool> {
     hooks_installed_at(&settings_path()?)
@@ -401,7 +401,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("termhub-install-{tag}-{ts}"));
+        let dir = std::env::temp_dir().join(format!("t-hub-install-{tag}-{ts}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("settings.json")
     }
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn install_requires_consent() {
         let path = temp_settings("consent");
-        let err = install_hooks_at(&path, "/usr/bin/termhub-agent", false).unwrap_err();
+        let err = install_hooks_at(&path, "/usr/bin/t-hub-agent", false).unwrap_err();
         assert!(err.to_string().contains("consent"));
         cleanup(&path);
     }
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn install_creates_settings_with_managed_hooks() {
         let path = temp_settings("create");
-        let report = install_hooks_at(&path, "/usr/bin/termhub-agent", true).unwrap();
+        let report = install_hooks_at(&path, "/usr/bin/t-hub-agent", true).unwrap();
         assert!(report.managed_events >= 15);
         assert!(path.exists());
         let written: serde_json::Value =
@@ -447,9 +447,9 @@ mod tests {
         });
         write_settings_atomic(&path, &seed).unwrap();
 
-        let report = install_hooks_at(&path, "/usr/bin/termhub-agent", true).unwrap();
+        let report = install_hooks_at(&path, "/usr/bin/t-hub-agent", true).unwrap();
         assert!(report.backed_up, "a backup must be made over an existing file");
-        assert!(path.with_extension("json.termhub-bak").exists());
+        assert!(path.with_extension("json.t-hub-bak").exists());
 
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn install_writes_statusline_and_uninstall_removes_it() {
         let path = temp_settings("statusline");
-        install_hooks_at(&path, "/usr/bin/termhub-agent", true).unwrap();
+        install_hooks_at(&path, "/usr/bin/t-hub-agent", true).unwrap();
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         // statusLine installed and points at --statusline.
@@ -491,7 +491,7 @@ mod tests {
             "statusLine": { "type": "command", "command": "my-own.sh" }
         });
         write_settings_atomic(&path, &seed).unwrap();
-        install_hooks_at(&path, "/usr/bin/termhub-agent", true).unwrap();
+        install_hooks_at(&path, "/usr/bin/t-hub-agent", true).unwrap();
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         // User's statusLine survives; ours is NOT forced in.
@@ -515,10 +515,10 @@ mod tests {
         });
         write_settings_atomic(&path, &seed).unwrap();
 
-        install_hooks_at(&path, "/usr/bin/termhub-agent", true).unwrap();
+        install_hooks_at(&path, "/usr/bin/t-hub-agent", true).unwrap();
         assert!(hooks_installed_at(&path).unwrap());
         // Idempotent install: second install keeps exactly one set per event.
-        install_hooks_at(&path, "/usr/bin/termhub-agent", true).unwrap();
+        install_hooks_at(&path, "/usr/bin/t-hub-agent", true).unwrap();
 
         let r = uninstall_hooks_at(&path).unwrap();
         assert_eq!(r.managed_events, 0);
@@ -538,7 +538,7 @@ mod tests {
     fn refuses_to_overwrite_malformed_settings() {
         let path = temp_settings("malformed");
         std::fs::write(&path, "{ this is not json ").unwrap();
-        let err = install_hooks_at(&path, "/usr/bin/termhub-agent", true).unwrap_err();
+        let err = install_hooks_at(&path, "/usr/bin/t-hub-agent", true).unwrap_err();
         assert!(err.to_string().contains("parsing"));
         cleanup(&path);
     }

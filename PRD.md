@@ -1,4 +1,4 @@
-**TERMHUB**
+**T-HUB**
 
 Terminal-first command center for persistent coding-agent sessions
 
@@ -28,12 +28,12 @@ Terminal-first command center for persistent coding-agent sessions
 
 # 1. Executive summary
 
-**TermHub is a full-screen, terminal-first control center for running and supervising many coding-agent sessions at once.** Its first release is optimized for one personal setup: Windows 11, WSL2 Ubuntu, zsh, and Claude Code installed inside WSL. The architecture remains adapter-based so Codex and other terminal agents can be added later without rebuilding the terminal, workspace, persistence, or file systems.
+**T-Hub is a full-screen, terminal-first control center for running and supervising many coding-agent sessions at once.** Its first release is optimized for one personal setup: Windows 11, WSL2 Ubuntu, zsh, and Claude Code installed inside WSL. The architecture remains adapter-based so Codex and other terminal agents can be added later without rebuilding the terminal, workspace, persistence, or file systems.
 
 - **Primary experience:** A user-defined workspace tab containing an arbitrary number of resizable terminal tiles. There is no product-level maximum such as 8 or 12.
 - **Primary control surface:** A collapsible sidebar that organizes workspace tabs, terminal/agent sessions, attention states, contextual files, usage, and WSL health.
 - **Persistence promise:** Closing the UI does not kill attached work. A crash or reboot can reconstruct the prior active setup and resume exact Claude session IDs after user review.
-- **Agent awareness:** TermHub knows whether each Claude session is working, waiting, asking a question, completed, failed, rate-limited, detached, or no longer resumable.
+- **Agent awareness:** T-Hub knows whether each Claude session is working, waiting, asking a question, completed, failed, rate-limited, detached, or no longer resumable.
 - **Just-enough files:** A fast contextual file tree, fuzzy search, Markdown reader, and lightweight editor remove the need to open VS Code or Notepad for small reads and edits.
 - **Local-first:** No account, no cloud backend, and no telemetry by default. Secrets and file contents are excluded from logs and MCP responses by default.
 
@@ -48,7 +48,7 @@ Native terminals and terminal multiplexers can keep processes alive, but they do
 
 ## 2.2 Product vision
 
-**TermHub should feel like an operations cockpit for active software builds, not an IDE and not a chat application.** The terminal remains real and unrestricted. TermHub contributes organization, durable identity, agent state, recovery, contextual files, preview control, and automation around it.
+**T-Hub should feel like an operations cockpit for active software builds, not an IDE and not a chat application.** The terminal remains real and unrestricted. T-Hub contributes organization, durable identity, agent state, recovery, contextual files, preview control, and automation around it.
 
 ## 2.3 Primary user
 
@@ -100,7 +100,7 @@ Native terminals and terminal multiplexers can keep processes alive, but they do
 | --- | --- |
 | Workspace tab | A user-named canvas containing any number of terminal tiles. It has no required semantic meaning. |
 | Terminal tile | A visual viewport and thin header that attaches to a terminal session. Moving or hiding it does not move or kill the process. |
-| Terminal session | The durable shell/process environment owned by TermHub, backed by a tmux session and represented by a stable TermHub ID. |
+| Terminal session | The durable shell/process environment owned by T-Hub, backed by a tmux session and represented by a stable T-Hub ID. |
 | Agent session | A provider-specific resumable conversation, such as a Claude Code session ID. One terminal session may currently have zero or one attached primary agent session. |
 | Project root | The repository or directory from which the terminal/agent was launched. |
 | Worktree context | The exact current worktree, branch, and current working directory associated with the selected agent session. |
@@ -116,7 +116,7 @@ Native terminals and terminal multiplexers can keep processes alive, but they do
 
 ## 5.1 Full-screen structure
 
-TermHub does not reserve conventional application chrome such as a permanent status bar, toolbar, or duplicated navigation row. The default content is the terminal canvas plus an optional collapsible sidebar. Native Windows window controls may remain available or be integrated into a minimal borderless frame, but they must not consume a product toolbar row.
+T-Hub does not reserve conventional application chrome such as a permanent status bar, toolbar, or duplicated navigation row. The default content is the terminal canvas plus an optional collapsible sidebar. Native Windows window controls may remain available or be integrated into a minimal borderless frame, but they must not consume a product toolbar row.
 
 ```
 FULL SCREEN
@@ -144,7 +144,7 @@ FULL SCREEN
 ## 5.3 Canvas layout
 
 - **Default mode:** Responsive auto-grid. New tiles are inserted immediately after the focused tile in reading order, then the grid rebalances deterministically.
-- **Manual mode:** Tiles can be resized, swapped, or split. When adding from the file tree in a manually arranged tab, TermHub splits the largest available tile region unless the user targets a specific drop zone.
+- **Manual mode:** Tiles can be resized, swapped, or split. When adding from the file tree in a manually arranged tab, T-Hub splits the largest available tile region unless the user targets a specific drop zone.
 - **Density controls:** Global terminal zoom, per-tile zoom, fit-to-tile, focus mode, and reset layout.
 - **Hidden tabs:** Background processes continue, but terminal rendering and attached PTY clients may be suspended to conserve resources.
 
@@ -175,7 +175,7 @@ status  Appturnity / Auth Refactor  ~/projects/appturnity  [Preview] [Files] [..
 - Default sound events: Claude asks a question, main agent completes a turn, and session fails/exits unexpectedly.
 - No default rate-limit sound.
 - Notification indicators appear on the affected tile and its sidebar session/tab entry, including when the tile is already visible.
-- Per-project and per-event sounds are supported. Desktop notifications are optional and can be limited to when TermHub is unfocused.
+- Per-project and per-event sounds are supported. Desktop notifications are optional and can be limited to when T-Hub is unfocused.
 - Orchestrator sessions may be classified as waiting on subagents rather than completed when background task signals remain active.
 
 # 6. Core user workflows
@@ -184,9 +184,9 @@ status  Appturnity / Auth Refactor  ~/projects/appturnity  [Preview] [Files] [..
 
 **1.** Detect installed WSL distributions with `wsl -l -v`; default to Ubuntu and verify it is WSL 2.
 
-**2.** Verify zsh, tmux, Git, and Claude Code inside Ubuntu. Offer to install only TermHub-owned helper components; do not silently alter the user's shell configuration.
+**2.** Verify zsh, tmux, Git, and Claude Code inside Ubuntu. Offer to install only T-Hub-owned helper components; do not silently alter the user's shell configuration.
 
-**3.** Install the TermHub WSL agent and Claude integration hooks/status bridge.
+**3.** Install the T-Hub WSL agent and Claude integration hooks/status bridge.
 
 **4.** Select one or more project roots to index, with the WSL home/projects area suggested.
 
@@ -198,15 +198,15 @@ status  Appturnity / Auth Refactor  ~/projects/appturnity  [Preview] [Files] [..
 
 **1.** User right-clicks any folder and chooses Open terminal / Spin up agent.
 
-**2.** TermHub opens the preset chooser: Claude, Shell, Resume Claude, or Custom command.
+**2.** T-Hub opens the preset chooser: Claude, Shell, Resume Claude, or Custom command.
 
-**3.** TermHub queries known Claude sessions for that directory and repository worktrees.
+**3.** T-Hub queries known Claude sessions for that directory and repository worktrees.
 
-**4.** If sessions exist, the dialog shows session name/summary, last activity, context information when available, worktree/branch, resumability, and whether the session is already live in TermHub.
+**4.** If sessions exist, the dialog shows session name/summary, last activity, context information when available, worktree/branch, resumability, and whether the session is already live in T-Hub.
 
 **5.** User may create a new Claude session, resume an inactive exact session, focus an already-live session, or fork an existing session.
 
-**6.** TermHub prevents accidental duplicate resume of the same exact Claude session. Advanced override is hidden behind an explicit warning because messages would interleave into one transcript.
+**6.** T-Hub prevents accidental duplicate resume of the same exact Claude session. Advanced override is hidden behind an explicit warning because messages would interleave into one transcript.
 
 **7.** The tile is inserted after the focused tile and the grid rebalances, or the targeted manual drop region is used.
 
@@ -224,14 +224,14 @@ status  Appturnity / Auth Refactor  ~/projects/appturnity  [Preview] [Files] [..
 | Close tile | Detach the visual tile and preserve the tmux process/session record. Move it to Recent/Detached unless configured otherwise. |
 | Stop terminal | Terminate the tmux session after confirmation if a process is active. |
 | Archive record | Remove from normal active/recent views but retain metadata and provider linkage. |
-| Forget TermHub record | Remove TermHub metadata after confirmation; does not delete provider transcript unless separately selected. |
+| Forget T-Hub record | Remove T-Hub metadata after confirmation; does not delete provider transcript unless separately selected. |
 | Delete Claude transcript | Never available to MCP by default. Requires a dedicated destructive flow and explicit confirmation. |
 
 ## 6.5 App reopen while WSL/tmux is alive
 
 **1.** Load the last active workspace snapshot from SQLite.
 
-**2.** Query the isolated TermHub tmux server and match sessions by stable TermHub ID.
+**2.** Query the isolated T-Hub tmux server and match sessions by stable T-Hub ID.
 
 **3.** Reattach visible terminal tiles; keep hidden-tab sessions detached until needed.
 
@@ -256,7 +256,7 @@ status  Appturnity / Auth Refactor  ~/projects/appturnity  [Preview] [Files] [..
 - Display all known projects and agent sessions separately from the active workspace snapshot.
 - Support filters for provider, project, worktree, active, resumable, expired, archived, context, and last activity.
 - Store cheap metadata for hundreds or thousands of sessions. Full transcript availability is provider-dependent.
-- TermHub metadata may remain indefinitely. A Claude session is marked non-resumable if its local transcript has been cleaned up or moved.
+- T-Hub metadata may remain indefinitely. A Claude session is marked non-resumable if its local transcript has been cleaned up or moved.
 
 ## 6.8 File reading and editing
 
@@ -266,7 +266,7 @@ status  Appturnity / Auth Refactor  ~/projects/appturnity  [Preview] [Files] [..
 
 **3.** Markdown opens in rendered read mode by default with a Source toggle.
 
-**4.** Editing may open in a separate lightweight TermHub window or a temporary split; both are required, with the separate window implemented first.
+**4.** Editing may open in a separate lightweight T-Hub window or a temporary split; both are required, with the separate window implemented first.
 
 **5.** Saving writes directly to WSL through the WSL agent with atomic replace semantics and external-change detection.
 
@@ -274,7 +274,7 @@ status  Appturnity / Auth Refactor  ~/projects/appturnity  [Preview] [Files] [..
 
 - V1: detect or explicitly register localhost URLs and open them in the configured external browser.
 - V1.5: maintain one managed Chrome for Testing/Chromium page per preview target, reload it in the background, and bring the correct page to the foreground only on explicit Preview or an opt-in rule.
-- Preview discovery priority: explicit TermHub declaration; Claude/footer link metadata; terminal URL detection; process/port association; saved project setting.
+- Preview discovery priority: explicit T-Hub declaration; Claude/footer link metadata; terminal URL detection; process/port association; saved project setting.
 
 ## 6.10 Rate-limit scheduling / night mode
 
@@ -297,7 +297,7 @@ status  Appturnity / Auth Refactor  ~/projects/appturnity  [Preview] [Files] [..
 | FR-001 | Canvas | Store and render an arbitrary number of terminal tiles per workspace tab. No hard maximum in schema or UI. |
 | FR-002 | Canvas | Provide responsive auto-grid, deterministic insertion, drag/swap, resize, manual splits, global/per-tile zoom, focus mode, and layout reset. |
 | FR-003 | Tabs | Create, rename, reorder, duplicate-layout, and delete empty workspace tabs. Move terminal tiles between tabs without process interruption. |
-| FR-004 | Terminal | Launch interactive WSL zsh terminals through a PTY and back each TermHub terminal with a stable tmux session. |
+| FR-004 | Terminal | Launch interactive WSL zsh terminals through a PTY and back each T-Hub terminal with a stable tmux session. |
 | FR-005 | Terminal | Detach hidden terminals while preserving processes and tmux scrollback; reattach and restore display when visible. |
 | FR-006 | Agent adapters | Support provider presets through an adapter interface. Claude is the only required V1 provider. |
 | FR-007 | Claude | Capture session ID, name/summary, transcript path, cwd, project directory, worktree, context, usage, rate limits, and lifecycle events. |
@@ -312,7 +312,7 @@ status  Appturnity / Auth Refactor  ~/projects/appturnity  [Preview] [Files] [..
 | FR-016 | Files | Provide shallow tree, Recent, Key Files, and Pinned views and remember per-session/worktree navigation state. |
 | FR-017 | Editor | Provide rendered Markdown, read-only source, editable source, and safe .env raw/structured editing in separate window and temporary split. |
 | FR-018 | Preview | Register/detect a preview URL and expose a conditional Preview action. Managed Chromium is V1.5. |
-| FR-019 | System | Show compact WSL RAM, swap, CPU/load, distro state, TermHub/Claude process count, and warnings in the sidebar utility area. |
+| FR-019 | System | Show compact WSL RAM, swap, CPU/load, distro state, T-Hub/Claude process count, and warnings in the sidebar utility area. |
 | FR-020 | Scheduling | Persist and execute opt-in exact-session continuation after a Claude rate-limit reset, with safety checks and audit logs. |
 | FR-021 | MCP | Expose read and safe organization actions by default; require confirmation or explicit settings for destructive/process-changing actions. |
 | FR-022 | Settings | Support configurable keyboard binds, sidebar mode, optional top switcher, density, themes, sounds, recovery, retention warning, and adapter settings. |
@@ -362,8 +362,8 @@ EventJournalEntry
 
 | **State** | **Meaning** |
 | --- | --- |
-| Live in TermHub | Exact provider session is attached to a known running terminal/tmux session. |
-| Live externally | Hooks or provider state indicate activity, but TermHub does not own the visible terminal. |
+| Live in T-Hub | Exact provider session is attached to a known running terminal/tmux session. |
+| Live externally | Hooks or provider state indicate activity, but T-Hub does not own the visible terminal. |
 | Resumable | No live process is attached, but the provider transcript/session data exists. |
 | Fork recommended | The same exact session is already live; starting another terminal should fork rather than resume. |
 | Expired/unavailable | Metadata remains, but required transcript/session data no longer exists. |
@@ -380,32 +380,32 @@ EventJournalEntry
 | UI state | Zustand + TanStack Query | Fast local interaction state plus explicit asynchronous backend/query state. |
 | Terminal renderer | xterm.js + Fit + WebGL + Search + Unicode; Serialize where useful | Proven terminal emulation and GPU-backed rendering; avoids writing an emulator. |
 | Windows PTY | portable-pty / ConPTY | Interactive PTY control for `wsl.exe`; Tauri shell spawn alone is not a terminal. |
-| Durable mux | tmux on isolated `termhub` socket | Keeps shell and Claude alive while UI clients detach; battle-tested and scriptable. |
-| WSL control plane | Bundled TermHub Linux agent over persistent stdio NDJSON | Centralizes tmux, files, Git/worktrees, system metrics, and Claude hook events inside WSL. |
+| Durable mux | tmux on isolated `t-hub` socket | Keeps shell and Claude alive while UI clients detach; battle-tested and scriptable. |
+| WSL control plane | Bundled T-Hub Linux agent over persistent stdio NDJSON | Centralizes tmux, files, Git/worktrees, system metrics, and Claude hook events inside WSL. |
 | Persistence | SQLite in Windows app data + WSL event journal | Transactional UI state and durable recovery, with event replay when UI was closed. |
 | File watcher | notify/inotify inside WSL | Watch Linux project files from the Linux side rather than through `\\wsl$`. |
 | Reader/editor | CodeMirror 6 + Markdown renderer | Lightweight normal editing without becoming an IDE. |
 | Managed preview | On-demand Playwright sidecar + Chrome for Testing (V1.5) | Reliable page mapping, background reload, tab activation, and isolated browser profile. |
-| MCP | Local MCP server backed by the same internal command bus (V1.5) | Claude can organize TermHub without fragile UI automation. |
+| MCP | Local MCP server backed by the same internal command bus (V1.5) | Claude can organize T-Hub without fragile UI automation. |
 
 ## 9.2 Process topology
 
 ```
 Windows 11
-  TermHub.exe (Tauri / Rust)
+  T-Hub.exe (Tauri / Rust)
     +-- React WebView: sidebar, canvases, xterm.js, editor windows
     +-- SQLite state and recovery journal
     +-- PTY manager
     |     +-- wsl.exe -> tmux attach (one client per visible tile)
     +-- WSL control bridge
-    |     +-- wsl.exe -d Ubuntu -- termhub-agent --stdio
+    |     +-- wsl.exe -d Ubuntu -- t-hub-agent --stdio
     +-- Optional V1.5 browser sidecar
           +-- Playwright -> isolated Chrome for Testing profile
 
 WSL2 Ubuntu
-  tmux server socket: termhub
-    +-- one named tmux session per TermHub terminal
-  termhub-agent
+  tmux server socket: t-hub
+    +-- one named tmux session per T-Hub terminal
+  t-hub-agent
     +-- tmux/session registry and commands
     +-- file index + inotify watcher
     +-- git/worktree queries
@@ -420,15 +420,15 @@ Tauri is recommended because most heavy workloads already live inside WSL. The d
 
 ## 9.4 Terminal and tmux model
 
-- Use one TermHub-owned tmux session per terminal record, typically with one pane. This makes independent attach/detach, cwd, recovery, and ownership straightforward.
-- Run TermHub sessions on an isolated tmux socket (`tmux -L termhub`) so the app does not interfere with the user's existing tmux sessions.
+- Use one T-Hub-owned tmux session per terminal record, typically with one pane. This makes independent attach/detach, cwd, recovery, and ownership straightforward.
+- Run T-Hub sessions on an isolated tmux socket (`tmux -L t-hub`) so the app does not interfere with the user's existing tmux sessions.
 - Each visible tile has one PTY client running `wsl.exe` and attaching to the corresponding tmux session. Hidden tabs can detach their PTY clients while the tmux programs continue.
 - On remount, use tmux scrollback/capture plus fresh attachment to restore display. xterm serialization is a display optimization, not the authoritative process state.
 - Do not use tmux control mode in V1. It could reduce the number of attached clients later, but it adds a protocol/parser and pane-routing system before the core product is proven.
 
 ## 9.5 WSL control agent
 
-A small bundled Linux binary is installed into the selected Ubuntu distribution. The Windows Rust core maintains one long-lived `wsl.exe ... termhub-agent --stdio` bridge using newline-delimited JSON. This avoids depending on WSL localhost networking mode and prevents repeated process startup for file, Git, metrics, and tmux queries.
+A small bundled Linux binary is installed into the selected Ubuntu distribution. The Windows Rust core maintains one long-lived `wsl.exe ... t-hub-agent --stdio` bridge using newline-delimited JSON. This avoids depending on WSL localhost networking mode and prevents repeated process startup for file, Git, metrics, and tmux queries.
 
 - The agent owns no UI and can restart independently.
 - Claude hooks append events to a WSL-side journal and notify the agent when available. Events remain recoverable if the Windows app is closed.
@@ -437,9 +437,9 @@ A small bundled Linux binary is installed into the selected Ubuntu distribution.
 
 ## 9.6 Claude adapter
 
-- Install TermHub hook handlers for SessionStart, SessionEnd, UserPromptSubmit, Stop, StopFailure, PermissionRequest, Notification, SubagentStart/Stop, TaskCreated/Completed, CwdChanged, WorktreeCreate/Remove, and relevant file/config events.
+- Install T-Hub hook handlers for SessionStart, SessionEnd, UserPromptSubmit, Stop, StopFailure, PermissionRequest, Notification, SubagentStart/Stop, TaskCreated/Completed, CwdChanged, WorktreeCreate/Remove, and relevant file/config events.
 - Install a status bridge that receives Claude's JSON status data and writes the latest session snapshot keyed by exact session ID.
-- Use official Agent SDK session listing/info APIs for on-demand import and details, but do not poll them aggressively until their memory behavior is benchmarked. The persistent TermHub index should be driven by hooks plus incremental transcript/file metadata.
+- Use official Agent SDK session listing/info APIs for on-demand import and details, but do not poll them aggressively until their memory behavior is benchmarked. The persistent T-Hub index should be driven by hooks plus incremental transcript/file metadata.
 - The provider adapter exposes generic operations: discover sessions, start new, resume exact, fork, get status, get context, get rate limits, and verify resumability.
 
 ## 9.7 File indexing
@@ -461,18 +461,18 @@ A small bundled Linux binary is installed into the selected Ubuntu distribution.
 
 ## 10.1 Exact session ID is mandatory
 
-Claude saves sessions continuously and supports exact resume by ID or name. `--continue` resumes the most recent session in the current directory. A directory can contain multiple sessions, and the session picker can widen across worktrees or all projects. Most importantly, Anthropic states that resuming the same session in two terminals without forking causes both terminals' messages to interleave into one transcript. TermHub therefore treats exact provider session ID as the identity and blocks accidental duplicate live attachment. [R1] [R3]
+Claude saves sessions continuously and supports exact resume by ID or name. `--continue` resumes the most recent session in the current directory. A directory can contain multiple sessions, and the session picker can widen across worktrees or all projects. Most importantly, Anthropic states that resuming the same session in two terminals without forking causes both terminals' messages to interleave into one transcript. T-Hub therefore treats exact provider session ID as the identity and blocks accidental duplicate live attachment. [R1] [R3]
 
 ## 10.2 Session history is not indefinite by default
 
-Claude stores local JSONL transcripts under `~/.claude/projects/` and removes them after 30 days by default, configurable through `cleanupPeriodDays`. TermHub can keep its own cheap metadata indefinitely, but exact Claude resumability depends on the original transcript remaining available. The UI must display Resumable versus Expired, and onboarding should offer an explicit longer-retention setting without silently changing Claude configuration. [R1] [R2]
+Claude stores local JSONL transcripts under `~/.claude/projects/` and removes them after 30 days by default, configurable through `cleanupPeriodDays`. T-Hub can keep its own cheap metadata indefinitely, but exact Claude resumability depends on the original transcript remaining available. The UI must display Resumable versus Expired, and onboarding should offer an explicit longer-retention setting without silently changing Claude configuration. [R1] [R2]
 
-|   | **Privacy implication:** Claude transcripts are plaintext and can contain secrets if an agent reads or prints them. Extending retention increases recovery value and increases local secret exposure. TermHub must explain this tradeoff. |
+|   | **Privacy implication:** Claude transcripts are plaintext and can contain secrets if an agent reads or prints them. Extending retention increases recovery value and increases local secret exposure. T-Hub must explain this tradeoff. |
 | --- | --- |
 
 ## 10.3 Existing-session discovery
 
-Claude's Agent SDK exposes session enumeration, resume, fork, and a custom session store (`listSessions`, `getSessionInfo`, `getSessionMessages`, `rename`, `tag`). Verified caveat: the SDK metadata surface is thinner than a full catalog — the exact session ID and the message transcript are available, but summary, cwd, branch, and first prompt are **not** returned as session metadata and must be derived by parsing the transcript or by maintaining TermHub's own index. This reinforces the decision to keep a lightweight TermHub index for the normal UI and to use the SDK for import, resume, fork, and verification rather than as the primary metadata source. [R6]
+Claude's Agent SDK exposes session enumeration, resume, fork, and a custom session store (`listSessions`, `getSessionInfo`, `getSessionMessages`, `rename`, `tag`). Verified caveat: the SDK metadata surface is thinner than a full catalog — the exact session ID and the message transcript are available, but summary, cwd, branch, and first prompt are **not** returned as session metadata and must be derived by parsing the transcript or by maintaining T-Hub's own index. This reinforces the decision to keep a lightweight T-Hub index for the normal UI and to use the SDK for import, resume, fork, and verification rather than as the primary metadata source. [R6]
 
 ## 10.4 Worktree truth hierarchy
 
@@ -480,13 +480,13 @@ Claude's Agent SDK exposes session enumeration, resume, fork, and a custom sessi
 
 **2.** `git rev-parse`, `git branch --show-current`, and `git worktree list --porcelain` verification inside WSL.
 
-**3.** Optional TermHub/agent-authored metadata contract for provider-specific edge cases.
+**3.** Optional T-Hub/agent-authored metadata contract for provider-specific edge cases.
 
 A Claude-authored MD file is acceptable as a fallback integration contract, but not as the primary source of truth because it can become stale or be skipped. [R4] [R5]
 
 ## 10.5 WSL detection and execution
 
-TermHub should run `wsl -l -v` to discover installed distributions, state, and WSL version, and `wsl --status` / `wsl --version` for diagnostics. Commands should always target the selected distribution explicitly. [R7]
+T-Hub should run `wsl -l -v` to discover installed distributions, state, and WSL version, and `wsl --status` / `wsl --version` for diagnostics. Commands should always target the selected distribution explicitly. [R7]
 
 ## 10.6 tmux remains the correct V1 persistence layer
 
@@ -494,13 +494,13 @@ tmux sessions can detach while their programs continue and later reattach. Its c
 
 ## 10.7 Open-file context can be injected safely
 
-Claude's UserPromptSubmit hook can add `additionalContext` before a submitted prompt is processed. TermHub can associate an open file and optional selection with the exact Claude session, then inject only the path/selection metadata. This avoids rewriting CLAUDE.md and avoids automatically copying file or secret contents. [R5]
+Claude's UserPromptSubmit hook can add `additionalContext` before a submitted prompt is processed. T-Hub can associate an open file and optional selection with the exact Claude session, then inject only the path/selection metadata. This avoids rewriting CLAUDE.md and avoids automatically copying file or secret contents. [R5]
 
 # 11. Privacy, security, and permissions
 
 ## 11.1 Defaults
 
-- No TermHub account.
+- No T-Hub account.
 - No telemetry by default.
 - Optional crash-report export is generated locally and reviewed before sharing.
 - No file content in indexes, logs, notifications, analytics, or MCP responses by default.
@@ -514,14 +514,14 @@ Claude's UserPromptSubmit hook can add `additionalContext` before a submitted pr
 | Read | List tabs/sessions, status, context, WSL health, file paths, preview targets. | Allowed |
 | Organization | Focus session, move tile, rename tab/session, open a file, register a preview. | Allowed with visible audit event |
 | Process-changing | Start/resume/stop a terminal, schedule continuation, send terminal input. | Confirmation required |
-| Destructive | Delete TermHub record, delete transcript, remove worktree, change broad settings. | Denied unless explicitly enabled; confirmation still required |
+| Destructive | Delete T-Hub record, delete transcript, remove worktree, change broad settings. | Denied unless explicitly enabled; confirmation still required |
 | Secret-bearing | Read .env value, file content, transcript messages. | Denied by default and never returned implicitly |
 
 ## 11.3 Threat considerations
 
 - A malicious project could emit terminal escape sequences or misleading localhost URLs. Sanitize metadata and require confirmation before opening non-local or unexpected origins.
-- Hooks run in repositories and must authenticate to the local TermHub bridge with a per-install secret or restricted local socket/journal permissions.
-- Tauri capability scopes should expose only the specific sidecars, URLs, and file locations TermHub needs.
+- Hooks run in repositories and must authenticate to the local T-Hub bridge with a per-install secret or restricted local socket/journal permissions.
+- Tauri capability scopes should expose only the specific sidecars, URLs, and file locations T-Hub needs.
 - The managed browser must use an isolated profile rather than the user's personal Chrome profile.
 - Recovery prompts and automatic terminal input must be auditable and cancellable.
 
@@ -537,7 +537,7 @@ Claude's UserPromptSubmit hook can add `additionalContext` before a submitted pr
 | Autosave durability | Material UI/session changes committed within 500 ms; SQLite transactions survive abrupt app termination. |
 | Startup | Last workspace shell visible quickly; long indexing and catalog reconciliation continue incrementally. |
 | File search | Typical indexed file-name query responds within 100 ms after index hydration. |
-| Memory posture | TermHub overhead remains materially lower than the Claude/Node workloads it supervises; preview sidecar remains off until needed. |
+| Memory posture | T-Hub overhead remains materially lower than the Claude/Node workloads it supervises; preview sidecar remains off until needed. |
 
 ## 12.1 Rendering strategy
 
@@ -556,8 +556,8 @@ Claude's UserPromptSubmit hook can add `additionalContext` before a submitted pr
 | 0.5 - Personal alpha | Replace the normal terminal for daily multi-agent work. | Workspace tabs; sidebar; exact Claude IDs; duplicate-session guard; hooks/status; context/usage; autosave; recovery review; keyboard navigation; WSL health. | A full workday with 6-12 visible sessions and reliable working/waiting/completed awareness. |
 | 1.0 - Daily driver | Remove routine dependence on VS Code/Notepad. | Persistent file index; worktree context; fuzzy search; Recent/Key/Pinned; Markdown reader; separate editor and quick split; sounds; settings; catalog; crash journal. | Files open instantly for the selected worktree; small edits save safely; historical sessions are navigable. |
 | 1.1 - Night mode | Resume opted-in work after subscription reset. | Rate-limit overlay; reset scheduler; exact resume; continuation prompts; apply-to-all; cancel/audit safeguards. | A deliberately scheduled session resumes once, at the right time, without duplicating a live session. |
-| 1.5 - Automation and preview | Integrate external browser and agent control. | Managed Chromium; background reload; MCP; open-file prompt context; process attribution improvements. | One preview page per project/session is reused reliably; Claude can organize TermHub within permission boundaries. |
-| 2.0 - Agent operations | Handle deeper context and parallel structures. | Context threshold/handoff policies; subagent/worktree mapping; provider adapters; API usage dashboards. | TermHub can explain and transition complex parallel agent work without relying on terminal motion. |
+| 1.5 - Automation and preview | Integrate external browser and agent control. | Managed Chromium; background reload; MCP; open-file prompt context; process attribution improvements. | One preview page per project/session is reused reliably; Claude can organize T-Hub within permission boundaries. |
+| 2.0 - Agent operations | Handle deeper context and parallel structures. | Context threshold/handoff policies; subagent/worktree mapping; provider adapters; API usage dashboards. | T-Hub can explain and transition complex parallel agent work without relying on terminal motion. |
 
 |   | **Sequencing note (verified 2026-06-13):** Claude Code already ships `SubagentStart`/`SubagentStop` (each carrying a unique `agent_id`), `TaskCreated`/`TaskCompleted`, and `Elicitation` hooks. The read-only parallel-agent awareness listed under 2.0 — orchestrator→subagent tree, per-subagent state, and waiting-on-subagents classification — therefore has its full event substrate available today and should be pulled forward into 0.5/1.0 as a first-class part of the status model rather than deferred. The deeper 2.0 work (context-threshold handoff policies and automated worktree mapping) remains later. |
 | --- | --- |
@@ -581,7 +581,7 @@ Claude's UserPromptSubmit hook can add `additionalContext` before a submitted pr
 - Create 12 terminal tiles in one workspace tab without a hard-cap warning or schema failure.
 - Typing remains responsive in the focused tile while other terminals produce output.
 - Move and resize tiles; adding a tile chooses a deterministic position.
-- Close TermHub, reopen it, and reattach to all still-running tmux sessions.
+- Close T-Hub, reopen it, and reattach to all still-running tmux sessions.
 - Closing a tile does not kill its process unless Stop is explicitly chosen.
 
 ## 14.2 V0.5
@@ -596,14 +596,14 @@ Claude's UserPromptSubmit hook can add `additionalContext` before a submitted pr
 
 - Selecting a terminal instantly loads the correct project/worktree file context from the hydrated index.
 - Search `md`, `.env`, or a multi-token path query and receive relevant files in under the target latency.
-- Open Markdown in rendered mode and edit a config file in a TermHub editor window; save is atomic and visible to the running agent.
+- Open Markdown in rendered mode and edit a config file in a T-Hub editor window; save is atomic and visible to the running agent.
 - Browse active, detached, resumable, and expired historical Claude sessions across projects.
 - The app remains usable with 12 visible, 24 live/background, and at least 1,000 catalog records in the test fixture.
 
 ## 14.4 V1.1
 
 - A rate-limited session offers a scheduled resume at the structured reset time with a configurable buffer.
-- Restarting TermHub does not lose the schedule.
+- Restarting T-Hub does not lose the schedule.
 - The scheduler refuses to run when the same session is already live, transcript is unavailable, or the schedule was cancelled.
 - Successful continuation occurs exactly once and appears in the event journal.
 
@@ -614,7 +614,7 @@ Claude's UserPromptSubmit hook can add `additionalContext` before a submitted pr
 | Unit | Layout insertion/rebalance; state reducers; session collision checks; recovery policy resolution; file search ranking; URL detection; permission decisions. |
 | Rust integration | PTY spawn/resize/input; WSL agent protocol; tmux creation/attach/detach/capture; SQLite migrations; process cleanup. |
 | Claude adapter | New session, exact resume, fork, same-directory multiple sessions, hooks missing/late, context absent, transcript cleaned up, rate-limit reset. |
-| Crash/recovery | Kill WebView, kill TermHub, `wsl --shutdown`, reboot simulation, corrupted snapshot, missing tmux session, stale PID, partial recovery. |
+| Crash/recovery | Kill WebView, kill T-Hub, `wsl --shutdown`, reboot simulation, corrupted snapshot, missing tmux session, stale PID, partial recovery. |
 | Performance | 12 visible with output; 24 live background; rapid tab switching; large monorepo index; 1,000+ session catalog. |
 | Security | Malicious terminal escape sequences, unsafe URLs, secret-bearing .env, MCP destructive calls, hook spoofing, path traversal, symlink handling. |
 | UX | Keyboard-only navigation, sidebar collapsed/expanded, high-DPI monitor, font zoom, sounds, focus restoration, editor external-change conflict. |
@@ -625,7 +625,7 @@ Claude's UserPromptSubmit hook can add `additionalContext` before a submitted pr
 | --- | --- | --- |
 | PTY/ConPTY edge cases | Broken control keys, resize, Unicode, or EOF handling. | Build a spike first; pin tested portable-pty version; maintain a PTY integration harness and fallback diagnostics. |
 | Too many visible WebGL terminals | GPU/memory pressure or sluggish input. | Visibility virtualization, bounded scrollback, batched writes, render throttling, measured soft warnings rather than a hard tile cap. |
-| tmux state divergence | TermHub record points to missing or renamed session. | Isolated socket, stable generated names, reconciliation on startup, and an explicit orphan-repair flow. |
+| tmux state divergence | T-Hub record points to missing or renamed session. | Isolated socket, stable generated names, reconciliation on startup, and an explicit orphan-repair flow. |
 | Claude integration changes | Hooks/status schema or CLI flags change. | Versioned provider adapter, capability detection, changelog tests, and graceful fallback to transcript metadata. |
 | Session retention | Historical record exists but cannot resume. | Separate metadata/resumability states; warn at onboarding; allow longer cleanup period; future transcript archive adapter. |
 | Duplicate exact session | Interleaved transcript and confusing agent behavior. | Live attachment registry, external hook detection, default block, and explicit fork flow. |
@@ -637,7 +637,7 @@ Claude's UserPromptSubmit hook can add `additionalContext` before a submitted pr
 
 ## 17.1 Locked
 
-- Product name: TermHub (working name).
+- Product name: T-Hub (working name).
 - V1 is a personal tool, but the core architecture remains distributable.
 - Windows 11 + WSL2 Ubuntu + zsh + Claude Code inside WSL.
 - Arbitrary terminal tile count; performance target 12 visible and 24 live/background.

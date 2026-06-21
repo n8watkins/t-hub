@@ -56,7 +56,7 @@ pub struct TerminalInfo {
     pub state: TerminalState,
 }
 
-/// App-wide registry of live PTY/tmux-backed terminals, keyed by TermHub id.
+/// App-wide registry of live PTY/tmux-backed terminals, keyed by T-Hub id.
 #[derive(Default)]
 pub struct TerminalManager {
     pub sessions: Mutex<HashMap<String, PtySession>>,
@@ -365,7 +365,7 @@ pub async fn kill_terminal(
 pub async fn list_terminals(
     state: tauri::State<'_, TerminalManager>,
 ) -> Result<Vec<TerminalInfo>, String> {
-    // Source of truth for liveness is the tmux server on the `termhub` socket;
+    // Source of truth for liveness is the tmux server on the `t-hub` socket;
     // the in-memory map only tells us which terminals this UI currently has a
     // PTY client for (Live) vs. ones running detached (Detached).
     let live_sessions = tmux::list_sessions()
@@ -382,12 +382,12 @@ pub async fn list_terminals(
 
     let sessions = state.sessions.lock();
 
-    // Reconcile: every tmux session named `th_*` is a TermHub terminal. Reverse
+    // Reconcile: every tmux session named `th_*` is a T-Hub terminal. Reverse
     // any leftover in-memory entries whose tmux session vanished by NOT
     // reporting them (their reader thread will have emitted `exit`).
     let mut infos: Vec<TerminalInfo> = Vec::with_capacity(live_sessions.len());
     for tmux_session in &live_sessions {
-        // Only surface sessions that belong to TermHub (the `th_` prefix), not
+        // Only surface sessions that belong to T-Hub (the `th_` prefix), not
         // anything a user might have created on this socket out-of-band.
         if !tmux_session.starts_with("th_") {
             continue;

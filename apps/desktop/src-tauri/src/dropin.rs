@@ -83,14 +83,14 @@ const PASTE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 6
 /// We `create_dir_all` the subdir but FALL BACK to the temp root if that fails:
 /// a paste must never fail just because the housekeeping subdir couldn't be made.
 fn paste_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("termhub-paste");
+    let dir = std::env::temp_dir().join("t-hub-paste");
     match std::fs::create_dir_all(&dir) {
         Ok(()) => dir,
         Err(_) => std::env::temp_dir(),
     }
 }
 
-/// Delete `termhub-paste-*.png` files older than [`PASTE_MAX_AGE`]. Scans ONLY our
+/// Delete `t-hub-paste-*.png` files older than [`PASTE_MAX_AGE`]. Scans ONLY our
 /// dedicated [`paste_dir`], not the whole temp dir, so this stays O(our files).
 /// Best-effort: any error (unreadable dir, file vanished, no mtime) is ignored —
 /// reaping is housekeeping, never the caller's concern.
@@ -103,7 +103,7 @@ fn prune_old_pastes() {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !(name.starts_with("termhub-paste-") && name.ends_with(".png")) {
+        if !(name.starts_with("t-hub-paste-") && name.ends_with(".png")) {
             continue;
         }
         let stale = entry
@@ -119,7 +119,7 @@ fn prune_old_pastes() {
     }
 }
 
-/// A unique `termhub-paste-<millis>-<seq>.png` path in our dedicated [`paste_dir`]
+/// A unique `t-hub-paste-<millis>-<seq>.png` path in our dedicated [`paste_dir`]
 /// (falling back to the temp root if the subdir couldn't be created).
 fn temp_png_path() -> PathBuf {
     let millis = SystemTime::now()
@@ -127,5 +127,5 @@ fn temp_png_path() -> PathBuf {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let seq = PASTE_SEQ.fetch_add(1, Ordering::Relaxed);
-    paste_dir().join(format!("termhub-paste-{millis}-{seq}.png"))
+    paste_dir().join(format!("t-hub-paste-{millis}-{seq}.png"))
 }

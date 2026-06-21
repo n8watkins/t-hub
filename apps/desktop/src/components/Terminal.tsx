@@ -150,7 +150,7 @@ const URL_SCAN_TAIL = 256;
 /** Default xterm theme when the active theme carries no terminal palette. */
 const DEFAULT_TERM_THEME: ITheme = { background: "#0a0a0a" };
 
-/** Map TermHub's TerminalPalette onto xterm's ITheme (default when absent). */
+/** Map T-Hub's TerminalPalette onto xterm's ITheme (default when absent). */
 function toXtermTheme(p: TerminalPalette | undefined): ITheme {
   if (!p) return DEFAULT_TERM_THEME;
   return {
@@ -640,7 +640,7 @@ export function TerminalView({
       // what, so flag it to keep a devtools session honest.
       if (t.rows <= 0) {
         console.warn(
-          `[termhub] forceRepaint on terminal ${terminalId} with no buffer (rows=${t.rows})`,
+          `[t-hub] forceRepaint on terminal ${terminalId} with no buffer (rows=${t.rows})`,
         );
         return;
       }
@@ -808,7 +808,7 @@ export function TerminalView({
   return (
     <div
       ref={containerRef}
-      className="termhub-terminal h-full w-full"
+      className="t-hub-terminal h-full w-full"
       onContextMenu={(e) => e.preventDefault()}
     />
   );

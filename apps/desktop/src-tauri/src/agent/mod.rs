@@ -1,8 +1,8 @@
 //! Core-side **agent bridge** (PLAN.md Workstream A, core half).
 //!
-//! Owns the long-lived connection to the WSL-side `termhub-agent`:
-//!   - launches `wsl.exe -d <distro> -- termhub-agent --stdio` on Windows, or
-//!     `termhub-agent --stdio` directly on a unix dev box ([`launch_argv`]);
+//! Owns the long-lived connection to the WSL-side `t-hub-agent`:
+//!   - launches `wsl.exe -d <distro> -- t-hub-agent --stdio` on Windows, or
+//!     `t-hub-agent --stdio` directly on a unix dev box ([`launch_argv`]);
 //!   - performs the [`Hello`]/[`Ready`] handshake;
 //!   - correlates [`AgentRequest`]s with [`AgentResponse`]s by [`RequestId`];
 //!   - consumes streamed/replayed [`EventJournalEntry`]s, advances the journal
@@ -14,13 +14,13 @@
 //! This file defines the **contract** for the bridge: the public types,
 //! [`AgentBridge`] handle, and method signatures the Tauri commands call. The
 //! transport internals (spawning the child, reader/writer threads, the priority
-//! scheduler that exploits [`termhub_protocol::Channel`]/`Priority`, reconnect +
+//! scheduler that exploits [`t_hub_protocol::Channel`]/`Priority`, reconnect +
 //! replay) are implemented by SUBAGENT(agent-bridge). The stubs compile and
 //! return a clear "not yet connected" error so the command surface is wired and
 //! typecheckable today.
 //!
 //! Boundary: SUBAGENT(agent-bridge) owns this directory (`agent/`). It must not
-//! change `termhub-protocol`, `model.rs`, or `supervision.rs` (it *calls* them).
+//! change `t-hub-protocol`, `model.rs`, or `supervision.rs` (it *calls* them).
 
 mod connection;
 pub mod emit;
@@ -31,7 +31,7 @@ pub use emit::{EventEmitter, TauriEmitter};
 use std::sync::{mpsc, Arc};
 
 use parking_lot::Mutex;
-use termhub_protocol::{
+use t_hub_protocol::{
     AgentRequest, AgentResponse, Channel, CoreFrame, CoreToAgent, EventJournalEntry, Hello,
     HostMetrics, Priority, WorktreeInfo, PROTOCOL_VERSION,
 };
@@ -50,8 +50,8 @@ use emit::{
 ///
 /// ## Windows agent resolution
 ///
-/// The bundled `termhub-agent` is installed to `~/.local/bin/termhub-agent`
-/// inside the distro. A bare `wsl.exe -d <distro> -- termhub-agent` runs a
+/// The bundled `t-hub-agent` is installed to `~/.local/bin/t-hub-agent`
+/// inside the distro. A bare `wsl.exe -d <distro> -- t-hub-agent` runs a
 /// **non-login, non-interactive** shell, so the user's profile is never sourced
 /// and `~/.local/bin` is *not* on `PATH` — the spawn fails and no live WSL
 /// health / agent state ever reaches the sidebar. To make resolution robust we
@@ -59,14 +59,14 @@ use emit::{
 /// puts `~/.local/bin` on `PATH`:
 ///
 /// ```text
-/// wsl.exe -d <distro> --cd ~ -- bash -lc "exec termhub-agent --stdio"
+/// wsl.exe -d <distro> --cd ~ -- bash -lc "exec t-hub-agent --stdio"
 /// ```
 ///
 /// `exec` replaces the login shell with the agent so there's no extra process
 /// in the tree and stdio is wired straight through. The `--cd ~` lands the
 /// child in the user's home, matching the profile-relative `~/.local/bin`.
 ///
-/// The `TERMHUB_AGENT_BIN` escape hatch (honored here on Windows and in
+/// The `T_HUB_AGENT_BIN` escape hatch (honored here on Windows and in
 /// [`connection::spawn_child`] on every platform) bypasses the login-shell hop
 /// entirely: when set, its value is used **verbatim** as the program to spawn,
 /// so a developer can point the bridge at an arbitrary binary without touching
@@ -77,10 +77,10 @@ use emit::{
 pub fn launch_argv(distro: &str) -> Vec<String> {
     #[cfg(windows)]
     {
-        // Escape hatch: if TERMHUB_AGENT_BIN is set, spawn it verbatim (no
+        // Escape hatch: if T_HUB_AGENT_BIN is set, spawn it verbatim (no
         // wsl.exe / login-shell hop). This keeps the override usable on Windows
         // where it would otherwise be misapplied as wsl.exe's argv[0].
-        if let Some(bin) = std::env::var("TERMHUB_AGENT_BIN")
+        if let Some(bin) = std::env::var("T_HUB_AGENT_BIN")
             .ok()
             .filter(|s| !s.is_empty())
         {
@@ -98,13 +98,13 @@ pub fn launch_argv(distro: &str) -> Vec<String> {
             "--".to_string(),
             "bash".to_string(),
             "-lc".to_string(),
-            "exec termhub-agent --stdio".to_string(),
+            "exec t-hub-agent --stdio".to_string(),
         ]
     }
     #[cfg(unix)]
     {
         let _ = distro; // distro is irrelevant when launching directly.
-        vec!["termhub-agent".to_string(), "--stdio".to_string()]
+        vec!["t-hub-agent".to_string(), "--stdio".to_string()]
     }
 }
 
@@ -236,12 +236,12 @@ impl AgentBridge {
     ///
     /// Spawns the child from [`launch_argv`] with piped stdin/stdout (stderr
     /// inherited). Starts a reader thread that dispatches incoming
-    /// [`termhub_protocol::AgentToCore`] frames. Sends `Hello`, waits for
+    /// [`t_hub_protocol::AgentToCore`] frames. Sends `Hello`, waits for
     /// `Ready`, and if the agent's `journal_head_seq` is ahead of our cursor,
     /// sends `ReplayJournal` and waits for `ReplayComplete` before setting the
     /// state to `Live`.
     ///
-    /// The `TERMHUB_AGENT_BIN` env var overrides argv[0] for tests / dev
+    /// The `T_HUB_AGENT_BIN` env var overrides argv[0] for tests / dev
     /// (see [`connection::spawn_child`]).
     pub fn connect(&self, distro: &str) -> Result<(), String> {
         // Build argv and spawn child.
@@ -297,7 +297,7 @@ impl AgentBridge {
                 channel: Channel::Control,
                 msg: CoreToAgent::Hello(Hello {
                     protocol_version: PROTOCOL_VERSION,
-                    core_version: "termhub 0.5.0".to_string(),
+                    core_version: "t-hub 0.5.0".to_string(),
                 }),
             };
             let mut stdin_guard = handles.stdin.lock();
@@ -346,7 +346,7 @@ impl AgentBridge {
 
     /// Send a request and await its correlated response (blocking, 10 s timeout).
     ///
-    /// Allocates the next [`termhub_protocol::RequestId`] from an atomic
+    /// Allocates the next [`t_hub_protocol::RequestId`] from an atomic
     /// counter, registers a one-shot [`mpsc`] sender in the correlation map,
     /// serializes the [`CoreFrame`] to the child's stdin (behind a `Mutex` so
     /// concurrent callers don't interleave bytes), then blocks on the receiver.
@@ -472,7 +472,7 @@ impl AgentBridge {
         // 3. A statusline snapshot rides the journal too (JournalSource::Status).
         //    Route it through the status bridge so `status://snapshot` goes live
         //    and the snapshot is queryable via the status_snapshot command.
-        if matches!(entry.event_type, termhub_protocol::JournalEventType::StatusSnapshot) {
+        if matches!(entry.event_type, t_hub_protocol::JournalEventType::StatusSnapshot) {
             self.ingest_status_from_journal(entry);
         }
 
@@ -481,7 +481,7 @@ impl AgentBridge {
         //     prompt (what the user just asked Claude to do); `SessionStart`
         //     gives the project/cwd as a fallback. The UI prefers this over the
         //     raw command·cwd label. Carries `cwd` so the frontend can correlate
-        //     the Claude session id to a TermHub terminal.
+        //     the Claude session id to a T-Hub terminal.
         self.emit_session_title(entry);
 
         // 4. Feed the supervision reducer. Pull the subagent base fields out of
@@ -596,10 +596,10 @@ const TITLE_MAX_CHARS: usize = 60;
 // `Stop`/`SessionEnd` payload carrying a model-written one-line summary, or a
 // transcript tail), prefer it here over the raw prompt's first line.
 fn derive_session_title(
-    event_type: termhub_protocol::JournalEventType,
+    event_type: t_hub_protocol::JournalEventType,
     payload: &serde_json::Value,
 ) -> Option<String> {
-    use termhub_protocol::JournalEventType as E;
+    use t_hub_protocol::JournalEventType as E;
     let raw = match event_type {
         E::UserPromptSubmit => payload.get("prompt").and_then(|v| v.as_str()),
         E::SessionStart => {
@@ -656,7 +656,7 @@ fn cap_title(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use termhub_protocol::{JournalEventType, JournalSource};
+    use t_hub_protocol::{JournalEventType, JournalSource};
 
     fn entry(
         seq: u64,
@@ -684,12 +684,12 @@ mod tests {
         #[cfg(unix)]
         {
             let argv = launch_argv("Ubuntu-24.04");
-            assert_eq!(argv, vec!["termhub-agent", "--stdio"]);
+            assert_eq!(argv, vec!["t-hub-agent", "--stdio"]);
         }
         #[cfg(windows)]
         {
             // Default Windows path: a login shell so `~/.local/bin` is on PATH.
-            std::env::remove_var("TERMHUB_AGENT_BIN");
+            std::env::remove_var("T_HUB_AGENT_BIN");
             let argv = launch_argv("Ubuntu-24.04");
             assert_eq!(
                 argv,
@@ -702,15 +702,15 @@ mod tests {
                     "--",
                     "bash",
                     "-lc",
-                    "exec termhub-agent --stdio",
+                    "exec t-hub-agent --stdio",
                 ]
             );
 
-            // Escape hatch: TERMHUB_AGENT_BIN is spawned verbatim (no wsl.exe).
-            std::env::set_var("TERMHUB_AGENT_BIN", "C:/tmp/termhub-agent.exe");
+            // Escape hatch: T_HUB_AGENT_BIN is spawned verbatim (no wsl.exe).
+            std::env::set_var("T_HUB_AGENT_BIN", "C:/tmp/t-hub-agent.exe");
             let argv = launch_argv("Ubuntu-24.04");
-            assert_eq!(argv, vec!["C:/tmp/termhub-agent.exe", "--stdio"]);
-            std::env::remove_var("TERMHUB_AGENT_BIN");
+            assert_eq!(argv, vec!["C:/tmp/t-hub-agent.exe", "--stdio"]);
+            std::env::remove_var("T_HUB_AGENT_BIN");
         }
     }
 
@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn status_snapshot_journal_entry_routes_to_status_bridge_and_emits() {
-        use termhub_protocol::{JournalSource, EventJournalEntry};
+        use t_hub_protocol::{JournalSource, EventJournalEntry};
         let bridge = AgentBridge::new();
         let rec = RecordingEmitter::default();
         let status = Arc::new(crate::claude::StatusBridge::new());

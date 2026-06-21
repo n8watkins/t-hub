@@ -236,7 +236,7 @@ fn codex_dir() -> Option<std::path::PathBuf> {
 
 #[cfg(windows)]
 fn codex_dir() -> Option<std::path::PathBuf> {
-    let distro = std::env::var("TERMHUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string());
+    let distro = std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string());
     let home = wsl_home(&distro)?;
     let home_rel = home.trim_start_matches('/').replace('/', "\\");
     Some(std::path::PathBuf::from(format!(

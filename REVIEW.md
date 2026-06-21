@@ -1,4 +1,4 @@
-# TermHub PRD v1.0 — Technical Review
+# T-Hub PRD v1.0 — Technical Review
 
 **Reviewed:** 2026-06-13 · **Document:** [PRD.md](./PRD.md) (v1.0, 2026-06-13) · **Reviewer:** Claude (Opus 4.8)
 
@@ -31,7 +31,7 @@ Keystroke I/O through ConPTY→`wsl.exe`→tmux is the easy part; SIGWINCH propa
 **Action:** Add a dedicated resize test to the PTY harness; set `window-size latest` / audit `aggressive-resize`; ensure detached hidden clients don't constrain the active window. Measure end-to-end keypress→on-screen-echo (including the WSL hop) even with a looser target.
 
 ### 5. The duplicate-resume guard's "Live externally" detection needs a lease, not a latch
-It works because hooks are global, so even a non-TermHub `claude` fires `SessionStart` into the journal — clever. But a crash with no `SessionEnd` leaves a session stuck "live," which then *blocks* a legitimate resume.
+It works because hooks are global, so even a non-T-Hub `claude` fires `SessionStart` into the journal — clever. But a crash with no `SessionEnd` leaves a session stuck "live," which then *blocks* a legitimate resume.
 **Action:** Treat liveness as a lease (heartbeat + TTL + startup reconciliation against actual tmux/PID), not a latch. Make stale-liveness a first-class reconciliation case alongside the "stale PID" tests.
 
 ## Smaller hardening items
