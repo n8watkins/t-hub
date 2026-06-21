@@ -35,6 +35,20 @@
 //! degrades to an empty list rather than erroring the UI.
 
 use serde::Serialize;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+/// How long a recent-sessions scan stays fresh. The scan stats THOUSANDS of
+/// transcript files (over the `\\wsl.localhost\` UNC share on Windows), and the
+/// sidebar re-polls on mount + window focus + each spawn — so without this every
+/// poll re-walked the whole catalog, a stream of slow UNC I/O that contributed to
+/// the UI freezing. A few seconds of staleness is invisible for a "recent" list.
+const RECENT_TTL: Duration = Duration::from_secs(15);
+
+/// Last scan + when it ran, shared across all callers/windows so rapid re-polls
+/// collapse onto one scan per [`RECENT_TTL`].
+static RECENT_CACHE: LazyLock<Mutex<Option<(Instant, Vec<RecentSession>)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// How many distinct PROJECTS (folders) to surface in Recent, ranked newest-first
 /// by each project's most-recent session. The cap is on PROJECTS, not raw
@@ -75,11 +89,26 @@ pub struct RecentSession {
 /// catalog can't be read, so the sidebar simply shows an empty Recent list.
 #[tauri::command]
 pub async fn recent_sessions() -> Result<Vec<RecentSession>, String> {
+    // Serve a fresh-enough cached scan if we have one — collapses the sidebar's
+    // mount/focus/spawn re-polls onto one real scan per RECENT_TTL so we don't
+    // re-walk ~10k transcripts over the UNC share on every poll. The lock is held
+    // only to clone the cached Vec, never across the scan below.
+    if let Some(cached) = RECENT_CACHE.lock().ok().and_then(|g| {
+        g.as_ref()
+            .filter(|(at, _)| at.elapsed() < RECENT_TTL)
+            .map(|(_, sessions)| sessions.clone())
+    }) {
+        return Ok(cached);
+    }
     // Read off the async runtime's blocking-friendly path: the work is filesystem
     // / process IO, so hop to a blocking thread to avoid stalling the executor.
-    Ok(tauri::async_runtime::spawn_blocking(collect_recent)
+    let sessions = tauri::async_runtime::spawn_blocking(collect_recent)
         .await
-        .unwrap_or_default())
+        .unwrap_or_default();
+    if let Ok(mut guard) = RECENT_CACHE.lock() {
+        *guard = Some((Instant::now(), sessions.clone()));
+    }
+    Ok(sessions)
 }
 
 /// Collect + sort the recent sessions (platform-dispatched). Never panics; any
