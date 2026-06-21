@@ -273,6 +273,9 @@ pub fn run() {
             let emitter = std::sync::Arc::new(agent::TauriEmitter::new(app.handle().clone()));
             state.agent.set_emitter(emitter);
             state.agent.set_status_bridge(state.status.clone());
+            // Always-fires startup marker (proves the diag log is writable + shows
+            // the resolved path; diagnoses "app runs but diag is stale").
+            diag::log_startup();
             // Kick off the agent connection in the background once state exists.
             spawn_agent_connect(&state);
             // Best-effort startup reconcile: if the user already has T-Hub-managed

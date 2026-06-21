@@ -38,18 +38,31 @@ static DIAG_FILE: LazyLock<PathBuf> = LazyLock::new(|| match std::env::var("T_HU
     _ => default_diag_log_path(),
 });
 
-/// The fixed per-OS diagnostics log path (the default when `$T_HUB_DIAG_FILE`
-/// is unset). Windows points at the user's `C:\Users\natha\.t-hub\diag.log`;
-/// unix at the WSL home. The orchestrator reads this same path.
+/// The per-user diagnostics log path (the default when `$T_HUB_DIAG_FILE` is
+/// unset): `<home>/.t-hub/diag.log`, where `home` is `%USERPROFILE%` on Windows
+/// and `$HOME` on unix — resolved at runtime, NOT hardcoded (so it's correct on any
+/// machine, not just the dev box). Falls back to the current dir if neither is set.
 fn default_diag_log_path() -> PathBuf {
     #[cfg(windows)]
-    {
-        PathBuf::from(r"C:\Users\natha\.t-hub\diag.log")
-    }
+    let home = std::env::var_os("USERPROFILE");
     #[cfg(not(windows))]
-    {
-        PathBuf::from("/home/natkins/.t-hub/diag.log")
-    }
+    let home = std::env::var_os("HOME");
+    home.map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".t-hub")
+        .join("diag.log")
+}
+
+/// Emit a one-line startup marker that ALWAYS fires, recording the build version
+/// and the RESOLVED diag path. If this line is absent from the log after a launch,
+/// diag writes aren't landing (the path is wrong, or the dir isn't writable) —
+/// which is exactly the "app runs but diag is stale" symptom to chase.
+pub fn log_startup() {
+    diag_log(format!(
+        "t-hub: started v{} (diag -> {})",
+        env!("CARGO_PKG_VERSION"),
+        diag_log_path().display()
+    ));
 }
 
 /// The resolved diagnostics log path (`$T_HUB_DIAG_FILE` or the per-OS
