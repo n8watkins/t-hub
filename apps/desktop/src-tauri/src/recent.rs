@@ -523,6 +523,134 @@ fn projects_unc(distro: &str, wsl_home: &str) -> std::path::PathBuf {
     ))
 }
 
+/// FAST listing: run `find` INSIDE WSL (native ext4 stat, ~0.2s) instead of
+/// stat-walking ~10k transcripts over the slow `\\wsl.localhost\` UNC share. The
+/// `-e` flag is CRITICAL: `wsl.exe -d <distro> -- bash` execs the user's DEFAULT
+/// login shell (zsh here, which mangles the invocation), whereas `-e bash` execs
+/// real bash directly. We print one `%T@\t%P` row per transcript (mtime epoch +
+/// the path RELATIVE to ~/.claude/projects, i.e. `<project-dir>/<session>.jsonl`).
+///
+/// Returns the parsed `(mtime_secs, rel_path)` rows, or None when the spawn fails
+/// or `find` exits non-zero — the caller then degrades to the UNC stat-walk so
+/// Recent always works. Malformed stdout lines are skipped (never `?`-returned).
+#[cfg(windows)]
+fn wsl_find_rows(distro: &str) -> Option<Vec<(i64, String)>> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("wsl.exe")
+        .arg("-d")
+        .arg(distro)
+        .arg("-e")
+        .arg("bash")
+        .arg("-lc")
+        .arg("find ~/.claude/projects -mindepth 2 -maxdepth 2 -name '*.jsonl' -printf '%T@\\t%P\\n'")
+        .creation_flags(0x0800_0000)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        // Each row is `<epoch_float>\t<project-dir>/<session>.jsonl`.
+        let mut fields = line.splitn(2, '\t');
+        let Some(mtime_field) = fields.next() else {
+            continue;
+        };
+        let Some(rel) = fields.next() else {
+            continue;
+        };
+        // mtime = integer part of the epoch float (drop the fractional seconds).
+        let Some(secs_str) = mtime_field.split('.').next() else {
+            continue;
+        };
+        let Ok(mtime) = secs_str.parse::<i64>() else {
+            continue;
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        rows.push((mtime, rel.to_string()));
+    }
+    Some(rows)
+}
+
+/// FAST Windows reader: take the native `find` rows, do the SAME per-project
+/// bucketing as [`read_sessions_from_dir`] Phase 1 (group by project dir, keep each
+/// project's newest `per_project_limit`, then the newest `project_limit` projects),
+/// then run Phase 2 (32KB prefix+suffix read over UNC) on ONLY the survivors. This
+/// reads ~80 small prefixes over UNC instead of stat-walking the whole 10k catalog.
+#[cfg(windows)]
+fn read_sessions_windows_fast(
+    projects_unc: &std::path::Path,
+    rows: Vec<(i64, String)>,
+    project_limit: usize,
+    per_project_limit: usize,
+) -> Vec<RecentSession> {
+    // Phase 1: bucket per project folder (the rel path's first `/`-segment), keeping
+    // each project's newest `per_project_limit` sessions. Each kept tuple mirrors
+    // read_sessions_from_dir's `(id, path, mtime)` shape so Phase 2 is identical.
+    let mut buckets: Vec<(i64, Vec<(String, std::path::PathBuf, i64)>)> = Vec::new();
+    let mut by_project: std::collections::HashMap<String, Vec<(String, std::path::PathBuf, i64)>> =
+        std::collections::HashMap::new();
+    let total = rows.len();
+    for (mtime, rel) in rows {
+        // rel = `<project-dir>/<session>.jsonl`; split on the FIRST '/'.
+        let mut parts = rel.splitn(2, '/');
+        let Some(project_dir) = parts.next() else {
+            continue;
+        };
+        let Some(file) = parts.next() else {
+            continue;
+        };
+        if project_dir.is_empty() || file.is_empty() {
+            continue;
+        }
+        // id = the session filename's stem (`<session>.jsonl` -> `<session>`).
+        let id = file.strip_suffix(".jsonl").unwrap_or(file).to_string();
+        let path = projects_unc.join(project_dir).join(file);
+        by_project
+            .entry(project_dir.to_string())
+            .or_default()
+            .push((id, path, mtime));
+    }
+    for (_project, mut sessions) in by_project {
+        if sessions.is_empty() {
+            continue;
+        }
+        // Newest sessions first; keep just this project's newest few.
+        sessions.sort_by(|a, b| b.2.cmp(&a.2));
+        sessions.truncate(per_project_limit);
+        let newest = sessions.first().map(|s| s.2).unwrap_or(0);
+        buckets.push((newest, sessions));
+    }
+
+    // Keep the newest `project_limit` projects (by their most-recent session),
+    // then flatten back to a session list for the prefix-read phase.
+    buckets.sort_by(|a, b| b.0.cmp(&a.0));
+    buckets.truncate(project_limit);
+    let kept_projects = buckets.len();
+    let metas: Vec<(String, std::path::PathBuf, i64)> =
+        buckets.into_iter().flat_map(|(_, sessions)| sessions).collect();
+
+    // Phase 2: read the 32KB PREFIX (cwd/summary) AND 32KB SUFFIX (last message
+    // text) of just the survivors — EXACTLY like read_sessions_from_dir.
+    let mut out = Vec::new();
+    for (id, path, last_seen) in metas {
+        let parsed = parse_transcript(&read_prefix(&path, 32 * 1024));
+        let last_text = parse_last_text(&read_suffix(&path, 32 * 1024));
+        if let Some(s) = make_session(id, last_seen, parsed, last_text) {
+            out.push(s);
+        }
+    }
+    crate::diag::diag_log(format!(
+        "{{\"t\":\"recent\",\"m\":\"read_sessions_windows_fast: {} rows -> kept {} projects -> {} sessions\"}}",
+        total, kept_projects, out.len()
+    ));
+    out
+}
+
 #[cfg(windows)]
 fn read_sessions_windows() -> Vec<RecentSession> {
     let distro = host_distro();
@@ -537,6 +665,25 @@ fn read_sessions_windows() -> Vec<RecentSession> {
         "{{\"t\":\"recent\",\"m\":\"windows reader: home={home} -> {}\"}}",
         projects.display().to_string().replace('"', "'")
     ));
+    // FAST path: list the catalog natively inside WSL (`find`, ~0.2s) and parse only
+    // the survivors over UNC. Falls back to the UNC stat-walk if the find spawn
+    // fails, exits non-zero, or yields zero rows — so Recent always works.
+    if let Some(rows) = wsl_find_rows(&distro) {
+        if !rows.is_empty() {
+            crate::diag::diag_log(
+                "{\"t\":\"recent\",\"m\":\"windows reader: FAST wsl-find path\"}".to_string(),
+            );
+            return read_sessions_windows_fast(
+                &projects,
+                rows,
+                PROJECT_LIMIT,
+                PER_PROJECT_LIMIT,
+            );
+        }
+    }
+    crate::diag::diag_log(
+        "{\"t\":\"recent\",\"m\":\"windows reader: FALLBACK UNC stat-walk path\"}".to_string(),
+    );
     read_sessions_from_dir(&projects, PROJECT_LIMIT, PER_PROJECT_LIMIT)
 }
 
