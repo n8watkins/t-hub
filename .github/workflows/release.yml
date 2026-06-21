@@ -49,6 +49,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps/desktop/src-tauri
+          # Separate cache per variant. A DEV build compiles `t-hub` WITH the
+          # `devbuild` feature (isolated t-hub-dev socket + ~/.t-hub-dev state);
+          # sharing one cache leaked that devbuild-compiled crate into PROD builds,
+          # so the prod app wrongly ran on the dev socket and broke the MCP control
+          # channel. Keying on the variant keeps dev and prod artifacts isolated.
+          shared-key: ${{ github.event.inputs.variant == 'dev' && 'dev' || 'prod' }}
 
       # Install the whole pnpm workspace from the lockfile (the desktop app is the
       # only workspace member). Run at the repo root so the workspace resolves.
@@ -69,6 +75,11 @@ jobs:
         # builds DEV by default: "T-Hub Dev" (com.t-hub.dev) with the
         # devbuild feature, installable ALONGSIDE production. See tauri.dev.conf.json.
         run: |
+          # Force a fresh compile of the t-hub crate so its cargo features
+          # (devbuild on/off) can NEVER be served stale from the build cache — a
+          # devbuild-compiled t-hub must never end up in a prod binary (and vice
+          # versa). Cheap insurance: it's one crate, recompiled in seconds.
+          cargo clean -p t-hub --release --manifest-path src-tauri/Cargo.toml
           if ("${{ github.event.inputs.variant }}" -eq "dev") {
             Write-Host "Building DEV variant: T-Hub Dev (com.t-hub.dev, isolated t-hub-dev socket)"
             pnpm tauri build -f devbuild --config src-tauri/tauri.dev.conf.json
