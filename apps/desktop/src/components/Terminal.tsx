@@ -49,6 +49,7 @@ import { installFileDropOnce, formatPathsForInsert } from "../lib/dropPaste";
 import { usePanels } from "../store/panels";
 import { useWorkspace } from "../store/workspace";
 import { useTheme, DEFAULT_THEME, type TerminalPalette } from "../store/theme";
+import { useActivity } from "../store/activity";
 import { tlog } from "../lib/diag";
 import { REPAINT_ALL_EVENT, REFRESH_TERMINAL_EVENT } from "../lib/repaint";
 import type { ITheme } from "@xterm/xterm";
@@ -552,6 +553,11 @@ export function TerminalView({
 
             const offOutput = await onOutput((e) => {
               if (e.id !== terminalId || disposed) return;
+              // RUNNING signal (#11): this terminal is producing output, so mark it
+              // active — the sidebar row pulses while output flows. This is the
+              // cross-agent proxy for Codex (no mid-turn hooks) and shells running a
+              // command; Claude additionally pulses from supervision (mid-turn).
+              useActivity.getState().bump(terminalId);
               const bytes = decodeBase64(e.base64);
               scanForUrls(bytes);
               if (seeded) term.write(bytes);

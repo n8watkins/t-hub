@@ -23,6 +23,7 @@ import { useWorkspace, deriveLabel } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
 import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
 import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
+import { useActivity } from "../store/activity";
 import { sessionNameForTerminal } from "../store/sessionContext";
 import { clientForTerminal } from "../store/clientType";
 import { ClaudeIcon } from "./ClaudeIcon";
@@ -686,6 +687,11 @@ function TerminalRow({
   const working = useSupervision((s) =>
     tmuxSessionMidTurn(s, sessionNameForTerminal(id)),
   );
+  // RUNNING animation (#11): also pulse while the terminal is actively producing
+  // output (store/activity) — the cross-agent proxy for Codex (no mid-turn hooks)
+  // and shells running a command. Claude keeps its precise supervision pulse above.
+  const outputActive = useActivity((s) => !!s.active[id]);
+  const pulsing = working || outputActive;
   // Which agent runs here (claude/codex/shell) — drives the leading icon so the
   // sidebar row reads as the AGENT, not just a generic dot.
   const client = clientForTerminal(id);
@@ -774,15 +780,17 @@ function TerminalRow({
           <CodexIcon size={14} className="shrink-0" title="Codex" />
         ) : null}
         <span
-          // ACTIVITY: pulse while the bound session is mid-turn; static when idle.
-          className={`h-2 w-2 shrink-0 rounded-full${working ? " animate-pulse" : ""}`}
+          // ACTIVITY: pulse while the agent is working — Claude mid-turn
+          // (supervision) OR any live output (Codex / a shell running a command);
+          // static when idle.
+          className={`h-2 w-2 shrink-0 rounded-full${pulsing ? " animate-pulse" : ""}`}
           style={{
             backgroundColor: DOT_VAR[state],
-            // A soft glow while working makes the pulse read even on a tiny dot.
-            boxShadow: working ? `0 0 5px 0 ${DOT_VAR[state]}` : undefined,
+            // A soft glow while active makes the pulse read even on a tiny dot.
+            boxShadow: pulsing ? `0 0 5px 0 ${DOT_VAR[state]}` : undefined,
           }}
           aria-hidden
-          title={working ? "Working…" : undefined}
+          title={pulsing ? "Working…" : undefined}
         />
         <span className="min-w-0 flex-1">
           <span className="block truncate">{workName ?? detail}</span>
