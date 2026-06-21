@@ -301,7 +301,7 @@ impl AgentBridge {
                 channel: Channel::Control,
                 msg: CoreToAgent::Hello(Hello {
                     protocol_version: PROTOCOL_VERSION,
-                    core_version: "t-hub 0.5.0".to_string(),
+                    core_version: format!("t-hub {}", env!("CARGO_PKG_VERSION")),
                 }),
             };
             let mut stdin_guard = handles.stdin.lock();

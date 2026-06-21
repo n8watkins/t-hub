@@ -9,11 +9,13 @@
 //!   - `diag_log(line)` — append `<ISO-8601 timestamp> <line>\n` to the log.
 //!   - `diag_clear()`   — truncate the log so a fresh repro starts clean.
 //!
-//! The log path is fixed per-OS so the WSL-side orchestrator always knows where
-//! to read:
-//!   - Windows: `C:\Users\natha\.t-hub\diag.log`
-//!     (readable from WSL at `/mnt/c/Users/natha/.t-hub/diag.log`)
-//!   - unix:    `/home/natkins/.t-hub/diag.log`
+//! The log path is resolved per-user at startup so the WSL-side orchestrator
+//! always knows where to read: `$T_HUB_DIAG_FILE` if set (the side-by-side DEV
+//! build points this at `~/.t-hub-dev/diag.log`), otherwise `<home>/.t-hub/diag.log`
+//! — `%USERPROFILE%` on Windows (readable from WSL under `/mnt/c/...`) and `$HOME`
+//! on unix. NOTE: an inherited env var wins, so a prod app launched from a shell
+//! that already carries `T_HUB_DIAG_FILE` (e.g. spawned by a dev-isolated app)
+//! logs to THAT path — the cause of "prod app writing to the dev diag".
 //!
 //! Everything here is BEST-EFFORT: we never panic and swallow every IO error, so
 //! a missing dir / locked file / full disk can never take down the app or a hot
