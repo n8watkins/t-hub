@@ -1,0 +1,5 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "T-Hub Dev",
+  "identifier": "com.termhub.devbuild"
+}

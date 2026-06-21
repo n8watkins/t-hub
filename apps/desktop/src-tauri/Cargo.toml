@@ -21,7 +21,7 @@ anyhow = "1"
 [package]
 name = "termhub"
 version = "0.1.54"
-description = "TermHub — terminal-first command center for Claude Code sessions in WSL2"
+description = "T-Hub — terminal-first command center for Claude Code sessions in WSL2"
 authors = ["Nathan Watkins"]
 edition = "2021"
 rust-version = "1.77"
@@ -31,6 +31,20 @@ rust-version = "1.77"
 [lib]
 name = "termhub_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# Default: production. No extra features — the prod build is byte-for-byte
+# unchanged.
+default = []
+# The side-by-side **DEV** variant ("T-Hub Dev"). Enabling it does NOT change any
+# behavior except routing the app's runtime state to an isolated namespace at
+# startup (see `apply_devbuild_isolation` in lib.rs): a separate tmux socket
+# (`termhub-dev`) and a separate state dir (`~/.termhub-dev`) for the MCP control
+# channel + diag log, so a dev build never touches a production T-Hub running at
+# the same time. Pair with the `tauri.dev.conf.json` overlay (productName
+# "T-Hub Dev" + the distinct bundle id `com.termhub.devbuild`) so it installs
+# ALONGSIDE production. Build: `pnpm tauri build -f devbuild --config src-tauri/tauri.dev.conf.json`.
+devbuild = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

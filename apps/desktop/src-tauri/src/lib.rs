@@ -174,7 +174,43 @@ fn start_control_listener(state: &AppState, app: &tauri::AppHandle) {
     }
 }
 
+/// When built as the side-by-side DEV variant (`--features devbuild`), point the
+/// app's runtime state at an isolated namespace BEFORE anything reads it, so a
+/// dev build never collides with — or clobbers — a production T-Hub running at
+/// the same time: a separate tmux socket (`termhub-dev`, so dev terminals never
+/// appear in / kill prod's live sessions) and a separate state dir
+/// (`~/.termhub-dev`) for the MCP control channel + diag log. This reuses the
+/// existing `TERMHUB_*` env hooks (tmux.rs / control.rs / diag.rs all read them
+/// lazily on first use), so no path code changes; each var is set only when the
+/// user hasn't already overridden it. No-op in production builds.
+#[cfg(feature = "devbuild")]
+fn apply_devbuild_isolation() {
+    if std::env::var_os("TERMHUB_TMUX_SOCKET").is_none() {
+        std::env::set_var("TERMHUB_TMUX_SOCKET", "termhub-dev");
+    }
+    let dev_home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".termhub-dev"));
+    if let Some(dir) = dev_home {
+        let _ = std::fs::create_dir_all(&dir);
+        if std::env::var_os("TERMHUB_CONTROL_FILE").is_none() {
+            std::env::set_var("TERMHUB_CONTROL_FILE", dir.join("control.json"));
+        }
+        if std::env::var_os("TERMHUB_DIAG_FILE").is_none() {
+            std::env::set_var("TERMHUB_DIAG_FILE", dir.join("diag.log"));
+        }
+    }
+}
+
+#[cfg(not(feature = "devbuild"))]
+fn apply_devbuild_isolation() {}
+
 pub fn run() {
+    // Must run before any `TERMHUB_*`-backed LazyLock (socket/control/diag) is
+    // first touched — i.e. before the Tauri builder spawns anything.
+    apply_devbuild_isolation();
+
     tauri::Builder::default()
         // Shell plugin: lets the frontend open URLs/paths in the OS default
         // browser (web-preview "Open externally"). Without it the JS open() is a
@@ -231,6 +267,12 @@ pub fn run() {
             if let Some(main) = app.get_webview_window("main") {
                 if let Err(e) = win_snap::install(&main) {
                     eprintln!("termhub: failed to install Snap-Layouts hit-test hook: {e}");
+                }
+                // DEV variant: distinguish the window (alt-tab / taskbar tooltip)
+                // from a production T-Hub that may be running alongside it.
+                #[cfg(feature = "devbuild")]
+                {
+                    let _ = main.set_title("T-Hub Dev");
                 }
             }
             // Force `mouse on` server-wide AND on every already-running session
