@@ -47,6 +47,8 @@ export const Commands = {
   attachTerminal: "attach_terminal",
   writeTerminal: "write_terminal",
   resizeTerminal: "resize_terminal",
+  /** Re-capture a DEEP scrollback window (base64) to re-seed xterm on ⟳ refresh. */
+  recaptureScrollback: "recapture_scrollback",
   /** Detach the tile but keep the tmux process alive. */
   closeTerminal: "close_terminal",
   /** Stop: terminate the tmux session and its process. */

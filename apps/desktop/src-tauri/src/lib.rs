@@ -330,6 +330,7 @@ pub fn run() {
             commands::attach_terminal,
             commands::write_terminal,
             commands::resize_terminal,
+            commands::recapture_scrollback,
             commands::close_terminal,
             commands::kill_terminal,
             commands::list_terminals,

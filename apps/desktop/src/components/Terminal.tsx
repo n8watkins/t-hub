@@ -39,6 +39,7 @@ import {
   decodeBase64,
   onExit,
   onOutput,
+  recaptureScrollback,
   resizeTerminal,
   writeTerminal,
 } from "../ipc/client";
@@ -722,10 +723,30 @@ export function TerminalView({
     // full that didn't reflow on its own. Targets this terminal by id; an
     // undefined id refreshes all (parity with the repaint-all broadcast).
     const onRefresh = (e: Event) => {
-      const id = (e as CustomEvent<{ id?: string }>).detail?.id;
-      if (id && id !== terminalId) return;
-      pushResize();
-      requestAnimationFrame(forceRepaint);
+      const eid = (e as CustomEvent<{ id?: string }>).detail?.id;
+      if (eid && eid !== terminalId) return;
+      void (async () => {
+        // 1) Re-fit the live screen to the current tile size (reflow on a grow).
+        try {
+          fit.fit();
+          await resizeTerminal(terminalId, term.cols, term.rows);
+        } catch {
+          /* container detached mid-fit; ignore */
+        }
+        // 2) Re-seed a DEEP scrollback at the (now-resized) width so you can scroll
+        //    up far past the ~2000-line attach seed. Capture FIRST; only reset +
+        //    re-seed on a GOOD capture so a failure never blanks the terminal.
+        try {
+          const deep = await recaptureScrollback(terminalId);
+          if (!disposed && deep) {
+            term.reset();
+            term.write(decodeBase64(deep));
+          }
+        } catch {
+          /* best-effort: keep the current buffer */
+        }
+        if (!disposed) requestAnimationFrame(forceRepaint);
+      })();
     };
     window.addEventListener(REFRESH_TERMINAL_EVENT, onRefresh);
 

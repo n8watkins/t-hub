@@ -38,6 +38,17 @@ pub fn socket() -> &'static str {
 /// How many lines of scrollback history we capture to seed xterm on attach.
 const SCROLLBACK_LINES: i64 = 2000;
 
+/// tmux per-window scrollback cap for NEW sessions. The default 2000 is why you
+/// couldn't scroll up far. `history-limit` is per-window and FIXED at window
+/// creation, so we set it GLOBALLY (`-g`) before `new-session` — new terminals keep
+/// deep history; already-created windows keep their old limit. ~50k lines is cheap.
+const HISTORY_LIMIT: i64 = 50000;
+
+/// How many lines the ⟳ refresh re-captures + re-seeds into xterm (well under
+/// xterm's own 20000-line buffer), so a refresh lets you scroll up far past the
+/// 2000-line attach seed — up to whatever `HISTORY_LIMIT` has accumulated.
+const DEEP_SCROLLBACK_LINES: i64 = 10000;
+
 /// A structured error from a tmux invocation.
 #[derive(Debug, Clone)]
 pub struct TmuxError {
@@ -161,6 +172,18 @@ pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), T
         // session's first pane; tmux runs it via the shell.
         args.push(cmd);
     }
+
+    // Raise the scrollback cap for the window we're about to create. history-limit
+    // is per-window and fixed at creation, so it must be the GLOBAL default BEFORE
+    // new-session. start-server first so `set -g` has a server to set it on (fresh
+    // boot). Best-effort: a failure just falls back to tmux's 2000 default.
+    let limit = HISTORY_LIMIT.to_string();
+    let _ = run("start-server", &["start-server"]);
+    let _ = run(
+        "set-option",
+        &["set-option", "-g", "history-limit", &limit],
+    );
+
     run("new-session", &args)?;
 
     // Pin the pane to the latest active client. Best-effort: if this fails the
@@ -454,6 +477,19 @@ fn pane_info_command(script: &str) -> Command {
 /// responsible for base64-encoding before sending over IPC.
 pub fn capture_pane(name: &str) -> Result<Vec<u8>, TmuxError> {
     let start = format!("-{SCROLLBACK_LINES}");
+    let output = run(
+        "capture-pane",
+        &["capture-pane", "-p", "-e", "-S", &start, "-t", name],
+    )?;
+    Ok(output.stdout)
+}
+
+/// Like [`capture_pane`] but with a much DEEPER scrollback window
+/// ([`DEEP_SCROLLBACK_LINES`]), captured at the pane's CURRENT width. Used by the
+/// ⟳ refresh to re-seed xterm so you can scroll up far past the attach seed (up to
+/// whatever tmux's history-limit has actually retained). ANSI preserved (`-e`).
+pub fn capture_pane_deep(name: &str) -> Result<Vec<u8>, TmuxError> {
+    let start = format!("-{DEEP_SCROLLBACK_LINES}");
     let output = run(
         "capture-pane",
         &["capture-pane", "-p", "-e", "-S", &start, "-t", name],
