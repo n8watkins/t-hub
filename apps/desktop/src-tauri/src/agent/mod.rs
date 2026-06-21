@@ -59,7 +59,7 @@ use emit::{
 /// puts `~/.local/bin` on `PATH`:
 ///
 /// ```text
-/// wsl.exe -d <distro> --cd ~ -- bash -lc "exec t-hub-agent --stdio"
+/// wsl.exe -d <distro> --cd ~ -e bash -lc "exec t-hub-agent --stdio"
 /// ```
 ///
 /// `exec` replaces the login shell with the agent so there's no extra process
@@ -88,14 +88,18 @@ pub fn launch_argv(distro: &str) -> Vec<String> {
         }
         // Login shell so the user's profile is sourced and `~/.local/bin`
         // (where the orchestrator installs the agent) is on PATH. `exec` so the
-        // agent replaces the shell rather than running as a child of it.
+        // agent replaces the shell rather than running as a child of it. `-e`
+        // makes wsl.exe exec bash DIRECTLY — a bare `--` routes the command through
+        // the user's DEFAULT login shell (zsh here), NOT bash (see the note on
+        // tmux.rs::pane_info_command). bash's login PATH also has ~/.local/bin, so
+        // the agent still resolves; `-e` just keeps us in the shell we intend.
         vec![
             "wsl.exe".to_string(),
             "-d".to_string(),
             distro.to_string(),
             "--cd".to_string(),
             "~".to_string(),
-            "--".to_string(),
+            "-e".to_string(),
             "bash".to_string(),
             "-lc".to_string(),
             "exec t-hub-agent --stdio".to_string(),
@@ -699,7 +703,7 @@ mod tests {
                     "Ubuntu-24.04",
                     "--cd",
                     "~",
-                    "--",
+                    "-e",
                     "bash",
                     "-lc",
                     "exec t-hub-agent --stdio",
