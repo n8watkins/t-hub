@@ -46,6 +46,19 @@ pub const HOOK_EVENTS: &[&str] = &[
 /// uninstaller can remove exactly our entries and leave the user's intact.
 pub const T_HUB_HOOK_MARKER: &str = "__t_hub_managed__";
 
+/// The marker pre-rename `termhub` builds wrote. We NEVER write it, but we still
+/// RECOGNIZE it so a (re)install strips + migrates stale `termhub-agent` hook /
+/// statusLine entries to the current marker + agent path. Those legacy entries
+/// point at a `termhub-agent` binary the t-hub build no longer ships, so they
+/// silently break the Claude statusline + hooks until migrated.
+const LEGACY_HOOK_MARKER: &str = "__termhub_managed__";
+
+/// True when a hook/statusLine `command` string is T-Hub-managed — under the
+/// current marker OR the legacy `termhub` one (so reinstall self-heals old entries).
+fn command_is_t_hub(command: &str) -> bool {
+    command.contains(T_HUB_HOOK_MARKER) || command.contains(LEGACY_HOOK_MARKER)
+}
+
 // ---------------------------------------------------------------------------
 // statusLine install (the Claude USAGE data source)
 // ---------------------------------------------------------------------------
@@ -86,7 +99,7 @@ pub fn statusline_is_t_hub(statusline: &serde_json::Value) -> bool {
     statusline
         .get("command")
         .and_then(|c| c.as_str())
-        .map(|s| s.contains(T_HUB_HOOK_MARKER))
+        .map(|s| command_is_t_hub(s))
         .unwrap_or(false)
 }
 
@@ -281,7 +294,7 @@ fn group_is_t_hub(group: &serde_json::Value) -> bool {
             inner_hooks.iter().any(|h| {
                 h.get("command")
                     .and_then(|c| c.as_str())
-                    .map(|s| s.contains(T_HUB_HOOK_MARKER))
+                    .map(|s| command_is_t_hub(s))
                     .unwrap_or(false)
             })
         })
