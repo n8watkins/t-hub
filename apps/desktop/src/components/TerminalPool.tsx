@@ -230,6 +230,15 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // of the stable poolIds order above.
   const lastTransformRef = useRef<Map<TerminalId, string>>(new Map());
 
+  // Last width/height we applied per wrapper. A GROW/SHRINK changes a visible
+  // terminal's size while it can keep the SAME transform (a corner tile grown to
+  // full expands from the same top-left), so a transform-only diff misses it.
+  // We diff size too and fire "th-pool-moved" on a size change so Terminal.tsx
+  // re-fits (reflows) — the fix for "grew a tile and it stayed wrapped narrow".
+  const lastSizeRef = useRef<Map<TerminalId, { width: number; height: number }>>(
+    new Map(),
+  );
+
   // THE MUTED-BUG FIX (last-good rect cache). Per terminal id we remember the
   // last NON-degenerate placeholder geometry we measured while it was on the
   // active tab: the on-screen offset (relative to the container base) plus its
@@ -334,14 +343,31 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       wrap.style.width = `${width}px`;
       wrap.style.height = `${height}px`;
       const prevTransform = lastTransformRef.current.get(id);
-      if (
+      const prevSize = lastSizeRef.current.get(id);
+      // Fire "th-pool-moved" when this VISIBLE terminal MOVED (new transform) OR
+      // GREW/SHRANK (new width/height). The size case is the reflow fix: growing
+      // a corner tile to full keeps the SAME translate offset (it expands right/
+      // down from the same top-left) while only width/height change — so gating
+      // the event on transform alone fired nothing, and the terminal never re-fit
+      // to the new width (text stayed wrapped narrow). Terminal.tsx routes this
+      // event through its debounced settleResize, which re-fits + dedupes width,
+      // so a same-size reposition still only repaints and the normal grid-resize
+      // path isn't double-fitted. We skip the very first apply (no prev*) and any
+      // un-park (prevTransform was the offscreen value) so a reappear doesn't
+      // count as a move.
+      const transformChanged =
         prevTransform !== undefined &&
         prevTransform !== transform &&
-        prevTransform !== "translate(-100000px, 0px)"
-      ) {
+        prevTransform !== "translate(-100000px, 0px)";
+      const sizeChanged =
+        prevSize !== undefined &&
+        prevTransform !== "translate(-100000px, 0px)" &&
+        (prevSize.width !== width || prevSize.height !== height);
+      if (transformChanged || sizeChanged) {
         wrap.dispatchEvent(new CustomEvent("th-pool-moved"));
       }
       lastTransformRef.current.set(id, transform);
+      lastSizeRef.current.set(id, { width, height });
     },
     [],
   );

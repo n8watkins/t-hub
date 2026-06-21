@@ -681,15 +681,30 @@ export function TerminalView({
       visObserver.observe(container);
     }
 
-    // Belt-and-suspenders repaint on an on-screen REPOSITION. The pool dispatches
-    // a "th-pool-moved" event on this terminal's wrapper whenever it repositions
-    // a VISIBLE terminal to a new transform (a same-tab reorder/swap). That move
-    // keeps the terminal on-screen, so the IntersectionObserver above never fires
-    // -- and a moved WebGL canvas can read stale/blank until something dirties it.
-    // We repaint on the next frame (after the pool's layout sync settles the box).
-    // ADDITIVE: never fits or attaches, so the first-fit/prompt cascade is intact.
+    // Re-FIT (not just repaint) on an on-screen REPOSITION-OR-RESIZE. The pool
+    // dispatches a "th-pool-moved" event on this terminal's wrapper whenever it
+    // repositions OR RESIZES a VISIBLE terminal (a same-tab reorder/swap, OR a
+    // GROW from a small corner tile to large/full — see TerminalPool.applyVisible,
+    // which now fires on a size change too, not only a transform change).
+    //
+    // ROOT CAUSE this fixes: when the pool grows a tile by writing a new
+    // width/height onto the wrapper imperatively (inside its layout-effect/rAF),
+    // the inner container's ResizeObserver tick can be missed/coalesced, so the
+    // 250ms settle that runs fit.fit()+resizeTerminal never fires for the grow —
+    // the buffer stays wrapped at the OLD narrow width (no new cols => no reflow).
+    // The pool-move signal, by contrast, ALWAYS fires on a grow, so we drive a
+    // real re-fit from it. We route through the SAME debounced settleResize the
+    // ResizeObserver uses (not pushResize directly), so this reuses the 250ms
+    // anti-burst coalescing, the width-change dedupe (no reflow when cols are
+    // unchanged — so we never double-fit the normal grid-resize path that already
+    // worked), and the alt-screen guard (never term.clear() the live frame of a
+    // full-screen app mid-resize). settleResize already repaints, so the
+    // stale-frame repaint this used to do is preserved.
     const wrapEl = container.closest("[data-th-pool-tile]") as HTMLElement | null;
-    const onPoolMoved = () => requestAnimationFrame(forceRepaint);
+    const onPoolMoved = () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(settleResize, 250);
+    };
     wrapEl?.addEventListener("th-pool-moved", onPoolMoved);
 
     // Repaint when ANY full-screen overlay (spawn-preset menu, file/web preview,
