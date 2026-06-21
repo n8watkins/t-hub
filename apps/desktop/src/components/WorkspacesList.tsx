@@ -603,10 +603,33 @@ function WorkspaceRow({
   );
 }
 
-/** One nested terminal row: a themed lifecycle dot + the friendly "what's
- *  running" label (e.g. "claude · tools" from deriveLabel — the command + dir,
- *  NOT the opaque session id, which isn't useful here), and an X to close it. The
- *  focused tile (of the active workspace) gets the subtle accent tint + left bar. */
+/** Worktree-aware folder detail for a terminal row, mirroring the Recent list
+ *  (RecentList.tsx `cwdBasename`/`cwdWorktree`). The agent ICON already conveys
+ *  claude/codex, so the row shows WHERE the work lives — the folder, plus a
+ *  `· <worktree>` hint (a `wt-<branch>` segment, else the parent project folder) —
+ *  instead of repeating the command word. Returns "" for an empty cwd. */
+function folderDetail(cwd: string): string {
+  const parts = cwd
+    .replace(/[/\\]+$/, "")
+    .split(/[/\\]+/)
+    .filter(Boolean);
+  if (parts.length === 0) return "";
+  const name = parts[parts.length - 1];
+  let worktree = "";
+  for (let i = parts.length - 1; i >= 0; i -= 1) {
+    if (/^wt-/.test(parts[i])) {
+      worktree = parts[i].replace(/^wt-/, "");
+      break;
+    }
+  }
+  if (!worktree && parts.length >= 2) worktree = parts[parts.length - 2];
+  return worktree && worktree !== name ? `${name} · ${worktree}` : name;
+}
+
+/** One nested terminal row: the agent icon + a themed lifecycle dot (pulses while
+ *  the bound session is mid-turn) + the folder/worktree detail (NOT the command
+ *  word — the icon already says claude/codex — and NOT the opaque session id), and
+ *  an X to close it. The focused tile of the active workspace gets the accent tint. */
 function TerminalRow({
   id,
   info,
@@ -676,6 +699,10 @@ function TerminalRow({
   // The user's cosmetic "work name" for this project (keyed by cwd) — shown as the
   // primary line when set, with the derived command·dir label as a muted subtitle.
   const workName = useTheme((s) => (cwd ? s.workNames[cwd] : undefined));
+  // #10: the agent ICON conveys claude/codex, so the row text shows WHERE the work
+  // lives (folder + worktree, like the Recent list) rather than the command word.
+  // Falls back to the derived label only when there's no cwd yet (fresh spawn).
+  const detail = folderDetail(cwd) || label;
 
   // A committed drag (pointerup after crossing the move threshold) can be
   // followed by a synthetic click on this button; this ref lets us swallow that
@@ -758,13 +785,13 @@ function TerminalRow({
           title={working ? "Working…" : undefined}
         />
         <span className="min-w-0 flex-1">
-          <span className="block truncate">{workName ?? label}</span>
+          <span className="block truncate">{workName ?? detail}</span>
           {workName && (
             <span
               className="block truncate text-[11px]"
               style={{ color: "var(--th-fg-muted)" }}
             >
-              {label}
+              {detail}
             </span>
           )}
         </span>
