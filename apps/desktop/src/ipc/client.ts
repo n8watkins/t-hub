@@ -40,12 +40,6 @@ export function resizeTerminal(
   return invoke(Commands.resizeTerminal, { id, cols, rows });
 }
 
-/** Re-capture a DEEP scrollback window for `id` (base64) so the ⟳ refresh can
- *  re-seed xterm with far more history — at the pane's current width. */
-export function recaptureScrollback(id: TerminalId): Promise<string> {
-  return invoke(Commands.recaptureScrollback, { id });
-}
-
 export function closeTerminal(id: TerminalId): Promise<void> {
   return invoke(Commands.closeTerminal, { id });
 }

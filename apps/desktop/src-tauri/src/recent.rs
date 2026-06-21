@@ -25,11 +25,12 @@
 //! ## Crossing the Windows↔WSL boundary
 //!
 //! On Windows, Claude runs INSIDE WSL, so `~/.claude` is the *distro* home, not a
-//! Windows path. Like the rest of the backend (tmux.rs / agent/mod.rs), we cross
-//! the boundary with `wsl.exe`: a single `bash -lc` invocation lists + stats the
-//! transcripts and prints one TSV row per session, which we parse here. On unix
-//! (the dev / `cargo check` build) we read the filesystem directly. Both paths
-//! converge on the same [`RecentSession`] list.
+//! Windows path. The fast path runs one `wsl.exe -d <distro> -e bash -lc 'find …
+//! -printf'` (`-e` execs real bash, not the default shell) to list + stat the whole
+//! transcript catalog NATIVELY in ~0.2s, then reads only the survivors over the
+//! `\\wsl.localhost\` UNC share; if that `find` is unavailable it falls back to the
+//! pure-UNC stat-walk. On unix (the dev / `cargo check` build) we read the
+//! filesystem directly. All paths converge on the same [`RecentSession`] list.
 //!
 //! Everything is best-effort: any failure (no WSL, missing dir, malformed file)
 //! degrades to an empty list rather than erroring the UI.

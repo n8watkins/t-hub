@@ -44,11 +44,6 @@ const SCROLLBACK_LINES: i64 = 2000;
 /// deep history; already-created windows keep their old limit. ~50k lines is cheap.
 const HISTORY_LIMIT: i64 = 50000;
 
-/// How many lines the ⟳ refresh re-captures + re-seeds into xterm (well under
-/// xterm's own 20000-line buffer), so a refresh lets you scroll up far past the
-/// 2000-line attach seed — up to whatever `HISTORY_LIMIT` has accumulated.
-const DEEP_SCROLLBACK_LINES: i64 = 10000;
-
 /// A structured error from a tmux invocation.
 #[derive(Debug, Clone)]
 pub struct TmuxError {
@@ -477,19 +472,6 @@ fn pane_info_command(script: &str) -> Command {
 /// responsible for base64-encoding before sending over IPC.
 pub fn capture_pane(name: &str) -> Result<Vec<u8>, TmuxError> {
     let start = format!("-{SCROLLBACK_LINES}");
-    let output = run(
-        "capture-pane",
-        &["capture-pane", "-p", "-e", "-S", &start, "-t", name],
-    )?;
-    Ok(output.stdout)
-}
-
-/// Like [`capture_pane`] but with a much DEEPER scrollback window
-/// ([`DEEP_SCROLLBACK_LINES`]), captured at the pane's CURRENT width. Used by the
-/// ⟳ refresh to re-seed xterm so you can scroll up far past the attach seed (up to
-/// whatever tmux's history-limit has actually retained). ANSI preserved (`-e`).
-pub fn capture_pane_deep(name: &str) -> Result<Vec<u8>, TmuxError> {
-    let start = format!("-{DEEP_SCROLLBACK_LINES}");
     let output = run(
         "capture-pane",
         &["capture-pane", "-p", "-e", "-S", &start, "-t", name],

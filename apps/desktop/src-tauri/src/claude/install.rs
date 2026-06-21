@@ -264,6 +264,12 @@ pub fn reconcile_managed_hooks() -> Result<()> {
     if !hooks::any_managed(&existing) {
         return Ok(());
     }
+    // Already current? No legacy marker AND every command already points at
+    // agent_bin -> nothing to migrate, so DON'T rewrite settings.json. This runs on
+    // every launch; only touch the file when an entry is genuinely stale.
+    if !hooks::managed_stale(&existing, &agent_bin) {
+        return Ok(());
+    }
 
     // Re-install exactly the set we currently manage. If we somehow have a
     // managed statusLine but no managed hook events (e.g. a partial legacy

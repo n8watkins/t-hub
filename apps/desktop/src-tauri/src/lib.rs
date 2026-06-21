@@ -91,9 +91,10 @@ fn spawn_agent_connect(state: &AppState) {
         .spawn(move || {
             // Log the resolved launch argv up front so a missing/unresolvable
             // agent binary is diagnosable from the core's stderr. On Windows
-            // this is the `wsl.exe -d <distro> --cd ~ -- bash -lc "exec
-            // t-hub-agent --stdio"` login-shell form (or the verbatim
-            // T_HUB_AGENT_BIN override); on unix it's the direct spawn.
+            // this is the `wsl.exe -d <distro> --cd ~ -e bash -lc "exec
+            // t-hub-agent --stdio"` login-shell form — `-e` execs REAL bash, not
+            // the default login shell (zsh); see agent::launch_argv. (Or the
+            // verbatim T_HUB_AGENT_BIN override.) On unix it's the direct spawn.
             let argv = agent::launch_argv(&distro);
             eprintln!(
                 "t-hub: connecting agent bridge (distro={distro:?}) via {argv:?}"
@@ -330,7 +331,6 @@ pub fn run() {
             commands::attach_terminal,
             commands::write_terminal,
             commands::resize_terminal,
-            commands::recapture_scrollback,
             commands::close_terminal,
             commands::kill_terminal,
             commands::list_terminals,

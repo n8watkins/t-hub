@@ -305,6 +305,44 @@ pub fn any_managed(settings: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// True when any T-Hub-managed entry is STALE and the startup reconcile should
+/// rewrite it: a command carries the legacy `termhub` marker, OR it doesn't already
+/// point at `agent_bin`. False when every managed hook + statusLine already matches
+/// the current marker + path — so the reconcile can NO-OP and avoid rewriting
+/// settings.json (and bumping its mtime) on every launch. Read-only.
+pub fn managed_stale(settings: &serde_json::Value, agent_bin: &str) -> bool {
+    let cmd_stale = |c: &str| c.contains(LEGACY_HOOK_MARKER) || !c.contains(agent_bin);
+    // statusLine
+    if let Some(sl) = settings.get("statusLine") {
+        if statusline_is_t_hub(sl) {
+            let c = sl.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            if cmd_stale(c) {
+                return true;
+            }
+        }
+    }
+    // Every managed hook command across all groups.
+    let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else {
+        return false;
+    };
+    for groups in hooks.values() {
+        let Some(arr) = groups.as_array() else { continue };
+        for g in arr {
+            let Some(inner) = g.get("hooks").and_then(|h| h.as_array()) else {
+                continue;
+            };
+            for h in inner {
+                if let Some(c) = h.get("command").and_then(|c| c.as_str()) {
+                    if command_is_t_hub(c) && cmd_stale(c) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Return true if a matcher-group object contains any T-Hub-managed command.
 ///
 /// A group is T-Hub-managed when at least one of its inner `hooks[].command`

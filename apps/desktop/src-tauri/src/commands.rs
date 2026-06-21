@@ -319,27 +319,6 @@ pub async fn resize_terminal(
     session.resize(cols, rows)
 }
 
-/// Re-capture a DEEP scrollback window for `id` and return it base64-encoded, so
-/// the ⟳ refresh can re-seed xterm with far more history (scroll-up) at the pane's
-/// current width. Read-only on tmux; resolves the session name from the live entry
-/// if present, else `th_<id>` (mirrors attach/resize/kill). The lock is released
-/// before the (blocking) tmux capture.
-#[tauri::command]
-pub async fn recapture_scrollback(
-    state: tauri::State<'_, TerminalManager>,
-    id: String,
-) -> Result<String, String> {
-    let tmux_session = state
-        .sessions
-        .lock()
-        .get(&id)
-        .map(|s| s.tmux_session.clone())
-        .unwrap_or_else(|| format!("th_{}", &id[..id.len().min(8)]));
-    let bytes = tmux::capture_pane_deep(&tmux_session)
-        .map_err(|e| format!("failed to capture scrollback: {e}"))?;
-    Ok(STANDARD.encode(bytes))
-}
-
 #[tauri::command]
 pub async fn close_terminal(
     state: tauri::State<'_, TerminalManager>,
