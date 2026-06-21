@@ -22,6 +22,10 @@ export const PersistenceCommands = {
   listSnapshots: "list_snapshots",
   /** Fetch one history snapshot's full layout JSON by id (Recovery review). */
   getSnapshot: "get_snapshot",
+  /** Read the SHARED, all-variants layout (~/.config/t-hub/workspaces.json, #9). */
+  loadSharedLayout: "load_shared_layout",
+  /** Write the SHARED, all-variants layout. */
+  saveSharedLayout: "save_shared_layout",
 } as const;
 
 /**
@@ -57,6 +61,25 @@ export async function loadWorkspaceSnapshot(): Promise<string | null> {
   const v = await invoke<string | null>(
     PersistenceCommands.loadWorkspaceSnapshot,
   );
+  return v ?? null;
+}
+
+/**
+ * Persist the layout to the SHARED, all-variants file (~/.config/t-hub/workspaces.json,
+ * #9). Best-effort, like {@link saveWorkspaceSnapshot}: the SQLite + localStorage
+ * copies remain authoritative; this is the cross-variant carrier (dev↔prod).
+ */
+export function saveSharedLayout(json: string): Promise<void> {
+  return invoke(PersistenceCommands.saveSharedLayout, { layout: json });
+}
+
+/**
+ * Load the SHARED, all-variants workspace layout JSON (#9), or `null` when none
+ * exists yet / the backend is absent. Adopted on a fresh variant whose per-variant
+ * durable copy is empty, so your workspaces follow you across a dev↔prod switch.
+ */
+export async function loadSharedLayout(): Promise<string | null> {
+  const v = await invoke<string | null>(PersistenceCommands.loadSharedLayout);
   return v ?? null;
 }
 

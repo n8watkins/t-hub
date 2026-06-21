@@ -134,6 +134,42 @@ pub async fn set_theme(app: tauri::AppHandle, theme: String) -> Result<(), Strin
     Ok(())
 }
 
+// --- Shared workspace layout (#9: persist workspaces across variants) ----------
+// A single `~/.config/t-hub/workspaces.json` shared by ALL variants (prod + dev),
+// a sibling of theme.json. The per-variant SQLite copy (db.rs) stays the PRIMARY
+// durable store; this shared file is what carries your workspace layout across a
+// dev↔prod switch — adopted on a fresh variant whose per-variant copy is empty.
+
+/// Full path to the shared (all-variants) workspace layout file.
+fn shared_layout_file() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("workspaces.json"))
+}
+
+/// Read the shared workspace layout JSON, or `None` if absent/empty/unreadable.
+#[tauri::command]
+pub async fn load_shared_layout() -> Result<Option<String>, String> {
+    let Some(path) = shared_layout_file() else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => Ok(Some(s)),
+        _ => Ok(None),
+    }
+}
+
+/// Write the shared workspace layout JSON (best-effort, creating the dir as needed).
+#[tauri::command]
+pub async fn save_shared_layout(layout: String) -> Result<(), String> {
+    let path = shared_layout_file().ok_or_else(|| {
+        "could not resolve a config dir (no XDG_CONFIG_HOME / HOME)".to_string()
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, layout).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -578,7 +578,13 @@ function loadPersisted(): PersistedLayout {
 function saveToBackend(json: string): void {
   if (SATELLITE_TAB) return;
   void import("../ipc/persistence")
-    .then((m) => m.saveWorkspaceSnapshot(json))
+    .then((m) => {
+      // Per-variant durable copy (SQLite) — the primary durable store.
+      void m.saveWorkspaceSnapshot(json);
+      // Shared, all-variants copy (~/.config/t-hub/workspaces.json, #9): the
+      // cross-variant carrier so a dev↔prod switch keeps your workspaces.
+      void m.saveSharedLayout(json);
+    })
     .catch(() => {});
 }
 
@@ -1389,6 +1395,33 @@ export function tabIdForTerminal(
  * user just acted on, we only adopt the SQLite layout when it is non-trivially
  * present and the store still holds its initial (un-reconciled) terminal set.
  */
+/** Adopt a durable layout (the per-variant SQLite snapshot OR the shared file)
+ *  onto the store — but only while no live terminals have reconciled yet, so we
+ *  never yank a tile the user just acted on. Re-mirrors to localStorage + both
+ *  durable copies afterward so all three agree. */
+function adoptDurableLayout(snapshot: PersistedLayout): void {
+  const layout = adoptOrphans(snapshot);
+  if (Object.keys(useWorkspace.getState().terminals).length > 0) return;
+  const claudeTitles = useWorkspace.getState().claudeTitles;
+  useWorkspace.setState({
+    tabs: layout.tabs,
+    activeTabId: layout.activeTabId,
+    focusedId: layout.focusedId,
+    fontSize: layout.fontSize,
+    userLabels: layout.labels,
+    labels: mergeLabels(layout.labels, claudeTitles),
+    poppedOutTabs: layout.poppedOutTabs,
+  });
+  savePersisted({
+    tabs: layout.tabs,
+    activeTabId: layout.activeTabId,
+    focusedId: layout.focusedId,
+    fontSize: layout.fontSize,
+    labels: layout.labels,
+    poppedOutTabs: layout.poppedOutTabs,
+  });
+}
+
 async function hydrateFromBackend(): Promise<void> {
   if (SATELLITE_TAB) return;
   if (typeof window === "undefined") return; // no webview → no backend
@@ -1398,8 +1431,24 @@ async function hydrateFromBackend(): Promise<void> {
     const snapshot = parseV2Snapshot(json);
 
     if (!snapshot) {
-      // Nothing durable yet: seed SQLite once from the current (localStorage-
-      // derived) layout so subsequent boots can prefer the durable copy.
+      // No per-variant durable copy yet (a FRESH variant / first run). Before
+      // seeding defaults, try the SHARED, all-variants layout (#9) — this is what
+      // carries your workspaces across a dev↔prod switch.
+      let shared: PersistedLayout | null = null;
+      try {
+        const { loadSharedLayout } = await import("../ipc/persistence");
+        shared = parseV2Snapshot(await loadSharedLayout());
+      } catch {
+        /* no backend — fall through to seeding */
+      }
+      if (shared) {
+        // adoptDurableLayout re-mirrors into localStorage + the per-variant copy.
+        adoptDurableLayout(shared);
+        return;
+      }
+      // Nothing shared either: seed BOTH durable copies (SQLite + shared file)
+      // once from the current (localStorage-derived) layout so later boots and
+      // other variants can prefer the durable copies.
       const {
         tabs,
         activeTabId,
@@ -1422,37 +1471,10 @@ async function hydrateFromBackend(): Promise<void> {
       return;
     }
 
-    // The durable copy wins. Adopt orphaned popped-out tabs (a fresh main-window
-    // launch has no satellites yet) just like the localStorage boot path does.
-    const layout = adoptOrphans(snapshot);
-
-    // Only overwrite if the store hasn't already reconciled live terminals onto
-    // a different arrangement (i.e. a spawn/listTerminals beat us). If it has, the
-    // backend's setTerminals reconciliation is authoritative for this session;
-    // we still refresh the durable copy from that state via the next persist().
-    if (Object.keys(useWorkspace.getState().terminals).length > 0) return;
-
-    // `layout.labels` is the persisted user-rename set: adopt it as userLabels
-    // and recompute the effective `labels` over any live Claude titles.
-    const claudeTitles = useWorkspace.getState().claudeTitles;
-    useWorkspace.setState({
-      tabs: layout.tabs,
-      activeTabId: layout.activeTabId,
-      focusedId: layout.focusedId,
-      fontSize: layout.fontSize,
-      userLabels: layout.labels,
-      labels: mergeLabels(layout.labels, claudeTitles),
-      poppedOutTabs: layout.poppedOutTabs,
-    });
-    // Re-mirror to localStorage so both copies agree after adopting SQLite.
-    savePersisted({
-      tabs: layout.tabs,
-      activeTabId: layout.activeTabId,
-      focusedId: layout.focusedId,
-      fontSize: layout.fontSize,
-      labels: layout.labels,
-      poppedOutTabs: layout.poppedOutTabs,
-    });
+    // The durable per-variant copy wins (adopted only while no live terminals have
+    // reconciled yet — that guard lives inside adoptDurableLayout, which also
+    // re-mirrors to localStorage + the shared file so all copies agree).
+    adoptDurableLayout(snapshot);
   } catch {
     // No backend or a transient error — keep the localStorage-derived boot state.
   }

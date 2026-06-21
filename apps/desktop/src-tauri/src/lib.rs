@@ -342,6 +342,9 @@ pub fn run() {
             // theme://changed.
             theme::get_theme,
             theme::set_theme,
+            // #9: shared (all-variants) workspace layout at ~/.config/t-hub/workspaces.json.
+            theme::load_shared_layout,
+            theme::save_shared_layout,
             // #sqlite: durable workspace-layout persistence (mirrors localStorage).
             db::save_workspace_snapshot,
             db::load_workspace_snapshot,
