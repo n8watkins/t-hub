@@ -1,6 +1,6 @@
 # T-Hub — Session Handoff
 
-**Last updated:** 2026-06-20 · **Branch:** `main` (clean, pushed to `origin/main`, `HEAD = 417c8d1`) · **App version:** `0.1.54`
+**Last updated:** 2026-06-20 · **Branch:** `main` (clean, in sync with `origin/main`) · **App version:** `0.1.54`
 
 > Read this whole file first, plus `PRD.md` and `README.md`. Most decisions below
 > are already made — **do not re-ask the user anything answered here.**
@@ -11,7 +11,7 @@
 
 This was a long live-iteration session. It (1) **merged 3 parallel lanes** (A tile-identity, B sidebar-strips, C terminal-input) to `main`, (2) ran **post-merge code reviews** and fixed the findings, (3) worked through a **big user-walkthrough backlog**, (4) built **Codex support** (usage readout, icon, auto-continue), and (5) **rebranded the user-facing name to "T-Hub"**. Everything is committed + pushed.
 
-**REPO MOVED mid-session:** the tree is now at **`/home/natkins/projects/tools/t-hub/`** (was `…/n8builds/tools/t-hub`). Main repo: `…/projects/tools/t-hub/t-hub-app`; active worktree (where work happened): `…/projects/tools/t-hub/wt-terminal-input` on branch **`fix/post-merge-review`** (it tracks + pushes to `origin/main`). The worktree's git link broke on the move and was fixed with `git worktree repair <worktree-path>` from the main repo. See [[t-hub-monorepo-structure]] memory.
+**REPO LOCATION + LAYOUT:** the tree is at **`/home/natkins/projects/tools/t-hub/`** (was `…/n8builds/tools/t-hub` earlier in the session). It's now a **SINGLE repo** — work directly in **`/home/natkins/projects/tools/t-hub/t-hub-app`** on **`main`**. The parallel-lane worktrees (incl. `wt-terminal-input`) and their branches (`fix/post-merge-review` etc.) were **removed after merge** (cleanup 2026-06-20) — `git worktree list` should show only `t-hub-app [main]`, `git branch` only `main`. See [[t-hub-monorepo-structure]] memory.
 
 **Two dev surfaces — know the difference:**
 - **WSLg/Linux dev instance** (`TERMHUB_TMUX_SOCKET=termhub-dev pnpm tauri dev` from `apps/desktop`): fast hot-reload, but **cannot** exercise Windows-only features (OS file-drop, clipboard-image) — it's webkitgtk, not WebView2. Great for UI/logic; misleading for those two features.
@@ -56,8 +56,8 @@ Merged lane work + fixes (oldest→newest): `e40c82d`…`99f3517` (lanes A/B/C c
 
 ## 4. Conventions & gotchas
 
-- **Commit + push cadence:** commit after each logical change; push to `origin/main`. Trailer: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`. Work happens on the `fix/post-merge-review` worktree which pushes to `main` via `git push origin HEAD:main` (rebase onto `origin/main` first).
-- **Gates:** `pnpm --filter termhub typecheck` (from worktree root) + `cargo check -p termhub` (from `apps/desktop/src-tauri`). The lone `TerminalState` dead-code warning is pre-existing.
+- **Commit + push cadence:** work on `main` in `t-hub-app`; commit after each logical change (trailer `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`) and `git push origin main`.
+- **Gates:** `pnpm --filter termhub typecheck` (from the repo root, `t-hub-app`) + `cargo check -p termhub` (from `apps/desktop/src-tauri`). The lone `TerminalState` dead-code warning is pre-existing.
 - **Windows build:** `gh workflow run release.yml --ref main` triggers a **`workflow_dispatch`** build = a downloadable **artifact** (NOT a public release; release/`latest.json` steps are gated on `v*` tags). Download with `gh run download <id> -n termhub-installers -D <dir>`. Installer name follows `productName` → now `T-Hub_<ver>_x64-setup.exe`.
 - **Brand rename caveat:** `productName` is now `T-Hub`, so the installer/install-path changed → the old "TermHub" install will NOT auto-upgrade in place (one-time manual install of T-Hub). Reversible by setting `productName` back. Technical ids stay `termhub` ON PURPOSE.
 - **Codex detection:** Codex runs as a `node` process (`@openai/codex/bin/codex.js`), so `pane_current_command` = `node`. `tmux.rs::pane_info` now resolves it via `/proc/<child>/cmdline`. Claude runs as `claude` directly.
