@@ -47,6 +47,7 @@ import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
 import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
 import { resolveDropTarget } from "../lib/dropTarget";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
+import { refreshTerminal } from "../lib/repaint";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { gitInfo, type GitInfo } from "../ipc/git";
 import { GitBranch } from "lucide-react";
@@ -753,6 +754,25 @@ export function Tile({
           })}
         </div>
 
+        {/* ⟳ refresh: RE-FIT this terminal to its current size + repaint. The
+            manual recovery for a tile grown from a small corner to full that didn't
+            reflow on its own (also reachable by right-clicking the header). */}
+        <button
+          type="button"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            onFocus();
+            refreshTerminal(terminalId);
+          }}
+          className="shrink-0 rounded px-1 leading-none hover:bg-neutral-800"
+          style={{ color: "var(--th-fg-muted)" }}
+          title="Refresh terminal (re-fit + repaint)"
+          aria-label="Refresh terminal"
+        >
+          ⟳
+        </button>
+
         {/* ⋯ menu: per-terminal color overrides so you can tell this terminal
             apart from the rest. Opens a small popover anchored under the button;
             edits apply live and persist (see store/theme termOverrides). */}
@@ -903,6 +923,14 @@ export function Tile({
             }}
             onPointerDown={(e) => e.stopPropagation()}
           >
+            <CtxItem
+              label="Refresh terminal"
+              hint="Re-fit to the current size + repaint — fixes a tile that didn't reflow after growing"
+              onClick={() => {
+                setCtxMenu(null);
+                refreshTerminal(terminalId);
+              }}
+            />
             <CtxItem
               label="Kill session"
               hint="Ends the tmux session — resume later from Recent (asks first if busy)"

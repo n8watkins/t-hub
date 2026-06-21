@@ -30,3 +30,22 @@ export function repaintAllTerminals(): void {
     /* no window / event constructor — nothing to do */
   }
 }
+
+/** The window event TerminalView listens for to RE-FIT + repaint a terminal.
+ *  Detail `{ id }`: a specific terminal, or undefined = every terminal. */
+export const REFRESH_TERMINAL_EVENT = "th-refresh-terminal";
+
+/** Manually refresh a terminal: re-fit it to its CURRENT container size (pushing
+ *  the new cols/rows to the PTY) and repaint. This is the recovery for a tile that
+ *  was grown — e.g. from a small corner to full — but didn't reflow on its own
+ *  (a missed ResizeObserver tick). Pass an `id` to target one tile, or omit for
+ *  all. Wired to the tile header's ⟳ button and a right-click on the header. */
+export function refreshTerminal(id?: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    tlog("repaint", `refresh terminal ${id ?? "(all)"}`);
+    window.dispatchEvent(new CustomEvent(REFRESH_TERMINAL_EVENT, { detail: { id } }));
+  } catch {
+    /* no window / event constructor — nothing to do */
+  }
+}

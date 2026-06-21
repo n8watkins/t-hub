@@ -50,7 +50,7 @@ import { usePanels } from "../store/panels";
 import { useWorkspace } from "../store/workspace";
 import { useTheme, DEFAULT_THEME, type TerminalPalette } from "../store/theme";
 import { tlog } from "../lib/diag";
-import { REPAINT_ALL_EVENT } from "../lib/repaint";
+import { REPAINT_ALL_EVENT, REFRESH_TERMINAL_EVENT } from "../lib/repaint";
 import type { ITheme } from "@xterm/xterm";
 import {
   readText as tauriReadText,
@@ -695,6 +695,19 @@ export function TerminalView({
     const onRepaintAll = () => requestAnimationFrame(forceRepaint);
     window.addEventListener(REPAINT_ALL_EVENT, onRepaintAll);
 
+    // Manual per-terminal refresh (tile header ⟳ / right-click): RE-FIT to the
+    // current container size — pushing fresh cols/rows to the PTY so the shell
+    // reflows — then repaint. The recovery for a tile grown from a small corner to
+    // full that didn't reflow on its own. Targets this terminal by id; an
+    // undefined id refreshes all (parity with the repaint-all broadcast).
+    const onRefresh = (e: Event) => {
+      const id = (e as CustomEvent<{ id?: string }>).detail?.id;
+      if (id && id !== terminalId) return;
+      pushResize();
+      requestAnimationFrame(forceRepaint);
+    };
+    window.addEventListener(REFRESH_TERMINAL_EVENT, onRefresh);
+
     // Debounced resize -> keep PTY columns/rows in sync with the tile size, but
     // only ONCE the drag SETTLES. A continuous window/gutter drag fires this
     // observer (and the pool's per-placeholder one) rapidly; firing a PTY resize
@@ -724,6 +737,7 @@ export function TerminalView({
       visObserver = null;
       wrapEl?.removeEventListener("th-pool-moved", onPoolMoved);
       window.removeEventListener(REPAINT_ALL_EVENT, onRepaintAll);
+      window.removeEventListener(REFRESH_TERMINAL_EVENT, onRefresh);
 
       dataSub.dispose();
 
