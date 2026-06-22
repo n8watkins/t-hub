@@ -1,6 +1,6 @@
 # T-Hub — Session Handoff
 
-**Last updated:** 2026-06-20 · **Branch:** `main` (clean, in sync with `origin/main`) · **App version:** `0.1.54`
+**Last updated:** 2026-06-22 · **Branch:** `main` (clean, in sync with `origin/main`) · **App version:** `0.1.67`
 
 > Read this whole file first, plus `PRD.md` and `README.md`. Most decisions below
 > are already made — **do not re-ask the user anything answered here.**
@@ -15,10 +15,10 @@ This was a long live-iteration session. It (1) **merged 3 parallel lanes** (A ti
 
 **Two dev surfaces — know the difference:**
 - **WSLg/Linux dev instance** (`T_HUB_TMUX_SOCKET=t-hub-dev pnpm tauri dev` from `apps/desktop`): fast hot-reload, but **cannot** exercise Windows-only features (OS file-drop, clipboard-image) — it's webkitgtk, not WebView2. Great for UI/logic; misleading for those two features.
-- **Windows installer** (`T-Hub_0.1.54_x64-setup.exe`, in `C:\Users\natha\Downloads\`): the REAL app (WebView2). This is what to install to test file-drop / image-paste / true titlebar.
+- **Windows installer** (`T-Hub_0.1.67_x64-setup.exe`, in `C:\Users\natha\Downloads\`): the REAL app (WebView2). This is what to install to test file-drop / image-paste / true titlebar.
 - **T-Hub Dev** (side-by-side Windows sandbox): a SEPARATE installable app (`com.t-hub.dev`, isolated `t-hub-dev` socket + `~/.t-hub-dev` state) that coexists with production T-Hub and can't disturb its live sessions. Build via `gh workflow run release.yml --ref main -f variant=dev`. **See [docs/DEV-BUILD.md](DEV-BUILD.md)** for the full prod-vs-dev model, what's isolated/shared, and the complete `t-hub`-identifier inventory.
 
-**Best debug tool:** the running app writes a diag log readable from WSL at **`/home/natkins/.t-hub/diag.log`** (dev instance) and `/mnt/c/Users/natha/.t-hub/diag.log` (Windows). Grep tags: `codex`, `autocontinue`, `usage`, `pool`, `resize`.
+**Best debug tool:** the running app writes a diag log to `<home>/.t-hub/diag.log`, resolved per-user at startup — `%USERPROFILE%` on Windows (read from WSL at `/mnt/c/Users/natha/.t-hub/diag.log`), `$HOME` on unix. Overridable via `$T_HUB_DIAG_FILE` (the side-by-side DEV build points it at `~/.t-hub-dev/diag.log`). **Gotcha:** an *inherited* `T_HUB_DIAG_FILE`/`T_HUB_TMUX_SOCKET`/`T_HUB_CONTROL_FILE` WINS — so a prod app launched from a WSL session a dev-isolated app spawned will silently run on the dev socket + log to the DEV path. The always-fires startup marker `t-hub: started vX (diag -> …)` reveals the resolved path; if it points at `.t-hub-dev`, the env is polluted (close the dev app / relaunch from a clean shell). Grep tags: `codex`, `autocontinue`, `usage`, `pool`, `resize`, `reconcile`, `recent`.
 
 ---
 

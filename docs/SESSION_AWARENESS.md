@@ -93,8 +93,9 @@ T_HUB_AGENT_BIN=$PWD/src-tauri/target/debug/t-hub-agent pnpm tauri dev
 
 ## Installing the Claude hooks (consent-gated)
 
-The hooks are what *populate* the journal. The **HookInstallPanel** is mounted in
-the sidebar (consent checkbox → Install). It is non-destructive: it merges into
+The hooks are what *populate* the journal. The **HookInstallPanel** lives in
+**Settings → Hooks** (mounted in `ThemeEditor.tsx`, not the sidebar): a consent
+checkbox → Install. It is non-destructive: it merges into
 `~/.claude/settings.json`, preserves your existing hooks + non-hook keys, makes a
 one-time `settings.json.t-hub-bak`, and ships a clean uninstall that removes
 only T-Hub's marker-tagged entries. It installs handlers for the 15 verified
