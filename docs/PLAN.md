@@ -1,6 +1,6 @@
 # T-Hub — Forward Build Plan (0.5 → 2.0)
 
-**Status:** Planning track (no code). Source of truth for product/architecture is [PRD.md](../PRD.md); technical risks and the verified Claude Code facts are in [REVIEW.md](../REVIEW.md). The 0.1 IPC contract is [src/ipc/types.ts](../src/ipc/types.ts).
+**Status:** ⚠️ **Largely SHIPPED — kept as the design-rationale record, not a to-do list.** The 0.1 nucleus and most of the 0.5 supervision track (agent bridge, journal/statusline spine, supervision tree, hooks, Codex) are built in the current `0.1.67` app. Read the sections below for *why* things are shaped the way they are, not as pending work. Source of truth for product/architecture is [PRD.md](../PRD.md); technical risks and the verified Claude Code facts are in [REVIEW.md](../REVIEW.md). The 0.1 IPC contract is [src/ipc/types.ts](../src/ipc/types.ts).
 
 **Scope of this document:** the phased implementation plan *after* the 0.1 nucleus. Each release section carries: Goal · Workstreams · Key Claude Code mechanisms · Data-model additions · Exit criteria · Risks/watch-items.
 
@@ -8,7 +8,7 @@
 
 ## 0. Foundation — what 0.1 already gives us (do not re-plan)
 
-The 0.1 "playable proof" nucleus is being scaffolded in parallel and is the floor every later release builds on. It establishes:
+The 0.1 "playable proof" nucleus is built and is the floor every later release builds on. It establishes:
 
 - **Tauri 2 + React/TS** desktop shell with a WebView canvas.
 - **PTY spine:** `portable-pty`/ConPTY spawning `wsl.exe` → `tmux -L t-hub attach` (one client per visible tile).

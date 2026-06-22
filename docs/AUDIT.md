@@ -4,6 +4,8 @@
 **Scope:** stale code / doc drift · correctness bugs (Rust + React/TS) · strategic next direction · competitive positioning.
 **Reviewer:** Claude (Opus 4.8), read-only. App was not run; findings are from code + docs.
 
+> ⚠️ **HISTORICAL SNAPSHOT — do not treat as current.** This audit was taken at **0.1.16**; the app is now **0.1.67** (≈50 patches later). Many findings below have since been resolved — e.g. the per-user diag path, the `wsl.exe -e bash` shell fix, hook self-heal/auto-migrate, the native Recent scan, and the dev/prod isolation model. Kept for trend + rationale; **verify any item against current code before acting on it.**
+
 All file references are absolute. Severity: **P0** (broken / data-loss / security) · **P1** (real bug or
 dead user-facing feature) · **P2** (latent / low-blast-radius / polish).
 
