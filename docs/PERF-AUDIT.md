@@ -37,9 +37,11 @@ PTY/thread lifecycle (joined on close, `pty.rs`); tmux client cleanup; the new t
 
 Verified: cargo build + 159 lib tests + tsc all green. Runtime smoke-test still pending.
 
-### Tier 2 — RAM growth
-4. **Evict ended sessions** from `Supervisor.sessions` + `StatusBridge.latest`; **prune completed children**; **self-reap exited terminals** from `TerminalManager` on reader EOF. *(backend)*
-5. **Wire the dead `supervision.remove()`** + add `sessionContext.forget()` + fix `DevTab`/`activity`/label maps, all via `cleanupTileSideState`. *(frontend)*
+### Tier 2 — RAM growth ✅ DONE (`90d870d`, `75ad77f`, `d803120`)
+4. ✅ **Evicted ended sessions** from `Supervisor.sessions` + `StatusBridge.latest` (on SessionEnd + 256-LRU backstop); **capped completed children**; **self-reaped exited terminals** via the `list_terminals` reconcile (tmux-liveness cross-check, never reaps a detached one). *(backend)*
+5. ✅ **Wired the dead `supervision.remove()`** + added `sessionContext.forget()`/`activity.forget()`/`DevTab.forgetDevState()` + pruned label maps, all via `cleanupTileSideState`. *(frontend)*
+
+Plus 2 review-caught regressions fixed (`11158ae`): git-cache invalidation on commit/worktree, and draining output before the exit banner. Verified: cargo build + 170 lib tests + tsc all green. Runtime smoke-test still pending.
 
 ### Tier 3 — smaller
 6. Drop `claude_usage` to 1–2 attempts / longer backoff; gate `tlog` behind a debug flag (per-frame `console.log` + `invoke`); consider throttling output processing for hidden-tab terminals.
