@@ -180,9 +180,6 @@ impl Supervisor {
         // when it actually changes (not on a same-status re-ingest). `SessionStatus`
         // is `Copy`, so this is a cheap snapshot.
         let prev_status = entry.status;
-        // Set by the `SessionEnd` arm to evict this session after the terminal
-        // transition is logged (the authoritative end signal — see that arm).
-        let mut evict_after = false;
 
         match event {
             JournalEventType::SessionStart => {
@@ -283,15 +280,14 @@ impl Supervisor {
                 if entry.status != SessionStatus::Completed {
                     entry.status = SessionStatus::Failed;
                 }
-                // `SessionEnd` is the authoritative "this session is over" signal,
-                // so we EVICT the entry below (after the transition is logged) to
-                // free its tree + children — they will never change again. The
-                // transition log is keyed by `seq`, independent of `sessions`, so
-                // eviction does not disturb a poller waiting on the end state:
-                // `matched_since`/`transitions_since` still surface the logged edge,
-                // and `status()` correctly reports `Unknown` for the now-unseen
-                // session.
-                evict_after = true;
+                // We KEEP the entry (with its terminal status) rather than evicting
+                // here: the live-UI emit (`emit_session`) and a late `wait_for_status`
+                // poller both read the current `status()` right after this ingest, so
+                // an immediate eviction would make them see `Unknown` instead of the
+                // real Completed/Failed end. The entry stops being touched, so it
+                // becomes the least-recently-updated and the LRU cap below ages it
+                // out first as new sessions arrive — bounded growth without losing
+                // the terminal status.
             }
 
             // Events not relevant to the status reducer (cwd/worktree/status
@@ -309,18 +305,12 @@ impl Supervisor {
             self.push_transition(session_id, new_status);
         }
 
-        // Authoritative end: drop the session (and its children) now that the
-        // terminal transition is logged. Safe — every reader defaults an unseen
-        // session to `Unknown` / `None`.
-        if evict_after {
-            self.sessions.remove(session_id);
-        } else {
-            // Backstop for sessions that never emit `SessionEnd` (crash / lost
-            // spine): keep the map hard-bounded by evicting the least-recently-
-            // updated entries once it exceeds the cap. Never evicts the session we
-            // just touched (it has the highest `update_stamp`).
-            self.enforce_session_cap();
-        }
+        // Keep the map hard-bounded by evicting the least-recently-updated entries
+        // once it exceeds the cap. Ended sessions stop being touched, so they sort
+        // oldest and age out first; the just-touched session (highest `update_stamp`)
+        // is never the victim. Safe — every reader defaults an unseen session to
+        // `Unknown` / `None`.
+        self.enforce_session_cap();
 
         Some(session_id.to_string())
     }
@@ -598,45 +588,57 @@ mod tests {
     // --- Memory-leak fixes: eviction + bounded growth --------------------------
 
     #[test]
-    fn session_end_evicts_entry_and_status_falls_back_to_unknown() {
-        // The authoritative end signal must drop the session (and its children) so
-        // the map doesn't grow one entry per session id forever. After eviction the
-        // session is "unseen" again → `status()` is Unknown and `tree()` is None.
+    fn session_end_keeps_entry_with_terminal_status() {
+        // `SessionEnd` must KEEP the entry (with its terminal status) so the live-UI
+        // emit + a late `wait_for_status` poller read the real end status, not
+        // Unknown. Bounded growth is the LRU cap's job (the entry stops being touched
+        // → ages out oldest-first), not an immediate evict here.
         let mut s = sup();
         s.ingest(Some("o1"), None, None, JournalEventType::SessionStart, 1);
         s.ingest(Some("o1"), Some("a1"), Some("explore"), JournalEventType::SubagentStart, 2);
         s.ingest(Some("o1"), None, None, JournalEventType::Stop, 3);
-        // Sanity: the session is live and tracked before the end signal.
         assert!(s.tree("o1").is_some());
-        assert_eq!(s.session_ids().len(), 1);
 
         s.ingest(Some("o1"), None, None, JournalEventType::SessionEnd, 4);
-        // Evicted: no tree, no id, Unknown status (the unseen-session default).
-        assert!(s.tree("o1").is_none(), "tree must be gone after SessionEnd");
-        assert!(s.session_ids().is_empty(), "session id must be evicted");
+        // Entry survives with the terminal status (Failed — it wasn't Completed).
+        assert!(s.tree("o1").is_some(), "tree must survive SessionEnd for the UI");
+        assert_eq!(s.session_ids().len(), 1);
         assert_eq!(
             s.status("o1"),
-            SessionStatus::Unknown,
-            "evicted session falls back to Unknown"
+            SessionStatus::Failed,
+            "ended session keeps its terminal status (not Unknown)"
         );
     }
 
     #[test]
-    fn session_end_logs_terminal_transition_before_evicting() {
-        // Eviction must NOT disturb the transition-log contract: a poller that
-        // captured `start` before the run can still observe the terminal edge
-        // (here Working→Failed on an abnormal end) even though the entry is gone.
+    fn session_end_after_completed_keeps_completed_status() {
+        // A clean Completed → SessionEnd must stay Completed and KEEP the entry, so a
+        // `wait_for_status(completed)` poller that polls right after the end still
+        // sees Completed instead of a spurious timeout. (Regression guard.)
+        let mut s = sup();
+        s.ingest(Some("o1"), None, None, JournalEventType::SessionStart, 1);
+        s.ingest(Some("o1"), None, None, JournalEventType::Stop, 2); // no children → Completed
+        assert_eq!(s.status("o1"), SessionStatus::Completed);
+        s.ingest(Some("o1"), None, None, JournalEventType::SessionEnd, 3);
+        assert_eq!(
+            s.status("o1"),
+            SessionStatus::Completed,
+            "clean end stays Completed and is still readable"
+        );
+    }
+
+    #[test]
+    fn session_end_logs_terminal_transition() {
+        // The terminal transition (here Working→Failed on an abnormal end) is logged,
+        // so a poller that captured `start` before the run observes it via the log.
         let mut s = sup();
         let start = s.current_seq();
         s.ingest(Some("o1"), None, None, JournalEventType::SessionStart, 1);
         s.ingest(Some("o1"), None, None, JournalEventType::SessionEnd, 2);
-        // Entry is evicted...
-        assert!(s.session_ids().is_empty());
-        // ...but the terminal transition is still recoverable from the log.
         let matched = s.matched_since("o1", &[SessionStatus::Failed], start);
         assert!(
             matches!(matched, Some((_, SessionStatus::Failed))),
-            "terminal Failed edge must be logged before eviction, got {matched:?}"
+            "terminal Failed edge must be logged, got {matched:?}"
         );
     }
 

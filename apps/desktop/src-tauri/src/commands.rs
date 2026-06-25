@@ -517,13 +517,36 @@ pub async fn list_terminals(
     // reports as gone, so we can neither kill a live process nor double-free one:
     // we do NOT touch tmux here, only drop the already-dead in-memory handle.
     let stale_ids = stale_session_ids(&reap_candidates, &live_sessions);
-    for id in stale_ids {
-        // Re-check under the lock and remove. Dropping the dead `PtySession`
-        // runs its `Drop` (best-effort kill of an already-gone attach client +
-        // join of the already-exited reader thread) — both are no-ops on a
-        // terminal whose process tree has ended, so this can't block or
-        // double-free. We don't kill the tmux session (it's already gone).
-        let dead = state.sessions.lock().remove(&id);
+    if !stale_ids.is_empty() {
+        // The tmux session we judged stale for each candidate id. We re-confirm
+        // UNDER THE LOCK that the entry STILL backs that same (now-dead) session
+        // before dropping it, so a concurrent op that replaced the entry under this
+        // id can never make us drop a LIVE PtySession (belt-and-braces: ids are
+        // unique today, so a replacement can't reuse an id — this just makes the
+        // invariant explicit instead of removing by id alone).
+        let expected: std::collections::HashMap<&str, &str> = reap_candidates
+            .iter()
+            .map(|(id, t)| (id.as_str(), t.as_str()))
+            .collect();
+        let mut dead = Vec::new();
+        {
+            let mut sessions = state.sessions.lock();
+            for id in &stale_ids {
+                let still_backs = sessions
+                    .get(id)
+                    .zip(expected.get(id.as_str()).copied())
+                    .is_some_and(|(entry, exp)| entry.tmux_session.as_str() == exp);
+                if still_backs {
+                    if let Some(s) = sessions.remove(id) {
+                        dead.push(s);
+                    }
+                }
+            }
+        }
+        // Drop the dead `PtySession`s OUTSIDE the lock: each `Drop` best-effort kills
+        // an already-gone attach client + joins the already-exited reader thread
+        // (no-ops on an ended process), so it can't block or double-free. We never
+        // touch tmux here — the session is already gone.
         drop(dead);
     }
 
