@@ -27,6 +27,7 @@ import { Markdown } from "./Markdown";
 import { tlog } from "../lib/diag";
 import { useSettings } from "../store/settings";
 import { useFileOpen } from "../store/fileOpen";
+import { useWorkspace } from "../store/workspace";
 
 const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx", "mdown", "markdn"]);
 
@@ -632,6 +633,15 @@ function GitBar({
     { kind: "ok"; hash: string } | { kind: "error"; message: string } | null
   >(null);
 
+  // --- New-worktree affordance (WS-4) ---
+  const [wtOpen, setWtOpen] = useState(false);
+  const [wtPath, setWtPath] = useState("");
+  const [wtBranch, setWtBranch] = useState("");
+  const [wtBusy, setWtBusy] = useState(false);
+  const [wtResult, setWtResult] = useState<
+    { kind: "ok" } | { kind: "error"; message: string } | null
+  >(null);
+
   // Not a repo (or still loading / no root): render nothing.
   if (!git || !git.isRepo) return null;
 
@@ -651,6 +661,30 @@ function GitBar({
       .catch((e) => {
         setCommitting(false);
         setResult({ kind: "error", message: String(e) });
+      });
+  };
+
+  // Create a worktree at `wtPath` (optionally checking out `wtBranch`), open it as
+  // a new tab, and spawn a terminal there — the store's atomic helper does it all.
+  // A git failure (e.g. branch already checked out elsewhere) surfaces inline.
+  const createWorktree = () => {
+    const path = wtPath.trim();
+    if (!path || wtBusy) return;
+    setWtBusy(true);
+    setWtResult(null);
+    useWorkspace
+      .getState()
+      .addWorktreeWorkspace(root, path, wtBranch.trim() || undefined)
+      .then(() => {
+        setWtBusy(false);
+        setWtResult({ kind: "ok" });
+        setWtPath("");
+        setWtBranch("");
+        setWtOpen(false);
+      })
+      .catch((e) => {
+        setWtBusy(false);
+        setWtResult({ kind: "error", message: String(e) });
       });
   };
 
@@ -709,18 +743,32 @@ function GitBar({
               : `${git.dirtyCount} change${git.dirtyCount === 1 ? "" : "s"}`}
           </span>
         </div>
-        {!open && (
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(true);
-              setResult(null);
-            }}
-            className="shrink-0 rounded border px-2 py-0.5 text-[11px] transition-colors hover:bg-neutral-700/30"
-            style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
-          >
-            Commit…
-          </button>
+        {!open && !wtOpen && (
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                setWtOpen(true);
+                setWtResult(null);
+              }}
+              className="shrink-0 rounded border px-2 py-0.5 text-[11px] transition-colors hover:bg-neutral-700/30"
+              style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+              title="Create a git worktree and open it as a new workspace tab with a terminal."
+            >
+              New worktree…
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setOpen(true);
+                setResult(null);
+              }}
+              className="shrink-0 rounded border px-2 py-0.5 text-[11px] transition-colors hover:bg-neutral-700/30"
+              style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+            >
+              Commit…
+            </button>
+          </div>
         )}
       </div>
 
@@ -771,6 +819,79 @@ function GitBar({
         </div>
       )}
 
+      {/* Inline new-worktree form (WS-4): a path field + optional branch, then
+          Create / Cancel. Creating opens a new workspace tab with a terminal in
+          the worktree dir. */}
+      {wtOpen && (
+        <div className="mt-2 flex flex-col gap-2">
+          <input
+            value={wtPath}
+            onChange={(e) => setWtPath(e.target.value)}
+            placeholder="Worktree path (e.g. /home/you/repo-feat)…"
+            spellCheck={false}
+            autoFocus
+            className="min-w-0 flex-1 px-2 py-1 text-[12px] focus:outline-none"
+            style={{
+              borderRadius: "var(--th-radius)",
+              border: "1px solid var(--th-border)",
+              background: "var(--th-tile-bg)",
+              color: "var(--th-fg)",
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                createWorktree();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                setWtOpen(false);
+              }
+            }}
+          />
+          <div className="flex items-center gap-2">
+            <input
+              value={wtBranch}
+              onChange={(e) => setWtBranch(e.target.value)}
+              placeholder="Branch (optional — blank = new branch from path)…"
+              spellCheck={false}
+              className="min-w-0 flex-1 px-2 py-1 text-[12px] focus:outline-none"
+              style={{
+                borderRadius: "var(--th-radius)",
+                border: "1px solid var(--th-border)",
+                background: "var(--th-tile-bg)",
+                color: "var(--th-fg)",
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  createWorktree();
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  setWtOpen(false);
+                }
+              }}
+            />
+            <button
+              type="button"
+              onClick={createWorktree}
+              disabled={wtBusy || !wtPath.trim()}
+              className="shrink-0 rounded border px-2 py-1 text-[11px] transition-colors hover:bg-neutral-700/30 disabled:cursor-not-allowed disabled:opacity-40"
+              style={{ borderColor: "var(--th-accent)", color: "var(--th-fg)" }}
+            >
+              {wtBusy ? "Creating…" : "Create"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setWtOpen(false)}
+              disabled={wtBusy}
+              className="shrink-0 rounded border px-2 py-1 text-[11px] transition-colors hover:bg-neutral-700/30 disabled:cursor-not-allowed disabled:opacity-40"
+              style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Inline success/failure feedback. */}
       {result?.kind === "ok" && (
         <div className="mt-1 text-[11px]" style={{ color: "var(--th-dot-running)" }}>
@@ -784,6 +905,20 @@ function GitBar({
           title={result.message}
         >
           {result.message}
+        </div>
+      )}
+      {wtResult?.kind === "ok" && (
+        <div className="mt-1 text-[11px]" style={{ color: "var(--th-dot-running)" }}>
+          Worktree created — opened in a new tab.
+        </div>
+      )}
+      {wtResult?.kind === "error" && (
+        <div
+          className="mt-1 break-words text-[11px]"
+          style={{ color: "var(--th-dot-error)" }}
+          title={wtResult.message}
+        >
+          {wtResult.message}
         </div>
       )}
     </div>

@@ -208,6 +208,34 @@ interface WorkspaceState {
    *  failure. */
   recall: (sessionId: string, cwd: string) => Promise<TerminalId | null>;
 
+  // --- Git worktrees (WS-4) ---
+  /** Atomically: create a git worktree at `worktreePath` (via `gitWorktreeAdd`,
+   *  unless `opts.alreadyCreated` says it already exists on disk), open a NEW
+   *  workspace tab, spawn a terminal in the worktree dir, place it in that tab, and
+   *  focus it. The new tab is named after `branch` / the path's final component, or
+   *  `opts.tabName` when given. Reuses the existing spawn path (`spawnTerminal` IPC
+   *  + a fresh tab) so a worktree tile is created exactly like any other tile.
+   *  Returns the new terminal id, or null on failure (a `gitWorktreeAdd` failure
+   *  is propagated so a UI caller can surface git's message; the MCP path passes
+   *  `alreadyCreated` so git has already run). */
+  addWorktreeWorkspace: (
+    repoRoot: string,
+    worktreePath: string,
+    branch?: string,
+    opts?: { tabName?: string; alreadyCreated?: boolean },
+  ) => Promise<TerminalId | null>;
+  /** Remove a git worktree SAFELY: first DETACH every live tile whose cwd is the
+   *  worktree dir (or inside it) — their tmux sessions survive a detach, so no
+   *  process is orphaned — then call `gitWorktreeRemove`. Detaching before git
+   *  tears the dir down is the whole point; a forced removal with live, unsaved
+   *  work is still gated on `force`. Resolves when git has removed the worktree;
+   *  rejects with git's message on failure (the tiles are already detached). */
+  removeWorktreeWorkspace: (
+    repoRoot: string,
+    worktreePath: string,
+    force?: boolean,
+  ) => Promise<void>;
+
   // --- Tabs (PRD §5.2) ---
   /** Create a new empty tab (auto-named) and activate it; returns its id. */
   addTab: () => string;
@@ -873,6 +901,75 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         console.error("recall failed", err);
         return null;
       }
+    },
+
+    // --- Git worktrees (WS-4) -------------------------------------------------
+    // Atomic create→tab→spawn. `gitWorktreeAdd` makes the worktree on disk (unless
+    // it already exists — the MCP path creates it backend-side and passes
+    // `alreadyCreated`), then we open a NEW tab and spawn a terminal in the
+    // worktree dir, placing it in that tab. The same `spawnTerminal` IPC the "+"
+    // menu / recall use creates the tile, so a worktree tile is just a tile. A
+    // `gitWorktreeAdd` failure is PROPAGATED (so a UI caller can show git's message
+    // — e.g. "branch already checked out elsewhere"); a spawn failure is logged and
+    // returns null after the worktree already exists.
+    addWorktreeWorkspace: async (repoRoot, worktreePath, branch, opts) => {
+      const repo = repoRoot.trim();
+      const path = worktreePath.trim();
+      if (!path) return null;
+
+      // 1) Create the worktree on disk unless it already exists (MCP path).
+      if (!opts?.alreadyCreated) {
+        const { gitWorktreeAdd } = await import("../ipc/git");
+        // Let a git failure reject — the caller (FilePanel) surfaces the message.
+        await gitWorktreeAdd(repo, path, branch?.trim() || undefined);
+      }
+
+      // 2) Open a new tab named for the worktree, then spawn a terminal in it.
+      try {
+        const { spawnTerminal } = await import("../ipc/client");
+        const tabId = get().addTab(); // creates + activates a fresh tab
+        const name =
+          opts?.tabName?.trim() ||
+          branch?.trim() ||
+          path.split("/").filter(Boolean).pop() ||
+          "Worktree";
+        get().renameTab(tabId, name);
+
+        const info = await spawnTerminal({ cwd: path, name });
+        // Place the tile in the (now active) worktree tab and focus it. addTab()
+        // activated the tab and cleared focus, so addAfterFocused appends + focuses.
+        get().addAfterFocused(info);
+        return info.id;
+      } catch (err) {
+        console.error("addWorktreeWorkspace: spawn failed", err);
+        return null;
+      }
+    },
+
+    removeWorktreeWorkspace: async (repoRoot, worktreePath, force) => {
+      const repo = repoRoot.trim();
+      const path = worktreePath.trim().replace(/\/+$/, "");
+      if (!path) return;
+
+      // 1) DETACH every live tile whose cwd is the worktree dir (or inside it),
+      // BEFORE git removes the dir. Detaching keeps the tmux session alive (no
+      // orphaned process); the tile just leaves this window's layout. We match on a
+      // path-segment boundary so `/x/wt` does not match `/x/wt-other`.
+      const { terminals } = get();
+      const prefix = path + "/";
+      const victims = Object.values(terminals)
+        .filter((t) => {
+          const cwd = (t.cwd ?? "").replace(/\/+$/, "");
+          return cwd === path || cwd.startsWith(prefix);
+        })
+        .map((t) => t.id);
+      for (const id of victims) get().detachTile(id);
+
+      // 2) Now that no process is rooted in the dir, remove the worktree. A
+      // failure (e.g. uncommitted changes without `force`) rejects with git's
+      // message; the tiles are already safely detached regardless.
+      const { gitWorktreeRemove } = await import("../ipc/git");
+      await gitWorktreeRemove(repo, path, force);
     },
 
     remove: (id) => {

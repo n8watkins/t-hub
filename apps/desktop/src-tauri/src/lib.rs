@@ -368,6 +368,10 @@ pub fn run() {
             // Git awareness for the Files panel: branch/worktree info + commit.
             git::git_info,
             git::git_commit,
+            // WS-4: git worktrees as a first-class primitive (list/add/remove).
+            git::git_worktree_list,
+            git::git_worktree_add,
+            git::git_worktree_remove,
             // ----------------------
             // feat/dev-runner: managed per-project dev server (Dev tab). Self-
             // contained (its own process-global registry; no .manage() needed).

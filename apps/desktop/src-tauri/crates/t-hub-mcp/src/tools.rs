@@ -279,6 +279,37 @@ fn schema_spawn_terminal() -> Value {
     })
 }
 
+/// `create_worktree` schema (WS-4): create a git worktree and open it as a new
+/// workspace tab with a terminal spawned in the worktree dir.
+fn schema_create_worktree() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "repoRoot":     { "type": "string", "description": "Path inside the repo to create the worktree from (any path in the working tree)." },
+            "worktreePath": { "type": "string", "description": "Absolute POSIX path for the new worktree's working-tree dir." },
+            "branch":       { "type": "string", "description": "Optional branch to check out at the worktree (must not be checked out elsewhere). Omitted => git creates a new branch named after the path's final component." },
+            "tabName":      { "type": "string", "description": "Optional name for the new workspace tab (defaults to the branch / final path component)." }
+        },
+        "required": ["repoRoot", "worktreePath"],
+        "additionalProperties": false
+    })
+}
+
+/// `remove_worktree` schema (WS-4): remove a git worktree (its live tiles are
+/// detached first so no process is orphaned).
+fn schema_remove_worktree() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "repoRoot":     { "type": "string", "description": "Path inside the repo the worktree belongs to." },
+            "worktreePath": { "type": "string", "description": "Absolute POSIX path of the worktree to remove." },
+            "force":        { "type": "boolean", "description": "Force removal even with uncommitted changes (git refuses otherwise). Default false." }
+        },
+        "required": ["repoRoot", "worktreePath"],
+        "additionalProperties": false
+    })
+}
+
 /// `set_theme` schema.
 fn schema_set_theme() -> Value {
     json!({
@@ -406,6 +437,18 @@ pub fn catalog() -> Vec<ToolDef> {
             summary: "Open a text file in T-Hub's reader (returns capped contents + metadata).",
             input_schema: schema_open_file,
         },
+        ToolDef {
+            name: "create_worktree",
+            tier: Tier::Organization,
+            summary: "Create a git worktree at a path (optionally a branch), open it as a new workspace tab, and spawn a terminal in the worktree dir.",
+            input_schema: schema_create_worktree,
+        },
+        ToolDef {
+            name: "remove_worktree",
+            tier: Tier::Organization,
+            summary: "Remove a git worktree (detaching any live tiles first so no process is orphaned).",
+            input_schema: schema_remove_worktree,
+        },
         // ---- Theme ------------------------------------------------------
         ToolDef {
             name: "get_theme",
@@ -454,6 +497,8 @@ mod tests {
             "send_keys",
             "close_terminal",
             "open_file",
+            "create_worktree",
+            "remove_worktree",
             "get_theme",
             "set_theme",
         ] {

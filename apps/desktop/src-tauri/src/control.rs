@@ -50,7 +50,7 @@ use serde_json::{json, Value};
 
 use crate::claude::StatusBridge;
 use crate::supervision::Supervisor;
-use crate::{files, tmux};
+use crate::{files, git, tmux};
 
 /// A single control request: a command name + free-form JSON args, authenticated
 /// by the per-launch `token`.
@@ -317,6 +317,11 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "new_tab" => organization_apply(ctx, "new_tab", args),
         "focus_tab" => organization_apply(ctx, "focus_tab", args),
         "open_file" => open_file(ctx, args),
+        // WS-4 git worktrees: create runs git here then forwards the tab+spawn to
+        // the UI; remove forwards to the UI so it detaches live tiles BEFORE git
+        // tears the dir down (no orphaned processes).
+        "create_worktree" => create_worktree(ctx, args),
+        "remove_worktree" => remove_worktree(ctx, args),
 
         // ---- Process-changing tier (PRD §11.2: confirmation required) ------
         // `spawn_terminal` stays gated off (it would create an untracked tmux
@@ -563,6 +568,117 @@ fn open_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let path = arg_str(args, "path").ok_or("open_file requires a 'path' argument")?;
     let contents = files::control_read_text(&ctx.files, &path)?;
     Ok(serde_json::to_value(contents).map_err(|e| e.to_string())?)
+}
+
+/// `create_worktree` (WS-4): create a git worktree, then open it as a new
+/// workspace tab with a terminal spawned in the worktree dir. We run the git
+/// command HERE (mirroring the Tauri `git_worktree_add` exec) so a git failure
+/// (e.g. a branch already checked out elsewhere) is reported up front and nothing
+/// is forwarded to the UI on failure. On success we forward an
+/// `add_worktree_workspace` command to the frontend via the [`ApplySink`]; the
+/// `controlBridge` maps it to the workspace store's atomic create→tab→spawn helper
+/// (`addWorktreeWorkspace`), which is the same path the FilePanel UI uses. The git
+/// worktree already exists by then, so the store SKIPS its own `gitWorktreeAdd` —
+/// the forward carries `alreadyCreated: true`. Args: `repoRoot`, `worktreePath`
+/// (required); `branch`, `tabName` (optional).
+fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let repo_root = arg_str(args, "repoRoot")
+        .or_else(|| arg_str(args, "repo_root"))
+        .ok_or("create_worktree requires a 'repoRoot' argument")?;
+    let worktree_path = arg_str(args, "worktreePath")
+        .or_else(|| arg_str(args, "worktree_path"))
+        .ok_or("create_worktree requires a 'worktreePath' argument")?;
+    let branch = arg_str(args, "branch");
+    let tab_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
+
+    // Create the worktree on disk first (shares git_worktree_add's impl). A git
+    // failure short-circuits here — no tab/terminal is spawned for a failed add.
+    let git_output = git::worktree_add(&repo_root, &worktree_path, branch.as_deref())?;
+
+    // Forward the UI orchestration (new tab + spawn a terminal in the worktree
+    // dir). The git worktree already exists, so `alreadyCreated: true` tells the
+    // store not to run `gitWorktreeAdd` again.
+    let forward = json!({
+        "worktreePath": worktree_path,
+        "repoRoot": repo_root,
+        "branch": branch,
+        "tabName": tab_name,
+        "alreadyCreated": true,
+    });
+    let applied = match &ctx.apply_sink {
+        Some(sink) => match sink.apply("add_worktree_workspace", &forward) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("t-hub-control: failed to forward 'add_worktree_workspace' to the UI: {e}");
+                false
+            }
+        },
+        None => false,
+    };
+    Ok(json!({
+        "accepted": "create_worktree",
+        "worktreePath": worktree_path,
+        "branch": branch,
+        "gitOutput": git_output,
+        "audited": true,
+        "applied": applied,
+        "note": if applied {
+            "worktree created on disk; a new workspace tab + terminal in the \
+             worktree dir are being opened in the UI."
+        } else {
+            "worktree created on disk; the UI tab/terminal forward was not \
+             delivered (headless/no sink)."
+        },
+    }))
+}
+
+/// `remove_worktree` (WS-4): remove a git worktree WITHOUT orphaning processes.
+/// We do NOT run `git worktree remove` here, because any live tiles whose cwd is
+/// inside the worktree must be detached FIRST (their tmux session survives a
+/// detach; killing the dir out from under a running process would orphan it). So
+/// we forward a `remove_worktree_workspace` command to the frontend, which (in the
+/// workspace store) detaches every tile rooted in the worktree dir AND THEN calls
+/// `gitWorktreeRemove` — keeping the detach→remove ordering correct. If no apply
+/// sink is wired (headless), we have no UI to detach tiles, so we refuse rather
+/// than risk an orphan, telling the caller why. Args: `repoRoot`, `worktreePath`
+/// (required); `force` (optional).
+fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let repo_root = arg_str(args, "repoRoot")
+        .or_else(|| arg_str(args, "repo_root"))
+        .ok_or("remove_worktree requires a 'repoRoot' argument")?;
+    let worktree_path = arg_str(args, "worktreePath")
+        .or_else(|| arg_str(args, "worktree_path"))
+        .ok_or("remove_worktree requires a 'worktreePath' argument")?;
+    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let forward = json!({
+        "worktreePath": worktree_path,
+        "repoRoot": repo_root,
+        "force": force,
+    });
+    match &ctx.apply_sink {
+        Some(sink) => {
+            sink.apply("remove_worktree_workspace", &forward).map_err(|e| {
+                format!("remove_worktree: failed to forward removal to the UI: {e}")
+            })?;
+            Ok(json!({
+                "accepted": "remove_worktree",
+                "worktreePath": worktree_path,
+                "force": force,
+                "audited": true,
+                "applied": true,
+                "note": "the UI is detaching any live tiles in the worktree, then \
+                         removing it (git worktree remove) — no process is orphaned.",
+            }))
+        }
+        // No UI to detach tiles ⇒ refuse rather than orphan a process.
+        None => Err(
+            "remove_worktree: no UI is connected to detach the worktree's live \
+             tiles first; refusing to remove it to avoid orphaning a running \
+             process (the app must be running for worktree removal)"
+                .to_string(),
+        ),
+    }
 }
 
 /// Organization-tier actions whose effect is a pure UI mutation
@@ -1034,6 +1150,38 @@ mod tests {
     fn tmux_target_maps_id_and_is_idempotent() {
         assert_eq!(tmux_target("abc"), "th_abc");
         assert_eq!(tmux_target("th_abc"), "th_abc");
+    }
+
+    #[test]
+    fn remove_worktree_requires_args() {
+        let ctx = test_ctx("t");
+        let err = dispatch(&ctx, "remove_worktree", &json!({"worktreePath": "/x"})).unwrap_err();
+        assert!(err.contains("repoRoot"), "got: {err}");
+        let err = dispatch(&ctx, "remove_worktree", &json!({"repoRoot": "/r"})).unwrap_err();
+        assert!(err.contains("worktreePath"), "got: {err}");
+    }
+
+    #[test]
+    fn remove_worktree_without_sink_refuses_to_orphan() {
+        // No apply sink (headless): we have no UI to detach the worktree's tiles,
+        // so removal is refused rather than risk orphaning a running process.
+        let ctx = test_ctx("t");
+        let err = dispatch(
+            &ctx,
+            "remove_worktree",
+            &json!({"repoRoot": "/r", "worktreePath": "/r/wt"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("orphan"), "got: {err}");
+    }
+
+    #[test]
+    fn create_worktree_requires_args() {
+        let ctx = test_ctx("t");
+        let err = dispatch(&ctx, "create_worktree", &json!({"worktreePath": "/x"})).unwrap_err();
+        assert!(err.contains("repoRoot"), "got: {err}");
+        let err = dispatch(&ctx, "create_worktree", &json!({"repoRoot": "/r"})).unwrap_err();
+        assert!(err.contains("worktreePath"), "got: {err}");
     }
 
     #[test]

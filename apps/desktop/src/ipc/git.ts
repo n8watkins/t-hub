@@ -11,6 +11,12 @@ export const CommandsGit = {
   gitInfo: "git_info",
   /** Stage all + commit with a message. → new short hash (or git output) */
   gitCommit: "git_commit",
+  /** List the worktrees of the repo containing a cwd. → WorktreeInfo[] (WS-4) */
+  gitWorktreeList: "git_worktree_list",
+  /** Create/check out a worktree at a path (optionally a branch). → git output */
+  gitWorktreeAdd: "git_worktree_add",
+  /** Remove the worktree at a path (optionally forced). → void */
+  gitWorktreeRemove: "git_worktree_remove",
 } as const;
 
 /**
@@ -42,4 +48,55 @@ export function gitInfo(cwd: string): Promise<GitInfo> {
  */
 export function gitCommit(cwd: string, message: string): Promise<string> {
   return invoke(CommandsGit.gitCommit, { cwd, message });
+}
+
+/**
+ * One worktree of a repository (WS-4). Mirrors the Rust `WorktreeInfo` struct.
+ * The main worktree is reported first with `isLinked: false`; every linked
+ * worktree (`git worktree add`) has `isLinked: true`.
+ */
+export interface WorktreeInfo {
+  /** Absolute working-tree path of this worktree (POSIX inside WSL). */
+  path: string;
+  /** Short branch name checked out here, or null (detached / bare). */
+  branch: string | null;
+  /** True for a linked worktree; false for the main one. */
+  isLinked: boolean;
+}
+
+/**
+ * List the worktrees attached to the repo containing `cwd`. Best-effort: a
+ * non-repo (or unreadable dir) resolves to an empty list rather than rejecting.
+ */
+export function gitWorktreeList(cwd: string): Promise<WorktreeInfo[]> {
+  return invoke(CommandsGit.gitWorktreeList, { cwd });
+}
+
+/**
+ * Create (or check out into) a worktree at `path` for the repo containing `cwd`
+ * (`git worktree add <path> [branch]`). With `branch`, checks that branch out;
+ * without, git creates a new branch from the path's final component. Resolves to
+ * git's output; rejects with a clear message if the branch is already checked out
+ * in another worktree, or on any other git failure.
+ */
+export function gitWorktreeAdd(
+  cwd: string,
+  path: string,
+  branch?: string,
+): Promise<string> {
+  return invoke(CommandsGit.gitWorktreeAdd, { cwd, path, branch });
+}
+
+/**
+ * Remove the worktree at `path` from the repo containing `cwd`
+ * (`git worktree remove [--force] <path>`). git refuses a worktree with
+ * uncommitted changes unless `force` is true. Rejects with git's message on
+ * failure.
+ */
+export function gitWorktreeRemove(
+  cwd: string,
+  path: string,
+  force?: boolean,
+): Promise<void> {
+  return invoke(CommandsGit.gitWorktreeRemove, { cwd, path, force });
 }

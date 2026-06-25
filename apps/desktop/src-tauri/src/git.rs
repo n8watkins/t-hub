@@ -58,6 +58,22 @@ impl GitInfo {
     }
 }
 
+/// One entry from `git worktree list --porcelain` (WS-4). Serialized camelCase to
+/// mirror the TS `WorktreeInfo` interface in `src/ipc/git.ts`. `path` is the
+/// worktree's working-tree dir (a POSIX path inside WSL); `branch` is the short
+/// branch name (e.g. `feat/x`) or `None` on a detached/bare entry; `is_linked` is
+/// true for every entry except the main worktree (the first one git reports).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeInfo {
+    /// Absolute working-tree path of this worktree (POSIX inside WSL).
+    pub path: String,
+    /// Short branch name checked out here, or `None` (detached / bare).
+    pub branch: Option<String>,
+    /// True for a linked worktree (`git worktree add`); false for the main one.
+    pub is_linked: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Platform plumbing: run a `git -C <cwd> <args...>` invocation and capture
 // stdout. On unix this is a direct spawn; on Windows it shells into WSL.
@@ -148,6 +164,95 @@ fn is_linked_worktree(git_dir: Option<&str>, git_common_dir: Option<&str>) -> bo
     match (git_dir, git_common_dir) {
         (Some(g), Some(c)) => g.trim() != c.trim(),
         _ => false,
+    }
+}
+
+/// Parse `git worktree list --porcelain` into a list of [`WorktreeInfo`]. The
+/// porcelain format emits one record per worktree, records separated by a blank
+/// line; within a record each attribute is a line:
+/// ```text
+/// worktree /home/u/repo
+/// HEAD <sha>
+/// branch refs/heads/main
+///
+/// worktree /home/u/repo-feat
+/// HEAD <sha>
+/// branch refs/heads/feat/x
+/// ```
+/// A detached worktree omits the `branch` line (and carries a `detached` line); a
+/// bare repo carries a `bare` line. We map `branch refs/heads/<name>` to the short
+/// `<name>` and leave `branch: None` otherwise. The FIRST entry git reports is the
+/// main worktree (`is_linked: false`); every later entry is a linked worktree.
+fn parse_worktree_list(stdout: &str) -> Vec<WorktreeInfo> {
+    let mut out = Vec::new();
+    let mut path: Option<String> = None;
+    let mut branch: Option<String> = None;
+
+    // Flush the in-progress record (if it has a path) into `out`, marking it
+    // linked iff it isn't the first record we've seen.
+    let mut flush = |path: &mut Option<String>, branch: &mut Option<String>, out: &mut Vec<WorktreeInfo>| {
+        if let Some(p) = path.take() {
+            let is_linked = !out.is_empty();
+            out.push(WorktreeInfo {
+                path: p,
+                branch: branch.take(),
+                is_linked,
+            });
+        } else {
+            // No path => nothing to flush, but still clear any stray branch.
+            *branch = None;
+        }
+    };
+
+    for line in stdout.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            // Blank line: record separator.
+            flush(&mut path, &mut branch, &mut out);
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("worktree ") {
+            // A new `worktree` line begins a new record; flush any prior one that
+            // wasn't terminated by a blank line (defensive — git always blanks).
+            flush(&mut path, &mut branch, &mut out);
+            path = Some(p.trim().to_string());
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            // `branch refs/heads/<name>` -> short `<name>`; tolerate a bare ref.
+            let short = b
+                .trim()
+                .strip_prefix("refs/heads/")
+                .unwrap_or_else(|| b.trim())
+                .to_string();
+            if !short.is_empty() {
+                branch = Some(short);
+            }
+        }
+        // Other attribute lines (HEAD/detached/bare/locked/prunable) don't affect
+        // the fields we surface.
+    }
+    // Flush a trailing record with no terminating blank line.
+    flush(&mut path, &mut branch, &mut out);
+    out
+}
+
+/// Extract the branch name a `git worktree add` failure says is already checked
+/// out elsewhere, so the surfaced error can name it. git phrases this as e.g.
+/// `fatal: 'feat/x' is already checked out at '/path'`. Returns the unquoted
+/// branch if the message matches, else `None`.
+fn already_checked_out_branch(stderr: &str) -> Option<String> {
+    let lower = stderr.to_lowercase();
+    if !lower.contains("already checked out") && !lower.contains("already used by worktree") {
+        return None;
+    }
+    // Pull the first single-quoted token (git quotes the branch/ref first).
+    let start = stderr.find('\'')? + 1;
+    let rest = &stderr[start..];
+    let end = rest.find('\'')?;
+    let name = &rest[..end];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
     }
 }
 
@@ -255,6 +360,121 @@ pub async fn git_commit(cwd: String, message: String) -> Result<String, String> 
 }
 
 // ---------------------------------------------------------------------------
+// Worktree commands (WS-4). Mirror `git_commit`'s exec pattern exactly: shell out
+// to git via `run_git` (wsl.exe `--cd` on Windows, direct `.current_dir` on unix),
+// passing each argument as its own argv entry so paths/branches with shell
+// metacharacters are safe. They do NOT route through the agent protocol.
+// ---------------------------------------------------------------------------
+
+/// List the worktrees attached to the repository containing `cwd` (parses
+/// `git worktree list --porcelain`). Returns the main worktree first
+/// (`isLinked: false`) followed by every linked worktree. A non-repo (or an
+/// unreadable dir) yields an empty list rather than erroring, so the UI can stay
+/// quiet; only a genuine spawn failure surfaces as `Err`.
+#[tauri::command]
+pub async fn git_worktree_list(cwd: String) -> Result<Vec<WorktreeInfo>, String> {
+    match run_git(&cwd, &["worktree", "list", "--porcelain"]) {
+        Ok((true, stdout, _)) => Ok(parse_worktree_list(&stdout)),
+        // Not a repo / no worktrees / git unavailable: empty list (best-effort).
+        Ok((false, _, _)) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Create (or check out into) a worktree at `path` for the repo containing `cwd`.
+/// Runs `git worktree add <path> [branch]`:
+///   - with `branch`: checks that branch out at `path` (it must exist and not be
+///     checked out elsewhere — git refuses a branch already used by a worktree);
+///   - without `branch`: git creates a new branch named after the final path
+///     component (its default behavior) and checks it out at `path`.
+/// Returns git's output on success. On the common "branch already checked out
+/// elsewhere" failure we surface a CLEAR, named error (the path is a POSIX path
+/// inside WSL; each arg is its own argv entry, so spaces/metacharacters are safe).
+#[tauri::command]
+pub async fn git_worktree_add(
+    cwd: String,
+    path: String,
+    branch: Option<String>,
+) -> Result<String, String> {
+    worktree_add(&cwd, &path, branch.as_deref())
+}
+
+/// Synchronous core of [`git_worktree_add`], shared with the MCP control channel
+/// (`control::create_worktree`) so both call exactly one implementation.
+pub(crate) fn worktree_add(cwd: &str, path: &str, branch: Option<&str>) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("worktree path is empty".to_string());
+    }
+
+    // Build argv: `worktree add <path> [branch]`. Each is a distinct argv entry.
+    let mut args: Vec<&str> = vec!["worktree", "add", path];
+    let branch_trimmed = branch.map(str::trim).filter(|b| !b.is_empty());
+    if let Some(b) = branch_trimmed {
+        args.push(b);
+    }
+
+    let (ok, stdout, stderr) = run_git(cwd, &args)?;
+    if !ok {
+        // Name the branch git says is already checked out elsewhere, when it is.
+        if let Some(b) = already_checked_out_branch(&stderr) {
+            return Err(format!(
+                "git worktree add failed: branch '{b}' is already checked out in \
+                 another worktree (a branch can be checked out in only one \
+                 worktree at a time). Pick a different branch or remove the other \
+                 worktree first."
+            ));
+        }
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
+        return Err(format!("git worktree add failed: {detail}"));
+    }
+    Ok(stdout.trim().to_string())
+}
+
+/// Remove the worktree at `path` from the repo containing `cwd`
+/// (`git worktree remove [--force] <path>`). git refuses to remove a worktree with
+/// uncommitted changes unless `force` is set; we surface git's own message on
+/// failure. Idempotency is left to git (a missing worktree is an error, reported
+/// verbatim). Each arg is its own argv entry.
+#[tauri::command]
+pub async fn git_worktree_remove(
+    cwd: String,
+    path: String,
+    force: Option<bool>,
+) -> Result<(), String> {
+    worktree_remove(&cwd, &path, force.unwrap_or(false))
+}
+
+/// Synchronous core of [`git_worktree_remove`], shared with the MCP control
+/// channel (`control::remove_worktree`).
+pub(crate) fn worktree_remove(cwd: &str, path: &str, force: bool) -> Result<(), String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("worktree path is empty".to_string());
+    }
+    let mut args: Vec<&str> = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(path);
+
+    let (ok, stdout, stderr) = run_git(cwd, &args)?;
+    if !ok {
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
+        return Err(format!("git worktree remove failed: {detail}"));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests (pure parsing helpers; runnable on Linux).
 // ---------------------------------------------------------------------------
 
@@ -311,5 +531,81 @@ mod tests {
         assert_eq!(info.worktree_root, None);
         assert!(!info.is_linked_worktree);
         assert_eq!(info.dirty_count, 0);
+    }
+
+    #[test]
+    fn parse_worktree_list_marks_main_then_linked() {
+        let out = "\
+worktree /home/u/repo
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+worktree /home/u/repo-feat
+HEAD 2222222222222222222222222222222222222222
+branch refs/heads/feat/x
+";
+        let wts = parse_worktree_list(out);
+        assert_eq!(wts.len(), 2);
+        assert_eq!(wts[0].path, "/home/u/repo");
+        assert_eq!(wts[0].branch.as_deref(), Some("main"));
+        assert!(!wts[0].is_linked, "first entry is the main worktree");
+        assert_eq!(wts[1].path, "/home/u/repo-feat");
+        assert_eq!(wts[1].branch.as_deref(), Some("feat/x"));
+        assert!(wts[1].is_linked, "later entries are linked worktrees");
+    }
+
+    #[test]
+    fn parse_worktree_list_handles_detached_and_bare() {
+        // A bare repo entry (no branch) then a detached worktree (HEAD + detached,
+        // no branch line). Neither should carry a branch.
+        let out = "\
+worktree /home/u/repo.git
+bare
+
+worktree /home/u/detached
+HEAD 3333333333333333333333333333333333333333
+detached
+";
+        let wts = parse_worktree_list(out);
+        assert_eq!(wts.len(), 2);
+        assert_eq!(wts[0].path, "/home/u/repo.git");
+        assert_eq!(wts[0].branch, None);
+        assert!(!wts[0].is_linked);
+        assert_eq!(wts[1].path, "/home/u/detached");
+        assert_eq!(wts[1].branch, None);
+        assert!(wts[1].is_linked);
+    }
+
+    #[test]
+    fn parse_worktree_list_empty_input() {
+        assert!(parse_worktree_list("").is_empty());
+        assert!(parse_worktree_list("\n\n").is_empty());
+    }
+
+    #[test]
+    fn parse_worktree_list_trailing_record_without_blank() {
+        // No terminating blank line on the last record (defensive flush).
+        let out = "worktree /home/u/repo\nbranch refs/heads/dev";
+        let wts = parse_worktree_list(out);
+        assert_eq!(wts.len(), 1);
+        assert_eq!(wts[0].path, "/home/u/repo");
+        assert_eq!(wts[0].branch.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn already_checked_out_branch_names_the_branch() {
+        let stderr = "fatal: 'feat/x' is already checked out at '/home/u/repo-feat'\n";
+        assert_eq!(
+            already_checked_out_branch(stderr).as_deref(),
+            Some("feat/x")
+        );
+        // The "already used by worktree" phrasing is also recognized.
+        let alt = "fatal: 'main' is already used by worktree at '/home/u/repo'\n";
+        assert_eq!(already_checked_out_branch(alt).as_deref(), Some("main"));
+        // An unrelated failure returns None (so we fall back to git's message).
+        assert_eq!(
+            already_checked_out_branch("fatal: not a git repository"),
+            None
+        );
     }
 }

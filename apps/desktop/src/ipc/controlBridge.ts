@@ -80,6 +80,40 @@ export function applyControl(command: string, args: ControlApply["args"]): void 
       return;
     }
 
+    case "add_worktree_workspace": {
+      // WS-4: the backend already created the git worktree (create_worktree ran
+      // `git worktree add` before forwarding), so the store skips its own
+      // gitWorktreeAdd via `alreadyCreated`. We just open the tab + spawn a
+      // terminal in the worktree dir. Best-effort: a spawn failure is swallowed
+      // by addWorktreeWorkspace (logged, returns null) so the listener never throws.
+      const worktreePath = str(args, "worktreePath") ?? str(args, "worktree_path");
+      if (!worktreePath) return;
+      const repoRoot = str(args, "repoRoot") ?? str(args, "repo_root") ?? "";
+      const branch = str(args, "branch");
+      const tabName = str(args, "tabName") ?? str(args, "tab_name");
+      void ws
+        .addWorktreeWorkspace(repoRoot, worktreePath, branch, {
+          tabName,
+          alreadyCreated: true,
+        })
+        .catch((e) => console.error("add_worktree_workspace failed", e));
+      return;
+    }
+
+    case "remove_worktree_workspace": {
+      // WS-4: detach any live tiles in the worktree dir (no orphaned process),
+      // then `git worktree remove`. The backend forwarded this INSTEAD of running
+      // git itself so the detach happens before the dir is torn down.
+      const worktreePath = str(args, "worktreePath") ?? str(args, "worktree_path");
+      if (!worktreePath) return;
+      const repoRoot = str(args, "repoRoot") ?? str(args, "repo_root") ?? "";
+      const force = args?.force === true;
+      void ws
+        .removeWorktreeWorkspace(repoRoot, worktreePath, force)
+        .catch((e) => console.error("remove_worktree_workspace failed", e));
+      return;
+    }
+
     case "focus_session": {
       // MCP schema: { sessionId } -> switch to the session's tab and focus its
       // tile. The id may name a terminal/tile id, the owning tab's id, or a tab
