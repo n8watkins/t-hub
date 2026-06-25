@@ -756,8 +756,13 @@ export function TerminalView({
             unlisteners.push(offOutput);
 
             const offExit = await onExit((e) => {
-              if (e.id === terminalId && !disposed)
+              if (e.id === terminalId && !disposed) {
+                // Flush any queued output FIRST so the process's final bytes land
+                // before the banner — the rAF queue could otherwise write them
+                // AFTER this synchronous writeln (out of order).
+                drainQueue();
                 term.writeln("\r\n[process exited]");
+              }
             });
             if (disposed) {
               void offExit();

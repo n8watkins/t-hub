@@ -64,6 +64,16 @@ const GIT_INFO_TTL: Duration = Duration::from_millis(3500);
 static GIT_INFO_CACHE: LazyLock<Mutex<HashMap<String, (Instant, GitInfo)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Drop any cached `git_info` for `cwd` so the next poll re-runs git. Called after
+/// a mutation (commit / worktree add+remove) that changes what `git_info` reports —
+/// otherwise the TTL cache would serve a stale answer (e.g. the pre-commit dirty
+/// count) for up to `GIT_INFO_TTL` after the change.
+fn invalidate_git_info_cache(cwd: &str) {
+    if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
+        guard.remove(cwd);
+    }
+}
+
 impl GitInfo {
     /// The "not a git repo" answer the commands fall back to (best-effort: a
     /// missing dir, a non-repo, or git not on PATH all collapse to this).
@@ -490,6 +500,10 @@ pub async fn git_commit(cwd: String, message: String) -> Result<String, String> 
         return Err(format!("git commit failed: {detail}"));
     }
 
+    // The dirty count just changed — drop the stale cache entry so the UI's
+    // immediate post-commit refresh re-runs git instead of serving the old count.
+    invalidate_git_info_cache(&cwd);
+
     // Report the new short hash so the UI can confirm the commit.
     match run_git(&cwd, &["rev-parse", "--short", "HEAD"]) {
         Ok((true, out, _)) => Ok(first_line_opt(&out).unwrap_or_else(|| stdout.trim().to_string())),
@@ -571,6 +585,10 @@ pub(crate) fn worktree_add(cwd: &str, path: &str, branch: Option<&str>) -> Resul
         };
         return Err(format!("git worktree add failed: {detail}"));
     }
+    // The new worktree dir is now a repo (and the source repo's worktree set
+    // changed) — drop any cached git_info for both so a fresh poll is accurate.
+    invalidate_git_info_cache(cwd);
+    invalidate_git_info_cache(path);
     Ok(stdout.trim().to_string())
 }
 
@@ -610,6 +628,9 @@ pub(crate) fn worktree_remove(cwd: &str, path: &str, force: bool) -> Result<(), 
         };
         return Err(format!("git worktree remove failed: {detail}"));
     }
+    // The worktree is gone — drop any cached git_info for it and the source repo.
+    invalidate_git_info_cache(cwd);
+    invalidate_git_info_cache(path);
     Ok(())
 }
 
