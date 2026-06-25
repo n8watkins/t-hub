@@ -16,11 +16,26 @@ import { create } from "zustand";
 import type { TerminalInfo, TerminalId, TerminalState } from "../ipc/types";
 import { usePanels } from "./panels";
 import { useTheme } from "./theme";
+import { useSupervision } from "./supervision";
+import { useSessionContext, sessionNameForTerminal } from "./sessionContext";
+import { useActivity } from "./activity";
 
 /**
  * Clean up the per-tile side state that lives OUTSIDE this store when a
- * terminal's tile goes away for good (detach / delete / close-tab):
+ * terminal's tile goes away for good (detach / delete / close-tab). This is the
+ * SINGLE close-cleanup hub: every per-terminal / per-session map keyed by an id
+ * that is minted fresh per spawn must be pruned here or it grows forever (the
+ * perf-audit leak). Covers:
  *   - the per-tile panel state (active view, detected/typed URLs) in usePanels;
+ *   - the per-terminal color overrides in useTheme;
+ *   - this store's own per-terminal LABEL maps (labels / userLabels /
+ *     claudeTitles — userLabels is persisted, so its prune is persisted too);
+ *   - the supervision store's session-keyed maps (trees / statuses / snapshots /
+ *     sessionIdByTmux) via its `remove(sessionId)`, resolving the session from
+ *     this terminal's `th_<id>` tmux name through the reverse index;
+ *   - the context-meter reading (useSessionContext.forget);
+ *   - the output-activity entry + its idle timer (useActivity.forget);
+ *   - the DevTab module-level state + its live backend listener (forgetDevState);
  *   - any managed dev server still running for it (a fire-and-forget Tauri call,
  *     dynamically imported so the store stays web/test-safe — a no-op if there's
  *     no dev server for this id or no Tauri runtime).
@@ -34,11 +49,65 @@ function cleanupTileSideState(id: TerminalId): void {
   useTheme.getState().clearTermFocusRing(id);
   // (The cosmetic work name is keyed by CWD, not terminal id, so it is durable —
   // intentionally NOT cleared here; it persists with the project.)
+
+  // Prune THIS store's per-terminal label maps so they don't grow once per
+  // spawned terminal. userLabels is persisted, so dropping it here keeps the
+  // saved snapshot from accumulating dead ids too. Done via setState (we're a
+  // module-level helper, not inside the store closure); persisting is left to the
+  // caller's own persist() in remove()/closeTab().
+  forgetTerminalLabels(id);
+
+  // Supervision store: its trees/statuses/snapshots/sessionIdByTmux are keyed by
+  // Claude session id (a fresh UUID per spawn/resume) and were never pruned. The
+  // tile only knows its terminal id, so resolve the session via the reverse index
+  // sessionIdByTmux[`th_<id>`] (the tmux session T-Hub gives every terminal),
+  // then drop it. No-op when this terminal never ran a Claude session.
+  const sup = useSupervision.getState();
+  const sessionId = sup.sessionIdByTmux[sessionNameForTerminal(id)];
+  if (sessionId) sup.remove(sessionId);
+
+  // Context-meter reading (keyed by `th_<id>` session name) and output-activity
+  // entry (keyed by terminal id, + its idle timer) — both grow per spawn.
+  useSessionContext.getState().forget(id);
+  useActivity.getState().forget(id);
+
+  // DevTab module-level state + its live backend listener. Dynamic import keeps
+  // the store from eagerly pulling a React component module and stays web/test
+  // safe (same pattern as the devserver stop below).
+  void import("../components/DevTab")
+    .then((m) => m.forgetDevState(id))
+    .catch(() => {
+      /* DevTab never loaded for this id, or no runtime — nothing to forget */
+    });
+
   void import("../ipc/devserver")
     .then((m) => m.stopDevServer(id))
     .catch(() => {
       /* no dev server for this id, or no Tauri runtime — nothing to stop */
     });
+}
+
+/**
+ * Delete a terminal's entries from all three label maps (effective `labels`, the
+ * persisted `userLabels` source of truth, and the live `claudeTitles`). A module
+ * helper rather than a store action because `cleanupTileSideState` runs outside
+ * the store closure; it writes via setState and no-ops when nothing is keyed
+ * under `id` (so it never thrashes subscribers on the common no-label close).
+ */
+function forgetTerminalLabels(id: TerminalId): void {
+  const { labels, userLabels, claudeTitles } = useWorkspace.getState();
+  if (!(id in labels) && !(id in userLabels) && !(id in claudeTitles)) return;
+  const nextLabels = { ...labels };
+  const nextUser = { ...userLabels };
+  const nextClaude = { ...claudeTitles };
+  delete nextLabels[id];
+  delete nextUser[id];
+  delete nextClaude[id];
+  useWorkspace.setState({
+    labels: nextLabels,
+    userLabels: nextUser,
+    claudeTitles: nextClaude,
+  });
 }
 
 /**

@@ -96,6 +96,12 @@ function freshState(): DevState {
 const states = new Map<TerminalId, DevState>();
 /** Per-terminal subscriber callbacks (the mounted DevTab's re-render trigger). */
 const listeners = new Map<TerminalId, Set<() => void>>();
+/** Per-terminal backend dev-server unlisten handle. The subscription is attached
+ *  once per terminal (see the effect below) and deliberately NOT torn down on a
+ *  DevTab unmount (the process outlives the view). Stored here so the real
+ *  teardown — `forgetDevState`, called when the tile is gone for good — can
+ *  detach it and stop the channel leaking for the app's lifetime. */
+const unlisteners = new Map<TerminalId, () => void>();
 
 function getState(id: TerminalId): DevState {
   let s = states.get(id);
@@ -131,6 +137,32 @@ function subscribe(id: TerminalId, cb: () => void): () => void {
   return () => {
     subs?.delete(cb);
   };
+}
+
+/**
+ * Real teardown for a terminal's dev-server bookkeeping, called when its tile is
+ * gone for good (close / detach / close-tab — via workspace.ts
+ * `cleanupTileSideState`). The backend process is stopped separately on that same
+ * path (`stopDevServer`); here we drop the FRONTEND state that the
+ * "process outlives the view" model otherwise keeps forever:
+ *   - detach this terminal's live backend event listener (the subscription is
+ *     attached once and intentionally NOT removed on unmount), and
+ *   - delete its `states` / `listeners` / `unlisteners` map entries so none of
+ *     these module-level maps grow once per spawned terminal.
+ * Idempotent and safe to call for a terminal that never opened its Dev tab.
+ */
+export function forgetDevState(id: TerminalId): void {
+  const un = unlisteners.get(id);
+  if (un) {
+    try {
+      un();
+    } catch {
+      /* listener already gone / no Tauri runtime — nothing to detach */
+    }
+    unlisteners.delete(id);
+  }
+  states.delete(id);
+  listeners.delete(id);
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +234,6 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
   useEffect(() => {
     if (state.subscribed) return;
     update(terminalId, { subscribed: true });
-    let unlisten: (() => void) | null = null;
     let disposed = false;
     void onDevServerEvent(terminalId, (e: DevServerEvent) => {
       handleEvent(terminalId, e);
@@ -210,17 +241,19 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
       if (disposed) {
         un();
       } else {
-        unlisten = un;
+        // Stash the live unlisten at module level so the real teardown
+        // (forgetDevState, on tile close) can detach it — the component unmount
+        // below deliberately keeps it attached.
+        unlisteners.set(terminalId, un);
       }
     });
     return () => {
       // We intentionally do NOT unsubscribe on unmount: the process outlives the
       // view, and re-subscribing on every tab switch would risk missing lines in
       // the gap. The listener is torn down only if the tile is truly gone, which
-      // the panel handles via usePanels.forget; here we just stop the pending
-      // attach if it hasn't resolved yet.
+      // the workspace close path handles via forgetDevState; here we just stop the
+      // pending attach if it hasn't resolved yet.
       disposed = true;
-      void unlisten; // keep the live listener; see comment above.
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [terminalId]);

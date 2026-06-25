@@ -23,6 +23,12 @@ interface ActivityState {
   /** Record an output chunk for `id`. Safe to call on every chunk (throttled
    *  internally to two state writes per active burst). */
   bump: (id: string) => void;
+  /** Drop a terminal's activity entry when its tile goes away for good (close /
+   *  detach / close-tab). `active[id]` is set on every output chunk and only ever
+   *  flipped to false (never deleted), so without this it grows once per spawned
+   *  terminal. Deletes the `active[id]` key and clears any pending idle timer so a
+   *  late-firing timeout can't resurrect a stale key after the tile is gone. */
+  forget: (id: string) => void;
 }
 
 /** Per-terminal idle timers. Module-level (not in the store) so resetting them on
@@ -48,5 +54,20 @@ export const useActivity = create<ActivityState>((set, get) => ({
     if (!get().active[id]) {
       set((s) => ({ active: { ...s.active, [id]: true } }));
     }
+  },
+  forget: (id) => {
+    // Clear any pending idle timer so it can't fire after teardown and re-seed
+    // the key we're about to delete.
+    const t = idleTimers.get(id);
+    if (t) {
+      clearTimeout(t);
+      idleTimers.delete(id);
+    }
+    if (!(id in get().active)) return; // nothing to drop (avoid a redundant write)
+    set((s) => {
+      const active = { ...s.active };
+      delete active[id];
+      return { active };
+    });
   },
 }));

@@ -64,6 +64,15 @@ interface SessionContextState {
    *  ALWAYS also by cwd when present (fallback for tiles that can't match the
    *  session). No-op unless it has a context % and at least one usable key. */
   ingest: (snap: StatusSnapshotWire) => void;
+  /** Drop a terminal's context reading when its tile goes away for good (close /
+   *  detach / close-tab). Deletes the `bySession` entry for the terminal's
+   *  `th_<id>` session name so this map can't grow without bound across spawns.
+   *  Leaves `byCwd` untouched: it is keyed by NORMALIZED project directory, not
+   *  per-terminal, so it is bounded by the set of project dirs the user opens
+   *  (and a re-opened dir simply overwrites its single entry) — pruning it on a
+   *  tile close could also drop a reading another live tile in the same dir still
+   *  reads via the fallback path. */
+  forget: (terminalId: string) => void;
 }
 
 export const useSessionContext = create<SessionContextState>((set) => ({
@@ -99,6 +108,14 @@ export const useSessionContext = create<SessionContextState>((set) => ({
         }
       }
       return next;
+    }),
+  forget: (terminalId) =>
+    set((s) => {
+      const session = sessionNameForTerminal(terminalId);
+      if (!(session in s.bySession)) return s; // nothing filed under this session
+      const bySession = { ...s.bySession };
+      delete bySession[session];
+      return { bySession };
     }),
 }));
 
