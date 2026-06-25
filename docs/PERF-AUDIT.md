@@ -43,8 +43,10 @@ Verified: cargo build + 159 lib tests + tsc all green. Runtime smoke-test still 
 
 Plus 2 review-caught regressions fixed (`11158ae`): git-cache invalidation on commit/worktree, and draining output before the exit banner. Verified: cargo build + 170 lib tests + tsc all green. Runtime smoke-test still pending.
 
-### Tier 3 — smaller
-6. Drop `claude_usage` to 1–2 attempts / longer backoff; gate `tlog` behind a debug flag (per-frame `console.log` + `invoke`); consider throttling output processing for hidden-tab terminals.
+### Tier 3 — smaller ✅ MOSTLY DONE (`e888a7d`)
+6. ✅ `claude_usage` 3→2 attempts; ✅ `tlog` gated behind a runtime debug flag (default off). ⏳ **Deferred:** throttling hidden-tab output — higher-risk on the just-validated `Terminal.tsx` hot path, low marginal benefit after Tier 1's coalescing; revisit only if profiling shows it's still needed.
+
+> A Tier-2 review (`c438c71`) caught + fixed a HIGH regression: SessionEnd eviction ran before the UI emit → ended sessions showed "unknown". Fixed by keeping the entry and letting the LRU cap age it out.
 
 ## Idea — tray "recovery / WSL" submenu (backlog)
 A tray affordance to recover from a wedged state without a full reboot, at increasing granularity: **reconnect agent bridge** (cheap) → **restart the `t-hub` tmux server** (kills only T-Hub's terminals) → **reclaim WSL memory now** (`drop_caches`) → **full `wsl --shutdown`** (confirm-gated, nukes all WSL). Useful as a safety hatch; the better fix is removing the *need* for it via Tier 1–2.
