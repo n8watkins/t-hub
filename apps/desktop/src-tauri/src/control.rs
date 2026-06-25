@@ -299,6 +299,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // ---- Read tier (PRD §11.2: allowed) --------------------------------
         "list_terminals" => list_terminals(),
         "get_status" => get_status(ctx, args),
+        "wait_for_status" => wait_for_status(ctx, args),
         "supervision_tree" => supervision_tree(ctx, args),
         "wsl_health" => wsl_health(ctx),
         "search_files" => search_files(ctx, args),
@@ -389,6 +390,88 @@ fn get_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         "status": status,
         "snapshot": snapshot,
     }))
+}
+
+/// `wait_for_status`: long-poll the supervision reducer until a session reaches a
+/// target FR-012 status (or a timeout). The reducer is snapshot-only (no
+/// subscription/condvar), so this polls `status()` every 500ms — releasing the
+/// supervisor mutex between reads (each `with_supervisor` acquires + drops it) and
+/// sleeping *outside* the lock. Blocking this control connection's thread for up
+/// to `timeoutMs` is expected: connections are handled per-connection.
+///
+/// Args: `sessionId` (required), `targetStatus` (required; a camelCase status
+/// string or an array of them — matches any), `timeoutMs` (optional, default
+/// 30000). Returns `{ finalStatus, elapsedMs, timedOut }`. Statuses are compared
+/// by serializing [`SessionStatus`] to its camelCase string, so the target
+/// strings match the `get_status` / IPC representation exactly.
+fn wait_for_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let session_id = arg_str(args, "sessionId")
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("wait_for_status requires a 'sessionId' argument")?;
+    let targets = parse_target_statuses(args)?;
+    let timeout = std::time::Duration::from_millis(
+        args.get("timeoutMs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30000),
+    );
+
+    let started = std::time::Instant::now();
+    loop {
+        let status = ctx.with_supervisor(|s| s.status(&session_id));
+        let status_str = status_camel(status);
+        let elapsed = started.elapsed();
+        if targets.iter().any(|t| t == &status_str) {
+            return Ok(json!({
+                "finalStatus": status_str,
+                "elapsedMs": elapsed.as_millis() as u64,
+                "timedOut": false,
+            }));
+        }
+        if elapsed >= timeout {
+            return Ok(json!({
+                "finalStatus": status_str,
+                "elapsedMs": elapsed.as_millis() as u64,
+                "timedOut": true,
+            }));
+        }
+        // Mutex is already released (with_supervisor drops it per call); sleep
+        // outside the lock so the reducer keeps advancing while we wait.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Serialize a [`SessionStatus`] to its camelCase wire string (e.g. "completed",
+/// "needsQuestion"), matching the `get_status` / IPC representation. The enum is
+/// `#[serde(rename_all = "camelCase")]`, so it serializes to a bare JSON string.
+fn status_camel(status: crate::model::SessionStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Parse `targetStatus` into a non-empty set of camelCase status strings. Accepts
+/// a single string or an array of strings (matches any).
+fn parse_target_statuses(args: &Value) -> Result<Vec<String>, String> {
+    let raw = args
+        .get("targetStatus")
+        .ok_or("wait_for_status requires a 'targetStatus' argument (string or array of strings)")?;
+    let targets: Vec<String> = match raw {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => {
+            return Err(
+                "wait_for_status 'targetStatus' must be a string or an array of strings".into(),
+            )
+        }
+    };
+    if targets.is_empty() {
+        return Err("wait_for_status 'targetStatus' must not be empty".into());
+    }
+    Ok(targets)
 }
 
 /// `supervision_tree`: the read-only orchestrator→subagent tree for one session.
@@ -849,6 +932,59 @@ mod tests {
         let ctx = test_ctx("t");
         let err = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap_err();
         assert!(err.contains("process-changing"), "got: {err}");
+    }
+
+    #[test]
+    fn wait_for_status_immediate_match_does_not_time_out() {
+        // An empty Supervisor reports `unknown` for any unseen session, so a
+        // target of "unknown" matches on the first poll and returns at once.
+        let ctx = test_ctx("t");
+        let v = dispatch(
+            &ctx,
+            "wait_for_status",
+            &json!({"sessionId": "absent", "targetStatus": "unknown"}),
+        )
+        .unwrap();
+        assert_eq!(v["finalStatus"], "unknown");
+        assert_eq!(v["timedOut"], false);
+    }
+
+    #[test]
+    fn wait_for_status_accepts_target_array() {
+        let ctx = test_ctx("t");
+        let v = dispatch(
+            &ctx,
+            "wait_for_status",
+            &json!({"sessionId": "absent", "targetStatus": ["completed", "unknown"]}),
+        )
+        .unwrap();
+        assert_eq!(v["finalStatus"], "unknown");
+        assert_eq!(v["timedOut"], false);
+    }
+
+    #[test]
+    fn wait_for_status_times_out_when_target_never_seen() {
+        // A status that never occurs for an unseen session, with a 0ms timeout,
+        // returns on the first iteration with timedOut:true.
+        let ctx = test_ctx("t");
+        let v = dispatch(
+            &ctx,
+            "wait_for_status",
+            &json!({"sessionId": "absent", "targetStatus": "completed", "timeoutMs": 0}),
+        )
+        .unwrap();
+        assert_eq!(v["finalStatus"], "unknown");
+        assert_eq!(v["timedOut"], true);
+    }
+
+    #[test]
+    fn wait_for_status_requires_session_and_target() {
+        let ctx = test_ctx("t");
+        let err = dispatch(&ctx, "wait_for_status", &json!({"targetStatus": "completed"}))
+            .unwrap_err();
+        assert!(err.contains("sessionId"), "got: {err}");
+        let err = dispatch(&ctx, "wait_for_status", &json!({"sessionId": "x"})).unwrap_err();
+        assert!(err.contains("targetStatus"), "got: {err}");
     }
 
     #[test]

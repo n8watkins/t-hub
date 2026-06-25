@@ -100,6 +100,28 @@ fn schema_session_id() -> Value {
     })
 }
 
+/// `wait_for_status` schema: long-poll until a session reaches a target FR-012
+/// status (or a timeout). `targetStatus` accepts one camelCase status string or
+/// an array of them; the poll returns as soon as the session matches any of them.
+fn schema_wait_for_status() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "sessionId":    { "type": "string", "description": "Exact Claude/T-Hub session id to watch." },
+            "targetStatus": {
+                "description": "FR-012 status to wait for (camelCase, e.g. \"completed\", \"needsQuestion\", \"waitingOnSubagents\"). One string, or an array of strings to match any.",
+                "oneOf": [
+                    { "type": "string" },
+                    { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+                ]
+            },
+            "timeoutMs":    { "type": "integer", "minimum": 0, "description": "Max time to wait before returning with timedOut:true (default 30000)." }
+        },
+        "required": ["sessionId", "targetStatus"],
+        "additionalProperties": false
+    })
+}
+
 /// `search_files` schema.
 fn schema_search_files() -> Value {
     json!({
@@ -286,6 +308,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_session_id,
         },
         ToolDef {
+            name: "wait_for_status",
+            tier: Tier::Read,
+            summary: "Long-poll until a session reaches a target FR-012 status (or a timeout); returns the final status, elapsed ms, and whether it timed out.",
+            input_schema: schema_wait_for_status,
+        },
+        ToolDef {
             name: "supervision_tree",
             tier: Tier::Read,
             summary: "Get the orchestrator→subagent supervision tree for one session.",
@@ -410,6 +438,7 @@ mod tests {
         for expected in [
             "list_terminals",
             "get_status",
+            "wait_for_status",
             "supervision_tree",
             "wsl_health",
             "search_files",
