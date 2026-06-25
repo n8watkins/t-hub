@@ -586,6 +586,36 @@ pub fn exit_copy_mode(name: &str) -> Result<(), TmuxError> {
 mod tests {
     use super::*;
 
+    /// True when a real `tmux` binary is reachable for the tests below. These
+    /// tests drive a live tmux server on the isolated socket, so they can only
+    /// pass where tmux is installed (the WSL2 dev shell) — NOT on the Windows CI
+    /// target, where tmux isn't on PATH. We probe with `tmux -V` (cheap, touches
+    /// no socket/session) and SKIP gracefully when it can't be spawned, mirroring
+    /// the missing-binary gate `agent/connection.rs` uses for its agent tests
+    /// (`bin_path.exists()` → eprintln + early `return`) so CI never hard-fails on
+    /// a platform without tmux.
+    ///
+    /// On Windows tmux lives inside WSL, so — like every other tmux call here — we
+    /// probe through `wsl.exe -- tmux -V` rather than a bare `tmux` (which doesn't
+    /// exist on the Windows host at all).
+    fn tmux_available() -> bool {
+        #[cfg(windows)]
+        let mut cmd = {
+            use std::os::windows::process::CommandExt;
+            let mut c = Command::new("wsl.exe");
+            c.arg("--").arg("tmux").arg("-V");
+            c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            c
+        };
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = Command::new("tmux");
+            c.arg("-V");
+            c
+        };
+        cmd.output().map(|o| o.status.success()).unwrap_or(false)
+    }
+
     /// Generate a unique throwaway session name so concurrent test runs (or a
     /// crashed prior run) don't collide.
     fn unique_name() -> String {
@@ -604,6 +634,12 @@ mod tests {
     /// expected to run on the Windows CI target).
     #[test]
     fn lifecycle_create_list_capture_kill() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::lifecycle_create_list_capture_kill: tmux not on PATH — skipping"
+            );
+            return;
+        }
         let name = unique_name();
 
         // Clean slate in case a previous run leaked this name (it shouldn't).
@@ -640,6 +676,13 @@ mod tests {
     /// PATH (present in the WSL2 dev shell, not on the Windows CI target).
     #[test]
     fn send_text_then_capture_plain_text_roundtrips() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::send_text_then_capture_plain_text_roundtrips: \
+                 tmux not on PATH — skipping"
+            );
+            return;
+        }
         let name = unique_name();
         let _ = kill_session(&name);
         new_session(&name, "/tmp", None).expect("new_session should succeed");
@@ -667,6 +710,13 @@ mod tests {
     /// on a live session (it interrupts whatever is running / clears the line).
     #[test]
     fn send_keys_named_keys_succeed_on_live_session() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::send_keys_named_keys_succeed_on_live_session: \
+                 tmux not on PATH — skipping"
+            );
+            return;
+        }
         let name = unique_name();
         let _ = kill_session(&name);
         new_session(&name, "/tmp", None).expect("new_session should succeed");
@@ -681,6 +731,12 @@ mod tests {
     /// has_session reports false for a name that was never created.
     #[test]
     fn kill_missing_is_idempotent() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::kill_missing_is_idempotent: tmux not on PATH — skipping"
+            );
+            return;
+        }
         let name = format!("{}_never", unique_name());
         assert!(!has_session(&name));
         kill_session(&name).expect("killing a missing session should be Ok");
@@ -690,6 +746,12 @@ mod tests {
     /// (possibly empty) rather than erroring.
     #[test]
     fn list_sessions_tolerates_empty() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::list_sessions_tolerates_empty: tmux not on PATH — skipping"
+            );
+            return;
+        }
         // Whether or not a server is running, this must not error.
         let _ = list_sessions().expect("list_sessions must tolerate no-server");
     }

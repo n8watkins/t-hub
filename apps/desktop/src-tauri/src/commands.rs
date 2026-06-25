@@ -51,6 +51,14 @@ pub struct SpawnOptions {
 pub struct TerminalInfo {
     pub id: String,
     pub tmux_session: String,
+    /// The tile's working directory. At SPAWN time this is the dir the pane was
+    /// rooted at (`resolve_cwd`); on every `list_terminals` reconcile it is
+    /// REPLACED by the pane's *live* current path (`#{pane_current_path}` from
+    /// `tmux::pane_info`), so it tracks the user `cd`-ing around. There is a
+    /// single `cwd` field — the spawn value is just its initial seed, and the
+    /// ~5s `list_terminals` poll keeps it current. This is the enabling primitive
+    /// for the worktree "anchor to the focused tile's repo" flow (WS-9) and the
+    /// relative-file-open TODO (WS-1).
     pub cwd: String,
     pub title: String,
     pub state: TerminalState,

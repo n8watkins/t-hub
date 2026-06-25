@@ -35,6 +35,15 @@ export interface TerminalInfo {
   id: TerminalId;
   /** tmux session name on the isolated `t-hub` socket. */
   tmuxSession: string;
+  /**
+   * The tile's working directory. From `spawn_terminal` this is the SPAWN dir;
+   * from `list_terminals` it is the pane's LIVE current path
+   * (`#{pane_current_path}`), refreshed on each ~5s poll, so it follows the user
+   * as they `cd` around. There is a single `cwd` field — the spawn value seeds
+   * it and the poll keeps it live. This is the enabling primitive for the
+   * worktree "anchor to the focused tile's repo" flow (WS-9) and relative
+   * file-open (WS-1).
+   */
   cwd: string;
   title: string;
   state: TerminalState;

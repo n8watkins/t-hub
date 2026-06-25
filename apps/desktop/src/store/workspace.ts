@@ -918,6 +918,13 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       for (const t of list) {
         const ex = next[t.id];
         if (!ex) continue; // unknown id: new terminals arrive via setTerminals
+        // Overwrite cwd with the backend's value (which `list_terminals` fills
+        // from the pane's LIVE `#{pane_current_path}`), so `terminals[id].cwd`
+        // tracks the CURRENT pane directory — refreshed on the ~5s poll — not
+        // just the spawn dir. We keep the single `cwd` field (no separate
+        // spawn/live field): the spawn value seeds it and is then replaced live,
+        // so existing `cwd` consumers (Files tree root, worktree anchor) read the
+        // live path with no rename. Title/state ride along on the same diff.
         if (ex.cwd !== t.cwd || ex.title !== t.title || ex.state !== t.state) {
           next[t.id] = { ...ex, cwd: t.cwd, title: t.title, state: t.state };
           changed = true;
