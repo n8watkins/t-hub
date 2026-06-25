@@ -12,6 +12,48 @@
 import { invoke } from "@tauri-apps/api/core";
 
 /**
+ * Runtime DEBUG gate for `tlog`. `tlog` fires per-terminal on every pool sync()
+ * (many times/frame while dragging), on every resize settle, on every attach,
+ * etc. — a console.log + fire-and-forget invoke on each call adds GC pressure
+ * and feeds WebView2 RAM growth. So `tlog` is a near-total no-op unless this is
+ * on, while staying switchable WITHOUT a rebuild.
+ *
+ * Sourced ONCE (cheap per-call boolean check) from either a `localStorage`
+ * flag (`t-hub.debug === "1"`) or a `window.__T_HUB_DEBUG__` global, both guarded
+ * for non-DOM contexts. Flip at runtime from devtools via `setDiagEnabled(true)`.
+ * Default OFF.
+ */
+let diagEnabled = ((): boolean => {
+  try {
+    if (typeof window !== "undefined" && (window as { __T_HUB_DEBUG__?: unknown }).__T_HUB_DEBUG__) {
+      return true;
+    }
+    if (typeof localStorage !== "undefined" && localStorage.getItem("t-hub.debug") === "1") {
+      return true;
+    }
+  } catch {
+    // localStorage can throw (disabled/partitioned storage); stay OFF.
+  }
+  return false;
+})();
+
+/**
+ * Toggle the `tlog` DEBUG gate at runtime (e.g. from devtools) WITHOUT a rebuild.
+ * Persists to `localStorage` (best-effort) so the choice survives a reload.
+ */
+export function setDiagEnabled(on: boolean): void {
+  diagEnabled = on;
+  try {
+    if (typeof localStorage !== "undefined") {
+      if (on) localStorage.setItem("t-hub.debug", "1");
+      else localStorage.removeItem("t-hub.debug");
+    }
+  } catch {
+    // best-effort persistence only — the in-memory flag is what gates `tlog`.
+  }
+}
+
+/**
  * Fire-and-forget: ship one already-formatted line to the backend diag file.
  * Best-effort — the promise is intentionally not awaited and its rejection is
  * swallowed (no devtools, no Tauri, or the command missing must all be silent).
@@ -57,6 +99,9 @@ function compact(arg: unknown): unknown {
  * throws.
  */
 export function tlog(tag: string, ...args: unknown[]): void {
+  // Gate FIRST: when DEBUG is off this is a near-total no-op — no message build,
+  // no console.log, no invoke. Cheap module-level boolean; flip via setDiagEnabled.
+  if (!diagEnabled) return;
   // Console first so a devtools session still sees everything live.
   console.log(`[${tag}]`, ...args);
   try {
