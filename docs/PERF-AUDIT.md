@@ -30,10 +30,12 @@ PTY/thread lifecycle (joined on close, `pty.rs`); tmux client cleanup; the new t
 
 ## Fix plan (prioritized)
 
-### Tier 1 — the freeze
-1. **`spawn_blocking` the per-poll commands** — `git_info`, `list_terminals`, `host_metrics` (and cold `search_files`/`index_project`). Stops Tokio-worker pinning. *(backend)*
-2. **Collapse `git_info` to one `wsl.exe`** (a single `bash -lc` script doing branch+worktree+dirty in one shot) **+ a per-cwd TTL cache** like `recent.rs`. Kills the dominant spawn storm. *(backend)*
-3. **Coalesce terminal output** — batch `onOutput` writes (rAF/microtask queue) and move `stripAnsi`/URL-scan off the per-chunk hot path (scan a small tail, throttled). *(frontend)*
+### Tier 1 — the freeze ✅ DONE (`8e12fbf`, `b17d922`, `a15416f`)
+1. ✅ **`spawn_blocking` the per-poll commands** — `git_info`, `list_terminals`, `host_metrics`, cold `search_files`/`index_project`. Stops Tokio-worker pinning. *(backend)*
+2. ✅ **Collapsed `git_info` to one `wsl.exe`** (single `bash -lc` script) **+ per-cwd ~3.5s TTL cache**. Kills the dominant spawn storm. *(backend)*
+3. ✅ **Coalesced terminal output** — `onOutput` decodes+enqueues, one rAF flush per frame; `stripAnsi`/URL-scan + activity bump run once per flush; faster base64 decode. *(frontend)*
+
+Verified: cargo build + 159 lib tests + tsc all green. Runtime smoke-test still pending.
 
 ### Tier 2 — RAM growth
 4. **Evict ended sessions** from `Supervisor.sessions` + `StatusBridge.latest`; **prune completed children**; **self-reap exited terminals** from `TerminalManager` on reader EOF. *(backend)*
