@@ -22,7 +22,10 @@
 //! Boundaries: this module is self-contained. It owns no managed state and shares
 //! nothing with the file index / agent / supervision modules.
 
+use std::collections::HashMap;
 use std::process::Command;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -43,6 +46,23 @@ pub struct GitInfo {
     /// Number of changed entries (`git status --porcelain` line count). 0 = clean.
     pub dirty_count: u32,
 }
+
+/// How long a `git_info` answer stays fresh per cwd. The Files panel re-polls
+/// `git_info` PER TILE every 5s (plus a burst on window focus), so without a
+/// cache M tiles on the same cwd each spawned their own `wsl.exe` every poll —
+/// the storm that pinned the Tokio workers and froze the UI. A TTL just under
+/// the 5s poll collapses every tile sharing a cwd (and the focus re-poll burst)
+/// onto ONE `wsl.exe` invocation per cwd per poll cycle. A few seconds of
+/// staleness on a branch/dirty-count is invisible in the panel header.
+const GIT_INFO_TTL: Duration = Duration::from_millis(3500);
+
+/// Per-cwd cache of the last `git_info` answer + when it was computed, shared
+/// across all tiles/windows so rapid same-cwd re-polls collapse onto one real
+/// `wsl.exe` invocation per [`GIT_INFO_TTL`] (mirrors `recent.rs`'s TTL cache).
+/// Keyed by the raw `cwd` string the frontend passes (tiles for the same project
+/// pass an identical cwd, so they share an entry). `Instant`, never wall-clock.
+static GIT_INFO_CACHE: LazyLock<Mutex<HashMap<String, (Instant, GitInfo)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl GitInfo {
     /// The "not a git repo" answer the commands fall back to (best-effort: a
@@ -136,14 +156,144 @@ fn build_git_command(cwd: &str, args: &[&str]) -> Command {
 }
 
 // ---------------------------------------------------------------------------
-// Pure parsing helpers (unit-tested on Linux).
+// One-shot `git_info` collection: ONE shell invocation computes everything.
+//
+// The Files panel polls `git_info` per tile every 5s (+ a focus burst). The old
+// path made SIX sequential `run_git` calls, and on Windows each one spawned its
+// own blocking `wsl.exe` on the Tokio executor — 6×M `wsl.exe` spawns every 5s,
+// pinning worker threads. We collapse those six into a SINGLE `bash -lc` script
+// (one `wsl.exe` on Windows; one direct `bash` on unix) that runs every git
+// query in one shell and prints `key<TAB>value` lines we parse back into a
+// `GitInfo`. The exact per-field semantics of the old six-call path are
+// preserved by [`parse_git_info_output`].
 // ---------------------------------------------------------------------------
 
-/// Count changed entries from `git status --porcelain` output: one entry per
-/// non-empty line. Tolerates a trailing newline / blank lines.
-fn parse_porcelain_count(stdout: &str) -> u32 {
-    stdout.lines().filter(|l| !l.trim().is_empty()).count() as u32
+/// The shell script run ONCE per `git_info`. It emits tab-delimited `key\tvalue`
+/// lines (one per line; values are single-line git answers) that
+/// [`parse_git_info_output`] maps back onto `GitInfo`:
+///   - `inside\t<true|false|>` — `rev-parse --is-inside-work-tree` (the gate);
+///   - `branch\t<name>`        — `rev-parse --abbrev-ref HEAD` (`HEAD` => detached);
+///   - `toplevel\t<path>`      — `rev-parse --show-toplevel` (worktree root);
+///   - `gitdir\t<path>`        — `rev-parse --git-dir`;
+///   - `commondir\t<path>`     — `rev-parse --git-common-dir`;
+///   - `dirty\t<n>`            — `git status --porcelain | wc -l` (dirty count).
+/// We short-circuit to ONLY the `inside` line when not in a work tree, so a
+/// non-repo collapses to `is_repo:false` exactly like the old cheap gate did.
+/// Every git invocation is silenced (`2>/dev/null`) so stderr never pollutes the
+/// parseable stdout; a failed query simply omits/blank-values its line, which the
+/// parser already treats as "absent" (matching the old per-call `_ => None`).
+const GIT_INFO_SCRIPT: &str = "\
+inside=$(git rev-parse --is-inside-work-tree 2>/dev/null); \
+printf 'inside\\t%s\\n' \"$inside\"; \
+if [ \"$inside\" = true ]; then \
+printf 'branch\\t%s\\n' \"$(git rev-parse --abbrev-ref HEAD 2>/dev/null)\"; \
+printf 'toplevel\\t%s\\n' \"$(git rev-parse --show-toplevel 2>/dev/null)\"; \
+printf 'gitdir\\t%s\\n' \"$(git rev-parse --git-dir 2>/dev/null)\"; \
+printf 'commondir\\t%s\\n' \"$(git rev-parse --git-common-dir 2>/dev/null)\"; \
+printf 'dirty\\t%s\\n' \"$(git status --porcelain 2>/dev/null | wc -l)\"; \
+fi";
+
+/// Run [`GIT_INFO_SCRIPT`] in ONE shell against `cwd`, returning its stdout.
+///
+/// unix: spawn `bash -lc <script>` with `.current_dir(cwd)`.
+///
+/// Windows: spawn `wsl.exe -d <distro> --cd <cwd> -- bash -lc <script>` with the
+/// console window suppressed (`CREATE_NO_WINDOW`, matching `run_git`). The script
+/// is a SINGLE argv arg (passed straight to `-lc`); it contains no
+/// caller-interpolated data (the cwd is set by `--cd` / `current_dir`, never
+/// spliced into the script text), so the trailing-arg mangling that bit the
+/// commit path can't apply here. Returns `Err` only on a genuine spawn failure;
+/// a non-repo just yields the short-circuited `inside\tfalse` stdout.
+fn run_git_info_script(cwd: &str) -> Result<String, String> {
+    let output = build_git_info_command(cwd)
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+/// Build the one-shot `bash -lc <script>` command for the current platform.
+#[cfg(not(windows))]
+fn build_git_info_command(cwd: &str) -> Command {
+    let mut c = Command::new("bash");
+    c.current_dir(cwd);
+    c.arg("-lc").arg(GIT_INFO_SCRIPT);
+    c
+}
+
+#[cfg(windows)]
+fn build_git_info_command(cwd: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    let distro = host_distro();
+    let mut c = Command::new("wsl.exe");
+    // `wsl.exe -d <distro> --cd <posix-cwd> -- bash -lc '<script>'`. `--cd` sets
+    // the working dir inside the distro (NOT interpolated into the script), so the
+    // script body is a fixed, data-free string — the `bash -lc` trailing-arg
+    // mangling caveat (which only bit a caller-supplied trailing arg) doesn't
+    // apply. A login shell is fine here: the script is our own and self-contained.
+    c.arg("-d")
+        .arg(&distro)
+        .arg("--cd")
+        .arg(cwd)
+        .arg("--")
+        .arg("bash")
+        .arg("-lc")
+        .arg(GIT_INFO_SCRIPT);
+    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (see files.rs/tmux.rs)
+    c
+}
+
+/// Parse the [`GIT_INFO_SCRIPT`] stdout (tab-delimited `key\tvalue` lines) back
+/// into a [`GitInfo`], preserving the EXACT semantics of the old six-call path:
+///   - `inside` != `true`            -> `GitInfo::not_repo()` (`is_repo:false`);
+///   - `branch` == `HEAD` or empty   -> `branch: None` (detached HEAD);
+///   - `toplevel` empty              -> `worktree_root: None`;
+///   - linked iff `gitdir` != `commondir` (both present), via `is_linked_worktree`;
+///   - `dirty` parsed as the porcelain line count (absent/garbage -> 0).
+/// Unknown keys and malformed lines are ignored. A blank value for any field is
+/// treated as "absent", matching the old per-call `_ => None` fallbacks.
+fn parse_git_info_output(stdout: &str) -> GitInfo {
+    let mut fields: HashMap<&str, &str> = HashMap::new();
+    for line in stdout.lines() {
+        if let Some((key, value)) = line.split_once('\t') {
+            fields.insert(key.trim(), value.trim_end_matches(['\r', '\n']));
+        }
+    }
+
+    // The gate: only an explicit `true` means we're inside a work tree.
+    if fields.get("inside").map(|v| v.trim()) != Some("true") {
+        return GitInfo::not_repo();
+    }
+
+    // Branch: map detached (`HEAD`) and empty to None, like `--abbrev-ref HEAD`.
+    let branch = fields
+        .get("branch")
+        .and_then(|v| first_line_opt(v))
+        .filter(|b| b != "HEAD");
+
+    let worktree_root = fields.get("toplevel").and_then(|v| first_line_opt(v));
+
+    let git_dir = fields.get("gitdir").and_then(|v| first_line_opt(v));
+    let git_common_dir = fields.get("commondir").and_then(|v| first_line_opt(v));
+    let is_linked_worktree = is_linked_worktree(git_dir.as_deref(), git_common_dir.as_deref());
+
+    // Dirty count is already `git status --porcelain | wc -l` from the script.
+    let dirty_count = fields
+        .get("dirty")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+
+    GitInfo {
+        is_repo: true,
+        branch,
+        worktree_root,
+        is_linked_worktree,
+        dirty_count,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure parsing helpers (unit-tested on Linux).
+// ---------------------------------------------------------------------------
 
 /// Trim a single-line `git rev-parse` answer, returning `None` if empty.
 fn first_line_opt(stdout: &str) -> Option<String> {
@@ -262,60 +412,49 @@ fn already_checked_out_branch(stderr: &str) -> Option<String> {
 
 /// Report git facts for `cwd` (branch / worktree root / linked-worktree / dirty
 /// count). Best-effort: a non-repo, missing dir, or absent git all yield
-/// `is_repo: false`. Never returns `Err` for a non-repo — only for a genuinely
-/// unexpected spawn failure is surfaced (so the UI can stay quiet).
+/// `is_repo: false`. Never returns `Err` for a non-repo — only a genuinely
+/// unexpected spawn/join failure is surfaced (so the UI can stay quiet).
+///
+/// PERF (the freeze fix): this used to make SIX sequential blocking `run_git`
+/// calls — on Windows six separate `wsl.exe` spawns — directly on the async
+/// executor, per tile, every 5s poll (+ a focus burst). It now does ONE of three
+/// cheap things: (1) returns a fresh cached answer for this cwd, OR (2) runs a
+/// SINGLE one-shot shell script ([`GIT_INFO_SCRIPT`]) — one `wsl.exe` total —
+/// inside `spawn_blocking` so the blocking IO never pins a Tokio worker, then
+/// caches it. Many tiles polling the same cwd (and the focus re-poll burst) thus
+/// collapse onto one `wsl.exe` per cwd per [`GIT_INFO_TTL`].
 #[tauri::command]
 pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
-    // Cheap gate: is this even inside a work tree? If not (or git is unavailable),
-    // collapse to the "not a repo" answer and render nothing in the UI.
-    let inside = match run_git(&cwd, &["rev-parse", "--is-inside-work-tree"]) {
-        Ok((true, out, _)) => out.trim() == "true",
-        // A non-zero exit (the usual "not a git repository") or any spawn problem
-        // is treated as "not a repo" — best-effort, the UI just shows nothing.
-        Ok(_) => false,
-        Err(_) => false,
-    };
-    if !inside {
-        return Ok(GitInfo::not_repo());
+    // (1) Serve a fresh-enough cached answer for this cwd. The lock is held only
+    // to clone the cached `GitInfo`, never across the spawn below, so many tiles
+    // polling the same cwd within the TTL all return without spawning anything.
+    if let Some(cached) = GIT_INFO_CACHE.lock().ok().and_then(|g| {
+        g.get(&cwd)
+            .filter(|(at, _)| at.elapsed() < GIT_INFO_TTL)
+            .map(|(_, info)| info.clone())
+    }) {
+        return Ok(cached);
     }
 
-    // Branch: `--abbrev-ref HEAD` is `HEAD` on a detached checkout; map that to
-    // None so the UI shows no branch rather than a misleading "HEAD".
-    let branch = match run_git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"]) {
-        Ok((true, out, _)) => first_line_opt(&out).filter(|b| b != "HEAD"),
-        _ => None,
-    };
-
-    // Worktree root.
-    let worktree_root = match run_git(&cwd, &["rev-parse", "--show-toplevel"]) {
-        Ok((true, out, _)) => first_line_opt(&out),
-        _ => None,
-    };
-
-    // Linked-worktree detection: compare --git-dir vs --git-common-dir.
-    let git_dir = match run_git(&cwd, &["rev-parse", "--git-dir"]) {
-        Ok((true, out, _)) => first_line_opt(&out),
-        _ => None,
-    };
-    let git_common_dir = match run_git(&cwd, &["rev-parse", "--git-common-dir"]) {
-        Ok((true, out, _)) => first_line_opt(&out),
-        _ => None,
-    };
-    let linked = is_linked_worktree(git_dir.as_deref(), git_common_dir.as_deref());
-
-    // Dirty count: one entry per porcelain line.
-    let dirty_count = match run_git(&cwd, &["status", "--porcelain"]) {
-        Ok((true, out, _)) => parse_porcelain_count(&out),
-        _ => 0,
-    };
-
-    Ok(GitInfo {
-        is_repo: true,
-        branch,
-        worktree_root,
-        is_linked_worktree: linked,
-        dirty_count,
+    // (2) Cache miss / stale: run the single one-shot script off the async
+    // runtime. The blocking work (the `wsl.exe`/`bash` spawn + parse) lives in a
+    // closure that captures only OWNED data (the cloned `cwd`) — no `&State` is
+    // held across the await — so it can't pin a worker thread.
+    let cwd_for_blocking = cwd.clone();
+    let info = tauri::async_runtime::spawn_blocking(move || {
+        // A spawn failure (no git / no wsl.exe / unreadable dir) degrades to the
+        // "not a repo" answer — best-effort, exactly like the old per-call path.
+        let stdout = run_git_info_script(&cwd_for_blocking).unwrap_or_default();
+        parse_git_info_output(&stdout)
     })
+    .await
+    .map_err(|e| format!("git_info task failed: {e}"))?;
+
+    // Cache the fresh answer for this cwd so sibling tiles + the focus burst hit (1).
+    if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
+        guard.insert(cwd, (Instant::now(), info.clone()));
+    }
+    Ok(info)
 }
 
 /// Stage all changes (`git add -A`) and commit them with `message`. Returns the
@@ -483,19 +622,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn porcelain_count_counts_nonblank_lines() {
-        assert_eq!(parse_porcelain_count(""), 0);
-        assert_eq!(parse_porcelain_count("\n"), 0);
-        assert_eq!(parse_porcelain_count(" M src/a.rs\n"), 1);
-        assert_eq!(
-            parse_porcelain_count(" M src/a.rs\n?? new.txt\n D gone.rs\n"),
-            3
-        );
-        // A trailing newline / blank line must not inflate the count.
-        assert_eq!(parse_porcelain_count(" M a\n\n M b\n\n"), 2);
-    }
-
-    #[test]
     fn first_line_opt_trims_and_handles_empty() {
         assert_eq!(first_line_opt(""), None);
         assert_eq!(first_line_opt("   \n"), None);
@@ -521,6 +647,88 @@ mod tests {
         // Missing either answer is conservatively "not linked".
         assert!(!is_linked_worktree(None, Some("/repo/.git")));
         assert!(!is_linked_worktree(Some("/repo/.git"), None));
+    }
+
+    #[test]
+    fn parse_git_info_output_non_repo() {
+        // The short-circuited script output when not inside a work tree: only the
+        // `inside` line, valued anything but `true` (here git printed nothing).
+        let info = parse_git_info_output("inside\t\n");
+        assert_eq!(info, GitInfo::not_repo());
+        // A literal `false` (some git builds) is likewise "not a repo".
+        assert_eq!(parse_git_info_output("inside\tfalse\n"), GitInfo::not_repo());
+        // Completely empty stdout (total spawn weirdness) -> not a repo.
+        assert_eq!(parse_git_info_output(""), GitInfo::not_repo());
+    }
+
+    #[test]
+    fn parse_git_info_output_main_worktree() {
+        // Main worktree: gitdir == commondir -> not linked; a real branch + dirty.
+        let out = "\
+inside\ttrue
+branch\tmain
+toplevel\t/home/u/repo
+gitdir\t/home/u/repo/.git
+commondir\t/home/u/repo/.git
+dirty\t3
+";
+        let info = parse_git_info_output(out);
+        assert!(info.is_repo);
+        assert_eq!(info.branch.as_deref(), Some("main"));
+        assert_eq!(info.worktree_root.as_deref(), Some("/home/u/repo"));
+        assert!(!info.is_linked_worktree);
+        assert_eq!(info.dirty_count, 3);
+    }
+
+    #[test]
+    fn parse_git_info_output_linked_worktree() {
+        // Linked worktree: per-worktree gitdir differs from the common dir; clean.
+        let out = "\
+inside\ttrue
+branch\tfeat/x
+toplevel\t/home/u/repo-feat
+gitdir\t/home/u/repo/.git/worktrees/repo-feat
+commondir\t/home/u/repo/.git
+dirty\t0
+";
+        let info = parse_git_info_output(out);
+        assert!(info.is_repo);
+        assert_eq!(info.branch.as_deref(), Some("feat/x"));
+        assert_eq!(info.worktree_root.as_deref(), Some("/home/u/repo-feat"));
+        assert!(info.is_linked_worktree, "gitdir != commondir => linked");
+        assert_eq!(info.dirty_count, 0);
+    }
+
+    #[test]
+    fn parse_git_info_output_detached_head_maps_branch_to_none() {
+        // `--abbrev-ref HEAD` is the literal `HEAD` on a detached checkout — the
+        // parser must map that (and an empty branch) to None, like the old path.
+        let out = "\
+inside\ttrue
+branch\tHEAD
+toplevel\t/home/u/repo
+gitdir\t/home/u/repo/.git
+commondir\t/home/u/repo/.git
+dirty\t0
+";
+        assert_eq!(parse_git_info_output(out).branch, None);
+        // An empty branch value is also None (git failed/blanked that line).
+        let out_blank = "inside\ttrue\nbranch\t\ntoplevel\t/r\ndirty\t0\n";
+        assert_eq!(parse_git_info_output(out_blank).branch, None);
+    }
+
+    #[test]
+    fn parse_git_info_output_tolerates_missing_and_garbage_fields() {
+        // Inside a repo but several lines absent / a garbage dirty value: missing
+        // fields collapse to None (matching the old per-call `_ => None`) and an
+        // unparseable dirty count falls back to 0.
+        let out = "inside\ttrue\ndirty\tnope\n";
+        let info = parse_git_info_output(out);
+        assert!(info.is_repo);
+        assert_eq!(info.branch, None);
+        assert_eq!(info.worktree_root, None);
+        assert!(!info.is_linked_worktree); // both gitdir/commondir absent
+        assert_eq!(info.dirty_count, 0); // "nope" -> 0
     }
 
     #[test]
