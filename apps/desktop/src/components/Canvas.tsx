@@ -34,6 +34,15 @@ import { SpawnMenu } from "./SpawnMenu";
 import { repaintAllTerminals } from "../lib/repaint";
 import { tlog } from "../lib/diag";
 import type { TerminalId } from "../ipc/types";
+import { useKeybindings, directCommandForChord } from "../store/keybindings";
+import { runCommand, registerSidebarFocus } from "../lib/keymapExecutor";
+import { chordFromEvent } from "../lib/chord";
+import {
+  isPrefixArmed,
+  armPrefix,
+  handlePrefixedKey,
+  disarm,
+} from "../lib/prefixKeyHandler";
 
 /**
  * Split `ids` into balanced rows that completely fill the canvas — no empty
@@ -97,13 +106,9 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   const deleteTerminal = useWorkspace((s) => s.deleteTerminal);
   const setFocus = useWorkspace((s) => s.setFocus);
   const updateState = useWorkspace((s) => s.updateState);
-  const cycleTab = useWorkspace((s) => s.cycleTab);
-  const cycleTileGlobal = useWorkspace((s) => s.cycleTileGlobal);
-  const toggleFocusRegion = useWorkspace((s) => s.toggleFocusRegion);
-  const setActiveTabByIndex = useWorkspace((s) => s.setActiveTabByIndex);
-  const zoomIn = useWorkspace((s) => s.zoomIn);
-  const zoomOut = useWorkspace((s) => s.zoomOut);
-  const zoomReset = useWorkspace((s) => s.zoomReset);
+  // Navigation / zoom / focus-region actions used to be selected here and called
+  // inline by the keymap; they now flow through lib/keymapExecutor (which reads
+  // them off useWorkspace.getState()), so Canvas no longer subscribes to them.
 
   // Per-tile fullscreen: when set, ONE tile is blown up to fill the whole window
   // (covering the sidebar/titlebar for a true fullscreen). The grid + pool keep
@@ -196,14 +201,6 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     [addAfterFocused],
   );
 
-  const closeFocused = useCallback(() => {
-    const id = useWorkspace.getState().focusedId;
-    if (!id) return;
-    // Ctrl/Cmd+W kills the focused session (kill + drop tile) — no busy gate here
-    // (the keybind is an explicit, deliberate action).
-    deleteTerminal(id);
-  }, [deleteTerminal]);
-
   // The tile's onClose: kill this session (kill tmux + drop tile + cleanup). The
   // Tile already showed the busy confirm (if needed) before calling this.
   const close = useCallback(
@@ -213,92 +210,77 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     [deleteTerminal],
   );
 
-  // Global keybindings: Ctrl/Cmd+T = new terminal, Ctrl/Cmd+W = kill focused,
-  // Ctrl/Cmd+B = toggle nav FOCUS between the terminal area and the sidebar,
-  // Ctrl/Cmd+Tab = cycle WITHIN the focused region (terminals across ALL
-  // workspaces when the terminal area is focused, workspaces when the sidebar is
-  // focused; Shift reverses), Ctrl/Cmd+1..9 = jump to the tab at that index.
+  // Global keybindings — the HYBRID keymap (WS-3). Three tiers, all driven from
+  // the keybindings store (defaults reproduce the old hardcoded hotkeys):
+  //   1. PREFIX (default Ctrl/Cmd+B): pressing it ARMS the tmux-style prefix tier
+  //      (a brief HUD hint + ~1.5s timeout); the NEXT key resolves a `prefixed`
+  //      binding (see lib/prefixKeyHandler). Pressing the prefix TWICE sends a
+  //      literal prefix keystroke to the focused terminal.
+  //   2. DIRECT: a single chord (Ctrl/Cmd+T, +W, +Tab, +1..9, +=/-/0, the
+  //      RELOCATED focus-toggle on Ctrl/Cmd+J, the new palette on Ctrl/Cmd+K)
+  //      dispatches its command outright through the executor.
+  //   3. Fall-through: anything unbound is left for xterm to handle.
   //
   // Registered on `document` in the CAPTURE phase (the third `true` arg) so it
   // fires BEFORE a focused xterm's own key handler
   // (term.attachCustomKeyEventHandler runs in the bubbling target phase). Without
-  // capture, Ctrl+B / Ctrl+Tab would be swallowed by the terminal while it has
-  // focus and never reach the app. tmux's Ctrl+B prefix is also disabled
-  // server-side (tmux.rs) so the key is free to mean "switch region" here.
+  // capture, the prefix / direct chords would be swallowed by the terminal while
+  // it has focus. tmux's Ctrl+B prefix is also disabled server-side (tmux.rs) so
+  // Ctrl+B is free to be the app prefix.
+  //
+  // Register the sidebar-reveal side effect the toggleFocusRegion command needs
+  // (reveal a hidden sidebar + focus its nav target) — the executor can't reach
+  // Canvas's `onFocusSidebar` prop / focusSidebarTarget helper directly.
+  useEffect(() => {
+    registerSidebarFocus(() => {
+      const visible = onFocusSidebar ? onFocusSidebar() : false;
+      if (visible) focusSidebarTarget();
+    });
+    return () => registerSidebarFocus(null);
+  }, [onFocusSidebar]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const mod = e.ctrlKey || e.metaKey;
-      if (!mod) return;
-      // Ctrl/Cmd+B: toggle nav focus between the terminal area and the sidebar.
-      // Moving to the sidebar reveals it (if hidden) and focuses its nav target;
-      // moving back to the terminal lets Terminal.tsx refocus the focused xterm
-      // (it watches focusedRegion). Handled before the Tab branch.
-      if ((e.key === "b" || e.key === "B") && !e.altKey) {
-        e.preventDefault();
-        e.stopPropagation();
-        const region = toggleFocusRegion();
-        if (region === "sidebar") {
-          // Reveal the sidebar if hidden, then focus its nav surface.
-          const visible = onFocusSidebar ? onFocusSidebar() : false;
-          if (visible) focusSidebarTarget();
+      // ARMED: every key (modifiers or not — a prefixed binding is a BARE key)
+      // routes to the prefix state machine until it resolves/disarms.
+      if (isPrefixArmed()) {
+        const consumed = handlePrefixedKey(e);
+        if (consumed) {
+          e.preventDefault();
+          e.stopPropagation();
         }
         return;
       }
-      // Ctrl/Cmd+Tab cycles WITHIN the focused region (Shift => previous): the
-      // sidebar region cycles WORKSPACES, the terminal region cycles TILES across
-      // EVERY workspace (so any terminal in any workspace is reachable — crossing
-      // a tab boundary switches the active workspace to the one that owns it).
-      if (e.key === "Tab" && !e.altKey) {
+
+      const chord = chordFromEvent(e);
+      if (!chord) return;
+
+      // PREFIX: arm the tmux-style tier (the next key resolves a prefixed
+      // binding). Swallow the prefix itself so it never reaches the terminal.
+      if (chord === useKeybindings.getState().prefixKey) {
         e.preventDefault();
         e.stopPropagation();
-        const dir = e.shiftKey ? -1 : 1;
-        if (useWorkspace.getState().focusedRegion === "sidebar") {
-          cycleTab(dir);
-        } else {
-          cycleTileGlobal(dir);
-        }
+        armPrefix(chord);
         return;
       }
-      if (e.altKey) return;
-      // Ctrl/Cmd+1..9 jumps straight to that tab (1-based -> 0-based index).
-      if (e.key >= "1" && e.key <= "9") {
+
+      // DIRECT: a single chord bound to a command -> dispatch it.
+      const cmd = directCommandForChord(chord);
+      if (cmd) {
         e.preventDefault();
-        setActiveTabByIndex(Number(e.key) - 1);
+        e.stopPropagation();
+        runCommand(cmd);
         return;
       }
-      const key = e.key.toLowerCase();
-      if (key === "t") {
-        e.preventDefault();
-        void spawn();
-      } else if (key === "w") {
-        e.preventDefault();
-        closeFocused();
-      } else if (key === "=" || key === "+") {
-        e.preventDefault();
-        zoomIn();
-      } else if (key === "-" || key === "_") {
-        e.preventDefault();
-        zoomOut();
-      } else if (key === "0") {
-        e.preventDefault();
-        zoomReset();
-      }
+      // Unbound -> fall through to xterm (no preventDefault).
     };
     // Capture phase on the document so we beat the focused xterm's key handler.
     document.addEventListener("keydown", onKey, true);
-    return () => document.removeEventListener("keydown", onKey, true);
-  }, [
-    spawn,
-    closeFocused,
-    cycleTab,
-    cycleTileGlobal,
-    toggleFocusRegion,
-    setActiveTabByIndex,
-    zoomIn,
-    zoomOut,
-    zoomReset,
-    onFocusSidebar,
-  ]);
+    return () => {
+      document.removeEventListener("keydown", onKey, true);
+      disarm(); // never leave the prefix armed across a remount
+    };
+  }, []);
 
   // Clear a STALE fullscreen target. The fullscreen tile can be removed out from
   // under us by any deletion path (Ctrl/Cmd+W, the context-menu delete, a

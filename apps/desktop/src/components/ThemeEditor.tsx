@@ -51,6 +51,12 @@ import { RecoveryReview } from "./RecoveryReview";
 // Claude hooks install/uninstall now lives in Settings (moved out of the sidebar).
 import { HookInstallPanel } from "./HookInstallPanel";
 import { claudeHooksInstalled } from "../ipc/client05";
+// Hybrid keymap (WS-3): the interactive Keyboard section shows every command's
+// live direct/prefixed binding, opens the palette to rebind, and resets defaults.
+import { useKeybindings } from "../store/keybindings";
+import { COMMANDS } from "../lib/commands";
+import { formatChord } from "../lib/chord";
+import { openKeyboardPalette } from "./CommandPalette";
 
 /**
  * Wire the global `Ctrl/Cmd+,` toggle (and Esc-to-close) onto the settings
@@ -97,6 +103,7 @@ export function ThemeEditor() {
 type SectionId =
   | "general"
   | "hotkeys"
+  | "keyboard"
   | "hooks"
   | "updates"
   | "about"
@@ -181,7 +188,8 @@ function SectionNav({
       label: "App",
       items: [
         { id: "general", label: "General", hint: "App behavior" },
-        { id: "hotkeys", label: "Hotkeys", hint: "Keyboard shortcuts" },
+        { id: "keyboard", label: "Keyboard", hint: "Rebindable command shortcuts + prefix" },
+        { id: "hotkeys", label: "Hotkeys", hint: "Keyboard shortcuts reference" },
         { id: "hooks", label: "Hooks", hint: "Claude Code lifecycle hooks" },
         { id: "updates", label: "Updates", hint: "Check for + install app updates" },
         { id: "about", label: "About", hint: "What T-Hub is + version" },
@@ -244,6 +252,8 @@ function SectionContent({
   switch (section) {
     case "general":
       return <GeneralSection onNavigate={onNavigate} />;
+    case "keyboard":
+      return <KeyboardSection />;
     case "hotkeys":
       return <HotkeysSection />;
     case "hooks":
@@ -518,6 +528,99 @@ function ThemeTabs({
 }
 
 // ---------------------------------------------------------------------------
+// Keyboard (WS-3) — the interactive, REBINDABLE keymap. Shows the tmux-style
+// prefix + every command's live direct/prefixed binding; "Rebind" opens the
+// fuzzy command palette (where the press-new-key flow lives) and "Reset to
+// defaults" restores the shipped bindings.
+// ---------------------------------------------------------------------------
+function KeyboardSection() {
+  const prefixKey = useKeybindings((s) => s.prefixKey);
+  const direct = useKeybindings((s) => s.direct);
+  const prefixed = useKeybindings((s) => s.prefixed);
+  const resetDefaults = useKeybindings((s) => s.resetDefaults);
+
+  return (
+    <>
+      <Group
+        title="Prefix"
+        description="A tmux-style prefix arms an expanding command tail: press it, then a single key runs a prefixed command. Press it twice to send a literal prefix keystroke to the terminal."
+      >
+        <Row label="Prefix key">
+          <kbd
+            className="rounded border px-1.5 py-0.5 font-mono text-xs"
+            style={{
+              borderColor: "var(--th-border)",
+              color: "var(--th-fg)",
+              backgroundColor: "var(--th-tile-bg)",
+            }}
+          >
+            {formatChord(prefixKey)}
+          </kbd>
+        </Row>
+      </Group>
+
+      <Group
+        title="Commands"
+        description="Each command can fire directly from a single chord and/or after the prefix. Open the command palette to change a direct shortcut interactively."
+      >
+        <div className="flex items-center justify-between gap-3">
+          <button
+            type="button"
+            onClick={openKeyboardPalette}
+            className="rounded border px-2.5 py-1 text-xs transition-colors hover:bg-neutral-700/30"
+            style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+          >
+            Open command palette to rebind
+          </button>
+          <button
+            type="button"
+            onClick={resetDefaults}
+            className="rounded border px-2.5 py-1 text-xs transition-colors hover:bg-neutral-700/30"
+            style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
+            title="Restore every shortcut + the prefix to the shipped defaults"
+          >
+            Reset to defaults
+          </button>
+        </div>
+        {COMMANDS.map((cmd) => (
+          <div
+            key={cmd.id}
+            className="flex items-center justify-between gap-3 text-sm"
+          >
+            <span style={{ color: "var(--th-fg-muted)" }}>{cmd.label}</span>
+            <span className="flex shrink-0 items-center gap-1.5">
+              <kbd
+                className="rounded border px-1.5 py-0.5 font-mono text-xs"
+                style={{
+                  borderColor: "var(--th-border)",
+                  color: direct[cmd.id] ? "var(--th-fg)" : "var(--th-fg-muted)",
+                  backgroundColor: "var(--th-tile-bg)",
+                }}
+              >
+                {direct[cmd.id] ? formatChord(direct[cmd.id]) : "—"}
+              </kbd>
+              {prefixed[cmd.id] && (
+                <kbd
+                  className="rounded border px-1.5 py-0.5 font-mono text-xs"
+                  style={{
+                    borderColor: "var(--th-border)",
+                    color: "var(--th-fg-muted)",
+                    backgroundColor: "var(--th-tile-bg)",
+                  }}
+                  title="Prefixed binding (press the prefix first)"
+                >
+                  {formatChord(prefixKey)} {prefixed[cmd.id]}
+                </kbd>
+              )}
+            </span>
+          </div>
+        ))}
+      </Group>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Hotkeys — a reference list of the app's keyboard shortcuts.
 // ---------------------------------------------------------------------------
 function HotkeysSection() {
@@ -533,8 +636,10 @@ function HotkeysSection() {
     {
       title: "Navigation",
       keys: [
-        ["Ctrl/Cmd + B", "Cycle sidebar (full → rail → hidden)"],
-        ["Ctrl/Cmd + Tab", "Next workspace tab (Shift = previous)"],
+        ["Ctrl/Cmd + B", "Prefix — arms the tmux-style command tail"],
+        ["Ctrl/Cmd + J", "Toggle focus: terminal ↔ sidebar"],
+        ["Ctrl/Cmd + K", "Command palette (fuzzy; rebind shortcuts here)"],
+        ["Ctrl/Cmd + Tab", "Next terminal (Shift = previous)"],
         ["Ctrl/Cmd + 1…9", "Jump to workspace tab"],
         ["Ctrl/Cmd + ,", "Open / close Settings"],
       ],
