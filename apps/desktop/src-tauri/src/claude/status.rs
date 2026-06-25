@@ -19,10 +19,21 @@
 //! store); it is self-contained and feeds [`crate::model::AgentSessionRecord`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+
+/// Hard cap on live per-session snapshots kept in [`StatusBridge::latest`]. Like
+/// the supervision map, this grows one entry per Claude session id (a fresh UUID
+/// per spawn/resume) and — because the statusline never carries a session-end
+/// signal (see [`StatusBridge::ingest`]) — nothing organically removes ended
+/// sessions. So we hard-bound the map: once it exceeds this many entries, the
+/// least-recently-ingested snapshot is evicted (LRU by a monotonic touch stamp, not
+/// wall-clock). 256 covers every realistically-concurrent session while keeping the
+/// store from leaking over a long-lived hub.
+const STATUS_MAP_CAP: usize = 256;
 
 /// One rate-limit window from the statusline `rate_limits` block. Both fields
 /// are optional because the block may be partial.
@@ -188,7 +199,14 @@ fn parse_window(v: &serde_json::Value) -> RateLimitWindow {
 /// under tmux) is still stored for the usage meter but not recorded for restore.
 #[derive(Default)]
 pub struct StatusBridge {
-    latest: RwLock<HashMap<String, StatusSnapshot>>,
+    /// Latest snapshot per session, paired with a monotonic `touch` stamp (from
+    /// [`Self::touch_seq`]) used purely as an LRU key for the [`STATUS_MAP_CAP`]
+    /// backstop. The stamp is NOT wall-clock, so eviction order is deterministic
+    /// and test-stable even though snapshots also carry an `ingested_at_ms` clock.
+    latest: RwLock<HashMap<String, (u64, StatusSnapshot)>>,
+    /// Monotonic counter bumped on every ingest to stamp `latest` entries with
+    /// their recency for the LRU cap. Atomic so `ingest` keeps its `&self` shape.
+    touch_seq: AtomicU64,
     /// The durable DB, wired in `setup()` after the AppHandle exists (the bridge
     /// is built in `AppState::default()`, before any DB). `None` until then (and
     /// in tests), in which case the WS-6 record is silently skipped.
@@ -222,12 +240,50 @@ impl StatusBridge {
         now_ms: u64,
     ) -> StatusSnapshot {
         let snap = StatusSnapshot::from_statusline(session_id, raw, now_ms);
-        self.latest
-            .write()
-            .insert(session_id.to_string(), snap.clone());
+        // Bump the monotonic touch counter so this entry is the most-recently-used
+        // and the cap evicts true LRU victims (never the session we just ingested).
+        let touch = self.touch_seq.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut latest = self.latest.write();
+            latest.insert(session_id.to_string(), (touch, snap.clone()));
+            // Backstop for the leak: the statusline carries no session-end signal,
+            // so ended sessions are never removed organically. Hard-bound the map
+            // by evicting the least-recently-ingested entries once over the cap.
+            Self::enforce_cap(&mut latest);
+        }
         // WS-6: durably record the tile→session binding for boot-time restore.
         self.record_for_restore(&snap);
         snap
+    }
+
+    /// Bound `latest` to [`STATUS_MAP_CAP`] entries, evicting the least-recently-
+    /// ingested snapshots (lowest touch stamp) until back at the cap. Called under
+    /// the write lock from [`Self::ingest`]. The just-inserted entry has the highest
+    /// stamp and is never the victim. Normally a no-op (one insert grows the map by
+    /// at most one); the loop is robust if the cap were lowered.
+    fn enforce_cap(latest: &mut HashMap<String, (u64, StatusSnapshot)>) {
+        if latest.len() <= STATUS_MAP_CAP {
+            return;
+        }
+        let mut by_recency: Vec<(u64, String)> = latest
+            .iter()
+            .map(|(id, (touch, _))| (*touch, id.clone()))
+            .collect();
+        by_recency.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let to_remove = latest.len() - STATUS_MAP_CAP;
+        for (_, id) in by_recency.into_iter().take(to_remove) {
+            latest.remove(&id);
+        }
+    }
+
+    /// Drop a session's snapshot — the seam for an explicit session-end eviction.
+    /// The statusline payloads that feed [`Self::ingest`] carry no lifecycle/end
+    /// signal, so today the bridge relies on the [`STATUS_MAP_CAP`] LRU backstop to
+    /// bound growth; if a `SessionEnd` signal is ever routed here (as the
+    /// supervision reducer already evicts on), call this for prompt cleanup. Kept
+    /// in-crate and harmless when the session is already gone.
+    pub fn evict(&self, session_id: &str) {
+        self.latest.write().remove(session_id);
     }
 
     /// Best-effort: upsert this snapshot's tile→session binding into the durable
@@ -281,12 +337,12 @@ impl StatusBridge {
 
     /// The latest snapshot for a session, if any.
     pub fn get(&self, session_id: &str) -> Option<StatusSnapshot> {
-        self.latest.read().get(session_id).cloned()
+        self.latest.read().get(session_id).map(|(_, snap)| snap.clone())
     }
 
     /// All known snapshots (for the utility-area usage display).
     pub fn all(&self) -> Vec<StatusSnapshot> {
-        self.latest.read().values().cloned().collect()
+        self.latest.read().values().map(|(_, snap)| snap.clone()).collect()
     }
 }
 
@@ -491,5 +547,52 @@ mod tests {
         );
         assert_eq!(snap.session_id, "s1");
         assert!(bridge.get("s1").is_some());
+    }
+
+    // --- Memory-leak fix: bounded growth ------------------------------------
+
+    fn ctx_payload(pct: f64) -> serde_json::Value {
+        serde_json::json!({ "context_window": { "used_percentage": pct } })
+    }
+
+    /// The statusline never carries a session-end signal, so `latest` would grow
+    /// one entry per session id forever. The cap backstop hard-bounds it: once over
+    /// the cap, the least-recently-ingested snapshot is evicted (LRU, recency-based
+    /// not insertion-based).
+    #[test]
+    fn latest_map_is_capped_and_evicts_least_recently_ingested() {
+        let bridge = StatusBridge::new();
+        // Fill exactly to the cap, one ingest each in ascending order.
+        for i in 0..STATUS_MAP_CAP {
+            bridge.ingest(&format!("s{i:05}"), &ctx_payload(i as f64 % 100.0), i as u64);
+        }
+        assert_eq!(bridge.all().len(), STATUS_MAP_CAP, "filled to the cap");
+
+        // Re-ingest the oldest session so it's no longer the LRU victim.
+        bridge.ingest("s00000", &ctx_payload(99.0), 9_000);
+
+        // One brand-new session pushes over the cap → exactly one eviction.
+        bridge.ingest("s99999", &ctx_payload(1.0), 9_001);
+        assert_eq!(bridge.all().len(), STATUS_MAP_CAP, "map stays bounded at the cap");
+
+        // The re-ingested oldest survives; the now-least-recent (s00001) is evicted.
+        assert!(bridge.get("s00000").is_some(), "re-ingested session survives");
+        assert!(bridge.get("s00001").is_none(), "least-recently-ingested evicted");
+        assert!(bridge.get("s99999").is_some(), "the new session is present");
+    }
+
+    /// The explicit eviction seam drops a session's snapshot (used if a session-end
+    /// signal is ever routed to the bridge) and is harmless when already gone.
+    #[test]
+    fn evict_removes_snapshot_and_is_idempotent() {
+        let bridge = StatusBridge::new();
+        bridge.ingest("s1", &ctx_payload(10.0), 1);
+        assert!(bridge.get("s1").is_some());
+        bridge.evict("s1");
+        assert!(bridge.get("s1").is_none(), "evicted snapshot is gone");
+        // Evicting an unknown / already-evicted session is a harmless no-op.
+        bridge.evict("s1");
+        bridge.evict("never-seen");
+        assert!(bridge.all().is_empty());
     }
 }
