@@ -280,6 +280,16 @@ export function TerminalView({
     let disposed = false;
     let promptTimer: ReturnType<typeof setTimeout> | null = null;
     let rafId = 0;
+    // Coalesced-write rAF (perf): a flood of small terminal://output events is
+    // batched into one frame of decode+write work instead of one synchronous
+    // write per event on the single WebView2 JS thread. 0 == none scheduled;
+    // torn down in cleanup like `rafId` so it can't fire into a disposed term.
+    let flushRaf = 0;
+    // Drains any queued bytes synchronously. Set inside the async attach block
+    // (which owns the pending queue); cleanup calls it ONCE before disposing the
+    // term so a partial frame of output isn't dropped on unmount, matching the
+    // old synchronous path's completeness. Stays null if teardown beats setup.
+    let drainPending: (() => void) | null = null;
 
     const term = new Terminal({
       allowProposedApi: true,
@@ -669,17 +679,75 @@ export function TerminalView({
                 raw.length > URL_SCAN_TAIL ? raw.slice(-URL_SCAN_TAIL) : raw;
             };
 
+            // PER-TERMINAL COALESCED WRITE (perf): the old path decoded, scanned
+            // for URLs (stripAnsi + regex over a rolling buffer), and wrote to
+            // xterm SYNCHRONOUSLY for every single output event, on the one
+            // WebView2 JS thread, for every live terminal. A burst from a few
+            // busy terminals turned into a decode/ANSI/regex storm that froze the
+            // app. Now `onOutput` only decodes and ENQUEUES the bytes; a single
+            // rAF flush per terminal does the writing + (bounded) URL scan once
+            // per frame, collapsing a burst of small events into one frame of
+            // work. Byte ORDER is preserved because the queue is FIFO and a flush
+            // drains it in arrival order; COMPLETENESS is preserved because every
+            // decoded chunk lands in the queue and the queue is fully drained on
+            // every flush (and one final flush runs before teardown disposes the
+            // term — see cleanup).
+            const pending: Uint8Array[] = [];
+
+            // Drain the queued bytes: URL-scan + activity-bump + write, ONCE for
+            // the whole frame's worth of chunks. Shared by the rAF flush and the
+            // teardown drain; the only difference is the rAF path's `disposed`
+            // guard (it must not write into an about-to-be-disposed term on a
+            // late frame), whereas the teardown path runs deliberately while the
+            // term is still alive (cleanup disposes it only afterward).
+            const drainQueue = (): void => {
+              if (pending.length === 0) return;
+              // Snapshot + clear up front so anything that arrives DURING this
+              // drain queues cleanly for the next frame (FIFO order intact).
+              const chunks = pending.splice(0, pending.length);
+
+              // URL detection runs at most ONCE per flush over the frame's bytes
+              // (in arrival order), not once per chunk — same stripAnsi/regex
+              // work, far fewer invocations. The dedup ring + tail carry-over
+              // make this identical in effect to the old per-chunk scan: a URL
+              // split across chunks within or across frames still resolves via
+              // `scanTail`, and `recentUrls` still suppresses repeats.
+              for (const bytes of chunks) scanForUrls(bytes);
+
+              // RUNNING signal (#11): bump ONCE per flush rather than per chunk.
+              // The sidebar pulse is a coarse "output is flowing" indicator, so a
+              // per-frame bump is indistinguishable from a per-chunk one to the
+              // user while saving a store write per event.
+              useActivity.getState().bump(terminalId);
+
+              // Write the frame's bytes to xterm in arrival order. Before the
+              // seed has landed we still route into `liveBuffer` (flushed after
+              // the seed) so history/live ordering is preserved exactly as before.
+              if (seeded) {
+                for (const bytes of chunks) term.write(bytes);
+              } else {
+                for (const bytes of chunks) liveBuffer.push(bytes);
+              }
+            };
+
+            const flushPending = (): void => {
+              flushRaf = 0;
+              if (disposed) return;
+              drainQueue();
+            };
+
+            // Expose a synchronous drain to the outer cleanup so a partial frame
+            // of output queued at unmount isn't lost (the old write path was
+            // synchronous, so nothing received was ever pending at teardown).
+            drainPending = drainQueue;
+
             const offOutput = await onOutput((e) => {
               if (e.id !== terminalId || disposed) return;
-              // RUNNING signal (#11): this terminal is producing output, so mark it
-              // active — the sidebar row pulses while output flows. This is the
-              // cross-agent proxy for Codex (no mid-turn hooks) and shells running a
-              // command; Claude additionally pulses from supervision (mid-turn).
-              useActivity.getState().bump(terminalId);
-              const bytes = decodeBase64(e.base64);
-              scanForUrls(bytes);
-              if (seeded) term.write(bytes);
-              else liveBuffer.push(bytes);
+              // HOT PATH: decode + enqueue only. The heavy work (URL scan, store
+              // bump, term.write) is deferred to the coalesced rAF flush above so
+              // a flood of events doesn't block the JS thread chunk-by-chunk.
+              pending.push(decodeBase64(e.base64));
+              if (flushRaf === 0) flushRaf = requestAnimationFrame(flushPending);
             });
             if (disposed) {
               void offOutput();
@@ -872,6 +940,15 @@ export function TerminalView({
       initializedRef.current = false;
 
       cancelAnimationFrame(rafId);
+      // Cancel any scheduled coalesced-write flush, then drain its queue ONCE
+      // synchronously below (before term.dispose) so the final partial frame of
+      // output isn't lost. The cancel stops a late rAF from firing into the
+      // disposed term; flushPending also re-checks `disposed`, so even a frame
+      // that slips through the cancel is a no-op.
+      if (flushRaf !== 0) {
+        cancelAnimationFrame(flushRaf);
+        flushRaf = 0;
+      }
       if (promptTimer) clearTimeout(promptTimer);
       if (resizeTimer) clearTimeout(resizeTimer);
       if (copyTimer) clearTimeout(copyTimer);
@@ -903,6 +980,14 @@ export function TerminalView({
         /* ignore unlisten races */
       });
       unlisteners.length = 0;
+
+      // Final synchronous drain of any output that was queued for the next rAF
+      // frame but never flushed (the cancel above stopped that frame). The term
+      // is still alive here — it's disposed on the next line — so this writes the
+      // last partial frame's bytes in order, preserving completeness the same way
+      // the old per-event synchronous write did. No-op if setup never reached the
+      // point of assigning `drainPending` (teardown beat the async attach).
+      drainPending?.();
 
       term.dispose();
       termRef.current = null;

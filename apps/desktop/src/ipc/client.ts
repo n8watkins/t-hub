@@ -131,10 +131,17 @@ export function onExit(cb: (e: ExitEvent) => void): Promise<UnlistenFn> {
   return Promise.resolve(exitHub.subscribe(cb));
 }
 
-/** Decode base64 PTY output into bytes suitable for `xterm.write(Uint8Array)`. */
+/**
+ * Decode base64 PTY output into bytes suitable for `xterm.write(Uint8Array)`.
+ *
+ * Hot path: this runs for EVERY output chunk of EVERY live terminal, so the
+ * inner loop matters. `Uint8Array.from(atob(b64), c => c.charCodeAt(0))` lets
+ * the engine size + fill the array in one native pass instead of a hand-rolled
+ * `charCodeAt` loop with a bounds check per byte. `atob` still does the actual
+ * base64 work; a malformed string throws there exactly as before, so callers
+ * (which already wrap output handling in try/catch) see identical error
+ * behavior — we just trade the JS loop for the engine's.
+ */
 export function decodeBase64(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 }
