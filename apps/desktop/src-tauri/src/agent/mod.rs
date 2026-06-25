@@ -838,6 +838,73 @@ mod tests {
     }
 
     #[test]
+    fn consume_session_end_emits_terminal_status_not_unknown() {
+        // REGRESSION (HIGH): evicting the session on `SessionEnd` made
+        // `emit_session` read `status()` for an absent session — which defaults to
+        // `Unknown` — so the UI's last `session://status` was `unknown` instead of
+        // the real terminal status. The supervision reducer tests passed because
+        // they assert on `ingest()`'s `status()` in isolation; this asserts on the
+        // EMITTED payload from the `consume_journal_entry` → `emit_session` path.
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec.clone()));
+        rec.events.lock().clear();
+
+        // Clean-completed path: a main-agent Stop with no outstanding subagents
+        // classifies Completed, and SessionEnd keeps that terminal status.
+        bridge.consume_journal_entry(&entry(1, "o1", None, JournalEventType::SessionStart));
+        bridge.consume_journal_entry(&entry(2, "o1", None, JournalEventType::Stop));
+        bridge.consume_journal_entry(&entry(3, "o1", None, JournalEventType::SessionEnd));
+
+        // The LAST session://status emit for this session — the one the UI renders
+        // after the session ends — must be the terminal status, never `unknown`.
+        let last_status = rec
+            .events
+            .lock()
+            .iter()
+            .filter(|(c, _)| c == super::EVT_SESSION_STATUS)
+            .last()
+            .cloned()
+            .expect("a session://status must be emitted on SessionEnd");
+        assert_eq!(last_status.1["sessionId"], "o1");
+        assert_eq!(
+            last_status.1["status"], "completed",
+            "SessionEnd after a clean Stop must emit the terminal Completed status"
+        );
+        assert_ne!(
+            last_status.1["status"], "unknown",
+            "evicting on SessionEnd must never let emit_session broadcast Unknown"
+        );
+
+        // Abnormal path: a Stop with an outstanding subagent is WaitingOnSubagents,
+        // so SessionEnd downgrades to Failed (non-Completed → Failed). Still never
+        // `unknown` on the emitted payload.
+        let rec2 = RecordingEmitter::default();
+        bridge.set_emitter(Arc::new(rec2.clone()));
+        rec2.events.lock().clear();
+
+        bridge.consume_journal_entry(&entry(4, "o2", None, JournalEventType::SessionStart));
+        bridge.consume_journal_entry(&entry(5, "o2", Some("a1"), JournalEventType::SubagentStart));
+        bridge.consume_journal_entry(&entry(6, "o2", None, JournalEventType::Stop));
+        bridge.consume_journal_entry(&entry(7, "o2", None, JournalEventType::SessionEnd));
+
+        let last_status2 = rec2
+            .events
+            .lock()
+            .iter()
+            .filter(|(c, _)| c == super::EVT_SESSION_STATUS)
+            .last()
+            .cloned()
+            .expect("a session://status must be emitted on SessionEnd");
+        assert_eq!(last_status2.1["sessionId"], "o2");
+        assert_eq!(
+            last_status2.1["status"], "failed",
+            "SessionEnd while waiting on a subagent must emit the terminal Failed status"
+        );
+        assert_ne!(last_status2.1["status"], "unknown");
+    }
+
+    #[test]
     fn status_snapshot_journal_entry_routes_to_status_bridge_and_emits() {
         use t_hub_protocol::{JournalSource, EventJournalEntry};
         let bridge = AgentBridge::new();
