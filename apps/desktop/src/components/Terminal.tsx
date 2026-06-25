@@ -47,12 +47,13 @@ import type { TerminalId } from "../ipc/types";
 import { stripAnsi } from "../lib/ansi";
 import { installFileDropOnce, formatPathsForInsert } from "../lib/dropPaste";
 import { usePanels } from "../store/panels";
+import { useFileOpen } from "../store/fileOpen";
 import { useWorkspace } from "../store/workspace";
 import { useTheme, DEFAULT_THEME, type TerminalPalette } from "../store/theme";
 import { useActivity } from "../store/activity";
 import { tlog } from "../lib/diag";
 import { REPAINT_ALL_EVENT, REFRESH_TERMINAL_EVENT } from "../lib/repaint";
-import type { ITheme } from "@xterm/xterm";
+import type { ITheme, ILink } from "@xterm/xterm";
 import {
   readText as tauriReadText,
   writeText as tauriWriteText,
@@ -147,6 +148,34 @@ const LOCALHOST_URL_RE =
 // here is well under this; the tail just has to outspan the longest plausible
 // split point. Kept small — it runs on every output chunk.
 const URL_SCAN_TAIL = 256;
+
+// Matches a CLICKABLE FILE PATH printed in terminal output (WS-1, open-file-on-
+// Ctrl+click). Deliberately STRICT to avoid false positives — we'd rather miss a
+// path than underline arbitrary text:
+//   - ABSOLUTE paths only for now: POSIX/WSL `/a/b/c` or Windows `C:\a\b` /
+//     `C:/a/b`. Relative paths need the tile's cwd to resolve (see the link
+//     provider's TODO), so we don't offer them yet.
+//   - At least one path separator (a bare `/foo` token isn't enough on its own
+//     for the POSIX form — it must look like a real multi-segment path OR carry a
+//     file extension), and the final segment must not end in a separator.
+// `g` so one line can yield several path matches; segment chars exclude
+// whitespace and shell/quote punctuation so we don't swallow surrounding syntax.
+const FILE_PATH_RE =
+  /(?:[A-Za-z]:[\\/]|\/)(?:[^\s"'`<>|:*?()[\]{}]+[\\/])*[^\s"'`<>|:*?()[\]{}]+/g;
+
+/** True for a token we're willing to open: an absolute path with a real shape —
+ *  either it has a directory part (a separator after the root) or a file
+ *  extension on its single segment. Trailing sentence punctuation is trimmed by
+ *  the caller before this check. */
+function looksLikeOpenablePath(token: string): boolean {
+  // Drop the leading root marker, then require either an inner separator (a real
+  // nested path) or a dotted extension on the leaf so a bare `/usr` doesn't match.
+  const afterRoot = token.replace(/^(?:[A-Za-z]:)?[\\/]/, "");
+  const hasInnerSep = /[\\/]/.test(afterRoot);
+  const leaf = afterRoot.split(/[\\/]/).pop() ?? "";
+  const hasExt = /\.[A-Za-z0-9]+$/.test(leaf);
+  return hasInnerSep || hasExt;
+}
 
 /** Default xterm theme when the active theme carries no terminal palette. */
 const DEFAULT_TERM_THEME: ITheme = { background: "#0a0a0a" };
@@ -291,11 +320,70 @@ export function TerminalView({
     });
     term.loadAddon(webLinks);
 
+    // CLICKABLE FILE PATHS (WS-1): a SECOND link provider, alongside WebLinksAddon
+    // (link providers stack — WebLinks underlines URLs, this underlines file
+    // paths; the two regexes don't overlap). For the hovered buffer line we read
+    // its text and surface each strict-absolute-path token as an xterm ILink:
+    // xterm draws the hover underline + pointer cursor for free. We gate the
+    // ACTIVATE on Ctrl/Cmd (like VS Code / iTerm "open file"), routing through the
+    // fileOpen bus + switching the tile to its Files tab; a plain click is left to
+    // xterm (selection), so ordinary drag-to-select copy is unaffected.
+    const pathLinks = term.registerLinkProvider({
+      provideLinks: (lineNumber, callback) => {
+        const line = term.buffer.active.getLine(lineNumber - 1);
+        if (!line) return callback(undefined);
+        const text = line.translateToString(false);
+        const links: ILink[] = [];
+        FILE_PATH_RE.lastIndex = 0;
+        for (const m of text.matchAll(FILE_PATH_RE)) {
+          // Trim trailing sentence punctuation a path is unlikely to really end
+          // in (".", ",", ")", ":" — e.g. "see /a/b/c.ts:" or "(/a/b)").
+          const raw = m[0];
+          const token = raw.replace(/[.,:;)\]}]+$/, "");
+          if (!looksLikeOpenablePath(token)) continue;
+          const startX = (m.index ?? 0) + 1; // ILink ranges are 1-based.
+          links.push({
+            text: token,
+            range: {
+              start: { x: startX, y: lineNumber },
+              end: { x: startX + token.length - 1, y: lineNumber },
+            },
+            activate: (event, linkText) => {
+              // Only Ctrl/Cmd+click opens the file; a bare click falls through to
+              // xterm so the user can still place the cursor / start a selection.
+              if (!event.ctrlKey && !event.metaKey) return;
+              // TODO: resolve relative paths against the tile cwd — only ABSOLUTE
+              // paths are matched/opened today (FILE_PATH_RE requires a root).
+              usePanels.getState().setTab(terminalId, "files");
+              useFileOpen.getState().requestOpen(terminalId, linkText);
+            },
+          });
+        }
+        callback(links.length ? links : undefined);
+      },
+    });
+
     // No WebGL addon: xterm uses its default DOM renderer. See the file header
     // (mutedbug fix) for why -- a per-terminal WebGL context hits WebView2's
     // context ceiling and blanks the whole grid on eviction. The DOM renderer
     // has no GPU context, so that failure mode does not exist.
     term.open(container);
+
+    // COPY-ON-SELECT (WS-1): mirror Claude Code / iTerm — selecting text in the
+    // terminal auto-copies it to the clipboard, no Ctrl+C needed. onSelectionChange
+    // fires rapidly during a drag, so we DEBOUNCE (~120ms) and only write once the
+    // drag settles. We do NOT clear the selection (it stays highlighted) and this
+    // is fully independent of the Ctrl+C handler above (which copies AND clears on
+    // demand, and still falls through to SIGINT with no selection).
+    let copyTimer: ReturnType<typeof setTimeout> | null = null;
+    const selectionSub = term.onSelectionChange(() => {
+      if (copyTimer) clearTimeout(copyTimer);
+      copyTimer = setTimeout(() => {
+        if (disposed || !term.hasSelection()) return;
+        const sel = term.getSelection();
+        if (sel) void clipboardWrite(sel);
+      }, 120);
+    });
 
     // Forward keystrokes/paste to the PTY.
     const dataSub = term.onData((d) => {
@@ -756,6 +844,7 @@ export function TerminalView({
       cancelAnimationFrame(rafId);
       if (promptTimer) clearTimeout(promptTimer);
       if (resizeTimer) clearTimeout(resizeTimer);
+      if (copyTimer) clearTimeout(copyTimer);
       resizeObserver?.disconnect();
       resizeObserver = null;
       visObserver?.disconnect();
@@ -765,6 +854,8 @@ export function TerminalView({
       window.removeEventListener(REFRESH_TERMINAL_EVENT, onRefresh);
 
       dataSub.dispose();
+      selectionSub.dispose();
+      pathLinks.dispose();
 
       // Await all event unlisteners so no stray onOutput fires into a disposed
       // term. Any subscriptions still in-flight bail via the `disposed` flag.

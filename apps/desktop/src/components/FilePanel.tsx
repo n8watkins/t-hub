@@ -22,10 +22,11 @@ import {
   writeTextFile,
 } from "../ipc/files";
 import { type GitInfo, gitCommit, gitInfo } from "../ipc/git";
-import type { DirEntry, FileContents, FileHit } from "../ipc/types";
+import type { DirEntry, FileContents, FileHit, TerminalId } from "../ipc/types";
 import { Markdown } from "./Markdown";
 import { tlog } from "../lib/diag";
 import { useSettings } from "../store/settings";
+import { useFileOpen } from "../store/fileOpen";
 
 const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx", "mdown", "markdn"]);
 
@@ -57,6 +58,13 @@ export interface FilePanelProps {
    * If omitted, the panel renders an empty state prompting for a root.
    */
   root?: string;
+  /**
+   * The tile/terminal this panel belongs to. When set, the panel watches the
+   * `fileOpen` bus and opens any request TARGETED at this tile (a Ctrl+click on a
+   * path in that tile's terminal). Omitted for hosts with no tile context (e.g.
+   * the Settings-modal reader), which simply don't participate in the bus.
+   */
+  terminalId?: TerminalId;
   /** Optional starting absolute path to open in the reader. */
   initialFile?: string;
   /** Optional max results for a search query (default 50). */
@@ -90,6 +98,7 @@ type ReaderMode = "rendered" | "source";
 
 export function FilePanel({
   root,
+  terminalId,
   initialFile,
   searchLimit = 50,
   readerOnly = false,
@@ -218,6 +227,20 @@ export function FilePanel({
         setReader({ status: "error", path, message: String(e) });
       });
   }, []);
+
+  // --- Open-file-on-Ctrl+click bus (WS-1). -------------------------------
+  // A Ctrl/Cmd+click on a path in this tile's terminal publishes a request on the
+  // fileOpen store (and switches the tile to its Files tab, which mounts us). We
+  // open any pending request TARGETED at this tile, then clear it so it's consumed
+  // exactly once. Subscribing to the store value (not getState) means we also
+  // catch a request that was already pending when we mounted from the tab switch.
+  const pendingOpen = useFileOpen((s) => s.pending);
+  const clearOpen = useFileOpen((s) => s.clear);
+  useEffect(() => {
+    if (!pendingOpen || pendingOpen.terminalId !== terminalId) return;
+    openFile(pendingOpen.path);
+    clearOpen();
+  }, [pendingOpen, terminalId, openFile, clearOpen]);
 
   // After the editor saves, reflect the new text (and byte size) in the open
   // reader so the view + the next edit's baseline match what's now on disk.

@@ -64,7 +64,9 @@ export function TilePanel({
 
   switch (tab) {
     case "files":
-      return <FilePanel root={cwd || undefined} compact={compact} />;
+      return (
+        <FilePanel root={cwd || undefined} terminalId={terminalId} compact={compact} />
+      );
     case "preview":
       return (
         <WebPreview
