@@ -254,6 +254,11 @@ pub fn run() {
         // `updater:default` / `process:default` capabilities.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // OS toast notifications for key session events (WS-2). The frontend's
+        // lib/notify.ts dynamically imports @tauri-apps/plugin-notification and
+        // calls into this; gated by the `notification:*` capabilities + the
+        // `plugins.notification` block in tauri.conf.json.
+        .plugin(tauri_plugin_notification::init())
         .manage(TerminalManager::default())
         .manage(AppState::default())
         .manage(files::FileIndexState::new())

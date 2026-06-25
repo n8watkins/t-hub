@@ -71,6 +71,12 @@ tauri-plugin-clipboard-manager = "2"
 # tauri.conf.json. Versions match the sibling "scribe" app.
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# OS toast notifications for key session events (WS-2). The JS
+# @tauri-apps/plugin-notification calls this Rust side; it's gated by the
+# `notification:*` capabilities and the `plugins.notification` block in
+# tauri.conf.json. Without it the frontend degrades to sound-only (see
+# src/lib/notify.ts).
+tauri-plugin-notification = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 portable-pty = "0.8"
