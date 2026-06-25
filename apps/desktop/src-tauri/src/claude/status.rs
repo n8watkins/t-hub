@@ -19,6 +19,7 @@
 //! store); it is self-contained and feeds [`crate::model::AgentSessionRecord`].
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -192,6 +193,12 @@ pub struct StatusBridge {
     /// is built in `AppState::default()`, before any DB). `None` until then (and
     /// in tests), in which case the WS-6 record is silently skipped.
     db: RwLock<Option<std::sync::Arc<crate::db::Db>>>,
+    /// Dedup cache for the WS-6 restore record (#8): the last (session_id, cwd) we
+    /// actually wrote for each `terminal_id`. The tile→session row is write-once-
+    /// per-session, but a statusline ingests on EVERY refresh; so we skip the
+    /// SQLite upsert when the tuple is unchanged from what's cached here. A miss /
+    /// changed tuple writes the row and refreshes the cache.
+    last_recorded: Mutex<HashMap<String, (String, String)>>,
 }
 
 impl StatusBridge {
@@ -229,6 +236,10 @@ impl StatusBridge {
     /// a `cwd` — without both we can't restore the session to the right place, so
     /// we skip rather than write a half-row. A DB error is swallowed (logged by the
     /// DB layer); recording must never disturb the live usage meter.
+    ///
+    /// #8: the row is write-once-per-session, but a statusline ingests on every
+    /// refresh — so we keep a per-tile cache of the last (session_id, cwd) written
+    /// and skip the SQLite upsert entirely when the tuple is unchanged.
     fn record_for_restore(&self, snap: &StatusSnapshot) {
         let Some(db) = self.db.read().clone() else {
             return; // no DB wired (pre-setup / tests)
@@ -244,7 +255,28 @@ impl StatusBridge {
         // names every session `th_<terminalId>`). Fall back to the whole name if
         // the prefix is somehow absent so the row is still keyed consistently.
         let terminal_id = tmux_session.strip_prefix("th_").unwrap_or(tmux_session);
-        let _ = db.record_tile_session(terminal_id, &snap.session_id, cwd, tmux_session);
+        // #8: skip the upsert when this tile's (session_id, cwd) is unchanged from
+        // what we last wrote — the common case on a repeating statusline. We update
+        // the cache only AFTER recording so a transient DB error is retried next
+        // ingest rather than masked by a premature cache write.
+        {
+            let cache = self.last_recorded.lock().expect("status dedup mutex poisoned");
+            if cache
+                .get(terminal_id)
+                .is_some_and(|(s, c)| s == &snap.session_id && c == cwd)
+            {
+                return;
+            }
+        }
+        if db
+            .record_tile_session(terminal_id, &snap.session_id, cwd, tmux_session)
+            .is_ok()
+        {
+            self.last_recorded
+                .lock()
+                .expect("status dedup mutex poisoned")
+                .insert(terminal_id.to_string(), (snap.session_id.clone(), cwd.to_string()));
+        }
     }
 
     /// The latest snapshot for a session, if any.
@@ -378,6 +410,69 @@ mod tests {
         // Both snapshots are still queryable for the usage meter.
         assert!(bridge.get("claude-sess-1").is_some());
         assert!(bridge.get("claude-sess-2").is_some());
+
+        drop(bridge);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #8: a repeating statusline for the SAME (terminal, session, cwd) is
+    /// deduped — only the first ingest writes the row; a CHANGED session/cwd
+    /// breaks the cache and writes again (the row still upserts in place).
+    #[test]
+    fn record_for_restore_dedups_unchanged_tuple() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-status-ws6-dedup-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = std::sync::Arc::new(crate::db::Db::open_in(dir.clone()));
+        let bridge = StatusBridge::new();
+        bridge.set_db(db.clone());
+
+        let payload = serde_json::json!({
+            "cwd": "/home/u/proj",
+            "tmux_session": "th_t1",
+            "context_window": { "used_percentage": 10.0 }
+        });
+        // Three identical ingests: the dedup cache caches after the first, so the
+        // tuple is recorded once and skipped twice. Observable via the cache state.
+        bridge.ingest("sess-a", &payload, 1);
+        bridge.ingest("sess-a", &payload, 2);
+        bridge.ingest("sess-a", &payload, 3);
+        {
+            let cache = bridge.last_recorded.lock().unwrap();
+            assert_eq!(
+                cache.get("t1"),
+                Some(&("sess-a".to_string(), "/home/u/proj".to_string())),
+                "cache holds the last-written tuple after dedup",
+            );
+        }
+        // A new session for the same tile is a cache miss -> records again.
+        bridge.ingest(
+            "sess-b",
+            &serde_json::json!({
+                "cwd": "/home/u/proj2",
+                "tmux_session": "th_t1",
+                "context_window": { "used_percentage": 20.0 }
+            }),
+            4,
+        );
+        let rows = db.all_tile_sessions().unwrap();
+        assert_eq!(rows.len(), 1, "still one row per terminal_id (upsert)");
+        assert_eq!(rows[0].session_id, "sess-b", "the changed session was written");
+        assert_eq!(rows[0].cwd, "/home/u/proj2");
+        {
+            let cache = bridge.last_recorded.lock().unwrap();
+            assert_eq!(
+                cache.get("t1"),
+                Some(&("sess-b".to_string(), "/home/u/proj2".to_string())),
+                "cache refreshed to the new tuple",
+            );
+        }
 
         drop(bridge);
         drop(db);

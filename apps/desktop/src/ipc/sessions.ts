@@ -1,13 +1,11 @@
 // Typed IPC wrappers for native session-restore (WS-6).
 //
 // Mirrors `src-tauri/src/db.rs`:
-//   - command `record_tile_session(terminalId, sessionId, cwd, tmuxSession)` —
-//     upsert the Claude session a tile is hosting (the status-ingest path records
-//     this automatically; the command exists for a future native hook).
 //   - command `list_orphaned_sessions() -> OrphanedSession[]` — the boot-time
 //     restore catalog: recorded tile→session bindings whose tmux session is GONE
 //     (app/backend/host restarted) but whose transcript still EXISTS, so
-//     `claude --resume <sessionId>` can bring them back.
+//     `claude --resume <sessionId>` can bring them back. Recording the bindings
+//     is automatic on the status-ingest path (no frontend command for it).
 //
 // Kept self-contained (its own command-name table + payload type) like
 // `persistence.ts`. Keep the command names in lockstep with the Rust side.
@@ -15,8 +13,6 @@ import { invoke } from "@tauri-apps/api/core";
 
 /** Exact Tauri command names for native session-restore (WS-6). */
 export const SessionCommands = {
-  /** Upsert the Claude session a tile is hosting (per-tile session map). */
-  recordTileSession: "record_tile_session",
   /** List resumable orphaned sessions left by an app/backend/host restart. */
   listOrphanedSessions: "list_orphaned_sessions",
 } as const;
@@ -36,25 +32,6 @@ export interface OrphanedSession {
   label: string;
   /** Unix epoch SECONDS the binding was last recorded (sorts newest-first). */
   lastSeen: number;
-}
-
-/**
- * Record (upsert) the Claude session a tile is hosting. Best-effort: the
- * status-ingest path already records this as statusline snapshots arrive, so a
- * UI caller can fire-and-forget. Keyed by `terminalId`.
- */
-export function recordTileSession(
-  terminalId: string,
-  sessionId: string,
-  cwd: string,
-  tmuxSession: string,
-): Promise<void> {
-  return invoke(SessionCommands.recordTileSession, {
-    terminalId,
-    sessionId,
-    cwd,
-    tmuxSession,
-  });
 }
 
 /**

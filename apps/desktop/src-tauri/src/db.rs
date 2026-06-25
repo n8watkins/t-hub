@@ -320,6 +320,30 @@ impl Db {
         })?;
         rows.collect()
     }
+
+    /// Prune the given `terminal_id`s from `tile_sessions` (WS-6, #9). Called by
+    /// the orphan scan with the rows it proved DEAD (tmux session gone AND no
+    /// transcript), so they never accumulate — they can never be restored, so the
+    /// boot scan needn't keep re-reading them. Best-effort: a `None`-backed DB or
+    /// an empty list is a no-op. Done in one transaction so the delete is atomic.
+    pub fn delete_tile_sessions(&self, terminal_ids: &[String]) -> rusqlite::Result<()> {
+        if terminal_ids.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.conn.lock().expect("db mutex poisoned");
+        let Some(conn) = guard.as_mut() else {
+            return Ok(()); // no DB → nothing to prune
+        };
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM tile_sessions WHERE terminal_id = ?1")?;
+            for id in terminal_ids {
+                stmt.execute([id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 /// Lightweight metadata for one history snapshot, returned by `list_snapshots`.
@@ -487,24 +511,6 @@ pub async fn load_workspace_snapshot(
 
 // --- Native session-restore (WS-6) -----------------------------------------
 
-/// Record the Claude session a tile is hosting (WS-6). The status-ingest path
-/// upserts this automatically as statusline snapshots arrive (see
-/// `StatusBridge::ingest`); this command also exposes it directly so the
-/// frontend / a future native hook can stamp a binding without a statusline.
-/// Best-effort: a DB error is returned but never breaks live state.
-#[tauri::command]
-pub async fn record_tile_session(
-    app: tauri::AppHandle,
-    terminal_id: String,
-    session_id: String,
-    cwd: String,
-    tmux_session: String,
-) -> Result<(), String> {
-    app.state::<std::sync::Arc<Db>>()
-        .record_tile_session(&terminal_id, &session_id, &cwd, &tmux_session)
-        .map_err(|e| format!("record_tile_session: {e}"))
-}
-
 /// List the resumable ORPHANED Claude sessions (WS-6) — the boot-time restore
 /// catalog. Cross-references the recorded `tile_sessions` map against:
 ///   1. the SURVIVING `th_*` tmux sessions (same source `list_terminals` uses) —
@@ -529,54 +535,90 @@ pub async fn list_orphaned_sessions(
 
     // Move the cross-referencing work (a tmux listing + a transcript-catalog
     // walk, both blocking I/O) off the async executor.
-    let orphans = tauri::async_runtime::spawn_blocking(move || cross_reference_orphans(rows))
+    let scan = tauri::async_runtime::spawn_blocking(move || cross_reference_orphans(rows))
         .await
         .unwrap_or_default();
-    Ok(orphans)
+    // #9: prune the rows we proved DEAD (tmux gone AND no transcript) — they can
+    // never be restored, so they'd only grow the table + future boot scans. Best-
+    // effort: a prune failure is logged, never failing the restore list.
+    if let Err(e) = app
+        .state::<std::sync::Arc<Db>>()
+        .delete_tile_sessions(&scan.dead_terminal_ids)
+    {
+        eprintln!("db: prune of dead tile_sessions failed: {e}");
+    }
+    Ok(scan.orphans)
+}
+
+/// The outcome of one orphan cross-reference (WS-6): the resumable orphans to
+/// offer for restore, plus the `terminal_id`s proven DEAD (tmux session gone AND
+/// no transcript) that the caller prunes from `tile_sessions` (#9).
+#[derive(Debug, Default)]
+struct OrphanScan {
+    orphans: Vec<OrphanedSession>,
+    dead_terminal_ids: Vec<String>,
 }
 
 /// Filter recorded tile→session bindings down to resumable orphans (WS-6): drop
 /// any whose tmux session is still LIVE, and any whose transcript is GONE; for
-/// the rest, attach a friendly label from the transcript catalog. Pulled out as a
-/// plain fn so the orphan logic is testable without Tauri/DB. Newest-first.
-fn cross_reference_orphans(rows: Vec<TileSession>) -> Vec<OrphanedSession> {
+/// the rest, attach a friendly label from the transcript catalog. Also collects
+/// the provably-dead rows (tmux gone AND no transcript) for the caller to prune
+/// (#9). Pulled out as a plain fn so the orphan logic is testable without
+/// Tauri/DB. Newest-first.
+fn cross_reference_orphans(rows: Vec<TileSession>) -> OrphanScan {
     // Live tmux sessions (the `t-hub` socket) — a still-running binding isn't
-    // orphaned. A listing failure degrades to "none live" so we don't wrongly
-    // suppress restorable sessions.
-    let live: std::collections::HashSet<String> =
-        crate::tmux::list_sessions().unwrap_or_default().into_iter().collect();
+    // orphaned. FAIL CLOSED (#3): if the listing ITSELF fails, liveness is
+    // unknown, so we must NOT offer any session for restore (a still-live session
+    // would otherwise look orphaned and get double-`--resume`d into a new tile).
+    // We also skip pruning, since we can't prove anything dead without the live
+    // set.
+    let live: std::collections::HashSet<String> = match crate::tmux::list_sessions() {
+        Ok(names) => names.into_iter().collect(),
+        Err(e) => {
+            eprintln!(
+                "db: tmux list_sessions failed during orphan scan: {e} \
+                 (failing closed — offering no sessions for restore)"
+            );
+            return OrphanScan::default();
+        }
+    };
+    // The not-live rows — computed ONCE (#21) and driving BOTH the transcript
+    // lookup and the output, so the `!live.contains` predicate is evaluated a
+    // single time per row.
+    let not_live: Vec<TileSession> = rows
+        .into_iter()
+        .filter(|r| !live.contains(&r.tmux_session))
+        .collect();
     // The candidate session ids whose tmux session is gone — only THESE need a
     // transcript lookup (the recorded map is small, so this stays cheap).
-    let candidates: std::collections::HashSet<String> = rows
-        .iter()
-        .filter(|r| !live.contains(&r.tmux_session))
-        .map(|r| r.session_id.clone())
-        .collect();
+    let candidates: std::collections::HashSet<String> =
+        not_live.iter().map(|r| r.session_id.clone()).collect();
     // The resumable transcript catalog for just those ids: id → (label, cwd).
     // A present transcript IS the resumability signal (`--resume` reads it).
     let catalog = crate::recent::resumable_entries(&candidates);
 
-    let mut out: Vec<OrphanedSession> = rows
-        .into_iter()
-        .filter(|r| !live.contains(&r.tmux_session)) // skip still-live tiles
-        .filter_map(|r| {
-            // Skip bindings whose transcript is gone (can't be resumed).
-            let entry = catalog.get(&r.session_id)?;
-            Some(OrphanedSession {
-                session_id: r.session_id,
-                // Prefer the recorded cwd; fall back to the catalog's if blank.
-                cwd: if r.cwd.trim().is_empty() {
-                    entry.cwd.clone()
-                } else {
-                    r.cwd
-                },
-                label: entry.label.clone(),
-                last_seen: r.created_at,
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
-    out
+    let mut scan = OrphanScan::default();
+    for r in not_live {
+        // A not-live row whose transcript is GONE can never be resumed — record
+        // its terminal_id for pruning (#9) and skip it.
+        let Some(entry) = catalog.get(&r.session_id) else {
+            scan.dead_terminal_ids.push(r.terminal_id);
+            continue;
+        };
+        scan.orphans.push(OrphanedSession {
+            // Prefer the recorded cwd; fall back to the catalog's if blank.
+            cwd: if r.cwd.trim().is_empty() {
+                entry.cwd.clone()
+            } else {
+                r.cwd
+            },
+            label: entry.label.clone(),
+            last_seen: r.created_at,
+            session_id: r.session_id,
+        });
+    }
+    scan.orphans.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    scan
 }
 
 #[cfg(test)]
@@ -773,6 +815,26 @@ mod tests {
         let db = Db::default();
         assert!(db.record_tile_session("t1", "s", "/c", "th_t1").is_ok());
         assert!(db.all_tile_sessions().unwrap().is_empty());
+        // #9: pruning a None-backed DB (and the empty case) is a silent no-op.
+        assert!(db.delete_tile_sessions(&[]).is_ok());
+        assert!(db.delete_tile_sessions(&["t1".into()]).is_ok());
+    }
+
+    #[test]
+    fn delete_tile_sessions_prunes_only_named_rows() {
+        let (db, dir) = temp_db();
+        db.record_tile_session("t1", "sess-a", "/a", "th_t1").unwrap();
+        db.record_tile_session("t2", "sess-b", "/b", "th_t2").unwrap();
+        db.record_tile_session("t3", "sess-c", "/c", "th_t3").unwrap();
+        // Prune two; the third survives.
+        db.delete_tile_sessions(&["t1".into(), "t3".into()]).unwrap();
+        let rows = db.all_tile_sessions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].terminal_id, "t2");
+        // An empty list deletes nothing.
+        db.delete_tile_sessions(&[]).unwrap();
+        assert_eq!(db.all_tile_sessions().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
 }

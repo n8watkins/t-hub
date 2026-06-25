@@ -407,9 +407,9 @@ pub fn run() {
             // #recovery: snapshot-history read commands for the Recovery review UI.
             db::list_snapshots,
             db::get_snapshot,
-            // WS-6: native session-restore — record per-tile session bindings and
-            // list resumable orphans after an app/backend/host restart.
-            db::record_tile_session,
+            // WS-6: native session-restore — list resumable orphans after an
+            // app/backend/host restart. (Recording happens automatically via the
+            // status bridge on every statusline ingest; there is no record command.)
             db::list_orphaned_sessions,
             // --- feat/projects-sidebar (Agent A) -------------------------------
             // Recent recallable Claude sessions for the sidebar "Recent" list.
