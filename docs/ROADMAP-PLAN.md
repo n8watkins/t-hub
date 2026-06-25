@@ -4,6 +4,8 @@
 
 **Active scope = Wave 0 + Wave 1.** Remote/SSH (⑥) and the beyond-parity wildcards are deferred to *Later / someday* (bottom). All paths below are real (`apps/desktop/…` monorepo).
 
+**Progress:** ✅ Wave 0 complete — WS-1 (`a00085c`), WS-2 (`c5915d8`), and WS-5a (`683ff61`, pulled forward) are implemented, verified (cargo build + tsc + pnpm install), and committed. Remaining: WS-3, WS-4, WS-5b, WS-6.
+
 ## Principles
 
 - **Personal system, will be public.** No auth / multi-tenant / enterprise plumbing. But "public" means polish matters → UX quick wins carry weight.
