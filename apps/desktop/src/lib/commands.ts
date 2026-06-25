@@ -36,12 +36,19 @@ export const COMMAND_IDS = [
   "zoomReset",
   "toggleFocusRegion",
   "commandPalette",
+  "newPlainWorkspace",
+  "newWorktreeWorkspace",
 ] as const;
 
 export type CommandId = (typeof COMMAND_IDS)[number];
 
 /** Display groups for the palette + settings list (purely presentational). */
-export type CommandCategory = "Terminals" | "Navigation" | "Zoom" | "App";
+export type CommandCategory =
+  | "Terminals"
+  | "Workspaces"
+  | "Navigation"
+  | "Zoom"
+  | "App";
 
 export interface CommandMeta {
   id: CommandId;
@@ -65,6 +72,19 @@ export const COMMANDS: CommandMeta[] = [
     label: "Close terminal",
     description: "Kill the focused terminal's session",
     category: "Terminals",
+  },
+  {
+    id: "newPlainWorkspace",
+    label: "New workspace",
+    description: "Open a new empty tab (no repo, no worktree)",
+    category: "Workspaces",
+  },
+  {
+    id: "newWorktreeWorkspace",
+    label: "New worktree workspace",
+    description:
+      "Branch the focused repo into a sibling worktree and open it in a new tab",
+    category: "Workspaces",
   },
   {
     id: "cycleTileNext",

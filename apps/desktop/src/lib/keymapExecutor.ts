@@ -36,6 +36,16 @@ export function registerPaletteOpener(fn: (() => void) | null): void {
   openPalette = fn;
 }
 
+let openWorktreePrompt: ((cwd: string | undefined) => void) | null = null;
+/** WorktreePrompt registers its opener here on mount (App root). The executor
+ *  passes the focused tile's LIVE cwd so the prompt can anchor repo resolution.
+ *  Mirrors registerPaletteOpener (no import from the component → no cycle). */
+export function registerWorktreePromptOpener(
+  fn: ((cwd: string | undefined) => void) | null,
+): void {
+  openWorktreePrompt = fn;
+}
+
 let revealSidebarAndFocus: (() => void) | null = null;
 /**
  * Canvas registers the side effect that, when focus moves to the sidebar region,
@@ -100,6 +110,23 @@ function doToggleFocusRegion(): void {
   if (region === "sidebar") revealSidebarAndFocus?.();
 }
 
+/** New PLAIN workspace (WS-9c) — a fresh empty tab, no repo, no worktree. Just
+ *  `addTab()` (which creates + activates the tab); the design's `Ctrl+B c`. */
+function doNewPlainWorkspace(): void {
+  useWorkspace.getState().addTab();
+}
+
+/** New WORKTREE workspace (WS-9c) — the design's `Ctrl+B w`. Capture the focused
+ *  tile's LIVE cwd (the repo anchor) and open the branch prompt; the prompt drives
+ *  the rest (resolve target -> addWorktreeWorkspace, with no-repo/error inline).
+ *  A missing cwd is fine — the prompt opens and resolution falls through to
+ *  no-repo. */
+function doNewWorktreeWorkspace(): void {
+  const id = useWorkspace.getState().focusedId;
+  const cwd = id ? useWorkspace.getState().terminals[id]?.cwd : undefined;
+  openWorktreePrompt?.(cwd);
+}
+
 /** The registry: every CommandId -> its handler. The Record type makes this
  *  exhaustive — a new CommandId won't compile until it has a handler here. */
 const HANDLERS: Record<CommandId, () => void> = {
@@ -121,6 +148,8 @@ const HANDLERS: Record<CommandId, () => void> = {
   zoomReset: () => useWorkspace.getState().zoomReset(),
   toggleFocusRegion: doToggleFocusRegion,
   commandPalette: () => openPalette?.(),
+  newPlainWorkspace: doNewPlainWorkspace,
+  newWorktreeWorkspace: doNewWorktreeWorkspace,
 };
 
 /** Run a command by id. Safe to call from any trigger (Canvas keydown, the

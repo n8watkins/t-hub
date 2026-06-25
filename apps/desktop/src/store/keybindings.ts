@@ -34,7 +34,9 @@ export const DEFAULT_PREFIX = "ctrl+b";
  * to a free direct chord (`ctrl+j`). Everything else keeps its old chord, so no
  * other behavior regresses.
  */
-const DEFAULT_DIRECT: Record<CommandId, string> = {
+// Partial: not every command has a DIRECT chord — some (e.g. the WS-9c
+// new-workspace actions) are prefix-only by default. Mirrors DEFAULT_PREFIXED.
+const DEFAULT_DIRECT: Partial<Record<CommandId, string>> = {
   spawnTerminal: "ctrl+t",
   closeTerminal: "ctrl+w",
   cycleTileNext: "ctrl+tab",
@@ -62,7 +64,13 @@ const DEFAULT_DIRECT: Record<CommandId, string> = {
  * more via the command palette's rebind flow. Keys here are single bare keys.
  */
 const DEFAULT_PREFIXED: Partial<Record<CommandId, string>> = {
-  spawnTerminal: "c", // tmux muscle memory: prefix-c = new window
+  // WS-9c: the two "new" actions are the canonical owners of `c`/`w` per the
+  // worktree-workflow design (docs/WORKTREE-WORKFLOW.md). `c` previously seeded
+  // spawnTerminal — RELOCATED to `t` (mirrors its direct Ctrl+T; spawnTerminal is
+  // also the Ctrl+T direct chord, so the prefix tier is just an alias).
+  newPlainWorkspace: "c", // new plain tab (workspace)
+  newWorktreeWorkspace: "w", // new tab that is a git worktree
+  spawnTerminal: "t", // RELOCATED off `c` (now newPlainWorkspace)
   closeTerminal: "x", // tmux: prefix-x = kill pane
   commandPalette: "p",
   toggleFocusRegion: "o", // tmux: prefix-o = cycle panes
