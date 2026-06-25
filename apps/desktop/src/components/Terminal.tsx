@@ -328,11 +328,36 @@ export function TerminalView({
     // ACTIVATE on Ctrl/Cmd (like VS Code / iTerm "open file"), routing through the
     // fileOpen bus + switching the tile to its Files tab; a plain click is left to
     // xterm (selection), so ordinary drag-to-select copy is unaffected.
+    // ONE-ENTRY HOVER CACHE: xterm calls provideLinks for the line under the
+    // cursor on effectively every mouse-move across cells, so the same line gets
+    // recomputed identically each time the cursor returns to it. We memoize the
+    // LAST line only (hover targets one line at a time) keyed on its lineNumber +
+    // buffer text; if both match we return the cached ILink[] verbatim instead of
+    // re-running the regex scan. The text comparison invalidates naturally when
+    // the line's content changes (scroll/reflow/new output) under the same number.
+    let cachedLineNumber = -1;
+    let cachedText = "";
+    let cachedLinks: ILink[] | undefined;
     const pathLinks = term.registerLinkProvider({
       provideLinks: (lineNumber, callback) => {
         const line = term.buffer.active.getLine(lineNumber - 1);
         if (!line) return callback(undefined);
         const text = line.translateToString(false);
+        // Serve the memoized result when the hovered line + its text are unchanged
+        // (same ILink ranges/activate as a fresh compute — just computed once).
+        if (lineNumber === cachedLineNumber && text === cachedText) {
+          return callback(cachedLinks);
+        }
+        // CHEAP PRE-CHECK: an absolute path must carry a POSIX `/` or a Windows
+        // drive `:\`. If neither is present the heavy matchAll can't match, so we
+        // skip it for the common no-path line. Still cache the empty result so a
+        // re-hover of that same line doesn't even re-run includes().
+        if (!text.includes("/") && !text.includes(":\\")) {
+          cachedLineNumber = lineNumber;
+          cachedText = text;
+          cachedLinks = undefined;
+          return callback(undefined);
+        }
         const links: ILink[] = [];
         FILE_PATH_RE.lastIndex = 0;
         for (const m of text.matchAll(FILE_PATH_RE)) {
@@ -359,7 +384,12 @@ export function TerminalView({
             },
           });
         }
-        callback(links.length ? links : undefined);
+        // Memoize this line's result so a re-hover returns it without recomputing.
+        const result = links.length ? links : undefined;
+        cachedLineNumber = lineNumber;
+        cachedText = text;
+        cachedLinks = result;
+        callback(result);
       },
     });
 
