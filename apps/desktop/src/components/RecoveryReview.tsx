@@ -17,6 +17,12 @@
 // unplaced live terminal onto the active tab on its next reconcile), so we just
 // make them visible so the user knows nothing was lost.
 //
+// Finally (WS-6, native session-restore) it lists RESUMABLE orphaned Claude
+// sessions — recorded per-tile bindings whose tmux session is GONE (the app /
+// backend / host restarted) but whose transcript still EXISTS — each with a
+// Restore button that re-spawns the conversation via `claude --resume <id>` in its
+// original cwd (list_orphaned_sessions + the store's recall action).
+//
 // Styling matches the Settings modal (ThemeEditor): a scrim + centered themed
 // panel, all `var(--th-*)` tokens, a `th-scroll` body. It is fully self-contained
 // — its own open/close state lives here — and mounts via a "Recovery" button the
@@ -28,6 +34,10 @@ import {
   type SnapshotMeta,
 } from "../ipc/persistence";
 import { listTerminals } from "../ipc/client";
+import {
+  listOrphanedSessions,
+  type OrphanedSession,
+} from "../ipc/sessions";
 import {
   useWorkspace,
   deriveLabel,
@@ -162,24 +172,34 @@ function RecoveryPanel({ onClose }: { onClose: () => void }) {
   const [confirming, setConfirming] = useState(false);
   const [restoreMsg, setRestoreMsg] = useState<string | null>(null);
   const [liveTerminals, setLiveTerminals] = useState<TerminalInfo[]>([]);
+  // WS-6: resumable orphaned Claude sessions (recorded tile bindings whose tmux
+  // session is gone but whose transcript survives). null = still loading.
+  const [orphanSessions, setOrphanSessions] = useState<OrphanedSession[] | null>(
+    null,
+  );
 
   // The live layout — to compute which sessions are orphaned (present in the
   // backend but not placed in any current tab).
   const tabs = useWorkspace((s) => s.tabs);
   const poppedOutTabs = useWorkspace((s) => s.poppedOutTabs);
+  // Re-spawn + resume a past Claude session into the active tab (the SAME store
+  // path the sidebar's Recent recall uses — one way a resumed tile is created).
+  const recall = useWorkspace((s) => s.recall);
 
-  // Load the snapshot list + live terminals once on open.
+  // Load the snapshot list + live terminals + resumable orphans once on open.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const [snaps, terms] = await Promise.all([
+        const [snaps, terms, orphans] = await Promise.all([
           listSnapshots(),
           listTerminals().catch(() => [] as TerminalInfo[]),
+          listOrphanedSessions().catch(() => [] as OrphanedSession[]),
         ]);
         if (cancelled) return;
         setSnapshots(snaps);
         setLiveTerminals(terms);
+        setOrphanSessions(orphans);
         if (snaps.length > 0) setSelectedId(snaps[0].id);
       } catch (e) {
         if (!cancelled) setError(String(e));
@@ -353,7 +373,15 @@ function RecoveryPanel({ onClose }: { onClose: () => void }) {
               />
             )}
 
-            {/* Orphaned sessions — read-only awareness. */}
+            {/* Resumable orphaned Claude sessions (WS-6) — Restore brings them
+                back via `claude --resume` after an app/backend/host restart. */}
+            <ResumableSessionsSection
+              sessions={orphanSessions}
+              liveTerminals={liveTerminals}
+              onRestore={(s) => recall(s.sessionId, s.cwd)}
+            />
+
+            {/* Orphaned LIVE sessions — read-only awareness. */}
             <OrphanSection orphanIds={orphanIds} liveTerminals={liveTerminals} />
           </div>
         </div>
@@ -530,6 +558,130 @@ function PreviewPane({
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+/** Format an epoch-SECONDS timestamp as a short relative "Nd/Nh/Nm ago" string. */
+function relativeAgo(ts: number): string {
+  const secs = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (secs < 60) return "just now";
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+/**
+ * Resumable orphaned Claude sessions (WS-6, native session-restore). Each row is a
+ * tile we recorded whose tmux session is GONE (the app/backend/host restarted) but
+ * whose transcript still EXISTS, so `claude --resume <sessionId>` in its original
+ * cwd brings the conversation back. The backend already excludes any session whose
+ * tmux session is still live, so everything here is genuinely orphaned.
+ *
+ * Restore reuses the workspace store's `recall` action (the same spawn path the
+ * sidebar's Recent recall uses): it spawns a terminal rooted at `cwd` running
+ * `claude --resume <sessionId>`, places the tile in the active tab, and focuses it.
+ * Double-resume guard: once a row is restored (or if a live terminal is already
+ * running in that cwd) it shows "Restored" and disables, so a resume can't be
+ * fired twice for the same session from this panel.
+ */
+function ResumableSessionsSection({
+  sessions,
+  liveTerminals,
+  onRestore,
+}: {
+  sessions: OrphanedSession[] | null;
+  liveTerminals: TerminalInfo[];
+  onRestore: (s: OrphanedSession) => Promise<TerminalId | null>;
+}) {
+  // Sessions restored from THIS panel (so a second click is a no-op + clearly
+  // labeled). Keyed by sessionId.
+  const [restored, setRestored] = useState<Set<string>>(() => new Set());
+  const [busy, setBusy] = useState<string | null>(null);
+
+  // A live terminal already running in a session's cwd is a strong signal that
+  // it may already be placed/resumed — guard against a duplicate resume.
+  const liveCwds = useMemo(() => {
+    const s = new Set<string>();
+    for (const t of liveTerminals) if (t.cwd) s.add(t.cwd.replace(/\/+$/, ""));
+    return s;
+  }, [liveTerminals]);
+
+  const doRestore = useCallback(
+    async (s: OrphanedSession) => {
+      setBusy(s.sessionId);
+      try {
+        await onRestore(s);
+        setRestored((prev) => new Set(prev).add(s.sessionId));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [onRestore],
+  );
+
+  // Still loading, or genuinely nothing to restore — render nothing.
+  if (sessions == null || sessions.length === 0) return null;
+
+  return (
+    <div className="mt-5">
+      <div className="text-xs font-semibold uppercase tracking-wide" style={{ color: "var(--th-fg)" }}>
+        Resumable sessions ({sessions.length})
+      </div>
+      <p className="mb-2 mt-1 text-xs leading-snug" style={{ color: "var(--th-fg-muted)" }}>
+        Claude sessions whose terminal didn&apos;t survive the last restart. Restore
+        re-opens each in its original directory via{" "}
+        <span className="font-mono">claude --resume</span>.
+      </p>
+      <ul className="rounded border" style={{ borderColor: "var(--th-border)" }}>
+        {sessions.map((s) => {
+          const alreadyLive = liveCwds.has(s.cwd.replace(/\/+$/, ""));
+          const isRestored = restored.has(s.sessionId);
+          const isBusy = busy === s.sessionId;
+          const guarded = isRestored || alreadyLive;
+          return (
+            <li
+              key={s.sessionId}
+              className="flex items-center gap-2 border-b px-3 py-1.5 text-sm last:border-b-0"
+              style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+            >
+              <span
+                className="h-1.5 w-1.5 shrink-0 rounded-full"
+                style={{ backgroundColor: "var(--th-dot-detached, #fbbf24)" }}
+                title="Orphaned — resumable"
+              />
+              <div className="flex min-w-0 flex-col">
+                <span className="truncate">{s.label}</span>
+                <span className="truncate font-mono text-[11px]" style={{ color: "var(--th-fg-muted)" }}>
+                  {s.cwd} · {relativeAgo(s.lastSeen)}
+                </span>
+              </div>
+              <div className="ml-auto shrink-0">
+                {isRestored ? (
+                  <span className="text-xs" style={{ color: "var(--th-dot-live, #4ade80)" }}>
+                    Restored
+                  </span>
+                ) : (
+                  <Btn
+                    onClick={() => void doRestore(s)}
+                    disabled={isBusy || guarded}
+                    title={
+                      alreadyLive
+                        ? "A terminal is already running in this directory"
+                        : `Resume: claude --resume in ${s.cwd}`
+                    }
+                    emphasis
+                  >
+                    {isBusy ? "Restoring…" : alreadyLive ? "Already open" : "Restore"}
+                  </Btn>
+                )}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }

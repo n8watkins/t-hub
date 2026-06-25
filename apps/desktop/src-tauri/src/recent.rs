@@ -473,6 +473,106 @@ fn read_sessions() -> Vec<RecentSession> {
     }
 }
 
+// ===========================================================================
+// Native session-restore (WS-6): targeted transcript lookup by session id.
+//
+// The boot-time orphan scan (`db::list_orphaned_sessions`) needs, for a small set
+// of CANDIDATE session ids (the tiles whose tmux session is gone), two things:
+//   - does a transcript still EXIST? (existence == resumable: `--resume` reads it)
+//   - a friendly LABEL + the cwd (for the row + where to resume).
+// We reuse the same transcript parsing as Recent, but DON'T walk/parse the whole
+// catalog — we only stat for the wanted stems and prefix-read those, since the
+// candidate set is bounded by the number of tiles. Best-effort: any failure yields
+// an empty map (no orphans offered) rather than erroring.
+// ===========================================================================
+
+/// What the orphan scan needs about one resumable past session: a friendly label
+/// and the cwd to resume it in.
+#[derive(Debug, Clone)]
+pub struct ResumableEntry {
+    /// Friendly label (transcript summary/first-prompt, else cwd basename).
+    pub label: String,
+    /// The directory the session ran in (`--resume` lands here).
+    pub cwd: String,
+}
+
+/// Resolve `(label, cwd)` for each requested session id whose transcript still
+/// EXISTS on disk (WS-6). An id absent from the returned map has no transcript and
+/// is therefore NOT resumable. Targeted: only the wanted stems are prefix-read, so
+/// cost scales with `wanted`, not the whole catalog. Empty `wanted` ⇒ empty map.
+pub fn resumable_entries(
+    wanted: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, ResumableEntry> {
+    if wanted.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    #[cfg(windows)]
+    {
+        let distro = host_distro();
+        let Some(home) = wsl_home(&distro) else {
+            return std::collections::HashMap::new();
+        };
+        let projects = projects_unc(&distro, &home);
+        resumable_entries_from_dir(&projects, wanted)
+    }
+    #[cfg(not(windows))]
+    {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return std::collections::HashMap::new();
+        };
+        resumable_entries_from_dir(&home.join(".claude").join("projects"), wanted)
+    }
+}
+
+/// Walk `<projects>/<project>/<id>.jsonl`, and for every transcript whose stem is
+/// in `wanted`, prefix-read it into a `(label, cwd)` entry. Shared by both
+/// platforms (only the root differs — unix FS vs. the Windows UNC share). A
+/// transcript with no usable cwd is dropped (we can't resume where we don't know).
+fn resumable_entries_from_dir(
+    projects: &std::path::Path,
+    wanted: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, ResumableEntry> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(project_dirs) = std::fs::read_dir(projects) else {
+        return out;
+    };
+    for project in project_dirs.flatten() {
+        let Ok(files) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for entry in files.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !wanted.contains(id) {
+                continue;
+            }
+            // Existence + a parseable cwd is the resumability bar; reuse the same
+            // prefix parse + label derivation as Recent (make_session via a 0
+            // mtime — the orphan scan supplies last_seen from the recorded row).
+            let parsed = parse_transcript(&read_prefix(&path, 32 * 1024));
+            if let Some(s) = make_session(id.to_string(), 0, parsed, None) {
+                out.insert(
+                    id.to_string(),
+                    ResumableEntry {
+                        label: s.label,
+                        cwd: s.cwd,
+                    },
+                );
+            }
+            // Stop early once we've matched every wanted id.
+            if out.len() == wanted.len() {
+                return out;
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Windows: the transcripts live inside the WSL distro. Resolve the WSL $HOME via
 // wsl.exe once, then read the catalog over the `\\wsl.localhost\` UNC share.
@@ -850,6 +950,45 @@ mod tests {
         std::fs::remove_file(&p).ok();
         assert_eq!(s.len(), 16);
         assert!(s.ends_with("TAILEND"));
+    }
+
+    #[test]
+    fn resumable_entries_from_dir_finds_only_wanted_existing_transcripts() {
+        // WS-6: the orphan scan asks for a small set of session ids; only those
+        // whose transcript EXISTS come back, each with a label + cwd (existence ==
+        // resumable). Unwanted ids and non-jsonl files are ignored.
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("th_resumable_{}", std::process::id()));
+        let proj = tmp.join("proj-a");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // sess-keep: wanted + present -> returned with its summary as the label.
+        let mut f = std::fs::File::create(proj.join("sess-keep.jsonl")).unwrap();
+        writeln!(f, "{{\"type\":\"user\",\"cwd\":\"/home/u/work\"}}").unwrap();
+        writeln!(f, "{{\"type\":\"summary\",\"summary\":\"Resume me\"}}").unwrap();
+        // sess-other: present but NOT wanted -> skipped.
+        let mut g = std::fs::File::create(proj.join("sess-other.jsonl")).unwrap();
+        writeln!(g, "{{\"type\":\"user\",\"cwd\":\"/home/u/other\"}}").unwrap();
+
+        let wanted: std::collections::HashSet<String> =
+            ["sess-keep".to_string(), "sess-gone".to_string()].into_iter().collect();
+        let got = resumable_entries_from_dir(&tmp, &wanted);
+        std::fs::remove_dir_all(&tmp).ok();
+
+        // Only sess-keep matches: it's wanted AND on disk. sess-gone has no
+        // transcript (not resumable); sess-other isn't wanted.
+        assert_eq!(got.len(), 1);
+        let keep = got.get("sess-keep").unwrap();
+        assert_eq!(keep.label, "Resume me"); // summary wins
+        assert_eq!(keep.cwd, "/home/u/work");
+        assert!(!got.contains_key("sess-gone"));
+        assert!(!got.contains_key("sess-other"));
+    }
+
+    #[test]
+    fn resumable_entries_empty_wanted_is_empty() {
+        let got = resumable_entries(&std::collections::HashSet::new());
+        assert!(got.is_empty());
     }
 
     #[test]

@@ -278,6 +278,18 @@ pub fn run() {
             let emitter = std::sync::Arc::new(agent::TauriEmitter::new(app.handle().clone()));
             state.agent.set_emitter(emitter);
             state.agent.set_status_bridge(state.status.clone());
+            // --- WS-6: open the durable DB now (before the status bridge ingests
+            // any statusline) and manage it, so save/load_workspace_snapshot AND
+            // the per-tile session-restore record share one handle. Wire it into
+            // the status bridge so every ingested snapshot durably records its
+            // tile→session binding for the boot-time restore catalog. A failed
+            // open resolves to a no-op Db (logged inside), never aborting startup.
+            let db = std::sync::Arc::new(db::init(&app.handle().clone()));
+            state.status.set_db(db.clone());
+            // Manage the SAME handle the workspace-persistence + recovery + WS-6
+            // commands read via `app.state::<Arc<Db>>()` — one open connection,
+            // shared by everything.
+            app.manage(db);
             // Always-fires startup marker (proves the diag log is writable + shows
             // the resolved path; diagnoses "app runs but diag is stale").
             diag::log_startup();
@@ -323,11 +335,9 @@ pub fn run() {
             // off-thread: it spawns one `wsl.exe tmux` per live session, which we
             // never want to block the window's first paint on. Best-effort.
             std::thread::spawn(|| tmux::ensure_mouse_on());
-            // --- #sqlite: open the durable workspace DB (app_data_dir/t-hub.db,
-            // WAL+NORMAL) and manage it so save/load_workspace_snapshot share one
-            // handle. A failure resolves to a no-op Db (logged inside), never
-            // aborting startup — the frontend keeps its localStorage mirror.
-            app.manage(db::init(&app.handle().clone()));
+            // (The durable workspace DB — app_data_dir/t-hub.db, WAL+NORMAL — is
+            // opened + managed + wired into the status bridge above, before any
+            // statusline ingest; see the WS-6 block.)
             Ok(())
         })
         // Closing the main window hides it to the tray instead of quitting; only
@@ -397,6 +407,10 @@ pub fn run() {
             // #recovery: snapshot-history read commands for the Recovery review UI.
             db::list_snapshots,
             db::get_snapshot,
+            // WS-6: native session-restore — record per-tile session bindings and
+            // list resumable orphans after an app/backend/host restart.
+            db::record_tile_session,
+            db::list_orphaned_sessions,
             // --- feat/projects-sidebar (Agent A) -------------------------------
             // Recent recallable Claude sessions for the sidebar "Recent" list.
             recent::recent_sessions,

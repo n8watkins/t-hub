@@ -141,6 +141,26 @@ impl Db {
              )",
             [],
         )?;
+        // Native session-restore (WS-6): a durable per-tile map of the last Claude
+        // session we saw running in each T-Hub terminal. Keyed by `terminal_id`
+        // (one row per tile — a tile only ever hosts one live Claude session at a
+        // time, so the latest statusline upserts in place). `tmux_session`
+        // (`th_<id>`) is the ROBUST tile↔session key we cross-reference against the
+        // surviving tmux sessions on boot; `session_id` is the `claude --resume`
+        // handle, `cwd` the directory to resume it in. After the app/backend/host
+        // restarts, a row whose `tmux_session` is GONE but whose `session_id`
+        // transcript still EXISTS is a resumable orphan (see list_orphaned_sessions).
+        // No `agent_kind`: `claude --resume` is agent-agnostic.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tile_sessions (
+                 terminal_id  TEXT PRIMARY KEY,
+                 session_id   TEXT NOT NULL,
+                 cwd          TEXT NOT NULL,
+                 tmux_session TEXT NOT NULL,
+                 created_at   INTEGER NOT NULL
+             )",
+            [],
+        )?;
         Ok(conn)
     }
 
@@ -241,6 +261,65 @@ impl Db {
             Err(e) => Err(e),
         }
     }
+
+    // --- Native session-restore (WS-6) -------------------------------------
+
+    /// Upsert the Claude session a tile is hosting (WS-6). Keyed by
+    /// `terminal_id`: each statusline that arrives for a tile overwrites that
+    /// tile's row in place (a tile hosts one live session at a time), so the
+    /// table is a current map of tile → last-seen Claude session, never a log.
+    /// `created_at` stamps when THIS binding was first recorded (the upsert keeps
+    /// it stable across re-stamps so it reads as "last seen at"). Best-effort: a
+    /// `None`-backed DB is a no-op (no restore catalog, but live state is fine).
+    pub fn record_tile_session(
+        &self,
+        terminal_id: &str,
+        session_id: &str,
+        cwd: &str,
+        tmux_session: &str,
+    ) -> rusqlite::Result<()> {
+        let guard = self.conn.lock().expect("db mutex poisoned");
+        let Some(conn) = guard.as_ref() else {
+            return Ok(()); // no DB → no restore catalog
+        };
+        // On conflict (re-stamp of the same tile) refresh session/cwd/tmux but
+        // KEEP the original created_at, so the column always means "first seen".
+        conn.execute(
+            "INSERT INTO tile_sessions(terminal_id, session_id, cwd, tmux_session, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(terminal_id) DO UPDATE SET
+                 session_id   = ?2,
+                 cwd          = ?3,
+                 tmux_session = ?4",
+            rusqlite::params![terminal_id, session_id, cwd, tmux_session, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// All recorded tile→session bindings (WS-6). The boot-time orphan scan reads
+    /// this and cross-references each row's `tmux_session` against the surviving
+    /// tmux sessions + the on-disk transcript catalog. Empty when none recorded or
+    /// no DB.
+    pub fn all_tile_sessions(&self) -> rusqlite::Result<Vec<TileSession>> {
+        let guard = self.conn.lock().expect("db mutex poisoned");
+        let Some(conn) = guard.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT terminal_id, session_id, cwd, tmux_session, created_at
+               FROM tile_sessions ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TileSession {
+                terminal_id: row.get(0)?,
+                session_id: row.get(1)?,
+                cwd: row.get(2)?,
+                tmux_session: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
 }
 
 /// Lightweight metadata for one history snapshot, returned by `list_snapshots`.
@@ -256,6 +335,42 @@ pub struct SnapshotMeta {
     pub ts: i64,
     /// A human summary like `"5 tabs · 12 terminals"`, derived from the layout.
     pub summary: String,
+}
+
+/// One recorded tile→session binding (WS-6), as stored in `tile_sessions`. Read
+/// by the boot-time orphan scan; not serialized to the frontend directly (the
+/// scan maps it onto [`OrphanedSession`] after cross-referencing live tmux +
+/// transcripts).
+#[derive(Debug, Clone)]
+pub struct TileSession {
+    /// The T-Hub terminal id (the tmux session's `th_<id>` suffix); primary key.
+    pub terminal_id: String,
+    /// Claude's session id — the `claude --resume <id>` handle.
+    pub session_id: String,
+    /// The directory the session ran in (where `--resume` must land).
+    pub cwd: String,
+    /// The owning tmux session name (`th_<terminal_id>`); the robust liveness key.
+    pub tmux_session: String,
+    /// Unix epoch seconds the binding was first recorded (≈ last-seen).
+    pub created_at: i64,
+}
+
+/// A resumable orphaned Claude session (WS-6): a tile we recorded whose tmux
+/// session is GONE (the app/backend/host restarted) but whose transcript still
+/// EXISTS on disk, so `claude --resume <sessionId>` can pick it back up. Returned
+/// by [`list_orphaned_sessions`]; mirrored by `src/ipc/sessions.ts` (camelCase).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanedSession {
+    /// Claude's session id — the `--resume <id>` handle the Restore button passes.
+    pub session_id: String,
+    /// The directory to resume the session in (spawned as the new tile's cwd).
+    pub cwd: String,
+    /// A friendly label (the transcript summary/first-prompt when known, else the
+    /// cwd basename) so the row is recognizable.
+    pub label: String,
+    /// Unix epoch seconds we last recorded this tile binding (sorts newest-first).
+    pub last_seen: i64,
 }
 
 /// Derive a cheap "N tabs · M terminals" summary from a layout snapshot JSON
@@ -321,7 +436,7 @@ pub async fn save_workspace_snapshot(
     app: tauri::AppHandle,
     json: String,
 ) -> Result<(), String> {
-    let db = app.state::<Db>();
+    let db = app.state::<std::sync::Arc<Db>>();
     // The live save: upsert the latest layout (boot hydration reads this). This
     // result is authoritative — a failure here is the command's failure.
     db.put(WORKSPACE_KEY, &json)
@@ -340,7 +455,7 @@ pub async fn save_workspace_snapshot(
 /// when there is no history yet or the DB couldn't be opened.
 #[tauri::command]
 pub async fn list_snapshots(app: tauri::AppHandle) -> Result<Vec<SnapshotMeta>, String> {
-    app.state::<Db>()
+    app.state::<std::sync::Arc<Db>>()
         .list_snapshots()
         .map_err(|e| format!("list_snapshots: {e}"))
 }
@@ -353,7 +468,7 @@ pub async fn get_snapshot(
     app: tauri::AppHandle,
     id: i64,
 ) -> Result<Option<String>, String> {
-    app.state::<Db>()
+    app.state::<std::sync::Arc<Db>>()
         .get_snapshot(id)
         .map_err(|e| format!("get_snapshot: {e}"))
 }
@@ -365,9 +480,103 @@ pub async fn get_snapshot(
 pub async fn load_workspace_snapshot(
     app: tauri::AppHandle,
 ) -> Result<Option<String>, String> {
-    app.state::<Db>()
+    app.state::<std::sync::Arc<Db>>()
         .get(WORKSPACE_KEY)
         .map_err(|e| format!("load_workspace_snapshot: {e}"))
+}
+
+// --- Native session-restore (WS-6) -----------------------------------------
+
+/// Record the Claude session a tile is hosting (WS-6). The status-ingest path
+/// upserts this automatically as statusline snapshots arrive (see
+/// `StatusBridge::ingest`); this command also exposes it directly so the
+/// frontend / a future native hook can stamp a binding without a statusline.
+/// Best-effort: a DB error is returned but never breaks live state.
+#[tauri::command]
+pub async fn record_tile_session(
+    app: tauri::AppHandle,
+    terminal_id: String,
+    session_id: String,
+    cwd: String,
+    tmux_session: String,
+) -> Result<(), String> {
+    app.state::<std::sync::Arc<Db>>()
+        .record_tile_session(&terminal_id, &session_id, &cwd, &tmux_session)
+        .map_err(|e| format!("record_tile_session: {e}"))
+}
+
+/// List the resumable ORPHANED Claude sessions (WS-6) — the boot-time restore
+/// catalog. Cross-references the recorded `tile_sessions` map against:
+///   1. the SURVIVING `th_*` tmux sessions (same source `list_terminals` uses) —
+///      a binding whose tmux session is STILL LIVE is not orphaned (its tile is
+///      either placed or auto-adopted), so we skip it; and
+///   2. the on-disk transcript catalog (recent.rs) — a binding whose transcript
+///      is GONE can't be `--resume`d, so we skip it.
+/// What remains is exactly the sessions a crash/restart left behind that can be
+/// brought back. Newest-first. Best-effort: any failure degrades to an empty list
+/// (nothing offered) rather than erroring the UI.
+#[tauri::command]
+pub async fn list_orphaned_sessions(
+    app: tauri::AppHandle,
+) -> Result<Vec<OrphanedSession>, String> {
+    let rows = app
+        .state::<std::sync::Arc<Db>>()
+        .all_tile_sessions()
+        .map_err(|e| format!("list_orphaned_sessions: {e}"))?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Move the cross-referencing work (a tmux listing + a transcript-catalog
+    // walk, both blocking I/O) off the async executor.
+    let orphans = tauri::async_runtime::spawn_blocking(move || cross_reference_orphans(rows))
+        .await
+        .unwrap_or_default();
+    Ok(orphans)
+}
+
+/// Filter recorded tile→session bindings down to resumable orphans (WS-6): drop
+/// any whose tmux session is still LIVE, and any whose transcript is GONE; for
+/// the rest, attach a friendly label from the transcript catalog. Pulled out as a
+/// plain fn so the orphan logic is testable without Tauri/DB. Newest-first.
+fn cross_reference_orphans(rows: Vec<TileSession>) -> Vec<OrphanedSession> {
+    // Live tmux sessions (the `t-hub` socket) — a still-running binding isn't
+    // orphaned. A listing failure degrades to "none live" so we don't wrongly
+    // suppress restorable sessions.
+    let live: std::collections::HashSet<String> =
+        crate::tmux::list_sessions().unwrap_or_default().into_iter().collect();
+    // The candidate session ids whose tmux session is gone — only THESE need a
+    // transcript lookup (the recorded map is small, so this stays cheap).
+    let candidates: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|r| !live.contains(&r.tmux_session))
+        .map(|r| r.session_id.clone())
+        .collect();
+    // The resumable transcript catalog for just those ids: id → (label, cwd).
+    // A present transcript IS the resumability signal (`--resume` reads it).
+    let catalog = crate::recent::resumable_entries(&candidates);
+
+    let mut out: Vec<OrphanedSession> = rows
+        .into_iter()
+        .filter(|r| !live.contains(&r.tmux_session)) // skip still-live tiles
+        .filter_map(|r| {
+            // Skip bindings whose transcript is gone (can't be resumed).
+            let entry = catalog.get(&r.session_id)?;
+            Some(OrphanedSession {
+                session_id: r.session_id,
+                // Prefer the recorded cwd; fall back to the catalog's if blank.
+                cwd: if r.cwd.trim().is_empty() {
+                    entry.cwd.clone()
+                } else {
+                    r.cwd
+                },
+                label: entry.label.clone(),
+                last_seen: r.created_at,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    out
 }
 
 #[cfg(test)]
@@ -525,4 +734,45 @@ mod tests {
         assert!(db.list_snapshots().unwrap().is_empty());
         assert_eq!(db.get_snapshot(1).unwrap(), None);
     }
+
+    // --- Native session-restore (WS-6) --------------------------------------
+
+    #[test]
+    fn record_tile_session_upserts_by_terminal_id() {
+        let (db, dir) = temp_db();
+        // First binding for a tile.
+        db.record_tile_session("t1", "sess-a", "/home/u/p", "th_t1").unwrap();
+        // A later statusline for the SAME tile (new session) overwrites in place.
+        db.record_tile_session("t1", "sess-b", "/home/u/p2", "th_t1").unwrap();
+        // A different tile is a separate row.
+        db.record_tile_session("t2", "sess-c", "/home/u/q", "th_t2").unwrap();
+        let rows = db.all_tile_sessions().unwrap();
+        assert_eq!(rows.len(), 2, "one row per terminal_id (upsert, not insert)");
+        let t1 = rows.iter().find(|r| r.terminal_id == "t1").unwrap();
+        assert_eq!(t1.session_id, "sess-b", "latest session wins for the tile");
+        assert_eq!(t1.cwd, "/home/u/p2");
+        assert_eq!(t1.tmux_session, "th_t1");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tile_sessions_survive_reopen() {
+        let (db, dir) = temp_db();
+        db.record_tile_session("t1", "sess-a", "/work", "th_t1").unwrap();
+        drop(db);
+        let db2 = Db::open_in(dir.clone());
+        let rows = db2.all_tile_sessions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "sess-a");
+        drop(db2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn none_backed_tile_sessions_is_noop() {
+        let db = Db::default();
+        assert!(db.record_tile_session("t1", "s", "/c", "th_t1").is_ok());
+        assert!(db.all_tile_sessions().unwrap().is_empty());
+    }
+
 }

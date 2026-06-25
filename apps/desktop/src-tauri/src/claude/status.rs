@@ -174,14 +174,36 @@ fn parse_window(v: &serde_json::Value) -> RateLimitWindow {
 /// The latest-snapshot-per-session store. Thread-safe; the status-ingest path
 /// (from the journal `StatusSnapshot` event or a direct bridge call) writes,
 /// and the Tauri status commands read.
+///
+/// ## Native session-restore hook (WS-6)
+/// Every ingested snapshot is the freshest proof of "this Claude session is
+/// running, here, in this tile". The status-ingest path is therefore the single,
+/// correct place to durably record the tile→session binding the boot-time restore
+/// catalog reads back: BOTH ingest paths (the journal `StatusSnapshot` entry AND
+/// the `ingest_status` command) funnel through [`StatusBridge::ingest`], so hooking
+/// it here captures every session with one integration point. We need all three of
+/// `session_id`, `tmux_session` (the `th_<terminalId>` ⇒ the tile id), and `cwd`
+/// to write a usable row; a snapshot missing any of them (un-upgraded agent / not
+/// under tmux) is still stored for the usage meter but not recorded for restore.
 #[derive(Default)]
 pub struct StatusBridge {
     latest: RwLock<HashMap<String, StatusSnapshot>>,
+    /// The durable DB, wired in `setup()` after the AppHandle exists (the bridge
+    /// is built in `AppState::default()`, before any DB). `None` until then (and
+    /// in tests), in which case the WS-6 record is silently skipped.
+    db: RwLock<Option<std::sync::Arc<crate::db::Db>>>,
 }
 
 impl StatusBridge {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wire the durable DB so ingested snapshots also record the per-tile session
+    /// binding for native restore (WS-6). Called once from `setup()` alongside the
+    /// emitter wiring; before this the restore-record is a no-op.
+    pub fn set_db(&self, db: std::sync::Arc<crate::db::Db>) {
+        *self.db.write() = Some(db);
     }
 
     /// Ingest a raw statusline payload for `session_id`, storing the normalized
@@ -196,7 +218,33 @@ impl StatusBridge {
         self.latest
             .write()
             .insert(session_id.to_string(), snap.clone());
+        // WS-6: durably record the tile→session binding for boot-time restore.
+        self.record_for_restore(&snap);
         snap
+    }
+
+    /// Best-effort: upsert this snapshot's tile→session binding into the durable
+    /// `tile_sessions` map (WS-6), keyed by the tile id (`th_<id>` ⇒ `<id>`). Only
+    /// fires when the snapshot carries the robust tmux binding (`tmux_session`) AND
+    /// a `cwd` — without both we can't restore the session to the right place, so
+    /// we skip rather than write a half-row. A DB error is swallowed (logged by the
+    /// DB layer); recording must never disturb the live usage meter.
+    fn record_for_restore(&self, snap: &StatusSnapshot) {
+        let Some(db) = self.db.read().clone() else {
+            return; // no DB wired (pre-setup / tests)
+        };
+        let (Some(tmux_session), Some(cwd)) = (snap.tmux_session.as_deref(), snap.cwd.as_deref())
+        else {
+            return; // un-upgraded agent / not under tmux — can't bind a tile.
+        };
+        if snap.session_id.is_empty() || cwd.trim().is_empty() {
+            return;
+        }
+        // The terminal id is the tmux session name minus the `th_` prefix (T-Hub
+        // names every session `th_<terminalId>`). Fall back to the whole name if
+        // the prefix is somehow absent so the row is still keyed consistently.
+        let terminal_id = tmux_session.strip_prefix("th_").unwrap_or(tmux_session);
+        let _ = db.record_tile_session(terminal_id, &snap.session_id, cwd, tmux_session);
     }
 
     /// The latest snapshot for a session, if any.
@@ -281,5 +329,72 @@ mod tests {
         assert_eq!(bridge.get("s1").unwrap().context_used_pct, Some(20.0));
         assert_eq!(bridge.get("s2").unwrap().context_used_pct, Some(5.0));
         assert_eq!(bridge.all().len(), 2);
+    }
+
+    // --- Native session-restore hook (WS-6) ---------------------------------
+
+    /// A bridge wired to a temp DB records a tile→session binding on ingest when
+    /// the snapshot carries the robust tmux binding + cwd, deriving the terminal
+    /// id from the `th_<id>` session name. A snapshot missing either is stored for
+    /// the usage meter but NOT recorded for restore.
+    #[test]
+    fn ingest_records_tile_session_only_with_tmux_binding_and_cwd() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-status-ws6-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = std::sync::Arc::new(crate::db::Db::open_in(dir.clone()));
+        let bridge = StatusBridge::new();
+        bridge.set_db(db.clone());
+
+        // Full snapshot: tmux_session + cwd present -> recorded under terminal id
+        // `abcd1234` (the `th_` prefix stripped).
+        bridge.ingest(
+            "claude-sess-1",
+            &serde_json::json!({
+                "cwd": "/home/u/proj",
+                "tmux_session": "th_abcd1234",
+                "context_window": { "used_percentage": 10.0 }
+            }),
+            1,
+        );
+        // No tmux binding -> stored for usage but NOT recorded for restore.
+        bridge.ingest(
+            "claude-sess-2",
+            &serde_json::json!({ "cwd": "/home/u/other", "context_window": { "used_percentage": 5.0 } }),
+            2,
+        );
+
+        let rows = db.all_tile_sessions().unwrap();
+        assert_eq!(rows.len(), 1, "only the tmux-bound snapshot is recorded");
+        assert_eq!(rows[0].terminal_id, "abcd1234");
+        assert_eq!(rows[0].session_id, "claude-sess-1");
+        assert_eq!(rows[0].cwd, "/home/u/proj");
+        assert_eq!(rows[0].tmux_session, "th_abcd1234");
+        // Both snapshots are still queryable for the usage meter.
+        assert!(bridge.get("claude-sess-1").is_some());
+        assert!(bridge.get("claude-sess-2").is_some());
+
+        drop(bridge);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// With no DB wired (the pre-setup / default state), ingest still stores the
+    /// snapshot and the restore-record is a silent no-op.
+    #[test]
+    fn ingest_without_db_skips_restore_record() {
+        let bridge = StatusBridge::new();
+        let snap = bridge.ingest(
+            "s1",
+            &serde_json::json!({ "cwd": "/c", "tmux_session": "th_t1" }),
+            1,
+        );
+        assert_eq!(snap.session_id, "s1");
+        assert!(bridge.get("s1").is_some());
     }
 }
