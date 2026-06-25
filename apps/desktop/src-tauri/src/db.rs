@@ -584,18 +584,45 @@ fn cross_reference_orphans(rows: Vec<TileSession>) -> OrphanScan {
     };
     // The not-live rows — computed ONCE (#21) and driving BOTH the transcript
     // lookup and the output, so the `!live.contains` predicate is evaluated a
-    // single time per row.
+    // single time per row. (`classify_orphans` re-applies the same `!live`
+    // filter; here we pre-filter only to scope the transcript lookup to the
+    // sessions that can actually be offered.)
+    let candidates: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|r| !live.contains(&r.tmux_session))
+        .map(|r| r.session_id.clone())
+        .collect();
+    // The resumable transcript catalog for just those ids: id → (label, cwd).
+    // A present transcript IS the resumability signal (`--resume` reads it).
+    let catalog = crate::recent::resumable_entries(&candidates);
+
+    classify_orphans(rows, &live, &catalog)
+}
+
+/// The PURE combining core of the orphan scan (WS-6): given ALL recorded rows, the
+/// set of LIVE tmux session names, and the resumable transcript catalog, split the
+/// rows into resumable orphans (tmux session GONE *and* transcript EXISTS) and the
+/// provably-dead `terminal_id`s to prune (tmux gone *and* transcript GONE),
+/// attaching a friendly label + the resume cwd to each orphan. A row whose tmux
+/// session is still LIVE is skipped entirely (never offered, never pruned).
+/// Extracted from [`cross_reference_orphans`] so these subtle combining rules are
+/// testable WITHOUT tmux/transcripts/DB.
+///
+/// FAIL-CLOSED note: the empty-live-set case is handled by the caller (a
+/// `list_sessions()` Err returns early before reaching here); this fn trusts the
+/// `live` set it is handed. The `!live.contains` predicate is the SINGLE liveness
+/// gate — evaluated once per row. Newest-first.
+fn classify_orphans(
+    rows: Vec<TileSession>,
+    live: &std::collections::HashSet<String>,
+    catalog: &std::collections::HashMap<String, crate::recent::ResumableEntry>,
+) -> OrphanScan {
+    // The not-live rows — a still-running binding isn't orphaned, so it's never
+    // offered and never pruned. Computed ONCE (#21), driving the output below.
     let not_live: Vec<TileSession> = rows
         .into_iter()
         .filter(|r| !live.contains(&r.tmux_session))
         .collect();
-    // The candidate session ids whose tmux session is gone — only THESE need a
-    // transcript lookup (the recorded map is small, so this stays cheap).
-    let candidates: std::collections::HashSet<String> =
-        not_live.iter().map(|r| r.session_id.clone()).collect();
-    // The resumable transcript catalog for just those ids: id → (label, cwd).
-    // A present transcript IS the resumability signal (`--resume` reads it).
-    let catalog = crate::recent::resumable_entries(&candidates);
 
     let mut scan = OrphanScan::default();
     for r in not_live {
@@ -837,4 +864,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // --- Orphan classifier (WS-6 cross-reference core) ----------------------
+    // These exercise the PURE `classify_orphans` combining logic directly, with a
+    // fixture row set × a fake live-tmux set × a fake transcript catalog — no
+    // tmux, transcripts, or DB needed.
+
+    /// One recorded tile→session binding. `terminal_id`/`tmux_session` follow the
+    /// real `th_<id>` convention so the liveness key lines up with the live set.
+    fn row(terminal_id: &str, session_id: &str, cwd: &str, created_at: i64) -> TileSession {
+        TileSession {
+            terminal_id: terminal_id.to_string(),
+            session_id: session_id.to_string(),
+            cwd: cwd.to_string(),
+            tmux_session: format!("th_{terminal_id}"),
+            created_at,
+        }
+    }
+
+    /// A fake transcript catalog: each entry is a session id that "still has a
+    /// transcript on disk" with the given label + resume cwd.
+    fn catalog(
+        entries: &[(&str, &str, &str)],
+    ) -> std::collections::HashMap<String, crate::recent::ResumableEntry> {
+        entries
+            .iter()
+            .map(|(id, label, cwd)| {
+                (
+                    id.to_string(),
+                    crate::recent::ResumableEntry {
+                        label: label.to_string(),
+                        cwd: cwd.to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// A fake live-tmux set from terminal ids (mirroring `th_<id>`).
+    fn live_set(terminal_ids: &[&str]) -> std::collections::HashSet<String> {
+        terminal_ids.iter().map(|id| format!("th_{id}")).collect()
+    }
+
+    #[test]
+    fn classify_gone_tmux_with_transcript_is_resumable_orphan() {
+        // (a) tmux session GONE (not in live set) AND transcript EXISTS ⇒ offered
+        // as a resumable orphan, carrying the recorded cwd + the catalog label.
+        let rows = vec![row("t1", "sess-a", "/home/u/proj", 100)];
+        let cat = catalog(&[("sess-a", "Fix the parser", "/catalog/cwd")]);
+        let scan = classify_orphans(rows, &live_set(&[]), &cat);
+
+        assert_eq!(scan.orphans.len(), 1);
+        let o = &scan.orphans[0];
+        assert_eq!(o.session_id, "sess-a");
+        assert_eq!(o.cwd, "/home/u/proj", "recorded cwd is preferred over catalog");
+        assert_eq!(o.label, "Fix the parser");
+        assert_eq!(o.last_seen, 100);
+        assert!(scan.dead_terminal_ids.is_empty(), "a resumable row is not pruned");
+    }
+
+    #[test]
+    fn classify_live_tmux_is_skipped_never_offered() {
+        // (b) tmux session still LIVE ⇒ skipped entirely: not orphaned (its tile is
+        // placed/adopted), so never offered AND never pruned — even though its
+        // transcript exists in the catalog.
+        let rows = vec![row("t1", "sess-a", "/home/u/proj", 100)];
+        let cat = catalog(&[("sess-a", "Still running", "/catalog/cwd")]);
+        let scan = classify_orphans(rows, &live_set(&["t1"]), &cat);
+
+        assert!(scan.orphans.is_empty(), "a live session is never offered for restore");
+        assert!(
+            scan.dead_terminal_ids.is_empty(),
+            "a live session is never pruned (we can't prove it dead)",
+        );
+    }
+
+    #[test]
+    fn classify_gone_transcript_is_skipped_and_pruned() {
+        // (c) tmux session GONE but transcript GONE (absent from the catalog) ⇒ can
+        // never be `--resume`d: skipped from the offer AND collected for prune (#9).
+        let rows = vec![row("t1", "sess-a", "/home/u/proj", 100)];
+        let cat = catalog(&[]); // no transcripts on disk
+        let scan = classify_orphans(rows, &live_set(&[]), &cat);
+
+        assert!(scan.orphans.is_empty(), "no transcript ⇒ not resumable");
+        assert_eq!(
+            scan.dead_terminal_ids,
+            vec!["t1".to_string()],
+            "a provably-dead row is collected for prune",
+        );
+    }
+
+    #[test]
+    fn classify_sorts_orphans_newest_first() {
+        // (d) Multiple resumable orphans come back sorted by last_seen DESC
+        // (newest first), independent of input order.
+        let rows = vec![
+            row("t1", "sess-old", "/a", 100),
+            row("t2", "sess-new", "/b", 300),
+            row("t3", "sess-mid", "/c", 200),
+        ];
+        let cat = catalog(&[
+            ("sess-old", "old", "/a"),
+            ("sess-new", "new", "/b"),
+            ("sess-mid", "mid", "/c"),
+        ]);
+        let scan = classify_orphans(rows, &live_set(&[]), &cat);
+
+        let order: Vec<&str> = scan.orphans.iter().map(|o| o.session_id.as_str()).collect();
+        assert_eq!(order, vec!["sess-new", "sess-mid", "sess-old"]);
+    }
+
+    #[test]
+    fn classify_blank_cwd_falls_back_to_catalog_cwd() {
+        // A whitespace-only recorded cwd falls back to the catalog's cwd, so the
+        // session resumes somewhere valid; a non-blank recorded cwd wins.
+        let rows = vec![
+            row("t1", "sess-blank", "   ", 100),
+            row("t2", "sess-set", "/recorded", 100),
+        ];
+        let cat = catalog(&[
+            ("sess-blank", "blank", "/from-catalog"),
+            ("sess-set", "set", "/from-catalog"),
+        ]);
+        let scan = classify_orphans(rows, &live_set(&[]), &cat);
+
+        let blank = scan.orphans.iter().find(|o| o.session_id == "sess-blank").unwrap();
+        let set = scan.orphans.iter().find(|o| o.session_id == "sess-set").unwrap();
+        assert_eq!(blank.cwd, "/from-catalog", "blank recorded cwd falls back to catalog");
+        assert_eq!(set.cwd, "/recorded", "non-blank recorded cwd is preferred");
+    }
+
+    #[test]
+    fn classify_mixed_partitions_offers_and_prunes() {
+        // A realistic mix: one live (skip), one gone-with-transcript (offer), one
+        // gone-without-transcript (prune). Confirms the three buckets are disjoint
+        // and complete in a single pass.
+        let rows = vec![
+            row("live1", "sess-live", "/x", 100),  // still live ⇒ skip
+            row("orph1", "sess-orph", "/y", 200),  // gone + transcript ⇒ offer
+            row("dead1", "sess-dead", "/z", 300),  // gone + no transcript ⇒ prune
+        ];
+        let cat = catalog(&[
+            ("sess-live", "live", "/x"),  // present but its row is live ⇒ unused
+            ("sess-orph", "orphan", "/y"),
+        ]);
+        let scan = classify_orphans(rows, &live_set(&["live1"]), &cat);
+
+        assert_eq!(scan.orphans.len(), 1);
+        assert_eq!(scan.orphans[0].session_id, "sess-orph");
+        assert_eq!(scan.dead_terminal_ids, vec!["dead1".to_string()]);
+    }
 }
