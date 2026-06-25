@@ -4,7 +4,11 @@
 
 **Active scope = Wave 0 + Wave 1.** Remote/SSH (⑥) and the beyond-parity wildcards are deferred to *Later / someday* (bottom). All paths below are real (`apps/desktop/…` monorepo).
 
-**Progress:** ✅ Wave 0 complete — WS-1 (`a00085c`), WS-2 (`c5915d8`), and WS-5a (`683ff61`, pulled forward) are implemented, verified (cargo build + tsc + pnpm install), and committed. Remaining: WS-3, WS-4, WS-5b, WS-6.
+**Progress:** ✅ **Wave 0 + Wave 1 complete.** All eight slices implemented, verified (cargo build + lib tests + tsc + pnpm install), and committed:
+- Wave 0 — WS-1 copy-on-select/open-file (`a00085c`), WS-2 OS toasts (`c5915d8`), WS-5a `wait_for_status` (`683ff61`).
+- Wave 1 — WS-4 worktree primitive (`9b72b75`), WS-3 prefix-key + palette (`7a70af2`), WS-6 session restore (`c2b6c8d`), WS-5b rules engine (`853e8ba`).
+
+**Not yet done:** runtime smoke-test in the live app (all verification so far is compile + unit-test level). Next up is `Later/someday` (remote ⑥, wildcards).
 
 ## Principles
 
