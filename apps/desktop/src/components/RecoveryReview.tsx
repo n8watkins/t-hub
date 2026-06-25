@@ -378,7 +378,10 @@ function RecoveryPanel({ onClose }: { onClose: () => void }) {
             <ResumableSessionsSection
               sessions={orphanSessions}
               liveTerminals={liveTerminals}
-              onRestore={(s) => recall(s.sessionId, s.cwd)}
+              // Restore is an EXPLICIT "resume THIS session" action whose copy
+              // promises `claude --resume`, so force the resume regardless of the
+              // passive global `resumeStartsClaude` default.
+              onRestore={(s) => recall(s.sessionId, s.cwd, { forceResume: true })}
             />
 
             {/* Orphaned LIVE sessions — read-only awareness. */}

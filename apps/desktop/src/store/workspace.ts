@@ -205,8 +205,18 @@ interface WorkspaceState {
    *  the "+" menu / Canvas use) — recall is just a spawn with a cwd + a resume
    *  startup command. Best-effort: a spawn failure is logged, not thrown, so a
    *  click can never crash the sidebar. Returns the new terminal id, or null on
-   *  failure. */
-  recall: (sessionId: string, cwd: string) => Promise<TerminalId | null>;
+   *  failure.
+   *
+   *  Whether the resume command actually runs is normally the passive global
+   *  `resumeStartsClaude` setting (default on) — the sidebar's Recent recall honors
+   *  it. But an EXPLICIT "resume THIS session" action (e.g. Recovery's Restore)
+   *  must always resume regardless: pass `opts.forceResume` to ALWAYS issue
+   *  `claude --resume <id>`, ignoring the setting. */
+  recall: (
+    sessionId: string,
+    cwd: string,
+    opts?: { forceResume?: boolean },
+  ) => Promise<TerminalId | null>;
 
   // --- Git worktrees (WS-4) ---
   /** Atomically: create a git worktree at `worktreePath` (via `gitWorktreeAdd`,
@@ -877,7 +887,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     // it here (rather than reaching into Canvas, which another agent owns) per the
     // build split. The dynamic `../ipc/client` import keeps the store free of a
     // hard Tauri dependency, matching detachTile/deleteTerminal/saveToBackend.
-    recall: async (sessionId, cwd) => {
+    recall: async (sessionId, cwd, opts) => {
       const id = sessionId.trim();
       const dir = cwd.trim();
       if (!id) return null;
@@ -885,10 +895,13 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         const { spawnTerminal } = await import("../ipc/client");
         const { useSettings } = await import("./settings");
         // Spawn rooted at the session's cwd. Whether we actually launch Claude is
-        // a SETTING (resumeStartsClaude, default on): on -> `claude --resume <id>`
-        // resumes that conversation directly; off -> just a terminal in the dir
-        // (no Claude). Quoting the id is a defensive guard (ids are plain UUIDs).
-        const startClaude = useSettings.getState().resumeStartsClaude;
+        // normally a SETTING (resumeStartsClaude, default on): on -> `claude --resume
+        // <id>` resumes that conversation directly; off -> just a terminal in the dir
+        // (no Claude). `forceResume` overrides that: an EXPLICIT "resume THIS session"
+        // action (Recovery's Restore) must always resume, regardless of the passive
+        // default. Quoting the id is a defensive guard (ids are plain UUIDs).
+        const startClaude =
+          opts?.forceResume || useSettings.getState().resumeStartsClaude;
         const info = await spawnTerminal({
           cwd: dir || undefined,
           startupCommand: startClaude ? `claude --resume '${id}'` : undefined,

@@ -202,7 +202,7 @@ function SectionNav({
       items: [
         { id: "general", label: "General", hint: "App behavior" },
         { id: "keyboard", label: "Keyboard", hint: "Rebindable command shortcuts + prefix" },
-        { id: "hotkeys", label: "Hotkeys", hint: "Keyboard shortcuts reference" },
+        { id: "hotkeys", label: "Hotkeys", hint: "Fixed app + terminal keys (the rebindable ones live in Keyboard)" },
         { id: "rules", label: "Rules", hint: "Run an action when a session changes status" },
         { id: "hooks", label: "Hooks", hint: "Claude Code lifecycle hooks" },
         { id: "updates", label: "Updates", hint: "Check for + install app updates" },
@@ -832,39 +832,36 @@ function RuleCard({ rule }: { rule: Rule }) {
 }
 
 // ---------------------------------------------------------------------------
-// Hotkeys — a reference list of the app's keyboard shortcuts.
+// Hotkeys — a reference for the keys NOT owned by the rebindable keymap.
+//
+// The app command shortcuts (new/close terminal, cycle, tab-jump, zoom, prefix,
+// command palette, focus-toggle) are now rebindable through the keymap and are
+// listed LIVE in the Keyboard section, so they intentionally do NOT appear here —
+// a hand-maintained copy would lie the moment a user rebinds one. What's left is
+// the genuinely FIXED surface: a couple of app keys the keymap doesn't own
+// (delete-session, settings, exit-fullscreen) and the xterm-intrinsic keys that
+// live inside the terminal (copy/paste/scroll/select).
 // ---------------------------------------------------------------------------
 function HotkeysSection() {
-  const groups: { title: string; keys: [string, string][] }[] = [
+  const groups: {
+    title: string;
+    description?: string;
+    keys: [string, string][];
+  }[] = [
     {
-      title: "Terminals",
+      title: "Fixed app shortcuts",
+      description:
+        "App keys the rebindable keymap doesn't own — see the Keyboard section for everything that IS rebindable.",
       keys: [
-        ["Ctrl/Cmd + T", "New terminal"],
-        ["Ctrl/Cmd + W", "Close terminal (detach — keeps the session alive)"],
         ["Ctrl/Cmd + Shift + W", "Delete terminal from session (kills tmux)"],
-      ],
-    },
-    {
-      title: "Navigation",
-      keys: [
-        ["Ctrl/Cmd + B", "Prefix — arms the tmux-style command tail"],
-        ["Ctrl/Cmd + J", "Toggle focus: terminal ↔ sidebar"],
-        ["Ctrl/Cmd + K", "Command palette (fuzzy; rebind shortcuts here)"],
-        ["Ctrl/Cmd + Tab", "Next terminal (Shift = previous)"],
-        ["Ctrl/Cmd + 1…9", "Jump to workspace tab"],
         ["Ctrl/Cmd + ,", "Open / close Settings"],
-      ],
-    },
-    {
-      title: "Zoom",
-      keys: [
-        ["Ctrl/Cmd + =", "Increase terminal font size"],
-        ["Ctrl/Cmd + -", "Decrease terminal font size"],
-        ["Ctrl/Cmd + 0", "Reset terminal font size"],
+        ["Esc", "Exit a fullscreen tile"],
       ],
     },
     {
       title: "Inside a terminal",
+      description:
+        "Handled by the terminal itself (xterm), not the keymap — these aren't rebindable.",
       keys: [
         ["Ctrl + C", "Copy selection (or send SIGINT when nothing is selected)"],
         ["Ctrl + V", "Paste"],
@@ -876,7 +873,7 @@ function HotkeysSection() {
   return (
     <>
       {groups.map((g) => (
-        <Group key={g.title} title={g.title}>
+        <Group key={g.title} title={g.title} description={g.description}>
           {g.keys.map(([combo, desc]) => (
             <div
               key={combo}
