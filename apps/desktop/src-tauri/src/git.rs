@@ -70,8 +70,45 @@ static GIT_INFO_CACHE: LazyLock<Mutex<HashMap<String, (Instant, GitInfo)>>> =
 /// count) for up to `GIT_INFO_TTL` after the change.
 fn invalidate_git_info_cache(cwd: &str) {
     if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
-        guard.remove(cwd);
+        cache_invalidate(&mut guard, cwd);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pure TTL-cache seams (unit-tested on Linux). These operate on an explicit map +
+// `now`/`ttl` so the freshness/invalidation logic is testable WITHOUT the global
+// static or wall-clock. Production wires them to `GIT_INFO_CACHE`, `Instant::now()`
+// and `GIT_INFO_TTL`, so behavior is byte-identical to the inlined logic they
+// replace. A flipped `<` here (serving stale data) is exactly what these catch.
+// ---------------------------------------------------------------------------
+
+/// Look up a still-fresh cached `GitInfo` for `cwd`: returns a clone iff an entry
+/// exists AND its age (`now - stored_instant`) is strictly less than `ttl`. A
+/// stale (age >= ttl) or absent entry yields `None`. Pure: no static, no clock.
+fn cache_lookup(
+    map: &HashMap<String, (Instant, GitInfo)>,
+    cwd: &str,
+    now: Instant,
+    ttl: Duration,
+) -> Option<GitInfo> {
+    map.get(cwd)
+        .filter(|(at, _)| now.duration_since(*at) < ttl)
+        .map(|(_, info)| info.clone())
+}
+
+/// Store `info` for `cwd` stamped at `now` (the put half of the cache). Pure.
+fn cache_store(
+    map: &mut HashMap<String, (Instant, GitInfo)>,
+    cwd: String,
+    now: Instant,
+    info: GitInfo,
+) {
+    map.insert(cwd, (now, info));
+}
+
+/// Drop any entry for `cwd` (the invalidation half). Pure.
+fn cache_invalidate(map: &mut HashMap<String, (Instant, GitInfo)>, cwd: &str) {
+    map.remove(cwd);
 }
 
 impl GitInfo {
@@ -438,11 +475,11 @@ pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
     // (1) Serve a fresh-enough cached answer for this cwd. The lock is held only
     // to clone the cached `GitInfo`, never across the spawn below, so many tiles
     // polling the same cwd within the TTL all return without spawning anything.
-    if let Some(cached) = GIT_INFO_CACHE.lock().ok().and_then(|g| {
-        g.get(&cwd)
-            .filter(|(at, _)| at.elapsed() < GIT_INFO_TTL)
-            .map(|(_, info)| info.clone())
-    }) {
+    if let Some(cached) = GIT_INFO_CACHE
+        .lock()
+        .ok()
+        .and_then(|g| cache_lookup(&g, &cwd, Instant::now(), GIT_INFO_TTL))
+    {
         return Ok(cached);
     }
 
@@ -462,7 +499,7 @@ pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
 
     // Cache the fresh answer for this cwd so sibling tiles + the focus burst hit (1).
     if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
-        guard.insert(cwd, (Instant::now(), info.clone()));
+        cache_store(&mut guard, cwd, Instant::now(), info.clone());
     }
     Ok(info)
 }
@@ -819,6 +856,86 @@ detached
         assert_eq!(wts.len(), 1);
         assert_eq!(wts[0].path, "/home/u/repo");
         assert_eq!(wts[0].branch.as_deref(), Some("dev"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TTL-cache seams (the GIT_INFO_CACHE perf change). These guard against the
+    // silent-stale-data failure: a flipped TTL comparison or a forgotten
+    // invalidation would serve an old branch/dirty-count with no other signal.
+    // -----------------------------------------------------------------------
+
+    /// A trivial non-default `GitInfo` so a served entry is distinguishable.
+    fn sample_info() -> GitInfo {
+        GitInfo {
+            is_repo: true,
+            branch: Some("main".to_string()),
+            worktree_root: Some("/home/u/repo".to_string()),
+            is_linked_worktree: false,
+            dirty_count: 2,
+        }
+    }
+
+    #[test]
+    fn cache_lookup_serves_a_fresh_entry() {
+        // (a) Age < TTL: the cached answer is returned verbatim.
+        let ttl = Duration::from_millis(3500);
+        let now = Instant::now();
+        let mut map: HashMap<String, (Instant, GitInfo)> = HashMap::new();
+        // Stored 1s ago — well within a 3.5s TTL.
+        map.insert(
+            "/repo".to_string(),
+            (now - Duration::from_secs(1), sample_info()),
+        );
+        assert_eq!(cache_lookup(&map, "/repo", now, ttl), Some(sample_info()));
+        // A different cwd has no entry -> None (cache is keyed per cwd).
+        assert_eq!(cache_lookup(&map, "/other", now, ttl), None);
+    }
+
+    #[test]
+    fn cache_lookup_rejects_a_stale_entry() {
+        // (b) Age > TTL: a stale entry is NOT served (forces a re-run). This is the
+        // case a flipped `<`/`>=` comparison would silently break.
+        let ttl = Duration::from_millis(3500);
+        let now = Instant::now();
+        let mut map: HashMap<String, (Instant, GitInfo)> = HashMap::new();
+        // Stored 5s ago — older than the 3.5s TTL.
+        map.insert(
+            "/repo".to_string(),
+            (now - Duration::from_secs(5), sample_info()),
+        );
+        assert_eq!(cache_lookup(&map, "/repo", now, ttl), None);
+        // Boundary: age exactly == TTL is treated as stale (strict `<`).
+        let mut at_boundary: HashMap<String, (Instant, GitInfo)> = HashMap::new();
+        at_boundary.insert("/repo".to_string(), (now - ttl, sample_info()));
+        assert_eq!(cache_lookup(&at_boundary, "/repo", now, ttl), None);
+    }
+
+    #[test]
+    fn cache_store_then_lookup_round_trips() {
+        // The put half stamps the entry at `now` so an immediate lookup is fresh.
+        let ttl = Duration::from_millis(3500);
+        let now = Instant::now();
+        let mut map: HashMap<String, (Instant, GitInfo)> = HashMap::new();
+        cache_store(&mut map, "/repo".to_string(), now, sample_info());
+        assert_eq!(cache_lookup(&map, "/repo", now, ttl), Some(sample_info()));
+    }
+
+    #[test]
+    fn cache_invalidate_drops_the_entry() {
+        // (c) Invalidation (the commit/worktree path) removes the entry, so the
+        // very next lookup misses and the caller re-runs git instead of serving the
+        // pre-mutation answer. A forgotten invalidation would leave this fresh.
+        let ttl = Duration::from_millis(3500);
+        let now = Instant::now();
+        let mut map: HashMap<String, (Instant, GitInfo)> = HashMap::new();
+        cache_store(&mut map, "/repo".to_string(), now, sample_info());
+        // Fresh before invalidation...
+        assert!(cache_lookup(&map, "/repo", now, ttl).is_some());
+        cache_invalidate(&mut map, "/repo");
+        // ...gone after. Invalidating an absent key is a harmless no-op.
+        assert_eq!(cache_lookup(&map, "/repo", now, ttl), None);
+        cache_invalidate(&mut map, "/repo");
+        assert_eq!(cache_lookup(&map, "/repo", now, ttl), None);
     }
 
     #[test]

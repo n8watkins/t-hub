@@ -51,6 +51,16 @@ const RECENT_TTL: Duration = Duration::from_secs(15);
 static RECENT_CACHE: LazyLock<Mutex<Option<(Instant, Vec<RecentSession>)>>> =
     LazyLock::new(|| Mutex::new(None));
 
+/// True iff a scan taken at `at` is still fresh as of `now` — i.e. its age
+/// (`now - at`) is strictly less than `ttl`. Pure seam (explicit `now`/`ttl`, no
+/// static or wall-clock) so the TTL comparison is unit-testable; production calls
+/// it with `Instant::now()` + [`RECENT_TTL`], so behavior is byte-identical to the
+/// inlined `at.elapsed() < RECENT_TTL` it replaces. A flipped comparison here would
+/// silently serve a stale recent list forever — exactly what the test catches.
+fn is_fresh(at: Instant, now: Instant, ttl: Duration) -> bool {
+    now.duration_since(at) < ttl
+}
+
 /// How many distinct PROJECTS (folders) to surface in Recent, ranked newest-first
 /// by each project's most-recent session. The cap is on PROJECTS, not raw
 /// sessions, so one very chatty folder (e.g. plain `claude` launched from $HOME
@@ -96,7 +106,7 @@ pub async fn recent_sessions() -> Result<Vec<RecentSession>, String> {
     // only to clone the cached Vec, never across the scan below.
     if let Some(cached) = RECENT_CACHE.lock().ok().and_then(|g| {
         g.as_ref()
-            .filter(|(at, _)| at.elapsed() < RECENT_TTL)
+            .filter(|(at, _)| is_fresh(*at, Instant::now(), RECENT_TTL))
             .map(|(_, sessions)| sessions.clone())
     }) {
         return Ok(cached);
@@ -791,6 +801,23 @@ fn read_sessions_windows() -> Vec<RecentSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_fresh_distinguishes_fresh_from_expired() {
+        // The RECENT_CACHE TTL seam: a scan younger than the TTL is fresh (served
+        // from cache); one at or past the TTL is expired (forces a re-scan). A
+        // flipped comparison would serve a stale recent list with no other signal.
+        let ttl = Duration::from_secs(15);
+        let now = Instant::now();
+        // 5s old, 15s TTL -> fresh.
+        assert!(is_fresh(now - Duration::from_secs(5), now, ttl));
+        // 20s old -> expired.
+        assert!(!is_fresh(now - Duration::from_secs(20), now, ttl));
+        // Boundary: age exactly == TTL is expired (strict `<`).
+        assert!(!is_fresh(now - ttl, now, ttl));
+        // Just inside the boundary is still fresh.
+        assert!(is_fresh(now - (ttl - Duration::from_millis(1)), now, ttl));
+    }
 
     #[test]
     fn cwd_basename_handles_separators_and_trailing_slash() {
