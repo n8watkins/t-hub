@@ -1072,7 +1072,15 @@ pub async fn index_project(
     root: String,
 ) -> Result<IndexSummary, String> {
     let root = normalize(&root);
-    let index = build_index(&root)?;
+    // The walk is a full `wsl.exe rg --files` spawn (blocking on a child); run it
+    // off the Tokio executor so it can't pin a worker. `build_index` borrows only
+    // an owned `PathBuf`, so the `'static` closure captures a clone — no `&State`
+    // crosses the `.await`. The `FileIndexState` Mutex is touched only by the
+    // brief `put` AFTER the walk completes, never held across it.
+    let walk_root = root.clone();
+    let index = tauri::async_runtime::spawn_blocking(move || build_index(&walk_root))
+        .await
+        .map_err(|e| format!("index_project task failed: {e}"))??;
     let count = index.entries.len();
     let root_str = index.root.to_string_lossy().into_owned();
     state.put(index);
@@ -1092,9 +1100,21 @@ pub async fn search_files(
     limit: Option<usize>,
 ) -> Result<Vec<FileHit>, String> {
     let root = normalize(&root);
+    // Warm path: a cached `Arc<ProjectIndex>` is a cheap clone under the Mutex (it
+    // acquires and releases internally), so the lock is never held across any
+    // blocking work. Cold path: `build_index` is a full `wsl.exe rg --files` walk
+    // — hop it onto a blocking thread so it can't pin a Tokio worker, then cache
+    // the result. The closure captures only an owned `PathBuf` clone, never
+    // `&State`, and `put` re-acquires the Mutex AFTER the walk.
     let index = match state.get(&root) {
         Some(i) => i,
-        None => state.put(build_index(&root)?),
+        None => {
+            let walk_root = root.clone();
+            let built = tauri::async_runtime::spawn_blocking(move || build_index(&walk_root))
+                .await
+                .map_err(|e| format!("search_files task failed: {e}"))??;
+            state.put(built)
+        }
     };
     let limit = limit.unwrap_or(50).clamp(1, 1000);
     Ok(search_index(&index, &query, limit))

@@ -43,7 +43,15 @@ pub async fn agent_state(state: tauri::State<'_, AppState>) -> Result<AgentState
 
 #[tauri::command]
 pub async fn host_metrics(state: tauri::State<'_, AppState>) -> Result<HostMetrics, String> {
-    state.agent.metrics()
+    // `metrics()` blocks on a `recv_timeout(10s)` against the agent transport, so
+    // a slow/stalled agent would pin a Tokio worker for up to ten seconds — and
+    // this is polled every ~4s. Clone the bridge handle (it wraps an `Arc`
+    // internally, so the clone is cheap) and run the blocking RPC off the
+    // executor. Don't hold `&State` across the `.await`.
+    let agent = state.agent.clone();
+    tauri::async_runtime::spawn_blocking(move || agent.metrics())
+        .await
+        .map_err(|e| format!("host_metrics task failed: {e}"))?
 }
 
 #[tauri::command]
