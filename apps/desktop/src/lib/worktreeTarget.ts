@@ -84,7 +84,8 @@ export function sanitizeBranchToDir(branch: string): string {
  * MAIN repo root (WS-9b). See {@link WorktreeTarget}.
  *
  * The MAIN root is the `gitWorktreeList` entry with `isLinked === false` (git
- * lists it first; we fall back to the first entry defensively). The sibling
+ * lists it first; if there's no non-linked entry we return `no-repo` rather than
+ * guessing the wrong root). The sibling
  * path is `<parent-of-root>/<root-name>-worktrees/<sanitized-branch>`. The
  * returned `branch` is the UNMODIFIED input (slashes intact).
  *
@@ -97,9 +98,12 @@ export async function resolveWorktreeTarget(
 ): Promise<WorktreeTarget> {
   const list = await gitWorktreeList(cwd);
 
-  // MAIN repo root = the non-linked entry (git lists it first); fall back to the
-  // first entry if every flag somehow says linked. No usable path → not a repo.
-  const repoRoot = list.find((w) => !w.isLinked)?.path ?? list[0]?.path;
+  // MAIN repo root = the non-linked entry (git lists it first). Do NOT fall back
+  // to list[0] if every entry says linked: anchoring off a LINKED worktree would
+  // build the sibling under the wrong checkout (and could nest). A missing
+  // non-linked entry (empty/corrupt/all-linked listing) → treat as not-a-repo and
+  // let the caller pick, rather than guessing the wrong root.
+  const repoRoot = list.find((w) => !w.isLinked)?.path;
   if (!repoRoot) return { kind: "no-repo" };
 
   const parent = posixDirname(repoRoot);
