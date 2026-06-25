@@ -398,11 +398,21 @@ fn get_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 }
 
 /// `wait_for_status`: long-poll the supervision reducer until a session reaches a
-/// target FR-012 status (or a timeout). The reducer is snapshot-only (no
-/// subscription/condvar), so this polls `status()` every 500ms — releasing the
-/// supervisor mutex between reads (each `with_supervisor` acquires + drops it) and
-/// sleeping *outside* the lock. Blocking this control connection's thread for up
-/// to `timeoutMs` is expected: connections are handled per-connection.
+/// target FR-012 status (or a timeout). The reducer is snapshot-only, but it keeps
+/// a bounded **transition log** (see [`Supervisor`]) so this is *edge-capturing*:
+/// a status the session merely passes *through* between two 500ms polls (e.g.
+/// working→completed→working, or a transient `needsQuestion`) is still observed,
+/// instead of being missed and reported as a spurious `timedOut`.
+///
+/// How it works: we capture the supervisor's `current_seq()` up front, check the
+/// current status for an immediate match, then loop — each iteration checks both
+/// (a) the *current* status and (b) any logged transition for this session since
+/// the last-consumed seq whose status matches a target (advancing the consumed
+/// seq as we go). Either hit returns immediately. Each `with_supervisor` call
+/// acquires + drops the supervisor mutex, and the 500ms sleep is *outside* the
+/// lock, so the reducer keeps advancing (and logging edges) while we wait.
+/// Blocking this control connection's thread for up to `timeoutMs` is expected:
+/// connections are handled per-connection.
 ///
 /// Args: `sessionId` (required), `targetStatus` (required; a camelCase status
 /// string or an array of them — matches any), `timeoutMs` (optional, default
@@ -414,17 +424,46 @@ fn wait_for_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("wait_for_status requires a 'sessionId' argument")?;
     let targets = parse_target_statuses(args)?;
+    // The same targets, resolved once to enum space for the transition-log edge
+    // query (`matched_since`). Hoisted out of the loop since it never changes.
+    let target_enums = target_statuses(&targets);
     let timeout = std::time::Duration::from_millis(
         args.get("timeoutMs")
             .and_then(|v| v.as_u64())
             .unwrap_or(30000),
     );
 
+    // Watermark: every transition with seq > `consumed` is one we have not yet
+    // inspected. Captured before we start waiting, so any edge that lands while we
+    // sleep (including a transient status the session passes *through*) is caught
+    // on a later iteration. We return on the first match, so this stays fixed.
+    let consumed = ctx.with_supervisor(|s| s.current_seq());
+
     let started = std::time::Instant::now();
     loop {
-        let status = ctx.with_supervisor(|s| s.status(&session_id));
+        // (a) current status, and (b) any transition edge for this session since
+        // `consumed` that matches a target — both read under one lock acquisition.
+        // We advance `consumed` past every inspected edge so we never re-scan.
+        let (status, edge_match) = ctx.with_supervisor(|s| {
+            let status = s.status(&session_id);
+            let edge = s.matched_since(&session_id, &target_enums, consumed);
+            (status, edge)
+        });
         let status_str = status_camel(status);
         let elapsed = started.elapsed();
+
+        // An edge we slept through matched a target — report that status as final,
+        // even though the *current* status may have already moved on past it. (We
+        // return on the first match, so there's no need to advance `consumed`
+        // past this edge; the watermark only matters across the no-match sleeps.)
+        if let Some((_seq, matched_status)) = edge_match {
+            return Ok(json!({
+                "finalStatus": status_camel(matched_status),
+                "elapsedMs": elapsed.as_millis() as u64,
+                "timedOut": false,
+            }));
+        }
+        // The current status matches a target.
         if targets.iter().any(|t| t == &status_str) {
             return Ok(json!({
                 "finalStatus": status_str,
@@ -440,9 +479,24 @@ fn wait_for_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
             }));
         }
         // Mutex is already released (with_supervisor drops it per call); sleep
-        // outside the lock so the reducer keeps advancing while we wait.
+        // outside the lock so the reducer keeps advancing while we wait. The log
+        // captures any edges the session crosses during this sleep window.
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+}
+
+/// Resolve the parsed camelCase target strings back to [`SessionStatus`] values
+/// for the transition-log edge query (`matched_since` works in enum space, while
+/// the wire targets arrive as strings). Unrecognized strings are dropped — they
+/// can never match a real logged status anyway, and the current-status string
+/// comparison still covers any exotic value.
+fn target_statuses(targets: &[String]) -> Vec<crate::model::SessionStatus> {
+    targets
+        .iter()
+        .filter_map(|t| {
+            serde_json::from_value::<crate::model::SessionStatus>(Value::String(t.clone())).ok()
+        })
+        .collect()
 }
 
 /// Serialize a [`SessionStatus`] to its camelCase wire string (e.g. "completed",
@@ -666,9 +720,18 @@ fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
                 "worktreePath": worktree_path,
                 "force": force,
                 "audited": true,
-                "applied": true,
-                "note": "the UI is detaching any live tiles in the worktree, then \
-                         removing it (git worktree remove) — no process is orphaned.",
+                // We only *forwarded* the removal request over this channel — the
+                // real `git worktree remove` runs later in the frontend (after it
+                // detaches live tiles) and can still fail (dirty tree without
+                // force, a tile detach throwing). The control channel cannot
+                // confirm that completion synchronously, so we report `requested`,
+                // not `applied`, to avoid falsely telling the caller it succeeded.
+                "requested": true,
+                "note": "the UI was asked to detach any live tiles rooted in the \
+                         worktree and then remove it (git worktree remove). \
+                         Completion is NOT confirmed synchronously over this \
+                         channel — the removal runs in the frontend and may still \
+                         fail (e.g. a dirty tree without force).",
             }))
         }
         // No UI to detach tiles ⇒ refuse rather than orphan a process.
@@ -1103,6 +1166,74 @@ mod tests {
         assert!(err.contains("targetStatus"), "got: {err}");
     }
 
+    /// Build a ControlContext over a *shared* Supervisor and hand the test the
+    /// handle, so it can drive transitions from another thread while
+    /// `wait_for_status` is polling. Mirrors `test_ctx`'s visitor wiring.
+    fn test_ctx_with_shared_supervisor(
+        token: &str,
+    ) -> (ControlContext, Arc<StdMutex<Supervisor>>) {
+        let supervisor = Arc::new(StdMutex::new(Supervisor::new()));
+        let sup_for_closure = supervisor.clone();
+        let visitor: Arc<dyn Fn(&mut dyn FnMut(&Supervisor)) + Send + Sync> =
+            Arc::new(move |f: &mut dyn FnMut(&Supervisor)| {
+                let guard = sup_for_closure.lock().unwrap();
+                f(&guard);
+            });
+        let ctx = ControlContext::new(Arc::new(StatusBridge::new()), visitor, token.to_string());
+        (ctx, supervisor)
+    }
+
+    #[test]
+    fn wait_for_status_captures_transient_edge_between_polls() {
+        use t_hub_protocol::JournalEventType;
+
+        // BUG #6 regression: drive the session A(working) → B(completed) → A(working)
+        // entirely *between* the poller's 500ms snapshot reads. The current status
+        // ends back at A, so a pure snapshot poll would never see B and would
+        // (wrongly) time out. The transition log captures the transient B edge, so
+        // `wait_for_status` for target "completed" must return timedOut:false with
+        // finalStatus:"completed".
+        let (ctx, supervisor) = test_ctx_with_shared_supervisor("t");
+
+        // Seed the session as Working *before* wait starts, so its captured
+        // start_seq sits just before the transient B→A transitions we drive next.
+        {
+            let mut s = supervisor.lock().unwrap();
+            s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 1);
+            assert_eq!(s.status("o1"), crate::model::SessionStatus::Working);
+        }
+
+        // Driver thread: after wait_for_status has captured its start_seq and is
+        // sleeping through its first 500ms window, push completed→working so the
+        // transient B is gone from the *current* status by the next poll, but
+        // recorded in the log.
+        let sup = supervisor.clone();
+        let driver = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let mut s = sup.lock().unwrap();
+            s.ingest(Some("o1"), None, None, JournalEventType::Stop, 2); // → Completed (B)
+            s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 3); // → Working (A)
+            assert_eq!(s.status("o1"), crate::model::SessionStatus::Working);
+        });
+
+        let v = dispatch(
+            &ctx,
+            "wait_for_status",
+            &json!({"sessionId": "o1", "targetStatus": "completed", "timeoutMs": 5000}),
+        )
+        .unwrap();
+        driver.join().unwrap();
+
+        assert_eq!(
+            v["timedOut"], false,
+            "transient completed edge must be observed, not timed out; got {v:?}"
+        );
+        assert_eq!(
+            v["finalStatus"], "completed",
+            "finalStatus should report the transient target B even though current is A; got {v:?}"
+        );
+    }
+
     #[test]
     fn read_terminal_requires_session_id() {
         let ctx = test_ctx("t");
@@ -1173,6 +1304,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("orphan"), "got: {err}");
+    }
+
+    #[test]
+    fn remove_worktree_with_sink_reports_requested_not_applied() {
+        // With a sink wired, the removal is only *forwarded* to the UI — the real
+        // `git worktree remove` runs later in the frontend and can still fail. The
+        // response must be honest about that: `requested: true`, and NO misleading
+        // `applied` field claiming synchronous success.
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let v = dispatch(
+            &ctx,
+            "remove_worktree",
+            &json!({"repoRoot": "/r", "worktreePath": "/r/wt", "force": true}),
+        )
+        .unwrap();
+        assert_eq!(v["accepted"], "remove_worktree");
+        assert_eq!(v["audited"], true);
+        assert_eq!(v["requested"], true);
+        assert!(
+            v.get("applied").is_none(),
+            "remove_worktree must not claim synchronous completion via 'applied'; got {v:?}"
+        );
+        // The note must not falsely imply confirmed completion.
+        let note = v["note"].as_str().unwrap();
+        assert!(note.contains("not confirmed") || note.contains("NOT confirmed"), "got: {note}");
+
+        // The removal was actually forwarded to the UI with the args.
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "remove_worktree_workspace");
+        assert_eq!(calls[0].1["force"], true);
     }
 
     #[test]

@@ -26,10 +26,15 @@
 //! Boundary for parallel work: keep this module a deterministic reducer over
 //! events with no I/O. The bridge/emit side belongs in `agent`/`claude`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::model::{SessionStatus, SubagentNode, SubagentState, SupervisionTree};
 use t_hub_protocol::JournalEventType;
+
+/// Cap on the bounded transition log. Big enough that a poller sleeping 500ms
+/// between checks cannot realistically miss an edge (each `ingest` pushes at
+/// most one entry), small enough that the log stays trivially cheap.
+const TRANSITION_LOG_CAP: usize = 256;
 
 /// Per-session supervision state.
 #[derive(Debug, Default, Clone)]
@@ -62,9 +67,25 @@ impl SessionEntry {
 
 /// The supervision reducer. One instance per core process; not `Sync` by itself
 /// (the caller wraps it in a `Mutex`).
+///
+/// ## Edge-capturing transition log
+/// The reducer is snapshot-only: `status()` reports the *current* value. A poller
+/// (e.g. `control::wait_for_status`) that only reads `status()` between sleeps can
+/// miss a status the session passed *through* (e.g. working→completed→working, or
+/// a transient `NeedsQuestion`). To make those edges observable without a
+/// subscription/condvar, every *actual* status change is appended to a bounded
+/// [`VecDeque`] keyed by a monotonic `seq`. A poller captures `current_seq()` up
+/// front, then asks `transitions_since`/`matched_since` for any edge it slept
+/// through. The log is capped (oldest entries drop) so it never grows unbounded.
 #[derive(Debug, Default)]
 pub struct Supervisor {
     sessions: HashMap<String, SessionEntry>,
+    /// Monotonic counter; the seq assigned to the *next* transition pushed. Also
+    /// the `current_seq()` watermark a poller captures before it starts waiting.
+    seq: u64,
+    /// Bounded edge log of `(seq, session_id, new_status)`, oldest first. Capped
+    /// at [`TRANSITION_LOG_CAP`]; pushing past the cap evicts the front.
+    transitions: VecDeque<(u64, String, SessionStatus)>,
 }
 
 impl Supervisor {
@@ -86,6 +107,10 @@ impl Supervisor {
     ) -> Option<String> {
         let session_id = session_id?;
         let entry = self.sessions.entry(session_id.to_string()).or_default();
+        // Capture the status before the reducer runs so we can log an *edge* only
+        // when it actually changes (not on a same-status re-ingest). `SessionStatus`
+        // is `Copy`, so this is a cheap snapshot.
+        let prev_status = entry.status;
 
         match event {
             JournalEventType::SessionStart => {
@@ -189,7 +214,69 @@ impl Supervisor {
             _ => {}
         }
 
+        // Read the post-reducer status (the `entry` borrow above ended with the
+        // match). Log an edge only on an *actual* change, so a same-status
+        // re-ingest does not pollute the log.
+        let new_status = self.sessions[session_id].status;
+        if new_status != prev_status {
+            self.push_transition(session_id, new_status);
+        }
+
         Some(session_id.to_string())
+    }
+
+    /// Append `(seq, session_id, status)` to the bounded transition log and bump
+    /// `seq`. Seqs are 1-based and strictly increasing: we *pre*-increment so the
+    /// first transition is seq 1, and a watermark captured as `current_seq()`
+    /// (the highest seq assigned so far) plus an exclusive `> since` query catches
+    /// every edge logged *after* the capture. Evicts the oldest entry once the cap
+    /// is reached so the log stays `O(TRANSITION_LOG_CAP)`. Called only on an
+    /// actual status change.
+    fn push_transition(&mut self, session_id: &str, status: SessionStatus) {
+        if self.transitions.len() >= TRANSITION_LOG_CAP {
+            self.transitions.pop_front();
+        }
+        self.seq += 1;
+        self.transitions
+            .push_back((self.seq, session_id.to_string(), status));
+    }
+
+    /// The current transition watermark: the highest seq assigned so far (0 before
+    /// any transition). A poller captures this before it starts waiting, then asks
+    /// [`Self::transitions_since`] / [`Self::matched_since`] for edges with `seq >`
+    /// this value — i.e. every transition logged *after* the capture, including a
+    /// transient status the session passes through.
+    pub fn current_seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Every logged `(session_id, status)` transition with `seq > since_seq`, in
+    /// order. Entries older than the cap are gone; a caller that captured
+    /// `current_seq()` recently will see all edges since then.
+    pub fn transitions_since(&self, since_seq: u64) -> Vec<(String, SessionStatus)> {
+        self.transitions
+            .iter()
+            .filter(|(seq, _, _)| *seq > since_seq)
+            .map(|(_, sid, status)| (sid.clone(), *status))
+            .collect()
+    }
+
+    /// Focused edge query for one session: the *first* logged transition with
+    /// `seq > since_seq` whose status is in `targets`, paired with the seq that
+    /// matched (so the caller can advance its consumed watermark past it). Returns
+    /// `None` if no such edge was logged.
+    pub fn matched_since(
+        &self,
+        session_id: &str,
+        targets: &[SessionStatus],
+        since_seq: u64,
+    ) -> Option<(u64, SessionStatus)> {
+        self.transitions
+            .iter()
+            .find(|(seq, sid, status)| {
+                *seq > since_seq && sid == session_id && targets.contains(status)
+            })
+            .map(|(seq, _, status)| (*seq, *status))
     }
 
     /// After a child/task finishes, if the main agent had already stopped and
@@ -333,5 +420,52 @@ mod tests {
         s.ingest(Some("o1"), None, None, JournalEventType::SessionStart, 1);
         s.ingest(Some("o1"), None, None, JournalEventType::StopFailure, 2);
         assert_eq!(s.status("o1"), SessionStatus::Failed);
+    }
+
+    #[test]
+    fn transition_log_captures_transient_edge_through_b() {
+        // Drive A(Working) → B(Completed, transient) → A(Working). The current
+        // status ends back at A, but the edge through B must be logged so a poller
+        // that captured `start` before the run can still observe it after the fact.
+        let mut s = sup();
+        let start = s.current_seq();
+        s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 1);
+        assert_eq!(s.status("o1"), SessionStatus::Working);
+        s.ingest(Some("o1"), None, None, JournalEventType::Stop, 2);
+        assert_eq!(s.status("o1"), SessionStatus::Completed);
+        s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 3);
+        // Current status is back to Working — Completed was only transient.
+        assert_eq!(s.status("o1"), SessionStatus::Working);
+
+        // The transient Completed edge is still recoverable from the log.
+        let edges = s.transitions_since(start);
+        assert!(
+            edges
+                .iter()
+                .any(|(sid, st)| sid == "o1" && *st == SessionStatus::Completed),
+            "expected a logged Completed edge in {edges:?}"
+        );
+        // Focused query finds it too, and reports the seq that matched.
+        let matched = s.matched_since("o1", &[SessionStatus::Completed], start);
+        assert!(
+            matches!(matched, Some((_, SessionStatus::Completed))),
+            "matched_since should find the transient Completed edge, got {matched:?}"
+        );
+    }
+
+    #[test]
+    fn transition_log_only_records_actual_changes() {
+        // Re-ingesting the same-status signal must not push a duplicate edge.
+        let mut s = sup();
+        let start = s.current_seq();
+        s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 1);
+        // A second UserPromptSubmit while already Working is a same-status re-ingest.
+        s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 2);
+        let working_edges = s
+            .transitions_since(start)
+            .into_iter()
+            .filter(|(sid, st)| sid == "o1" && *st == SessionStatus::Working)
+            .count();
+        assert_eq!(working_edges, 1, "same-status re-ingest must not log an edge");
     }
 }
