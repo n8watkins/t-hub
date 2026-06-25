@@ -8,7 +8,7 @@
 - Wave 0 — WS-1 copy-on-select/open-file (`a00085c`), WS-2 OS toasts (`c5915d8`), WS-5a `wait_for_status` (`683ff61`).
 - Wave 1 — WS-4 worktree primitive (`9b72b75`), WS-3 prefix-key + palette (`7a70af2`), WS-6 session restore (`c2b6c8d`), WS-5b rules engine (`853e8ba`).
 
-**Not yet done:** runtime smoke-test in the live app (all verification so far is compile + unit-test level). Next up is `Later/someday` (remote ⑥, wildcards).
+**Not yet done:** runtime smoke-test in the live app (all verification so far is compile + unit-test level). **Next build = WS-9 (worktree-centric workflow)** — locked design in [WORKTREE-WORKFLOW.md](./WORKTREE-WORKFLOW.md). After that: `Later/someday` (remote ⑥, wildcards).
 
 ## Principles
 
@@ -111,6 +111,12 @@ Harden the dev-vs-prod control-channel "which instance?" bug. Namespace the hand
 4. **Gate:** Wave 1 starts after Wave 0 merges.
 
 **Suggested ordering tweak:** WS-2 (~30 min) and WS-5a (~1–2 d) are tiny and backend/config-isolated — knock them out first as confidence-builders, even before the full Wave 0/1 fan-out.
+
+---
+
+## Next — WS-9 · Worktree-centric workflow
+
+Locked design: [WORKTREE-WORKFLOW.md](./WORKTREE-WORKFLOW.md). Builds on shipped WS-4 (worktree primitive) + WS-3 (keymap). Core: a worktree = a sibling folder for a branch (`<repo>-worktrees/<branch>`); the repo is **anchored to the focused tile's repo** (main-root resolved, so siblings never nest), with a repo-picker fallback when there's no repo in context. The three "new" actions split by layer — `Ctrl+T` = terminal in current tab (never a worktree), `Ctrl+B c` = new plain tab, `Ctrl+B w` = new worktree tab, all in the `Ctrl+K` palette. **Enabling primitive:** live tile cwd (`#{pane_current_path}`) → `git_info` — the *same* unlock as relative file-open (the WS-1 TODO), so do it first.
 
 ---
 
