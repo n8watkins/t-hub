@@ -18,6 +18,11 @@ import "./lib/updateMount";
 // injects the continue command so it resumes on its own. Idempotent. See
 // src/lib/autoContinueMount.ts.
 import "./lib/autoContinueMount";
+// Side-effect import: arms the event→action RULES engine (WS-5b) — when a
+// supervised session's FR-012 status transitions, runs the user-configured action
+// (notify / send text / spawn / restart / run). Loop-guarded + startup-warmed.
+// Idempotent. See src/lib/rulesMount.ts.
+import "./lib/rulesMount";
 
 // Note: React.StrictMode is intentionally omitted. Its double-invoke of effects
 // in development breaks xterm.js terminals (double `open()` / disposed addons).

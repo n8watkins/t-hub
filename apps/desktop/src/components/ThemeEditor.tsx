@@ -57,6 +57,18 @@ import { useKeybindings } from "../store/keybindings";
 import { COMMANDS } from "../lib/commands";
 import { formatChord } from "../lib/chord";
 import { openKeyboardPalette } from "./CommandPalette";
+// Rules (WS-5b): the event→action engine's config surface. The list + CRUD live
+// in store/rules; lib/rulesMount does the firing.
+import {
+  useRules,
+  TRIGGER_STATUSES,
+  ACTION_KINDS,
+  statusLabel,
+  actionKindLabel,
+  type Rule,
+  type ActionKind,
+} from "../store/rules";
+import type { SessionStatus } from "../ipc/model";
 
 /**
  * Wire the global `Ctrl/Cmd+,` toggle (and Esc-to-close) onto the settings
@@ -104,6 +116,7 @@ type SectionId =
   | "general"
   | "hotkeys"
   | "keyboard"
+  | "rules"
   | "hooks"
   | "updates"
   | "about"
@@ -190,6 +203,7 @@ function SectionNav({
         { id: "general", label: "General", hint: "App behavior" },
         { id: "keyboard", label: "Keyboard", hint: "Rebindable command shortcuts + prefix" },
         { id: "hotkeys", label: "Hotkeys", hint: "Keyboard shortcuts reference" },
+        { id: "rules", label: "Rules", hint: "Run an action when a session changes status" },
         { id: "hooks", label: "Hooks", hint: "Claude Code lifecycle hooks" },
         { id: "updates", label: "Updates", hint: "Check for + install app updates" },
         { id: "about", label: "About", hint: "What T-Hub is + version" },
@@ -254,6 +268,8 @@ function SectionContent({
       return <GeneralSection onNavigate={onNavigate} />;
     case "keyboard":
       return <KeyboardSection />;
+    case "rules":
+      return <RulesSection />;
     case "hotkeys":
       return <HotkeysSection />;
     case "hooks":
@@ -617,6 +633,201 @@ function KeyboardSection() {
         ))}
       </Group>
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Rules (WS-5b) — the event→action engine's config surface. Each rule runs an
+// action when a supervised session's FR-012 status transitions into a target
+// status. The list + CRUD live in store/rules; lib/rulesMount does the firing.
+// This section is a minimal-but-complete builder: enable/disable, add/remove, and
+// per-rule editors for the trigger (from→to status) and the action (kind + its
+// params). Every edit is live (it writes straight to the store, which persists).
+// ---------------------------------------------------------------------------
+
+/** Which action kinds take a free-text param, and what that text means for each
+ *  (so the input's label/placeholder reads right per kind). `null` = no text
+ *  param (restart needs none beyond an optional command, handled below). */
+const ACTION_TEXT_HINT: Record<ActionKind, { label: string; placeholder: string } | null> = {
+  notify: { label: "Message", placeholder: "A session changed status." },
+  sendText: { label: "Text to send", placeholder: "e.g. continue" },
+  run: { label: "Command", placeholder: "e.g. npm test" },
+  spawn: { label: "Startup command (optional)", placeholder: "e.g. claude --resume" },
+  restart: { label: "Startup command (optional)", placeholder: "e.g. claude" },
+};
+
+/** Which action kinds spawn a NEW terminal, so they offer a cwd field. */
+const ACTION_HAS_CWD: Record<ActionKind, boolean> = {
+  notify: false,
+  sendText: false,
+  run: false,
+  spawn: true,
+  restart: true,
+};
+
+function RulesSection() {
+  const rules = useRules((s) => s.rules);
+  const add = useRules((s) => s.add);
+
+  return (
+    <>
+      <Group
+        title="Rules"
+        description="Run an action when a supervised Claude session's status changes — e.g. open a terminal when a session ends, or ping you when one needs a permission. Rules react to live status transitions; a loop-guard caps how often each rule can fire for a session."
+      >
+        {rules.length === 0 ? (
+          <p className="text-xs" style={{ color: "var(--th-fg-muted)" }}>
+            No rules yet. Add one to react to a session's status change.
+          </p>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {rules.map((rule) => (
+              <RuleCard key={rule.id} rule={rule} />
+            ))}
+          </div>
+        )}
+        <div className="mt-1">
+          <Btn onClick={add} title="Add a new (disabled) rule to configure">
+            + Add rule
+          </Btn>
+        </div>
+      </Group>
+    </>
+  );
+}
+
+/** One editable rule: enable toggle + name, trigger (from→to status), action
+ *  (kind + params), and a remove button. */
+function RuleCard({ rule }: { rule: Rule }) {
+  const toggle = useRules((s) => s.toggle);
+  const remove = useRules((s) => s.remove);
+  const update = useRules((s) => s.update);
+
+  const textHint = ACTION_TEXT_HINT[rule.action.kind];
+  const hasCwd = ACTION_HAS_CWD[rule.action.kind];
+
+  return (
+    <div
+      className="flex flex-col gap-2.5 rounded border p-3"
+      style={{ borderColor: "var(--th-border)", opacity: rule.enabled ? 1 : 0.7 }}
+    >
+      {/* Header: enable switch + editable name + remove. */}
+      <div className="flex items-center gap-2.5">
+        <Switch
+          checked={rule.enabled}
+          onChange={() => toggle(rule.id)}
+          label={`Enable ${rule.name}`}
+        />
+        <input
+          value={rule.name}
+          onChange={(e) => update(rule.id, { name: e.target.value })}
+          placeholder="Rule name"
+          className="min-w-0 flex-1 rounded border bg-transparent px-2 py-1 text-sm"
+          style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+          aria-label="Rule name"
+        />
+        <button
+          type="button"
+          onClick={() => remove(rule.id)}
+          className="shrink-0 rounded border px-2 py-1 text-xs hover:bg-neutral-700/30"
+          style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
+          title="Delete this rule"
+        >
+          Remove
+        </button>
+      </div>
+
+      {/* Trigger: when status goes from → to. */}
+      <Row label="When status becomes">
+        <div className="flex items-center gap-2">
+          <ThemeSelect
+            value={rule.trigger.from}
+            onChange={(v) =>
+              update(rule.id, {
+                trigger: { ...rule.trigger, from: v as SessionStatus | "any" },
+              })
+            }
+            title="Only fire when the previous status was this (Any = don't care)"
+          >
+            <Opt value="any">{statusLabel("any")}</Opt>
+            {TRIGGER_STATUSES.map((s) => (
+              <Opt key={s} value={s}>
+                {statusLabel(s)}
+              </Opt>
+            ))}
+          </ThemeSelect>
+          <span style={{ color: "var(--th-fg-muted)" }}>→</span>
+          <ThemeSelect
+            value={rule.trigger.to}
+            onChange={(v) =>
+              update(rule.id, {
+                trigger: { ...rule.trigger, to: v as SessionStatus },
+              })
+            }
+            title="The status the session must enter for this rule to fire"
+          >
+            {TRIGGER_STATUSES.map((s) => (
+              <Opt key={s} value={s}>
+                {statusLabel(s)}
+              </Opt>
+            ))}
+          </ThemeSelect>
+        </div>
+      </Row>
+
+      {/* Action: kind + its params. */}
+      <Row label="Do">
+        <ThemeSelect
+          value={rule.action.kind}
+          onChange={(v) =>
+            update(rule.id, {
+              action: { ...rule.action, kind: v as ActionKind },
+            })
+          }
+          title="The action to run when this rule fires"
+        >
+          {ACTION_KINDS.map((k) => (
+            <Opt key={k} value={k}>
+              {actionKindLabel(k)}
+            </Opt>
+          ))}
+        </ThemeSelect>
+      </Row>
+
+      {textHint && (
+        <Row label={textHint.label}>
+          <input
+            value={rule.action.text ?? ""}
+            onChange={(e) =>
+              update(rule.id, {
+                action: { ...rule.action, text: e.target.value },
+              })
+            }
+            placeholder={textHint.placeholder}
+            className="w-full rounded border bg-transparent px-2 py-1 text-sm"
+            style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+            aria-label={textHint.label}
+          />
+        </Row>
+      )}
+
+      {hasCwd && (
+        <Row label="Directory (optional)">
+          <input
+            value={rule.action.cwd ?? ""}
+            onChange={(e) =>
+              update(rule.id, {
+                action: { ...rule.action, cwd: e.target.value },
+              })
+            }
+            placeholder="Inherit the session's directory"
+            className="w-full rounded border bg-transparent px-2 py-1 text-sm"
+            style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
+            aria-label="Working directory"
+          />
+        </Row>
+      )}
+    </div>
   );
 }
 
