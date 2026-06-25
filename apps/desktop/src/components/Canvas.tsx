@@ -90,6 +90,36 @@ function focusSidebarTarget(): void {
   });
 }
 
+/**
+ * True when the keydown's target is a real text-entry surface that should keep
+ * its OWN keystrokes — a form `<input>`/`<textarea>`/`<select>`, or any
+ * `contentEditable` host. The global keymap bails out for these so:
+ *   - the command palette's search input + its "press new key" rebind capture
+ *     actually RECEIVE the chord (the capture-phase keymap used to fire the
+ *     direct command — e.g. Ctrl+T — before the palette could capture it, so a
+ *     currently-bound chord was unrebindable);
+ *   - typing chords into the worktree-path form, rename-tab, or theme fields
+ *     can't accidentally trigger app commands.
+ *
+ * CRITICAL EXCLUSION: xterm renders an OFFSCREEN `<textarea class=
+ * "xterm-helper-textarea">` as a focused terminal's keyboard input sink, so when
+ * a terminal is focused EVERY keydown's target is that textarea. We must treat
+ * it as NON-editable here, or the editable-guard would disable all global
+ * hotkeys (Ctrl+T/+W/+Tab/prefix…) the moment a terminal has focus. We
+ * explicitly let that one class fall through so terminal-focused hotkeys keep
+ * working; the prefix/direct chords still beat xterm via the capture phase.
+ */
+function isEditableTarget(t: EventTarget | null): boolean {
+  const el = t as HTMLElement | null;
+  if (!el || typeof el.tagName !== "string") return false;
+  // xterm's hidden input sink is NOT an editable surface for the keymap — global
+  // hotkeys must keep firing while a terminal is focused.
+  if (el.classList?.contains("xterm-helper-textarea")) return false;
+  const tag = el.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  return el.isContentEditable === true;
+}
+
 export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   const tabs = useWorkspace((s) => s.tabs);
   const activeTabId = useWorkspace((s) => s.activeTabId);
@@ -241,6 +271,26 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // EDITABLE GUARD: when focus is in a real text field (a form input, a
+      // textarea, a contentEditable host, or — crucially — the command palette's
+      // search input / "press new key" rebind capture), let the field own its
+      // keystrokes. We must do this in the CAPTURE phase BEFORE everything else,
+      // because this listener beats the palette's bubble-phase handlers: without
+      // the bail-out, pressing a chord that is ALREADY a direct binding (e.g.
+      // Ctrl+T) would fire that command + preventDefault before the palette could
+      // capture it (so a bound chord couldn't be rebound), and typing chords into
+      // the worktree/rename/theme forms could trigger app commands. We return
+      // WITHOUT preventDefault so the focused element handles the key normally.
+      // Placed ABOVE the prefix-armed check too, so a focused field never gets a
+      // key swallowed by a stale armed prefix; disarm() here is belt-and-braces.
+      // NOTE: isEditableTarget() deliberately EXCLUDES xterm's offscreen
+      // .xterm-helper-textarea, so global hotkeys keep firing over a focused
+      // terminal (whose keydown target IS that textarea) — see its doc comment.
+      if (isEditableTarget(e.target)) {
+        disarm();
+        return;
+      }
+
       // ARMED: every key (modifiers or not — a prefixed binding is a BARE key)
       // routes to the prefix state machine until it resolves/disarms.
       if (isPrefixArmed()) {
