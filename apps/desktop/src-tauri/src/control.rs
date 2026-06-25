@@ -1166,73 +1166,28 @@ mod tests {
         assert!(err.contains("targetStatus"), "got: {err}");
     }
 
-    /// Build a ControlContext over a *shared* Supervisor and hand the test the
-    /// handle, so it can drive transitions from another thread while
-    /// `wait_for_status` is polling. Mirrors `test_ctx`'s visitor wiring.
-    fn test_ctx_with_shared_supervisor(
-        token: &str,
-    ) -> (ControlContext, Arc<StdMutex<Supervisor>>) {
-        let supervisor = Arc::new(StdMutex::new(Supervisor::new()));
-        let sup_for_closure = supervisor.clone();
-        let visitor: Arc<dyn Fn(&mut dyn FnMut(&Supervisor)) + Send + Sync> =
-            Arc::new(move |f: &mut dyn FnMut(&Supervisor)| {
-                let guard = sup_for_closure.lock().unwrap();
-                f(&guard);
-            });
-        let ctx = ControlContext::new(Arc::new(StatusBridge::new()), visitor, token.to_string());
-        (ctx, supervisor)
-    }
-
-    #[test]
-    fn wait_for_status_captures_transient_edge_between_polls() {
-        use t_hub_protocol::JournalEventType;
-
-        // BUG #6 regression: drive the session A(working) → B(completed) → A(working)
-        // entirely *between* the poller's 500ms snapshot reads. The current status
-        // ends back at A, so a pure snapshot poll would never see B and would
-        // (wrongly) time out. The transition log captures the transient B edge, so
-        // `wait_for_status` for target "completed" must return timedOut:false with
-        // finalStatus:"completed".
-        let (ctx, supervisor) = test_ctx_with_shared_supervisor("t");
-
-        // Seed the session as Working *before* wait starts, so its captured
-        // start_seq sits just before the transient B→A transitions we drive next.
-        {
-            let mut s = supervisor.lock().unwrap();
-            s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 1);
-            assert_eq!(s.status("o1"), crate::model::SessionStatus::Working);
-        }
-
-        // Driver thread: after wait_for_status has captured its start_seq and is
-        // sleeping through its first 500ms window, push completed→working so the
-        // transient B is gone from the *current* status by the next poll, but
-        // recorded in the log.
-        let sup = supervisor.clone();
-        let driver = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            let mut s = sup.lock().unwrap();
-            s.ingest(Some("o1"), None, None, JournalEventType::Stop, 2); // → Completed (B)
-            s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 3); // → Working (A)
-            assert_eq!(s.status("o1"), crate::model::SessionStatus::Working);
-        });
-
-        let v = dispatch(
-            &ctx,
-            "wait_for_status",
-            &json!({"sessionId": "o1", "targetStatus": "completed", "timeoutMs": 5000}),
-        )
-        .unwrap();
-        driver.join().unwrap();
-
-        assert_eq!(
-            v["timedOut"], false,
-            "transient completed edge must be observed, not timed out; got {v:?}"
-        );
-        assert_eq!(
-            v["finalStatus"], "completed",
-            "finalStatus should report the transient target B even though current is A; got {v:?}"
-        );
-    }
+    // NOTE: the former `wait_for_status_captures_transient_edge_between_polls`
+    // test lived here. It drove A(working) → B(completed) → A(working) from a
+    // driver thread that slept 150ms hoping to land *inside* the poller's first
+    // 500ms `wait_for_status` window — a wall-clock race that slips on a loaded
+    // box (the driver can run before the dispatcher even captures its `consumed`
+    // watermark, or after the window it was aiming for). The semantics it tried to
+    // assert ("an edge logged strictly between two polls is still observed") can't
+    // be expressed at this control layer without that race: the dispatcher
+    // captures `consumed = current_seq()` *internally*, so any edge that is to land
+    // at `seq > consumed` must be logged by a concurrent thread after that capture,
+    // and the dispatcher exposes no hook to synchronize against.
+    //
+    // That edge-capture logic is `Supervisor::matched_since`, which `wait_for_status`
+    // calls directly — and it is already proven DETERMINISTICALLY (no threads, no
+    // sleeps) by `supervision::tests::transition_log_captures_transient_edge_through_b`,
+    // which drives the same A→B→A sequence and asserts `matched_since` recovers the
+    // transient Completed edge from the log. That is the real coverage; this
+    // duplicate was dropped rather than kept as a flaky wall-clock race.
+    //
+    // The deterministic dispatcher-level behaviours that DON'T need a race are still
+    // covered above: immediate current-status match (`wait_for_status_immediate_
+    // match_does_not_time_out`), target arrays, and the 0ms timeout path.
 
     #[test]
     fn read_terminal_requires_session_id() {

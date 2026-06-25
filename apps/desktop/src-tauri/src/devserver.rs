@@ -547,21 +547,59 @@ mod tests {
 
     /// The TCP probe should connect to a port we open and report it refused once
     /// closed. Uses an ephemeral listener so the test is hermetic.
+    ///
+    /// De-flaked: instead of a single probe per phase (which assumes the OS has
+    /// already settled the socket into the expected state), each phase polls
+    /// `tcp_reachable` with a deadline until the expected reachability is observed.
+    /// The open phase is normally instant; the *closed* phase is the one that can
+    /// lag — dropping the listener releases the port asynchronously, so a fresh
+    /// probe can momentarily still connect (e.g. to a half-open socket) on a loaded
+    /// box. Polling until refused (or a short timeout) removes the fixed-time
+    /// assumption while still asserting the same open→closed transition.
     #[test]
     fn tcp_reachable_detects_open_then_closed() {
         use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        // Poll `tcp_reachable` until it returns `want`, or fail after `deadline`.
+        // Each probe carries a tight connect budget so the loop is responsive; the
+        // overall deadline (not any single probe) bounds the wait.
+        fn poll_until_reachable(
+            host: &str,
+            port: u16,
+            want: bool,
+            deadline: Duration,
+        ) -> bool {
+            let start = Instant::now();
+            loop {
+                if tcp_reachable(host, port, 50).unwrap() == want {
+                    return true;
+                }
+                if start.elapsed() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
         let port = listener.local_addr().unwrap().port();
-        // Open: a listener is accepting, so the handshake succeeds.
+
+        // Open: a listener is accepting, so the handshake succeeds (effectively
+        // immediate, but poll for symmetry / to absorb any scheduling hiccup).
         assert!(
-            tcp_reachable("127.0.0.1", port, 500).unwrap(),
+            poll_until_reachable("127.0.0.1", port, true, Duration::from_secs(2)),
             "expected the open port to accept a connection"
         );
-        // Closed: drop the listener, then a fresh probe must be refused.
+
+        // Closed: drop the listener, then poll until a fresh probe is refused. The
+        // refusal may not be observable on the very first probe after drop, so we
+        // wait (bounded) for the port to be released rather than assuming a fixed
+        // settle time.
         drop(listener);
         assert!(
-            !tcp_reachable("127.0.0.1", port, 500).unwrap(),
-            "expected the closed port to refuse"
+            poll_until_reachable("127.0.0.1", port, false, Duration::from_secs(2)),
+            "expected the closed port to refuse once the listener is released"
         );
     }
 }

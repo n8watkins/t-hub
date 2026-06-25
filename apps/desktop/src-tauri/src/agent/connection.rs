@@ -308,9 +308,29 @@ pub(crate) fn spawn_reader(
 #[cfg(test)]
 mod transport_tests {
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::agent::AgentBridge;
+    // `ConnectionState` is defined in this module (the parent of these tests).
+    use super::ConnectionState;
+
+    /// Poll `cond` every 10ms until it returns true or `deadline` elapses; returns
+    /// whether the condition was met. Replaces bare "give the reader a moment"
+    /// sleeps with a bounded wait on the actual observable state, so the tests
+    /// don't depend on a fixed-time guess (fast machines don't waste the full nap,
+    /// loaded machines aren't cut off early — they wait up to the deadline).
+    fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        loop {
+            if cond() {
+                return true;
+            }
+            if start.elapsed() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     /// Integration test: spin up the real t-hub-agent binary, send Hello,
     /// list sessions, and fetch metrics. Skips gracefully when the binary is
@@ -343,8 +363,15 @@ mod transport_tests {
         let bridge = AgentBridge::new();
         bridge.connect("ignored").expect("connect() must succeed");
 
-        // Give the reader thread a moment to complete the handshake + replay.
-        std::thread::sleep(Duration::from_millis(100));
+        // `connect()` blocks until the handshake + replay finish and the state is
+        // Live, so this is normally already satisfied — but assert it via a bounded
+        // wait on the observable state instead of a fixed "give the reader a moment"
+        // nap, so the test never races a slow handshake and never sleeps blindly.
+        assert!(
+            wait_until(Duration::from_secs(5), || bridge.state() == ConnectionState::Live),
+            "bridge should reach Live after connect(); got {:?}",
+            bridge.state()
+        );
 
         // --- ListSessions ---
         let resp = bridge
@@ -472,18 +499,20 @@ mod transport_tests {
         bridge.set_emitter(Arc::new(rec.clone()));
         bridge.connect("ignored").expect("connect must succeed");
 
-        // Give the reader thread a moment to finish replay + emit.
-        std::thread::sleep(Duration::from_millis(300));
-
-        // The replayed Stop must have produced a supervision://tree emit with
-        // WaitingOnSubagents for our session.
-        let waiting_tree = rec.events.lock().iter().any(|(ch, p)| {
-            ch == super::super::emit::EVT_SUPERVISION
-                && p["sessionId"] == sid
-                && p["status"] == "waitingOnSubagents"
-        });
+        // `connect()` returns once replay is complete, but the replayed entries are
+        // emitted on the reader thread, so the emits may land just after connect()
+        // returns. Wait (bounded) for the observable condition this phase asserts —
+        // the replayed Stop's supervision://tree emit with WaitingOnSubagents — instead
+        // of a fixed "give the reader a moment" sleep.
+        let waiting_tree = |rec: &Rec| {
+            rec.events.lock().iter().any(|(ch, p)| {
+                ch == super::super::emit::EVT_SUPERVISION
+                    && p["sessionId"] == sid
+                    && p["status"] == "waitingOnSubagents"
+            })
+        };
         assert!(
-            waiting_tree,
+            wait_until(Duration::from_secs(5), || waiting_tree(&rec)),
             "replay must emit a supervision://tree with waitingOnSubagents; got {:?}",
             *rec.events.lock()
         );
@@ -509,18 +538,15 @@ mod transport_tests {
         );
 
         // Wait for the agent's ~200ms tail poll + stream + core consume + emit.
-        let mut completed = false;
-        for _ in 0..30 {
-            std::thread::sleep(Duration::from_millis(100));
-            if rec.events.lock().iter().any(|(ch, p)| {
+        // Bounded poll on the observable session-status emit (returns as soon as it
+        // lands, up to a 3s ceiling) — no fixed end-to-end sleep.
+        let completed = wait_until(Duration::from_secs(3), || {
+            rec.events.lock().iter().any(|(ch, p)| {
                 ch == super::super::emit::EVT_SESSION_STATUS
                     && p["sessionId"] == sid
                     && p["status"] == "completed"
-            }) {
-                completed = true;
-                break;
-            }
-        }
+            })
+        });
         assert!(
             completed,
             "live tail path must stream SubagentStop and emit completed; got {:?}",
