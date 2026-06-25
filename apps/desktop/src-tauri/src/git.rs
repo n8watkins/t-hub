@@ -453,6 +453,34 @@ fn already_checked_out_branch(stderr: &str) -> Option<String> {
     }
 }
 
+/// Build the `git worktree add` argv for the SMART branch behavior (WS-9), given
+/// the trimmed `path` and the caller's `branch` choice plus whether that local
+/// branch already exists (the existence check — a real `git show-ref` — lives in
+/// [`worktree_add`]; this stays pure so it's unit-testable without git):
+///   - `branch = None`                  -> `["worktree","add",path]` (git's default:
+///     creates a branch named after the path's final component);
+///   - `branch = Some(b)`, exists       -> `["worktree","add",path,b]` (check the
+///     existing branch out — the original WS-4 behavior);
+///   - `branch = Some(b)`, NOT exists   -> `["worktree","add",path,"-b",b]` (create
+///     the branch and check it out).
+/// Each element is its own argv entry (no shell interpolation), so paths/branches
+/// with metacharacters — and branch names containing `/` (e.g. `feature/login`) —
+/// are passed verbatim to git.
+fn worktree_add_args<'a>(path: &'a str, branch: Option<&'a str>, branch_exists: bool) -> Vec<&'a str> {
+    let mut args: Vec<&str> = vec!["worktree", "add", path];
+    if let Some(b) = branch {
+        if branch_exists {
+            // Existing branch: check it out (`git worktree add <path> <b>`).
+            args.push(b);
+        } else {
+            // New branch: create it (`git worktree add <path> -b <b>`).
+            args.push("-b");
+            args.push(b);
+        }
+    }
+    args
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands (registered in lib.rs; mirrored in src/ipc/git.ts)
 // ---------------------------------------------------------------------------
@@ -571,10 +599,13 @@ pub async fn git_worktree_list(cwd: String) -> Result<Vec<WorktreeInfo>, String>
     }
 }
 
-/// Create (or check out into) a worktree at `path` for the repo containing `cwd`.
-/// Runs `git worktree add <path> [branch]`:
-///   - with `branch`: checks that branch out at `path` (it must exist and not be
-///     checked out elsewhere — git refuses a branch already used by a worktree);
+/// Create (or check out into) a worktree at `path` for the repo containing `cwd`,
+/// with SMART branch handling (WS-9, option A):
+///   - with `branch` that EXISTS locally: checks that branch out at `path`
+///     (`git worktree add <path> <branch>` — the original WS-4 behavior); git still
+///     refuses a branch already used by another worktree (named clearly below);
+///   - with `branch` that does NOT exist: CREATES it and checks it out
+///     (`git worktree add <path> -b <branch>`);
 ///   - without `branch`: git creates a new branch named after the final path
 ///     component (its default behavior) and checks it out at `path`.
 /// Returns git's output on success. On the common "branch already checked out
@@ -597,12 +628,27 @@ pub(crate) fn worktree_add(cwd: &str, path: &str, branch: Option<&str>) -> Resul
         return Err("worktree path is empty".to_string());
     }
 
-    // Build argv: `worktree add <path> [branch]`. Each is a distinct argv entry.
-    let mut args: Vec<&str> = vec!["worktree", "add", path];
+    // Normalize the branch: a `None`/empty branch keeps git's default behavior.
     let branch_trimmed = branch.map(str::trim).filter(|b| !b.is_empty());
-    if let Some(b) = branch_trimmed {
-        args.push(b);
-    }
+
+    // SMART branch handling (WS-9): when a branch is named, check whether the local
+    // branch already exists so we pick checkout (`<b>`) vs create (`-b <b>`). The
+    // check is `git show-ref --verify --quiet refs/heads/<b>` — exit 0 means the
+    // ref exists. Branch names may contain `/` (e.g. `feature/login`); the full ref
+    // `refs/heads/feature/login` is passed as its own argv entry, so it's safe.
+    // A `None` branch skips the check entirely (git's path-derived default).
+    let branch_exists = if let Some(b) = branch_trimmed {
+        let ref_name = format!("refs/heads/{b}");
+        matches!(
+            run_git(cwd, &["show-ref", "--verify", "--quiet", &ref_name]),
+            Ok((true, _, _))
+        )
+    } else {
+        false
+    };
+
+    // Build argv from the pure decision helper (checkout vs `-b` create vs default).
+    let args = worktree_add_args(path, branch_trimmed, branch_exists);
 
     let (ok, stdout, stderr) = run_git(cwd, &args)?;
     if !ok {
@@ -953,5 +999,39 @@ detached
             already_checked_out_branch("fatal: not a git repository"),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Smart worktree-add arg decision (WS-9, option A). The git existence check
+    // lives in `worktree_add`; here we test ONLY the pure arg builder: a new
+    // branch must use `-b`, an existing branch must use the bare checkout form
+    // (no `-b`), and `None` must stay the path-derived default.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktree_add_args_new_branch_uses_dash_b() {
+        // branch given + does NOT exist -> create it with `-b`.
+        let args = worktree_add_args("/home/u/repo-feat", Some("feat/login"), false);
+        assert_eq!(args, vec!["worktree", "add", "/home/u/repo-feat", "-b", "feat/login"]);
+        // `-b` must come immediately before the branch name (git's create form).
+        let b_idx = args.iter().position(|a| *a == "-b").expect("contains -b");
+        assert_eq!(args[b_idx + 1], "feat/login");
+    }
+
+    #[test]
+    fn worktree_add_args_existing_branch_checks_out_without_dash_b() {
+        // branch given + already exists -> bare checkout (`<path> <branch>`, no `-b`).
+        let args = worktree_add_args("/home/u/repo-feat", Some("feat/login"), true);
+        assert_eq!(args, vec!["worktree", "add", "/home/u/repo-feat", "feat/login"]);
+        assert!(!args.contains(&"-b"), "existing branch must not pass -b");
+    }
+
+    #[test]
+    fn worktree_add_args_none_branch_is_bare_default() {
+        // No branch -> `["worktree","add",path]`; git derives the branch from the
+        // path's final component. The `branch_exists` flag is irrelevant here.
+        let expected = vec!["worktree", "add", "/home/u/repo-feat"];
+        assert_eq!(worktree_add_args("/home/u/repo-feat", None, false), expected);
+        assert_eq!(worktree_add_args("/home/u/repo-feat", None, true), expected);
     }
 }
