@@ -241,34 +241,50 @@ const lastNotifiedStatus = new Map<string, SessionStatus>();
 // every session, so replayed statuses dedup out.
 // ---------------------------------------------------------------------------
 
-/** Hard cap so warmup always ends even if the agent never connects / emits. */
+/** Hard cap so warmup always ends — captured ONCE as an absolute deadline at
+ *  install, so it holds even under sustained transitions (the grace window below
+ *  may only end warmup EARLIER, never push past this cap). */
 const WARMUP_INITIAL_MS = 6000;
 /** Quiet interval after the last startup event before we consider events live. */
 const WARMUP_GRACE_MS = 1500;
 
 let warmupActive = true;
-let warmupTimer: ReturnType<typeof setTimeout> | undefined;
+let warmupDeadline = 0; // epoch ms; set once in startWarmup()
+let graceTimer: ReturnType<typeof setTimeout> | undefined;
 
-/** Begin (or re-arm) the warmup-end timer. Called once at install (initial cap)
- *  and again on each event seen during warmup (short grace), so a startup burst
- *  keeps the window open until it settles. */
-function armWarmupEnd(ms: number): void {
+/** Start the warmup window once at install: record the absolute deadline and arm
+ *  the grace timer. The deadline is never recomputed, so warmup always ends by
+ *  `WARMUP_INITIAL_MS` regardless of how many events arrive. */
+function startWarmup(): void {
   if (typeof window === "undefined") {
     warmupActive = false;
     return;
   }
-  if (warmupTimer) clearTimeout(warmupTimer);
-  warmupTimer = setTimeout(() => {
+  warmupDeadline = Date.now() + WARMUP_INITIAL_MS;
+  armGrace();
+}
+
+/** (Re-)arm the short grace timer — it can only end warmup EARLIER, after a quiet
+ *  gap; it never extends past `warmupDeadline`. */
+function armGrace(): void {
+  if (graceTimer) clearTimeout(graceTimer);
+  graceTimer = setTimeout(() => {
     warmupActive = false;
-  }, ms);
+  }, WARMUP_GRACE_MS);
 }
 
 /** True while we're still swallowing the startup replay. When true, callers
- *  should record their dedup state but skip the actual chime/notification, and
- *  re-arm the grace window. */
+ *  should record their dedup state but skip the actual chime/notification. The
+ *  absolute deadline is enforced here so a steady event stream can't keep warmup
+ *  muted past the cap; the grace re-arm can only end it sooner. */
 function inWarmup(): boolean {
   if (!warmupActive) return false;
-  armWarmupEnd(WARMUP_GRACE_MS);
+  if (Date.now() >= warmupDeadline) {
+    warmupActive = false;
+    if (graceTimer) clearTimeout(graceTimer);
+    return false;
+  }
+  armGrace();
   return true;
 }
 
@@ -280,8 +296,9 @@ export async function installSessionNotifications(): Promise<() => void> {
   // Primary signal: FR-012 session status (needs-question / completed / failed
   // / rate-limited). This is the richest event and carries the asks-signal.
   // Kick off the warmup window so the journal-replay burst at first connect is
-  // seeded (for dedup) but silent. Re-armed by `inWarmup()` on each startup event.
-  armWarmupEnd(WARMUP_INITIAL_MS);
+  // seeded (for dedup) but silent. The absolute deadline holds even under a
+  // steady event stream; `inWarmup()`'s grace re-arm can only end it sooner.
+  startWarmup();
 
   unlisteners.push(
     await onSessionStatus(({ sessionId, status }) => {
