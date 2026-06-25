@@ -62,6 +62,46 @@ pub struct TerminalManager {
     pub sessions: Mutex<HashMap<String, PtySession>>,
 }
 
+/// Decide which in-memory map entries are stale and must be evicted, given the
+/// set of tmux sessions tmux reports as currently alive.
+///
+/// This is the self-reap predicate for genuinely-EXITED terminals. An entry is
+/// stale — and ONLY stale — when its backing tmux session is absent from the
+/// live set: the process tree ended, tmux tore the session down, and the reader
+/// thread has already emitted `exit` + `state=Exited`, yet the dead `PtySession`
+/// (retained master-PTY fd + joined reader handle) still sits in the map.
+///
+/// CRITICAL SAFETY INVARIANT — a DETACHED-but-running terminal can never match:
+///   - Detach (`close_terminal`) REMOVES the entry from the map and deliberately
+///     leaves the tmux session alive. So a detached terminal is not among the
+///     `candidates` at all (nothing to evict), and even if it were its session is
+///     present in `live_sessions` and so would be kept.
+///   - The cross-check is against tmux itself (the source of truth for
+///     liveness): only a session tmux no longer knows about is reaped, so we can
+///     never evict a terminal whose process is still running.
+///
+/// `candidates` is `(id, tmux_session)` for each map entry that existed BEFORE
+/// the tmux walk; `live_sessions` is the names from `tmux::list_sessions()`.
+/// Returns the ids to remove.
+///
+/// RACE SAFETY — only entries that predate the tmux snapshot are considered: a
+/// terminal `spawn_terminal` creates AFTER `list_sessions()` ran (tmux session
+/// made, then inserted into the map) is absent from `live_sessions` purely
+/// because the snapshot is stale, NOT because it exited. If such a fresh entry
+/// were a candidate we'd wrongly reap a live terminal. Passing only the pre-walk
+/// snapshot as `candidates` excludes it; it is re-evaluated on the next reconcile
+/// with a fresh tmux view.
+fn stale_session_ids<S: std::hash::BuildHasher>(
+    candidates: &[(String, String)],
+    live_sessions: &std::collections::HashSet<String, S>,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|(_, tmux_session)| !live_sessions.contains(tmux_session))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 /// Resolve the working directory for a new terminal.
 ///
 /// Honors an explicit `cwd`; otherwise falls back to `$HOME` (Unix / WSL) or, as
@@ -379,10 +419,24 @@ pub async fn list_terminals(
             .collect()
     };
 
+    // Candidate set for the self-reap below: `(id, tmux_session)` for exactly the
+    // entries that existed BEFORE the tmux walk. Limiting reaping to pre-walk
+    // entries is what makes it race-safe against a concurrent `spawn_terminal`
+    // (see `stale_session_ids`). Built from `live_clients` before it's moved into
+    // the closure.
+    let reap_candidates: Vec<(String, String)> = live_clients
+        .iter()
+        .map(|(tmux_session, id)| (id.clone(), tmux_session.clone()))
+        .collect();
+
     // The two `wsl.exe` spawns (`list_sessions` + `pane_info`) each wait on a
     // child, which would pin a Tokio worker; run the whole reconcile off the
-    // executor so a saturated worker pool can't stall the UI's IPC.
-    tauri::async_runtime::spawn_blocking(move || {
+    // executor so a saturated worker pool can't stall the UI's IPC. The blocking
+    // walk returns both the rendered `infos` AND the live tmux session set, so
+    // the caller (which still holds `state`) can evict dead map entries without
+    // the `'static` closure needing to borrow `&State`.
+    let (infos, live_sessions): (Vec<TerminalInfo>, std::collections::HashSet<String>) =
+        tauri::async_runtime::spawn_blocking(move || {
         // Source of truth for liveness is the tmux server on the `t-hub` socket;
         // the in-memory map only tells us which terminals this UI currently has a
         // PTY client for (Live) vs. ones running detached (Detached).
@@ -439,8 +493,126 @@ pub async fn list_terminals(
             });
         }
 
-        Ok(infos)
+        // Hand back the live tmux session set too, so the caller can self-reap
+        // genuinely-EXITED entries from the in-memory map (see below).
+        let live_set: std::collections::HashSet<String> =
+            live_sessions.into_iter().collect();
+        Ok::<_, String>((infos, live_set))
     })
     .await
-    .map_err(|e| format!("list_terminals task failed: {e}"))?
+    .map_err(|e| format!("list_terminals task failed: {e}"))??;
+
+    // Self-reap genuinely-EXITED terminals: any in-memory map entry whose tmux
+    // session is no longer in the live set has had its process tree end (tmux
+    // tore the session down), so the reader thread already emitted `exit` +
+    // `state=Exited` but the dead `PtySession` (retained master-PTY fd + joined
+    // reader handle) still lingers in the map until the UI happens to call
+    // `close_terminal`/`kill_terminal`. Evict it here, piggybacking on this
+    // existing 5s reconcile.
+    //
+    // SAFETY — a DETACHED-but-running terminal is NEVER reaped: `close_terminal`
+    // already removed it from the map (nothing to evict) and intentionally kept
+    // its tmux session ALIVE, so its session is in `live_sessions` and the
+    // predicate can't match. We only ever drop entries whose session tmux itself
+    // reports as gone, so we can neither kill a live process nor double-free one:
+    // we do NOT touch tmux here, only drop the already-dead in-memory handle.
+    let stale_ids = stale_session_ids(&reap_candidates, &live_sessions);
+    for id in stale_ids {
+        // Re-check under the lock and remove. Dropping the dead `PtySession`
+        // runs its `Drop` (best-effort kill of an already-gone attach client +
+        // join of the already-exited reader thread) — both are no-ops on a
+        // terminal whose process tree has ended, so this can't block or
+        // double-free. We don't kill the tmux session (it's already gone).
+        let dead = state.sessions.lock().remove(&id);
+        drop(dead);
+    }
+
+    Ok(infos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn live(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn candidate(id: &str, session: &str) -> (String, String) {
+        (id.to_string(), session.to_string())
+    }
+
+    /// An EXITED terminal — in the map but its tmux session has vanished from the
+    /// live set (process tree ended, tmux tore the session down) — is reaped.
+    #[test]
+    fn reconcile_evicts_entry_whose_tmux_session_is_gone() {
+        let candidates = vec![candidate("aaaa1111", "th_aaaa1111")];
+        // tmux reports NO sessions (the exited terminal's was the only one).
+        let live = live(&[]);
+
+        let stale = stale_session_ids(&candidates, &live);
+        assert_eq!(
+            stale,
+            vec!["aaaa1111".to_string()],
+            "an entry whose tmux session is gone must be evicted"
+        );
+    }
+
+    /// A DETACHED-but-running terminal must NEVER be reaped. After `close_terminal`
+    /// it isn't even in the map; here we model the stricter case where (somehow) an
+    /// entry remains AND its tmux session is still alive — the live-tmux cross-check
+    /// keeps it. This is the core safety guarantee.
+    #[test]
+    fn reconcile_keeps_detached_but_alive_session() {
+        let candidates = vec![candidate("bbbb2222", "th_bbbb2222")];
+        // The session is still alive on the socket (detached, process running).
+        let live = live(&["th_bbbb2222"]);
+
+        let stale = stale_session_ids(&candidates, &live);
+        assert!(
+            stale.is_empty(),
+            "a terminal whose tmux session is still alive must NOT be reaped, got {stale:?}"
+        );
+    }
+
+    /// Mixed map: one exited (session gone) and one live (session present). Only the
+    /// exited one is evicted; the live one is untouched.
+    #[test]
+    fn reconcile_evicts_only_the_dead_entry() {
+        let candidates = vec![
+            candidate("dead0001", "th_dead0001"),
+            candidate("live0002", "th_live0002"),
+        ];
+        let live = live(&["th_live0002"]);
+
+        let stale = stale_session_ids(&candidates, &live);
+        assert_eq!(stale, vec!["dead0001".to_string()]);
+    }
+
+    /// RACE SAFETY: a terminal spawned AFTER the tmux walk is absent from the live
+    /// set yet must not be reaped. Modeled by it NOT being among the pre-walk
+    /// `candidates`: even though its session isn't in `live`, it's never considered.
+    #[test]
+    fn reconcile_ignores_entries_created_after_the_tmux_walk() {
+        // Only the pre-walk entry is a candidate; the freshly-spawned `new00099`
+        // is deliberately absent from `candidates`.
+        let candidates = vec![candidate("old00001", "th_old00001")];
+        // tmux now has the new session but not the old (which exited).
+        let live = live(&["th_new00099"]);
+
+        let stale = stale_session_ids(&candidates, &live);
+        assert_eq!(
+            stale,
+            vec!["old00001".to_string()],
+            "only the pre-walk entry is reaped; the post-walk spawn is never a candidate"
+        );
+    }
+
+    /// Empty inputs are well-behaved: no candidates ⇒ nothing to reap.
+    #[test]
+    fn reconcile_no_candidates_is_noop() {
+        let stale = stale_session_ids(&[], &live(&["th_anything"]));
+        assert!(stale.is_empty());
+    }
 }
