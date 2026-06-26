@@ -258,6 +258,10 @@ pub struct ControlContext {
     /// in headless tests; `lib.rs` wires it from `AgentBridge`. See [`MetricsFn`]
     /// for why this is the canonical source on the Windows-host topology.
     metrics: Option<MetricsFn>,
+    /// Idle read timeout for a connection's request phase ([`CONN_READ_TIMEOUT`] by
+    /// default). A field (not the bare const) so tests can drive a short timeout
+    /// against a real listener; could later carry an operator override.
+    idle_timeout: std::time::Duration,
     /// The per-launch auth token.
     token: String,
 }
@@ -569,10 +573,7 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
     // that connects but never sends — or stalls mid-line — closes itself rather
     // than parking this thread forever. CLEARED below when the connection becomes
     // a long-lived event/PTY stream (those block on reads for minutes by design).
-    reader
-        .get_ref()
-        .set_read_timeout(Some(CONN_READ_TIMEOUT))
-        .ok();
+    reader.get_ref().set_read_timeout(Some(ctx.idle_timeout)).ok();
     // Set once this connection joins the event-subscription registry; used to
     // prune it from the fanout on clean disconnect (loop EOF below).
     let mut subscriber_id: Option<u64> = None;
@@ -1624,6 +1625,7 @@ impl ControlContext {
             apply_sink: None,
             fanout: Arc::new(EventFanout::new()),
             metrics: None,
+            idle_timeout: CONN_READ_TIMEOUT,
             token,
         }
     }
@@ -2030,6 +2032,41 @@ mod tests {
         let c = dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
         assert_eq!(c["accepted"], "close_terminal");
         assert!(!tmux::has_session(&target), "session should be gone after close");
+    }
+
+    #[test]
+    fn idle_connection_is_closed_after_the_read_timeout() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+
+        // A listener + a context with a SHORT idle timeout. A client that connects
+        // and never sends a request must be closed by the server (M2b hardening),
+        // not left to park the handler thread forever.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let mut ctx = test_ctx("t");
+        ctx.idle_timeout = std::time::Duration::from_millis(200);
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            // Returns Ok once the idle read times out and the request loop breaks.
+            let _ = handle_conn(stream, &ctx);
+        });
+
+        // Connect, send NOTHING, then read: the server should close the socket
+        // after ~200ms, so the read returns 0 (EOF). The generous 2s client-side
+        // timeout only trips if the server FAILED to close us — the regression.
+        let mut client = TcpStream::connect(addr).expect("connect");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let n = client
+            .read(&mut buf)
+            .expect("read should return EOF, not time out");
+        assert_eq!(n, 0, "server should have closed the idle connection (EOF)");
+
+        server.join().unwrap();
     }
 
     #[test]
