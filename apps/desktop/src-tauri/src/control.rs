@@ -280,6 +280,11 @@ pub struct ControlContext {
     /// default). A field (not the bare const) so tests can drive a short timeout
     /// against a real listener; could later carry an operator override.
     idle_timeout: std::time::Duration,
+    /// Whether the connection being served is from the LOCAL loopback (same machine,
+    /// fully trusted) vs a REMOTE tailnet peer. Set per-connection in `handle_conn`;
+    /// `true` by default (tests + the loopback case). Gates the file-read scope (#23):
+    /// remote peers are restricted to indexed roots, loopback is unrestricted.
+    peer_is_loopback: bool,
     /// The per-launch auth token.
     token: String,
 }
@@ -584,6 +589,14 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
             return Ok(());
         }
     }
+    // Per-connection view (#23): tag whether the peer is LOOPBACK (same machine =
+    // fully trusted) so the file-read handlers can scope a REMOTE tailnet peer to
+    // indexed roots while leaving the local path unrestricted. Fail closed (treat an
+    // un-resolvable peer as remote/scoped). We clone+shadow `ctx` so the rest of this
+    // connection — dispatch included — sees the peer-aware context.
+    let mut ctx = ctx.clone();
+    ctx.peer_is_loopback = peer.map(|a| a.ip().is_loopback()).unwrap_or(false);
+    let ctx = &ctx;
     let mut writer = stream.try_clone()?;
     // Read lines manually (not `reader.lines()`) so a connection mode that takes
     // over the rest of the stream (the PTY attach) can be handed `&mut reader`.
@@ -834,6 +847,8 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "git_info" => git_info(args),
         "index_project" => index_project(ctx, args),
         "search_files" => search_files(ctx, args),
+        "list_dir" => list_dir(ctx, args),
+        "read_text_file" => read_text_file(ctx, args),
         "list_tabs" => list_tabs(),
         "read_terminal" | "capture_pane" => read_terminal(args),
 
@@ -1224,6 +1239,32 @@ fn search_files(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     Ok(json!({ "root": root, "query": query, "hits": hits }))
 }
 
+/// `list_dir` (server-split #23 — the Files-panel TREE over the socket): a shallow
+/// directory listing (dirs first, the directory-only gitignore rule). Mirrors the
+/// `list_dir` Tauri command (same `DirEntry[]` shape). A REMOTE peer is SCOPED to
+/// indexed roots (`files::control_list_dir`); loopback is unrestricted. Args: `path`
+/// (required), `showIgnored` (optional, default false).
+fn list_dir(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let path = arg_str(args, "path").ok_or("list_dir requires a 'path' argument")?;
+    let show_ignored = args
+        .get("showIgnored")
+        .or_else(|| args.get("show_ignored"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let entries = files::control_list_dir(&ctx.files, &path, show_ignored, !ctx.peer_is_loopback)?;
+    serde_json::to_value(entries).map_err(|e| e.to_string())
+}
+
+/// `read_text_file` (server-split #23 — the Files-panel READER over the socket): a
+/// size-capped, binary-rejecting text read. Mirrors the `read_text_file` Tauri
+/// command (same `FileContents` shape). A REMOTE peer is SCOPED to indexed roots;
+/// loopback is unrestricted. WRITE stays in-process (deferred). Args: `path`.
+fn read_text_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let path = arg_str(args, "path").ok_or("read_text_file requires a 'path' argument")?;
+    let contents = files::control_read_text(&ctx.files, &path, !ctx.peer_is_loopback)?;
+    serde_json::to_value(contents).map_err(|e| e.to_string())
+}
+
 /// `list_tabs`: the snapshot-track workspace tabs. Workspace-tab persistence is a
 /// later workstream (PRD §8 snapshot track / persistence workstream G), so there
 /// is no live tab store to read yet. We return an explicit empty list with a note
@@ -1272,7 +1313,9 @@ fn read_terminal(args: &Value) -> Result<Value, String> {
 /// the file's contents/metadata. Args: `path` (required).
 fn open_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let path = arg_str(args, "path").ok_or("open_file requires a 'path' argument")?;
-    let contents = files::control_read_text(&ctx.files, &path)?;
+    // Same file-read scope as the #23 reader: a REMOTE peer may only open files
+    // under an indexed root; loopback (the local MCP) is unrestricted.
+    let contents = files::control_read_text(&ctx.files, &path, !ctx.peer_is_loopback)?;
     Ok(serde_json::to_value(contents).map_err(|e| e.to_string())?)
 }
 
@@ -1674,6 +1717,7 @@ impl ControlContext {
             fanout: Arc::new(EventFanout::new()),
             metrics: None,
             idle_timeout: CONN_READ_TIMEOUT,
+            peer_is_loopback: true,
             token,
         }
     }
@@ -2167,6 +2211,43 @@ mod tests {
         // clients don't advertise one).
         let legacy = send(json!({"token": "secret", "command": "list_tabs"}));
         assert_eq!(legacy["ok"], true, "got: {legacy}");
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn loopback_file_read_bypasses_the_scope() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let ctx = test_ctx("secret");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let _ = handle_conn(stream, &ctx);
+        });
+
+        // list_dir on a NON-indexed path: over loopback the peer is trusted, so the
+        // #23 scope is bypassed and the listing succeeds. This proves handle_conn
+        // tags the 127.0.0.1 peer as loopback -> enforce_scope=false end-to-end (a
+        // logic inversion would either over-restrict locally or — worse — fail to
+        // restrict a real remote peer; the core's enforce=true path is covered by
+        // the files.rs scope test).
+        let mut s = TcpStream::connect(addr).expect("connect");
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let frame = json!({"token": "secret", "command": "list_dir", "args": {"path": tmp}});
+        let mut bytes = serde_json::to_vec(&frame).unwrap();
+        bytes.push(b'\n');
+        s.write_all(&bytes).unwrap();
+        let mut reader = BufReader::new(s);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let resp: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(resp["ok"], true, "loopback list_dir should bypass scope: {resp}");
+        // Close the client so the server's next read hits EOF and handle_conn
+        // returns immediately — otherwise it would park until the idle timeout.
+        drop(reader);
 
         server.join().unwrap();
     }

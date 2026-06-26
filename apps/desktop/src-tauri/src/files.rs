@@ -217,6 +217,17 @@ impl FileIndexState {
         self.indexes.lock().insert(arc.root.clone(), arc.clone());
         arc
     }
+
+    /// True if `path` (already normalized) equals, or is nested under, a root this
+    /// state has indexed. The control-channel file READS use this to SCOPE a remote
+    /// peer to the project roots it has indexed — so a tailnet client can browse +
+    /// read within its own projects but not arbitrary host files (`~/.ssh`, `/etc`,
+    /// …). Loopback callers bypass the check entirely (same machine = trusted).
+    /// `starts_with` is component-wise, so `/a/proj` does NOT match `/a/proj2`.
+    fn is_within_indexed_root(&self, path: &Path) -> bool {
+        let map = self.indexes.lock();
+        map.keys().any(|root| path == root || path.starts_with(root))
+    }
 }
 
 /// Normalize a user-supplied path to an absolute, lexically-clean form. We
@@ -1095,11 +1106,62 @@ pub fn control_search(
     Ok(search_index(&index, query, limit.clamp(1, 1000)))
 }
 
-/// Control-channel capped text read: normalize `path` and read it through the
-/// same size-capped, binary-rejecting reader the `read_text_file` command uses.
-pub fn control_read_text(_state: &FileIndexState, path: &str) -> Result<FileContents, String> {
+/// Resolve + SCOPE a control-channel file path (server-split #23). Normalizes
+/// `path`, then — when `enforce` (a REMOTE peer) — requires it to live under a root
+/// the channel has indexed, so a tailnet client can't read/list arbitrary host
+/// files. Loopback callers pass `enforce = false` and are unrestricted (the path is
+/// still normalized). Returns the resolved host path.
+fn scoped_path(state: &FileIndexState, path: &str, enforce: bool) -> Result<PathBuf, String> {
     let p = normalize(path);
+    if enforce {
+        // Defense-in-depth against traversal: `normalize` only canonicalizes when
+        // the target EXISTS (and skips it entirely on the Windows WSL-UNC fast
+        // path), so a leftover `..` could pass the component-wise root check below
+        // yet resolve OUTSIDE the root at read time. Legitimate remote callers send
+        // fully-resolved absolute paths (the tree/reader never emit `..`), so reject
+        // any `..` outright rather than rely on canonicalization having run.
+        if p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "rejecting a path containing '..' over the control channel: {}",
+                p.display()
+            ));
+        }
+        if !state.is_within_indexed_root(&p) {
+            return Err(format!(
+                "path is outside every indexed project root: {} — index_project a \
+                 containing root first (remote file reads are scoped to indexed roots)",
+                p.display()
+            ));
+        }
+    }
+    Ok(p)
+}
+
+/// Control-channel capped text read (server-split #23 — the Files reader over the
+/// socket): scope `path` (remote-only), then read it through the same size-capped,
+/// binary-rejecting reader the `read_text_file` command uses.
+pub fn control_read_text(
+    state: &FileIndexState,
+    path: &str,
+    enforce_scope: bool,
+) -> Result<FileContents, String> {
+    let p = scoped_path(state, path, enforce_scope)?;
     read_text_capped(&p)
+}
+
+/// Control-channel shallow directory listing (server-split #23 — the Files tree
+/// over the socket): scope `path` (remote-only), then list it exactly as the
+/// `list_dir` command does (dirs first, the directory-only gitignore rule).
+pub fn control_list_dir(
+    state: &FileIndexState,
+    path: &str,
+    show_ignored: bool,
+    enforce_scope: bool,
+) -> Result<Vec<DirEntry>, String> {
+    let dir = scoped_path(state, path, enforce_scope)?;
+    read_dir_shallow(&dir, show_ignored)
 }
 
 /// Control-channel index build: walk `root`, cache the index in the control
@@ -1346,6 +1408,40 @@ mod tests {
         // A generous cap (and the uncapped local Tauri path) index the fixture fine.
         assert!(build_index(&root, Some(100_000)).is_ok());
         assert!(build_index(&root, None).is_ok());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn control_reads_are_scoped_to_indexed_roots_for_remote_peers() {
+        let root = make_fixture();
+        let root_str = root.to_string_lossy().into_owned();
+        let parent_str = root.parent().unwrap().to_string_lossy().into_owned();
+
+        let state = FileIndexState::new();
+        // Register the root the way the real control flow does (normalized key).
+        control_index(&state, &root_str).unwrap();
+
+        // REMOTE peer (enforce=true): the indexed root + a file inside it are OK...
+        assert!(control_list_dir(&state, &root_str, false, true).is_ok());
+        assert!(control_read_text(&state, &root.join("README.md").to_string_lossy(), true).is_ok());
+        // ...but its PARENT (outside every indexed root) is refused with the scope error.
+        let err = control_list_dir(&state, &parent_str, false, true).unwrap_err();
+        assert!(
+            err.contains("outside every indexed project root"),
+            "got: {err}"
+        );
+
+        // A `..` traversal is refused outright. Target a NON-existent leaf so
+        // normalize() can't canonicalize the `..` away (mirrors the Windows WSL-UNC
+        // fast path, where canonicalize is always skipped) — then the lexical `..`
+        // survives and the guard fires before the root check.
+        let traversal = format!("{root_str}/../../no_such_dir_scopetest_xyz");
+        let terr = control_list_dir(&state, &traversal, false, true).unwrap_err();
+        assert!(terr.contains("'..'"), "expected a '..' rejection, got: {terr}");
+
+        // LOOPBACK (enforce=false) bypasses the scope — the parent lists fine.
+        assert!(control_list_dir(&state, &parent_str, false, false).is_ok());
+
         cleanup(&root);
     }
 

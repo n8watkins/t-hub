@@ -57,17 +57,34 @@ export async function searchFiles(
  * rule: false hides ignored DIRECTORIES (`node_modules`, `dist`, …) while always
  * showing ignored FILES (`.env`, `.env.local`, …); true lists everything except
  * `.git`. Maps to the `show_ignored` arg of the `list_dir` command.
+ *
+ * Server-split #23 (the Files TREE over the socket): routed via `controlRequest`
+ * (`list_dir` in control.rs), shape-identical, so locally it's a transport swap.
+ * A thin client browses the REMOTE tree — scoped to indexed roots on the daemon
+ * side (loopback is unrestricted, so the local UX is unchanged).
  */
 export function listDir(path: string, showIgnored = false): Promise<DirEntry[]> {
-  return invoke(CommandsFiles.listDir, { path, showIgnored });
+  return controlRequest("list_dir", { path, showIgnored }) as Promise<DirEntry[]>;
 }
 
-/** Read a text file for the reader (capped; rejects binary blobs). */
+/**
+ * Read a text file for the reader (capped; rejects binary blobs).
+ *
+ * Server-split #23 (the Files READER over the socket): routed via `controlRequest`
+ * (`read_text_file` in control.rs), shape-identical. A thin client reads REMOTE
+ * files — scoped to indexed roots on the daemon (loopback unrestricted).
+ */
 export function readTextFile(path: string): Promise<FileContents> {
-  return invoke(CommandsFiles.readTextFile, { path });
+  return controlRequest("read_text_file", { path }) as Promise<FileContents>;
 }
 
-/** Overwrite a text file with new contents (the editor's save). */
+/**
+ * Overwrite a text file with new contents (the editor's save).
+ *
+ * Stays on in-process `invoke` (NOT yet over the socket): a remote WRITE to an
+ * arbitrary path is the riskiest surface, deferred until the file-read scope above
+ * is proven over a real two-device run (#19) and write-side gating is designed.
+ */
 export function writeTextFile(path: string, contents: string): Promise<void> {
   return invoke(CommandsFiles.writeTextFile, { path, contents });
 }
