@@ -35,29 +35,27 @@ The keystone roadmap item. The bet: pull T-Hub's "brain" out of the desktop GUI 
 - **M2 — Tiles over the wire — ✅ core SHIPPED.**
   - **M2a:** a tile's PTY (`tmux attach`) streams over the socket. Server emits `{out}`/`{exit}` frames and reads `{write}`/`{resize}`; client side is `RemotePty`/`RemotePtyManager`. Commits: `935c1a0` (server half), `72d5fa1` (client flip), `73cfe99`/`d08615a` (review fixes — bounded per-subscriber write, unified `tmux_target`).
   - **M2b:** persistent server key (`~/.t-hub/server-key`, stable identity across restarts), **opt-in** network bind, and an `is_allowed_peer` gate (loopback + Tailscale CGNAT `100.64.0.0/10` + `fd7a:115c::/32`, with IPv4-mapped-IPv6 normalization). Thin-client mode via `T_HUB_REMOTE_ADDR` / `T_HUB_REMOTE_TOKEN`. Commits: `c07d3ec` (core), `47cb906` (hardening — conn cap, constant-time token compare, reconnect backoff), `040dc8b` (security-review fixes — dual-stack peer norm + forwarder backoff).
-- **M3 — Overlay server-side — ◐ 4 of 5 done.** Each overlay source moved to a shape-identical control command + a sync core (so the SAME code serves the in-process and socket paths) + a frontend `controlRequest` flip. **Migrated:** `recent_sessions` (`eeeb8b0`), `claude_usage`, `codex_usage`, `git_info` (`c45b9fb`). **Remaining:** `host_metrics` + the file index (see §3).
+- **M3 — Overlay server-side — ✅ SHIPPED.** Each source moved to a shape-identical control command + a sync core (so the SAME code serves the in-process and socket paths) + a frontend `controlRequest` flip. `recent_sessions` (`eeeb8b0`), `claude_usage`/`codex_usage`/`git_info` (`c45b9fb`), `host_metrics` (`bdd71e3` — bridge-first, Linux-only local-`/proc` fallback so Windows never zeros), and the file **index** — `index_project` + `search_files` (`9dbbc39`). **Deliberately deferred to M4:** the file BROWSER/READER/EDITOR (`list_dir`/`read_text_file`/`write_text_file`) — arbitrary-path read+write over a network-bindable channel needs peer-gating/path-scoping first.
 - **M4 — Multi-client + hardening — ☐ not started.**
 
 **§8 pre-M1 decisions (settled, do not re-litigate):** (a) **shared-vs-per-client split** — server owns sessions/agents/status/scrollback/cost/supervision; client owns layout/focus/theme/keymap (those never cross the wire). (b) **No network bind until auth-beyond-loopback** — satisfied by M2b's `is_allowed_peer` tailnet gate + persistent key; the bind is **opt-in**, default stays loopback-only.
 
 **Also this session (UI batch, pre-split):** tab strip removed (brand = tray icon, settings moved top-right); sidebar reshape (`+` in Workspaces header, expand-all default, last-active time, bigger buttons, portal'd color picker, collapsed-rail stats); a shared ring+center **status indicator** (working = spinner, done = true solid green `#22c55e`, idle = green ring) with a live legend in Settings; Win11 Snap-Layouts maximize-button rect tracking; **notifications + sounds now default OFF** (opt-in); titlebar × hides-to-tray (default) vs quits, as a setting.
 
-**Verification (re-run green at the tip of `main`, `d800e0e`):** `cargo build` clean · **188 Rust lib tests** pass · `tsc` clean · **53 vitest** pass. Each server-split commit was also verified **live** against the running app via control-socket probes, and reviewed by sub-agents (security-critical surfaces — peer gate, token compare, write bounding — all came back clean; every real finding was acted on).
+**Verification (re-run green at the tip of `main`, `9dbbc39`):** `cargo build` clean · **190 Rust lib tests** pass · `tsc` clean · **53 vitest** pass. Each server-split commit was also verified **live** against the running app via control-socket probes, and reviewed by sub-agents (security-critical surfaces — peer gate, token compare, write bounding — all came back clean; every real finding was acted on).
 
-**Push state:** `d800e0e` (the docs commit) is local-ahead of `origin/main` at push time — **this handoff pushes it** (the session has been pushing throughout).
+**Push state:** all server-split + M3 commits through `9dbbc39` are on `origin/main`; this handoff's doc commit follows (the session has been pushing throughout).
 
 ---
 
 ## 3. Next steps (ordered)
 
-The server-split **tail** comes first. Read [`SERVER-SPLIT-AND-ROADMAP.md`](./SERVER-SPLIT-AND-ROADMAP.md) §6 (the M1→M4 detail + the per-milestone status table) before starting.
+**M3 is now complete** (all overlay/index reads on the socket). The remaining server-split **tail** is below. Read [`SERVER-SPLIT-AND-ROADMAP.md`](./SERVER-SPLIT-AND-ROADMAP.md) §6 (the M1→M4 detail + the per-milestone status table) before starting.
 
-1. **M3 source #5 — `host_metrics` over the socket (PREMISE-DEPENDENT — read this first).**
-   The naive flip is a **trap**: the daemon reading the **local** `/proc` returns **zeros on Windows** (the GUI process is the Windows host, not WSL), which would **regress the working local Windows overlay**. The metrics must come from the **WSL-side agent's `/proc`**, not control.rs reading the host's. Frontend reader: `apps/desktop/src/ipc/client05.ts` (the `host_metrics` shape is snake_case from the WSL agent). **Acceptance:** remote thin-client shows real CPU/mem; local Windows is unchanged (still real, not zeros). If the premise doesn't hold cheaply, leave it deferred and say so — don't ship a Windows regression.
-2. **M3 source — the file index (`search_files`).** Frontend: `apps/desktop/src/ipc/files.ts`. Same pattern as the 4 done sources: add a shape-identical `search_files` (or equivalent) dispatch arm in `control.rs` backed by a sync core, then flip `files.ts` to `controlRequest`. **Acceptance:** file search works through the socket with zero UI change locally; a thin client searches the remote tree.
-3. **M2b deferred hardening** (task #18 — before trusting the bind beyond a single-user tailnet): per-client auth for `attach_pty` (today the PTY attach trusts the connection), a server read/idle timeout, protocol versioning, and reconnect re-sync. These are listed in the §6 M2 row.
-4. **Real two-device Tailscale test + a `variant=dev` Windows build** (task #19): the M2b bind/gate path has only been exercised locally — drive a second physical device over the tailnet against a dev build. (This one needs the **user** — it's a two-machine test.)
-5. **M4 — multi-client + hardening:** named-session namespacing, per-client view vs shared state, PTY resize-ownership arbitration, auth beyond the loopback token, split client/server logs.
+1. **File BROWSER/READER/EDITOR remoting (the deferred Files chunk — security-sensitive, M4-gated).** `index_project` + `search_files` are on the socket; `list_dir` / `read_text_file` / `write_text_file` (frontend `apps/desktop/src/ipc/files.ts`) are NOT — they read+WRITE **arbitrary paths**, which over the network-bindable (post-M2b) control channel is a real security expansion. There's already a `files::control_read_text` core ready, but DON'T just dispatch it: first add path-scoping (restrict to known project roots) and confirm the `is_allowed_peer` gate is the right boundary for filesystem writes. **Acceptance:** a thin client browses + opens + saves remote files; a peer cannot read/write outside the allowed roots. Until then the file panel's tree/reader/editor stays local (works fine on one machine).
+2. **M2b deferred hardening** (task #18 — before trusting the bind beyond a single-user tailnet): per-client auth for `attach_pty` (today the PTY attach trusts the connection), a server read/idle timeout, protocol versioning, and reconnect re-sync. These are listed in the §6 M2 row.
+3. **Real two-device Tailscale test + a `variant=dev` Windows build** (task #19): the M2b bind/gate path has only been exercised locally — drive a second physical device over the tailnet against a dev build. (This one needs the **user** — it's a two-machine test.)
+4. **M4 — multi-client + hardening:** named-session namespacing, per-client view vs shared state, PTY resize-ownership arbitration, auth beyond the loopback token, split client/server logs.
 
 **Older parked work (still valid, lower priority):** broader vitest coverage (component/RTL); the **heavy** tray actions (restart-tmux, full-WSL-shutdown — add only when needed); WS-9 nits (`sanitizeBranchToDir` collision + remote-branch `-b`-vs-DWIM — see [`WORKTREE-WORKFLOW.md`](./WORKTREE-WORKFLOW.md)); the parked differentiators (budget governor, worktree fleet launcher, MCP supervision event stream).
 
@@ -81,12 +79,12 @@ The server-split **tail** comes first. Read [`SERVER-SPLIT-AND-ROADMAP.md`](./SE
 - An **inherited** `T_HUB_*` env var WINS over per-user resolution — a prod app launched from a polluted WSL shell silently runs on the wrong socket. The startup marker `t-hub: started vX (diag -> …)` reveals the resolved path; if unexpected, relaunch from a clean shell.
 
 **Verify commands**
-- Rust: `cd apps/desktop/src-tauri && cargo build` · `cargo test --lib` (188 tests).
+- Rust: `cd apps/desktop/src-tauri && cargo build` · `cargo test --lib` (190 tests).
 - Frontend: `cd apps/desktop && pnpm typecheck` · `pnpm test` (53 vitest).
 
 **Traps**
 - **`tauri.conf.json` must NOT have a `plugins.notification` block** — even empty `{}` PANICS at startup ("invalid type: map, expected unit"). Passes `cargo build` + `tsc`, crashes only at runtime — **always run the app, not just build it.**
-- **`host_metrics` on Windows** — see §3 step 1; the local-`/proc` source zeroes on Windows. Don't naively flip it.
+- **`host_metrics` / any `/proc` read over the control channel** — the daemon's local `/proc` is the **Windows host** (zeros) on the current in-GUI topology; the WSL agent bridge is the real source. `host_metrics` already handles this (bridge-first, Linux-only local fallback — see `control.rs::host_metrics`); apply the same bridge-first pattern to any future `/proc`-derived read, never a naive local read.
 - **Never `pkill -f "<pattern>"` matching your own bash command** — kills your shell (exit 144). Use `pkill -x` or PIDs.
 - **`apps/desktop/bin/claude`** is an untracked local symlink into `node_modules` (a claude-code install) — a dev artifact, **not ours to commit**. Leave it untracked.
 
@@ -107,8 +105,8 @@ The server-split **tail** comes first. Read [`SERVER-SPLIT-AND-ROADMAP.md`](./SE
 
 **Server-split — frontend (`apps/desktop/src/ipc/`)**
 - `controlClient.ts` — `controlRequest()` + `onControlEvent()`: the frontend transport over the socket.
-- `recent.ts` / `usage.ts` / `codex.ts` / `git.ts` — already flipped to `controlRequest` (reference these for the pattern).
-- `client05.ts` — still holds `host_metrics` (M3 #5 target); `files.ts` — file index (M3 target).
+- `recent.ts` / `usage.ts` / `codex.ts` / `git.ts` — flipped to `controlRequest` (reference these for the pattern).
+- `client05.ts` — `hostMetrics()` flipped (the rest of the 0.5 surface stays on `invoke`); `files.ts` — `indexProject`/`searchFiles` flipped, but `listDir`/`readTextFile`/`writeTextFile` still on `invoke` (the deferred M4-gated Files-remoting chunk).
 - `controlBridge.ts` — the original one-way org-mutation bridge (the prototype M1 generalized).
 
 **Status UI (`apps/desktop/src/components/`)** — `StatusIndicator.tsx` (variants + `sessionStatusToVariant`/`terminalVariant` helpers), `StatusBadge.tsx`, `WorkspacesList.tsx`, `Sidebar.tsx`, `Titlebar.tsx`, `ThemeEditor.tsx` (status legend + closeToTray).
