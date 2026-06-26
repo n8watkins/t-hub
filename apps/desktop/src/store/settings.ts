@@ -7,6 +7,10 @@
 // behavior flags, best-effort, under a versioned key. Transient UI state (panel
 // open) is never persisted — a reopen of the app starts with the panel closed.
 import { create } from "zustand";
+import {
+  loadPersisted as loadFromStorage,
+  savePersisted as saveToStorage,
+} from "../lib/persist";
 
 const PERSIST_KEY = "t-hub.settings.v1";
 
@@ -83,78 +87,73 @@ function clampNum(v: unknown, min: number, max: number, fallback: number): numbe
     : fallback;
 }
 
+/** Validate one persisted blob field-by-field, falling back per-field to
+ *  DEFAULTS (and clamping the numeric timings). Owns this store's coerce logic;
+ *  the SSR guard + corrupt-fallback plumbing lives in lib/persist. */
+function coerceSettings(raw: unknown): PersistedSettings {
+  const p = (raw ?? {}) as Partial<PersistedSettings>;
+  return {
+    revealPushesContent:
+      typeof p.revealPushesContent === "boolean"
+        ? p.revealPushesContent
+        : DEFAULTS.revealPushesContent,
+    autoHideTitlebarMaximized:
+      typeof p.autoHideTitlebarMaximized === "boolean"
+        ? p.autoHideTitlebarMaximized
+        : DEFAULTS.autoHideTitlebarMaximized,
+    titlebarHideDelayMs: clampNum(
+      p.titlebarHideDelayMs,
+      TITLEBAR_HIDE_DELAY_MIN,
+      TITLEBAR_HIDE_DELAY_MAX,
+      DEFAULTS.titlebarHideDelayMs,
+    ),
+    titlebarRevealAnimMs: clampNum(
+      p.titlebarRevealAnimMs,
+      TITLEBAR_REVEAL_ANIM_MIN,
+      TITLEBAR_REVEAL_ANIM_MAX,
+      DEFAULTS.titlebarRevealAnimMs,
+    ),
+    soundsEnabled:
+      typeof p.soundsEnabled === "boolean"
+        ? p.soundsEnabled
+        : DEFAULTS.soundsEnabled,
+    notificationsEnabled:
+      typeof p.notificationsEnabled === "boolean"
+        ? p.notificationsEnabled
+        : DEFAULTS.notificationsEnabled,
+    autoUpdateCheckEnabled:
+      typeof p.autoUpdateCheckEnabled === "boolean"
+        ? p.autoUpdateCheckEnabled
+        : DEFAULTS.autoUpdateCheckEnabled,
+    autoInstallUpdates:
+      typeof p.autoInstallUpdates === "boolean"
+        ? p.autoInstallUpdates
+        : DEFAULTS.autoInstallUpdates,
+    resumeStartsClaude:
+      typeof p.resumeStartsClaude === "boolean"
+        ? p.resumeStartsClaude
+        : DEFAULTS.resumeStartsClaude,
+    fileIconTheme:
+      typeof p.fileIconTheme === "string"
+        ? p.fileIconTheme
+        : DEFAULTS.fileIconTheme,
+    hideDotfiles:
+      typeof p.hideDotfiles === "boolean"
+        ? p.hideDotfiles
+        : DEFAULTS.hideDotfiles,
+    autoContinueText:
+      typeof p.autoContinueText === "string"
+        ? p.autoContinueText
+        : DEFAULTS.autoContinueText,
+  };
+}
+
 function loadPersisted(): PersistedSettings {
-  if (typeof localStorage === "undefined") return { ...DEFAULTS };
-  try {
-    const raw = localStorage.getItem(PERSIST_KEY);
-    if (!raw) return { ...DEFAULTS };
-    const p = JSON.parse(raw) as Partial<PersistedSettings>;
-    return {
-      revealPushesContent:
-        typeof p.revealPushesContent === "boolean"
-          ? p.revealPushesContent
-          : DEFAULTS.revealPushesContent,
-      autoHideTitlebarMaximized:
-        typeof p.autoHideTitlebarMaximized === "boolean"
-          ? p.autoHideTitlebarMaximized
-          : DEFAULTS.autoHideTitlebarMaximized,
-      titlebarHideDelayMs: clampNum(
-        p.titlebarHideDelayMs,
-        TITLEBAR_HIDE_DELAY_MIN,
-        TITLEBAR_HIDE_DELAY_MAX,
-        DEFAULTS.titlebarHideDelayMs,
-      ),
-      titlebarRevealAnimMs: clampNum(
-        p.titlebarRevealAnimMs,
-        TITLEBAR_REVEAL_ANIM_MIN,
-        TITLEBAR_REVEAL_ANIM_MAX,
-        DEFAULTS.titlebarRevealAnimMs,
-      ),
-      soundsEnabled:
-        typeof p.soundsEnabled === "boolean"
-          ? p.soundsEnabled
-          : DEFAULTS.soundsEnabled,
-      notificationsEnabled:
-        typeof p.notificationsEnabled === "boolean"
-          ? p.notificationsEnabled
-          : DEFAULTS.notificationsEnabled,
-      autoUpdateCheckEnabled:
-        typeof p.autoUpdateCheckEnabled === "boolean"
-          ? p.autoUpdateCheckEnabled
-          : DEFAULTS.autoUpdateCheckEnabled,
-      autoInstallUpdates:
-        typeof p.autoInstallUpdates === "boolean"
-          ? p.autoInstallUpdates
-          : DEFAULTS.autoInstallUpdates,
-      resumeStartsClaude:
-        typeof p.resumeStartsClaude === "boolean"
-          ? p.resumeStartsClaude
-          : DEFAULTS.resumeStartsClaude,
-      fileIconTheme:
-        typeof p.fileIconTheme === "string"
-          ? p.fileIconTheme
-          : DEFAULTS.fileIconTheme,
-      hideDotfiles:
-        typeof p.hideDotfiles === "boolean"
-          ? p.hideDotfiles
-          : DEFAULTS.hideDotfiles,
-      autoContinueText:
-        typeof p.autoContinueText === "string"
-          ? p.autoContinueText
-          : DEFAULTS.autoContinueText,
-    };
-  } catch {
-    return { ...DEFAULTS };
-  }
+  return loadFromStorage(PERSIST_KEY, { ...DEFAULTS }, coerceSettings);
 }
 
 function savePersisted(s: PersistedSettings): void {
-  if (typeof localStorage === "undefined") return;
-  try {
-    localStorage.setItem(PERSIST_KEY, JSON.stringify(s));
-  } catch {
-    // localStorage full / unavailable — non-fatal; settings stay in memory.
-  }
+  saveToStorage(PERSIST_KEY, s);
 }
 
 interface SettingsState {

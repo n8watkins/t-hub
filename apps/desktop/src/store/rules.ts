@@ -14,6 +14,7 @@
 // fall back to the built-in defaults so a bad write can never wedge the engine.
 import { create } from "zustand";
 import type { SessionStatus } from "../ipc/model";
+import { loadPersisted, savePersisted } from "../lib/persist";
 
 const STORAGE_KEY = "t-hub.rules.v1";
 
@@ -192,26 +193,17 @@ function coerceRule(raw: unknown): Rule | null {
 }
 
 function load(): Rule[] {
-  if (typeof localStorage === "undefined") return builtinRules();
-  try {
-    const rawStr = localStorage.getItem(STORAGE_KEY);
-    if (rawStr === null) return builtinRules(); // first run — seed the starters
-    const parsed = JSON.parse(rawStr) as unknown;
+  // SSR / absent key / corrupt blob => the built-in starters (the fallback);
+  // a parsed-but-non-array blob => an empty list (the coerce decision below).
+  // The SSR guard + getItem + corrupt-fallback plumbing lives in lib/persist.
+  return loadPersisted(STORAGE_KEY, builtinRules(), (parsed): Rule[] => {
     if (!Array.isArray(parsed)) return [];
     return parsed.map(coerceRule).filter((r): r is Rule => r !== null);
-  } catch {
-    // Corrupt / unavailable — start from the built-ins rather than wedging.
-    return builtinRules();
-  }
+  });
 }
 
 function save(rules: Rule[]): void {
-  if (typeof localStorage === "undefined") return;
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(rules));
-  } catch {
-    // Quota / serialization failure — non-fatal; rules stay in memory.
-  }
+  savePersisted(STORAGE_KEY, rules);
 }
 
 interface RulesState {

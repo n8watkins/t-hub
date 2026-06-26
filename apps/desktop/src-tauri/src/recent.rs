@@ -518,7 +518,7 @@ pub fn resumable_entries(
     }
     #[cfg(windows)]
     {
-        let distro = host_distro();
+        let distro = crate::files::host_distro();
         let Some(home) = wsl_home(&distro) else {
             return std::collections::HashMap::new();
         };
@@ -587,13 +587,6 @@ fn resumable_entries_from_dir(
 // Windows: the transcripts live inside the WSL distro. Resolve the WSL $HOME via
 // wsl.exe once, then read the catalog over the `\\wsl.localhost\` UNC share.
 // ---------------------------------------------------------------------------
-
-/// The WSL distro to read from (mirrors files.rs::host_distro so Recent and the
-/// file index agree). Overridable via T_HUB_DISTRO; defaults to the dev distro.
-#[cfg(windows)]
-fn host_distro() -> String {
-    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
-}
 
 /// Resolve the WSL `$HOME` for `distro` by shelling a login bash once (the proven
 /// pattern from claude/install.rs::wsl_home). `echo $HOME` is a SINGLE simple arg,
@@ -764,7 +757,7 @@ fn read_sessions_windows_fast(
 
 #[cfg(windows)]
 fn read_sessions_windows() -> Vec<RecentSession> {
-    let distro = host_distro();
+    let distro = crate::files::host_distro();
     let Some(home) = wsl_home(&distro) else {
         crate::diag::diag_log(format!(
             "{{\"t\":\"recent\",\"m\":\"wsl_home FAILED (distro={distro}); cannot locate ~/.claude\"}}"

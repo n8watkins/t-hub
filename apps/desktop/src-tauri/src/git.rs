@@ -146,14 +146,6 @@ pub struct WorktreeInfo {
 // stdout. On unix this is a direct spawn; on Windows it shells into WSL.
 // ---------------------------------------------------------------------------
 
-/// The WSL distro projects live in, as seen from the Windows host. Mirrors
-/// `files.rs::host_distro` (replicated locally to stay in-lane this batch):
-/// overridable via `T_HUB_DISTRO`, defaulting to the dev distro. Windows only.
-#[cfg(windows)]
-fn host_distro() -> String {
-    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
-}
-
 /// Run `git <args...>` against `cwd` and return `(success, stdout, stderr)`.
 ///
 /// unix: spawn `git` directly with `.current_dir(cwd)`.
@@ -184,7 +176,7 @@ fn build_git_command(cwd: &str, args: &[&str]) -> Command {
 #[cfg(windows)]
 fn build_git_command(cwd: &str, args: &[&str]) -> Command {
     use std::os::windows::process::CommandExt;
-    let distro = host_distro();
+    let distro = crate::files::host_distro();
     let mut c = Command::new("wsl.exe");
     // `wsl.exe -d <distro> --cd <posix-cwd> -- git <args...>`. `--cd` sets the
     // working dir inside the distro; `--` ends wsl flags so everything after is
@@ -270,7 +262,7 @@ fn build_git_info_command(cwd: &str) -> Command {
 #[cfg(windows)]
 fn build_git_info_command(cwd: &str) -> Command {
     use std::os::windows::process::CommandExt;
-    let distro = host_distro();
+    let distro = crate::files::host_distro();
     let mut c = Command::new("wsl.exe");
     // `wsl.exe -d <distro> --cd <posix-cwd> -- bash -lc '<script>'`. `--cd` sets
     // the working dir inside the distro (NOT interpolated into the script), so the

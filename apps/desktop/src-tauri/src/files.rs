@@ -246,8 +246,12 @@ fn normalize(path: &str) -> PathBuf {
 /// The WSL distro projects live in, as seen from the Windows host. Mirrors the
 /// agent bridge's `default_distro` (lib.rs): overridable via `T_HUB_DISTRO`,
 /// defaulting to the dev distro. Only consulted on Windows.
+///
+/// Canonical definition for the crate: `git.rs`, `recent.rs`, and `devserver.rs`
+/// all call `crate::files::host_distro()` rather than re-declaring this (one
+/// source of truth for the distro default + `T_HUB_DISTRO` override).
 #[cfg(windows)]
-fn host_distro() -> String {
+pub(crate) fn host_distro() -> String {
     std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
 }
 

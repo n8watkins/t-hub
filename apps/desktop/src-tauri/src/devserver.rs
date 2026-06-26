@@ -111,14 +111,6 @@ impl DevProcess {
 static REGISTRY: LazyLock<Mutex<HashMap<String, DevProcess>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// The WSL distro projects live in, as seen from the Windows host. Mirrors
-/// `files.rs`/`lib.rs`: overridable via `T_HUB_DISTRO`, defaulting to the dev
-/// distro. Only consulted on Windows.
-#[cfg(windows)]
-fn host_distro() -> String {
-    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
-}
-
 /// Recover a POSIX/WSL path from a `\\wsl.localhost\<distro>\...` (or legacy
 /// `\\wsl$\<distro>\...`) UNC path, or pass through a path that is already a bare
 /// POSIX path. Returns `None` for a genuine Windows drive path (`C:\...`).
@@ -200,7 +192,7 @@ fn build_command(cwd: &str, command: &str) -> Command {
         // lands inside the distro's ext4 filesystem; fall back to the given cwd.
         let posix_cwd = unc_to_posix(cwd).unwrap_or_else(|| cwd.to_string());
         let mut c = Command::new("wsl.exe");
-        c.arg("-d").arg(host_distro());
+        c.arg("-d").arg(crate::files::host_distro());
         if !posix_cwd.is_empty() {
             c.arg("--cd").arg(&posix_cwd);
         }
@@ -408,7 +400,7 @@ fn wsl_host_ip() -> Option<String> {
     use std::os::windows::process::CommandExt;
     let mut c = Command::new("wsl.exe");
     c.arg("-d")
-        .arg(host_distro())
+        .arg(crate::files::host_distro())
         .arg("--")
         .arg("bash")
         .arg("-lc")

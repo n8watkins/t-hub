@@ -15,6 +15,7 @@ import { useSettings } from "../store/settings";
 import { onSessionStatus, onSupervision } from "../ipc/client05";
 import { onExit, onState } from "../ipc/client";
 import type { SessionStatus } from "../ipc/model";
+import { createWarmup } from "./warmup";
 
 /** The three event flavors the rest of the app fires. */
 export type NotifyKind = "attention" | "done" | "error";
@@ -248,45 +249,15 @@ const WARMUP_INITIAL_MS = 6000;
 /** Quiet interval after the last startup event before we consider events live. */
 const WARMUP_GRACE_MS = 1500;
 
-let warmupActive = true;
-let warmupDeadline = 0; // epoch ms; set once in startWarmup()
-let graceTimer: ReturnType<typeof setTimeout> | undefined;
-
-/** Start the warmup window once at install: record the absolute deadline and arm
- *  the grace timer. The deadline is never recomputed, so warmup always ends by
- *  `WARMUP_INITIAL_MS` regardless of how many events arrive. */
-function startWarmup(): void {
-  if (typeof window === "undefined") {
-    warmupActive = false;
-    return;
-  }
-  warmupDeadline = Date.now() + WARMUP_INITIAL_MS;
-  armGrace();
-}
-
-/** (Re-)arm the short grace timer — it can only end warmup EARLIER, after a quiet
- *  gap; it never extends past `warmupDeadline`. */
-function armGrace(): void {
-  if (graceTimer) clearTimeout(graceTimer);
-  graceTimer = setTimeout(() => {
-    warmupActive = false;
-  }, WARMUP_GRACE_MS);
-}
-
-/** True while we're still swallowing the startup replay. When true, callers
- *  should record their dedup state but skip the actual chime/notification. The
- *  absolute deadline is enforced here so a steady event stream can't keep warmup
- *  muted past the cap; the grace re-arm can only end it sooner. */
-function inWarmup(): boolean {
-  if (!warmupActive) return false;
-  if (Date.now() >= warmupDeadline) {
-    warmupActive = false;
-    if (graceTimer) clearTimeout(graceTimer);
-    return false;
-  }
-  armGrace();
-  return true;
-}
+// The absolute-cap warmup machinery, shared with lib/rulesMount.ts (see
+// lib/warmup.ts). The initial grace arm is `WARMUP_GRACE_MS` (the factory's
+// default), exactly as before: with no events, warmup ends after the grace
+// window; with events, the absolute deadline still caps it at `WARMUP_INITIAL_MS`.
+const warmup = createWarmup({
+  initialMs: WARMUP_INITIAL_MS,
+  graceMs: WARMUP_GRACE_MS,
+});
+const { start: startWarmup, inWarmup } = warmup;
 
 /** Subscribe to the backend session events and fire notifications. Returns an
  *  unlisten that tears down every subscription. Safe to call once at startup. */

@@ -20,6 +20,10 @@
 import { create } from "zustand";
 import { COMMAND_IDS, type CommandId } from "../lib/commands";
 import { normalizeChord } from "../lib/chord";
+import {
+  loadPersisted as loadFromStorage,
+  savePersisted as saveToStorage,
+} from "../lib/persist";
 
 const PERSIST_KEY = "t-hub.keybindings.v1";
 
@@ -139,34 +143,29 @@ function defaults(): Persisted {
   };
 }
 
+/** Validate one persisted blob: a normalized prefix (default on a bad/empty
+ *  chord) plus the two sanitized command->key maps. Owns this store's coerce
+ *  logic; the SSR guard + corrupt-fallback plumbing lives in lib/persist. */
+function coercePersisted(raw: unknown): Persisted {
+  const p = (raw ?? {}) as Partial<Persisted>;
+  const prefixKey =
+    typeof p.prefixKey === "string" && normalizeChord(p.prefixKey)
+      ? normalizeChord(p.prefixKey)
+      : DEFAULT_PREFIX;
+  return {
+    prefixKey,
+    direct: sanitizeMap(p.direct, normalizeChord),
+    // Prefixed values are bare single keys — lowercase + trim, no modifiers.
+    prefixed: sanitizeMap(p.prefixed, (s) => s.trim().toLowerCase()),
+  };
+}
+
 function loadPersisted(): Persisted {
-  if (typeof localStorage === "undefined") return defaults();
-  try {
-    const raw = localStorage.getItem(PERSIST_KEY);
-    if (!raw) return defaults();
-    const p = JSON.parse(raw) as Partial<Persisted>;
-    const prefixKey =
-      typeof p.prefixKey === "string" && normalizeChord(p.prefixKey)
-        ? normalizeChord(p.prefixKey)
-        : DEFAULT_PREFIX;
-    return {
-      prefixKey,
-      direct: sanitizeMap(p.direct, normalizeChord),
-      // Prefixed values are bare single keys — lowercase + trim, no modifiers.
-      prefixed: sanitizeMap(p.prefixed, (s) => s.trim().toLowerCase()),
-    };
-  } catch {
-    return defaults();
-  }
+  return loadFromStorage(PERSIST_KEY, defaults(), coercePersisted);
 }
 
 function savePersisted(s: Persisted): void {
-  if (typeof localStorage === "undefined") return;
-  try {
-    localStorage.setItem(PERSIST_KEY, JSON.stringify(s));
-  } catch {
-    // localStorage full / unavailable — non-fatal; bindings stay in memory.
-  }
+  saveToStorage(PERSIST_KEY, s);
 }
 
 const initial = loadPersisted();
