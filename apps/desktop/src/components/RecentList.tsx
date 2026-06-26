@@ -76,10 +76,11 @@ function relativeTime(epochSecs: number): string {
   return `${Math.floor(diff / 2592000)}mo`;
 }
 
-// --- Hidden rows: a persisted set of dismissed session ids (the × button). Keyed
-// by the row's most-recent session id, so dismissing hides THIS project now but it
-// resurfaces if a newer session appears (its newest id changes -> no longer hidden).
-const HIDDEN_KEY = "th.recent.hidden.v1";
+// --- Hidden rows: a persisted set of dismissed project CWDs (the × button). Keyed
+// by cwd (NOT session id) so a dismissed project stays gone — it does NOT resurface
+// when a newer session appears in it (which a session-id key would miss). v2 because
+// the key meaning changed from id -> cwd.
+const HIDDEN_KEY = "th.recent.hidden.v2";
 function loadHidden(): Set<string> {
   try {
     const raw = localStorage.getItem(HIDDEN_KEY);
@@ -173,18 +174,31 @@ export function RecentList({ onRecall, onCount }: RecentListProps) {
     return () => window.removeEventListener("focus", refresh);
   }, [refresh]);
 
-  const hide = useCallback((sessionId: string) => {
+  const hide = useCallback((cwd: string) => {
     setHidden((prev) => {
       const next = new Set(prev);
-      next.add(sessionId);
+      next.add(cwd);
       saveHidden(next);
       return next;
     });
   }, []);
 
+  // The cwds currently OPEN as tiles in this window. Recent is a library of work you
+  // can resume — so it should show only projects you DON'T already have up; a project
+  // open in a workspace is filtered out (and reappears once you close that tile).
+  const terminals = useWorkspace((s) => s.terminals);
+  const openCwds = useMemo(() => {
+    const set = new Set<string>();
+    for (const t of Object.values(terminals)) if (t.cwd) set.add(t.cwd);
+    return set;
+  }, [terminals]);
+
   const groups = useMemo(
-    () => groupByFolder(sessions).filter((g) => !hidden.has(g.session.id)),
-    [sessions, hidden],
+    () =>
+      groupByFolder(sessions).filter(
+        (g) => !hidden.has(g.cwd) && !openCwds.has(g.cwd),
+      ),
+    [sessions, hidden, openCwds],
   );
 
   // Report the visible count up to the "Recent" section header (item 5).
@@ -198,7 +212,6 @@ export function RecentList({ onRecall, onCount }: RecentListProps) {
   // terminal open in that project's cwd (best-effort: only currently-open,
   // colored workspaces tint; past-only projects use the default).
   const tabs = useWorkspace((s) => s.tabs);
-  const terminals = useWorkspace((s) => s.terminals);
   const workspaceColors = useTheme((s) => s.workspaceColors);
   const cwdColor = useMemo(() => {
     const m: Record<string, string> = {};
@@ -327,10 +340,10 @@ function ProjectRow({
       </button>
       <button
         type="button"
-        onClick={() => onHide(s.id)}
+        onClick={() => onHide(group.cwd)}
         className="shrink-0 rounded-md px-2 py-1.5 text-[15px] leading-none opacity-0 transition-opacity hover:bg-neutral-700/50 focus:opacity-100 group-hover:opacity-100"
         style={{ color: "var(--th-fg-muted)" }}
-        title="Hide from Recent (does not delete the transcript)"
+        title="Hide this project from Recent (does not delete the transcript)"
         aria-label="Hide from Recent"
       >
         ×
