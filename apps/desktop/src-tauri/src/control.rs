@@ -857,7 +857,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "claude_usage" => claude_usage(),
         "codex_usage" => codex_usage(),
         "host_metrics" => host_metrics(ctx),
-        "git_info" => git_info(args),
+        "git_info" => git_info(ctx, args),
         "index_project" => index_project(ctx, args),
         "search_files" => search_files(ctx, args),
         "list_dir" => list_dir(ctx, args),
@@ -1217,10 +1217,21 @@ fn local_host_metrics() -> t_hub_protocol::HostMetrics {
 /// gets the Files-panel git header remotely. Mirrors the `git_info` Tauri command
 /// (same `GitInfo` shape), reusing its per-cwd TTL cache (the freeze fix). Args:
 /// `path` (or `cwd`), the same cwd string the frontend passes.
-fn git_info(args: &Value) -> Result<Value, String> {
+fn git_info(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let cwd = arg_str(args, "path")
         .or_else(|| arg_str(args, "cwd"))
         .ok_or("git_info requires a 'path' (cwd) argument")?;
+    // #27 follow-up: gate the peer-controlled cwd for a REMOTE peer to the operator
+    // allowlist — else it leaks whether an arbitrary host path is a git repo + its
+    // branch/dirty state. Loopback is unrestricted (scoped_create_path handles the
+    // existing cwd; substitute the scoped path so check and use can't diverge).
+    let cwd = if ctx.peer_is_loopback {
+        cwd
+    } else {
+        files::scoped_create_path(&cwd, true, files::remote_file_roots())?
+            .to_string_lossy()
+            .into_owned()
+    };
     serde_json::to_value(crate::git::git_info_cached(&cwd)).map_err(|e| e.to_string())
 }
 
@@ -2166,6 +2177,9 @@ mod tests {
                 "{cmd} should be gated for a remote peer; got: {err}"
             );
         }
+        // git_info probes git at a peer-controlled cwd — same allowlist gate.
+        let err = dispatch(&ctx, "git_info", &json!({"path": "/home/x/whatever"})).unwrap_err();
+        assert!(err.contains("disabled"), "git_info should be gated; got: {err}");
     }
 
     #[test]
