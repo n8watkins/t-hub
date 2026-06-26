@@ -646,8 +646,18 @@ impl AgentBridge {
             .payload
             .get("status")
             .unwrap_or(&entry.payload);
+        // Capture the PREVIOUS snapshot, then ingest, then only emit when something
+        // MEANINGFUL changed. The statusline re-ingests an IDENTICAL snapshot many
+        // times/sec (only `ingested_at_ms` ticks); emitting each was ~25 events/sec
+        // PER SESSION into the webview — a sustained event flood that pinned the UI
+        // (the "constant freezing") even after the frontend stopped re-rendering on
+        // them. ingest() still runs every time (the bridge/restore stay current); we
+        // just skip the redundant emit.
+        let prev = status_bridge.get(sid);
         let snap = status_bridge.ingest(sid, raw, entry.timestamp_ms);
-        self.inner.emit(EVT_STATUS_SNAPSHOT, &snap);
+        if prev.as_ref().map_or(true, |p| !p.same_status(&snap)) {
+            self.inner.emit(EVT_STATUS_SNAPSHOT, &snap);
+        }
     }
 }
 

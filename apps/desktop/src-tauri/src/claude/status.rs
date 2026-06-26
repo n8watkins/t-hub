@@ -37,7 +37,7 @@ const STATUS_MAP_CAP: usize = 256;
 
 /// One rate-limit window from the statusline `rate_limits` block. Both fields
 /// are optional because the block may be partial.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateLimitWindow {
     /// Unix-epoch seconds the window resets (None until known — Pro/Max +
@@ -97,6 +97,23 @@ pub struct StatusSnapshot {
 }
 
 impl StatusSnapshot {
+    /// True if `other` is the SAME snapshot for EMIT purposes — every field matches
+    /// EXCEPT `ingested_at_ms`, which ticks on every re-ingest even when nothing
+    /// changed. The statusline re-ingests an identical snapshot many times/sec, so
+    /// emitting each `status://snapshot` floods the webview with ~25 events/sec per
+    /// session (the freeze); callers skip the emit when this returns true.
+    pub fn same_status(&self, other: &StatusSnapshot) -> bool {
+        self.session_id == other.session_id
+            && self.cwd == other.cwd
+            && self.tmux_pane == other.tmux_pane
+            && self.tmux_session == other.tmux_session
+            && self.context_used_pct == other.context_used_pct
+            && self.cost_usd == other.cost_usd
+            && self.five_hour == other.five_hour
+            && self.seven_day == other.seven_day
+            && self.rate_limits_present == other.rate_limits_present
+    }
+
     /// Parse a raw statusline JSON object into a normalized snapshot for
     /// `session_id`. Tolerant of missing fields/blocks (returns a snapshot with
     /// `None`s rather than failing). `now_ms` is injected for testability.
