@@ -4,6 +4,7 @@
 // payload types in ./types, which in turn mirror `src-tauri/src/files.rs`.
 
 import { invoke } from "@tauri-apps/api/core";
+import { controlRequest } from "./controlClient";
 import {
   CommandsFiles,
   type DirEntry,
@@ -12,21 +13,41 @@ import {
   type IndexSummary,
 } from "./types";
 
-/** Walk `root`, (re)build the in-memory index, and return a summary. */
+/**
+ * Walk `root`, (re)build the in-memory index, and return a summary.
+ *
+ * Server-split M3 (the file INDEX, build half): routed over the control socket
+ * (`index_project` in control.rs) instead of the in-process Tauri command —
+ * shape-identical (`IndexSummary`), so it's a transport swap. This warms the
+ * daemon's index cache, which {@link searchFiles} (also on the socket) reuses; a
+ * thin client thus indexes the REMOTE tree. NOTE: the file BROWSER/READER/EDITOR
+ * (`listDir`/`readTextFile`/`writeTextFile`) stays on in-process `invoke` — those
+ * read/write arbitrary paths, a security-sensitive surface to expose over the
+ * (network-bindable, post-M2b) control channel, so they're deferred to the M4
+ * hardening pass with proper peer-gating/path-scoping.
+ */
 export function indexProject(root: string): Promise<IndexSummary> {
-  return invoke(CommandsFiles.indexProject, { root });
+  return controlRequest("index_project", { root }) as Promise<IndexSummary>;
 }
 
 /**
  * Fuzzy-search the index for `root`. Indexes on demand if `root` is not cached.
  * An empty `query` returns key files first, then a stable prefix of the index.
+ *
+ * Server-split M3 (the file INDEX, query half): routed over the control socket
+ * (`search_files` in control.rs — already MCP-exposed, so no new surface) instead
+ * of the in-process Tauri command. The dispatcher wraps the bare `FileHit[]` as
+ * `{root, query, hits}`, so we unwrap `.hits` to keep this wrapper's contract.
  */
-export function searchFiles(
+export async function searchFiles(
   root: string,
   query: string,
   limit = 50,
 ): Promise<FileHit[]> {
-  return invoke(CommandsFiles.searchFiles, { root, query, limit });
+  const res = (await controlRequest("search_files", { root, query, limit })) as {
+    hits: FileHit[];
+  };
+  return res.hits;
 }
 
 /**

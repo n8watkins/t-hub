@@ -1064,6 +1064,22 @@ pub fn control_read_text(_state: &FileIndexState, path: &str) -> Result<FileCont
     read_text_capped(&p)
 }
 
+/// Control-channel index build: walk `root`, cache the index in the control
+/// channel's own [`FileIndexState`], and return its summary — the server-side
+/// mirror of the `index_project` command. A subsequent [`control_search`] on the
+/// same root reuses this cache. (Server-split M3: the file index served by the
+/// daemon, so a thin client warms + searches the REMOTE tree's index.)
+pub fn control_index(state: &FileIndexState, root: &str) -> Result<IndexSummary, String> {
+    let root = normalize(root);
+    let index = build_index(&root)?;
+    let root_str = index.root.to_string_lossy().into_owned();
+    let arc = state.put(index);
+    Ok(IndexSummary {
+        root: root_str,
+        count: arc.entries.len(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands (registered in lib.rs; mirrored in src/ipc/files.ts)
 // ---------------------------------------------------------------------------

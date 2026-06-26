@@ -743,6 +743,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "codex_usage" => codex_usage(),
         "host_metrics" => host_metrics(ctx),
         "git_info" => git_info(args),
+        "index_project" => index_project(ctx, args),
         "search_files" => search_files(ctx, args),
         "list_tabs" => list_tabs(),
         "read_terminal" | "capture_pane" => read_terminal(args),
@@ -1104,6 +1105,18 @@ fn git_info(args: &Value) -> Result<Value, String> {
         .or_else(|| arg_str(args, "cwd"))
         .ok_or("git_info requires a 'path' (cwd) argument")?;
     serde_json::to_value(crate::git::git_info_cached(&cwd)).map_err(|e| e.to_string())
+}
+
+/// `index_project` (server-split M3 — the file index, build half): walk `root`,
+/// (re)build the control channel's file index, and return its `IndexSummary`
+/// (`{root, count}`). Mirrors the `index_project` Tauri command (same shape), so
+/// the frontend's warmup flips onto the wire and a thin client indexes the REMOTE
+/// tree. Args: `root` (required). Paired with [`search_files`], which reuses the
+/// cache this warms (and self-indexes on demand if skipped).
+fn index_project(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let root = arg_str(args, "root").ok_or("index_project requires a 'root' argument")?;
+    let summary = files::control_index(&ctx.files, &root)?;
+    serde_json::to_value(summary).map_err(|e| e.to_string())
 }
 
 /// `search_files`: fuzzy basename/path/extension search over a project root,
