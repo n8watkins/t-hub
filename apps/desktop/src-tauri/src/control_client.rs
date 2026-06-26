@@ -167,13 +167,30 @@ impl EventEmitter for TeeEmitter {
 pub fn spawn_event_forwarder(app: AppHandle, addr: String, token: String) {
     std::thread::Builder::new()
         .name("t-hub-control-forward".into())
-        .spawn(move || loop {
-            if let Err(e) = forward_once(&app, &addr, &token) {
-                eprintln!("t-hub-control: event forwarder disconnected: {e}");
+        .spawn(move || {
+            // EXPONENTIAL BACKOFF on reconnect (M2b): a live connection that ENDS
+            // (Ok — server closed/restarted) retries promptly and resets the backoff;
+            // a connect/transport FAILURE (Err — server down/unreachable) backs off
+            // 250ms→10s so we don't hammer a down remote server. In M1/loopback the
+            // listener never dies, so this loop parks inside `forward_once`.
+            // (Jitter is unnecessary for one client; add it for M4's many clients.)
+            let mut backoff = Duration::from_millis(250);
+            let max_backoff = Duration::from_secs(10);
+            loop {
+                match forward_once(&app, &addr, &token) {
+                    Ok(()) => {
+                        backoff = Duration::from_millis(250);
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "t-hub-control: event forwarder reconnect failed: {e} (retry in {backoff:?})"
+                        );
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(max_backoff);
+                    }
+                }
             }
-            // Re-subscribe after a brief pause. In M1 the listener is in-process and
-            // never dies, so this loop normally parks inside `forward_once`.
-            std::thread::sleep(Duration::from_millis(1000));
         })
         .ok();
 }

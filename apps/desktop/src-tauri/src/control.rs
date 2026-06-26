@@ -43,7 +43,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -461,12 +461,38 @@ fn is_allowed_peer(ip: std::net::IpAddr) -> bool {
 /// Accept loop: one short read/serve thread per connection. Connections are
 /// expected to be local and short-lived (one MCP `tools/call` round-trip), but we
 /// handle multiple lines per connection so a client may pipeline.
+/// Max concurrent control connections. Bounds the thread-per-connection DoS surface
+/// the M2b network bind opens (a flaky/hostile remote client reconnecting in a tight
+/// loop). Generous — normal use is a handful (the MCP, the event forwarder, one per
+/// terminal tile); this only trips on runaway connection churn.
+const MAX_CONNS: usize = 256;
+static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Decrements the live-connection counter when a connection handler thread exits.
+struct ConnGuard;
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONNS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn serve(listener: TcpListener, ctx: ControlContext) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // Connection cap: reject (close) once at the ceiling rather than
+                // spawning an unbounded number of handler threads.
+                if ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed) >= MAX_CONNS {
+                    ACTIVE_CONNS.fetch_sub(1, Ordering::Relaxed);
+                    eprintln!(
+                        "t-hub-control: connection cap ({MAX_CONNS}) reached; rejecting a connection"
+                    );
+                    drop(stream);
+                    continue;
+                }
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
+                    let _guard = ConnGuard; // decrements ACTIVE_CONNS on exit
                     if let Err(e) = handle_conn(stream, &ctx) {
                         eprintln!("t-hub-control: connection error: {e}");
                     }
@@ -512,7 +538,7 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
             // event stream. After the ack we send no per-line responses — the
             // fanout owns the socket and the read loop just parks until disconnect.
             Ok(req) if req.command == SUBSCRIBE_COMMAND => {
-                if req.token != ctx.token {
+                if !ct_token_eq(&req.token, &ctx.token) {
                     write_response(
                         &mut writer,
                         &ControlResponse::err("unauthorized: bad control token"),
@@ -530,7 +556,7 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
             // PTY stream (M2a): the terminal channel owns the rest of the
             // connection until the client disconnects.
             Ok(req) if req.command == ATTACH_PTY_COMMAND => {
-                if req.token != ctx.token {
+                if !ct_token_eq(&req.token, &ctx.token) {
                     write_response(
                         &mut writer,
                         &ControlResponse::err("unauthorized: bad control token"),
@@ -645,10 +671,25 @@ fn write_response(writer: &mut TcpStream, resp: &ControlResponse) -> std::io::Re
     writer.flush()
 }
 
+/// Constant-time token comparison: avoids a timing oracle on the auth token once
+/// the channel is network-reachable (M2b). Token length is a fixed-size UUID, so
+/// the early length check leaks nothing meaningful.
+fn ct_token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Check the token, then dispatch. A bad token is rejected before any command
 /// runs (no information about which commands exist is leaked).
 fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
-    if req.token != ctx.token {
+    if !ct_token_eq(&req.token, &ctx.token) {
         return ControlResponse::err("unauthorized: bad control token");
     }
     match dispatch(ctx, &req.command, &req.args) {
