@@ -198,3 +198,60 @@ body {
 .th-scroll-thin::-webkit-scrollbar-thumb:hover {
   background: var(--th-fg-muted);
 }
+
+/* =====================================================================
+ * StatusIndicator — shared ring+center status shape (src/components/
+ * StatusIndicator.tsx). APPENDED block; do not interleave with rules above.
+ *
+ * The component sets width/height/border/opacity inline per variant; these
+ * rules provide the shared shape (round, centered child) and the `working`/
+ * `attention` PULSE animation. The pulse is a HALO (box-shadow), not a size
+ * change, so the indicator never reflows its neighbors while animating. The
+ * halo color comes from the per-variant `--th-ind-pulse-color` custom prop the
+ * component sets inline.
+ * ===================================================================== */
+.th-ind {
+  display: inline-block;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  border-radius: 9999px;
+  /* Center the solid inner dot inside the ring. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  vertical-align: middle;
+}
+.th-ind-center {
+  display: block;
+  border-radius: 9999px;
+}
+
+/* Pulsing halo for `working` / `attention`. A growing+fading ring of the
+ * variant color around the indicator, so "actively working" reads even on a
+ * tiny shape without moving the dot itself. Honors reduced-motion. */
+@keyframes th-ind-pulse {
+  0% {
+    box-shadow: 0 0 0 0
+      color-mix(
+        in srgb,
+        var(--th-ind-pulse-color, var(--th-accent)) 60%,
+        transparent
+      );
+  }
+  70% {
+    box-shadow: 0 0 0 4px
+      color-mix(in srgb, var(--th-ind-pulse-color, var(--th-accent)) 0%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+.th-ind-pulse {
+  animation: th-ind-pulse 1.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .th-ind-pulse {
+    animation: none;
+  }
+}

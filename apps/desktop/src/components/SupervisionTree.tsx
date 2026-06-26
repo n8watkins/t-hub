@@ -6,6 +6,7 @@
 import type { SubagentNode, SupervisionTree as Tree } from "../ipc/model";
 import { useSupervision } from "../store/supervision";
 import { StatusBadge } from "./StatusBadge";
+import { StatusIndicator } from "./StatusIndicator";
 
 /** A single subagent row: a state dot, its type, and a duration when finished. */
 function SubagentRow({ node }: { node: SubagentNode }) {
@@ -15,12 +16,12 @@ function SubagentRow({ node }: { node: SubagentNode }) {
     node.endedAt != null ? `${Math.max(0, node.endedAt - node.startedAt)}ms` : null;
   return (
     <li className="flex items-center gap-2 py-0.5 pl-4 text-xs">
-      <span
-        className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-          running ? "bg-amber-400 animate-pulse" : "bg-neutral-500"
-        }`}
+      {/* Subagent state via the shared ring+center indicator: a running child
+          pulses (working), a finished one is a calm solid (done). */}
+      <StatusIndicator
+        variant={running ? "working" : "done"}
+        size={8}
         title={running ? "running" : "completed"}
-        aria-label={node.state}
       />
       <span className={running ? "text-neutral-200" : "text-neutral-400"}>{label}</span>
       {duration && <span className="text-neutral-600">{duration}</span>}

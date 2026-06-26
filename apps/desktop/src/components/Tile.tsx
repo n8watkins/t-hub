@@ -44,6 +44,8 @@ import { useAutoContinue } from "../store/autoContinue";
 import { ContextMeter } from "./ContextMeter";
 import { useContextPctForTile, sessionNameForTerminal } from "../store/sessionContext";
 import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
+import { useActivity } from "../store/activity";
+import { StatusIndicator, type StatusVariant } from "./StatusIndicator";
 import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
 import { resolveDropTarget } from "../lib/dropTarget";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
@@ -131,20 +133,6 @@ export interface TileProps {
   onFocus: () => void;
   onClose: () => void;
 }
-
-/**
- * Status-dot color per lifecycle state (PRD §5.3 tile chrome). These are themed:
- * each maps to a CSS var the theme store writes, so retheming the dot palette is
- * live. Used as an inline `backgroundColor` (Tailwind can't take a dynamic var
- * key per state).
- */
-const DOT_VAR: Record<TerminalState, string> = {
-  starting: "var(--th-dot-starting)",
-  live: "var(--th-dot-live)",
-  detached: "var(--th-dot-detached)",
-  exited: "var(--th-dot-exited)",
-  error: "var(--th-dot-error)",
-};
 
 /**
  * Resolve which T-Hub drop target sits under a viewport point mid-drag.
@@ -315,6 +303,27 @@ export function Tile({
   const setWorkName = useTheme((s) => s.setWorkName);
 
   const state: TerminalState = info?.state ?? "starting";
+
+  // HEADER STATUS INDICATOR (the ring+center). Previously the tile dot reflected
+  // ONLY the xterm TerminalState, so the big tile never showed "working" even
+  // while its agent was mid-turn — the asymmetry with the sidebar row. Mirror the
+  // sidebar's derivation (WorkspacesList.tsx): a tile is WORKING when its bound
+  // Claude session is mid-turn (`claudeMidTurn`, reused from the busy gate above)
+  // OR the terminal is actively producing output (the cross-agent proxy for Codex
+  // / a shell running a command, store/activity). Otherwise the variant falls out
+  // of the lifecycle TerminalState.
+  const outputActive = useActivity((s) => !!s.active[terminalId]);
+  const working = claudeMidTurn || outputActive;
+  const tileVariant: StatusVariant = working
+    ? "working"
+    : state === "error"
+      ? "error"
+      : state === "live"
+        ? // A live, quiet session reads as "done" (calm green) — its last turn
+          // finished and nothing is running. starting/detached/exited are idle.
+          "done"
+        : "idle";
+
   const cwd = info?.cwd ?? "";
   // Git facts for this tile's project (branch / worktree / dirty) — header chip.
   const git = useGitInfo(cwd);
@@ -593,13 +602,18 @@ export function Tile({
             )}
           </span>
         )}
-        <span
-          // Lifecycle dot, intentionally small/low-key (#5) so it no longer
-          // reads as a "selected" marker; hover for the exact state.
-          className="h-1.5 w-1.5 shrink-0 rounded-full"
-          style={{ backgroundColor: DOT_VAR[state] }}
-          aria-label={state}
-          title={`Terminal state: ${state}`}
+        {/* Session status: the shared ring+center indicator. It now reflects the
+            agent's WORK (pulses while mid-turn / streaming) rather than only the
+            xterm lifecycle — matching the sidebar row. Hover for the exact xterm
+            state. Kept small/low-key (#5) so it doesn't read as a "selected"
+            marker. */}
+        <StatusIndicator
+          variant={tileVariant}
+          size={9}
+          title={
+            working ? `Working… (terminal: ${state})` : `Terminal state: ${state}`
+          }
+          className="shrink-0"
         />
         {/* Folder name (Feature 1). The path display is gone — the folder
             basename is enough to place the work. The full cwd stays in the
