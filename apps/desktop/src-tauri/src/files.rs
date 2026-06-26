@@ -548,9 +548,30 @@ fn build_index_from_rels(root: &Path, rels: Vec<String>) -> ProjectIndex {
     }
 }
 
+/// Cap on entries traversed when building an index over the CONTROL CHANNEL (M2b
+/// hardening). The local Tauri path passes `None` — a user indexing their own
+/// project must never be capped (large monorepos are legitimate). Over the opt-in
+/// network bind, an authenticated peer requesting `index_project` on `/` or `C:\`
+/// would otherwise drive an unbounded in-process walk; this bounds the traversal
+/// and returns a clear error telling the caller to scope to a project subdirectory.
+/// Generous: a real project is far under this — only a pathological root trips it.
+const CONTROL_INDEX_MAX_ENTRIES: usize = 200_000;
+
+/// The error returned when a control-channel index walk exceeds
+/// [`CONTROL_INDEX_MAX_ENTRIES`] — phrased so the caller knows to narrow the root.
+fn index_too_large_err(root: &Path, cap: usize) -> String {
+    format!(
+        "refusing to index more than {cap} entries under {} over the control \
+         channel; scope the request to a project subdirectory",
+        root.display()
+    )
+}
+
 /// Build (or rebuild) the index for `root`, honoring `.gitignore` + pruned dirs
-/// + a binary sniff, and walk it into a flat [`ProjectIndex`].
-fn build_index(root: &Path) -> Result<ProjectIndex, String> {
+/// + a binary sniff, and walk it into a flat [`ProjectIndex`]. `max_entries`
+/// bounds the traversal for the control-channel callers (`None` = uncapped, for
+/// the local Tauri path) — see [`CONTROL_INDEX_MAX_ENTRIES`].
+fn build_index(root: &Path, max_entries: Option<usize>) -> Result<ProjectIndex, String> {
     // Windows fast path: a native WSL project lives on ext4 behind the slow
     // `\\wsl.localhost\` UNC/9P bridge. Walking it with `std::fs` is painfully
     // slow, so enumerate the file list natively inside the distro instead (rg →
@@ -559,6 +580,13 @@ fn build_index(root: &Path) -> Result<ProjectIndex, String> {
     {
         if let Some(posix) = unc_to_posix(root) {
             let rels = wsl_list_files(&posix)?;
+            // rg already ran (a bounded child spawn), but cap the returned list so
+            // a pathological root can't balloon the index in memory.
+            if let Some(cap) = max_entries {
+                if rels.len() > cap {
+                    return Err(index_too_large_err(root, cap));
+                }
+            }
             return Ok(build_index_from_rels(root, rels));
         }
     }
@@ -568,6 +596,10 @@ fn build_index(root: &Path) -> Result<ProjectIndex, String> {
     }
 
     let mut entries = Vec::new();
+    // Bound total traversal (M2b): count every entry the walker yields — files,
+    // dirs, AND skips — not just indexed files, so a tree of mostly-empty dirs
+    // can't walk unbounded. Uncapped when `max_entries` is `None` (local path).
+    let mut visited = 0usize;
 
     // `ignore::WalkBuilder` gives us .gitignore + global gitignore + .ignore
     // semantics for free. We additionally prune the always-skip dirs and skip
@@ -592,6 +624,12 @@ fn build_index(root: &Path) -> Result<ProjectIndex, String> {
         .build();
 
     for result in walker {
+        if let Some(cap) = max_entries {
+            visited += 1;
+            if visited > cap {
+                return Err(index_too_large_err(root, cap));
+            }
+        }
         let dent = match result {
             Ok(d) => d,
             Err(_) => continue, // unreadable entry: skip, don't fail the whole walk
@@ -1052,7 +1090,7 @@ pub fn control_search(
     let root = normalize(root);
     let index = match state.get(&root) {
         Some(i) => i,
-        None => state.put(build_index(&root)?),
+        None => state.put(build_index(&root, Some(CONTROL_INDEX_MAX_ENTRIES))?),
     };
     Ok(search_index(&index, query, limit.clamp(1, 1000)))
 }
@@ -1071,7 +1109,7 @@ pub fn control_read_text(_state: &FileIndexState, path: &str) -> Result<FileCont
 /// daemon, so a thin client warms + searches the REMOTE tree's index.)
 pub fn control_index(state: &FileIndexState, root: &str) -> Result<IndexSummary, String> {
     let root = normalize(root);
-    let index = build_index(&root)?;
+    let index = build_index(&root, Some(CONTROL_INDEX_MAX_ENTRIES))?;
     let root_str = index.root.to_string_lossy().into_owned();
     let arc = state.put(index);
     Ok(IndexSummary {
@@ -1098,7 +1136,7 @@ pub async fn index_project(
     // crosses the `.await`. The `FileIndexState` Mutex is touched only by the
     // brief `put` AFTER the walk completes, never held across it.
     let walk_root = root.clone();
-    let index = tauri::async_runtime::spawn_blocking(move || build_index(&walk_root))
+    let index = tauri::async_runtime::spawn_blocking(move || build_index(&walk_root, None))
         .await
         .map_err(|e| format!("index_project task failed: {e}"))??;
     let count = index.entries.len();
@@ -1130,7 +1168,7 @@ pub async fn search_files(
         Some(i) => i,
         None => {
             let walk_root = root.clone();
-            let built = tauri::async_runtime::spawn_blocking(move || build_index(&walk_root))
+            let built = tauri::async_runtime::spawn_blocking(move || build_index(&walk_root, None))
                 .await
                 .map_err(|e| format!("search_files task failed: {e}"))??;
             state.put(built)
@@ -1259,7 +1297,7 @@ mod tests {
     #[test]
     fn index_respects_gitignore_and_prunes() {
         let root = make_fixture();
-        let index = build_index(&root).unwrap();
+        let index = build_index(&root, None).unwrap();
         let rels = rel_set(&index);
 
         // Included.
@@ -1295,9 +1333,26 @@ mod tests {
     }
 
     #[test]
+    fn control_index_cap_bounds_the_walk() {
+        let root = make_fixture();
+        // A tiny cap trips on the multi-entry fixture: the walk stops early and
+        // errors with a "scope to a subdirectory" message (the M2b DoS bound for
+        // a peer pointing index_project at `/`), rather than indexing everything.
+        let err = build_index(&root, Some(1)).unwrap_err();
+        assert!(
+            err.contains("refusing to index") && err.contains("control channel"),
+            "expected an index-too-large error, got: {err}"
+        );
+        // A generous cap (and the uncapped local Tauri path) index the fixture fine.
+        assert!(build_index(&root, Some(100_000)).is_ok());
+        assert!(build_index(&root, None).is_ok());
+        cleanup(&root);
+    }
+
+    #[test]
     fn entry_metadata_is_correct() {
         let root = make_fixture();
-        let index = build_index(&root).unwrap();
+        let index = build_index(&root, None).unwrap();
         let main = index
             .entries
             .iter()
@@ -1327,7 +1382,7 @@ mod tests {
     #[test]
     fn fuzzy_basename_ranks_above_path() {
         let root = make_fixture();
-        let index = build_index(&root).unwrap();
+        let index = build_index(&root, None).unwrap();
 
         // "main" should surface src/main.rs as the top hit.
         let hits = search_index(&index, "main", 10);
@@ -1340,7 +1395,7 @@ mod tests {
     #[test]
     fn fuzzy_subsequence_matches() {
         let root = make_fixture();
-        let index = build_index(&root).unwrap();
+        let index = build_index(&root, None).unwrap();
 
         // "srlib" is a subsequence of "src/lib.rs" but not of others meaningfully.
         let hits = search_index(&index, "srlib", 10);
@@ -1356,7 +1411,7 @@ mod tests {
     #[test]
     fn extension_query_ranks_matching_ext() {
         let root = make_fixture();
-        let index = build_index(&root).unwrap();
+        let index = build_index(&root, None).unwrap();
 
         let hits = search_index(&index, ".ts", 10);
         assert!(!hits.is_empty(), "expected .ts hits");
@@ -1369,7 +1424,7 @@ mod tests {
     #[test]
     fn empty_query_returns_key_files_first() {
         let root = make_fixture();
-        let index = build_index(&root).unwrap();
+        let index = build_index(&root, None).unwrap();
         let hits = search_index(&index, "", 10);
         assert!(!hits.is_empty());
         // The first results should be key files (README/package.json).
@@ -1384,7 +1439,7 @@ mod tests {
     #[test]
     fn no_match_returns_empty() {
         let root = make_fixture();
-        let index = build_index(&root).unwrap();
+        let index = build_index(&root, None).unwrap();
         let hits = search_index(&index, "zzzzzqqqqq", 10);
         assert!(hits.is_empty(), "garbage query should not match");
         cleanup(&root);
@@ -1393,7 +1448,7 @@ mod tests {
     #[test]
     fn search_respects_limit() {
         let root = make_fixture();
-        let index = build_index(&root).unwrap();
+        let index = build_index(&root, None).unwrap();
         let hits = search_index(&index, "", 2);
         assert_eq!(hits.len(), 2, "limit should cap results");
         cleanup(&root);
@@ -1530,7 +1585,7 @@ mod tests {
         // src-tauri/ is CARGO_MANIFEST_DIR; the repo root is its parent.
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let repo_root = manifest.parent().unwrap().to_path_buf();
-        let index = build_index(&repo_root).unwrap();
+        let index = build_index(&repo_root, None).unwrap();
         println!(
             "\n=== indexed {} : {} files ===",
             repo_root.display(),
@@ -1587,7 +1642,7 @@ mod tests {
     fn build_index_errors_on_nonexistent_root() {
         let mut root = std::env::temp_dir();
         root.push(format!("t-hub-does-not-exist-{}", uuid::Uuid::new_v4()));
-        let err = build_index(&root).unwrap_err();
+        let err = build_index(&root, None).unwrap_err();
         assert!(err.contains("not a directory"), "got: {err}");
     }
 }
