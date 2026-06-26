@@ -22,10 +22,11 @@
 // behavior. So the meter keeps working before the rebuilt agent is installed; it
 // just gets more precise once it is.
 //
-// It deliberately keeps its OWN `status://snapshot` subscription (Tauri fans an
-// event out to every listener) rather than reshaping the supervision store,
-// which keys by session id and carries none of this — staying out of that store
-// keeps this feature self-contained and cleanly revertible.
+// It deliberately keeps its OWN `status://snapshot` subscription (server-split
+// M1: the snapshot now arrives over the control socket and the demux hub fans it
+// to every `onControlEvent` subscriber) rather than reshaping the supervision
+// store, which keys by session id and carries none of this — staying out of that
+// store keeps this feature self-contained and cleanly revertible.
 import { create } from "zustand";
 import { onStatus, type StatusSnapshotWire } from "../ipc/client05";
 

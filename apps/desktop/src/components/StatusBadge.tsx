@@ -3,46 +3,30 @@
 // orchestrator that's still supervising children reads differently from a
 // completed one. Pure presentational; no IPC.
 import type { SessionStatus } from "../ipc/model";
-import { StatusIndicator, type StatusVariant } from "./StatusIndicator";
+import { StatusIndicator, sessionStatusToVariant } from "./StatusIndicator";
 
-/** Indicator variant + label + label text color per status. The visual is now
- *  the shared ring+center {@link StatusIndicator}; `variant` picks its state. */
+/** Per-status label + label-text color. The indicator VARIANT is NOT stored here:
+ *  it's derived from the shared {@link sessionStatusToVariant} so every surface
+ *  (tiles, sidebar rows, this badge, and the Settings legend) renders the same
+ *  status with the same indicator — no per-component drift. */
 interface StatusMeta {
-  variant: StatusVariant;
   label: string;
   /** Tailwind text color for the label. */
   text: string;
 }
 
-// FR-012 11-state SessionStatus → the shared 5 indicator variants:
-//   working                            → working   (pulsing accent ring)
-//   completed                          → done      (solid green)
-//   needsQuestion/needsPermission/
-//     waitingOnSubagents               → attention (pulsing amber ring)
-//   failed (+ rateLimited)             → error     (solid red)
-//   detached/restoring/expired/unknown → idle      (muted hollow ring)
-// rateLimited maps to `error` (it's a hard block on progress); restoring keeps
-// the amber-ish "in flight" read via `attention`.
 const STATUS_META: Record<SessionStatus, StatusMeta> = {
-  working: { variant: "working", label: "Working", text: "text-emerald-300" },
-  waitingOnSubagents: {
-    variant: "attention",
-    label: "Waiting on subagents",
-    text: "text-amber-300",
-  },
-  needsQuestion: { variant: "attention", label: "Needs answer", text: "text-sky-300" },
-  needsPermission: {
-    variant: "attention",
-    label: "Needs permission",
-    text: "text-violet-300",
-  },
-  completed: { variant: "done", label: "Completed", text: "text-neutral-300" },
-  failed: { variant: "error", label: "Failed", text: "text-red-300" },
-  rateLimited: { variant: "error", label: "Rate-limited", text: "text-orange-300" },
-  detached: { variant: "idle", label: "Detached", text: "text-neutral-400" },
-  restoring: { variant: "attention", label: "Restoring", text: "text-amber-300" },
-  expired: { variant: "idle", label: "Expired", text: "text-neutral-500" },
-  unknown: { variant: "idle", label: "Unknown", text: "text-neutral-500" },
+  working: { label: "Working", text: "text-emerald-300" },
+  waitingOnSubagents: { label: "Waiting on subagents", text: "text-amber-300" },
+  needsQuestion: { label: "Needs answer", text: "text-sky-300" },
+  needsPermission: { label: "Needs permission", text: "text-violet-300" },
+  completed: { label: "Completed", text: "text-neutral-300" },
+  failed: { label: "Failed", text: "text-red-300" },
+  rateLimited: { label: "Rate-limited", text: "text-orange-300" },
+  detached: { label: "Detached", text: "text-neutral-400" },
+  restoring: { label: "Restoring", text: "text-amber-300" },
+  expired: { label: "Expired", text: "text-neutral-500" },
+  unknown: { label: "Unknown", text: "text-neutral-500" },
 };
 
 export interface StatusBadgeProps {
@@ -54,10 +38,11 @@ export interface StatusBadgeProps {
 
 export function StatusBadge({ status, dotOnly, className }: StatusBadgeProps) {
   const meta = STATUS_META[status] ?? STATUS_META.unknown;
+  const variant = sessionStatusToVariant(status);
   if (dotOnly) {
     return (
       <StatusIndicator
-        variant={meta.variant}
+        variant={variant}
         size={9}
         title={meta.label}
         className={className}
@@ -69,7 +54,7 @@ export function StatusBadge({ status, dotOnly, className }: StatusBadgeProps) {
       className={`inline-flex items-center gap-1.5 text-xs ${className ?? ""}`}
       title={meta.label}
     >
-      <StatusIndicator variant={meta.variant} size={9} title={meta.label} />
+      <StatusIndicator variant={variant} size={9} title={meta.label} />
       <span className={meta.text}>{meta.label}</span>
     </span>
   );
