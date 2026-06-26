@@ -14,95 +14,106 @@
 
 - **Stack:** Rust backend + React/TypeScript/Tailwind frontend with xterm.js terminals.
 - **Repo:** a **pnpm monorepo**. `apps/desktop` = the app (Tauri); `apps/site` = the marketing site. Work happens in `apps/desktop`.
-- **How it reaches the agents:** on **Windows** it drives WSL via `wsl.exe -e bash` running **`tmux -L t-hub`**; under `#[cfg(unix)]` it attaches tmux **directly** (this is the Linux/WSLg dev variant). Each terminal's tmux session is `th_<terminalId>`.
-- **Backend surface:** ~50 `#[tauri::command]`s + an **MCP server** (`t-hub-mcp`, 22 tools) + a **loopback control channel** (`control.rs`, a `127.0.0.1` TCP server with a per-launch token — this is the seam the server split builds on).
+- **How it reaches the agents:** on **Windows** it drives WSL via `wsl.exe -e bash` running **`tmux -L t-hub`**; under `#[cfg(unix)]` it attaches tmux **directly** (this is the Linux/WSLg dev variant). Each terminal's tmux session is `th_<terminalId[..8]>`.
+- **Backend surface:** ~50 `#[tauri::command]`s + an **MCP server** (`t-hub-mcp`, 22 tools) + a **loopback control channel** (`control.rs`, a `127.0.0.1` TCP NDJSON server with a per-launch token). **The control channel is now the spine of the server-split** (§2).
 - Codebase/repo identifiers deliberately stay `t-hub` (lowercase); the user-facing name is "T-Hub".
 
 ---
 
-## 2. State — v0.2.0 SHIPPED
+## 2. State
 
-**`v0.2.0` is tagged (`9ee6b75`) and the GitHub Release is published** — signed `T-Hub_0.2.0_x64-setup.exe` + `latest.json`, so **auto-update is LIVE** for users.
+### Baseline: v0.2.0 SHIPPED
+`v0.2.0` is tagged (`9ee6b75`) and the GitHub Release is published — signed `T-Hub_0.2.0_x64-setup.exe` + `latest.json`, so **auto-update is LIVE**. That release shipped the herdr-parity wave (worktree workflow, rebindable keymap, rules engine, OS toasts, session-restore, a perf overhaul) plus post-release cheap-wins (dedup refactor, light tray recovery, vitest). Details in [`ROADMAP-PLAN.md`](./ROADMAP-PLAN.md).
 
-This session shipped the whole **"herdr-parity wave"**:
-- **Git worktree workflow** — `Ctrl+B w` / `c` / `l` plus a repo picker; worktrees created as a sibling `<repo>-worktrees/<branch>`.
-- **Rebindable keymap** — `Ctrl+B` prefix + `Ctrl+K` command palette.
-- **Event→action rules engine** (`store/rules.ts` + `lib/rulesMount.ts`).
-- **OS toast notifications** (native, via `tauri_plugin_notification`).
-- **Native session-restore** (relaunch offers to restore live agent tiles).
-- **PERF overhaul** — fixed a freeze and RAM-creep (see §5 gotcha + `PERF-AUDIT.md`).
+> ⚠️ The v0.2.0 **Windows** build was **not** runtime-tested — only the Linux/WSLg dev variant. If Windows surprises, **fix-forward with v0.2.1**, don't block.
 
-**Post-release cheap-wins, also on `main`** (commits after the `9ee6b75` release):
-- `30e863b` — `refactor: dedup host_distro, persist codec, warmup (backlog cleanup)`
-- `bec5ff7` — `feat(tray): light recovery actions — reload window + reconnect agent`
-- `8a3674c` — `test: stand up vitest + first frontend tests` (vitest now wired; 53 frontend tests)
+### This session: THE SERVER-SPLIT (item ⑥) is largely shipped — all on `main`, ahead of the v0.2.0 release
 
-**Verification (all green at the tip of `main`):** `cargo build` clean · **185 Rust lib tests** pass · `tsc` clean · **53 vitest** pass · the CI **prod** build was green.
+The keystone roadmap item. The bet: pull T-Hub's "brain" out of the desktop GUI and onto the **loopback control socket**, so the same wire that serves localhost today can later reach a remote host — any device gets the full cockpit. The webview's JS can't open a raw TCP socket, so the socket I/O lives in the Rust shell (the thin-client seam). **Progress vs the §6 M1→M4 plan in [`SERVER-SPLIT-AND-ROADMAP.md`](./SERVER-SPLIT-AND-ROADMAP.md):**
 
-**⚠️ Known gap:** the v0.2.0 **Windows** build was **not** runtime-tested — only the **Linux/WSLg dev variant** was exercised locally. If the Windows build surprises, **fix-forward with v0.2.1** (don't block on it).
+- **M1 — Decouple locally — ✅ SHIPPED.** GUI↔backend traffic for server-owned state crosses the socket: a command request/response transport (`control_request`), the event stream forwarded into the webview (`spawn_event_forwarder` → re-emits `control://event`), and a `TeeEmitter` so channels migrate **one at a time** (events go to BOTH the webview and the socket until a channel is fully flipped). Commits: `bca229d` (first slice — one read command + the event stream), `090225e` (widen — the 0.5 supervision/status surface).
+- **M2 — Tiles over the wire — ✅ core SHIPPED.**
+  - **M2a:** a tile's PTY (`tmux attach`) streams over the socket. Server emits `{out}`/`{exit}` frames and reads `{write}`/`{resize}`; client side is `RemotePty`/`RemotePtyManager`. Commits: `935c1a0` (server half), `72d5fa1` (client flip), `73cfe99`/`d08615a` (review fixes — bounded per-subscriber write, unified `tmux_target`).
+  - **M2b:** persistent server key (`~/.t-hub/server-key`, stable identity across restarts), **opt-in** network bind, and an `is_allowed_peer` gate (loopback + Tailscale CGNAT `100.64.0.0/10` + `fd7a:115c::/32`, with IPv4-mapped-IPv6 normalization). Thin-client mode via `T_HUB_REMOTE_ADDR` / `T_HUB_REMOTE_TOKEN`. Commits: `c07d3ec` (core), `47cb906` (hardening — conn cap, constant-time token compare, reconnect backoff), `040dc8b` (security-review fixes — dual-stack peer norm + forwarder backoff).
+- **M3 — Overlay server-side — ◐ 4 of 5 done.** Each overlay source moved to a shape-identical control command + a sync core (so the SAME code serves the in-process and socket paths) + a frontend `controlRequest` flip. **Migrated:** `recent_sessions` (`eeeb8b0`), `claude_usage`, `codex_usage`, `git_info` (`c45b9fb`). **Remaining:** `host_metrics` + the file index (see §3).
+- **M4 — Multi-client + hardening — ☐ not started.**
+
+**§8 pre-M1 decisions (settled, do not re-litigate):** (a) **shared-vs-per-client split** — server owns sessions/agents/status/scrollback/cost/supervision; client owns layout/focus/theme/keymap (those never cross the wire). (b) **No network bind until auth-beyond-loopback** — satisfied by M2b's `is_allowed_peer` tailnet gate + persistent key; the bind is **opt-in**, default stays loopback-only.
+
+**Also this session (UI batch, pre-split):** tab strip removed (brand = tray icon, settings moved top-right); sidebar reshape (`+` in Workspaces header, expand-all default, last-active time, bigger buttons, portal'd color picker, collapsed-rail stats); a shared ring+center **status indicator** (working = spinner, done = true solid green `#22c55e`, idle = green ring) with a live legend in Settings; Win11 Snap-Layouts maximize-button rect tracking; **notifications + sounds now default OFF** (opt-in); titlebar × hides-to-tray (default) vs quits, as a setting.
+
+**Verification (re-run green at the tip of `main`, `d800e0e`):** `cargo build` clean · **188 Rust lib tests** pass · `tsc` clean · **53 vitest** pass. Each server-split commit was also verified **live** against the running app via control-socket probes, and reviewed by sub-agents (security-critical surfaces — peer gate, token compare, write bounding — all came back clean; every real finding was acted on).
+
+**Push state:** `d800e0e` (the docs commit) is local-ahead of `origin/main` at push time — **this handoff pushes it** (the session has been pushing throughout).
 
 ---
 
 ## 3. Next steps (ordered)
 
-1. **SERVER-SPLIT M1 — the headline next project.**
-   **Before doing anything, read [`docs/SERVER-SPLIT-AND-ROADMAP.md`](./SERVER-SPLIT-AND-ROADMAP.md) IN FULL.** It is now a **cold-start build guide** (not a survey): §6 has the **M1→M4** detail, §8 has the **pre-M1 decisions to settle first**, and the file references are verified against the v0.2.0 tree. The one-line bet: pull T-Hub's "brain" out of the desktop GUI into a headless `t-hub-server` that lives where the agents live (WSL/remote), so any device can connect and get the full cockpit. **M1 = decouple locally**: route a slice of GUI↔backend through the control-channel socket on one machine (no remote yet, zero user-visible change) — the foundation. The seam is **`control.rs`**. Forward-compat discipline to start immediately: **new backend features get added as control-channel commands/events, not in-process-only Tauri calls.**
-2. **More vitest coverage** — component tests; close the test-audit gaps. See `docs/AUDIT.md` / `docs/SMOKE-TEST.md`.
-3. **Heavier tray actions** (restart-tmux, full-WSL-shutdown) — the tray currently has only the *light* recovery actions (reload window + reconnect agent). Add the heavier ones **only when actually needed**.
-4. **WS-9 nits:** `sanitizeBranchToDir` has a many-to-one collision risk, and remote-branch handling has a `-b`-vs-DWIM ambiguity. See [`docs/WORKTREE-WORKFLOW.md`](./WORKTREE-WORKFLOW.md) and [`docs/ROADMAP-PLAN.md`](./ROADMAP-PLAN.md).
-5. **Parked differentiators** (not yet scoped): budget governor, worktree fleet launcher, MCP supervision event stream.
+The server-split **tail** comes first. Read [`SERVER-SPLIT-AND-ROADMAP.md`](./SERVER-SPLIT-AND-ROADMAP.md) §6 (the M1→M4 detail + the per-milestone status table) before starting.
+
+1. **M3 source #5 — `host_metrics` over the socket (PREMISE-DEPENDENT — read this first).**
+   The naive flip is a **trap**: the daemon reading the **local** `/proc` returns **zeros on Windows** (the GUI process is the Windows host, not WSL), which would **regress the working local Windows overlay**. The metrics must come from the **WSL-side agent's `/proc`**, not control.rs reading the host's. Frontend reader: `apps/desktop/src/ipc/client05.ts` (the `host_metrics` shape is snake_case from the WSL agent). **Acceptance:** remote thin-client shows real CPU/mem; local Windows is unchanged (still real, not zeros). If the premise doesn't hold cheaply, leave it deferred and say so — don't ship a Windows regression.
+2. **M3 source — the file index (`search_files`).** Frontend: `apps/desktop/src/ipc/files.ts`. Same pattern as the 4 done sources: add a shape-identical `search_files` (or equivalent) dispatch arm in `control.rs` backed by a sync core, then flip `files.ts` to `controlRequest`. **Acceptance:** file search works through the socket with zero UI change locally; a thin client searches the remote tree.
+3. **M2b deferred hardening** (task #18 — before trusting the bind beyond a single-user tailnet): per-client auth for `attach_pty` (today the PTY attach trusts the connection), a server read/idle timeout, protocol versioning, and reconnect re-sync. These are listed in the §6 M2 row.
+4. **Real two-device Tailscale test + a `variant=dev` Windows build** (task #19): the M2b bind/gate path has only been exercised locally — drive a second physical device over the tailnet against a dev build. (This one needs the **user** — it's a two-machine test.)
+5. **M4 — multi-client + hardening:** named-session namespacing, per-client view vs shared state, PTY resize-ownership arbitration, auth beyond the loopback token, split client/server logs.
+
+**Older parked work (still valid, lower priority):** broader vitest coverage (component/RTL); the **heavy** tray actions (restart-tmux, full-WSL-shutdown — add only when needed); WS-9 nits (`sanitizeBranchToDir` collision + remote-branch `-b`-vs-DWIM — see [`WORKTREE-WORKFLOW.md`](./WORKTREE-WORKFLOW.md)); the parked differentiators (budget governor, worktree fleet launcher, MCP supervision event stream).
 
 ---
 
 ## 4. Conventions & gotchas (hard-won)
 
+**Server-split migration pattern (use this for the M3 tail):**
+- A migrated read = **(1)** a shape-identical command arm in `control.rs`'s `dispatch`, backed by **(2)** a **sync core** extracted from the existing Tauri command (so the in-process and socket paths share one implementation — see `recent::recent_sessions_cached`, `usage::claude_usage_blocking`, `git::git_info_cached` for the shape), then **(3)** flip the frontend `ipc/<x>.ts` wrapper from `invoke` to `controlRequest` (and `listen` → `onControlEvent` for events). The response JSON must be **byte-identical** to the old `invoke` result — it's a transport swap, not a redesign.
+- **Verify each flip LIVE**, not just by build: socket probes against the running app (the build + tsc pass even when the wire is wrong). There are **no GUI-automation tools** in this env (xdotool/ydotool/wtype all absent) and the **MCP tools hit the prod instance + drive the control channel, not the webview attach path** — so to exercise a webview path, forward a real frontend action (e.g. via `create_worktree`) and watch the socket.
+- **`control.rs` stays Tauri-free** (it's the server half); `control_client.rs` is the Tauri-aware client half (the `#[tauri::command]` + `AppHandle` event re-emit). They meet only at the NDJSON wire + the shared `EventFanout`.
+- **Thin-client mode:** `T_HUB_REMOTE_ADDR` + `T_HUB_REMOTE_TOKEN` point the GUI's control_request/event-forwarder/RemotePty at a remote server instead of local loopback. Unset = local loopback (the default).
+
 **Build / release**
-- **Version lives in 3 files:** `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json`, `apps/desktop/src-tauri/Cargo.toml`. Bump **all three**, run `cargo build` to sync `Cargo.lock`, then commit.
-- A pushed `v*` tag **or** `gh workflow run release.yml -f variant=prod` builds the **PROD** Windows installer, publishes a GitHub Release, and updates `latest.json`. **CI builds from the REMOTE — push first.**
-- `variant=dev` builds a side-by-side **"T-Hub Dev"** (`com.t-hub.dev`, isolated socket) for testing; it coexists with prod and can't disturb live sessions. Variant model: [`docs/DEV-BUILD.md`](./DEV-BUILD.md).
+- **Version lives in 3 files:** `apps/desktop/package.json`, `apps/desktop/src-tauri/tauri.conf.json`, `apps/desktop/src-tauri/Cargo.toml`. Bump all three, run `cargo build` to sync `Cargo.lock`, then commit.
+- A pushed `v*` tag **or** `gh workflow run release.yml -f variant=prod` builds the **PROD** Windows installer + GitHub Release + `latest.json`. **CI builds from the REMOTE — push first.** `variant=dev` builds a side-by-side "T-Hub Dev" (`com.t-hub.dev`, isolated socket) that can't disturb live sessions. Variant model: [`DEV-BUILD.md`](./DEV-BUILD.md).
 
 **Local dev run**
-- `pnpm -C apps/desktop tauri dev` builds the **Linux/WSLg** variant (no `wsl.exe`; attaches tmux directly). Great for cross-platform feature logic, but it does **NOT** cover the Windows `wsl.exe` path or WebView2 rendering.
-- **Isolate a test instance** so it can't touch live sessions/state:
-  `T_HUB_TMUX_SOCKET=t-hub-localtest T_HUB_CONTROL_FILE=~/.t-hub-localtest/control.json T_HUB_DIAG_FILE=~/.t-hub-localtest/diag.log`
-- An **inherited** `T_HUB_*` env var WINS over per-user resolution — a prod app launched from a WSL shell that a dev/test instance polluted will silently run on the wrong socket / log to the wrong path. The startup marker `t-hub: started vX (diag -> …)` reveals the resolved diag path; if it points somewhere unexpected, the env is polluted (relaunch from a clean shell).
+- `pnpm -C apps/desktop tauri dev` builds the **Linux/WSLg** variant (attaches tmux directly; **no `wsl.exe`, no WebView2**). Good for cross-platform logic; does NOT cover the Windows path.
+- **Isolate a test instance** so it can't touch live sessions: `T_HUB_TMUX_SOCKET=t-hub-localtest T_HUB_CONTROL_FILE=~/.t-hub-localtest/control.json T_HUB_DIAG_FILE=~/.t-hub-localtest/diag.log`.
+- An **inherited** `T_HUB_*` env var WINS over per-user resolution — a prod app launched from a polluted WSL shell silently runs on the wrong socket. The startup marker `t-hub: started vX (diag -> …)` reveals the resolved path; if unexpected, relaunch from a clean shell.
 
 **Verify commands**
-- Rust: `cd apps/desktop/src-tauri && cargo build` · `cargo test --lib`
-- Frontend: `cd apps/desktop && pnpm typecheck` (tsc) · `pnpm test` (vitest)
+- Rust: `cd apps/desktop/src-tauri && cargo build` · `cargo test --lib` (188 tests).
+- Frontend: `cd apps/desktop && pnpm typecheck` · `pnpm test` (53 vitest).
 
 **Traps**
-- **`tauri.conf.json` must NOT have a `plugins.notification` config block.** The notification plugin takes no config there; even an empty `{}` **PANICS on startup** ("invalid type: map, expected unit"). It's wired via `.plugin(tauri_plugin_notification::init())` + capabilities only. This passes `cargo build` + `tsc` but crashes **only at runtime** — **always run the app, not just build it.** (This was a release-blocker; fixed in `c2c50a6`.)
-- **Never `pkill -f "<pattern>"` where the pattern also matches your own running bash command** — it kills your own shell (exit 144). Use exact names (`pkill -x`) or PIDs.
-- **The freeze was Windows-`wsl.exe`-specific** (`git_info` spawning `wsl.exe` 6×/tile/5s) — fixed via `spawn_blocking` + a per-cwd TTL cache. **Not reproducible on the Linux build**, so don't expect it locally.
+- **`tauri.conf.json` must NOT have a `plugins.notification` block** — even empty `{}` PANICS at startup ("invalid type: map, expected unit"). Passes `cargo build` + `tsc`, crashes only at runtime — **always run the app, not just build it.**
+- **`host_metrics` on Windows** — see §3 step 1; the local-`/proc` source zeroes on Windows. Don't naively flip it.
+- **Never `pkill -f "<pattern>"` matching your own bash command** — kills your shell (exit 144). Use `pkill -x` or PIDs.
+- **`apps/desktop/bin/claude`** is an untracked local symlink into `node_modules` (a claude-code install) — a dev artifact, **not ours to commit**. Leave it untracked.
 
 **Commits**
-- Conventional Commits. Trailer: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
-- Commit after each logical change; **push only when the user asks**; branch first on the default branch (`main` was pushed directly for the v0.2.0 release deliberately).
-- **Subagent caveat:** subagents sometimes commit mid-batch despite instructions — verify commit boundaries didn't cross-contaminate.
+- Conventional Commits. Trailer: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`. Commit after each logical change; **push only when the user asks** (this session was actively pushing). `main` is pushed directly. **Subagent caveat:** subagents sometimes commit mid-batch despite instructions — verify commit boundaries didn't cross-contaminate.
 
 ---
 
 ## 5. File map (key entry points)
 
-**Backend (`apps/desktop/src-tauri/src/`)**
-- `control.rs` — loopback control channel = **the seam for the server split** (start M1 here).
-- `agent/emit.rs` + `agent/mod.rs` — the event spine (EventEmitter trait; `launch_argv` is the core↔agent seam).
-- `git.rs` — worktree primitive + the `git_info` TTL cache (the freeze fix).
-- `commands.rs` / `pty.rs` / `tmux.rs` — terminals (PTY, tmux attach, `pane_info`).
-- `supervision.rs` — FR-012 agent status / supervision tree.
+**Server-split — backend (`apps/desktop/src-tauri/src/`)**
+- `control.rs` — the server half: NDJSON dispatch table, `EventFanout` (subscriber registry), `SUBSCRIBE_COMMAND` + `ATTACH_PTY_COMMAND`, `serve_pty_attach`, `persistent_key`/`key_path`, `resolve_remote_bind`/`tailscale_ip4`/`is_allowed_peer`, `MAX_CONNS`/`ConnGuard`, `ct_token_eq`. **The M3-tail dispatch arms go here.**
+- `control_client.rs` — the Tauri-aware client half: `control_request` command, `SocketEmitter`/`TeeEmitter`, `spawn_event_forwarder` (backoff reconnect → re-emits `control://event`), `ControlEndpoint`, `install()` (honors `T_HUB_REMOTE_ADDR/TOKEN`).
+- `remote_pty.rs` — `RemotePty`/`RemotePtyManager`: connect/handshake/reader thread re-emits `terminal://output|exit|state`; write/resize on a cloned stream; `fresh` set for fresh-spawn scrollback.
+- `pty.rs` — `stream_attach_to_sink` + `PtyStreamHandle` (the socket-streaming attach); in-process variant kept `#[allow(dead_code)]` as the M2a revert path.
+- `commands.rs` — terminal commands rewired onto `RemotePtyManager`; `tmux_target` delegates to `tmux::target_for_id`.
+- `recent.rs` / `usage.rs` / `codex.rs` / `git.rs` — each has a **sync core** (`*_cached` / `*_blocking`) shared by the in-process and socket paths — **the template for migrating `host_metrics` + files.**
 
-**Frontend (`apps/desktop/src/`)**
-- `store/keybindings.ts` + `lib/keymapExecutor.ts` — the rebindable keymap.
-- `components/WorktreePrompt.tsx` / `components/WorktreesList.tsx` — worktree UI.
-- `lib/rulesMount.ts` + `store/rules.ts` — the event→action rules engine.
-- `lib/notify.ts` — OS toast notifications.
+**Server-split — frontend (`apps/desktop/src/ipc/`)**
+- `controlClient.ts` — `controlRequest()` + `onControlEvent()`: the frontend transport over the socket.
+- `recent.ts` / `usage.ts` / `codex.ts` / `git.ts` — already flipped to `controlRequest` (reference these for the pattern).
+- `client05.ts` — still holds `host_metrics` (M3 #5 target); `files.ts` — file index (M3 target).
+- `controlBridge.ts` — the original one-way org-mutation bridge (the prototype M1 generalized).
 
-**Roadmap / design docs (`docs/`)** — link these, don't duplicate them:
-- [`SERVER-SPLIT-AND-ROADMAP.md`](./SERVER-SPLIT-AND-ROADMAP.md) — **read for M1** (item ⑥; M1→M4 + pre-M1 decisions).
-- [`ROADMAP-PLAN.md`](./ROADMAP-PLAN.md) — the herdr-parity wave + shipped status (Wave 0/1, WS-1…WS-9).
-- [`PERF-AUDIT.md`](./PERF-AUDIT.md) — the freeze + RAM-creep investigation.
-- [`WORKTREE-WORKFLOW.md`](./WORKTREE-WORKFLOW.md) — worktree UX + the WS-9 nits.
-- [`SMOKE-TEST.md`](./SMOKE-TEST.md) — pre-release runtime checklist.
-- [`HERDR-PARITY.md`](./HERDR-PARITY.md) — the parity rationale/matrix.
-- [`DEV-BUILD.md`](./DEV-BUILD.md) — prod-vs-dev variant model + the `t-hub` identifier inventory.
+**Status UI (`apps/desktop/src/components/`)** — `StatusIndicator.tsx` (variants + `sessionStatusToVariant`/`terminalVariant` helpers), `StatusBadge.tsx`, `WorkspacesList.tsx`, `Sidebar.tsx`, `Titlebar.tsx`, `ThemeEditor.tsx` (status legend + closeToTray).
+
+**Roadmap / design docs (`docs/`)** — link, don't duplicate:
+- [`SERVER-SPLIT-AND-ROADMAP.md`](./SERVER-SPLIT-AND-ROADMAP.md) — **read for the M3 tail / M4** (item ⑥; §6 M1→M4 + the status table; §8 decisions).
+- [`ROADMAP-PLAN.md`](./ROADMAP-PLAN.md) — the herdr-parity wave + shipped status.
+- [`PERF-AUDIT.md`](./PERF-AUDIT.md) · [`WORKTREE-WORKFLOW.md`](./WORKTREE-WORKFLOW.md) · [`SMOKE-TEST.md`](./SMOKE-TEST.md) · [`HERDR-PARITY.md`](./HERDR-PARITY.md) · [`DEV-BUILD.md`](./DEV-BUILD.md).
