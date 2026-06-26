@@ -408,7 +408,10 @@ mod imp {
         None
     }
 
-    /// An axis-aligned hit rectangle in window-relative physical px (ints).
+    /// An axis-aligned hit rectangle in window-relative physical px (ints). `Copy`
+    /// (a 16-byte POD) so the `Option<Slot>` can be matched twice in `hit_test`
+    /// without a move (the `if let Some(r)` peek + the later `match`).
+    #[derive(Clone, Copy)]
     struct Slot {
         left: i32,
         top: i32,
