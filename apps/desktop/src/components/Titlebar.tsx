@@ -22,6 +22,7 @@ import { exit } from "@tauri-apps/plugin-process";
 import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
 import { closeSatellite, readSatelliteTab } from "../lib/windows";
+import { useAppName } from "../lib/appName";
 import brandIcon from "../assets/brand.png";
 
 /** Minimize the window, swallowing any IPC rejection. */
@@ -359,9 +360,11 @@ function SatelliteBar() {
   );
 }
 
-/** "T-Hub" wordmark led by the app/tray icon (item 9: the brand uses the same
- *  mark as the system tray). A window-drag handle. */
+/** App wordmark led by the app/tray icon (item 9: the brand uses the same mark as
+ *  the system tray). A window-drag handle. The text is the Tauri `productName` so
+ *  the side-by-side dev build reads "T-Hub Dev" here, matching the tray + title. */
 function Brand() {
+  const appName = useAppName();
   return (
     <div
       data-tauri-drag-region
@@ -378,7 +381,7 @@ function Brand() {
         className="text-xs font-semibold tracking-tight"
         style={{ color: "var(--th-fg)" }}
       >
-        T-Hub
+        {appName}
       </span>
     </div>
   );

@@ -90,7 +90,13 @@ fn reconnect_agent_bridge(app: &AppHandle) {
 /// the caller can decide how to surface it; startup should not abort on a tray
 /// failure (the app is still usable via its window).
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, "show", "Show T-Hub", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(
+        app,
+        "show",
+        format!("Show {}", crate::brand_name()),
+        true,
+        None::<&str>,
+    )?;
     // --- Recovery (light tier): unwedge without a full restart. ---
     let reload_item =
         MenuItem::with_id(app, "reload_window", "Reload window", true, None::<&str>)?;
@@ -120,7 +126,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     )?;
 
     let mut builder = TrayIconBuilder::new()
-        .tooltip("T-Hub")
+        .tooltip(crate::brand_name())
         .menu(&menu)
         // Left-click toggles to showing the window (the menu handles the rest),
         // so don't pop the menu on a plain left click.

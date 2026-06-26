@@ -56,6 +56,7 @@ import { claudeHooksInstalled } from "../ipc/client05";
 // live direct/prefixed binding, opens the palette to rebind, and resets defaults.
 import { useKeybindings } from "../store/keybindings";
 import { COMMANDS } from "../lib/commands";
+import { useAppName } from "../lib/appName";
 import { formatChord } from "../lib/chord";
 import { openKeyboardPalette } from "./CommandPalette";
 // Rules (WS-5b): the event→action engine's config surface. The list + CRUD live
@@ -485,10 +486,11 @@ function AboutGroup() {
   }, []);
 
   const version = runtimeVersion ?? pkg.version;
+  const appName = useAppName();
   return (
     <Group title="About" description="Which build of T-Hub you're running.">
       <Row label="App">
-        <span style={{ color: "var(--th-fg)" }}>T-Hub</span>
+        <span style={{ color: "var(--th-fg)" }}>{appName}</span>
       </Row>
       <Row label="Version">
         <span className="font-mono text-xs" style={{ color: "var(--th-fg)" }}>

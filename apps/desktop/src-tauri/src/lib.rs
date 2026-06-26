@@ -267,6 +267,21 @@ fn apply_devbuild_isolation() {
 #[cfg(not(feature = "devbuild"))]
 fn apply_devbuild_isolation() {}
 
+/// The user-facing app name — "T-Hub Dev" for the side-by-side dev build, "T-Hub"
+/// for production. Single source so the dev build is visibly distinct everywhere it
+/// is named (tray tooltip + menu; the window title is set from the same intent in
+/// `setup`, and the frontend wordmark reads the Tauri `productName` via `getName()`).
+pub fn brand_name() -> &'static str {
+    #[cfg(feature = "devbuild")]
+    {
+        "T-Hub Dev"
+    }
+    #[cfg(not(feature = "devbuild"))]
+    {
+        "T-Hub"
+    }
+}
+
 pub fn run() {
     // Must run before any `T_HUB_*`-backed LazyLock (socket/control/diag) is
     // first touched — i.e. before the Tauri builder spawns anything.
