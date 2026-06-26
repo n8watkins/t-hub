@@ -1372,6 +1372,26 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     let branch = arg_str(args, "branch");
     let tab_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
 
+    // #27: a REMOTE peer may create worktrees ONLY under the operator allowlist —
+    // this execs `git worktree add` SERVER-SIDE at peer-controlled paths (a write/
+    // exec surface). Loopback (the local frontend/MCP) is unrestricted. For a remote
+    // peer we substitute the SCOPED (normalized) paths so the security check and the
+    // git call can't diverge; the new worktree dir doesn't exist yet, hence
+    // scoped_create_path (checks the deepest existing ancestor).
+    let (repo_root, worktree_path) = if ctx.peer_is_loopback {
+        (repo_root, worktree_path)
+    } else {
+        let roots = files::remote_file_roots();
+        (
+            files::scoped_create_path(&repo_root, true, roots)?
+                .to_string_lossy()
+                .into_owned(),
+            files::scoped_create_path(&worktree_path, true, roots)?
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+
     // Create the worktree on disk first (shares git_worktree_add's impl). A git
     // failure short-circuits here — no tab/terminal is spawned for a failed add.
     let git_output = git::worktree_add(&repo_root, &worktree_path, branch.as_deref())?;
@@ -1431,6 +1451,23 @@ fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         .or_else(|| arg_str(args, "worktree_path"))
         .ok_or("remove_worktree requires a 'worktreePath' argument")?;
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // #27: a REMOTE peer may remove worktrees ONLY under the operator allowlist —
+    // this forwards a `git worktree remove` of a peer-controlled path to the UI.
+    // Loopback is unrestricted. (scoped_create_path also handles the existing path.)
+    let (repo_root, worktree_path) = if ctx.peer_is_loopback {
+        (repo_root, worktree_path)
+    } else {
+        let roots = files::remote_file_roots();
+        (
+            files::scoped_create_path(&repo_root, true, roots)?
+                .to_string_lossy()
+                .into_owned(),
+            files::scoped_create_path(&worktree_path, true, roots)?
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
 
     let forward = json!({
         "worktreePath": worktree_path,
@@ -2106,6 +2143,29 @@ mod tests {
         assert!(err.contains("repoRoot"), "got: {err}");
         let err = dispatch(&ctx, "create_worktree", &json!({"repoRoot": "/r"})).unwrap_err();
         assert!(err.contains("worktreePath"), "got: {err}");
+    }
+
+    #[test]
+    fn remote_worktree_ops_are_gated_to_the_allowlist() {
+        // A REMOTE peer (peer_is_loopback=false) with no T_HUB_REMOTE_FILE_ROOTS is
+        // refused BEFORE any git runs (#27) — the scope gate fires ahead of
+        // git::worktree_add and the UI forward. (test_ctx defaults to loopback, so
+        // the existing create/remove tests above keep exercising the unrestricted
+        // local path.)
+        let mut ctx = test_ctx("t");
+        ctx.peer_is_loopback = false;
+        for cmd in ["create_worktree", "remove_worktree"] {
+            let err = dispatch(
+                &ctx,
+                cmd,
+                &json!({"repoRoot": "/home/x/proj", "worktreePath": "/home/x/proj-wt/feature"}),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("disabled"),
+                "{cmd} should be gated for a remote peer; got: {err}"
+            );
+        }
     }
 
     #[test]

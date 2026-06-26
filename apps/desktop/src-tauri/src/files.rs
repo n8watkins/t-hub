@@ -1142,14 +1142,14 @@ pub fn remote_file_roots() -> &'static [PathBuf] {
 /// endgame). On the current Windows-host topology reading WSL via the 9P UNC bridge,
 /// symlink resolution is best-effort — see the WSL-symlink hardening task before
 /// trusting an allowlist on an UNtrusted tailnet.
-fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
-    let p = normalize(path);
-    if !enforce {
-        return Ok(p);
-    }
+/// Shared pre-check for the remote-scope gates: an empty allowlist denies all
+/// remote access (the default), and `..` is rejected outright (it could survive a
+/// `normalize` that skipped canonicalization and escape the under-root check).
+fn remote_precheck(p: &Path, allowed_roots: &[PathBuf]) -> Result<(), String> {
     if allowed_roots.is_empty() {
-        return Err("remote file access is disabled — set T_HUB_REMOTE_FILE_ROOTS to \
-                    a colon-separated list of project roots to enable it"
+        return Err("remote file/worktree access is disabled — set \
+                    T_HUB_REMOTE_FILE_ROOTS to a colon-separated list of allowed \
+                    roots to enable it"
             .to_string());
     }
     if p.components()
@@ -1160,17 +1160,33 @@ fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<P
             p.display()
         ));
     }
+    Ok(())
+}
+
+/// True if a CANONICALIZED `resolved` path equals or is nested under one of the
+/// (also-canonicalized) `allowed_roots`. Component-wise, so `/a/proj` does NOT match
+/// `/a/proj-secret`. A non-existent allowed root canonicalizes-fails ⇒ never matches
+/// (fail-closed: a misconfigured root can only deny, never widen).
+fn under_allowed_root(resolved: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .map(|r| resolved == r || resolved.starts_with(&r))
+            .unwrap_or(false)
+    })
+}
+
+fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
+    let p = normalize(path);
+    if !enforce {
+        return Ok(p);
+    }
+    remote_precheck(&p, allowed_roots)?;
     // Resolve symlinks (+ residual `.`/`..`) so the under-root check can't be escaped
     // via a symlink in an allowed root. Requires existence — a remote read of a
     // nonexistent path is pointless and unverifiable.
     let real = std::fs::canonicalize(&p)
         .map_err(|e| format!("cannot resolve {} on the host: {e}", p.display()))?;
-    let allowed = allowed_roots.iter().any(|root| {
-        std::fs::canonicalize(root)
-            .map(|r| real == r || real.starts_with(&r))
-            .unwrap_or(false)
-    });
-    if !allowed {
+    if !under_allowed_root(&real, allowed_roots) {
         return Err(format!(
             "path is outside the allowed remote roots ({}): {}",
             allowed_roots.len(),
@@ -1178,6 +1194,46 @@ fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<P
         ));
     }
     Ok(real)
+}
+
+/// Like [`scoped_path`] but for a path that may NOT exist yet — a worktree dir a
+/// remote peer asks to CREATE (`create_worktree`), or an existing one to remove.
+/// Rejects `..`, then requires the deepest EXISTING ancestor to canonicalize under
+/// an allowed root, so the (symlink-free, `..`-free) new tail lands inside it.
+/// Loopback (`enforce = false`) is unrestricted. Returns the normalized target.
+pub fn scoped_create_path(
+    path: &str,
+    enforce: bool,
+    allowed_roots: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let p = normalize(path);
+    if !enforce {
+        return Ok(p);
+    }
+    remote_precheck(&p, allowed_roots)?;
+    let mut ancestor: &Path = &p;
+    let resolved_ancestor = loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(c) => break c,
+            Err(_) => match ancestor.parent() {
+                Some(parent) => ancestor = parent,
+                None => {
+                    return Err(format!(
+                        "cannot resolve any existing ancestor of {}",
+                        p.display()
+                    ))
+                }
+            },
+        }
+    };
+    if !under_allowed_root(&resolved_ancestor, allowed_roots) {
+        return Err(format!(
+            "path is outside the allowed remote roots ({}): {}",
+            allowed_roots.len(),
+            p.display()
+        ));
+    }
+    Ok(p)
 }
 
 /// Control-channel capped text read (server-split #23 — the Files reader over the
@@ -1513,6 +1569,32 @@ mod tests {
 
         // LOOPBACK (enforce=false) bypasses the scope entirely — the parent lists fine.
         assert!(control_list_dir(&parent_str, false, false, &empty).is_ok());
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn scoped_create_path_confines_new_paths_to_the_allowlist() {
+        let root = make_fixture();
+        let root_str = root.to_string_lossy().into_owned();
+        let allow = vec![normalize(&root_str)];
+        let empty: Vec<PathBuf> = Vec::new();
+
+        // A NEW path under an allowed root (the leaf doesn't exist yet) is accepted —
+        // its deepest existing ancestor (the root) canonicalizes under the allowlist.
+        let new_under = format!("{root_str}/wt-new/sub");
+        assert!(scoped_create_path(&new_under, true, &allow).is_ok());
+
+        // Empty allowlist => denied (the default); outside the root => denied.
+        assert!(scoped_create_path(&new_under, true, &empty).is_err());
+        let outside = root.parent().unwrap().join("wt-elsewhere");
+        let outside_str = outside.to_string_lossy().into_owned();
+        assert!(scoped_create_path(&outside_str, true, &allow).is_err());
+        // `..` is refused outright.
+        assert!(scoped_create_path(&format!("{root_str}/../escape"), true, &allow).is_err());
+
+        // Loopback (enforce=false) is unrestricted.
+        assert!(scoped_create_path(&outside_str, false, &empty).is_ok());
 
         cleanup(&root);
     }
