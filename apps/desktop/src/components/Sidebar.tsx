@@ -385,6 +385,98 @@ function ProviderLabel({ name }: { name: string }) {
   );
 }
 
+/** Remaining-% color: red nearly out, amber low, else healthy green. */
+function usageLeftColor(left: number): string {
+  if (left <= 10) return "#f87171";
+  if (left <= 30) return "#fbbf24";
+  return "#34d399";
+}
+/** RAM-used color by fraction (matches WslHealth's thresholds). */
+function ramUsedColor(frac: number): string {
+  if (frac >= 0.9) return "#f87171";
+  if (frac >= 0.75) return "#fbbf24";
+  return "var(--th-fg-muted)";
+}
+/** Remaining % (100 − used), rounded, or null when the used % is unknown. */
+function leftPct(usedPct: number | null | undefined): number | null {
+  return usedPct == null ? null : Math.max(0, Math.round(100 - usedPct));
+}
+
+/**
+ * Compact stats for the COLLAPSED (rail) sidebar: the headline Claude/Codex weekly
+ * usage-remaining % and a WSL RAM/load readout, stacked to fit the ~48px rail. The
+ * full sidebar shows the expanded Usage + WSL strips; this keeps the key numbers
+ * visible when collapsed (so you don't have to expand just to glance at them).
+ */
+function RailStats() {
+  const { metrics } = useAgentTelemetry();
+  const usage = useClaudeUsage();
+  const codex = useCodexUsage();
+
+  const wkClaude = usage?.ok ? leftPct(usage.weekUsedPct) : null;
+  const wkCodex = codex?.ok ? leftPct(codex.secondary?.usedPercent ?? null) : null;
+  const memFrac = metrics
+    ? usedFraction(metrics.mem_total_kib, metrics.mem_available_kib)
+    : null;
+  const load1 = metrics?.load_avg?.[0] ?? null;
+  const loadWarn =
+    !!metrics &&
+    metrics.cpu_count > 0 &&
+    load1 != null &&
+    load1 / metrics.cpu_count >= 1;
+
+  return (
+    <div
+      className="mt-auto flex w-full flex-col items-center gap-2 px-1 pb-2 pt-2 text-[9px] tabular-nums"
+      style={{ color: "var(--th-fg-muted)" }}
+    >
+      {wkClaude != null && (
+        <div
+          className="flex flex-col items-center gap-0.5"
+          title={`Claude weekly usage: ${wkClaude}% left`}
+        >
+          <ClaudeIcon
+            size={12}
+            className="shrink-0"
+            style={{ color: "#D97757" }}
+            title="Claude weekly usage"
+          />
+          <span style={{ color: usageLeftColor(wkClaude) }}>{wkClaude}%</span>
+        </div>
+      )}
+      {wkCodex != null && (
+        <div
+          className="flex flex-col items-center gap-0.5"
+          title={`Codex weekly usage: ${wkCodex}% left`}
+        >
+          <CodexIcon size={12} className="shrink-0" title="Codex weekly usage" />
+          <span style={{ color: usageLeftColor(wkCodex) }}>{wkCodex}%</span>
+        </div>
+      )}
+      {memFrac != null && (
+        <div
+          className="flex flex-col items-center gap-0.5"
+          title={`WSL RAM ${(memFrac * 100).toFixed(0)}% used${
+            load1 != null
+              ? ` · load ${load1.toFixed(2)} (${metrics?.cpu_count} cores)`
+              : ""
+          }`}
+        >
+          <span className="text-[8px] uppercase tracking-wide opacity-70">ram</span>
+          <span style={{ color: ramUsedColor(memFrac) }}>
+            {(memFrac * 100).toFixed(0)}%
+          </span>
+          {load1 != null && (
+            <span style={{ color: loadWarn ? "#fbbf24" : undefined }}>
+              {load1.toFixed(1)}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /**
  * Rail mode (#1): a thin ~48px iconic strip — "barely showing" but still useful.
  * It stacks one square per workspace tab (its initial + a tiny tile count) so the
@@ -470,16 +562,9 @@ function SidebarRail({
           </div>
         )}
       </div>
-      {/* Section hints: glyphs standing in for the full sidebar's two lists. */}
-      <div
-        className="mt-auto flex flex-col items-center gap-1 px-1 pb-2 pt-2 text-sm"
-        style={{ color: "var(--th-fg-muted)" }}
-        aria-hidden
-      >
-        <span title="Projects">▦</span>
-        <span title="Recent">↺</span>
-        <span title="WSL">◷</span>
-      </div>
+      {/* Collapsed stats: the headline Claude/Codex usage-remaining + WSL RAM/load,
+          so the rail stays informative without expanding. */}
+      <RailStats />
     </aside>
   );
 }
