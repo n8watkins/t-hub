@@ -20,8 +20,13 @@ use crate::tmux;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
+// Wire-contract enum mirroring the frontend `TerminalState` (ipc/types.ts). The
+// backend doesn't emit every variant yet — `Starting`/`Error` are part of the
+// contract but currently unconstructed Rust-side — so allow dead variants rather
+// than diverge from the frontend's type.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub enum TerminalState {
     Starting,
     Live,

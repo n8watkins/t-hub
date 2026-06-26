@@ -387,7 +387,7 @@ fn parse_worktree_list(stdout: &str) -> Vec<WorktreeInfo> {
 
     // Flush the in-progress record (if it has a path) into `out`, marking it
     // linked iff it isn't the first record we've seen.
-    let mut flush = |path: &mut Option<String>, branch: &mut Option<String>, out: &mut Vec<WorktreeInfo>| {
+    let flush = |path: &mut Option<String>, branch: &mut Option<String>, out: &mut Vec<WorktreeInfo>| {
         if let Some(p) = path.take() {
             let is_linked = !out.is_empty();
             out.push(WorktreeInfo {
@@ -659,6 +659,17 @@ pub(crate) fn worktree_add(cwd: &str, path: &str, branch: Option<&str>) -> Resul
                  another worktree (a branch can be checked out in only one \
                  worktree at a time). Pick a different branch or remove the other \
                  worktree first."
+            ));
+        }
+        // A leftover directory at the target path (a stale dir, or one left by a
+        // prior failed/aborted run) makes git refuse with a raw "already exists".
+        // Surface an ACTIONABLE message — the user just needs to remove it or pick
+        // a different branch name (which derives a different dir).
+        if stderr.to_lowercase().contains("already exists") {
+            return Err(format!(
+                "git worktree add failed: a directory already exists at '{path}'. \
+                 Remove that leftover directory, or pick a different branch name, \
+                 and try again."
             ));
         }
         let detail = if !stderr.trim().is_empty() {
