@@ -348,6 +348,78 @@ impl AgentBridge {
         Ok(())
     }
 
+    /// Tear down the live connection so a fresh [`connect`](Self::connect) can't
+    /// leak the old reader thread or orphan in-flight senders. Safe to call when
+    /// already disconnected (it's a no-op then). Used by [`reconnect`](Self::reconnect)
+    /// and callable directly from a tray "reconnect" action.
+    ///
+    /// Order matters (an earlier audit flagged a reader-thread / pending-sender
+    /// leak on reconnect), so we do, in sequence:
+    ///   1. **Take** the old `TransportHandles` out of `self.inner.transport`
+    ///      (leaving it `None`), so any concurrent `request()` immediately sees
+    ///      "not connected" rather than writing to a dying stdin.
+    ///   2. **Clear the `pending` correlation map.** Dropping each one-shot
+    ///      `Sender` wakes its blocked `request()` caller right away (its
+    ///      `recv_timeout` returns `Err` instead of hanging the full 10 s), so no
+    ///      in-flight sender is orphaned waiting on a reply that can never come.
+    ///   3. **Kill the child** (`Child::kill`). Closing its stdout is what makes
+    ///      the detached `agent-reader` thread hit EOF and exit — that's how the
+    ///      old reader thread is reclaimed. `spawn_reader` returns no `JoinHandle`
+    ///      (the thread is detached and self-terminating on EOF), so we cannot
+    ///      `join()` it; killing the child is the deterministic teardown signal.
+    ///      We then `wait()` to reap the zombie.
+    ///
+    /// LIMITATION: the reader thread is detached, so we can't *block* until it has
+    /// fully unwound — we kill the child (its EOF trigger) and rely on it exiting
+    /// promptly. In practice it returns from `BufReader::lines()` the moment stdout
+    /// closes. Because each `connect()` builds a brand-new `pending` map + reader
+    /// thread (nothing is shared with the previous connection), a not-yet-exited
+    /// old reader can only touch its OWN now-empty map — it can't corrupt the new
+    /// connection's state.
+    pub fn disconnect(&self) {
+        // 1. Detach the live transport so new requests can't use it.
+        let old = self.inner.transport.lock().take();
+        let Some(handles) = old else {
+            // Already disconnected: still normalize the state and bail.
+            self.set_state(ConnectionState::Disconnected);
+            return;
+        };
+
+        // 2. Clear pending correlations: dropping the senders unblocks any waiting
+        //    request() callers (recv_timeout -> Err) instead of orphaning them.
+        handles.pending.lock().clear();
+
+        // 3. Kill + reap the child so its stdout closes and the detached reader
+        //    thread hits EOF and exits. Best-effort: a kill on an already-dead
+        //    child is a benign error.
+        {
+            let mut child = handles.child.lock();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        // Drop this Arc reference. If a concurrent request() still holds a clone,
+        // the struct's memory outlives this call, but the child is already killed
+        // + reaped above, so teardown is complete regardless; the new connect()
+        // allocates entirely fresh handles either way.
+        drop(handles);
+        self.set_state(ConnectionState::Disconnected);
+    }
+
+    /// Re-establish the agent connection without touching terminals: safely tear
+    /// the old connection down (see [`disconnect`](Self::disconnect)) and then
+    /// [`connect`](Self::connect) again. Fixes a wedged bridge ("supervision /
+    /// cost stopped updating") where the reader thread died or the agent went
+    /// away, with no full app restart.
+    ///
+    /// The journal cursor is intentionally preserved across the reconnect, so the
+    /// fresh handshake only replays entries newer than what we already consumed
+    /// (no duplicate ingestion).
+    pub fn reconnect(&self, distro: &str) -> Result<(), String> {
+        self.disconnect();
+        self.connect(distro)
+    }
+
     /// Send a request and await its correlated response (blocking, 10 s timeout).
     ///
     /// Allocates the next [`t_hub_protocol::RequestId`] from an atomic
