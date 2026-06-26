@@ -46,6 +46,17 @@ export function registerWorktreePromptOpener(
   openWorktreePrompt = fn;
 }
 
+let openWorktreesList: ((cwd: string | undefined) => void) | null = null;
+/** WorktreesList registers its opener here on mount (App root). The executor
+ *  passes the focused tile's LIVE cwd so the modal can resolve that repo's
+ *  worktrees. Mirrors registerWorktreePromptOpener (no import from the component
+ *  → no cycle). */
+export function registerWorktreesListOpener(
+  fn: ((cwd: string | undefined) => void) | null,
+): void {
+  openWorktreesList = fn;
+}
+
 let revealSidebarAndFocus: (() => void) | null = null;
 /**
  * Canvas registers the side effect that, when focus moves to the sidebar region,
@@ -127,6 +138,16 @@ function doNewWorktreeWorkspace(): void {
   openWorktreePrompt?.(cwd);
 }
 
+/** Open the WORKTREES LIST (WS-9e) — re-open or remove an existing worktree.
+ *  Capture the focused tile's LIVE cwd (the repo to list) and open the modal; it
+ *  resolves the repo via gitWorktreeList and drives the rest. A missing cwd is
+ *  fine — the modal resolves to a "not in a repo" empty state. */
+function doOpenWorktreesList(): void {
+  const id = useWorkspace.getState().focusedId;
+  const cwd = id ? useWorkspace.getState().terminals[id]?.cwd : undefined;
+  openWorktreesList?.(cwd);
+}
+
 /** The registry: every CommandId -> its handler. The Record type makes this
  *  exhaustive — a new CommandId won't compile until it has a handler here. */
 const HANDLERS: Record<CommandId, () => void> = {
@@ -150,6 +171,7 @@ const HANDLERS: Record<CommandId, () => void> = {
   commandPalette: () => openPalette?.(),
   newPlainWorkspace: doNewPlainWorkspace,
   newWorktreeWorkspace: doNewWorktreeWorkspace,
+  openWorktreesList: doOpenWorktreesList,
 };
 
 /** Run a command by id. Safe to call from any trigger (Canvas keydown, the

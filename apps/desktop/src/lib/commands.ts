@@ -38,6 +38,7 @@ export const COMMAND_IDS = [
   "commandPalette",
   "newPlainWorkspace",
   "newWorktreeWorkspace",
+  "openWorktreesList",
 ] as const;
 
 export type CommandId = (typeof COMMAND_IDS)[number];
@@ -84,6 +85,12 @@ export const COMMANDS: CommandMeta[] = [
     label: "New worktree workspace",
     description:
       "Branch the focused repo into a sibling worktree and open it in a new tab",
+    category: "Workspaces",
+  },
+  {
+    id: "openWorktreesList",
+    label: "List worktrees",
+    description: "Show the focused repo's worktrees to re-open or remove",
     category: "Workspaces",
   },
   {

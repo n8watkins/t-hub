@@ -76,6 +76,9 @@ const DEFAULT_PREFIXED: Partial<Record<CommandId, string>> = {
   toggleFocusRegion: "o", // tmux: prefix-o = cycle panes
   cycleTileNext: "n",
   cycleTilePrev: "p", // (overridden below — kept distinct from palette)
+  // WS-9e: list/re-open worktrees. `l` = "list" — free (the seeded set above uses
+  // c/w/t/x/p/o/n/b). Prefix-only by default (no direct chord); rebindable.
+  openWorktreesList: "l",
 };
 // Keep the seeded prefixed map free of duplicate keys (the last writer in the
 // literal above would otherwise silently win). `p` is the palette; give cycle-

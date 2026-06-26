@@ -6,6 +6,7 @@ import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Side
 import { Titlebar } from "./components/Titlebar";
 import { CommandPalette, PrefixHint } from "./components/CommandPalette";
 import { WorktreePrompt } from "./components/WorktreePrompt";
+import { WorktreesList } from "./components/WorktreesList";
 import { useSettings } from "./store/settings";
 import { useWorkspace } from "./store/workspace";
 import { initWindowSync, isSatellite } from "./lib/windows";
@@ -328,6 +329,9 @@ export default function App() {
       {/* WS-9c: the worktree branch-name prompt, opened by newWorktreeWorkspace
           (default Ctrl/Cmd+B w). Renders nothing until opened. */}
       <WorktreePrompt />
+      {/* WS-9e: the worktrees list (re-open / remove), opened by openWorktreesList
+          (default Ctrl/Cmd+B l). Renders nothing until opened. */}
+      <WorktreesList />
       {/* Top-edge reveal hot zone — only while auto-hide is active AND the bar is
           hidden, so it never steals clicks from the visible bar (#7/#8). */}
       {hideable && !barShown && (
