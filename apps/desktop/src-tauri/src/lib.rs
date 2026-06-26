@@ -19,6 +19,7 @@ mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.
 mod git; // git awareness for the Files panel: branch/worktree info + commit
 // ----------------------
 mod model; // data-model structs (PRD §8)
+mod remote_pty; // server-split M2a: client-side remote-PTY transport (terminal tiles over the control socket)
 // --- feat/projects-sidebar (Agent A) ---------------------------------------
 mod recent; // recent recallable Claude sessions for the sidebar "Recent" list
 // ---------------------------------------------------------------------------
@@ -274,6 +275,11 @@ pub fn run() {
         // `plugins.notification` block in tauri.conf.json.
         .plugin(tauri_plugin_notification::init())
         .manage(TerminalManager::default())
+        // Server-split M2a: live remote-PTY connections (terminal tiles streamed
+        // over the control socket) live here instead of the in-process
+        // TerminalManager. Both are managed during the migration; the streaming
+        // path (attach/write/resize/close) is now backed by this one.
+        .manage(remote_pty::RemotePtyManager::default())
         .manage(AppState::default())
         .manage(files::FileIndexState::new())
         // Live theming state, seeded from the persisted theme file if present.

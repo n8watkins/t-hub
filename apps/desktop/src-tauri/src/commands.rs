@@ -4,21 +4,16 @@
 //! frontend contract. The bodies below are stubs implemented by the Rust backend
 //! subagent (task #9); they compile and return errors until then.
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
+use crate::control_client::ControlEndpoint;
 use crate::events::{self, StateEvent};
-use crate::pty::{self, PtySession};
+use crate::pty::PtySession;
+use crate::remote_pty::{RemotePty, RemotePtyManager};
 use crate::tmux;
-
-/// Default terminal geometry used when a tile is spawned before the frontend
-/// has measured the xterm viewport. The first real `resize_terminal` from the
-/// UI corrects this immediately.
-const DEFAULT_COLS: u16 = 80;
-const DEFAULT_ROWS: u16 = 24;
 
 // Wire-contract enum mirroring the frontend `TerminalState` (ipc/types.ts). The
 // backend doesn't emit every variant yet — `Starting`/`Error` are part of the
@@ -70,9 +65,41 @@ pub struct TerminalInfo {
 }
 
 /// App-wide registry of live PTY/tmux-backed terminals, keyed by T-Hub id.
+///
+/// As of server-split M2a the streaming path (attach/write/resize/close) is
+/// backed by [`RemotePtyManager`] (terminal tiles over the control socket); this
+/// in-process manager is retained but no longer drives those commands. It (and
+/// [`pty::spawn_attach_client`]) stay defined so the revert is a one-liner and the
+/// reaping unit tests below keep proving the tmux-vs-map invariant.
 #[derive(Default)]
 pub struct TerminalManager {
+    // Retained for the M2a revert path; no command reads it now (the streaming
+    // commands are backed by `RemotePtyManager`). `#[allow(dead_code)]` keeps the
+    // intentional retention from warning.
+    #[allow(dead_code)]
     pub sessions: Mutex<HashMap<String, PtySession>>,
+}
+
+/// Resolve the tmux session name that backs terminal `id`. The id IS the tmux
+/// session's `th_`-prefixed suffix (see [`spawn_terminal`]), capped at 8 chars,
+/// so `th_<id[..8]>` reconstructs it deterministically — identical to the
+/// derivation the old in-process path used in `attach_terminal`/`kill_terminal`.
+fn tmux_target(id: &str) -> String {
+    format!("th_{}", &id[..id.len().min(8)])
+}
+
+/// Read the managed [`ControlEndpoint`] (addr + token) installed by `setup()`
+/// after the control listener binds. Terminal commands run on user action (well
+/// after setup), so it is normally present; if a command somehow runs before it
+/// exists we return a clear error rather than panicking on the missing state.
+fn control_endpoint(app: &tauri::AppHandle) -> Result<ControlEndpoint, String> {
+    app.try_state::<ControlEndpoint>()
+        .map(|s| s.inner().clone())
+        .ok_or_else(|| {
+            "control endpoint is not available yet (the control listener has not \
+             finished binding); retry once the app has finished starting"
+                .to_string()
+        })
 }
 
 /// Decide which in-memory map entries are stale and must be evicted, given the
@@ -203,7 +230,7 @@ fn resolve_pane_command(opts: &SpawnOptions) -> Option<String> {
 #[tauri::command]
 pub async fn spawn_terminal(
     app: tauri::AppHandle,
-    state: tauri::State<'_, TerminalManager>,
+    remote: tauri::State<'_, RemotePtyManager>,
     opts: SpawnOptions,
 ) -> Result<TerminalInfo, String> {
     // The terminal id IS the tmux session's own suffix, so the id is stable and
@@ -228,26 +255,21 @@ pub async fn spawn_terminal(
     tmux::new_session(&tmux_session, &cwd, command.as_deref())
         .map_err(|e| format!("failed to create tmux session: {e}"))?;
 
-    // Spawn the PTY attach client that streams this session to the frontend. If
-    // it fails, tear down the tmux session we just created so we don't leak it.
-    let session = match pty::spawn_attach_client(
-        &app,
-        &id,
-        &tmux_session,
-        &cwd,
-        DEFAULT_COLS,
-        DEFAULT_ROWS,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tmux::kill_session(&tmux_session);
-            return Err(e);
-        }
-    };
+    // Mark this id FRESH so its first `attach_terminal` returns empty scrollback
+    // (the frontend then draws one clean prompt via Ctrl-L instead of replaying the
+    // reflow-prone capture). A later reattach-after-close is NOT fresh → real
+    // scrollback. Preserves the in-process path's `has_live` fresh-vs-reattach signal.
+    remote.fresh.lock().insert(id.clone());
 
-    state.sessions.lock().insert(id.clone(), session);
-
-    // The terminal is now live and streaming.
+    // Server-split M2a: spawn NO local PTY here. The detached tmux session is now
+    // ready; the frontend's mount flow calls `attach_terminal`, which opens a
+    // `RemotePty` against the control socket and begins streaming. (Previously this
+    // spawned an in-process `pty::spawn_attach_client` into the TerminalManager —
+    // that step moved to `attach_terminal` over the wire.)
+    //
+    // The Live state event is still emitted here so the freshly-created tile flips
+    // out of its "starting" placeholder immediately, exactly as before; the
+    // subsequent `attach_terminal` re-emits Live idempotently once it's streaming.
     let _ = app.emit(
         events::STATE,
         &StateEvent {
@@ -268,59 +290,69 @@ pub async fn spawn_terminal(
 #[tauri::command]
 pub async fn attach_terminal(
     app: tauri::AppHandle,
-    state: tauri::State<'_, TerminalManager>,
+    remote: tauri::State<'_, RemotePtyManager>,
     id: String,
     cols: u16,
     rows: u16,
 ) -> Result<String, String> {
-    // Find the tmux session name for this id. It may be known via an existing
-    // (possibly detached) in-memory PtySession; otherwise we reconstruct it
-    // from the id, which is how `th_{prefix}` is derived in `spawn_terminal`.
-    let tmux_session = {
-        let sessions = state.sessions.lock();
-        match sessions.get(&id) {
-            Some(existing) => existing.tmux_session.clone(),
-            None => format!("th_{}", &id[..id.len().min(8)]),
-        }
-    };
+    // Reconstruct the tmux session name from the id (the `th_<id[..8]>` derivation
+    // `spawn_terminal` uses). Server-split M2a: there is no in-process PtySession to
+    // read it off — the RemotePtyManager keys connections by id directly.
+    let tmux_session = tmux_target(&id);
 
     // The tmux session must still exist to (re)attach; if it's gone the terminal
-    // has been killed or exited and there is nothing to attach to.
+    // has been killed or exited and there is nothing to attach to. (The server-side
+    // `serve_pty_attach` re-checks this too, but verifying here lets us return the
+    // same clear error before opening a socket.)
     if !tmux::has_session(&tmux_session) {
         return Err(format!(
             "tmux session {tmux_session} for terminal {id} no longer exists"
         ));
     }
 
-    // Ensure a live PTY client exists for this id. If one is already present
-    // (the tile is visible and streaming) we keep it and just re-seed xterm with
-    // the current scrollback. If not (first attach, or re-attach after
-    // `close_terminal` detached it), create a fresh attach client.
-    let has_live = state.sessions.lock().contains_key(&id);
+    // If a RemotePty already streams this id (the tile is visible), keep it and
+    // just resize it to the freshly-mounted xterm geometry — no re-seed (matching
+    // the old `has_live` branch, which returned empty scrollback). We hold the
+    // manager lock only for the in-memory resize-frame write (a non-blocking socket
+    // write of a tiny frame), never across a connect.
     {
-        if !has_live {
-            // Best-effort cwd for the Windows attach path; the pane already has
-            // its own cwd, so an empty string is acceptable on Unix.
-            let cwd = std::env::var("HOME").unwrap_or_default();
-            let session =
-                pty::spawn_attach_client(&app, &id, &tmux_session, &cwd, cols, rows)?;
-            state.sessions.lock().insert(id.clone(), session);
-        } else {
-            // Already streaming — make sure the geometry matches the freshly
-            // mounted xterm so the pane isn't stale.
-            if let Some(session) = state.sessions.lock().get_mut(&id) {
-                let _ = session.resize(cols, rows);
-            }
+        let mut conns = remote.conns.lock();
+        if let Some(conn) = conns.get_mut(&id) {
+            let _ = conn.resize(cols, rows);
+            // Already streaming — re-affirm Live (idempotent) and return empty
+            // scrollback (no re-seed), exactly as the in-process path did.
+            let _ = app.emit(
+                events::STATE,
+                &StateEvent {
+                    id: id.clone(),
+                    state: TerminalState::Live,
+                },
+            );
+            return Ok(String::new());
         }
     }
 
-    // A successful attach means a PTY client is now bound to this session, so the
-    // terminal is unambiguously Live. Emit on BOTH paths (fresh client AND an
-    // already-streaming reattach): after a reload the frontend may have seeded
-    // this terminal from `list_terminals` as Detached (no in-memory client at
-    // list time) or never seeded it at all, and without this transition the tile
-    // would stay stuck on its initial dot (bug #16). Idempotent for a tile that
-    // was already Live.
+    // First attach (or re-attach after `close_terminal` detached it): open a new
+    // RemotePty over the control socket. `connect` performs the attach_pty
+    // handshake and returns the server's base64 scrollback (its opening frame),
+    // which we hand straight back to the frontend — the same wire shape the old
+    // path returned (a base64 string of the pane scrollback).
+    let endpoint = control_endpoint(&app)?;
+    let (conn, scrollback_b64) =
+        RemotePty::connect(&app, &endpoint.addr, &endpoint.token, &id, cols, rows)?;
+    remote.conns.lock().insert(id.clone(), conn);
+
+    // Fresh spawn (spawn_terminal marked it) → return EMPTY scrollback so the
+    // frontend draws a clean prompt via Ctrl-L instead of replaying the capture's
+    // reflow cascade. A reattach (not in `fresh`) → the real scrollback, to restore
+    // history. Mirrors the old `has_live` ? empty : capture_pane branch.
+    let was_fresh = remote.fresh.lock().remove(&id);
+
+    // A successful attach binds a remote PTY to this session, so the terminal is
+    // unambiguously Live. After a reload the frontend may have seeded this terminal
+    // as Detached (no live conn at list time) or never seeded it; without this
+    // transition the tile would stay stuck on its initial dot (bug #16). Idempotent
+    // for a tile that was already Live.
     let _ = app.emit(
         events::STATE,
         &StateEvent {
@@ -329,106 +361,112 @@ pub async fn attach_terminal(
         },
     );
 
-    // Seed xterm. A true reattach replays full scrollback history. A FRESH spawn
-    // is NOT seeded (empty): the pane's prompt may not be drawn yet (zsh startup
-    // races attach) and any visible reflow from the 80x24 -> real-size resize
-    // would replay as a "cascade" of duplicate prompts. The frontend instead
-    // forces a single clean redraw (Ctrl-L) once it has subscribed.
-    let scrollback: Vec<u8> = if has_live {
-        Vec::new()
+    Ok(if was_fresh {
+        String::new()
     } else {
-        tmux::capture_pane(&tmux_session)
-            .map_err(|e| format!("failed to capture scrollback: {e}"))?
-    };
-    Ok(STANDARD.encode(scrollback))
+        scrollback_b64
+    })
 }
 
 #[tauri::command]
 pub async fn write_terminal(
-    state: tauri::State<'_, TerminalManager>,
+    remote: tauri::State<'_, RemotePtyManager>,
     id: String,
     data: String,
 ) -> Result<(), String> {
-    let mut sessions = state.sessions.lock();
-    let session = sessions
+    // Write a `{"write"}` frame to the remote PTY. The lock is held only for the
+    // small frame write (a non-blocking loopback send), never across a connect.
+    let mut conns = remote.conns.lock();
+    let conn = conns
         .get_mut(&id)
         .ok_or_else(|| format!("no live terminal {id}"))?;
-    session
-        .write(data.as_bytes())
+    conn.write(data.as_bytes())
         .map_err(|e| format!("failed to write to terminal {id}: {e}"))
 }
 
 #[tauri::command]
 pub async fn resize_terminal(
-    state: tauri::State<'_, TerminalManager>,
+    remote: tauri::State<'_, RemotePtyManager>,
     id: String,
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let mut sessions = state.sessions.lock();
-    let session = sessions
+    let mut conns = remote.conns.lock();
+    let conn = conns
         .get_mut(&id)
         .ok_or_else(|| format!("no live terminal {id}"))?;
-    session.resize(cols, rows)
+    conn.resize(cols, rows)
 }
 
 #[tauri::command]
 pub async fn close_terminal(
-    state: tauri::State<'_, TerminalManager>,
+    remote: tauri::State<'_, RemotePtyManager>,
     id: String,
 ) -> Result<(), String> {
-    // Detach the PTY client and remove it from the map, but DO NOT kill the
-    // tmux session: the backing process keeps running so the terminal survives
-    // the UI closing the tile. Re-attaching later via `attach_terminal` spins up
-    // a fresh PTY client against the still-alive session.
-    let session = state.sessions.lock().remove(&id);
-    if let Some(session) = session {
-        // Kills the attach client, drops master/writer, joins the reader thread.
-        session.detach();
+    // Detach the remote PTY and remove it from the map, but DO NOT kill the tmux
+    // session: the backing process keeps running so the terminal survives the UI
+    // closing the tile. Re-attaching later via `attach_terminal` opens a fresh
+    // RemotePty against the still-alive session.
+    //
+    // We `remove` the conn (releasing the lock) BEFORE `detach`, so the manager
+    // Mutex is never held across the blocking socket shutdown + reader-thread join.
+    let conn = remote.conns.lock().remove(&id);
+    if let Some(conn) = conn {
+        // Shuts down the socket (the server detaches; tmux survives) and joins the
+        // reader thread.
+        conn.detach();
     }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn kill_terminal(
-    state: tauri::State<'_, TerminalManager>,
+    remote: tauri::State<'_, RemotePtyManager>,
     id: String,
 ) -> Result<(), String> {
-    // Stop for real: kill the tmux session (terminating its process tree), then
-    // drop the PTY client and remove it from the map.
-    let session = state.sessions.lock().remove(&id);
+    // Stop for real: detach the remote PTY AND kill the tmux session (terminating
+    // its process tree). Remove the conn (releasing the lock) before any blocking
+    // socket op so the Mutex is never held across I/O.
+    let conn = remote.conns.lock().remove(&id);
 
-    // Derive the session name from the live entry if present, else from the id.
-    let tmux_session = session
-        .as_ref()
-        .map(|s| s.tmux_session.clone())
-        .unwrap_or_else(|| format!("th_{}", &id[..id.len().min(8)]));
+    // The tmux session name is reconstructed from the id (the RemotePty doesn't
+    // carry it); this is the same `th_<id[..8]>` derivation as everywhere else.
+    let tmux_session = tmux_target(&id);
 
     let kill_result = tmux::kill_session(&tmux_session)
         .map_err(|e| format!("failed to kill tmux session {tmux_session}: {e}"));
 
-    // Dropping the PtySession kills the attach client and joins the reader; do
-    // this regardless of whether the tmux kill reported an error.
-    drop(session);
+    // Detaching the RemotePty shuts down the socket + joins the reader; do this
+    // regardless of whether the tmux kill reported an error. (Killing the tmux
+    // session also closes the server-side attach client, so the connection would
+    // EOF on its own; detaching here makes the teardown prompt + deterministic.)
+    if let Some(conn) = conn {
+        conn.detach();
+    }
 
     kill_result
 }
 
 #[tauri::command]
 pub async fn list_terminals(
-    state: tauri::State<'_, TerminalManager>,
+    remote: tauri::State<'_, RemotePtyManager>,
 ) -> Result<Vec<TerminalInfo>, String> {
     // Snapshot what the reconciliation needs from the in-memory map BEFORE we
     // hop to a blocking thread: a `tmux_session -> canonical id` map. The closure
     // is `'static`, so it can't borrow `&State`; this owned snapshot is all the
     // matching logic uses (recover the canonical id, and Live vs Detached based
-    // on whether this UI holds a client for the session). Lock is released the
+    // on whether this UI holds a connection for the session). Lock is released the
     // instant this block ends — never held across the blocking tmux walk.
+    //
+    // Server-split M2a: liveness is "this UI holds a RemotePty conn for the id".
+    // The conn map is keyed by id (it doesn't carry the tmux session name), so we
+    // reconstruct each one's session via the `th_<id[..8]>` derivation, matching
+    // how every other command resolves it.
     let live_clients: std::collections::HashMap<String, String> = {
-        let sessions = state.sessions.lock();
-        sessions
-            .values()
-            .map(|s| (s.tmux_session.clone(), s.id.clone()))
+        let conns = remote.conns.lock();
+        conns
+            .keys()
+            .map(|id| (tmux_target(id), id.clone()))
             .collect()
     };
 
@@ -515,13 +553,13 @@ pub async fn list_terminals(
     .await
     .map_err(|e| format!("list_terminals task failed: {e}"))??;
 
-    // Self-reap genuinely-EXITED terminals: any in-memory map entry whose tmux
-    // session is no longer in the live set has had its process tree end (tmux
-    // tore the session down), so the reader thread already emitted `exit` +
-    // `state=Exited` but the dead `PtySession` (retained master-PTY fd + joined
-    // reader handle) still lingers in the map until the UI happens to call
-    // `close_terminal`/`kill_terminal`. Evict it here, piggybacking on this
-    // existing 5s reconcile.
+    // Self-reap genuinely-EXITED terminals: any in-memory conn whose tmux session
+    // is no longer in the live set has had its process tree end (tmux tore the
+    // session down), so the server-side attach client EOF'd, the reader thread
+    // already emitted `exit` + `state=Exited`, and the connection dropped — yet the
+    // dead `RemotePty` (joined reader handle) still lingers in the map until the UI
+    // happens to call `close_terminal`/`kill_terminal`. Evict it here, piggybacking
+    // on this existing 5s reconcile.
     //
     // SAFETY — a DETACHED-but-running terminal is NEVER reaped: `close_terminal`
     // already removed it from the map (nothing to evict) and intentionally kept
@@ -531,35 +569,36 @@ pub async fn list_terminals(
     // we do NOT touch tmux here, only drop the already-dead in-memory handle.
     let stale_ids = stale_session_ids(&reap_candidates, &live_sessions);
     if !stale_ids.is_empty() {
-        // The tmux session we judged stale for each candidate id. We re-confirm
-        // UNDER THE LOCK that the entry STILL backs that same (now-dead) session
-        // before dropping it, so a concurrent op that replaced the entry under this
-        // id can never make us drop a LIVE PtySession (belt-and-braces: ids are
-        // unique today, so a replacement can't reuse an id — this just makes the
-        // invariant explicit instead of removing by id alone).
+        // Re-confirm UNDER THE LOCK that the entry we're about to drop STILL maps to
+        // the same (now-dead) tmux session before dropping it. The conn map doesn't
+        // store the session name, but the id→session derivation is deterministic
+        // (`tmux_target`), so re-deriving it and comparing to the candidate's
+        // recorded session makes the "still the same dead entry" invariant explicit
+        // (belt-and-braces: ids are unique today, so a replacement can't reuse an id).
         let expected: std::collections::HashMap<&str, &str> = reap_candidates
             .iter()
             .map(|(id, t)| (id.as_str(), t.as_str()))
             .collect();
         let mut dead = Vec::new();
         {
-            let mut sessions = state.sessions.lock();
+            let mut conns = remote.conns.lock();
             for id in &stale_ids {
-                let still_backs = sessions
-                    .get(id)
-                    .zip(expected.get(id.as_str()).copied())
-                    .is_some_and(|(entry, exp)| entry.tmux_session.as_str() == exp);
+                let still_backs = conns.contains_key(id)
+                    && expected
+                        .get(id.as_str())
+                        .copied()
+                        .is_some_and(|exp| tmux_target(id) == exp);
                 if still_backs {
-                    if let Some(s) = sessions.remove(id) {
-                        dead.push(s);
+                    if let Some(c) = conns.remove(id) {
+                        dead.push(c);
                     }
                 }
             }
         }
-        // Drop the dead `PtySession`s OUTSIDE the lock: each `Drop` best-effort kills
-        // an already-gone attach client + joins the already-exited reader thread
-        // (no-ops on an ended process), so it can't block or double-free. We never
-        // touch tmux here — the session is already gone.
+        // Drop the dead `RemotePty`s OUTSIDE the lock: each `Drop` best-effort shuts
+        // down an already-closed socket + joins the already-exited reader thread
+        // (no-ops on a dropped connection), so it can't block or double-free. We
+        // never touch tmux here — the session is already gone.
         drop(dead);
     }
 

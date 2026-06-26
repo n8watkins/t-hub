@@ -42,6 +42,14 @@ const READ_BUF: usize = 8 * 1024;
 ///
 /// All fields are `Send`, so `PtySession` is `Send` and can be stored in the
 /// Tauri-managed `Mutex<HashMap<String, PtySession>>`.
+///
+/// Server-split M2a: this in-process PTY path no longer backs the terminal
+/// commands — they stream over the control socket via `crate::remote_pty` now.
+/// It is retained (not deleted) so reverting the streaming path to in-process is a
+/// one-line swap; `#[allow(dead_code)]` keeps that intentional retention from
+/// warning. (The socket-streaming `PtyStreamHandle`/`stream_attach_to_sink` below
+/// are still LIVE — used by the server half in `control::serve_pty_attach`.)
+#[allow(dead_code)]
 pub struct PtySession {
     pub id: String,
     pub tmux_session: String,
@@ -59,6 +67,7 @@ pub struct PtySession {
     size: PtySize,
 }
 
+#[allow(dead_code)] // retained for the M2a revert path; see PtySession docs.
 impl PtySession {
     /// Write raw bytes to the PTY (the attach client's stdin → the shell).
     pub fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
@@ -158,6 +167,7 @@ pub fn attach_argv(name: &str, _cwd: &str) -> Vec<String> {
 /// Output chunks are base64-encoded and emitted on `terminal://output`; on EOF
 /// the reader emits `terminal://exit` (with the client's exit code) and
 /// `terminal://state = Exited`.
+#[allow(dead_code)] // retained for the M2a revert path; see PtySession docs.
 pub fn spawn_attach_client(
     app: &AppHandle,
     id: &str,
@@ -232,6 +242,7 @@ pub fn spawn_attach_client(
 
 /// Drain the PTY reader, emitting base64 output chunks, until EOF; then report
 /// the child's exit code and an `Exited` state transition.
+#[allow(dead_code)] // retained for the M2a revert path; see PtySession docs.
 fn reader_loop(
     app: AppHandle,
     id: String,
