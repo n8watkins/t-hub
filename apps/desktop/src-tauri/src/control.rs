@@ -714,6 +714,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "supervision_tree" => supervision_tree(ctx, args),
         "supervision_session_ids" => supervision_session_ids(ctx),
         "wsl_health" => wsl_health(ctx),
+        "recent_sessions" => recent_sessions(),
         "search_files" => search_files(ctx, args),
         "list_tabs" => list_tabs(),
         "read_terminal" | "capture_pane" => read_terminal(args),
@@ -974,6 +975,16 @@ fn wsl_health(ctx: &ControlContext) -> Result<Value, String> {
         "metrics": metrics,
         "supervisedSessions": supervised,
     }))
+}
+
+/// `recent_sessions` (server-split M3 — first overlay source over the wire): the
+/// daemon's recent recallable Claude sessions, so a thin client gets the Recent
+/// list remotely. Mirrors the `recent_sessions` Tauri command (same
+/// `RecentSession[]` shape), reusing its shared scan cache. When the daemon runs
+/// natively in WSL (the M3 endgame) this read is a plain local filesystem walk
+/// rather than the `wsl.exe`/UNC hop.
+fn recent_sessions() -> Result<Value, String> {
+    serde_json::to_value(crate::recent::recent_sessions_cached()).map_err(|e| e.to_string())
 }
 
 /// `search_files`: fuzzy basename/path/extension search over a project root,

@@ -6,10 +6,7 @@
 // in one place. Mirrors `src-tauri/src/recent.rs` (structs there serialize
 // `rename_all = "camelCase"`); keep the two in lockstep.
 
-import { invoke } from "@tauri-apps/api/core";
-
-/** Tauri command name for the recent-sessions query (mirrors recent.rs). */
-const RECENT_SESSIONS = "recent_sessions";
+import { controlRequest } from "./controlClient";
 
 /**
  * One recallable past Claude session, read from the on-disk Claude transcripts
@@ -37,7 +34,12 @@ export interface RecentSession {
  * caps). Best-effort: the backend returns an empty list rather than erroring
  * when the transcript catalog can't be read, so callers can render an empty
  * Recent section without special-casing failure.
+ *
+ * Server-split M3 (first overlay source over the wire): routed over the control
+ * socket (`recent_sessions` in control.rs) instead of the in-process Tauri
+ * command — shape-identical, so it's a transport swap. A thin client now gets the
+ * REMOTE daemon's recent list; the wire M2 stretches to a remote host.
  */
 export function recentSessions(): Promise<RecentSession[]> {
-  return invoke<RecentSession[]>(RECENT_SESSIONS);
+  return controlRequest("recent_sessions") as Promise<RecentSession[]>;
 }

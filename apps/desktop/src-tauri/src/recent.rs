@@ -102,24 +102,49 @@ pub struct RecentSession {
 pub async fn recent_sessions() -> Result<Vec<RecentSession>, String> {
     // Serve a fresh-enough cached scan if we have one — collapses the sidebar's
     // mount/focus/spawn re-polls onto one real scan per RECENT_TTL so we don't
-    // re-walk ~10k transcripts over the UNC share on every poll. The lock is held
-    // only to clone the cached Vec, never across the scan below.
-    if let Some(cached) = RECENT_CACHE.lock().ok().and_then(|g| {
-        g.as_ref()
-            .filter(|(at, _)| is_fresh(*at, Instant::now(), RECENT_TTL))
-            .map(|(_, sessions)| sessions.clone())
-    }) {
+    // re-walk ~10k transcripts over the UNC share on every poll. The cheap cache
+    // hit stays on the async path (no thread hop); only the scan hops to blocking.
+    if let Some(cached) = cached_fresh() {
         return Ok(cached);
     }
-    // Read off the async runtime's blocking-friendly path: the work is filesystem
-    // / process IO, so hop to a blocking thread to avoid stalling the executor.
+    // The work is filesystem / process IO, so hop to a blocking thread to avoid
+    // stalling the executor.
     let sessions = tauri::async_runtime::spawn_blocking(collect_recent)
         .await
         .unwrap_or_default();
-    if let Ok(mut guard) = RECENT_CACHE.lock() {
-        *guard = Some((Instant::now(), sessions.clone()));
-    }
+    store_cache(&sessions);
     Ok(sessions)
+}
+
+/// The fresh cached scan, or `None` if stale/absent. The lock is held only to clone
+/// the cached Vec, never across a scan.
+fn cached_fresh() -> Option<Vec<RecentSession>> {
+    RECENT_CACHE.lock().ok().and_then(|g| {
+        g.as_ref()
+            .filter(|(at, _)| is_fresh(*at, Instant::now(), RECENT_TTL))
+            .map(|(_, sessions)| sessions.clone())
+    })
+}
+
+/// Store a fresh scan in the shared cache.
+fn store_cache(sessions: &[RecentSession]) {
+    if let Ok(mut guard) = RECENT_CACHE.lock() {
+        *guard = Some((Instant::now(), sessions.to_vec()));
+    }
+}
+
+/// SYNC cached recent-sessions scan — the core of [`recent_sessions`] minus the
+/// async/`spawn_blocking` wrapper. The control channel calls this (server-split M3)
+/// to serve the daemon's recent list over the socket, so a thin client gets it
+/// remotely. Reuses [`RECENT_CACHE`], so local + remote polls collapse onto one
+/// scan per [`RECENT_TTL`]. Safe to call on a (blocking) control connection thread.
+pub fn recent_sessions_cached() -> Vec<RecentSession> {
+    if let Some(cached) = cached_fresh() {
+        return cached;
+    }
+    let sessions = collect_recent();
+    store_cache(&sessions);
+    sessions
 }
 
 /// Collect + sort the recent sessions (platform-dispatched). Never panics; any
