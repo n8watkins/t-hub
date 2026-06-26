@@ -114,7 +114,10 @@ Harden the dev-vs-prod control-channel "which instance?" bug. Namespace the hand
 
 ---
 
-## Next — WS-9 · Worktree-centric workflow
+## ✅ WS-9 · Worktree-centric workflow — DONE
+
+Shipped 9a–9e: live tile cwd (`9f1d7e3`, was already plumbed) · smart `-b`/checkout create (`418433f`) · resolver (`2364dc3`) · `Ctrl+B w`/`c` + branch prompt (`52a8ebd`) · anchor-only-to-non-linked fix (`24310a9`) · repo picker + worktrees list/re-open + spawn-fail fix (`2fe1948`). Reviewed; two clear findings fixed inline.
+**Open design decisions (deferred, low):** `sanitizeBranchToDir` is many-to-one (`feat/x` & `feat-x` → same dir; git surfaces the collision as an error, no silent corruption) — flatten vs nest; and a remote-only branch takes the `-b` create path rather than DWIM-tracking `origin/x`.
 
 Locked design: [WORKTREE-WORKFLOW.md](./WORKTREE-WORKFLOW.md). Builds on shipped WS-4 (worktree primitive) + WS-3 (keymap). Core: a worktree = a sibling folder for a branch (`<repo>-worktrees/<branch>`); the repo is **anchored to the focused tile's repo** (main-root resolved, so siblings never nest), with a repo-picker fallback when there's no repo in context. The three "new" actions split by layer — `Ctrl+T` = terminal in current tab (never a worktree), `Ctrl+B c` = new plain tab, `Ctrl+B w` = new worktree tab, all in the `Ctrl+K` palette. **Enabling primitive:** live tile cwd (`#{pane_current_path}`) → `git_info` — the *same* unlock as relative file-open (the WS-1 TODO), so do it first.
 
