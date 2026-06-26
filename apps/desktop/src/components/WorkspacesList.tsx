@@ -19,6 +19,7 @@
 // Reads the workspace store directly (no props), so App needs no extra wiring.
 import { useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
+import { createPortal } from "react-dom";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
 import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
@@ -397,6 +398,7 @@ function WorkspaceRow({
   const inputRef = useRef<HTMLInputElement>(null);
   // Color-picker popover open state (the dot). Anchored under the dot button.
   const [colorMenu, setColorMenu] = useState(false);
+  const colorBtnRef = useRef<HTMLButtonElement>(null);
   // Which terminal row's color picker is open (its id), or null. Only one at a time.
   const [termColorMenuId, setTermColorMenuId] = useState<TerminalId | null>(null);
   const activateRef = useRef<HTMLButtonElement>(null);
@@ -481,6 +483,7 @@ function WorkspaceRow({
             The dot shows the assigned color (or the muted default when unset). */}
         <div className="relative shrink-0">
           <button
+            ref={colorBtnRef}
             type="button"
             onClick={(e) => {
               e.stopPropagation();
@@ -502,6 +505,7 @@ function WorkspaceRow({
           </button>
           {colorMenu && (
             <ColorPicker
+              anchorEl={colorBtnRef.current}
               current={color}
               onPick={(c) => onSetColor(c)}
               onClear={() => {
@@ -745,6 +749,7 @@ function TerminalRow({
   // one click so a drag never also selects. Cleared at the start of every press,
   // so it can't leak into a later, genuine click.
   const suppressClickRef = useRef(false);
+  const colorBtnRef = useRef<HTMLButtonElement>(null);
   return (
     <li
       className="group relative flex items-center gap-2 rounded-lg pr-1 transition-colors hover:bg-neutral-800/25"
@@ -833,6 +838,7 @@ function TerminalRow({
           is set) so it doesn't clutter the list. */}
       <div className="relative shrink-0">
         <button
+          ref={colorBtnRef}
           type="button"
           onClick={(e) => {
             e.stopPropagation();
@@ -861,6 +867,7 @@ function TerminalRow({
         </button>
         {colorMenuOpen && (
           <ColorPicker
+            anchorEl={colorBtnRef.current}
             title="Terminal color"
             current={ownColor}
             onPick={onSetColor}
@@ -901,25 +908,39 @@ function ColorPicker({
   onClear,
   onClose,
   title = "Workspace color",
+  anchorEl,
 }: {
   current?: string;
   onPick: (color: string) => void;
   onClear: () => void;
   onClose: () => void;
   title?: string;
+  /** The swatch button the popover anchors under. The picker is rendered into a
+   *  portal at this element's VIEWPORT rect so the sidebar's `overflow` (#3) can
+   *  never clip it. */
+  anchorEl?: HTMLElement | null;
 }) {
-  return (
+  // Anchor under the swatch in viewport coords, clamped to stay fully on-screen.
+  const PICKER_W = 184;
+  const rect = anchorEl?.getBoundingClientRect();
+  const top = rect ? Math.min(rect.bottom + 4, window.innerHeight - 8) : 8;
+  const left = rect
+    ? Math.max(8, Math.min(rect.left, window.innerWidth - PICKER_W - 8))
+    : 8;
+  return createPortal(
     <>
       <div
-        className="fixed inset-0 z-40"
+        className="fixed inset-0 z-[60]"
         onClick={(e) => {
           e.stopPropagation();
           onClose();
         }}
       />
       <div
-        className="absolute left-0 top-6 z-50 w-[176px] rounded-md border p-2 shadow-2xl"
+        className="fixed z-[61] w-[176px] rounded-md border p-2 shadow-2xl"
         style={{
+          top,
+          left,
           // Solid surface so the picker never bleeds content through
           // (--th-header-bg carries alpha in some themes).
           backgroundColor: "var(--th-tile-bg)",
@@ -988,6 +1009,7 @@ function ColorPicker({
           </button>
         </div>
       </div>
-    </>
+    </>,
+    document.body,
   );
 }
