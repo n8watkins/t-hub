@@ -6,7 +6,7 @@
 >
 > **What's left is ⑥ — and the owner has signaled "remote matters."** So this doc's job changed: it is no longer a survey, it is the **cold-start build guide for the split**. A fresh agent should be able to read it top-to-bottom and start **Milestone 1** with zero prior context. The actionable centerpiece is **§6 (M1→M4)**; settle the **§8 pre-M1 decisions** first. Per §9's owner question, **M1–M2 are pulled forward** (reach-my-agents-from-anywhere is the priority); accept a degraded overlay on remote until M3.
 
-**Status of the design itself:** proposal, grounded in the current code; file references are real and verified against the v0.2.0 tree. No split code yet — M1 is the first cut.
+**Status of the BUILD (updated — the split is largely shipped):** **M1, M2a, and M2b-core are SHIPPED, and 4 of 5 M3 overlay sources are migrated** — all on `main` as `feat(server-split): …` / `fix(server-split): …` commits, each verified live against the running app (socket probes) and reviewed by sub-agents. The design below is now RETROSPECTIVE for M1/M2a/M2b and forward-looking for the M3 tail + M4; see the §6 table for per-milestone status and exactly what's left. The original "design proposal" text is kept for the rationale.
 
 > The one-line bet: **pull T-Hub's "brain" out of the desktop GUI into a headless `t-hub-server` that lives where the agents live (WSL/remote), so any device can connect to one instance and get the full cockpit.** Today brain + face are fused in one Windows process hard-wired to the local WSL.
 
@@ -119,12 +119,12 @@ All survive; most are unaffected locally. The ones that need *re-pointing to be 
 
 This is the build. Each milestone stands alone and ships value. **M1→M2 are the priority** (per §9). Read §8 first — the shared-vs-per-client split shapes M1, and you must NOT bind to a network interface (M2) until auth-beyond-loopback is settled.
 
-| Milestone | What | Delivers | Effort |
+| Milestone | What | Delivers | Status |
 |---|---|---|---|
-| **M1 — Decouple locally** | Route ALL GUI↔backend traffic **through the socket** on one machine (no remote). Generalize `ApplySink`/`controlBridge` to carry every command + every event. | Proof the wire works end-to-end; zero user-visible change; the foundation. | Med |
-| **M2 — Tiles over the wire** | Put PTY attach/output/write/resize on the channel; bind to the Tailscale interface; client points at a remote server. | **See + drive your remote tmux tiles from device B.** (Overlay still degraded.) The first real "wow." | Med |
-| **M3 — Overlay server-side** | Re-point the 5 independent overlay data sources to be **served by the daemon** (native Linux in WSL). Embarrassingly parallel — 5 agents. | The **full cockpit** remotely. | Hard |
-| **M4 — Multi-client + hardening** | Named-session namespacing; per-client view vs shared state; PTY resize-ownership; auth beyond the loopback token; split logs. | A/B/C all on one instance, safely. | Med-Hard |
+| **M1 — Decouple locally** | Route GUI↔backend traffic for **server-owned state** through the socket on one machine (no remote). Command request/response over the wire (`control_request`); the event stream forwarded into the webview (`spawn_event_forwarder` → `control://event`); `TeeEmitter` so channels migrate one at a time. | Proof the wire works end-to-end; zero user-visible change; the foundation. | ✅ **SHIPPED** — `control_client.rs`, `EventFanout` in `control.rs`, frontend `ipc/controlClient.ts`. Verified live via socket probes. |
+| **M2 — Tiles over the wire** | **M2a:** server-owned PTY streaming — `tmux attach` on the socket (`attach_pty` → `{out}`/`{exit}` frames out, `{write}`/`{resize}` in), client-side `RemotePty`. **M2b:** persistent server key (`~/.t-hub/server-key`), opt-in Tailscale bind, `is_allowed_peer` gate (loopback + 100.64/10 + fd7a:115c::/32), thin-client mode (`T_HUB_REMOTE_ADDR`/`TOKEN`). | **See + drive your remote tmux tiles from device B.** (Overlay still degraded.) The first real "wow." | ✅ **core SHIPPED** — `remote_pty.rs`, `pty.rs` stream-attach, M2b bind+gate. **Deferred hardening:** per-client auth for `attach_pty`, server read/idle timeout, protocol versioning, reconnect re-sync; real two-device Tailscale test + `variant=dev` Windows build. |
+| **M3 — Overlay server-side** | Re-point the independent overlay data sources to be **served by the daemon** via shape-identical control commands + sync cores (frontend `controlRequest` flip). | The **full cockpit** remotely. | ◐ **4 of 5 done** — recent / claude-usage / codex-usage / git migrated. **Remaining:** `host_metrics` (local `/proc` returns zeros on Windows — needs WSL-agent source, would regress local Windows if naively flipped) + file index. |
+| **M4 — Multi-client + hardening** | Named-session namespacing; per-client view vs shared state; PTY resize-ownership; auth beyond the loopback token; split logs. | A/B/C all on one instance, safely. | ☐ **not started** — see §8 decisions (shared-vs-per-client split settled; no network bind until auth-beyond-loopback, satisfied by M2b's `is_allowed_peer`). |
 
 ### M1 — Decouple locally (START HERE)
 

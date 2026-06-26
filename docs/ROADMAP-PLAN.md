@@ -3,7 +3,7 @@
 > ## 🚢 v0.2.0 SHIPPED
 > Git tag `v0.2.0`, GitHub Release published with the signed Windows installer + `latest.json` auto-update (`9ee6b75`). Wave 0 + Wave 1 + WS-9 all landed, plus the cheap-wins backlog: **vitest + 53 frontend tests** (`8a3674c`), a **dedup refactor** — host_distro / persist codec / warmup (`30e863b`), and **light tray recovery actions** — Reload window + Reconnect agent bridge (`bec5ff7`).
 >
-> **Headline next:** the **server-split M1** (decouple locally via `RemoteTarget`) — see [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md). Still deferred after that: the **heavy** tray actions (restart-tmux + full-WSL-shutdown), more vitest coverage (component/RTL tests), the WS-9 nits (`sanitizeBranchToDir` collision + remote-branch DWIM-tracking), and the parked beyond-parity differentiators (bottom).
+> **Headline:** the **server-split is largely shipped** — M1 (decouple locally), M2a/M2b-core (tiles + events + reads over the socket; opt-in Tailscale bind + peer gate), and 4 of 5 M3 overlay sources are on `main`, each verified live. **Remaining tail:** M3's `host_metrics` + file-index, M2b deferred hardening (per-client `attach_pty` auth, read/idle timeout, protocol versioning, reconnect re-sync) + a real two-device Tailscale test, then M4 (multi-client). See [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md) §6. Also still deferred: the **heavy** tray actions (restart-tmux + full-WSL-shutdown), more vitest coverage (component/RTL tests), the WS-9 nits (`sanitizeBranchToDir` collision + remote-branch DWIM-tracking), and the parked beyond-parity differentiators (bottom).
 
 **Status:** Active plan, **verified against the live codebase** (six read-only audits, file:line-grounded). Turns [HERDR-PARITY.md](./HERDR-PARITY.md) (the *why* + gap analysis) into an *executable* plan organized for **parallel agent execution**. Companion: [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md) (item ⑥).
 
@@ -18,7 +18,7 @@
 - **dedup refactor** — `host_distro()` (4 copies → one), the localStorage persist codec (3 stores → `lib/persist.ts`), warmup machinery (`notify.ts` + `rulesMount.ts` → `lib/warmup.ts`) — `30e863b`.
 - **two light tray recovery actions** — Reload window + Reconnect agent bridge — `bec5ff7`.
 
-**Next build = the server-split M1** (decouple locally — route the WSL/tmux/git hops through a `RemoteTarget`), per [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md). Still deferred behind it: the **heavy** tray actions (restart-tmux + full-WSL-shutdown), broader vitest coverage (component/RTL), the WS-9 nits (sanitize-collision + remote-branch DWIM), and the parked beyond-parity wildcards (bottom).
+**Server-split: M1 + M2a + M2b-core + 4-of-5 M3 SHIPPED** (the GUI↔backend command/event/PTY/overlay traffic now crosses the loopback control socket; opt-in Tailscale bind + `is_allowed_peer` gate land the remote path), per [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md) §6. **Next build = the server-split tail:** M3's `host_metrics` (needs a WSL-agent source — local `/proc` zeroes on Windows) + file-index, then M2b deferred hardening (per-client `attach_pty` auth, read/idle timeout, protocol versioning, reconnect re-sync) + a real two-device Tailscale test, then M4 (multi-client). Still deferred alongside: the **heavy** tray actions (restart-tmux + full-WSL-shutdown), broader vitest coverage (component/RTL), the WS-9 nits (sanitize-collision + remote-branch DWIM), and the parked beyond-parity wildcards (bottom).
 
 ## Principles
 
