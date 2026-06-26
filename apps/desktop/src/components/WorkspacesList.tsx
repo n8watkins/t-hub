@@ -32,6 +32,7 @@ import type { TerminalId, TerminalInfo, TerminalState } from "../ipc/types";
 import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
 import { resolveDropTarget } from "../lib/dropTarget";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
+import { popOutTab } from "../lib/windows";
 import { ChevronIcon, CountBadge } from "./SidebarChrome";
 import { StatusIndicator, type StatusVariant } from "./StatusIndicator";
 
@@ -44,6 +45,29 @@ function dotVariant(pulsing: boolean, state: TerminalState): StatusVariant {
   if (state === "error") return "error";
   if (state === "live") return "done";
   return "idle";
+}
+
+/** "Open in new window" arrow — pop a workspace out into its own window (item 4,
+ *  re-homed from the removed top tab strip). */
+function PopOutIcon() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="pointer-events-none"
+      aria-hidden
+    >
+      <path d="M14 4h6v6" />
+      <path d="M20 4 11 13" />
+      <path d="M19 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4" />
+    </svg>
+  );
 }
 
 export function WorkspacesList() {
@@ -418,7 +442,7 @@ function WorkspaceRow({
     // dragged terminal resolves to it via elementFromPoint + closest.
     <li data-th-ws-row={tab.id}>
       <div
-        className="flex w-full items-center gap-1 rounded-lg pr-1 transition-colors hover:bg-neutral-800/25"
+        className="group flex w-full items-center gap-1 rounded-lg pr-1 transition-colors hover:bg-neutral-800/25"
         style={{
           color: "var(--th-fg)",
           // Dim this row while it is the workspace being dragged to reorder.
@@ -552,6 +576,20 @@ function WorkspaceRow({
             <CountBadge n={count} />
           </button>
         )}
+        {/* Item 4: pop this workspace out into its own window (re-homed here from
+            the removed top tab strip). Reveals on row hover. */}
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            void popOutTab(tab.id);
+          }}
+          className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-neutral-400 opacity-0 transition-opacity hover:bg-neutral-700/50 hover:text-white group-hover:opacity-100"
+          title="Pop out into a new window"
+          aria-label={`Pop out ${tab.name} into a new window`}
+        >
+          <PopOutIcon />
+        </button>
       </div>
 
       {/* Smooth expand/collapse via a 0fr↔1fr grid row (rows stay mounted). */}

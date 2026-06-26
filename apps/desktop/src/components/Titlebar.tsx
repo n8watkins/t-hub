@@ -1,40 +1,27 @@
 // Persistent Chrome-style top bar for the frameless (decorations:false) main
 // window — the primary window chrome.
 //
-// The window controls (minimize / maximize-restore / close) AND the primary
-// settings gear live at the TOP-RIGHT of this titlebar (where they always were).
-// They are ALWAYS in the titlebar regardless of the sidebar's collapse state, so
-// they're never unreachable — no fallback plumbing is needed.
-//
 // Main layout, left -> right:
-//   [tab-strip spacer (drag)] · [workspace tab strip + "＋"] · [flexible drag
-//   region] · [settings gear] · [window controls: min / max-restore / close]
+//   [brand (tray icon) + sidebar toggle] · [flexible drag region] · [settings
+//   gear] · [window controls: min / max-restore / close]
 //
-// The spacer + the flexible stretch carry `data-tauri-drag-region`, so grabbing
-// the empty areas moves the window (like Chrome). The bar is always visible
-// (~32px) with a subtle 1px bottom border and participates in layout.
+// There is NO workspace tab strip — the sidebar's Workspaces list is the sole
+// workspace switcher (item 1). The brand + the flexible stretch carry
+// `data-tauri-drag-region`, so grabbing the empty areas moves the window (like
+// Chrome). The bar is always visible (~32px) with a subtle 1px bottom border.
 //
-// Drag interactions are POINTER-based (see src/lib/pointerDrag.ts): both tile
-// drag (Tile.tsx) and tab reorder here avoid HTML5 DnD, which is unreliable over
-// xterm's WebGL canvas in WebView2. Each tab carries `data-tab-id`, which makes
-// it a drop target for BOTH reordering a tab and dropping a *tile* onto it (the
-// tile's drag resolves tabs via elementFromPoint + closest).
-//
-// Window controls (minimize / maximize-restore / close) and the settings gear
-// use the Tauri window API / settings store and must NOT carry
+// The window controls + the settings gear live at the TOP-RIGHT and are ALWAYS in
+// the titlebar regardless of the sidebar's collapse state, so they're never
+// unreachable. They use the Tauri window API / settings store and must NOT carry
 // data-tauri-drag-region, or a click would start a window drag instead.
 import { useEffect, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent, RefObject } from "react";
+import type { RefObject } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
-import { useWorkspace, deriveLabel } from "../store/workspace";
-import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
+import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
-import { startPointerDrag } from "../lib/pointerDrag";
-import { resolveDropTarget } from "../lib/dropTarget";
-import { createDragGhost, type DragGhost } from "../lib/dragGhost";
-import { popOutTab, closeSatellite, readSatelliteTab } from "../lib/windows";
-import { closeTerminal } from "../ipc/client";
+import { closeSatellite, readSatelliteTab } from "../lib/windows";
+import brandIcon from "../assets/brand.png";
 
 /** Minimize the window, swallowing any IPC rejection. */
 function minimize(): void {
@@ -195,37 +182,12 @@ function useReportMaxButtonRect(
   }, [ref, maximized]);
 }
 
-/** The workspace-tab id under a viewport point, or null (drag resolution). */
-function tabUnder(x: number, y: number): string | null {
-  return resolveDropTarget(x, y, ["[data-tab-id]"])?.value ?? null;
-}
-
-/** Height (px) of the titlebar row (matches the bar's h-8); a drop below this is
- *  out in the canvas, used to decide a tear-off vs an in-strip drop (TASK 2). */
-const TITLEBAR_H = 32;
-
-/** Matches the auto-generated default tab name "Workspace N" (#labels): such a
- *  name carries no user intent, so a single-terminal tab can instead surface that
- *  terminal's friendly label. A renamed tab (anything else) always wins. */
-const AUTO_TAB_NAME = /^Workspace \d+$/;
-
 /**
- * True when a drag was released AWAY from the tab strip — out in the canvas area
- * rather than within the titlebar row (TASK 2). The caller only consults this
- * once it knows the release wasn't over any tab; here we just check the release
- * is below the titlebar, so a drop into the strip's own empty/drag region (still
- * within the bar) is NOT treated as a tear-off.
- */
-function droppedOutsideStrip(y: number): boolean {
-  return y > TITLEBAR_H;
-}
-
-/**
- * The top bar. In the MAIN window it hosts the workspace tab strip + new-tab
- * button. In a SATELLITE window (#21, a popped-out tab) there is no strip — just
- * the brand, the popped tab's name, and a "return to main window" control — since
- * a satellite renders exactly one tab and creating/closing tabs there is
- * meaningless.
+ * The top bar. In the MAIN window it's the brand (tray icon) + sidebar toggle on
+ * the left, a drag region, then settings + window controls on the right — no tab
+ * strip (item 1: the sidebar Workspaces list is the sole workspace switcher). In a
+ * SATELLITE window (#21, a popped-out tab) it's the brand, the popped tab's name,
+ * and a "return to main window" control.
  */
 export function Titlebar({
   satellite = false,
@@ -256,18 +218,14 @@ export function Titlebar({
           <WindowControls satellite />
         </>
       ) : (
-        // Main: the LEFT chrome cluster (brand + collapse + settings) fills what
-        // used to be dead space to the left of the first tab, so the sidebar no
-        // longer needs its own header row. Then the workspace tabs (+ new-tab),
-        // a flexible drag region, and the window controls at the top-right.
+        // Main (item 1: no tab strip — the sidebar Workspaces list is the sole
+        // workspace switcher now). LEFT chrome = brand (tray icon) + sidebar
+        // toggle; the rest of the bar is a drag region; settings + window controls
+        // sit at the top-right (item 9: settings moved right, near minimize).
         <>
-          <LeftChrome
-            onToggleSidebar={onToggleSidebar}
-            onSettings={toggleSettings}
-          />
-          <TabStrip />
+          <LeftChrome onToggleSidebar={onToggleSidebar} />
           <div data-tauri-drag-region className="min-w-0 flex-1" aria-hidden />
-          <WindowControls />
+          <WindowControls onSettings={toggleSettings} />
         </>
       )}
     </div>
@@ -284,10 +242,8 @@ export function Titlebar({
  */
 function LeftChrome({
   onToggleSidebar,
-  onSettings,
 }: {
   onToggleSidebar?: () => void;
-  onSettings: () => void;
 }) {
   return (
     <div className="flex shrink-0 items-stretch">
@@ -303,7 +259,6 @@ function LeftChrome({
           <SidebarToggleIcon />
         </button>
       )}
-      <SettingsButton onClick={onSettings} />
     </div>
   );
 }
@@ -392,38 +347,20 @@ function SatelliteBar() {
   );
 }
 
-/**
- * Draggable filler before the tab strip (TASK 1). It widens so the strip begins
- * `offset` px from the window's left edge — i.e. at the sidebar's right / the
- * canvas's left edge — making the leftmost tab align with the canvas. With the
- * brand now in the sidebar (not the titlebar), the spacer simply equals the
- * offset; when the sidebar is hidden (offset 0) the strip hugs the left edge.
- * The offset updates live from App as the sidebar mode/width changes. Carries
- * data-tauri-drag-region so grabbing this gap still moves the window.
- */
-function TabStripSpacer({ offset }: { offset: number }) {
-  return (
-    <div
-      data-tauri-drag-region
-      aria-hidden
-      className="shrink-0"
-      style={{ width: Math.max(0, offset) }}
-    />
-  );
-}
-
-/** "T-Hub" wordmark with a small accent glyph (satellite titlebar only — the
- *  main window's brand now lives in the sidebar header). A drag handle. */
+/** "T-Hub" wordmark led by the app/tray icon (item 9: the brand uses the same
+ *  mark as the system tray). A window-drag handle. */
 function Brand() {
   return (
     <div
       data-tauri-drag-region
       className="flex shrink-0 select-none items-center gap-1.5 pl-2.5 pr-2"
     >
-      <span
-        className="inline-block h-2.5 w-2.5 rounded-[2px]"
-        style={{ backgroundColor: "var(--th-accent)" }}
+      <img
+        src={brandIcon}
+        alt=""
         aria-hidden
+        draggable={false}
+        className="h-4 w-4 shrink-0 rounded-[3px]"
       />
       <span
         className="text-xs font-semibold tracking-tight"
@@ -446,7 +383,15 @@ function Brand() {
 // "Return" is the single affordance that hands the tab back and destroys the
 // window.
 // ---------------------------------------------------------------------------
-function WindowControls({ satellite = false }: { satellite?: boolean }) {
+function WindowControls({
+  satellite = false,
+  onSettings,
+}: {
+  satellite?: boolean;
+  /** Open the settings surface. Rendered as a gear at the LEFT of the window
+   *  controls (item 9: settings moved to the top-right). Main window only. */
+  onSettings?: () => void;
+}) {
   // Track the window's maximized state so the middle button reflects it (BUG 3):
   // a single square when restored ("Maximize"), overlapping squares when
   // maximized ("Restore"). Tauri fires `tauri://resize` (onResized) on every
@@ -462,6 +407,8 @@ function WindowControls({ satellite = false }: { satellite?: boolean }) {
   useReportMaxButtonRect(maxBtnRef, maximized);
   return (
     <div className="flex shrink-0 items-stretch">
+      {/* Settings gear at the top-right, left of the window controls (item 9). */}
+      {!satellite && onSettings && <SettingsButton onClick={onSettings} />}
       <button
         type="button"
         aria-label="Minimize"
@@ -560,448 +507,8 @@ function WindowControls({ satellite = false }: { satellite?: boolean }) {
 }
 
 // ---------------------------------------------------------------------------
-// Workspace tab strip (PRD §5.2), hosted in the top bar. Click to activate,
-// double-click to rename inline, × to close an empty tab, and drag a tab
-// left/right to reorder it (pointer-based). Each tab also accepts a dropped
-// TILE (drag-a-tile-onto-a-tab, #1) via its `data-tab-id`. The "＋" new-tab
-// button sits immediately to the right of the right-most tab.
-// ---------------------------------------------------------------------------
-function TabStrip() {
-  const tabs = useWorkspace((s) => s.tabs);
-  const activeTabId = useWorkspace((s) => s.activeTabId);
-  // Live terminal records + user labels: a single-terminal tab that still has its
-  // default "Workspace N" name shows that terminal's friendly label instead (#labels).
-  const terminals = useWorkspace((s) => s.terminals);
-  const labels = useWorkspace((s) => s.labels);
-  const setActiveTab = useWorkspace((s) => s.setActiveTab);
-  const addTab = useWorkspace((s) => s.addTab);
-  const renameTab = useWorkspace((s) => s.renameTab);
-  const closeTab = useWorkspace((s) => s.closeTab);
-  const moveTab = useWorkspace((s) => s.moveTab);
-  const setDraggingTab = useWorkspace((s) => s.setDraggingTab);
-  const setDropTab = useWorkspace((s) => s.setDropTab);
-  const draggingTabId = useWorkspace((s) => s.draggingTabId);
-  const dropTabId = useWorkspace((s) => s.dropTabId);
-  // Per-workspace color identity (feat/workspace-colors): the active tab's dot +
-  // an accent on the tab read the workspace color; a right-click menu sets it.
-  const workspaceColors = useTheme((s) => s.workspaceColors);
-  const setWorkspaceColor = useTheme((s) => s.setWorkspaceColor);
-  const clearWorkspaceColor = useTheme((s) => s.clearWorkspaceColor);
-
-  // id of the tab currently being renamed inline (null = none).
-  const [editing, setEditing] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
-  // Right-click color menu for a tab: which tab + the pointer position (null off).
-  const [colorMenu, setColorMenu] = useState<{
-    tabId: string;
-    x: number;
-    y: number;
-  } | null>(null);
-
-  // Tracks the previous pointerdown for manual double-click detection. A tab is
-  // renamed when two quick clicks land on the SAME tab that was ALREADY the
-  // active tab when this pair started — i.e. double-clicking the currently-active
-  // tab renames it, while double-clicking an inactive tab only activates it (the
-  // first click makes it active, the pair doesn't qualify because it wasn't
-  // active when the pair began). Prevents accidental renames on tab switches.
-  const clickRef = useRef<{ id: string; time: number; wasActive: boolean } | null>(null);
-
-  const startRename = (id: string, name: string) => {
-    setEditing(id);
-    setDraft(name);
-  };
-  const commitRename = () => {
-    if (editing) renameTab(editing, draft);
-    setEditing(null);
-  };
-
-  // Close a workspace tab (#5). An EMPTY tab closes immediately. A NON-EMPTY tab
-  // is closed behind a confirm; on confirm we DETACH (not kill) each of its
-  // terminals via closeTerminal — tmux survives, so the work is reachable again
-  // by relaunching/respawning — then drop the tab. closeTab returns the removed
-  // tile ids and also guards the last-tab case (returns [] without closing).
-  const requestCloseTab = (id: string) => {
-    const tab = tabs.find((t) => t.id === id);
-    if (!tab) return;
-    if (tab.order.length > 0) {
-      const n = tab.order.length;
-      const ok = window.confirm(
-        `Close "${tab.name}"? Its ${n} terminal${n === 1 ? "" : "s"} will be ` +
-          `detached (the tmux session${n === 1 ? "" : "s"} keep running and ` +
-          `can be reattached later).`,
-      );
-      if (!ok) return;
-    }
-    const removed = closeTab(id);
-    for (const tid of removed) void closeTerminal(tid).catch(() => {});
-  };
-
-  // Pointer-based reorder: pressing a tab activates it; dragging past the
-  // threshold reorders it onto whichever tab is released over (moveTab).
-  const onTabPointerDown = (tabId: string, e: ReactPointerEvent) => {
-    if (editing === tabId) return; // let the rename input own the pointer
-    if (e.button !== 0) return;
-    const name = tabs.find((t) => t.id === tabId)?.name ?? "Workspace";
-    const wasActive = tabId === activeTabId;
-    const now = Date.now();
-    // Second click of a quick pair on the SAME tab => inline rename, but ONLY if
-    // that tab was already active when the FIRST click of the pair landed (the
-    // `wasActive` flag recorded then). So double-clicking an INACTIVE tab just
-    // activates it (the first click had wasActive=false), while double-clicking
-    // the CURRENTLY-ACTIVE tab renames it.
-    if (
-      clickRef.current &&
-      clickRef.current.id === tabId &&
-      now - clickRef.current.time < 400 &&
-      clickRef.current.wasActive
-    ) {
-      startRename(tabId, name);
-      clickRef.current = null;
-      return;
-    }
-    clickRef.current = { id: tabId, time: now, wasActive };
-    setActiveTab(tabId);
-    let ghost: DragGhost | null = null;
-    startPointerDrag(e.clientX, e.clientY, {
-      onBegin: () => {
-        setDraggingTab(tabId);
-        document.body.dataset.thDragging = "1";
-        ghost = createDragGhost({ title: name, width: 150 });
-      },
-      onMove: (x, y) => {
-        ghost?.move(x, y);
-        const overId = tabUnder(x, y);
-        setDropTab(overId && overId !== tabId ? overId : null);
-      },
-      onEnd: (x, y, committed) => {
-        const targetId = committed ? tabUnder(x, y) : null;
-        ghost?.destroy();
-        ghost = null;
-        delete document.body.dataset.thDragging;
-        setDraggingTab(null);
-        setDropTab(null);
-        if (!committed) return;
-        if (targetId && targetId !== tabId) {
-          // Released over another tab -> reorder within the strip (as before).
-          moveTab(tabId, targetId);
-        } else if (!targetId && droppedOutsideStrip(y)) {
-          // Released AWAY from the strip — not over any tab and below the ~32px
-          // titlebar, i.e. out in the canvas — so tear the tab off into its own
-          // window (TASK 2), same path as the per-tab pop-out button.
-          void popOutTab(tabId);
-        }
-        // Released over the strip's empty area (no tab, still in the titlebar):
-        // no-op, matching the prior behavior.
-      },
-    });
-  };
-
-  return (
-    // The strip scrolls horizontally if there are many tabs; it never grows past
-    // the available width, so the flexible drag region + controls stay reachable.
-    // `overflow-y-hidden` clips the scrollbar gutter so it can't steal the row.
-    // `th-scroll-thin` gives that horizontal bar a thin, on-brand look (#4).
-    // pl-1: the strip box starts at the sidebar's right edge (via the spacer); a
-    // 4px hair of inset keeps the rounded leftmost tab off the seam while still
-    // aligning it with the canvas's left edge (TASK 1).
-    <>
-    <div className="th-scroll-thin flex min-w-0 items-stretch gap-1 overflow-x-auto overflow-y-hidden pl-1 pr-1">
-      {tabs.map((tab) => {
-        const active = tab.id === activeTabId;
-        // Any tab can be closed as long as it isn't the last one. A non-empty tab
-        // closes behind a confirm (#5); the close × is always rendered (its space
-        // reserved) and only its visibility toggles on hover so the tab never
-        // resizes.
-        const closable = tabs.length > 1;
-        // Highlighted as a drop target by EITHER a tab reorder or a tile being
-        // dragged onto it; never highlight the tab being dragged itself.
-        const isDropTarget = dropTabId === tab.id && draggingTabId !== tab.id;
-        const isDragging = draggingTabId === tab.id;
-        // When a tab is a single terminal and still carries its auto "Workspace N"
-        // name, show that terminal's friendly label (with the short id faint) so a
-        // terminal-tab reads like the terminal it holds (#labels). A user-renamed
-        // tab keeps its own name; multi-tile / empty tabs keep theirs too.
-        const soleId =
-          tab.order.length === 1 && AUTO_TAB_NAME.test(tab.name)
-            ? tab.order[0]
-            : null;
-        const soleInfo = soleId ? terminals[soleId] : undefined;
-        const termLabel = soleId
-          ? deriveLabel({
-              id: soleId,
-              label: labels[soleId],
-              title: soleInfo?.title,
-              cwd: soleInfo?.cwd,
-            })
-          : null;
-        const tabLabel = termLabel ?? tab.name;
-        // The faint short id, shown only when the label isn't already that id.
-        const tabShortId = soleId && termLabel !== soleId ? soleId : null;
-        // This workspace's color identity (undefined => the default accent).
-        const color = workspaceColors[tab.id];
-        const accent = color ?? "var(--th-accent)";
-        return (
-          <div
-            key={tab.id}
-            // data-tab-id: the drop target a tab reorder / a tile drag resolves to.
-            data-tab-id={tab.id}
-            onPointerDown={(e) => onTabPointerDown(tab.id, e)}
-            // Right-click a tab to set its workspace color (or reset to default).
-            onContextMenu={(e) => {
-              e.preventDefault();
-              setColorMenu({ tabId: tab.id, x: e.clientX, y: e.clientY });
-            }}
-            // Fixed width (#3): a comfortably wide tab whose size NEVER changes on
-            // hover. The pop-out + close buttons always occupy their space (their
-            // visibility toggles, not their layout), so revealing them on hover
-            // can't shift or resize the tab.
-            className={[
-              "group flex w-44 shrink-0 cursor-pointer touch-none select-none items-center gap-1.5 rounded px-3",
-              active
-                ? "bg-neutral-800 text-neutral-100"
-                : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200",
-              isDragging ? "opacity-40" : "",
-            ].join(" ")}
-            style={
-              isDropTarget
-                ? { boxShadow: `0 0 0 1px ${accent}` }
-                : active && color
-                  ? // A subtle colored bottom accent so the active tab reflects
-                    // its workspace color without overwhelming the chrome.
-                    { boxShadow: `inset 0 -2px 0 0 ${color}` }
-                  : undefined
-            }
-            title={tabShortId ? `${tabLabel} · ${tabShortId}` : tabLabel}
-          >
-            <span
-              className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                active || color ? "" : "bg-neutral-600"
-              }`}
-              // The dot shows the workspace color when set (active or not); else
-              // the theme accent on the active tab, or a muted gray otherwise.
-              style={
-                color
-                  ? { backgroundColor: color }
-                  : active
-                    ? { backgroundColor: "var(--th-accent)" }
-                    : undefined
-              }
-            />
-            {editing === tab.id ? (
-              <input
-                autoFocus
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                onBlur={commitRename}
-                onPointerDown={(e) => e.stopPropagation()}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") commitRename();
-                  else if (e.key === "Escape") setEditing(null);
-                }}
-                className="min-w-0 flex-1 bg-neutral-700 px-1 text-neutral-100 outline-none"
-                style={{ boxShadow: "0 0 0 1px var(--th-accent)" }}
-              />
-            ) : (
-              <span className="flex min-w-0 flex-1 items-baseline gap-1.5 truncate">
-                <span className="min-w-0 truncate">{tabLabel}</span>
-                {tabShortId && (
-                  <span
-                    className="shrink-0 font-mono text-[0.8em]"
-                    style={{ color: "var(--th-fg-muted)" }}
-                  >
-                    {tabShortId}
-                  </span>
-                )}
-              </span>
-            )}
-            {tab.order.length > 0 && (
-              <span
-                className="shrink-0 rounded-full px-1.5 text-[11px] font-semibold leading-tight"
-                style={{
-                  backgroundColor: "color-mix(in srgb, var(--th-accent) 22%, transparent)",
-                  color: "var(--th-accent)",
-                }}
-              >
-                {tab.order.length}
-              </span>
-            )}
-            {/* Pop-out (#21): tear this tab off into its own window. Its space is
-                always reserved; only its visibility toggles on hover (#3), so the
-                tab never resizes. Available for any tab (the point is to pop out a
-                tab WITH terminals); pointerDown is stopped so it never starts a
-                tab drag/reorder. When hidden it's also un-clickable (invisible
-                drops pointer events) so it can't be hit on a non-hovered tab. */}
-            <button
-              type="button"
-              tabIndex={-1}
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={(e) => {
-                e.stopPropagation();
-                void popOutTab(tab.id);
-              }}
-              className="ml-0.5 inline-flex shrink-0 rounded p-0.5 leading-none text-neutral-500 invisible hover:bg-neutral-600 hover:text-neutral-100 group-hover:visible"
-              title="Pop out into a new window"
-              aria-label={`Pop out ${tab.name} into a new window`}
-            >
-              <PopOutIcon />
-            </button>
-            {closable && (
-              <button
-                type="button"
-                tabIndex={-1}
-                onPointerDown={(e) => e.stopPropagation()}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  requestCloseTab(tab.id);
-                }}
-                className="ml-0.5 inline-flex shrink-0 rounded px-0.5 leading-none text-neutral-500 invisible hover:bg-neutral-600 hover:text-neutral-100 group-hover:visible"
-                title={tab.order.length > 0 ? "Close tab" : "Close empty tab"}
-                aria-label={`Close ${tab.name}`}
-              >
-                ×
-              </button>
-            )}
-          </div>
-        );
-      })}
-
-      {/* New-tab button, immediately to the right of the right-most tab. */}
-      <button
-        type="button"
-        onClick={() => addTab()}
-        className="my-1 shrink-0 self-center rounded px-2 py-0.5 leading-none text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100"
-        title="New workspace tab"
-        aria-label="New workspace tab"
-      >
-        ＋
-      </button>
-    </div>
-
-    {/* Right-click color menu for a workspace tab: a palette + custom picker +
-        reset, anchored at the pointer. A full-window backdrop dismisses it. */}
-    {colorMenu && (
-      <TabColorMenu
-        x={colorMenu.x}
-        y={colorMenu.y}
-        current={workspaceColors[colorMenu.tabId]}
-        onPick={(c) => {
-          setWorkspaceColor(colorMenu.tabId, c);
-          setColorMenu(null);
-        }}
-        onClear={() => {
-          clearWorkspaceColor(colorMenu.tabId);
-          setColorMenu(null);
-        }}
-        onClose={() => setColorMenu(null)}
-      />
-    )}
-    </>
-  );
-}
-
-/**
- * The workspace-tab right-click color menu: a fixed popover at the pointer with
- * the palette swatches, a custom `<input type="color">`, and a reset-to-default.
- * Mirrors the tile ⋯ color popover (a full-window backdrop dismisses it).
- */
-function TabColorMenu({
-  x,
-  y,
-  current,
-  onPick,
-  onClear,
-  onClose,
-}: {
-  x: number;
-  y: number;
-  current?: string;
-  onPick: (color: string) => void;
-  onClear: () => void;
-  onClose: () => void;
-}) {
-  return (
-    <>
-      <div
-        className="fixed inset-0 z-40"
-        onPointerDown={onClose}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          onClose();
-        }}
-      />
-      <div
-        className="fixed z-50 w-[184px] rounded-md border p-2 shadow-2xl"
-        style={{
-          left: x,
-          top: y,
-          // Solid surface so the picker never bleeds content through
-          // (--th-header-bg carries alpha in some themes).
-          backgroundColor: "var(--th-tile-bg)",
-          borderColor: "var(--th-border)",
-          color: "var(--th-fg)",
-        }}
-        onPointerDown={(e) => e.stopPropagation()}
-      >
-        <div
-          className="mb-1.5 px-0.5 text-[10px] font-semibold uppercase tracking-wide"
-          style={{ color: "var(--th-fg-muted)" }}
-        >
-          Workspace color
-        </div>
-        <div className="grid grid-cols-4 gap-1.5">
-          {WORKSPACE_COLOR_PALETTE.map((c) => {
-            const selected =
-              !!current && current.toLowerCase() === c.toLowerCase();
-            return (
-              <button
-                key={c}
-                type="button"
-                onClick={() => onPick(c)}
-                className="h-6 w-full rounded"
-                style={{
-                  backgroundColor: c,
-                  outline: selected ? "2px solid var(--th-fg)" : undefined,
-                  outlineOffset: "1px",
-                }}
-                title={c}
-                aria-label={`Use ${c}`}
-              />
-            );
-          })}
-        </div>
-        <div className="mt-2 flex items-center gap-2">
-          <label
-            className="flex flex-1 cursor-pointer items-center gap-1.5 text-xs"
-            style={{ color: "var(--th-fg-muted)" }}
-            title="Custom color"
-          >
-            <input
-              type="color"
-              value={current ?? "#38bdf8"}
-              onChange={(e) => onPick(e.target.value)}
-              className="h-6 w-9 shrink-0 cursor-pointer rounded bg-transparent p-0"
-            />
-            Custom
-          </label>
-          <button
-            type="button"
-            onClick={onClear}
-            disabled={!current}
-            className="rounded border px-2 py-1 text-xs hover:bg-neutral-800 disabled:opacity-40"
-            style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
-            title="Clear (follow the default accent)"
-          >
-            Default
-          </button>
-        </div>
-      </div>
-    </>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Small inline icons for the tear-off controls (#21). Sized to sit inline with
-// the tab text; they inherit `currentColor` so they follow the button's hover.
+// Small inline icons. They inherit `currentColor` so they follow the button's
+// hover state.
 // ---------------------------------------------------------------------------
 
 /** Settings gear (the primary titlebar settings control). */
@@ -1021,28 +528,6 @@ function GearIcon() {
     >
       <circle cx="12" cy="12" r="3" />
       <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-    </svg>
-  );
-}
-
-/** "Open in new window" arrow (pop a tab out). */
-function PopOutIcon() {
-  return (
-    <svg
-      width="11"
-      height="11"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="pointer-events-none"
-      aria-hidden
-    >
-      <path d="M14 4h6v6" />
-      <path d="M20 4 11 13" />
-      <path d="M19 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4" />
     </svg>
   );
 }
