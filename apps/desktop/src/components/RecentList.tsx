@@ -27,6 +27,9 @@ import { useWorkspace } from "../store/workspace";
 export interface RecentListProps {
   /** Resume a past session: spawn `claude --resume <id>` in `cwd`, focus it. */
   onRecall: (sessionId: string, cwd: string) => void;
+  /** Report the visible (post hidden-filter) project count up to the sidebar so
+   *  the "Recent" section header can show it. Called when the count changes. */
+  onCount?: (n: number) => void;
 }
 
 /** Final path segment of a cwd (POSIX or Windows separators), or the whole string
@@ -143,7 +146,7 @@ function groupByFolder(sessions: RecentSession[]): FolderGroup[] {
   return out;
 }
 
-export function RecentList({ onRecall }: RecentListProps) {
+export function RecentList({ onRecall, onCount }: RecentListProps) {
   // Seed from cache so we render the previous Recent immediately; `loaded` is
   // true when a cache existed, so "Loading…" only shows on the very first run.
   const [sessions, setSessions] = useState<RecentSession[]>(loadCache);
@@ -183,6 +186,11 @@ export function RecentList({ onRecall }: RecentListProps) {
     () => groupByFolder(sessions).filter((g) => !hidden.has(g.session.id)),
     [sessions, hidden],
   );
+
+  // Report the visible count up to the "Recent" section header (item 5).
+  useEffect(() => {
+    onCount?.(groups.length);
+  }, [groups.length, onCount]);
 
   // Cosmetic per-project work names (keyed by cwd) — surfaced as the row title.
   const workNames = useTheme((s) => s.workNames);
@@ -259,10 +267,14 @@ function ProjectRow({
   onHide: (sessionId: string) => void;
 }) {
   const s = group.session;
-  // Prefer the session's most-recent text; fall back to its summary/first-prompt
-  // label when the transcript tail yielded nothing usable.
-  const subtitle = s.lastText || s.label;
+  // Item 5: surface WHEN this project was last in session (not the last-request
+  // text). `relativeTime` is compact ("3h"); render it as a clear "… ago" label,
+  // with the absolute timestamp on hover.
   const rel = relativeTime(s.lastSeen);
+  const lastActive = rel ? (rel === "now" ? "active now" : `${rel} ago`) : "";
+  const lastSeenAbs = s.lastSeen
+    ? new Date(s.lastSeen * 1000).toLocaleString()
+    : "";
   // The named work wins the title; the folder name then moves into the subtitle so
   // it's still visible.
   const title = workName || group.name;
@@ -273,7 +285,7 @@ function ProjectRow({
 
   return (
     <div
-      className="group flex items-center gap-2 rounded-lg px-2 py-1.5 transition-colors hover:bg-neutral-800/40"
+      className="group flex items-center gap-2 rounded-lg px-2 py-1.5 transition-colors hover:bg-neutral-800/25"
       style={{
         color: "var(--th-fg)",
         ...(color ? { boxShadow: `inset 2px 0 0 0 ${color}` } : {}),
@@ -294,12 +306,11 @@ function ProjectRow({
         <div
           className="truncate text-[11px]"
           style={{ color: "var(--th-fg-muted)" }}
-          title={subtitle}
+          title={lastSeenAbs ? `Last active ${lastSeenAbs}` : undefined}
         >
           {workName ? `${group.name} · ` : ""}
           {worktree ? `⎇ ${worktree} · ` : ""}
-          {subtitle}
-          {rel ? ` · ${rel}` : ""}
+          {lastActive || "—"}
         </div>
       </div>
 
@@ -307,7 +318,7 @@ function ProjectRow({
       <button
         type="button"
         onClick={() => onRecall(s.id, s.cwd)}
-        className="shrink-0 rounded-md px-1.5 py-1 text-[13px] leading-none opacity-0 transition-opacity hover:bg-neutral-700/40 focus:opacity-100 group-hover:opacity-100"
+        className="shrink-0 rounded-md px-2 py-1.5 text-[15px] leading-none opacity-0 transition-opacity hover:bg-neutral-700/50 focus:opacity-100 group-hover:opacity-100"
         style={{ color: "var(--th-fg-muted)" }}
         title={`Resume: claude --resume in ${group.cwd}`}
         aria-label="Resume session"
@@ -317,7 +328,7 @@ function ProjectRow({
       <button
         type="button"
         onClick={() => onHide(s.id)}
-        className="shrink-0 rounded-md px-1.5 py-1 text-[13px] leading-none opacity-0 transition-opacity hover:bg-neutral-700/40 focus:opacity-100 group-hover:opacity-100"
+        className="shrink-0 rounded-md px-2 py-1.5 text-[15px] leading-none opacity-0 transition-opacity hover:bg-neutral-700/50 focus:opacity-100 group-hover:opacity-100"
         style={{ color: "var(--th-fg-muted)" }}
         title="Hide from Recent (does not delete the transcript)"
         aria-label="Hide from Recent"

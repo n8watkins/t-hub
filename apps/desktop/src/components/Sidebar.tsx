@@ -32,11 +32,12 @@ import {
   CodexUsageInline,
   useCodexUsage,
 } from "./UsageStrip";
+import { useState } from "react";
 import { WorkspacesList } from "./WorkspacesList";
 import { RecentList } from "./RecentList";
 import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
-import { ChevronIcon, CountBadge } from "./SidebarChrome";
+import { ChevronIcon } from "./SidebarChrome";
 import { usePersistedToggle } from "../hooks/usePersistedToggle";
 import type { HostMetrics, ConnectionState } from "../ipc/protocol";
 import type { TerminalId } from "../ipc/types";
@@ -125,6 +126,9 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
   // Only the tab list is needed here now (the Workspaces section count); the
   // Workspaces list itself reads everything else from the store directly.
   const tabs = useWorkspace((s) => s.tabs);
+  // The Recent section's count is owned by RecentList (it does the fetch +
+  // hidden-filter); it reports its filtered length up so the header shows it.
+  const [recentCount, setRecentCount] = useState(0);
 
   return (
     <aside
@@ -148,23 +152,57 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
       <div className="th-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
         {/* Workspaces — every workspace tab as a collapsible row over its
             terminals: switch workspace/terminal, rename, close. Self-contained
-            (reads the store directly). */}
-        <Section title="Workspaces" count={tabs.length} className="border-b">
+            (reads the store directly). The header carries the sidebar-collapse
+            toggle (leading) and a "+" to create a new workspace (action). */}
+        <Section
+          title="Workspaces"
+          count={tabs.length}
+          className="border-b"
+          leading={
+            onToggleSidebar ? (
+              <button
+                type="button"
+                onClick={onToggleSidebar}
+                aria-label="Collapse sidebar"
+                title="Collapse sidebar (Ctrl/Cmd+B)"
+                className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-neutral-400 transition-colors hover:bg-neutral-700/60 hover:text-white"
+              >
+                <SidebarToggleIcon />
+              </button>
+            ) : undefined
+          }
+          action={
+            <button
+              type="button"
+              onClick={() => useWorkspace.getState().addTab()}
+              aria-label="New workspace"
+              title="New workspace"
+              className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
+            >
+              <PlusIcon />
+            </button>
+          }
+        >
           <WorkspacesList />
         </Section>
 
         {/* Recent — past Claude sessions to resume. Collapsible, and capped to
             half the viewport with its own scroll so a long history can't swallow
-            the whole sidebar; the list scrolls inside this region, not the page. */}
+            the whole sidebar; the list scrolls inside this region, not the page.
+            The count is reported up from RecentList (post hidden-filter). */}
         <Section
           title="Recent"
+          count={recentCount}
           className="border-b"
           collapsible
           storageKey="t-hub.sidebar.recent.open"
           bodyClassName="th-scroll overflow-y-auto"
           bodyStyle={{ maxHeight: "38vh" }}
         >
-          <RecentList onRecall={(id, cwd) => onRecall?.(id, cwd)} />
+          <RecentList
+            onRecall={(id, cwd) => onRecall?.(id, cwd)}
+            onCount={setRecentCount}
+          />
         </Section>
       </div>
 
@@ -616,8 +654,43 @@ function SidebarToggleIcon() {
 // there are only two, and both are primary, so they're always shown.
 // ===========================================================================
 
-/** A titled sidebar section: an uppercase header (chevron-free) with an optional
- *  count chip, over its body. The outer `className` carries the border styling. */
+/** A larger, left-adjacent section count (replaces the muted pill in section
+ *  headers): a bit bigger than the uppercase title and sitting right after it, so
+ *  "Workspaces 3" reads as one unit (per the sidebar redesign). */
+function SectionCount({ n }: { n: number }) {
+  return (
+    <span
+      className="shrink-0 text-[13px] font-bold leading-none tabular-nums"
+      style={{ color: "var(--th-fg-muted)" }}
+    >
+      {n}
+    </span>
+  );
+}
+
+/** A small "new" plus glyph for a section header action (e.g. new workspace). */
+function PlusIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="pointer-events-none"
+      aria-hidden
+    >
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  );
+}
+
+/** A titled sidebar section: an uppercase header with an optional (larger,
+ *  left-adjacent) count, an optional leading control, and an optional right-aligned
+ *  action, over its body. The outer `className` carries the border styling. */
 function Section({
   title,
   count,
@@ -627,6 +700,8 @@ function Section({
   storageKey,
   bodyClassName,
   bodyStyle,
+  leading,
+  action,
 }: {
   title: string;
   count?: number;
@@ -640,6 +715,12 @@ function Section({
    *  scrolling region so a long list can't consume the whole sidebar. */
   bodyClassName?: string;
   bodyStyle?: React.CSSProperties;
+  /** Optional control rendered before the title (non-collapsible sections only),
+   *  e.g. the sidebar collapse toggle next to "Workspaces". */
+  leading?: React.ReactNode;
+  /** Optional right-aligned action rendered in the header, e.g. a "+" that creates
+   *  a new workspace. Sits outside the collapse toggle so it stays clickable. */
+  action?: React.ReactNode;
 }) {
   const [open, setOpen] = usePersistedToggle(storageKey);
   const isOpen = collapsible ? open : true;
@@ -650,28 +731,32 @@ function Section({
       className={["flex flex-col", className ?? ""].join(" ")}
       style={{ borderColor: "var(--th-border)" }}
     >
-      {collapsible ? (
-        <button
-          type="button"
-          onClick={toggle}
-          aria-expanded={isOpen}
-          title={isOpen ? "Collapse" : "Expand"}
-          className="flex w-full items-center gap-1 px-2 pt-2 pb-1 text-xs font-semibold uppercase tracking-wide opacity-80 hover:opacity-100"
-          style={{ color: "var(--th-fg-muted)" }}
-        >
-          <ChevronIcon open={isOpen} />
-          <span className="min-w-0 flex-1 truncate text-left">{title}</span>
-          {count != null && <CountBadge n={count} />}
-        </button>
-      ) : (
-        <div
-          className="flex w-full items-center gap-1 px-2 pt-2 pb-1 text-xs font-semibold uppercase tracking-wide"
-          style={{ color: "var(--th-fg-muted)" }}
-        >
-          <span className="min-w-0 flex-1 truncate">{title}</span>
-          {count != null && <CountBadge n={count} />}
-        </div>
-      )}
+      <div className="flex w-full items-center gap-1 px-2 pt-2 pb-1">
+        {collapsible ? (
+          <button
+            type="button"
+            onClick={toggle}
+            aria-expanded={isOpen}
+            title={isOpen ? "Collapse" : "Expand"}
+            className="flex min-w-0 flex-1 items-center gap-1.5 text-xs font-semibold uppercase tracking-wide opacity-80 hover:opacity-100"
+            style={{ color: "var(--th-fg-muted)" }}
+          >
+            <ChevronIcon open={isOpen} />
+            <span className="min-w-0 truncate text-left">{title}</span>
+            {count != null && <SectionCount n={count} />}
+          </button>
+        ) : (
+          <div
+            className="flex min-w-0 flex-1 items-center gap-1.5 text-xs font-semibold uppercase tracking-wide"
+            style={{ color: "var(--th-fg-muted)" }}
+          >
+            {leading}
+            <span className="min-w-0 truncate">{title}</span>
+            {count != null && <SectionCount n={count} />}
+          </div>
+        )}
+        {action && <div className="shrink-0">{action}</div>}
+      </div>
       {/* Animate open/close by transitioning the grid row 0fr↔1fr; the body
           stays mounted and the inner wrapper clips it as it collapses. */}
       <div

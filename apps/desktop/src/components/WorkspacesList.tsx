@@ -33,16 +33,18 @@ import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag"
 import { resolveDropTarget } from "../lib/dropTarget";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { ChevronIcon, CountBadge } from "./SidebarChrome";
+import { StatusIndicator, type StatusVariant } from "./StatusIndicator";
 
-/** Lifecycle-dot color per terminal state — the SAME `--th-dot-*` palette Tile
- *  uses, so a terminal reads identically wherever it appears. */
-const DOT_VAR: Record<TerminalState, string> = {
-  starting: "var(--th-dot-starting)",
-  live: "var(--th-dot-live)",
-  detached: "var(--th-dot-detached)",
-  exited: "var(--th-dot-exited)",
-  error: "var(--th-dot-error)",
-};
+/** Map a terminal's working/lifecycle state to a shared StatusIndicator variant
+ *  (item 11): actively working → the pulsing ring; otherwise error / done (quiet
+ *  but live) / idle. Mirrors the Tile header mapping so a terminal reads the same
+ *  in the sidebar and on its tile. */
+function dotVariant(pulsing: boolean, state: TerminalState): StatusVariant {
+  if (pulsing) return "working";
+  if (state === "error") return "error";
+  if (state === "live") return "done";
+  return "idle";
+}
 
 export function WorkspacesList() {
   const tabs = useWorkspace((s) => s.tabs);
@@ -82,9 +84,11 @@ export function WorkspacesList() {
   // so keyboard nav reads clearly.
   const sidebarFocused = focusedRegion === "sidebar";
 
-  // Local expand/collapse, keyed by tab id. Undefined = default (open iff active).
+  // Local expand/collapse, keyed by tab id. Item 8: every workspace is expanded by
+  // DEFAULT (undefined ⇒ open); the chevron still collapses any individual row, and
+  // switching the active workspace never auto-collapses the others.
   const [openMap, setOpenMap] = useState<Record<string, boolean>>({});
-  const isOpen = (tab: WorkspaceTab) => openMap[tab.id] ?? tab.id === activeTabId;
+  const isOpen = (tab: WorkspaceTab) => openMap[tab.id] ?? true;
   const toggleOpen = (tab: WorkspaceTab) =>
     setOpenMap((m) => ({ ...m, [tab.id]: !isOpen(tab) }));
 
@@ -414,7 +418,7 @@ function WorkspaceRow({
     // dragged terminal resolves to it via elementFromPoint + closest.
     <li data-th-ws-row={tab.id}>
       <div
-        className="flex w-full items-center gap-1 rounded-lg pr-1 transition-colors hover:bg-neutral-800/40"
+        className="flex w-full items-center gap-1 rounded-lg pr-1 transition-colors hover:bg-neutral-800/25"
         style={{
           color: "var(--th-fg)",
           // Dim this row while it is the workspace being dragged to reorder.
@@ -455,7 +459,7 @@ function WorkspaceRow({
           aria-expanded={open}
           aria-label={open ? "Collapse workspace" : "Expand workspace"}
           title={open ? "Collapse" : "Expand"}
-          className="flex h-7 w-5 shrink-0 items-center justify-center opacity-70 hover:opacity-100"
+          className="flex h-8 w-6 shrink-0 items-center justify-center opacity-70 hover:opacity-100"
         >
           <ChevronIcon open={open} />
         </button>
@@ -469,14 +473,14 @@ function WorkspaceRow({
               e.stopPropagation();
               setColorMenu((v) => !v);
             }}
-            className="flex h-5 w-5 items-center justify-center rounded hover:bg-neutral-700/40"
+            className="flex h-6 w-6 items-center justify-center rounded hover:bg-neutral-700/50"
             title="Workspace color"
             aria-label="Set workspace color"
             aria-haspopup="menu"
             aria-expanded={colorMenu}
           >
             <span
-              className="h-2.5 w-2.5 rounded-full"
+              className="h-3 w-3 rounded-full"
               style={{
                 backgroundColor: color ?? "var(--th-fg-muted)",
                 boxShadow: color ? `0 0 5px -1px ${color}` : undefined,
@@ -541,7 +545,7 @@ function WorkspaceRow({
             }}
             onDoubleClick={startEdit}
             aria-current={active ? "true" : undefined}
-            className="flex min-w-0 flex-1 cursor-pointer touch-none select-none items-center gap-2 py-1.5 pr-1 text-left text-sm outline-none"
+            className="flex min-w-0 flex-1 cursor-pointer touch-none select-none items-center gap-2 py-2 pr-1 text-left text-[15px] outline-none"
             title={`${tab.name} — ${count} terminal${count === 1 ? "" : "s"} · double-click to rename · drag to reorder`}
           >
             <span className="min-w-0 flex-1 truncate font-medium">{tab.name}</span>
@@ -717,7 +721,7 @@ function TerminalRow({
   const suppressClickRef = useRef(false);
   return (
     <li
-      className="group relative flex items-center gap-2 rounded-lg pr-1 transition-colors hover:bg-neutral-800/40"
+      className="group relative flex items-center gap-2 rounded-lg pr-1 transition-colors hover:bg-neutral-800/25"
       style={{
         color: "var(--th-fg)",
         // Dim the source row while it's being dragged into another workspace.
@@ -764,7 +768,7 @@ function TerminalRow({
           });
         }}
         aria-current={active ? "true" : undefined}
-        className="flex min-w-0 flex-1 cursor-pointer touch-none select-none items-center gap-2 py-1.5 pl-2.5 text-left text-sm"
+        className="flex min-w-0 flex-1 cursor-pointer touch-none select-none items-center gap-2 py-2 pl-2.5 text-left text-sm"
         title={cwd ? `${label} — ${cwd} (${state})` : `${label} — ${state}`}
       >
         {/* Agent icon (claude/codex) so the row reads as the agent at a glance;
@@ -779,17 +783,13 @@ function TerminalRow({
         ) : client === "codex" ? (
           <CodexIcon size={14} className="shrink-0" title="Codex" />
         ) : null}
-        <span
-          // ACTIVITY: pulse while the agent is working — Claude mid-turn
-          // (supervision) OR any live output (Codex / a shell running a command);
-          // static when idle.
-          className={`h-2 w-2 shrink-0 rounded-full${pulsing ? " animate-pulse" : ""}`}
-          style={{
-            backgroundColor: DOT_VAR[state],
-            // A soft glow while active makes the pulse read even on a tiny dot.
-            boxShadow: pulsing ? `0 0 5px 0 ${DOT_VAR[state]}` : undefined,
-          }}
-          aria-hidden
+        {/* ACTIVITY (item 11): the shared ring/center indicator — a pulsing ring
+            while the agent is working (Claude mid-turn OR any live output), a calm
+            solid when quiet/live, muted when idle. */}
+        <StatusIndicator
+          variant={dotVariant(pulsing, state)}
+          size={10}
+          className="shrink-0"
           title={pulsing ? "Working…" : undefined}
         />
         <span className="min-w-0 flex-1">
@@ -820,7 +820,7 @@ function TerminalRow({
           // visible only while its own picker is open. The row already shows the
           // assigned color as its tint/accent bar, so the swatch button itself
           // doesn't need to persist when a color is set.
-          className={`flex h-5 w-5 items-center justify-center rounded transition-opacity hover:bg-neutral-700/40 group-hover:opacity-100${
+          className={`flex h-6 w-6 items-center justify-center rounded transition-opacity hover:bg-neutral-700/50 group-hover:opacity-100${
             colorMenuOpen ? " opacity-100" : " opacity-0"
           }`}
           title="Terminal color"
@@ -829,7 +829,7 @@ function TerminalRow({
           aria-expanded={colorMenuOpen}
         >
           <span
-            className="h-2.5 w-2.5 rounded-full"
+            className="h-3 w-3 rounded-full"
             style={{
               backgroundColor: ownColor ?? "var(--th-fg-muted)",
               boxShadow: ownColor ? `0 0 5px -1px ${ownColor}` : undefined,
@@ -855,7 +855,7 @@ function TerminalRow({
           e.stopPropagation();
           onClose();
         }}
-        className="shrink-0 rounded px-1 leading-none opacity-0 transition-opacity hover:bg-neutral-700/40 group-hover:opacity-100"
+        className="shrink-0 rounded px-1.5 text-base leading-none opacity-0 transition-opacity hover:bg-neutral-700/50 group-hover:opacity-100"
         style={{ color: "var(--th-fg-muted)" }}
         title="Close this terminal (kills its session)"
         aria-label="Close terminal"
