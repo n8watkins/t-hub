@@ -187,7 +187,10 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
         .catch(() => {});
     };
     refresh();
-    const id = window.setInterval(refresh, 5000);
+    // 15s (was 5s): each refresh is a `wsl.exe tmux list-sessions` spawn; pair it
+    // with the focus listener so the list is fresh on return without spawning a
+    // wsl.exe every 5s in the background.
+    const id = window.setInterval(refresh, 15000);
     window.addEventListener("focus", refresh);
     return () => {
       window.clearInterval(id);

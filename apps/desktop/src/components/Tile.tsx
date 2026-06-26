@@ -77,14 +77,16 @@ function useGitInfo(cwd: string): GitInfo | null {
     load();
     window.addEventListener("focus", load);
     // Poll so a branch switch in the SAME directory (`git switch` without a cwd
-    // change) is reflected — the cwd-keyed effect alone wouldn't re-fire, leaving
-    // the chip stuck on the old branch until the window regained focus. Skip the
-    // poll while the window is hidden/minimized so a wall of tiles doesn't spawn
-    // a `git` process each every 5s in the background (focus re-runs load on
-    // return, so the chip is still fresh the moment the user comes back).
+    // change) is eventually reflected — the cwd-keyed effect alone wouldn't re-fire.
+    // Skip while hidden, and poll INFREQUENTLY: each tick spawns a `git` (a wsl.exe
+    // on Windows) per tile, and GIT_INFO_TTL (3.5s) is SHORTER than this interval, so
+    // every tick is a cache MISS → a real spawn. At 5s × a wall of tiles that was a
+    // periodic freeze (8 wsl.exe spawns every 5s); 30s + focus-refresh keeps the chip
+    // fresh enough without the storm. (An in-place branch switch shows on focus or
+    // within 30s.)
     const poll = window.setInterval(() => {
       if (!document.hidden) load();
-    }, 5000);
+    }, 30000);
     return () => {
       alive = false;
       window.removeEventListener("focus", load);

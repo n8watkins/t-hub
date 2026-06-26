@@ -60,14 +60,20 @@ impl ThemeState {
 }
 
 /// `~/.config/t-hub` (honoring `XDG_CONFIG_HOME`), the dir we persist into.
-/// Returns `None` only when neither `XDG_CONFIG_HOME` nor `HOME` is set.
+/// Returns `None` only when none of `XDG_CONFIG_HOME` / `HOME` / `USERPROFILE` is
+/// set. `USERPROFILE` is the Windows home — without it the app (which runs ON
+/// Windows, where `HOME` is unset) could never resolve a config dir, so every theme
+/// read/write failed with "could not resolve a config dir" — on a tight loop, that
+/// was a steady error/log storm.
 fn config_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
             return Some(Path::new(&xdg).join("t-hub"));
         }
     }
-    std::env::var_os("HOME").map(|h| Path::new(&h).join(".config").join("t-hub"))
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| Path::new(&h).join(".config").join("t-hub"))
 }
 
 /// Full path to the persisted theme file.
