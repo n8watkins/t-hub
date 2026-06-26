@@ -48,6 +48,7 @@ import pkg from "../../package.json";
 // Recovery review (#recovery): a self-contained modal opened from a button in the
 // General section. It renders its own scrim/panel above this one (z-[60] > z-50).
 import { RecoveryReview } from "./RecoveryReview";
+import { StatusIndicator, type StatusVariant } from "./StatusIndicator";
 // Claude hooks install/uninstall now lives in Settings (moved out of the sidebar).
 import { HookInstallPanel } from "./HookInstallPanel";
 import { claudeHooksInstalled } from "../ipc/client05";
@@ -319,6 +320,42 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
           hint="When you Resume a session from the sidebar's Recent list, run `claude --resume` to reopen that conversation. Turn off to just open a terminal in the session's directory instead."
           value={resumeStartsClaude}
           onChange={setResumeStartsClaude}
+        />
+      </Group>
+
+      <Group
+        title="Status indicators"
+        description="The ring shown beside each terminal in the sidebar and on its tile header. For Claude it reflects the agent's reported status (needs the status hooks installed below); a plain shell only shows the running/empty states."
+      >
+        <StatusLegendRow
+          variant="working"
+          name="Working"
+          hint="A pulsing ring — the agent is actively generating a response (or a shell command is producing output)."
+        />
+        <StatusLegendRow
+          variant="attention"
+          name="Needs you"
+          hint="A pulsing amber ring — the agent is asking a question or waiting on a permission prompt."
+        />
+        <StatusLegendRow
+          variant="done"
+          name="Done"
+          hint="A solid green dot — the last turn finished and the session is ready for input."
+        />
+        <StatusLegendRow
+          variant="idle"
+          name="Idle"
+          hint="A muted hollow ring — an agent is open but not doing anything right now."
+        />
+        <StatusLegendRow
+          variant="error"
+          name="Error"
+          hint="A solid red dot — the session failed."
+        />
+        <StatusLegendRow
+          variant={null}
+          name="Empty"
+          hint="No indicator — a plain shell with nothing running."
         />
       </Group>
 
@@ -1875,6 +1912,51 @@ function ToggleRow({
  * Like {@link ToggleRow}, the row is a plain <div> and the label is plain text:
  * only the Switch toggles the value, never the label/helper text.
  */
+/** One row of the status-indicator legend: the live indicator on the right (so it
+ *  always matches the real thing), with its name + meaning on the left. A `null`
+ *  variant is the BLANK/empty state — shown as a faint dashed ring stand-in so the
+ *  legend entry isn't an empty box. */
+function StatusLegendRow({
+  variant,
+  name,
+  hint,
+}: {
+  variant: StatusVariant | null;
+  name: string;
+  hint: string;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3 text-sm">
+      <span className="flex min-w-0 flex-col">
+        <span style={{ color: "var(--th-fg)" }}>{name}</span>
+        <span
+          className="mt-1 text-xs leading-snug"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          {hint}
+        </span>
+      </span>
+      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
+        {variant === null ? (
+          <span
+            className="inline-block rounded-full"
+            style={{
+              width: 13,
+              height: 13,
+              border: "1px dashed var(--th-fg-muted)",
+              opacity: 0.5,
+            }}
+            aria-label="Empty (no indicator)"
+            title="Empty (no indicator)"
+          />
+        ) : (
+          <StatusIndicator variant={variant} size={13} />
+        )}
+      </span>
+    </div>
+  );
+}
+
 function SettingToggleRow({
   label,
   value,
