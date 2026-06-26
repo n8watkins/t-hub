@@ -1107,11 +1107,14 @@ pub fn control_search(
 
 /// Parse the `T_HUB_REMOTE_FILE_ROOTS` allowlist: colon-separated absolute
 /// (WSL/POSIX) project roots a REMOTE peer may browse/read under. Empties trimmed.
+/// Each root is RESOLVED to its real symlink-free path once here (so the per-request
+/// scope check compares resolved-vs-resolved); a root that can't be resolved (doesn't
+/// exist / not a WSL path) is dropped — fail-closed (it can only deny, never widen).
 fn parse_file_roots(raw: &str) -> Vec<PathBuf> {
     raw.split(':')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(normalize)
+        .filter_map(resolve_real_posix)
         .collect()
 }
 
@@ -1129,63 +1132,109 @@ pub fn remote_file_roots() -> &'static [PathBuf] {
     })
 }
 
-/// Resolve + SCOPE a control-channel file path (server-split #23). Normalizes
-/// `path`; loopback callers (`enforce = false`) get it back unrestricted. For a
-/// REMOTE peer the boundary is the OPERATOR allowlist (`allowed_roots`), NOT the
-/// peer-chosen index — so a peer can't widen scope by `index_project`-ing a
-/// sensitive dir. Empty allowlist ⇒ deny everything. We then reject `..` and
-/// **canonicalize** (resolving symlinks) before the under-root check, so a symlink
-/// inside an allowed root can't point out of it, returning the RESOLVED path for the
-/// read (no check-vs-read divergence).
-///
-/// NB: canonicalization fully confines on a native unix/WSL daemon (the server-split
-/// endgame). On the current Windows-host topology reading WSL via the 9P UNC bridge,
-/// symlink resolution is best-effort — see the WSL-symlink hardening task before
-/// trusting an allowlist on an UNtrusted tailnet.
-/// Shared pre-check for the remote-scope gates: an empty allowlist denies all
-/// remote access (the default), and `..` is rejected outright (it could survive a
-/// `normalize` that skipped canonicalization and escape the under-root check).
-fn remote_precheck(p: &Path, allowed_roots: &[PathBuf]) -> Result<(), String> {
+// --- Remote file-access scope (server-split #23/#26/#27) -------------------
+// For a REMOTE peer the boundary is the OPERATOR allowlist (T_HUB_REMOTE_FILE_ROOTS),
+// NOT the peer-chosen index — so a peer can't widen scope by `index_project`-ing a
+// sensitive dir. Empty allowlist ⇒ deny everything (the default). We reject `..`,
+// then resolve symlinks AUTHORITATIVELY before the under-root check (#26: inside WSL
+// on Windows, where std::fs::canonicalize can't be trusted over the 9P UNC bridge),
+// and the read targets the host form of the RESOLVED path so a symlink can't redirect
+// it after the check. Loopback (same machine) bypasses all of this.
+
+/// Shared pre-check: an empty allowlist denies all remote access (the default), and a
+/// `..` component is rejected outright (belt-and-suspenders ahead of resolution).
+fn remote_precheck(path: &str, allowed_roots: &[PathBuf]) -> Result<(), String> {
     if allowed_roots.is_empty() {
         return Err("remote file/worktree access is disabled — set \
                     T_HUB_REMOTE_FILE_ROOTS to a colon-separated list of allowed \
                     roots to enable it"
             .to_string());
     }
-    if p.components()
+    if Path::new(path)
+        .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Err(format!(
-            "rejecting a path containing '..' over the control channel: {}",
-            p.display()
+            "rejecting a path containing '..' over the control channel: {path}"
         ));
     }
     Ok(())
 }
 
-/// True if a CANONICALIZED `resolved` path equals or is nested under one of the
-/// (also-canonicalized) `allowed_roots`. Component-wise, so `/a/proj` does NOT match
-/// `/a/proj-secret`. A non-existent allowed root canonicalizes-fails ⇒ never matches
-/// (fail-closed: a misconfigured root can only deny, never widen).
+/// Authoritative symlink-resolving real path for the scope check, as a POSIX path.
+/// On unix the daemon IS the WSL/Linux host, so `canonicalize` resolves natively. On
+/// Windows the daemon reaches WSL over the 9P UNC bridge, where `std::fs::canonicalize`
+/// can't be relied on to resolve ext4 symlinks — so we run `realpath` INSIDE the
+/// distro on the POSIX form (#26). Returns None ⇒ the caller DENIES (fail-closed):
+/// path doesn't exist, isn't a WSL path, or the wsl.exe call failed.
+fn resolve_real_posix(path: &str) -> Option<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        std::fs::canonicalize(path).ok()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        // POSIX form: pass-through for a bare POSIX path, strip the WSL-UNC prefix
+        // for a host path; a non-WSL drive path ⇒ None ⇒ caller fail-closes.
+        let posix = unc_to_posix(&PathBuf::from(path))?;
+        let mut c = Command::new("wsl.exe");
+        c.arg("-d")
+            .arg(host_distro())
+            .arg("-e")
+            .arg("realpath")
+            .arg("--")
+            .arg(&posix);
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let out = c.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let resolved = String::from_utf8(out.stdout).ok()?;
+        let resolved = resolved.trim();
+        if !resolved.starts_with('/') {
+            return None;
+        }
+        Some(PathBuf::from(resolved))
+    }
+}
+
+/// True if a RESOLVED (symlink-free POSIX) path equals or is nested under one of the
+/// (also-resolved) `allowed_roots`. Component-wise via `Path::starts_with`, so
+/// `/a/proj` does NOT match `/a/proj-secret`.
 fn under_allowed_root(resolved: &Path, allowed_roots: &[PathBuf]) -> bool {
-    allowed_roots.iter().any(|root| {
-        std::fs::canonicalize(root)
-            .map(|r| resolved == r || resolved.starts_with(&r))
-            .unwrap_or(false)
-    })
+    allowed_roots
+        .iter()
+        .any(|root| resolved == root || resolved.starts_with(root))
+}
+
+/// Convert a resolved POSIX path back to the host form the file readers use (identity
+/// on unix; the `\\wsl.localhost\...` UNC on Windows). The read then targets exactly
+/// the resolved path the scope check validated — a symlink can't redirect it after.
+fn host_of_resolved(real_posix: &Path) -> PathBuf {
+    to_host_path(&real_posix.to_string_lossy())
+}
+
+/// The POSIX form of a control-channel path for the ancestor walk: identity on unix
+/// (already POSIX), the WSL-UNC→POSIX mapping on Windows.
+fn posix_form(path: &str) -> String {
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
+    #[cfg(windows)]
+    {
+        unc_to_posix(&PathBuf::from(path)).unwrap_or_else(|| path.to_string())
+    }
 }
 
 fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
-    let p = normalize(path);
     if !enforce {
-        return Ok(p);
+        return Ok(normalize(path));
     }
-    remote_precheck(&p, allowed_roots)?;
-    // Resolve symlinks (+ residual `.`/`..`) so the under-root check can't be escaped
-    // via a symlink in an allowed root. Requires existence — a remote read of a
-    // nonexistent path is pointless and unverifiable.
-    let real = std::fs::canonicalize(&p)
-        .map_err(|e| format!("cannot resolve {} on the host: {e}", p.display()))?;
+    remote_precheck(path, allowed_roots)?;
+    let real = resolve_real_posix(path).ok_or_else(|| format!("cannot resolve {path} on the host"))?;
     if !under_allowed_root(&real, allowed_roots) {
         return Err(format!(
             "path is outside the allowed remote roots ({}): {}",
@@ -1193,47 +1242,41 @@ fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<P
             real.display()
         ));
     }
-    Ok(real)
+    Ok(host_of_resolved(&real))
 }
 
 /// Like [`scoped_path`] but for a path that may NOT exist yet — a worktree dir a
 /// remote peer asks to CREATE (`create_worktree`), or an existing one to remove.
-/// Rejects `..`, then requires the deepest EXISTING ancestor to canonicalize under
-/// an allowed root, so the (symlink-free, `..`-free) new tail lands inside it.
-/// Loopback (`enforce = false`) is unrestricted. Returns the normalized target.
+/// Rejects `..`, then resolves the deepest EXISTING ancestor and requires it under an
+/// allowed root, so the (symlink-free, `..`-free) new tail lands inside it. Loopback
+/// is unrestricted. Returns the normalized host target.
 pub fn scoped_create_path(
     path: &str,
     enforce: bool,
     allowed_roots: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    let p = normalize(path);
     if !enforce {
-        return Ok(p);
+        return Ok(normalize(path));
     }
-    remote_precheck(&p, allowed_roots)?;
-    let mut ancestor: &Path = &p;
+    remote_precheck(path, allowed_roots)?;
+    let posix = posix_form(path);
+    let mut ancestor = Path::new(&posix);
     let resolved_ancestor = loop {
-        match std::fs::canonicalize(ancestor) {
-            Ok(c) => break c,
-            Err(_) => match ancestor.parent() {
-                Some(parent) => ancestor = parent,
-                None => {
-                    return Err(format!(
-                        "cannot resolve any existing ancestor of {}",
-                        p.display()
-                    ))
-                }
-            },
+        if let Some(resolved) = resolve_real_posix(&ancestor.to_string_lossy()) {
+            break resolved;
+        }
+        match ancestor.parent() {
+            Some(parent) => ancestor = parent,
+            None => return Err(format!("cannot resolve any existing ancestor of {path}")),
         }
     };
     if !under_allowed_root(&resolved_ancestor, allowed_roots) {
         return Err(format!(
-            "path is outside the allowed remote roots ({}): {}",
+            "path is outside the allowed remote roots ({}): {path}",
             allowed_roots.len(),
-            p.display()
         ));
     }
-    Ok(p)
+    Ok(normalize(path))
 }
 
 /// Control-channel capped text read (server-split #23 — the Files reader over the
