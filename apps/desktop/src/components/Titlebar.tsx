@@ -24,8 +24,9 @@
 // use the Tauri window API / settings store and must NOT carry
 // data-tauri-drag-region, or a click would start a window drag instead.
 import { useEffect, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
+import type { PointerEvent as ReactPointerEvent, RefObject } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
 import { useSettings } from "../store/settings";
@@ -92,6 +93,106 @@ function closeWindow(): void {
   void getCurrentWindow()
     .close()
     .catch(() => {});
+}
+
+/**
+ * Win11 Snap Layouts (#snap). The native flyout only appears when the OS gets an
+ * `HTMAXBUTTON` from `WM_NCHITTEST` over the *visible* maximize button. The
+ * frameless window has no native frame, so `src-tauri/src/win_snap.rs` synthesizes
+ * that hit-test — but it needs to know WHERE the button is. Rather than hard-code
+ * pixel offsets (fragile: wrong on real Win11 DPI, and silently stale if the
+ * top-right controls are rearranged), this hook reports the button's REAL rect to
+ * the backend.
+ *
+ * Contract with `set_maximize_button_rect` (win_snap.rs): we send
+ * `{ x, y, width, height }` in **physical pixels relative to the window's
+ * top-left**. `getBoundingClientRect()` is CSS px relative to the webview client
+ * top-left; for this frameless window the client area == the window (tao answers
+ * WM_NCCALCSIZE with 0), so client-relative == window-relative. Multiplying by the
+ * window scale factor yields physical px in exactly the space the backend's
+ * `WM_NCHITTEST` handler works in (it subtracts GetWindowRect().left/top from the
+ * screen point). No screen-position math here, so multi-monitor offsets can't bite.
+ *
+ * We recompute whenever the rect can move or rescale: on mount, on every resize
+ * (the flexible drag region grows/shrinks, shifting the controls), on DPI/scale
+ * change, on window move (the monitor's scale may differ), and whenever the
+ * maximized flag flips (the restore<->maximize glyph swaps but the slot is the
+ * same width; recomputing is cheap insurance against any layout shift). A failed
+ * invoke is swallowed — outside Tauri (plain `pnpm dev`) there's no command, and a
+ * missed report just means no flyout until the next event fires.
+ *
+ * `maximized` is passed in (not read here) so a single `useMaximizedState()` in
+ * the parent drives BOTH the glyph and the recompute, and the effect re-runs when
+ * it changes.
+ */
+function useReportMaxButtonRect(
+  ref: RefObject<HTMLButtonElement | null>,
+  maximized: boolean,
+): void {
+  useEffect(() => {
+    let win: ReturnType<typeof getCurrentWindow>;
+    try {
+      win = getCurrentWindow();
+    } catch {
+      return; // Not in a Tauri window (e.g. browser dev server): nothing to report.
+    }
+    let cancelled = false;
+    const unlisteners: Array<() => void> = [];
+
+    const report = () => {
+      const el = ref.current;
+      if (!el) return;
+      void win
+        .scaleFactor()
+        .then((scale) => {
+          if (cancelled) return;
+          const r = el.getBoundingClientRect();
+          // getBoundingClientRect is already relative to the webview client
+          // top-left == the window top-left for this frameless window. Scale CSS
+          // px -> physical px. The backend treats this as window-relative.
+          return invoke("set_maximize_button_rect", {
+            rect: {
+              x: r.left * scale,
+              y: r.top * scale,
+              width: r.width * scale,
+              height: r.height * scale,
+            },
+          });
+        })
+        .catch(() => {});
+    };
+
+    // Initial report — defer one frame so layout (and the live tab strip) has
+    // settled, then send. requestAnimationFrame guards against a 0-size rect read
+    // during the first paint.
+    const raf = requestAnimationFrame(report);
+
+    const subscribe = (
+      register: (cb: () => void) => Promise<() => void>,
+    ) => {
+      void register(() => report())
+        .then((fn) => {
+          if (cancelled) fn();
+          else unlisteners.push(fn);
+        })
+        .catch(() => {});
+    };
+    // Resize: the flexible drag region between the tab strip and the controls
+    // grows/shrinks, moving the button. Scale change: DPI moved (physical px shift
+    // even at the same CSS position). Move: dragging to a monitor with a different
+    // scale changes the physical mapping.
+    subscribe((cb) => win.onResized(cb));
+    subscribe((cb) => win.onScaleChanged(cb));
+    subscribe((cb) => win.onMoved(cb));
+
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      for (const fn of unlisteners) fn();
+    };
+    // Re-run on maximize/restore: the control glyph swaps and a recompute keeps
+    // the backend slot exact if anything in the row shifted.
+  }, [ref, maximized]);
 }
 
 /** The workspace-tab id under a viewport point, or null (drag resolution). */
@@ -354,6 +455,11 @@ function WindowControls({ satellite = false }: { satellite?: boolean }) {
   // there keeps the icon in lockstep no matter HOW the toggle happened (our
   // button, the OS Snap flyout, a double-click, or a keyboard shortcut).
   const maximized = useMaximizedState();
+  // Ref + report the maximize button's live rect to the backend so the Win11
+  // Snap Layouts flyout triggers exactly over the visible button (#snap). See
+  // useReportMaxButtonRect for the full physical-px / window-relative contract.
+  const maxBtnRef = useRef<HTMLButtonElement>(null);
+  useReportMaxButtonRect(maxBtnRef, maximized);
   return (
     <div className="flex shrink-0 items-stretch">
       <button
@@ -374,6 +480,7 @@ function WindowControls({ satellite = false }: { satellite?: boolean }) {
         </svg>
       </button>
       <button
+        ref={maxBtnRef}
         type="button"
         aria-label={maximized ? "Restore" : "Maximize"}
         title={maximized ? "Restore" : "Maximize"}

@@ -460,6 +460,11 @@ pub fn run() {
             // Server-split M1: thin client transport — round-trip one control
             // command over the loopback socket (the wire M2 stretches to remote).
             control_client::control_request,
+            // #snap: the frontend reports the maximize button's live rect (physical
+            // px, window-relative) so the Win32 WM_NCHITTEST returns HTMAXBUTTON
+            // exactly over the visible button — what makes Win11 show the Snap
+            // Layouts flyout on hover. No-op effect on unix (stored but unread).
+            win_snap::set_maximize_button_rect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running T-Hub");

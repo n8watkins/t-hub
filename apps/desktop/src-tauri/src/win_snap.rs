@@ -40,18 +40,88 @@
 //! Everything here is `#[cfg(windows)]`; on unix this module compiles to an
 //! empty `install` no-op so the rest of the app is untouched.
 //!
-//! ## Geometry (kept in sync with `src/components/Titlebar.tsx`)
-//! The titlebar is `h-8` = 32 logical px tall. The window controls are each
-//! `w-11` = 44 logical px wide, anchored at the top-right in the order (from the
-//! right edge): Close, Maximize, Minimize. So the **maximize** button occupies
-//! the slot `[width - 88, width - 44)` horizontally and `[0, 32)` vertically, in
-//! logical pixels. We scale those by the window DPI to get physical pixels.
+//! ## Geometry — frontend-reported maximize-button rect (the durable fix)
+//! The maximize button's exact bounds are NOT hard-coded here. Pixel constants
+//! mirrored from the React layout are fragile: they silently desync if the
+//! controls are rearranged (e.g. a Settings gear later joins the top-right
+//! cluster) and they can simply be *wrong* on real Win11 (the rendered button is
+//! wherever flexbox + the live tab strip + DPI rounding put it, which a fixed
+//! "two control-widths from the right edge" guess only approximates). When the
+//! `HTMAXBUTTON` region misses the visible button by even a few px, the Snap
+//! Layouts flyout never triggers.
 //!
-//! These are constants mirrored from the frontend (phase 1); if the titlebar
-//! layout changes materially, update [`TITLEBAR_H_LOGICAL`] / [`CONTROL_W_LOGICAL`]
-//! here too. A later phase could plumb the exact device-pixel bounds from the
-//! frontend (e.g. via a Tauri command that reports the maximize button's
-//! `getBoundingClientRect()`), removing the duplication.
+//! So the FRONTEND owns the geometry: `src/components/Titlebar.tsx` refs the
+//! maximize `<button>`, and on mount / resize / DPI change / maximize-state
+//! change it computes `getBoundingClientRect()`, scales it to **physical pixels
+//! relative to the window's top-left** (× the Tauri window scale factor), and
+//! pushes it to the backend via the [`set_maximize_button_rect`] Tauri command
+//! (see `commands::set_maximize_button_rect` registered in `lib.rs`). We stash
+//! the latest rect in a process-global ([`MAX_BUTTON_RECT`]) and `WM_NCHITTEST`
+//! reports `HTMAXBUTTON` only when the (window-relative, physical-px) cursor
+//! point lands inside it. Until the frontend reports a rect (the brief window
+//! before React mounts), no slot is claimed — hover does nothing, which is the
+//! safe default. The titlebar HEIGHT is still needed for the caption / edge-band
+//! logic and remains a constant ([`TITLEBAR_H_LOGICAL`]), matching the `h-8` row;
+//! that one is stable and not tied to the controls' horizontal arrangement.
+//!
+//! Coordinate contract (important, easy to get wrong):
+//!   * `WM_NCHITTEST` lparam is a **screen** point in **physical** px. `hit_test`
+//!     subtracts `GetWindowRect().left/top` to get a point **relative to the
+//!     window's top-left**, still in physical px.
+//!   * The frontend's `getBoundingClientRect()` is CSS px relative to the
+//!     **webview client** top-left. For this frameless window tao collapses the
+//!     non-client area (answers `WM_NCCALCSIZE` with 0), so the client rect ==
+//!     the window rect: client-relative == window-relative. Multiplying by the
+//!     scale factor yields physical px relative to the window top-left — the
+//!     SAME space as the backend's `(x, y)`. No screen-position plumbing (and
+//!     thus no multi-monitor offset math) is needed on either side.
+
+/// The maximize button's rectangle, in **physical pixels relative to the
+/// window's top-left** (NOT screen coords; see the module-level coordinate
+/// contract). Reported by the frontend via [`set_maximize_button_rect`]; read by
+/// the `WM_NCHITTEST` handler on Windows. `serde`-derived so it crosses the Tauri
+/// IPC boundary as the `{ x, y, width, height }` JSON the frontend sends.
+///
+/// All fields are physical px. `width`/`height` are `f64` so a sub-pixel
+/// `getBoundingClientRect()` × scale survives the wire without premature
+/// rounding; the hit-test rounds once, at compare time.
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+// On unix nothing reads the fields back (only the `#[cfg(windows)]` hit-test
+// does), so the otherwise-correct dead-code lint would fire on the Linux build.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct MaxButtonRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// The latest maximize-button rect reported by the frontend, or `None` before
+/// React has mounted / reported one. A plain global `Mutex<Option<…>>` is enough:
+/// T-Hub's frameless main window is the only window that installs the subclass,
+/// the rect is tiny + `Copy`, and writes (a handful, on resize/DPI/maximize) and
+/// reads (one per `WM_NCHITTEST`) never contend meaningfully. Cross-platform so
+/// the command compiles on unix; only the Windows hit-test actually reads it.
+static MAX_BUTTON_RECT: std::sync::Mutex<Option<MaxButtonRect>> = std::sync::Mutex::new(None);
+
+/// Store the maximize-button rect reported by the frontend. Cross-platform (the
+/// command must compile on unix); on unix nothing reads it back, so it is inert.
+/// A poisoned lock is recovered from — a stale rect must never be fatal.
+pub fn store_max_button_rect(rect: MaxButtonRect) {
+    let mut guard = MAX_BUTTON_RECT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(rect);
+}
+
+/// Tauri command: the frontend reports the maximize button's current rect (in
+/// physical px relative to the window top-left). Registered in `lib.rs`'s
+/// `invoke_handler`. Infallible from the frontend's perspective: it just updates
+/// the global the Windows hit-test consults. No-op effect on unix.
+#[tauri::command]
+pub fn set_maximize_button_rect(rect: MaxButtonRect) {
+    store_max_button_rect(rect);
+}
 
 /// Install the Snap-Layouts / edge-resize window subclass on the given Tauri
 /// window. On non-Windows targets this is a no-op. Errors are returned so the
@@ -83,17 +153,13 @@ mod imp {
         WM_NCLBUTTONUP, WM_SYSCOMMAND,
     };
 
+    use super::MAX_BUTTON_RECT;
+
     /// Titlebar height in *logical* (CSS) pixels - must match the `h-8` row in
-    /// `src/components/Titlebar.tsx`.
+    /// `src/components/Titlebar.tsx`. Still a constant: the row height is stable
+    /// and (unlike the controls' horizontal positions) not affected by adding /
+    /// rearranging top-right buttons. Used for the caption + edge-band logic.
     const TITLEBAR_H_LOGICAL: f64 = 32.0;
-    /// Width of a single window-control button in *logical* pixels - the `w-11`
-    /// minimize / maximize / close buttons in `src/components/Titlebar.tsx`.
-    const CONTROL_W_LOGICAL: f64 = 44.0;
-    /// The maximize button is the 2nd control from the right edge (Close is 1st),
-    /// so its right edge is one control-width in from the window's right edge.
-    const MAXBTN_RIGHT_OFFSET_LOGICAL: f64 = CONTROL_W_LOGICAL; // 44
-    /// ...and its left edge is two control-widths in.
-    const MAXBTN_LEFT_OFFSET_LOGICAL: f64 = CONTROL_W_LOGICAL * 2.0; // 88
     /// Thickness (logical px) of the invisible window-edge band that triggers a
     /// native resize. A few px wider than the OS default makes the frameless
     /// edges easier to grab without eating into the content.
@@ -275,8 +341,10 @@ mod imp {
         let scale = if dpi == 0 { 1.0 } else { dpi as f64 / 96.0 };
         let border = (RESIZE_BORDER_LOGICAL * scale).round() as i32;
         let titlebar_h = (TITLEBAR_H_LOGICAL * scale).round() as i32;
-        let maxbtn_left = win_w - (MAXBTN_LEFT_OFFSET_LOGICAL * scale).round() as i32;
-        let maxbtn_right = win_w - (MAXBTN_RIGHT_OFFSET_LOGICAL * scale).round() as i32;
+        // The maximize-button slot in window-relative physical px, as REPORTED by
+        // the frontend (`set_maximize_button_rect`). `None` until React mounts +
+        // reports it, in which case we claim no HTMAXBUTTON slot (safe default).
+        let maxbtn = max_button_slot();
 
         // --- Edge / corner resize bands (skip when maximized: no edges to drag).
         if !is_maximized(hwnd) {
@@ -306,29 +374,88 @@ mod imp {
             // pop the Snap Layouts flyout on hover. Because reporting HTMAXBUTTON
             // moves this slot into the non-client area, the WebView no longer sees
             // a plain click here; the WM_NCLBUTTONDOWN/UP arm of `subclass_proc`
-            // restores click-to-maximize for it.
-            if x >= maxbtn_left && x < maxbtn_right {
-                return Some(HTMAXBUTTON);
+            // restores click-to-maximize for it. The slot is the exact
+            // frontend-reported rect (no hand-mirrored constants).
+            if let Some(r) = maxbtn {
+                if r.contains(x, y) {
+                    return Some(HTMAXBUTTON);
+                }
             }
             // Anywhere else along the titlebar row is draggable caption. This is
             // belt-and-braces alongside the frontend's `data-tauri-drag-region`;
             // returning HTCAPTION here makes the WHOLE row draggable at the OS
             // level (including over the tab strip's gaps), matching native windows.
-            // NOTE: returning HTCAPTION over the custom buttons (settings/min/close)
-            // would swallow their clicks, so we must NOT claim those slots. They
-            // sit to the right of the tab strip; we only claim caption to the LEFT
-            // of the rightmost three control slots + the settings gear (4 slots).
-            let controls_left = win_w - (CONTROL_W_LOGICAL * 4.0 * scale).round() as i32;
-            if x < controls_left {
-                return Some(HTCAPTION);
+            // NOTE: returning HTCAPTION over the custom buttons (min/close, and the
+            // maximize handled above) would swallow their clicks, so we must NOT
+            // claim those slots. The window controls cluster (min / max / close)
+            // sits at the top-right; we anchor "where the controls begin" to the
+            // LEFT edge of the reported maximize-button rect (min is to the left of
+            // max, close to the right, all the same width). Everything to the LEFT
+            // of that is caption (drag); everything from there rightward is HTCLIENT
+            // so the webview's own buttons receive their clicks.
+            match maxbtn {
+                Some(r) if x < r.left => return Some(HTCAPTION),
+                Some(_) => return Some(HTCLIENT),
+                // No reported rect yet (the brief pre-mount window): don't risk
+                // stealing a control click, so return HTCLIENT for the whole row.
+                // The frontend's `data-tauri-drag-region` attributes still drive
+                // window drag where appropriate until the rect arrives.
+                None => return Some(HTCLIENT),
             }
-            // Over the min/close/settings buttons (and the maximize handled above):
-            // let the WebView receive the click so the custom buttons work.
-            return Some(HTCLIENT);
         }
 
         // Below the titlebar and not on an edge: normal client area.
         None
+    }
+
+    /// An axis-aligned hit rectangle in window-relative physical px (ints).
+    struct Slot {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    impl Slot {
+        /// Half-open containment: `[left, right) × [top, bottom)`, matching the
+        /// edge conventions used for the resize bands / titlebar row.
+        fn contains(&self, x: i32, y: i32) -> bool {
+            x >= self.left && x < self.right && y >= self.top && y < self.bottom
+        }
+    }
+
+    /// The frontend-reported maximize-button rect, converted to a window-relative
+    /// physical-px [`Slot`] (rounded once, here). `None` until the frontend has
+    /// reported a rect (`set_maximize_button_rect`) — before React mounts, or if a
+    /// degenerate (zero-area / negative) rect was sent, in which case we claim no
+    /// slot rather than guess. A poisoned lock is recovered from (a stale read is
+    /// harmless and must never panic the window proc).
+    fn max_button_slot() -> Option<Slot> {
+        let guard = MAX_BUTTON_RECT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let r = (*guard)?;
+        // Round the (already physical-px) rect to integer pixels. Reject anything
+        // non-finite or non-positive so a bad report can't produce a giant or
+        // inverted slot.
+        if !(r.x.is_finite() && r.y.is_finite() && r.width.is_finite() && r.height.is_finite()) {
+            return None;
+        }
+        if r.width <= 0.0 || r.height <= 0.0 {
+            return None;
+        }
+        let left = r.x.round() as i32;
+        let top = r.y.round() as i32;
+        let right = (r.x + r.width).round() as i32;
+        let bottom = (r.y + r.height).round() as i32;
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(Slot {
+            left,
+            top,
+            right,
+            bottom,
+        })
     }
 
     /// Whether the window is currently maximized (so we suppress edge-resize).
