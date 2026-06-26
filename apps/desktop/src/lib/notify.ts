@@ -115,11 +115,11 @@ export function playSound(kind: NotifyKind): void {
 // Desktop notification — optional Tauri plugin, graceful fallback
 // ---------------------------------------------------------------------------
 
-// `@tauri-apps/plugin-notification` is NOT currently a dependency (see report).
-// We load it dynamically and tolerate its absence so the bundle builds and tsc
-// passes without it. If/when the plugin is added, OS notifications light up with
-// no further code change. `@vite-ignore` keeps Vite from trying to pre-bundle a
-// module that may not exist.
+// `@tauri-apps/plugin-notification` IS a dependency now (package.json +
+// tauri-plugin-notification in Cargo.toml), so OS toasts fire. We still load it
+// DYNAMICALLY and tolerate its absence so a plain `pnpm dev` (no Tauri host) or a
+// build without the plugin still compiles + runs (sound-only). `@vite-ignore`
+// keeps Vite from trying to pre-bundle a module that may be absent at build time.
 type NotificationModule = {
   isPermissionGranted: () => Promise<boolean>;
   requestPermission: () => Promise<"granted" | "denied" | "default">;

@@ -105,31 +105,52 @@ runs, and the listener only accepts loopback peers.
 | --- | --- | --- | --- |
 | `list_terminals` | Read | allowed | tmux `list-sessions` on the isolated `t-hub` socket |
 | `get_status` | Read | allowed | supervision status + statusline snapshot for a `sessionId` |
+| `wait_for_status` | Read | allowed | long-polls the supervision reducer until a session reaches a target FR-012 status (or a timeout) |
 | `supervision_tree` | Read | allowed | orchestrator→subagent tree for a `sessionId` |
 | `wsl_health` | Read | allowed | host metrics from `/proc` (+ supervised-session count) |
 | `search_files` | Read | allowed | fuzzy file-index search (names + metadata only, never contents) |
 | `list_tabs` | Read | allowed | workspace tabs (empty until the persistence track lands) |
+| `read_terminal` | Read | allowed | a session's recent visible output via tmux `capture-pane` (plain text; optional scrollback) |
 | `focus_session` | Organization | allowed, **audited** | accepted + audited; UI application via the frontend command |
 | `move_tile` | Organization | allowed, **audited** | accepted + audited |
 | `rename_tab` | Organization | allowed, **audited** | accepted + audited |
+| `new_tab` | Organization | allowed, **audited** | accepted + audited; UI application via the frontend command |
+| `focus_tab` | Organization | allowed, **audited** | accepted + audited; UI application via the frontend command |
 | `open_file` | Organization | allowed, **audited** | capped text read via the Files reader |
+| `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, then forwards a new tab + spawn-in-worktree to the UI |
+| `remove_worktree` | Organization | allowed, **audited** | forwards removal to the UI (which detaches live tiles first, then runs `git worktree remove`); refused if no UI is connected, to avoid orphaning a process |
 | `spawn_terminal` | **Process-changing** | **confirmation required** | gated off; refused on the control channel |
+| `send_text` | **Process-changing** | **confirmation required** | types literal text into an existing session via tmux `send-keys -l` (optional trailing Enter); executes |
+| `send_keys` | **Process-changing** | **confirmation required** | sends named control keys (e.g. `C-c`, `Up`, `Escape`) to an existing session via tmux `send-keys`; executes |
+| `close_terminal` | **Process-changing** | **confirmation required** | kills an existing session + its process tree via tmux `kill-session`; executes |
 | `get_theme` / `set_theme` | Theme | forwarded by name | see the theme contract below |
 
 ### How tiers are enforced
 - **Read** tools dispatch directly and return live data.
 - **Organization** tools are accepted and **audited** (PRD §11.2: "allowed with
   visible audit event"). Those whose effect is a pure UI mutation
-  (`focus_session`, `move_tile`, `rename_tab`) return an audit acknowledgement
-  (`{accepted, audited:true, applied:false, …}`) today; `open_file` has a real
-  side-effect-free backing (the reader) and returns file contents.
-- **Process-changing** tools (`spawn_terminal`) carry an explicit
-  `CONFIRMATION REQUIRED` notice in their MCP `description` **and** are gated off
-  on the app side — the listener refuses them with a clear error rather than
-  spawning anything. The description is the user-facing contract; the app-side
-  gate is the enforcement. Each tool also carries an
-  `annotations.confirmationRequired` boolean and an `annotations.t-hubTier`
-  string so a permission-aware client can map it to its own policy.
+  (`focus_session`, `move_tile`, `rename_tab`, `new_tab`, `focus_tab`) return an
+  audit acknowledgement (`{accepted, audited:true, applied, …}`) and forward the
+  mutation to the frontend (`control://apply`); `open_file` has a real
+  side-effect-free backing (the reader) and returns file contents. The two
+  worktree tools (`create_worktree`, `remove_worktree`) are also Organization
+  tier: `create_worktree` runs `git worktree add` here and forwards a new tab +
+  spawn to the UI, while `remove_worktree` forwards the removal to the UI (which
+  detaches any live tiles before `git worktree remove`) and refuses outright when
+  no UI is connected, so a running process is never orphaned.
+- **Process-changing** tools all carry an explicit `CONFIRMATION REQUIRED` notice
+  in their MCP `description`, an `annotations.confirmationRequired:true` boolean,
+  and an `annotations.t-hubTier:"process-changing"` string so a permission-aware
+  client can gate them — that confirmation contract is the user-facing gate. On
+  the app side they split:
+  - `spawn_terminal` is **gated off**: the listener refuses it with a clear error
+    rather than spawning anything (it would create an untracked tmux session the
+    UI never adopts).
+  - `send_text`, `send_keys`, and `close_terminal` **execute**: they act only on
+    an existing `th_*` session the app already owns, driving tmux directly
+    (`send-keys -l` / `send-keys` / `kill-session`). They return an audited
+    acknowledgement (`{accepted, audited:true, …}`); `send_text`/`send_keys`
+    return a clear "no such session" error if the target session does not exist.
 - **Destructive / secret-bearing** tools (PRD §11.2 lower tiers) are simply not
   in the catalog and not dispatchable — the listener's `match` has no arm for
   them, so an unknown command is refused.
@@ -249,10 +270,10 @@ snapshot, both fetched live through the control channel:
 | Scope | Where | Count |
 | --- | --- | --- |
 | MCP protocol framing | `crates/t-hub-mcp/src/protocol.rs` | 4 |
-| Tool catalog + tiers | `crates/t-hub-mcp/src/tools.rs` | 6 |
+| Tool catalog + tiers | `crates/t-hub-mcp/src/tools.rs` | 8 |
 | Control client (forwarding, discovery) | `crates/t-hub-mcp/src/control_client.rs` | 4 |
 | MCP server dispatch (initialize/list/call) | `crates/t-hub-mcp/src/server.rs` | 9 |
-| App-side control dispatch + tiers | `src/control.rs` | 13 |
+| App-side control dispatch + tiers | `src/control.rs` | 30 |
 | End-to-end (real binary ⇄ real listener) | `tests/mcp_e2e.rs` | 1 |
 
 Run them:
@@ -270,9 +291,14 @@ cargo test --manifest-path src-tauri/Cargo.toml -p t-hub --test mcp_e2e # end-to
 - The control channel binds **loopback only** and gates every request on a
   **per-launch token** written to a `0600` handshake file. A bad token is
   rejected before dispatch.
-- Only Read + Organization commands are dispatchable; process-changing and
-  destructive commands are refused at the listener (no `match` arm), independent
-  of what any MCP client advertises.
+- Read + Organization commands are dispatchable. Of the process-changing tier,
+  `spawn_terminal` is refused at the listener (it returns a clear gated error),
+  while `send_text`, `send_keys`, and `close_terminal` **execute** — they act
+  only on a `th_*` session the app already owns (typing into / interrupting /
+  killing an existing session via tmux), never spawning an untracked process.
+  Their MCP descriptions carry the `CONFIRMATION REQUIRED` contract a permission-
+  aware client gates on. Any command with no `match` arm (a tool not in the
+  catalog) is refused outright, independent of what an MCP client advertises.
 - `search_files` returns **names + metadata only, never file contents**
   (PRD §11.1, FR-023). `open_file` reads through the same size-capped,
   binary-rejecting reader the UI uses.

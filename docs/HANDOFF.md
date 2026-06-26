@@ -46,12 +46,13 @@ Merged lane work + fixes (oldest→newest): `e40c82d`…`99f3517` (lanes A/B/C c
 
 ## 3. Next steps (ordered)
 
-1. **Test file-drop + image-paste on the Windows build** — install `T-Hub_0.1.54_x64-setup.exe`. Drag a file from Explorer onto a terminal (should type its `/mnt/c/…` path) and Ctrl+V a screenshot (should insert a temp PNG path). Code: `src/lib/dropPaste.ts`, `src-tauri/src/dropin.rs`. WSLg dev CANNOT test these.
-2. **"Move some info to the bottom"** — BLOCKED on the user: needs which items → where. Don't guess.
-3. **PR-view per workspace** — a `gh pr list` panel for the workspace's repos/worktrees (title, checks, click-to-open). User likes it; awaiting go-ahead.
-4. **Detached EDITABLE Files window** — pending from before this session (see [[t-hub-ui-batch-jun2026]] memory).
-5. **Perf/cleanup nits (low):** per-row supervision lookup O(rows×snapshots) (partly done — `sessionIdByTmux` index added); duplicated terminal-row vs workspace-row drag choreography; Recents `cwdWorktree` is a path heuristic that can disagree with the real branch.
-6. **Validate auto-continue against a real limit** — it's untested end-to-end (can't force a rate-limit). Watch the `autocontinue` diag tag when a limit naturally hits.
+> **Note (since this handoff):** the herdr-parity backlog that followed this session has **shipped** — Wave 0 + Wave 1 (OS toasts, the `Ctrl+B` prefix + `Ctrl+K` palette keymap, the `git_worktree_add/list/remove` primitive, `wait_for_status`, the `store/rules.ts` rules engine, and session-restore via `tile_sessions` + the Recovery panel) plus **WS-9** (the worktree-centric workflow). See [ROADMAP-PLAN.md](./ROADMAP-PLAN.md) for the shipped state. **The real next project is the remote / server-split (⑥)** — extract a headless `t-hub-server` in WSL and make the GUI a thin client over Tailscale. See [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md) and the *Later / someday* section of ROADMAP-PLAN.
+
+1. **⑥ Remote / SSH (server split) — the next big project.** Per [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md): M1 decouple locally (`RemoteTarget` routing the WSL/tmux/git hops) → M2 PTY over the wire → M3 overlay panels server-side → M4 multi-client. It refactors the same backend seams everything else touches, so it runs *after* the parity work (now done).
+2. **Runtime smoke-test the shipped parity work in the live Windows app** — all of Wave 0/1 + WS-9 was verified at compile + unit-test level, not runtime-clicked. Drive a session to `NeedsPermission` (toast), exercise `Ctrl+B w`/`c`/`l` (worktree tabs), and kill+relaunch with live agent tiles (offered restore).
+3. **Test file-drop + image-paste on the Windows build** — install `T-Hub_0.1.67_x64-setup.exe`. Drag a file from Explorer onto a terminal (should type its `/mnt/c/…` path) and Ctrl+V a screenshot (should insert a temp PNG path). Code: `src/lib/dropPaste.ts`, `src-tauri/src/dropin.rs`. WSLg dev CANNOT test these.
+4. **Perf/cleanup nits (low):** per-row supervision lookup O(rows×snapshots) (partly done — `sessionIdByTmux` index added); duplicated terminal-row vs workspace-row drag choreography; Recents `cwdWorktree` is a path heuristic that can disagree with the real branch.
+5. **Validate auto-continue against a real limit** — it's untested end-to-end (can't force a rate-limit). Watch the `autocontinue` diag tag when a limit naturally hits. (Now a migrated rule in the rules engine.)
 
 ---
 
