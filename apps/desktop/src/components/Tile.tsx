@@ -43,9 +43,13 @@ import { clientForTerminal } from "../store/clientType";
 import { useAutoContinue } from "../store/autoContinue";
 import { ContextMeter } from "./ContextMeter";
 import { useContextPctForTile, sessionNameForTerminal } from "../store/sessionContext";
-import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
+import {
+  useSupervision,
+  tmuxSessionMidTurn,
+  sessionStatusForTmux,
+} from "../store/supervision";
 import { useActivity } from "../store/activity";
-import { StatusIndicator, type StatusVariant } from "./StatusIndicator";
+import { StatusIndicator, terminalVariant } from "./StatusIndicator";
 import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag";
 import { resolveDropTarget } from "../lib/dropTarget";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
@@ -304,25 +308,17 @@ export function Tile({
 
   const state: TerminalState = info?.state ?? "starting";
 
-  // HEADER STATUS INDICATOR (the ring+center). Previously the tile dot reflected
-  // ONLY the xterm TerminalState, so the big tile never showed "working" even
-  // while its agent was mid-turn — the asymmetry with the sidebar row. Mirror the
-  // sidebar's derivation (WorkspacesList.tsx): a tile is WORKING when its bound
-  // Claude session is mid-turn (`claudeMidTurn`, reused from the busy gate above)
-  // OR the terminal is actively producing output (the cross-agent proxy for Codex
-  // / a shell running a command, store/activity). Otherwise the variant falls out
-  // of the lifecycle TerminalState.
+  // HEADER STATUS INDICATOR (the ring+center). Same precise derivation as the
+  // sidebar (terminalVariant): a bound agent session (Claude) drives the variant
+  // from its reducer status — distinct working / asking-a-question / idle, and an
+  // idle Claude TUI that keeps redrawing no longer false-pulses as "working" — and
+  // a session-less shell / Codex falls back to output activity (pulse while a
+  // command runs, blank when quiet).
+  const sessionStatus = useSupervision((s) =>
+    sessionStatusForTmux(s, sessionNameForTerminal(terminalId)),
+  );
   const outputActive = useActivity((s) => !!s.active[terminalId]);
-  const working = claudeMidTurn || outputActive;
-  const tileVariant: StatusVariant = working
-    ? "working"
-    : state === "error"
-      ? "error"
-      : state === "live"
-        ? // A live, quiet session reads as "done" (calm green) — its last turn
-          // finished and nothing is running. starting/detached/exited are idle.
-          "done"
-        : "idle";
+  const tileVariant = terminalVariant(state, sessionStatus, outputActive);
 
   const cwd = info?.cwd ?? "";
   // Git facts for this tile's project (branch / worktree / dirty) — header chip.
@@ -611,7 +607,9 @@ export function Tile({
           variant={tileVariant}
           size={9}
           title={
-            working ? `Working… (terminal: ${state})` : `Terminal state: ${state}`
+            tileVariant === "working"
+              ? `Working… (terminal: ${state})`
+              : `Terminal state: ${state}`
           }
           className="shrink-0"
         />

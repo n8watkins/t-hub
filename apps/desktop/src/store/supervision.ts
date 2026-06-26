@@ -143,6 +143,29 @@ export function tmuxSessionMidTurn(
 }
 
 /**
+ * The DISPLAY status of the agent session bound to `tmuxSession` (`th_<id>`), or
+ * `undefined` when nothing is bound (a plain shell, or Claude before its first
+ * statusline snapshot). Resolves the tile/row→session gap via `sessionIdByTmux`
+ * (populated by the statusline snapshot), then applies the rate-limit overlay.
+ * This is the precise per-terminal status the sidebar + tiles render — distinct
+ * working / asking / idle states, instead of a raw output-activity pulse.
+ */
+export function sessionStatusForTmux(
+  state: Pick<
+    SupervisionState,
+    "statuses" | "snapshots" | "sessionIdByTmux"
+  >,
+  tmuxSession: string,
+): SessionStatus | undefined {
+  if (!tmuxSession) return undefined;
+  const sessionId = state.sessionIdByTmux[tmuxSession];
+  if (sessionId === undefined) return undefined;
+  const status = state.statuses[sessionId];
+  if (status === undefined) return undefined;
+  return displayStatus(status, state.snapshots[sessionId]);
+}
+
+/**
  * True when a statusline snapshot reports either rate-limit window at/over
  * {@link RATE_LIMIT_THRESHOLD}. False when the `rate_limits` block is absent
  * (free tier / pre-first-response — REVIEW caveat), so we never false-alarm.

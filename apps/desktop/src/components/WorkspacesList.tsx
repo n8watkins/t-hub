@@ -22,7 +22,7 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
 import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
-import { useSupervision, tmuxSessionMidTurn } from "../store/supervision";
+import { useSupervision, sessionStatusForTmux } from "../store/supervision";
 import { useActivity } from "../store/activity";
 import { sessionNameForTerminal } from "../store/sessionContext";
 import { clientForTerminal } from "../store/clientType";
@@ -34,18 +34,7 @@ import { resolveDropTarget } from "../lib/dropTarget";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { popOutTab } from "../lib/windows";
 import { ChevronIcon, CountBadge } from "./SidebarChrome";
-import { StatusIndicator, type StatusVariant } from "./StatusIndicator";
-
-/** Map a terminal's working/lifecycle state to a shared StatusIndicator variant
- *  (item 11): actively working → the pulsing ring; otherwise error / done (quiet
- *  but live) / idle. Mirrors the Tile header mapping so a terminal reads the same
- *  in the sidebar and on its tile. */
-function dotVariant(pulsing: boolean, state: TerminalState): StatusVariant {
-  if (pulsing) return "working";
-  if (state === "error") return "error";
-  if (state === "live") return "done";
-  return "idle";
-}
+import { StatusIndicator, terminalVariant } from "./StatusIndicator";
 
 /** "Open in new window" arrow — pop a workspace out into its own window (item 4,
  *  re-homed from the removed top tab strip). */
@@ -722,18 +711,17 @@ function TerminalRow({
   onClose: () => void;
 }) {
   const state: TerminalState = info?.state ?? "starting";
-  // ACTIVITY: pulse this row's lifecycle dot while the bound Claude session is
-  // mid-turn (working / waiting on subagents / needs*). Cheap CSS (animate-pulse),
-  // and nothing animates when the session is idle. Keyed by `th_<id>`, the same
-  // session name the tile uses (see store/sessionContext).
-  const working = useSupervision((s) =>
-    tmuxSessionMidTurn(s, sessionNameForTerminal(id)),
+  // STATUS: the precise indicator variant for this row. A bound agent session
+  // (Claude) uses its reducer status — distinct working / asking-a-question /
+  // idle states, and an idle Claude TUI that keeps redrawing no longer
+  // false-pulses as "working". A session-less shell / Codex falls back to output
+  // activity (pulse while a command runs, blank when quiet). Keyed by `th_<id>`,
+  // the same session name the tile uses (see store/sessionContext).
+  const sessionStatus = useSupervision((s) =>
+    sessionStatusForTmux(s, sessionNameForTerminal(id)),
   );
-  // RUNNING animation (#11): also pulse while the terminal is actively producing
-  // output (store/activity) — the cross-agent proxy for Codex (no mid-turn hooks)
-  // and shells running a command. Claude keeps its precise supervision pulse above.
   const outputActive = useActivity((s) => !!s.active[id]);
-  const pulsing = working || outputActive;
+  const variant = terminalVariant(state, sessionStatus, outputActive);
   // Which agent runs here (claude/codex/shell) — drives the leading icon so the
   // sidebar row reads as the AGENT, not just a generic dot.
   const client = clientForTerminal(id);
@@ -821,15 +809,11 @@ function TerminalRow({
         ) : client === "codex" ? (
           <CodexIcon size={14} className="shrink-0" title="Codex" />
         ) : null}
-        {/* ACTIVITY (item 11): the shared ring/center indicator — a pulsing ring
-            while the agent is working (Claude mid-turn OR any live output), a calm
-            solid when quiet/live, muted when idle. */}
-        <StatusIndicator
-          variant={dotVariant(pulsing, state)}
-          size={10}
-          className="shrink-0"
-          title={pulsing ? "Working…" : undefined}
-        />
+        {/* STATUS: the shared ring/center indicator — pulsing ring while the agent
+            is genuinely working, amber while it needs you (a question / permission),
+            calm green when a turn finished, muted hollow when idle, and a BLANK slot
+            for an empty/quiet shell. */}
+        <StatusIndicator variant={variant} size={10} className="shrink-0" />
         <span className="min-w-0 flex-1">
           <span className="block truncate">{workName ?? detail}</span>
           {workName && (
