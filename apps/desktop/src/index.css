@@ -255,3 +255,25 @@ body {
     animation: none;
   }
 }
+
+/* Spinner for `working` — a rotating arc that reads as "thinking", distinct from
+ * the attention pulse. One colored side of an otherwise-faint ring, spun. Honors
+ * reduced-motion (falls back to the static partial ring). */
+@keyframes th-ind-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.th-ind-spin {
+  display: inline-block;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  border-radius: 9999px;
+  vertical-align: middle;
+  animation: th-ind-spin 0.7s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .th-ind-spin {
+    animation: none;
+  }
+}

@@ -330,7 +330,7 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
         <StatusLegendRow
           variant="working"
           name="Working"
-          hint="A pulsing ring — the agent is actively generating a response (or a shell command is producing output)."
+          hint="A spinner — the agent is thinking / actively generating a response (or a shell command is producing output)."
         />
         <StatusLegendRow
           variant="attention"
@@ -345,7 +345,7 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
         <StatusLegendRow
           variant="idle"
           name="Idle"
-          hint="A muted hollow ring — an agent is open but not doing anything right now."
+          hint="A hollow green ring — an agent is open but not doing anything right now."
         />
         <StatusLegendRow
           variant="error"

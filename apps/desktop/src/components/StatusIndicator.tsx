@@ -68,59 +68,35 @@ export function terminalVariant(
   return null;
 }
 
-/** Per-variant visual spec. `ring` is the border color, `center` the inner dot
- *  color, `pulse` toggles the halo animation, `hollow` makes the center empty
- *  (idle). All colors are CSS color strings (theme tokens where it tracks the
- *  theme, literal hex for the semantic amber/red that aren't themed). */
+/** How a variant draws:
+ *  - `spinner` — a rotating arc ("thinking"); the working state.
+ *  - `solid`   — a true filled disc (done / error).
+ *  - `ring`    — a hollow colored outline (idle).
+ *  - `pulse`   — a ring + solid center with a pulsing halo (attention). */
+type IndicatorKind = "spinner" | "solid" | "ring" | "pulse";
+
+/** Per-variant visual spec: the main `color` (theme token or semantic hex) + how
+ *  it draws (`kind`). */
 interface VariantSpec {
-  ring: string;
-  center: string;
-  pulse: boolean;
-  hollow: boolean;
+  color: string;
+  kind: IndicatorKind;
   label: string;
 }
 
+/** A true, vivid green for the finished/idle states (done = solid, idle = ring). */
+const TRUE_GREEN = "#22c55e";
+
 const VARIANTS: Record<StatusVariant, VariantSpec> = {
-  // Actively working: accent ring + a bright solid center, pulsing halo.
-  working: {
-    ring: "var(--th-accent)",
-    center: "var(--th-accent)",
-    pulse: true,
-    hollow: false,
-    label: "Working",
-  },
-  // Needs the user: amber ring + amber center, pulsing so it draws the eye.
-  attention: {
-    ring: "#f59e0b",
-    center: "#f59e0b",
-    pulse: true,
-    hollow: false,
-    label: "Needs attention",
-  },
-  // Finished, calm: solid green fill, no animation.
-  done: {
-    ring: "#10b981",
-    center: "#10b981",
-    pulse: false,
-    hollow: false,
-    label: "Done",
-  },
-  // Error: solid red, no animation.
-  error: {
-    ring: "#ef4444",
-    center: "#ef4444",
-    pulse: false,
-    hollow: false,
-    label: "Error",
-  },
-  // Idle: muted, hollow outline ring — clearly a "nothing happening" state.
-  idle: {
-    ring: "var(--th-fg-muted)",
-    center: "transparent",
-    pulse: false,
-    hollow: true,
-    label: "Idle",
-  },
+  // Actively working: an accent SPINNER — reads as "thinking".
+  working: { color: "var(--th-accent)", kind: "spinner", label: "Working" },
+  // Needs the user: amber ring + center, pulsing so it draws the eye.
+  attention: { color: "#f59e0b", kind: "pulse", label: "Needs attention" },
+  // Finished, calm: a TRUE solid green disc, no animation.
+  done: { color: TRUE_GREEN, kind: "solid", label: "Done" },
+  // Error: a solid red disc, no animation.
+  error: { color: "#ef4444", kind: "solid", label: "Error" },
+  // Idle: a hollow GREEN ring — present but nothing happening.
+  idle: { color: TRUE_GREEN, kind: "ring", label: "Idle" },
 };
 
 export interface StatusIndicatorProps {
@@ -152,37 +128,72 @@ export function StatusIndicator({
   }
   const spec = VARIANTS[variant] ?? VARIANTS.idle;
   const label = title ?? spec.label;
-  // Ring thickness + center size scale with the indicator so it stays crisp at
-  // any size. The ring is ~18% of the diameter (min 1.25px); the solid center is
-  // ~44% so the contrasting fill is unmistakable inside the ring.
+  const common = { role: "img" as const, "aria-label": label, title: label };
+  const base = { width: size, height: size, borderRadius: 9999 };
+  // Border/arc thickness scales with the indicator so it stays crisp at any size.
+  const bw = Math.max(1.5, Math.round(size * 0.16 * 100) / 100);
+
+  // Working: a rotating arc — one colored side of a faint ring, spun ("thinking").
+  if (spec.kind === "spinner") {
+    return (
+      <span
+        className={`th-ind-spin ${className ?? ""}`}
+        style={{
+          ...base,
+          border: `${bw}px solid color-mix(in srgb, ${spec.color} 22%, transparent)`,
+          borderTopColor: spec.color,
+        }}
+        {...common}
+      />
+    );
+  }
+
+  // Done / error: a true solid filled disc.
+  if (spec.kind === "solid") {
+    return (
+      <span
+        className={className}
+        style={{ ...base, display: "inline-block", backgroundColor: spec.color }}
+        {...common}
+      />
+    );
+  }
+
+  // Idle: a hollow colored ring (just the border).
+  if (spec.kind === "ring") {
+    return (
+      <span
+        className={className}
+        style={{
+          ...base,
+          display: "inline-block",
+          boxSizing: "border-box",
+          border: `${bw}px solid ${spec.color}`,
+        }}
+        {...common}
+      />
+    );
+  }
+
+  // Attention: a ring + solid center with a pulsing halo (the eye-catcher).
   const ring = Math.max(1.25, Math.round(size * 0.18 * 100) / 100);
   const center = Math.max(2, Math.round(size * 0.44 * 100) / 100);
   return (
     <span
-      className={`th-ind${spec.pulse ? " th-ind-pulse" : ""} ${className ?? ""}`}
+      className={`th-ind th-ind-pulse ${className ?? ""}`}
       style={{
-        // The pulse keyframe reads --th-ind-pulse-color to draw a halo of the
-        // ring color (set per-variant; ignored when not pulsing).
-        ["--th-ind-pulse-color" as string]: spec.ring,
+        // The pulse keyframe reads --th-ind-pulse-color to draw a halo of the color.
+        ["--th-ind-pulse-color" as string]: spec.color,
         width: size,
         height: size,
-        // The RING: a colored border with a transparent interior.
-        border: `${ring}px solid ${spec.ring}`,
-        // Muted/idle reads dimmer; active/done/error are full strength.
-        opacity: spec.hollow ? 0.6 : 1,
+        border: `${ring}px solid ${spec.color}`,
       }}
-      role="img"
-      aria-label={label}
-      title={label}
+      {...common}
     >
-      {/* The SOLID CENTER — a contrasting fill inside the ring (empty for idle). */}
+      {/* The SOLID CENTER — a contrasting fill inside the ring. */}
       <span
         className="th-ind-center"
-        style={{
-          width: center,
-          height: center,
-          backgroundColor: spec.center,
-        }}
+        style={{ width: center, height: center, backgroundColor: spec.color }}
       />
     </span>
   );
