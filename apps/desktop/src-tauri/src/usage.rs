@@ -95,9 +95,19 @@ fn run_usage() -> ClaudeUsage {
     last
 }
 
-/// The shell command that runs `/usage` and prints the full readout.
+/// The shell command that runs `/usage`, prints the full readout, then CLEANS UP
+/// after itself.
 ///
-/// TWO things are needed or `/usage` prints nothing useful:
+/// WHY the cleanup: every headless `claude -p /usage` spawns a fresh SDK session
+/// that Claude Code persists as a throwaway transcript under
+/// `~/.claude/projects/<cwd-encoded>/`. Run from `~`, those landed in
+/// `-home-natkins` and piled up at ~1k/day — bloating the Recent-sessions scan
+/// (recent.rs walks the whole transcript catalog) into a periodic UI freeze. So we
+/// run the probe from a DEDICATED scratch cwd (`/tmp/t-hub-usage`, encoded as the
+/// project dir `-tmp-t-hub-usage`) and `rm -rf` that one project dir right after —
+/// leaving ZERO residue per poll. The dir is ours alone, so the delete is safe.
+///
+/// TWO things are still needed or `/usage` prints nothing useful:
 ///   1. claude must be on PATH — it lives in `~/.npm-global/bin` exported in
 ///      ~/.zshrc, which only an INTERACTIVE login shell sources -> `$SHELL -ilc`.
 ///   2. A PSEUDO-TTY — `claude -p /usage` only prints the session/week numbers
@@ -106,7 +116,7 @@ fn run_usage() -> ClaudeUsage {
 ///      so the numbers appear. (Verified: piped = intro only; under `script` =
 ///      full output.)
 const USAGE_SHELL_CMD: &str =
-    "script -qec 'exec \"${SHELL:-/bin/sh}\" -ilc \"claude -p /usage\"' /dev/null";
+    "mkdir -p /tmp/t-hub-usage; script -qec 'exec \"${SHELL:-/bin/sh}\" -ilc \"cd /tmp/t-hub-usage && claude -p /usage\"' /dev/null; rm -rf ~/.claude/projects/-tmp-t-hub-usage";
 
 /// Build the invocation. Windows: through WSL. unix (dev): a login shell.
 #[cfg(windows)]

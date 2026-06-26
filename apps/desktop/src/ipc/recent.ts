@@ -43,3 +43,14 @@ export interface RecentSession {
 export function recentSessions(): Promise<RecentSession[]> {
   return controlRequest("recent_sessions") as Promise<RecentSession[]>;
 }
+
+/**
+ * Archive a project OUT of Recent for good — the × button made durable. Moves the
+ * project's Claude transcripts (`~/.claude/projects/<cwd-encoded>`) into a sibling
+ * `projects-archive` dir, so the row stops resurfacing AND stops costing scan time,
+ * while staying reversible (nothing is deleted). Routed over the control socket
+ * (`archive_recent_project` in control.rs). Resolves `true` on success.
+ */
+export function archiveRecentProject(cwd: string): Promise<boolean> {
+  return controlRequest("archive_recent_project", { cwd }) as Promise<boolean>;
+}

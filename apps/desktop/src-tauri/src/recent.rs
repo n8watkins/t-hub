@@ -73,6 +73,18 @@ const PROJECT_LIMIT: usize = 80;
 /// constant (not inlined) so a multi-session affordance is trivial to restore.
 const PER_PROJECT_LIMIT: usize = 1;
 
+/// Project dirs (Claude's `<cwd-encoded>` folders under `~/.claude/projects`) that
+/// Recent must NEVER surface — they hold machine-generated throwaway sessions, not
+/// resumable work. `-tmp-t-hub-usage` is where the `/usage` poller (usage.rs) runs
+/// its probe; usage.rs deletes it after each run, but a scan could race the delete,
+/// so we also filter it here. Matched on the project dir's basename.
+const IGNORED_PROJECT_DIRS: &[&str] = &["-tmp-t-hub-usage"];
+
+/// True if `name` (a project dir basename) is one Recent must skip.
+fn is_ignored_project_dir(name: &str) -> bool {
+    IGNORED_PROJECT_DIRS.contains(&name)
+}
+
 /// One recallable past Claude session, mirrored by `src/ipc/recent.ts`
 /// (`rename_all = "camelCase"`).
 #[derive(Debug, Clone, Serialize)]
@@ -145,6 +157,94 @@ pub fn recent_sessions_cached() -> Vec<RecentSession> {
     let sessions = collect_recent();
     store_cache(&sessions);
     sessions
+}
+
+// ---------------------------------------------------------------------------
+// Archive a project FROM Recent (the × button, made durable).
+//
+// The old × only hid the row in localStorage — the transcripts stayed on disk, so
+// the backend kept returning the project and it kept costing scan time. This MOVES
+// the project's transcripts out of the scanned catalog (into a sibling archive
+// dir) so the row truly goes away, while staying reversible (nothing is deleted).
+// ---------------------------------------------------------------------------
+
+/// Encode a session `cwd` into Claude Code's project-dir name under
+/// `~/.claude/projects`: every non-alphanumeric character becomes `-`. Verified
+/// against real dirs (`/home/natkins/projects/tools/t-hub/t-hub-app` ->
+/// `-home-natkins-projects-tools-t-hub-t-hub-app`). Lets us locate the transcripts
+/// for a project the user dismisses from Recent.
+fn encode_project_dir(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// The shell that performs the archive MOVE inside the (WSL) home where the
+/// transcripts live. Idempotent: a missing source exits 0 (the row is already
+/// gone); a name clash in the archive falls back to a timestamped name so a prior
+/// archive of the same project is never clobbered. `encoded` is `[A-Za-z0-9-]+`
+/// (every other char was mapped to `-`), so it's safe to interpolate here.
+fn archive_shell_cmd(encoded: &str) -> String {
+    format!(
+        "src=\"$HOME/.claude/projects/{encoded}\"; [ -d \"$src\" ] || exit 0; \
+         dst=\"$HOME/.claude/projects-archive\"; mkdir -p \"$dst\"; \
+         mv \"$src\" \"$dst/{encoded}\" 2>/dev/null || mv \"$src\" \"$dst/{encoded}-$(date +%s)\""
+    )
+}
+
+/// Move a project's transcripts out of `~/.claude/projects` into
+/// `~/.claude/projects-archive` so it leaves Recent for good (reversible). Best-
+/// effort + idempotent; invalidates the recent cache so the dismissed project
+/// can't reappear from a stale scan. Refuses an empty/all-separator encoding
+/// (which would target the whole projects dir).
+pub fn archive_project(cwd: &str) -> Result<(), String> {
+    let encoded = encode_project_dir(cwd);
+    if !encoded.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return Err("refusing to archive: empty/invalid project path".into());
+    }
+    let result = run_archive(&encoded);
+    // Whatever the move's outcome, drop the cache so the next scan reflects reality.
+    if let Ok(mut guard) = RECENT_CACHE.lock() {
+        *guard = None;
+    }
+    result
+}
+
+/// Run the archive move in WSL (Windows) where `~/.claude` actually lives.
+#[cfg(windows)]
+fn run_archive(encoded: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let distro = crate::files::host_distro();
+    let status = std::process::Command::new("wsl.exe")
+        .arg("-d")
+        .arg(&distro)
+        .arg("-e")
+        .arg("bash")
+        .arg("-lc")
+        .arg(archive_shell_cmd(encoded))
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .status()
+        .map_err(|e| format!("archive spawn failed: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("archive move failed".into())
+    }
+}
+
+/// Run the archive move directly (unix / dev build).
+#[cfg(not(windows))]
+fn run_archive(encoded: &str) -> Result<(), String> {
+    let status = std::process::Command::new("sh")
+        .arg("-lc")
+        .arg(archive_shell_cmd(encoded))
+        .status()
+        .map_err(|e| format!("archive spawn failed: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("archive move failed".into())
+    }
 }
 
 /// Collect + sort the recent sessions (platform-dispatched). Never panics; any
@@ -427,6 +527,10 @@ fn read_sessions_from_dir(
     let mut buckets: Vec<(i64, Vec<(String, std::path::PathBuf, i64)>)> = Vec::new();
     let mut total = 0usize;
     for project in project_dirs.flatten() {
+        // Skip machine-generated throwaway project dirs (e.g. the /usage probe).
+        if project.file_name().to_str().is_some_and(is_ignored_project_dir) {
+            continue;
+        }
         let Ok(files) = std::fs::read_dir(project.path()) else {
             continue;
         };
@@ -671,7 +775,7 @@ fn wsl_find_rows(distro: &str) -> Option<Vec<(i64, String)>> {
         .arg("-e")
         .arg("bash")
         .arg("-lc")
-        .arg("find ~/.claude/projects -mindepth 2 -maxdepth 2 -name '*.jsonl' -printf '%T@\\t%P\\n'")
+        .arg("find ~/.claude/projects -mindepth 2 -maxdepth 2 -name '*.jsonl' -not -path '*/-tmp-t-hub-usage/*' -printf '%T@\\t%P\\n'")
         .creation_flags(0x0800_0000)
         .output()
         .ok()?;
@@ -734,6 +838,10 @@ fn read_sessions_windows_fast(
             continue;
         };
         if project_dir.is_empty() || file.is_empty() {
+            continue;
+        }
+        // Skip machine-generated throwaway project dirs (e.g. the /usage probe).
+        if is_ignored_project_dir(project_dir) {
             continue;
         }
         // id = the session filename's stem (`<session>.jsonl` -> `<session>`).
@@ -843,6 +951,30 @@ mod tests {
         assert_eq!(cwd_basename("/home/natkins/n8builds/tools/"), "tools");
         assert_eq!(cwd_basename("C:\\Users\\natha\\proj"), "proj");
         assert_eq!(cwd_basename("solo"), "solo");
+    }
+
+    #[test]
+    fn encode_project_dir_matches_claude_scheme() {
+        // Every non-alphanumeric becomes '-'; hyphens already in a segment are kept
+        // (they map to themselves). Matches the real on-disk dir names so archive
+        // targets the correct folder.
+        assert_eq!(
+            encode_project_dir("/home/natkins/projects/tools/t-hub/t-hub-app"),
+            "-home-natkins-projects-tools-t-hub-t-hub-app"
+        );
+        assert_eq!(encode_project_dir("/home/natkins"), "-home-natkins");
+        // Dots / underscores also collapse to '-'.
+        assert_eq!(encode_project_dir("/a/b.c_d"), "-a-b-c-d");
+        // The /usage probe dir encodes to the folder Recent ignores.
+        assert_eq!(encode_project_dir("/tmp/t-hub-usage"), "-tmp-t-hub-usage");
+        // A path with no alphanumerics is what archive_project's guard rejects.
+        assert!(!encode_project_dir("///").chars().any(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn is_ignored_project_dir_filters_the_usage_probe() {
+        assert!(is_ignored_project_dir("-tmp-t-hub-usage"));
+        assert!(!is_ignored_project_dir("-home-natkins-projects-tools-t-hub-t-hub-app"));
     }
 
     #[test]

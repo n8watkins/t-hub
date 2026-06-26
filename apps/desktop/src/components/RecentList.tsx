@@ -14,13 +14,20 @@
 // activity text. The worktree + name are joined on the FRONTEND so the backend
 // `RecentSession` contract is untouched. On row hover, two understated controls
 // appear on the RIGHT: a → that RESUMES (spawns a terminal in the cwd running
-// `claude --resume <id>`, via onRecall) and an × that HIDES the row from Recent.
-// Hiding is persisted locally and does NOT delete the transcript; a project
-// resurfaces if it later gets a newer session. Fetched on mount + window focus;
-// an IPC failure degrades to a muted empty state.
+// `claude --resume <id>`, via onRecall) and an × that REMOVES the row from Recent
+// for good. The × optimistically hides the row (persisted locally as a fallback),
+// then ARCHIVES the project's transcripts out of `~/.claude/projects` into a
+// sibling `projects-archive` dir (archiveRecentProject -> archive_recent_project in
+// recent.rs) — so the project stops resurfacing AND stops costing scan time, while
+// staying reversible (nothing is deleted). Fetched on mount + window focus; an IPC
+// failure degrades to a muted empty state.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ClaudeIcon } from "./ClaudeIcon";
-import { recentSessions, type RecentSession } from "../ipc/recent";
+import {
+  recentSessions,
+  archiveRecentProject,
+  type RecentSession,
+} from "../ipc/recent";
 import { useTheme } from "../store/theme";
 import { useWorkspace } from "../store/workspace";
 
@@ -174,14 +181,28 @@ export function RecentList({ onRecall, onCount }: RecentListProps) {
     return () => window.removeEventListener("focus", refresh);
   }, [refresh]);
 
-  const hide = useCallback((cwd: string) => {
-    setHidden((prev) => {
-      const next = new Set(prev);
-      next.add(cwd);
-      saveHidden(next);
-      return next;
-    });
-  }, []);
+  // The × button: DISMISS a project from Recent for good. We optimistically hide
+  // the row instantly (also the graceful fallback if the archive fails — it stays
+  // hidden locally exactly as the old behavior did), then durably archive the
+  // project's transcripts out of the scanned catalog so it stops resurfacing AND
+  // stops costing scan time, and refresh from the backend's new reality.
+  const hide = useCallback(
+    (cwd: string) => {
+      setHidden((prev) => {
+        const next = new Set(prev);
+        next.add(cwd);
+        saveHidden(next);
+        return next;
+      });
+      void archiveRecentProject(cwd)
+        .then(() => refresh())
+        .catch(() => {
+          /* archive move failed (e.g. daemon offline) — the optimistic hide
+             keeps the row out of view; it may resurface on a later fresh scan. */
+        });
+    },
+    [refresh],
+  );
 
   // The cwds currently OPEN as tiles in this window. Recent is a library of work you
   // can resume — so it should show only projects you DON'T already have up; a project
@@ -343,8 +364,8 @@ function ProjectRow({
         onClick={() => onHide(group.cwd)}
         className="shrink-0 rounded-md px-2 py-1.5 text-[15px] leading-none opacity-0 transition-opacity hover:bg-neutral-700/50 focus:opacity-100 group-hover:opacity-100"
         style={{ color: "var(--th-fg-muted)" }}
-        title="Hide this project from Recent (does not delete the transcript)"
-        aria-label="Hide from Recent"
+        title="Remove this project from Recent — archives its transcripts (reversible)"
+        aria-label="Remove from Recent"
       >
         ×
       </button>

@@ -881,6 +881,10 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // tears the dir down (no orphaned processes).
         "create_worktree" => create_worktree(ctx, args),
         "remove_worktree" => remove_worktree(ctx, args),
+        // Recent list × made durable: move a project's transcripts out of the
+        // scanned catalog into projects-archive (reversible). App-initiated from
+        // the sidebar; filesystem-mutating like the worktree ops above.
+        "archive_recent_project" => archive_recent_project(args),
 
         // ---- Process-changing tier (PRD §11.2: confirmation required) ------
         // `spawn_terminal` stays gated off (it would create an untracked tmux
@@ -1131,6 +1135,19 @@ fn wsl_health(ctx: &ControlContext) -> Result<Value, String> {
 /// rather than the `wsl.exe`/UNC hop.
 fn recent_sessions() -> Result<Value, String> {
     serde_json::to_value(crate::recent::recent_sessions_cached()).map_err(|e| e.to_string())
+}
+
+/// `archive_recent_project`: the Recent list's × made durable. Moves the project
+/// at `args.cwd` out of `~/.claude/projects` into `projects-archive` (reversible)
+/// so the dismissed project stops appearing in Recent and stops costing scan time.
+/// Returns `true` on success.
+fn archive_recent_project(args: &Value) -> Result<Value, String> {
+    let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+    if cwd.is_empty() {
+        return Err("archive_recent_project requires a 'cwd'".into());
+    }
+    crate::recent::archive_project(cwd)?;
+    Ok(Value::Bool(true))
 }
 
 /// `claude_usage` (server-split M3 overlay source): the daemon's Claude plan usage
