@@ -443,6 +443,18 @@ fn tailscale_ip4() -> Option<String> {
 /// Everything else is rejected before auth, so even a `0.0.0.0` bind only ever
 /// serves loopback + the tailnet; the token gates dispatch on top of this.
 fn is_allowed_peer(ip: std::net::IpAddr) -> bool {
+    // Normalize an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its IPv4 form —
+    // that's how IPv4 peers arrive on a dual-stack (`[::]`) listener. Without this a
+    // dual-stack bind would reject the very loopback/tailnet peers it should serve
+    // (a mapped public IP still falls through to the rejecting V6 arm, so this never
+    // *admits* anything new — it only un-breaks the legitimate mapped cases).
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        v4 => v4,
+    };
     if ip.is_loopback() {
         return true;
     }
@@ -1992,6 +2004,11 @@ mod tests {
         // 100.x OUTSIDE the 64..=127 second octet is NOT Tailscale — rejected.
         assert!(!is_allowed_peer(IpAddr::V4(Ipv4Addr::new(100, 0, 0, 1))));
         assert!(!is_allowed_peer(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
+        // IPv4-mapped IPv6 (how IPv4 peers arrive on a dual-stack [::] bind): a
+        // mapped loopback / tailnet IP is admitted, a mapped public IP rejected.
+        assert!(is_allowed_peer("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_allowed_peer("::ffff:100.64.0.1".parse().unwrap()));
+        assert!(!is_allowed_peer("::ffff:8.8.8.8".parse().unwrap()));
     }
 
     #[test]

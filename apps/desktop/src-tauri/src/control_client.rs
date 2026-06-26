@@ -176,11 +176,24 @@ pub fn spawn_event_forwarder(app: AppHandle, addr: String, token: String) {
             // (Jitter is unnecessary for one client; add it for M4's many clients.)
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(10);
+            // A connection that lived at least this long is "healthy" — its end is a
+            // server close/restart, so retry promptly + reset. A shorter Ok (accepted
+            // then dropped immediately — e.g. the remote's peer gate rejected our
+            // source IP) is treated like a failure so we back off instead of
+            // tight-looping at ~4 Hz against a remote that keeps closing us.
+            let healthy_after = Duration::from_secs(1);
             loop {
-                match forward_once(&app, &addr, &token) {
-                    Ok(()) => {
+                let started = std::time::Instant::now();
+                let result = forward_once(&app, &addr, &token);
+                let lived = started.elapsed();
+                match result {
+                    Ok(()) if lived >= healthy_after => {
                         backoff = Duration::from_millis(250);
                         std::thread::sleep(Duration::from_millis(250));
+                    }
+                    Ok(()) => {
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(max_backoff);
                     }
                     Err(e) => {
                         eprintln!(
