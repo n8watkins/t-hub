@@ -83,8 +83,6 @@ export const Events = {
 export const Commands05 = {
   /** Core↔agent connection state + journal cursor. */
   agentState: "agent_state",
-  /** WSL host metrics snapshot (RAM/swap/CPU/load/...). */
-  hostMetrics: "host_metrics",
   /** Derive the current git branch for a cwd (statusline lacks it). */
   gitBranch: "git_branch",
   /** Scroll a tile's tmux scrollback by a page (copy-mode). */

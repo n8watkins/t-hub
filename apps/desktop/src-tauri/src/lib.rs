@@ -414,7 +414,6 @@ pub fn run() {
             commands::list_terminals,
             // 0.5 surface
             commands_05::agent_state,
-            commands_05::host_metrics,
             commands_05::git_branch,
             commands_05::tmux_scroll,
             commands_05::tmux_exit_scroll,

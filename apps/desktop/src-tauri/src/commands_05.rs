@@ -10,7 +10,6 @@
 //!
 //! Command name ↔ identifier mapping (keep in lockstep with `Commands05`):
 //!   - `agent_state`            → connection state + journal cursor
-//!   - `host_metrics`           → WSL host metrics snapshot (RPC)
 //!   - `git_branch`             → derive branch for a cwd (RPC)
 //!   - `supervision_tree`       → read-only tree for one session
 //!   - `supervision_session_ids`→ all supervised session ids
@@ -23,7 +22,6 @@ use serde::Serialize;
 use crate::claude::StatusSnapshot;
 use crate::model::{SessionStatus, SupervisionTree};
 use crate::AppState;
-use t_hub_protocol::HostMetrics;
 
 /// Current core↔agent connection state for the UI health area.
 #[derive(Debug, Clone, Serialize)]
@@ -39,19 +37,6 @@ pub async fn agent_state(state: tauri::State<'_, AppState>) -> Result<AgentState
         connection: state.agent.state(),
         journal_cursor: state.agent.journal_cursor(),
     })
-}
-
-#[tauri::command]
-pub async fn host_metrics(state: tauri::State<'_, AppState>) -> Result<HostMetrics, String> {
-    // `metrics()` blocks on a `recv_timeout(10s)` against the agent transport, so
-    // a slow/stalled agent would pin a Tokio worker for up to ten seconds — and
-    // this is polled every ~4s. Clone the bridge handle (it wraps an `Arc`
-    // internally, so the clone is cheap) and run the blocking RPC off the
-    // executor. Don't hold `&State` across the `.await`.
-    let agent = state.agent.clone();
-    tauri::async_runtime::spawn_blocking(move || agent.metrics())
-        .await
-        .map_err(|e| format!("host_metrics task failed: {e}"))?
 }
 
 #[tauri::command]
