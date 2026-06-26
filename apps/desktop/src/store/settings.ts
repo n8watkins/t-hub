@@ -33,10 +33,13 @@ const DEFAULTS = {
   titlebarHideDelayMs: 2000,
   /** Duration (ms) of the titlebar show/hide slide animation. */
   titlebarRevealAnimMs: 140,
-  /** Play a short chime on key session events (attention / done / error). */
-  soundsEnabled: true,
-  /** Show desktop (OS) notifications for key session events. */
-  notificationsEnabled: true,
+  /** Play a short chime on key session events (attention / done / error).
+   *  Default OFF — notifications/sounds are opt-in (the user enables them in
+   *  Settings) so a fresh install is quiet. */
+  soundsEnabled: false,
+  /** Show desktop (OS) notifications for key session events. Default OFF (opt-in,
+   *  paired with soundsEnabled). */
+  notificationsEnabled: false,
   /** Periodically check GitHub Releases for a newer signed build (feat/auto-updater). */
   autoUpdateCheckEnabled: true,
   /** Silently download + install a found update on launch, then relaunch. Only
