@@ -179,8 +179,16 @@ fn start_control_listener(
     app: &tauri::AppHandle,
     fanout: std::sync::Arc<control::EventFanout>,
 ) -> Option<control::ControlHandshake> {
+    // The control auth token. Server-split M2b: a PERSISTENT key (stable across
+    // restarts) so a remote client paired once doesn't have to re-pair every launch.
+    // An explicit T_HUB_CONTROL_TOKEN still overrides (test harnesses / the dev
+    // isolation). For loopback the MCP/client rediscover it from the handshake file
+    // each launch, so persistence is invisible there; it matters only once M2b binds
+    // a network interface and a remote client knows the key out-of-band.
     let token = std::env::var("T_HUB_CONTROL_TOKEN")
-        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(control::persistent_key);
 
     // A visitor closure that locks the bridge's Supervisor and runs `f`. Capturing
     // a clone of the bridge keeps `control` decoupled from `agent` internals.

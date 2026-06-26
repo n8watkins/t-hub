@@ -283,6 +283,47 @@ pub fn handshake_path() -> PathBuf {
     home.join(".t-hub").join("control.json")
 }
 
+/// Resolve the persistent server-key file: `$T_HUB_SERVER_KEY_FILE` if set, else
+/// `~/.t-hub/server-key`. Mirrors [`handshake_path`] so dev-isolation can point it
+/// elsewhere via the env var.
+fn key_path() -> PathBuf {
+    if let Ok(p) = std::env::var("T_HUB_SERVER_KEY_FILE") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".t-hub").join("server-key")
+}
+
+/// The PERSISTENT control auth key (server-split M2b): the server's stable identity
+/// across restarts, so a remote client paired once need not re-pair each launch.
+/// Read from [`key_path`] if present + non-empty; otherwise a fresh UUID is generated
+/// and written (best-effort `0600` on unix). On any read/write failure we still
+/// return a usable (in-memory) key so the channel always comes up.
+pub fn persistent_key() -> String {
+    let path = key_path();
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let k = existing.trim().to_string();
+        if !k.is_empty() {
+            return k;
+        }
+    }
+    let key = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&path, &key).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    key
+}
+
 /// Write the handshake file (best-effort `0600` on unix) so the MCP binary can
 /// discover the live listener.
 fn write_handshake(handshake: &ControlHandshake) -> std::io::Result<()> {
@@ -318,12 +359,103 @@ pub fn start(ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     };
     write_handshake(&handshake)?;
 
+    // Opt-in ADDITIONAL bind for REMOTE access (server-split M2b). GATED — default
+    // OFF, so the §8 loopback-only boundary holds unless explicitly enabled. When
+    // set, a second listener serves the same dispatch; `handle_conn` restricts peers
+    // to loopback + the Tailscale ranges, and the persistent token still gates every
+    // request on top of that. A bind failure is logged and never aborts startup.
+    if let Some(bind) = resolve_remote_bind() {
+        match TcpListener::bind(&bind) {
+            Ok(remote_listener) => {
+                let remote_addr = remote_listener
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| bind.clone());
+                eprintln!(
+                    "t-hub: control listener ALSO bound on {remote_addr} for REMOTE \
+                     access (token-gated; loopback + Tailscale peers only)"
+                );
+                let ctx_remote = ctx.clone();
+                std::thread::Builder::new()
+                    .name("t-hub-control-remote".into())
+                    .spawn(move || serve(remote_listener, ctx_remote))
+                    .ok();
+            }
+            Err(e) => eprintln!("t-hub: remote control bind '{bind}' failed: {e}"),
+        }
+    }
+
     std::thread::Builder::new()
         .name("t-hub-control".into())
         .spawn(move || serve(listener, ctx))
         .ok();
 
     Ok(handshake)
+}
+
+/// Resolve the optional REMOTE bind address (M2b), or `None` to stay loopback-only.
+/// `T_HUB_CONTROL_BIND=<ip:port>` binds that explicitly; `T_HUB_BIND_TAILSCALE=1`
+/// auto-detects the Tailscale IPv4 (`tailscale ip -4`) and binds it on
+/// `T_HUB_CONTROL_PORT` (default 8787). Explicit wins. Neither set ⇒ loopback-only.
+fn resolve_remote_bind() -> Option<String> {
+    if let Ok(a) = std::env::var("T_HUB_CONTROL_BIND") {
+        if !a.trim().is_empty() {
+            return Some(a.trim().to_string());
+        }
+    }
+    let want_tailscale = std::env::var("T_HUB_BIND_TAILSCALE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if want_tailscale {
+        if let Some(ip) = tailscale_ip4() {
+            let port = std::env::var("T_HUB_CONTROL_PORT")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "8787".to_string());
+            return Some(format!("{ip}:{port}"));
+        }
+        eprintln!(
+            "t-hub: T_HUB_BIND_TAILSCALE set but `tailscale ip -4` returned nothing; \
+             staying loopback-only"
+        );
+    }
+    None
+}
+
+/// Best-effort Tailscale IPv4 via the CLI. `None` if tailscale isn't installed/up.
+fn tailscale_ip4() -> Option<String> {
+    let out = std::process::Command::new("tailscale")
+        .args(["ip", "-4"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+}
+
+/// Whether a peer IP may use the control channel: loopback always, plus the
+/// Tailscale ranges (CGNAT `100.64.0.0/10` for IPv4, ULA `fd7a:115c::/32` for IPv6).
+/// Everything else is rejected before auth, so even a `0.0.0.0` bind only ever
+/// serves loopback + the tailnet; the token gates dispatch on top of this.
+fn is_allowed_peer(ip: std::net::IpAddr) -> bool {
+    if ip.is_loopback() {
+        return true;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (64..=127).contains(&o[1])
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c
+        }
+    }
 }
 
 /// Accept loop: one short read/serve thread per connection. Connections are
@@ -350,10 +482,12 @@ fn serve(listener: TcpListener, ctx: ControlContext) {
 /// Serve every newline-delimited request on one connection until EOF.
 fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
     let peer = stream.peer_addr().ok();
-    // Loopback-only: reject anything that didn't come from 127.0.0.1/::1. The
-    // bind is already loopback, but this is a cheap defensive belt.
+    // Restrict peers to loopback + the Tailscale ranges (M2b). With the default
+    // loopback-only bind this only ever sees 127.0.0.1; with the opt-in remote bind
+    // it admits tailnet peers and rejects everything else BEFORE auth, so a LAN/
+    // public peer can't even reach the token check. The token then gates dispatch.
     if let Some(addr) = peer {
-        if !addr.ip().is_loopback() {
+        if !is_allowed_peer(addr.ip()) {
             return Ok(());
         }
     }
@@ -1784,6 +1918,28 @@ mod tests {
 
         fanout.unregister(id);
         assert_eq!(fanout.subscriber_count(), 0);
+    }
+
+    #[test]
+    fn is_allowed_peer_admits_only_loopback_and_tailscale() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        // Loopback — always.
+        assert!(is_allowed_peer(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_allowed_peer(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // Tailscale CGNAT 100.64.0.0/10 (IPv4).
+        assert!(is_allowed_peer(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_allowed_peer(IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254))));
+        // Tailscale ULA fd7a:115c::/32 (IPv6).
+        assert!(is_allowed_peer(IpAddr::V6(Ipv6Addr::new(
+            0xfd7a, 0x115c, 0, 0, 0, 0, 0, 1
+        ))));
+        // LAN / public — rejected before auth.
+        assert!(!is_allowed_peer(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))));
+        assert!(!is_allowed_peer(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+        assert!(!is_allowed_peer(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        // 100.x OUTSIDE the 64..=127 second octet is NOT Tailscale — rejected.
+        assert!(!is_allowed_peer(IpAddr::V4(Ipv4Addr::new(100, 0, 0, 1))));
+        assert!(!is_allowed_peer(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
     }
 
     #[test]

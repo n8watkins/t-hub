@@ -229,9 +229,27 @@ fn forward_once(app: &AppHandle, addr: &str, token: &str) -> Result<(), String> 
 /// the handshake (addr+token), so both halves of the wire share one source of
 /// truth and the forwarder connects to an already-accepting listener.
 pub fn install(app: &AppHandle, handshake: &control::ControlHandshake) {
+    // Server-split M2b: a REMOTE-client override. When T_HUB_REMOTE_ADDR (+
+    // T_HUB_REMOTE_TOKEN) is set, this GUI is a THIN CLIENT to a remote server —
+    // control_request, the event forwarder, AND the terminal RemotePty (all read
+    // ControlEndpoint) target the remote control socket instead of this machine's
+    // loopback. Unset (the default) ⇒ the local loopback server, exactly as today.
+    let (addr, token) = match (
+        std::env::var("T_HUB_REMOTE_ADDR").ok().filter(|a| !a.is_empty()),
+        std::env::var("T_HUB_REMOTE_TOKEN").ok().filter(|t| !t.is_empty()),
+    ) {
+        (Some(addr), Some(token)) => {
+            eprintln!(
+                "t-hub: REMOTE client mode — control endpoint = {addr} (T_HUB_REMOTE_ADDR); \
+                 tiles + events + reads target the remote server"
+            );
+            (addr, token)
+        }
+        _ => (handshake.addr.clone(), handshake.token.clone()),
+    };
     app.manage(ControlEndpoint {
-        addr: handshake.addr.clone(),
-        token: handshake.token.clone(),
+        addr: addr.clone(),
+        token: token.clone(),
     });
-    spawn_event_forwarder(app.clone(), handshake.addr.clone(), handshake.token.clone());
+    spawn_event_forwarder(app.clone(), addr, token);
 }
