@@ -5,6 +5,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+import { controlRequest } from "./controlClient";
+
 /** Git command names (used with `invoke`). Mirrors the lib.rs registration. */
 export const CommandsGit = {
   /** Branch / worktree / dirty-count for a cwd. → GitInfo */
@@ -36,9 +38,18 @@ export interface GitInfo {
   dirtyCount: number;
 }
 
-/** Report git facts for `cwd`. Best-effort: a non-repo yields `isRepo: false`. */
+/**
+ * Report git facts for `cwd`. Best-effort: a non-repo yields `isRepo: false`.
+ *
+ * Server-split M3 (overlay source over the wire): routed over the control socket
+ * (`git_info` in control.rs) instead of the in-process Tauri command —
+ * shape-identical, so it's a transport swap. The daemon reuses the same per-cwd
+ * TTL cache (the freeze fix), so a thin client gets the REMOTE project's git state.
+ * Only `gitInfo` moves over the socket; the mutating git commands below stay on
+ * `invoke` (process-changing — gated off the control channel).
+ */
 export function gitInfo(cwd: string): Promise<GitInfo> {
-  return invoke(CommandsGit.gitInfo, { cwd });
+  return controlRequest(CommandsGit.gitInfo, { cwd }) as Promise<GitInfo>;
 }
 
 /**

@@ -2,7 +2,7 @@
 // newest session rollout file (~/.codex/sessions). Mirrors ipc/usage.ts; the
 // shape parallels ClaudeUsage's rate-limit windows (primary ≈ 5h, secondary ≈
 // weekly), but Codex reports a Unix-epoch `resetsAt` instead of human text.
-import { invoke } from "@tauri-apps/api/core";
+import { controlRequest } from "./controlClient";
 
 export interface CodexRateWindow {
   /** Used amount 0..=100; the UI shows "left" = 100 - used. */
@@ -28,7 +28,12 @@ export interface CodexUsage {
 }
 
 /** Read Codex plan usage from its newest session rollout. Best-effort: resolves
- *  to `{ ok: false }` when no Codex session / usage data is present. */
+ *  to `{ ok: false }` when no Codex session / usage data is present.
+ *
+ *  Server-split M3 (overlay source over the wire): routed over the control socket
+ *  (`codex_usage` in control.rs) instead of the in-process Tauri command —
+ *  shape-identical, so it's a transport swap. A thin client now gets the REMOTE
+ *  daemon's Codex usage. */
 export function codexUsage(): Promise<CodexUsage> {
-  return invoke("codex_usage");
+  return controlRequest("codex_usage") as Promise<CodexUsage>;
 }

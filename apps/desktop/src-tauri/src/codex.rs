@@ -48,9 +48,19 @@ pub struct CodexUsage {
 /// returns `CodexUsage { ok: false }` (never errors) so the sidebar degrades.
 #[tauri::command]
 pub async fn codex_usage() -> Result<CodexUsage, String> {
-    Ok(tauri::async_runtime::spawn_blocking(read_codex_usage)
+    Ok(tauri::async_runtime::spawn_blocking(codex_usage_blocking)
         .await
         .unwrap_or_default())
+}
+
+/// SYNC Codex usage read — the core of [`codex_usage`] minus the async/`spawn_blocking`
+/// wrapper. The control channel calls this (server-split M3) to serve the daemon's
+/// Codex plan usage over the socket, so a thin client gets the Codex usage strip
+/// remotely. Reads the newest `~/.codex/logs_*.sqlite` rate-limit row on a (blocking)
+/// control connection thread — the blocking sqlite/WSL IO is fine there. No cache:
+/// it's a single cheap newest-row read.
+pub fn codex_usage_blocking() -> CodexUsage {
+    read_codex_usage()
 }
 
 fn read_codex_usage() -> CodexUsage {

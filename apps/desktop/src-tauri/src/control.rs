@@ -727,6 +727,9 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "supervision_session_ids" => supervision_session_ids(ctx),
         "wsl_health" => wsl_health(ctx),
         "recent_sessions" => recent_sessions(),
+        "claude_usage" => claude_usage(),
+        "codex_usage" => codex_usage(),
+        "git_info" => git_info(args),
         "search_files" => search_files(ctx, args),
         "list_tabs" => list_tabs(),
         "read_terminal" | "capture_pane" => read_terminal(args),
@@ -997,6 +1000,35 @@ fn wsl_health(ctx: &ControlContext) -> Result<Value, String> {
 /// rather than the `wsl.exe`/UNC hop.
 fn recent_sessions() -> Result<Value, String> {
     serde_json::to_value(crate::recent::recent_sessions_cached()).map_err(|e| e.to_string())
+}
+
+/// `claude_usage` (server-split M3 overlay source): the daemon's Claude plan usage
+/// (`claude -p /usage`, parsed), so a thin client gets the sidebar Usage strip
+/// remotely. Mirrors the `claude_usage` Tauri command (same `ClaudeUsage` shape).
+/// Runs the `/usage` flow synchronously on this blocking connection thread.
+fn claude_usage() -> Result<Value, String> {
+    serde_json::to_value(crate::usage::claude_usage_blocking()).map_err(|e| e.to_string())
+}
+
+/// `codex_usage` (server-split M3 overlay source): the daemon's Codex plan usage
+/// (the newest `~/.codex/logs_*.sqlite` rate-limit row), so a thin client gets the
+/// Codex usage strip remotely. Mirrors the `codex_usage` Tauri command (same
+/// `CodexUsage` shape). Reads the log DB synchronously on this blocking connection
+/// thread.
+fn codex_usage() -> Result<Value, String> {
+    serde_json::to_value(crate::codex::codex_usage_blocking()).map_err(|e| e.to_string())
+}
+
+/// `git_info` (server-split M3 overlay source): git awareness — branch / worktree
+/// root / linked-worktree flag / dirty count — for a project cwd, so a thin client
+/// gets the Files-panel git header remotely. Mirrors the `git_info` Tauri command
+/// (same `GitInfo` shape), reusing its per-cwd TTL cache (the freeze fix). Args:
+/// `path` (or `cwd`), the same cwd string the frontend passes.
+fn git_info(args: &Value) -> Result<Value, String> {
+    let cwd = arg_str(args, "path")
+        .or_else(|| arg_str(args, "cwd"))
+        .ok_or("git_info requires a 'path' (cwd) argument")?;
+    serde_json::to_value(crate::git::git_info_cached(&cwd)).map_err(|e| e.to_string())
 }
 
 /// `search_files`: fuzzy basename/path/extension search over a project root,

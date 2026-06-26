@@ -508,20 +508,50 @@ pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
     // closure that captures only OWNED data (the cloned `cwd`) — no `&State` is
     // held across the await — so it can't pin a worker thread.
     let cwd_for_blocking = cwd.clone();
-    let info = tauri::async_runtime::spawn_blocking(move || {
-        // A spawn failure (no git / no wsl.exe / unreadable dir) degrades to the
-        // "not a repo" answer — best-effort, exactly like the old per-call path.
-        let stdout = run_git_info_script(&cwd_for_blocking).unwrap_or_default();
-        parse_git_info_output(&stdout)
-    })
-    .await
-    .map_err(|e| format!("git_info task failed: {e}"))?;
+    let info = tauri::async_runtime::spawn_blocking(move || compute_git_info(&cwd_for_blocking))
+        .await
+        .map_err(|e| format!("git_info task failed: {e}"))?;
 
     // Cache the fresh answer for this cwd so sibling tiles + the focus burst hit (1).
     if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
         cache_store(&mut guard, cwd, Instant::now(), info.clone());
     }
     Ok(info)
+}
+
+/// Run the one-shot [`GIT_INFO_SCRIPT`] for `cwd` and parse it into a [`GitInfo`] —
+/// the "scan" half shared by the async [`git_info`] command (inside its
+/// `spawn_blocking`) and the sync [`git_info_cached`] control core. A spawn failure
+/// (no git / no wsl.exe / unreadable dir) degrades to the "not a repo" answer,
+/// best-effort exactly like the old per-call path. Pure blocking IO; no cache.
+fn compute_git_info(cwd: &str) -> GitInfo {
+    let stdout = run_git_info_script(cwd).unwrap_or_default();
+    parse_git_info_output(&stdout)
+}
+
+/// SYNC `git_info` for `cwd` — the core of [`git_info`] minus the async/`spawn_blocking`
+/// wrapper. The control channel calls this (server-split M3) to serve the daemon's git
+/// awareness over the socket, so a thin client gets a project's branch / worktree root /
+/// linked flag / dirty count remotely. Reuses [`GIT_INFO_CACHE`] (the freeze-fix
+/// per-cwd TTL cache) via the same [`cache_lookup`]/[`cache_store`] seams as the async
+/// command, so local + remote per-tile polls collapse onto one `wsl.exe`/`git` spawn
+/// per cwd per [`GIT_INFO_TTL`]. Safe on a (blocking) control connection thread — the
+/// script spawn is blocking IO.
+pub fn git_info_cached(cwd: &str) -> GitInfo {
+    // (1) Fresh cached answer for this cwd (same fast-path as the async command).
+    if let Some(cached) = GIT_INFO_CACHE
+        .lock()
+        .ok()
+        .and_then(|g| cache_lookup(&g, cwd, Instant::now(), GIT_INFO_TTL))
+    {
+        return cached;
+    }
+    // (2) Cache miss / stale: run the one-shot script synchronously, then cache it.
+    let info = compute_git_info(cwd);
+    if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
+        cache_store(&mut guard, cwd.to_string(), Instant::now(), info.clone());
+    }
+    info
 }
 
 /// Stage all changes (`git add -A`) and commit them with `message`. Returns the

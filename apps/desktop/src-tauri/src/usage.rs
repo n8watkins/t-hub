@@ -41,9 +41,19 @@ pub struct ClaudeUsage {
 /// gentle hint.
 #[tauri::command]
 pub async fn claude_usage() -> Result<ClaudeUsage, String> {
-    Ok(tauri::async_runtime::spawn_blocking(run_usage)
+    Ok(tauri::async_runtime::spawn_blocking(claude_usage_blocking)
         .await
         .unwrap_or_default())
+}
+
+/// SYNC `/usage` read — the core of [`claude_usage`] minus the async/`spawn_blocking`
+/// wrapper. The control channel calls this (server-split M3) to serve the daemon's
+/// Claude plan usage over the socket, so a thin client gets the sidebar Usage strip
+/// remotely. Runs the same `claude -p /usage` flow on a (blocking) control connection
+/// thread — the blocking process IO is fine there. No cache: `/usage` is itself a
+/// fresh per-call network read (and the sidebar polls it at a long interval).
+pub fn claude_usage_blocking() -> ClaudeUsage {
+    run_usage()
 }
 
 /// How many times to (re)run `/usage` before giving up. `claude -p /usage` is
