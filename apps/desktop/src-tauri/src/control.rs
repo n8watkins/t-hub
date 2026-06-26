@@ -66,6 +66,11 @@ pub struct ControlRequest {
     /// Command arguments. Shape is per-command; absent ⇒ `null`.
     #[serde(default)]
     pub args: Value,
+    /// Wire protocol version the client speaks (server-split M2b). Absent for the
+    /// MCP / any legacy client (then unchecked, for backward compatibility); when
+    /// present it must equal [`PROTOCOL_VERSION`] or the server rejects the request.
+    #[serde(default)]
+    pub v: Option<u32>,
 }
 
 /// A single control response. `ok` discriminates success (`result`) from failure
@@ -106,6 +111,11 @@ pub struct ControlHandshake {
     pub token: String,
     /// PID of the app that owns this listener (diagnostics / staleness checks).
     pub pid: u32,
+    /// The control wire protocol version this server speaks ([`PROTOCOL_VERSION`]).
+    /// A local client (the MCP) can read it to detect a stale binary; defaults to 0
+    /// when absent so older handshake readers/files stay parseable.
+    #[serde(default)]
+    pub protocol_version: u32,
 }
 
 /// A sink that delivers an Organization-tier UI mutation to the frontend. The
@@ -126,6 +136,14 @@ pub trait ApplySink: Send + Sync {
 /// <value>}` frames (newline-delimited) until the client disconnects. This is the
 /// send half of the M1 event wire; the receive half is
 /// `control_client::spawn_event_forwarder`.
+/// The control wire protocol version (server-split M2b). Bump this on any
+/// breaking change to the request/response/event/PTY framing. The server
+/// advertises it in the handshake file + the subscribe ack, and rejects a client
+/// that advertises a different version (see [`ControlRequest::v`]) — so a remote
+/// client running a skewed T-Hub build fails fast with a clear message instead of
+/// a cryptic downstream parse error. Clients that send no version stay accepted.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 pub const SUBSCRIBE_COMMAND: &str = "__subscribe_events";
 
 /// The command name that switches a control connection into a **PTY stream**
@@ -372,6 +390,7 @@ pub fn start(ctx: ControlContext) -> std::io::Result<ControlHandshake> {
         addr: addr.to_string(),
         token: ctx.token.clone(),
         pid: std::process::id(),
+        protocol_version: PROTOCOL_VERSION,
     };
     write_handshake(&handshake)?;
 
@@ -591,47 +610,76 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
             continue;
         }
         match serde_json::from_str::<ControlRequest>(&line) {
-            // Event-subscription handshake: switch this connection into a one-way
-            // event stream. After the ack we send no per-line responses — the
-            // fanout owns the socket and the read loop just parks until disconnect.
-            Ok(req) if req.command == SUBSCRIBE_COMMAND => {
-                if !ct_token_eq(&req.token, &ctx.token) {
-                    write_response(
-                        &mut writer,
-                        &ControlResponse::err("unauthorized: bad control token"),
-                    )?;
-                    continue;
+            Ok(req) => {
+                // Protocol-version gate (M2b hardening): reject a client whose wire
+                // version differs from ours with a CLEAR message, instead of letting
+                // a version-skewed remote build fail cryptically downstream. A client
+                // that sends NO version (the MCP today, any legacy peer) is allowed —
+                // so adding the field now is backward-compatible, and enforcement
+                // engages only once a peer advertises a mismatching version. The peer
+                // is already IP-gated (is_allowed_peer), so echoing our version here
+                // leaks nothing the handshake file doesn't already record.
+                if let Some(v) = req.v {
+                    if v != PROTOCOL_VERSION {
+                        write_response(
+                            &mut writer,
+                            &ControlResponse::err(format!(
+                                "protocol version mismatch: server v{PROTOCOL_VERSION}, \
+                                 client v{v}; run matching T-Hub builds on both ends"
+                            )),
+                        )?;
+                        continue;
+                    }
                 }
-                if subscriber_id.is_none() {
-                    // Ack FIRST, then register: so the fanout can never interleave an
-                    // event frame with our ack on the same socket.
-                    write_response(&mut writer, &ControlResponse::ok(json!({ "subscribed": true })))?;
-                    subscriber_id = Some(ctx.fanout.register(writer.try_clone()?));
-                    // This is now a one-way event stream — the client never sends
-                    // again, so the read loop must park indefinitely. Drop the idle
-                    // timeout (else a quiet stream would self-close every 120s).
+                // Event-subscription handshake: switch this connection into a one-way
+                // event stream. After the ack we send no per-line responses — the
+                // fanout owns the socket and the read loop just parks until disconnect.
+                if req.command == SUBSCRIBE_COMMAND {
+                    if !ct_token_eq(&req.token, &ctx.token) {
+                        write_response(
+                            &mut writer,
+                            &ControlResponse::err("unauthorized: bad control token"),
+                        )?;
+                        continue;
+                    }
+                    if subscriber_id.is_none() {
+                        // Ack FIRST, then register: so the fanout can never interleave
+                        // an event frame with our ack on the same socket. The ack
+                        // carries the server version so the forwarder can log a skew.
+                        write_response(
+                            &mut writer,
+                            &ControlResponse::ok(json!({
+                                "subscribed": true,
+                                "protocolVersion": PROTOCOL_VERSION,
+                            })),
+                        )?;
+                        subscriber_id = Some(ctx.fanout.register(writer.try_clone()?));
+                        // This is now a one-way event stream — the client never sends
+                        // again, so the read loop must park indefinitely. Drop the idle
+                        // timeout (else a quiet stream would self-close every 120s).
+                        reader.get_ref().set_read_timeout(None).ok();
+                    }
+                    // Park: subsequent reads block until the client disconnects.
+                } else if req.command == ATTACH_PTY_COMMAND {
+                    // PTY stream (M2a): the terminal channel owns the rest of the
+                    // connection until the client disconnects.
+                    if !ct_token_eq(&req.token, &ctx.token) {
+                        write_response(
+                            &mut writer,
+                            &ControlResponse::err("unauthorized: bad control token"),
+                        )?;
+                        continue;
+                    }
+                    // The PTY stream reads {write}/{resize} frames for as long as the
+                    // user leaves the tile open — clear the idle timeout so an
+                    // untouched terminal isn't force-detached after 120s.
                     reader.get_ref().set_read_timeout(None).ok();
+                    serve_pty_attach(&mut writer, &mut reader, &req.args)?;
+                    break;
+                } else {
+                    write_response(&mut writer, &dispatch_authenticated(ctx, req))?;
                 }
-                // Park: subsequent reads block until the client disconnects.
             }
-            // PTY stream (M2a): the terminal channel owns the rest of the
-            // connection until the client disconnects.
-            Ok(req) if req.command == ATTACH_PTY_COMMAND => {
-                if !ct_token_eq(&req.token, &ctx.token) {
-                    write_response(
-                        &mut writer,
-                        &ControlResponse::err("unauthorized: bad control token"),
-                    )?;
-                    continue;
-                }
-                // The PTY stream reads {write}/{resize} frames for as long as the
-                // user leaves the tile open — clear the idle timeout so an
-                // untouched terminal isn't force-detached after 120s.
-                reader.get_ref().set_read_timeout(None).ok();
-                serve_pty_attach(&mut writer, &mut reader, &req.args)?;
-                break;
-            }
-            Ok(req) => write_response(&mut writer, &dispatch_authenticated(ctx, req))?,
             Err(e) => write_response(
                 &mut writer,
                 &ControlResponse::err(format!("malformed control request: {e}")),
@@ -1703,6 +1751,7 @@ mod tests {
             token: "wrong".into(),
             command: "list_tabs".into(),
             args: Value::Null,
+            v: None,
         };
         let resp = dispatch_authenticated(&ctx, req);
         assert!(!resp.ok);
@@ -1716,6 +1765,7 @@ mod tests {
             token: "secret".into(),
             command: "list_tabs".into(),
             args: Value::Null,
+            v: None,
         };
         let resp = dispatch_authenticated(&ctx, req);
         assert!(resp.ok, "expected ok, got {:?}", resp.error);
@@ -2070,6 +2120,58 @@ mod tests {
     }
 
     #[test]
+    fn protocol_version_gate_rejects_a_skewed_client() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let ctx = test_ctx("secret");
+        // Serve one connection per assertion (each `send` opens + closes one).
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().expect("accept");
+                let _ = handle_conn(stream, &ctx);
+            }
+        });
+
+        // Open a connection, send one frame, read one response line.
+        let send = |frame: Value| -> Value {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            let mut bytes = serde_json::to_vec(&frame).unwrap();
+            bytes.push(b'\n');
+            s.write_all(&bytes).unwrap();
+            let mut reader = BufReader::new(s);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<Value>(line.trim()).unwrap()
+        };
+
+        // A valid token but a MISMATCHED version is rejected — the gate fires before
+        // dispatch, with a clear, actionable message.
+        let bad = send(json!({"token": "secret", "command": "list_tabs", "v": 999}));
+        assert_eq!(bad["ok"], false);
+        assert!(
+            bad["error"]
+                .as_str()
+                .unwrap()
+                .contains("protocol version mismatch"),
+            "got: {bad}"
+        );
+
+        // The matching version passes the gate and dispatches normally.
+        let good = send(json!({"token": "secret", "command": "list_tabs", "v": PROTOCOL_VERSION}));
+        assert_eq!(good["ok"], true, "got: {good}");
+
+        // No version field at all stays accepted (backward-compat: the MCP / legacy
+        // clients don't advertise one).
+        let legacy = send(json!({"token": "secret", "command": "list_tabs"}));
+        assert_eq!(legacy["ok"], true, "got: {legacy}");
+
+        server.join().unwrap();
+    }
+
+    #[test]
     fn theme_commands_are_forwarded_by_name() {
         let ctx = test_ctx("t");
         // Forwarded by name; not yet wired ⇒ a clear, theme-specific error (not
@@ -2279,11 +2381,13 @@ mod tests {
             addr: "127.0.0.1:5000".into(),
             token: "abc".into(),
             pid: 42,
+            protocol_version: PROTOCOL_VERSION,
         };
         let s = serde_json::to_string(&h).unwrap();
         let back: ControlHandshake = serde_json::from_str(&s).unwrap();
         assert_eq!(back.addr, "127.0.0.1:5000");
         assert_eq!(back.token, "abc");
         assert_eq!(back.pid, 42);
+        assert_eq!(back.protocol_version, PROTOCOL_VERSION);
     }
 }

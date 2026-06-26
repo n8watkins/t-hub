@@ -69,6 +69,7 @@ fn request(addr: &str, token: &str, command: &str, args: &Value) -> Result<Value
         "token": token,
         "command": command,
         "args": args,
+        "v": control::PROTOCOL_VERSION,
     }))
     .map_err(|e| format!("control_request: serialize request failed: {e}"))?;
     frame.push(b'\n');
@@ -224,6 +225,7 @@ fn forward_once(app: &AppHandle, addr: &str, token: &str) -> Result<(), String> 
         "token": token,
         "command": control::SUBSCRIBE_COMMAND,
         "args": {},
+        "v": control::PROTOCOL_VERSION,
     }))
     .map_err(|e| e.to_string())?;
     frame.push(b'\n');
@@ -242,6 +244,17 @@ fn forward_once(app: &AppHandle, addr: &str, token: &str) -> Result<(), String> 
             Ok(v) => v,
             Err(_) => continue, // skip a malformed frame rather than tearing down
         };
+        // A subscribe REJECTION ({"ok":false,error}) — bad token or a protocol
+        // version mismatch (M2b) — surfaces here. Return it (with the server's
+        // message) so the reconnect loop logs a clear cause and backs off, instead
+        // of silently skipping it and parking until the idle timeout.
+        if frame.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            let msg = frame
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("subscribe rejected");
+            return Err(format!("subscribe rejected: {msg}"));
+        }
         // The subscribe ack ({"ok":true,...}) carries no "event"; skip it.
         let Some(channel) = frame.get("event").and_then(|v| v.as_str()) else {
             continue;

@@ -138,6 +138,7 @@ impl RemotePty {
             "token": token,
             "command": ATTACH_PTY_COMMAND,
             "args": { "sessionId": id, "cols": cols, "rows": rows },
+            "v": crate::control::PROTOCOL_VERSION,
         }))
         .map_err(|e| format!("remote_pty: serialize attach_pty failed: {e}"))?;
         frame.push(b'\n');
