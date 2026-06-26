@@ -203,11 +203,22 @@ fn start_control_listener(
     let apply_sink: std::sync::Arc<dyn control::ApplySink> =
         std::sync::Arc::new(AppHandleApplySink { app: app.clone() });
 
+    // Host-metrics RPC (server-split M3, overlay source #5): a closure that fetches
+    // the WSL agent's `/proc` snapshot via the bridge. The control `host_metrics`
+    // handler prefers this over the daemon's local `/proc` (which is the Windows
+    // host = zeros on the current topology). `metrics()` blocks ~10s on the agent
+    // transport, so it runs on the per-connection blocking thread, never here.
+    let metrics_bridge = state.agent.clone();
+    let metrics: std::sync::Arc<
+        dyn Fn() -> Result<t_hub_protocol::HostMetrics, String> + Send + Sync,
+    > = std::sync::Arc::new(move || metrics_bridge.metrics());
+
     // Share the event fanout (server-split M1) so a subscribed control connection
     // receives the same stream the backend emits through the SocketEmitter.
     let ctx = control::ControlContext::new(state.status.clone(), supervisor, token)
         .with_apply_sink(apply_sink)
-        .with_event_fanout(fanout);
+        .with_event_fanout(fanout)
+        .with_metrics(metrics);
     match control::start(ctx) {
         Ok(h) => {
             eprintln!(

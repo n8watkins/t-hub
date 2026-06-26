@@ -27,9 +27,20 @@ export function agentState(): Promise<AgentStateInfo> {
   return invoke(Commands05.agentState);
 }
 
-/** WSL host metrics snapshot. Rejects until the agent bridge is connected. */
+/**
+ * WSL host metrics snapshot.
+ *
+ * Server-split M3 (overlay source #5): routed over the control socket
+ * (`host_metrics` in control.rs) instead of the in-process Tauri command —
+ * shape-identical (snake_case `HostMetrics`), so it's a transport swap. The
+ * daemon prefers the agent bridge's `/proc` (the WSL agent), so locally this is a
+ * no-op; a thin client now gets the REMOTE host's metrics. Still rejects until the
+ * bridge is connected (the daemon's local `/proc` is the Windows host = zeros, so
+ * we surface the "not connected" error rather than zeros — Linux daemons fall back
+ * to their own real `/proc`).
+ */
 export function hostMetrics(): Promise<HostMetrics> {
-  return invoke(Commands05.hostMetrics);
+  return controlRequest("host_metrics") as Promise<HostMetrics>;
 }
 
 /** Derive the current git branch for `cwd` (statusline lacks it). */

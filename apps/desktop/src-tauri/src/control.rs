@@ -228,6 +228,14 @@ impl EventFanout {
 ///     private one is correct — it just re-walks on first query);
 ///   - supervision + status are read from the `Arc`-shared bridges in
 ///     [`crate::AppState`], which *is* `Clone`.
+/// Fetch a host-metrics snapshot from the **agent bridge** — i.e. the WSL agent's
+/// own `/proc`. On the current Windows-host topology this is the ONLY correct
+/// source: the daemon runs in the GUI's Windows process, whose "local `/proc`" is
+/// the Windows host (no `/proc` ⇒ zeros), so `host_metrics` must prefer this RPC.
+/// `lib.rs` supplies the closure (a clone of the `AgentBridge`); `None` in headless
+/// tests/proofs. Returns the bridge's "not connected" error until the agent attaches.
+type MetricsFn = Arc<dyn Fn() -> Result<t_hub_protocol::HostMetrics, String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ControlContext {
     status: Arc<StatusBridge>,
@@ -246,6 +254,10 @@ pub struct ControlContext {
     /// tests; `lib.rs` shares the same `Arc` with the socket emitter so emits and
     /// subscribers meet here.
     fanout: Arc<EventFanout>,
+    /// Fetch host metrics from the agent bridge (the WSL agent's `/proc`). `None`
+    /// in headless tests; `lib.rs` wires it from `AgentBridge`. See [`MetricsFn`]
+    /// for why this is the canonical source on the Windows-host topology.
+    metrics: Option<MetricsFn>,
     /// The per-launch auth token.
     token: String,
 }
@@ -729,6 +741,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "recent_sessions" => recent_sessions(),
         "claude_usage" => claude_usage(),
         "codex_usage" => codex_usage(),
+        "host_metrics" => host_metrics(ctx),
         "git_info" => git_info(args),
         "search_files" => search_files(ctx, args),
         "list_tabs" => list_tabs(),
@@ -1017,6 +1030,68 @@ fn claude_usage() -> Result<Value, String> {
 /// thread.
 fn codex_usage() -> Result<Value, String> {
     serde_json::to_value(crate::codex::codex_usage_blocking()).map_err(|e| e.to_string())
+}
+
+/// `host_metrics` (server-split M3 overlay source #5): the WSL host's memory / CPU
+/// / load / process snapshot for the sidebar health strip, so a thin client gets it
+/// remotely. Mirrors the `host_metrics` Tauri command (same snake_case
+/// `t_hub_protocol::HostMetrics` shape) — a transport swap, NOT a re-source.
+///
+/// **Source order matters (the regression trap).** The current topology runs the
+/// daemon *in the Windows GUI process*, whose local `/proc` is the Windows host
+/// (no `/proc` ⇒ all-zeros). So we PREFER the [`MetricsFn`] agent-bridge RPC (the
+/// WSL agent's own `/proc`) — exactly what the in-process Tauri command does today,
+/// so flipping the frontend onto this is a no-op locally. We fall back to the
+/// daemon's local `/proc` **only on Linux** (`#[cfg(target_os = "linux")]`): that
+/// covers the native-WSL / remote-Linux daemon endgame (where local `/proc` IS the
+/// real host) and the Linux dev box (a strict improvement — today it shows nothing
+/// until the agent connects). On Windows the fallback is compiled out, so we surface
+/// the bridge's "not connected" error instead of zeros — preserving today's UX.
+fn host_metrics(ctx: &ControlContext) -> Result<Value, String> {
+    let bridge_result = match &ctx.metrics {
+        Some(fetch) => fetch(),
+        None => Err("host_metrics: agent bridge not wired into the control context".to_string()),
+    };
+    match bridge_result {
+        Ok(m) => serde_json::to_value(m).map_err(|e| e.to_string()),
+        Err(bridge_err) => {
+            #[cfg(target_os = "linux")]
+            {
+                let _ = bridge_err; // the daemon's own /proc is the real host here
+                serde_json::to_value(local_host_metrics()).map_err(|e| e.to_string())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(bridge_err)
+            }
+        }
+    }
+}
+
+/// Build a snake_case [`t_hub_protocol::HostMetrics`] from the daemon's OWN `/proc`
+/// (the M3 fallback when no agent bridge is attached — a native-WSL/Linux daemon).
+/// Distinct from [`collect_host_metrics`], which emits the camelCase shape the MCP
+/// `wsl_health` tool returns; this one matches the frontend's `host_metrics` wire.
+#[cfg(target_os = "linux")]
+fn local_host_metrics() -> t_hub_protocol::HostMetrics {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let (mem_total_kib, mem_available_kib, swap_total_kib, swap_free_kib) = read_meminfo();
+    t_hub_protocol::HostMetrics {
+        mem_total_kib,
+        mem_available_kib,
+        swap_total_kib,
+        swap_free_kib,
+        cpu_count: std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(0),
+        load_avg: read_loadavg(),
+        process_count: count_procs(),
+        distro: read_pretty_name(),
+        captured_at_ms: now_ms,
+    }
 }
 
 /// `git_info` (server-split M3 overlay source): git awareness — branch / worktree
@@ -1495,6 +1570,7 @@ impl ControlContext {
             files: Arc::new(files::FileIndexState::new()),
             apply_sink: None,
             fanout: Arc::new(EventFanout::new()),
+            metrics: None,
             token,
         }
     }
@@ -1514,6 +1590,15 @@ impl ControlContext {
     /// keep the sink-less context (they audit without applying).
     pub fn with_apply_sink(mut self, sink: Arc<dyn ApplySink>) -> Self {
         self.apply_sink = Some(sink);
+        self
+    }
+
+    /// Attach the agent-bridge host-metrics RPC (server-split M3, overlay source
+    /// #5). Builder-style so `lib.rs` wires it from `AgentBridge` after construction
+    /// while headless tests keep the metrics-less context (they fall back to local
+    /// `/proc` on Linux, or report the missing bridge elsewhere). See [`MetricsFn`].
+    pub fn with_metrics(mut self, metrics: MetricsFn) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -1587,6 +1672,61 @@ mod tests {
         let ctx = test_ctx("t");
         let err = dispatch(&ctx, "definitely_not_a_command", &Value::Null).unwrap_err();
         assert!(err.contains("not exposed over the control channel"));
+    }
+
+    #[test]
+    fn host_metrics_prefers_the_bridge_and_serializes_snake_case() {
+        // A stubbed agent-bridge metrics RPC: the handler must PREFER it over the
+        // daemon's local /proc, and serialize snake_case (the frontend wire shape in
+        // src/ipc/protocol.ts) — NOT the camelCase `wsl_health` shape.
+        let ctx = test_ctx("t").with_metrics(Arc::new(|| {
+            Ok(t_hub_protocol::HostMetrics {
+                mem_total_kib: 16_000_000,
+                mem_available_kib: 8_000_000,
+                swap_total_kib: 2_000_000,
+                swap_free_kib: 1_500_000,
+                cpu_count: 12,
+                load_avg: [1.0, 0.5, 0.25],
+                process_count: 432,
+                distro: Some("Ubuntu 24.04".into()),
+                captured_at_ms: 1_700_000_000_000,
+            })
+        }));
+        let v = dispatch(&ctx, "host_metrics", &Value::Null).unwrap();
+        assert_eq!(
+            v.get("mem_total_kib").and_then(|x| x.as_u64()),
+            Some(16_000_000)
+        );
+        assert_eq!(v.get("cpu_count").and_then(|x| x.as_u64()), Some(12));
+        assert_eq!(v.get("process_count").and_then(|x| x.as_u64()), Some(432));
+        assert_eq!(v.get("distro").and_then(|x| x.as_str()), Some("Ubuntu 24.04"));
+        assert!(
+            v.get("memTotalKib").is_none(),
+            "must be snake_case, not the camelCase wsl_health shape"
+        );
+    }
+
+    #[test]
+    fn host_metrics_falls_back_when_the_bridge_errors() {
+        // Bridge says "not connected". On Linux the daemon's own /proc IS the real
+        // host (native-WSL / remote-Linux daemon, or the dev box), so we serve a
+        // snake_case snapshot from it. On non-Linux the local /proc would be
+        // all-zeros, so we surface the error instead (preserves today's UX).
+        let ctx = test_ctx("t").with_metrics(Arc::new(|| Err("not connected".into())));
+        let out = dispatch(&ctx, "host_metrics", &Value::Null);
+        #[cfg(target_os = "linux")]
+        {
+            let v = out.expect("linux falls back to local /proc");
+            assert!(
+                v.get("mem_total_kib").is_some(),
+                "snake_case local snapshot"
+            );
+            assert!(v.get("captured_at_ms").is_some());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(out.unwrap_err().contains("not connected"));
+        }
     }
 
     #[test]
