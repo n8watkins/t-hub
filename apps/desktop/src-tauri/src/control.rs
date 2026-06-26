@@ -46,12 +46,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::claude::StatusBridge;
 use crate::supervision::Supervisor;
-use crate::{files, git, tmux};
+use crate::{files, git, pty, tmux};
 
 /// A single control request: a command name + free-form JSON args, authenticated
 /// by the per-launch `token`.
@@ -126,6 +127,14 @@ pub trait ApplySink: Send + Sync {
 /// send half of the M1 event wire; the receive half is
 /// `control_client::spawn_event_forwarder`.
 pub const SUBSCRIBE_COMMAND: &str = "__subscribe_events";
+
+/// The command name that switches a control connection into a **PTY stream**
+/// (server-split M2a): the connection becomes a full-duplex terminal channel —
+/// the server captures scrollback, spawns the PTY-runs-`tmux attach`, streams
+/// `{"out":"<b64>"}` frames down, and reads `{"write":"<b64>"}` / `{"resize":
+/// {cols,rows}}` frames back up, until the client disconnects (then it detaches —
+/// the tmux session survives). Args: `sessionId` (required), `cols`, `rows`.
+pub const ATTACH_PTY_COMMAND: &str = "attach_pty";
 
 /// A registry of connected event subscribers. The backend's event emitter
 /// (`control_client::SocketEmitter`, composed onto the agent bridge via a
@@ -340,12 +349,18 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
         }
     }
     let mut writer = stream.try_clone()?;
-    let reader = BufReader::new(stream);
+    // Read lines manually (not `reader.lines()`) so a connection mode that takes
+    // over the rest of the stream (the PTY attach) can be handed `&mut reader`.
+    let mut reader = BufReader::new(stream);
     // Set once this connection joins the event-subscription registry; used to
     // prune it from the fanout on clean disconnect (loop EOF below).
     let mut subscriber_id: Option<u64> = None;
-    for line in reader.lines() {
-        let line = line?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break; // EOF: client disconnected.
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -369,6 +384,19 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
                 }
                 // Park: subsequent reads block until the client disconnects.
             }
+            // PTY stream (M2a): the terminal channel owns the rest of the
+            // connection until the client disconnects.
+            Ok(req) if req.command == ATTACH_PTY_COMMAND => {
+                if req.token != ctx.token {
+                    write_response(
+                        &mut writer,
+                        &ControlResponse::err("unauthorized: bad control token"),
+                    )?;
+                    continue;
+                }
+                serve_pty_attach(&mut writer, &mut reader, &req.args)?;
+                break;
+            }
             Ok(req) => write_response(&mut writer, &dispatch_authenticated(ctx, req))?,
             Err(e) => write_response(
                 &mut writer,
@@ -380,6 +408,87 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
         ctx.fanout.unregister(id);
     }
     Ok(())
+}
+
+/// Serve a PTY stream (M2a) on this connection: send the scrollback seed, spawn
+/// the PTY-runs-`tmux attach` streaming `{"out"}` frames down (via a clone of the
+/// writer — the reader thread owns those writes, so they never interleave with the
+/// scrollback we send first), then read `{"write"}`/`{"resize"}` frames from the
+/// client until it disconnects, and detach (the tmux session survives).
+fn serve_pty_attach(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    args: &Value,
+) -> std::io::Result<()> {
+    let session_id = match arg_str(args, "sessionId").or_else(|| arg_str(args, "session_id")) {
+        Some(s) => s,
+        None => {
+            return write_response(
+                writer,
+                &ControlResponse::err("attach_pty requires a 'sessionId' argument"),
+            );
+        }
+    };
+    let tmux_session = tmux_target(&session_id);
+    let cols = args.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+    let rows = args.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+
+    if !tmux::has_session(&tmux_session) {
+        return write_response(
+            writer,
+            &ControlResponse::err(format!(
+                "attach_pty: tmux session {tmux_session} for terminal {session_id} no longer exists"
+            )),
+        );
+    }
+
+    // Scrollback seed (base64), as the opening frame — sent BEFORE the stream
+    // starts so the reader thread's output frames never race it.
+    let scrollback = tmux::capture_pane(&tmux_session).unwrap_or_default();
+    write_json_line(writer, &json!({ "scrollback": STANDARD.encode(&scrollback) }))?;
+
+    // Spawn the PTY streaming output to a clone of this connection.
+    let sink = writer.try_clone()?;
+    let cwd = std::env::var("HOME").unwrap_or_default();
+    let mut handle = match pty::stream_attach_to_sink(&tmux_session, &cwd, cols, rows, Box::new(sink)) {
+        Ok(h) => h,
+        Err(e) => {
+            return write_json_line(writer, &json!({ "error": format!("attach_pty: {e}") }));
+        }
+    };
+
+    // Drive write/resize frames from the client until it disconnects (EOF).
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break; // client disconnected
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue, // skip a malformed frame rather than tearing down
+        };
+        if let Some(b64) = frame.get("write").and_then(|v| v.as_str()) {
+            if let Ok(bytes) = STANDARD.decode(b64) {
+                let _ = handle.write(&bytes);
+            }
+        } else if let Some(rz) = frame.get("resize") {
+            let c = rz.get("cols").and_then(|v| v.as_u64()).unwrap_or(cols as u64) as u16;
+            let r = rz.get("rows").and_then(|v| v.as_u64()).unwrap_or(rows as u64) as u16;
+            let _ = handle.resize(c, r);
+        }
+    }
+    handle.detach(); // tmux session survives, like close_terminal
+    Ok(())
+}
+
+/// Write one newline-delimited JSON frame to a stream (best-effort flush). Used by
+/// the PTY stream for its scrollback/error frames.
+fn write_json_line(writer: &mut TcpStream, frame: &Value) -> std::io::Result<()> {
+    let mut body = serde_json::to_vec(frame).unwrap_or_default();
+    body.push(b'\n');
+    writer.write_all(&body)?;
+    writer.flush()
 }
 
 /// Write one newline-delimited control response and flush. Shared by the normal
