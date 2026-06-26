@@ -152,16 +152,24 @@ const URL_SCAN_TAIL = 256;
 // Matches a CLICKABLE FILE PATH printed in terminal output (WS-1, open-file-on-
 // Ctrl+click). Deliberately STRICT to avoid false positives — we'd rather miss a
 // path than underline arbitrary text:
-//   - ABSOLUTE paths only for now: POSIX/WSL `/a/b/c` or Windows `C:\a\b` /
-//     `C:/a/b`. Relative paths need the tile's cwd to resolve (see the link
-//     provider's TODO), so we don't offer them yet.
-//   - At least one path separator (a bare `/foo` token isn't enough on its own
-//     for the POSIX form — it must look like a real multi-segment path OR carry a
-//     file extension), and the final segment must not end in a separator.
+//   - ABSOLUTE paths: POSIX/WSL `/a/b/c` or Windows `C:\a\b` / `C:/a/b`.
+//   - RELATIVE paths (WS-1, now that live tile cwd exists): `./x`, `../x`, or a
+//     bare `src/app.tsx` shape — resolved against the tile's live cwd in the link
+//     provider's activate. The strict shape rules live in looksLikeRelativePath
+//     (NOT this regex), which only TOKENIZES; we filter what's openable below.
+//   - The final segment must not end in a separator.
 // `g` so one line can yield several path matches; segment chars exclude
 // whitespace and shell/quote punctuation so we don't swallow surrounding syntax.
+// The token may start with a root (`/`, `C:\`), a `./`/`../` prefix, or a bare
+// segment — the per-token classifiers (absolute vs. strict-relative) decide
+// which are actually surfaced as links.
 const FILE_PATH_RE =
-  /(?:[A-Za-z]:[\\/]|\/)(?:[^\s"'`<>|:*?()[\]{}]+[\\/])*[^\s"'`<>|:*?()[\]{}]+/g;
+  /(?:[A-Za-z]:[\\/]|\.{0,2}[\\/]|(?=[^\s"'`<>|:*?()[\]{}]))(?:[^\s"'`<>|:*?()[\]{}]+[\\/])*[^\s"'`<>|:*?()[\]{}]+/g;
+
+/** True for an ABSOLUTE token: a POSIX `/...` or Windows `C:\...` / `C:/...`. */
+function isAbsolutePath(token: string): boolean {
+  return /^(?:[A-Za-z]:[\\/]|[\\/])/.test(token);
+}
 
 /** True for a token we're willing to open: an absolute path with a real shape —
  *  either it has a directory part (a separator after the root) or a file
@@ -175,6 +183,51 @@ function looksLikeOpenablePath(token: string): boolean {
   const leaf = afterRoot.split(/[\\/]/).pop() ?? "";
   const hasExt = /\.[A-Za-z0-9]+$/.test(leaf);
   return hasInnerSep || hasExt;
+}
+
+// Source-ish file extensions that make a SINGLE bare segment (no separator)
+// openable as a relative path. Kept tight on purpose — a lone `notes.txt` is a
+// real reference, but a lone `foo` (no extension) is just a word.
+const REL_SINGLE_SEG_EXT_RE =
+  /\.(?:ts|tsx|js|jsx|rs|py|go|md|json|toml|txt|sh|css|html|yml|yaml|lock)$/i;
+
+/** STRICT relative-path classifier (WS-1). INTENTIONALLY conservative — lots of
+ *  prose reads like `foo/bar`, so we only treat a token as a relative path when
+ *  it's clearly one and let everything else fall through as plain text:
+ *    1. starts with `./` or `../` (or `.\`/`..\`), OR
+ *    2. has at least one `/` AND a final segment with a real file extension
+ *       (e.g. `src/app.tsx`, `lib/x.rs`), OR
+ *    3. is a SINGLE segment carrying a known source extension (REL_SINGLE_SEG_…).
+ *  Bare words, `a/b` without an extension, flags, and URLs (owned by the
+ *  WebLinks addon) are deliberately NOT matched. */
+function looksLikeRelativePath(token: string): boolean {
+  if (isAbsolutePath(token)) return false; // absolute is handled separately
+  if (/^\.{1,2}[\\/]/.test(token)) return true; // ./ or ../ prefix
+  const leaf = token.split(/[\\/]/).pop() ?? "";
+  const hasSep = /[\\/]/.test(token);
+  if (hasSep) return /\.[A-Za-z0-9]+$/.test(leaf); // dir + extensioned leaf
+  return REL_SINGLE_SEG_EXT_RE.test(token); // lone source-ish file
+}
+
+/** POSIX-join a token onto an absolute cwd and normalize `.`/`..` segments — a
+ *  pure string op (these are WSL POSIX paths; we never touch node `path`). A
+ *  leading `./`/`../` in the token is preserved through normalization, and `..`
+ *  pops a parent segment (bounded at the root so it never escapes `/`). Windows
+ *  backslashes in the relative token are folded to `/` first since the cwd is
+ *  POSIX. Returns an absolute `/...` path. */
+function resolveRelativePosix(cwd: string, token: string): string {
+  const base = cwd.replace(/\/+$/, ""); // strip trailing slash(es)
+  const rel = token.replace(/\\/g, "/");
+  const out: string[] = base.split("/").filter((s) => s.length > 0);
+  for (const seg of rel.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") {
+      if (out.length > 0) out.pop();
+      continue;
+    }
+    out.push(seg);
+  }
+  return "/" + out.join("/");
 }
 
 /** Default xterm theme when the active theme carries no terminal palette. */
@@ -333,11 +386,14 @@ export function TerminalView({
     // CLICKABLE FILE PATHS (WS-1): a SECOND link provider, alongside WebLinksAddon
     // (link providers stack — WebLinks underlines URLs, this underlines file
     // paths; the two regexes don't overlap). For the hovered buffer line we read
-    // its text and surface each strict-absolute-path token as an xterm ILink:
-    // xterm draws the hover underline + pointer cursor for free. We gate the
-    // ACTIVATE on Ctrl/Cmd (like VS Code / iTerm "open file"), routing through the
-    // fileOpen bus + switching the tile to its Files tab; a plain click is left to
-    // xterm (selection), so ordinary drag-to-select copy is unaffected.
+    // its text and surface each clickable path token as an xterm ILink — both
+    // ABSOLUTE paths and STRICT relative paths (the latter resolved against the
+    // tile's live cwd on activate; see looksLikeRelativePath, kept intentionally
+    // strict to avoid underlining prose). xterm draws the hover underline +
+    // pointer cursor for free. We gate the ACTIVATE on Ctrl/Cmd (like VS Code /
+    // iTerm "open file"), routing through the fileOpen bus + switching the tile to
+    // its Files tab; a plain click is left to xterm (selection), so ordinary
+    // drag-to-select copy is unaffected.
     // ONE-ENTRY HOVER CACHE: xterm calls provideLinks for the line under the
     // cursor on effectively every mouse-move across cells, so the same line gets
     // recomputed identically each time the cursor returns to it. We memoize the
@@ -358,11 +414,14 @@ export function TerminalView({
         if (lineNumber === cachedLineNumber && text === cachedText) {
           return callback(cachedLinks);
         }
-        // CHEAP PRE-CHECK: an absolute path must carry a POSIX `/` or a Windows
-        // drive `:\`. If neither is present the heavy matchAll can't match, so we
-        // skip it for the common no-path line. Still cache the empty result so a
-        // re-hover of that same line doesn't even re-run includes().
-        if (!text.includes("/") && !text.includes(":\\")) {
+        // CHEAP PRE-CHECK: a clickable path always carries a `/` (POSIX root,
+        // any `dir/leaf`, or a Windows `C:/`) or a `.` (a Windows `:\` drive, or
+        // a bare extensioned relative leaf like `app.tsx`). If the line has
+        // neither it can't hold an absolute OR a strict-relative path, so we skip
+        // the heavy matchAll. Still cache the empty result so a re-hover of that
+        // same line doesn't even re-run includes(). (A `.`-only line is rare in
+        // practice, so this stays nearly as cheap as the absolute-only check.)
+        if (!text.includes("/") && !text.includes(".")) {
           cachedLineNumber = lineNumber;
           cachedText = text;
           cachedLinks = undefined;
@@ -375,7 +434,14 @@ export function TerminalView({
           // in (".", ",", ")", ":" — e.g. "see /a/b/c.ts:" or "(/a/b)").
           const raw = m[0];
           const token = raw.replace(/[.,:;)\]}]+$/, "");
-          if (!looksLikeOpenablePath(token)) continue;
+          // Classify ONCE per token: an absolute path (unchanged shape rules) or
+          // a STRICT relative path. The relative matcher is intentionally strict
+          // (see looksLikeRelativePath) to avoid underlining prose like `foo/bar`.
+          const absolute = isAbsolutePath(token);
+          const openable = absolute
+            ? looksLikeOpenablePath(token)
+            : looksLikeRelativePath(token);
+          if (!openable) continue;
           const startX = (m.index ?? 0) + 1; // ILink ranges are 1-based.
           links.push({
             text: token,
@@ -387,10 +453,19 @@ export function TerminalView({
               // Only Ctrl/Cmd+click opens the file; a bare click falls through to
               // xterm so the user can still place the cursor / start a selection.
               if (!event.ctrlKey && !event.metaKey) return;
-              // TODO: resolve relative paths against the tile cwd — only ABSOLUTE
-              // paths are matched/opened today (FILE_PATH_RE requires a root).
+              // ABSOLUTE tokens open as-is. RELATIVE tokens resolve against the
+              // tile's LIVE cwd (WS-9a: list_terminals refreshes it ~every 5s). If
+              // the cwd is missing/empty/non-absolute we can't safely resolve, so
+              // we SKIP rather than guess at a wrong path.
+              let target = linkText;
+              if (!isAbsolutePath(linkText)) {
+                const cwd =
+                  useWorkspace.getState().terminals[terminalId]?.cwd ?? "";
+                if (!cwd.startsWith("/")) return; // no usable cwd -> non-openable
+                target = resolveRelativePosix(cwd, linkText);
+              }
               usePanels.getState().setTab(terminalId, "files");
-              useFileOpen.getState().requestOpen(terminalId, linkText);
+              useFileOpen.getState().requestOpen(terminalId, target);
             },
           });
         }
