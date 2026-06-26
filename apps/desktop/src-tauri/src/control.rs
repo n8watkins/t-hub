@@ -419,6 +419,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "get_status" => get_status(ctx, args),
         "wait_for_status" => wait_for_status(ctx, args),
         "supervision_tree" => supervision_tree(ctx, args),
+        "supervision_session_ids" => supervision_session_ids(ctx),
         "wsl_health" => wsl_health(ctx),
         "search_files" => search_files(ctx, args),
         "list_tabs" => list_tabs(),
@@ -649,6 +650,14 @@ fn parse_target_statuses(args: &Value) -> Result<Vec<String>, String> {
         return Err("wait_for_status 'targetStatus' must not be empty".into());
     }
     Ok(targets)
+}
+
+/// `supervision_session_ids`: every session id the supervision reducer knows.
+/// Mirrors the `supervision_session_ids` Tauri command; returns a JSON array of ids
+/// (server-split M1 — the supervision/status read surface moves onto the socket).
+fn supervision_session_ids(ctx: &ControlContext) -> Result<Value, String> {
+    let ids = ctx.with_supervisor(|s| s.session_ids());
+    serde_json::to_value(ids).map_err(|e| e.to_string())
 }
 
 /// `supervision_tree`: the read-only orchestrator→subagent tree for one session.
@@ -1516,6 +1525,16 @@ mod tests {
         let ctx = test_ctx("t");
         let v = dispatch(&ctx, "supervision_tree", &json!({"sessionId": "nope"})).unwrap();
         assert!(v.is_null());
+    }
+
+    #[test]
+    fn supervision_session_ids_returns_an_array() {
+        // An empty supervisor reports no sessions — but the command returns a JSON
+        // array (not null/error), matching the Tauri command's `Vec<String>`.
+        let ctx = test_ctx("t");
+        let v = dispatch(&ctx, "supervision_session_ids", &Value::Null).unwrap();
+        assert!(v.is_array(), "expected an array, got {v:?}");
+        assert_eq!(v.as_array().unwrap().len(), 0);
     }
 
     #[test]

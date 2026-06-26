@@ -4,7 +4,7 @@
 // in ./model and ./protocol.
 
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { Commands05, Events05 } from "./types";
 import { controlRequest, onControlEvent } from "./controlClient";
 import type {
@@ -69,21 +69,27 @@ export function supervisionTree(
   >;
 }
 
-/** All supervised session ids. */
+/** All supervised session ids. Server-split M1: over the control socket. */
 export function supervisionSessionIds(): Promise<string[]> {
-  return invoke(Commands05.supervisionSessionIds);
+  return controlRequest("supervision_session_ids") as Promise<string[]>;
 }
 
-/** FR-012 status for one session. */
+/** FR-012 status for one session. Server-split M1: over the control socket. The
+ *  channel's `get_status` returns `{ status, snapshot }`; we take `status`. */
 export function sessionStatus(sessionId: string): Promise<SessionStatus> {
-  return invoke(Commands05.sessionStatus, { sessionId });
+  return controlRequest("get_status", { sessionId }).then(
+    (r) => (r as { status: SessionStatus }).status,
+  );
 }
 
-/** Latest statusline snapshot for a session (null if none ingested yet). */
+/** Latest statusline snapshot for a session (null if none ingested yet).
+ *  Server-split M1: over the control socket, via `get_status`'s `snapshot`. */
 export function statusSnapshot(
   sessionId: string,
 ): Promise<StatusSnapshot | null> {
-  return invoke(Commands05.statusSnapshot, { sessionId });
+  return controlRequest("get_status", { sessionId }).then(
+    (r) => (r as { snapshot: StatusSnapshot | null }).snapshot ?? null,
+  );
 }
 
 /** Push a raw statusline payload into the status bridge; returns the snapshot. */
@@ -121,27 +127,32 @@ export function claudeHooksManaged(): Promise<string[]> {
 }
 
 // --- Events ----------------------------------------------------------------
+//
+// Server-split M1: the whole 0.5 event surface is delivered over the loopback
+// control socket. The backend Tee-emits every channel to the socket fanout; the
+// Rust forwarder reads the frames off the socket and re-emits them into the
+// webview as `control://event`, which `onControlEvent` demuxes by channel. The
+// in-process Tauri `emit` for these channels still fires but has no listener, so
+// there is no double-delivery. This is the wire M2 stretches to a remote server —
+// only the Rust endpoint's address changes.
 
 /** Subscribe to durable journal entries the core consumes from the spine. */
 export function onJournal(cb: (e: JournalEvent) => void): Promise<UnlistenFn> {
-  return listen<JournalEvent>(Events05.journal, (ev) => cb(ev.payload));
+  return Promise.resolve(
+    onControlEvent(Events05.journal, (p) => cb(p as JournalEvent)),
+  );
 }
 
 /** Subscribe to supervision-tree snapshot changes. */
 export function onSupervision(
   cb: (e: SupervisionTree) => void,
 ): Promise<UnlistenFn> {
-  return listen<SupervisionTree>(Events05.supervision, (ev) => cb(ev.payload));
+  return Promise.resolve(
+    onControlEvent(Events05.supervision, (p) => cb(p as SupervisionTree)),
+  );
 }
 
-/** Subscribe to per-session FR-012 status changes.
- *
- *  Server-split M1: delivered over the loopback control socket (the backend
- *  Tee-emits `session://status` to the socket fanout; the Rust forwarder re-emits
- *  it into the webview) instead of the direct in-process Tauri `session://status`
- *  listen. Same `{sessionId, status}` payload, single chokepoint (every consumer
- *  uses this wrapper), so there is no double-delivery and zero user-visible
- *  change — the first event migrated onto the wire M2 stretches to remote. */
+/** Subscribe to per-session FR-012 status changes. */
 export function onSessionStatus(
   cb: (e: SessionStatusEvent) => void,
 ): Promise<UnlistenFn> {
@@ -154,7 +165,9 @@ export function onSessionStatus(
 export function onAgentState(
   cb: (e: AgentStateInfo) => void,
 ): Promise<UnlistenFn> {
-  return listen<AgentStateInfo>(Events05.agentState, (ev) => cb(ev.payload));
+  return Promise.resolve(
+    onControlEvent(Events05.agentState, (p) => cb(p as AgentStateInfo)),
+  );
 }
 
 /**
@@ -184,5 +197,7 @@ export type StatusSnapshotWire = StatusSnapshot & {
 export function onStatus(
   cb: (e: StatusSnapshotWire) => void,
 ): Promise<UnlistenFn> {
-  return listen<StatusSnapshotWire>(Events05.status, (ev) => cb(ev.payload));
+  return Promise.resolve(
+    onControlEvent(Events05.status, (p) => cb(p as StatusSnapshotWire)),
+  );
 }
