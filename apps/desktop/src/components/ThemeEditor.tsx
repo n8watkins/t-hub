@@ -301,6 +301,8 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
   const setTitlebarHideDelayMs = useSettings((s) => s.setTitlebarHideDelayMs);
   const titlebarRevealAnimMs = useSettings((s) => s.titlebarRevealAnimMs);
   const setTitlebarRevealAnimMs = useSettings((s) => s.setTitlebarRevealAnimMs);
+  const closeToTray = useSettings((s) => s.closeToTray);
+  const setCloseToTray = useSettings((s) => s.setCloseToTray);
   const resumeStartsClaude = useSettings((s) => s.resumeStartsClaude);
   const setResumeStartsClaude = useSettings((s) => s.setResumeStartsClaude);
   const fileIconTheme = useSettings((s) => s.fileIconTheme);
@@ -354,6 +356,15 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
             Open in Hooks →
           </Btn>
         </Row>
+      </Group>
+
+      <Group title="Window">
+        <SettingToggleRow
+          label="Close button hides to tray"
+          hint="The titlebar × hides T-Hub to the system tray and keeps it running, so your sessions stay alive — reopen it from the tray icon. Turn off to make the × quit the app instead."
+          value={closeToTray}
+          onChange={setCloseToTray}
+        />
       </Group>
 
       <Group title="Titlebar">

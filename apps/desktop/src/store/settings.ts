@@ -40,6 +40,9 @@ const DEFAULTS = {
   /** Show desktop (OS) notifications for key session events. Default OFF (opt-in,
    *  paired with soundsEnabled). */
   notificationsEnabled: false,
+  /** The titlebar × hides the window to the system tray (true) vs. quits the app
+   *  (false). Default ON — close-to-tray, matching the tray's keep-running model. */
+  closeToTray: true,
   /** Periodically check GitHub Releases for a newer signed build (feat/auto-updater). */
   autoUpdateCheckEnabled: true,
   /** Silently download + install a found update on launch, then relaunch. Only
@@ -74,6 +77,7 @@ interface PersistedSettings {
   titlebarRevealAnimMs: number;
   soundsEnabled: boolean;
   notificationsEnabled: boolean;
+  closeToTray: boolean;
   autoUpdateCheckEnabled: boolean;
   autoInstallUpdates: boolean;
   resumeStartsClaude: boolean;
@@ -124,6 +128,10 @@ function coerceSettings(raw: unknown): PersistedSettings {
       typeof p.notificationsEnabled === "boolean"
         ? p.notificationsEnabled
         : DEFAULTS.notificationsEnabled,
+    closeToTray:
+      typeof p.closeToTray === "boolean"
+        ? p.closeToTray
+        : DEFAULTS.closeToTray,
     autoUpdateCheckEnabled:
       typeof p.autoUpdateCheckEnabled === "boolean"
         ? p.autoUpdateCheckEnabled
@@ -196,6 +204,11 @@ interface SettingsState {
   notificationsEnabled: boolean;
   setNotificationsEnabled: (v: boolean) => void;
 
+  /** The titlebar × hides to tray (true) vs. quits (false). Read by Titlebar's
+   *  close handler. */
+  closeToTray: boolean;
+  setCloseToTray: (v: boolean) => void;
+
   /** Periodically check for app updates. Respected by lib/updateMount.ts and the
    *  Updates settings section. */
   autoUpdateCheckEnabled: boolean;
@@ -241,6 +254,7 @@ export const useSettings = create<SettingsState>((set, get) => {
       titlebarRevealAnimMs: s.titlebarRevealAnimMs,
       soundsEnabled: s.soundsEnabled,
       notificationsEnabled: s.notificationsEnabled,
+      closeToTray: s.closeToTray,
       autoUpdateCheckEnabled: s.autoUpdateCheckEnabled,
       autoInstallUpdates: s.autoInstallUpdates,
       resumeStartsClaude: s.resumeStartsClaude,
@@ -305,6 +319,12 @@ export const useSettings = create<SettingsState>((set, get) => {
     notificationsEnabled: initial.notificationsEnabled,
     setNotificationsEnabled: (v) => {
       set({ notificationsEnabled: v });
+      persistAll();
+    },
+
+    closeToTray: initial.closeToTray,
+    setCloseToTray: (v) => {
+      set({ closeToTray: v });
       persistAll();
     },
 

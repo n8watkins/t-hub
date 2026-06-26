@@ -18,6 +18,7 @@ import { useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
+import { exit } from "@tauri-apps/plugin-process";
 import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
 import { closeSatellite, readSatelliteTab } from "../lib/windows";
@@ -75,11 +76,22 @@ function useMaximizedState(): boolean {
   return maximized;
 }
 
-/** Close the window, swallowing any IPC rejection. */
+/**
+ * Close the titlebar's × — hide to tray (default) or quit, per the `closeToTray`
+ * setting (item 9). The window is frameless (no native close button), so this is
+ * the ONLY close path; no backend cooperation is needed. `close()` routes through
+ * tray.rs's CloseRequested handler (which prevents-close + hides); `exit(0)`
+ * bypasses that to actually quit (matching the tray menu's Quit). The setting is
+ * read at click time via getState() (a one-shot action, no need to subscribe).
+ */
 function closeWindow(): void {
-  void getCurrentWindow()
-    .close()
-    .catch(() => {});
+  if (useSettings.getState().closeToTray) {
+    void getCurrentWindow()
+      .close()
+      .catch(() => {});
+  } else {
+    void exit(0).catch(() => {});
+  }
 }
 
 /**
