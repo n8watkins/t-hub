@@ -1,5 +1,10 @@
 # T-Hub Roadmap — Execution Plan
 
+> ## 🚢 v0.2.0 SHIPPED
+> Git tag `v0.2.0`, GitHub Release published with the signed Windows installer + `latest.json` auto-update (`9ee6b75`). Wave 0 + Wave 1 + WS-9 all landed, plus the cheap-wins backlog: **vitest + 53 frontend tests** (`8a3674c`), a **dedup refactor** — host_distro / persist codec / warmup (`30e863b`), and **light tray recovery actions** — Reload window + Reconnect agent bridge (`bec5ff7`).
+>
+> **Headline next:** the **server-split M1** (decouple locally via `RemoteTarget`) — see [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md). Still deferred after that: the **heavy** tray actions (restart-tmux + full-WSL-shutdown), more vitest coverage (component/RTL tests), the WS-9 nits (`sanitizeBranchToDir` collision + remote-branch DWIM-tracking), and the parked beyond-parity differentiators (bottom).
+
 **Status:** Active plan, **verified against the live codebase** (six read-only audits, file:line-grounded). Turns [HERDR-PARITY.md](./HERDR-PARITY.md) (the *why* + gap analysis) into an *executable* plan organized for **parallel agent execution**. Companion: [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md) (item ⑥).
 
 **Active scope = Wave 0 + Wave 1.** Remote/SSH (⑥) and the beyond-parity wildcards are deferred to *Later / someday* (bottom). All paths below are real (`apps/desktop/…` monorepo).
@@ -8,7 +13,12 @@
 - Wave 0 — WS-1 copy-on-select/open-file (`a00085c`), WS-2 OS toasts (`c5915d8`), WS-5a `wait_for_status` (`683ff61`).
 - Wave 1 — WS-4 worktree primitive (`9b72b75`), WS-3 prefix-key + palette (`7a70af2`), WS-6 session restore (`c2b6c8d`), WS-5b rules engine (`853e8ba`).
 
-**Not yet done:** runtime smoke-test in the live app (all verification so far is compile + unit-test level). **Next build = WS-9 (worktree-centric workflow)** — locked design in [WORKTREE-WORKFLOW.md](./WORKTREE-WORKFLOW.md). After that: `Later/someday` (remote ⑥, wildcards).
+✅ **Cheap-wins backlog cleared** (post-Wave-1, all shipped in `v0.2.0`):
+- **vitest stood up** + 53 first frontend tests (`chord.ts`, `worktreeTarget.ts` pure helpers) — `8a3674c`.
+- **dedup refactor** — `host_distro()` (4 copies → one), the localStorage persist codec (3 stores → `lib/persist.ts`), warmup machinery (`notify.ts` + `rulesMount.ts` → `lib/warmup.ts`) — `30e863b`.
+- **two light tray recovery actions** — Reload window + Reconnect agent bridge — `bec5ff7`.
+
+**Next build = the server-split M1** (decouple locally — route the WSL/tmux/git hops through a `RemoteTarget`), per [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md). Still deferred behind it: the **heavy** tray actions (restart-tmux + full-WSL-shutdown), broader vitest coverage (component/RTL), the WS-9 nits (sanitize-collision + remote-branch DWIM), and the parked beyond-parity wildcards (bottom).
 
 ## Principles
 
@@ -123,11 +133,14 @@ Locked design: [WORKTREE-WORKFLOW.md](./WORKTREE-WORKFLOW.md). Builds on shipped
 
 ---
 
-## Later / someday (explicitly deferred — not in the active plan)
+## Next + Later / someday
 
-The active roadmap is **Wave 0 + Wave 1.** Everything below is wanted, none scheduled.
+Wave 0 + Wave 1 + WS-9 + the cheap-wins backlog all shipped in **v0.2.0**. What follows is the order of remaining work.
 
-- **⑥ Remote / SSH (the server split)** — the one big project. Per [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md): M1 decouple locally (`RemoteTarget` routing the WSL/tmux/git hops through `ssh`) → M2 PTY over the wire → M3 overlay panels server-side → M4 multi-client. Sequential, after Wave 1 — it refactors the same backend seams everything else touches.
+- **⑥ Remote / SSH (the server split) — the headline next item.** The one big project. Per [SERVER-SPLIT-AND-ROADMAP.md](./SERVER-SPLIT-AND-ROADMAP.md): **M1 decouple locally** (`RemoteTarget` routing the WSL/tmux/git hops, local pass-through first) → M2 PTY over the wire → M3 overlay panels server-side → M4 multi-client. Sequential — it refactors the same backend seams everything else touches, so it goes first.
+- **Heavy tray recovery actions** (deferred from the light pair that shipped): restart-tmux + full-WSL-shutdown — held until actually needed.
+- **Broader vitest coverage** — component / RTL tests beyond the first 53 pure-function tests.
+- **WS-9 deferred nits** — `sanitizeBranchToDir` is many-to-one (`feat/x` & `feat-x` → same dir; git surfaces the collision, no silent corruption) — flatten vs nest; and a remote-only branch takes the `-b` create path rather than DWIM-tracking `origin/x`.
 - **Beyond-parity wildcards** (lean into our differentiators):
   - **Cost-aware orchestration / budget governor** — pause/throttle on spend or context budget; route to the cheapest idle agent.
   - **Worktree fleet launcher** with **aggregate cost rollup**.

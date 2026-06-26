@@ -2,9 +2,9 @@
 
 T-Hub is a **terminal-first command center for running and supervising many persistent coding-agent (Claude Code) sessions at once**. The V1 target is a single personal setup: Windows 11 + WSL2 Ubuntu + zsh, with an adapter-based core so other terminal agents can be added later.
 
-## Status — feature-complete personal alpha (v0.1.67)
+## Status — released personal alpha (v0.2.0)
 
-Well past the original "playable proof" nucleus: the terminal spine, the agent-supervision layer (the 0.5 plan), Codex support, and the full Windows/WSL integration all ship in the installed app.
+Well past the original "playable proof" nucleus: the terminal spine, the agent-supervision layer (the 0.5 plan), Codex support, and the full Windows/WSL integration all ship in the installed app. **v0.2.0 is released** — a signed Windows installer ships from a GitHub Release with `latest.json` auto-update wired in (Tauri updater plugin).
 
 - **Tauri 2 + React 18 + TypeScript + Tailwind** desktop shell with an xterm.js tile grid (Fit + WebGL + Search + Unicode 11), deterministic insertion/focus, and durable layout/workspace persistence.
 - **Rust PTY ↔ tmux backend:** `portable-pty` (ConPTY on Windows) drives a `tmux -L t-hub` session per terminal — one PTY client per visible tile. Closing a tile **detaches** (the process survives); stop **kills** the session. `#[cfg(windows)]` reaches into WSL via `wsl.exe -e bash` (the `-e`/`--exec` is load-bearing — `wsl.exe -- bash` runs the user's *login* shell, e.g. zsh); `#[cfg(unix)]` attaches to tmux directly.
@@ -14,9 +14,11 @@ Well past the original "playable proof" nucleus: the terminal spine, the agent-s
 - **Event→action rules engine:** user-configurable rules fire when a supervised session's FR-012 status transitions (optionally from a specific prior status) and run one action — notify, type text, spawn, restart, or run a command in the session.
 - **Notifications:** synthesized WebAudio chimes for attention/done/error plus OS toast notifications (via the Tauri notification plugin), both gated by Settings toggles.
 - **Native session-restore:** orphaned Claude sessions surviving an app/host restart are listed in the **Recovery** panel and brought back via `claude --resume <id>` into a fresh tile.
+- **Tray recovery actions:** light, no-restart recovery from the system tray — **Reload window** (re-renders the React UI without touching tmux/agent) and **Reconnect agent bridge** (safe disconnect → reconnect off the UI thread, preserving the journal cursor).
 - **Codex + Claude:** per-provider usage readouts, icons, and running-pulse activity in the sidebar.
 - **MCP control channel:** the `t-hub-mcp` server forwards `tools/call` to the running app over a local control socket. The catalog is **~22 tools** — read tools (`get_status`, `list_terminals`, `read_terminal`, `supervision_tree`, …) open, organization tools audited, and process-changing tools (`spawn_terminal`, `send_text`/`send_keys`, `new_tab`/`focus_tab`/`rename_tab`, `create_worktree`/`remove_worktree`, `wait_for_status`, …) confirmation-gated.
 - **50 Tauri commands** across ~a dozen backend modules, plus a **side-by-side DEV build** (`com.t-hub.dev`, isolated `t-hub-dev` socket + `~/.t-hub-dev` state) installable alongside production — see [docs/DEV-BUILD.md](./docs/DEV-BUILD.md).
+- **Tests:** Rust unit + MCP e2e suites on the backend, plus a **vitest** frontend harness (jsdom + RTL) — first 53 pure-function tests over `chord.ts` and `worktreeTarget.ts` (`pnpm test`).
 
 ## Repository layout
 
