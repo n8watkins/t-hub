@@ -261,6 +261,22 @@ pub fn ensure_mouse_on() {
     apply_global_keybinds();
 }
 
+/// Resolve a T-Hub terminal id to its tmux session name. The id IS the session's
+/// `th_`-prefixed suffix capped at 8 chars (see `commands::spawn_terminal`). This
+/// is the SINGLE source of that mapping — shared by the in-process commands AND the
+/// control channel (`remote_pty`/`serve_pty_attach`) so the client and server can
+/// never derive a different name for the same id (a real footgun if the id scheme
+/// ever changes). An id already prefixed `th_` (a full session name) passes through;
+/// a bare id becomes `th_<id[..8]>` (the cap is a no-op for today's 8-char ids but
+/// defends a future longer-id scheme).
+pub fn target_for_id(id: &str) -> String {
+    if id.starts_with("th_") {
+        id.to_string()
+    } else {
+        format!("th_{}", &id[..id.len().min(8)])
+    }
+}
+
 /// Returns true if a session named `name` exists on the `t-hub` socket.
 ///
 /// `has-session` exits 0 when the session exists and non-zero otherwise

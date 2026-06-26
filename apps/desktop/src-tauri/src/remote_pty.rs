@@ -38,10 +38,12 @@
 //! independently usable for the two directions, so the two never interleave a
 //! partial frame. On detach we `shutdown(Both)` the stream, which unblocks the
 //! reader's blocking `read_line` (it returns EOF), then we `join` the thread — no
-//! leak, no hang. We never hold the manager `Mutex` across a blocking socket op:
-//! `commands.rs` removes the [`RemotePty`] from the map (releasing the lock) before
-//! calling [`RemotePty::detach`], and `write`/`resize` only touch the per-conn
-//! `writer` under the conn's own short-lived access.
+//! leak, no hang. The manager `Mutex` is never held across the UNBOUNDED socket
+//! ops (`connect`/`shutdown`/`join`): `commands.rs` `connect`s before inserting and
+//! `remove`s the conn (releasing the lock) before `detach`. The one op that DOES
+//! run under the lock is the `write`/`resize` frame write — bounded by
+//! [`WRITE_TIMEOUT`] so a stalled remote peer errors out rather than deadlocking
+//! the terminal commands.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -63,6 +65,15 @@ use crate::events::{self, ExitEvent, OutputEvent, StateEvent};
 /// read timeout on the stream: the reader thread blocks indefinitely on the live
 /// stream and is unblocked by a `shutdown`, not a timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Write timeout on the per-conn writer. `write`/`resize` send their frame while
+/// the command holds the manager `Mutex`, so without a bound a stalled peer (its
+/// kernel recv buffer full) would block the write under the lock and deadlock ALL
+/// terminal commands. Harmless on loopback (the server drains promptly); it matters
+/// once M2 binds this to a remote/Tailscale host. On timeout the write errors and
+/// the command returns a clear error instead of hanging. (Symmetric to the event
+/// fanout's subscriber write timeout in `control::EventFanout::register`.)
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A live remote-PTY connection for one terminal tile. Holds the WRITE half of the
 /// socket (a `TcpStream` clone) for `write`/`resize`, plus the reader thread handle
@@ -109,13 +120,15 @@ impl RemotePty {
         let stream = TcpStream::connect_timeout(&socket, CONNECT_TIMEOUT)
             .map_err(|e| format!("remote_pty: connect to {addr} failed: {e}"))?;
         // No read timeout: the reader thread blocks on the live stream and is
-        // unblocked by `shutdown`, not a timeout. A write timeout is harmless but
-        // unnecessary for a loopback peer that drains promptly.
+        // unblocked by `shutdown`, not a timeout.
 
-        // The write half used by this struct for write/resize.
+        // The write half used by this struct for write/resize. A WRITE timeout
+        // bounds the frame write (which runs under the manager lock) so a stalled
+        // remote peer can't deadlock the terminal commands — see WRITE_TIMEOUT.
         let writer = stream
             .try_clone()
             .map_err(|e| format!("remote_pty: clone stream failed: {e}"))?;
+        let _ = writer.set_write_timeout(Some(WRITE_TIMEOUT));
 
         // Send the attach_pty handshake on the (soon-to-be) read half.
         let mut handshake = stream

@@ -921,15 +921,20 @@ function ColorPicker({
   anchorEl?: HTMLElement | null;
 }) {
   // The popover is placed at the swatch's rect at open time; if the sidebar scrolls
-  // or the window resizes it would drift off the swatch, so close it on either.
+  // or the window resizes it would drift off the swatch, so close it on either. The
+  // callsites pass an inline `onClose`, so capture it in a ref and bind the listeners
+  // ONCE (stable handler, [] deps) instead of re-binding every render.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
-    window.addEventListener("scroll", onClose, true); // capture: catch the sidebar's own scroll
-    window.addEventListener("resize", onClose);
+    const close = () => onCloseRef.current();
+    window.addEventListener("scroll", close, true); // capture: catch the sidebar's own scroll
+    window.addEventListener("resize", close);
     return () => {
-      window.removeEventListener("scroll", onClose, true);
-      window.removeEventListener("resize", onClose);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
     };
-  }, [onClose]);
+  }, []);
   // Anchor under the swatch in viewport coords, clamped to stay fully on-screen.
   const PICKER_W = 184;
   const rect = anchorEl?.getBoundingClientRect();

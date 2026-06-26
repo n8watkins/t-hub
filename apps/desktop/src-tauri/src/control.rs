@@ -1124,11 +1124,9 @@ fn close_terminal(args: &Value) -> Result<Value, String> {
 /// (see [`list_terminals`]), so a bare id maps back to `th_<id>`. We also accept a
 /// caller that already passed the full `th_`-prefixed name (idempotent).
 fn tmux_target(session_id: &str) -> String {
-    if session_id.starts_with("th_") {
-        session_id.to_string()
-    } else {
-        format!("th_{session_id}")
-    }
+    // Single shared derivation (must match commands.rs / remote_pty so client +
+    // server attach to the SAME session). See tmux::target_for_id.
+    tmux::target_for_id(session_id)
 }
 
 // ---------------------------------------------------------------------------

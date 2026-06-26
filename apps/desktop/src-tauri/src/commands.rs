@@ -85,7 +85,9 @@ pub struct TerminalManager {
 /// so `th_<id[..8]>` reconstructs it deterministically — identical to the
 /// derivation the old in-process path used in `attach_terminal`/`kill_terminal`.
 fn tmux_target(id: &str) -> String {
-    format!("th_{}", &id[..id.len().min(8)])
+    // Single shared derivation (must match the control channel's resolution exactly,
+    // or client + server would attach to different sessions). See tmux::target_for_id.
+    tmux::target_for_id(id)
 }
 
 /// Read the managed [`ControlEndpoint`] (addr + token) installed by `setup()`
@@ -428,6 +430,9 @@ pub async fn kill_terminal(
     // its process tree). Remove the conn (releasing the lock) before any blocking
     // socket op so the Mutex is never held across I/O.
     let conn = remote.conns.lock().remove(&id);
+    // Drop any lingering "fresh" mark for this id (spawned but never attached) so
+    // it can't accumulate — the id is gone for good after a kill.
+    remote.fresh.lock().remove(&id);
 
     // The tmux session name is reconstructed from the id (the RemotePty doesn't
     // carry it); this is the same `th_<id[..8]>` derivation as everywhere else.
