@@ -492,6 +492,26 @@ fn is_allowed_peer(ip: std::net::IpAddr) -> bool {
 const MAX_CONNS: usize = 256;
 static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
 
+/// Idle/read timeout for a control connection's request phase (M2b hardening).
+/// A connection that connects and never speaks — or stalls mid-request — would
+/// otherwise pin a handler thread indefinitely (up to [`MAX_CONNS`] of them, which
+/// wedges the listener). With the opt-in network bind this is a cheap remote DoS;
+/// even on loopback it leaks threads on a buggy client. The timeout is CLEARED once
+/// a connection enters a long-lived mode (event subscribe-park, PTY attach), which
+/// legitimately block on reads for minutes with no client input. Generous: real
+/// request/response clients send their line in milliseconds and close on EOF.
+const CONN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A socket read timeout surfaces as `WouldBlock` (SO_RCVTIMEO on unix) or
+/// `TimedOut` (windows). Both mean "idle — close this connection cleanly", not a
+/// transport error worth logging or propagating.
+fn is_read_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 /// Decrements the live-connection counter when a connection handler thread exits.
 struct ConnGuard;
 impl Drop for ConnGuard {
@@ -545,14 +565,26 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
     // Read lines manually (not `reader.lines()`) so a connection mode that takes
     // over the rest of the stream (the PTY attach) can be handed `&mut reader`.
     let mut reader = BufReader::new(stream);
+    // Bound the request phase with an idle read timeout (M2b hardening): a client
+    // that connects but never sends — or stalls mid-line — closes itself rather
+    // than parking this thread forever. CLEARED below when the connection becomes
+    // a long-lived event/PTY stream (those block on reads for minutes by design).
+    reader
+        .get_ref()
+        .set_read_timeout(Some(CONN_READ_TIMEOUT))
+        .ok();
     // Set once this connection joins the event-subscription registry; used to
     // prune it from the fanout on clean disconnect (loop EOF below).
     let mut subscriber_id: Option<u64> = None;
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break; // EOF: client disconnected.
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF: client disconnected.
+            Ok(_) => {}
+            // Idle past CONN_READ_TIMEOUT: close cleanly (not a real error).
+            Err(e) if is_read_timeout(&e) => break,
+            Err(e) => return Err(e),
         }
         if line.trim().is_empty() {
             continue;
@@ -574,6 +606,10 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
                     // event frame with our ack on the same socket.
                     write_response(&mut writer, &ControlResponse::ok(json!({ "subscribed": true })))?;
                     subscriber_id = Some(ctx.fanout.register(writer.try_clone()?));
+                    // This is now a one-way event stream — the client never sends
+                    // again, so the read loop must park indefinitely. Drop the idle
+                    // timeout (else a quiet stream would self-close every 120s).
+                    reader.get_ref().set_read_timeout(None).ok();
                 }
                 // Park: subsequent reads block until the client disconnects.
             }
@@ -587,6 +623,10 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
                     )?;
                     continue;
                 }
+                // The PTY stream reads {write}/{resize} frames for as long as the
+                // user leaves the tile open — clear the idle timeout so an
+                // untouched terminal isn't force-detached after 120s.
+                reader.get_ref().set_read_timeout(None).ok();
                 serve_pty_attach(&mut writer, &mut reader, &req.args)?;
                 break;
             }
