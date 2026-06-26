@@ -161,7 +161,16 @@ impl EventFanout {
     }
 
     /// Register a subscriber's socket; returns an id for [`unregister`](Self::unregister).
+    ///
+    /// We set a WRITE TIMEOUT on the subscriber's socket: [`emit_event`](Self::emit_event)
+    /// writes to every subscriber while holding `subs`, so without a bound a single
+    /// stuck/slow client (its kernel send buffer full) would block the emit — and the
+    /// whole journal-consumer path — indefinitely. On loopback the local forwarder
+    /// drains promptly so this never fires; it matters the moment M2 binds this wire
+    /// to a remote/Tailscale host. On timeout the write errors and `emit_event` prunes
+    /// the subscriber, so one wedged client self-heals instead of stalling the rest.
     fn register(&self, writer: TcpStream) -> u64 {
+        let _ = writer.set_write_timeout(Some(std::time::Duration::from_secs(5)));
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut subs) = self.subs.lock() {
             subs.push(Subscriber { id, writer });
