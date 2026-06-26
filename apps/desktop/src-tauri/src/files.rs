@@ -218,16 +218,6 @@ impl FileIndexState {
         arc
     }
 
-    /// True if `path` (already normalized) equals, or is nested under, a root this
-    /// state has indexed. The control-channel file READS use this to SCOPE a remote
-    /// peer to the project roots it has indexed — so a tailnet client can browse +
-    /// read within its own projects but not arbitrary host files (`~/.ssh`, `/etc`,
-    /// …). Loopback callers bypass the check entirely (same machine = trusted).
-    /// `starts_with` is component-wise, so `/a/proj` does NOT match `/a/proj2`.
-    fn is_within_indexed_root(&self, path: &Path) -> bool {
-        let map = self.indexes.lock();
-        map.keys().any(|root| path == root || path.starts_with(root))
-    }
 }
 
 /// Normalize a user-supplied path to an absolute, lexically-clean form. We
@@ -1097,70 +1087,122 @@ pub fn control_search(
     root: &str,
     query: &str,
     limit: usize,
+    enforce_scope: bool,
+    allowed_roots: &[PathBuf],
 ) -> Result<Vec<FileHit>, String> {
-    let root = normalize(root);
+    let root = scoped_path(root, enforce_scope, allowed_roots)?;
+    // The walk cap is a REMOTE DoS bound; loopback (the local user's own project,
+    // possibly a huge monorepo) indexes uncapped.
+    let cap = if enforce_scope {
+        Some(CONTROL_INDEX_MAX_ENTRIES)
+    } else {
+        None
+    };
     let index = match state.get(&root) {
         Some(i) => i,
-        None => state.put(build_index(&root, Some(CONTROL_INDEX_MAX_ENTRIES))?),
+        None => state.put(build_index(&root, cap)?),
     };
     Ok(search_index(&index, query, limit.clamp(1, 1000)))
 }
 
+/// Parse the `T_HUB_REMOTE_FILE_ROOTS` allowlist: colon-separated absolute
+/// (WSL/POSIX) project roots a REMOTE peer may browse/read under. Empties trimmed.
+fn parse_file_roots(raw: &str) -> Vec<PathBuf> {
+    raw.split(':')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(normalize)
+        .collect()
+}
+
+/// The OPERATOR allowlist of roots a remote peer may access (server-split #23,
+/// security review). Read ONCE from `T_HUB_REMOTE_FILE_ROOTS`; **empty by default**,
+/// so remote file access is OFF until the operator names specific roots (fail-closed,
+/// opt-in — like the M2b network bind itself). Loopback callers ignore it entirely.
+pub fn remote_file_roots() -> &'static [PathBuf] {
+    static ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| {
+        std::env::var("T_HUB_REMOTE_FILE_ROOTS")
+            .ok()
+            .map(|s| parse_file_roots(&s))
+            .unwrap_or_default()
+    })
+}
+
 /// Resolve + SCOPE a control-channel file path (server-split #23). Normalizes
-/// `path`, then — when `enforce` (a REMOTE peer) — requires it to live under a root
-/// the channel has indexed, so a tailnet client can't read/list arbitrary host
-/// files. Loopback callers pass `enforce = false` and are unrestricted (the path is
-/// still normalized). Returns the resolved host path.
-fn scoped_path(state: &FileIndexState, path: &str, enforce: bool) -> Result<PathBuf, String> {
+/// `path`; loopback callers (`enforce = false`) get it back unrestricted. For a
+/// REMOTE peer the boundary is the OPERATOR allowlist (`allowed_roots`), NOT the
+/// peer-chosen index — so a peer can't widen scope by `index_project`-ing a
+/// sensitive dir. Empty allowlist ⇒ deny everything. We then reject `..` and
+/// **canonicalize** (resolving symlinks) before the under-root check, so a symlink
+/// inside an allowed root can't point out of it, returning the RESOLVED path for the
+/// read (no check-vs-read divergence).
+///
+/// NB: canonicalization fully confines on a native unix/WSL daemon (the server-split
+/// endgame). On the current Windows-host topology reading WSL via the 9P UNC bridge,
+/// symlink resolution is best-effort — see the WSL-symlink hardening task before
+/// trusting an allowlist on an UNtrusted tailnet.
+fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
     let p = normalize(path);
-    if enforce {
-        // Defense-in-depth against traversal: `normalize` only canonicalizes when
-        // the target EXISTS (and skips it entirely on the Windows WSL-UNC fast
-        // path), so a leftover `..` could pass the component-wise root check below
-        // yet resolve OUTSIDE the root at read time. Legitimate remote callers send
-        // fully-resolved absolute paths (the tree/reader never emit `..`), so reject
-        // any `..` outright rather than rely on canonicalization having run.
-        if p.components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(format!(
-                "rejecting a path containing '..' over the control channel: {}",
-                p.display()
-            ));
-        }
-        if !state.is_within_indexed_root(&p) {
-            return Err(format!(
-                "path is outside every indexed project root: {} — index_project a \
-                 containing root first (remote file reads are scoped to indexed roots)",
-                p.display()
-            ));
-        }
+    if !enforce {
+        return Ok(p);
     }
-    Ok(p)
+    if allowed_roots.is_empty() {
+        return Err("remote file access is disabled — set T_HUB_REMOTE_FILE_ROOTS to \
+                    a colon-separated list of project roots to enable it"
+            .to_string());
+    }
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "rejecting a path containing '..' over the control channel: {}",
+            p.display()
+        ));
+    }
+    // Resolve symlinks (+ residual `.`/`..`) so the under-root check can't be escaped
+    // via a symlink in an allowed root. Requires existence — a remote read of a
+    // nonexistent path is pointless and unverifiable.
+    let real = std::fs::canonicalize(&p)
+        .map_err(|e| format!("cannot resolve {} on the host: {e}", p.display()))?;
+    let allowed = allowed_roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .map(|r| real == r || real.starts_with(&r))
+            .unwrap_or(false)
+    });
+    if !allowed {
+        return Err(format!(
+            "path is outside the allowed remote roots ({}): {}",
+            allowed_roots.len(),
+            real.display()
+        ));
+    }
+    Ok(real)
 }
 
 /// Control-channel capped text read (server-split #23 — the Files reader over the
-/// socket): scope `path` (remote-only), then read it through the same size-capped,
-/// binary-rejecting reader the `read_text_file` command uses.
+/// socket): scope `path` (remote peers only, to `allowed_roots`), then read it
+/// through the same size-capped, binary-rejecting reader as the `read_text_file`
+/// command.
 pub fn control_read_text(
-    state: &FileIndexState,
     path: &str,
     enforce_scope: bool,
+    allowed_roots: &[PathBuf],
 ) -> Result<FileContents, String> {
-    let p = scoped_path(state, path, enforce_scope)?;
+    let p = scoped_path(path, enforce_scope, allowed_roots)?;
     read_text_capped(&p)
 }
 
 /// Control-channel shallow directory listing (server-split #23 — the Files tree
-/// over the socket): scope `path` (remote-only), then list it exactly as the
+/// over the socket): scope `path` (remote peers only), then list it exactly as the
 /// `list_dir` command does (dirs first, the directory-only gitignore rule).
 pub fn control_list_dir(
-    state: &FileIndexState,
     path: &str,
     show_ignored: bool,
     enforce_scope: bool,
+    allowed_roots: &[PathBuf],
 ) -> Result<Vec<DirEntry>, String> {
-    let dir = scoped_path(state, path, enforce_scope)?;
+    let dir = scoped_path(path, enforce_scope, allowed_roots)?;
     read_dir_shallow(&dir, show_ignored)
 }
 
@@ -1169,9 +1211,21 @@ pub fn control_list_dir(
 /// mirror of the `index_project` command. A subsequent [`control_search`] on the
 /// same root reuses this cache. (Server-split M3: the file index served by the
 /// daemon, so a thin client warms + searches the REMOTE tree's index.)
-pub fn control_index(state: &FileIndexState, root: &str) -> Result<IndexSummary, String> {
-    let root = normalize(root);
-    let index = build_index(&root, Some(CONTROL_INDEX_MAX_ENTRIES))?;
+pub fn control_index(
+    state: &FileIndexState,
+    root: &str,
+    enforce_scope: bool,
+    allowed_roots: &[PathBuf],
+) -> Result<IndexSummary, String> {
+    let root = scoped_path(root, enforce_scope, allowed_roots)?;
+    // Remote: cap the walk (DoS bound). Loopback indexes the user's own project
+    // uncapped (a large local monorepo is legitimate).
+    let cap = if enforce_scope {
+        Some(CONTROL_INDEX_MAX_ENTRIES)
+    } else {
+        None
+    };
+    let index = build_index(&root, cap)?;
     let root_str = index.root.to_string_lossy().into_owned();
     let arc = state.put(index);
     Ok(IndexSummary {
@@ -1412,35 +1466,53 @@ mod tests {
     }
 
     #[test]
-    fn control_reads_are_scoped_to_indexed_roots_for_remote_peers() {
+    fn parse_file_roots_splits_trims_and_drops_empties() {
+        assert!(parse_file_roots("").is_empty());
+        assert!(parse_file_roots("  :  : ").is_empty());
+        // Three non-empty entries (existing dirs are canonicalized; all still count).
+        assert_eq!(parse_file_roots("/tmp: /var :/usr").len(), 3);
+    }
+
+    #[test]
+    fn control_reads_are_scoped_to_the_operator_allowlist_for_remote() {
         let root = make_fixture();
         let root_str = root.to_string_lossy().into_owned();
         let parent_str = root.parent().unwrap().to_string_lossy().into_owned();
+        let readme = root.join("README.md").to_string_lossy().into_owned();
+        let allow = vec![normalize(&root_str)]; // operator allows THIS root
+        let empty: Vec<PathBuf> = Vec::new();
 
-        let state = FileIndexState::new();
-        // Register the root the way the real control flow does (normalized key).
-        control_index(&state, &root_str).unwrap();
+        // REMOTE + EMPTY allowlist (the default) => everything is denied.
+        assert!(control_list_dir(&root_str, false, true, &empty).is_err());
+        assert!(control_read_text(&readme, true, &empty).is_err());
 
-        // REMOTE peer (enforce=true): the indexed root + a file inside it are OK...
-        assert!(control_list_dir(&state, &root_str, false, true).is_ok());
-        assert!(control_read_text(&state, &root.join("README.md").to_string_lossy(), true).is_ok());
-        // ...but its PARENT (outside every indexed root) is refused with the scope error.
-        let err = control_list_dir(&state, &parent_str, false, true).unwrap_err();
-        assert!(
-            err.contains("outside every indexed project root"),
-            "got: {err}"
-        );
+        // REMOTE + allowlist[root] => the root + a file inside it are allowed...
+        assert!(control_list_dir(&root_str, false, true, &allow).is_ok());
+        assert!(control_read_text(&readme, true, &allow).is_ok());
+        // ...but the PARENT (outside the allowed root) is refused.
+        assert!(control_list_dir(&parent_str, false, true, &allow).is_err());
 
-        // A `..` traversal is refused outright. Target a NON-existent leaf so
-        // normalize() can't canonicalize the `..` away (mirrors the Windows WSL-UNC
-        // fast path, where canonicalize is always skipped) — then the lexical `..`
-        // survives and the guard fires before the root check.
+        // A `..` traversal is refused outright (target a NON-existent leaf so
+        // normalize can't canonicalize the `..` away — mirrors the WSL-UNC fast path).
         let traversal = format!("{root_str}/../../no_such_dir_scopetest_xyz");
-        let terr = control_list_dir(&state, &traversal, false, true).unwrap_err();
+        let terr = control_list_dir(&traversal, false, true, &allow).unwrap_err();
         assert!(terr.contains("'..'"), "expected a '..' rejection, got: {terr}");
 
-        // LOOPBACK (enforce=false) bypasses the scope — the parent lists fine.
-        assert!(control_list_dir(&state, &parent_str, false, false).is_ok());
+        // A symlink INSIDE the allowed root that points OUT is refused — canonicalize
+        // resolves it to the parent, which isn't under the allowed root. (unix: where
+        // canonicalize is authoritative — the native-WSL/Linux daemon endgame.)
+        #[cfg(unix)]
+        {
+            let link = root.join("escape_link");
+            let _ = std::os::unix::fs::symlink(root.parent().unwrap(), &link);
+            assert!(
+                control_list_dir(&link.to_string_lossy(), false, true, &allow).is_err(),
+                "a symlink out of the allowed root must be rejected"
+            );
+        }
+
+        // LOOPBACK (enforce=false) bypasses the scope entirely — the parent lists fine.
+        assert!(control_list_dir(&parent_str, false, false, &empty).is_ok());
 
         cleanup(&root);
     }

@@ -591,11 +591,24 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
     }
     // Per-connection view (#23): tag whether the peer is LOOPBACK (same machine =
     // fully trusted) so the file-read handlers can scope a REMOTE tailnet peer to
-    // indexed roots while leaving the local path unrestricted. Fail closed (treat an
-    // un-resolvable peer as remote/scoped). We clone+shadow `ctx` so the rest of this
-    // connection — dispatch included — sees the peer-aware context.
+    // the operator allowlist while leaving the local path unrestricted. Fail closed
+    // (treat an un-resolvable peer as remote/scoped). Normalize IPv4-mapped IPv6
+    // first (as `is_allowed_peer` does) so a real 127.0.0.1 over a dual-stack bind
+    // — arriving as ::ffff:127.0.0.1 — is still recognized as loopback. We
+    // clone+shadow `ctx` so the rest of this connection (dispatch included) sees it.
     let mut ctx = ctx.clone();
-    ctx.peer_is_loopback = peer.map(|a| a.ip().is_loopback()).unwrap_or(false);
+    ctx.peer_is_loopback = peer
+        .map(|a| {
+            let ip = match a.ip() {
+                std::net::IpAddr::V6(v6) => v6
+                    .to_ipv4_mapped()
+                    .map(std::net::IpAddr::V4)
+                    .unwrap_or(std::net::IpAddr::V6(v6)),
+                v4 => v4,
+            };
+            ip.is_loopback()
+        })
+        .unwrap_or(false);
     let ctx = &ctx;
     let mut writer = stream.try_clone()?;
     // Read lines manually (not `reader.lines()`) so a connection mode that takes
@@ -1219,7 +1232,12 @@ fn git_info(args: &Value) -> Result<Value, String> {
 /// cache this warms (and self-indexes on demand if skipped).
 fn index_project(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let root = arg_str(args, "root").ok_or("index_project requires a 'root' argument")?;
-    let summary = files::control_index(&ctx.files, &root)?;
+    let summary = files::control_index(
+        &ctx.files,
+        &root,
+        !ctx.peer_is_loopback,
+        files::remote_file_roots(),
+    )?;
     serde_json::to_value(summary).map_err(|e| e.to_string())
 }
 
@@ -1235,7 +1253,14 @@ fn search_files(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .map(|n| n as usize)
         .unwrap_or(20)
         .clamp(1, 1000);
-    let hits = files::control_search(&ctx.files, &root, &query, limit)?;
+    let hits = files::control_search(
+        &ctx.files,
+        &root,
+        &query,
+        limit,
+        !ctx.peer_is_loopback,
+        files::remote_file_roots(),
+    )?;
     Ok(json!({ "root": root, "query": query, "hits": hits }))
 }
 
@@ -1251,7 +1276,12 @@ fn list_dir(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .or_else(|| args.get("show_ignored"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let entries = files::control_list_dir(&ctx.files, &path, show_ignored, !ctx.peer_is_loopback)?;
+    let entries = files::control_list_dir(
+        &path,
+        show_ignored,
+        !ctx.peer_is_loopback,
+        files::remote_file_roots(),
+    )?;
     serde_json::to_value(entries).map_err(|e| e.to_string())
 }
 
@@ -1261,7 +1291,8 @@ fn list_dir(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// loopback is unrestricted. WRITE stays in-process (deferred). Args: `path`.
 fn read_text_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let path = arg_str(args, "path").ok_or("read_text_file requires a 'path' argument")?;
-    let contents = files::control_read_text(&ctx.files, &path, !ctx.peer_is_loopback)?;
+    let contents =
+        files::control_read_text(&path, !ctx.peer_is_loopback, files::remote_file_roots())?;
     serde_json::to_value(contents).map_err(|e| e.to_string())
 }
 
@@ -1314,8 +1345,9 @@ fn read_terminal(args: &Value) -> Result<Value, String> {
 fn open_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let path = arg_str(args, "path").ok_or("open_file requires a 'path' argument")?;
     // Same file-read scope as the #23 reader: a REMOTE peer may only open files
-    // under an indexed root; loopback (the local MCP) is unrestricted.
-    let contents = files::control_read_text(&ctx.files, &path, !ctx.peer_is_loopback)?;
+    // under the operator allowlist; loopback (the local MCP) is unrestricted.
+    let contents =
+        files::control_read_text(&path, !ctx.peer_is_loopback, files::remote_file_roots())?;
     Ok(serde_json::to_value(contents).map_err(|e| e.to_string())?)
 }
 
