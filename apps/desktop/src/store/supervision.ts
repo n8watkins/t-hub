@@ -43,7 +43,29 @@ interface SupervisionState {
   remove: (sessionId: string) => void;
 }
 
-export const useSupervision = create<SupervisionState>((set) => ({
+/**
+ * Two snapshots are equivalent for the UI if every meaningful field matches — i.e.
+ * everything EXCEPT `ingestedAtMs`, which ticks on every re-ingest even when nothing
+ * actually changed. The statusline re-emits an identical snapshot many times/sec, so
+ * without this the store updated + diag-logged on every one — a re-render + disk-IO
+ * storm that froze the app (and the machine), and ballooned the diag log past 100 MB.
+ */
+function sameSnapshot(a: StatusSnapshot, b: StatusSnapshot): boolean {
+  return (
+    a.contextUsedPct === b.contextUsedPct &&
+    a.costUsd === b.costUsd &&
+    a.rateLimitsPresent === b.rateLimitsPresent &&
+    a.cwd === b.cwd &&
+    a.tmuxPane === b.tmuxPane &&
+    a.tmuxSession === b.tmuxSession &&
+    a.fiveHour?.usedPercentage === b.fiveHour?.usedPercentage &&
+    a.fiveHour?.resetsAt === b.fiveHour?.resetsAt &&
+    a.sevenDay?.usedPercentage === b.sevenDay?.usedPercentage &&
+    a.sevenDay?.resetsAt === b.sevenDay?.resetsAt
+  );
+}
+
+export const useSupervision = create<SupervisionState>((set, get) => ({
   trees: {},
   statuses: {},
   snapshots: {},
@@ -78,24 +100,27 @@ export const useSupervision = create<SupervisionState>((set) => ({
       };
     }),
 
-  setSnapshot: (snap) =>
-    set((s) => {
-      // Diag: a statusline snapshot reached the store — the orchestrator can
-      // confirm the full chain (statusline -> agent -> core -> status://snapshot
-      // -> here) by grepping the diag log for `usage` lines.
-      tlog(
-        "usage",
-        `setSnapshot ${snap.sessionId} ctx=${snap.contextUsedPct ?? "-"} cost=${snap.costUsd ?? "-"} rl5h=${snap.fiveHour?.usedPercentage ?? "-"}`,
-      );
-      return {
-        snapshots: { ...s.snapshots, [snap.sessionId]: snap },
-        // Keep the tmux->session index current (latest snapshot wins). Only when
-        // the snapshot carries its owning tmux session (un-upgraded agents omit it).
-        sessionIdByTmux: snap.tmuxSession
-          ? { ...s.sessionIdByTmux, [snap.tmuxSession]: snap.sessionId }
-          : s.sessionIdByTmux,
-      };
-    }),
+  setSnapshot: (snap) => {
+    // Drop NO-OP resends (the freeze fix). The statusline re-emits an identical
+    // snapshot many times/sec — only `ingestedAtMs` ticks — so without this the
+    // store updated + diag-logged on every one: a re-render + disk-IO storm. Bail
+    // BEFORE set()/tlog() when nothing meaningful changed (no notify, no render).
+    const prev = get().snapshots[snap.sessionId];
+    if (prev && sameSnapshot(prev, snap)) return;
+    // Real change: record it (and confirm the statusline->store chain in the diag).
+    tlog(
+      "usage",
+      `setSnapshot ${snap.sessionId} ctx=${snap.contextUsedPct ?? "-"} cost=${snap.costUsd ?? "-"} rl5h=${snap.fiveHour?.usedPercentage ?? "-"}`,
+    );
+    set((s) => ({
+      snapshots: { ...s.snapshots, [snap.sessionId]: snap },
+      // Keep the tmux->session index current (latest snapshot wins). Only when
+      // the snapshot carries its owning tmux session (un-upgraded agents omit it).
+      sessionIdByTmux: snap.tmuxSession
+        ? { ...s.sessionIdByTmux, [snap.tmuxSession]: snap.sessionId }
+        : s.sessionIdByTmux,
+    }));
+  },
 
   remove: (sessionId) =>
     set((s) => {
