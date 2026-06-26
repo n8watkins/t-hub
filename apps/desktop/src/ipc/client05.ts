@@ -6,6 +6,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Commands05, Events05 } from "./types";
+import { controlRequest, onControlEvent } from "./controlClient";
 import type {
   InstallReport,
   SessionStatus,
@@ -54,11 +55,18 @@ export function clipboardImageToTemp(): Promise<string | null> {
   return invoke(Commands05.clipboardImageToTemp);
 }
 
-/** Read-only orchestrator→subagent tree for one session (null if unseen). */
+/** Read-only orchestrator→subagent tree for one session (null if unseen).
+ *
+ *  Server-split M1: routed over the loopback control socket (control.rs's
+ *  `supervision_tree`) instead of the in-process Tauri command. Shape-identical
+ *  (`Option<SupervisionTree>`), so this is a transport swap with zero user-visible
+ *  change — the first command migrated onto the wire M2 stretches to remote. */
 export function supervisionTree(
   sessionId: string,
 ): Promise<SupervisionTree | null> {
-  return invoke(Commands05.supervisionTree, { sessionId });
+  return controlRequest("supervision_tree", { sessionId }) as Promise<
+    SupervisionTree | null
+  >;
 }
 
 /** All supervised session ids. */
@@ -126,12 +134,19 @@ export function onSupervision(
   return listen<SupervisionTree>(Events05.supervision, (ev) => cb(ev.payload));
 }
 
-/** Subscribe to per-session FR-012 status changes. */
+/** Subscribe to per-session FR-012 status changes.
+ *
+ *  Server-split M1: delivered over the loopback control socket (the backend
+ *  Tee-emits `session://status` to the socket fanout; the Rust forwarder re-emits
+ *  it into the webview) instead of the direct in-process Tauri `session://status`
+ *  listen. Same `{sessionId, status}` payload, single chokepoint (every consumer
+ *  uses this wrapper), so there is no double-delivery and zero user-visible
+ *  change — the first event migrated onto the wire M2 stretches to remote. */
 export function onSessionStatus(
   cb: (e: SessionStatusEvent) => void,
 ): Promise<UnlistenFn> {
-  return listen<SessionStatusEvent>(Events05.sessionStatus, (ev) =>
-    cb(ev.payload),
+  return Promise.resolve(
+    onControlEvent(Events05.sessionStatus, (p) => cb(p as SessionStatusEvent)),
   );
 }
 

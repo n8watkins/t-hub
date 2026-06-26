@@ -9,6 +9,7 @@ mod agent; // core-side agent bridge (Workstream A, core half)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.
+mod control_client; // server-split M1: client-side socket transport (control_request command + event forwarder)
 mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
 mod devserver; // feat/dev-runner: managed `npm run dev` per-project runner (Dev tab)
 mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/diag)
@@ -172,7 +173,11 @@ impl control::ApplySink for AppHandleApplySink {
     }
 }
 
-fn start_control_listener(state: &AppState, app: &tauri::AppHandle) {
+fn start_control_listener(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    fanout: std::sync::Arc<control::EventFanout>,
+) -> Option<control::ControlHandshake> {
     let token = std::env::var("T_HUB_CONTROL_TOKEN")
         .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
 
@@ -189,15 +194,24 @@ fn start_control_listener(state: &AppState, app: &tauri::AppHandle) {
     let apply_sink: std::sync::Arc<dyn control::ApplySink> =
         std::sync::Arc::new(AppHandleApplySink { app: app.clone() });
 
+    // Share the event fanout (server-split M1) so a subscribed control connection
+    // receives the same stream the backend emits through the SocketEmitter.
     let ctx = control::ControlContext::new(state.status.clone(), supervisor, token)
-        .with_apply_sink(apply_sink);
+        .with_apply_sink(apply_sink)
+        .with_event_fanout(fanout);
     match control::start(ctx) {
-        Ok(h) => eprintln!(
-            "t-hub: control listener on {} (handshake: {})",
-            h.addr,
-            control::handshake_path().display()
-        ),
-        Err(e) => eprintln!("t-hub: control listener failed to start: {e}"),
+        Ok(h) => {
+            eprintln!(
+                "t-hub: control listener on {} (handshake: {})",
+                h.addr,
+                control::handshake_path().display()
+            );
+            Some(h)
+        }
+        Err(e) => {
+            eprintln!("t-hub: control listener failed to start: {e}");
+            None
+        }
     }
 }
 
@@ -275,7 +289,23 @@ pub fn run() {
             // actually emits on them.
             use tauri::Manager;
             let state = app.state::<AppState>().inner().clone();
-            let emitter = std::sync::Arc::new(agent::TauriEmitter::new(app.handle().clone()));
+            // Server-split M1: backend events fan out to BOTH the in-process
+            // webview (TauriEmitter) and the loopback control socket
+            // (SocketEmitter, backed by this shared fanout), composed via a
+            // TeeEmitter. This lets individual event channels be flipped onto the
+            // wire one at a time with zero risk to the un-migrated ones. The same
+            // fanout `Arc` is handed to the control listener below, so a connection
+            // that subscribes receives exactly this stream.
+            let control_fanout = std::sync::Arc::new(control::EventFanout::new());
+            let tauri_emitter: std::sync::Arc<dyn agent::EventEmitter> =
+                std::sync::Arc::new(agent::TauriEmitter::new(app.handle().clone()));
+            let socket_emitter: std::sync::Arc<dyn agent::EventEmitter> = std::sync::Arc::new(
+                control_client::SocketEmitter::new(control_fanout.clone()),
+            );
+            let emitter = std::sync::Arc::new(control_client::TeeEmitter::new(
+                tauri_emitter,
+                socket_emitter,
+            ));
             state.agent.set_emitter(emitter);
             state.agent.set_status_bridge(state.status.clone());
             // --- WS-6: open the durable DB now (before the status bridge ingests
@@ -305,8 +335,13 @@ pub fn run() {
             // Start the MCP control listener so `t-hub-mcp` can forward
             // `tools/call` over the local control channel (PRD §9.6). A bind
             // failure is logged and does not abort startup (the channel is
-            // optional, like the agent bridge).
-            start_control_listener(&state, app.handle());
+            // optional, like the agent bridge). On success, install the
+            // server-split M1 client transport: manage the endpoint (addr+token)
+            // for the `control_request` command and start the event forwarder that
+            // re-emits the socket's event stream into the webview.
+            if let Some(handshake) = start_control_listener(&state, app.handle(), control_fanout) {
+                control_client::install(app.handle(), &handshake);
+            }
             // Install the system-tray icon + menu (#17). A tray build failure is
             // logged and does not abort startup; the app remains usable via its
             // window (close-to-tray still works regardless via on_window_event).
@@ -422,6 +457,9 @@ pub fn run() {
             // the WSL-side orchestrator can read from a RELEASE build).
             diag::diag_log,
             diag::diag_clear,
+            // Server-split M1: thin client transport — round-trip one control
+            // command over the loopback socket (the wire M2 stretches to remote).
+            control_client::control_request,
         ])
         .run(tauri::generate_context!())
         .expect("error while running T-Hub");

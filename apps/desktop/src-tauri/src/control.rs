@@ -43,7 +43,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -118,6 +119,85 @@ pub trait ApplySink: Send + Sync {
     fn apply(&self, command: &str, args: &Value) -> Result<(), String>;
 }
 
+/// The command name a client sends to switch a control connection into an
+/// **event-subscription stream** (server-split M1). Instead of one response, the
+/// connection stays open and the server streams `{"event":<channel>,"payload":
+/// <value>}` frames (newline-delimited) until the client disconnects. This is the
+/// send half of the M1 event wire; the receive half is
+/// `control_client::spawn_event_forwarder`.
+pub const SUBSCRIBE_COMMAND: &str = "__subscribe_events";
+
+/// A registry of connected event subscribers. The backend's event emitter
+/// (`control_client::SocketEmitter`, composed onto the agent bridge via a
+/// `TeeEmitter`) writes each event to every subscriber's socket through
+/// [`EventFanout::emit_event`]; a control connection joins the registry via the
+/// [`SUBSCRIBE_COMMAND`] handshake in [`handle_conn`]. Cheap to construct empty —
+/// the default before any subscriber and in headless tests.
+#[derive(Default)]
+pub struct EventFanout {
+    subs: Mutex<Vec<Subscriber>>,
+    next_id: AtomicU64,
+}
+
+/// One subscribed connection: the (write half of the) socket plus an id used to
+/// prune it on clean disconnect.
+struct Subscriber {
+    id: u64,
+    writer: TcpStream,
+}
+
+impl EventFanout {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a subscriber's socket; returns an id for [`unregister`](Self::unregister).
+    fn register(&self, writer: TcpStream) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut subs) = self.subs.lock() {
+            subs.push(Subscriber { id, writer });
+        }
+        id
+    }
+
+    /// Drop a subscriber by id (called when its connection closes cleanly). A
+    /// subscriber whose socket errors mid-stream is also pruned lazily by the next
+    /// [`emit_event`](Self::emit_event), so this is the prompt path, not the only one.
+    fn unregister(&self, id: u64) {
+        if let Ok(mut subs) = self.subs.lock() {
+            subs.retain(|s| s.id != id);
+        }
+    }
+
+    /// Write one event frame to every subscriber, pruning any whose socket errors
+    /// (a disconnected client). Best-effort: a transport failure to one subscriber
+    /// never affects another or the emitting (journal-consumption) path. Holding the
+    /// lock across the writes serializes emits so frames never interleave on a socket.
+    pub fn emit_event(&self, channel: &str, payload: &Value) {
+        let mut frame = match serde_json::to_vec(&json!({ "event": channel, "payload": payload })) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("t-hub-control: failed to serialize event {channel}: {e}");
+                return;
+            }
+        };
+        frame.push(b'\n');
+        if let Ok(mut subs) = self.subs.lock() {
+            subs.retain_mut(|s| {
+                s.writer
+                    .write_all(&frame)
+                    .and_then(|()| s.writer.flush())
+                    .is_ok()
+            });
+        }
+    }
+
+    /// Number of live subscribers (diagnostics / tests).
+    pub fn subscriber_count(&self) -> usize {
+        self.subs.lock().map(|s| s.len()).unwrap_or(0)
+    }
+}
+
 /// The shared state the control dispatcher reads. Holds exactly the handles the
 /// Read + Organization tools need.
 ///
@@ -143,6 +223,11 @@ pub struct ControlContext {
     /// `move_tile`, `rename_tab`) to the frontend. `None` in headless tests /
     /// proofs (those just audit); `Some` once `lib.rs` wires the `AppHandle`.
     apply_sink: Option<Arc<dyn ApplySink>>,
+    /// The event-subscription registry. Backend events fan out to subscribed
+    /// connections through this (server-split M1). Default-empty in headless
+    /// tests; `lib.rs` shares the same `Arc` with the socket emitter so emits and
+    /// subscribers meet here.
+    fanout: Arc<EventFanout>,
     /// The per-launch auth token.
     token: String,
 }
@@ -256,23 +341,56 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
     }
     let mut writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
+    // Set once this connection joins the event-subscription registry; used to
+    // prune it from the fanout on clean disconnect (loop EOF below).
+    let mut subscriber_id: Option<u64> = None;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let resp = match serde_json::from_str::<ControlRequest>(&line) {
-            Ok(req) => dispatch_authenticated(ctx, req),
-            Err(e) => ControlResponse::err(format!("malformed control request: {e}")),
-        };
-        let mut body = serde_json::to_vec(&resp).unwrap_or_else(|_| {
-            br#"{"ok":false,"error":"failed to serialize response"}"#.to_vec()
-        });
-        body.push(b'\n');
-        writer.write_all(&body)?;
-        writer.flush()?;
+        match serde_json::from_str::<ControlRequest>(&line) {
+            // Event-subscription handshake: switch this connection into a one-way
+            // event stream. After the ack we send no per-line responses — the
+            // fanout owns the socket and the read loop just parks until disconnect.
+            Ok(req) if req.command == SUBSCRIBE_COMMAND => {
+                if req.token != ctx.token {
+                    write_response(
+                        &mut writer,
+                        &ControlResponse::err("unauthorized: bad control token"),
+                    )?;
+                    continue;
+                }
+                if subscriber_id.is_none() {
+                    // Ack FIRST, then register: so the fanout can never interleave an
+                    // event frame with our ack on the same socket.
+                    write_response(&mut writer, &ControlResponse::ok(json!({ "subscribed": true })))?;
+                    subscriber_id = Some(ctx.fanout.register(writer.try_clone()?));
+                }
+                // Park: subsequent reads block until the client disconnects.
+            }
+            Ok(req) => write_response(&mut writer, &dispatch_authenticated(ctx, req))?,
+            Err(e) => write_response(
+                &mut writer,
+                &ControlResponse::err(format!("malformed control request: {e}")),
+            )?,
+        }
+    }
+    if let Some(id) = subscriber_id {
+        ctx.fanout.unregister(id);
     }
     Ok(())
+}
+
+/// Write one newline-delimited control response and flush. Shared by the normal
+/// request path and the subscribe ack.
+fn write_response(writer: &mut TcpStream, resp: &ControlResponse) -> std::io::Result<()> {
+    let mut body = serde_json::to_vec(resp).unwrap_or_else(|_| {
+        br#"{"ok":false,"error":"failed to serialize response"}"#.to_vec()
+    });
+    body.push(b'\n');
+    writer.write_all(&body)?;
+    writer.flush()
 }
 
 /// Check the token, then dispatch. A bad token is rejected before any command
@@ -1021,8 +1139,18 @@ impl ControlContext {
             supervisor,
             files: Arc::new(files::FileIndexState::new()),
             apply_sink: None,
+            fanout: Arc::new(EventFanout::new()),
             token,
         }
+    }
+
+    /// Share the [`EventFanout`] that backend events fan out through, so a
+    /// control connection that subscribes ([`SUBSCRIBE_COMMAND`]) receives the live
+    /// event stream (server-split M1). `lib.rs` builds the `Arc` once and hands the
+    /// same clone to the socket emitter, so emits and subscribers meet here.
+    pub fn with_event_fanout(mut self, fanout: Arc<EventFanout>) -> Self {
+        self.fanout = fanout;
+        self
     }
 
     /// Attach the [`ApplySink`] that forwards Organization-tier UI mutations to
@@ -1489,6 +1617,38 @@ mod tests {
         assert!(v["text"].as_str().unwrap().contains("# Title"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn event_fanout_streams_a_frame_to_a_subscriber() {
+        // server-split M1: a registered subscriber receives each backend event as a
+        // newline-delimited `{event,payload}` frame; unregister drops it. Uses a
+        // real loopback socket pair but is deterministic (no disconnect-timing
+        // races — we assert the explicit unregister, not write-error pruning).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let fanout = EventFanout::new();
+        let id = fanout.register(server);
+        assert_eq!(fanout.subscriber_count(), 1);
+
+        fanout.emit_event(
+            "session://status",
+            &json!({ "sessionId": "s1", "status": "working" }),
+        );
+
+        let mut reader = BufReader::new(&client);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let frame: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(frame["event"], "session://status");
+        assert_eq!(frame["payload"]["sessionId"], "s1");
+        assert_eq!(frame["payload"]["status"], "working");
+
+        fanout.unregister(id);
+        assert_eq!(fanout.subscriber_count(), 0);
     }
 
     #[test]
