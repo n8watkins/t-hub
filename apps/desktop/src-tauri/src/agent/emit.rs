@@ -18,8 +18,10 @@
 //!   - the bridge's unit tests call `consume_journal_entry` directly with no app
 //!     handle at all — emission must degrade to a no-op there.
 //!
-//! The Tauri-backed implementation is [`TauriEmitter`]; tests can use any
-//! [`EventEmitter`] (including a recording fake).
+//! The production implementation is [`crate::control_client::SocketEmitter`]
+//! (events flow out over the loopback control socket and back into the webview as
+//! a `control://event` envelope); tests can use any [`EventEmitter`] (including a
+//! recording fake).
 
 use serde::Serialize;
 
@@ -92,11 +94,12 @@ pub struct SessionTitlePayload {
 }
 
 // ---------------------------------------------------------------------------
-// EventEmitter trait + Tauri implementation
+// EventEmitter trait
 // ---------------------------------------------------------------------------
 
 /// A minimal sink the backend uses to push events to the UI. Implemented by
-/// [`TauriEmitter`] in production; any type works in tests.
+/// [`crate::control_client::SocketEmitter`] in production; any type works in
+/// tests.
 ///
 /// It is `Send + Sync` because the agent reader thread (which calls it as it
 /// consumes journal entries) is a separate OS thread from the one that installs
@@ -117,27 +120,6 @@ impl dyn EventEmitter {
             Err(e) => {
                 eprintln!("agent-emit: failed to serialize payload for {channel}: {e}");
             }
-        }
-    }
-}
-
-/// The production [`EventEmitter`]: a thin wrapper over a Tauri [`AppHandle`]
-/// that emits app-global events (delivered to every window's listeners).
-pub struct TauriEmitter {
-    app: tauri::AppHandle,
-}
-
-impl TauriEmitter {
-    pub fn new(app: tauri::AppHandle) -> Self {
-        Self { app }
-    }
-}
-
-impl EventEmitter for TauriEmitter {
-    fn emit_json(&self, channel: &str, payload: &serde_json::Value) {
-        use tauri::Emitter;
-        if let Err(e) = self.app.emit(channel, payload.clone()) {
-            eprintln!("agent-emit: failed to emit {channel}: {e}");
         }
     }
 }

@@ -11,6 +11,10 @@ dist/
 dist-ssr/
 *.local
 
+# Local convenience symlink to the bundled Claude Code binary (machine-specific
+# target under node_modules; created for dev, never committed).
+apps/desktop/bin/
+
 # Rust / Tauri (now nested under the desktop app in the monorepo)
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/

@@ -119,11 +119,13 @@ pub fn control_request(
     )
 }
 
-/// An [`EventEmitter`] that writes every backend event to the control socket's
-/// [`EventFanout`] (i.e. out over the wire to subscribed clients). Composed with
-/// the in-process `TauriEmitter` via [`TeeEmitter`] so events go to BOTH the local
-/// webview (un-migrated channels) and the socket (migrated channels) — letting M1
-/// flip channels onto the wire one at a time with zero risk to the rest.
+/// The production [`EventEmitter`]: writes every backend event to the control
+/// socket's [`EventFanout`] (out over the wire to subscribed clients). The local
+/// event forwarder (see [`spawn_event_forwarder`]) subscribes and re-emits each
+/// frame into the webview as a single `control://event` envelope, which the
+/// frontend demuxes by channel. This is the SOLE bridge-event sink: the M1
+/// migration moved every channel onto this wire, so there is no longer a parallel
+/// in-process Tauri emit (the old TeeEmitter/TauriEmitter dual-leg is gone).
 pub struct SocketEmitter {
     fanout: Arc<EventFanout>,
 }
@@ -137,26 +139,6 @@ impl SocketEmitter {
 impl EventEmitter for SocketEmitter {
     fn emit_json(&self, channel: &str, payload: &Value) {
         self.fanout.emit_event(channel, payload);
-    }
-}
-
-/// Forward every emit to two sinks. Used to run the existing [`crate::agent::TauriEmitter`]
-/// and the new [`SocketEmitter`] side by side during the M1 migration.
-pub struct TeeEmitter {
-    a: Arc<dyn EventEmitter>,
-    b: Arc<dyn EventEmitter>,
-}
-
-impl TeeEmitter {
-    pub fn new(a: Arc<dyn EventEmitter>, b: Arc<dyn EventEmitter>) -> Self {
-        Self { a, b }
-    }
-}
-
-impl EventEmitter for TeeEmitter {
-    fn emit_json(&self, channel: &str, payload: &Value) {
-        self.a.emit_json(channel, payload);
-        self.b.emit_json(channel, payload);
     }
 }
 

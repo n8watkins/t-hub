@@ -26,7 +26,7 @@ mod connection;
 pub mod emit;
 
 pub use connection::ConnectionState;
-pub use emit::{EventEmitter, TauriEmitter};
+pub use emit::EventEmitter;
 
 use std::sync::{mpsc, Arc};
 

@@ -14,13 +14,14 @@
 // the titlebar regardless of the sidebar's collapse state, so they're never
 // unreachable. They use the Tauri window API / settings store and must NOT carry
 // data-tauri-drag-region, or a click would start a window drag instead.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import type { RefObject } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { exit } from "@tauri-apps/plugin-process";
 import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
+import { useWindowMaximized } from "../lib/windowMaximized";
 import { closeSatellite, readSatelliteTab } from "../lib/windows";
 import { useAppName } from "../lib/appName";
 import brandIcon from "../assets/brand.png";
@@ -37,44 +38,6 @@ function toggleMaximize(): void {
   void getCurrentWindow()
     .toggleMaximize()
     .catch(() => {});
-}
-
-/**
- * Live "is the window maximized?" flag (BUG 3 — icon reflects state). Seeds from
- * the current state on mount, then re-reads it on every `tauri://resize` (which
- * Tauri fires on the maximize/restore transition however it was triggered — our
- * button, the native Snap flyout, a double-click on the caption, or a keyboard
- * shortcut). Cleans up the listener on unmount. Errors are swallowed so a missing
- * Tauri context (e.g. a browser dev server) just leaves the flag false.
- */
-function useMaximizedState(): boolean {
-  const [maximized, setMaximized] = useState(false);
-  useEffect(() => {
-    const win = getCurrentWindow();
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    const refresh = () => {
-      void win
-        .isMaximized()
-        .then((m) => {
-          if (!cancelled) setMaximized(m);
-        })
-        .catch(() => {});
-    };
-    refresh();
-    void win
-      .onResized(() => refresh())
-      .then((fn) => {
-        if (cancelled) fn();
-        else unlisten = fn;
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
-  return maximized;
 }
 
 /**
@@ -132,7 +95,7 @@ function closeWindow(): void {
  * swallowed — outside Tauri (plain `pnpm dev`) there's no command, and a missed
  * report just means no flyout until the next event fires.
  *
- * `maximized` is passed in (not read here) so a single `useMaximizedState()` in
+ * `maximized` is passed in (not read here) so a single `useWindowMaximized()` in
  * the parent drives BOTH the glyph and the recompute, and the effect re-runs when
  * it changes.
  */
@@ -456,12 +419,13 @@ function WindowControls({
 }) {
   // Track the window's maximized state so the middle button reflects it (BUG 3):
   // a single square when restored ("Maximize"), overlapping squares when
-  // maximized ("Restore"). Tauri fires `tauri://resize` (onResized) on every
-  // size change, including the maximize/restore transition driven from the
-  // native WM_SYSCOMMAND in src-tauri/src/win_snap.rs, so polling isMaximized()
-  // there keeps the icon in lockstep no matter HOW the toggle happened (our
-  // button, the OS Snap flyout, a double-click, or a keyboard shortcut).
-  const maximized = useMaximizedState();
+  // maximized ("Restore"). Backed by the shared single-subscription
+  // useWindowMaximized (lib/windowMaximized), which polls isMaximized() on every
+  // `tauri://resize` — including the maximize/restore transition driven from the
+  // native WM_SYSCOMMAND in src-tauri/src/win_snap.rs — so the icon stays in
+  // lockstep no matter HOW the toggle happened (our button, the OS Snap flyout, a
+  // double-click, or a keyboard shortcut), with ONE listener shared app-wide.
+  const maximized = useWindowMaximized();
   // Ref + report the maximize button's live rect to the backend so the Win11
   // Snap Layouts flyout triggers exactly over the visible button (#snap). See
   // useReportMaxButtonRect for the full physical-px / window-relative contract.

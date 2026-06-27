@@ -155,11 +155,11 @@ pub const SUBSCRIBE_COMMAND: &str = "__subscribe_events";
 pub const ATTACH_PTY_COMMAND: &str = "attach_pty";
 
 /// A registry of connected event subscribers. The backend's event emitter
-/// (`control_client::SocketEmitter`, composed onto the agent bridge via a
-/// `TeeEmitter`) writes each event to every subscriber's socket through
-/// [`EventFanout::emit_event`]; a control connection joins the registry via the
-/// [`SUBSCRIBE_COMMAND`] handshake in [`handle_conn`]. Cheap to construct empty —
-/// the default before any subscriber and in headless tests.
+/// (`control_client::SocketEmitter`, installed on the agent bridge) writes each
+/// event to every subscriber's socket through [`EventFanout::emit_event`]; a
+/// control connection joins the registry via the [`SUBSCRIBE_COMMAND`] handshake
+/// in [`handle_conn`]. Cheap to construct empty — the default before any
+/// subscriber and in headless tests.
 #[derive(Default)]
 pub struct EventFanout {
     subs: Mutex<Vec<Subscriber>>,

@@ -46,7 +46,7 @@
 //! the terminal commands.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -260,60 +260,149 @@ impl Drop for RemotePty {
     }
 }
 
-/// Drain the socket's frames, re-emitting into the webview EXACTLY like
-/// [`crate::pty::reader_loop`]:
-///   - `{"out":"<b64>"}`  → `app.emit(OUTPUT, OutputEvent { id, base64 })`,
-///   - `{"exit":<code>}`  → `app.emit(EXIT, ExitEvent { id, code })` then
-///                          `app.emit(STATE, StateEvent { id, Exited })`,
-///   - EOF (connection closed without an `{"exit"}`) → same Exited transition with
-///     `code: None`, so a server/connection drop still tears the tile down cleanly
-///     rather than leaving it stuck "live".
-///
-/// NOTE: the server already base64-encodes each `out` chunk, so we forward the
-/// base64 string straight through (the old in-process loop encoded raw PTY bytes;
-/// here the encode happened on the server). The frontend decodes it identically.
-fn reader_loop(app: AppHandle, id: String, mut reader: BufReader<TcpStream>) {
-    let mut line = String::new();
+/// How long the reader keeps gathering more `{"out"}` frames before flushing a
+/// pending batch as ONE `terminal://output` emit. A redraw-heavy TUI (Claude's
+/// spinner, streaming tokens, full-screen repaints) produces many small chunks;
+/// without coalescing that was one webview event per chunk — a sustained
+/// hundreds/sec IPC stream per terminal that backed up against the main thread
+/// (notably while a window drag parks it in the OS modal loop). The window is
+/// only applied WHILE a batch is pending, so an idle terminal still does a plain
+/// blocking read (no busy-poll), and it is well under the frontend's ~16 ms rAF
+/// flush so the added echo latency is imperceptible.
+const COALESCE_WINDOW: Duration = Duration::from_millis(8);
+/// Flush a pending batch the moment it reaches this many DECODED bytes, so a
+/// firehose stays responsive (and memory bounded) even within one window.
+const MAX_BATCH_BYTES: usize = 256 * 1024;
+/// Raw socket read size. A single read can carry several NDJSON frames, which the
+/// loop parses out of its own accumulation buffer.
+const RECV_BUF: usize = 16 * 1024;
+
+/// One parsed PTY wire frame. Factored out of [`reader_loop`] so the framing —
+/// `{"out":"<b64>"}` / `{"exit":<code>}` / everything-else — has a single
+/// definition that is unit-testable without a socket or an `AppHandle`.
+#[derive(Debug, PartialEq)]
+enum PtyFrame {
+    /// Decoded output bytes (the server's base64 already undone).
+    Output(Vec<u8>),
+    /// The process exited; `Option<i32>` is the exit code when known.
+    Exit(Option<i32>),
+    /// A blank line, a malformed frame, or any other shape (e.g. a late
+    /// `{"scrollback"}`) — skipped without tearing the stream down.
+    Ignore,
+}
+
+/// Parse one NDJSON line (without the trailing newline) into a [`PtyFrame`]. A
+/// blank line, non-JSON, or un-decodable base64 yields [`PtyFrame::Ignore`] so a
+/// single bad frame can never tear down the terminal.
+fn parse_pty_frame(line: &[u8]) -> PtyFrame {
+    if line.iter().all(|b| b.is_ascii_whitespace()) {
+        return PtyFrame::Ignore;
+    }
+    let frame: Value = match serde_json::from_slice(line) {
+        Ok(v) => v,
+        Err(_) => return PtyFrame::Ignore,
+    };
+    if let Some(b64) = frame.get("out").and_then(|v| v.as_str()) {
+        match STANDARD.decode(b64) {
+            Ok(bytes) => PtyFrame::Output(bytes),
+            Err(_) => PtyFrame::Ignore,
+        }
+    } else if let Some(exit) = frame.get("exit") {
+        PtyFrame::Exit(exit.as_i64().and_then(|c| i32::try_from(c).ok()))
+    } else {
+        PtyFrame::Ignore
+    }
+}
+
+/// Emit the accumulated output `batch` as a single base64 `terminal://output`
+/// event, then clear it. A no-op when empty. (We re-encode the COMBINED bytes
+/// once rather than per source frame, so N coalesced chunks cost one emit.)
+fn emit_batch(app: &AppHandle, id: &str, batch: &mut Vec<u8>) {
+    if batch.is_empty() {
+        return;
+    }
+    let payload = OutputEvent {
+        id: id.to_string(),
+        base64: STANDARD.encode(&batch),
+    };
+    // If emit fails the window is gone; we still clear so the buffer doesn't grow.
+    let _ = app.emit(events::OUTPUT, &payload);
+    batch.clear();
+}
+
+/// Drain the socket's frames, re-emitting into the webview like
+/// [`crate::pty::reader_loop`], but COALESCING bursts of `{"out"}` frames into one
+/// `terminal://output` emit per [`COALESCE_WINDOW`] (or per [`MAX_BATCH_BYTES`]):
+///   - `{"out":"<b64>"}`  → decoded + appended to the pending batch,
+///   - `{"exit":<code>}`  → flush the batch, then `app.emit(EXIT)` + `app.emit(STATE Exited)`,
+///   - EOF (connection closed without an `{"exit"}`) → flush, then the same Exited
+///     transition with `code: None`, so a server/connection drop still tears the
+///     tile down cleanly rather than leaving it stuck "live".
+fn reader_loop(app: AppHandle, id: String, reader: BufReader<TcpStream>) {
+    // The handshake's BufReader may already hold bytes past the scrollback frame
+    // (the first `out` frames can ride the same TCP segment). Drain that buffered
+    // tail into our accumulator BEFORE switching to raw, timeout-toggled reads, so
+    // no output is lost or reordered.
+    let mut acc: Vec<u8> = reader.buffer().to_vec();
+    let stream = reader.into_inner();
+
+    let mut batch: Vec<u8> = Vec::new();
+    let mut buf = [0u8; RECV_BUF];
     let mut saw_exit = false;
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF: the server detached / the connection dropped.
-            Ok(_) => {}
+
+    'read: loop {
+        // Parse every COMPLETE line currently in `acc` before blocking again. A
+        // partial trailing line stays in `acc` for the next read.
+        while let Some(pos) = acc.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = acc.drain(..=pos).collect();
+            match parse_pty_frame(&line[..line.len() - 1]) {
+                PtyFrame::Output(bytes) => {
+                    batch.extend_from_slice(&bytes);
+                    if batch.len() >= MAX_BATCH_BYTES {
+                        emit_batch(&app, &id, &mut batch);
+                    }
+                }
+                PtyFrame::Exit(code) => {
+                    // Flush any output that preceded the exit so order is preserved.
+                    emit_batch(&app, &id, &mut batch);
+                    let _ = app.emit(events::EXIT, &ExitEvent { id: id.clone(), code });
+                    let _ = app.emit(
+                        events::STATE,
+                        &StateEvent {
+                            id: id.clone(),
+                            state: TerminalState::Exited,
+                        },
+                    );
+                    saw_exit = true;
+                    break 'read;
+                }
+                PtyFrame::Ignore => {}
+            }
+        }
+
+        // Coalesce: block indefinitely when nothing is pending (no busy-poll), but
+        // cap the wait at COALESCE_WINDOW once a batch is building so it flushes
+        // promptly. A raw `read` into our own buffer means a timeout consumes
+        // nothing (no partial-line corruption) — unlike a timed `read_line`.
+        let pending = !batch.is_empty();
+        let _ = stream.set_read_timeout(if pending {
+            Some(COALESCE_WINDOW)
+        } else {
+            None
+        });
+        match (&stream).read(&mut buf) {
+            Ok(0) => break, // EOF: server detached / connection dropped.
+            Ok(n) => acc.extend_from_slice(&buf[..n]),
+            // The coalesce window elapsed with a batch pending → flush it.
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                emit_batch(&app, &id, &mut batch);
+            }
             Err(_) => break, // a torn-down connection (shutdown) surfaces here.
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let frame: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue, // skip a malformed frame rather than tearing down
-        };
-        if let Some(b64) = frame.get("out").and_then(|v| v.as_str()) {
-            // The server already base64-encoded the chunk; forward it as-is.
-            let payload = OutputEvent {
-                id: id.clone(),
-                base64: b64.to_string(),
-            };
-            // If emit fails the window is gone; keep draining so the socket buffer
-            // doesn't back up against the server.
-            let _ = app.emit(events::OUTPUT, &payload);
-        } else if let Some(exit) = frame.get("exit") {
-            let code = exit.as_i64().and_then(|c| i32::try_from(c).ok());
-            let _ = app.emit(events::EXIT, &ExitEvent { id: id.clone(), code });
-            let _ = app.emit(
-                events::STATE,
-                &StateEvent {
-                    id: id.clone(),
-                    state: TerminalState::Exited,
-                },
-            );
-            saw_exit = true;
-            break;
-        }
-        // Any other frame (e.g. a late {"scrollback"} — shouldn't happen) is ignored.
     }
+
+    // Flush whatever output was still pending when the stream ended.
+    emit_batch(&app, &id, &mut batch);
 
     // If the stream ended WITHOUT an explicit {"exit"} (a server/connection drop
     // mid-stream), still emit a terminal Exited transition so the tile doesn't hang
@@ -346,4 +435,55 @@ pub struct RemotePtyManager {
     /// this set) returns the real scrollback to restore history. This preserves the
     /// exact fresh-vs-reattach signal the in-process path encoded via `has_live`.
     pub fresh: Mutex<HashSet<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn out_frame(bytes: &[u8]) -> Vec<u8> {
+        format!("{{\"out\":\"{}\"}}", STANDARD.encode(bytes)).into_bytes()
+    }
+
+    #[test]
+    fn parses_out_frame_decoding_base64() {
+        assert_eq!(
+            parse_pty_frame(&out_frame(b"hello\x1b[0m")),
+            PtyFrame::Output(b"hello\x1b[0m".to_vec())
+        );
+    }
+
+    #[test]
+    fn parses_exit_frame_with_and_without_code() {
+        assert_eq!(parse_pty_frame(br#"{"exit":0}"#), PtyFrame::Exit(Some(0)));
+        assert_eq!(parse_pty_frame(br#"{"exit":137}"#), PtyFrame::Exit(Some(137)));
+        // A null/absent exit code → Exit(None) (signalled / unknown).
+        assert_eq!(parse_pty_frame(br#"{"exit":null}"#), PtyFrame::Exit(None));
+    }
+
+    #[test]
+    fn ignores_blank_malformed_undecodable_and_other_frames() {
+        assert_eq!(parse_pty_frame(b""), PtyFrame::Ignore);
+        assert_eq!(parse_pty_frame(b"   \t"), PtyFrame::Ignore);
+        assert_eq!(parse_pty_frame(b"not json"), PtyFrame::Ignore);
+        // Well-formed JSON but `out` isn't valid base64 → skipped, not a panic.
+        assert_eq!(parse_pty_frame(br#"{"out":"!!!not base64!!!"}"#), PtyFrame::Ignore);
+        // A late/unknown frame shape (e.g. scrollback) is ignored.
+        assert_eq!(parse_pty_frame(br#"{"scrollback":"x"}"#), PtyFrame::Ignore);
+    }
+
+    #[test]
+    fn coalescing_two_out_frames_concatenates_their_decoded_bytes() {
+        // The reader appends each Output frame's bytes to one batch; the emitted
+        // base64 is the COMBINED bytes (re-encoded once), so the frontend sees the
+        // same stream it would have from two separate emits.
+        let mut batch = Vec::new();
+        for chunk in [b"foo".as_slice(), b"bar".as_slice()] {
+            if let PtyFrame::Output(b) = parse_pty_frame(&out_frame(chunk)) {
+                batch.extend_from_slice(&b);
+            }
+        }
+        assert_eq!(batch, b"foobar");
+        assert_eq!(STANDARD.encode(&batch), STANDARD.encode(b"foobar"));
+    }
 }

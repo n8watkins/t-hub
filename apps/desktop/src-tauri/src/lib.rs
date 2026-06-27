@@ -329,23 +329,26 @@ pub fn run() {
             // actually emits on them.
             use tauri::Manager;
             let state = app.state::<AppState>().inner().clone();
-            // Server-split M1: backend events fan out to BOTH the in-process
-            // webview (TauriEmitter) and the loopback control socket
-            // (SocketEmitter, backed by this shared fanout), composed via a
-            // TeeEmitter. This lets individual event channels be flipped onto the
-            // wire one at a time with zero risk to the un-migrated ones. The same
-            // fanout `Arc` is handed to the control listener below, so a connection
-            // that subscribes receives exactly this stream.
+            // Server-split: backend bridge events now flow over the loopback
+            // control socket ONLY. The SocketEmitter writes each into this shared
+            // EventFanout; the forwarder thread (control_client) reads them back and
+            // re-emits a single `control://event` envelope, which the frontend
+            // demuxes by channel (ipc/controlClient.ts). The same fanout `Arc` is
+            // handed to the control listener below, so a connection that subscribes
+            // receives exactly this stream.
+            //
+            // The M1 migration is COMPLETE: every bridge channel (journal /
+            // supervision / session-status / agent-state / status-snapshot / title)
+            // is consumed via that demux, so the old in-process TauriEmitter leg (a
+            // raw `app.emit(channel)`) had NO remaining listener. Running it
+            // alongside the socket leg (the former TeeEmitter) double-emitted every
+            // event into the webview for nothing — ~doubling the event volume that
+            // pinned the UI. So we install the SocketEmitter ALONE. (The dual-leg
+            // TeeEmitter + in-process TauriEmitter have been removed entirely.)
             let control_fanout = std::sync::Arc::new(control::EventFanout::new());
-            let tauri_emitter: std::sync::Arc<dyn agent::EventEmitter> =
-                std::sync::Arc::new(agent::TauriEmitter::new(app.handle().clone()));
-            let socket_emitter: std::sync::Arc<dyn agent::EventEmitter> = std::sync::Arc::new(
+            let emitter: std::sync::Arc<dyn agent::EventEmitter> = std::sync::Arc::new(
                 control_client::SocketEmitter::new(control_fanout.clone()),
             );
-            let emitter = std::sync::Arc::new(control_client::TeeEmitter::new(
-                tauri_emitter,
-                socket_emitter,
-            ));
             state.agent.set_emitter(emitter);
             state.agent.set_status_bridge(state.status.clone());
             // --- WS-6: open the durable DB now (before the status bridge ingests

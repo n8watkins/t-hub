@@ -19,6 +19,7 @@ import { useTheme } from "./theme";
 import { useSupervision } from "./supervision";
 import { useSessionContext, sessionNameForTerminal } from "./sessionContext";
 import { useActivity } from "./activity";
+import { onControlEvent } from "../ipc/controlClient";
 
 /**
  * Clean up the per-tile side state that lives OUTSIDE this store when a
@@ -1712,25 +1713,26 @@ function terminalForCwd(
 }
 
 /** Subscribe to `agent://title` and route each Claude-derived title onto the
- *  matching terminal's label. Fire-and-forget; a missing Tauri runtime (e.g. a
- *  test/SSR context) is tolerated. */
-async function subscribeClaudeTitles(): Promise<void> {
-  try {
-    const { listen } = await import("@tauri-apps/api/event");
-    await listen<{ sessionId: string; cwd?: string; title: string }>(
-      "agent://title",
-      (ev) => {
-        const { cwd, title } = ev.payload;
-        if (!title) return;
-        const id = terminalForCwd(useWorkspace.getState().terminals, cwd);
-        // TODO(claude-title): when the backend can map a Claude session id to a
-        // terminal directly (shared layer), prefer that over cwd correlation.
-        if (id) useWorkspace.getState().setClaudeTitle(id, title);
-      },
-    );
-  } catch {
-    // No Tauri event runtime — titles simply won't stream (non-fatal).
-  }
+ *  matching terminal's label. Delivered over the loopback control socket like
+ *  every other bridge channel — the backend emits it through the SocketEmitter and
+ *  the forwarder re-emits it as `control://event`, which `onControlEvent` demuxes
+ *  by channel. (Previously a raw `listen("agent://title")` on the in-process Tauri
+ *  leg; that leg is gone now that bridge events are single-sourced over the
+ *  socket.) Synchronous + fire-and-forget; outside a Tauri runtime the backing
+ *  listener simply never fires (non-fatal). */
+function subscribeClaudeTitles(): void {
+  onControlEvent("agent://title", (p) => {
+    const { cwd, title } = p as {
+      sessionId: string;
+      cwd?: string;
+      title: string;
+    };
+    if (!title) return;
+    const id = terminalForCwd(useWorkspace.getState().terminals, cwd);
+    // TODO(claude-title): when the backend can map a Claude session id to a
+    // terminal directly (shared layer), prefer that over cwd correlation.
+    if (id) useWorkspace.getState().setClaudeTitle(id, title);
+  });
 }
 
-void subscribeClaudeTitles();
+subscribeClaudeTitles();

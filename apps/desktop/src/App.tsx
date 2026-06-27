@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Canvas } from "./components/Canvas";
 import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
@@ -10,6 +9,7 @@ import { WorktreesList } from "./components/WorktreesList";
 import { useSettings } from "./store/settings";
 import { useWorkspace } from "./store/workspace";
 import { initWindowSync, isSatellite } from "./lib/windows";
+import { useWindowMaximized } from "./lib/windowMaximized";
 import { LifecycleKeybinds } from "./lib/useLifecycleKeybinds";
 
 // Multi-window tear-off (#21): a window opened with `?tab=<id>` is a SATELLITE
@@ -70,41 +70,6 @@ function loadSidebarWidth(): number {
   if (typeof localStorage === "undefined") return SIDEBAR_DEFAULT;
   const raw = Number(localStorage.getItem(SIDEBAR_KEY));
   return raw ? clampSidebar(raw) : SIDEBAR_DEFAULT;
-}
-
-/** Track the Tauri window's maximized state, updating on every resize. */
-function useWindowMaximized(): boolean {
-  const [maximized, setMaximized] = useState(false);
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let disposed = false;
-    try {
-      const win = getCurrentWindow();
-      const check = () => {
-        win
-          .isMaximized()
-          .then((m) => {
-            if (!disposed) setMaximized(m);
-          })
-          .catch(() => {});
-      };
-      check();
-      win
-        .onResized(() => check())
-        .then((fn) => {
-          if (disposed) fn();
-          else unlisten = fn;
-        })
-        .catch(() => {});
-    } catch {
-      // Not running inside a Tauri window (e.g. plain `pnpm dev`): stay false.
-    }
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
-  return maximized;
 }
 
 /**
