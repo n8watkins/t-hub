@@ -397,8 +397,23 @@ pub fn run() {
             // failure here is logged and never aborts startup; the window stays
             // fully usable, just without the native snap flyout / edge resize.
             if let Some(main) = app.get_webview_window("main") {
-                if let Err(e) = win_snap::install(&main) {
-                    eprintln!("t-hub: failed to install Snap-Layouts hit-test hook: {e}");
+                // DIAGNOSTIC (v0.3.5 drag A/B): win_snap installs a Win32 subclass
+                // that runs DwmDefWindowProc on EVERY message + extends the DWM frame
+                // (DwmExtendFrameIntoClientArea). That per-message DWM work inside the
+                // OS move/resize modal loop is the prime suspect for the laggy
+                // frameless drag/resize. This build SKIPS it BY DEFAULT so we can feel
+                // the window with it gone; set T_HUB_ENABLE_WIN_SNAP=1 to force the old
+                // behavior back (Snap Layouts flyout + native edge-resize) without a
+                // rebuild, for a direct A/B.
+                if std::env::var_os("T_HUB_ENABLE_WIN_SNAP").is_some() {
+                    if let Err(e) = win_snap::install(&main) {
+                        eprintln!("t-hub: failed to install Snap-Layouts hit-test hook: {e}");
+                    }
+                } else {
+                    eprintln!(
+                        "t-hub: win_snap SKIPPED (v0.3.5 drag A/B test). \
+                         Set T_HUB_ENABLE_WIN_SNAP=1 to restore the Snap-Layouts subclass."
+                    );
                 }
                 // DEV variant: distinguish the window (alt-tab / taskbar tooltip)
                 // from a production T-Hub that may be running alongside it.
