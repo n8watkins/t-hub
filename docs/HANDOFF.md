@@ -22,7 +22,7 @@
 
 ## 2. State
 
-### Latest session (2026-06-27): PERFORMANCE & DRAG-LAG OVERHAUL — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md)
+### Latest session (2026-06-27): PERFORMANCE & FREEZE OVERHAUL (v0.3.12→v0.3.18) — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md)
 
 **[`docs/PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) is the single source of
 truth** for everything below (fixes shipped, hypotheses ruled out, full prioritized
@@ -31,30 +31,86 @@ ruled-out causes (win_snap, transparent/redirection-bitmap, frameless, memory, e
 flood). Versions 0.3.2→0.3.11 are **local Windows builds only — NOT committed-to-a-tag,
 NOT pushed, NOT released** (commits are on local `main`).
 
-**The headline result (user-verified):** the severe drag freeze / "used to be faster"
-sluggishness was a **`claude -p /usage` focus-storm** — the sidebar Usage strip ran
-the heavy, flaky `claude -p /usage` (full Claude CLI in WSL, ~65% fail → ~4s retry) on
-**every window focus**, pegging WSL/CPU; a drag's OS modal move-loop got starved →
-3-4s freeze. Throttling it to 60s (`3285e54`, v0.3.8) **fixed it.** Found by reading
-the diag log after every *visual* hypothesis was ruled out.
+**THE HEADLINE (v0.3.17, watchdog-confirmed):** the original *always-present, sporadic,
+"super-laggy" hard freeze* — the one that ghosted the T-Hub icon in Alt-Tab (Windows
+hung-window: UI thread not pumping for ~5s) — was **`control_request` running on the
+MAIN THREAD.** It's the loopback transport for `recent`/`git`/`usage`/`codex`/`files`,
+and it was a **synchronous** `#[tauri::command]`; Tauri runs sync commands on the main
+UI thread, so a slow backend op (a flaky ~4s `claude -p /usage`, a stalling
+`\\wsl.localhost\` read) blocked the whole window for its full duration. **Fix: `async`
++ `tauri::async_runtime::spawn_blocking`** (drop the `State` borrow before the await).
+After it: **zero** `rust-main` blocks across 326 lines of active use (was 2–4s every
+~minute). Found by building a **Rust main-thread watchdog** (`hangwatch.rs`,
+`run_on_main_thread` probe + emit counter) once a JS detector proved the block was
+host-side, not renderer-side (emit-flood was *ruled out* — blocks had only ~20–54 emits).
 
-Also this session: xterm **DOM → GPU canvas renderer** (`93deab7`) + a force-repaint
-on window-state change (`a0ba809`/`1ca1482`) for busy-terminal stutter; killed ~4 GB
-of orphaned `claude` processes; deleted the dead `codex/client-review` worktree;
-consolidated 5 scattered perf docs into the one worklog.
+**Other wins this session (all on `main`, local Windows builds, NOT pushed/tagged):**
+- **v0.3.14** cold first-drag freeze (focus storm) — Option A `lib/windowInteraction.ts`
+  defers focus work during a drag (`runWhenIdle`/`isInteracting`). *User-verified.*
+- **v0.3.13** Codex usage — read the LIVE session rollout (`~/.codex/sessions/**`,
+  timestamp-selected) not the 6-day-stale `logs_*.sqlite`; polls only when a Codex tile
+  is open. *User-verified.*
+- **v0.3.18** Claude usage — **statusline-first**: live `rate_limits` from the per-turn
+  statusline (free, account-wide, NOT per-terminal); `claude -p /usage` only the
+  cold-start fallback (one check on load, then never while a session runs). *Verified:
+  `/usage` dropped from every-few-min to once-on-load.*
+- v0.3.12 usage freshness (no blank/revert); v0.3.9 GPU canvas renderer; v0.3.10/11
+  stale-frame repaint; killed ~4 GB orphaned `claude`; consolidated perf docs.
+- **Diagnostics shipped & STILL ARMED in release:** `hangDetector.ts` (JS) +
+  `hangwatch.rs` (Rust watchdog) → `{"t":"hang",...}` in `~/.t-hub/diag.log`.
+  ⚠️ Tier-2 decides keep/gate/remove now the freeze is fixed.
 
-**Top of the backlog (worklog §6, in order):**
-1. **A1 — drag-while-a-focused-session-works lag.** Root-caused (subagent, evidence):
-   terminal-output `app.emit(terminal://output)` marshals onto the Windows main thread
-   (`remote_pty.rs:329`); a sent-prompt output burst (~125 emits/sec/streaming-terminal)
-   starves the OS modal drag loop. **Fix (Tauri app, normal rebuild):** an
-   `AtomicBool window_interacting` set from window move/resize events; while true, widen
-   the output coalesce window (8ms→~100ms) + `MAX_BATCH_BYTES` in `remote_pty.rs`
-   `emit_batch`/`reader_loop`. Optionally coalesce `control://event` the same way.
-2. **Reap-on-leave-workspace** (the user's directive — fixes the orphan leak). "Leave" =
-   workspace CLOSE/DELETE only, NOT switch/pop-out. See worklog §6 + the lifecycle table.
-3. **Cheap correctness gates:** per-window automation `!isSatellite()` (#3); Recent-resume/
-   spawn-menu busy gate (#7). Then the rest (worklog §6 D).
+**EXECUTION PLAN — next context (tiered; full per-item detail + file:line in worklog §6).**
+⚠️ A recent-work REVIEW workflow is in flight (scanning v0.3.12–v0.3.18 for missed polish
++ OTHER sync-command-on-main-thread freeze sources like `control_request` was). FOLD its
+confirmed findings into Tier 1/2 before executing — they may add items or reprioritize.
+
+**Tier 1 — parallel WORKTREE batch** (10 items, all FRONTEND, low-risk, zero conflict with
+the backend hang/emit work; all triaged "ideal for a worktree"). Several share
+`Terminal.tsx`/`repaintMount.ts`, so do them SEQUENTIALLY in ONE worktree, then one build:
+  1. **maximize doesn't re-FIT terminals** (user-reported) — `repaintMount.ts onResized`
+     broadcasts `refresh()` not `fit()`; call `refreshTerminal()` (which fits) on the settle.
+  2. **#6** delete-confirm fires while typing — add editable-target guard in
+     `useLifecycleKeybinds.tsx` (export+reuse `isEditableTarget` from `Canvas.tsx`).
+  3. **#5** chord rebind leaves a stale shadow binding — in `store/keybindings.ts setBinding`/
+     `setPrefixedBinding`, delete the chord from any other command first.
+  4. **#3** per-window automation duplicates — `if (isSatellite()) return;` in
+     `autoContinueMount.ts`/`rulesMount.ts` installers (dup spawns/continues in satellites).
+  5. **#4** satellite boots a BLANK window — `workspace.ts setTerminals` satellite branch
+     never repopulates an empty order; recover from the live terminal list.
+  6. **#7** double-click stacks duplicate spawns — per-action pending guard (Set in
+     `workspace.ts` recall + local `spawning` in `Canvas.tsx`/`SpawnMenu.tsx`/`RecentList.tsx`).
+  7. **hidden-tab output queue UNBOUNDED** (memory) — cap/collapse stale `pending[]` for a
+     parked terminal in `Terminal.tsx` (~line 164/889).
+  8. **foreground-aware repaint** — `Terminal.tsx:1103` `onRepaintAll` should early-return
+     when `!foregroundRef.current` (don't refresh bg terminals on an overlay toggle).
+  9. **file-search stale-result cancellation** — request-id guard in `FilePanel.tsx` +
+     `FileTree.tsx` search effects (`searchFiles` has no ordering guarantee).
+  10. *(small, med-risk)* **drag commits React state only on pointerup** — `Canvas.tsx`
+      onPointerMove drives flexGrow/CSS imperatively, commit `setRows/Cols` on release.
+
+**Tier 2 — perf polish on `main`** (the residual stutters the user still feels, now that the
+big freeze is gone):
+  - **Option B** — de-storm the focus handlers so **alt-tab in/out** stops hitching (focus
+    work has no drag to defer against): run on idle-callback + coalesce the N `gitInfo`/IPC
+    into one + drop RecentList's `JSON.stringify` diff. (Option A already deferred them
+    during drags; B makes them non-blocking when they DO run.)
+  - **A1 emit-coalesce during interaction** — `AtomicBool window_interacting` set from
+    window move/resize; while true widen the terminal-output coalesce window (8ms→~100ms) +
+    `MAX_BATCH_BYTES` in `remote_pty.rs` (the "freeze while a terminal actively works" case).
+  - **Pinpoint the "staggered" sub-500ms stutter** — drop the `hangwatch.rs` `STALL_MS`
+    threshold to ~200ms, reproduce, read what it names, fix that.
+  - Drop the consumer-less `agent://journal` emit; decide keep/gate/remove the hang
+    instrumentation; any review-flagged polishes.
+
+**Tier 3 — architectural (careful — keep the lifecycle contract in worklog §6):**
+  - **Reap-on-leave-workspace** — workspace CLOSE/DELETE currently ORPHANS sessions (the
+    original ~4.5 GB leak): record to Recent, then SIGKILL the process tree. MUST preserve
+    on workspace SWITCH and pop-out-to-satellite. App/window-close is an OPEN decision.
+
+**Tier 4 — verify / housekeeping:** canvas-renderer acceptance matrix (worklog §6 checklist) ·
+`t-hub-agent` statusline self-throttle (SEPARATE binary/build) · `React.memo` hot
+sidebar/tile components.
 
 **Local Windows build (this session's verified flow):** see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) §7 + the Claude Code memory note `local-windows-build.md`
 (external memory, not a repo file). Summary: an isolated Windows clone at
