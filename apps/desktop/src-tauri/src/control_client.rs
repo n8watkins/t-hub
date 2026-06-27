@@ -242,6 +242,7 @@ fn forward_once(app: &AppHandle, addr: &str, token: &str) -> Result<(), String> 
             continue;
         };
         let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
+        crate::hangwatch::note_emit(); // count toward the main-thread emit-rate watchdog
         if let Err(e) = app.emit(CONTROL_EVENT, json!({ "channel": channel, "payload": payload })) {
             eprintln!("t-hub-control: re-emit of {channel} failed: {e}");
         }

@@ -326,6 +326,7 @@ fn emit_batch(app: &AppHandle, id: &str, batch: &mut Vec<u8>) {
         base64: STANDARD.encode(&batch),
     };
     // If emit fails the window is gone; we still clear so the buffer doesn't grow.
+    crate::hangwatch::note_emit(); // count toward the main-thread emit-rate watchdog
     let _ = app.emit(events::OUTPUT, &payload);
     batch.clear();
 }

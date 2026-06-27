@@ -13,6 +13,7 @@ mod control_client; // server-split M1: client-side socket transport (control_re
 mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
 mod devserver; // feat/dev-runner: managed `npm run dev` per-project runner (Dev tab)
 mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/diag)
+mod hangwatch; // host main-thread hang watchdog (sporadic Not-Responding/ghost hunt)
 mod dropin; // feat/terminal-input (Lane C): clipboard-image -> temp PNG for image paste
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
 // --- feat/git-panel ---
@@ -329,6 +330,10 @@ pub fn run() {
             // actually emits on them.
             use tauri::Manager;
             let state = app.state::<AppState>().inner().clone();
+            // Arm the host main-thread hang watchdog (catches the sporadic
+            // Not-Responding/Alt-Tab-ghost freeze that the renderer-side JS detector
+            // can't see). Logs {"t":"hang","src":"rust-main",...} to the diag file.
+            hangwatch::spawn(app.handle().clone());
             // Server-split: backend bridge events now flow over the loopback
             // control socket ONLY. The SocketEmitter writes each into this shared
             // EventFanout; the forwarder thread (control_client) reads them back and

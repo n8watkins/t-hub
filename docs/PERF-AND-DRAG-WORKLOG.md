@@ -294,6 +294,21 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
       `workspace.ts:967-989`). On-theme with "stop unneeded spawns" — disable the control
       until the spawn settles. *(from the codex `PERF-AUDIT.md` follow-up F6/Fix#6)*
 
+**Rendering correctness — TO TACKLE LATER (user-reported)**
+- [ ] **Maximize doesn't re-FIT terminals — stale/wrong-sized frame until you nudge a
+      split.** On window MAXIMIZE the terminals don't reflow to the larger area; the
+      user has to slightly drag the split between two terminals to force it. The
+      maximize repaint path does an xterm `refresh()` (redraw existing grid) but the
+      terminals need a `fitAddon.fit()` (recompute rows/cols for the new size) — only
+      a manual resize triggers the tile ResizeObserver → fit. There's already partial
+      handling for the grow case (`Terminal.tsx:1079-1084` notes "the inner container's
+      ResizeObserver tick can be missed/coalesced, so the 250ms settle that runs
+      fit.fit()+resizeTerminal never fires for the grow") — so the gap is a missed/
+      coalesced ResizeObserver tick on maximize. Fix: on the window maximize/restore
+      event (or the repaintMount `onResized`), force a `fit()` (not just refresh) on
+      all terminals, debounced to the settle. Adjacent to the v0.3.10/11 canvas
+      stale-frame work but distinct (fit vs refresh). *(Predates recent changes.)*
+
 **Perf — medium (from the optimization review)**
 - [ ] Debounce durable **workspace persistence** (tiers: immediate for lifecycle,
       debounce for focus/tab/layout).
