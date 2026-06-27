@@ -149,6 +149,25 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
       *(User explicitly asked to keep B queued here.)*
 
 **Now / verify**
+- [ ] **⚠️ Alt-Tab GHOSTING = sustained multi-second UI-thread HANG (user-reported,
+      v0.3.13).** Symptom: during normal work the T-Hub icon in the Alt-Tab switcher
+      sometimes turns into a generic/default Windows icon and the window can't be
+      switched to. That is Windows' **hung-window ghosting** — it fires when a Win32
+      window's thread doesn't pump its message loop for ~5s. So the single WebView2/UI
+      thread is being **fully blocked for seconds**, not just stuttering. This is the
+      SAME axis as the A1 emit residual below but escalated (hang, not stutter), and it
+      happens with NO drag, so Option A doesn't address it. **Hypotheses to chase
+      (investigate before fixing):** (a) terminal-output `app.emit` flood marshaling
+      onto the main thread faster than it drains, starving the tao window message pump;
+      (b) frontend xterm write/canvas-render volume on output bursts; (c) a React
+      re-render storm from per-event setState; (d) a synchronous heavy op (workspace
+      persistence `JSON.stringify`, large diff, localStorage). The fix likely combines
+      the A1 backend coalesce with frontend batching — confirm the dominant blocker
+      with evidence first. **NOTE (user):** this is NOT new from our recent changes —
+      it was ALWAYS present; the user just couldn't describe it until now. So this is
+      very likely *the original "super laggy / freezes" complaint* that kicked off this
+      worklog, finally isolated after the drag/usage/render contributors were cleared.
+      Treat as the TOP remaining priority.
 - [x] **Codex usage stale/reverting.** **DONE (v0.3.13).** Was scraped from
       `~/.codex/logs_*.sqlite` (only written on certain events → 6 days stale when a
       session was idle/out-of-credits, overwriting the good cached value). Now read
