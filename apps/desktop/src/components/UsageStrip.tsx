@@ -5,15 +5,26 @@
 // exist on Pro/Max + after the first turn): `/usage` always prints the plan
 // usage. We LEAD with what the user watches — WEEKLY remaining — then session,
 // each as "left" (100 - used) with the reset hint Claude reports.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { claudeUsage, type ClaudeUsage } from "../ipc/usage";
 import { codexUsage, type CodexUsage } from "../ipc/codex";
 import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
 
-/** Poll cadence: /usage is a quick local Claude command; every 5 min (plus on
- *  mount + window focus) keeps the numbers fresh without spamming it. */
+/** Poll cadence: every 5 min (plus on mount) keeps the numbers fresh without
+ *  spamming the (heavy) underlying commands. */
 const POLL_MS = 5 * 60 * 1000;
+
+/** Minimum spacing between FOCUS-triggered usage refreshes. The window `focus`
+ *  event fires many times a minute (alt-tab, click away + back, even some window
+ *  ops), and EACH one used to re-run the heavy `claude -p /usage` — which spawns a
+ *  full Claude CLI in WSL, retries twice on failure (~4s), and is flaky. That
+ *  focus storm pinned WSL/CPU and showed up in the diag log as a constant
+ *  subprocess churn (the app's "wakeup" stall, and a strong suspect for the 3-4s
+ *  drag freeze via CPU/WSL contention). The 5-min interval + mount still
+ *  force-refresh; a focus only refreshes if it's been at least this long since the
+ *  last run, so rapid Alt-Tab can't pile up Claude spawns. */
+const FOCUS_THROTTLE_MS = 60 * 1000;
 
 /** Fill color by REMAINING %: red nearly out, amber low, green healthy. */
 function fillColor(left: number): string {
@@ -164,8 +175,13 @@ function loadCachedUsage(): ClaudeUsage | null {
  */
 export function useClaudeUsage(): ClaudeUsage | null {
   const [usage, setUsage] = useState<ClaudeUsage | null>(loadCachedUsage);
+  const lastRunRef = useRef(0);
 
-  const refresh = useCallback(() => {
+  // `force` bypasses the focus throttle (used by mount + the 5-min interval).
+  const refresh = useCallback((force = false) => {
+    const now = Date.now();
+    if (!force && now - lastRunRef.current < FOCUS_THROTTLE_MS) return;
+    lastRunRef.current = now;
     void claudeUsage()
       .then((u) => {
         // Only ADOPT a good reading. A failed/unavailable poll must NOT wipe the
@@ -186,12 +202,13 @@ export function useClaudeUsage(): ClaudeUsage | null {
   }, []);
 
   useEffect(() => {
-    refresh();
-    const id = window.setInterval(refresh, POLL_MS);
-    window.addEventListener("focus", refresh);
+    refresh(true);
+    const id = window.setInterval(() => refresh(true), POLL_MS);
+    const onFocus = () => refresh(); // throttled — see FOCUS_THROTTLE_MS
+    window.addEventListener("focus", onFocus);
     return () => {
       window.clearInterval(id);
-      window.removeEventListener("focus", refresh);
+      window.removeEventListener("focus", onFocus);
     };
   }, [refresh]);
 
@@ -237,8 +254,12 @@ function loadCachedCodexUsage(): CodexUsage | null {
  *  Returns null until the first good reading; never blanks on a failed poll. */
 export function useCodexUsage(): CodexUsage | null {
   const [usage, setUsage] = useState<CodexUsage | null>(loadCachedCodexUsage);
+  const lastRunRef = useRef(0);
 
-  const refresh = useCallback(() => {
+  const refresh = useCallback((force = false) => {
+    const now = Date.now();
+    if (!force && now - lastRunRef.current < FOCUS_THROTTLE_MS) return;
+    lastRunRef.current = now;
     void codexUsage()
       .then((u) => {
         if (u && u.ok) {
@@ -256,12 +277,13 @@ export function useCodexUsage(): CodexUsage | null {
   }, []);
 
   useEffect(() => {
-    refresh();
-    const id = window.setInterval(refresh, POLL_MS);
-    window.addEventListener("focus", refresh);
+    refresh(true);
+    const id = window.setInterval(() => refresh(true), POLL_MS);
+    const onFocus = () => refresh(); // throttled — see FOCUS_THROTTLE_MS
+    window.addEventListener("focus", onFocus);
     return () => {
       window.clearInterval(id);
-      window.removeEventListener("focus", refresh);
+      window.removeEventListener("focus", onFocus);
     };
   }, [refresh]);
 
