@@ -910,20 +910,16 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         };
       }
 
-      // SATELLITE recovery (#4): a satellite renders exactly its own (single)
-      // tab. If that tab's order pruned down to empty — its persisted ids didn't
-      // survive (persistence lagged the pop-out spawn, or the sessions were
-      // re-minted) — the window would boot BLANK with nothing to attach, even
-      // though live terminals exist for it. Repopulate the satellite's tab from
-      // the live terminal list so it has something to show instead of an empty
-      // canvas. (The main window never needs this: its unplaced terminals are
-      // appended to the active tab above.)
-      if (SATELLITE_TAB && nextTabs.length > 0 && nextTabs[0].order.length === 0) {
-        const recovered = list.map((t) => t.id);
-        if (recovered.length > 0) {
-          nextTabs[0] = { ...nextTabs[0], order: recovered };
-        }
-      }
+      // SATELLITE blank-boot (#4): DEFERRED — needs scoped recovery, not the
+      // unscoped list. An earlier attempt repopulated an empty satellite tab from
+      // `list.map(t => t.id)`, but `list` (listTerminals) is EVERY window's
+      // sessions, so the satellite would adopt the MAIN window's terminals and a
+      // second tmux client would attach to each → interleaved/garbled output (the
+      // exact case the `appended` block above avoids for satellites). We can't
+      // scope by id once the tab's own ids pruned away (they're gone), so a correct
+      // fix needs per-terminal owning-tab metadata from the backend (or a
+      // persist-before-pop-out guarantee). Until then a satellite that pruned to
+      // empty stays empty (pre-v0.3.20 behavior) rather than dual-attaching.
 
       const active = nextTabs.find((t) => t.id === activeTabId) ?? nextTabs[0];
       const focusedId =

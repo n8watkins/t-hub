@@ -21,7 +21,7 @@
 // recent.rs) — so the project stops resurfacing AND stops costing scan time, while
 // staying reversible (nothing is deleted). Fetched on mount + window focus; an IPC
 // failure degrades to a muted empty state.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ClaudeIcon } from "./ClaudeIcon";
 import {
   recentSessions,
@@ -310,13 +310,21 @@ function ProjectRow({
   // is the visible UI half). Reset shortly after so a deliberate later resume of a
   // project that didn't end up open still works.
   const [resuming, setResuming] = useState(false);
+  // Hold the re-enable timer so it can be cleared on unmount — a successful resume
+  // usually unmounts this row (hide-already-open) within the 1.5s, and an uncleared
+  // timer would fire setResuming on an unmounted component.
+  const resumeTimer = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (resumeTimer.current != null) window.clearTimeout(resumeTimer.current);
+  }, []);
   const resume = useCallback(() => {
     if (resuming) return;
     setResuming(true);
     onRecall(s.id, s.cwd);
     // The store guard owns correctness; this just re-enables the trigger after the
     // spawn has had time to settle (onRecall is fire-and-forget / returns void).
-    window.setTimeout(() => setResuming(false), 1500);
+    if (resumeTimer.current != null) window.clearTimeout(resumeTimer.current);
+    resumeTimer.current = window.setTimeout(() => setResuming(false), 1500);
   }, [resuming, onRecall, s.id, s.cwd]);
   // Item 5: surface WHEN this project was last in session (not the last-request
   // text). `relativeTime` is compact ("3h"); render it as a clear "… ago" label,

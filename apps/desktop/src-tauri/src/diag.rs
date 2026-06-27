@@ -30,7 +30,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// the file historically grew unbounded to 100+ MiB under the ~20 always-on
 /// hang-detector callers.
 const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Bound on the channel into the background writer. The queue is BOUNDED (not the
+/// old unbounded `mpsc::channel`) so a stalled writer (full disk / locked or
+/// network-backed `%USERPROFILE%`) can't let the ~20 always-on hang-detector
+/// callers grow it without limit — the very memory-pressure pathology this app
+/// fights. On overflow `diag_log` drops the line (try_send) rather than block or
+/// grow; diagnostics degrade gracefully, the app never stalls on logging.
+const DIAG_QUEUE_CAP: usize = 8192;
 
 /// The diagnostics log path, resolved ONCE at startup.
 ///
@@ -135,14 +143,14 @@ enum Msg {
 /// the `Sender` keeps the writer alive for the app's lifetime (it's a daemon —
 /// never joined). A failed send (writer thread gone) is swallowed at the call
 /// site so diagnostics can never panic the app.
-static WRITER: OnceLock<Sender<Msg>> = OnceLock::new();
+static WRITER: OnceLock<SyncSender<Msg>> = OnceLock::new();
 
 /// Lazily spawn the background writer thread and return its sender. The writer
 /// owns ONE open file handle for the app's lifetime and serializes every append
 /// and clear, so the hot logging path does no file I/O.
-fn writer() -> &'static Sender<Msg> {
+fn writer() -> &'static SyncSender<Msg> {
     WRITER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Msg>();
+        let (tx, rx) = mpsc::sync_channel::<Msg>(DIAG_QUEUE_CAP);
         let path = diag_log_path();
         // Daemon thread: deliberately not joined. It exits when all senders
         // drop, which only happens at process teardown (the static lives for
@@ -175,11 +183,26 @@ fn writer_loop(path: PathBuf, rx: mpsc::Receiver<Msg>) {
                 if let Some(f) = file.as_mut() {
                     if f.write_all(entry.as_bytes()).is_ok() {
                         size += entry.len() as u64;
+                    } else {
+                        // Write failed (handle went bad — file unlinked/replaced, a
+                        // transient error on the network-backed path). DROP the
+                        // handle so the next Line reopens via the `is_none()` path
+                        // above; otherwise we'd re-issue write_all on a dead handle
+                        // forever and silently drop every subsequent line.
+                        file = None;
                     }
                 }
                 if size >= ROTATE_BYTES {
-                    file = rotate(&path);
-                    size = 0;
+                    let (f, rotated) = rotate(&path);
+                    file = f;
+                    // Only reset the size counter if the rename actually happened.
+                    // If it failed (e.g. a native Windows reader holds the file
+                    // without share-delete), keep `size` over-cap so the next line
+                    // retries the rotation promptly instead of growing another full
+                    // ROTATE_BYTES before trying again.
+                    if rotated {
+                        size = 0;
+                    }
                 }
             }
             Msg::Clear => {
@@ -191,7 +214,20 @@ fn writer_loop(path: PathBuf, rx: mpsc::Receiver<Msg>) {
                     Some(f) => {
                         let _ = f.set_len(0);
                     }
-                    None => file = open_log(&path),
+                    None => {
+                        // No live handle: an append-mode open would NOT empty the
+                        // file, so truncate it explicitly (diag_clear's contract is
+                        // "fresh repro starts clean"), then reopen for append.
+                        if let Some(dir) = path.parent() {
+                            let _ = fs::create_dir_all(dir);
+                        }
+                        let _ = OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .truncate(true)
+                            .open(&path);
+                        file = open_log(&path);
+                    }
                 }
                 size = 0;
             }
@@ -209,9 +245,11 @@ fn open_log(path: &Path) -> Option<File> {
 }
 
 /// Rotate the primary log to a single `.1` backup (overwriting any previous
-/// backup) and reopen a fresh, empty primary. Best-effort: on any failure we
-/// just reopen the primary for append so logging continues.
-fn rotate(path: &Path) -> Option<File> {
+/// backup) and reopen a fresh primary. Returns the reopened handle and whether
+/// the rename actually succeeded (so the caller only resets its size counter on a
+/// real rotation). Best-effort: on rename failure we still reopen the primary for
+/// append so logging continues (just without the size reset → prompt retry).
+fn rotate(path: &Path) -> (Option<File>, bool) {
     // Append ".1" to the FULL filename (e.g. `diag.log` -> `diag.log.1`) rather
     // than replacing the extension, so the primary keeps its `.log` name.
     let mut backup = path.as_os_str().to_owned();
@@ -219,9 +257,11 @@ fn rotate(path: &Path) -> Option<File> {
     let backup = PathBuf::from(backup);
     // rename() overwrites an existing destination on both unix and Windows
     // (the latter via the std MoveFileEx replace path), so the .1 backup is
-    // single and self-overwriting.
-    let _ = fs::rename(path, &backup);
-    open_log(path)
+    // single and self-overwriting. Our own append handle uses FILE_SHARE_DELETE,
+    // so holding it open does NOT block the rename; only a foreign reader without
+    // share-delete would, and that's the failure we report.
+    let rotated = fs::rename(path, &backup).is_ok();
+    (open_log(path), rotated)
 }
 
 /// Append `<ISO-8601 timestamp> <line>\n` to the diag log. NON-BLOCKING: formats
@@ -231,7 +271,9 @@ fn rotate(path: &Path) -> Option<File> {
 #[tauri::command]
 pub fn diag_log(line: String) {
     let entry = format!("{} {}\n", iso8601_now(), line);
-    let _ = writer().send(Msg::Line(entry));
+    // try_send: if the bounded queue is full (writer stalled), DROP the line
+    // rather than block the (possibly UI/main) caller or grow memory.
+    let _ = writer().try_send(Msg::Line(entry));
 }
 
 /// Truncate the diag log so a fresh repro starts clean. NON-BLOCKING: the clear
@@ -239,5 +281,5 @@ pub fn diag_log(line: String) {
 /// is swallowed.
 #[tauri::command]
 pub fn diag_clear() {
-    let _ = writer().send(Msg::Clear);
+    let _ = writer().try_send(Msg::Clear);
 }

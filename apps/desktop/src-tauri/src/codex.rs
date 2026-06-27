@@ -246,10 +246,13 @@ if dbs:
             # Start the slice at the '{' that OPENS the object enclosing rate_limits,
             # so plan_type (a SIBLING that sits BEFORE rate_limits in this DB shape)
             # rides along — matching the rollout path's body shape. Fall back to the
-            # rate_limits offset if no enclosing brace is found.
+            # rate_limits offset if no enclosing brace is found. End the window at
+            # i+2000 (NOT j+2000) so moving the start earlier never shrinks the
+            # rate_limits coverage — the object must stay fully inside the slice or
+            # extract_object returns None (ok=false).
             i = b.find('"rate_limits":'); j = b.rfind('{', 0, i)
             if j < 0: j = i
-            print(b[j:j+2000]); break
+            print(b[j:i+2000]); break
     except sqlite3.Error:
         pass
 PY"#;

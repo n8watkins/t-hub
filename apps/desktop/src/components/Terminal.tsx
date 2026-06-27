@@ -903,12 +903,25 @@ export function TerminalView({
               // scrollback before the tab is ever shown, so dropping it is safe and
               // avoids both the leak and a giant single flush on reveal. FIFO order
               // of the surviving (most-recent) chunks is preserved.
+              //
+              // Chunks are raw PTY byte slices, so a naive cut can leave the SURVIVOR
+              // starting mid-UTF-8-codepoint or mid-ANSI-escape, which xterm's
+              // streaming parser would render as garbage on reveal. So once we've
+              // dropped at all, keep dropping until the LAST dropped chunk ended on a
+              // newline (0x0a) — the survivor then begins at a clean line boundary.
+              let dropped = false;
+              let lastEndedNewline = true;
               while (
                 pending.length > 1 &&
-                pendingBytes > MAX_BACKGROUND_QUEUE_BYTES
+                (pendingBytes > MAX_BACKGROUND_QUEUE_BYTES ||
+                  (dropped && !lastEndedNewline))
               ) {
-                const dropped = pending.shift();
-                if (dropped) pendingBytes -= dropped.byteLength;
+                const chunk = pending.shift();
+                if (!chunk) break;
+                pendingBytes -= chunk.byteLength;
+                dropped = true;
+                lastEndedNewline =
+                  chunk.byteLength > 0 && chunk[chunk.byteLength - 1] === 0x0a;
               }
               if (flushRaf !== 0 || flushTimer) return;
               const delay =
