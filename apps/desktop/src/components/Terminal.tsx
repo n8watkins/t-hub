@@ -1,20 +1,24 @@
 // xterm.js terminal tile for the 0.1 terminal nucleus.
 //
-// RENDERER (mutedbug fix): we deliberately do NOT load the WebGL addon. Each
-// xterm WebGL addon opens its OWN WebGL context, and WebView2 (Chromium) caps
-// the number of simultaneously-live WebGL contexts and evicts the
-// least-recently-used ones under GPU/memory pressure. With 6+ terminals (each a
-// context) plus a relayout/repaint (e.g. clicking a tile that was repositioned
-// while unfocused), WebView2 would evict contexts across the grid. xterm's
-// WebGL addon responds to the browser's `webglcontextlost` event by calling
-// preventDefault() and waiting a HARD-CODED 3000ms before firing its
-// onContextLoss fallback -- during which every evicted canvas is blank with
-// nothing repainting it. That is the "all terminals go blank / uniform muted
-// gray, then a tab switch resets them" symptom. Using xterm's default DOM
-// renderer (no GPU context) removes the ceiling entirely, so the eviction --
-// and the blanking -- cannot happen. For 6-12 terminals the DOM renderer is
-// plenty fast, and it also sidesteps WebView2 driver-state context refusals and
-// the stale-frame-on-move class of bugs.
+// RENDERER: we load the **CANVAS addon** (GPU-accelerated 2D), with the **DOM
+// renderer as the automatic fallback**, and **deliberately avoid the WebGL
+// addon**. Rationale (the full version lives next to `term.open()` below):
+//   - The DOM renderer couldn't keep up with a busy Claude TUI's full-screen
+//     repaints (symptom D — the last thing still freezing a terminal after the
+//     rest of the app went smooth), so we moved to a GPU path.
+//   - We do NOT use WebGL: each xterm WebGL addon opens its OWN WebGL context,
+//     and WebView2 (Chromium) caps simultaneously-live WebGL contexts (~16) and
+//     HARD-EVICTS the least-recently-used under GPU/memory pressure. With 6+
+//     terminals plus a relayout/repaint, WebView2 evicted contexts across the
+//     grid; xterm's WebGL addon then preventDefault()s `webglcontextlost` and
+//     waits a HARD-CODED 3000ms before its fallback — during which every evicted
+//     canvas is blank. That is the "all terminals go blank / uniform muted gray,
+//     then a tab switch resets them" symptom (the "mutedbug" this build fixed).
+//   - The 2D CANVAS context has no such hard ceiling/evict (Chromium falls back
+//     to software for overflow instead of blanking), so it gives most of the GPU
+//     speedup without reintroducing the blank-grid failure. If the canvas addon
+//     can't load, we fall back to the DOM renderer (still correct, just slower on
+//     a busy TUI) rather than break the terminal.
 //
 // Responsibilities (PRD §9.1, FR-004/FR-005, §12.1):
 //   - Create an xterm.js Terminal with Fit + Search + Unicode11 addons.
@@ -1012,10 +1016,11 @@ export function TerminalView({
       });
     });
 
-    // Force xterm's renderer to repaint the whole viewport. The DOM renderer
-    // (like the GPU ones before it) doesn't redraw a frame when the element
-    // merely goes hidden->visible (or the window settles after a resize) at the
-    // SAME size, because nothing wrote new cells and no fit/SIGWINCH fired -- so
+    // Force xterm's renderer to repaint the whole viewport. Every renderer (the
+    // active CANVAS one, and the DOM/GPU ones before it) skips redrawing a frame
+    // when the element merely goes hidden->visible (or the window settles after a
+    // resize) at the SAME size, because nothing wrote new cells and no
+    // fit/SIGWINCH fired -- so
     // the box can show a stale/blank frame until something dirties it (e.g. a
     // click). `term.refresh(0, rows-1)` marks every line dirty and forces a
     // fresh frame. Cheap and idempotent; safe to call whenever the box reappears.
@@ -1044,8 +1049,8 @@ export function TerminalView({
     // onscreen on a tab switch. That offscreen<->onscreen move is a geometric
     // change an IntersectionObserver reports (visibility:hidden alone is not,
     // but the transform park is), so this fires exactly when a pooled terminal
-    // becomes the visible active tab again -- the moment its WebGL canvas would
-    // otherwise read blank. We repaint on the NEXT frame so it lands after the
+    // becomes the visible active tab again -- the moment its canvas would
+    // otherwise read a stale/blank frame. We repaint on the NEXT frame so it lands after the
     // pool's useLayoutEffect has settled the box. ADDITIVE: this never fits or
     // attaches, so it can't perturb the first-fit/prompt cascade timing.
     let visObserver: IntersectionObserver | null = null;
@@ -1090,7 +1095,7 @@ export function TerminalView({
     wrapEl?.addEventListener("th-pool-moved", onPoolMoved);
 
     // Repaint when ANY full-screen overlay (spawn-preset menu, file/web preview,
-    // Settings) opens or closes. WebView2 leaves the DOM-rendered terminals on a
+    // Settings) opens or closes. WebView2 leaves the terminals on a
     // stale/blank frame when a new `fixed` layer is added over them or removed,
     // and nothing moves or resizes — so the two repaint paths above never fire.
     // repaintAllTerminals() broadcasts on every overlay toggle; we redraw on the

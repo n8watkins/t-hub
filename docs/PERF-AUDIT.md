@@ -1,5 +1,17 @@
 # T-Hub — Performance / Memory Audit (freeze root-cause)
 
+> ⚠️ **HISTORICAL / SUPERSEDED for the drag-freeze root cause — see
+> [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) (the single source of truth).**
+> This doc blames **Tokio worker-thread exhaustion** and names **`git_info`** the
+> dominant offender. That diagnosis was for the *workload-dependent* freeze and its
+> Tier-1/2 fixes shipped — but the **dominant** cause of the 3-4s drag freeze + the
+> general sluggishness (symptoms A/B/C) turned out to be a `claude -p /usage`
+> **focus-storm** (CPU/WSL contention), fixed in v0.3.8 and user-verified. The
+> `git_info`/`list_terminals`/`recent` focus refreshes named below still fire but are
+> now **backend-cached** (git ~3.5s TTL, recent 15s) and were **ruled out** as the
+> drag cause. Read this for the memory-growth/eviction history; do **not** treat its
+> root-cause framing as current. Kept as-is for that history.
+
 **Status:** Findings from a 4-agent read-only audit. **Symptom:** under increased usage T-Hub (and *only* T-Hub) freezes and shows random RAM spikes, while the rest of Windows stays responsive. **Conclusion:** the freeze is **app-level** (backend Tokio worker-thread exhaustion + frontend main-thread saturation), not OS/WSL memory starvation. Grounded in `file:line`.
 
 ## Root cause — two converging mechanisms

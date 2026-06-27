@@ -32,7 +32,13 @@ The pre-existing `PERF-AUDIT.md` (broader/older history) is kept as-is.
 
 ---
 
-## 2. THE root cause (confirmed)
+## 2. The dominant confirmed root cause for A/B/C
+
+This is the **dominant, user-verified** cause of the drag freeze (A), the general
+sluggishness (B), and the app-switch stall (C). Residual focus lag (C) and the
+busy-terminal renderer jank (D) still need post-fix verification — see §6 — but the
+structural hypotheses (win_snap / frameless / redirection-bitmap, §4) are
+**conclusively ruled out** and should not be re-opened.
 
 The sidebar Usage strip read plan usage by running **`claude -p /usage`** — which
 spawns a **full Claude CLI (Node) in WSL** (`wsl.exe → bash → script → $SHELL -ilc →
@@ -69,7 +75,7 @@ looking at what the app was *doing*, not theorizing about rendering.
 | 0.3.5 | `964636d` | *Diag:* `win_snap` off by default | ruled win_snap OUT |
 | 0.3.6 | *(clone)* | *Diag:* `decorations:true` native frame | ruled frameless path OUT |
 | 0.3.7 | `49aec86` | `transparent:true` (+ opaque bg); restore win_snap; (swept in the bg-terminal throttle) | ruled redirection-bitmap OUT |
-| **0.3.8** | **`3285e54`** | **Throttle usage+codex focus refresh to 60s** | **✅ THE fix (A + B + C)** |
+| **0.3.8** | **`3285e54`** | **Throttle usage+codex focus refresh to 60s** | **✅ Fixed the dominant offender for A + B + C** (user-verified) |
 | 0.3.9 | *(building)* | **xterm CANVAS (GPU) renderer** + `@xterm/addon-canvas` | 🔬 fix D (busy-terminal stutter) |
 | — | `49aec86` (swept) | Background-terminal output throttling (fg rAF vs bg 250/1000ms/512KiB); windowMaximized rAF+in-flight guard | C/B |
 
@@ -84,8 +90,11 @@ events/IPC flood · CSS blur (none) · indicator animations (only on active sess
 memory pressure (freed ~4 GB, no change) · webview process bloat (T-Hub owns 1 env) ·
 **win_snap** (0.3.5 off, still froze) · **WebView2 redirection bitmap** (0.3.7
 `transparent`, still froze) · **frameless path** (0.3.6 native frame, still froze) ·
-GPU/software-render (native resize was smooth). All of A/B/C traced to the **usage
-storm**; D is the **DOM renderer**.
+**GPU/software-render as the cause of the A/B/C window-interaction freeze** (native
+resize was smooth → graphics wasn't starving the move loop; the usage storm was).
+All of A/B/C traced to the **usage storm**. This does **not** rule out terminal
+rendering for **D** (busy-terminal stutter), which IS the **DOM renderer** — the
+canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze.
 
 ---
 
@@ -108,18 +117,50 @@ storm**; D is the **DOM renderer**.
 ## 6. What's LEFT to tackle (prioritized)
 
 **Now / verify**
-- [ ] **Verify v0.3.9 canvas renderer**: busy terminal smooth **and NO blank/stale
-      terminals** with several tiles (the regression to watch — the old WebGL
-      blank-grid). If it blanks, revert to DOM or scope canvas to foreground tiles.
+- [ ] **Verify v0.3.9 canvas renderer.** Acceptance for the whole matrix: the busy
+      terminal is **smoother** than the DOM build AND there is **NO blank/stale-frame
+      regression** (the regression to watch — the old WebGL blank-grid). If any case
+      blanks, revert to DOM or scope canvas to foreground tiles. v0.3.10 already
+      force-repaints terminals on window-state change (canvas stale-frame fix), so
+      these cases also re-validate that path. Cases:
+  - [ ] 1 busy TUI (Claude full-screen repaint) + the rest idle.
+  - [ ] 6-12 tile grid, mixed busy/idle.
+  - [ ] Tab-switch back to a tab whose hidden terminals emitted output while parked.
+  - [ ] Open / close the spawn-preset menu.
+  - [ ] Open / close the Preview and Settings overlays.
+  - [ ] Maximize/fullscreen a tile, then restore.
+  - [ ] Resize the grid gutters.
+  - [ ] Pop out a workspace to a satellite, then return.
+  - [ ] Windows minimize, then restore.
+  - [ ] Alt-Tab away from T-Hub, then back.
 
 **High value — architectural (the directive: "nothing runs unless in a workspace")**
-- [ ] **Reap-on-leave-workspace.** Today tile-close kills the session, but
-      **workspace-close orphans it** (`WorkspacesList → closeTab` ignores returned
-      ids → leaked tmux + claude; this caused the ~4.5 GB). Fix: on leave-workspace,
-      record the binding to Recent, then kill the tmux/PTY **and reap the process
-      tree (SIGKILL — they ignore SIGTERM)**. Recall stays available via Recent →
-      `claude --resume <id>` (transcript on disk; WS-6 `db.rs`/`list_orphaned_sessions`).
-      *Subsumes much of perf-rec #1/#5.*
+- [ ] **Reap-on-leave-workspace.** ⚠️ **"Leave workspace" here means workspace
+      CLOSE / DELETE — NOT normal switching.** Switching to another workspace must
+      **preserve** every session; popping a workspace out to a satellite window must
+      **preserve** too. Only close/delete reaps. Today tile-close kills the session,
+      but **workspace-close orphans it** (`WorkspacesList → closeTab` ignores returned
+      ids → leaked tmux + claude; this caused the ~4.5 GB). Fix: on workspace
+      close/delete, **first record the binding to Recent (recall metadata)**, then kill
+      the tmux/PTY **and reap the process tree (SIGKILL — they ignore SIGTERM)**.
+      Recall stays available via Recent → `claude --resume <id>` (transcript on disk;
+      WS-6 `db.rs`/`list_orphaned_sessions`). This targets the orphan leak **without**
+      making navigation destructive. *Subsumes much of perf-rec #1/#5.*
+
+> **Session-lifecycle semantics (the product contract — keep this stable; future
+> perf work must NOT accidentally change it):**
+>
+> | Action | Sessions | Recall |
+> |---|---|---|
+> | **Tile close** | kill that one session | yes, via Recent |
+> | **Workspace close/delete** | kill all of its sessions | yes, via Recent |
+> | **Workspace switch** | **preserve** (kill nothing) | n/a (still live) |
+> | **Pop-out to satellite** | **preserve** (kill nothing) | n/a (still live) |
+> | **App / window close** | ⚠️ **OPEN DECISION** — explicitly decide preserve-vs-reap | TBD |
+>
+> The only paths that kill are tile close and workspace close/delete; both record
+> recall metadata to Recent *before* the kill. App/window close is deliberately left
+> undecided here — flag it before touching that path.
 
 **Correctness findings (all CONFIRMED by review, not yet fixed)**
 - [ ] #1 close kills instead of detaches — *reconciled by the reap directive* (kill on
@@ -147,9 +188,12 @@ storm**; D is the **DOM renderer**.
       (`Canvas.tsx:621-707`/`724-801`, `App.tsx:243-247`). *(codex `PERF-AUDIT.md` follow-up F1/F2/Fix#2)*
 
 **Perf — low (already mitigated by backend TTL caches; do only if instrumentation shows jank)**
-- [ ] Throttle the **recent / git / listTerminals** focus refreshes. Backend already
-      caches: git 3.5s (`git.rs:57`), recent 15s (`recent.rs:47`). The proposed
-      centralized `focusRefresh.ts` scheduler is **over-engineered** — skip it.
+- [ ] Throttle the **recent / git / listTerminals** focus refreshes. These *non-usage*
+      focus refreshes still fire on every focus, but are **backend-cached** (git ~3.5s
+      `git.rs:57`, recent 15s `recent.rs:47`), so they're **low priority** — revisit
+      only if post-v0.3.8 instrumentation shows a **remaining focus-return stall** (the
+      `claude -p /usage` storm, the one uncached offender, is already fixed). The
+      proposed centralized `focusRefresh.ts` scheduler is **over-engineered** — skip it.
 - [ ] Centralize git polling by cwd (frontend) — low priority (backend-cached).
 
 **Investigate / cleanup**
@@ -169,4 +213,6 @@ Local native MSVC build from an isolated Windows clone
 `pnpm install` → edit `tauri.conf.json` for test (`createUpdaterArtifacts:false`,
 `targets:["nsis"]`) → `pnpm tauri build` → install `T-Hub_<ver>_x64-setup.exe`.
 Drag/resize/render lag can't be reproduced from WSL (no display), so every version
-is hand-tested on Windows. See memory `local-windows-build.md`.
+is hand-tested on Windows. (Full recipe lives in the author's external Claude Code
+memory note `local-windows-build.md` — a local agent-memory note, **not** a file in
+this repo.)
