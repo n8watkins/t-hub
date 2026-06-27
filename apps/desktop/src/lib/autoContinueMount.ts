@@ -22,6 +22,7 @@ import { codexUsage, type CodexUsage } from "../ipc/codex";
 import type { StatusSnapshot } from "../ipc/model";
 import type { TerminalId } from "../ipc/types";
 import { tlog } from "./diag";
+import { isSatellite } from "./windows";
 
 // A window counts as EXHAUSTED (the session has actually run out, not merely "near
 // the cap") at/above this used %. Higher than supervision's RATE_LIMIT_THRESHOLD
@@ -149,6 +150,10 @@ function evaluate(): void {
 
 let installed = false;
 function installAutoContinue(): void {
+  // Satellites (popped-out tab windows) load the same bundle; the auto-continue
+  // watcher must run in exactly ONE window or every open window arms its own
+  // timer and double-injects the continue. The main window owns it.
+  if (isSatellite()) return;
   if (installed) return;
   installed = true;
   // Claude is event-driven: re-evaluate whenever a snapshot/status lands or the

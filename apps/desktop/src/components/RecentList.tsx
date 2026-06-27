@@ -304,6 +304,20 @@ function ProjectRow({
   onHide: (sessionId: string) => void;
 }) {
   const s = group.session;
+  // Busy gate (#7): a resume spawns a tmux session + `claude --resume`, which
+  // takes a moment. Disable the → as soon as it's clicked so a double-click can't
+  // fire a second recall (the store's recall also guards itself by sessionId; this
+  // is the visible UI half). Reset shortly after so a deliberate later resume of a
+  // project that didn't end up open still works.
+  const [resuming, setResuming] = useState(false);
+  const resume = useCallback(() => {
+    if (resuming) return;
+    setResuming(true);
+    onRecall(s.id, s.cwd);
+    // The store guard owns correctness; this just re-enables the trigger after the
+    // spawn has had time to settle (onRecall is fire-and-forget / returns void).
+    window.setTimeout(() => setResuming(false), 1500);
+  }, [resuming, onRecall, s.id, s.cwd]);
   // Item 5: surface WHEN this project was last in session (not the last-request
   // text). `relativeTime` is compact ("3h"); render it as a clear "… ago" label,
   // with the absolute timestamp on hover.
@@ -354,8 +368,9 @@ function ProjectRow({
       {/* RIGHT (revealed on row hover or keyboard focus): resume arrow, then hide ×. */}
       <button
         type="button"
-        onClick={() => onRecall(s.id, s.cwd)}
-        className="shrink-0 rounded-md px-2 py-1.5 text-[15px] leading-none opacity-0 transition-opacity hover:bg-neutral-700/50 focus:opacity-100 group-hover:opacity-100"
+        onClick={resume}
+        disabled={resuming}
+        className="shrink-0 rounded-md px-2 py-1.5 text-[15px] leading-none opacity-0 transition-opacity hover:bg-neutral-700/50 focus:opacity-100 group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-50"
         style={{ color: "var(--th-fg-muted)" }}
         title={`Resume: claude --resume in ${group.cwd}`}
         aria-label="Resume session"

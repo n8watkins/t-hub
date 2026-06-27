@@ -162,6 +162,16 @@ const URL_SCAN_TAIL = 256;
 const BACKGROUND_OUTPUT_FLUSH_MS = 250;
 const HIDDEN_DOCUMENT_OUTPUT_FLUSH_MS = 1000;
 const MAX_BACKGROUND_PENDING_BYTES = 512 * 1024;
+// Hard CAP on a parked terminal's pending[] queue (memory). The byte threshold
+// above only speeds up the flush; it never bounds the queue, so a hidden tab
+// emitting faster than its (throttled) flush drains it grows pending[] without
+// limit — a leak plus a huge stall on the eventual flush when the tab is shown.
+// xterm scrollback is bounded (20000 lines) anyway, so output older than the most
+// recent ~MAX_BACKGROUND_QUEUE_BYTES would be scrolled off the moment it lands; we
+// drop those stale OLDEST chunks rather than buffer them. Foreground terminals
+// flush every frame and never hit this. Kept a small multiple of the flush
+// threshold so a normal background burst is unaffected.
+const MAX_BACKGROUND_QUEUE_BYTES = 2 * 1024 * 1024;
 const TERMINAL_FOREGROUND_EVENT = "th-terminal-foreground";
 
 interface TerminalForegroundDetail {
@@ -886,6 +896,20 @@ export function TerminalView({
                 return;
               }
 
+              // CAP the parked queue (memory): if output is arriving on a hidden
+              // tab faster than the throttled flush drains it, pending[] would grow
+              // unbounded. Drop the OLDEST chunks until we're back under the cap —
+              // anything that far back would be scrolled out of xterm's bounded
+              // scrollback before the tab is ever shown, so dropping it is safe and
+              // avoids both the leak and a giant single flush on reveal. FIFO order
+              // of the surviving (most-recent) chunks is preserved.
+              while (
+                pending.length > 1 &&
+                pendingBytes > MAX_BACKGROUND_QUEUE_BYTES
+              ) {
+                const dropped = pending.shift();
+                if (dropped) pendingBytes -= dropped.byteLength;
+              }
               if (flushRaf !== 0 || flushTimer) return;
               const delay =
                 pendingBytes >= MAX_BACKGROUND_PENDING_BYTES
@@ -1100,7 +1124,16 @@ export function TerminalView({
     // and nothing moves or resizes — so the two repaint paths above never fire.
     // repaintAllTerminals() broadcasts on every overlay toggle; we redraw on the
     // next frame, after that overlay change has painted. See src/lib/repaint.ts.
-    const onRepaintAll = () => requestAnimationFrame(forceRepaint);
+    // FOREGROUND-ONLY: only the on-surface terminals can be left muted by an
+    // overlay appearing/disappearing over them, and only those are worth a frame of
+    // redraw on the toggle. Background/hidden terminals are parked offscreen, so an
+    // overlay never covers them; they self-heal via the IntersectionObserver repaint
+    // when brought back to the foreground. Skipping them keeps an overlay toggle
+    // from doing a full repaint of every pooled terminal.
+    const onRepaintAll = () => {
+      if (!foregroundRef.current) return;
+      requestAnimationFrame(forceRepaint);
+    };
     window.addEventListener(REPAINT_ALL_EVENT, onRepaintAll);
 
     // Manual per-terminal refresh (tile header ⟳ / right-click): RE-FIT to the

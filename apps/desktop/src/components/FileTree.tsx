@@ -173,6 +173,12 @@ export function FileTree({
 
   // Debounced fuzzy search. The backend indexes on demand, so search works even
   // before the background index lands — we don't gate on indexState here.
+  //
+  // searchFiles has no ordering guarantee, so a slow EARLIER query can resolve
+  // AFTER a newer one and clobber its results. A monotonic request id guards
+  // that: each run captures the id it bumped to and only applies its result if
+  // that id is still the latest — a stale run drops its result silently.
+  const searchReqId = useRef(0);
   useEffect(() => {
     if (!root || !query.trim()) {
       setHits([]);
@@ -180,17 +186,18 @@ export function FileTree({
       return;
     }
     let cancelled = false;
+    const reqId = ++searchReqId.current;
     setSearching(true);
     const handle = window.setTimeout(() => {
       searchFiles(root, query, searchLimit)
         .then((res) => {
-          if (!cancelled) setHits(res);
+          if (!cancelled && reqId === searchReqId.current) setHits(res);
         })
         .catch(() => {
-          if (!cancelled) setHits([]);
+          if (!cancelled && reqId === searchReqId.current) setHits([]);
         })
         .finally(() => {
-          if (!cancelled) setSearching(false);
+          if (!cancelled && reqId === searchReqId.current) setSearching(false);
         });
     }, 90);
     return () => {

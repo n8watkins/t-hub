@@ -22,6 +22,7 @@
 import { useEffect, useState } from "react";
 import { useWorkspace } from "../store/workspace";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { isEditableTarget } from "../components/Canvas";
 
 export function LifecycleKeybinds() {
   const deleteTerminal = useWorkspace((s) => s.deleteTerminal);
@@ -31,6 +32,12 @@ export function LifecycleKeybinds() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Don't fire a destructive lifecycle keybind while the user is typing in a
+      // real text field (a form input/textarea/select or contentEditable host) —
+      // e.g. a rename-tab or worktree-path input. isEditableTarget deliberately
+      // excludes xterm's offscreen helper textarea, so Ctrl/Cmd+Shift+W still
+      // works while a terminal is focused.
+      if (isEditableTarget(e.target)) return;
       const mod = e.ctrlKey || e.metaKey;
       if (!mod || e.altKey) return;
       // Ctrl/Cmd+Shift+W → delete the focused terminal's session (with confirm).

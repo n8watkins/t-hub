@@ -268,6 +268,12 @@ export function FilePanel({
   // No query -> show the tree, do nothing (and never index). On the first query
   // we build the index on demand (cheap, ~0.1s), then search; subsequent queries
   // reuse it. So browsing never pays the index cost — only an actual search does.
+  //
+  // searchFiles has no ordering guarantee, so a slow EARLIER query can resolve
+  // AFTER a newer one and clobber its results. A monotonic request id guards
+  // that: each run captures the id it bumped to and only applies its result if
+  // that id is still the latest — a stale run drops its result silently.
+  const searchReqId = useRef(0);
   useEffect(() => {
     const q = query.trim();
     if (!root || !q) {
@@ -275,13 +281,14 @@ export function FilePanel({
       return;
     }
     let cancelled = false;
+    const reqId = ++searchReqId.current;
     setSearching(true);
     const handle = setTimeout(async () => {
       try {
         if (indexState.status !== "ready") {
           setIndexState({ status: "indexing" });
           const summary = await indexProject(root);
-          if (cancelled) return;
+          if (cancelled || reqId !== searchReqId.current) return;
           setIndexState({
             status: "ready",
             count: summary.count,
@@ -289,14 +296,14 @@ export function FilePanel({
           });
         }
         const res = await searchFiles(root, q, searchLimit);
-        if (!cancelled) setHits(res);
+        if (!cancelled && reqId === searchReqId.current) setHits(res);
       } catch (e) {
-        if (!cancelled) {
+        if (!cancelled && reqId === searchReqId.current) {
           setHits([]);
           setIndexState({ status: "error", message: String(e) });
         }
       } finally {
-        if (!cancelled) setSearching(false);
+        if (!cancelled && reqId === searchReqId.current) setSearching(false);
       }
     }, 120);
     return () => {

@@ -189,8 +189,14 @@ export const useKeybindings = create<KeybindingsState>((set, get) => {
       const c = normalizeChord(chord);
       set((s) => {
         const direct = { ...s.direct };
-        if (c) direct[commandId] = c;
-        else delete direct[commandId];
+        if (c) {
+          // Drop this chord from any OTHER command that held it, so the old
+          // binding can't keep shadowing/firing the same key.
+          for (const [id, bound] of Object.entries(direct)) {
+            if (id !== commandId && bound === c) delete direct[id];
+          }
+          direct[commandId] = c;
+        } else delete direct[commandId];
         return { direct };
       });
       persistAll();
@@ -200,8 +206,14 @@ export const useKeybindings = create<KeybindingsState>((set, get) => {
       const k = key.trim().toLowerCase();
       set((s) => {
         const prefixed = { ...s.prefixed };
-        if (k) prefixed[commandId] = k;
-        else delete prefixed[commandId];
+        if (k) {
+          // Drop this bare key from any OTHER command that held it, so the old
+          // binding can't keep shadowing/firing the same key.
+          for (const [id, bound] of Object.entries(prefixed)) {
+            if (id !== commandId && bound === k) delete prefixed[id];
+          }
+          prefixed[commandId] = k;
+        } else delete prefixed[commandId];
         return { prefixed };
       });
       persistAll();

@@ -239,11 +239,26 @@ export default function App() {
   const resizeRef = useRef<{ startX: number; startW: number } | null>(null);
   const widthRef = useRef(sidebarWidth);
   widthRef.current = sidebarWidth;
+  // rAF-coalesced render during a sidebar drag (#10). The Sidebar subtree is
+  // heavy (it subscribes to the workspace store, agent telemetry, Recent, …), so
+  // calling setSidebarWidth on EVERY pointermove caused a re-render storm
+  // mid-drag. We update widthRef synchronously (so a release reads the latest)
+  // and coalesce the actual state commit to one update per animation frame, which
+  // keeps the resize visually live while collapsing many moves into one render.
+  // (The full imperative-flexGrow rewrite the canvas got isn't reachable here
+  // without forwarding a DOM ref into Sidebar, which is out of this cluster's
+  // scope — see concerns.)
+  const resizeRafRef = useRef<number | null>(null);
 
   const onResizeMove = useCallback((e: PointerEvent) => {
     const d = resizeRef.current;
     if (!d) return;
-    setSidebarWidth(clampSidebar(d.startW + (e.clientX - d.startX)));
+    widthRef.current = clampSidebar(d.startW + (e.clientX - d.startX));
+    if (resizeRafRef.current != null) return; // a frame is already queued
+    resizeRafRef.current = window.requestAnimationFrame(() => {
+      resizeRafRef.current = null;
+      setSidebarWidth(widthRef.current);
+    });
   }, []);
   const onResizeEnd = useCallback(() => {
     if (!resizeRef.current) return;
@@ -252,6 +267,12 @@ export default function App() {
     window.removeEventListener("pointerup", onResizeEnd);
     document.body.style.removeProperty("cursor");
     document.body.style.removeProperty("user-select");
+    // Flush any pending coalesced frame so the final width is committed once.
+    if (resizeRafRef.current != null) {
+      window.cancelAnimationFrame(resizeRafRef.current);
+      resizeRafRef.current = null;
+    }
+    setSidebarWidth(widthRef.current);
     try {
       localStorage.setItem(SIDEBAR_KEY, String(widthRef.current));
     } catch {
@@ -276,6 +297,10 @@ export default function App() {
     return () => {
       window.removeEventListener("pointermove", onResizeMove);
       window.removeEventListener("pointerup", onResizeEnd);
+      if (resizeRafRef.current != null) {
+        window.cancelAnimationFrame(resizeRafRef.current);
+        resizeRafRef.current = null;
+      }
     };
   }, [onResizeMove, onResizeEnd]);
 

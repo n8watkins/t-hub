@@ -12,9 +12,11 @@
 //   - `onResized` (Tauri) fires on maximize / restore / resize, and
 //   - the DOM `focus` event fires when a minimized window is restored / re-focused.
 // Debounced so a resize-DRAG doesn't storm repaints; the repaint runs once the
-// change settles. Imported once at startup from main.tsx (next to statusMount).
+// change settles. The settle additionally RE-FITS (refreshTerminal) so a
+// maximize/restore reflows the grid to the new pixel area instead of redrawing the
+// old cols/rows. Imported once at startup from main.tsx (next to statusMount).
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { repaintAllTerminals } from "./repaint";
+import { repaintAllTerminals, refreshTerminal } from "./repaint";
 import { runWhenIdle } from "./windowInteraction";
 
 let mounted = false;
@@ -43,10 +45,15 @@ export function mountWindowRepaint(): void {
         repaintAllTerminals();
       });
     }
-    // TRAILING edge: one more repaint once the burst settles, to lock in the final
-    // geometry after a resize-drag releases.
+    // TRAILING edge: once the burst settles, RE-FIT every terminal to the resolved
+    // pixel size (not just a bare repaint). A maximize/restore changes the available
+    // area, so the terminals must recompute cols/rows via fit.fit()+resizeTerminal —
+    // a refresh() alone redraws the OLD grid and leaves the larger area unfilled
+    // until a split is nudged. refreshTerminal() (no id) broadcasts the fit-capable
+    // path to all terminals; it already repaints, so it also locks in the final
+    // frame after a resize-drag releases.
     if (timer) clearTimeout(timer);
-    timer = setTimeout(() => repaintAllTerminals(), SETTLE_MS);
+    timer = setTimeout(() => refreshTerminal(), SETTLE_MS);
   };
 
   // Restore-from-minimize / re-focus: regains focus but fires no resize event.

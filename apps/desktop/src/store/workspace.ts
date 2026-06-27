@@ -811,6 +811,14 @@ function tabOf(tabs: WorkspaceTab[], id: TerminalId): WorkspaceTab | undefined {
 // never persists (so it can't overwrite the main window's full snapshot).
 const SATELLITE_TAB = satelliteTabId();
 
+// In-flight recall guard (#7): recall (Recent resume / Recovery Restore) spawns
+// a tmux session + claude --resume, which takes a moment. A double-click would
+// otherwise fire it twice and stack DUPLICATE spawns for the same session. We
+// track the ids whose recall is currently in flight (keyed by sessionId) and
+// ignore a second invocation until the first settles. Module-level (not store
+// state) since it's transient plumbing, never rendered or persisted.
+const recallInFlight = new Set<string>();
+
 const loaded = loadPersisted();
 const initial = SATELLITE_TAB
   ? scopeToSatellite(loaded, SATELLITE_TAB)
@@ -902,6 +910,21 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         };
       }
 
+      // SATELLITE recovery (#4): a satellite renders exactly its own (single)
+      // tab. If that tab's order pruned down to empty — its persisted ids didn't
+      // survive (persistence lagged the pop-out spawn, or the sessions were
+      // re-minted) — the window would boot BLANK with nothing to attach, even
+      // though live terminals exist for it. Repopulate the satellite's tab from
+      // the live terminal list so it has something to show instead of an empty
+      // canvas. (The main window never needs this: its unplaced terminals are
+      // appended to the active tab above.)
+      if (SATELLITE_TAB && nextTabs.length > 0 && nextTabs[0].order.length === 0) {
+        const recovered = list.map((t) => t.id);
+        if (recovered.length > 0) {
+          nextTabs[0] = { ...nextTabs[0], order: recovered };
+        }
+      }
+
       const active = nextTabs.find((t) => t.id === activeTabId) ?? nextTabs[0];
       const focusedId =
         get().focusedId && active.order.includes(get().focusedId as TerminalId)
@@ -968,6 +991,10 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       const id = sessionId.trim();
       const dir = cwd.trim();
       if (!id) return null;
+      // Drop a second recall of the same session while the first is still in
+      // flight (#7) — a double-click would otherwise stack duplicate spawns.
+      if (recallInFlight.has(id)) return null;
+      recallInFlight.add(id);
       try {
         const { spawnTerminal } = await import("../ipc/client");
         const { useSettings } = await import("./settings");
@@ -990,6 +1017,10 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       } catch (err) {
         console.error("recall failed", err);
         return null;
+      } finally {
+        // Release the in-flight guard once this spawn has settled (success or
+        // failure), so a later, deliberate resume of the same session works.
+        recallInFlight.delete(id);
       }
     },
 

@@ -31,6 +31,9 @@ export interface SpawnMenuProps {
    * behavior). Canvas owns the actual spawnTerminal() IPC call + tile insertion.
    */
   onSpawn: (startupCommand?: string) => void;
+  /** A spawn is already in flight (#7) — disable the presets so a double-click
+   *  can't stack duplicate spawns. */
+  busy?: boolean;
 }
 
 interface Preset {
@@ -54,7 +57,7 @@ const PRESETS: Preset[] = [
   },
 ];
 
-export function SpawnMenu({ onClose, onSpawn }: SpawnMenuProps) {
+export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
   // Escape closes the menu.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -68,6 +71,9 @@ export function SpawnMenu({ onClose, onSpawn }: SpawnMenuProps) {
   }, [onClose]);
 
   const pick = (command?: string) => {
+    // Busy gate (#7): a spawn is already in flight — ignore the pick so a
+    // double-click can't stack a duplicate spawn.
+    if (busy) return;
     onSpawn(command);
     onClose();
   };
@@ -115,7 +121,8 @@ export function SpawnMenu({ onClose, onSpawn }: SpawnMenuProps) {
             type="button"
             role="menuitem"
             onClick={() => pick(p.command)}
-            className="flex flex-col items-start gap-0.5 px-3 py-2 text-left transition-colors hover:bg-neutral-700/30"
+            disabled={busy}
+            className="flex flex-col items-start gap-0.5 px-3 py-2 text-left transition-colors hover:bg-neutral-700/30 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <span className="text-sm" style={{ color: "var(--th-fg)" }}>
               {p.label}

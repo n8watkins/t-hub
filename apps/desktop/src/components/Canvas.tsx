@@ -110,7 +110,7 @@ function focusSidebarTarget(): void {
  * explicitly let that one class fall through so terminal-focused hotkeys keep
  * working; the prefix/direct chords still beat xterm via the capture phase.
  */
-function isEditableTarget(t: EventTarget | null): boolean {
+export function isEditableTarget(t: EventTarget | null): boolean {
   const el = t as HTMLElement | null;
   if (!el || typeof el.tagName !== "string") return false;
   // xterm's hidden input sink is NOT an editable surface for the keymap — global
@@ -203,6 +203,12 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
 
   // Whether the "+" spawn-preset menu is open (anchored to the FAB).
   const [spawnMenuOpen, setSpawnMenuOpen] = useState(false);
+  // Busy gate (#7): a spawn (tmux + optional claude) takes a moment; without a
+  // guard a double-click on the FAB / a menu preset stacks duplicate spawns.
+  // `spawning` disables the trigger until the spawn settles; the ref makes the
+  // guard synchronous so two clicks in the same tick can't both pass.
+  const [spawning, setSpawning] = useState(false);
+  const spawningRef = useRef(false);
 
   // Opening/closing the spawn-preset menu adds/removes a full-screen `fixed`
   // overlay over the DOM-rendered terminals; WebView2 leaves them on a stale
@@ -218,6 +224,12 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   // the plain "Shell" preset = today's bare login shell (no regression).
   const spawn = useCallback(
     async (startupCommand?: string) => {
+      // Busy gate (#7): ignore a second trigger while a spawn is in flight, so a
+      // double-click can't stack duplicate tmux+claude spawns. The ref is the
+      // synchronous source of truth (state only drives the disabled styling).
+      if (spawningRef.current) return;
+      spawningRef.current = true;
+      setSpawning(true);
       try {
         const info = await spawnTerminal(
           startupCommand ? { startupCommand } : {},
@@ -232,6 +244,9 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
         addAfterFocused(info);
       } catch (err) {
         console.error("spawnTerminal failed", err);
+      } finally {
+        spawningRef.current = false;
+        setSpawning(false);
       }
     },
     [addAfterFocused],
@@ -462,6 +477,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
 
       {spawnMenuOpen && (
         <SpawnMenu
+          busy={spawning}
           onClose={() => setSpawnMenuOpen(false)}
           onSpawn={(startupCommand) => void spawn(startupCommand)}
         />
@@ -521,6 +537,33 @@ function minSideWeight(extentPx: number, pairWeight: number): number {
   }
   // Keep both sides representable: never let one side's floor exceed the pair.
   return Math.min(floor, pairWeight * 0.49);
+}
+
+/**
+ * Whether two weight layouts (rows + nested cols) differ by more than EPS in any
+ * entry — i.e. a real drag happened. Used by the pointer-up commit (#10) to skip
+ * the state write + persist when a press-and-release produced no meaningful
+ * change (so a stray click on a gutter never churns the layout snapshot).
+ */
+const SIZE_EPS = 1e-3;
+function sizesChanged(
+  a: { rows: number[]; cols: number[][] },
+  b: { rows: number[]; cols: number[][] },
+): boolean {
+  if (a.rows.length !== b.rows.length) return true;
+  for (let i = 0; i < a.rows.length; i++) {
+    if (Math.abs(a.rows[i] - b.rows[i]) > SIZE_EPS) return true;
+  }
+  if (a.cols.length !== b.cols.length) return true;
+  for (let r = 0; r < a.cols.length; r++) {
+    const ar = a.cols[r];
+    const br = b.cols[r];
+    if (ar.length !== br.length) return true;
+    for (let c = 0; c < ar.length; c++) {
+      if (Math.abs(ar[c] - br[c]) > SIZE_EPS) return true;
+    }
+  }
+  return false;
 }
 
 interface TabGridProps {
@@ -621,6 +664,40 @@ function TabGrid({
       };
   const dragRef = useRef<DragState | null>(null);
 
+  // Imperative-during-drag refs (#10). A gutter drag used to setRows/setCols on
+  // EVERY pointermove, re-rendering the whole grid mid-drag (a re-render storm).
+  // Instead we drive flexGrow directly on the live row/cell DOM nodes during the
+  // drag and COMMIT React state (+ persist) only on pointer-up. These maps hold
+  // the row containers (by row index) and the tile cells (by "r-c") so the move
+  // handler can reach them without a re-render. The weights still flow through
+  // `rowsRef`/`colsRef`, which the pointer-up commit reads.
+  const rowElsRef = useRef<Map<number, HTMLDivElement>>(new Map());
+  const cellElsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  // The weights as they were at pointer-DOWN, snapshotted by every begin*Drag so
+  // the pointer-up commit can detect a drag that produced no real change and skip
+  // the state write + persist entirely (the epsilon no-op guard, #10).
+  const dragStartRef = useRef<{ rows: number[]; cols: number[][] } | null>(null);
+
+  // Push the current `rowsRef`/`colsRef` weights onto the live DOM's flexGrow,
+  // bypassing React. Called from the drag move handlers so a drag never triggers
+  // a render; the post-drag commit re-syncs state to these same values.
+  const applyWeightsToDom = useCallback(() => {
+    const rowEls = rowElsRef.current;
+    for (let r = 0; r < rowsRef.current.length; r++) {
+      const el = rowEls.get(r);
+      if (el) el.style.flexGrow = String(rowsRef.current[r]);
+    }
+    const cellEls = cellElsRef.current;
+    for (let r = 0; r < colsRef.current.length; r++) {
+      const rowCols = colsRef.current[r];
+      for (let c = 0; c < rowCols.length; c++) {
+        const el = cellEls.get(`${r}-${c}`);
+        if (el) el.style.flexGrow = String(rowCols[c]);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const onPointerMove = useCallback((e: PointerEvent) => {
     const d = dragRef.current;
     if (!d) return;
@@ -639,7 +716,7 @@ function TabGrid({
         next[d.r] = d.rowAStart + rDelta;
         next[d.r + 1] = d.rowBStart - rDelta;
         rowsRef.current = next;
-        setRows(next);
+        applyWeightsToDom();
       }
 
       // --- Horizontal: slide the column seam to the same PIXEL position in
@@ -676,7 +753,7 @@ function TabGrid({
         if (d.bot) slide(d.r + 1, d.bot);
 
         colsRef.current = next;
-        setCols(next);
+        applyWeightsToDom();
       }
       return;
     }
@@ -700,15 +777,15 @@ function TabGrid({
       next[d.i] = a;
       next[d.i + 1] = b;
       rowsRef.current = next;
-      setRows(next);
+      applyWeightsToDom();
     } else {
       const next = colsRef.current.map((row) => row.slice());
       next[d.rowIdx][d.i] = a;
       next[d.rowIdx][d.i + 1] = b;
       colsRef.current = next;
-      setCols(next);
+      applyWeightsToDom();
     }
-  }, []);
+  }, [applyWeightsToDom]);
 
   const endDrag = useCallback(() => {
     if (!dragRef.current) return;
@@ -717,17 +794,38 @@ function TabGrid({
     window.removeEventListener("pointerup", endDrag);
     document.body.style.removeProperty("cursor");
     document.body.style.removeProperty("user-select");
-    // Persist the freshly dragged weights for this tab.
-    setTabSizes(tab.id, {
+
+    // COMMIT-ON-RELEASE (#10). The drag drove flexGrow imperatively on the DOM;
+    // now snapshot the final weights and, only if they actually moved past the
+    // epsilon (so a stray gutter click writes nothing), commit them to React
+    // state (so the next render matches the DOM) and persist them for this tab.
+    const final = {
       rows: rowsRef.current.slice(),
       cols: colsRef.current.map((row) => row.slice()),
-    });
+    };
+    const start = dragStartRef.current;
+    dragStartRef.current = null;
+    if (start && !sizesChanged(start, final)) return; // no real change → no write
+    setRows(final.rows);
+    setCols(final.cols);
+    setTabSizes(tab.id, final);
   }, [onPointerMove, setTabSizes, tab.id]);
+
+  // Snapshot the weights at pointer-down so the pointer-up commit can detect a
+  // no-op drag (#10). Reads the refs (which mirror the live weights) so it's
+  // valid for every begin*Drag variant.
+  const snapshotDragStart = () => {
+    dragStartRef.current = {
+      rows: rowsRef.current.slice(),
+      cols: colsRef.current.map((row) => row.slice()),
+    };
+  };
 
   const beginRowDrag = (i: number, e: ReactPointerEvent) => {
     const el = containerRef.current;
     if (!el) return;
     e.preventDefault();
+    snapshotDragStart();
     dragRef.current = {
       axis: "row",
       i,
@@ -748,6 +846,7 @@ function TabGrid({
     const rowEl = (e.currentTarget as HTMLElement).parentElement;
     if (!rowEl) return;
     e.preventDefault();
+    snapshotDragStart();
     dragRef.current = {
       axis: "col",
       rowIdx,
@@ -781,6 +880,7 @@ function TabGrid({
     )?.previousElementSibling as HTMLElement | null;
     e.preventDefault();
     e.stopPropagation(); // don't also start the RowGutter's single-axis drag
+    snapshotDragStart();
     const top = colsRef.current[r] ?? [];
     const bot = colsRef.current[r + 1] ?? [];
     const sum = (arr: number[]) => arr.reduce((a, b) => a + b, 0) || 1;
@@ -812,6 +912,16 @@ function TabGrid({
     };
   }, [onPointerMove, endDrag]);
 
+  // If ANYTHING re-renders TabGrid mid-drag (a focus change, a terminal state
+  // event, …), React would reconcile each tile's flexGrow back to the stale
+  // pre-drag STATE value and visually snap the grid — because we deliberately
+  // hold state still during a drag (#10). Re-assert the live drag weights onto
+  // the DOM after every commit while a drag is active, so the imperative values
+  // win and the resize stays smooth. No-op when not dragging.
+  useLayoutEffect(() => {
+    if (dragRef.current) applyWeightsToDom();
+  });
+
   // Build a flat, interleaved child list (row, gutter, row, …) with NO
   // display:contents wrappers, so every gutter's parentElement is a real flex
   // container with a measurable box (needed for the drag math).
@@ -825,6 +935,12 @@ function TabGrid({
         const rowEl = (
           <div
             key={`row-${r}`}
+            // #10: register the live row node so a drag can drive its flexGrow
+            // imperatively (no re-render); cleaned up when the node detaches.
+            ref={(el) => {
+              if (el) rowElsRef.current.set(r, el);
+              else rowElsRef.current.delete(r);
+            }}
             className="flex min-h-0"
             style={{
               flexGrow: rows[r] ?? 1,
@@ -836,6 +952,12 @@ function TabGrid({
               const cell = (
                 <div
                   key={id}
+                  // #10: register the live cell node (keyed "r-c") for the same
+                  // imperative-flexGrow drag path; cleaned up on detach.
+                  ref={(el) => {
+                    if (el) cellElsRef.current.set(`${r}-${c}`, el);
+                    else cellElsRef.current.delete(`${r}-${c}`);
+                  }}
                   className="min-h-0 min-w-0"
                   style={{ flexGrow: cols[r]?.[c] ?? 1, flexBasis: 0 }}
                 >
