@@ -81,7 +81,7 @@ looking at what the app was *doing*, not theorizing about rendering.
 | 0.3.11 | `1ca1482` | Tighter post-window-op repaint (leading-frame rAF + 50ms trailing) | snappier terminal refocus after maximize/minimize |
 | 0.3.12 | `0891d10` | Usage strip refreshes on focus only when STALE (gate on last-GOOD read) | ✅ Claude weekly/5h stop blanking/reverting (user-verified) |
 | 0.3.13 | `3807c29` | **Codex usage from the LIVE session rollout** (not the stale `logs_*.sqlite`); timestamp-selected; frontend window time-advance | ✅ Codex weekly/session correct + match `/status` (user-verified) |
-| **0.3.14** | *(pending)* | **Cold-first-drag fix "Option A": suppress focus-triggered work during a window drag** (`windowInteraction.ts` `runWhenIdle` + `isInteracting`; wrap all 6 focus handlers) **+ gate Codex polling on an open Codex tile** | first-drag-after-unfocus freeze (focus storm) — awaiting user verify |
+| **0.3.14** | `e82b49c` | **Cold-first-drag fix "Option A": suppress focus-triggered work during a window drag** (`windowInteraction.ts` `runWhenIdle` + `isInteracting`; wrap all 6 focus handlers) **+ gate Codex polling on an open Codex tile** | ✅ **user-verified: "no delay on drag"** (first-drag-after-unfocus focus storm) |
 | — | `49aec86` (swept) | Background-terminal output throttling (fg rAF vs bg 250/1000ms/512KiB); windowMaximized rAF+in-flight guard | C/B |
 
 One-time: **killed ~4 GB of orphaned `claude` processes** (they survive SIGTERM →
