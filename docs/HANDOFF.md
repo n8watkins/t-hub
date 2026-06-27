@@ -132,6 +132,42 @@ big freeze is gone):
 `t-hub-agent` statusline self-throttle (SEPARATE binary/build) · `React.memo` hot
 sidebar/tile components.
 
+---
+
+### EXECUTION MODEL — parallel agents (read before fanning out)
+
+**Intent:** run each tier as a PARALLEL agent fan-out (a `Workflow`), NOT one agent
+doing everything serially — BUT respect file-conflict boundaries or the worktrees
+collide on merge. Naive one-agent-per-item does NOT work here: `Terminal.tsx` is
+touched by 3 Tier-1 items and `Canvas.tsx` by 4. Group by FILE-DISJOINT clusters;
+give each cluster its own agent + `isolation: 'worktree'`; merge clusters back to
+`main` one at a time (run `tsc`/`cargo check` between merges).
+
+**Tier 1 — 5 file-disjoint clusters → 5 parallel agents (each its own worktree):**
+1. **terminal-render** — `repaintMount.ts`, `repaint.ts`, `Terminal.tsx`: maximize
+   re-fit + hidden-tab queue cap + foreground-aware repaint.
+2. **canvas/workspace/spawn** — `Canvas.tsx`, `workspace.ts`, `App.tsx`,
+   `SpawnMenu.tsx`, `RecentList.tsx`, `RecoveryReview.tsx`, `useLifecycleKeybinds.tsx`:
+   #6 editable guard + #4 satellite-blank + #7 spawn busy-gate + drag-commit-on-pointerup.
+   (These all share Canvas/workspace/App → MUST be one cluster, done sequentially within it.)
+3. **keybindings** — `store/keybindings.ts`: #5 chord-rebind shadow.
+4. **automation-gate** — `autoContinueMount.ts`, `rulesMount.ts` (read `windows.ts`): #3 `!isSatellite()`.
+5. **file-search** — `FilePanel.tsx`, `FileTree.tsx`: stale-result cancellation.
+   The 5 clusters share NO files with each other → safe to run fully in parallel.
+
+**Cross-tier ordering (overlap-driven, NOT free to fully parallelize):**
+- Tier 2 **Option B** edits the focus handlers (`Tile`/`RecentList`/`Canvas`/`UsageStrip`/
+  `repaintMount`) → overlaps Tier-1 clusters 1 & 2 → run AFTER Tier 1 merges.
+- Tier 2 **backend** items (emit-coalesce in `remote_pty.rs`/`lib.rs`, `diag_log` async in
+  `diag.rs`, `spawn_blocking` in `git.rs`/`files.rs`/`commands_05.rs`) touch only Rust →
+  file-disjoint from Tier 1 frontend → CAN run in parallel with Tier 1.
+- Tier 3 **reap** touches `workspace.ts`/`WorkspacesList` + backend → overlaps Tier-1
+  cluster 2's `workspace.ts` → run AFTER Tier 1 merges.
+
+So the parallel plan: **Tier 1 (5 clusters) ∥ Tier 2-backend** in one fan-out, merge,
+then **Tier 2 Option B** + **Tier 3** sequentially (they share files with Tier 1). Each
+item's exact file:line fix is in worklog §6 + the Tier list above.
+
 **Local Windows build (this session's verified flow):** see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) §7 + the Claude Code memory note `local-windows-build.md`
 (external memory, not a repo file). Summary: an isolated Windows clone at
 `C:\Users\natha\projects\Tools\t-hub\t-hub-app` (`git clone` the WSL repo → `pnpm install`
