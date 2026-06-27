@@ -18,18 +18,32 @@ import { repaintAllTerminals } from "./repaint";
 
 let mounted = false;
 
-/** How long to wait after the last window-state event before forcing a repaint —
- *  long enough that a resize-drag collapses to one repaint on release, short enough
- *  that a maximize/restore repaints near-instantly. */
-const SETTLE_MS = 80;
+/** Trailing-edge settle: a final repaint after the last window-state event, to
+ *  catch the resolved geometry once a resize-drag releases. Kept short — the
+ *  snappy refocus comes from the LEADING-edge rAF repaint below; this just cleans
+ *  up the final frame. */
+const SETTLE_MS = 50;
 
 /** Idempotent app-startup mount. */
 export function mountWindowRepaint(): void {
   if (mounted) return;
   mounted = true;
 
+  let rafId = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const schedule = (): void => {
+    // LEADING edge: repaint on the very next frame so the terminal refocuses
+    // snappily the instant a maximize/minimize/restore lands (no ~80ms wait).
+    // Coalesced to one repaint per frame, so a continuous resize-drag follows the
+    // size each frame without storming.
+    if (!rafId) {
+      rafId = requestAnimationFrame(() => {
+        rafId = 0;
+        repaintAllTerminals();
+      });
+    }
+    // TRAILING edge: one more repaint once the burst settles, to lock in the final
+    // geometry after a resize-drag releases.
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => repaintAllTerminals(), SETTLE_MS);
   };
