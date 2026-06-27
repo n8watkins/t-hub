@@ -23,7 +23,7 @@ import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
 import { useWindowMaximized } from "../lib/windowMaximized";
 import { closeSatellite, readSatelliteTab } from "../lib/windows";
-import { useAppName } from "../lib/appName";
+import { useAppName, useAppVersion } from "../lib/appName";
 import brandIcon from "../assets/brand.png";
 
 /** Minimize the window, swallowing any IPC rejection. */
@@ -375,6 +375,7 @@ function SatelliteBar() {
  *  the side-by-side dev build reads "T-Hub Dev" here, matching the tray + title. */
 function Brand() {
   const appName = useAppName();
+  const version = useAppVersion();
   return (
     <div
       data-tauri-drag-region
@@ -393,6 +394,17 @@ function Brand() {
       >
         {appName}
       </span>
+      {/* Build stamp — top-left so the running build is identifiable at a glance.
+          Dim + tabular so it reads as metadata, not chrome. */}
+      {version && (
+        <span
+          className="shrink-0 text-[10px] font-medium tabular-nums opacity-55"
+          style={{ color: "var(--th-fg)" }}
+          title={`${appName} v${version}`}
+        >
+          v{version}
+        </span>
+      )}
     </div>
   );
 }
