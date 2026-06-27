@@ -21,6 +21,13 @@ let maximized = false;
 let started = false;
 const listeners = new Set<() => void>();
 
+function afterNextPaint(fn: () => void): number {
+  if (typeof requestAnimationFrame === "function") {
+    return requestAnimationFrame(fn);
+  }
+  return window.setTimeout(fn, 16);
+}
+
 function notify(): void {
   for (const l of listeners) l();
 }
@@ -34,7 +41,15 @@ function ensureStarted(): void {
   started = true;
   try {
     const win = getCurrentWindow();
-    const refresh = () => {
+    let rafId = 0;
+    let inFlight = false;
+    let pending = false;
+    const runRefresh = () => {
+      if (inFlight) {
+        pending = true;
+        return;
+      }
+      inFlight = true;
       void win
         .isMaximized()
         .then((m) => {
@@ -43,10 +58,24 @@ function ensureStarted(): void {
             notify();
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          inFlight = false;
+          if (pending) {
+            pending = false;
+            scheduleRefresh();
+          }
+        });
     };
-    refresh(); // seed from the current state
-    void win.onResized(() => refresh()).catch(() => {});
+    const scheduleRefresh = () => {
+      if (rafId) return;
+      rafId = afterNextPaint(() => {
+        rafId = 0;
+        runRefresh();
+      });
+    };
+    runRefresh(); // seed from the current state
+    void win.onResized(() => scheduleRefresh()).catch(() => {});
   } catch {
     // Not in a Tauri window: leave `maximized` false.
   }

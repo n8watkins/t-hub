@@ -9,6 +9,13 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  /* Opaque window backing. REQUIRED for the window's `transparent: true` (set in
+   * tauri.conf.json to fix the WebView2 redirection-bitmap resize/drag lag on
+   * Windows): with a transparent window, any unpainted region shows the desktop
+   * through, so we paint the whole backing in the themed app color. `body` also
+   * sets this; covering html + #root kills any transient see-through during a
+   * fast resize before content repaints. */
+  background-color: var(--th-app-bg);
 }
 
 #root {

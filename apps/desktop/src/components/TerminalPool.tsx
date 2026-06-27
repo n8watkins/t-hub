@@ -266,6 +266,25 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
     return m;
   }, [tabs]);
 
+  // Render-time foreground set for TerminalView's output scheduler. The
+  // imperative sync() below still reads live store state for exact positioning,
+  // but this declarative signal is enough to tell a terminal whether it is on the
+  // active visible surface (rAF output) or parked/covered/backgrounded (throttled
+  // output).
+  const foregroundIds = useMemo(() => {
+    const ids = new Set<TerminalId>();
+    for (const id of poolIds) {
+      const onNonTerminal = (panelTab[id] ?? "terminal") !== "terminal";
+      if (onNonTerminal && (panelExpanded[id] ?? true)) continue;
+      if (fullscreenId != null) {
+        if (id === fullscreenId) ids.add(id);
+        continue;
+      }
+      if (tabOfId.get(id) === activeTabId) ids.add(id);
+    }
+    return ids;
+  }, [poolIds, panelTab, panelExpanded, fullscreenId, tabOfId, activeTabId]);
+
   // A deferred re-sync scheduled on the next animation frame. A sync that lands
   // mid-reflow (transient zero rect / zero container base) is always followed by
   // one that reads settled geometry, so any active-tab terminal pinned to its
@@ -751,8 +770,14 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
         >
           {/* Rendered ONCE, here, for this terminal's whole lifetime. Stable key
               + stable parent => xterm is never remounted on a tab move/reorder.
-              visible is always true (pool keeps every terminal attached). */}
-          <TerminalView terminalId={id} visible={true} />
+              visible stays true (pool keeps every terminal attached); foreground
+              controls whether output uses foreground rAF flushing or the
+              background throttled path. */}
+          <TerminalView
+            terminalId={id}
+            visible={true}
+            foreground={foregroundIds.has(id)}
+          />
         </div>
       ))}
     </div>

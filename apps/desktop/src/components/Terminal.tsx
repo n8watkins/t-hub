@@ -21,11 +21,12 @@
 //   - On mount/visible: attachTerminal(id, cols, rows), write the base64 scrollback,
 //     subscribe onOutput -> xterm.write(decodeBase64(...)).
 //   - xterm.onData -> writeTerminal(id, data); ResizeObserver/FitAddon -> resizeTerminal.
-//   - Dispose cleanly on unmount; mount only when `visible` (hidden tabs detach).
+//   - Dispose cleanly on unmount. The persistent pool keeps terminals mounted
+//     across tab switches; `foreground` only changes output flush cadence.
 //
-// Lifecycle is keyed on [terminalId, visible]. Hidden tiles fully tear down their
-// xterm instance + PTY-client subscriptions so a wall of tiles stays cheap; the
-// tmux session keeps running backend-side, and re-attaching replays scrollback.
+// Lifecycle is keyed on [terminalId, visible]. Hidden/parked terminals stay
+// attached so switching tabs does not reload, but background output is flushed on
+// a slower bounded timer instead of the foreground rAF path.
 import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -148,6 +149,20 @@ const LOCALHOST_URL_RE =
 // here is well under this; the tail just has to outspan the longest plausible
 // split point. Kept small — it runs on every output chunk.
 const URL_SCAN_TAIL = 256;
+
+// Output scheduling. Foreground terminals flush on rAF for low-latency typing.
+// Parked/inactive terminals keep their xterm buffers current, but flush less
+// often so inactive workspace tabs, covered panels, minimized windows, and
+// maximize/restore transitions do not spend a frame per terminal doing DOM work.
+const BACKGROUND_OUTPUT_FLUSH_MS = 250;
+const HIDDEN_DOCUMENT_OUTPUT_FLUSH_MS = 1000;
+const MAX_BACKGROUND_PENDING_BYTES = 512 * 1024;
+const TERMINAL_FOREGROUND_EVENT = "th-terminal-foreground";
+
+interface TerminalForegroundDetail {
+  id: TerminalId;
+  foreground: boolean;
+}
 
 // Matches a CLICKABLE FILE PATH printed in terminal output (WS-1, open-file-on-
 // Ctrl+click). Deliberately STRICT to avoid false positives — we'd rather miss a
@@ -282,16 +297,23 @@ function mergeTermPalette(
 
 export interface TerminalViewProps {
   terminalId: TerminalId;
-  /** Mount xterm only when visible; hidden tiles detach their PTY client. */
+  /** Mount xterm only when visible. The pool usually keeps this true. */
   visible: boolean;
+  /**
+   * True when this terminal is actually on the active workspace/panel surface.
+   * Background terminals stay attached, but output flushing is throttled.
+   */
+  foreground?: boolean;
 }
 
 export function TerminalView({
   terminalId,
   visible,
+  foreground = visible,
 }: TerminalViewProps): JSX.Element | null {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  const foregroundRef = useRef(foreground);
   // Guards against a second init for the same (id, visible) effect run even
   // though main.tsx omits StrictMode — belt-and-braces against double `open()`.
   const initializedRef = useRef(false);
@@ -313,6 +335,15 @@ export function TerminalView({
   // selector returns a stable ref unless THIS id's override changes, so other
   // terminals' edits don't re-render us.
   const termOverride = useTheme((s) => s.termOverrides[terminalId]);
+
+  useEffect(() => {
+    foregroundRef.current = foreground;
+    window.dispatchEvent(
+      new CustomEvent<TerminalForegroundDetail>(TERMINAL_FOREGROUND_EVENT, {
+        detail: { id: terminalId, foreground },
+      }),
+    );
+  }, [terminalId, foreground]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -343,6 +374,7 @@ export function TerminalView({
     // term so a partial frame of output isn't dropped on unmount, matching the
     // old synchronous path's completeness. Stays null if teardown beats setup.
     let drainPending: (() => void) | null = null;
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
     const term = new Terminal({
       allowProposedApi: true,
@@ -768,6 +800,7 @@ export function TerminalView({
             // every flush (and one final flush runs before teardown disposes the
             // term — see cleanup).
             const pending: Uint8Array[] = [];
+            let pendingBytes = 0;
 
             // Drain the queued bytes: URL-scan + activity-bump + write, ONCE for
             // the whole frame's worth of chunks. Shared by the rAF flush and the
@@ -780,6 +813,7 @@ export function TerminalView({
               // Snapshot + clear up front so anything that arrives DURING this
               // drain queues cleanly for the next frame (FIFO order intact).
               const chunks = pending.splice(0, pending.length);
+              pendingBytes = 0;
 
               // URL detection runs at most ONCE per flush over the frame's bytes
               // (in arrival order), not once per chunk — same stripAnsi/regex
@@ -810,6 +844,60 @@ export function TerminalView({
               if (disposed) return;
               drainQueue();
             };
+            const flushPendingTimer = (): void => {
+              flushTimer = null;
+              if (disposed) return;
+              drainQueue();
+            };
+
+            const documentHidden = (): boolean =>
+              typeof document !== "undefined" && document.visibilityState === "hidden";
+            const shouldFlushForeground = (): boolean =>
+              foregroundRef.current && !documentHidden();
+
+            const scheduleFlush = (): void => {
+              if (pending.length === 0) return;
+              if (shouldFlushForeground()) {
+                if (flushTimer) {
+                  clearTimeout(flushTimer);
+                  flushTimer = null;
+                }
+                if (flushRaf === 0) {
+                  flushRaf = requestAnimationFrame(flushPending);
+                }
+                return;
+              }
+
+              if (flushRaf !== 0 || flushTimer) return;
+              const delay =
+                pendingBytes >= MAX_BACKGROUND_PENDING_BYTES
+                  ? 0
+                  : documentHidden()
+                    ? HIDDEN_DOCUMENT_OUTPUT_FLUSH_MS
+                    : BACKGROUND_OUTPUT_FLUSH_MS;
+              flushTimer = setTimeout(flushPendingTimer, delay);
+            };
+
+            const onForegroundChanged = (
+              event: Event,
+            ): void => {
+              const detail = (event as CustomEvent<TerminalForegroundDetail>).detail;
+              if (detail?.id !== terminalId) return;
+              if (detail.foreground) scheduleFlush();
+            };
+            const onVisibilityChanged = (): void => {
+              if (documentHidden()) {
+                if (flushRaf !== 0) {
+                  cancelAnimationFrame(flushRaf);
+                  flushRaf = 0;
+                }
+                scheduleFlush();
+              } else {
+                scheduleFlush();
+              }
+            };
+            window.addEventListener(TERMINAL_FOREGROUND_EVENT, onForegroundChanged);
+            document.addEventListener("visibilitychange", onVisibilityChanged);
 
             // Expose a synchronous drain to the outer cleanup so a partial frame
             // of output queued at unmount isn't lost (the old write path was
@@ -821,14 +909,28 @@ export function TerminalView({
               // HOT PATH: decode + enqueue only. The heavy work (URL scan, store
               // bump, term.write) is deferred to the coalesced rAF flush above so
               // a flood of events doesn't block the JS thread chunk-by-chunk.
-              pending.push(decodeBase64(e.base64));
-              if (flushRaf === 0) flushRaf = requestAnimationFrame(flushPending);
+              const bytes = decodeBase64(e.base64);
+              pending.push(bytes);
+              pendingBytes += bytes.byteLength;
+              scheduleFlush();
             });
             if (disposed) {
+              window.removeEventListener(
+                TERMINAL_FOREGROUND_EVENT,
+                onForegroundChanged,
+              );
+              document.removeEventListener("visibilitychange", onVisibilityChanged);
               void offOutput();
               return;
             }
             unlisteners.push(offOutput);
+            unlisteners.push(() => {
+              window.removeEventListener(
+                TERMINAL_FOREGROUND_EVENT,
+                onForegroundChanged,
+              );
+              document.removeEventListener("visibilitychange", onVisibilityChanged);
+            });
 
             const offExit = await onExit((e) => {
               if (e.id === terminalId && !disposed) {
@@ -1028,6 +1130,10 @@ export function TerminalView({
       if (flushRaf !== 0) {
         cancelAnimationFrame(flushRaf);
         flushRaf = 0;
+      }
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
       }
       if (promptTimer) clearTimeout(promptTimer);
       if (resizeTimer) clearTimeout(resizeTimer);
