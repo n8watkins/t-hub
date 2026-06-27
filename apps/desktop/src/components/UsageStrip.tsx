@@ -15,16 +15,21 @@ import { CodexIcon } from "./CodexIcon";
  *  spamming the (heavy) underlying commands. */
 const POLL_MS = 5 * 60 * 1000;
 
-/** Minimum spacing between FOCUS-triggered usage refreshes. The window `focus`
- *  event fires many times a minute (alt-tab, click away + back, even some window
- *  ops), and EACH one used to re-run the heavy `claude -p /usage` — which spawns a
- *  full Claude CLI in WSL, retries twice on failure (~4s), and is flaky. That
- *  focus storm pinned WSL/CPU and showed up in the diag log as a constant
- *  subprocess churn (the app's "wakeup" stall, and a strong suspect for the 3-4s
- *  drag freeze via CPU/WSL contention). The 5-min interval + mount still
- *  force-refresh; a focus only refreshes if it's been at least this long since the
- *  last run, so rapid Alt-Tab can't pile up Claude spawns. */
-const FOCUS_THROTTLE_MS = 60 * 1000;
+/** Usage-strip FOCUS-refresh policy. The window `focus` event fires many times a
+ *  minute (alt-tab, click away + back), and each one used to re-run the heavy/flaky
+ *  `claude -p /usage` (full Claude CLI in WSL). That both stormed WSL/CPU AND —
+ *  because the misses correlate with call RATE (under load it prints intro-only,
+ *  ~40% `ok=false`; verified the command is reliable run individually) — LOWERED the
+ *  success rate, so the strip went stale ("weekly + 5h not updating").
+ *
+ *  Policy: on focus, refresh ONLY when the data is STALE — i.e. no GOOD (parsed)
+ *  read within `USAGE_FRESH_MS` — and never re-run more than once per
+ *  `USAGE_RETRY_GAP_MS` (so a failing streak can't storm). Mount + the 5-min
+ *  interval always force-refresh. Net: fresh data → zero requests; coming back to a
+ *  stale strip → one well-spaced request that updates it. Gating on the last GOOD
+ *  read (not the last run) is what fixes the staleness a failing run used to cause. */
+const USAGE_FRESH_MS = 60 * 1000;
+const USAGE_RETRY_GAP_MS = 15 * 1000;
 
 /** Fill color by REMAINING %: red nearly out, amber low, green healthy. */
 function fillColor(left: number): string {
@@ -176,11 +181,16 @@ function loadCachedUsage(): ClaudeUsage | null {
 export function useClaudeUsage(): ClaudeUsage | null {
   const [usage, setUsage] = useState<ClaudeUsage | null>(loadCachedUsage);
   const lastRunRef = useRef(0);
+  const lastGoodRef = useRef(0);
 
-  // `force` bypasses the focus throttle (used by mount + the 5-min interval).
+  // `force` (mount + 5-min interval) bypasses the focus policy.
   const refresh = useCallback((force = false) => {
     const now = Date.now();
-    if (!force && now - lastRunRef.current < FOCUS_THROTTLE_MS) return;
+    if (!force) {
+      const fresh = now - lastGoodRef.current < USAGE_FRESH_MS;
+      const ranRecently = now - lastRunRef.current < USAGE_RETRY_GAP_MS;
+      if (fresh || ranRecently) return; // data is fresh, or we just tried — skip
+    }
     lastRunRef.current = now;
     void claudeUsage()
       .then((u) => {
@@ -188,6 +198,7 @@ export function useClaudeUsage(): ClaudeUsage | null {
         // last-known values (the "usage keeps disappearing" fix) — we keep
         // showing the cached weekly + 5h until a fresh good reading replaces it.
         if (u && u.ok) {
+          lastGoodRef.current = Date.now(); // gate freshness off the last GOOD read
           setUsage(u);
           try {
             localStorage.setItem(CACHE_KEY, JSON.stringify(u));
@@ -204,7 +215,7 @@ export function useClaudeUsage(): ClaudeUsage | null {
   useEffect(() => {
     refresh(true);
     const id = window.setInterval(() => refresh(true), POLL_MS);
-    const onFocus = () => refresh(); // throttled — see FOCUS_THROTTLE_MS
+    const onFocus = () => refresh(); // refresh on focus only when stale — see USAGE_FRESH_MS / USAGE_RETRY_GAP_MS
     window.addEventListener("focus", onFocus);
     return () => {
       window.clearInterval(id);
@@ -255,14 +266,20 @@ function loadCachedCodexUsage(): CodexUsage | null {
 export function useCodexUsage(): CodexUsage | null {
   const [usage, setUsage] = useState<CodexUsage | null>(loadCachedCodexUsage);
   const lastRunRef = useRef(0);
+  const lastGoodRef = useRef(0);
 
   const refresh = useCallback((force = false) => {
     const now = Date.now();
-    if (!force && now - lastRunRef.current < FOCUS_THROTTLE_MS) return;
+    if (!force) {
+      const fresh = now - lastGoodRef.current < USAGE_FRESH_MS;
+      const ranRecently = now - lastRunRef.current < USAGE_RETRY_GAP_MS;
+      if (fresh || ranRecently) return;
+    }
     lastRunRef.current = now;
     void codexUsage()
       .then((u) => {
         if (u && u.ok) {
+          lastGoodRef.current = Date.now();
           setUsage(u);
           try {
             localStorage.setItem(CODEX_CACHE_KEY, JSON.stringify(u));
@@ -279,7 +296,7 @@ export function useCodexUsage(): CodexUsage | null {
   useEffect(() => {
     refresh(true);
     const id = window.setInterval(() => refresh(true), POLL_MS);
-    const onFocus = () => refresh(); // throttled — see FOCUS_THROTTLE_MS
+    const onFocus = () => refresh(); // refresh on focus only when stale — see USAGE_FRESH_MS / USAGE_RETRY_GAP_MS
     window.addEventListener("focus", onFocus);
     return () => {
       window.clearInterval(id);
