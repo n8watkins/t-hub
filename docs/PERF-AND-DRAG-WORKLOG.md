@@ -222,11 +222,22 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
       proposed centralized `focusRefresh.ts` scheduler is **over-engineered** — skip it.
 - [ ] Centralize git polling by cwd (frontend) — low priority (backend-cached).
 
-**Investigate / cleanup**
-- [ ] **Why `claude -p /usage` fails ~65%** — it's `/usage` flakiness (network
-      round-trip; prints intro-only), not a shell bug; the 2-attempt retry exists for
-      it. Options: fewer attempts, or longer cadence — each lowers cost. Fixing the
-      flakiness would also make usage actually populate.
+**Usage strip freshness (regression from the 0.3.8 throttle — user-reported "weekly + 5h not updating")**
+- [ ] **Claude usage (weekly + session) lags a few minutes.** `claude -p /usage` is
+      ~60% per-attempt success (INHERENT — it prints intro-only until a network
+      round-trip lands; the 2-attempt retry IS the mitigation, NOT removable; you
+      can't make it one-shot). The 0.3.8 focus throttle gates on the last *run*
+      (success OR fail), so during a failing streak the strip stays on the last-good
+      value for minutes. **FIX:** throttle on the last *GOOD* read instead — refresh
+      on focus only if >60s since a **successful** read (`UsageStrip.tsx`
+      `useClaudeUsage`: track `lastGoodRef`, not `lastRunRef`). Keeps perf, restores
+      freshness. The clean cost lever otherwise is **dropping/lengthening the focus +
+      5-min cadence** (Option 2) — "fix the flakiness" is NOT a real fix.
+- [ ] **Codex 5-hour + weekly may be stale/mis-parsed.** `codex_usage(wsl)` returns
+      `ok=true` reliably (reads the newest codex session rollout, `codex.rs`), but the
+      diag doesn't log the parsed windows. Verify it reads the **newest** rollout and
+      parses BOTH the ~5h (primary) and weekly (secondary) windows correctly — the
+      "5-hour not updating" report points here, not at the throttle.
 - [ ] Decide whether `transparent:true` stays (it's the documented resize-redirection
       fix and is harmless) — currently kept.
 

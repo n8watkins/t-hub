@@ -1,6 +1,6 @@
 # T-Hub — Session Handoff
 
-**Last updated:** 2026-06-25 · **Branch:** `main` · **App version:** `0.2.0` (shipped)
+**Last updated:** 2026-06-27 · **Branch:** `main` · **App version:** `0.3.11` (local builds; perf/drag overhaul — not pushed, not released)
 
 > **Zero-context handoff.** Read this file in full, plus any doc it links that's
 > relevant to your task. Every decision below is already made — **do not re-ask
@@ -21,6 +21,46 @@
 ---
 
 ## 2. State
+
+### Latest session (2026-06-27): PERFORMANCE & DRAG-LAG OVERHAUL — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md)
+
+**[`docs/PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) is the single source of
+truth** for everything below (fixes shipped, hypotheses ruled out, full prioritized
+backlog). Read it in full before doing any perf/drag work — do NOT re-chase the
+ruled-out causes (win_snap, transparent/redirection-bitmap, frameless, memory, event
+flood). Versions 0.3.2→0.3.11 are **local Windows builds only — NOT committed-to-a-tag,
+NOT pushed, NOT released** (commits are on local `main`).
+
+**The headline result (user-verified):** the severe drag freeze / "used to be faster"
+sluggishness was a **`claude -p /usage` focus-storm** — the sidebar Usage strip ran
+the heavy, flaky `claude -p /usage` (full Claude CLI in WSL, ~65% fail → ~4s retry) on
+**every window focus**, pegging WSL/CPU; a drag's OS modal move-loop got starved →
+3-4s freeze. Throttling it to 60s (`3285e54`, v0.3.8) **fixed it.** Found by reading
+the diag log after every *visual* hypothesis was ruled out.
+
+Also this session: xterm **DOM → GPU canvas renderer** (`93deab7`) + a force-repaint
+on window-state change (`a0ba809`/`1ca1482`) for busy-terminal stutter; killed ~4 GB
+of orphaned `claude` processes; deleted the dead `codex/client-review` worktree;
+consolidated 5 scattered perf docs into the one worklog.
+
+**Top of the backlog (worklog §6, in order):**
+1. **A1 — drag-while-a-focused-session-works lag.** Root-caused (subagent, evidence):
+   terminal-output `app.emit(terminal://output)` marshals onto the Windows main thread
+   (`remote_pty.rs:329`); a sent-prompt output burst (~125 emits/sec/streaming-terminal)
+   starves the OS modal drag loop. **Fix (Tauri app, normal rebuild):** an
+   `AtomicBool window_interacting` set from window move/resize events; while true, widen
+   the output coalesce window (8ms→~100ms) + `MAX_BATCH_BYTES` in `remote_pty.rs`
+   `emit_batch`/`reader_loop`. Optionally coalesce `control://event` the same way.
+2. **Reap-on-leave-workspace** (the user's directive — fixes the orphan leak). "Leave" =
+   workspace CLOSE/DELETE only, NOT switch/pop-out. See worklog §6 + the lifecycle table.
+3. **Cheap correctness gates:** per-window automation `!isSatellite()` (#3); Recent-resume/
+   spawn-menu busy gate (#7). Then the rest (worklog §6 D).
+
+**Local Windows build (this session's verified flow):** see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) §7 + the Claude Code memory note `local-windows-build.md`
+(external memory, not a repo file). Summary: an isolated Windows clone at
+`C:\Users\natha\projects\Tools\t-hub\t-hub-app` (`git clone` the WSL repo → `pnpm install`
+→ set `createUpdaterArtifacts:false` + `targets:["nsis"]` → `pnpm tauri build`); the lag
+can't be reproduced from WSL (no display), so every build is hand-tested on Windows.
 
 ### Baseline: v0.2.0 SHIPPED
 `v0.2.0` is tagged (`9ee6b75`) and the GitHub Release is published — signed `T-Hub_0.2.0_x64-setup.exe` + `latest.json`, so **auto-update is LIVE**. That release shipped the herdr-parity wave (worktree workflow, rebindable keymap, rules engine, OS toasts, session-restore, a perf overhaul) plus post-release cheap-wins (dedup refactor, light tray recovery, vitest). Details in [`ROADMAP-PLAN.md`](./ROADMAP-PLAN.md).
