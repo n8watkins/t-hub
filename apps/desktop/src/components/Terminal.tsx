@@ -33,6 +33,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { CanvasAddon } from "@xterm/addon-canvas";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -510,11 +511,24 @@ export function TerminalView({
       },
     });
 
-    // No WebGL addon: xterm uses its default DOM renderer. See the file header
-    // (mutedbug fix) for why -- a per-terminal WebGL context hits WebView2's
-    // context ceiling and blanks the whole grid on eviction. The DOM renderer
-    // has no GPU context, so that failure mode does not exist.
     term.open(container);
+
+    // RENDERER: the CANVAS addon (GPU-accelerated 2D), NOT WebGL. The DOM renderer
+    // can't keep up with a busy Claude TUI's full-screen repaints — that was the
+    // last thing freezing the terminal even after the rest of the app went smooth.
+    // We deliberately do NOT use the WebGL addon: each WebGL terminal opens its own
+    // WebGL context, WebView2 caps those (~16) and HARD-EVICTS the least-recent one
+    // under pressure → the whole grid blanks (the "mutedbug" this build originally
+    // fixed by dropping WebGL). A 2D canvas context has no such hard ceiling/evict
+    // (Chromium falls back to software for overflow instead of blanking), so canvas
+    // gives most of the GPU speedup without reintroducing the blank-grid failure.
+    // Loaded AFTER open(); a failure falls back to the DOM renderer rather than
+    // breaking the terminal.
+    try {
+      term.loadAddon(new CanvasAddon());
+    } catch {
+      // Canvas unavailable in this webview — fall back to the DOM renderer.
+    }
 
     // COPY-ON-SELECT (WS-1): mirror Claude Code / iTerm — selecting text in the
     // terminal auto-copies it to the clipboard, no Ctrl+C needed. onSelectionChange
