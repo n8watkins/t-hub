@@ -9,6 +9,10 @@ import "./lib/notifyMount";
 // populates app-wide (not just while the Sidebar is mounted). Idempotent.
 // See src/lib/statusMount.ts.
 import "./lib/statusMount";
+// Side-effect import: forces a terminal repaint after window-state changes
+// (maximize/minimize/restore/resize) so the canvas renderer never shows a stale
+// frame you'd otherwise have to scroll to refresh. See src/lib/repaintMount.ts.
+import "./lib/repaintMount";
 // Side-effect import: schedules a one-shot on-launch update check (and, if the
 // user opted in, a silent install + relaunch). Idempotent + best-effort — see
 // src/lib/updateMount.ts.
