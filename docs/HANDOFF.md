@@ -1,6 +1,6 @@
 # T-Hub — Session Handoff
 
-**Last updated:** 2026-06-27 · **Branch:** `main` · **App version:** `0.3.19` (local Windows builds; all session commits **pushed to `origin/main`**, tip `0e13eb0` — no `v*` tag / GitHub Release past v0.2.0)
+**Last updated:** 2026-06-27 · **Branch:** `main` · **App version:** `0.3.21` (local Windows builds). **⚠️ Tip `20853b7` is NOT yet pushed — `main` is 2 ahead of `origin/main` (v0.3.20 `19b8aa2` + v0.3.21 `20853b7`); the user pushes on request.** No `v*` tag / GitHub Release past v0.2.0.
 
 > **Zero-context handoff.** Read this file in full, plus any doc it links that's
 > relevant to your task. Every decision below is already made — **do not re-ask
@@ -22,7 +22,7 @@
 
 ## 2. State
 
-### Latest session (2026-06-27): PERFORMANCE & FREEZE OVERHAUL (v0.3.12→v0.3.19) — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md)
+### Latest session (2026-06-27): PERFORMANCE & FREEZE OVERHAUL (v0.3.12→v0.3.21) — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md)
 
 **[`docs/PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) is the single source of
 truth** for everything below (fixes shipped, hypotheses ruled out, full prioritized
@@ -62,40 +62,28 @@ host-side, not renderer-side (emit-flood was *ruled out* — blocks had only ~20
   off-thread via a channel). Lower the threshold (Tier 2) to chase the residual stutter.
 
 **EXECUTION PLAN — next context (tiered; full per-item detail + file:line in worklog §6).**
-✅ The recent-work + doc-staleness REVIEWS are **DONE** (v0.3.19, commit `a25a249`) and a
-handoff-readiness review followed — all confirmed findings are already folded in (the
-Tier-2 "Review-surfaced" block below + the v0.3.19 fixes). **Tier 1 is cleared to execute —
-no gate.**
+✅ The recent-work + doc-staleness REVIEWS are **DONE** (v0.3.19, commit `a25a249`).
 
-**Tier 1 — parallel WORKTREE batch** (10 items, all FRONTEND, low-risk, zero conflict with
-the backend hang/emit work; all triaged "ideal for a worktree"). **Run as 5 file-disjoint
-clusters in PARALLEL — see the "EXECUTION MODEL" section below for the cluster→item map**
-(naive one-agent-per-item conflicts: `Terminal.tsx` is shared by 3 items, `Canvas.tsx` by
-4). The 10 items (ordinal here ≠ the `#N` worklog numbers; per-item file:line in worklog §6):
-  1. **maximize doesn't re-FIT terminals** (user-reported) — `repaintMount.ts onResized`
-     broadcasts `refresh()` not `fit()`; call `refreshTerminal()` (which fits) on the settle.
-  2. **#6** delete-confirm fires while typing — add editable-target guard in
-     `lib/useLifecycleKeybinds.tsx` (a hook-named module under `lib/`, NOT `hooks/`;
-     export+reuse `isEditableTarget` from `Canvas.tsx:113`).
-  3. **#5** chord rebind leaves a stale shadow binding — in `store/keybindings.ts setBinding`/
-     `setPrefixedBinding`, delete the chord from any other command first.
-  4. **#3** per-window automation duplicates — `if (isSatellite()) return;` in
-     `autoContinueMount.ts`/`rulesMount.ts` installers (dup spawns/continues in satellites).
-  5. **#4** satellite boots a BLANK window — `workspace.ts setTerminals` satellite branch
-     never repopulates an empty order; recover from the live terminal list.
-  6. **#7** double-click stacks duplicate spawns — per-action pending guard (Set in
-     `workspace.ts` recall + local `spawning` in `Canvas.tsx`/`SpawnMenu.tsx`/`RecentList.tsx`).
-  7. **hidden-tab output queue UNBOUNDED** (memory) — cap/collapse stale `pending[]` for a
-     parked terminal in `Terminal.tsx` (~line 164/889).
-  8. **foreground-aware repaint** — `Terminal.tsx:1103` `onRepaintAll` should early-return
-     when `!foregroundRef.current` (don't refresh bg terminals on an overlay toggle).
-  9. **file-search stale-result cancellation** — request-id guard in `FilePanel.tsx` +
-     `FileTree.tsx` search effects (`searchFiles` has no ordering guarantee).
-  10. *(small, med-risk)* **drag commits React state only on pointerup** — `Canvas.tsx`
-      onPointerMove drives flexGrow/CSS imperatively, commit `setRows/Cols` on release.
+✅ **Tier 1 — SHIPPED (v0.3.20, `19b8aa2`).** All 10 frontend small-wins landed via a
+5-cluster parallel agent fan-out; tsc + 53 vitest green. **⏳ Windows smoke-test pending
+(SMOKE-TEST.md A–D) — that is the gate before trusting it.** The 10 items shipped (worklog
+§6 has the details): maximize re-fit (`repaintMount.ts` settle now calls `refreshTerminal`),
+editable-target guard on lifecycle keybinds, chord-rebind shadow removal
+(`store/keybindings.ts`), `!isSatellite()` automation gate (`autoContinueMount`/`rulesMount`),
+satellite blank-boot recovery (`workspace.ts setTerminals`), double-click spawn busy-gate
+(store `recallInFlight` Set + UI gates), hidden-tab `pending[]` cap (2 MiB, drop oldest),
+foreground-aware `onRepaintAll`, file-search request-id cancellation
+(`FilePanel`/`FileTree`), and drag commit-on-release (`Canvas.tsx` imperative flexGrow).
 
-**Tier 2 — perf polish on `main`** (the residual stutters the user still feels, now that the
-big freeze is gone):
+✅ **Tier 2 backend bucket — SHIPPED (v0.3.21, `20853b7`).** The LOW/confirmed
+review-surfaced backend items, via a 3-cluster Rust fan-out; cargo check + 205 lib tests
+green. ⏳ Windows smoke-test pending. Landed: `spawn_blocking` the blocking async cmds
+(tmux_scroll/exit_scroll HOT, list_dir/read_text_file UNC, git_commit/git_worktree_*);
+`diag_log`/`diag_clear` now NON-BLOCKING (mpsc → daemon writer, one fd) + ROTATING (`.1`
+backup at 8 MiB); codex Windows DB-fallback keeps `plan_type`.
+
+**Tier 2 — STILL TO DO (perf polish on `main`** — the residual stutters the user still feels,
+now that the big freeze is gone):
   - **Option B** — de-storm the focus handlers so **alt-tab in/out** stops hitching (focus
     work has no drag to defer against): run on idle-callback + coalesce the N `gitInfo`/IPC
     into one + drop RecentList's `JSON.stringify` diff. (Option A already deferred them
@@ -107,18 +95,15 @@ big freeze is gone):
     threshold to ~200ms, reproduce, read what it names, fix that.
   - Drop the consumer-less `agent://journal` emit.
   - **Review-surfaced (recent-work review, all LOW/confirmed):**
-    - `spawn_blocking` the async commands that block in-body (worker-pool starvation,
-      not a main freeze): **`tmux_scroll`/`tmux_exit_scroll`** (fire on scroll —
-      highest value), **`list_dir`/`read_text_file`** (UNC reads), then `git_commit`/
-      `git_worktree_*` for consistency. Mirror `git_info`'s `spawn_blocking` pattern.
-    - **`diag_log`/`diag_clear` are sync `#[tauri::command]`s** (file I/O on the main
-      thread when invoked from JS) + the diag.log **reopens per line and never
-      rotates** (unbounded growth; ~20 always-on callers). Make `diag_log` async +
-      a buffered/rotated background writer (one fd, size cap). *(Doing this also lets
-      the still-armed hang detectors log fully off-thread.)*
-    - Codex **Windows DB-fallback drops `plan_type`** (python slices from the
-      `rate_limits` offset; `plan_type` sits before it) — rollout path is fine.
-    - Polish: `advanceCodexUsage` reallocates every 60s tick even when nothing rolled
+    - ✅ **DONE (v0.3.21):** `spawn_blocking` the blocking async commands
+      (`tmux_scroll`/`tmux_exit_scroll`, `list_dir`/`read_text_file`, `git_commit`/
+      `git_worktree_*`) — mirrors `git_info`.
+    - ✅ **DONE (v0.3.21):** `diag_log`/`diag_clear` now NON-BLOCKING (mpsc → lazily
+      spawned daemon writer, one fd) + ROTATING (`.1` backup at 8 MiB). Public
+      signatures unchanged, so the always-on hang detectors now log fully off-thread.
+    - ✅ **DONE (v0.3.21):** Codex Windows DB-fallback now keeps `plan_type` (slice
+      starts at the `{` enclosing `rate_limits`). Rollout path unchanged.
+    - Polish (STILL TO DO): `advanceCodexUsage` reallocates every 60s tick even when nothing rolled
       over; in-flight cold-start `/usage` promise isn't cancelled when the statusline
       arrives; `useHasCodexSession` recomputes O(N) with an extra `getState()` per
       terminal; `runWhenIdle`'s deferred `onSettle` can fire a refresh on an unmounted
@@ -140,6 +125,21 @@ sidebar/tile components.
 ---
 
 ### EXECUTION MODEL — parallel agents (read before fanning out)
+
+> ✅ **Tier 1 (5 frontend clusters) + Tier-2-backend (3 Rust clusters) already executed
+> this way** (v0.3.20 / v0.3.21). The cluster→item map below is now HISTORICAL reference
+> for those; it's still the template for the remaining fan-outs. **What's now unblocked
+> (both shared files with Tier 1, so they were gated until it merged — it has):** Tier 2
+> **Option B** (focus de-storm) and Tier 3 **reap**. Run them sequentially (they touch
+> `Canvas`/`RecentList`/`repaintMount`/`UsageStrip` and `workspace.ts`). The worktree
+> isolation in the note below is NOT available in this env (the `WorktreeCreate` hook
+> returns no path) — run file-disjoint clusters in the SHARED tree instead and verify
+> centrally with `tsc`/`cargo` (that's how v0.3.20/21 were done).
+>
+> **⚠️ Lockfile gotcha (cost me a failed build):** do NOT hand-`sed` `Cargo.lock` to bump
+> the `t-hub` version — a range `sed` clobbered 205 dep version lines and produced a
+> "package specified twice" build failure that `tsc`/Linux never caught. Bump `Cargo.toml`
+> then run `cargo check` to regenerate the lock correctly.
 
 **Intent:** run each tier as a PARALLEL agent fan-out (a `Workflow`), NOT one agent
 doing everything serially — BUT respect file-conflict boundaries or the worktrees

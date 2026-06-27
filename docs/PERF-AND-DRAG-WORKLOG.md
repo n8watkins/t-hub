@@ -21,9 +21,21 @@ The pre-existing `PERF-AUDIT.md` (broader/older history) is kept as-is.
   Claude is **statusline-first** (v0.3.18, user-verified) — `/usage` only a cold-start fallback.
 - ✅ Cold first-drag freeze fixed (Option A, v0.3.14, user-verified); GPU canvas renderer
   (v0.3.9, shipped — acceptance matrix in §6 still to run).
-- 📋 **Still to tackle (see §6 + [`HANDOFF.md`](./HANDOFF.md) Tier 1–4):** the Tier-1
-  small-wins batch, Option B (alt-tab de-storm) + the residual "staggered" sub-500ms
-  stutter, reap-on-leave-workspace, correctness findings, medium/low perf items.
+- ✅ **Tier-1 frontend small-wins batch SHIPPED (v0.3.20, `19b8aa2`)** — all 10 items
+  (maximize re-fit, hidden-tab queue cap, foreground-aware repaint, editable-keybind
+  guard, satellite blank-boot recovery, double-click spawn gate, drag commit-on-release,
+  chord-rebind shadow, `!isSatellite()` automation gate, file-search cancellation).
+  tsc + 53 vitest green. ⏳ Windows smoke-test pending (SMOKE-TEST.md A–D).
+- ✅ **Tier-2 backend bucket SHIPPED (v0.3.21, `20853b7`)** — `spawn_blocking` the
+  blocking async cmds (tmux_scroll/exit_scroll hot, list_dir/read_text_file, git_*);
+  non-blocking + rotating `diag_log`; codex Windows DB-fallback `plan_type`. cargo
+  check + 205 lib tests green. ⏳ Windows smoke-test pending.
+- 📋 **Still to tackle (see §6 + [`HANDOFF.md`](./HANDOFF.md) Tier 2–4):** Option B
+  (alt-tab focus de-storm) + A1 emit-coalesce-during-interaction + the residual
+  "staggered" sub-500ms stutter (drop hangwatch `STALL_MS`, needs user repro) +
+  drop `agent://journal` emit; the benign frontend polish (advanceCodexUsage realloc,
+  in-flight `/usage` cancel, `useHasCodexSession` O(N), `runWhenIdle` onSettle unmount);
+  reap-on-leave-workspace (Tier 3); Tier-4 verify/housekeeping.
 
 ---
 
@@ -93,6 +105,8 @@ looking at what the app was *doing*, not theorizing about rendering.
 | **0.3.17** | `a38486a` | **🎯 THE FREEZE CURE: `control_request` async + `spawn_blocking`** (was a SYNC command → ran the blocking socket round-trip on the MAIN thread; recent/git/usage/codex/files all route through it). Also `USAGE_RETRY_GAP_MS` 15s→60s. | ✅ **CONFIRMED: zero `rust-main` blocks across 326 lines of active use** (was 2–4s every ~min). The original "always-present super-laggy/ghosting" freeze. |
 | **0.3.18** | `2f661a5` | **Claude usage = statusline-first** (live `rate_limits` from the per-turn statusline, account-wide, FREE/non-blocking; `claude -p /usage` only the cold-start fallback, hourly) | ✅ **user-verified:** strip matches `/usage` (74-75% wk / 27% session used) and `/usage` dropped from every-few-min to once-on-load |
 | **0.3.19** | `a25a249` | Review pass: Rust watchdog logs off-thread (was ironic main-thread `diag_log`); statusline usage backfills each window independently (partial snapshot can't blank the other); stale-doc sweep | hardening + doc accuracy |
+| **0.3.20** | `19b8aa2` | **Tier-1 frontend small-wins batch** (5 file-disjoint clusters, parallel agent fan-out): maximize re-fit (`refreshTerminal` on settle), hidden-tab `pending[]` cap (2 MiB, drop oldest), foreground-aware `onRepaintAll`, editable-target guard on lifecycle keybinds, satellite blank-boot recovery, double-click spawn busy-gate (store `recallInFlight` Set + UI gates), grid drag commit-on-release (imperative flexGrow), chord-rebind shadow removal, `!isSatellite()` automation gate, file-search request-id cancellation | tsc + 53 vitest green; ⏳ Windows smoke-test pending (SMOKE-TEST.md) |
+| **0.3.21** | `f78954d` | **Tier-2 backend bucket** (3 file-disjoint Rust agents): `spawn_blocking` the blocking async cmds (tmux_scroll/exit_scroll HOT, list_dir/read_text_file UNC, git_commit/git_worktree_*) — mirrors `git_info`; `diag_log`/`diag_clear` now NON-BLOCKING (mpsc → lazily-spawned daemon writer, one fd) + ROTATING (`.1` backup at 8 MiB, was unbounded→100+MB); codex Windows DB-fallback keeps `plan_type` (slice from enclosing `{`) | cargo check + 205 lib tests green; ⏳ Windows smoke-test pending |
 | — | `49aec86` (swept) | Background-terminal output throttling (fg rAF vs bg 250/1000ms/512KiB); windowMaximized rAF+in-flight guard | C/B |
 
 One-time: **killed ~4 GB of orphaned `claude` processes** (they survive SIGTERM →
@@ -309,23 +323,30 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
 > recall metadata to Recent *before* the kill. App/window close is deliberately left
 > undecided here — flag it before touching that path.
 
-**Correctness findings (all CONFIRMED by review, not yet fixed)**
+**Correctness findings (all CONFIRMED by review)**
 - [ ] #1 close kills instead of detaches — *reconciled by the reap directive* (kill on
-      leave + recall via Recent is the intended model).
-- [ ] #2 workspace-close orphans sessions (the leak — same fix as reap above).
-- [ ] #3 per-window automation duplicates — `autoContinueMount`/`rulesMount` run in
-      EVERY window incl. satellites → double spawns/continues. Gate on `!isSatellite()`.
-- [ ] #4 satellite fallback can boot a blank popped-out window.
-- [ ] #5 rebinding a chord doesn't remove it from other commands → old binding shadows.
-- [ ] #6 Ctrl/Cmd+Shift+W delete-confirm fires while typing in an input (no editable guard).
-- [ ] #7 **Recent-resume + spawn-menu have NO busy/pending gate** → a double-click stacks
-      duplicate tmux+claude spawns (`RecentList.tsx:352-355`, `Canvas.tsx:216-230`,
-      `workspace.ts:967-989`). On-theme with "stop unneeded spawns" — disable the control
-      until the spawn settles. *(from the codex `PERF-AUDIT.md` follow-up F6/Fix#6)*
+      leave + recall via Recent is the intended model). *(Tier 3 — still to do.)*
+- [ ] #2 workspace-close orphans sessions (the leak — same fix as reap above). *(Tier 3.)*
+- [x] #3 per-window automation duplicates — **FIXED v0.3.20:** `!isSatellite()` gate at the
+      top of `installAutoContinue`/`installRulesEngine`.
+- [x] #4 satellite fallback can boot a blank popped-out window — **FIXED v0.3.20:**
+      `workspace.ts setTerminals` satellite branch repopulates an empty order from the live list.
+- [x] #5 rebinding a chord doesn't remove it from other commands — **FIXED v0.3.20:**
+      `setBinding`/`setPrefixedBinding` clear the chord from any other command first.
+- [x] #6 Ctrl/Cmd+Shift+W delete-confirm fires while typing — **FIXED v0.3.20:**
+      `isEditableTarget` guard (exported from `Canvas.tsx`) in `useLifecycleKeybinds.tsx`.
+- [x] #7 Recent-resume + spawn-menu busy/pending gate — **FIXED v0.3.20:** store
+      `recallInFlight` Set (by sessionId) + synchronous `spawningRef` in `Canvas` + `busy`
+      prop on `SpawnMenu` + `resuming` gate on the `RecentList` resume button.
 
-**Rendering correctness — TO TACKLE LATER (user-reported)**
-- [ ] **Maximize doesn't re-FIT terminals — stale/wrong-sized frame until you nudge a
-      split.** On window MAXIMIZE the terminals don't reflow to the larger area; the
+**Rendering correctness**
+- [x] **Maximize doesn't re-FIT terminals — FIXED v0.3.20.** `repaintMount.ts`'s trailing
+      settle now calls `refreshTerminal()` (which broadcasts the fit-capable path:
+      `fit.fit()` + `resizeTerminal` → reflows cols/rows to the new area) instead of a bare
+      `repaintAllTerminals()`; the leading-edge per-frame path stays a cheap repaint so a
+      resize-drag doesn't fit every frame. Original analysis kept below.
+- [ ] ~~Maximize doesn't re-FIT terminals — stale/wrong-sized frame until you nudge a
+      split.~~ On window MAXIMIZE the terminals don't reflow to the larger area; the
       user has to slightly drag the split between two terminals to force it. The
       maximize repaint path does an xterm `refresh()` (redraw existing grid) but the
       terminals need a `fitAddon.fit()` (recompute rows/cols for the new size) — only
@@ -340,14 +361,17 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
 
 **Perf — medium (from the optimization review)**
 - [ ] Debounce durable **workspace persistence** (tiers: immediate for lifecycle,
-      debounce for focus/tab/layout).
-- [ ] **Foreground-aware repaint broadcasts** (don't `repaintAllTerminals` →
-      `term.refresh` on every terminal for an overlay toggle).
-- [ ] **File-search cancellation** (request-id stale suppression for huge repos).
-- [ ] **Drag commits state only on `pointerup`.** During a grid/sidebar drag, drive CSS
-      variables imperatively (+ an epsilon no-op guard) and skip the React
-      `setRows`/`setCols`/`setSidebarWidth` + persistence writes until release
-      (`Canvas.tsx:621-707`/`724-801`, `App.tsx:243-247`). *(codex `PERF-AUDIT.md` follow-up F1/F2/Fix#2)*
+      debounce for focus/tab/layout). *(STILL TO DO.)*
+- [x] **Foreground-aware repaint broadcasts — FIXED v0.3.20.** `Terminal.tsx onRepaintAll`
+      early-returns when `!foregroundRef.current`, so an overlay toggle no longer
+      `term.refresh`es every pooled/background terminal.
+- [x] **File-search cancellation — FIXED v0.3.20.** Monotonic request-id guard in
+      `FilePanel.tsx` + `FileTree.tsx` search effects (drop a stale result).
+- [x] **Drag commits state only on `pointerup` — FIXED v0.3.20.** `Canvas.tsx` grid drag
+      drives `flexGrow` imperatively on the live DOM nodes during the drag and commits
+      `setRows`/`setCols` (+ persist) only on release, with an epsilon no-op guard; sidebar
+      (`App.tsx`) rAF-coalesces its `setSidebarWidth` and commits on release (the full
+      imperative path needs a Sidebar ref-forward — deferred, noted in the commit).
 
 **Perf — low (already mitigated by backend TTL caches; do only if instrumentation shows jank)**
 - [ ] Throttle the **recent / git / listTerminals** focus refreshes. These *non-usage*
