@@ -114,12 +114,23 @@ function closeWindow(): void {
  * screen point). No screen-position math here, so multi-monitor offsets can't bite.
  *
  * We recompute whenever the rect can move or rescale: on mount, on every resize
- * (the flexible drag region grows/shrinks, shifting the controls), on DPI/scale
- * change, on window move (the monitor's scale may differ), and whenever the
- * maximized flag flips (the restore<->maximize glyph swaps but the slot is the
- * same width; recomputing is cheap insurance against any layout shift). A failed
- * invoke is swallowed — outside Tauri (plain `pnpm dev`) there's no command, and a
- * missed report just means no flyout until the next event fires.
+ * (the flexible drag region grows/shrinks, shifting the controls — coalesced to
+ * ONE report per animation frame so a resize-drag can't flood the IPC), on
+ * DPI/scale change (a monitor cross — we refresh the cached scale factor there),
+ * and whenever the maximized flag flips (the restore<->maximize glyph swaps but the
+ * slot is the same width; recomputing is cheap insurance against any layout shift).
+ *
+ * We deliberately DO NOT recompute on window MOVE. The button rect is
+ * window-relative, so a plain move never changes it; the only move that shifts the
+ * physical mapping — crossing to a different-DPI monitor — already fires
+ * onScaleChanged. Subscribing onMoved here ran TWO IPC round-trips (`scaleFactor()`
+ * + `set_maximize_button_rect`) plus a forced reflow on every move event, and a
+ * Windows window-drag fires move events tens of times/sec while the main thread is
+ * parked in the OS modal move loop — so those calls piled up against a blocked
+ * thread and froze the window on drag. Dropping onMoved (and caching the scale +
+ * rAF-coalescing the report) removes that storm entirely. A failed invoke is
+ * swallowed — outside Tauri (plain `pnpm dev`) there's no command, and a missed
+ * report just means no flyout until the next event fires.
  *
  * `maximized` is passed in (not read here) so a single `useMaximizedState()` in
  * the parent drives BOTH the glyph and the recompute, and the effect re-runs when
@@ -139,33 +150,50 @@ function useReportMaxButtonRect(
     let cancelled = false;
     const unlisteners: Array<() => void> = [];
 
-    const report = () => {
+    // Cache the window scale factor. It only changes on a DPI/monitor cross
+    // (onScaleChanged), so we read it ONCE up front and refresh it there — instead
+    // of an async `scaleFactor()` IPC on EVERY report. Removing the per-event IPC is
+    // half of what makes the report cheap enough to survive a resize-drag.
+    let scale = 1;
+
+    // rAF-coalesced report: a burst of resize events (a resize-drag fires onResized
+    // tens of times/sec) collapses to ONE rect report per animation frame. The
+    // `getBoundingClientRect()` reflow + the single `set_maximize_button_rect` IPC
+    // run at most once per frame, never per raw event.
+    let rafId = 0;
+    const flush = () => {
+      rafId = 0;
       const el = ref.current;
-      if (!el) return;
-      void win
-        .scaleFactor()
-        .then((scale) => {
-          if (cancelled) return;
-          const r = el.getBoundingClientRect();
-          // getBoundingClientRect is already relative to the webview client
-          // top-left == the window top-left for this frameless window. Scale CSS
-          // px -> physical px. The backend treats this as window-relative.
-          return invoke("set_maximize_button_rect", {
-            rect: {
-              x: r.left * scale,
-              y: r.top * scale,
-              width: r.width * scale,
-              height: r.height * scale,
-            },
-          });
-        })
-        .catch(() => {});
+      if (cancelled || !el) return;
+      const r = el.getBoundingClientRect();
+      // getBoundingClientRect is already relative to the webview client top-left ==
+      // the window top-left for this frameless window. Scale CSS px -> physical px;
+      // the backend treats this as window-relative.
+      void invoke("set_maximize_button_rect", {
+        rect: {
+          x: r.left * scale,
+          y: r.top * scale,
+          width: r.width * scale,
+          height: r.height * scale,
+        },
+      }).catch(() => {});
+    };
+    const report = () => {
+      if (rafId) return; // already scheduled this frame
+      rafId = requestAnimationFrame(flush);
     };
 
-    // Initial report — defer one frame so layout (and the live tab strip) has
-    // settled, then send. requestAnimationFrame guards against a 0-size rect read
-    // during the first paint.
-    const raf = requestAnimationFrame(report);
+    // Seed the cached scale, then do the initial report (deferred one frame inside
+    // `report()`/rAF so layout has settled and we don't read a 0-size rect).
+    void win
+      .scaleFactor()
+      .then((s) => {
+        if (!cancelled) scale = s;
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) report();
+      });
 
     const subscribe = (
       register: (cb: () => void) => Promise<() => void>,
@@ -177,17 +205,36 @@ function useReportMaxButtonRect(
         })
         .catch(() => {});
     };
-    // Resize: the flexible drag region between the tab strip and the controls
-    // grows/shrinks, moving the button. Scale change: DPI moved (physical px shift
-    // even at the same CSS position). Move: dragging to a monitor with a different
-    // scale changes the physical mapping.
+    // Resize: the flexible drag region between the left chrome and the controls
+    // grows/shrinks, so the right-anchored maximize button's window-relative rect
+    // moves — re-report (coalesced). NOT onMoved: see the doc comment above — a
+    // plain move never changes the window-relative rect, and the per-move IPC storm
+    // it caused was the window-drag freeze.
     subscribe((cb) => win.onResized(cb));
-    subscribe((cb) => win.onScaleChanged(cb));
-    subscribe((cb) => win.onMoved(cb));
+    // Scale change (DPI / monitor cross): refresh the cached scale FIRST, then
+    // re-report in the new physical-px space. Rare, so the `scaleFactor()` IPC here
+    // is fine (unlike per-move/per-resize).
+    void win
+      .onScaleChanged(() => {
+        void win
+          .scaleFactor()
+          .then((s) => {
+            if (!cancelled) scale = s;
+          })
+          .catch(() => {})
+          .finally(() => {
+            if (!cancelled) report();
+          });
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisteners.push(fn);
+      })
+      .catch(() => {});
 
     return () => {
       cancelled = true;
-      cancelAnimationFrame(raf);
+      if (rafId) cancelAnimationFrame(rafId);
       for (const fn of unlisteners) fn();
     };
     // Re-run on maximize/restore: the control glyph swaps and a recompute keeps

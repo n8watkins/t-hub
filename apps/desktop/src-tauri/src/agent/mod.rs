@@ -188,6 +188,20 @@ impl AgentBridge {
         *self.inner.journal_cursor.lock()
     }
 
+    /// Advance the replay cursor to `seq` if it moves it forward. Returns whether
+    /// the cursor actually advanced (so the caller can decide whether to emit an
+    /// `agent://state` reflecting the new `journalCursor`). A late/duplicate lower
+    /// seq is ignored (the cursor never regresses).
+    fn advance_cursor(&self, seq: u64) -> bool {
+        let mut cursor = self.inner.journal_cursor.lock();
+        if seq > *cursor {
+            *cursor = seq;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Run a closure against the supervision reducer (read or mutate). Used by
     /// the supervision Tauri commands and by the journal consumer.
     pub fn with_supervisor<R>(&self, f: impl FnOnce(&mut Supervisor) -> R) -> R {
@@ -523,15 +537,38 @@ impl AgentBridge {
     /// (so the unit tests that call this directly still pass). Returns the
     /// affected session id for callers/tests that want it.
     pub fn consume_journal_entry(&self, entry: &EventJournalEntry) -> Option<String> {
-        let cursor_advanced = {
-            let mut cursor = self.inner.journal_cursor.lock();
-            if entry.seq > *cursor {
-                *cursor = entry.seq;
-                true
-            } else {
-                false
-            }
-        };
+        // StatusSnapshot entries get a DEDICATED minimal path. The statusline
+        // re-journals an IDENTICAL snapshot ~25x/sec/session (only `ingested_at_ms`
+        // ticks). On that path the full fan-out below is pure waste and a sustained
+        // webview flood (the "constant freeze", and what makes a window drag lock
+        // up): a status snapshot NEVER advances the supervision reducer (its `_`
+        // arm), so `supervision://tree` + `session://status` would carry identical
+        // payloads; `agent://journal` has NO frontend consumer at all; and the
+        // `agent://state` cursor bump is cosmetic. So we keep the status bridge +
+        // replay cursor current and emit ONLY `status://snapshot`, and ONLY when the
+        // snapshot meaningfully changed (the `same_status` gate in
+        // `ingest_status_from_journal`). No other channel fires.
+        if matches!(
+            entry.event_type,
+            t_hub_protocol::JournalEventType::StatusSnapshot
+        ) {
+            self.advance_cursor(entry.seq);
+            self.ingest_status_from_journal(entry);
+            // Return the entry's own session id for callers/tests; no tree/status
+            // emit (the reducer status is unchanged by a status snapshot).
+            return entry
+                .entity_id
+                .clone()
+                .or_else(|| {
+                    entry
+                        .payload
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                });
+        }
+
+        let cursor_advanced = self.advance_cursor(entry.seq);
 
         // 1. Forward the raw journal entry to the UI (snake_case, verbatim — it's
         //    the protocol type). Serialize once and reuse the value.
@@ -545,12 +582,9 @@ impl AgentBridge {
             self.emit_agent_state();
         }
 
-        // 3. A statusline snapshot rides the journal too (JournalSource::Status).
-        //    Route it through the status bridge so `status://snapshot` goes live
-        //    and the snapshot is queryable via the status_snapshot command.
-        if matches!(entry.event_type, t_hub_protocol::JournalEventType::StatusSnapshot) {
-            self.ingest_status_from_journal(entry);
-        }
+        // NOTE: StatusSnapshot entries never reach here — they are short-circuited
+        // at the top of this method onto a dedicated minimal path (status bridge +
+        // cursor only, no fan-out). See the early return above.
 
         // 3b. Derive a Claude-suggested title for the session (GOAL NAMES) and
         //     emit `agent://title`. The strongest signal is `UserPromptSubmit`'s
@@ -1023,6 +1057,57 @@ mod tests {
         assert_eq!(snap_ev.1["contextUsedPct"], 55.0);
         // And the status bridge holds it (queryable via the command).
         assert_eq!(status.get("o1").unwrap().context_used_pct, Some(55.0));
+    }
+
+    #[test]
+    fn status_snapshot_does_not_flood_journal_or_supervision_channels() {
+        // FREEZE REGRESSION: the statusline re-journals a near-identical
+        // StatusSnapshot ~25x/sec/session (only the timestamp ticks). Consuming one
+        // must NOT fan out the journal/state/supervision/session channels — that was
+        // a sustained ~hundreds/sec webview flood that pinned the UI ("constant
+        // freeze") and locked up the window drag. Only `status://snapshot` may fire,
+        // and only on a meaningful change; a no-op resend must emit NOTHING.
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        let status = Arc::new(crate::claude::StatusBridge::new());
+        bridge.set_emitter(Arc::new(rec.clone()));
+        bridge.set_status_bridge(Arc::clone(&status));
+        rec.events.lock().clear();
+
+        let snap = |seq: u64, ts: u64| EventJournalEntry {
+            seq,
+            timestamp_ms: ts,
+            source: JournalSource::Status,
+            entity_id: Some("o1".to_string()),
+            event_type: JournalEventType::StatusSnapshot,
+            payload: serde_json::json!({
+                "session_id": "o1",
+                "status": { "context_window": { "used_percentage": 42.0 } }
+            }),
+            result: None,
+        };
+
+        // First snapshot: exactly ONE emit, on status://snapshot. No journal /
+        // agent://state / supervision://tree / session://status.
+        bridge.consume_journal_entry(&snap(1, 100));
+        let channels: Vec<String> =
+            rec.events.lock().iter().map(|(c, _)| c.clone()).collect();
+        assert_eq!(
+            channels,
+            vec![super::EVT_STATUS_SNAPSHOT.to_string()],
+            "a status snapshot must emit ONLY status://snapshot, got {channels:?}"
+        );
+        rec.events.lock().clear();
+
+        // Identical resend (only the timestamp ticks): ZERO emits.
+        bridge.consume_journal_entry(&snap(2, 200));
+        let after = rec.events.lock().clone();
+        assert!(
+            after.is_empty(),
+            "a no-op status snapshot resend must emit nothing, got {after:?}"
+        );
+        // ...but the replay cursor still advanced (durability is preserved).
+        assert_eq!(bridge.journal_cursor(), 2);
     }
 
     // -----------------------------------------------------------------------
