@@ -27,15 +27,20 @@ The pre-existing `PERF-AUDIT.md` (broader/older history) is kept as-is.
   chord-rebind shadow, `!isSatellite()` automation gate, file-search cancellation).
   tsc + 53 vitest green. ⏳ Windows smoke-test pending (SMOKE-TEST.md A–D).
 - ✅ **Tier-2 backend bucket SHIPPED (v0.3.21, `20853b7`)** — `spawn_blocking` the
-  blocking async cmds (tmux_scroll/exit_scroll hot, list_dir/read_text_file, git_*);
-  non-blocking + rotating `diag_log`; codex Windows DB-fallback `plan_type`. cargo
-  check + 205 lib tests green. ⏳ Windows smoke-test pending.
-- 📋 **Still to tackle (see §6 + [`HANDOFF.md`](./HANDOFF.md) Tier 2–4):** Option B
-  (alt-tab focus de-storm) + A1 emit-coalesce-during-interaction + the residual
-  "staggered" sub-500ms stutter (drop hangwatch `STALL_MS`, needs user repro) +
-  drop `agent://journal` emit; the benign frontend polish (advanceCodexUsage realloc,
-  in-flight `/usage` cancel, `useHasCodexSession` O(N), `runWhenIdle` onSettle unmount);
-  reap-on-leave-workspace (Tier 3); Tier-4 verify/housekeeping.
+  blocking async cmds; non-blocking + rotating `diag_log`; codex DB-fallback `plan_type`.
+- ✅ **Review-hardening SHIPPED (v0.3.22, `01aa1e9`)** — adversarial review of v0.3.20/21
+  (live verify = **0 rust-main hang blocks**, control channel responsive); fixed the
+  satellite over-adopt, codex slice truncation, diag write-error/channel/clear/rotate
+  nits, hidden-queue UTF-8/ANSI split, RecentList timer leak.
+- ✅ **Option B + A1 diagnostic prep SHIPPED (v0.3.23, `714f0e2`)** — focus de-storm
+  (gitInfo in-flight dedup, RecentList `sameRecent`); hangwatch rewritten to the
+  gap-between-runs metric so it reliably catches ≥200ms stalls. ⏳ smoke-test + the
+  A1 stutter repro pending (then the A1 emit-coalesce FIX targets what the diag names).
+- 📋 **Still to tackle (see §6 + [`HANDOFF.md`](./HANDOFF.md) Tier 2–4):** the **A1
+  emit-coalesce FIX** (after the user's repro names the culprit) + drop `agent://journal`
+  emit; the benign frontend polish (advanceCodexUsage realloc, in-flight `/usage` cancel,
+  `useHasCodexSession` O(N), `runWhenIdle` onSettle unmount); **Tier 3
+  reap-on-leave-workspace**; Tier-4 verify/housekeeping.
 
 ---
 
@@ -106,7 +111,9 @@ looking at what the app was *doing*, not theorizing about rendering.
 | **0.3.18** | `2f661a5` | **Claude usage = statusline-first** (live `rate_limits` from the per-turn statusline, account-wide, FREE/non-blocking; `claude -p /usage` only the cold-start fallback, hourly) | ✅ **user-verified:** strip matches `/usage` (74-75% wk / 27% session used) and `/usage` dropped from every-few-min to once-on-load |
 | **0.3.19** | `a25a249` | Review pass: Rust watchdog logs off-thread (was ironic main-thread `diag_log`); statusline usage backfills each window independently (partial snapshot can't blank the other); stale-doc sweep | hardening + doc accuracy |
 | **0.3.20** | `19b8aa2` | **Tier-1 frontend small-wins batch** (5 file-disjoint clusters, parallel agent fan-out): maximize re-fit (`refreshTerminal` on settle), hidden-tab `pending[]` cap (2 MiB, drop oldest), foreground-aware `onRepaintAll`, editable-target guard on lifecycle keybinds, satellite blank-boot recovery, double-click spawn busy-gate (store `recallInFlight` Set + UI gates), grid drag commit-on-release (imperative flexGrow), chord-rebind shadow removal, `!isSatellite()` automation gate, file-search request-id cancellation | tsc + 53 vitest green; ⏳ Windows smoke-test pending (SMOKE-TEST.md) |
-| **0.3.21** | `f78954d` | **Tier-2 backend bucket** (3 file-disjoint Rust agents): `spawn_blocking` the blocking async cmds (tmux_scroll/exit_scroll HOT, list_dir/read_text_file UNC, git_commit/git_worktree_*) — mirrors `git_info`; `diag_log`/`diag_clear` now NON-BLOCKING (mpsc → lazily-spawned daemon writer, one fd) + ROTATING (`.1` backup at 8 MiB, was unbounded→100+MB); codex Windows DB-fallback keeps `plan_type` (slice from enclosing `{`) | cargo check + 205 lib tests green; ⏳ Windows smoke-test pending |
+| **0.3.21** | `f78954d`→`20853b7` | **Tier-2 backend bucket** (3 file-disjoint Rust agents): `spawn_blocking` the blocking async cmds (tmux_scroll/exit_scroll HOT, list_dir/read_text_file UNC, git_commit/git_worktree_*) — mirrors `git_info`; `diag_log`/`diag_clear` now NON-BLOCKING (mpsc → lazily-spawned daemon writer, one fd) + ROTATING (`.1` backup at 8 MiB, was unbounded→100+MB); codex Windows DB-fallback keeps `plan_type` (slice from enclosing `{`). *(`20853b7` = amend fixing a sed-corrupted Cargo.lock; see §7.)* | cargo check + 205 lib tests green; built+installed |
+| **0.3.22** | `01aa1e9` | **Review-hardening** (adversarial review of v0.3.20/21 — 5 code reviewers + live verify; live = 0 rust-main hang blocks, control channel responsive): reverted the satellite blank-recovery (it adopted the UNSCOPED terminal list → dual-attach garble; #4 re-deferred); codex DB-fallback window `b[j:i+2000]` (no rate_limits truncation); diag.rs drops the handle on write error, bounded `sync_channel(8192)` + try_send, clear truncates, rotate resets size only on rename success; Terminal hidden-queue drop now stops on a newline boundary; RecentList resume-timer cleared on unmount | tsc+vitest+cargo+205 green |
+| **0.3.23** | `714f0e2` | **Option B (focus de-storm)** + **A1 diagnostic prep**: gitInfo in-flight dedup (N same-cwd focus calls → 1 round-trip, no added staleness, gitCommit busts it); RecentList `JSON.stringify` diff → `sameRecent` field compare; hangwatch rewritten to the **gap-between-runs** metric (old per-probe wait missed ~200ms stalls) — reliably catches ≥200ms, one line per stall | tsc+vitest+cargo+205 green; adversarial-reviewed; ⏳ smoke-test + A1 repro pending |
 | — | `49aec86` (swept) | Background-terminal output throttling (fg rAF vs bg 250/1000ms/512KiB); windowMaximized rAF+in-flight guard | C/B |
 
 One-time: **killed ~4 GB of orphaned `claude` processes** (they survive SIGTERM →
@@ -159,7 +166,14 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
       a `th-window-settled` event). All 6 focus handlers (`repaintMount`, `Tile`,
       `RecentList`, `Canvas`, `UsageStrip` ×2) now wrap their refresh in
       `runWhenIdle`, so the storm runs AFTER the drag settles, never during.
-- [ ] **Option B (de-storm focus handlers) — FOLLOW-UP, not yet done.** Option A only
+- [x] **Option B (de-storm focus handlers) — SHIPPED v0.3.23 (`714f0e2`).** gitInfo
+      in-flight dedup (N same-cwd focus calls collapse to 1 round-trip, no added
+      staleness; gitCommit busts the entry) + RecentList `JSON.stringify` diff →
+      `sameRecent` field compare. (Focus repaint was already foreground-only via the
+      v0.3.20 `onRepaintAll` fix; the focus handlers themselves are unchanged.)
+      Adversarial-reviewed clean. Original analysis below. ⏳ Verify alt-tab in/out no
+      longer hitches in the Windows smoke-test.
+- [ ] ~~Option B (de-storm focus handlers) — FOLLOW-UP.~~ Option A only
       DEFERS the storm past a DRAG; the storm itself is still heavy, so a focus
       transition with **no drag still hitches** — most notably **ALT-TAB IN/OUT of the
       app** (user-reported on v0.3.13: "freeze that affects the ability to tab in and

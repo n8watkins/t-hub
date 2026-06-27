@@ -1,6 +1,6 @@
 # T-Hub — Session Handoff
 
-**Last updated:** 2026-06-27 · **Branch:** `main` · **App version:** `0.3.21` (local Windows builds). **⚠️ Tip `20853b7` is NOT yet pushed — `main` is 2 ahead of `origin/main` (v0.3.20 `19b8aa2` + v0.3.21 `20853b7`); the user pushes on request.** No `v*` tag / GitHub Release past v0.2.0.
+**Last updated:** 2026-06-27 · **Branch:** `main` · **App version:** `0.3.23` (local Windows builds). **⚠️ Tip `714f0e2` is NOT yet pushed — `main` is 5 ahead of `origin/main` (v0.3.20 `19b8aa2`, v0.3.21 `20853b7`, docs `ed371e9`, v0.3.22 review-hardening `01aa1e9`, v0.3.23 Option B + A1-prep `714f0e2`); the user pushes on request.** No `v*` tag / GitHub Release past v0.2.0.
 
 > **Zero-context handoff.** Read this file in full, plus any doc it links that's
 > relevant to your task. Every decision below is already made — **do not re-ask
@@ -22,7 +22,7 @@
 
 ## 2. State
 
-### Latest session (2026-06-27): PERFORMANCE & FREEZE OVERHAUL (v0.3.12→v0.3.21) — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md)
+### Latest session (2026-06-27): PERFORMANCE & FREEZE OVERHAUL (v0.3.12→v0.3.23) — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md)
 
 **[`docs/PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) is the single source of
 truth** for everything below (fixes shipped, hypotheses ruled out, full prioritized
@@ -82,17 +82,23 @@ green. ⏳ Windows smoke-test pending. Landed: `spawn_blocking` the blocking asy
 `diag_log`/`diag_clear` now NON-BLOCKING (mpsc → daemon writer, one fd) + ROTATING (`.1`
 backup at 8 MiB); codex Windows DB-fallback keeps `plan_type`.
 
-**Tier 2 — STILL TO DO (perf polish on `main`** — the residual stutters the user still feels,
-now that the big freeze is gone):
-  - **Option B** — de-storm the focus handlers so **alt-tab in/out** stops hitching (focus
-    work has no drag to defer against): run on idle-callback + coalesce the N `gitInfo`/IPC
-    into one + drop RecentList's `JSON.stringify` diff. (Option A already deferred them
-    during drags; B makes them non-blocking when they DO run.)
-  - **A1 emit-coalesce during interaction** — `AtomicBool window_interacting` set from
-    window move/resize; while true widen the terminal-output coalesce window (8ms→~100ms) +
-    `MAX_BATCH_BYTES` in `remote_pty.rs` (the "freeze while a terminal actively works" case).
-  - **Pinpoint the "staggered" sub-500ms stutter** — drop the `hangwatch.rs` `STALL_MS`
-    threshold to ~200ms, reproduce, read what it names, fix that.
+**Tier 2 — perf polish on `main`** (the residual stutters the user still feels, now that the
+big freeze is gone):
+  - ✅ **Option B — SHIPPED (v0.3.23, `714f0e2`).** gitInfo in-flight dedup (N same-cwd
+    focus calls → 1 round-trip, gitCommit busts it, no added staleness) + RecentList
+    `JSON.stringify` diff → `sameRecent` field compare. Focus repaint was already
+    foreground-only (v0.3.20). Adversarial-reviewed clean.
+  - ✅ **hangwatch gap-metric — SHIPPED (v0.3.23).** Rewrote `hangwatch.rs` to measure the
+    GAP between consecutive main-thread probe runs (PERIOD=100ms, STALL_MS=200ms) so it
+    reliably catches the residual ≥200ms "staggered" stutter — the old per-probe wait
+    missed sub-PERIOD-aligned blocks. One hang line per stall.
+  - ⏳ **NEXT: A1 emit-coalesce FIX (needs the user's repro first).** With v0.3.23
+    installed, the user reproduces the stutter (drag a tile while a Claude session is
+    actively working; alt-tab in/out); read `~/.t-hub/diag.log` for the `"src":"rust-main"`
+    gap lines + their `emitsDuringBlock` to confirm the culprit, THEN apply the fix:
+    `AtomicBool window_interacting` set from window move/resize; while true widen the
+    terminal-output coalesce window (8ms→~100ms) + `MAX_BATCH_BYTES` in `remote_pty.rs`.
+    Do NOT change the hot output path blind — confirm with the diag evidence first.
   - Drop the consumer-less `agent://journal` emit.
   - **Review-surfaced (recent-work review, all LOW/confirmed):**
     - ✅ **DONE (v0.3.21):** `spawn_blocking` the blocking async commands
