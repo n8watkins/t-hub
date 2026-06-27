@@ -28,7 +28,7 @@ The pre-existing `PERF-AUDIT.md` (broader/older history) is kept as-is.
 | **A** | Drag/resize/maximize/minimize → **3-4s hard freeze then jump**, idle/empty, size-independent, native-frame too | CPU/WSL starvation of the OS move loop by the usage subprocess storm | ✅ **Fixed** (v0.3.8) — user-verified |
 | **B** | General sluggishness, "used to be faster", slow session creation | Same usage storm | ✅ **Fixed** (v0.3.8) |
 | **C** | App-switch (Alt-Tab back) 1-2s stall | Focus-refresh burst; the only uncached offender was `claude -p /usage` | ✅ dominant offender fixed; rest backend-cached |
-| **D** | A *busy* terminal stutters while the rest of the app is smooth | xterm **DOM renderer** can't keep up with Claude TUI full-screen repaints | 🔬 **v0.3.9 canvas renderer** (under test) |
+| **D** | A *busy* terminal stutters while the rest of the app is smooth | xterm **DOM renderer** can't keep up with Claude TUI full-screen repaints | ✅ CANVAS renderer (0.3.9) renders smoothly; window-op stale-frame fixed (0.3.10/0.3.11). **Residual:** lags when dragging *while* a focused session works → §6 |
 
 ---
 
@@ -76,7 +76,9 @@ looking at what the app was *doing*, not theorizing about rendering.
 | 0.3.6 | *(clone)* | *Diag:* `decorations:true` native frame | ruled frameless path OUT |
 | 0.3.7 | `49aec86` | `transparent:true` (+ opaque bg); restore win_snap; (swept in the bg-terminal throttle) | ruled redirection-bitmap OUT |
 | **0.3.8** | **`3285e54`** | **Throttle usage+codex focus refresh to 60s** | **✅ Fixed the dominant offender for A + B + C** (user-verified) |
-| 0.3.9 | *(building)* | **xterm CANVAS (GPU) renderer** + `@xterm/addon-canvas` | 🔬 fix D (busy-terminal stutter) |
+| 0.3.9 | `93deab7` | **xterm CANVAS (GPU) renderer** + `@xterm/addon-canvas` | ✅ fix D — busy terminal renders smoothly (user-verified); avoids the WebGL blank-grid |
+| 0.3.10 | `a0ba809` | Force terminal repaint on window-state change (`repaintMount.ts`) | ✅ canvas stale-frame after maximize/minimize ("scroll to reload") fixed |
+| 0.3.11 | `1ca1482` | Tighter post-window-op repaint (leading-frame rAF + 50ms trailing) | snappier terminal refocus after maximize/minimize |
 | — | `49aec86` (swept) | Background-terminal output throttling (fg rAF vs bg 250/1000ms/512KiB); windowMaximized rAF+in-flight guard | C/B |
 
 One-time: **killed ~4 GB of orphaned `claude` processes** (they survive SIGTERM →
@@ -117,6 +119,14 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
 ## 6. What's LEFT to tackle (prioritized)
 
 **Now / verify**
+- [ ] **Drag/maximize lags when a FOCUSED Claude session is actively working** (the
+      current residual — idle is fine; this is what's left after 0.3.8/0.3.9). Prime
+      suspect: Claude's statusline spawns a `t-hub-agent` process **~25×/sec** while a
+      session works (each does a journal read + append + **fsync** in WSL) → CPU/WSL
+      contention with the window op. A smaller cousin of the usage storm. Likely fix:
+      a **statusline write throttle** (timestamp/lock gate) — note this lives in the
+      **`t-hub-agent` WSL binary, which builds separately**, not the Tauri app.
+      *Under investigation (subagent).*
 - [ ] **Verify v0.3.9 canvas renderer.** Acceptance for the whole matrix: the busy
       terminal is **smoother** than the DOM build AND there is **NO blank/stale-frame
       regression** (the regression to watch — the old WebGL blank-grid). If any case
