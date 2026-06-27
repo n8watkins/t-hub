@@ -53,14 +53,31 @@ pub async fn git_branch(
 /// alt-screen app (claude/vim) owns the pane.
 #[tauri::command]
 pub async fn tmux_scroll(session: String, down: bool) -> Result<(), String> {
-    crate::tmux::scroll_history(&session, down).map_err(|e| e.to_string())
+    // Fires on EVERY scroll page, per tile. The body spawns blocking `tmux`
+    // child processes (copy-mode + send-keys, and pane-format queries on
+    // Windows via wsl.exe), so run it off the Tokio executor — directly in the
+    // async body it would pin a worker thread for the whole op (the hot-path
+    // worker-pool starvation). The closure captures only the owned `session`
+    // String (moved in), so it's `'static + Send`.
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::tmux::scroll_history(&session, down).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("tmux_scroll task failed: {e}"))?
 }
 
 /// Exit tmux copy-mode for a tile (back to the live prompt). Called the instant
 /// the user types after scrolling, so paging up reads as a peek, not a mode.
 #[tauri::command]
 pub async fn tmux_exit_scroll(session: String) -> Result<(), String> {
-    crate::tmux::exit_copy_mode(&session).map_err(|e| e.to_string())
+    // Fires the instant the user types after scrolling. Like `tmux_scroll` it
+    // spawns a blocking `tmux send-keys` child, so hop it off the executor (the
+    // owned `session` String is moved into the `'static + Send` closure).
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::tmux::exit_copy_mode(&session).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("tmux_exit_scroll task failed: {e}"))?
 }
 
 #[tauri::command]

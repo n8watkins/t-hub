@@ -561,42 +561,53 @@ pub fn git_info_cached(cwd: &str) -> GitInfo {
 /// string, so metacharacters are safe.
 #[tauri::command]
 pub async fn git_commit(cwd: String, message: String) -> Result<String, String> {
-    let msg = message.trim();
-    if msg.is_empty() {
-        return Err("commit message is empty".to_string());
-    }
-
-    // Stage everything (new, modified, deleted).
-    match run_git(&cwd, &["add", "-A"]) {
-        Ok((true, _, _)) => {}
-        Ok((_, _, stderr)) => {
-            return Err(format!("git add failed: {}", stderr.trim()));
+    // Multiple blocking `run_git` spawns (on Windows each a `wsl.exe` child):
+    // `add -A`, `commit -m`, then `rev-parse`. Run the whole sequence off the
+    // Tokio executor so it can't pin a worker thread (mirrors `git_info`). The
+    // closure owns `cwd`/`message` (moved in), so it's `'static + Send`; no
+    // `&State` is captured.
+    tauri::async_runtime::spawn_blocking(move || {
+        let msg = message.trim();
+        if msg.is_empty() {
+            return Err("commit message is empty".to_string());
         }
-        Err(e) => return Err(e),
-    }
 
-    // Commit. `-m <msg>` is two argv entries; the message is never shell-parsed.
-    let (ok, stdout, stderr) = run_git(&cwd, &["commit", "-m", msg])?;
-    if !ok {
-        // Surface git's own message (e.g. "nothing to commit, working tree clean").
-        let detail = if !stderr.trim().is_empty() {
-            stderr.trim()
-        } else {
-            stdout.trim()
-        };
-        return Err(format!("git commit failed: {detail}"));
-    }
+        // Stage everything (new, modified, deleted).
+        match run_git(&cwd, &["add", "-A"]) {
+            Ok((true, _, _)) => {}
+            Ok((_, _, stderr)) => {
+                return Err(format!("git add failed: {}", stderr.trim()));
+            }
+            Err(e) => return Err(e),
+        }
 
-    // The dirty count just changed — drop the stale cache entry so the UI's
-    // immediate post-commit refresh re-runs git instead of serving the old count.
-    invalidate_git_info_cache(&cwd);
+        // Commit. `-m <msg>` is two argv entries; the message is never shell-parsed.
+        let (ok, stdout, stderr) = run_git(&cwd, &["commit", "-m", msg])?;
+        if !ok {
+            // Surface git's own message (e.g. "nothing to commit, working tree clean").
+            let detail = if !stderr.trim().is_empty() {
+                stderr.trim()
+            } else {
+                stdout.trim()
+            };
+            return Err(format!("git commit failed: {detail}"));
+        }
 
-    // Report the new short hash so the UI can confirm the commit.
-    match run_git(&cwd, &["rev-parse", "--short", "HEAD"]) {
-        Ok((true, out, _)) => Ok(first_line_opt(&out).unwrap_or_else(|| stdout.trim().to_string())),
-        // Commit succeeded but we couldn't read the hash — return git's output.
-        _ => Ok(stdout.trim().to_string()),
-    }
+        // The dirty count just changed — drop the stale cache entry so the UI's
+        // immediate post-commit refresh re-runs git instead of serving the old count.
+        invalidate_git_info_cache(&cwd);
+
+        // Report the new short hash so the UI can confirm the commit.
+        match run_git(&cwd, &["rev-parse", "--short", "HEAD"]) {
+            Ok((true, out, _)) => {
+                Ok(first_line_opt(&out).unwrap_or_else(|| stdout.trim().to_string()))
+            }
+            // Commit succeeded but we couldn't read the hash — return git's output.
+            _ => Ok(stdout.trim().to_string()),
+        }
+    })
+    .await
+    .map_err(|e| format!("git_commit task failed: {e}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -613,12 +624,18 @@ pub async fn git_commit(cwd: String, message: String) -> Result<String, String> 
 /// quiet; only a genuine spawn failure surfaces as `Err`.
 #[tauri::command]
 pub async fn git_worktree_list(cwd: String) -> Result<Vec<WorktreeInfo>, String> {
-    match run_git(&cwd, &["worktree", "list", "--porcelain"]) {
-        Ok((true, stdout, _)) => Ok(parse_worktree_list(&stdout)),
-        // Not a repo / no worktrees / git unavailable: empty list (best-effort).
-        Ok((false, _, _)) => Ok(Vec::new()),
-        Err(e) => Err(e),
-    }
+    // `run_git` is a blocking spawn (a `wsl.exe` child on Windows); run it off the
+    // Tokio executor (the owned `cwd` is moved into the `'static + Send` closure).
+    tauri::async_runtime::spawn_blocking(move || {
+        match run_git(&cwd, &["worktree", "list", "--porcelain"]) {
+            Ok((true, stdout, _)) => Ok(parse_worktree_list(&stdout)),
+            // Not a repo / no worktrees / git unavailable: empty list (best-effort).
+            Ok((false, _, _)) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    })
+    .await
+    .map_err(|e| format!("git_worktree_list task failed: {e}"))?
 }
 
 /// Create (or check out into) a worktree at `path` for the repo containing `cwd`,
@@ -639,7 +656,12 @@ pub async fn git_worktree_add(
     path: String,
     branch: Option<String>,
 ) -> Result<String, String> {
-    worktree_add(&cwd, &path, branch.as_deref())
+    // `worktree_add` runs several blocking `run_git` spawns (show-ref + the add,
+    // each a `wsl.exe` child on Windows). Run it off the Tokio executor; the owned
+    // args are moved into the `'static + Send` closure.
+    tauri::async_runtime::spawn_blocking(move || worktree_add(&cwd, &path, branch.as_deref()))
+        .await
+        .map_err(|e| format!("git_worktree_add task failed: {e}"))?
 }
 
 /// Synchronous core of [`git_worktree_add`], shared with the MCP control channel
@@ -719,7 +741,13 @@ pub async fn git_worktree_remove(
     path: String,
     force: Option<bool>,
 ) -> Result<(), String> {
-    worktree_remove(&cwd, &path, force.unwrap_or(false))
+    // `worktree_remove` is a blocking `run_git` spawn (a `wsl.exe` child on
+    // Windows). Run it off the Tokio executor; the owned args are moved into the
+    // `'static + Send` closure.
+    let force = force.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || worktree_remove(&cwd, &path, force))
+        .await
+        .map_err(|e| format!("git_worktree_remove task failed: {e}"))?
 }
 
 /// Synchronous core of [`git_worktree_remove`], shared with the MCP control

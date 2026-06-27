@@ -1403,7 +1403,17 @@ pub async fn search_files(
 #[tauri::command]
 pub async fn list_dir(path: String, show_ignored: Option<bool>) -> Result<Vec<DirEntry>, String> {
     let dir = normalize(&path);
-    let res = read_dir_shallow(&dir, show_ignored.unwrap_or(false));
+    // `read_dir_shallow` does a UNC `\\wsl.localhost\` directory read on Windows
+    // (or a native `wsl.exe` child spawn) — blocking IO. Run it off the Tokio
+    // executor so it can't pin a worker thread. The closure captures only an
+    // owned `PathBuf` clone of `dir` (so it stays `'static + Send`); the original
+    // `dir` (and `path`) remain here for the diag log below, mirroring
+    // `git_info`'s clone-before-`spawn_blocking`.
+    let scan_dir = dir.clone();
+    let show = show_ignored.unwrap_or(false);
+    let res = tauri::async_runtime::spawn_blocking(move || read_dir_shallow(&scan_dir, show))
+        .await
+        .map_err(|e| format!("list_dir task failed: {e}"))?;
     // DIAG: file tree "not loading" was undiagnosable from the release build.
     // Log the incoming path, the normalized host path, and the outcome so the
     // diag log shows exactly where the tree breaks (bad/empty path vs wsl/fs read
@@ -1429,7 +1439,13 @@ pub async fn list_dir(path: String, show_ignored: Option<bool>) -> Result<Vec<Di
 #[tauri::command]
 pub async fn read_text_file(path: String) -> Result<FileContents, String> {
     let p = normalize(&path);
-    read_text_capped(&p)
+    // `read_text_capped` stats + reads the file over the `\\wsl.localhost\` UNC
+    // bridge on Windows — blocking IO that would pin a Tokio worker if run in the
+    // async body. Hop it onto a blocking thread; the owned `PathBuf` is moved into
+    // the `'static + Send` closure.
+    tauri::async_runtime::spawn_blocking(move || read_text_capped(&p))
+        .await
+        .map_err(|e| format!("read_text_file task failed: {e}"))?
 }
 
 /// Overwrite `path` with `contents` (the editor's save). Routes through the same
