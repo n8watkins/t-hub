@@ -223,16 +223,20 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
 - [ ] Centralize git polling by cwd (frontend) — low priority (backend-cached).
 
 **Usage strip freshness (regression from the 0.3.8 throttle — user-reported "weekly + 5h not updating")**
-- [ ] **Claude usage (weekly + session) lags a few minutes.** `claude -p /usage` is
-      ~60% per-attempt success (INHERENT — it prints intro-only until a network
-      round-trip lands; the 2-attempt retry IS the mitigation, NOT removable; you
-      can't make it one-shot). The 0.3.8 focus throttle gates on the last *run*
-      (success OR fail), so during a failing streak the strip stays on the last-good
-      value for minutes. **FIX:** throttle on the last *GOOD* read instead — refresh
-      on focus only if >60s since a **successful** read (`UsageStrip.tsx`
-      `useClaudeUsage`: track `lastGoodRef`, not `lastRunRef`). Keeps perf, restores
-      freshness. The clean cost lever otherwise is **dropping/lengthening the focus +
-      5-min cadence** (Option 2) — "fix the flakiness" is NOT a real fix.
+- [ ] **Claude usage (weekly + session) lags / shows stale.** **LIVE EVIDENCE (ran the
+      exact command 3×, 3/3 success):** `claude -p /usage` is **RELIABLE when called
+      individually** — it prints session/week %s fine. The ~40% `ok=false` in the diag
+      **correlates with HIGH CALL RATE** (the pre-throttle focus storm / clustered
+      calls): under load the usage round-trip doesn't land before the process prints
+      intro-only → likely **light rate-limiting / a timing race**, NOT a parse-format
+      or auth bug. So **fewer requests directly improves the success rate** — the 0.3.8
+      throttle already helps; lengthening the cadence (Option 2) helps more.
+      Separately, the *freshness* regression is that the throttle gates on the last
+      *run* (success OR fail), so a failing call resets the gate → stale strip.
+      **FIX (both at once):** (a) gate the focus refresh on the last *GOOD* read
+      (`UsageStrip.tsx useClaudeUsage`: track `lastGoodRef`, not `lastRunRef` — refresh
+      only if >60s since a SUCCESS) and (b) keep the request cadence sparse. "Fix the
+      flakiness to one-shot" is NOT achievable; "make fewer, well-spaced requests" is.
 - [ ] **Codex 5-hour + weekly may be stale/mis-parsed.** `codex_usage(wsl)` returns
       `ok=true` reliably (reads the newest codex session rollout, `codex.rs`), but the
       diag doesn't log the parsed windows. Verify it reads the **newest** rollout and
