@@ -168,6 +168,41 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
       very likely *the original "super laggy / freezes" complaint* that kicked off this
       worklog, finally isolated after the drag/usage/render contributors were cleared.
       Treat as the TOP remaining priority.
+  - **INVESTIGATION (workflow, 4 finders + adversarial verify) — conclusions:**
+    - ❌ **RULED OUT: xterm write path.** `@xterm/xterm` time-slices parsing into
+      ~12ms chunks (`WriteBuffer._innerWrite` breaks at 12ms + reschedules via
+      `setTimeout`), so even a multi-MB backlog can't monopolize the thread. (Did
+      surface a real but separate bug: the hidden-tab pending queue is UNBOUNDED —
+      `Terminal.tsx:164` only sets flush delay at 512KB, never caps — a memory/UX fix.)
+    - ❌ **RULED OUT: workspace persistence / store storm.** `savePersisted` stringifies
+      only bounded tab/label metadata (terminals + scrollback are NOT persisted) =
+      sub-ms; no synchronous/blocking `invoke` exists; the zustand/snapshot path is
+      already hardened (sameSnapshot dedup, primitive selectors).
+    - ⚠️ **KEY CORRECTION: WebView2 `ExecuteScript` is ASYNC** (wry `webview2/mod.rs`
+      runs JS in the renderer with a no-op completion handler), so an `app.emit` does
+      NOT run its JS on the main thread — the main-thread cost is the per-emit tao
+      user-event DISPATCH + marshaling the payload string across the WebView2 IPC
+      boundary, not executing the JS. This weakens "JS storm" theories.
+    - 🎯 **LIVE SUSPECT (plausible-contributor, medium): emit-dispatch VOLUME.** Each
+      `app.emit` from a reader thread posts its OWN tao user-event (unbounded mpsc,
+      no backpressure on the release eval path). No CROSS-terminal coalescing
+      (`remote_pty.rs` batches per-terminal only); control events are serialized
+      TWICE (`control_client.rs:245`); a forwarder RECONNECT can flush a backlog as a
+      tight emit burst. A transient alignment of bursts (multi-terminal token streams +
+      TUI repaint + control stream + reconnect) can saturate the main-thread user-event
+      queue and starve the message pump → ghosting. SPORADIC because it needs a burst
+      alignment, not steady state. **Magnitude unconfirmed** (since ExecuteScript is
+      async) → do NOT commit to the emit-multiplexing rework blind.
+  - **SHIPPED (v0.3.15): hang detector** (`lib/hangDetector.ts`, mounted from
+    `main.tsx`) — a 500ms heartbeat (logs `blockedMs` when a tick is late ≥500ms,
+    `ghostRisk` at ≥5s) + `PerformanceObserver(['longtask','event'])` (≥200ms, with
+    attribution + `heapMB`), logging single-line JSON via the `diag_log` command to
+    `~/.t-hub/diag.log`. **Next:** user reproduces; tail
+    `/mnt/c/Users/natha/.t-hub/diag.log | grep '"t":"hang"'`; the line before a ghost
+    (`blockedMs` ≥5000 + nearest longtask `attr` + `heapMB`) names the culprit → THEN
+    fix precisely (likely emit coalescing and/or drop the consumer-less `agent://journal`
+    emit). Candidate safe wins already identified: drop `agent://journal` (no JS
+    subscriber), batch the control forwarder re-emits, cap the hidden-tab queue.
 - [x] **Codex usage stale/reverting.** **DONE (v0.3.13).** Was scraped from
       `~/.codex/logs_*.sqlite` (only written on certain events → 6 days stale when a
       session was idle/out-of-credits, overwriting the good cached value). Now read

@@ -13,6 +13,11 @@ import "./lib/statusMount";
 // focus-triggered work defers during a drag (the cold-first-drag fix). See
 // src/lib/windowInteraction.ts.
 import "./lib/windowInteraction";
+// Side-effect import: arms the MAIN-THREAD HANG DETECTOR — a heartbeat +
+// PerformanceObserver that log to the diag file whenever the UI thread blocks
+// >500ms, to catch the sporadic "Not Responding"/Alt-Tab-ghost freeze in the act.
+// See src/lib/hangDetector.ts.
+import "./lib/hangDetector";
 // Side-effect import: forces a terminal repaint after window-state changes
 // (maximize/minimize/restore/resize) so the canvas renderer never shows a stale
 // frame you'd otherwise have to scroll to refresh. See src/lib/repaintMount.ts.
