@@ -12,12 +12,18 @@ The pre-existing `PERF-AUDIT.md` (broader/older history) is kept as-is.
 
 ## TL;DR — where we are now
 
-- ✅ **The dominant cause is FIXED:** a `claude -p /usage` **focus-storm** was pegging
-  WSL/CPU. App went from "almost unusable" to **"a lot better."**
-- 🔬 **Residual being fixed:** a *busy terminal* still stuttered (DOM renderer) while
-  the rest of the app stayed smooth → **GPU canvas renderer** (v0.3.9, under test).
-- 📋 **Still to tackle:** see §6 — the reap-when-not-in-workspace directive (biggest
-  remaining lever), 6 correctness findings, and a handful of medium/low perf items.
+- ✅ **THE freeze is FIXED (v0.3.17, watchdog-confirmed):** the always-present sporadic
+  HARD freeze (Alt-Tab icon ghosting / Windows hung-window) was **`control_request`
+  running SYNC on the main UI thread** → made `async` + `spawn_blocking` → **0 main-thread
+  blocks** after. (The earlier `claude -p /usage` focus-storm throttle, v0.3.8, was a
+  contributor to the *deterministic* lag, not this sporadic hard freeze.)
+- ✅ **Flaky usage CLI retired:** Codex reads the live session rollout (v0.3.13);
+  Claude is **statusline-first** (v0.3.18, user-verified) — `/usage` only a cold-start fallback.
+- ✅ Cold first-drag freeze fixed (Option A, v0.3.14, user-verified); GPU canvas renderer
+  (v0.3.9, shipped — acceptance matrix in §6 still to run).
+- 📋 **Still to tackle (see §6 + [`HANDOFF.md`](./HANDOFF.md) Tier 1–4):** the Tier-1
+  small-wins batch, Option B (alt-tab de-storm) + the residual "staggered" sub-500ms
+  stutter, reap-on-leave-workspace, correctness findings, medium/low perf items.
 
 ---
 
@@ -85,7 +91,8 @@ looking at what the app was *doing*, not theorizing about rendering.
 | 0.3.15 | `6a678fe` | JS hang detector (renderer heartbeat + longtask) | diagnostic — found NO JS blocks → freeze is host-side |
 | 0.3.16 | `eb3a649` | **Rust main-thread hang watchdog** (`hangwatch.rs`, `run_on_main_thread` ping + emit counter) | diagnostic — caught 2–4s main-thread blocks w/ ~20–54 emits (NOT emit flood) |
 | **0.3.17** | `a38486a` | **🎯 THE FREEZE CURE: `control_request` async + `spawn_blocking`** (was a SYNC command → ran the blocking socket round-trip on the MAIN thread; recent/git/usage/codex/files all route through it). Also `USAGE_RETRY_GAP_MS` 15s→60s. | ✅ **CONFIRMED: zero `rust-main` blocks across 326 lines of active use** (was 2–4s every ~min). The original "always-present super-laggy/ghosting" freeze. |
-| **0.3.18** | *(pending)* | **Claude usage = statusline-first** (live `rate_limits` from the per-turn statusline, account-wide, FREE/non-blocking; `claude -p /usage` only the cold-start fallback, now hourly) | retires the heavy/flaky CLI poll in the common case — awaiting user verify the strip matches `/usage` (~75%/27%) |
+| **0.3.18** | `2f661a5` | **Claude usage = statusline-first** (live `rate_limits` from the per-turn statusline, account-wide, FREE/non-blocking; `claude -p /usage` only the cold-start fallback, hourly) | ✅ **user-verified:** strip matches `/usage` (74-75% wk / 27% session used) and `/usage` dropped from every-few-min to once-on-load |
+| **0.3.19** | `a25a249` | Review pass: Rust watchdog logs off-thread (was ironic main-thread `diag_log`); statusline usage backfills each window independently (partial snapshot can't blank the other); stale-doc sweep | hardening + doc accuracy |
 | — | `49aec86` (swept) | Background-terminal output throttling (fg rAF vs bg 250/1000ms/512KiB); windowMaximized rAF+in-flight guard | C/B |
 
 One-time: **killed ~4 GB of orphaned `claude` processes** (they survive SIGTERM →

@@ -1,6 +1,6 @@
 # T-Hub — Session Handoff
 
-**Last updated:** 2026-06-27 · **Branch:** `main` · **App version:** `0.3.11` (local builds; perf/drag overhaul — not pushed, not released)
+**Last updated:** 2026-06-27 · **Branch:** `main` · **App version:** `0.3.19` (local Windows builds; all session commits **pushed to `origin/main`**, tip `0e13eb0` — no `v*` tag / GitHub Release past v0.2.0)
 
 > **Zero-context handoff.** Read this file in full, plus any doc it links that's
 > relevant to your task. Every decision below is already made — **do not re-ask
@@ -22,14 +22,14 @@
 
 ## 2. State
 
-### Latest session (2026-06-27): PERFORMANCE & FREEZE OVERHAUL (v0.3.12→v0.3.18) — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md)
+### Latest session (2026-06-27): PERFORMANCE & FREEZE OVERHAUL (v0.3.12→v0.3.19) — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md)
 
 **[`docs/PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) is the single source of
 truth** for everything below (fixes shipped, hypotheses ruled out, full prioritized
 backlog). Read it in full before doing any perf/drag work — do NOT re-chase the
 ruled-out causes (win_snap, transparent/redirection-bitmap, frameless, memory, event
-flood). Versions 0.3.2→0.3.11 are **local Windows builds only — NOT committed-to-a-tag,
-NOT pushed, NOT released** (commits are on local `main`).
+flood). Versions 0.3.2→0.3.19 are **local Windows builds** — all commits are **pushed to
+`origin/main`** (tip `0e13eb0`); there is **no `v*` tag / GitHub Release past v0.2.0**.
 
 **THE HEADLINE (v0.3.17, watchdog-confirmed):** the original *always-present, sporadic,
 "super-laggy" hard freeze* — the one that ghosted the T-Hub icon in Alt-Tab (Windows
@@ -44,7 +44,7 @@ After it: **zero** `rust-main` blocks across 326 lines of active use (was 2–4s
 `run_on_main_thread` probe + emit counter) once a JS detector proved the block was
 host-side, not renderer-side (emit-flood was *ruled out* — blocks had only ~20–54 emits).
 
-**Other wins this session (all on `main`, local Windows builds, NOT pushed/tagged):**
+**Other wins this session (all on `main`, pushed to origin; local Windows builds, untagged):**
 - **v0.3.14** cold first-drag freeze (focus storm) — Option A `lib/windowInteraction.ts`
   defers focus work during a drag (`runWhenIdle`/`isInteracting`). *User-verified.*
 - **v0.3.13** Codex usage — read the LIVE session rollout (`~/.codex/sessions/**`,
@@ -56,22 +56,27 @@ host-side, not renderer-side (emit-flood was *ruled out* — blocks had only ~20
   `/usage` dropped from every-few-min to once-on-load.*
 - v0.3.12 usage freshness (no blank/revert); v0.3.9 GPU canvas renderer; v0.3.10/11
   stale-frame repaint; killed ~4 GB orphaned `claude`; consolidated perf docs.
-- **Diagnostics shipped & STILL ARMED in release:** `hangDetector.ts` (JS) +
-  `hangwatch.rs` (Rust watchdog) → `{"t":"hang",...}` in `~/.t-hub/diag.log`.
-  ⚠️ Tier-2 decides keep/gate/remove now the freeze is fixed.
+- **Diagnostics shipped & KEPT ON (user wants ongoing monitoring):** `hangDetector.ts`
+  (JS) + `hangwatch.rs` (Rust watchdog) → `{"t":"hang",...}` in `~/.t-hub/diag.log`. The
+  Rust watchdog's ironic main-thread `diag_log` was fixed in v0.3.19 (it now logs
+  off-thread via a channel). Lower the threshold (Tier 2) to chase the residual stutter.
 
 **EXECUTION PLAN — next context (tiered; full per-item detail + file:line in worklog §6).**
-⚠️ A recent-work REVIEW workflow is in flight (scanning v0.3.12–v0.3.18 for missed polish
-+ OTHER sync-command-on-main-thread freeze sources like `control_request` was). FOLD its
-confirmed findings into Tier 1/2 before executing — they may add items or reprioritize.
+✅ The recent-work + doc-staleness REVIEWS are **DONE** (v0.3.19, commit `a25a249`) and a
+handoff-readiness review followed — all confirmed findings are already folded in (the
+Tier-2 "Review-surfaced" block below + the v0.3.19 fixes). **Tier 1 is cleared to execute —
+no gate.**
 
 **Tier 1 — parallel WORKTREE batch** (10 items, all FRONTEND, low-risk, zero conflict with
-the backend hang/emit work; all triaged "ideal for a worktree"). Several share
-`Terminal.tsx`/`repaintMount.ts`, so do them SEQUENTIALLY in ONE worktree, then one build:
+the backend hang/emit work; all triaged "ideal for a worktree"). **Run as 5 file-disjoint
+clusters in PARALLEL — see the "EXECUTION MODEL" section below for the cluster→item map**
+(naive one-agent-per-item conflicts: `Terminal.tsx` is shared by 3 items, `Canvas.tsx` by
+4). The 10 items (ordinal here ≠ the `#N` worklog numbers; per-item file:line in worklog §6):
   1. **maximize doesn't re-FIT terminals** (user-reported) — `repaintMount.ts onResized`
      broadcasts `refresh()` not `fit()`; call `refreshTerminal()` (which fits) on the settle.
   2. **#6** delete-confirm fires while typing — add editable-target guard in
-     `useLifecycleKeybinds.tsx` (export+reuse `isEditableTarget` from `Canvas.tsx`).
+     `lib/useLifecycleKeybinds.tsx` (a hook-named module under `lib/`, NOT `hooks/`;
+     export+reuse `isEditableTarget` from `Canvas.tsx:113`).
   3. **#5** chord rebind leaves a stale shadow binding — in `store/keybindings.ts setBinding`/
      `setPrefixedBinding`, delete the chord from any other command first.
   4. **#3** per-window automation duplicates — `if (isSatellite()) return;` in
@@ -143,16 +148,21 @@ touched by 3 Tier-1 items and `Canvas.tsx` by 4. Group by FILE-DISJOINT clusters
 give each cluster its own agent + `isolation: 'worktree'`; merge clusters back to
 `main` one at a time (run `tsc`/`cargo check` between merges).
 
-**Tier 1 — 5 file-disjoint clusters → 5 parallel agents (each its own worktree):**
-1. **terminal-render** — `repaintMount.ts`, `repaint.ts`, `Terminal.tsx`: maximize
-   re-fit + hidden-tab queue cap + foreground-aware repaint.
-2. **canvas/workspace/spawn** — `Canvas.tsx`, `workspace.ts`, `App.tsx`,
-   `SpawnMenu.tsx`, `RecentList.tsx`, `RecoveryReview.tsx`, `useLifecycleKeybinds.tsx`:
-   #6 editable guard + #4 satellite-blank + #7 spawn busy-gate + drag-commit-on-pointerup.
-   (These all share Canvas/workspace/App → MUST be one cluster, done sequentially within it.)
-3. **keybindings** — `store/keybindings.ts`: #5 chord-rebind shadow.
-4. **automation-gate** — `autoContinueMount.ts`, `rulesMount.ts` (read `windows.ts`): #3 `!isSatellite()`.
-5. **file-search** — `FilePanel.tsx`, `FileTree.tsx`: stale-result cancellation.
+**Tier 1 — 5 file-disjoint clusters → 5 parallel agents (each its own worktree).**
+*(Ordinals below = the Tier-1 numbered list above; all paths under `apps/desktop/src/`.)*
+1. **terminal-render** — items **1, 7, 8** — `lib/repaintMount.ts`, `lib/repaint.ts`,
+   `components/Terminal.tsx`: maximize re-fit + hidden-tab queue cap + foreground-aware repaint.
+2. **canvas/workspace/spawn** — items **2, 5, 6, 10** — `components/Canvas.tsx`,
+   `store/workspace.ts`, `App.tsx`, `components/SpawnMenu.tsx`, `components/RecentList.tsx`,
+   `components/RecoveryReview.tsx`, `lib/useLifecycleKeybinds.tsx`: editable guard +
+   satellite-blank + spawn busy-gate + drag-commit-on-pointerup. (Share Canvas/workspace/App
+   → MUST be one cluster, done SEQUENTIALLY within it. **drag-commit (item 10) lives HERE,
+   not in Tier 2 — the worklog "Perf-medium" mention is a cross-ref, not a second copy.**)
+3. **keybindings** — item **3** — `store/keybindings.ts`: chord-rebind shadow.
+4. **automation-gate** — item **4** — `lib/autoContinueMount.ts`, `lib/rulesMount.ts`
+   (read `lib/windows.ts` for `isSatellite`): `!isSatellite()` gate.
+5. **file-search** — item **9** — `components/FilePanel.tsx`, `components/FileTree.tsx`:
+   stale-result cancellation.
    The 5 clusters share NO files with each other → safe to run fully in parallel.
 
 **Cross-tier ordering (overlap-driven, NOT free to fully parallelize):**
@@ -168,11 +178,20 @@ So the parallel plan: **Tier 1 (5 clusters) ∥ Tier 2-backend** in one fan-out,
 then **Tier 2 Option B** + **Tier 3** sequentially (they share files with Tier 1). Each
 item's exact file:line fix is in worklog §6 + the Tier list above.
 
-**Local Windows build (this session's verified flow):** see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) §7 + the Claude Code memory note `local-windows-build.md`
-(external memory, not a repo file). Summary: an isolated Windows clone at
-`C:\Users\natha\projects\Tools\t-hub\t-hub-app` (`git clone` the WSL repo → `pnpm install`
-→ set `createUpdaterArtifacts:false` + `targets:["nsis"]` → `pnpm tauri build`); the lag
-can't be reproduced from WSL (no display), so every build is hand-tested on Windows.
+**Local Windows build (self-contained recipe — the lag can't be reproduced from WSL/no
+display, so every perf fix is hand-built + tested on Windows):**
+1. There's an **isolated Windows clone** at `C:\Users\natha\projects\Tools\t-hub\t-hub-app`
+   (separate from the WSL repo; its `git` `origin` IS the WSL repo). Sync it from WSL:
+   `git -C /mnt/c/Users/natha/projects/Tools/t-hub/t-hub-app fetch origin && git -C … merge --ff-only origin/main`.
+2. Apply **test-only tweaks** (don't commit) in that clone's `apps/desktop/src-tauri/tauri.conf.json`:
+   `"targets": ["nsis"]` and `"createUpdaterArtifacts": false`.
+3. Build from Windows: `powershell.exe -NoProfile -Command "cd 'C:\…\apps\desktop'; pnpm tauri build"`.
+   Installer → `…\src-tauri\target\release\bundle\nsis\T-Hub_<ver>_x64-setup.exe`; launch via
+   `powershell.exe -NoProfile -Command "Start-Process -FilePath '<exe>'"`.
+- **Prereq:** MSVC build tools are installed on this machine (builds are green). **Gotcha:**
+  probe Windows paths with **PowerShell**, never `cmd` — `Program Files (x86)`'s parens break
+  `cmd /c` quoting (caused a false "no MSVC" once). Bump the 3 version files first
+  (`apps/desktop/scripts/bump-version.sh`). Fuller notes: worklog §7.
 
 ### Baseline: v0.2.0 SHIPPED
 `v0.2.0` is tagged (`9ee6b75`) and the GitHub Release is published — signed `T-Hub_0.2.0_x64-setup.exe` + `latest.json`, so **auto-update is LIVE**. That release shipped the herdr-parity wave (worktree workflow, rebindable keymap, rules engine, OS toasts, session-restore, a perf overhaul) plus post-release cheap-wins (dedup refactor, light tray recovery, vitest). Details in [`ROADMAP-PLAN.md`](./ROADMAP-PLAN.md).
@@ -183,7 +202,7 @@ can't be reproduced from WSL (no display), so every build is hand-tested on Wind
 
 The keystone roadmap item. The bet: pull T-Hub's "brain" out of the desktop GUI and onto the **loopback control socket**, so the same wire that serves localhost today can later reach a remote host — any device gets the full cockpit. The webview's JS can't open a raw TCP socket, so the socket I/O lives in the Rust shell (the thin-client seam). **Progress vs the §6 M1→M4 plan in [`SERVER-SPLIT-AND-ROADMAP.md`](./SERVER-SPLIT-AND-ROADMAP.md):**
 
-- **M1 — Decouple locally — ✅ SHIPPED.** GUI↔backend traffic for server-owned state crosses the socket: a command request/response transport (`control_request`), the event stream forwarded into the webview (`spawn_event_forwarder` → re-emits `control://event`), and a `TeeEmitter` so channels migrate **one at a time** (events go to BOTH the webview and the socket until a channel is fully flipped). Commits: `bca229d` (first slice — one read command + the event stream), `090225e` (widen — the 0.5 supervision/status surface).
+- **M1 — Decouple locally — ✅ SHIPPED.** GUI↔backend traffic for server-owned state crosses the socket: a command request/response transport (`control_request` — now an **async** `#[tauri::command]` + `spawn_blocking`; as a SYNC command it ran the blocking round-trip on the main UI thread = the v0.3.17 freeze root cause), and the event stream forwarded into the webview (`spawn_event_forwarder` → re-emits `control://event`). *(A transitional `TeeEmitter` dual-leg let channels migrate one at a time; once all flipped it was REMOVED — `SocketEmitter` is now the SOLE bridge-event sink.)* Commits: `bca229d` (first slice — one read command + the event stream), `090225e` (widen — the 0.5 supervision/status surface).
 - **M2 — Tiles over the wire — ✅ core SHIPPED.**
   - **M2a:** a tile's PTY (`tmux attach`) streams over the socket. Server emits `{out}`/`{exit}` frames and reads `{write}`/`{resize}`; client side is `RemotePty`/`RemotePtyManager`. Commits: `935c1a0` (server half), `72d5fa1` (client flip), `73cfe99`/`d08615a` (review fixes — bounded per-subscriber write, unified `tmux_target`).
   - **M2b:** persistent server key (`~/.t-hub/server-key`, stable identity across restarts), **opt-in** network bind, and an `is_allowed_peer` gate (loopback + Tailscale CGNAT `100.64.0.0/10` + `fd7a:115c::/32`, with IPv4-mapped-IPv6 normalization). Thin-client mode via `T_HUB_REMOTE_ADDR` / `T_HUB_REMOTE_TOKEN`. Commits: `c07d3ec` (core), `47cb906` (hardening — conn cap, constant-time token compare, reconnect backoff), `040dc8b` (security-review fixes — dual-stack peer norm + forwarder backoff).
@@ -194,13 +213,17 @@ The keystone roadmap item. The bet: pull T-Hub's "brain" out of the desktop GUI 
 
 **Also this session (UI batch, pre-split):** tab strip removed (brand = tray icon, settings moved top-right); sidebar reshape (`+` in Workspaces header, expand-all default, last-active time, bigger buttons, portal'd color picker, collapsed-rail stats); a shared ring+center **status indicator** (working = spinner, done = true solid green `#22c55e`, idle = green ring) with a live legend in Settings; Win11 Snap-Layouts maximize-button rect tracking; **notifications + sounds now default OFF** (opt-in); titlebar × hides-to-tray (default) vs quits, as a setting.
 
-**Verification (re-run green at the tip of `main`, `9dbbc39`):** `cargo build` clean · **190 Rust lib tests** pass · `tsc` clean · **53 vitest** pass. Each server-split commit was also verified **live** against the running app via control-socket probes, and reviewed by sub-agents (security-critical surfaces — peer gate, token compare, write bounding — all came back clean; every real finding was acted on).
+**Verification (server-split tip `9dbbc39`):** `cargo build` clean · ~190 Rust lib tests · `tsc` clean · 53 vitest — each server-split commit also verified **live** via control-socket probes + sub-agent review (peer gate / token compare / write bounding all clean). The perf/freeze commits SINCE (0.3.2→0.3.19) were each `tsc` + `cargo check` green and hand-tested on Windows; **re-run `cargo test --lib` + `pnpm test` for current counts before trusting exact numbers** (more tests have been added since 9dbbc39).
 
 **Push state:** all server-split + M3 commits through `9dbbc39` are on `origin/main`; this handoff's doc commit follows (the session has been pushing throughout).
 
 ---
 
 ## 3. Next steps (ordered)
+
+> ⚠️ **PRIORITY:** the **PERF/FREEZE tiers in §2 (Tier 1–4) are the CURRENT work stream —
+> start there.** The server-split tail below is a **separate, lower-priority roadmap track**;
+> do NOT start it ahead of the §2 tiers unless the user explicitly redirects.
 
 **M3 is now complete** (all overlay/index reads on the socket). The remaining server-split **tail** is below. Read [`SERVER-SPLIT-AND-ROADMAP.md`](./SERVER-SPLIT-AND-ROADMAP.md) §6 (the M1→M4 detail + the per-milestone status table) before starting.
 
