@@ -1,6 +1,6 @@
 # T-Hub — Session Handoff
 
-**Last updated:** 2026-06-27 · **Branch:** `main` · **App version:** `0.3.23` (local Windows builds). **⚠️ Tip `714f0e2` is NOT yet pushed — `main` is 5 ahead of `origin/main` (v0.3.20 `19b8aa2`, v0.3.21 `20853b7`, docs `ed371e9`, v0.3.22 review-hardening `01aa1e9`, v0.3.23 Option B + A1-prep `714f0e2`); the user pushes on request.** No `v*` tag / GitHub Release past v0.2.0.
+**Last updated:** 2026-06-27 · **Branch:** `main` · **App version:** `0.3.24` (local Windows builds). **⚠️ Tip `cc604bd` is NOT yet pushed — `main` is 7 ahead of `origin/main` (v0.3.20 `19b8aa2`, v0.3.21 `20853b7`, docs `ed371e9`, v0.3.22 review-hardening `01aa1e9`, v0.3.23 Option B + A1-prep `714f0e2`, docs `4165042`, v0.3.24 canvas stale-frame heal `cc604bd`); last pushed = `5119699`; the user pushes on request.** No `v*` tag / GitHub Release past v0.2.0.
 
 > **Zero-context handoff.** Read this file in full, plus any doc it links that's
 > relevant to your task. Every decision below is already made — **do not re-ask
@@ -22,14 +22,15 @@
 
 ## 2. State
 
-### Latest session (2026-06-27): PERFORMANCE & FREEZE OVERHAUL (v0.3.12→v0.3.23) — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md)
+### Latest session (2026-06-27): PERFORMANCE & FREEZE OVERHAUL (v0.3.12→v0.3.24) — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md)
 
 **[`docs/PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) is the single source of
 truth** for everything below (fixes shipped, hypotheses ruled out, full prioritized
 backlog). Read it in full before doing any perf/drag work — do NOT re-chase the
 ruled-out causes (win_snap, transparent/redirection-bitmap, frameless, memory, event
-flood). Versions 0.3.2→0.3.19 are **local Windows builds** — all commits are **pushed to
-`origin/main`** (tip `0e13eb0`); there is **no `v*` tag / GitHub Release past v0.2.0**.
+flood). Versions 0.3.2→0.3.24 are **local Windows builds**; commits through `5119699` are
+**pushed to `origin/main`**, but **v0.3.20–v0.3.24 (7 commits) are NOT yet pushed** (the
+user pushes on request); there is **no `v*` tag / GitHub Release past v0.2.0**.
 
 **THE HEADLINE (v0.3.17, watchdog-confirmed):** the original *always-present, sporadic,
 "super-laggy" hard freeze* — the one that ghosted the T-Hub icon in Alt-Tab (Windows
@@ -64,15 +65,16 @@ host-side, not renderer-side (emit-flood was *ruled out* — blocks had only ~20
 **EXECUTION PLAN — next context (tiered; full per-item detail + file:line in worklog §6).**
 ✅ The recent-work + doc-staleness REVIEWS are **DONE** (v0.3.19, commit `a25a249`).
 
-✅ **Tier 1 — SHIPPED (v0.3.20, `19b8aa2`).** All 10 frontend small-wins landed via a
-5-cluster parallel agent fan-out; tsc + 53 vitest green. **⏳ Windows smoke-test pending
-(SMOKE-TEST.md A–D) — that is the gate before trusting it.** The 10 items shipped (worklog
-§6 has the details): maximize re-fit (`repaintMount.ts` settle now calls `refreshTerminal`),
-editable-target guard on lifecycle keybinds, chord-rebind shadow removal
+✅ **Tier 1 — SHIPPED (v0.3.20, `19b8aa2`); now 9 shipped + 1 reverted.** The frontend
+small-wins landed via a 5-cluster parallel agent fan-out; tsc + 53 vitest green. **⏳ Windows
+smoke-test pending (SMOKE-TEST.md A–D) — that is the gate before trusting it.** The items
+(worklog §6 has the details): maximize re-fit (`repaintMount.ts` settle now calls
+`refreshTerminal`), editable-target guard on lifecycle keybinds, chord-rebind shadow removal
 (`store/keybindings.ts`), `!isSatellite()` automation gate (`autoContinueMount`/`rulesMount`),
-satellite blank-boot recovery (`workspace.ts setTerminals`), double-click spawn busy-gate
-(store `recallInFlight` Set + UI gates), hidden-tab `pending[]` cap (2 MiB, drop oldest),
-foreground-aware `onRepaintAll`, file-search request-id cancellation
+satellite blank-boot recovery (`workspace.ts setTerminals`) **— REVERTED in v0.3.22 (it
+adopted the unscoped terminal list → dual-attach garble; #4 re-deferred)**, double-click spawn
+busy-gate (store `recallInFlight` Set + UI gates), hidden-tab `pending[]` cap (2 MiB, drop
+oldest), foreground-aware `onRepaintAll`, file-search request-id cancellation
 (`FilePanel`/`FileTree`), and drag commit-on-release (`Canvas.tsx` imperative flexGrow).
 
 ✅ **Tier 2 backend bucket — SHIPPED (v0.3.21, `20853b7`).** The LOW/confirmed
@@ -92,13 +94,19 @@ big freeze is gone):
     GAP between consecutive main-thread probe runs (PERIOD=100ms, STALL_MS=200ms) so it
     reliably catches the residual ≥200ms "staggered" stutter — the old per-probe wait
     missed sub-PERIOD-aligned blocks. One hang line per stall.
-  - ⏳ **NEXT: A1 emit-coalesce FIX (needs the user's repro first).** With v0.3.23
-    installed, the user reproduces the stutter (drag a tile while a Claude session is
-    actively working; alt-tab in/out); read `~/.t-hub/diag.log` for the `"src":"rust-main"`
-    gap lines + their `emitsDuringBlock` to confirm the culprit, THEN apply the fix:
-    `AtomicBool window_interacting` set from window move/resize; while true widen the
-    terminal-output coalesce window (8ms→~100ms) + `MAX_BATCH_BYTES` in `remote_pty.rs`.
-    Do NOT change the hot output path blind — confirm with the diag evidence first.
+  - ✅ **v0.3.24 canvas stale-frame heal — SHIPPED (`cc604bd`).** `forceFullRedraw` =
+    throttled `clearTextureAtlas` + refresh, wired at **6 geometry-heal points**
+    (new-session relayout, maximize/restore, minimize/restore, window-edge drag,
+    grid-gutter resize, tab-switch/overlay toggle) + a **foreground-only broadcast** (which
+    also killed the ~327ms pooled-fit storm). Helps satisfy the **Tier-4 canvas-renderer
+    acceptance matrix** (worklog §6 checklist). The freeze + Alt-Tab ghost are now
+    watchdog-CONFIRMED gone on v0.3.24 (**0 `"src":"rust-main"` blocks in ~51min**).
+  - ❌ **A1 emit-coalesce FIX — DROPPED on evidence.** The A1 repro is COMPLETE; the diag
+    named ONE main-thread stall (~327ms) with `emitsDuringBlock=0`, which RULES OUT
+    terminal-output emit marshaling as the cause. **Do NOT** pursue the
+    `window_interacting` / coalesce-widen rework in `remote_pty.rs`/`lib.rs` — the real
+    residual was the broadcast `onRefresh` fitting ~16 pooled terminals, fixed structurally
+    in v0.3.24 (above).
   - Drop the consumer-less `agent://journal` emit.
   - **Review-surfaced (recent-work review, all LOW/confirmed):**
     - ✅ **DONE (v0.3.21):** `spawn_blocking` the blocking async commands
@@ -174,9 +182,10 @@ give each cluster its own agent + `isolation: 'worktree'`; merge clusters back t
 **Cross-tier ordering (overlap-driven, NOT free to fully parallelize):**
 - Tier 2 **Option B** edits the focus handlers (`Tile`/`RecentList`/`Canvas`/`UsageStrip`/
   `repaintMount`) → overlaps Tier-1 clusters 1 & 2 → run AFTER Tier 1 merges.
-- Tier 2 **backend** items (emit-coalesce in `remote_pty.rs`/`lib.rs`, `diag_log` async in
-  `diag.rs`, `spawn_blocking` in `git.rs`/`files.rs`/`commands_05.rs`) touch only Rust →
-  file-disjoint from Tier 1 frontend → CAN run in parallel with Tier 1.
+- Tier 2 **backend** items (`diag_log` async in `diag.rs`, `spawn_blocking` in
+  `git.rs`/`files.rs`/`commands_05.rs`) touch only Rust → file-disjoint from Tier 1
+  frontend → CAN run in parallel with Tier 1. *(The emit-coalesce in `remote_pty.rs`/`lib.rs`
+  was DROPPED on evidence — see Tier 2 above.)*
 - Tier 3 **reap** touches `workspace.ts`/`WorkspacesList` + backend → overlaps Tier-1
   cluster 2's `workspace.ts` → run AFTER Tier 1 merges.
 
@@ -219,7 +228,7 @@ The keystone roadmap item. The bet: pull T-Hub's "brain" out of the desktop GUI 
 
 **Also this session (UI batch, pre-split):** tab strip removed (brand = tray icon, settings moved top-right); sidebar reshape (`+` in Workspaces header, expand-all default, last-active time, bigger buttons, portal'd color picker, collapsed-rail stats); a shared ring+center **status indicator** (working = spinner, done = true solid green `#22c55e`, idle = green ring) with a live legend in Settings; Win11 Snap-Layouts maximize-button rect tracking; **notifications + sounds now default OFF** (opt-in); titlebar × hides-to-tray (default) vs quits, as a setting.
 
-**Verification (server-split tip `9dbbc39`):** `cargo build` clean · ~190 Rust lib tests · `tsc` clean · 53 vitest — each server-split commit also verified **live** via control-socket probes + sub-agent review (peer gate / token compare / write bounding all clean). The perf/freeze commits SINCE (0.3.2→0.3.19) were each `tsc` + `cargo check` green and hand-tested on Windows; **re-run `cargo test --lib` + `pnpm test` for current counts before trusting exact numbers** (more tests have been added since 9dbbc39).
+**Verification (server-split tip `9dbbc39`):** `cargo build` clean · ~190 Rust lib tests · `tsc` clean · 53 vitest — each server-split commit also verified **live** via control-socket probes + sub-agent review (peer gate / token compare / write bounding all clean). The perf/freeze commits SINCE (0.3.2→0.3.24) were each `tsc` + `cargo check` green and hand-tested on Windows; **re-run `cargo test --lib` + `pnpm test` for current counts before trusting exact numbers** (more tests have been added since 9dbbc39).
 
 **Push state:** all server-split + M3 commits through `9dbbc39` are on `origin/main`; this handoff's doc commit follows (the session has been pushing throughout).
 

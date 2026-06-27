@@ -21,11 +21,11 @@ The pre-existing `PERF-AUDIT.md` (broader/older history) is kept as-is.
   Claude is **statusline-first** (v0.3.18, user-verified) — `/usage` only a cold-start fallback.
 - ✅ Cold first-drag freeze fixed (Option A, v0.3.14, user-verified); GPU canvas renderer
   (v0.3.9, shipped — acceptance matrix in §6 still to run).
-- ✅ **Tier-1 frontend small-wins batch SHIPPED (v0.3.20, `19b8aa2`)** — all 10 items
-  (maximize re-fit, hidden-tab queue cap, foreground-aware repaint, editable-keybind
-  guard, satellite blank-boot recovery, double-click spawn gate, drag commit-on-release,
-  chord-rebind shadow, `!isSatellite()` automation gate, file-search cancellation).
-  tsc + 53 vitest green. ⏳ Windows smoke-test pending (SMOKE-TEST.md A–D).
+- ✅ **Tier-1 frontend small-wins batch SHIPPED (v0.3.20, `19b8aa2`)** — 9 net (1 reverted)
+  items (maximize re-fit, hidden-tab queue cap, foreground-aware repaint, editable-keybind
+  guard, satellite blank-boot recovery (reverted v0.3.22 — #4 re-deferred), double-click
+  spawn gate, drag commit-on-release, chord-rebind shadow, `!isSatellite()` automation gate,
+  file-search cancellation). tsc + 53 vitest green. ⏳ Windows smoke-test pending (SMOKE-TEST.md A–D).
 - ✅ **Tier-2 backend bucket SHIPPED (v0.3.21, `20853b7`)** — `spawn_blocking` the
   blocking async cmds; non-blocking + rotating `diag_log`; codex DB-fallback `plan_type`.
 - ✅ **Review-hardening SHIPPED (v0.3.22, `01aa1e9`)** — adversarial review of v0.3.20/21
@@ -34,10 +34,16 @@ The pre-existing `PERF-AUDIT.md` (broader/older history) is kept as-is.
   nits, hidden-queue UTF-8/ANSI split, RecentList timer leak.
 - ✅ **Option B + A1 diagnostic prep SHIPPED (v0.3.23, `714f0e2`)** — focus de-storm
   (gitInfo in-flight dedup, RecentList `sameRecent`); hangwatch rewritten to the
-  gap-between-runs metric so it reliably catches ≥200ms stalls. ⏳ smoke-test + the
-  A1 stutter repro pending (then the A1 emit-coalesce FIX targets what the diag names).
-- 📋 **Still to tackle (see §6 + [`HANDOFF.md`](./HANDOFF.md) Tier 2–4):** the **A1
-  emit-coalesce FIX** (after the user's repro names the culprit) + drop `agent://journal`
+  gap-between-runs metric so it reliably catches ≥200ms stalls.
+- ✅ **A1 repro COMPLETE → emit-coalesce FIX DROPPED (on evidence).** The diag named ONE
+  main-thread stall (~327ms) with `emitsDuringBlock=0` → terminal-output emit marshaling
+  RULED OUT. The real residual was the broadcast `onRefresh` fitting ~16 pooled terminals,
+  fixed structurally in v0.3.24 (below) — NOT the `window_interacting`/coalesce-widen rework.
+- ✅ **v0.3.24 canvas stale-frame heal SHIPPED (`cc604bd`)** — `forceFullRedraw` = throttled
+  `clearTextureAtlas` + refresh at 6 geometry-heal points + foreground-only broadcast (also
+  killed the ~327ms pooled-fit storm). Freeze + Alt-Tab ghost watchdog-CONFIRMED gone
+  (0 `"src":"rust-main"` blocks in ~51min).
+- 📋 **Still to tackle (see §6 + [`HANDOFF.md`](./HANDOFF.md) Tier 2–4):** drop `agent://journal`
   emit; the benign frontend polish (advanceCodexUsage realloc, in-flight `/usage` cancel,
   `useHasCodexSession` O(N), `runWhenIdle` onSettle unmount); **Tier 3
   reap-on-leave-workspace**; Tier-4 verify/housekeeping.
@@ -51,7 +57,7 @@ The pre-existing `PERF-AUDIT.md` (broader/older history) is kept as-is.
 | **A** | Drag/resize/maximize/minimize → **3-4s hard freeze then jump**, idle/empty, size-independent, native-frame too | CPU/WSL starvation of the OS move loop by the usage subprocess storm | ✅ **Fixed** (v0.3.8) — user-verified |
 | **B** | General sluggishness, "used to be faster", slow session creation | Same usage storm | ✅ **Fixed** (v0.3.8) |
 | **C** | App-switch (Alt-Tab back) 1-2s stall | Focus-refresh burst; the only uncached offender was `claude -p /usage` | ✅ dominant offender fixed; rest backend-cached |
-| **D** | A *busy* terminal stutters while the rest of the app is smooth | xterm **DOM renderer** can't keep up with Claude TUI full-screen repaints | ✅ CANVAS renderer (0.3.9) renders smoothly; window-op stale-frame fixed (0.3.10/0.3.11). **Residual:** lags when dragging *while* a focused session works → §6 |
+| **D** | A *busy* terminal stutters while the rest of the app is smooth | xterm **DOM renderer** can't keep up with Claude TUI full-screen repaints | ✅ CANVAS renderer (0.3.9) renders smoothly; window-op stale-frame fixed (0.3.10/0.3.11), **broadened in v0.3.24** (`forceFullRedraw`/`clearTextureAtlas` at ANY geometry change). **Residual** (drag *while* a focused session works) → §6: emit-marshaling ruled out, fix dropped, no longer reproducing |
 
 ---
 
@@ -110,10 +116,11 @@ looking at what the app was *doing*, not theorizing about rendering.
 | **0.3.17** | `a38486a` | **🎯 THE FREEZE CURE: `control_request` async + `spawn_blocking`** (was a SYNC command → ran the blocking socket round-trip on the MAIN thread; recent/git/usage/codex/files all route through it). Also `USAGE_RETRY_GAP_MS` 15s→60s. | ✅ **CONFIRMED: zero `rust-main` blocks across 326 lines of active use** (was 2–4s every ~min). The original "always-present super-laggy/ghosting" freeze. |
 | **0.3.18** | `2f661a5` | **Claude usage = statusline-first** (live `rate_limits` from the per-turn statusline, account-wide, FREE/non-blocking; `claude -p /usage` only the cold-start fallback, hourly) | ✅ **user-verified:** strip matches `/usage` (74-75% wk / 27% session used) and `/usage` dropped from every-few-min to once-on-load |
 | **0.3.19** | `a25a249` | Review pass: Rust watchdog logs off-thread (was ironic main-thread `diag_log`); statusline usage backfills each window independently (partial snapshot can't blank the other); stale-doc sweep | hardening + doc accuracy |
-| **0.3.20** | `19b8aa2` | **Tier-1 frontend small-wins batch** (5 file-disjoint clusters, parallel agent fan-out): maximize re-fit (`refreshTerminal` on settle), hidden-tab `pending[]` cap (2 MiB, drop oldest), foreground-aware `onRepaintAll`, editable-target guard on lifecycle keybinds, satellite blank-boot recovery, double-click spawn busy-gate (store `recallInFlight` Set + UI gates), grid drag commit-on-release (imperative flexGrow), chord-rebind shadow removal, `!isSatellite()` automation gate, file-search request-id cancellation | tsc + 53 vitest green; ⏳ Windows smoke-test pending (SMOKE-TEST.md) |
+| **0.3.20** | `19b8aa2` | **Tier-1 frontend small-wins batch** (5 file-disjoint clusters, parallel agent fan-out): maximize re-fit (`refreshTerminal` on settle), hidden-tab `pending[]` cap (2 MiB, drop oldest), foreground-aware `onRepaintAll`, editable-target guard on lifecycle keybinds, satellite blank-boot recovery **(reverted v0.3.22 — #4 re-deferred)**, double-click spawn busy-gate (store `recallInFlight` Set + UI gates), grid drag commit-on-release (imperative flexGrow), chord-rebind shadow removal, `!isSatellite()` automation gate, file-search request-id cancellation | tsc + 53 vitest green; ⏳ Windows smoke-test pending (SMOKE-TEST.md) |
 | **0.3.21** | `f78954d`→`20853b7` | **Tier-2 backend bucket** (3 file-disjoint Rust agents): `spawn_blocking` the blocking async cmds (tmux_scroll/exit_scroll HOT, list_dir/read_text_file UNC, git_commit/git_worktree_*) — mirrors `git_info`; `diag_log`/`diag_clear` now NON-BLOCKING (mpsc → lazily-spawned daemon writer, one fd) + ROTATING (`.1` backup at 8 MiB, was unbounded→100+MB); codex Windows DB-fallback keeps `plan_type` (slice from enclosing `{`). *(`20853b7` = amend fixing a sed-corrupted Cargo.lock; see §7.)* | cargo check + 205 lib tests green; built+installed |
 | **0.3.22** | `01aa1e9` | **Review-hardening** (adversarial review of v0.3.20/21 — 5 code reviewers + live verify; live = 0 rust-main hang blocks, control channel responsive): reverted the satellite blank-recovery (it adopted the UNSCOPED terminal list → dual-attach garble; #4 re-deferred); codex DB-fallback window `b[j:i+2000]` (no rate_limits truncation); diag.rs drops the handle on write error, bounded `sync_channel(8192)` + try_send, clear truncates, rotate resets size only on rename success; Terminal hidden-queue drop now stops on a newline boundary; RecentList resume-timer cleared on unmount | tsc+vitest+cargo+205 green |
 | **0.3.23** | `714f0e2` | **Option B (focus de-storm)** + **A1 diagnostic prep**: gitInfo in-flight dedup (N same-cwd focus calls → 1 round-trip, no added staleness, gitCommit busts it); RecentList `JSON.stringify` diff → `sameRecent` field compare; hangwatch rewritten to the **gap-between-runs** metric (old per-probe wait missed ~200ms stalls) — reliably catches ≥200ms, one line per stall | tsc+vitest+cargo+205 green; adversarial-reviewed; ⏳ smoke-test + A1 repro pending |
+| **0.3.24** | `cc604bd` | **Canvas stale-frame heal**: `forceFullRedraw` = throttled `clearTextureAtlas` + refresh, wired at **6 geometry-heal points** (new-session relayout, maximize/restore, minimize/restore, window-edge drag, grid-gutter resize, tab-switch/overlay toggle); **foreground-only broadcast** (also killed the ~327ms pooled-fit storm the A1 diag named — `emitsDuringBlock=0`) | tsc+vitest+cargo green; freeze + Alt-Tab ghost **watchdog-CONFIRMED gone** (0 `"src":"rust-main"` blocks in ~51min) |
 | — | `49aec86` (swept) | Background-terminal output throttling (fg rAF vs bg 250/1000ms/512KiB); windowMaximized rAF+in-flight guard | C/B |
 
 One-time: **killed ~4 GB of orphaned `claude` processes** (they survive SIGTERM →
@@ -268,25 +275,24 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
       window past its reset and polls only while a Codex tile is open
       (`useHasCodexSession`). Verified against the live rollout (session 0% left /
       weekly 70% left) and user-confirmed.
-- [ ] **Drag/maximize lags when a FOCUSED Claude session is actively working** (the
-      current residual — idle is fine; what's left after 0.3.8/0.3.9). **ROOT CAUSE
-      (subagent, evidence-based — corrects an earlier wrong guess of a statusline
-      spawn-storm):** the statusline is throttled to `refreshInterval:5` ≈ 0.2/sec/
-      session (verified against the live 19 MB journal, peak 5/sec) — NOT the cause.
-      The cause is **terminal output `app.emit(terminal://output)` marshaling onto the
-      Windows MAIN/UI thread** (`remote_pty.rs:329`): a freshly-sent prompt triggers an
-      output burst (echo + spinner + token stream + TUI repaints) → ~125 emits/sec per
-      streaming terminal *even after* the 8ms/256KB coalesce + frontend rAF batch, and
-      during a drag the OS modal move/size loop owns that same main thread → the emits
-      drain slowly → the drag stutters.
-      **FIX (Tauri app — normal rebuild, NO t-hub-agent rebuild):** set an
-      `AtomicBool window_interacting` from window move/resize events (lib.rs setup);
-      while true, WIDEN the terminal-output coalesce window (8ms → ~100ms) + raise
-      `MAX_BATCH_BYTES` in `remote_pty.rs` `emit_batch`/`reader_loop`, so output
-      accumulates and flushes in a few large emits AFTER release instead of ~125/sec
-      during the drag. Optionally coalesce `control://event` emits (`control_client.rs:245`)
-      the same way. *Principle: stop marshaling work onto the main UI thread while
-      Windows owns it for the drag.*
+- [x] **Drag/maximize lags when a FOCUSED Claude session is actively working** —
+      **emit-marshaling RULED OUT; the emit-coalesce fix was DROPPED; this residual is no
+      longer reproducing.** The A1 diag (v0.3.23 hangwatch gap-metric) named ONE main-thread
+      stall (~327ms) with `emitsDuringBlock=0` — which refutes the terminal-output
+      emit-marshaling hypothesis below (a marshaling-bound block would carry many emits).
+      The real residual was the broadcast `onRefresh` fitting ~16 pooled terminals, fixed
+      structurally in **v0.3.24** (foreground-only broadcast). The freeze is now
+      **watchdog-confirmed gone** (0 `"src":"rust-main"` blocks in ~51min on v0.3.24).
+      <br>**Original (now-superseded) hypothesis, kept for history:** ROOT CAUSE (subagent,
+      evidence-based — corrected a still-earlier statusline spawn-storm guess): the
+      statusline is throttled to `refreshInterval:5` ≈ 0.2/sec/session (verified against the
+      live 19 MB journal, peak 5/sec) — NOT the cause. The supposed cause was **terminal
+      output `app.emit(terminal://output)` marshaling onto the Windows MAIN/UI thread**
+      (`remote_pty.rs:329`): a freshly-sent prompt triggers an output burst → ~125 emits/sec
+      per streaming terminal *even after* the 8ms/256KB coalesce + frontend rAF batch, and
+      during a drag the OS modal move/size loop owns that same main thread. The proposed FIX
+      (`AtomicBool window_interacting` from window move/resize → widen the coalesce window
+      8ms→~100ms + raise `MAX_BATCH_BYTES`) was **DROPPED** once the diag showed `emits=0`.
 - [ ] *Secondary (separate builds/scope):* statusline self-throttle in `t-hub-agent`
       (skip the journal append+fsync + the per-render `tmux display` spawn if <~2s
       since last) → shrinks the 19 MB journal — **t-hub-agent builds separately**.
@@ -343,8 +349,10 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
 - [ ] #2 workspace-close orphans sessions (the leak — same fix as reap above). *(Tier 3.)*
 - [x] #3 per-window automation duplicates — **FIXED v0.3.20:** `!isSatellite()` gate at the
       top of `installAutoContinue`/`installRulesEngine`.
-- [x] #4 satellite fallback can boot a blank popped-out window — **FIXED v0.3.20:**
-      `workspace.ts setTerminals` satellite branch repopulates an empty order from the live list.
+- [ ] #4 satellite fallback can boot a blank popped-out window — SHIPPED v0.3.20
+      (`workspace.ts setTerminals` satellite branch repopulated an empty order from the live
+      list) then **REVERTED in v0.3.22** — it adopted the UNSCOPED terminal list →
+      dual-attach garble. **#4 re-deferred.**
 - [x] #5 rebinding a chord doesn't remove it from other commands — **FIXED v0.3.20:**
       `setBinding`/`setPrefixedBinding` clear the chord from any other command first.
 - [x] #6 Ctrl/Cmd+Shift+W delete-confirm fires while typing — **FIXED v0.3.20:**
