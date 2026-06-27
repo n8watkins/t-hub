@@ -736,10 +736,10 @@ export function TerminalView({
             // Renderer/buffer detached mid-call; ignore.
           }
           tlog("resize", `${terminalId} cleared scrollback + repaint (rows=${term.rows})`);
-          forceRepaint();
+          forceFullRedraw();
         });
       } else {
-        forceRepaint();
+        forceFullRedraw();
       }
     };
 
@@ -1081,6 +1081,42 @@ export function TerminalView({
       }
     };
 
+    // The RELIABLE recomposite — the programmatic equivalent of "scroll/type
+    // heals the frozen frame". A bare t.refresh() only marks rows dirty; the
+    // 2D-canvas renderer then skips redrawing "unchanged" cells and keeps the
+    // CACHED geometry, so a stale frame after a geometry change (new session
+    // relayout, maximize/restore, drag) survives — and the ⟳ reload button, which
+    // only fit()s+refreshes, can't clear it when cols/rows didn't change (fit is
+    // then a no-op). term.clearTextureAtlas() throws away the cached glyph atlas
+    // and forces a full re-composite, exactly what a scroll does. It RE-RASTERIZES
+    // glyphs (heavier than refresh), so we self-throttle the atlas clear to at most
+    // ~10x/sec: a discrete heal (maximize/restore/new-session) clears immediately;
+    // a continuous drag that calls this per frame only clears every 100ms and falls
+    // back to a plain refresh in between — bounded cost, never a per-frame atlas
+    // rebuild. (fit() — the only thing that fixes a SIZE change — stays on the
+    // debounced settle; this just re-composites correctly into the resized canvas.)
+    let lastAtlasClearMs = 0;
+    const forceFullRedraw = () => {
+      if (disposed) return;
+      const t = termRef.current;
+      if (!t || t.rows <= 0) return;
+      const now =
+        typeof performance !== "undefined" ? performance.now() : Date.now();
+      if (now - lastAtlasClearMs >= 100) {
+        lastAtlasClearMs = now;
+        try {
+          t.clearTextureAtlas();
+        } catch {
+          // DOM-renderer fallback has no atlas; ignore.
+        }
+      }
+      try {
+        t.refresh(0, t.rows - 1);
+      } catch {
+        // Renderer detached mid-call; ignore.
+      }
+    };
+
     // The pool parks inactive/cross-tab terminals offscreen (translate
     // -100000px) + visibility:hidden, and brings the active tab's terminal back
     // onscreen on a tab switch. That offscreen<->onscreen move is a geometric
@@ -1126,6 +1162,14 @@ export function TerminalView({
     // stale-frame repaint this used to do is preserved.
     const wrapEl = container.closest("[data-th-pool-tile]") as HTMLElement | null;
     const onPoolMoved = () => {
+      // LEADING heal: a new-session relayout / grow resizes this tile but fires NO
+      // window onResized and NO focus, so repaintMount never runs — without this the
+      // foreground tile shows a stale/frozen frame for the whole 250ms debounce
+      // (the "open a new session blanks a terminal" case). Recomposite the
+      // foreground tile next frame; the trailing settle still does the real
+      // fit+reflow-dedupe. (We do NOT fit per call — the fit stays on the settle so
+      // a continuous drag still coalesces to one SIGWINCH.)
+      if (foregroundRef.current) requestAnimationFrame(forceFullRedraw);
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(settleResize, 250);
     };
@@ -1145,7 +1189,12 @@ export function TerminalView({
     // from doing a full repaint of every pooled terminal.
     const onRepaintAll = () => {
       if (!foregroundRef.current) return;
-      requestAnimationFrame(forceRepaint);
+      // forceFullRedraw (not just refresh): a same-size restore-from-minimize or an
+      // overlay close needs the canvas RE-COMPOSITED, which a bare refresh won't do
+      // (see forceFullRedraw). The atlas-clear self-throttles, so a continuous
+      // window drag (repaintMount's per-frame leading rAF lands here too) only
+      // rebuilds the atlas ~10x/sec, not every frame.
+      requestAnimationFrame(forceFullRedraw);
     };
     window.addEventListener(REPAINT_ALL_EVENT, onRepaintAll);
 
@@ -1157,12 +1206,22 @@ export function TerminalView({
     const onRefresh = (e: Event) => {
       const eid = (e as CustomEvent<{ id?: string }>).detail?.id;
       if (eid && eid !== terminalId) return;
-      // Re-fit + repaint ONLY. We do NOT reset/re-seed xterm's buffer here: doing
+      // A no-id BROADCAST (repaintMount's window-resize/maximize settle) would
+      // otherwise pushResize() EVERY pooled terminal — ~16 synchronous fit.fit()
+      // calls = the observed ~327ms main-thread stall. Background tiles re-fit on
+      // un-park via the IntersectionObserver, so for a broadcast only fit+heal the
+      // FOREGROUND tile. A TARGETED refresh (eid set — the ⟳ reload button on this
+      // tile) always runs regardless of foreground.
+      if (!eid && !foregroundRef.current) return;
+      // Re-fit + RECOMPOSITE. We do NOT reset/re-seed xterm's buffer here: doing
       // that on a LIVE terminal (especially a full-screen app in the alt-screen
       // buffer) mangles the formatting. Deep scroll-up is handled by Page Up (tmux
       // copy-mode), which reads the real tmux history (up to history-limit).
+      // forceFullRedraw (not refresh) is why the ⟳ button now actually clears a
+      // stale frame: when cols/rows are unchanged, pushResize()'s fit is a no-op,
+      // so only the atlas-clear re-composite heals it.
       pushResize();
-      requestAnimationFrame(forceRepaint);
+      requestAnimationFrame(forceFullRedraw);
     };
     window.addEventListener(REFRESH_TERMINAL_EVENT, onRefresh);
 
@@ -1177,6 +1236,12 @@ export function TerminalView({
     // long enough that a fast continuous drag never trips it mid-motion yet
     // short enough to feel immediate once the user lets go.
     resizeObserver = new ResizeObserver(() => {
+      // LEADING heal so a grid-GUTTER drag (resizing tiles inside the window — no
+      // window onResized, no pool-move; only this observer fires) doesn't sit on a
+      // frozen frame for the 250ms debounce. forceFullRedraw self-throttles its
+      // atlas clear, so per-callback during a continuous drag is bounded; the FIT
+      // stays on the trailing settle ONLY (no per-frame SIGWINCH/reflow storm).
+      if (foregroundRef.current) requestAnimationFrame(forceFullRedraw);
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(settleResize, 250);
     });
