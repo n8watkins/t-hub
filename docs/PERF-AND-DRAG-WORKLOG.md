@@ -120,13 +120,29 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
 
 **Now / verify**
 - [ ] **Drag/maximize lags when a FOCUSED Claude session is actively working** (the
-      current residual — idle is fine; this is what's left after 0.3.8/0.3.9). Prime
-      suspect: Claude's statusline spawns a `t-hub-agent` process **~25×/sec** while a
-      session works (each does a journal read + append + **fsync** in WSL) → CPU/WSL
-      contention with the window op. A smaller cousin of the usage storm. Likely fix:
-      a **statusline write throttle** (timestamp/lock gate) — note this lives in the
-      **`t-hub-agent` WSL binary, which builds separately**, not the Tauri app.
-      *Under investigation (subagent).*
+      current residual — idle is fine; what's left after 0.3.8/0.3.9). **ROOT CAUSE
+      (subagent, evidence-based — corrects an earlier wrong guess of a statusline
+      spawn-storm):** the statusline is throttled to `refreshInterval:5` ≈ 0.2/sec/
+      session (verified against the live 19 MB journal, peak 5/sec) — NOT the cause.
+      The cause is **terminal output `app.emit(terminal://output)` marshaling onto the
+      Windows MAIN/UI thread** (`remote_pty.rs:329`): a freshly-sent prompt triggers an
+      output burst (echo + spinner + token stream + TUI repaints) → ~125 emits/sec per
+      streaming terminal *even after* the 8ms/256KB coalesce + frontend rAF batch, and
+      during a drag the OS modal move/size loop owns that same main thread → the emits
+      drain slowly → the drag stutters.
+      **FIX (Tauri app — normal rebuild, NO t-hub-agent rebuild):** set an
+      `AtomicBool window_interacting` from window move/resize events (lib.rs setup);
+      while true, WIDEN the terminal-output coalesce window (8ms → ~100ms) + raise
+      `MAX_BATCH_BYTES` in `remote_pty.rs` `emit_batch`/`reader_loop`, so output
+      accumulates and flushes in a few large emits AFTER release instead of ~125/sec
+      during the drag. Optionally coalesce `control://event` emits (`control_client.rs:245`)
+      the same way. *Principle: stop marshaling work onto the main UI thread while
+      Windows owns it for the drag.*
+- [ ] *Secondary (separate builds/scope):* statusline self-throttle in `t-hub-agent`
+      (skip the journal append+fsync + the per-render `tmux display` spawn if <~2s
+      since last) → shrinks the 19 MB journal — **t-hub-agent builds separately**.
+      Memoize hot sidebar/tile components (`React.memo` on `TerminalRow`/`Tile`/
+      `SupervisionTree`). Drop the no-frontend-consumer `agent://journal` emit.
 - [ ] **Verify v0.3.9 canvas renderer.** Acceptance for the whole matrix: the busy
       terminal is **smoother** than the DOM build AND there is **NO blank/stale-frame
       regression** (the regression to watch — the old WebGL blank-grid). If any case
