@@ -11,6 +11,8 @@ import { codexUsage, type CodexRateWindow, type CodexUsage } from "../ipc/codex"
 import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
 import { runWhenIdle } from "../lib/windowInteraction";
+import { useSupervision } from "../store/supervision";
+import type { StatusSnapshot } from "../ipc/model";
 
 /** Poll cadence: every 5 min (plus on mount) keeps the numbers fresh without
  *  spamming the (heavy) underlying commands. */
@@ -36,6 +38,14 @@ const POLL_MS = 5 * 60 * 1000;
  *  the only faster-than-that path and it's deliberately sparse. */
 const USAGE_FRESH_MS = 60 * 1000;
 const USAGE_RETRY_GAP_MS = 60 * 1000;
+
+/** `claude -p /usage` is now only the COLD-START FALLBACK for Claude (the live
+ *  statusline is the primary source — see {@link useClaudeUsage}). It's the
+ *  heavy/flaky CLI, so when it IS used, keep it sparse: a good read is fresh for an
+ *  hour and the interval re-checks hourly (a failed read still retries within
+ *  USAGE_RETRY_GAP_MS so a flaky first read recovers in ~a minute). */
+const CLAUDE_FRESH_MS = 60 * 60 * 1000;
+const CLAUDE_POLL_MS = 60 * 60 * 1000;
 
 /** Fill color by REMAINING %: red nearly out, amber low, green healthy. */
 function fillColor(left: number): string {
@@ -175,37 +185,90 @@ function loadCachedUsage(): ClaudeUsage | null {
   }
 }
 
+/** Build a {@link ClaudeUsage} from the freshest statusline snapshot that carries
+ *  rate limits. Rate limits are ACCOUNT-WIDE, so any active session's snapshot
+ *  reflects current usage — we take the most recently ingested one. Returns null
+ *  until a session has reported rate limits (pre-first-turn / free tier), so the
+ *  caller can fall back to `claude -p /usage`. `usedPercentage` maps to the strip's
+ *  "used" (it shows "left" = 100 − used); reset epochs are formatted like Codex. */
+function selectStatuslineUsage(
+  snapshots: Record<string, StatusSnapshot>,
+): ClaudeUsage | null {
+  let best: StatusSnapshot | null = null;
+  for (const snap of Object.values(snapshots)) {
+    if (!snap.rateLimitsPresent) continue;
+    if (!best || snap.ingestedAtMs > best.ingestedAtMs) best = snap;
+  }
+  if (!best) return null;
+  const five = best.fiveHour;
+  const seven = best.sevenDay;
+  if (five?.usedPercentage == null && seven?.usedPercentage == null) return null;
+  return {
+    sessionUsedPct: five?.usedPercentage ?? null,
+    sessionResets: fmtReset(five?.resetsAt),
+    weekUsedPct: seven?.usedPercentage ?? null,
+    weekResets: fmtReset(seven?.resetsAt),
+    weekSonnetUsedPct: null,
+    ok: true,
+  };
+}
+
+/** Field-equality for the statusline-derived usage, so we return a STABLE object
+ *  ref while the displayed numbers are unchanged (snapshots churn every turn). */
+function sameClaudeUsage(a: ClaudeUsage | null, b: ClaudeUsage | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.ok === b.ok &&
+    a.sessionUsedPct === b.sessionUsedPct &&
+    a.weekUsedPct === b.weekUsedPct &&
+    a.sessionResets === b.sessionResets &&
+    a.weekResets === b.weekResets
+  );
+}
+
 /**
- * Poll `claude -p /usage` and return the latest good reading (or null before the
- * first one). Seeded from the last-good cached reading so usage is visible
- * immediately on launch and never blanks while a poll is in flight; a
- * failed/unavailable poll keeps the last-known values rather than wiping them.
+ * Claude plan usage for the sidebar. **Statusline-first:** the PRIMARY source is the
+ * live statusline `rate_limits` (5h + weekly) that Claude Code already streams per
+ * turn for any active session — FREE, non-blocking, ACCOUNT-WIDE (one reading no
+ * matter how many terminals), so there's no `claude -p /usage` spawn in the common
+ * case. `claude -p /usage` is only the COLD-START FALLBACK: it runs when no session
+ * has reported rate limits yet (pre-first-turn / free tier), sparsely (hourly).
  *
- * Extracted as a hook so the SINGLE poller can feed both the expanded strip and
- * the collapsed inline summary without double-polling (Sidebar.tsx owns it).
+ * One poller, owned by Sidebar.tsx — NOT per-terminal. Seeded from the last-good
+ * cache so usage shows immediately on launch and never blanks on a failed poll.
  */
 export function useClaudeUsage(): ClaudeUsage | null {
-  const [usage, setUsage] = useState<ClaudeUsage | null>(loadCachedUsage);
+  // PRIMARY: live statusline rate-limits, ref-stabilized so the strip only
+  // re-renders when a displayed number actually changes (snapshots churn per turn).
+  const snapshots = useSupervision((s) => s.snapshots);
+  const slRef = useRef<ClaudeUsage | null>(null);
+  const statusline = useMemo(() => {
+    const next = selectStatuslineUsage(snapshots);
+    if (sameClaudeUsage(slRef.current, next)) return slRef.current;
+    slRef.current = next;
+    return next;
+  }, [snapshots]);
+
+  // FALLBACK: claude -p /usage — only while the statusline has NO rate-limit data.
+  const [polled, setPolled] = useState<ClaudeUsage | null>(loadCachedUsage);
   const lastRunRef = useRef(0);
   const lastGoodRef = useRef(0);
 
-  // `force` (mount + 5-min interval) bypasses the focus policy.
   const refresh = useCallback((force = false) => {
     const now = Date.now();
     if (!force) {
-      const fresh = now - lastGoodRef.current < USAGE_FRESH_MS;
+      const fresh = now - lastGoodRef.current < CLAUDE_FRESH_MS;
       const ranRecently = now - lastRunRef.current < USAGE_RETRY_GAP_MS;
-      if (fresh || ranRecently) return; // data is fresh, or we just tried — skip
+      if (fresh || ranRecently) return; // fresh, or we just tried — skip
     }
     lastRunRef.current = now;
     void claudeUsage()
       .then((u) => {
-        // Only ADOPT a good reading. A failed/unavailable poll must NOT wipe the
-        // last-known values (the "usage keeps disappearing" fix) — we keep
-        // showing the cached weekly + 5h until a fresh good reading replaces it.
+        // Only ADOPT a good reading; a failed poll keeps the last-known values.
         if (u && u.ok) {
-          lastGoodRef.current = Date.now(); // gate freshness off the last GOOD read
-          setUsage(u);
+          lastGoodRef.current = Date.now();
+          setPolled(u);
           try {
             localStorage.setItem(CACHE_KEY, JSON.stringify(u));
           } catch {
@@ -218,20 +281,32 @@ export function useClaudeUsage(): ClaudeUsage | null {
       });
   }, []);
 
+  // Only spawn `claude -p /usage` while the statusline has nothing yet (cold start).
+  const haveStatusline = !!statusline;
   useEffect(() => {
+    if (haveStatusline) return; // statusline covers it — no CLI spawn
     refresh(true);
-    const id = window.setInterval(() => refresh(true), POLL_MS);
-    // refresh on focus only when stale (USAGE_FRESH_MS/USAGE_RETRY_GAP_MS), and
-    // DEFER it past an active window drag so it can't starve the first drag.
+    const id = window.setInterval(() => refresh(true), CLAUDE_POLL_MS);
     const onFocus = () => runWhenIdle(() => refresh());
     window.addEventListener("focus", onFocus);
     return () => {
       window.clearInterval(id);
       window.removeEventListener("focus", onFocus);
     };
-  }, [refresh]);
+  }, [refresh, haveStatusline]);
 
-  return usage;
+  // Persist the live statusline reading so a later fallback / restart shows it
+  // immediately instead of blanking until the first /usage poll.
+  useEffect(() => {
+    if (!statusline) return;
+    try {
+      localStorage.setItem(CACHE_KEY, JSON.stringify(statusline));
+    } catch {
+      /* ignore quota */
+    }
+  }, [statusline]);
+
+  return statusline ?? polled;
 }
 
 // ============================ Codex usage ===================================
