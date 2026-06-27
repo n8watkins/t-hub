@@ -23,6 +23,7 @@ import { useAgentTelemetry } from "../store/telemetry";
 import { useSettings } from "../store/settings";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import { useTheme } from "../store/theme";
+import { useHasCodexSession } from "../store/clientType";
 import { WslHealth, gib, usedFraction } from "./WslHealth";
 import {
   UsageStrip,
@@ -318,7 +319,8 @@ function UsageSection() {
   // One poller each drives both the collapsed inline summary and the full strip,
   // for Claude and (when present) Codex.
   const usage = useClaudeUsage();
-  const codex = useCodexUsage();
+  // Only poll Codex while a Codex tile is open; otherwise show the cached value.
+  const codex = useCodexUsage(useHasCodexSession());
   const hasCodex = !!codex?.ok;
   return (
     <div className="shrink-0 border-t" style={{ borderColor: "var(--th-border)" }}>
@@ -411,7 +413,8 @@ function leftPct(usedPct: number | null | undefined): number | null {
 function RailStats() {
   const { metrics } = useAgentTelemetry();
   const usage = useClaudeUsage();
-  const codex = useCodexUsage();
+  // Only poll Codex while a Codex tile is open; otherwise show the cached value.
+  const codex = useCodexUsage(useHasCodexSession());
 
   const wkClaude = usage?.ok ? leftPct(usage.weekUsedPct) : null;
   const wkCodex = codex?.ok ? leftPct(codex.secondary?.usedPercent ?? null) : null;

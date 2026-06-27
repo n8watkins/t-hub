@@ -10,6 +10,7 @@ import { claudeUsage, type ClaudeUsage } from "../ipc/usage";
 import { codexUsage, type CodexRateWindow, type CodexUsage } from "../ipc/codex";
 import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
+import { runWhenIdle } from "../lib/windowInteraction";
 
 /** Poll cadence: every 5 min (plus on mount) keeps the numbers fresh without
  *  spamming the (heavy) underlying commands. */
@@ -215,7 +216,9 @@ export function useClaudeUsage(): ClaudeUsage | null {
   useEffect(() => {
     refresh(true);
     const id = window.setInterval(() => refresh(true), POLL_MS);
-    const onFocus = () => refresh(); // refresh on focus only when stale — see USAGE_FRESH_MS / USAGE_RETRY_GAP_MS
+    // refresh on focus only when stale (USAGE_FRESH_MS/USAGE_RETRY_GAP_MS), and
+    // DEFER it past an active window drag so it can't starve the first drag.
+    const onFocus = () => runWhenIdle(() => refresh());
     window.addEventListener("focus", onFocus);
     return () => {
       window.clearInterval(id);
@@ -298,8 +301,12 @@ function advanceCodexUsage(
 /** Poll Codex usage (same cadence + last-good caching as {@link useClaudeUsage}).
  *  Returns null until the first good reading; never blanks on a failed poll. The
  *  returned value is time-ADVANCED: windows past their reset show as fresh without
- *  waiting for the next poll (see {@link advanceCodexUsage}). */
-export function useCodexUsage(): CodexUsage | null {
+ *  waiting for the next poll (see {@link advanceCodexUsage}).
+ *
+ *  `enabled` GATES polling to "Codex is in use" (a Codex tile is open — see
+ *  `useHasCodexSession`): when false we never spawn the WSL read, but still return
+ *  the cached, time-advanced last-known value so the strip persists what it had. */
+export function useCodexUsage(enabled = true): CodexUsage | null {
   const [usage, setUsage] = useState<CodexUsage | null>(loadCachedCodexUsage);
   const lastRunRef = useRef(0);
   const lastGoodRef = useRef(0);
@@ -330,15 +337,17 @@ export function useCodexUsage(): CodexUsage | null {
   }, []);
 
   useEffect(() => {
+    if (!enabled) return; // only poll while a Codex session is in use
     refresh(true);
     const id = window.setInterval(() => refresh(true), POLL_MS);
-    const onFocus = () => refresh(); // refresh on focus only when stale — see USAGE_FRESH_MS / USAGE_RETRY_GAP_MS
+    // Stale-gated, and deferred past an active window drag (see useClaudeUsage).
+    const onFocus = () => runWhenIdle(() => refresh());
     window.addEventListener("focus", onFocus);
     return () => {
       window.clearInterval(id);
       window.removeEventListener("focus", onFocus);
     };
-  }, [refresh]);
+  }, [refresh, enabled]);
 
   // Re-render once a minute so a window that has rolled past its reset shows as
   // "available again" without needing a fresh poll. Cheap: one state write/min.

@@ -79,6 +79,9 @@ looking at what the app was *doing*, not theorizing about rendering.
 | 0.3.9 | `93deab7` | **xterm CANVAS (GPU) renderer** + `@xterm/addon-canvas` | ✅ fix D — busy terminal renders smoothly (user-verified); avoids the WebGL blank-grid |
 | 0.3.10 | `a0ba809` | Force terminal repaint on window-state change (`repaintMount.ts`) | ✅ canvas stale-frame after maximize/minimize ("scroll to reload") fixed |
 | 0.3.11 | `1ca1482` | Tighter post-window-op repaint (leading-frame rAF + 50ms trailing) | snappier terminal refocus after maximize/minimize |
+| 0.3.12 | `0891d10` | Usage strip refreshes on focus only when STALE (gate on last-GOOD read) | ✅ Claude weekly/5h stop blanking/reverting (user-verified) |
+| 0.3.13 | `3807c29` | **Codex usage from the LIVE session rollout** (not the stale `logs_*.sqlite`); timestamp-selected; frontend window time-advance | ✅ Codex weekly/session correct + match `/status` (user-verified) |
+| **0.3.14** | *(pending)* | **Cold-first-drag fix "Option A": suppress focus-triggered work during a window drag** (`windowInteraction.ts` `runWhenIdle` + `isInteracting`; wrap all 6 focus handlers) **+ gate Codex polling on an open Codex tile** | first-drag-after-unfocus freeze (focus storm) — awaiting user verify |
 | — | `49aec86` (swept) | Background-terminal output throttling (fg rAF vs bg 250/1000ms/512KiB); windowMaximized rAF+in-flight guard | C/B |
 
 One-time: **killed ~4 GB of orphaned `claude` processes** (they survive SIGTERM →
@@ -118,7 +121,42 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
 
 ## 6. What's LEFT to tackle (prioritized)
 
+**Cold-first-drag = FOCUS STORM (distinct from the A1 emit residual below)**
+- [x] **First drag "out of the blue" freezes; the second is smooth.** **ROOT CAUSE
+      (workflow, adversarially verified):** clicking the title bar of an UNFOCUSED
+      window fires a `focus` transition, and ~8 focus handlers fire at once on the
+      single UI thread right as the OS drag loop starts — repaint EVERY terminal
+      (dominant), plus `gitInfo` per tile, `listTerminals`, `recentSessions` (+ a
+      JSON diff), claude/codex usage IPC. The 2nd drag has no focus transition → no
+      storm. **Option A SHIPPED (v0.3.14):** `windowInteraction.ts` exposes
+      `isInteracting()` (set on pointerdown + Tauri `onMoved`/`onResized`, cleared
+      ~250ms after) and `runWhenIdle(fn)` (defer one frame; if interacting, defer to
+      a `th-window-settled` event). All 6 focus handlers (`repaintMount`, `Tile`,
+      `RecentList`, `Canvas`, `UsageStrip` ×2) now wrap their refresh in
+      `runWhenIdle`, so the storm runs AFTER the drag settles, never during.
+- [ ] **Option B (de-storm focus handlers) — FOLLOW-UP, not yet done.** Option A only
+      DEFERS the storm past a DRAG; the storm itself is still heavy, so a focus
+      transition with **no drag still hitches** — most notably **ALT-TAB IN/OUT of the
+      app** (user-reported on v0.3.13: "freeze that affects the ability to tab in and
+      out"). Alt-tab is keyboard focus → no pointerdown, no `onMoved` → `isInteracting()`
+      is false → `runWhenIdle` runs the storm after one frame, so the hitch remains.
+      Option B fixes this by making the handlers non-blocking even when they run:
+      (a) run focus work on an idle callback / after-paint instead of synchronously;
+      (b) **coalesce duplicate IPC** — one batched `gitInfo` for all tiles instead of N,
+      a single shared usage poll; (c) drop `RecentList`'s main-thread
+      `JSON.stringify(prev)===JSON.stringify(list)` diff. Bigger change, more files,
+      more regression surface — do it as a focused pass once Option A is verified.
+      *(User explicitly asked to keep B queued here.)*
+
 **Now / verify**
+- [x] **Codex usage stale/reverting.** **DONE (v0.3.13).** Was scraped from
+      `~/.codex/logs_*.sqlite` (only written on certain events → 6 days stale when a
+      session was idle/out-of-credits, overwriting the good cached value). Now read
+      from the LIVE session rollout (`~/.codex/sessions/**/rollout-*.jsonl`), the same
+      data `/status` shows, selecting by event timestamp; frontend time-advances each
+      window past its reset and polls only while a Codex tile is open
+      (`useHasCodexSession`). Verified against the live rollout (session 0% left /
+      weekly 70% left) and user-confirmed.
 - [ ] **Drag/maximize lags when a FOCUSED Claude session is actively working** (the
       current residual — idle is fine; what's left after 0.3.8/0.3.9). **ROOT CAUSE
       (subagent, evidence-based — corrects an earlier wrong guess of a statusline

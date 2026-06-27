@@ -43,6 +43,7 @@ import {
   handlePrefixedKey,
   disarm,
 } from "../lib/prefixKeyHandler";
+import { runWhenIdle } from "../lib/windowInteraction";
 
 /**
  * Split `ids` into balanced rows that completely fill the canvas — no empty
@@ -191,10 +192,12 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     // with the focus listener so the list is fresh on return without spawning a
     // wsl.exe every 5s in the background.
     const id = window.setInterval(refresh, 15000);
-    window.addEventListener("focus", refresh);
+    // Defer the focus refresh past an active window drag (cold-first-drag fix).
+    const onFocus = () => runWhenIdle(refresh);
+    window.addEventListener("focus", onFocus);
     return () => {
       window.clearInterval(id);
-      window.removeEventListener("focus", refresh);
+      window.removeEventListener("focus", onFocus);
     };
   }, [focusedId, updateTerminalsMeta]);
 

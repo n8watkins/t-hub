@@ -15,6 +15,7 @@
 // change settles. Imported once at startup from main.tsx (next to statusMount).
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { repaintAllTerminals } from "./repaint";
+import { runWhenIdle } from "./windowInteraction";
 
 let mounted = false;
 
@@ -49,8 +50,12 @@ export function mountWindowRepaint(): void {
   };
 
   // Restore-from-minimize / re-focus: regains focus but fires no resize event.
+  // DEFER past an active window drag — a focus-driven repaint of every terminal
+  // is the dominant cost that froze the first drag (cold-first-drag fix). The
+  // settle pass after the interaction (or the next scroll) covers any real
+  // stale-frame case; a plain re-focus needs no synchronous full repaint.
   if (typeof window !== "undefined") {
-    window.addEventListener("focus", schedule);
+    window.addEventListener("focus", () => runWhenIdle(() => repaintAllTerminals()));
   }
 
   // Maximize / restore / resize. Swallow outside a Tauri window (plain dev/tests).

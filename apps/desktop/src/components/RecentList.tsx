@@ -30,6 +30,7 @@ import {
 } from "../ipc/recent";
 import { useTheme } from "../store/theme";
 import { useWorkspace } from "../store/workspace";
+import { runWhenIdle } from "../lib/windowInteraction";
 
 export interface RecentListProps {
   /** Resume a past session: spawn `claude --resume <id>` in `cwd`, focus it. */
@@ -177,8 +178,10 @@ export function RecentList({ onRecall, onCount }: RecentListProps) {
 
   useEffect(() => {
     refresh();
-    window.addEventListener("focus", refresh);
-    return () => window.removeEventListener("focus", refresh);
+    // Defer the focus refresh past an active window drag (cold-first-drag fix).
+    const onFocus = () => runWhenIdle(refresh);
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, [refresh]);
 
   // The × button: DISMISS a project from Recent for good. We optimistically hide

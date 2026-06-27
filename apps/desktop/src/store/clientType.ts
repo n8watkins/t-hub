@@ -65,3 +65,18 @@ export function clientForTerminal(id: TerminalId): ClientType {
   if (/\bcodex\b/.test(haystack)) return "codex";
   return "shell";
 }
+
+/**
+ * True when ANY open tile is running Codex — i.e. "Codex is in use". Used to GATE
+ * Codex usage polling: when no Codex session is open we don't spawn the WSL read
+ * (the cached, time-advanced last-known value still shows). Subscribes to the
+ * workspace store, so it re-evaluates when a tile's title/label changes (e.g. a
+ * spawned `codex` tile becomes identifiable, or it closes).
+ */
+export function useHasCodexSession(): boolean {
+  return useWorkspace((s) =>
+    Object.keys(s.terminals).some(
+      (id) => clientForTerminal(id as TerminalId) === "codex",
+    ),
+  );
+}

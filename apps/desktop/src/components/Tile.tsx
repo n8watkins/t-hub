@@ -56,6 +56,7 @@ import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { refreshTerminal } from "../lib/repaint";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { gitInfo, type GitInfo } from "../ipc/git";
+import { runWhenIdle } from "../lib/windowInteraction";
 import { GitBranch } from "lucide-react";
 
 /** Poll git facts (branch / worktree / dirty count) for a tile's cwd. Refreshes
@@ -75,7 +76,9 @@ function useGitInfo(cwd: string): GitInfo | null {
         .catch(() => alive && setInfo(null));
     };
     load();
-    window.addEventListener("focus", load);
+    // Defer the focus refresh past an active window drag (cold-first-drag fix).
+    const onFocus = () => runWhenIdle(load);
+    window.addEventListener("focus", onFocus);
     // Poll so a branch switch in the SAME directory (`git switch` without a cwd
     // change) is eventually reflected — the cwd-keyed effect alone wouldn't re-fire.
     // Skip while hidden, and poll INFREQUENTLY: each tick spawns a `git` (a wsl.exe
@@ -89,7 +92,7 @@ function useGitInfo(cwd: string): GitInfo | null {
     }, 30000);
     return () => {
       alive = false;
-      window.removeEventListener("focus", load);
+      window.removeEventListener("focus", onFocus);
       window.clearInterval(poll);
     };
   }, [cwd]);

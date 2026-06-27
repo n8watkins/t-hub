@@ -9,6 +9,10 @@ import "./lib/notifyMount";
 // populates app-wide (not just while the Sidebar is mounted). Idempotent.
 // See src/lib/statusMount.ts.
 import "./lib/statusMount";
+// Side-effect import: arms the shared "window is moving/resizing" flag so
+// focus-triggered work defers during a drag (the cold-first-drag fix). See
+// src/lib/windowInteraction.ts.
+import "./lib/windowInteraction";
 // Side-effect import: forces a terminal repaint after window-state changes
 // (maximize/minimize/restore/resize) so the canvas renderer never shows a stale
 // frame you'd otherwise have to scroll to refresh. See src/lib/repaintMount.ts.
