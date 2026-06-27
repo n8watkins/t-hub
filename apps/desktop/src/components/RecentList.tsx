@@ -155,6 +155,30 @@ function groupByFolder(sessions: RecentSession[]): FolderGroup[] {
   return out;
 }
 
+/**
+ * Cheap structural equality for two recent-session lists — the Option B
+ * replacement for a per-refresh `JSON.stringify` deep-compare. RecentSession is a
+ * flat record, so comparing every field by index covers exactly what stringify
+ * did, but allocates nothing and short-circuits on the first difference.
+ */
+function sameRecent(a: RecentSession[], b: RecentSession[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (
+      x.id !== y.id ||
+      x.lastSeen !== y.lastSeen ||
+      x.label !== y.label ||
+      x.cwd !== y.cwd ||
+      x.lastText !== y.lastText
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function RecentList({ onRecall, onCount }: RecentListProps) {
   // Seed from cache so we render the previous Recent immediately; `loaded` is
   // true when a cache existed, so "Loading…" only shows on the very first run.
@@ -168,9 +192,11 @@ export function RecentList({ onRecall, onCount }: RecentListProps) {
         setLoaded(true);
         // Only swap state when the list actually changed — an unchanged refetch
         // keeps the same array ref, so React skips the re-render (no flash).
-        setSessions((prev) =>
-          JSON.stringify(prev) === JSON.stringify(list) ? prev : list,
-        );
+        // Option B: a field-by-field compare (RecentSession is a flat 5-field
+        // record) instead of JSON.stringify(prev)===JSON.stringify(list), which
+        // serialized the whole list on EVERY focus/refresh on the main thread.
+        // This covers the same fields but allocates nothing and short-circuits.
+        setSessions((prev) => (sameRecent(prev, list) ? prev : list));
         saveCache(list);
       })
       .catch(() => setLoaded(true));

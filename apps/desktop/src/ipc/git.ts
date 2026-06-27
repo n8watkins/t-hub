@@ -48,8 +48,31 @@ export interface GitInfo {
  * Only `gitInfo` moves over the socket; the mutating git commands below stay on
  * `invoke` (process-changing — gated off the control channel).
  */
+/**
+ * In-flight dedup (Option B focus de-storm): a window-focus refresh fires
+ * `gitInfo(cwd)` from EVERY open tile at once, and tiles in the same repo
+ * (worktrees, multiple tiles in one project) repeat the same cwd. Concurrent
+ * calls for an identical cwd now share ONE `control_request` round-trip instead
+ * of N. The entry is cleared the instant the request settles, so a later call
+ * (e.g. the post-commit refresh, after `gitCommit` invalidated the daemon's
+ * per-cwd cache) always re-fetches fresh — there is NO retained client cache and
+ * therefore no added staleness.
+ */
+const inflightGitInfo = new Map<string, Promise<GitInfo>>();
+
 export function gitInfo(cwd: string): Promise<GitInfo> {
-  return controlRequest(CommandsGit.gitInfo, { cwd }) as Promise<GitInfo>;
+  const existing = inflightGitInfo.get(cwd);
+  if (existing) return existing;
+  const p = (controlRequest(CommandsGit.gitInfo, { cwd }) as Promise<GitInfo>).finally(
+    () => {
+      // Only clear if THIS promise is still the current entry — a concurrent
+      // gitCommit invalidation (or a newer call) may have already replaced it, and
+      // we must not delete that newer in-flight entry.
+      if (inflightGitInfo.get(cwd) === p) inflightGitInfo.delete(cwd);
+    },
+  );
+  inflightGitInfo.set(cwd, p);
+  return p;
 }
 
 /**
@@ -58,7 +81,15 @@ export function gitInfo(cwd: string): Promise<GitInfo> {
  * a git failure (e.g. nothing to commit).
  */
 export function gitCommit(cwd: string, message: string): Promise<string> {
-  return invoke(CommandsGit.gitCommit, { cwd, message });
+  return (invoke(CommandsGit.gitCommit, { cwd, message }) as Promise<string>).finally(
+    () => {
+      // The dirty count just changed. Drop any in-flight gitInfo for this cwd so
+      // the post-commit refresh starts a FRESH fetch (the daemon cache is also
+      // invalidated server-side) instead of possibly reusing a pre-commit
+      // in-flight result and showing a stale dirty count for one refresh cycle.
+      inflightGitInfo.delete(cwd);
+    },
+  );
 }
 
 /**
