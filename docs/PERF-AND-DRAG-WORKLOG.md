@@ -130,6 +130,10 @@ storm**; D is the **DOM renderer**.
 - [ ] #4 satellite fallback can boot a blank popped-out window.
 - [ ] #5 rebinding a chord doesn't remove it from other commands → old binding shadows.
 - [ ] #6 Ctrl/Cmd+Shift+W delete-confirm fires while typing in an input (no editable guard).
+- [ ] #7 **Recent-resume + spawn-menu have NO busy/pending gate** → a double-click stacks
+      duplicate tmux+claude spawns (`RecentList.tsx:352-355`, `Canvas.tsx:216-230`,
+      `workspace.ts:967-989`). On-theme with "stop unneeded spawns" — disable the control
+      until the spawn settles. *(from the codex `PERF-AUDIT.md` follow-up F6/Fix#6)*
 
 **Perf — medium (from the optimization review)**
 - [ ] Debounce durable **workspace persistence** (tiers: immediate for lifecycle,
@@ -137,6 +141,10 @@ storm**; D is the **DOM renderer**.
 - [ ] **Foreground-aware repaint broadcasts** (don't `repaintAllTerminals` →
       `term.refresh` on every terminal for an overlay toggle).
 - [ ] **File-search cancellation** (request-id stale suppression for huge repos).
+- [ ] **Drag commits state only on `pointerup`.** During a grid/sidebar drag, drive CSS
+      variables imperatively (+ an epsilon no-op guard) and skip the React
+      `setRows`/`setCols`/`setSidebarWidth` + persistence writes until release
+      (`Canvas.tsx:621-707`/`724-801`, `App.tsx:243-247`). *(codex `PERF-AUDIT.md` follow-up F1/F2/Fix#2)*
 
 **Perf — low (already mitigated by backend TTL caches; do only if instrumentation shows jank)**
 - [ ] Throttle the **recent / git / listTerminals** focus refreshes. Backend already
