@@ -1,127 +1,164 @@
-# T-Hub Performance & Drag-Lag Worklog
+# T-Hub Performance & Drag-Lag — Master Worklog
 
-Date: 2026-06-26 → 2026-06-27
-Status: **living document** — the authoritative trail of what we tried, what we
-ruled out, what we shipped, and what's left. Read this before re-investigating;
-several "obvious" causes are already conclusively ruled out below.
+Date: 2026-06-26 → 2026-06-27 · Branch: `main` · **Single source of truth.**
 
-Companion docs: `DRAG-LAG-INVESTIGATION.md` (drag deep-dive), `PERF-OPTIMIZATION-REVIEW.md`
-(the 6-item responsiveness review), `FOCUS-RETURN-LAG-ANALYSIS.md` (app-switch lag),
-`PERF-MAIN-UNCONFIRMED-PATCH.md` (the bg-terminal patch that landed).
-
----
-
-## 1. Symptoms (as reported, refined over the session)
-
-There are **three distinct problems**, repeatedly conflated. Keep them separate:
-
-| # | Symptom | Nature |
-|---|---|---|
-| **A** | **Drag/resize/maximize/minimize lag → a 3-4s COMPLETE freeze, then the window jumps to the target.** Reproduces **idle / empty workspace (0-2 tiles)**, **size-independent**, on a **native frame** too. Typing is fine *except* it's frozen *during* the drag. | Structural / contention. NOT yet fixed. |
-| **B** | **General sluggishness — "used to be faster"**, slow session creation. | Workload. Dominant cause found + fixed (see §4, usage storm). |
-| **C** | **App-switch return lag** (Alt-Tab back → 1-2s stall). | Focus-refresh burst. Dominant offender fixed; rest backend-cached. |
+This doc **consolidates and supersedes** the scattered perf notes:
+`DRAG-LAG-INVESTIGATION.md`, `PERF-OPTIMIZATION-REVIEW.md`,
+`PERF-MAIN-UNCONFIRMED-PATCH.md` (all deleted), and `FOCUS-RETURN-LAG-ANALYSIS.md`
+(lives in the `codex/client-review` worktree; its findings are folded in below).
+The pre-existing `PERF-AUDIT.md` (broader/older history) is kept as-is.
 
 ---
 
-## 2. Hypotheses tested → outcomes (the elimination trail)
+## TL;DR — where we are now
 
-| Hypothesis | Verdict | How we know |
-|---|---|---|
-| Event/IPC flood (status snapshots, double-emitter fan-out, terminal output) | **FIXED — real wins, but NOT problem A** | dedup at source + SocketEmitter-only + rAF/Rust coalescing (commits below). Problem A persists idle/empty where no events flow. |
-| CSS `backdrop-filter`/blur compositing | **RULED OUT** | none exist in the codebase. |
-| Indicator animations (`th-ind-pulse`/spin) forcing repaint | **RULED OUT for A** | only render on active sessions; A reproduces idle/empty. |
-| Memory pressure / leaked live processes | **RULED OUT as A's cause (but a real leak)** | killed **~4 GB** of orphaned `claude` processes; drag freeze unchanged. WSL still held 7 GB (doesn't auto-return). 5 GB free on Windows. |
-| WebView2 process bloat | **RULED OUT** | T-Hub owns ONE webview env (6 procs); the "26 procs" were other apps system-wide. |
-| `win_snap` Win32 subclass (DwmExtendFrameIntoClientArea + per-message DwmDefWindowProc) | **CONCLUSIVELY RULED OUT for A** | v0.3.5 shipped it **disabled** by default; still froze. |
-| WebView2 opaque redirection bitmap (`transparent:false`) | **RULED OUT for A** | v0.3.7 set `transparent:true` (→ tao adds `WS_EX_NOREDIRECTIONBITMAP`); still froze. (Kept — it's the documented resize-lag fix and doesn't hurt.) |
-| Frameless/custom-titlebar path | **RULED OUT for A** | v0.3.6 native frame (`decorations:true`); still froze 3-4s on the **native** title bar. |
-| GPU/software-rendering | **UNLIKELY** | native-frame **resize** went smooth → GPU composites fine. No `--disable-gpu` flag. |
-| `claude -p /usage` focus storm (no backend cache, ~4s flaky, fired on EVERY focus) | **CONFIRMED as B's dominant cause → FIXED** | diag log: ~4s/cycle, **~65% failure**, bursty 4-7s clusters; only offender w/o a backend TTL cache. Fixed in v0.3.8 (`3285e54`). |
-| **A (drag freeze) = CPU/WSL contention from the focus-spawn storm** | **LEADING, UNCONFIRMED** | freeze duration (~3-4s) ≈ one usage cycle (~4s). **Testable on v0.3.8.** Fallback: the OS modal-move-loop (would need a custom drag). |
-
-### Diag-log correction (important, don't repeat the mistake)
-The `~/.t-hub/diag.log` was **135 MB**, but **99.5% (~1.0 M lines) is an old `setSnapshot`
-debug-log flood** — 26 snapshot UUIDs each logged tens of thousands of times — which
-**stopped ~02:17** when the status-snapshot dedup (`d6d71ef`/`71a42ee`) landed. The file
-size is a *logging artifact of an already-fixed issue*, NOT a subprocess storm. The real
-`claude -p /usage` subprocess evidence is **~4,636 lines (~899 cycles / 27 h)** — small in
-volume but dominant in **cost** (only multi-second + flaky + uncached). Don't cite the
-135 MB as "usage storm."
+- ✅ **The dominant cause is FIXED:** a `claude -p /usage` **focus-storm** was pegging
+  WSL/CPU. App went from "almost unusable" to **"a lot better."**
+- 🔬 **Residual being fixed:** a *busy terminal* still stuttered (DOM renderer) while
+  the rest of the app stayed smooth → **GPU canvas renderer** (v0.3.9, under test).
+- 📋 **Still to tackle:** see §6 — the reap-when-not-in-workspace directive (biggest
+  remaining lever), 6 correctness findings, and a handful of medium/low perf items.
 
 ---
 
-## 3. What is firmly established about Problem A (the drag freeze)
-- Idle/empty, size-independent, **native-frame too**, both window-trails AND content-freeze, **3-4s hard freeze then jump**.
-- Ruled out: events, CSS, animations, memory, webview-bloat, win_snap, redirection bitmap, frameless path, GPU.
-- A 3-4s *hard freeze* (not frame jank) ⇒ the main thread / system is **blocked or starved** for ~3-4s when the move loop runs — consistent with the ~4s `wsl.exe`→Claude usage cycle (and the other still-unthrottled focus spawns) saturating WSL/CPU.
-- **Next test:** measure drag on v0.3.8 (usage now throttled). If the freeze shrinks → contention confirmed; finish throttling the other focus spawns. If unchanged → it's the OS modal-move-loop; prototype a custom `SetWindowPos` drag that doesn't enter the modal loop (won't help maximize/minimize).
+## 1. The three problems (kept separate — they were repeatedly conflated)
 
----
-
-## 4. Fixes shipped (commit · version · effect)
-
-| Version | Commit | What | Targets |
+| | Symptom | Root cause | Status |
 |---|---|---|---|
-| 0.3.2 | `71a42ee` | Drop Titlebar `onMoved` per-move IPC storm; dedup status-snapshot fan-out at source | event flood; first drag attempt |
-| 0.3.3 | `0afc609` | SocketEmitter-only (kill TeeEmitter double-fanout); Rust-side terminal-output coalescing; dedup the two maximized hooks | event volume halved |
-| 0.3.4 | `2324b0b` | App version stamp in the top-left titlebar (build identity) | diagnostics |
-| 0.3.5 | `964636d` | **Diagnostic:** `win_snap::install` skipped by default (`T_HUB_DISABLE/ENABLE_WIN_SNAP`) | A/B — ruled win_snap OUT |
-| 0.3.6 | *(clone-only)* | **Diagnostic:** `decorations:true` native frame | A/B — ruled frameless path OUT |
-| 0.3.7 | `49aec86` | `transparent:true` (+ opaque html/#root); restore win_snap default-on; (also swept in the bg-terminal throttle patch) | A/B — ruled redirection bitmap OUT |
-| 0.3.8 | `3285e54` | **Throttle `claude -p /usage` + codex focus refresh to 60s** (mount + 5-min interval still force) | **B (dominant), candidate for A** |
-| — | `49aec86` (swept) | Background-terminal output throttling (foreground rAF vs background 250ms/1000ms/512KiB) + windowMaximized rAF+in-flight guard | C/B (PERF-OPTIMIZATION-REVIEW #1, #2-half) |
-
-One-time action (not a commit): **killed ~4 GB of orphaned `claude` processes** (they
-survive SIGTERM; needed SIGKILL) — these were leaked by the workspace-close path (see §6).
+| **A** | Drag/resize/maximize/minimize → **3-4s hard freeze then jump**, idle/empty, size-independent, native-frame too | CPU/WSL starvation of the OS move loop by the usage subprocess storm | ✅ **Fixed** (v0.3.8) — user-verified |
+| **B** | General sluggishness, "used to be faster", slow session creation | Same usage storm | ✅ **Fixed** (v0.3.8) |
+| **C** | App-switch (Alt-Tab back) 1-2s stall | Focus-refresh burst; the only uncached offender was `claude -p /usage` | ✅ dominant offender fixed; rest backend-cached |
+| **D** | A *busy* terminal stutters while the rest of the app is smooth | xterm **DOM renderer** can't keep up with Claude TUI full-screen repaints | 🔬 **v0.3.9 canvas renderer** (under test) |
 
 ---
 
-## 5. Architecture clarification: "going back" does NOT need RAM
-A kept-alive session = a live `claude` (Node) process in WSL (~400-570 MB each; we saw
-~10 = ~4.5 GB, several idle 24-35 h). It does **not** need to stay resident: Claude
-persists transcripts to disk, T-Hub records the tile→session binding (WS-6 `db.rs` /
-`list_orphaned_sessions`), and Recent recall = `claude --resume <id>`. **Directive (user):
-"nothing should be actively running unless it's in a workspace; recall via Recent."**
-This is the right model and the biggest single RAM/CPU lever — see §6.
+## 2. THE root cause (confirmed)
+
+The sidebar Usage strip read plan usage by running **`claude -p /usage`** — which
+spawns a **full Claude CLI (Node) in WSL** (`wsl.exe → bash → script → $SHELL -ilc →
+claude`, ~2s startup). Three things made it a wrecking ball:
+
+1. It re-ran on **every window `focus` event, unthrottled** (`UsageStrip.tsx` —
+   `addEventListener("focus", refresh)`). Focus fires constantly.
+2. `claude -p /usage` is **flaky (~65% `ok=false`** — the numbers need a network
+   round-trip and the process often prints only the intro line), so on failure it
+   **retried twice → ~4s per cycle**.
+3. Net: a near-constant storm of heavy Claude subprocess spawns pegging WSL/CPU —
+   **even when the app looked idle** (the poll doesn't need tiles).
+
+**Why it looked like a graphics bug:** a drag enters the OS modal move loop, which
+needs steady CPU to track the cursor. Starved by a ~4s usage cycle, it **froze
+~3-4s then jumped** — perfectly mimicking a compositor/window bug, which is why the
+earlier reports (and we) chased WebView2/frameless/win_snap/transparent for so long.
+
+**The breakthrough was reading the diag log** (`<win-home>/.t-hub/diag.log`) — i.e.
+looking at what the app was *doing*, not theorizing about rendering.
+> Diag-log caveat: the file was 135 MB but **99.5% is an old `setSnapshot` logging
+> flood** (already fixed by `d6d71ef`/`71a42ee`), NOT the usage storm. Real usage
+> evidence = ~4,636 lines confirming ~4s/cycle, ~65% failure, bursty 4-7s clusters.
 
 ---
 
-## 6. Outstanding / NOT yet addressed
+## 3. What worked — fixes shipped
 
-**High-value, architectural:**
-- [ ] **Reap-on-leave-workspace** (the directive). Today: tile-close kills the session, but **workspace-close orphans it** (`WorkspacesList → closeTab` ignores returned ids → leaked tmux + claude). Fix: on leave-workspace, record to Recent + kill the tmux/PTY + reap the process tree (SIGKILL needed). Subsumes much of PERF-OPTIMIZATION-REVIEW #1/#5.
+| Ver | Commit | Change | Effect |
+|---|---|---|---|
+| 0.3.2 | `71a42ee` | Drop Titlebar `onMoved` per-move IPC; dedup status-snapshot fan-out | event flood |
+| 0.3.3 | `0afc609` | SocketEmitter-only (kill TeeEmitter double-fanout); Rust terminal-output coalescing; dedup maximized hooks | event volume halved |
+| 0.3.4 | `2324b0b` | App-version stamp in titlebar | build identity |
+| 0.3.5 | `964636d` | *Diag:* `win_snap` off by default | ruled win_snap OUT |
+| 0.3.6 | *(clone)* | *Diag:* `decorations:true` native frame | ruled frameless path OUT |
+| 0.3.7 | `49aec86` | `transparent:true` (+ opaque bg); restore win_snap; (swept in the bg-terminal throttle) | ruled redirection-bitmap OUT |
+| **0.3.8** | **`3285e54`** | **Throttle usage+codex focus refresh to 60s** | **✅ THE fix (A + B + C)** |
+| 0.3.9 | *(building)* | **xterm CANVAS (GPU) renderer** + `@xterm/addon-canvas` | 🔬 fix D (busy-terminal stutter) |
+| — | `49aec86` (swept) | Background-terminal output throttling (fg rAF vs bg 250/1000ms/512KiB); windowMaximized rAF+in-flight guard | C/B |
 
-**From PERF-OPTIMIZATION-REVIEW.md (6 items):**
-- [x] #1 background terminal throttle — landed (`49aec86`). *Subsumed-by-directive: it lazily renders backgrounded sessions that, per the directive, shouldn't be running at all.*
-- [x] #2 coalesce maximize IPC — already done (`windowMaximized` in-flight/pending guard). The "audit TerminalPool slot observer" half = low value; **skip** (would risk the slot-rect hardening for ~no win).
-- [ ] #3 debounce workspace persistence (tiers) — not done.
-- [ ] #4 centralize git polling by cwd — **low priority**: backend already has a 3.5s TTL cache (`git.rs:57`) that absorbs the focus burst; the frontend store rewrite is largely redundant.
-- [ ] #5 foreground-aware repaint broadcasts — not done (subsumed by directive for out-of-workspace).
-- [ ] #6 real file-search cancellation — not done (low impact except huge repos).
-
-**From FOCUS-RETURN-LAG-ANALYSIS.md:**
-- [x] usage + codex focus throttle — **done** (`3285e54`, the dominant offender).
-- [ ] recent focus refresh — low value (backend 15s TTL `recent.rs:47` already absorbs).
-- [ ] git focus refresh — low value (backend 3.5s TTL).
-- [ ] `listTerminals` focus — minor min-interval.
-- [ ] **The proposed centralized `focusRefresh.ts` scheduler = OVER-ENGINEERED** per review: backend TTL caches already collapse git/recent/codex bursts; the 15-line usage throttle captured ~all the win. Treat the scheduler as optional.
-
-**Correctness findings (separate client-review, all CONFIRMED, not yet fixed):**
-- [ ] #1 close kills instead of detaches — reconciled by the directive (kill on leave-workspace + recall via Recent is the intended model).
-- [ ] #2 workspace-close orphans sessions (the leak — see reap above).
-- [ ] #3 per-window automation duplicates (autoContinue/rules run in every window incl. satellites) — gate on `!isSatellite()`.
-- [ ] #4 satellite fallback can boot a blank window.
-- [ ] #5 rebinding allows a duplicate chord that shadows the new binding.
-- [ ] #6 Ctrl/Cmd+Shift+W delete-confirm fires while typing in an input.
-
-**Open question:**
-- [ ] Why does `claude -p /usage` fail ~65% of the time (`ok=false`)? (Likely the wsl.exe shell-resolution issue — see the memory note about `wsl.exe -- bash` running zsh; pass `-e`.) Fixing the *failure* removes the 2nd retry attempt (~halves each cycle's cost).
+One-time: **killed ~4 GB of orphaned `claude` processes** (they survive SIGTERM →
+needed SIGKILL) — leaked by the workspace-close path (see §6).
 
 ---
 
-## 7. Local build/test loop (how these were produced)
-Local Windows MSVC build, isolated clone at `C:\Users\natha\projects\Tools\t-hub\t-hub-app`
-(`git clone` of the WSL repo → `pnpm install` → `pnpm tauri build`); test config disables
-`createUpdaterArtifacts` + uses `targets:["nsis"]`. See memory `local-windows-build.md`.
-Each version above shipped as a `T-Hub_<ver>_x64-setup.exe` and was hand-tested on Windows
-(drag/resize/maximize), since the lag can't be reproduced from WSL (no display).
+## 4. Hypotheses RULED OUT (don't re-chase these)
+
+events/IPC flood · CSS blur (none) · indicator animations (only on active sessions) ·
+memory pressure (freed ~4 GB, no change) · webview process bloat (T-Hub owns 1 env) ·
+**win_snap** (0.3.5 off, still froze) · **WebView2 redirection bitmap** (0.3.7
+`transparent`, still froze) · **frameless path** (0.3.6 native frame, still froze) ·
+GPU/software-render (native resize was smooth). All of A/B/C traced to the **usage
+storm**; D is the **DOM renderer**.
+
+---
+
+## 5. Architecture note (we are NOT thread-limited)
+
+- Tauri's Rust backend already runs a **multi-threaded tokio runtime + unlimited
+  `spawn_blocking`**; terminals run as **separate WSL processes**. Not capped.
+- The real constraint is the **single WebView2 UI/JS/render thread** — *identical to
+  VS Code* (both are Chromium). You can't add threads to it.
+- VS Code stays smooth by **offloading off that thread** (extension host, language
+  servers, search = separate processes) and **GPU terminal rendering (WebGL)** — not
+  by adding UI threads.
+- Our two gaps vs VS Code, both fixable, neither architectural: (a) we render
+  terminals on the **DOM** (the v0.3.9 canvas renderer closes this), and (b) we had
+  the usage-storm bug (fixed). Web Workers could offload *computation* (ANSI/URL
+  parsing) but **not** DOM/rendering.
+
+---
+
+## 6. What's LEFT to tackle (prioritized)
+
+**Now / verify**
+- [ ] **Verify v0.3.9 canvas renderer**: busy terminal smooth **and NO blank/stale
+      terminals** with several tiles (the regression to watch — the old WebGL
+      blank-grid). If it blanks, revert to DOM or scope canvas to foreground tiles.
+
+**High value — architectural (the directive: "nothing runs unless in a workspace")**
+- [ ] **Reap-on-leave-workspace.** Today tile-close kills the session, but
+      **workspace-close orphans it** (`WorkspacesList → closeTab` ignores returned
+      ids → leaked tmux + claude; this caused the ~4.5 GB). Fix: on leave-workspace,
+      record the binding to Recent, then kill the tmux/PTY **and reap the process
+      tree (SIGKILL — they ignore SIGTERM)**. Recall stays available via Recent →
+      `claude --resume <id>` (transcript on disk; WS-6 `db.rs`/`list_orphaned_sessions`).
+      *Subsumes much of perf-rec #1/#5.*
+
+**Correctness findings (all CONFIRMED by review, not yet fixed)**
+- [ ] #1 close kills instead of detaches — *reconciled by the reap directive* (kill on
+      leave + recall via Recent is the intended model).
+- [ ] #2 workspace-close orphans sessions (the leak — same fix as reap above).
+- [ ] #3 per-window automation duplicates — `autoContinueMount`/`rulesMount` run in
+      EVERY window incl. satellites → double spawns/continues. Gate on `!isSatellite()`.
+- [ ] #4 satellite fallback can boot a blank popped-out window.
+- [ ] #5 rebinding a chord doesn't remove it from other commands → old binding shadows.
+- [ ] #6 Ctrl/Cmd+Shift+W delete-confirm fires while typing in an input (no editable guard).
+
+**Perf — medium (from the optimization review)**
+- [ ] Debounce durable **workspace persistence** (tiers: immediate for lifecycle,
+      debounce for focus/tab/layout).
+- [ ] **Foreground-aware repaint broadcasts** (don't `repaintAllTerminals` →
+      `term.refresh` on every terminal for an overlay toggle).
+- [ ] **File-search cancellation** (request-id stale suppression for huge repos).
+
+**Perf — low (already mitigated by backend TTL caches; do only if instrumentation shows jank)**
+- [ ] Throttle the **recent / git / listTerminals** focus refreshes. Backend already
+      caches: git 3.5s (`git.rs:57`), recent 15s (`recent.rs:47`). The proposed
+      centralized `focusRefresh.ts` scheduler is **over-engineered** — skip it.
+- [ ] Centralize git polling by cwd (frontend) — low priority (backend-cached).
+
+**Investigate / cleanup**
+- [ ] **Why `claude -p /usage` fails ~65%** — it's `/usage` flakiness (network
+      round-trip; prints intro-only), not a shell bug; the 2-attempt retry exists for
+      it. Options: fewer attempts, or longer cadence — each lowers cost. Fixing the
+      flakiness would also make usage actually populate.
+- [ ] Decide whether `transparent:true` stays (it's the documented resize-redirection
+      fix and is harmless) — currently kept.
+
+---
+
+## 7. Build / test loop
+
+Local native MSVC build from an isolated Windows clone
+(`C:\Users\natha\projects\Tools\t-hub\t-hub-app`): `git clone` the WSL repo →
+`pnpm install` → edit `tauri.conf.json` for test (`createUpdaterArtifacts:false`,
+`targets:["nsis"]`) → `pnpm tauri build` → install `T-Hub_<ver>_x64-setup.exe`.
+Drag/resize/render lag can't be reproduced from WSL (no display), so every version
+is hand-tested on Windows. See memory `local-windows-build.md`.
