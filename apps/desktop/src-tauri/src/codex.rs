@@ -1,24 +1,27 @@
-//! Codex plan usage, read from Codex's LIVE log database.
+//! Codex plan usage, read from Codex's LIVE session rollouts.
 //!
-//! Unlike Claude (`claude -p /usage`), the Codex CLI exposes no usage command.
-//! Older Codex wrote `token_count` events to per-session JSONL rollouts, but that
-//! stopped — current Codex logs everything to `~/.codex/logs_*.sqlite`. Each time
-//! Codex gets an API response it logs a line whose `feedback_log_body` embeds the
-//! account rate-limit block (the body is tracing text, NOT plain JSON, so we
-//! extract the `"rate_limits":{…}` object out of it):
+//! Unlike Claude (`claude -p /usage`), the Codex CLI exposes no usage command —
+//! but the running session writes the account rate-limit block into its per-session
+//! rollout (`~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl`) on every API response
+//! (a `token_count` event). That is the SAME data Codex's `/status` shows, and it
+//! is fresh the instant a session makes a call. Each event embeds clean JSON:
 //!
 //! ```text
-//! …codex.op="user_input"…"plan_type":"plus","rate_limits":{
-//!   "primary":  {"used_percent":100,"window_minutes":300,  "reset_at":1781157786},
-//!   "secondary":{"used_percent":16, "window_minutes":10080,"reset_at":1781744586}}…
+//! {"type":"event_msg","payload":{"type":"token_count","info":{…},"rate_limits":{
+//!   "primary":  {"used_percent":100,"window_minutes":300,  "resets_at":1782550520},
+//!   "secondary":{"used_percent":30, "window_minutes":10080,"resets_at":1782594985},
+//!   "credits":{"has_credits":false,…},"plan_type":"plus"}}}
 //! ```
 //!
-//! Rate limits are ACCOUNT-wide, so the most recent such row reflects current
-//! usage — but only for Codex CLI runs that touch THIS machine's `~/.codex`
-//! (a terminal tile in the app). Cloud/web Codex isn't logged here.
+//! We read the newest rollout's latest `rate_limits` line. Rate limits are
+//! ACCOUNT-wide, so the freshest such event reflects current usage. We FALL BACK
+//! to the `~/.codex/logs_*.sqlite` `feedback_log` (the previous source) only when
+//! no rollout carries a reading — that DB lags badly (it's only written on certain
+//! events), which is why it showed stale numbers when a session was idle/out-of-credits.
 //!
-//! Cross-platform like `recent.rs`: unix reads `$HOME/.codex`; Windows resolves
-//! the WSL `$HOME` via `wsl.exe` and reads over the `\\wsl.localhost\…` UNC share.
+//! Cross-platform like `recent.rs`: unix reads `$HOME/.codex`; Windows reads
+//! NATIVELY inside WSL (a recursive walk over the `\\wsl.localhost\…` UNC share is
+//! slow) and resolves the WSL `$HOME` via `wsl.exe` for the fallback path.
 
 use rusqlite::OpenFlags;
 use serde::Serialize;
@@ -64,10 +67,10 @@ pub fn codex_usage_blocking() -> CodexUsage {
 }
 
 fn read_codex_usage() -> CodexUsage {
-    // Windows: read the DB NATIVELY inside WSL first. The codex log DB is a 100MB+
-    // WAL sqlite, and a full-table scan over the `\\wsl.localhost\` UNC share
-    // fails/stalls (and saturates I/O — a freezing contributor). The WSL read is
-    // ~0.2s. Only fall through to the UNC path below if WSL/python is unusable.
+    // Windows: read NATIVELY inside WSL first (a recursive rollout walk + the 100MB+
+    // WAL fallback DB over the `\\wsl.localhost\` UNC share stalls and saturates I/O
+    // — a freezing contributor). The WSL read is ~0.2s. Only fall through to the UNC
+    // path below if WSL/python is unusable.
     #[cfg(windows)]
     if let Some(u) = read_codex_usage_via_wsl() {
         return u;
@@ -75,15 +78,26 @@ fn read_codex_usage() -> CodexUsage {
     let Some(dir) = codex_dir() else {
         return CodexUsage::default();
     };
+    // Prefer the freshest LIVE session rollout — the same numbers `/status` shows.
+    if let Some(usage) = newest_rollout_usage(&dir) {
+        crate::diag::diag_log(format!(
+            "{{\"t\":\"codex\",\"m\":\"codex_usage(rollout) ok={} primary={:?} secondary={:?}\"}}",
+            usage.ok,
+            usage.primary.as_ref().and_then(|w| w.used_percent),
+            usage.secondary.as_ref().and_then(|w| w.used_percent),
+        ));
+        return usage;
+    }
+    // Fallback: the laggier feedback-log sqlite (only written on certain events).
     let Some(db) = newest_logs_db(&dir) else {
         crate::diag::diag_log(
-            "{\"t\":\"codex\",\"m\":\"no ~/.codex/logs_*.sqlite found\"}".to_string(),
+            "{\"t\":\"codex\",\"m\":\"no rollout rate_limits and no logs_*.sqlite\"}".to_string(),
         );
         return CodexUsage::default();
     };
     let usage = read_db(&db).unwrap_or_default();
     crate::diag::diag_log(format!(
-        "{{\"t\":\"codex\",\"m\":\"codex_usage ok={} primary={:?} secondary={:?}\"}}",
+        "{{\"t\":\"codex\",\"m\":\"codex_usage(logdb-fallback) ok={} primary={:?} secondary={:?}\"}}",
         usage.ok,
         usage.primary.as_ref().and_then(|w| w.used_percent),
         usage.secondary.as_ref().and_then(|w| w.used_percent),
@@ -91,7 +105,87 @@ fn read_codex_usage() -> CodexUsage {
     usage
 }
 
-/// Windows fast path: read the newest `"rate_limits":{…}` body NATIVELY inside
+/// Read the freshest session rollout's latest rate-limit snapshot — the SAME
+/// account-wide numbers Codex's `/status` shows, written live on every API
+/// response (`token_count` events). We narrow to the few most-recently-modified
+/// rollouts, then pick the reading with the latest EVENT timestamp — a file's
+/// mtime can bump (resuming a session) without a new rate-limits line, so mtime
+/// alone could surface a stale reading; the event timestamp can't.
+fn newest_rollout_usage(codex_dir: &std::path::Path) -> Option<CodexUsage> {
+    let sessions = codex_dir.join("sessions");
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    collect_rollouts(&sessions, &mut files, 0);
+    files.sort_by(|a, b| b.0.cmp(&a.0)); // newest mtime first
+    let mut best: Option<(String, CodexUsage)> = None; // (event timestamp, usage)
+    for (_, path) in files.iter().take(8) {
+        let Some((ts, body)) = last_rate_limits_in(path) else {
+            continue;
+        };
+        let Some(usage) = parse_usage_body(&body) else {
+            continue;
+        };
+        if usage.primary.is_none() && usage.secondary.is_none() {
+            continue;
+        }
+        // ISO-8601 UTC timestamps sort lexicographically == chronologically.
+        if best.as_ref().map(|(t, _)| ts >= *t).unwrap_or(true) {
+            best = Some((ts, usage));
+        }
+    }
+    best.map(|(_, usage)| usage)
+}
+
+/// Recursively collect `rollout-*.jsonl` files (with mtime) under `dir`
+/// (`~/.codex/sessions/<yyyy>/<mm>/<dd>/`). Depth-capped — the layout is shallow.
+fn collect_rollouts(
+    dir: &std::path::Path,
+    out: &mut Vec<(std::time::SystemTime, std::path::PathBuf)>,
+    depth: u8,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if ft.is_dir() {
+            collect_rollouts(&path, out, depth + 1);
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+                if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                    out.push((mtime, path));
+                }
+            }
+        }
+    }
+}
+
+/// The latest `rate_limits` line in a rollout as `(event_timestamp, body)`, where
+/// `body` is sliced from `"rate_limits"` onward so [`parse_usage_body`] can extract
+/// the object. The rollout is append-only, so the LAST such line is the file's
+/// freshest; its `"timestamp"` lets the caller compare across files.
+fn last_rate_limits_in(path: &std::path::Path) -> Option<(String, String)> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut last: Option<String> = None;
+    for line in reader.lines().map_while(Result::ok) {
+        if line.contains("\"rate_limits\"") && line.contains("\"used_percent\"") {
+            last = Some(line);
+        }
+    }
+    let line = last?;
+    let ts = extract_string(&line, "timestamp").unwrap_or_default();
+    let idx = line.find("\"rate_limits\"")?;
+    Some((ts, line[idx..].to_string()))
+}
+
+/// Windows fast path: read the freshest `"rate_limits":{…}` body NATIVELY inside
 /// WSL and parse it. Returns `Some(usage)` whenever the WSL read RAN (even if it
 /// found no data → `ok=false`), and `None` only when wsl/python is unusable — so
 /// the caller falls back to the UNC read just for the truly-unavailable case.
@@ -107,22 +201,51 @@ fn read_codex_usage_via_wsl() -> Option<CodexUsage> {
     Some(usage)
 }
 
-/// Run a tiny reader INSIDE the distro that opens the newest `~/.codex/logs*.sqlite`
-/// read-only (immutable — no locks/WAL/shm, so it never touches the live writer)
-/// and prints the latest rate-limits body in ~0.2s. `-e` makes wsl.exe exec bash
-/// DIRECTLY; a bare `--` routes through the user's login shell (zsh) instead — see
-/// the note on `tmux.rs::pane_info_command`. `None` on any spawn/exit failure.
+/// Run a tiny reader INSIDE the distro that prints the freshest rate-limits body
+/// in ~0.2s. It scans the newest session ROLLOUTS first (the live `/status` data),
+/// then falls back to the newest `~/.codex/logs*.sqlite` row (opened immutable — no
+/// locks/WAL/shm, so it never touches the live writer). `-e` makes wsl.exe exec
+/// bash DIRECTLY; a bare `--` routes through the user's login shell (zsh) instead —
+/// see the note on `tmux.rs::pane_info_command`. `None` on any spawn/exit failure.
 #[cfg(windows)]
 fn codex_body_via_wsl() -> Option<String> {
     use std::os::windows::process::CommandExt;
     let distro = std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string());
     const READER: &str = r#"python3 - <<'PY'
-import sqlite3, glob, os, sys
-dbs = sorted(glob.glob(os.path.expanduser('~/.codex/logs*.sqlite')), key=os.path.getmtime)
-if not dbs: sys.exit(0)
-c = sqlite3.connect(f'file:{dbs[-1]}?immutable=1', uri=True)
-for (b,) in c.execute("SELECT feedback_log_body FROM logs WHERE feedback_log_body LIKE '%\"rate_limits\":%' ORDER BY rowid DESC LIMIT 1"):
-    i = b.find('"rate_limits":'); print(b[i:i+2000]); break
+import sqlite3, glob, os, sys, re
+home = os.path.expanduser('~')
+# 1) Freshest LIVE session rollout rate_limits (what /status shows). Pick the
+#    reading with the latest EVENT timestamp across the recent rollouts — a file's
+#    mtime can bump without a new rate-limits line, so mtime alone can be stale.
+sd = os.path.join(home, '.codex', 'sessions')
+files = sorted(glob.glob(os.path.join(sd, '**', 'rollout-*.jsonl'), recursive=True), key=os.path.getmtime)
+best_ts, best_body = '', None
+for f in reversed(files[-8:]):
+    last = None
+    try:
+        with open(f, errors='replace') as fh:
+            for line in fh:
+                if '"rate_limits"' in line and '"used_percent"' in line:
+                    last = line
+    except OSError:
+        continue
+    if not last:
+        continue
+    m = re.search(r'"timestamp":"([^"]*)"', last)
+    ts = m.group(1) if m else ''
+    if ts >= best_ts:
+        i = last.find('"rate_limits"'); best_ts, best_body = ts, last[i:i+2000]
+if best_body:
+    print(best_body); sys.exit(0)
+# 2) Fallback: newest feedback-log sqlite row (laggier).
+dbs = sorted(glob.glob(os.path.join(home, '.codex', 'logs*.sqlite')), key=os.path.getmtime)
+if dbs:
+    try:
+        c = sqlite3.connect(f'file:{dbs[-1]}?immutable=1', uri=True)
+        for (b,) in c.execute("SELECT feedback_log_body FROM logs WHERE feedback_log_body LIKE '%\"rate_limits\":%' ORDER BY rowid DESC LIMIT 1"):
+            i = b.find('"rate_limits":'); print(b[i:i+2000]); break
+    except sqlite3.Error:
+        pass
 PY"#;
     let out = std::process::Command::new("wsl.exe")
         .arg("-d")

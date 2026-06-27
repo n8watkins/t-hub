@@ -5,9 +5,9 @@
 // exist on Pro/Max + after the first turn): `/usage` always prints the plan
 // usage. We LEAD with what the user watches — WEEKLY remaining — then session,
 // each as "left" (100 - used) with the reset hint Claude reports.
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { claudeUsage, type ClaudeUsage } from "../ipc/usage";
-import { codexUsage, type CodexUsage } from "../ipc/codex";
+import { codexUsage, type CodexRateWindow, type CodexUsage } from "../ipc/codex";
 import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
 
@@ -261,8 +261,44 @@ function loadCachedCodexUsage(): CodexUsage | null {
   }
 }
 
+/** Locally roll a window past its reset boundary. Each window carries an absolute
+ *  `resetsAt`; once that has passed, the window has rolled over to a FRESH one
+ *  (0% used) — so we can show "available again" WITHOUT a new poll (esp. the 5h
+ *  session). While still in-window the reading is returned unchanged. */
+function advanceWindow(
+  w: CodexRateWindow | null,
+  nowSec: number,
+): CodexRateWindow | null {
+  if (!w) return w;
+  const { resetsAt, windowMinutes } = w;
+  if (resetsAt == null || windowMinutes == null || windowMinutes <= 0) return w;
+  if (nowSec < resetsAt) return w; // still inside the current window — unchanged
+  // One or more windows elapsed since the reading → a fresh window, 0% used.
+  const span = windowMinutes * 60;
+  let next = resetsAt;
+  while (nowSec >= next) next += span;
+  return { ...w, usedPercent: 0, resetsAt: next };
+}
+
+/** Apply {@link advanceWindow} to both Codex windows for display, so a stale
+ *  last-known reading still shows correct "available" windows between polls. */
+function advanceCodexUsage(
+  u: CodexUsage | null,
+  nowMs: number,
+): CodexUsage | null {
+  if (!u || !u.ok) return u;
+  const nowSec = Math.floor(nowMs / 1000);
+  return {
+    ...u,
+    primary: advanceWindow(u.primary, nowSec),
+    secondary: advanceWindow(u.secondary, nowSec),
+  };
+}
+
 /** Poll Codex usage (same cadence + last-good caching as {@link useClaudeUsage}).
- *  Returns null until the first good reading; never blanks on a failed poll. */
+ *  Returns null until the first good reading; never blanks on a failed poll. The
+ *  returned value is time-ADVANCED: windows past their reset show as fresh without
+ *  waiting for the next poll (see {@link advanceCodexUsage}). */
 export function useCodexUsage(): CodexUsage | null {
   const [usage, setUsage] = useState<CodexUsage | null>(loadCachedCodexUsage);
   const lastRunRef = useRef(0);
@@ -304,7 +340,15 @@ export function useCodexUsage(): CodexUsage | null {
     };
   }, [refresh]);
 
-  return usage;
+  // Re-render once a minute so a window that has rolled past its reset shows as
+  // "available again" without needing a fresh poll. Cheap: one state write/min.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 60 * 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  return useMemo(() => advanceCodexUsage(usage, nowMs), [usage, nowMs]);
 }
 
 /** Expanded Codex rows (weekly = secondary window, session = primary). Renders
