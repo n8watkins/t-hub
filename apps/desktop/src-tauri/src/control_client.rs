@@ -106,17 +106,27 @@ fn request(addr: &str, token: &str, command: &str, args: &Value) -> Result<Value
 /// frontend's `ipc/controlClient.ts` wraps this; migrated `client05`/`client`
 /// wrappers call it instead of a direct in-process `invoke`.
 #[tauri::command]
-pub fn control_request(
+pub async fn control_request(
     endpoint: tauri::State<'_, ControlEndpoint>,
     command: String,
     args: Option<Value>,
 ) -> Result<Value, String> {
-    request(
-        &endpoint.addr,
-        &endpoint.token,
-        &command,
-        &args.unwrap_or(Value::Null),
-    )
+    // ASYNC + spawn_blocking — `request` does a BLOCKING socket round-trip whose
+    // duration is the backend command's runtime. control_request is the transport
+    // for recent/git/usage/codex/files; as a SYNC command it ran on the main UI
+    // thread, so a slow backend op (a flaky ~4s `claude -p /usage`, a stalling
+    // `\\wsl.localhost\` recent read) FROZE the whole window for that whole time —
+    // the sporadic "Not Responding" / Alt-Tab-ghost hang (the watchdog caught 2-4s
+    // main-thread blocks with near-zero emits, ruling out emit volume). Running it
+    // on the blocking pool keeps the main thread pumping. (Frontend unchanged —
+    // `invoke` already returns a promise.)
+    let addr = endpoint.addr.clone();
+    let token = endpoint.token.clone();
+    drop(endpoint); // release the State borrow BEFORE the await (keeps the future Send)
+    let args = args.unwrap_or(Value::Null);
+    tauri::async_runtime::spawn_blocking(move || request(&addr, &token, &command, &args))
+        .await
+        .map_err(|e| format!("control_request: task join failed: {e}"))?
 }
 
 /// The production [`EventEmitter`]: writes every backend event to the control

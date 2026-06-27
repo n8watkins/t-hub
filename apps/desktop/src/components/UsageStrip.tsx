@@ -28,9 +28,14 @@ const POLL_MS = 5 * 60 * 1000;
  *  `USAGE_RETRY_GAP_MS` (so a failing streak can't storm). Mount + the 5-min
  *  interval always force-refresh. Net: fresh data → zero requests; coming back to a
  *  stale strip → one well-spaced request that updates it. Gating on the last GOOD
- *  read (not the last run) is what fixes the staleness a failing run used to cause. */
+ *  read (not the last run) is what fixes the staleness a failing run used to cause.
+ *
+ *  Both floors are ~1 MINUTE: a FAILED `claude -p /usage` must not re-poll every few
+ *  seconds (the flaky CLI takes ~4s/call, and even off the main thread that's wasted
+ *  WSL/CPU). So on focus, usage checks at most once a minute; the 5-min interval is
+ *  the only faster-than-that path and it's deliberately sparse. */
 const USAGE_FRESH_MS = 60 * 1000;
-const USAGE_RETRY_GAP_MS = 15 * 1000;
+const USAGE_RETRY_GAP_MS = 60 * 1000;
 
 /** Fill color by REMAINING %: red nearly out, amber low, green healthy. */
 function fillColor(left: number): string {

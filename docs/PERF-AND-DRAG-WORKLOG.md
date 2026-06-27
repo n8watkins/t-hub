@@ -149,7 +149,25 @@ canvas renderer (§3, v0.3.9) addresses D, a separate axis from the A/B/C freeze
       *(User explicitly asked to keep B queued here.)*
 
 **Now / verify**
-- [ ] **⚠️ Alt-Tab GHOSTING = sustained multi-second UI-thread HANG (user-reported,
+- [x] **✅ ROOT-CAUSED + FIXED (v0.3.17): `control_request` ran on the MAIN THREAD.**
+      The Rust main-thread watchdog (v0.3.16, `hangwatch.rs`) caught real blocks of
+      **2.3–4s with only ~20–54 `emitsDuringBlock`** — DIRECTLY refuting the emit-flood
+      theory (a flood would be hundreds/thousands). The blocks lined up with
+      `claude -p /usage` (~4s, 2 retries) and the `recent` `\\wsl.localhost\` reads.
+      Cause: **`control_request` was a SYNCHRONOUS `#[tauri::command]`**
+      (`control_client.rs`), and in Tauri sync commands run on the MAIN UI thread.
+      `recent` / `git` / `usage` / `codex` / `files` all route through it
+      (`controlRequest()` → `invoke("control_request")`), and `request()` does a
+      BLOCKING socket round-trip whose duration is the backend op's runtime — so a slow
+      backend op froze the whole window for its full duration (the "always-present"
+      sporadic Not-Responding/ghost). **FIX:** made `control_request` `async` +
+      `tauri::async_runtime::spawn_blocking` (drop the `State` borrow before the await
+      to keep the future `Send`) → the round-trip runs off the main thread; the main
+      thread keeps pumping. Frontend unchanged (`invoke` already returns a promise).
+      Also raised `USAGE_RETRY_GAP_MS` 15s→60s so a FAILED `claude -p /usage` won't
+      re-poll more than ~once/min. *Watch the watchdog log post-0.3.17: `rust-main`
+      blocks should drop out (any residual would be a DIFFERENT sync command).*
+- [x] **⚠️ Alt-Tab GHOSTING — investigation trail (RESOLVED above; kept for history) (user-reported,
       v0.3.13).** Symptom: during normal work the T-Hub icon in the Alt-Tab switcher
       sometimes turns into a generic/default Windows icon and the window can't be
       switched to. That is Windows' **hung-window ghosting** — it fires when a Win32
