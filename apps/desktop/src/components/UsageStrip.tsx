@@ -12,7 +12,7 @@ import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
 import { runWhenIdle } from "../lib/windowInteraction";
 import { useSupervision } from "../store/supervision";
-import type { StatusSnapshot } from "../ipc/model";
+import type { RateLimitWindow, StatusSnapshot } from "../ipc/model";
 
 /** Poll cadence: every 5 min (plus on mount) keeps the numbers fresh without
  *  spamming the (heavy) underlying commands. */
@@ -194,15 +194,26 @@ function loadCachedUsage(): ClaudeUsage | null {
 function selectStatuslineUsage(
   snapshots: Record<string, StatusSnapshot>,
 ): ClaudeUsage | null {
-  let best: StatusSnapshot | null = null;
+  // Rate limits are account-wide, but a single snapshot can be PARTIAL (one window
+  // populated, the other null — the Rust `RateLimitWindow` fields are optional). So
+  // pick the freshest NON-NULL value for EACH window INDEPENDENTLY — a partial newest
+  // snapshot must not blank the other number (same class as the Codex partial fix).
+  let five: RateLimitWindow | null = null;
+  let fiveAt = -1;
+  let seven: RateLimitWindow | null = null;
+  let sevenAt = -1;
   for (const snap of Object.values(snapshots)) {
     if (!snap.rateLimitsPresent) continue;
-    if (!best || snap.ingestedAtMs > best.ingestedAtMs) best = snap;
+    if (snap.fiveHour?.usedPercentage != null && snap.ingestedAtMs > fiveAt) {
+      five = snap.fiveHour;
+      fiveAt = snap.ingestedAtMs;
+    }
+    if (snap.sevenDay?.usedPercentage != null && snap.ingestedAtMs > sevenAt) {
+      seven = snap.sevenDay;
+      sevenAt = snap.ingestedAtMs;
+    }
   }
-  if (!best) return null;
-  const five = best.fiveHour;
-  const seven = best.sevenDay;
-  if (five?.usedPercentage == null && seven?.usedPercentage == null) return null;
+  if (five == null && seven == null) return null;
   return {
     sessionUsedPct: five?.usedPercentage ?? null,
     sessionResets: fmtReset(five?.resetsAt),

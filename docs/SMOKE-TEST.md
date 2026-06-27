@@ -9,7 +9,8 @@ Covers everything changed this session (perf Tiers 1–3, Wave 0/1 features, WS-
 ## A. The freeze + perf (the headline — Tiers 1–3)
 The whole reason for the perf work. Test under LOAD.
 
-- [ ] **No freeze under many busy tiles.** Open **8+ terminals**, several running agents/streaming output (a build, `claude` doing tool calls, a `dev` server logging). Switch tabs, scroll, type. → **UI stays responsive; no multi-second hangs.** *(Tier 1: spawn_blocking pollers + git_info collapse + output coalescing)*
+- [ ] **No freeze under many busy tiles.** Open **8+ terminals**, several running agents/streaming output (a build, `claude` doing tool calls, a `dev` server logging). Switch tabs, scroll, type. → **UI stays responsive; no multi-second hangs.** *(The deepest root cause of the always-present sporadic freeze was `control_request` running SYNC on the main thread — fixed v0.3.17 async+`spawn_blocking`; plus Tier-1 spawn_blocking pollers + git_info collapse + output coalescing.)*
+- [ ] **No sporadic "Not Responding" / Alt-Tab icon ghost.** Use the app normally for a while (let usage/recent polls fire, alt-tab in/out). → the T-Hub Alt-Tab icon never goes generic / the window never hangs for seconds. *(control_request async, v0.3.17 — verify via `~/.t-hub/diag.log`: no `"src":"rust-main"` blocks.)*
 - [ ] **Many tiles in one repo don't spawn-storm.** Open several tiles all `cd`'d into the same git repo. → smooth; no periodic stutter every ~5s. *(git_info 6→1 wsl call + per-cwd cache, `8e12fbf`)*
 - [ ] **Heavy output doesn't lock the window.** `cat` a large file / run a `--verbose` build in a tile. → output flows, window still interactive (the rest of Windows was always fine; now T-Hub is too). *(rAF output coalescing, `a15416f`)*
 - [ ] **Final output lands before the exit banner.** Run a command that prints then exits (e.g. `echo done; exit`). → you see `done` **above** `[process exited]`, not after. *(exit-drain fix, `11158ae`)*

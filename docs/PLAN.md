@@ -1,6 +1,6 @@
 # T-Hub — Forward Build Plan (0.5 → 2.0)
 
-**Status:** ⚠️ **Largely SHIPPED — kept as the design-rationale record, not a to-do list.** The 0.1 nucleus and most of the 0.5 supervision track (agent bridge, journal/statusline spine, supervision tree, hooks, Codex) are built in the current `0.1.67` app. Read the sections below for *why* things are shaped the way they are, not as pending work. Source of truth for product/architecture is [PRD.md](../PRD.md); technical risks and the verified Claude Code facts are in [REVIEW.md](../REVIEW.md). The 0.1 IPC contract is [src/ipc/types.ts](../src/ipc/types.ts).
+**Status:** ⚠️ **Largely SHIPPED — kept as the design-rationale record, not a to-do list.** The 0.1 nucleus and most of the 0.5 supervision track (agent bridge, journal/statusline spine, supervision tree, hooks, Codex) are built in the current app (local build `0.3.18`; nothing pushed/tagged past v0.2.0). Read the sections below for *why* things are shaped the way they are, not as pending work. Source of truth for product/architecture is [PRD.md](../PRD.md); technical risks and the verified Claude Code facts are in [REVIEW.md](../REVIEW.md). The 0.1 IPC contract is [src/ipc/types.ts](../src/ipc/types.ts).
 
 **Scope of this document:** the phased implementation plan *after* the 0.1 nucleus. Each release section carries: Goal · Workstreams · Key Claude Code mechanisms · Data-model additions · Exit criteria · Risks/watch-items.
 

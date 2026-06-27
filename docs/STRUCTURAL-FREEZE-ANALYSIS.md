@@ -3,9 +3,14 @@
 > ⚠️ **SUPERSEDED — see [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) (§2/§4).**
 > This doc's leading hypothesis (a compositor / win_snap / WebView2 child-HWND
 > structural cause for the drag freeze) was **DISPROVEN**: win_snap-off (0.3.5),
-> native frame (0.3.6), and `transparent:true` (0.3.7) all still froze. The actual
-> root cause of the drag freeze AND the general sluggishness was a `claude -p /usage`
-> **focus-storm** (CPU/WSL contention), fixed in 0.3.8. Kept for historical context only.
+> native frame (0.3.6), and `transparent:true` (0.3.7) all still froze. The
+> `claude -p /usage` **focus-storm** (throttled 0.3.8) was a contributor, but the
+> **actual root cause of the always-present sporadic HARD freeze** (Alt-Tab icon
+> ghosting / Windows hung-window) was **`control_request` being a SYNCHRONOUS
+> `#[tauri::command]`** → Tauri ran it on the MAIN UI thread, so the blocking
+> control-socket round-trip (flaky ~4s `claude -p /usage`, stalling `\\wsl.localhost\`
+> reads) froze the whole window. **FIXED v0.3.17** (async + `spawn_blocking`; confirmed
+> by the `hangwatch.rs` watchdog — 0 main-thread blocks after). Kept for history only.
 
 Date: 2026-06-27
 

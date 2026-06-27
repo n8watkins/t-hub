@@ -4,9 +4,16 @@
 > [`PERF-AND-DRAG-WORKLOG.md`](./PERF-AND-DRAG-WORKLOG.md) (the single source of truth).**
 > This doc blames **Tokio worker-thread exhaustion** and names **`git_info`** the
 > dominant offender. That diagnosis was for the *workload-dependent* freeze and its
-> Tier-1/2 fixes shipped — but the **dominant** cause of the 3-4s drag freeze + the
-> general sluggishness (symptoms A/B/C) turned out to be a `claude -p /usage`
-> **focus-storm** (CPU/WSL contention), fixed in v0.3.8 and user-verified. The
+> Tier-1/2 fixes shipped. The `claude -p /usage` **focus-storm** (CPU/WSL contention)
+> was ONE contributor (throttled v0.3.8, fixed the deterministic cold-drag case) — but
+> the **actual root cause of the always-present SPORADIC HARD freeze** (Not-Responding /
+> Alt-Tab icon ghosting = Windows hung-window) was **`control_request` running on the
+> MAIN UI thread**: it was a SYNCHRONOUS `#[tauri::command]` (Tauri runs sync commands
+> on the main thread), so a slow backend op (flaky ~4s `claude -p /usage`, a stalling
+> `\\wsl.localhost\` read) froze the whole window for its full duration. **Fixed v0.3.17**
+> (async + `tauri::async_runtime::spawn_blocking`); confirmed by the `hangwatch.rs` Rust
+> watchdog (0 main-thread blocks after). Claude usage went **statusline-first** in
+> v0.3.18 (`/usage` only a cold-start fallback). The
 > `git_info`/`list_terminals`/`recent` focus refreshes named below still fire but are
 > now **backend-cached** (git ~3.5s TTL, recent 15s) and were **ruled out** as the
 > drag cause. Read this for the memory-growth/eviction history; do **not** treat its

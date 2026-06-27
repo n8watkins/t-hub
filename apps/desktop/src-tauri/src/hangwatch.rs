@@ -35,19 +35,16 @@ const STALL_MS: u128 = 500;
 
 /// Spawn the watchdog thread. Call once from `.setup`.
 pub fn spawn(app: tauri::AppHandle) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(PERIOD);
-        let sent = Instant::now();
-        let emits_at_send = EMIT_COUNT.load(Ordering::Relaxed);
-        // Post a probe to the main thread; it runs once the pump services it. If the
-        // main thread is blocked, the probe queues behind whatever is blocking it, so
-        // `waited` measures the block. (Err only if the loop is shutting down.)
-        let _ = app.run_on_main_thread(move || {
-            let waited = sent.elapsed().as_millis();
-            if waited >= STALL_MS {
-                let emits = EMIT_COUNT
-                    .load(Ordering::Relaxed)
-                    .wrapping_sub(emits_at_send);
+    std::thread::spawn(move || {
+        // The main-thread probe must do NO blocking work — it runs on the very thread
+        // it measures, so a diag_log file write THERE would lengthen the block it's
+        // timing and skew the next probe. So the probe only times itself + reads the
+        // emit counter, then hands the numbers back over this channel; the (blocking)
+        // diag_log write happens HERE, on the watchdog's own background thread.
+        let (tx, rx) = std::sync::mpsc::channel::<(u128, u64)>();
+        loop {
+            // Drain + log any stalls the probe handed back (off the main thread).
+            while let Ok((waited, emits)) = rx.try_recv() {
                 crate::diag::diag_log(format!(
                     "{{\"t\":\"hang\",\"src\":\"rust-main\",\"blockedMs\":{},\"ghostRisk\":{},\"emitsDuringBlock\":{}}}",
                     waited,
@@ -55,6 +52,22 @@ pub fn spawn(app: tauri::AppHandle) {
                     emits
                 ));
             }
-        });
+            std::thread::sleep(PERIOD);
+            let sent = Instant::now();
+            let emits_at_send = EMIT_COUNT.load(Ordering::Relaxed);
+            let tx = tx.clone();
+            // Post a probe to the main thread; it runs once the pump services it. If the
+            // main thread is blocked, the probe queues behind whatever is blocking it, so
+            // `waited` measures the block. (Err only if the loop is shutting down.)
+            let _ = app.run_on_main_thread(move || {
+                let waited = sent.elapsed().as_millis();
+                if waited >= STALL_MS {
+                    let emits = EMIT_COUNT
+                        .load(Ordering::Relaxed)
+                        .wrapping_sub(emits_at_send);
+                    let _ = tx.send((waited, emits)); // non-blocking handoff; NO I/O here
+                }
+            });
+        }
     });
 }

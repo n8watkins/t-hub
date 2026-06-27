@@ -148,4 +148,6 @@ export function mountHangDetector(): void {
 }
 
 // Self-mount on import (side-effect module, mirroring statusMount / repaintMount).
+// Kept ON by default so it keeps catching any residual/regression stall; it only
+// writes when a real stall (>=200ms longtask / >=500ms heartbeat) occurs.
 mountHangDetector();

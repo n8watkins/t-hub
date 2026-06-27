@@ -100,8 +100,28 @@ big freeze is gone):
     `MAX_BATCH_BYTES` in `remote_pty.rs` (the "freeze while a terminal actively works" case).
   - **Pinpoint the "staggered" sub-500ms stutter** — drop the `hangwatch.rs` `STALL_MS`
     threshold to ~200ms, reproduce, read what it names, fix that.
-  - Drop the consumer-less `agent://journal` emit; decide keep/gate/remove the hang
-    instrumentation; any review-flagged polishes.
+  - Drop the consumer-less `agent://journal` emit.
+  - **Review-surfaced (recent-work review, all LOW/confirmed):**
+    - `spawn_blocking` the async commands that block in-body (worker-pool starvation,
+      not a main freeze): **`tmux_scroll`/`tmux_exit_scroll`** (fire on scroll —
+      highest value), **`list_dir`/`read_text_file`** (UNC reads), then `git_commit`/
+      `git_worktree_*` for consistency. Mirror `git_info`'s `spawn_blocking` pattern.
+    - **`diag_log`/`diag_clear` are sync `#[tauri::command]`s** (file I/O on the main
+      thread when invoked from JS) + the diag.log **reopens per line and never
+      rotates** (unbounded growth; ~20 always-on callers). Make `diag_log` async +
+      a buffered/rotated background writer (one fd, size cap). *(Doing this also lets
+      the still-armed hang detectors log fully off-thread.)*
+    - Codex **Windows DB-fallback drops `plan_type`** (python slices from the
+      `rate_limits` offset; `plan_type` sits before it) — rollout path is fine.
+    - Polish: `advanceCodexUsage` reallocates every 60s tick even when nothing rolled
+      over; in-flight cold-start `/usage` promise isn't cancelled when the statusline
+      arrives; `useHasCodexSession` recomputes O(N) with an extra `getState()` per
+      terminal; `runWhenIdle`'s deferred `onSettle` can fire a refresh on an unmounted
+      component (RecentList/UsageStrip). All benign; tidy when nearby.
+  - DONE in v0.3.19 (this review pass): fixed the Rust watchdog's ironic main-thread
+    `diag_log` (now logs off-thread via a channel); statusline usage backfills each
+    window independently (a partial snapshot no longer blanks the other); both hang
+    detectors kept ON by default (user wants ongoing monitoring).
 
 **Tier 3 — architectural (careful — keep the lifecycle contract in worklog §6):**
   - **Reap-on-leave-workspace** — workspace CLOSE/DELETE currently ORPHANS sessions (the
