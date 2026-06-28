@@ -51,19 +51,31 @@ function begin(): void {
  * DEFER it until the interaction settles. Used to wrap focus-triggered refreshes
  * so the first drag isn't starved. The one-frame defer (vs running inline in the
  * focus handler) lets a same-click pointerdown mark the interaction first.
+ *
+ * Returns a CANCEL function: call it (e.g. on a React effect's cleanup) to drop a
+ * still-pending run so the deferred `fn` can't fire on an unmounted component.
  */
-export function runWhenIdle(fn: () => void): void {
-  requestAnimationFrame(() => {
+export function runWhenIdle(fn: () => void): () => void {
+  let cancelled = false;
+  let onSettle: (() => void) | undefined;
+  const raf = requestAnimationFrame(() => {
+    if (cancelled) return;
     if (!isInteracting()) {
       fn();
       return;
     }
-    const onSettle = (): void => {
-      window.removeEventListener(SETTLED_EVENT, onSettle);
+    onSettle = (): void => {
+      window.removeEventListener(SETTLED_EVENT, onSettle!);
+      if (cancelled) return;
       fn();
     };
     window.addEventListener(SETTLED_EVENT, onSettle);
   });
+  return () => {
+    cancelled = true;
+    cancelAnimationFrame(raf);
+    if (onSettle) window.removeEventListener(SETTLED_EVENT, onSettle);
+  };
 }
 
 /** Idempotent app-startup mount. */

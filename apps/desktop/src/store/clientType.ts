@@ -45,9 +45,13 @@ export type ClientType = "claude" | "codex" | "shell";
  *   ANY signal reads as "shell" — environment-dependent. The real fix is a
  *   backend session→client mapping, which is out of scope here.
  */
-export function clientForTerminal(id: TerminalId): ClientType {
-  const s = useWorkspace.getState();
-
+/** The detection core, against an ALREADY-snapshotted workspace state. Split out
+ *  so callers iterating every terminal (e.g. {@link useHasCodexSession}) can run a
+ *  single pass over one state object instead of a `getState()` per terminal. */
+function clientFromState(
+  s: ReturnType<typeof useWorkspace.getState>,
+  id: TerminalId,
+): ClientType {
   // 1. Authoritative title: the tmux foreground command's basename.
   const title = s.terminals[id]?.title;
   if (typeof title === "string" && title.length > 0) {
@@ -66,6 +70,10 @@ export function clientForTerminal(id: TerminalId): ClientType {
   return "shell";
 }
 
+export function clientForTerminal(id: TerminalId): ClientType {
+  return clientFromState(useWorkspace.getState(), id);
+}
+
 /**
  * True when ANY open tile is running Codex — i.e. "Codex is in use". Used to GATE
  * Codex usage polling: when no Codex session is open we don't spawn the WSL read
@@ -75,8 +83,9 @@ export function clientForTerminal(id: TerminalId): ClientType {
  */
 export function useHasCodexSession(): boolean {
   return useWorkspace((s) =>
+    // Single pass over the SAME snapshot — no `getState()` per terminal.
     Object.keys(s.terminals).some(
-      (id) => clientForTerminal(id as TerminalId) === "codex",
+      (id) => clientFromState(s, id as TerminalId) === "codex",
     ),
   );
 }

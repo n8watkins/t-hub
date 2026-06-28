@@ -265,6 +265,10 @@ export function useClaudeUsage(): ClaudeUsage | null {
   const [polled, setPolled] = useState<ClaudeUsage | null>(loadCachedUsage);
   const lastRunRef = useRef(0);
   const lastGoodRef = useRef(0);
+  // Set true once the statusline takes over (cold-start effect cleanup), so an
+  // in-flight `claude -p /usage` started before the statusline landed is DROPPED
+  // instead of overwriting the fresher statusline values / cache with a late read.
+  const ignoreRef = useRef(false);
 
   const refresh = useCallback((force = false) => {
     const now = Date.now();
@@ -276,6 +280,7 @@ export function useClaudeUsage(): ClaudeUsage | null {
     lastRunRef.current = now;
     void claudeUsage()
       .then((u) => {
+        if (ignoreRef.current) return; // statusline landed first — drop late /usage
         // Only ADOPT a good reading; a failed poll keeps the last-known values.
         if (u && u.ok) {
           lastGoodRef.current = Date.now();
@@ -296,11 +301,18 @@ export function useClaudeUsage(): ClaudeUsage | null {
   const haveStatusline = !!statusline;
   useEffect(() => {
     if (haveStatusline) return; // statusline covers it — no CLI spawn
+    ignoreRef.current = false; // (re)arm: we're the active source again
     refresh(true);
     const id = window.setInterval(() => refresh(true), CLAUDE_POLL_MS);
-    const onFocus = () => runWhenIdle(() => refresh());
+    let cancelIdle: (() => void) | undefined;
+    const onFocus = () => {
+      cancelIdle?.();
+      cancelIdle = runWhenIdle(() => refresh());
+    };
     window.addEventListener("focus", onFocus);
     return () => {
+      ignoreRef.current = true; // statusline is taking over — drop in-flight /usage
+      cancelIdle?.();
       window.clearInterval(id);
       window.removeEventListener("focus", onFocus);
     };
@@ -382,11 +394,13 @@ function advanceCodexUsage(
 ): CodexUsage | null {
   if (!u || !u.ok) return u;
   const nowSec = Math.floor(nowMs / 1000);
-  return {
-    ...u,
-    primary: advanceWindow(u.primary, nowSec),
-    secondary: advanceWindow(u.secondary, nowSec),
-  };
+  const primary = advanceWindow(u.primary, nowSec);
+  const secondary = advanceWindow(u.secondary, nowSec);
+  // `advanceWindow` returns the SAME ref while a window is still in-window, so if
+  // neither rolled past its reset, return the SAME object — the 60s nowMs tick
+  // must not churn a new allocation (and downstream renders) for no real change.
+  if (primary === u.primary && secondary === u.secondary) return u;
+  return { ...u, primary, secondary };
 }
 
 /** Poll Codex usage (same cadence + last-good caching as {@link useClaudeUsage}).
@@ -432,9 +446,14 @@ export function useCodexUsage(enabled = true): CodexUsage | null {
     refresh(true);
     const id = window.setInterval(() => refresh(true), POLL_MS);
     // Stale-gated, and deferred past an active window drag (see useClaudeUsage).
-    const onFocus = () => runWhenIdle(() => refresh());
+    let cancelIdle: (() => void) | undefined;
+    const onFocus = () => {
+      cancelIdle?.();
+      cancelIdle = runWhenIdle(() => refresh());
+    };
     window.addEventListener("focus", onFocus);
     return () => {
+      cancelIdle?.(); // drop a deferred refresh so it can't fire after unmount
       window.clearInterval(id);
       window.removeEventListener("focus", onFocus);
     };
