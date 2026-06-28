@@ -207,7 +207,14 @@ export function RecentList({ onRecall, onCount }: RecentListProps) {
     // Defer the focus refresh past an active window drag (cold-first-drag fix).
     const onFocus = () => runWhenIdle(refresh);
     window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    // Tier 3 reap: a workspace close dispatches this so the just-closed projects
+    // appear in Recent immediately (the daemon cache was invalidated first). The
+    // open-cwd filter already un-hides them reactively; this forces the re-fetch.
+    window.addEventListener("t-hub:recent-changed", refresh);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("t-hub:recent-changed", refresh);
+    };
   }, [refresh]);
 
   // The × button: DISMISS a project from Recent for good. We optimistically hide

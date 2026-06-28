@@ -438,7 +438,10 @@ pub async fn kill_terminal(
     // carry it); this is the same `th_<id[..8]>` derivation as everywhere else.
     let tmux_session = tmux_target(&id);
 
-    let kill_result = tmux::kill_session(&tmux_session)
+    // kill_session_tree (not kill_session): SIGKILL the pane process tree so a
+    // SIGHUP-ignoring `claude` can't survive and leak. Covers both the per-tile ×
+    // and the workspace reap (closeWorkspace loops killTerminal over a tab's tiles).
+    let kill_result = tmux::kill_session_tree(&tmux_session)
         .map_err(|e| format!("failed to kill tmux session {tmux_session}: {e}"));
 
     // Detaching the RemotePty shuts down the socket + joins the reader; do this

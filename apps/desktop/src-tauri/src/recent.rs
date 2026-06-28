@@ -210,6 +210,15 @@ pub fn archive_project(cwd: &str) -> Result<(), String> {
     result
 }
 
+/// Drop the cached recent-sessions scan so the NEXT read re-scans transcripts from
+/// disk. Called right after a workspace close (Tier 3 reap) so the just-closed
+/// sessions appear in Recent immediately instead of lagging the 15s cache TTL.
+pub fn invalidate_recent_cache() {
+    if let Ok(mut guard) = RECENT_CACHE.lock() {
+        *guard = None;
+    }
+}
+
 /// Run the archive move in WSL (Windows) where `~/.claude` actually lives.
 #[cfg(windows)]
 fn run_archive(encoded: &str) -> Result<(), String> {

@@ -327,6 +327,13 @@ interface WorkspaceState {
    *  closeTerminal first — tmux survives, the sessions are not killed). The
    *  removed tile ids are returned so the caller can detach them. */
   closeTab: (id: string) => TerminalId[];
+  /** Tier 3 reap — the workspace × (close/delete). KILLS every session in the tab
+   *  (SIGKILL the process tree, so the orphan leak stops), then removes the tab via
+   *  closeTab. Recall stays available via Recent (the on-disk transcript survives
+   *  the kill), and the just-closed projects are forced to appear in Recent
+   *  immediately. PRESERVES sessions on switch (setActiveTab) and pop-out
+   *  (popOutTab) — those never call this. No-op on the last tab (mirrors closeTab). */
+  closeWorkspace: (id: string) => void;
   /** Activate a tab (moves focus onto one of its tiles). */
   setActiveTab: (id: string) => void;
   /** Activate the tab at strip index `i` (0-based); no-op if out of range. */
@@ -1257,6 +1264,53 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       if (!tabs.some((t) => t.id === id)) return;
       set({ tabs: tabs.map((t) => (t.id === id ? { ...t, name: trimmed } : t)) });
       persist();
+    },
+
+    closeWorkspace: (id) => {
+      // Tier 3 reap. ONLY the workspace × calls this; switch/pop-out never do, so
+      // they can't kill. Mirror closeTab's last-tab guard BEFORE killing so a kill
+      // never fires when closeTab would refuse to remove the tab.
+      const { tabs } = get();
+      if (tabs.length <= 1) return;
+      const target = tabs.find((t) => t.id === id);
+      if (!target) return;
+      const ids = target.order.slice();
+
+      const refreshRecent = (): void => {
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new Event("t-hub:recent-changed"));
+        }
+      };
+      // RECALL-FIRST: drop the daemon's Recent cache, THEN force the re-fetch — the
+      // dispatch is chained AFTER the invalidate resolves so RecentList re-scans a
+      // freshly-dropped cache, not the stale 15s-TTL one (a brand-new project closed
+      // within 15s of its first scan would otherwise lag). On a failure we still
+      // refresh (the on-disk transcript — Recent's source of truth — survives the
+      // SIGKILL, so `claude --resume` works regardless, and the open-cwd filter
+      // un-hides the closed projects synchronously via closeTab below).
+      void import("../ipc/recent")
+        .then((m) => m.invalidateRecentCache())
+        .then(refreshRecent)
+        .catch((err) => {
+          console.error("invalidateRecentCache failed", err);
+          refreshRecent();
+        });
+
+      // SIGKILL each session's process tree via the SAME backend path the per-tile
+      // × uses (killTerminal → kill_terminal → tmux::kill_session_tree). Fire-and-
+      // forget (mirrors deleteTerminal); a kill error is logged, not surfaced.
+      void import("../ipc/client").then((m) => {
+        for (const tid of ids) {
+          m.killTerminal(tid).catch((err) =>
+            console.error("killTerminal failed (closeWorkspace)", err),
+          );
+        }
+      });
+
+      // Layout removal/prune/persist (also deletes the tiles from `terminals`, so
+      // RecentList's open-cwd filter reactively un-hides the closed projects — the
+      // immediate visible recall, independent of the cache re-fetch above).
+      get().closeTab(id);
     },
 
     closeTab: (id) => {

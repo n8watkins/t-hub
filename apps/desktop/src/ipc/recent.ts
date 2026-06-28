@@ -45,6 +45,16 @@ export function recentSessions(): Promise<RecentSession[]> {
 }
 
 /**
+ * Drop the daemon's recent-sessions cache (Tier 3 reap). Called after a workspace
+ * close so the just-closed sessions appear in Recent IMMEDIATELY instead of lagging
+ * the 15s cache TTL. Best-effort — recall is durable via the on-disk transcript
+ * regardless, so a failure here only costs a few seconds of staleness.
+ */
+export function invalidateRecentCache(): Promise<void> {
+  return controlRequest("invalidate_recent_cache") as Promise<void>;
+}
+
+/**
  * Archive a project OUT of Recent for good — the × button made durable. Moves the
  * project's Claude transcripts (`~/.claude/projects/<cwd-encoded>`) into a sibling
  * `projects-archive` dir, so the row stops resurfacing AND stops costing scan time,

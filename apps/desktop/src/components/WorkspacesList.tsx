@@ -72,7 +72,7 @@ export function WorkspacesList() {
   const setFocusRegion = useWorkspace((s) => s.setFocusRegion);
   const renameTab = useWorkspace((s) => s.renameTab);
   const deleteTerminal = useWorkspace((s) => s.deleteTerminal);
-  const closeTab = useWorkspace((s) => s.closeTab);
+  const closeWorkspace = useWorkspace((s) => s.closeWorkspace);
   // Moving a terminal into another workspace by dragging its row (D2) reuses the
   // same store action the tile-header drag uses. setDraggingTile marks the
   // terminal as "being dragged" app-wide so its CANVAS tile dims too (the same
@@ -311,10 +311,11 @@ export function WorkspacesList() {
             setFocus(id);
           }}
           onCloseTerminal={(id) => deleteTerminal(id)}
-          // Close the WHOLE workspace: removes it from the sidebar + layout (its
-          // tiles detach — tmux survives, recall from Recent). Hidden on the last
-          // remaining workspace (closeTab keeps at least one).
-          onClose={() => closeTab(tab.id)}
+          // Close the WHOLE workspace: KILLS its sessions (SIGKILL the process
+          // tree — no orphan leak), removes it from the sidebar + layout, and the
+          // projects become recallable from Recent immediately. Hidden on the last
+          // remaining workspace (closeWorkspace keeps at least one).
+          onClose={() => closeWorkspace(tab.id)}
           canClose={tabs.length > 1}
         />
       ))}
@@ -397,7 +398,7 @@ function WorkspaceRow({
   onClearTerminalColor: (id: TerminalId) => void;
   onSelectTerminal: (id: TerminalId) => void;
   onCloseTerminal: (id: TerminalId) => void;
-  /** Close this whole workspace (removes it; its tiles detach, tmux survives). */
+  /** Close this whole workspace: removes it + KILLS its sessions (recall from Recent). */
   onClose: () => void;
   /** False on the last remaining workspace (it can't be closed) — hides the ×. */
   canClose: boolean;
@@ -604,7 +605,7 @@ function WorkspaceRow({
               onClose();
             }}
             className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-[15px] leading-none text-neutral-400 opacity-0 transition-opacity hover:bg-red-600/30 hover:text-white group-hover:opacity-100"
-            title={`Close workspace "${tab.name}" — removes it; its terminals detach (recall from Recent)`}
+            title={`Close workspace "${tab.name}" — ends its sessions (recall from Recent)`}
             aria-label={`Close workspace ${tab.name}`}
           >
             ×

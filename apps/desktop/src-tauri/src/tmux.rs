@@ -319,6 +319,60 @@ pub fn kill_session(name: &str) -> Result<(), TmuxError> {
     })
 }
 
+/// Like [`kill_session`] but GUARANTEES the pane process tree dies. `tmux
+/// kill-session` only SIGHUPs the pane process group, so a `claude` that
+/// ignores/handles SIGHUP survives and leaks (the orphan growth behind the
+/// ~4.5 GB). So we first enumerate THIS session's pane pids and SIGKILL each pid
+/// plus FOUR levels of descendants — the pane is a login shell (`zsh -ilc 'claude
+/// …'`), so the depths are L0=shell, L1=claude, L2=claude's node/MCP children,
+/// L3=their children — STRICTLY scoped to the named session's pid subtree (never a
+/// `pkill`-by-name, and never a process-GROUP kill, either of which could reach
+/// another workspace), then kill the session. Runs through the same `bash -lc`
+/// helper as [`pane_info`] (on Windows `wsl.exe -e bash`) so the single-quoted tmux
+/// `#{...}` format survives the round-trip (a bare `#` is eaten as a shell comment
+/// under wsl.exe). Best-effort: a daemonized escapee (its own setsid) survives any
+/// signal-based reap, as it would under tmux too. Idempotent — an already-gone /
+/// no-server session is success; but a REAL kill-session failure now propagates
+/// (no blanket `exit 0`) so a genuine reap failure surfaces instead of silently
+/// leaking.
+pub fn kill_session_tree(name: &str) -> Result<(), TmuxError> {
+    // Each kill in the loop is `2>/dev/null` (a dead/raced pid is fine), but the
+    // FINAL `kill-session` is NOT suppressed and is the LAST command, so the
+    // script's exit status == kill-session's: 0 on success, non-zero+stderr on a
+    // real failure (which the caller surfaces), and the already-gone case is
+    // absorbed below.
+    let script = format!(
+        "for pid in $(tmux -L {sock} list-panes -t '{name}' -F '#{{pane_pid}}' 2>/dev/null); do \
+l1=$(pgrep -P \"$pid\" 2>/dev/null); \
+l2=$(for k in $l1; do pgrep -P \"$k\" 2>/dev/null; done); \
+l3=$(for k in $l2; do pgrep -P \"$k\" 2>/dev/null; done); \
+kill -9 $pid $l1 $l2 $l3 2>/dev/null; \
+done; \
+tmux -L {sock} kill-session -t '{name}'",
+        sock = socket(),
+        name = name,
+    );
+    let output = pane_info_command(&script).output().map_err(|e| TmuxError {
+        op: "kill-session-tree",
+        code: None,
+        message: format!("failed to spawn tmux: {e}"),
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // Idempotent success when the session is simply already gone (is_already_gone
+    // already subsumes the no-server case). A genuine failure falls through to Err.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_already_gone(&stderr) {
+        return Ok(());
+    }
+    Err(TmuxError {
+        op: "kill-session-tree",
+        code: output.status.code(),
+        message: stderr.trim().to_string(),
+    })
+}
+
 /// List all session names on the `t-hub` socket.
 ///
 /// Tolerates the "no server running" case (no sessions have ever been created,

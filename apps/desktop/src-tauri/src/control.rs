@@ -854,6 +854,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "supervision_session_ids" => supervision_session_ids(ctx),
         "wsl_health" => wsl_health(ctx),
         "recent_sessions" => recent_sessions(),
+        "invalidate_recent_cache" => invalidate_recent_cache(),
         "claude_usage" => claude_usage(),
         "codex_usage" => codex_usage(),
         "host_metrics" => host_metrics(ctx),
@@ -1135,6 +1136,13 @@ fn wsl_health(ctx: &ControlContext) -> Result<Value, String> {
 /// rather than the `wsl.exe`/UNC hop.
 fn recent_sessions() -> Result<Value, String> {
     serde_json::to_value(crate::recent::recent_sessions_cached()).map_err(|e| e.to_string())
+}
+
+/// `invalidate_recent_cache` (Tier 3 reap): drop the recent-sessions cache so a
+/// just-closed workspace's sessions show in Recent immediately, not after the 15s TTL.
+fn invalidate_recent_cache() -> Result<Value, String> {
+    crate::recent::invalidate_recent_cache();
+    Ok(Value::Bool(true))
 }
 
 /// `archive_recent_project`: the Recent list's × made durable. Moves the project
