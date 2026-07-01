@@ -98,7 +98,7 @@ Dependency spine: T2 → T3 → T4 (T1 also gates T4); T4 → {T5, T8, T9}; T5 �
 
 | Task | What | Acceptance |
 |---|---|---|
-| **T1** | **Verify the server split against a second device** (M2b has never been tested): loopback regression; Tailscale-bind thin client from device B (`T_HUB_REMOTE_ADDR`/`T_HUB_CONTROL_TOKEN`); non-tailnet LAN peer rejected by `is_allowed_peer`; kill/reconnect re-sync. | All four checks documented pass/fail, fixes filed as tasks. |
+| **T1** | **Verify the server split against a second device** (M2b has never been tested): loopback regression; Tailscale-bind thin client from device B (`T_HUB_REMOTE_ADDR`/`T_HUB_REMOTE_TOKEN` - NOT `T_HUB_CONTROL_TOKEN`, which is the server-side override); non-tailnet LAN peer rejected by `is_allowed_peer`; kill/reconnect re-sync. | All four checks documented pass/fail, fixes filed as tasks. **Status 2026-07-01: loopback half PASSED end-to-end** (commands, version gate, auth, event fanout, PTY seed/out/write/resize, drop + re-sync); device-B half has a ready recipe in [T1-REMOTE-VERIFICATION.md](./T1-REMOTE-VERIFICATION.md), blocked only on a bind-enabled relaunch. Found en route: the `git_info` `wsl.exe -e` bug (tracked as a fix task). |
 | **T2** | **The decisive GPUI spike**: minimal GPUI app (or fork the standalone gpui-terminal / instrument a Zed nightly), one window, 12-16 firehose-fed `alacritty_terminal` Terms; measure sustained fps and the selected GPU adapter; `cargo deny check licenses` for the GPL chain (informational). | Recorded fps + adapter evidence; written pass/fail against both §6 gates. |
 | **T3** | **Record the framework decision** in §6; if T2 failed a gate, run the equivalent Iced spike first (custom `iced_wgpu::Primitive` + glyphon grids, `pane_grid` sanity, daemon multi-window smoke, adapter check). | This doc updated with the choice + evidence. |
 
@@ -145,6 +145,10 @@ Dependency spine: T2 → T3 → T4 (T1 also gates T4); T4 → {T5, T8, T9}; T5 �
   Unsolved, and predates this pivot.
 - **The scrollback seed is an approximation.**
   The `{scrollback}` frame is a reflowed `capture-pane -e` snapshot; the client grid is byte-authoritative only from attach forward.
+- **Two id spaces (verified in the T1 run).**
+  `list_terminals`/`attach_pty`/`read_terminal` address tmux tile ids (`th_`-stripped), while supervision/`get_status` key by Claude session UUID; a native client must maintain the tile-to-session-UUID mapping to render status.
+  Also `tmux_target` truncates a bare sessionId to 8 chars (`tmux.rs:272-278`) - pass the full `th_`-prefixed name for long-named sessions.
+- **Default remote port 8787 can collide** (occupied by `workerd` in WSL on the dev box, and WSL mirrored networking shares the port space); set `T_HUB_CONTROL_PORT` when enabling the remote bind.
 
 ## 9. Risks and open questions
 
