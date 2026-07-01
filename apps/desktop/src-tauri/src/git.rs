@@ -150,10 +150,10 @@ pub struct WorktreeInfo {
 ///
 /// unix: spawn `git` directly with `.current_dir(cwd)`.
 ///
-/// Windows: spawn `wsl.exe -d <distro> --cd <cwd> -- git <args...>` with the
+/// Windows: spawn `wsl.exe -d <distro> --cd <cwd> -e git <args...>` with the
 /// console window suppressed (`CREATE_NO_WINDOW`, mirroring files.rs/tmux.rs).
 /// We rely on `--cd` rather than `git -C` so the working dir is set by WSL itself,
-/// and we pass NO bash script (avoids the trailing-arg mangling caveat). `cwd`
+/// and `-e` (exec) runs git directly so no shell ever re-parses the args. `cwd`
 /// here is a native POSIX path (`/home/...`); the desktop app hands us those.
 fn run_git(cwd: &str, args: &[&str]) -> Result<(bool, String, String), String> {
     let output = build_git_command(cwd, args)
@@ -178,16 +178,19 @@ fn build_git_command(cwd: &str, args: &[&str]) -> Command {
     use std::os::windows::process::CommandExt;
     let distro = crate::files::host_distro();
     let mut c = Command::new("wsl.exe");
-    // `wsl.exe -d <distro> --cd <posix-cwd> -- git <args...>`. `--cd` sets the
-    // working dir inside the distro; `--` ends wsl flags so everything after is
-    // the command. git lives on the default PATH (/usr/bin), so no login shell —
-    // and crucially NO `bash -lc '<script>'`, which can mangle a trailing arg
-    // (the commit message). Each arg (incl. the message) is its own argv entry.
+    // `wsl.exe -d <distro> --cd <posix-cwd> -e git <args...>`. `--cd` sets the
+    // working dir inside the distro; `-e` (exec) runs git DIRECTLY with argv
+    // preserved. With a bare `--`, wsl.exe re-joins the tail and routes it
+    // through the user's default login shell (zsh here), which re-splits and
+    // EXPANDS it — an arg containing `$`/backticks (e.g. a commit message) gets
+    // shell-expanded (injection-shaped) and its quoting mangled. `-e` keeps each
+    // arg (incl. the message) its own argv entry — see the detailed note on
+    // tmux.rs `pane_info_command`.
     c.arg("-d")
         .arg(&distro)
         .arg("--cd")
         .arg(cwd)
-        .arg("--")
+        .arg("-e")
         .arg("git")
         .args(args);
     c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (see files.rs/tmux.rs)
@@ -236,9 +239,9 @@ fi";
 ///
 /// unix: spawn `bash -lc <script>` with `.current_dir(cwd)`.
 ///
-/// Windows: spawn `wsl.exe -d <distro> --cd <cwd> -- bash -lc <script>` with the
+/// Windows: spawn `wsl.exe -d <distro> --cd <cwd> -e bash -lc <script>` with the
 /// console window suppressed (`CREATE_NO_WINDOW`, matching `run_git`). The script
-/// is a SINGLE argv arg (passed straight to `-lc`); it contains no
+/// is a SINGLE argv arg (passed straight to `-lc` thanks to `-e`); it contains no
 /// caller-interpolated data (the cwd is set by `--cd` / `current_dir`, never
 /// spliced into the script text), so the trailing-arg mangling that bit the
 /// commit path can't apply here. Returns `Err` only on a genuine spawn failure;
@@ -264,16 +267,20 @@ fn build_git_info_command(cwd: &str) -> Command {
     use std::os::windows::process::CommandExt;
     let distro = crate::files::host_distro();
     let mut c = Command::new("wsl.exe");
-    // `wsl.exe -d <distro> --cd <posix-cwd> -- bash -lc '<script>'`. `--cd` sets
-    // the working dir inside the distro (NOT interpolated into the script), so the
-    // script body is a fixed, data-free string — the `bash -lc` trailing-arg
-    // mangling caveat (which only bit a caller-supplied trailing arg) doesn't
-    // apply. A login shell is fine here: the script is our own and self-contained.
+    // `wsl.exe -d <distro> --cd <posix-cwd> -e bash -lc '<script>'`. `--cd` sets
+    // the working dir inside the distro (NOT interpolated into the script). `-e`
+    // (exec) hands the script to bash VERBATIM as one argv entry. With a bare
+    // `--`, wsl.exe re-joins the tail through the user's default login shell
+    // (zsh), which expands the script's `$inside`/`$( )` BEFORE bash runs — every
+    // query got answered at zsh level, `inside` printed empty, and git_info
+    // collapsed to not_repo for every real repo (v0.3.27's silently blank
+    // branch/worktree titles). A login shell is fine here: the script is our own
+    // and self-contained — see the detailed note on tmux.rs `pane_info_command`.
     c.arg("-d")
         .arg(&distro)
         .arg("--cd")
         .arg(cwd)
-        .arg("--")
+        .arg("-e")
         .arg("bash")
         .arg("-lc")
         .arg(GIT_INFO_SCRIPT);
