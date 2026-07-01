@@ -8,6 +8,9 @@
 
 **Status of the BUILD (updated — the split is largely shipped):** **M1, M2a, M2b-core, and all of M3 are SHIPPED** — every overlay/index read (recent · usage · codex · git · host_metrics · file index) plus tiles + events now cross the control socket, all on `main` as `feat(server-split): …` / `fix(server-split): …` commits, each verified live against the running app (socket probes) and reviewed by sub-agents. The design below is now RETROSPECTIVE for M1–M3 and forward-looking for M4. **What's left:** the file BROWSER/READER/EDITOR remoting (M4-gated — arbitrary-path read+write), M2b deferred hardening + a real two-device Tailscale test, then M4 (multi-client). See the §6 table for per-milestone status. The original "design proposal" text is kept for the rationale.
 
+> **See also (2026-07-01): [NATIVE-RENDER-PIVOT.md](./NATIVE-RENDER-PIVOT.md).**
+> The client side of this split is being rebuilt as a native GPU app; the never-run M2b two-device test is that plan's T1, and M4 (multi-client) is now directly motivated by a second client implementation existing.
+
 > The one-line bet: **pull T-Hub's "brain" out of the desktop GUI into a headless `t-hub-server` that lives where the agents live (WSL/remote), so any device can connect to one instance and get the full cockpit.** Today brain + face are fused in one Windows process hard-wired to the local WSL.
 
 ---
