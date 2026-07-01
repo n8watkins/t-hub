@@ -1,8 +1,9 @@
 # T-Hub - Native Render Pivot (Design + Plan)
 
-> **STATUS (2026-07-01) - DECIDED, NOT STARTED.**
+> **STATUS (2026-07-01) - DECIDED; GATES RUN; FRAMEWORK CONFIRMED.**
 > The owner has chosen a full-native client: retire the webview renderer and rebuild the frontend on a native Rust GPU stack.
-> Framework: **GPUI leading, Iced 0.14 fallback**, decided by the spike gates in §6.
+> Framework: **GPUI - CONFIRMED by the T2 spike (both §6 gates PASSED**; evidence in [T2-GPUI-SPIKE-RESULTS.md](./T2-GPUI-SPIKE-RESULTS.md)); Iced 0.14 remains the documented fallback.
+> T1's loopback half also PASSED (see §7); the device-B remote half is recipe-ready in [T1-REMOTE-VERIFICATION.md](./T1-REMOTE-VERIFICATION.md).
 > This doc is the cold-start guide for the pivot; the working tracker mirrors §7 as tasks T1-T14.
 > Decision rubric, fixed by the owner: **scalability > implementation control > aesthetics**; effort, timeline, and migration risk are explicitly NOT factors; GPL-linked dependencies are acceptable (T-Hub stays open-source/personal).
 > Provenance: 29-agent adversarially-verified stack evaluation (2026-07-01); every load-bearing claim below survived or was corrected by that verification.
@@ -90,6 +91,15 @@ Hybrid winit+wgpu+wry: keeps React at the cost of a permanent two-render-tree wa
 
 Fail either gate → flip to Iced (T3) with no loss of architectural ceiling.
 
+**RESULT (2026-07-01): both gates PASSED - GPUI is the confirmed framework.**
+Full evidence in [T2-GPUI-SPIKE-RESULTS.md](./T2-GPUI-SPIKE-RESULTS.md); highlights:
+
+- G1: 16 real `alacritty_terminal` grids, worst-case renderer (no damage tracking, full reshape every frame): rock-steady ~90 fps on a 180Hz panel, never below 82, zero seconds under 55; 12 grids ran 150-180 fps.
+  GPU utilization 3.5-7.3% (the 7800 XT nearly idle) - enormous headroom; the spike's CPU-side brute force is the ceiling, and a production damage-driven renderer only improves it.
+- G2: discrete RX 7800 XT selected by default (gpui log + 100% of GPU-engine samples on the discrete LUID); no forcing needed on this box (the zed #36798 hybrid concern applies to laptop-style setups; OS-level per-app "High performance" is the lever there).
+- Buildability: **`gpui = "0.2.2"` exists on crates.io** and a standalone app built in 165s with zero workarounds - this CORRECTS the §6 caveat below about GPUI having no published crate (true only of git-main's newer split).
+- The zed #55470 GPL chain is absent from published gpui 0.2.2 (name-level check).
+
 ## 7. Phased plan (mirrored as tracker tasks T1-T14)
 
 Dependency spine: T2 → T3 → T4 (T1 also gates T4); T4 → {T5, T8, T9}; T5 → {T6, T7, T13}; T8 → {T10, T11, T12}; {T6, T7, T9, T10, T11, T12, T13} → T14.
@@ -99,8 +109,8 @@ Dependency spine: T2 → T3 → T4 (T1 also gates T4); T4 → {T5, T8, T9}; T5 �
 | Task | What | Acceptance |
 |---|---|---|
 | **T1** | **Verify the server split against a second device** (M2b has never been tested): loopback regression; Tailscale-bind thin client from device B (`T_HUB_REMOTE_ADDR`/`T_HUB_REMOTE_TOKEN` - NOT `T_HUB_CONTROL_TOKEN`, which is the server-side override); non-tailnet LAN peer rejected by `is_allowed_peer`; kill/reconnect re-sync. | All four checks documented pass/fail, fixes filed as tasks. **Status 2026-07-01: loopback half PASSED end-to-end** (commands, version gate, auth, event fanout, PTY seed/out/write/resize, drop + re-sync); device-B half has a ready recipe in [T1-REMOTE-VERIFICATION.md](./T1-REMOTE-VERIFICATION.md), blocked only on a bind-enabled relaunch. Found en route: the `git_info` `wsl.exe -e` bug (tracked as a fix task). |
-| **T2** | **The decisive GPUI spike**: minimal GPUI app (or fork the standalone gpui-terminal / instrument a Zed nightly), one window, 12-16 firehose-fed `alacritty_terminal` Terms; measure sustained fps and the selected GPU adapter; `cargo deny check licenses` for the GPL chain (informational). | Recorded fps + adapter evidence; written pass/fail against both §6 gates. |
-| **T3** | **Record the framework decision** in §6; if T2 failed a gate, run the equivalent Iced spike first (custom `iced_wgpu::Primitive` + glyphon grids, `pane_grid` sanity, daemon multi-window smoke, adapter check). | This doc updated with the choice + evidence. |
+| **T2** | **The decisive GPUI spike**: minimal GPUI app (or fork the standalone gpui-terminal / instrument a Zed nightly), one window, 12-16 firehose-fed `alacritty_terminal` Terms; measure sustained fps and the selected GPU adapter; `cargo deny check licenses` for the GPL chain (informational). | Recorded fps + adapter evidence; written pass/fail against both §6 gates. **✅ DONE 2026-07-01 - both gates PASSED** ([results](./T2-GPUI-SPIKE-RESULTS.md)); spike source at `C:\Users\natha\spikes\gpui-spike\`. |
+| **T3** | **Record the framework decision** in §6; if T2 failed a gate, run the equivalent Iced spike first (custom `iced_wgpu::Primitive` + glyphon grids, `pane_grid` sanity, daemon multi-window smoke, adapter check). | This doc updated with the choice + evidence. **✅ DONE 2026-07-01 - GPUI confirmed** (§6 RESULT block); pin `gpui = "0.2.2"` for T4. |
 
 ### Phase 1 - Terminal path
 
