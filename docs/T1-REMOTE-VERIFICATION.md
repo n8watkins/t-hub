@@ -96,3 +96,33 @@ Expected: the {scrollback} seed reflects everything the session printed while di
 ## 7. Restore
 
 Relaunch T-Hub without any `T_HUB_*` env -> loopback-only again (verify `control.json` + no remote log line).
+
+## 8. Findings from the first live run (2026-07-01, v0.3.28)
+
+What was actually observed when this recipe was executed on the dev box:
+
+- **`T_HUB_BIND_TAILSCALE=1` silently no-ops if `tailscale` is not on the app's PATH.**
+  The WSL-interop environment snapshot predates a same-day Tailscale install, so the launched app could not run `tailscale ip -4`.
+  Use the explicit `T_HUB_CONTROL_BIND=<tailnet-ip>:8790` (verified working: listener came up on `100.70.116.93:8790`), or prepend `C:\Program Files\Tailscale` to PATH before launching.
+- **Plain TCP from WSL to the host's tailnet IP times out** - the Hyper-V/WSL firewall layer eats the mirrored hairpin before it reaches the listener.
+  Not a T-Hub bug; do not use plain sockets from WSL to test the remote bind.
+- **`tailscale nc <host-tailnet-ip> 8790` from WSL connects but is dropped pre-auth** - and this is the peer gate WORKING:
+  under mirrored networking, same-host traffic (even from the WSL tailscaled node) arrives with a non-tailnet-looking source, and `is_allowed_peer` closes it without a response, exactly as designed (bad tokens get an explicit `unauthorized` reply; disallowed peers get silence).
+  **Consequence: this machine cannot serve as its own device B. The positive test requires a physically separate device.**
+- **Positive test from a real second device (phone, Termux, Tailscale VPN on):**
+
+  ```bash
+  pkg install -y python
+  python - <<'EOF'
+  import socket, json
+  s = socket.create_connection(("100.70.116.93", 8790), timeout=8)
+  s.sendall((json.dumps({"token": "<contents of C:\\Users\\natha\\.t-hub\\server-key>",
+                         "command": "list_terminals", "args": {}, "v": 1}) + "\n").encode())
+  print(s.makefile().readline())
+  EOF
+  ```
+
+  Expected: `{"ok":true,...,"count":N}`. This is the one remaining unchecked box for T1.
+- Everything else re-verified on the new build: boot, 13/13 session restore across two app bounces, `git_info` returning real branches (the v0.3.28 fix), loopback wire intact.
+- **Daily-use note:** the remote bind is env-var-driven and per-launch; a normal launch reverts to loopback-only.
+  If remote should be always-on, promote it to a persisted setting (follow-up).
