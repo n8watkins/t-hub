@@ -122,7 +122,9 @@ What was actually observed when this recipe was executed on the dev box:
   EOF
   ```
 
-  Expected: `{"ok":true,...,"count":N}`. This is the one remaining unchecked box for T1.
+  Expected: `{"ok":true,...,"count":N}`.
+  **✅ CONFIRMED 2026-07-01: an Android phone (Termux, bash `/dev/tcp`, Tailscale VPN on) received `{"ok":true,...}` from `100.70.116.93:8790` - the genuine device-B positive.
+  T1 is CLOSED.** (The §5 LAN negative with a `0.0.0.0` bind remains optional/untested; the tailnet-scoped bind + observed pre-auth gate rejection covers the shipped posture.)
 - Everything else re-verified on the new build: boot, 13/13 session restore across two app bounces, `git_info` returning real branches (the v0.3.28 fix), loopback wire intact.
 - **Daily-use note:** the remote bind is env-var-driven and per-launch; a normal launch reverts to loopback-only.
   If remote should be always-on, promote it to a persisted setting (follow-up).
