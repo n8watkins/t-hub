@@ -29,7 +29,8 @@ Note: `control.rs::tailscale_ip4()` shells out to plain `tailscale` - it must be
 
 ## 2. Relaunch T-Hub on the server with the remote bind (opt-in, default OFF)
 
-WARNING: closing the running app kills live agent sessions in its tiles (v0.3.26 reap-on-close); do this at a quiet moment.
+Note on safety (corrected 2026-07-01 against `workspace.ts:1270`): sessions SURVIVE an app quit - the Tier-3 reap fires ONLY on the workspace-tab ×, never on app exit; tmux sessions stay detached and native session restore re-attaches tiles on boot.
+A relaunch just blanks the UI briefly; agents keep running headless.
 PowerShell (env vars set in a shell are inherited by GUI apps it launches):
 
 ```powershell
