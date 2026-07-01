@@ -631,6 +631,48 @@ export function Tile({
           </span>
         )}
 
+        {/* Current worktree / branch, PROMINENT in the title line (not a muted side
+            chip) — you want to see at a glance which worktree a terminal is on. Shows
+            the git branch with a branch icon, a "wt" badge when it's a linked
+            worktree, and a dot when the tree is dirty. Renders nothing outside a repo.
+            The folder name (a worktree's dir is `<repo>-worktrees/<sanitized-branch>`)
+            can differ from the real branch (`feat/x` → dir `feat-x`), so showing the
+            actual branch here is the accurate signal. */}
+        {git?.isRepo && git.branch && (
+          <span
+            className="flex shrink-0 items-center gap-1 truncate"
+            style={{ color: "var(--th-fg)", fontSize: "1.02em" }}
+            title={`${git.isLinkedWorktree ? "worktree" : "branch"}: ${git.branch}${
+              git.dirtyCount > 0
+                ? ` · ${git.dirtyCount} uncommitted change${
+                    git.dirtyCount === 1 ? "" : "s"
+                  }`
+                : " · clean"
+            }`}
+          >
+            <GitBranch size="0.9em" aria-hidden style={{ opacity: 0.7 }} />
+            <span className="max-w-[11rem] truncate">{git.branch}</span>
+            {git.isLinkedWorktree && (
+              <span
+                className="rounded px-1 text-[0.7em] uppercase leading-none"
+                style={{
+                  backgroundColor: "var(--th-tile-bg)",
+                  color: "var(--th-fg-muted)",
+                }}
+              >
+                wt
+              </span>
+            )}
+            {git.dirtyCount > 0 && (
+              <span
+                className="h-1.5 w-1.5 shrink-0 rounded-full"
+                style={{ backgroundColor: "#eab308" }}
+                aria-hidden
+              />
+            )}
+          </span>
+        )}
+
         {/* Editable "what are you working on" name (Feature 1). Click to edit
             inline; Enter commits, Esc cancels. Persisted per-PROJECT (theme store
             workNames, keyed by cwd — so it also shows in the sidebar + Recent).
@@ -678,40 +720,8 @@ export function Tile({
           </button>
         )}
 
-        {/* Git chip: branch + worktree/dirty state for THIS tile's project (from
-            git_info on the cwd). Renders nothing for a non-repo. Lets you see at a
-            glance which branch/worktree a terminal is on. */}
-        {git?.isRepo && git.branch && (
-          <span
-            className="flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-[0.85em]"
-            style={{ color: "var(--th-fg-muted)" }}
-            title={`${git.isLinkedWorktree ? "worktree" : "branch"}: ${git.branch}${
-              git.dirtyCount > 0
-                ? ` · ${git.dirtyCount} uncommitted change${
-                    git.dirtyCount === 1 ? "" : "s"
-                  }`
-                : " · clean"
-            }`}
-          >
-            <GitBranch size="0.95em" aria-hidden />
-            <span className="max-w-[9rem] truncate">{git.branch}</span>
-            {git.isLinkedWorktree && (
-              <span
-                className="rounded px-1 text-[0.8em] uppercase leading-none"
-                style={{ backgroundColor: "var(--th-tile-bg)" }}
-              >
-                wt
-              </span>
-            )}
-            {git.dirtyCount > 0 && (
-              <span
-                className="h-1.5 w-1.5 shrink-0 rounded-full"
-                style={{ backgroundColor: "#eab308" }}
-                aria-hidden
-              />
-            )}
-          </span>
-        )}
+        {/* (The branch/worktree now renders PROMINENTLY in the title line above,
+            next to the folder name — the old muted side-chip was folded into it.) */}
 
         {/* Flexible spacer: pushes the view-tab bar + controls to the RIGHT edge
             of the header (the tabs used to be absolutely centered). */}

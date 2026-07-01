@@ -1803,15 +1803,32 @@ function terminalForCwd(
  *  listener simply never fires (non-fatal). */
 function subscribeClaudeTitles(): void {
   onControlEvent("agent://title", (p) => {
-    const { cwd, title } = p as {
+    const { sessionId, cwd, title } = p as {
       sessionId: string;
       cwd?: string;
       title: string;
     };
     if (!title) return;
-    const id = terminalForCwd(useWorkspace.getState().terminals, cwd);
-    // TODO(claude-title): when the backend can map a Claude session id to a
-    // terminal directly (shared layer), prefer that over cwd correlation.
+    const terminals = useWorkspace.getState().terminals;
+    // Prefer EXACT session→terminal routing. The supervision store maps each tmux
+    // session (`th_<id>`) to its Claude sessionId, so we can land the title on the
+    // precise terminal — even when TWO terminals share a cwd (or cwd-basename),
+    // which cwd correlation CANNOT disambiguate: `terminalForCwd` returns null on
+    // a tie, so both same-folder terminals would otherwise miss their own goal
+    // title and collapse to the identical `claude · <folder>` fallback (the bug
+    // where same-folder terminals looked linked). Fall back to cwd only until the
+    // session→tmux map is populated (before the first status snapshot lands).
+    let id: TerminalId | null = null;
+    if (sessionId) {
+      const { sessionIdByTmux } = useSupervision.getState();
+      for (const t of Object.values(terminals)) {
+        if (sessionIdByTmux[sessionNameForTerminal(t.id)] === sessionId) {
+          id = t.id;
+          break;
+        }
+      }
+    }
+    if (!id) id = terminalForCwd(terminals, cwd);
     if (id) useWorkspace.getState().setClaudeTitle(id, title);
   });
 }
