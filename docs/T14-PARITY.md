@@ -140,13 +140,13 @@ Consequences:
 
 | Status | Count |
 |---|---|
-| present | 25 |
-| degraded | 8 |
-| missing | 24 |
-| wontport | 4 |
-| **rows** | **61** |
+| present | 28 |
+| degraded | 9 |
+| missing | 37 |
+| wontport | 3 |
+| **rows** | **77** |
 
-Of the 24 missing: 8 sit with the in-flight chrome crews, 5 land in one keymap/palette task (T-A), 6 in a daily-drive gap task (T-B), and 5 are post-flip (T-C / distribution).
+Of the 37 missing: 9 sit with the in-flight chrome crews (incl. the panels URL push that rides their mount), 6 fold into one keymap/palette task (T-A), 6 into the daily-drive flow-gaps task (T-B), 12 are post-flip polish (T-C, the settings/theming family), 3 are the distribution items (§3), and 1 is server-gated (M4 file write).
 
 ## 2. WSL-boundary checks (T14 brief item)
 
