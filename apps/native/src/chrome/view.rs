@@ -91,6 +91,11 @@ const BUSY_WINDOW_MS: u64 = 2_000;
 // Shared state
 // ---------------------------------------------------------------------------
 
+/// One tab-layout snapshot bound for the server's registry mirror (T12):
+/// `(id, name, tileIds)` per workspace, in order. Plain data so the reporter
+/// thread owns it without touching the model lock.
+pub type TabsSnapshot = Vec<(String, String, Vec<String>)>;
+
 /// Chrome UI text metrics (not tile metrics - those are per-tile in `render`).
 #[derive(Clone, Copy)]
 struct UiMetrics {
@@ -117,6 +122,14 @@ pub struct CockpitState {
     pub(crate) tiles: HashMap<String, Tile>,
     /// Session titles from `list_terminals` (refreshed by the worker).
     pub(crate) titles: HashMap<String, String>,
+    /// Session cwds from `list_terminals` (refreshed by the worker). T12 uses
+    /// them for the worktree-removal detach match.
+    pub(crate) cwds: HashMap<String, String>,
+    /// Tab-layout snapshots for the server's registry mirror (T12):
+    /// [`save_layout`](Self::save_layout) snapshots the tabs here and the
+    /// background reporter sends the deduped `report_workspace_tabs` command.
+    /// `None` outside the cockpit (grid mode / tests).
+    report_tx: Option<crossbeam::channel::Sender<TabsSnapshot>>,
     /// Per-tile "last output" stamps (ms since `epoch`), written by the feeder
     /// threads - the recency fallback for the header's liveness cue.
     pub(crate) last_output_ms: HashMap<String, Arc<AtomicU64>>,
@@ -142,6 +155,8 @@ impl CockpitState {
             model,
             tiles: HashMap::new(),
             titles: HashMap::new(),
+            cwds: HashMap::new(),
+            report_tx: None,
             last_output_ms: HashMap::new(),
             epoch: Instant::now(),
             hits: HitZones::default(),
@@ -156,18 +171,41 @@ impl CockpitState {
         }
     }
 
+    /// Wire the T12 tab reporter (once, from the cockpit boot).
+    pub fn set_report_tx(&mut self, tx: crossbeam::channel::Sender<TabsSnapshot>) {
+        self.report_tx = Some(tx);
+    }
+
+    /// Snapshot the tab layout to the registry reporter (T12: the write half of
+    /// the `list_tabs` mirror, exactly what the webview's `startTabReporter`
+    /// does on every tabs change). No-op until [`set_report_tx`](Self::set_report_tx).
+    pub fn report_tabs(&self) {
+        if let Some(tx) = &self.report_tx {
+            let snap: TabsSnapshot = self
+                .model
+                .tabs
+                .iter()
+                .map(|t| (t.id.clone(), t.name.clone(), t.tiles.clone()))
+                .collect();
+            let _ = tx.send(snap);
+        }
+    }
+
     /// Persist the layout (best-effort: the cockpit must keep running even if
-    /// the disk write fails; the next mutation retries).
+    /// the disk write fails; the next mutation retries). Every persisted layout
+    /// change also re-reports the tabs to the server's registry mirror (T12).
     pub fn save_layout(&self) {
         if let Err(e) = persist::save(&self.layout_path, &Layout::from_model(&self.model)) {
             log::warn!("layout save failed: {e:#}");
         }
+        self.report_tabs();
     }
 
     /// Drop a tile's pool entries (its `PtyHandle` detaches on drop).
     pub fn drop_tile(&mut self, id: &str) {
         self.tiles.remove(id);
         self.last_output_ms.remove(id);
+        self.cwds.remove(id);
         if self.drag.as_ref().is_some_and(|d| d.id == id) {
             self.drag = None;
         }

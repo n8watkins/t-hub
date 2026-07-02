@@ -430,6 +430,19 @@ impl ChromeModel {
         }
     }
 
+    /// Place a live tile into the ACTIVE tab and focus it (T12 spawn placement:
+    /// the server minted the session; the reconcile attach follows). Refused
+    /// when the tile is already placed or user-hidden, so racing the reconcile
+    /// is idempotent.
+    pub fn place_tile(&mut self, id: &str) -> bool {
+        if self.contains_tile(id) || self.hidden.contains(id) {
+            return false;
+        }
+        self.tabs[self.active].tiles.push(id.to_string());
+        self.focused = Some(id.to_string());
+        true
+    }
+
     /// Move a tile into another tab by tab id (T12 `move_tile` apply; webview
     /// `moveTileToTab` parity): unknown target tab or already-there is a no-op;
     /// the tile leaves its source tab and is APPENDED to the target's order; the

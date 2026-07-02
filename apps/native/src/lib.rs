@@ -31,6 +31,11 @@ pub mod chrome;
 /// only `overlays::view` (feature `gui`) touches gpui.
 pub mod overlays;
 
+/// Organization-mutation application (T12): decodes the server's
+/// `control://apply` event broadcasts and applies them to the chrome model -
+/// the native twin of the webview's `controlBridge.ts`. gpui-free.
+pub mod apply;
+
 #[cfg(feature = "gui")]
 pub mod app;
 

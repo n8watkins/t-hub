@@ -1146,6 +1146,9 @@ pub struct SessionInfo {
     pub tmux_session: String,
     pub title: String,
     pub state: String,
+    /// The pane's live cwd (best-effort; empty when the server could not read
+    /// it). T12 uses it for worktree tab placement and removal detach.
+    pub cwd: String,
 }
 
 impl ControlClient {
@@ -1168,6 +1171,7 @@ impl ControlClient {
                     .to_string(),
                 title: t.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 state: t.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                cwd: t.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             })
             .collect())
     }
