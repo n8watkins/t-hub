@@ -16,3 +16,8 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Unix only: restore the default SIGPIPE disposition so `th | head` exits
+# cleanly (Rust otherwise ignores SIGPIPE and `println!` panics on EPIPE).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
