@@ -11,6 +11,12 @@ pub mod wire;
 /// `--no-default-features` the same way `wire` does.
 pub mod term;
 
+/// Font subsystem (T7): glyph classification, procedural box-drawing/Powerline
+/// sprite geometry, row segmentation, per-tile font config, and the torture-test
+/// fixture. gpui-free, so it compiles and unit-tests under
+/// `--no-default-features`; the GPUI glue lives in `render`.
+pub mod font;
+
 /// gpui-free render helpers (key encoding, layout math) - split out of `render` so
 /// they unit-test in WSL without linking the graphics backend.
 pub mod render_support;

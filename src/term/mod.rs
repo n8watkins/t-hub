@@ -69,6 +69,13 @@ pub struct SnapCell {
     pub bg: Option<Rgb>,
     pub bold: bool,
     pub underline: bool,
+    /// Grid columns this glyph occupies: 2 for a wide (CJK/emoji) char, else 1.
+    /// The spacer cell that pads a wide char is dropped (see [`to_snap_cell`]),
+    /// so the render layer uses this to advance its pen by whole cells (T7).
+    pub width: u8,
+    /// Zero-width combining chars attached to this cell (e.g. U+0301). Empty for
+    /// the common case; the shaper appends them to the base char's cluster (T7).
+    pub zw: Vec<char>,
 }
 
 /// Cursor position in viewport coordinates (row 0 == top visible line).
@@ -78,6 +85,8 @@ pub struct CursorPos {
     pub col: usize,
     /// False when the cursor is hidden (DECTCEM off) or scrolled out of view.
     pub visible: bool,
+    /// Cells the cursor block covers: 2 when it sits on a wide char, else 1 (T7).
+    pub width: u8,
 }
 
 /// A selection range in viewport coordinates (inclusive of both ends), as reported
@@ -368,7 +377,12 @@ impl TermSession {
             cols: self.cols,
             rows: self.rows,
             rows_cells,
-            cursor: cursor_from(&content.cursor, display_offset, rows),
+            cursor: cursor_from(
+                &content.cursor,
+                display_offset,
+                rows,
+                self.cursor_cell_width(content.cursor.point),
+            ),
             selection: selection_from(content.selection),
         }
     }
@@ -401,8 +415,23 @@ impl TermSession {
 
         PartialSnapshot {
             rows: out,
-            cursor: cursor_from(&content.cursor, display_offset, rows),
+            cursor: cursor_from(
+                &content.cursor,
+                display_offset,
+                rows,
+                self.cursor_cell_width(content.cursor.point),
+            ),
             selection: selection_from(content.selection),
+        }
+    }
+
+    /// Cells the cursor block covers at a grid point: 2 on a wide char, else 1
+    /// (T7 - the render layer sizes the cursor quad to the glyph underneath).
+    fn cursor_cell_width(&self, point: Point) -> u8 {
+        if self.term.grid()[point].flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
         }
     }
 
@@ -733,6 +762,8 @@ fn to_snap_cell(cell: &alacritty_terminal::term::cell::Cell) -> Option<SnapCell>
         bg,
         bold: cell.flags.intersects(Flags::BOLD),
         underline: cell.flags.intersects(Flags::UNDERLINE),
+        width: if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 },
+        zw: cell.zerowidth().map(<[char]>::to_vec).unwrap_or_default(),
     })
 }
 
@@ -742,12 +773,15 @@ fn cursor_from(
     cursor: &alacritty_terminal::term::RenderableCursor,
     display_offset: usize,
     rows: usize,
+    width: u8,
 ) -> Option<CursorPos> {
     let visible = cursor.shape != CursorShape::Hidden;
     match point_to_viewport(display_offset, cursor.point) {
-        Some(p) if p.line < rows => Some(CursorPos { line: p.line, col: p.column.0, visible }),
+        Some(p) if p.line < rows => {
+            Some(CursorPos { line: p.line, col: p.column.0, visible, width })
+        }
         // Off-viewport (scrolled away): report position clamped, marked invisible.
-        _ => Some(CursorPos { line: 0, col: 0, visible: false }),
+        _ => Some(CursorPos { line: 0, col: 0, visible: false, width: 1 }),
     }
 }
 
@@ -1085,5 +1119,52 @@ mod tests {
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].url, "http://abc.de/fgh");
         assert_eq!(urls[0].segs, vec![(0, 0, 9), (1, 0, 6)]);
+    }
+
+    // -- T7: cell width + zero-width chars (font subsystem inputs) ------------
+
+    #[test]
+    fn wide_char_cell_reports_width_two_and_drops_spacer() {
+        let mut t = TermSession::new(20, 3);
+        t.advance("你a".as_bytes());
+        let snap = t.renderable();
+        let row0 = &snap.rows_cells[0];
+        // The wide char covers columns 0-1; its spacer is dropped, so 'a' is
+        // the very next cell in the snapshot row.
+        assert_eq!(row0[0].c, '你');
+        assert_eq!(row0[0].width, 2);
+        assert_eq!(row0[1].c, 'a');
+        assert_eq!(row0[1].width, 1);
+    }
+
+    #[test]
+    fn combining_mark_lands_in_zerowidth_of_base_cell() {
+        let mut t = TermSession::new(20, 3);
+        // 'e' + combining acute accent (U+0301), then a plain 'x'.
+        t.advance("e\u{0301}x".as_bytes());
+        let snap = t.renderable();
+        let row0 = &snap.rows_cells[0];
+        assert_eq!(row0[0].c, 'e');
+        assert_eq!(row0[0].zw, vec!['\u{0301}']);
+        assert_eq!(row0[0].width, 1);
+        assert_eq!(row0[1].c, 'x');
+        assert!(row0[1].zw.is_empty());
+    }
+
+    #[test]
+    fn cursor_width_tracks_the_cell_underneath() {
+        // Carriage return puts the cursor back on column 0 - the wide char.
+        let mut t = TermSession::new(20, 3);
+        t.advance("你".as_bytes());
+        t.advance(b"\r");
+        let cur = t.renderable().cursor.expect("cursor present");
+        assert_eq!((cur.line, cur.col), (0, 0));
+        assert_eq!(cur.width, 2);
+
+        // A narrow char under the cursor reports width 1.
+        let mut t = TermSession::new(20, 3);
+        t.advance(b"a\r");
+        let cur = t.renderable().cursor.expect("cursor present");
+        assert_eq!(cur.width, 1);
     }
 }
