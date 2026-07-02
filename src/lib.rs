@@ -35,6 +35,10 @@ pub mod overlays;
 /// `control://apply` event broadcasts and applies them to the chrome model -
 /// the native twin of the webview's `controlBridge.ts`. gpui-free.
 pub mod apply;
+/// Panels (T11): Files (tree + fuzzy search), Preview (local dev URLs), Dev
+/// runner. State + reducers are gpui-free (testable under
+/// `--no-default-features`); only `panels::view` (feature `gui`) touches gpui.
+pub mod panels;
 
 #[cfg(feature = "gui")]
 pub mod app;
