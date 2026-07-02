@@ -1,9 +1,12 @@
 //! GPUI window for the native client.
 //!
-//! Two modes:
-//!  - **grid** (default, T5): the render seam - N live terminal tiles fed by the
-//!    §1.3 PTY plane, painted by [`crate::render::GridView`]. This is the pivot's
-//!    core deliverable.
+//! Three modes:
+//!  - **cockpit** (default, T8): the chrome - a left sidebar listing the
+//!    workspaces, the per-workspace tile grid, real per-tile headers -
+//!    live-populated from `list_terminals` and reconciled as sessions come and
+//!    go. [`crate::chrome::view::CockpitView`].
+//!  - **grid** (`THN_GRID=1`, the T5 seam demo): a flat near-square grid of the
+//!    first N sessions, kept for the damage/full A/B benches.
 //!  - **debug** (`THN_DEBUG=1`, the T4 overlay): a scrolling proof that the wire is
 //!    live (connection status, session list, event tail, first-attach byte count).
 //!
@@ -11,16 +14,18 @@
 //! driven by `request_animation_frame`) is lifted from the T2 spike main.rs, which
 //! is known-good on gpui 0.2.2.
 //!
-//! ## Session selection (T5)
+//! ## Session selection (T5 grid mode only)
 //! `THN_SESSIONS=id1,id2,...` attaches exactly those sessions (used by the
 //! acceptance harness with DISPOSABLE `t5-*` sessions, so typing tests never touch
 //! sessions we did not create). Unset -> the first `THN_TILES` (default 12) live
-//! sessions from `list_terminals`.
+//! sessions from `list_terminals`. The cockpit ignores both: it tracks the live
+//! session list and the persisted layout.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
@@ -30,7 +35,10 @@ use gpui::{
 };
 use parking_lot::Mutex;
 
-use crate::render::{GridView, TileSpec};
+use crate::chrome::model::ChromeModel;
+use crate::chrome::persist;
+use crate::chrome::view::{CockpitState, CockpitView};
+use crate::render::{GridView, Tile, TileSpec};
 use crate::term::TermSession;
 use crate::wire::{push_capped, ControlClient, Event, PtyFrame};
 
@@ -243,14 +251,17 @@ fn spawn_worker(state: Arc<Mutex<DebugState>>) {
     });
 }
 
-/// Entry point: dispatch to the debug overlay or the T5 render grid.
+/// Entry point: the T8 cockpit by default; `THN_GRID=1` for the T5 seam demo,
+/// `THN_DEBUG=1` for the T4 wire overlay.
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     log::info!("t-hub-native starting, pid={}", std::process::id());
     if std::env::var("THN_DEBUG").as_deref() == Ok("1") {
         run_debug();
-    } else {
+    } else if std::env::var("THN_GRID").as_deref() == Ok("1") {
         run_grid();
+    } else {
+        run_cockpit();
     }
 }
 
@@ -342,7 +353,7 @@ fn run_grid() {
     let (font_normal, font_bold) = fonts();
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);
-        cx.open_window(
+        let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Maximized(bounds)),
                 titlebar: Some(TitlebarOptions {
@@ -359,10 +370,230 @@ fn run_grid() {
                 window.focus(&focus);
                 view
             },
-        )
-        .unwrap();
+        );
+        if let Err(e) = opened {
+            eprintln!("t-hub-native: failed to open the grid window: {e:#}");
+            std::process::exit(1);
+        }
         cx.activate(true);
     });
+}
+
+// ---------------------------------------------------------------------------
+// T8 cockpit
+// ---------------------------------------------------------------------------
+
+/// How often the cockpit worker re-lists sessions when no event hints arrive.
+/// The control socket has no terminal-lifecycle channel (§1.2 lists only
+/// status/session/supervision/agent), so adds/removals ride this poll,
+/// accelerated to ~[`EVENT_DEBOUNCE`] by any session-ish event.
+const RELIST_INTERVAL: Duration = Duration::from_secs(2);
+/// After an event hint, wait this long (coalescing the burst) before re-listing.
+const EVENT_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Event channels that hint the session set (or its metadata) changed. Any of
+/// these triggers an early re-list instead of waiting out the poll interval.
+const LIFECYCLE_HINTS: [&str; 4] =
+    ["status://snapshot", "session://status", "agent://state", "agent://title"];
+
+/// T8 cockpit: tabs + per-workspace grid + headers over the live session list.
+/// Loads the persisted layout, spawns the reconcile worker (which attaches every
+/// placed session - the persistent pool), and opens the cockpit window.
+fn run_cockpit() {
+    let client = match ControlClient::connect_discovered() {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("t-hub-native: could not connect to the control socket: {e}");
+            eprintln!("  is the T-Hub app running? (control.json handshake missing/unreadable)");
+            std::process::exit(1);
+        }
+    };
+
+    let layout_path = persist::layout_path();
+    let model = match persist::load(&layout_path) {
+        Ok(Some(layout)) => layout.into_model(),
+        Ok(None) => ChromeModel::default(),
+        Err(e) => {
+            log::warn!("layout unreadable, starting fresh: {e:#}");
+            ChromeModel::default()
+        }
+    };
+    log::info!(
+        "cockpit: {} tab(s) from {}, active {}",
+        model.tabs.len(),
+        layout_path.display(),
+        model.active
+    );
+
+    let state = Arc::new(Mutex::new(CockpitState::new(model, layout_path)));
+    spawn_cockpit_worker(state.clone(), client.clone());
+
+    let (font_normal, font_bold) = fonts();
+    Application::new().run(move |cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);
+        let opened = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Maximized(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(SharedString::from("T-Hub Native")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |window, cx| {
+                let focus = cx.focus_handle();
+                let view = cx.new(|_| {
+                    CockpitView::new(state, client, font_normal, font_bold, focus.clone())
+                });
+                window.focus(&focus);
+                view
+            },
+        );
+        if let Err(e) = opened {
+            eprintln!("t-hub-native: failed to open the cockpit window: {e:#}");
+            std::process::exit(1);
+        }
+        cx.activate(true);
+    });
+}
+
+/// The cockpit reconcile worker: keep the model's tile set matched to the
+/// server's live sessions. Poll `list_terminals` every [`RELIST_INTERVAL`];
+/// any [`LIFECYCLE_HINTS`] event short-circuits the wait (debounced), so a
+/// session spawned by an agent shows up in well under a second.
+fn spawn_cockpit_worker(state: Arc<Mutex<CockpitState>>, client: Arc<ControlClient>) {
+    thread::Builder::new()
+        .name("t-hub-native-cockpit".into())
+        .spawn(move || {
+            let ev_rx = client.events();
+            loop {
+                reconcile_once(&state, &client);
+
+                // Wait out the poll interval, cutting it short on a lifecycle hint.
+                let deadline = Instant::now() + RELIST_INTERVAL;
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    match ev_rx.recv_timeout(left) {
+                        Ok(ev) if LIFECYCLE_HINTS.contains(&ev.channel.as_str()) => {
+                            thread::sleep(EVENT_DEBOUNCE);
+                            while ev_rx.try_recv().is_ok() {} // coalesce the burst
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(crossbeam::channel::RecvTimeoutError::Timeout) => break,
+                        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                            // Event plane gone (client dropping); fall back to polling.
+                            thread::sleep(RELIST_INTERVAL);
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .expect("spawn cockpit worker thread");
+}
+
+/// One reconcile pass: refresh titles, diff the layout against the live list,
+/// drop dead tiles from the pool, attach what needs attaching, persist changes.
+fn reconcile_once(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>) {
+    let sessions = match client.list_sessions() {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!("cockpit: list_terminals failed ({e}); retrying");
+            return;
+        }
+    };
+    let live: Vec<String> =
+        sessions.iter().map(|s| s.id.clone()).filter(|id| !id.is_empty()).collect();
+
+    let need_attach: Vec<String> = {
+        let mut st = state.lock();
+        for s in &sessions {
+            if !s.id.is_empty() {
+                st.titles.insert(s.id.clone(), s.title.clone());
+            }
+        }
+        let out = st.model.reconcile(&live);
+        for id in &out.removed {
+            log::info!("cockpit: session {id} gone; dropping its tile");
+            st.drop_tile(id);
+        }
+        if !out.added.is_empty() || !out.removed.is_empty() {
+            st.save_layout();
+        }
+        // Attach every placed tile missing from the pool - not just this pass's
+        // `added`: tiles restored from the persisted layout boot un-pooled (the
+        // bug the first live run caught), and a died-and-relisted session heals
+        // the same way.
+        st.model
+            .all_tiles()
+            .into_iter()
+            .filter(|id| !st.tiles.contains_key(id))
+            .collect()
+    };
+
+    // Attach outside the lock (each attach is a network round-trip).
+    for id in need_attach {
+        attach_tile(state, client, &id);
+    }
+}
+
+/// Attach one session into the pool: PTY attach at the provisional geometry
+/// (the first paint reflows it), seed the `TermSession` with the scrollback,
+/// and spawn the feeder thread (bytes -> `advance`, stamping the liveness cue).
+fn attach_tile(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>, id: &str) {
+    let handle = match client.attach_pty(id, PROVISIONAL_COLS, PROVISIONAL_ROWS) {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("cockpit: attach {id} failed ({e}); a later reconcile retries");
+            // Not hidden - just out of the layout, so reconcile can re-add it.
+            state.lock().model.remove_tile(id);
+            return;
+        }
+    };
+    let term = Arc::new(Mutex::new(TermSession::new(PROVISIONAL_COLS, PROVISIONAL_ROWS)));
+    if !handle.scrollback.is_empty() {
+        term.lock().advance(&handle.scrollback);
+    }
+
+    let stamp = Arc::new(AtomicU64::new(0));
+    let mut st = state.lock();
+    if !st.model.contains_tile(id) {
+        // Closed while the attach was in flight; drop the handle (detaches).
+        return;
+    }
+    let epoch = st.epoch;
+    let rx = handle.output.clone();
+    let feed_term = term.clone();
+    let feed_stamp = stamp.clone();
+    let feed_id = id.to_string();
+    thread::spawn(move || {
+        while let Ok(frame) = rx.recv() {
+            match frame {
+                PtyFrame::Out(bytes) => {
+                    feed_term.lock().advance(&bytes);
+                    feed_stamp.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                }
+                PtyFrame::Exit(code) => {
+                    // The next reconcile removes the tile once the server
+                    // drops the session from list_terminals.
+                    log::info!("feeder[{feed_id}]: session exited ({code})");
+                    break;
+                }
+            }
+        }
+    });
+    st.tiles.insert(
+        id.to_string(),
+        Tile::new(id.to_string(), term, handle, PROVISIONAL_COLS, PROVISIONAL_ROWS),
+    );
+    st.last_output_ms.insert(id.to_string(), stamp);
+    if st.model.focused.is_none() {
+        st.model.set_focused(id);
+    }
 }
 
 /// The T4 wire-debug overlay (opt-in via `THN_DEBUG=1`).
@@ -376,7 +607,7 @@ fn run_debug() {
     let (font_normal, font_bold) = fonts();
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.), px(700.)), cx);
-        cx.open_window(
+        let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
@@ -386,8 +617,11 @@ fn run_debug() {
                 ..Default::default()
             },
             |_, cx| cx.new(|_| DebugView { state, font_normal, font_bold }),
-        )
-        .unwrap();
+        );
+        if let Err(e) = opened {
+            eprintln!("t-hub-native: failed to open the debug window: {e:#}");
+            std::process::exit(1);
+        }
         cx.activate(true);
     });
 }

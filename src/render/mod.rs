@@ -84,7 +84,7 @@ static ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static LOGGER: OnceLock<()> = OnceLock::new();
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PaintMode {
+pub(crate) enum PaintMode {
     /// Rebuild only damaged rows (default). The production path.
     Damage,
     /// Rebuild every row every frame (the spike's brute force) - for A/B measurement.
@@ -92,7 +92,7 @@ enum PaintMode {
 }
 
 impl PaintMode {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         match std::env::var("THN_PAINT").as_deref() {
             Ok("full") => PaintMode::Full,
             _ => PaintMode::Damage,
@@ -115,13 +115,28 @@ struct BuiltRow {
 
 /// One live terminal tile: its session id, the shared `TermSession` (fed by a
 /// background thread), the PTY handle for write/resize, and the per-row run cache.
-struct Tile {
-    id: String,
-    term: Arc<Mutex<TermSession>>,
-    pty: PtyHandle,
+/// Shared with the T8 chrome ([`crate::chrome::view`]), which builds one per
+/// attached session and paints its content through [`sync_and_paint_content`].
+pub(crate) struct Tile {
+    pub(crate) id: String,
+    pub(crate) term: Arc<Mutex<TermSession>>,
+    pub(crate) pty: PtyHandle,
     built: Vec<BuiltRow>,
-    cols: u16,
-    rows: u16,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+}
+
+impl Tile {
+    /// A freshly attached tile with an empty run cache (filled on first paint).
+    pub(crate) fn new(
+        id: String,
+        term: Arc<Mutex<TermSession>>,
+        pty: PtyHandle,
+        cols: u16,
+        rows: u16,
+    ) -> Self {
+        Tile { id, term, pty, built: Vec::new(), cols, rows }
+    }
 }
 
 /// Mutable render state shared between the paint closure and the input listeners.
@@ -139,10 +154,10 @@ struct GridState {
 
 /// Font-derived geometry, probed once from the real window/text system.
 #[derive(Clone, Copy)]
-struct Metrics {
-    font_size: f32,
-    line_h: f32,
-    cell_w: f32,
+pub(crate) struct Metrics {
+    pub(crate) font_size: f32,
+    pub(crate) line_h: f32,
+    pub(crate) cell_w: f32,
 }
 
 /// The GPUI view: fonts, focus, shared render state, and a kept-alive control
@@ -168,14 +183,7 @@ impl GridView {
         spawn_logger();
         let tiles: Vec<Tile> = tiles
             .into_iter()
-            .map(|t| Tile {
-                id: t.id,
-                term: t.term,
-                pty: t.pty,
-                built: Vec::new(),
-                cols: t.cols,
-                rows: t.rows,
-            })
+            .map(|t| Tile::new(t.id, t.term, t.pty, t.cols, t.rows))
             .collect();
         GridView {
             state: Arc::new(Mutex::new(GridState {
@@ -228,26 +236,31 @@ fn tile_box(i: usize, n: usize, win: Bounds<Pixels>) -> Bounds<Pixels> {
     Bounds::new(point(px(x), px(y)), size(px(tile_w), px(tile_h)))
 }
 
-/// The terminal `cols x rows` that fit inside a tile box, given font metrics.
-fn tile_geometry(tile: Bounds<Pixels>, m: &Metrics) -> (u16, u16) {
-    let tw: f32 = tile.size.width.into();
-    let th: f32 = tile.size.height.into();
-    let inner_w = tw - 2.0 * (TILE_PAD + BORDER);
-    let inner_h = th - HEADER_H - 2.0 * (TILE_PAD + BORDER);
-    let cols = (inner_w / m.cell_w).floor().max(1.0) as u16;
-    let rows = (inner_h / m.line_h).floor().max(1.0) as u16;
-    (cols.min(400), rows.min(200))
+/// The content box of a grid tile: inside the border/padding, below the one-line
+/// debug header. This is what [`sync_and_paint_content`] derives geometry from.
+fn tile_content_box(tbox: Bounds<Pixels>) -> Bounds<Pixels> {
+    let tw: f32 = tbox.size.width.into();
+    let th: f32 = tbox.size.height.into();
+    let x: f32 = tbox.origin.x.into();
+    let y: f32 = tbox.origin.y.into();
+    Bounds::new(
+        point(px(x + BORDER + TILE_PAD), px(y + BORDER + HEADER_H)),
+        size(
+            px((tw - 2.0 * (TILE_PAD + BORDER)).max(1.0)),
+            px((th - HEADER_H - 2.0 * (TILE_PAD + BORDER)).max(1.0)),
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Color helpers
 // ---------------------------------------------------------------------------
 
-fn h(rgb: Rgb) -> Hsla {
+pub(crate) fn h(rgb: Rgb) -> Hsla {
     Rgba { r: rgb.r as f32 / 255.0, g: rgb.g as f32 / 255.0, b: rgb.b as f32 / 255.0, a: 1.0 }.into()
 }
 
-fn ha(rgb: Rgb, a: f32) -> Hsla {
+pub(crate) fn ha(rgb: Rgb, a: f32) -> Hsla {
     Rgba { r: rgb.r as f32 / 255.0, g: rgb.g as f32 / 255.0, b: rgb.b as f32 / 255.0, a }.into()
 }
 
@@ -255,12 +268,10 @@ fn ha(rgb: Rgb, a: f32) -> Hsla {
 // Paint
 // ---------------------------------------------------------------------------
 
-/// Probe font metrics from the real text system (once). cell_w is measured by
-/// shaping a run of `M`s and dividing - the honest monospace advance for this font.
-fn ensure_metrics(state: &mut GridState, font_normal: &Font, window: &mut Window) {
-    if state.metrics.is_some() {
-        return;
-    }
+/// Probe font metrics from the real text system. cell_w is measured by shaping a
+/// run of `M`s and dividing - the honest monospace advance for this font. Called
+/// once per view (grid and chrome both cache the result).
+pub(crate) fn probe_metrics(font_normal: &Font, window: &mut Window) -> Metrics {
     let probe: SharedString = "M".repeat(80).into();
     let run = TextRun {
         len: probe.len(),
@@ -274,7 +285,13 @@ fn ensure_metrics(state: &mut GridState, font_normal: &Font, window: &mut Window
     let w: f32 = line.width.into();
     let cell_w = (w / 80.0).max(1.0);
     log::info!("render metrics: font={FONT_SIZE}px line_h={LINE_H}px cell_w={cell_w:.3}px");
-    state.metrics = Some(Metrics { font_size: FONT_SIZE, line_h: LINE_H, cell_w });
+    Metrics { font_size: FONT_SIZE, line_h: LINE_H, cell_w }
+}
+
+fn ensure_metrics(state: &mut GridState, font_normal: &Font, window: &mut Window) {
+    if state.metrics.is_none() {
+        state.metrics = Some(probe_metrics(font_normal, window));
+    }
 }
 
 /// Build one row's merged style runs from its snapshot cells (the costly transform,
@@ -334,113 +351,125 @@ fn paint_grid(
     for i in 0..n {
         let tbox = tile_box(i, n, win);
         rects.push(tbox);
-        let (want_cols, want_rows) = tile_geometry(tbox, &m);
+        let is_focused = i == focused && focused_window;
+        let tile = &mut st.tiles[i];
 
-        // --- geometry: reflow the terminal + PTY to the tile if it changed -----
-        {
-            let tile = &mut st.tiles[i];
-            if (want_cols, want_rows) != (tile.cols, tile.rows) {
-                tile.term.lock().resize(want_cols, want_rows);
-                tile.pty.resize(want_cols, want_rows);
-                tile.cols = want_cols;
-                tile.rows = want_rows;
-                tile.built.clear(); // force a full rebuild at the new size
-            }
-        }
+        paint_tile_frame(tbox, is_focused, window);
+        let (rebuilt, total) = sync_and_paint_content(
+            tile,
+            tile_content_box(tbox),
+            &m,
+            mode,
+            is_focused,
+            font_normal,
+            font_bold,
+            window,
+            cx,
+        );
+        rebuilt_this_frame += rebuilt;
+        total_this_frame += total;
 
-        // --- snapshot + damage-clipped run rebuild -----------------------------
-        // Clone the term Arc so the lock guard does not borrow `st.tiles[i]`; that
-        // lets us mutate `tile.built` while reading the terminal.
-        let rows = st.tiles[i].rows as usize;
-        total_this_frame += rows as u64;
-        let term_arc = st.tiles[i].term.clone();
-        let mut term = term_arc.lock();
-        let damage = term.take_damage();
-        let need_full = mode == PaintMode::Full
-            || st.tiles[i].built.len() != rows
-            || matches!(damage, crate::term::Damage::Full);
-
-        let (cursor, selection) = if need_full {
-            let snap = term.renderable();
-            drop(term);
-            rebuild_all(&mut st.tiles[i], &snap, font_normal, font_bold);
-            rebuilt_this_frame += rows as u64;
-            (snap.cursor, snap.selection)
-        } else if let crate::term::Damage::Lines(lines) = damage {
-            if lines.is_empty() {
-                // Nothing changed: fetch only cursor/selection (cheap), no rebuild.
-                let partial = term.renderable_rows(&[]);
-                (partial.cursor, partial.selection)
-            } else {
-                let partial = term.renderable_rows(&lines);
-                drop(term);
-                for (r, cells) in &partial.rows {
-                    if *r < st.tiles[i].built.len() {
-                        st.tiles[i].built[*r] = build_row(cells, font_normal, font_bold);
-                    }
-                }
-                rebuilt_this_frame += lines.len() as u64;
-                (partial.cursor, partial.selection)
-            }
-        } else {
-            (None, None)
-        };
-
-        paint_tile(&st.tiles[i], tbox, &m, cursor, selection, i == focused && focused_window, window, cx);
+        // Debug header (id + geometry) - NOT the T8 cockpit header. Painted after
+        // the content sync so it shows this frame's geometry.
+        let label = format!("{}  {}x{}", tile.id, tile.cols, tile.rows);
+        paint_text(
+            &label,
+            tbox.origin.x + px(BORDER + TILE_PAD),
+            tbox.origin.y + px(BORDER + 1.0),
+            h(HEADER_FG),
+            m.font_size,
+            window,
+            cx,
+        );
     }
 
     st.tile_rects = rects;
     drop(st);
 
-    let dt = t0.elapsed().as_nanos() as u64;
-    SCENE_NS.fetch_add(dt, Ordering::Relaxed);
-    SCENE_NS_MAX.fetch_max(dt, Ordering::Relaxed);
-    ROWS_REBUILT.fetch_add(rebuilt_this_frame, Ordering::Relaxed);
-    ROWS_TOTAL.fetch_add(total_this_frame, Ordering::Relaxed);
+    record_frame(t0.elapsed().as_nanos() as u64, rebuilt_this_frame, total_this_frame);
+}
+
+/// Record one painted frame in the fps/damage counters (grid and chrome paints
+/// both report here; [`spawn_logger`] drains the counters once a second).
+pub(crate) fn record_frame(scene_ns: u64, rebuilt_rows: u64, total_rows: u64) {
+    SCENE_NS.fetch_add(scene_ns, Ordering::Relaxed);
+    SCENE_NS_MAX.fetch_max(scene_ns, Ordering::Relaxed);
+    ROWS_REBUILT.fetch_add(rebuilt_rows, Ordering::Relaxed);
+    ROWS_TOTAL.fetch_add(total_rows, Ordering::Relaxed);
     FRAMES.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Rebuild every row's run cache from a full snapshot.
-fn rebuild_all(tile: &mut Tile, snap: &Snapshot, font_normal: &Font, font_bold: &Font) {
-    tile.built = snap
-        .rows_cells
-        .iter()
-        .map(|cells| build_row(cells, font_normal, font_bold))
-        .collect();
-    // Guard against a snapshot shorter than the geometry (shouldn't happen).
-    tile.built.resize(tile.rows as usize, BuiltRow::default());
-}
-
-/// Paint one tile: border, header label, cached rows, cursor, selection.
+/// The row-paint seam: sync one tile's terminal to its `content` box (resizing
+/// the `TermSession` + PTY when the box changed) and paint its rows, selection,
+/// and cursor, damage-clipped. The T5 grid and the T8 chrome both paint tile
+/// content EXCLUSIVELY through this function; its internals are T6 territory.
+/// Returns `(rows_rebuilt, rows_total)` for the fps logger.
 #[allow(clippy::too_many_arguments)]
-fn paint_tile(
-    tile: &Tile,
-    tbox: Bounds<Pixels>,
+pub(crate) fn sync_and_paint_content(
+    tile: &mut Tile,
+    content: Bounds<Pixels>,
     m: &Metrics,
-    cursor: Option<crate::term::CursorPos>,
-    selection: Option<SelSpan>,
+    mode: PaintMode,
     focused: bool,
+    font_normal: &Font,
+    font_bold: &Font,
     window: &mut Window,
     cx: &mut App,
-) {
-    // Border (a filled rect under a slightly inset background = 1px frame).
-    let border_rgb = if focused { BORDER_FOCUS } else { BORDER_RGB };
-    window.paint_quad(fill(tbox, h(border_rgb)));
-    let inner = Bounds::new(
-        point(tbox.origin.x + px(BORDER), tbox.origin.y + px(BORDER)),
-        size(tbox.size.width - px(2.0 * BORDER), tbox.size.height - px(2.0 * BORDER)),
-    );
-    window.paint_quad(fill(inner, h(DEFAULT_BG)));
+) -> (u64, u64) {
+    // --- geometry: reflow the terminal + PTY to the content box if it changed --
+    let cw: f32 = content.size.width.into();
+    let ch: f32 = content.size.height.into();
+    let want_cols = (((cw / m.cell_w).floor().max(1.0)) as u16).min(400);
+    let want_rows = (((ch / m.line_h).floor().max(1.0)) as u16).min(200);
+    if (want_cols, want_rows) != (tile.cols, tile.rows) {
+        tile.term.lock().resize(want_cols, want_rows);
+        tile.pty.resize(want_cols, want_rows);
+        tile.cols = want_cols;
+        tile.rows = want_rows;
+        tile.built.clear(); // force a full rebuild at the new size
+    }
 
-    let ox = tbox.origin.x + px(BORDER + TILE_PAD);
-    let header_y = tbox.origin.y + px(BORDER + 1.0);
+    // --- snapshot + damage-clipped run rebuild -----------------------------
+    // Clone the term Arc so the lock guard does not borrow `tile`; that lets us
+    // mutate `tile.built` while reading the terminal.
+    let rows = tile.rows as usize;
+    let mut rebuilt: u64 = 0;
+    let term_arc = tile.term.clone();
+    let mut term = term_arc.lock();
+    let damage = term.take_damage();
+    let need_full = mode == PaintMode::Full
+        || tile.built.len() != rows
+        || matches!(damage, crate::term::Damage::Full);
 
-    // Debug header (id + geometry) - NOT the T8 cockpit header.
-    let label = format!("{}  {}x{}", tile.id, tile.cols, tile.rows);
-    paint_text(&label, ox, header_y, h(HEADER_FG), m.font_size, window, cx);
+    let (cursor, selection) = if need_full {
+        let snap = term.renderable();
+        drop(term);
+        rebuild_all(tile, &snap, font_normal, font_bold);
+        rebuilt += rows as u64;
+        (snap.cursor, snap.selection)
+    } else if let crate::term::Damage::Lines(lines) = damage {
+        if lines.is_empty() {
+            // Nothing changed: fetch only cursor/selection (cheap), no rebuild.
+            let partial = term.renderable_rows(&[]);
+            (partial.cursor, partial.selection)
+        } else {
+            let partial = term.renderable_rows(&lines);
+            drop(term);
+            for (r, cells) in &partial.rows {
+                if *r < tile.built.len() {
+                    tile.built[*r] = build_row(cells, font_normal, font_bold);
+                }
+            }
+            rebuilt += lines.len() as u64;
+            (partial.cursor, partial.selection)
+        }
+    } else {
+        (None, None)
+    };
 
-    // Rows.
-    let grid_top = tbox.origin.y + px(BORDER + HEADER_H);
+    // --- rows ---------------------------------------------------------------
+    let ox = content.origin.x;
+    let grid_top = content.origin.y;
     for (i, row) in tile.built.iter().enumerate() {
         if row.runs.is_empty() {
             continue;
@@ -474,6 +503,32 @@ fn paint_tile(
             ));
         }
     }
+
+    (rebuilt, rows as u64)
+}
+
+/// Rebuild every row's run cache from a full snapshot.
+fn rebuild_all(tile: &mut Tile, snap: &Snapshot, font_normal: &Font, font_bold: &Font) {
+    tile.built = snap
+        .rows_cells
+        .iter()
+        .map(|cells| build_row(cells, font_normal, font_bold))
+        .collect();
+    // Guard against a snapshot shorter than the geometry (shouldn't happen).
+    tile.built.resize(tile.rows as usize, BuiltRow::default());
+}
+
+/// Paint one tile's frame: a 1px border (focus-colored) under a slightly inset
+/// terminal-background fill. Shared by the grid and the T8 chrome; everything
+/// inside the frame is painted by [`sync_and_paint_content`] + a header.
+pub(crate) fn paint_tile_frame(tbox: Bounds<Pixels>, focused: bool, window: &mut Window) {
+    let border_rgb = if focused { BORDER_FOCUS } else { BORDER_RGB };
+    window.paint_quad(fill(tbox, h(border_rgb)));
+    let inner = Bounds::new(
+        point(tbox.origin.x + px(BORDER), tbox.origin.y + px(BORDER)),
+        size(tbox.size.width - px(2.0 * BORDER), tbox.size.height - px(2.0 * BORDER)),
+    );
+    window.paint_quad(fill(inner, h(DEFAULT_BG)));
 }
 
 /// Paint a single text line with one uniform color (used for the debug header).
@@ -665,7 +720,7 @@ fn log_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
 }
 
-fn spawn_logger() {
+pub(crate) fn spawn_logger() {
     if LOGGER.set(()).is_err() {
         return; // already running
     }
