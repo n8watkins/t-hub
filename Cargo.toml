@@ -23,6 +23,14 @@ name = "wire-probe"
 path = "src/bin/wire_probe.rs"
 required-features = []
 
+# T13b acceptance + bandwidth runner: proves v2 binary PTY framing end to end
+# through the real ControlClient (negotiation, round-trips, forced-v1 baseline)
+# and measures the v1-vs-v2 wire delta on a firehose. Headless, like wire-probe.
+[[bin]]
+name = "binframe-probe"
+path = "src/bin/binframe_probe.rs"
+required-features = []
+
 [features]
 # `gui` pulls in gpui. Default on, but gated so the wire/ contract can be
 # `cargo check`ed / tested in WSL (`--no-default-features`) even when the linux
