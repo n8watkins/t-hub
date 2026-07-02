@@ -301,15 +301,78 @@ fn reader_loop(
 // `app.emit`'d in-process. This is the server half of "tiles over the wire": the
 // daemon owns the PTY; the client just renders the frames it reads off the socket.
 //
-// Frames written to the sink:  {"out":"<base64 chunk>"}  per output chunk, then
-// {"exit":<code|null>} once on EOF. (Scrollback is sent by the caller before the
-// stream starts, so it isn't duplicated here.)
+// Frames written to the sink depend on the framing NEGOTIATED at attach (T13):
+//   - V1 (default): {"out":"<base64 chunk>"} per output chunk, then
+//     {"exit":<code|null>} once on EOF — newline-delimited JSON.
+//   - V2 (binary): length-prefixed binary frames (see [`PtyFraming`]/[`binframe`]),
+//     which drop the ~33% base64 tax + the JSON envelope on the firehose.
+// (Scrollback is sent by the caller before the stream starts, so it isn't
+// duplicated here.)
 //
 // NOTE: this duplicates [`spawn_attach_client`]/[`reader_loop`] rather than
 // generalizing their sink, to keep the in-process terminal nucleus untouched
 // while the split is proven; folding the two onto one sink abstraction is a
 // follow-up once the socket path is the default.
 // ---------------------------------------------------------------------------
+
+/// The PTY-plane wire framing, negotiated per-attach (T13 / PROTOCOL_VERSION 2).
+///
+/// `V1Json` is the historical framing: newline-delimited JSON whose byte payloads
+/// are base64 — `{"out":"<b64>"}` / `{"exit":code}` downstream, `{"write":"<b64>"}`
+/// / `{"resize":{cols,rows}}` upstream. Correct, but base64 inflates every output
+/// byte by ~33% and the JSON envelope adds fixed per-frame overhead — a real tax
+/// on a firehose terminal.
+///
+/// `V2Binary` sends length-prefixed BINARY frames (a 1-byte type tag + a 4-byte
+/// big-endian length + the raw payload): no base64, no JSON envelope on the
+/// out/write hot path. Commands and events stay JSON; only the PTY firehose goes
+/// binary. A client opts in with `attach_pty` arg `"binary": true`; a client that
+/// doesn't (the webview, any V1 peer) keeps getting `V1Json` unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PtyFraming {
+    V1Json,
+    V2Binary,
+}
+
+/// Binary PTY frame type tags (V2). `0x0_` are server→client, `0x1_` client→server.
+/// Wire layout of every frame: `[u8 type][u32 big-endian length][length payload bytes]`.
+pub mod binframe {
+    /// server→client: a chunk of raw PTY output (payload = the bytes verbatim).
+    pub const OUT: u8 = 0x01;
+    /// server→client: the attach client exited. Payload is 4 big-endian bytes (an
+    /// `i32` exit code) or EMPTY for unknown/signalled (the V1 `null`).
+    pub const EXIT: u8 = 0x02;
+    /// server→client: the opening scrollback seed (payload = raw capture bytes).
+    pub const SCROLLBACK: u8 = 0x03;
+    /// server→client: an attach error raised before the stream starts (UTF-8 message).
+    pub const ERROR: u8 = 0x04;
+    /// client→server: raw bytes for the PTY stdin (payload = the bytes verbatim).
+    pub const WRITE: u8 = 0x10;
+    /// client→server: a resize. Payload is 4 bytes: `[u16 BE cols][u16 BE rows]`.
+    pub const RESIZE: u8 = 0x11;
+}
+
+/// The 5-byte binary frame header: `[u8 type][u32 big-endian length]`.
+pub const BIN_HEADER_LEN: usize = 5;
+
+/// A defensive cap on an inbound binary frame's declared length (16 MiB). A single
+/// PTY write/resize is tiny; a frame claiming more than this is a corrupt or hostile
+/// peer, so we tear the stream down rather than allocate an arbitrary buffer.
+pub const BIN_MAX_FRAME: usize = 16 * 1024 * 1024;
+
+/// Write one length-prefixed binary frame (`[type][u32 BE len][payload]`) and flush.
+/// Shared by the server's scrollback/error frames (control.rs) and the out/exit
+/// firehose ([`stream_reader_loop`]).
+pub fn write_bin_frame(sink: &mut dyn Write, ty: u8, payload: &[u8]) -> std::io::Result<()> {
+    let mut header = [0u8; BIN_HEADER_LEN];
+    header[0] = ty;
+    header[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    sink.write_all(&header)?;
+    if !payload.is_empty() {
+        sink.write_all(payload)?;
+    }
+    sink.flush()
+}
 
 /// Handles for driving a socket-streamed PTY: write stdin, resize, detach. The
 /// output reader thread streams to the sink on its own; these let the owning
@@ -367,16 +430,18 @@ impl Drop for PtyStreamHandle {
 }
 
 /// Spawn a PTY whose child is a `tmux attach` client for `tmux_session`, streaming
-/// its output to `sink` as `{"out":"<b64>"}` frames (then `{"exit":code}` on EOF).
-/// Returns a [`PtyStreamHandle`] so the owning control connection can write/resize/
-/// detach. A sink write failure (the client disconnected) ends the stream — the
-/// owning connection then detaches the handle.
+/// its output to `sink`. The frame encoding follows `framing`: V1 emits
+/// `{"out":"<b64>"}` then `{"exit":code}` JSON lines; V2 emits binary [`binframe`]
+/// OUT then EXIT frames. Returns a [`PtyStreamHandle`] so the owning control
+/// connection can write/resize/detach. A sink write failure (the client
+/// disconnected) ends the stream — the owning connection then detaches the handle.
 pub fn stream_attach_to_sink(
     tmux_session: &str,
     cwd: &str,
     cols: u16,
     rows: u16,
     sink: Box<dyn Write + Send>,
+    framing: PtyFraming,
 ) -> Result<PtyStreamHandle, String> {
     let size = PtySize {
         rows,
@@ -415,7 +480,7 @@ pub fn stream_attach_to_sink(
 
     let handle = std::thread::Builder::new()
         .name(format!("t-hub-pty-stream-{tmux_session}"))
-        .spawn(move || stream_reader_loop(reader, child, sink))
+        .spawn(move || stream_reader_loop(reader, child, sink, framing))
         .map_err(|e| format!("failed to spawn pty stream thread: {e}"))?;
 
     Ok(PtyStreamHandle {
@@ -427,19 +492,28 @@ pub fn stream_attach_to_sink(
     })
 }
 
-/// Drain the PTY reader, writing base64 `{"out":...}` frames to `sink` until EOF
-/// or a sink write error (the client disconnected); then write one `{"exit":code}`.
+/// Drain the PTY reader, writing output frames to `sink` in the negotiated
+/// `framing` until EOF or a sink write error (the client disconnected); then write
+/// one exit frame. V1: `{"out":"<b64>"}` … `{"exit":code}`. V2: binary OUT … EXIT.
 fn stream_reader_loop(
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     mut sink: Box<dyn Write + Send>,
+    framing: PtyFraming,
 ) {
     let mut buf = [0u8; READ_BUF];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF: the attach client closed.
             Ok(n) => {
-                if write_frame(&mut sink, &json!({ "out": STANDARD.encode(&buf[..n]) })).is_err() {
+                let chunk = &buf[..n];
+                let wrote = match framing {
+                    PtyFraming::V1Json => {
+                        write_frame(&mut sink, &json!({ "out": STANDARD.encode(chunk) }))
+                    }
+                    PtyFraming::V2Binary => write_bin_frame(&mut *sink, binframe::OUT, chunk),
+                };
+                if wrote.is_err() {
                     // The client (socket) is gone; stop draining + tear down.
                     break;
                 }
@@ -457,7 +531,15 @@ fn stream_reader_loop(
         .wait()
         .ok()
         .and_then(|status| i32::try_from(status.exit_code()).ok());
-    let _ = write_frame(&mut sink, &json!({ "exit": code }));
+    let _ = match framing {
+        PtyFraming::V1Json => write_frame(&mut sink, &json!({ "exit": code })),
+        // V2 EXIT payload: 4 BE bytes for a known code, EMPTY for unknown/signalled
+        // (the wire equivalent of V1's `"exit":null`).
+        PtyFraming::V2Binary => {
+            let payload = code.map(|c| c.to_be_bytes().to_vec()).unwrap_or_default();
+            write_bin_frame(&mut *sink, binframe::EXIT, &payload)
+        }
+    };
 }
 
 /// Write one newline-delimited JSON frame to a byte sink (best-effort flush).

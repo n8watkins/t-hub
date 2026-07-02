@@ -40,7 +40,7 @@
 //! theme track lands the `get_theme`/`set_theme` Tauri commands + a control
 //! handler for them; until then they return a clear "not available" error.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -68,7 +68,10 @@ pub struct ControlRequest {
     pub args: Value,
     /// Wire protocol version the client speaks (server-split M2b). Absent for the
     /// MCP / any legacy client (then unchecked, for backward compatibility); when
-    /// present it must equal [`PROTOCOL_VERSION`] or the server rejects the request.
+    /// present it must be `<=` [`PROTOCOL_VERSION`] or the server rejects the request.
+    /// A LOWER version is accepted (the protocol is backward-compatible: v2 added
+    /// only the opt-in binary PTY framing of T13); only a HIGHER, unknown-future
+    /// version is rejected.
     #[serde(default)]
     pub v: Option<u32>,
 }
@@ -136,22 +139,39 @@ pub trait ApplySink: Send + Sync {
 /// <value>}` frames (newline-delimited) until the client disconnects. This is the
 /// send half of the M1 event wire; the receive half is
 /// `control_client::spawn_event_forwarder`.
-/// The control wire protocol version (server-split M2b). Bump this on any
-/// breaking change to the request/response/event/PTY framing. The server
-/// advertises it in the handshake file + the subscribe ack, and rejects a client
-/// that advertises a different version (see [`ControlRequest::v`]) — so a remote
-/// client running a skewed T-Hub build fails fast with a clear message instead of
-/// a cryptic downstream parse error. Clients that send no version stay accepted.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// The control wire protocol version (server-split M2b; T13 binary PTY framing).
+/// Bump this on any additive/breaking change to the request/response/event/PTY
+/// framing. The server advertises it in the handshake file + the subscribe ack so a
+/// client can DISCOVER the server's capabilities (e.g. that it can speak binary PTY
+/// frames — T13).
+///
+/// **v2 (T13):** the server can speak length-prefixed BINARY PTY frames on an
+/// attach connection when the client opts in (`attach_pty` arg `"binary": true`).
+/// This is ADDITIVE and NEGOTIATED per-attach: a client that doesn't opt in — the
+/// webview, any v1 peer — still gets the v1 base64-NDJSON framing unchanged. So the
+/// request-version gate ([`ControlRequest::v`]) accepts every version *at or below*
+/// this one and rejects only a HIGHER (unknown-future) version; a v1 client talking
+/// to this v2 server keeps working.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub const SUBSCRIBE_COMMAND: &str = "__subscribe_events";
 
 /// The command name that switches a control connection into a **PTY stream**
 /// (server-split M2a): the connection becomes a full-duplex terminal channel —
 /// the server captures scrollback, spawns the PTY-runs-`tmux attach`, streams
-/// `{"out":"<b64>"}` frames down, and reads `{"write":"<b64>"}` / `{"resize":
-/// {cols,rows}}` frames back up, until the client disconnects (then it detaches —
-/// the tmux session survives). Args: `sessionId` (required), `cols`, `rows`.
+/// output frames down, and reads write/resize frames back up, until the client
+/// disconnects (then it detaches — the tmux session survives).
+///
+/// Args: `sessionId` (required), `cols`, `rows`, and (T13) `binary` (optional bool).
+///
+/// **Framing (T13, negotiated here):** with `binary` absent/false the connection
+/// speaks **v1** — newline-delimited JSON, base64 payloads: opening
+/// `{"scrollback":"<b64>"}`, then `{"out":"<b64>"}` / `{"exit":code}` down and
+/// `{"write":"<b64>"}` / `{"resize":{cols,rows}}` up. With `"binary": true` it
+/// speaks **v2** — length-prefixed binary frames ([`pty::binframe`]): a SCROLLBACK
+/// frame opens, then OUT / EXIT down and WRITE / RESIZE up, with no base64 and no
+/// JSON envelope on the firehose. The webview (v1) is unaffected; only a client
+/// that asks for `binary` gets v2.
 pub const ATTACH_PTY_COMMAND: &str = "attach_pty";
 
 /// A registry of connected event subscribers. The backend's event emitter
@@ -754,21 +774,23 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
         }
         match serde_json::from_str::<ControlRequest>(&line) {
             Ok(req) => {
-                // Protocol-version gate (M2b hardening): reject a client whose wire
-                // version differs from ours with a CLEAR message, instead of letting
-                // a version-skewed remote build fail cryptically downstream. A client
-                // that sends NO version (the MCP today, any legacy peer) is allowed —
-                // so adding the field now is backward-compatible, and enforcement
-                // engages only once a peer advertises a mismatching version. The peer
-                // is already IP-gated (is_allowed_peer), so echoing our version here
-                // leaks nothing the handshake file doesn't already record.
+                // Protocol-version gate (M2b hardening; T13 relaxed to a ceiling).
+                // The protocol is backward-compatible — v2 only ADDED the opt-in
+                // binary PTY framing negotiated per-attach — so a client advertising
+                // an EQUAL-OR-LOWER version is served (the v1 webview keeps working
+                // against this v2 server). Only a HIGHER, unknown-future version is
+                // rejected, with a CLEAR message, rather than letting a client that
+                // expects framing we don't yet speak fail cryptically downstream. A
+                // client that sends NO version (the MCP, any legacy peer) is allowed.
+                // The peer is already IP-gated (is_allowed_peer), so echoing our
+                // version here leaks nothing the handshake file doesn't already record.
                 if let Some(v) = req.v {
-                    if v != PROTOCOL_VERSION {
+                    if v > PROTOCOL_VERSION {
                         write_response(
                             &mut writer,
                             &ControlResponse::err(format!(
-                                "protocol version mismatch: server v{PROTOCOL_VERSION}, \
-                                 client v{v}; run matching T-Hub builds on both ends"
+                                "protocol version too new: server speaks up to v{PROTOCOL_VERSION}, \
+                                 client asked for v{v}; upgrade T-Hub on this end"
                             )),
                         )?;
                         continue;
@@ -836,22 +858,30 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
 }
 
 /// Serve a PTY stream (M2a) on this connection: send the scrollback seed, spawn
-/// the PTY-runs-`tmux attach` streaming `{"out"}` frames down (via a clone of the
+/// the PTY-runs-`tmux attach` streaming output frames down (via a clone of the
 /// writer — the reader thread owns those writes, so they never interleave with the
-/// scrollback we send first), then read `{"write"}`/`{"resize"}` frames from the
-/// client until it disconnects, and detach (the tmux session survives).
+/// scrollback we send first), then read write/resize frames from the client until
+/// it disconnects, and detach (the tmux session survives).
+///
+/// Framing is negotiated from `args.binary` (T13): `true` ⇒ v2 length-prefixed
+/// BINARY frames, else v1 base64-NDJSON. The choice governs BOTH directions — the
+/// scrollback/out/exit/error frames written down AND the write/resize frames read
+/// up — so a v1 client is byte-for-byte unchanged and a v2 client never sees base64.
 fn serve_pty_attach(
     writer: &mut TcpStream,
     reader: &mut BufReader<TcpStream>,
     args: &Value,
 ) -> std::io::Result<()> {
+    let framing = if args.get("binary").and_then(|v| v.as_bool()).unwrap_or(false) {
+        pty::PtyFraming::V2Binary
+    } else {
+        pty::PtyFraming::V1Json
+    };
+
     let session_id = match arg_str(args, "sessionId").or_else(|| arg_str(args, "session_id")) {
         Some(s) => s,
         None => {
-            return write_response(
-                writer,
-                &ControlResponse::err("attach_pty requires a 'sessionId' argument"),
-            );
+            return send_attach_error(writer, framing, "attach_pty requires a 'sessionId' argument");
         }
     };
     let tmux_session = tmux_target(&session_id);
@@ -859,30 +889,75 @@ fn serve_pty_attach(
     let rows = args.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
 
     if !tmux::has_session(&tmux_session) {
-        return write_response(
+        return send_attach_error(
             writer,
-            &ControlResponse::err(format!(
+            framing,
+            format!(
                 "attach_pty: tmux session {tmux_session} for terminal {session_id} no longer exists"
-            )),
+            ),
         );
     }
 
-    // Scrollback seed (base64), as the opening frame — sent BEFORE the stream
-    // starts so the reader thread's output frames never race it.
+    // Scrollback seed as the opening frame — sent BEFORE the stream starts so the
+    // reader thread's output frames never race it. v1: `{"scrollback":"<b64>"}`;
+    // v2: a binary SCROLLBACK frame carrying the raw capture bytes.
     let scrollback = tmux::capture_pane(&tmux_session).unwrap_or_default();
-    write_json_line(writer, &json!({ "scrollback": STANDARD.encode(&scrollback) }))?;
+    match framing {
+        pty::PtyFraming::V1Json => {
+            write_json_line(writer, &json!({ "scrollback": STANDARD.encode(&scrollback) }))?
+        }
+        pty::PtyFraming::V2Binary => {
+            pty::write_bin_frame(writer, pty::binframe::SCROLLBACK, &scrollback)?
+        }
+    }
 
-    // Spawn the PTY streaming output to a clone of this connection.
+    // Spawn the PTY streaming output to a clone of this connection, in the same framing.
     let sink = writer.try_clone()?;
     let cwd = std::env::var("HOME").unwrap_or_default();
-    let mut handle = match pty::stream_attach_to_sink(&tmux_session, &cwd, cols, rows, Box::new(sink)) {
-        Ok(h) => h,
-        Err(e) => {
-            return write_json_line(writer, &json!({ "error": format!("attach_pty: {e}") }));
-        }
-    };
+    let mut handle =
+        match pty::stream_attach_to_sink(&tmux_session, &cwd, cols, rows, Box::new(sink), framing) {
+            Ok(h) => h,
+            Err(e) => {
+                return send_attach_error(writer, framing, format!("attach_pty: {e}"));
+            }
+        };
 
-    // Drive write/resize frames from the client until it disconnects (EOF).
+    // Drive write/resize frames from the client until it disconnects (EOF), in the
+    // negotiated framing.
+    match framing {
+        pty::PtyFraming::V1Json => read_pty_input_v1(reader, &mut handle, cols, rows)?,
+        pty::PtyFraming::V2Binary => read_pty_input_v2(reader, &mut handle)?,
+    }
+    handle.detach(); // tmux session survives, like close_terminal
+    Ok(())
+}
+
+/// Emit an attach-time error in the negotiated framing: a v1 `{"ok":false,error}`
+/// control response, or a v2 binary ERROR frame. Used for the pre-stream failures
+/// (missing session, dead tmux session, spawn failure) so a v2 client's binary
+/// reader never has to parse a stray JSON line.
+fn send_attach_error(
+    writer: &mut TcpStream,
+    framing: pty::PtyFraming,
+    msg: impl Into<String>,
+) -> std::io::Result<()> {
+    let msg = msg.into();
+    match framing {
+        pty::PtyFraming::V1Json => write_response(writer, &ControlResponse::err(msg)),
+        pty::PtyFraming::V2Binary => {
+            pty::write_bin_frame(writer, pty::binframe::ERROR, msg.as_bytes())
+        }
+    }
+}
+
+/// Read v1 base64-NDJSON `{"write"}`/`{"resize"}` frames from the client until EOF,
+/// applying each to the PTY handle. A malformed line is skipped, not fatal.
+fn read_pty_input_v1(
+    reader: &mut BufReader<TcpStream>,
+    handle: &mut pty::PtyStreamHandle,
+    cols: u16,
+    rows: u16,
+) -> std::io::Result<()> {
     let mut line = String::new();
     loop {
         line.clear();
@@ -903,7 +978,52 @@ fn serve_pty_attach(
             let _ = handle.resize(c, r);
         }
     }
-    handle.detach(); // tmux session survives, like close_terminal
+    Ok(())
+}
+
+/// Read v2 length-prefixed binary WRITE/RESIZE frames from the client until EOF,
+/// applying each to the PTY handle. Frame layout: `[u8 type][u32 BE len][payload]`.
+/// EOF at a frame boundary is a clean disconnect; a truncated frame ends the stream;
+/// an over-long declared length ([`pty::BIN_MAX_FRAME`]) tears it down (corrupt/
+/// hostile peer); an unknown type tag is skipped (forward-compat).
+fn read_pty_input_v2(
+    reader: &mut BufReader<TcpStream>,
+    handle: &mut pty::PtyStreamHandle,
+) -> std::io::Result<()> {
+    let mut header = [0u8; pty::BIN_HEADER_LEN];
+    loop {
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            // EOF at a frame boundary (or a truncated header): the client is gone.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let ty = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if len > pty::BIN_MAX_FRAME {
+            eprintln!("t-hub-control: attach_pty v2 frame len {len} exceeds cap; tearing down");
+            break;
+        }
+        let mut payload = vec![0u8; len];
+        if len > 0 {
+            match reader.read_exact(&mut payload) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+        }
+        match ty {
+            pty::binframe::WRITE => {
+                let _ = handle.write(&payload);
+            }
+            pty::binframe::RESIZE if payload.len() == 4 => {
+                let c = u16::from_be_bytes([payload[0], payload[1]]);
+                let r = u16::from_be_bytes([payload[2], payload[3]]);
+                let _ = handle.resize(c, r);
+            }
+            _ => {} // unknown/ malformed upstream frame: skip, don't tear down
+        }
+    }
     Ok(())
 }
 
@@ -2695,7 +2815,7 @@ mod tests {
         let ctx = test_ctx("secret");
         // Serve one connection per assertion (each `send` opens + closes one).
         let server = std::thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (stream, _) = listener.accept().expect("accept");
                 let _ = handle_conn(stream, &ctx);
             }
@@ -2713,21 +2833,27 @@ mod tests {
             serde_json::from_str::<Value>(line.trim()).unwrap()
         };
 
-        // A valid token but a MISMATCHED version is rejected — the gate fires before
-        // dispatch, with a clear, actionable message.
+        // A valid token but a version NEWER than the server speaks is rejected — the
+        // gate fires before dispatch, with a clear, actionable message.
         let bad = send(json!({"token": "secret", "command": "list_tabs", "v": 999}));
         assert_eq!(bad["ok"], false);
         assert!(
             bad["error"]
                 .as_str()
                 .unwrap()
-                .contains("protocol version mismatch"),
+                .contains("protocol version too new"),
             "got: {bad}"
         );
 
         // The matching version passes the gate and dispatches normally.
         let good = send(json!({"token": "secret", "command": "list_tabs", "v": PROTOCOL_VERSION}));
         assert_eq!(good["ok"], true, "got: {good}");
+
+        // A LOWER version (a v1 client against this v2 server) is still accepted —
+        // the protocol is backward-compatible (T13 binary framing is opt-in), so the
+        // live webview keeps working unchanged.
+        let v1 = send(json!({"token": "secret", "command": "list_tabs", "v": 1}));
+        assert_eq!(v1["ok"], true, "got: {v1}");
 
         // No version field at all stays accepted (backward-compat: the MCP / legacy
         // clients don't advertise one).
