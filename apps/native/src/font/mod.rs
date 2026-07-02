@@ -205,6 +205,16 @@ fn seg_is_isolate(cells: &[SnapCell], s: &Seg) -> bool {
     c.width > 1 || !c.zw.is_empty() || !is_plain_ascii(c.c)
 }
 
+/// True when two equal-length probe runs (wide `M`s vs narrow `i`s) shaped to
+/// different widths: a monospace face advances every glyph identically, so a
+/// mismatch means the requested family is missing and the platform substituted
+/// a proportional font (the T7 drift bug's root cause). 1% of the wide run
+/// tolerates sub-pixel shaping jitter; a real proportional face differs by
+/// whole pixels per glyph, so an 80-char probe lands far past the threshold.
+pub fn looks_proportional(wide_run_px: f32, narrow_run_px: f32) -> bool {
+    (wide_run_px - narrow_run_px).abs() > wide_run_px.max(1.0) * 0.01
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +346,27 @@ mod tests {
     #[test]
     fn empty_row_yields_no_segments() {
         assert!(segment_cells(&[]).is_empty());
+    }
+
+    // -- looks_proportional -----------------------------------------------------
+
+    #[test]
+    fn monospace_probe_widths_do_not_warn() {
+        // Identical advances, and sub-pixel shaping jitter, both pass.
+        assert!(!looks_proportional(624.0, 624.0));
+        assert!(!looks_proportional(624.0, 623.4));
+    }
+
+    #[test]
+    fn proportional_probe_widths_warn() {
+        // A substituted proportional face: 80 'M's shape far wider than 80 'i's.
+        assert!(looks_proportional(800.0, 350.0));
+        // Even a narrow-ish proportional face is whole pixels per glyph apart.
+        assert!(looks_proportional(624.0, 560.0));
+    }
+
+    #[test]
+    fn proportional_probe_is_zero_safe() {
+        assert!(!looks_proportional(0.0, 0.0));
     }
 }

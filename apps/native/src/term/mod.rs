@@ -751,6 +751,11 @@ fn to_snap_cell(cell: &alacritty_terminal::term::cell::Cell) -> Option<SnapCell>
     }
     let mut fg = ansi_to_rgb(cell.fg, true).unwrap_or(DEFAULT_FG);
     let mut bg = ansi_to_rgb(cell.bg, false);
+    // SGR dim (CSI 2 m) attenuates the foreground BEFORE the inverse swap, so
+    // dim+inverse yields a dimmed background - alacritty's compute order.
+    if cell.flags.contains(Flags::DIM) {
+        fg = dim_rgb(fg);
+    }
     if cell.flags.contains(Flags::INVERSE) {
         let old_fg = fg;
         fg = bg.unwrap_or(DEFAULT_BG);
@@ -765,6 +770,17 @@ fn to_snap_cell(cell: &alacritty_terminal::term::cell::Cell) -> Option<SnapCell>
         width: if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 },
         zw: cell.zerowidth().map(<[char]>::to_vec).unwrap_or_default(),
     })
+}
+
+/// alacritty's `DIM_FACTOR`: SGR dim renders the foreground at 66% intensity.
+const DIM_FACTOR: f32 = 0.66;
+
+fn dim_rgb(c: Rgb) -> Rgb {
+    Rgb {
+        r: (f32::from(c.r) * DIM_FACTOR) as u8,
+        g: (f32::from(c.g) * DIM_FACTOR) as u8,
+        b: (f32::from(c.b) * DIM_FACTOR) as u8,
+    }
 }
 
 /// Map alacritty's cursor into a viewport [`CursorPos`], honoring hidden shape and
@@ -821,6 +837,27 @@ mod tests {
         assert_eq!(cell.c, 'X');
         assert!(cell.bold, "expected bold");
         assert_eq!(cell.fg, xterm256(1)); // named red -> palette index 1
+    }
+
+    #[test]
+    fn sgr_dim_attenuates_the_foreground() {
+        let mut t = TermSession::new(20, 3);
+        t.advance(b"\x1b[2;31mX\x1b[0m");
+        let snap = t.renderable();
+        let cell = &snap.rows_cells[0][0];
+        assert_eq!(cell.c, 'X');
+        assert_eq!(cell.fg, dim_rgb(xterm256(1)));
+    }
+
+    #[test]
+    fn sgr_dim_inverse_dims_the_resulting_background() {
+        let mut t = TermSession::new(20, 3);
+        t.advance(b"\x1b[2;7mX\x1b[0m");
+        let snap = t.renderable();
+        let cell = &snap.rows_cells[0][0];
+        // Dim applies to the fg first, then inverse swaps it into the bg.
+        assert_eq!(cell.bg, Some(dim_rgb(DEFAULT_FG)));
+        assert_eq!(cell.fg, DEFAULT_BG);
     }
 
     #[test]

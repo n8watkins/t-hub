@@ -450,6 +450,29 @@ fn ensure_metrics(tile: &mut Tile, window: &mut Window) {
         tile.id,
         tile.spec.family,
     );
+    // A missing family silently substitutes a platform default; if that default
+    // is proportional, pure-ASCII runs drift off the grid (the T7 bug). Probe a
+    // narrow-glyph run against the wide one and warn - metrics stay usable.
+    let probe_i: SharedString = "i".repeat(80).into();
+    let run_i = TextRun {
+        len: probe_i.len(),
+        font: tile.font_normal.clone(),
+        color: h(DEFAULT_FG),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let line_i = window.text_system().shape_line(probe_i, px(size), &[run_i], None);
+    let wi: f32 = line_i.width.into();
+    if crate::font::looks_proportional(w, wi) {
+        log::warn!(
+            "render metrics[{}]: family {:?} shaped proportionally (80xM {w:.1}px vs 80xi \
+             {wi:.1}px) - the family is probably not installed and the platform substituted \
+             one; cells stay grid-aligned but glyphs will look wrong",
+            tile.id,
+            tile.spec.family,
+        );
+    }
     tile.metrics = Some(Metrics { font_size: size, line_h, cell_w });
 }
 
