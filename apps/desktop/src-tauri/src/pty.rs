@@ -446,6 +446,12 @@ impl Drop for PtyStreamHandle {
 /// OUT then EXIT frames. Returns a [`PtyStreamHandle`] so the owning control
 /// connection can write/resize/detach. A sink write failure (the client
 /// disconnected) ends the stream — the owning connection then detaches the handle.
+///
+/// `on_stream_end` (s27 churn-proofing) runs on the reader thread once the stream
+/// is over (PTY EOF or sink death), AFTER the exit frame if one was sent. The
+/// owning connection passes a socket-shutdown closure here so its input read
+/// unblocks the moment the stream dies, instead of parking until the client
+/// deigns to close - the leak that let dead-client forwarders accumulate.
 pub fn stream_attach_to_sink(
     tmux_session: &str,
     cwd: &str,
@@ -453,6 +459,7 @@ pub fn stream_attach_to_sink(
     rows: u16,
     sink: Box<dyn Write + Send>,
     framing: PtyFraming,
+    on_stream_end: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<PtyStreamHandle, String> {
     let size = PtySize {
         rows,
@@ -491,7 +498,12 @@ pub fn stream_attach_to_sink(
 
     let handle = std::thread::Builder::new()
         .name(format!("t-hub-pty-stream-{tmux_session}"))
-        .spawn(move || stream_reader_loop(reader, child, sink, framing))
+        .spawn(move || {
+            stream_reader_loop(reader, child, sink, framing);
+            if let Some(f) = on_stream_end {
+                f();
+            }
+        })
         .map_err(|e| format!("failed to spawn pty stream thread: {e}"))?;
 
     Ok(PtyStreamHandle {
@@ -513,6 +525,7 @@ fn stream_reader_loop(
     framing: PtyFraming,
 ) {
     let mut buf = [0u8; READ_BUF];
+    let mut sink_dead = false;
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF: the attach client closed.
@@ -526,6 +539,7 @@ fn stream_reader_loop(
                 };
                 if wrote.is_err() {
                     // The client (socket) is gone; stop draining + tear down.
+                    sink_dead = true;
                     break;
                 }
             }
@@ -538,19 +552,32 @@ fn stream_reader_loop(
         }
     }
 
+    if sink_dead {
+        // s27 churn-proofing: when the SINK died first, the attach client is
+        // still running and nobody else will kill it - the owning connection is
+        // parked in a read only the (dead) client could end, so its detach()
+        // never runs. Without this kill, the wait() below blocks forever and
+        // this thread leaks holding a socket clone: the CLOSE_WAIT forwarders
+        // that wedged the live server. This thread owns `child`, so reap it here.
+        let _ = child.kill();
+    }
     let code = child
         .wait()
         .ok()
         .and_then(|status| i32::try_from(status.exit_code()).ok());
-    let _ = match framing {
-        PtyFraming::V1Json => write_frame(&mut sink, &json!({ "exit": code })),
-        // V2 EXIT payload: 4 BE bytes for a known code, EMPTY for unknown/signalled
-        // (the wire equivalent of V1's `"exit":null`).
-        PtyFraming::V2Binary => {
-            let payload = code.map(|c| c.to_be_bytes().to_vec()).unwrap_or_default();
-            write_bin_frame(&mut *sink, binframe::EXIT, &payload)
-        }
-    };
+    // Skip the exit frame when the sink already failed: the client is gone, and
+    // another blocking write could stall a full write-timeout window for nothing.
+    if !sink_dead {
+        let _ = match framing {
+            PtyFraming::V1Json => write_frame(&mut sink, &json!({ "exit": code })),
+            // V2 EXIT payload: 4 BE bytes for a known code, EMPTY for unknown/signalled
+            // (the wire equivalent of V1's `"exit":null`).
+            PtyFraming::V2Binary => {
+                let payload = code.map(|c| c.to_be_bytes().to_vec()).unwrap_or_default();
+                write_bin_frame(&mut *sink, binframe::EXIT, &payload)
+            }
+        };
+    }
 }
 
 /// Write one newline-delimited JSON frame to a byte sink (best-effort flush).

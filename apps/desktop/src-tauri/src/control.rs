@@ -437,6 +437,15 @@ pub struct ControlContext {
     /// default). A field (not the bare const) so tests can drive a short timeout
     /// against a real listener; could later carry an operator override.
     idle_timeout: std::time::Duration,
+    /// Write timeout for a PTY attach connection's socket
+    /// ([`ATTACH_WRITE_TIMEOUT`] by default; a field so tests can drive a short
+    /// one). Bounds the scrollback seed AND the streaming sink - see
+    /// [`serve_pty_attach`] for why an unbounded write is the churn wedge.
+    attach_write_timeout: std::time::Duration,
+    /// Cap on concurrently live PTY attach forwarders
+    /// ([`MAX_ATTACH_FORWARDERS`] by default; a field so tests can drive a tiny
+    /// one). Defense in depth under client churn - see [`AttachForwarderGuard`].
+    max_attach_forwarders: usize,
     /// Whether the connection being served is from the LOCAL loopback (same machine,
     /// fully trusted) vs a REMOTE tailnet peer. Set per-connection in `handle_conn`;
     /// `true` by default (tests + the loopback case). Gates the file-read scope (#23):
@@ -697,6 +706,83 @@ fn is_read_timeout(e: &std::io::Error) -> bool {
     )
 }
 
+/// Write timeout for a PTY attach connection's socket (s27 churn-proofing).
+/// SO_SNDTIMEO is a property of the underlying socket, shared by every
+/// `try_clone`, so one setting bounds the scrollback seed written by the
+/// connection thread AND the output firehose written by the forwarder thread.
+/// Without it, a client that stops draining (suspended, wedged, or dead with no
+/// RST) leaves `write_all` blocked FOREVER: a received FIN does not unblock a
+/// blocked write, so the socket sits in CLOSE_WAIT while the handler thread
+/// pins an [`ACTIVE_CONNS`] slot - accumulate enough and `serve` rejects every
+/// new connection, which is exactly the incident that wedged the live server
+/// (fresh `attach_pty` failing for all clients while existing attaches stream).
+/// Generous: a healthy loopback/tailnet client drains a 30s backlog trivially;
+/// one that can't is gone, and tearing it down lets it reattach cleanly.
+const ATTACH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Defensive cap on concurrently live PTY attach forwarders (s27). Each
+/// forwarder costs a PTY pair, a `tmux attach` client, a reader thread, and a
+/// socket, and every one also holds an [`ACTIVE_CONNS`] slot - so a churn storm
+/// of attaches must never be able to starve the request/event paths (cap is
+/// well under [`MAX_CONNS`]). Generous: a full cockpit is ~14 attaches
+/// (T10-measured), satellites included, so 64 fits 4+ complete clients.
+const MAX_ATTACH_FORWARDERS: usize = 64;
+static ACTIVE_ATTACH_FORWARDERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of live PTY attach forwarders (diagnostics / the churn regression
+/// test's return-to-baseline assertion).
+pub fn attach_forwarder_count() -> usize {
+    ACTIVE_ATTACH_FORWARDERS.load(Ordering::Relaxed)
+}
+
+/// RAII slot in the attach forwarder table: acquired for the lifetime of one
+/// `serve_pty_attach` streaming phase, released on every exit path (including
+/// panics) via `Drop`. Acquisition is a CAS loop so the cap is exact under
+/// concurrent attach storms (no over-admit window).
+struct AttachForwarderGuard;
+impl AttachForwarderGuard {
+    fn try_acquire(limit: usize) -> Option<Self> {
+        let mut cur = ACTIVE_ATTACH_FORWARDERS.load(Ordering::Relaxed);
+        loop {
+            if cur >= limit {
+                return None;
+            }
+            match ACTIVE_ATTACH_FORWARDERS.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(now) => cur = now,
+            }
+        }
+    }
+}
+impl Drop for AttachForwarderGuard {
+    fn drop(&mut self) {
+        ACTIVE_ATTACH_FORWARDERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Enable TCP keepalive on an accepted control connection (s27 churn-proofing).
+/// The long-lived modes (event subscribe, PTY attach) deliberately clear the
+/// idle read timeout - an untouched terminal legitimately sends nothing for
+/// hours - so a peer that vanishes SILENTLY (no FIN, no RST: a powered-off
+/// tailnet box, a killed WSLg/msrdc window, a dropped VPN) would otherwise park
+/// the handler read forever and leak the forwarder behind it. Keepalive probes
+/// make that read fail within minutes; the kernel answers them even when the
+/// peer app is idle, so a healthy quiet client is never torn down. Best-effort:
+/// a platform refusing the option costs resilience, not correctness.
+fn enable_tcp_keepalive(stream: &TcpStream) {
+    let params = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(15));
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&params) {
+        eprintln!("t-hub-control: failed to enable TCP keepalive: {e}");
+    }
+}
+
 /// Decrements the live-connection counter when a connection handler thread exits.
 struct ConnGuard;
 impl Drop for ConnGuard {
@@ -720,12 +806,24 @@ fn serve(listener: TcpListener, ctx: ControlContext) {
                     continue;
                 }
                 let ctx = ctx.clone();
-                std::thread::spawn(move || {
-                    let _guard = ConnGuard; // decrements ACTIVE_CONNS on exit
-                    if let Err(e) = handle_conn(stream, &ctx) {
-                        eprintln!("t-hub-control: connection error: {e}");
-                    }
-                });
+                // Builder::spawn (not thread::spawn) so a failed spawn under
+                // resource exhaustion returns an error instead of PANICKING the
+                // accept loop - the listener must survive exactly the conditions
+                // (fd/thread pressure from leaked forwarders) it exists to serve.
+                let spawned = std::thread::Builder::new()
+                    .name("t-hub-control-conn".into())
+                    .spawn(move || {
+                        let _guard = ConnGuard; // decrements ACTIVE_CONNS on exit
+                        if let Err(e) = handle_conn(stream, &ctx) {
+                            eprintln!("t-hub-control: connection error: {e}");
+                        }
+                    });
+                if let Err(e) = spawned {
+                    // The closure never ran, so its ConnGuard never will: undo the
+                    // count here (the moved stream was dropped/closed with it).
+                    ACTIVE_CONNS.fetch_sub(1, Ordering::Relaxed);
+                    eprintln!("t-hub-control: failed to spawn connection handler: {e}");
+                }
             }
             Err(e) => {
                 eprintln!("t-hub-control: accept failed: {e}");
@@ -746,6 +844,10 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
             return Ok(());
         }
     }
+    // Keepalive on every admitted connection, BEFORE any mode can clear the idle
+    // read timeout: silent peer death (no FIN/RST) must never park a handler -
+    // or the attach forwarder behind it - forever. See enable_tcp_keepalive.
+    enable_tcp_keepalive(&stream);
     // Per-connection view (#23): tag whether the peer is LOOPBACK (same machine =
     // fully trusted) so the file-read handlers can scope a REMOTE tailnet peer to
     // the operator allowlist while leaving the local path unrestricted. Fail closed
@@ -857,9 +959,10 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
                     }
                     // The PTY stream reads {write}/{resize} frames for as long as the
                     // user leaves the tile open — clear the idle timeout so an
-                    // untouched terminal isn't force-detached after 120s.
+                    // untouched terminal isn't force-detached after 120s. (Half-open
+                    // peer death is covered by keepalive, set at accept.)
                     reader.get_ref().set_read_timeout(None).ok();
-                    serve_pty_attach(&mut writer, &mut reader, &req.args)?;
+                    serve_pty_attach(ctx, &mut writer, &mut reader, &req.args)?;
                     break;
                 } else {
                     write_response(&mut writer, &dispatch_authenticated(ctx, req))?;
@@ -887,7 +990,20 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
 /// BINARY frames, else v1 base64-NDJSON. The choice governs BOTH directions — the
 /// scrollback/out/exit/error frames written down AND the write/resize frames read
 /// up — so a v1 client is byte-for-byte unchanged and a v2 client never sees base64.
+///
+/// Churn-proofing (s27) - every leak path a dying client can take is bounded:
+///   - a slot in the forwarder table is acquired first (refused with a clear
+///     error at the cap) and released on every exit path via `Drop`;
+///   - the socket gets a write timeout before the seed, so a client that dies
+///     or stalls DURING the scrollback seed (or while streaming) fails the
+///     write instead of parking this thread forever;
+///   - when the stream ends first (sink death or PTY exit), the forwarder
+///     thread shuts the socket down (`on_stream_end`), unblocking the input
+///     read below so teardown never waits on a dead client to close;
+///   - teardown itself shuts the socket down BEFORE joining the forwarder, so
+///     the join can never wait behind a blocked write.
 fn serve_pty_attach(
+    ctx: &ControlContext,
     writer: &mut TcpStream,
     reader: &mut BufReader<TcpStream>,
     args: &Value,
@@ -907,6 +1023,28 @@ fn serve_pty_attach(
     let tmux_session = tmux_target(&session_id);
     let cols = args.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
     let rows = args.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+
+    // Defensive bound on the forwarder table (s27): refuse - with an actionable
+    // error, not a silent close - rather than let runaway churn pile forwarders
+    // onto the PTY/thread/fd budget. Held until this function returns, i.e. for
+    // the whole streaming phase.
+    let Some(_forwarder_slot) = AttachForwarderGuard::try_acquire(ctx.max_attach_forwarders) else {
+        return send_attach_error(
+            writer,
+            framing,
+            format!(
+                "attach_pty: forwarder table is full ({} live attach forwarders); \
+                 refusing a new attach - detach stale clients or investigate leaked \
+                 forwarders",
+                attach_forwarder_count()
+            ),
+        );
+    };
+
+    // Bound every write on this connection (seed, output firehose, exit frame):
+    // SO_SNDTIMEO lives on the underlying socket, shared by every clone, so this
+    // one call covers the sink the forwarder thread writes too.
+    writer.set_write_timeout(Some(ctx.attach_write_timeout)).ok();
 
     if !tmux::has_session(&tmux_session) {
         return send_attach_error(
@@ -931,25 +1069,46 @@ fn serve_pty_attach(
         }
     }
 
-    // Spawn the PTY streaming output to a clone of this connection, in the same framing.
+    // Spawn the PTY streaming output to a clone of this connection, in the same
+    // framing. `on_stream_end` shuts the SOCKET down when the stream is over, so
+    // the input loop below unblocks promptly whether the stream died because the
+    // client vanished (sink error) or because the tmux session exited under a
+    // still-connected client - without it, teardown waited on the client.
     let sink = writer.try_clone()?;
+    let conn_for_stream_end = writer.try_clone()?;
+    let on_stream_end: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let _ = conn_for_stream_end.shutdown(std::net::Shutdown::Both);
+    });
     let cwd = std::env::var("HOME").unwrap_or_default();
-    let mut handle =
-        match pty::stream_attach_to_sink(&tmux_session, &cwd, cols, rows, Box::new(sink), framing) {
-            Ok(h) => h,
-            Err(e) => {
-                return send_attach_error(writer, framing, format!("attach_pty: {e}"));
-            }
-        };
+    let mut handle = match pty::stream_attach_to_sink(
+        &tmux_session,
+        &cwd,
+        cols,
+        rows,
+        Box::new(sink),
+        framing,
+        Some(on_stream_end),
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            return send_attach_error(writer, framing, format!("attach_pty: {e}"));
+        }
+    };
 
     // Drive write/resize frames from the client until it disconnects (EOF), in the
-    // negotiated framing.
-    match framing {
-        pty::PtyFraming::V1Json => read_pty_input_v1(reader, &mut handle, cols, rows)?,
-        pty::PtyFraming::V2Binary => read_pty_input_v2(reader, &mut handle)?,
-    }
-    handle.detach(); // tmux session survives, like close_terminal
-    Ok(())
+    // negotiated framing. Capture the result instead of `?` so teardown runs on
+    // the error paths too (an abrupt RST mid-stream must still reap everything).
+    let input_result = match framing {
+        pty::PtyFraming::V1Json => read_pty_input_v1(reader, &mut handle, cols, rows),
+        pty::PtyFraming::V2Binary => read_pty_input_v2(reader, &mut handle),
+    };
+    // Deterministic teardown, same order on every path: shut the socket down
+    // FIRST so the forwarder thread can never sit blocked in a write while
+    // detach() joins it, then kill the attach client + join. The tmux session
+    // survives, like close_terminal.
+    let _ = writer.shutdown(std::net::Shutdown::Both);
+    handle.detach();
+    input_result
 }
 
 /// Emit an attach-time error in the negotiated framing: a v1 `{"ok":false,error}`
@@ -2332,6 +2491,8 @@ impl ControlContext {
             metrics: None,
             tabs: Arc::new(TabRegistry::new()),
             idle_timeout: CONN_READ_TIMEOUT,
+            attach_write_timeout: ATTACH_WRITE_TIMEOUT,
+            max_attach_forwarders: MAX_ATTACH_FORWARDERS,
             peer_is_loopback: true,
             token,
         }
@@ -3395,5 +3556,293 @@ mod tests {
         assert_eq!(back.token, "abc");
         assert_eq!(back.pid, 42);
         assert_eq!(back.protocol_version, PROTOCOL_VERSION);
+    }
+
+    // ---- s27: attach path vs client churn -----------------------------------
+
+    use std::time::Duration;
+
+    /// The attach-churn tests share the process-global forwarder counter (and
+    /// real tmux sessions), so they run serialized; everything else in this
+    /// module stays parallel. Poison is ignored: a failed churn test must not
+    /// cascade into the other one.
+    static ATTACH_TEST_SERIAL: StdMutex<()> = StdMutex::new(());
+
+    fn attach_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+        ATTACH_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Stand up the REAL accept loop (`serve`, not per-connection `handle_conn`)
+    /// on an ephemeral loopback port. The thread parks in accept for the process
+    /// lifetime, exactly like the `control_probe_server` example.
+    fn spawn_attach_listener(ctx: ControlContext) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve(listener, ctx));
+        addr
+    }
+
+    /// A disposable real tmux session for attach tests; returns (id, tmux name).
+    fn churn_tmux_session(tag: &str) -> (String, String) {
+        let id = format!(
+            "s27{tag}{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let target = format!("th_{id}");
+        let _ = tmux::kill_session(&target);
+        tmux::new_session(&target, "/tmp", None).expect("spawn churn tmux session");
+        (id, target)
+    }
+
+    /// Send a v1 `attach_pty` request line on `stream`.
+    fn send_attach_request(stream: &mut TcpStream, token: &str, session_id: &str) {
+        let mut frame = serde_json::to_vec(&json!({
+            "token": token,
+            "command": ATTACH_PTY_COMMAND,
+            "args": { "sessionId": session_id, "cols": 80, "rows": 24 },
+        }))
+        .unwrap();
+        frame.push(b'\n');
+        stream.write_all(&frame).expect("write attach_pty request");
+    }
+
+    /// Send a v1 `{"write":"<b64>"}` input frame (keystrokes) on `stream`.
+    fn send_write_frame(stream: &mut TcpStream, keys: &str) {
+        let mut frame = serde_json::to_vec(&json!({ "write": STANDARD.encode(keys) })).unwrap();
+        frame.push(b'\n');
+        stream.write_all(&frame).expect("write input frame");
+    }
+
+    /// Read one newline-delimited JSON frame; panics on EOF (caller expects one).
+    fn read_json_frame(reader: &mut BufReader<TcpStream>) -> Value {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read frame");
+        assert!(n > 0, "connection closed before the expected frame");
+        serde_json::from_str(line.trim()).expect("frame is JSON")
+    }
+
+    /// Poll `ok` until it holds or `deadline` elapses (then panic with `what`).
+    fn eventually(what: &str, deadline: Duration, mut ok: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// THE s27 regression: N clients die abruptly at every stage of the attach
+    /// lifecycle - before speaking, mid-request, pre-seed, post-seed via RST,
+    /// and the incident's exact shape: a client that starts a firehose, stops
+    /// draining, and silently HOLDS its socket (the un-reaped CLOSE_WAIT
+    /// forwarders that wedged the live server's new-attach path). The server
+    /// must reap every forwarder on its own and keep serving fresh attaches.
+    #[test]
+    fn attach_path_survives_abrupt_client_churn() {
+        let _serial = attach_serial_guard();
+        eventually("forwarder table to drain before the test", Duration::from_secs(10), || {
+            attach_forwarder_count() == 0
+        });
+
+        let mut ctx = test_ctx("churn-secret");
+        ctx.idle_timeout = Duration::from_millis(500);
+        ctx.attach_write_timeout = Duration::from_millis(300);
+        let addr = spawn_attach_listener(ctx);
+        let conns_baseline = ACTIVE_CONNS.load(Ordering::Relaxed);
+
+        let (id, target) = churn_tmux_session("churn");
+
+        // (a) Dies before speaking: reaped by the idle read timeout.
+        drop(TcpStream::connect(addr).expect("connect"));
+        // (b) Dies mid-request-line (no newline ever arrives).
+        {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            s.write_all(b"{\"token\":\"churn-secret\",\"comm").unwrap();
+            drop(s);
+        }
+        // (c) Attaches to a MISSING session and dies without reading the refusal.
+        {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            send_attach_request(&mut s, "churn-secret", "s27-definitely-absent");
+            drop(s);
+        }
+        // (d) Dies between the request and the seed (FIN lands mid-seed), x3.
+        for _ in 0..3 {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            send_attach_request(&mut s, "churn-secret", &id);
+            drop(s);
+        }
+        // (e) Reads the seed, then dies with an abrupt RST (SO_LINGER 0), x3.
+        for _ in 0..3 {
+            let s = TcpStream::connect(addr).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut w = s.try_clone().unwrap();
+            send_attach_request(&mut w, "churn-secret", &id);
+            let mut reader = BufReader::new(s);
+            let seed = read_json_frame(&mut reader);
+            assert!(seed.get("scrollback").is_some(), "expected a seed, got {seed}");
+            socket2::SockRef::from(reader.get_ref())
+                .set_linger(Some(Duration::from_secs(0)))
+                .unwrap();
+            // Dropping both clones now closes the socket -> RST, not FIN.
+        }
+
+        // (f) The incident wedge: a tiny-receive-buffer client attaches, starts a
+        // firehose, stops reading, and HOLDS the socket open in silence. ~13 MB of
+        // output against a 4 KiB client window and a <=4 MiB kernel send buffer
+        // guarantees the forwarder's sink write blocks; the write timeout must
+        // then tear the whole forwarder down while the client still holds its end.
+        let wedge = {
+            let sock =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            sock.set_recv_buffer_size(4096).unwrap();
+            sock.connect(&addr.into()).expect("connect wedge client");
+            TcpStream::from(sock)
+        };
+        wedge.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut wedge_writer = wedge.try_clone().unwrap();
+        send_attach_request(&mut wedge_writer, "churn-secret", &id);
+        let mut wedge_reader = BufReader::new(wedge);
+        let seed = read_json_frame(&mut wedge_reader);
+        assert!(seed.get("scrollback").is_some(), "expected a seed, got {seed}");
+        send_write_frame(&mut wedge_writer, "yes S27-FIREHOSE | head -n 1000000\n");
+        // Do NOT read, do NOT close. The server must reap the forwarder on its
+        // own; every earlier case drains here too (EOF/RST paths are fast).
+        eventually(
+            "forwarder teardown while the wedged client still holds its socket",
+            Duration::from_secs(20),
+            || attach_forwarder_count() == 0,
+        );
+
+        // A FRESH attach must now succeed end to end - the exact operation that
+        // failed for every client in the incident.
+        let fresh = TcpStream::connect(addr).expect("connect fresh client");
+        fresh.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut fresh_writer = fresh.try_clone().unwrap();
+        send_attach_request(&mut fresh_writer, "churn-secret", &id);
+        let mut fresh_reader = BufReader::new(fresh);
+        let seed = read_json_frame(&mut fresh_reader);
+        assert!(
+            seed.get("scrollback").is_some(),
+            "fresh attach after churn must get a seed, got {seed}"
+        );
+        send_write_frame(&mut fresh_writer, "echo S27_CHURN_OK\n");
+        let mut seen = String::new();
+        let sentinel_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !seen.contains("S27_CHURN_OK") {
+            assert!(
+                std::time::Instant::now() < sentinel_deadline,
+                "sentinel never arrived on the fresh attach; saw: {seen:?}"
+            );
+            let mut line = String::new();
+            let n = fresh_reader.read_line(&mut line).expect("read out frame");
+            assert!(n > 0, "server closed the fresh attach early; saw: {seen:?}");
+            let v: Value = match serde_json::from_str(line.trim()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(b64) = v.get("out").and_then(|x| x.as_str()) {
+                if let Ok(bytes) = STANDARD.decode(b64) {
+                    seen.push_str(&String::from_utf8_lossy(&bytes));
+                }
+            }
+        }
+
+        // Teardown: with every client gone, BOTH tables return to baseline - no
+        // leaked forwarder slot, no leaked connection slot.
+        drop(fresh_reader);
+        drop(fresh_writer);
+        drop(wedge_reader);
+        drop(wedge_writer);
+        let _ = tmux::kill_session(&target);
+        eventually("forwarder table back to baseline", Duration::from_secs(10), || {
+            attach_forwarder_count() == 0
+        });
+        eventually("connection handlers to drain", Duration::from_secs(10), || {
+            ACTIVE_CONNS.load(Ordering::Relaxed) <= conns_baseline
+        });
+    }
+
+    /// The defensive forwarder-table bound: at the cap a new attach is refused
+    /// with a clear error (not a silent close), and a released slot makes the
+    /// attach path serviceable again.
+    #[test]
+    fn attach_forwarder_cap_refuses_then_recovers() {
+        let _serial = attach_serial_guard();
+        eventually("forwarder table to drain before the test", Duration::from_secs(10), || {
+            attach_forwarder_count() == 0
+        });
+
+        let mut ctx = test_ctx("cap-secret");
+        ctx.idle_timeout = Duration::from_millis(500);
+        ctx.attach_write_timeout = Duration::from_secs(2);
+        ctx.max_attach_forwarders = 1;
+        let addr = spawn_attach_listener(ctx);
+
+        let (id, target) = churn_tmux_session("cap");
+
+        // First attach fills the size-1 table; reading the seed proves the slot
+        // is held (the guard is acquired before the seed is written).
+        let first = TcpStream::connect(addr).expect("connect");
+        first.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut first_writer = first.try_clone().unwrap();
+        send_attach_request(&mut first_writer, "cap-secret", &id);
+        let mut first_reader = BufReader::new(first);
+        assert!(read_json_frame(&mut first_reader).get("scrollback").is_some());
+        assert_eq!(attach_forwarder_count(), 1);
+
+        // Second attach: refused with an actionable error, then closed.
+        let second = TcpStream::connect(addr).expect("connect");
+        second.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut second_writer = second.try_clone().unwrap();
+        send_attach_request(&mut second_writer, "cap-secret", &id);
+        let mut second_reader = BufReader::new(second);
+        let refusal = read_json_frame(&mut second_reader);
+        assert_eq!(refusal["ok"], false, "expected a refusal, got {refusal}");
+        assert!(
+            refusal["error"]
+                .as_str()
+                .unwrap()
+                .contains("forwarder table is full"),
+            "got: {refusal}"
+        );
+        let mut rest = String::new();
+        assert_eq!(
+            second_reader.read_line(&mut rest).expect("read after refusal"),
+            0,
+            "the refused connection must be closed, not parked"
+        );
+
+        // Release the slot; the table must drain without any explicit detach call.
+        drop(first_reader);
+        drop(first_writer);
+        eventually("slot release after client disconnect", Duration::from_secs(10), || {
+            attach_forwarder_count() == 0
+        });
+
+        // And the attach path is serviceable again.
+        let third = TcpStream::connect(addr).expect("connect");
+        third.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut third_writer = third.try_clone().unwrap();
+        send_attach_request(&mut third_writer, "cap-secret", &id);
+        let mut third_reader = BufReader::new(third);
+        assert!(
+            read_json_frame(&mut third_reader).get("scrollback").is_some(),
+            "attach must succeed once the table drained"
+        );
+
+        drop(third_reader);
+        drop(third_writer);
+        let _ = tmux::kill_session(&target);
+        eventually("forwarder table drained at test end", Duration::from_secs(10), || {
+            attach_forwarder_count() == 0
+        });
     }
 }
