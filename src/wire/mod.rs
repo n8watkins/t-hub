@@ -230,13 +230,19 @@ impl Endpoint {
     }
 }
 
-/// Path to the control handshake file. `T_HUB_CONTROL_JSON` overrides; otherwise
-/// `$HOME/.t-hub/control.json` (WSL) or `%USERPROFILE%\.t-hub\control.json`
-/// (Windows). See the T1 notes on the WSL symlink mirroring the Windows-home file.
+/// Path to the control handshake file. `T_HUB_CONTROL_JSON` overrides, then
+/// `T_HUB_CONTROL_FILE` (the desktop app's own name for the same path - a
+/// devbuild server exports it as `~/.t-hub-dev/control.json`, so honoring it
+/// lets one env block point both the server and this client at the same file);
+/// otherwise `$HOME/.t-hub/control.json` (WSL) or
+/// `%USERPROFILE%\.t-hub\control.json` (Windows). See the T1 notes on the WSL
+/// symlink mirroring the Windows-home file.
 fn control_json_path() -> PathBuf {
-    if let Ok(p) = std::env::var("T_HUB_CONTROL_JSON") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
+    for var in ["T_HUB_CONTROL_JSON", "T_HUB_CONTROL_FILE"] {
+        if let Ok(p) = std::env::var(var) {
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
         }
     }
     let home = std::env::var("HOME")
@@ -1654,5 +1660,20 @@ mod tests {
         drop(handle);
         done.store(true, Ordering::Release);
         let _ = server.join();
+    }
+
+    /// `T_HUB_CONTROL_FILE` (the desktop app's name for the handshake path, set
+    /// by devbuild servers) resolves discovery when `T_HUB_CONTROL_JSON` is
+    /// unset; the JSON var still wins when both are set.
+    #[test]
+    fn control_file_env_var_is_honored_for_discovery() {
+        let _g = ENV_LOCK.lock();
+        std::env::remove_var("T_HUB_CONTROL_JSON");
+        std::env::set_var("T_HUB_CONTROL_FILE", "/tmp/th-dev/control.json");
+        assert_eq!(control_json_path(), PathBuf::from("/tmp/th-dev/control.json"));
+        std::env::set_var("T_HUB_CONTROL_JSON", "/tmp/th-json/control.json");
+        assert_eq!(control_json_path(), PathBuf::from("/tmp/th-json/control.json"));
+        std::env::remove_var("T_HUB_CONTROL_JSON");
+        std::env::remove_var("T_HUB_CONTROL_FILE");
     }
 }
