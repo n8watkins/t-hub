@@ -1,12 +1,21 @@
-//! GPUI window for the native client (T4 scaffold; T5 grows the render seam).
+//! GPUI window for the native client.
 //!
-//! Deliberately minimal: a debug overlay proving the §1.3 wire is live -
-//! connection status, the real session list, a scrolling tail of `status://`
-//! (and every other) event, and the head of the first attached session's
-//! scrollback + a running output byte count. GPUI boilerplate (Application, the
-//! canvas + `text_system().shape_line` paint loop driven by
-//! `request_animation_frame`) is lifted verbatim from the T2 spike main.rs, which
+//! Two modes:
+//!  - **grid** (default, T5): the render seam - N live terminal tiles fed by the
+//!    §1.3 PTY plane, painted by [`crate::render::GridView`]. This is the pivot's
+//!    core deliverable.
+//!  - **debug** (`THN_DEBUG=1`, the T4 overlay): a scrolling proof that the wire is
+//!    live (connection status, session list, event tail, first-attach byte count).
+//!
+//! GPUI boilerplate (Application, the canvas + `text_system().shape_line` paint loop
+//! driven by `request_animation_frame`) is lifted from the T2 spike main.rs, which
 //! is known-good on gpui 0.2.2.
+//!
+//! ## Session selection (T5)
+//! `THN_SESSIONS=id1,id2,...` attaches exactly those sessions (used by the
+//! acceptance harness with DISPOSABLE `t5-*` sessions, so typing tests never touch
+//! sessions we did not create). Unset -> the first `THN_TILES` (default 12) live
+//! sessions from `list_terminals`.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -15,13 +24,21 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, fill, font, point, px, size, App, Application, Bounds, Context, Font, Hsla,
-    IntoElement, Render, Rgba, SharedString, TextRun, TitlebarOptions, Window, WindowBounds,
+    canvas, div, fill, font, point, px, size, App, Application, Bounds, Context, Font, FontWeight,
+    Hsla, IntoElement, Render, Rgba, SharedString, TextRun, TitlebarOptions, Window, WindowBounds,
     WindowOptions,
 };
 use parking_lot::Mutex;
 
+use crate::render::{GridView, TileSpec};
+use crate::term::TermSession;
 use crate::wire::{push_capped, ControlClient, Event, PtyFrame};
+
+/// Provisional attach geometry before the first paint reflows each tile to fit.
+const PROVISIONAL_COLS: u16 = 80;
+const PROVISIONAL_ROWS: u16 = 24;
+/// Default tile count when `THN_SESSIONS` is unset.
+const DEFAULT_TILES: usize = 12;
 
 const EVENT_CAP: usize = 400;
 const RELIST_SECS: u64 = 3;
@@ -226,21 +243,137 @@ fn spawn_worker(state: Arc<Mutex<DebugState>>) {
     });
 }
 
-/// Open the "T-Hub Native" window and run the GPUI event loop.
+/// Entry point: dispatch to the debug overlay or the T5 render grid.
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     log::info!("t-hub-native starting, pid={}", std::process::id());
+    if std::env::var("THN_DEBUG").as_deref() == Ok("1") {
+        run_debug();
+    } else {
+        run_grid();
+    }
+}
 
+/// Fonts used by both modes. "Cascadia Mono" is present on the Windows box (§1.5).
+fn fonts() -> (Font, Font) {
+    let font_normal = font("Cascadia Mono");
+    let mut font_bold = font_normal.clone();
+    font_bold.weight = FontWeight::BOLD;
+    (font_normal, font_bold)
+}
+
+/// Which session ids to attach: `THN_SESSIONS` (explicit, disposable for tests), or
+/// the first `THN_TILES` (default 12) live sessions.
+fn select_sessions(client: &ControlClient) -> Vec<String> {
+    if let Ok(list) = std::env::var("THN_SESSIONS") {
+        let ids: Vec<String> =
+            list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if !ids.is_empty() {
+            return ids;
+        }
+    }
+    let n = std::env::var("THN_TILES").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_TILES);
+    match client.list_sessions() {
+        Ok(sessions) => sessions.into_iter().map(|s| s.id).filter(|id| !id.is_empty()).take(n).collect(),
+        Err(e) => {
+            log::error!("list_sessions failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// T5 render grid: connect, attach the selected sessions, spawn one feeder thread
+/// per tile (drains `PtyHandle::output` into the tile's `TermSession`), and open the
+/// grid window.
+fn run_grid() {
+    let client = match ControlClient::connect_discovered() {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("t-hub-native: could not connect to the control socket: {e}");
+            eprintln!("  is the T-Hub app running? (control.json handshake missing/unreadable)");
+            std::process::exit(1);
+        }
+    };
+
+    let ids = select_sessions(&client);
+    if ids.is_empty() {
+        eprintln!("t-hub-native: no sessions to attach (set THN_SESSIONS or start sessions).");
+        std::process::exit(1);
+    }
+    log::info!("grid: attaching {} session(s): {:?}", ids.len(), ids);
+
+    let mut specs: Vec<TileSpec> = Vec::new();
+    for id in ids {
+        let handle = match client.attach_pty(&id, PROVISIONAL_COLS, PROVISIONAL_ROWS) {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("attach {id} failed: {e}; skipping tile");
+                continue;
+            }
+        };
+        let term = Arc::new(Mutex::new(TermSession::new(PROVISIONAL_COLS, PROVISIONAL_ROWS)));
+        // Seed the grid with the opening scrollback frame.
+        if !handle.scrollback.is_empty() {
+            term.lock().advance(&handle.scrollback);
+        }
+        // One feeder thread per tile: PtyFrame::Out bytes -> TermSession.advance.
+        let rx = handle.output.clone();
+        let feed_term = term.clone();
+        let feed_id = id.clone();
+        thread::spawn(move || {
+            while let Ok(frame) = rx.recv() {
+                match frame {
+                    PtyFrame::Out(bytes) => feed_term.lock().advance(&bytes),
+                    PtyFrame::Exit(code) => {
+                        log::info!("feeder[{feed_id}]: session exited ({code})");
+                        break;
+                    }
+                }
+            }
+        });
+        specs.push(TileSpec { id, term, pty: handle, cols: PROVISIONAL_COLS, rows: PROVISIONAL_ROWS });
+    }
+
+    if specs.is_empty() {
+        eprintln!("t-hub-native: every attach failed; nothing to render.");
+        std::process::exit(1);
+    }
+
+    let (font_normal, font_bold) = fonts();
+    Application::new().run(move |cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Maximized(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(SharedString::from("T-Hub Native")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |window, cx| {
+                let focus = cx.focus_handle();
+                let view = cx.new(|_| {
+                    GridView::new(specs, client, font_normal, font_bold, focus.clone())
+                });
+                window.focus(&focus);
+                view
+            },
+        )
+        .unwrap();
+        cx.activate(true);
+    });
+}
+
+/// The T4 wire-debug overlay (opt-in via `THN_DEBUG=1`).
+fn run_debug() {
     let state = Arc::new(Mutex::new(DebugState {
         status: "connecting...".to_string(),
         ..Default::default()
     }));
     spawn_worker(state.clone());
 
-    let font_normal = font("Cascadia Mono");
-    let mut font_bold = font_normal.clone();
-    font_bold.weight = gpui::FontWeight::BOLD;
-
+    let (font_normal, font_bold) = fonts();
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.), px(700.)), cx);
         cx.open_window(

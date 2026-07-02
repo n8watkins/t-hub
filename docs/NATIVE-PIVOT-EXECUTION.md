@@ -211,3 +211,31 @@ If two tasks must touch the same file (expected only at `main.rs` layout composi
     6. gpui is an OPTIONAL cargo feature (`gui`, default on) so `wire/` compiles and unit-tests without a graphics backend (`--no-default-features`); `main.rs` and the `wire-probe` bin work either way.
     7. `crossbeam = "0.5"` provides `crossbeam::channel` exactly as the contract spelled it (it re-exports `crossbeam-channel`).
   - **Version:** the native crate is versioned independently at `0.1.0` (§0/§1.1); the desktop `bump-version.sh` was intentionally NOT run - this commit does not touch `apps/desktop/`.
+- 2026-07-01 T5 DONE (branch `t5-render-seam`): swapped the render seam - `PtyHandle` bytes -> `TermSession.advance` -> damage-driven GPU paint, N live grids in one GPUI window.
+  - **`term/`** (gpui-free, unit-tested under `--no-default-features`): `TermSession` wraps `alacritty_terminal::Term` + `vte::ansi::Processor` per the frozen §1.4 interface (`new`/`advance`/`resize`/`renderable()->Snapshot`/`take_damage()->Damage`).
+  `Snapshot` is plain data (chars + already-resolved RGB + flags); the cell->`TextRun` transform lives in `render/`, so `term/` stays graphics-free and testable in WSL.
+  Color mapping (xterm-256 cube, truecolor, inverse) is lifted from the T2 spike.
+  - **`render/`** (feature `gui`): `GridView` paints a near-square tile layout (`ceil(sqrt(n))`), sizing each tile's `cols x rows` to its pixel box so a window-resize reflows every terminal and resizes its PTY.
+  Damage-clipped paint: `take_damage()` drives which rows get their run vector rebuilt; unchanged rows reuse the cache.
+  No custom shaped-line cache - gpui's internal `LineLayoutCache` dedupes shaping (§1.5), confirmed by the spike's Run 4 and by these numbers (a full-repaint run is barely slower than damage on scene time precisely because shaping is already cached; the win shows up in rows-rebuilt).
+  `THN_PAINT=full` rebuilds every row every frame for the A/B measurement; the fps logger (reused from the spike) writes fps + scene-ms + rebuilt-vs-total rows to `THN_LOG_DIR/render.log`, and `THN_BENCH_SECS` writes a `SUMMARY` then exits for automated capture.
+  A one-line dim per-tile header (id + geometry) is a debug aid, explicitly NOT the T8 cockpit header.
+  - **`render_support.rs`** (gpui-free): the pure logic split out of `render/` - key encoding and layout math - so it unit-tests in WSL (the gui-feature test binary can't LINK the gpui graphics backend on this box; `cargo check` still validates the gui code).
+  - **Build:** `cargo check` (gui) AND `cargo check --no-default-features` both CLEAN in WSL; `cargo clippy --all-targets` clean on both feature sets; `cargo test --no-default-features` 20/20 green (7 term + 6 wire + 7 render_support).
+  Windows release build (`cargo build --release`, MSVC): clean, 2m45s cold, 13 MB binary.
+  - **Acceptance (real run, Windows clone, RX 7800 XT @ 180Hz, against the live app):** 12 DISPOSABLE `th_t5-*` sessions (4x `top`/htop busy TUIs, 4x colorized scrollers, 4x idle) attached and rendered in one native window as a 4x3 grid; screenshot in [`T5-render-grid.png`](./T5-render-grid.png) shows crisp monospace, bold runs, truecolor/indexed color, box-drawing and `top`'s colored status bars, all legible.
+  Each tile fitted to `81x27` from the provisional `80x24` attach - the content reflowing to 81 cols proves `TermSession::resize` + `PtyHandle::resize` round-tripped to tmux end-to-end (the resize acceptance).
+  - **Damage-clipped vs full repaint (LOGGED; the two numbers):** at 12 tiles both pin the 180Hz vsync cap, so the win is CPU scene-build, not fps.
+    - `THN_PAINT=damage`: **fps_avg 179.6, scene_avg 1.44 ms, rebuild_pct 7.2 %** (~4,200 of ~58,300 rows/s rebuilt) - full log [`T5-bench-damage.txt`](./T5-bench-damage.txt).
+    - `THN_PAINT=full`: **fps_avg 179.9, scene_avg 1.75 ms, rebuild_pct 100 %** (58,300 rows/s) - full log [`T5-bench-full.txt`](./T5-bench-full.txt).
+    - Damage clipping does **~1/14th** the per-frame run-build work and cuts scene-build CPU ~18 % (1.44 vs 1.75 ms) while holding full fps; `work_ms_per_s` ~260 vs ~310.
+    The modest scene-ms delta (vs the 14x rows delta) is the direct evidence for §1.5: gpui already caches the *shaping*, so damage only saves the cell->run transform - exactly why a bespoke shaped-line cache would be wasted.
+  - **Typing:** the key encoder (`render_support::encode`: text via `key_char`, Enter/Backspace/Tab/Shift-Tab/arrows/Home/End/PgUp/PgDn/Ins/Del, Ctrl-letter, Alt-prefix, platform-chord passthrough) is unit-tested (7 cases); the byte path is `PtyHandle::write`, already proven to round-trip live in T4.
+  Synthetic key injection into the GPUI window is not automatable headlessly, so live keystroke->echo is the captain's interactive check; the encode tests + T4's proven write path cover the seam.
+  - **Deviations from / additions to §1.4 (all additive; the frozen `new`/`advance`/`resize`/`renderable`/`take_damage` signatures are unchanged):**
+    1. `Snapshot` is gpui-free plain data (`rows_cells: Vec<Vec<SnapCell>>` + cursor + selection), materialized owned so the terminal lock drops before shaping; the cell->`TextRun` transform is `render/`'s job, keeping the seam one-way and `term/` testable without gpui.
+    2. `take_damage() -> Damage` where `Damage` is `Full | Lines(Vec<usize>)` (viewport rows); an empty `Lines` means "nothing changed this interval".
+    3. Additive `TermSession` methods for the T5 acceptance: `renderable_rows(&[usize]) -> PartialSnapshot` (damage-clipped rebuild - materializes only the requested rows), `scroll(i32)` / `scroll_to_bottom()` (scrollback viewport), and `cols()`/`rows()` accessors.
+    4. Geometry is clamped to >= 1x1 so a mid-layout zero-dimension resize can't panic alacritty.
+    5. `render_support.rs` is a new gpui-free module (not named in §1.1) holding key encoding + layout math so they unit-test on WSL; `render/` keeps only the gpui-dependent paint code.
+  - **Version:** native crate stays at `0.1.0` (independent; `bump-version.sh` NOT run - `apps/desktop/` untouched).
