@@ -31,6 +31,14 @@ name = "binframe-probe"
 path = "src/bin/binframe_probe.rs"
 required-features = []
 
+# T7 font torture screen: offline GPUI tiles rendering the torture fixture (one
+# tile per configured font), or `--emit` to dump the fixture bytes for a visual
+# diff in WezTerm / Windows Terminal. GUI-only (needs gpui).
+[[bin]]
+name = "font-torture"
+path = "src/bin/font_torture.rs"
+required-features = ["gui"]
+
 [features]
 # `gui` pulls in gpui. Default on, but gated so the wire/ contract can be
 # `cargo check`ed / tested in WSL (`--no-default-features`) even when the linux
