@@ -15,6 +15,11 @@ pub mod term;
 /// they unit-test in WSL without linking the graphics backend.
 pub mod render_support;
 
+/// Sidebar overlays (T9): recents, usage, host metrics, supervision, toasts.
+/// State + reducers are gpui-free (testable under `--no-default-features`);
+/// only `overlays::view` (feature `gui`) touches gpui.
+pub mod overlays;
+
 #[cfg(feature = "gui")]
 pub mod app;
 

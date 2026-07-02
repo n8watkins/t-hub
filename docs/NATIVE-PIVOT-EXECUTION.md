@@ -294,3 +294,48 @@ If two tasks must touch the same file (expected only at `main.rs` layout composi
   - **Deviation note (fallback proof):** no pre-v2 server binary exists to run (the headless example itself shipped in T13a), so the downgrade is proven at the protocol level - a deterministic mock-server test rejects `v: 2` exactly the way the old gate did (error response, connection left open) and the client transparently completes a v1 attach on the same connection - plus the live forced-v1 run above exercising the whole v1 path against the real server.
   - **Polish riding along (both T13a-verifier LOWs):** `pty.rs write_bin_frame` now uses a checked `u32` length cast (an over-`u32::MAX` payload returns `InvalidInput` instead of silently truncating the header and desyncing the stream); §1.2 documents the v1 pre-stream `{"ok":false,"error"}` attach-error envelope (T13a shape change) - `remote_pty.rs` and the native wire were audited and already handle it, so no consumer change.
   - **Version:** native crate stays at `0.1.0` (independent versioning per §0).
+- 2026-07-01 T9 DONE (branch `t9-overlays`): sidebar overlays, native - recents (+resume flow), Claude/Codex usage + cost, host/WSL metrics, supervision tree, toasts on status transitions.
+  Zero `app.rs` changes (T8 boundary respected); everything lives in `apps/native/src/overlays/`.
+  - **Layering (the brief's gpui-free rule):** one module per overlay - `recents.rs`, `usage.rs`, `metrics.rs`, `supervision.rs`, `toasts.rs` - each holding its wire-payload parsing (serde), a state struct, reducers, and a plain-data view-model, all unit-testable under `--no-default-features`.
+  `mod.rs` composes them into `SidebarState` (+ the cross-id-space `SessionIndex`) with `fold_event` as the single event reducer; `feed.rs` is the I/O pump (`OverlayFeed`: event drain + command polls on background threads, with the pure `PollPlan` cadence scheduler); `view.rs` (feature `gui`) is the ONLY file touching gpui.
+  - **Mount contract for T8 / captain (the exported element):**
+    ```rust
+    let feed = overlays::OverlayFeed::spawn(client.clone());          // Arc<ControlClient>, once per process
+    let overlays = cx.new(|_| overlays::OverlaySidebar::new(feed.clone()));
+    // in the sidebar shell, below the workspace list:
+    div().flex_1().child(overlays.clone())
+    // hooks:
+    feed.set_active_sessions(ids);      // tab-aware toast suppression (accepts session UUIDs and/or th_* tmux names)
+    let host_rx = feed.host_requests(); // HostRequest::ResumeSession{session_id,cwd} -> spawn a tile at cwd running `claude --resume <id>`
+    ```
+    One-step convenience: `OverlaySidebar::mount(client, cx) -> (Entity<OverlaySidebar>, OverlayFeed)`.
+    The element fills whatever box the host gives it (webview sidebar is 180-360px; reads fine across that range).
+  - **MERGE CAUTION (captain/T8):** `ControlClient::events()` clones one crossbeam mpmc receiver - cloned receivers COMPETE for frames, they do not fan out.
+  `OverlayFeed` must stay the process's single `events()` drainer; if chrome needs live status/supervision too (headers, status rings), read it from the shared `SidebarState` (it already folds statuses, snapshots, trees, titles, and the uuid<->tmux index) or grow a broadcast in `wire/` first.
+  - **Data sources:** commands `recent_sessions`, `archive_recent_project`, `claude_usage` (gated fallback), `codex_usage`, `host_metrics` (4s), `list_terminals` (10s, feeds the recents open-project filter), `supervision_session_ids` + `supervision_tree` (one seed pull); channels `status://snapshot`, `session://status`, `supervision://tree`, `agent://title`, `agent://state`.
+  Claude usage is statusline-first (freshest non-null reading per window across sessions, the webview's `selectStatuslineUsage`); the expensive `claude_usage` command only runs while NO statusline reading exists (attempt gap 60s, success fresh 1h - webview cadences).
+  Codex windows roll over locally past `resetsAt` (webview `advanceWindow`).
+  - **Build/verify:** `cargo check` AND `cargo clippy --all-targets` clean on BOTH feature sets; `cargo test --no-default-features` **108/108** green (baseline after T6+T13b was 63; +45 overlay tests: wire-shape parsing fixtures for every payload, recents dedup/filter/hide/resume-gate, usage source-priority/rollover/thresholds, metrics thresholds/staleness, supervision fold/ordering/durations, toast mapping/dedup/warmup/suppression/queue-expiry, `fold_event` integration incl. malformed payloads, `PollPlan` cadences).
+  - **Acceptance (live, against the running app at 127.0.0.1:57129):** headless `overlay-probe` printed `OVERLAY-PROBE-OK` - recents loaded with worktree hints and ONE project filtered as open (live filter working), statusline-derived usage meters (weekly 31% used / session 54% used with reset ETAs) plus Codex meters and summed cost, full WSL metrics (RAM/swap/load/procs/distro), 9 active supervision trees with child durations, and **a REAL toast fired on a live `failed` status transition during the 12s window** (the §3 toast acceptance).
+  - **Visual check (WSLg, per the wslg-native-gui-verification recipe - no Windows build needed):** `overlay-window` (new gui bin, the brief's demo entry point) screenshots in [`T9-overlay-sidebar.png`](./T9-overlay-sidebar.png) and [`T9-overlay-toasts.png`](./T9-overlay-toasts.png).
+  Verified interactively: section collapse/expand toggles, usage meters + provider labels + reset hints, WSL rows with the load row correctly amber (box was genuinely saturated: load 9.00 on 8 cores), and a recent-row click emitting `HostRequest::ResumeSession` with the real session id + cwd (logged by the demo shell).
+  `THN_TOAST_DEMO=1` folds three synthetic transitions through the real path (post-warmup) to inspect the toast cards.
+  - **Deviations / judgment calls:**
+    1. Resume is a `HostRequest` to the embedding shell, NOT a server call: the socket's `spawn_terminal` only forwards to a connected UI apply-sink (today: the webview) and carries no command argument, so it cannot run `claude --resume`.
+    The webview's own resume also spawns client-side.
+    T8 wires `host_requests()` to its tile-spawn path; the 1.5s double-spawn gate lives in the feed.
+    2. Epoch reset hints render as relative ETAs ("resets in 2h 15m") instead of the webview's absolute locale strings - the native crate carries no timezone database.
+    The `claude_usage` fallback keeps the server's human reset text verbatim.
+    3. The recents open-project filter is live-tmux ∩ snapshot-cwds (the webview filters on open TILES; the native workspace model is T8's).
+    Same visible effect once sessions emit statuslines, plus it also hides detached-but-running sessions - safer, since resuming those would fork a live conversation.
+    T8 can refine via the shared state if tile-accurate filtering is wanted.
+    4. Toasts are VISUAL cards (queue cap 4, TTL 8s, click-to-dismiss) rather than the webview's chimes + OS notifications; sound/OS-notify parity belongs to T14's checklist.
+    Same status->notification mapping and titles as `notify.ts`.
+    5. Toast warmup re-arms on agent `handshaking`/`replaying` (webview arms once at mount): replay bursts after an agent reconnect seed dedup baselines silently instead of re-toasting.
+    The feed's one-time supervision seed also baselines via `seed_status` (never toasts, even on a slow connect).
+    6. Tab-aware suppression is the `set_active_sessions` hook (T8 owns tabs); it accepts both id spaces and the fold checks the uuid AND its tmux alias.
+    7. The supervision section shows ALL orchestrators with subagent activity (live first, then most-recent), not the webview's one-session detail view (its sidebar variant was removed pre-pivot; a cockpit sidebar wants the fleet view).
+    8. Recents hide is in-memory + the durable `archive_recent_project` (the webview also persists its hidden-set in localStorage; native persistence can join T8's layout store).
+    9. Additive dep: `serde` (derive) for payload parsing - `serde_json` alone had no derive.
+  - **Windows check remaining:** only the `font_family("Segoe UI")` branch (WSLg ran the Linux default font); captain can eyeball it during merge reconcile.
+  - **Version:** native crate stays at `0.1.0` (T8 runs in parallel; same reasoning as T6). `apps/desktop/` untouched, so `bump-version.sh` intentionally not run.
