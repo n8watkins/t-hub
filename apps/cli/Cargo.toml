@@ -1,0 +1,23 @@
+[package]
+name = "t-hub-cli"
+version = "0.1.0"
+description = "th — T-Hub's canonical agent+human CLI (a thin control-socket client)"
+authors = ["Nathan Watkins"]
+edition = "2021"
+rust-version = "1.77"
+
+# The AXI-style binary. A single self-contained control-socket client — it does
+# NOT depend on apps/desktop; the protocol logic (discover + connect + auth +
+# request, plus an event subscribe path) is ported from scripts/probes/t1_lib.py.
+[[bin]]
+name = "th"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Unix only: restore the default SIGPIPE disposition so `th | head` exits
+# cleanly (Rust otherwise ignores SIGPIPE and `println!` panics on EPIPE).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
