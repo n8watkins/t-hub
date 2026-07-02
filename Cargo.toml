@@ -31,6 +31,21 @@ name = "binframe-probe"
 path = "src/bin/binframe_probe.rs"
 required-features = []
 
+# T9 acceptance runner (headless): spins the OverlayFeed against the real server
+# and prints a text rendering of every sidebar section (recents, usage, wsl
+# health, supervision, toasts, event counts).
+[[bin]]
+name = "overlay-probe"
+path = "src/bin/overlay_probe.rs"
+required-features = []
+
+# T9 visual demo: a standalone window hosting only the OverlaySidebar (the §3
+# brief's "separate bin" demo entry point - app.rs is T8's file).
+[[bin]]
+name = "overlay-window"
+path = "src/bin/overlay_window.rs"
+required-features = ["gui"]
+
 [features]
 # `gui` pulls in gpui. Default on, but gated so the wire/ contract can be
 # `cargo check`ed / tested in WSL (`--no-default-features`) even when the linux
@@ -40,6 +55,7 @@ gui = ["dep:gpui"]
 
 [dependencies]
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 crossbeam = "0.5"
