@@ -21,6 +21,11 @@ pub mod font;
 /// they unit-test in WSL without linking the graphics backend.
 pub mod render_support;
 
+/// Cockpit chrome (T8): the workspace sidebar, tile grid, per-tile headers. The
+/// state machine + layout math + persistence are gpui-free (tested under
+/// `--no-default-features`); only `chrome::view` is gated behind `gui`.
+pub mod chrome;
+
 /// Sidebar overlays (T9): recents, usage, host metrics, supervision, toasts.
 /// State + reducers are gpui-free (testable under `--no-default-features`);
 /// only `overlays::view` (feature `gui`) touches gpui.

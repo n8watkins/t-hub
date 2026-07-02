@@ -127,7 +127,7 @@ static ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static LOGGER: OnceLock<()> = OnceLock::new();
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PaintMode {
+pub(crate) enum PaintMode {
     /// Rebuild only damaged rows (default). The production path.
     Damage,
     /// Rebuild every row every frame (the spike's brute force) - for A/B measurement.
@@ -135,7 +135,7 @@ enum PaintMode {
 }
 
 impl PaintMode {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         match std::env::var("THN_PAINT").as_deref() {
             Ok("full") => PaintMode::Full,
             _ => PaintMode::Damage,
@@ -190,27 +190,56 @@ struct SearchUi {
 /// fixture tiles, e.g. the font-torture screen), the per-row run cache, the
 /// T6 UX state (detected URLs, find bar), and the T7 font state (spec, gpui
 /// fonts, measured metrics).
-struct Tile {
-    id: String,
-    term: Arc<Mutex<TermSession>>,
+pub(crate) struct Tile {
+    pub(crate) id: String,
+    pub(crate) term: Arc<Mutex<TermSession>>,
     pty: Option<PtyHandle>,
     built: Vec<BuiltRow>,
-    cols: u16,
-    rows: u16,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
     urls: Vec<UrlSpan>,
     search: SearchUi,
     spec: FontSpec,
     font_normal: Font,
     font_bold: Font,
-    metrics: Option<Metrics>,
+    pub(crate) metrics: Option<Metrics>,
     /// When set, a resize re-feeds these bytes into a FRESH TermSession instead
     /// of reflowing (fixture screens must stay pixel-deterministic at any size).
     fixture: Option<Arc<Vec<u8>>>,
 }
 
 impl Tile {
+    /// A tile at provisional geometry with fonts resolved from `spec` (shared
+    /// by the grid's `TileSpec` path and the T8 chrome's attach pool).
+    pub(crate) fn new(
+        id: String,
+        term: Arc<Mutex<TermSession>>,
+        pty: Option<PtyHandle>,
+        cols: u16,
+        rows: u16,
+        spec: FontSpec,
+        fixture: Option<Arc<Vec<u8>>>,
+    ) -> Self {
+        let (font_normal, font_bold) = tile_fonts(&spec);
+        Tile {
+            id,
+            term,
+            pty,
+            built: Vec::new(),
+            cols,
+            rows,
+            urls: Vec::new(),
+            search: SearchUi::default(),
+            spec,
+            font_normal,
+            font_bold,
+            metrics: None,
+            fixture,
+        }
+    }
+
     /// Write to the PTY if this tile has one (offline fixture tiles do not).
-    fn write(&self, bytes: &[u8]) {
+    pub(crate) fn write(&self, bytes: &[u8]) {
         if let Some(pty) = &self.pty {
             pty.write(bytes);
         }
@@ -233,7 +262,7 @@ fn tile_fonts(spec: &FontSpec) -> (Font, Font) {
 /// An in-progress mouse drag: either extending a selection or streaming motion
 /// reports to the app that owns the button.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DragMode {
+pub(crate) enum DragMode {
     Select,
     Report(u8),
 }
@@ -267,10 +296,10 @@ struct GridState {
 /// Font-derived geometry, probed per tile from the real window/text system
 /// (each tile's [`FontSpec`] yields its own cell box).
 #[derive(Clone, Copy)]
-struct Metrics {
-    font_size: f32,
-    line_h: f32,
-    cell_w: f32,
+pub(crate) struct Metrics {
+    pub(crate) font_size: f32,
+    pub(crate) line_h: f32,
+    pub(crate) cell_w: f32,
 }
 
 /// The GPUI view: focus, shared render state, and a kept-alive control client
@@ -296,22 +325,7 @@ impl GridView {
             .into_iter()
             .map(|t| {
                 let spec = t.font.unwrap_or_else(|| default_spec.clone());
-                let (font_normal, font_bold) = tile_fonts(&spec);
-                Tile {
-                    id: t.id,
-                    term: t.term,
-                    pty: t.pty,
-                    built: Vec::new(),
-                    cols: t.cols,
-                    rows: t.rows,
-                    urls: Vec::new(),
-                    search: SearchUi::default(),
-                    spec,
-                    font_normal,
-                    font_bold,
-                    metrics: None,
-                    fixture: t.fixture,
-                }
+                Tile::new(t.id, t.term, t.pty, t.cols, t.rows, spec, t.fixture)
             })
             .collect();
         GridView {
@@ -370,15 +384,20 @@ fn tile_box(i: usize, n: usize, win: Bounds<Pixels>) -> Bounds<Pixels> {
     Bounds::new(point(px(x), px(y)), size(px(tile_w), px(tile_h)))
 }
 
-/// The terminal `cols x rows` that fit inside a tile box, given font metrics.
-fn tile_geometry(tile: Bounds<Pixels>, m: &Metrics) -> (u16, u16) {
-    let tw: f32 = tile.size.width.into();
-    let th: f32 = tile.size.height.into();
-    let inner_w = tw - 2.0 * (TILE_PAD + BORDER);
-    let inner_h = th - HEADER_H - 2.0 * (TILE_PAD + BORDER);
-    let cols = (inner_w / m.cell_w).floor().max(1.0) as u16;
-    let rows = (inner_h / m.line_h).floor().max(1.0) as u16;
-    (cols.min(400), rows.min(200))
+/// The content box of a grid tile: inside the border/padding, below the one-line
+/// debug header. This is what [`sync_and_paint_content`] derives geometry from.
+fn tile_content_box(tbox: Bounds<Pixels>) -> Bounds<Pixels> {
+    let tw: f32 = tbox.size.width.into();
+    let th: f32 = tbox.size.height.into();
+    let x: f32 = tbox.origin.x.into();
+    let y: f32 = tbox.origin.y.into();
+    Bounds::new(
+        point(px(x + BORDER + TILE_PAD), px(y + BORDER + HEADER_H)),
+        size(
+            px((tw - 2.0 * (TILE_PAD + BORDER)).max(1.0)),
+            px((th - HEADER_H - 2.0 * (TILE_PAD + BORDER)).max(1.0)),
+        ),
+    )
 }
 
 /// Resolve a window position to a cell within tile `idx` (grid-relative).
@@ -393,11 +412,11 @@ fn tile_cell(st: &GridState, idx: usize, pos: gpui::Point<Pixels>, m: &Metrics) 
 // Color helpers
 // ---------------------------------------------------------------------------
 
-fn h(rgb: Rgb) -> Hsla {
+pub(crate) fn h(rgb: Rgb) -> Hsla {
     Rgba { r: rgb.r as f32 / 255.0, g: rgb.g as f32 / 255.0, b: rgb.b as f32 / 255.0, a: 1.0 }.into()
 }
 
-fn ha(rgb: Rgb, a: f32) -> Hsla {
+pub(crate) fn ha(rgb: Rgb, a: f32) -> Hsla {
     Rgba { r: rgb.r as f32 / 255.0, g: rgb.g as f32 / 255.0, b: rgb.b as f32 / 255.0, a }.into()
 }
 
@@ -550,125 +569,173 @@ fn paint_grid(
     for i in 0..n {
         let tbox = tile_box(i, n, win);
         rects.push(tbox);
+        let is_focused = i == focused && focused_window;
+        let tile = &mut st.tiles[i];
 
-        // Per-tile font metrics (T7: each tile can carry its own family/size).
-        ensure_metrics(&mut st.tiles[i], window);
-        let m = st.tiles[i].metrics.expect("metrics set");
-        let font_n = st.tiles[i].font_normal.clone();
-        let font_b = st.tiles[i].font_bold.clone();
-        let (want_cols, want_rows) = tile_geometry(tbox, &m);
-
-        // --- geometry: reflow the terminal + PTY to the tile if it changed -----
-        {
-            let tile = &mut st.tiles[i];
-            if (want_cols, want_rows) != (tile.cols, tile.rows) {
-                if let Some(fx) = tile.fixture.clone() {
-                    // Fixture tiles re-feed from scratch: alacritty's reflow
-                    // would scramble the deterministic torture art. Land at the
-                    // top so the screen reads first-section-first.
-                    let mut fresh = TermSession::new(want_cols, want_rows);
-                    fresh.advance(&fx);
-                    fresh.scroll_to_top();
-                    *tile.term.lock() = fresh;
-                } else {
-                    tile.term.lock().resize(want_cols, want_rows);
-                }
-                if let Some(pty) = &tile.pty {
-                    pty.resize(want_cols, want_rows);
-                }
-                tile.cols = want_cols;
-                tile.rows = want_rows;
-                tile.built.clear(); // force a full rebuild at the new size
-            }
-        }
-
-        // --- snapshot + damage-clipped run rebuild -----------------------------
-        // Clone the term Arc so the lock guard borrows the local Arc, not
-        // `st.tiles[i]`; that lets us mutate the tile while reading the terminal.
-        let rows = st.tiles[i].rows as usize;
-        total_this_frame += rows as u64;
-        let term_arc = st.tiles[i].term.clone();
-        let mut term = term_arc.lock();
-        let damage_lines = match term.take_damage() {
-            crate::term::Damage::Full => None,
-            crate::term::Damage::Lines(lines) => Some(lines),
-        };
-        let need_full = mode == PaintMode::Full
-            || st.tiles[i].built.len() != rows
-            || damage_lines.is_none();
-
-        let (cursor, selection, rebuilt) = if need_full {
-            let snap = term.renderable();
-            rebuild_all(&mut st.tiles[i], &snap, &font_n, &font_b, &m);
-            (snap.cursor, snap.selection, rows as u64)
-        } else {
-            // `need_full` already covered the full-damage (None) case.
-            let lines = damage_lines.unwrap_or_default();
-            let partial = term.renderable_rows(&lines);
-            for (r, cells) in &partial.rows {
-                if *r < st.tiles[i].built.len() {
-                    st.tiles[i].built[*r] = build_row(cells, &font_n, &font_b, &m);
-                }
-            }
-            (partial.cursor, partial.selection, lines.len() as u64)
-        };
-        rebuilt_this_frame += rebuilt;
-
-        // --- T6 overlay data, gathered while the terminal lock is held ---------
-        if rebuilt > 0 {
-            // Content changed (or scrolled: scroll_display damages fully), so the
-            // visible URL set may have moved. A pure scan, far cheaper than the
-            // run rebuild that gates it.
-            st.tiles[i].urls = term.visible_urls();
-        }
-        let offset = term.display_offset();
-        let (search_segs, focus_segs, search_bar) = {
-            let ui = &st.tiles[i].search;
-            if ui.open {
-                let segs =
-                    if ui.query.is_empty() { Vec::new() } else { term.visible_search_hits() };
-                let focus = ui
-                    .hit
-                    .map(|hit| {
-                        grid_span_segs(hit.start, hit.end, offset, rows, want_cols as usize)
-                    })
-                    .unwrap_or_default();
-                let bar = if ui.query.is_empty() {
-                    "find: (type to search)   enter=next  shift+enter=prev  esc=close".to_string()
-                } else {
-                    format!("find: {}   {}/{}", ui.query, ui.stats.0, ui.stats.1)
-                };
-                (segs, focus, Some(bar))
-            } else {
-                (Vec::new(), Vec::new(), None)
-            }
-        };
-        drop(term);
-
-        let overlay =
-            TileOverlay { cursor, selection, offset, search_segs, focus_segs, search_bar };
-        let badge = paint_tile(
-            &st.tiles[i],
-            tbox,
-            &m,
-            &overlay,
-            i == focused && focused_window,
+        paint_tile_frame(tbox, is_focused, window);
+        let paint = sync_and_paint_content(
+            tile,
+            tile_content_box(tbox),
+            mode,
+            is_focused,
             window,
             cx,
         );
-        badges.push(badge);
+        rebuilt_this_frame += paint.rebuilt;
+        total_this_frame += paint.total;
+        badges.push(paint.badge);
+
+        // Debug header (id + geometry + font) - NOT the T8 cockpit header.
+        // Painted after the content sync so it shows this frame's geometry; size
+        // is capped so a large tile font cannot overflow the fixed header strip.
+        let m = tile.metrics.expect("metrics set by sync_and_paint_content");
+        let label = format!(
+            "{}  {}x{}  {} {}px",
+            tile.id, tile.cols, tile.rows, tile.spec.family, tile.spec.size
+        );
+        let header_size = m.font_size.min(12.0);
+        paint_text(
+            &label,
+            tbox.origin.x + px(BORDER + TILE_PAD),
+            tbox.origin.y + px(BORDER + 1.0),
+            h(HEADER_FG),
+            header_size,
+            &tile.font_normal,
+            window,
+            cx,
+        );
     }
 
     st.tile_rects = rects;
     st.badge_rects = badges;
     drop(st);
 
-    let dt = t0.elapsed().as_nanos() as u64;
-    SCENE_NS.fetch_add(dt, Ordering::Relaxed);
-    SCENE_NS_MAX.fetch_max(dt, Ordering::Relaxed);
-    ROWS_REBUILT.fetch_add(rebuilt_this_frame, Ordering::Relaxed);
-    ROWS_TOTAL.fetch_add(total_this_frame, Ordering::Relaxed);
+    record_frame(t0.elapsed().as_nanos() as u64, rebuilt_this_frame, total_this_frame);
+}
+
+/// Record one painted frame in the fps/damage counters (grid and chrome paints
+/// both report here; [`spawn_logger`] drains the counters once a second).
+pub(crate) fn record_frame(scene_ns: u64, rebuilt_rows: u64, total_rows: u64) {
+    SCENE_NS.fetch_add(scene_ns, Ordering::Relaxed);
+    SCENE_NS_MAX.fetch_max(scene_ns, Ordering::Relaxed);
+    ROWS_REBUILT.fetch_add(rebuilt_rows, Ordering::Relaxed);
+    ROWS_TOTAL.fetch_add(total_rows, Ordering::Relaxed);
     FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// What one [`sync_and_paint_content`] call did: rows rebuilt vs total (for the
+/// fps logger) and the scrolled-back badge's screen rect (for click hit-testing).
+pub(crate) struct ContentPaint {
+    pub(crate) rebuilt: u64,
+    pub(crate) total: u64,
+    pub(crate) badge: Option<Bounds<Pixels>>,
+}
+
+/// The row-paint seam: sync one tile's terminal to its `content` box (per-tile
+/// font metrics, geometry reflow incl. the fixture path, damage-clipped run
+/// rebuild) and paint its content (bg spans, text segments, sprites, selection,
+/// search highlights, URL underlines, cursor, scrolled-back badge, find bar).
+/// The T5 grid and the T8 chrome both paint tile content EXCLUSIVELY through
+/// this function; its internals are T6/T7 territory.
+pub(crate) fn sync_and_paint_content(
+    tile: &mut Tile,
+    content: Bounds<Pixels>,
+    mode: PaintMode,
+    focused: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> ContentPaint {
+    // Per-tile font metrics (T7: each tile can carry its own family/size).
+    ensure_metrics(tile, window);
+    let m = tile.metrics.expect("metrics set");
+    let font_n = tile.font_normal.clone();
+    let font_b = tile.font_bold.clone();
+
+    // --- geometry: reflow the terminal + PTY to the content box if changed ----
+    let cw: f32 = content.size.width.into();
+    let ch: f32 = content.size.height.into();
+    let want_cols = (((cw / m.cell_w).floor().max(1.0)) as u16).min(400);
+    let want_rows = (((ch / m.line_h).floor().max(1.0)) as u16).min(200);
+    if (want_cols, want_rows) != (tile.cols, tile.rows) {
+        if let Some(fx) = tile.fixture.clone() {
+            // Fixture tiles re-feed from scratch: alacritty's reflow would
+            // scramble the deterministic torture art. Land at the top so the
+            // screen reads first-section-first.
+            let mut fresh = TermSession::new(want_cols, want_rows);
+            fresh.advance(&fx);
+            fresh.scroll_to_top();
+            *tile.term.lock() = fresh;
+        } else {
+            tile.term.lock().resize(want_cols, want_rows);
+        }
+        if let Some(pty) = &tile.pty {
+            pty.resize(want_cols, want_rows);
+        }
+        tile.cols = want_cols;
+        tile.rows = want_rows;
+        tile.built.clear(); // force a full rebuild at the new size
+    }
+
+    // --- snapshot + damage-clipped run rebuild --------------------------------
+    // Clone the term Arc so the lock guard borrows the local Arc, not `tile`;
+    // that lets us mutate the tile while reading the terminal.
+    let rows = tile.rows as usize;
+    let term_arc = tile.term.clone();
+    let mut term = term_arc.lock();
+    let damage_lines = match term.take_damage() {
+        crate::term::Damage::Full => None,
+        crate::term::Damage::Lines(lines) => Some(lines),
+    };
+    let need_full =
+        mode == PaintMode::Full || tile.built.len() != rows || damage_lines.is_none();
+
+    let (cursor, selection, rebuilt) = if need_full {
+        let snap = term.renderable();
+        rebuild_all(tile, &snap, &font_n, &font_b, &m);
+        (snap.cursor, snap.selection, rows as u64)
+    } else {
+        // `need_full` already covered the full-damage (None) case.
+        let lines = damage_lines.unwrap_or_default();
+        let partial = term.renderable_rows(&lines);
+        for (r, cells) in &partial.rows {
+            if *r < tile.built.len() {
+                tile.built[*r] = build_row(cells, &font_n, &font_b, &m);
+            }
+        }
+        (partial.cursor, partial.selection, lines.len() as u64)
+    };
+
+    // --- T6 overlay data, gathered while the terminal lock is held ------------
+    if rebuilt > 0 {
+        // Content changed (or scrolled: scroll_display damages fully), so the
+        // visible URL set may have moved. A pure scan, far cheaper than the
+        // run rebuild that gates it.
+        tile.urls = term.visible_urls();
+    }
+    let offset = term.display_offset();
+    let (search_segs, focus_segs, search_bar) = {
+        let ui = &tile.search;
+        if ui.open {
+            let segs = if ui.query.is_empty() { Vec::new() } else { term.visible_search_hits() };
+            let focus = ui
+                .hit
+                .map(|hit| grid_span_segs(hit.start, hit.end, offset, rows, want_cols as usize))
+                .unwrap_or_default();
+            let bar = if ui.query.is_empty() {
+                "find: (type to search)   enter=next  shift+enter=prev  esc=close".to_string()
+            } else {
+                format!("find: {}   {}/{}", ui.query, ui.stats.0, ui.stats.1)
+            };
+            (segs, focus, Some(bar))
+        } else {
+            (Vec::new(), Vec::new(), None)
+        }
+    };
+    drop(term);
+
+    let overlay = TileOverlay { cursor, selection, offset, search_segs, focus_segs, search_bar };
+    let badge = paint_content(tile, content, &m, &overlay, focused, window, cx);
+    ContentPaint { rebuilt, total: rows as u64, badge }
 }
 
 /// Rebuild every row's run cache from a full snapshot.
@@ -682,20 +749,10 @@ fn rebuild_all(tile: &mut Tile, snap: &Snapshot, font_normal: &Font, font_bold: 
     tile.built.resize(tile.rows as usize, BuiltRow::default());
 }
 
-/// Paint one tile: border, header label, cached rows, T6 overlays (selection,
-/// search highlights, URL underlines, scrolled-back badge, find bar), cursor.
-/// Returns the badge's screen rect (if painted) for click hit-testing.
-#[allow(clippy::too_many_arguments)]
-fn paint_tile(
-    tile: &Tile,
-    tbox: Bounds<Pixels>,
-    m: &Metrics,
-    overlay: &TileOverlay,
-    focused: bool,
-    window: &mut Window,
-    cx: &mut App,
-) -> Option<Bounds<Pixels>> {
-    // Border (a filled rect under a slightly inset background = 1px frame).
+/// Paint one tile's frame: a 1px border (focus-colored) under a slightly inset
+/// terminal-background fill. Shared by the grid and the T8 chrome; everything
+/// inside the frame is painted by [`sync_and_paint_content`] + a header.
+pub(crate) fn paint_tile_frame(tbox: Bounds<Pixels>, focused: bool, window: &mut Window) {
     let border_rgb = if focused { BORDER_FOCUS } else { BORDER_RGB };
     window.paint_quad(fill(tbox, h(border_rgb)));
     let inner = Bounds::new(
@@ -703,20 +760,27 @@ fn paint_tile(
         size(tbox.size.width - px(2.0 * BORDER), tbox.size.height - px(2.0 * BORDER)),
     );
     window.paint_quad(fill(inner, h(DEFAULT_BG)));
+}
 
-    let ox = tbox.origin.x + px(BORDER + TILE_PAD);
-    let header_y = tbox.origin.y + px(BORDER + 1.0);
-
-    // Debug header (id + geometry + font) - NOT the T8 cockpit header. Size is
-    // capped so a large tile font cannot overflow the fixed header strip.
-    let label =
-        format!("{}  {}x{}  {} {}px", tile.id, tile.cols, tile.rows, tile.spec.family, tile.spec.size);
-    let header_size = m.font_size.min(12.0);
-    paint_text(&label, ox, header_y, h(HEADER_FG), header_size, &tile.font_normal, window, cx);
+/// Paint one tile's terminal content into its content box: cached rows, T6
+/// overlays (selection, search highlights, URL underlines, scrolled-back badge,
+/// find bar), cursor. Returns the badge's screen rect (if painted) for click
+/// hit-testing. Only called from [`sync_and_paint_content`].
+#[allow(clippy::too_many_arguments)]
+fn paint_content(
+    tile: &Tile,
+    content: Bounds<Pixels>,
+    m: &Metrics,
+    overlay: &TileOverlay,
+    focused: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Bounds<Pixels>> {
+    let ox = content.origin.x;
 
     // Rows (T7): bg spans as exact grid quads, then positioned segments - text
     // shaped per segment at col * cell_w, sprites as precomputed quads.
-    let grid_top = tbox.origin.y + px(BORDER + HEADER_H);
+    let grid_top = content.origin.y;
     for (i, row) in tile.built.iter().enumerate() {
         let ry = grid_top + px(i as f32 * m.line_h);
         for &(col, ncols, bg) in &row.bgs {
@@ -821,7 +885,7 @@ fn paint_tile(
         let label = format!("^ {} lines", overlay.offset);
         let w = label.chars().count() as f32 * m.cell_w + 10.0;
         let hgt = m.line_h + 4.0;
-        let x = tbox.origin.x + tbox.size.width - px(BORDER + TILE_PAD) - px(w);
+        let x = content.origin.x + content.size.width - px(w);
         let y = grid_top;
         let rect = Bounds::new(point(x, y), size(px(w), px(hgt)));
         window.paint_quad(fill(rect, ha(BORDER_RGB, 0.92)));
@@ -838,14 +902,11 @@ fn paint_tile(
         badge_rect = Some(rect);
     }
 
-    // Find bar (bottom overlay, alacritty-style).
+    // Find bar (bottom overlay, alacritty-style), spanning the content width.
     if let Some(bar) = &overlay.search_bar {
         let bar_h = m.line_h + 6.0;
-        let y = tbox.origin.y + tbox.size.height - px(BORDER + bar_h);
-        let rect = Bounds::new(
-            point(tbox.origin.x + px(BORDER), y),
-            size(tbox.size.width - px(2.0 * BORDER), px(bar_h)),
-        );
+        let y = content.origin.y + content.size.height - px(bar_h);
+        let rect = Bounds::new(point(content.origin.x, y), size(content.size.width, px(bar_h)));
         window.paint_quad(fill(rect, h(SEARCHBAR_BG)));
         window.paint_quad(fill(
             Bounds::new(point(rect.origin.x, y), size(rect.size.width, px(1.0))),
@@ -938,7 +999,7 @@ fn paint_selection(
 // ---------------------------------------------------------------------------
 
 /// Adapt a `gpui::Keystroke` into the gpui-free [`KeyChord`] the encoder consumes.
-fn chord_of(ks: &Keystroke) -> KeyChord {
+pub(crate) fn chord_of(ks: &Keystroke) -> KeyChord {
     KeyChord {
         control: ks.modifiers.control,
         alt: ks.modifiers.alt,
@@ -950,7 +1011,7 @@ fn chord_of(ks: &Keystroke) -> KeyChord {
 }
 
 /// Map a gpui button to the mouse-reporting button code (None = unreported kind).
-fn report_button(button: MouseButton) -> Option<u8> {
+pub(crate) fn report_button(button: MouseButton) -> Option<u8> {
     match button {
         MouseButton::Left => Some(0),
         MouseButton::Middle => Some(1),
@@ -1039,54 +1100,199 @@ fn close_search(tile: &mut Tile) {
     tile.term.lock().clear_search();
 }
 
+// ---------------------------------------------------------------------------
+// Per-tile input core (shared by the T5 grid and the T8 chrome; the views are
+// thin adapters that resolve WHICH tile/cell an event hits, then call these)
+// ---------------------------------------------------------------------------
+
+/// Keyboard input for one tile: the find bar owns the keyboard while open;
+/// otherwise the T6 `key_action` switch (write / scroll / copy / paste / search).
+pub(crate) fn tile_key_input(tile: &mut Tile, chord: &KeyChord, cx: &mut App) {
+    // The find bar owns the keyboard while open on the focused tile.
+    if tile.search.open {
+        match search_key(chord) {
+            SearchKey::Input(text) => {
+                tile.search.query.push_str(&text);
+                search_requery(tile);
+            }
+            SearchKey::Backspace => {
+                tile.search.query.pop();
+                search_requery(tile);
+            }
+            SearchKey::Next => search_step(tile, true),
+            SearchKey::Prev => search_step(tile, false),
+            SearchKey::Close => close_search(tile),
+            SearchKey::Ignore => {}
+        }
+        return;
+    }
+
+    let mode_info = tile.term.lock().mode_info();
+    match key_action(chord, &mode_info) {
+        KeyAction::Write(bytes) => {
+            tile.write(&bytes);
+            let mut term = tile.term.lock();
+            term.scroll_to_bottom();
+            term.clear_selection();
+        }
+        KeyAction::ScrollPageUp => tile.term.lock().scroll_page_up(),
+        KeyAction::ScrollPageDown => tile.term.lock().scroll_page_down(),
+        KeyAction::ScrollTop => tile.term.lock().scroll_to_top(),
+        KeyAction::ScrollBottom => tile.term.lock().scroll_to_bottom(),
+        KeyAction::Copy => {
+            if let Some(text) = tile.term.lock().selection_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+        }
+        KeyAction::Paste => paste_into(tile, cx),
+        KeyAction::OpenSearch => tile.search.open = true,
+        KeyAction::Ignore => {}
+    }
+}
+
+/// Wheel input for one tile after the view resolved the line count: the app
+/// owns the wheel under mouse reporting, alt-screen maps to arrows (mode 1007),
+/// otherwise the viewport scrolls.
+pub(crate) fn tile_wheel_dispatch(
+    tile: &Tile,
+    lines: i32,
+    cell: CellHit,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+) {
+    let mi = tile.term.lock().mode_info();
+    if mi.any_mouse() && !shift {
+        // The app owns the wheel: one report per line, at the pointer cell.
+        if cell.inside {
+            let btn = if lines > 0 { MOUSE_WHEEL_UP } else { MOUSE_WHEEL_DOWN };
+            let mods = (false, alt, ctrl);
+            let bytes = encode_mouse(MouseKind::Press, btn, (cell.col, cell.row), mods, &mi);
+            for _ in 0..lines.unsigned_abs() {
+                tile.write(&bytes);
+            }
+        }
+    } else if mi.alt_screen && mi.alternate_scroll && !shift {
+        // Alt screen without mouse mode: wheel = arrow keys (mode 1007).
+        tile.write(&alt_scroll_bytes(lines, mi.app_cursor));
+    } else {
+        tile.term.lock().scroll(lines);
+    }
+}
+
+/// Button-down on a tile cell: ctrl+click URL open, mouse-reporting
+/// passthrough (shift overrides for selection), selection start/extend, middle
+/// paste. Returns the drag mode the view should track until button-up.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tile_mouse_down_dispatch(
+    tile: &Tile,
+    cell: CellHit,
+    button: MouseButton,
+    click_count: usize,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    cx: &mut App,
+) -> Option<DragMode> {
+    let mi = tile.term.lock().mode_info();
+
+    // Ctrl+click on a URL opens it (never forwarded to the app).
+    if button == MouseButton::Left && ctrl {
+        if let Some(url) = url_at(&tile.urls, cell.row, cell.col) {
+            open_url(&url);
+            return None;
+        }
+    }
+
+    // Mouse-reporting passthrough; Shift overrides for selection.
+    if mi.any_mouse() && !shift && cell.inside {
+        if let Some(btn) = report_button(button) {
+            let mods = (false, alt, ctrl);
+            tile.write(&encode_mouse(MouseKind::Press, btn, (cell.col, cell.row), mods, &mi));
+            return Some(DragMode::Report(btn));
+        }
+        return None;
+    }
+
+    match button {
+        MouseButton::Left => {
+            let mut term = tile.term.lock();
+            if shift && term.has_selection() {
+                // Shift+click extends the existing selection.
+                term.update_selection(cell.row, cell.col, cell.right_side);
+            } else {
+                let kind = match (click_count.max(1) - 1) % 3 {
+                    0 if ctrl => SelKind::Block,
+                    0 => SelKind::Simple,
+                    1 => SelKind::Semantic,
+                    _ => SelKind::Lines,
+                };
+                term.start_selection(kind, cell.row, cell.col, cell.right_side);
+            }
+            Some(DragMode::Select)
+        }
+        MouseButton::Middle => {
+            paste_into(tile, cx);
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Drag motion for one tile: extend the selection or stream motion reports.
+pub(crate) fn tile_drag_motion(tile: &Tile, mode: DragMode, cell: CellHit, alt: bool, ctrl: bool) {
+    match mode {
+        DragMode::Select => {
+            tile.term.lock().update_selection(cell.row, cell.col, cell.right_side);
+        }
+        DragMode::Report(btn) => {
+            let mi = tile.term.lock().mode_info();
+            if (mi.mouse_drag || mi.mouse_motion) && cell.inside {
+                let mods = (false, alt, ctrl);
+                tile.write(&encode_mouse(MouseKind::Motion, btn, (cell.col, cell.row), mods, &mi));
+            }
+        }
+    }
+}
+
+/// Button-up ending a report drag: send the release report.
+pub(crate) fn tile_report_release(tile: &Tile, btn: u8, cell: CellHit, alt: bool, ctrl: bool) {
+    let mi = tile.term.lock().mode_info();
+    if mi.any_mouse() {
+        let mods = (false, alt, ctrl);
+        tile.write(&encode_mouse(MouseKind::Release, btn, (cell.col, cell.row), mods, &mi));
+    }
+}
+
+/// Buttonless hover motion over a tile cell (mode 1003).
+pub(crate) fn tile_hover_motion(tile: &Tile, cell: CellHit, alt: bool, ctrl: bool) {
+    let mi = tile.term.lock().mode_info();
+    if mi.mouse_motion {
+        let mods = (false, alt, ctrl);
+        tile.write(&encode_mouse(
+            MouseKind::Motion,
+            MOUSE_NO_BUTTON,
+            (cell.col, cell.row),
+            mods,
+            &mi,
+        ));
+    }
+}
+
+/// Tell a terminal that tracks focus (mode 1004) it gained/lost focus.
+pub(crate) fn notify_focus(tile: &Tile, gained: bool) {
+    if tile.term.lock().mode_info().focus_in_out {
+        tile.write(if gained { b"\x1b[I" } else { b"\x1b[O" });
+    }
+}
+
 impl GridView {
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let chord = chord_of(&ev.keystroke);
         let mut st = self.state.lock();
         let focused = st.focused;
         let Some(tile) = st.tiles.get_mut(focused) else { return };
-
-        // The find bar owns the keyboard while open on the focused tile.
-        if tile.search.open {
-            match search_key(&chord) {
-                SearchKey::Input(text) => {
-                    tile.search.query.push_str(&text);
-                    search_requery(tile);
-                }
-                SearchKey::Backspace => {
-                    tile.search.query.pop();
-                    search_requery(tile);
-                }
-                SearchKey::Next => search_step(tile, true),
-                SearchKey::Prev => search_step(tile, false),
-                SearchKey::Close => close_search(tile),
-                SearchKey::Ignore => {}
-            }
-            cx.notify();
-            return;
-        }
-
-        let mode_info = tile.term.lock().mode_info();
-        match key_action(&chord, &mode_info) {
-            KeyAction::Write(bytes) => {
-                tile.write(&bytes);
-                let mut term = tile.term.lock();
-                term.scroll_to_bottom();
-                term.clear_selection();
-            }
-            KeyAction::ScrollPageUp => tile.term.lock().scroll_page_up(),
-            KeyAction::ScrollPageDown => tile.term.lock().scroll_page_down(),
-            KeyAction::ScrollTop => tile.term.lock().scroll_to_top(),
-            KeyAction::ScrollBottom => tile.term.lock().scroll_to_bottom(),
-            KeyAction::Copy => {
-                if let Some(text) = tile.term.lock().selection_text() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
-            }
-            KeyAction::Paste => paste_into(tile, cx),
-            KeyAction::OpenSearch => tile.search.open = true,
-            KeyAction::Ignore => {}
-        }
+        tile_key_input(tile, &chord, cx);
         cx.notify();
     }
 
@@ -1113,24 +1319,14 @@ impl GridView {
         st.wheel_accum -= lines as f32;
 
         let cell = tile_cell(&st, idx, ev.position, &m);
-        let tile = &st.tiles[idx];
-        let mi = tile.term.lock().mode_info();
-        if mi.any_mouse() && !ev.modifiers.shift {
-            // The app owns the wheel: one report per line, at the pointer cell.
-            if cell.inside {
-                let btn = if lines > 0 { MOUSE_WHEEL_UP } else { MOUSE_WHEEL_DOWN };
-                let mods = (false, ev.modifiers.alt, ev.modifiers.control);
-                let bytes = encode_mouse(MouseKind::Press, btn, (cell.col, cell.row), mods, &mi);
-                for _ in 0..lines.unsigned_abs() {
-                    tile.write(&bytes);
-                }
-            }
-        } else if mi.alt_screen && mi.alternate_scroll && !ev.modifiers.shift {
-            // Alt screen without mouse mode: wheel = arrow keys (mode 1007).
-            tile.write(&alt_scroll_bytes(lines, mi.app_cursor));
-        } else {
-            tile.term.lock().scroll(lines);
-        }
+        tile_wheel_dispatch(
+            &st.tiles[idx],
+            lines,
+            cell,
+            ev.modifiers.shift,
+            ev.modifiers.alt,
+            ev.modifiers.control,
+        );
         cx.notify();
     }
 
@@ -1150,14 +1346,9 @@ impl GridView {
         let old = st.focused;
         if old != idx {
             if let Some(t) = st.tiles.get(old) {
-                if t.term.lock().mode_info().focus_in_out {
-                    t.write(b"\x1b[O");
-                }
+                notify_focus(t, false);
             }
-            let t = &st.tiles[idx];
-            if t.term.lock().mode_info().focus_in_out {
-                t.write(b"\x1b[I");
-            }
+            notify_focus(&st.tiles[idx], true);
             st.focused = idx;
         }
 
@@ -1175,55 +1366,17 @@ impl GridView {
             }
 
             let cell = tile_cell(&st, idx, ev.position, &m);
-            let tile = &st.tiles[idx];
-            let mi = tile.term.lock().mode_info();
-
-            // Ctrl+click on a URL opens it (never forwarded to the app).
-            if button == MouseButton::Left && ev.modifiers.control {
-                if let Some(url) = url_at(&tile.urls, cell.row, cell.col) {
-                    open_url(&url);
-                    break 'actions;
-                }
-            }
-
-            // Mouse-reporting passthrough; Shift overrides for selection.
-            if mi.any_mouse() && !ev.modifiers.shift && cell.inside {
-                if let Some(btn) = report_button(button) {
-                    let mods = (false, ev.modifiers.alt, ev.modifiers.control);
-                    tile.write(&encode_mouse(
-                        MouseKind::Press,
-                        btn,
-                        (cell.col, cell.row),
-                        mods,
-                        &mi,
-                    ));
-                    st.drag =
-                        Some(Drag { tile: idx, mode: DragMode::Report(btn), last_cell: (cell.col, cell.row) });
-                }
-                break 'actions;
-            }
-
-            match button {
-                MouseButton::Left => {
-                    let mut term = tile.term.lock();
-                    if ev.modifiers.shift && term.has_selection() {
-                        // Shift+click extends the existing selection.
-                        term.update_selection(cell.row, cell.col, cell.right_side);
-                    } else {
-                        let kind = match (ev.click_count.max(1) - 1) % 3 {
-                            0 if ev.modifiers.control => SelKind::Block,
-                            0 => SelKind::Simple,
-                            1 => SelKind::Semantic,
-                            _ => SelKind::Lines,
-                        };
-                        term.start_selection(kind, cell.row, cell.col, cell.right_side);
-                    }
-                    drop(term);
-                    st.drag =
-                        Some(Drag { tile: idx, mode: DragMode::Select, last_cell: (cell.col, cell.row) });
-                }
-                MouseButton::Middle => paste_into(tile, cx),
-                _ => {}
+            if let Some(mode) = tile_mouse_down_dispatch(
+                &st.tiles[idx],
+                cell,
+                button,
+                ev.click_count,
+                ev.modifiers.shift,
+                ev.modifiers.alt,
+                ev.modifiers.control,
+                cx,
+            ) {
+                st.drag = Some(Drag { tile: idx, mode, last_cell: (cell.col, cell.row) });
             }
         }
 
@@ -1253,18 +1406,13 @@ impl GridView {
             if drag.tile < st.tiles.len() {
                 if let Some(m) = st.tiles[drag.tile].metrics {
                     let cell = tile_cell(&st, drag.tile, ev.position, &m);
-                    let tile = &st.tiles[drag.tile];
-                    let mi = tile.term.lock().mode_info();
-                    if mi.any_mouse() {
-                        let mods = (false, ev.modifiers.alt, ev.modifiers.control);
-                        tile.write(&encode_mouse(
-                            MouseKind::Release,
-                            btn,
-                            (cell.col, cell.row),
-                            mods,
-                            &mi,
-                        ));
-                    }
+                    tile_report_release(
+                        &st.tiles[drag.tile],
+                        btn,
+                        cell,
+                        ev.modifiers.alt,
+                        ev.modifiers.control,
+                    );
                 }
             }
         }
@@ -1286,29 +1434,15 @@ impl GridView {
             if (cell.col, cell.row) == drag.last_cell {
                 return;
             }
-            match drag.mode {
-                DragMode::Select => {
-                    st.tiles[drag.tile].term.lock().update_selection(
-                        cell.row,
-                        cell.col,
-                        cell.right_side,
-                    );
-                    cx.notify();
-                }
-                DragMode::Report(btn) => {
-                    let tile = &st.tiles[drag.tile];
-                    let mi = tile.term.lock().mode_info();
-                    if (mi.mouse_drag || mi.mouse_motion) && cell.inside {
-                        let mods = (false, ev.modifiers.alt, ev.modifiers.control);
-                        tile.write(&encode_mouse(
-                            MouseKind::Motion,
-                            btn,
-                            (cell.col, cell.row),
-                            mods,
-                            &mi,
-                        ));
-                    }
-                }
+            tile_drag_motion(
+                &st.tiles[drag.tile],
+                drag.mode,
+                cell,
+                ev.modifiers.alt,
+                ev.modifiers.control,
+            );
+            if drag.mode == DragMode::Select {
+                cx.notify();
             }
             if let Some(d) = st.drag.as_mut() {
                 d.last_cell = (cell.col, cell.row);
@@ -1334,18 +1468,7 @@ impl GridView {
             return;
         }
         st.hover_cell = Some((idx, cell.col, cell.row));
-        let tile = &st.tiles[idx];
-        let mi = tile.term.lock().mode_info();
-        if mi.mouse_motion {
-            let mods = (false, ev.modifiers.alt, ev.modifiers.control);
-            tile.write(&encode_mouse(
-                MouseKind::Motion,
-                MOUSE_NO_BUTTON,
-                (cell.col, cell.row),
-                mods,
-                &mi,
-            ));
-        }
+        tile_hover_motion(&st.tiles[idx], cell, ev.modifiers.alt, ev.modifiers.control);
     }
 }
 
@@ -1428,7 +1551,7 @@ fn log_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
 }
 
-fn spawn_logger() {
+pub(crate) fn spawn_logger() {
     if LOGGER.set(()).is_err() {
         return; // already running
     }

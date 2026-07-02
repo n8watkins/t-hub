@@ -72,6 +72,12 @@ impl SessionIndex {
         self.tmux_by_id.get(session_id).map(|s| s.as_str())
     }
 
+    /// Every known (session UUID, `th_*` tmux session) pair. The T8 chrome uses
+    /// this to resolve per-tile semantic status for its header dots.
+    pub fn tmux_aliases(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.tmux_by_id.iter().map(|(id, tmux)| (id.as_str(), tmux.as_str()))
+    }
+
     /// Normalized cwds of sessions whose tmux session is currently alive - the
     /// recents open-project filter. (The webview filters on open TILES; without
     /// a workspace model, live tmux is the closest server-derived signal - and
