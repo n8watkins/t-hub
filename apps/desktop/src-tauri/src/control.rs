@@ -133,6 +133,20 @@ pub trait ApplySink: Send + Sync {
     fn apply(&self, command: &str, args: &Value) -> Result<(), String>;
 }
 
+/// The event channel accepted Organization forwards are ALSO broadcast on (T12:
+/// MCP organization continuity for socket clients). The native cockpit is a
+/// socket client, not a Tauri webview, so it can never receive the
+/// `control://apply` Tauri event the [`ApplySink`] emits; instead every accepted
+/// forward is additionally emitted to event subscribers as
+/// `{"event":"control://apply","payload":{"command":..,"args":..}}`, and the
+/// native `apply/` module dispatches it into its workspace model exactly the way
+/// `controlBridge.ts` dispatches the Tauri event into the webview store.
+/// Additive and webview-safe: the ApplySink path is unchanged, a fanout with no
+/// subscribers is a no-op, and the app's own `control://event` forwarder re-emits
+/// this channel under an envelope nothing in the webview routes into applyControl
+/// (verified: `controlBridge.ts` listens only to the raw Tauri event).
+pub const APPLY_EVENT_CHANNEL: &str = "control://apply";
+
 /// The command name a client sends to switch a control connection into an
 /// **event-subscription stream** (server-split M1). Instead of one response, the
 /// connection stays open and the server streams `{"event":<channel>,"payload":
@@ -229,23 +243,29 @@ impl EventFanout {
     /// (a disconnected client). Best-effort: a transport failure to one subscriber
     /// never affects another or the emitting (journal-consumption) path. Holding the
     /// lock across the writes serializes emits so frames never interleave on a socket.
-    pub fn emit_event(&self, channel: &str, payload: &Value) {
+    ///
+    /// Returns how many subscribers the frame was delivered to (T12: the apply
+    /// broadcast reports delivery when no [`ApplySink`] is wired). Existing
+    /// callers ignore it.
+    pub fn emit_event(&self, channel: &str, payload: &Value) -> usize {
         let mut frame = match serde_json::to_vec(&json!({ "event": channel, "payload": payload })) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("t-hub-control: failed to serialize event {channel}: {e}");
-                return;
+                return 0;
             }
         };
         frame.push(b'\n');
-        if let Ok(mut subs) = self.subs.lock() {
-            subs.retain_mut(|s| {
-                s.writer
-                    .write_all(&frame)
-                    .and_then(|()| s.writer.flush())
-                    .is_ok()
-            });
-        }
+        let Ok(mut subs) = self.subs.lock() else {
+            return 0;
+        };
+        subs.retain_mut(|s| {
+            s.writer
+                .write_all(&frame)
+                .and_then(|()| s.writer.flush())
+                .is_ok()
+        });
+        subs.len()
     }
 
     /// Number of live subscribers (diagnostics / tests).
@@ -1101,6 +1121,11 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "list_dir" => list_dir(ctx, args),
         "read_text_file" => read_text_file(ctx, args),
         "list_tabs" => list_tabs(ctx),
+        // T12: the socket twin of the `report_workspace_tabs` Tauri command - a
+        // socket UI (the native cockpit) reports its tab layout into the same
+        // registry the webview reports into, so `list_tabs` stays truthful
+        // whichever client is attached.
+        "report_workspace_tabs" => report_workspace_tabs(ctx, args),
         "read_terminal" | "capture_pane" => read_terminal(args),
 
         // ---- Organization tier (PRD §11.2: allowed, audited) ---------------
@@ -1599,6 +1624,25 @@ fn list_tabs(ctx: &ControlContext) -> Result<Value, String> {
     Ok(json!({ "tabs": tabs, "count": tabs.len() }))
 }
 
+/// `report_workspace_tabs` (T12): a UI client replaces the CORE tab registry
+/// with its full live tab layout - the control-socket twin of the Tauri command
+/// of the same name (the native cockpit is a socket client and cannot call
+/// Tauri). Same consistency model as the webview's report: the reporting client
+/// is the source of truth, the registry is replaced wholesale (last writer
+/// wins), and MCP-driven mutations keep updating it optimistically in between.
+/// Args: `tabs`: `[{id, name, tileIds}]`.
+fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let tabs: Vec<TabRecord> = serde_json::from_value(
+        args.get("tabs")
+            .cloned()
+            .ok_or("report_workspace_tabs requires a 'tabs' array")?,
+    )
+    .map_err(|e| format!("report_workspace_tabs: bad 'tabs' shape: {e}"))?;
+    let count = tabs.len();
+    ctx.tabs.replace(tabs);
+    Ok(json!({ "reported": count }))
+}
+
 /// `read_terminal` / `capture_pane`: return a session's recent visible output as
 /// plain text so an external Claude can SEE what the session shows. Talks to tmux
 /// directly (`tmux -L t-hub capture-pane -p [-S -N] -t th_<id>`), no UI round
@@ -1706,7 +1750,7 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     // Forward the UI orchestration (open/reuse the named tab + spawn a terminal in
     // the worktree dir). The git worktree already exists, so `alreadyCreated: true`
     // tells the store not to run `gitWorktreeAdd` again.
-    let forward = json!({
+    let mut forward = json!({
         "worktreePath": worktree_path,
         "repoRoot": repo_root,
         "branch": branch,
@@ -1715,14 +1759,31 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         "alreadyCreated": true,
     });
     let applied = match &ctx.apply_sink {
-        Some(sink) => match sink.apply("add_worktree_workspace", &forward) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("t-hub-control: failed to forward 'add_worktree_workspace' to the UI: {e}");
+        // The webview spawns the worktree terminal client-side; forward_apply
+        // also broadcasts to event subscribers, so a native cockpit attached to
+        // this same server opens the named tab and places the tile when it
+        // appears (cwd match).
+        Some(_) => forward_apply(ctx, "add_worktree_workspace", &forward),
+        None => {
+            // T12 (native path): no webview means nobody runs the client-side
+            // spawn. When event subscribers exist (a native cockpit), spawn the
+            // worktree terminal HERE - the server owns tmux either way (the
+            // webview's spawnTerminal IPC lands in this same process) - and
+            // carry the minted id so the client places the tile in the named
+            // tab. With no subscribers, keep the headless behavior: worktree
+            // created on disk, nothing forwarded.
+            if ctx.fanout.subscriber_count() > 0 {
+                match spawn_tmux_terminal(&worktree_path, None) {
+                    Ok((id, _)) => forward["terminalId"] = json!(id),
+                    Err(e) => eprintln!(
+                        "t-hub-control: create_worktree: worktree terminal spawn failed: {e}"
+                    ),
+                }
+                broadcast_apply(ctx, "add_worktree_workspace", &forward) > 0
+            } else {
                 false
             }
-        },
-        None => false,
+        }
     };
     Ok(json!({
         "accepted": "create_worktree",
@@ -1798,6 +1859,13 @@ fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
             sink.apply("remove_worktree_workspace", &forward).map_err(|e| {
                 format!("remove_worktree: failed to forward removal to the UI: {e}")
             })?;
+            // T12: a native cockpit attached to this same server detaches its
+            // own tiles rooted in the worktree in parallel; the detach->git
+            // ordering and the git removal itself stay webview-owned. (With no
+            // sink there is still no removal path - the refusal below - because
+            // a socket client cannot run the git side; documented T12 deviation,
+            // revisited at the T14 cutover.)
+            let _ = broadcast_apply(ctx, "remove_worktree_workspace", &forward);
             Ok(json!({
                 "accepted": "remove_worktree",
                 "worktreePath": worktree_path,
@@ -1835,21 +1903,38 @@ fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
 /// the workspace store. `applied` reflects whether the forward happened — `true`
 /// once the app has wired its sink (the normal app path), `false` in the headless
 /// proof/tests that run the listener without an `AppHandle` (still audited).
+/// Broadcast one accepted forward to event subscribers on
+/// [`APPLY_EVENT_CHANNEL`] (T12: the native client's delivery path). Returns how
+/// many subscribers received it. Zero subscribers is a cheap no-op, so this runs
+/// unconditionally next to every [`ApplySink`] forward.
+fn broadcast_apply(ctx: &ControlContext, command: &str, args: &Value) -> usize {
+    ctx.fanout
+        .emit_event(APPLY_EVENT_CHANNEL, &json!({ "command": command, "args": args }))
+}
+
 /// Forward one command + args to the frontend through the [`ApplySink`], returning
 /// whether the forward was delivered. A forward failure is non-fatal (logged), and
 /// no sink (headless proof/tests) is simply `false`. Shared by every
 /// Organization-tier handler that mutates the UI.
+///
+/// T12: the forward is ALSO broadcast to event subscribers (the native client's
+/// path). With a sink wired (the Tauri app), `applied` keeps meaning exactly what
+/// it always did — the sink delivered — so the webview path is unchanged; with no
+/// sink (a headless server fronting the native cockpit), reaching at least one
+/// event subscriber counts as delivery.
 fn forward_apply(ctx: &ControlContext, command: &str, args: &Value) -> bool {
-    match &ctx.apply_sink {
+    let sink_applied = match &ctx.apply_sink {
         Some(sink) => match sink.apply(command, args) {
-            Ok(()) => true,
+            Ok(()) => Some(true),
             Err(e) => {
                 eprintln!("t-hub-control: failed to forward '{command}' to the UI: {e}");
-                false
+                Some(false)
             }
         },
-        None => false,
-    }
+        None => None,
+    };
+    let subscribers = broadcast_apply(ctx, command, args);
+    sink_applied.unwrap_or(subscribers > 0)
 }
 
 fn organization_apply(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, String> {
@@ -1943,6 +2028,9 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         Some(sink) => {
             sink.apply("spawn_terminal", &forward)
                 .map_err(|e| format!("spawn_terminal: failed to forward the spawn to the UI: {e}"))?;
+            // T12: subscribers also hear the forward (no id - the webview mints
+            // it); a native cockpit adopts the new session via its reconcile.
+            let _ = broadcast_apply(ctx, "spawn_terminal", &forward);
             Ok(json!({
                 "accepted": "spawn_terminal",
                 "cwd": cwd,
@@ -1958,14 +2046,60 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
                          synchronously over this channel.",
             }))
         }
-        // No UI to adopt the tile ⇒ refuse rather than spawn an untracked session.
-        None => Err(
-            "spawn_terminal: no UI is connected to adopt the new terminal tile; \
-             refusing to spawn an untracked session (the app must be running to \
-             spawn a terminal)"
-                .to_string(),
-        ),
+        None => {
+            // T12 (native path): a socket UI can't run the webview's spawnTerminal
+            // IPC, but the server owns tmux either way - that IPC lands in this
+            // same process. So with event subscribers present, spawn the session
+            // HERE (same id minting as `commands::spawn_terminal`) and broadcast
+            // the forward carrying the minted id; the native apply module places
+            // and attaches the tile. With no subscribers, keep refusing: nothing
+            // would adopt the session.
+            if ctx.fanout.subscriber_count() == 0 {
+                return Err(
+                    "spawn_terminal: no UI is connected to adopt the new terminal tile; \
+                     refusing to spawn an untracked session (the app must be running to \
+                     spawn a terminal)"
+                        .to_string(),
+                );
+            }
+            // Mirror `commands::resolve_cwd`'s unix arm ($HOME fallback); a
+            // `shell` preset is the pane's program verbatim (`resolve_pane_command`).
+            let cwd_effective = cwd
+                .clone()
+                .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
+            let (id, tmux_session) = spawn_tmux_terminal(&cwd_effective, shell.as_deref())?;
+            let forward = json!({ "cwd": cwd, "name": name, "shell": shell, "id": id });
+            let applied = broadcast_apply(ctx, "spawn_terminal", &forward) > 0;
+            Ok(json!({
+                "accepted": "spawn_terminal",
+                "id": id,
+                "tmuxSession": tmux_session,
+                "cwd": cwd,
+                "name": name,
+                "shell": shell,
+                "audited": true,
+                "applied": applied,
+                "requested": true,
+                "note": "no webview is attached; the server spawned the tmux session \
+                         directly and broadcast the placement to socket UI \
+                         subscribers (the native cockpit adopts it).",
+            }))
+        }
     }
+}
+
+/// Mint a terminal id + create its detached tmux session. The id IS the tmux
+/// session's own suffix, exactly like `commands::spawn_terminal` (bug #16 there:
+/// id and session name must never disagree). Shared by the T12 native-path arms
+/// of `spawn_terminal` / `create_worktree`, where no webview exists to run the
+/// spawn client-side.
+fn spawn_tmux_terminal(cwd: &str, command: Option<&str>) -> Result<(String, String), String> {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let id = suffix[..8].to_string();
+    let tmux_session = format!("th_{id}");
+    tmux::new_session(&tmux_session, cwd, command)
+        .map_err(|e| format!("failed to create tmux session: {e}"))?;
+    Ok((id, tmux_session))
 }
 
 /// `send_text`: type literal `text` into an existing session, optionally pressing
@@ -3014,6 +3148,137 @@ mod tests {
         let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
         assert_eq!(names, ["focus_session", "move_tile", "rename_tab"]);
         assert_eq!(calls[0].1, json!({"tabId": "tab-1"}));
+    }
+
+    /// Register a real loopback socket as an event subscriber on `fanout`,
+    /// returning a line reader over the client end (T12 broadcast tests).
+    fn subscribe_test_reader(fanout: &EventFanout) -> impl std::io::BufRead {
+        use std::io::BufReader;
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).expect("connect");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let (server_side, _) = listener.accept().expect("accept");
+        fanout.register(server_side);
+        BufReader::new(client)
+    }
+
+    /// Read one `{"event":..,"payload":..}` frame from a subscriber reader.
+    fn read_event_frame(reader: &mut impl std::io::BufRead) -> Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read event frame");
+        serde_json::from_str(line.trim()).expect("event frame is JSON")
+    }
+
+    #[test]
+    fn apply_forwards_are_broadcast_to_event_subscribers() {
+        // T12: every accepted Organization forward ALSO reaches event
+        // subscribers on `control://apply`, while the webview sink keeps
+        // receiving exactly what it always did.
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let fanout = Arc::new(EventFanout::new());
+        let ctx = test_ctx("t")
+            .with_apply_sink(sink.clone())
+            .with_event_fanout(fanout.clone());
+        let mut reader = subscribe_test_reader(&fanout);
+
+        // A plain organization apply: broadcast mirrors the sink call.
+        let v = dispatch(&ctx, "focus_tab", &json!({"tabId": "tab-1"})).unwrap();
+        assert_eq!(v["applied"], true);
+        let frame = read_event_frame(&mut reader);
+        assert_eq!(frame["event"], APPLY_EVENT_CHANNEL);
+        assert_eq!(frame["payload"]["command"], "focus_tab");
+        assert_eq!(frame["payload"]["args"], json!({"tabId": "tab-1"}));
+
+        // new_tab: the broadcast carries the SAME core-minted id the caller got.
+        let v = dispatch(&ctx, "new_tab", &json!({"name": "Logs"})).unwrap();
+        let frame = read_event_frame(&mut reader);
+        assert_eq!(frame["payload"]["command"], "new_tab");
+        assert_eq!(frame["payload"]["args"]["id"], v["tabId"]);
+        assert_eq!(frame["payload"]["args"]["name"], "Logs");
+
+        // spawn_terminal (sink path): forwarded to the webview AND broadcast
+        // (without an id - the webview mints it).
+        let v = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "name": "n"})).unwrap();
+        assert_eq!(v["accepted"], "spawn_terminal");
+        let frame = read_event_frame(&mut reader);
+        assert_eq!(frame["payload"]["command"], "spawn_terminal");
+        assert_eq!(frame["payload"]["args"]["cwd"], "/tmp");
+        assert!(frame["payload"]["args"].get("id").is_none());
+
+        // remove_worktree (sink path): subscribers hear the detach forward too.
+        let v = dispatch(
+            &ctx,
+            "remove_worktree",
+            &json!({"repoRoot": "/r", "worktreePath": "/r/wt"}),
+        )
+        .unwrap();
+        assert_eq!(v["accepted"], "remove_worktree");
+        let frame = read_event_frame(&mut reader);
+        assert_eq!(frame["payload"]["command"], "remove_worktree_workspace");
+        assert_eq!(frame["payload"]["args"]["worktreePath"], "/r/wt");
+
+        // The sink saw every forward, unchanged by the broadcast riding along.
+        let names: Vec<String> = sink.calls.lock().unwrap().iter().map(|(c, _)| c.clone()).collect();
+        assert_eq!(
+            names,
+            ["focus_tab", "new_tab", "spawn_terminal", "remove_worktree_workspace"]
+        );
+    }
+
+    #[test]
+    fn forward_without_sink_counts_event_subscribers_as_delivery() {
+        // T12: a headless server fronting the native cockpit has no ApplySink;
+        // reaching an event subscriber is what "applied" means there.
+        let fanout = Arc::new(EventFanout::new());
+        let ctx = test_ctx("t").with_event_fanout(fanout.clone());
+        let mut reader = subscribe_test_reader(&fanout);
+
+        let v = dispatch(&ctx, "rename_tab", &json!({"tabId": "x", "name": "ops"})).unwrap();
+        assert_eq!(v["applied"], true, "subscriber delivery counts without a sink");
+        let frame = read_event_frame(&mut reader);
+        assert_eq!(frame["payload"]["command"], "rename_tab");
+        // (Sink-less AND subscriber-less stays applied:false - covered by
+        // `organization_actions_are_accepted_and_audited`.)
+    }
+
+    #[test]
+    fn report_workspace_tabs_replaces_the_registry_for_list_tabs() {
+        // T12: the socket twin of the Tauri report command - the native client's
+        // half of the registry mirror.
+        let ctx = test_ctx("t");
+        let v = dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({"tabs": [
+                {"id": "t1", "name": "Workspace 1", "tileIds": ["aa", "bb"]},
+                {"id": "t2", "name": "ops", "tileIds": []},
+            ]}),
+        )
+        .unwrap();
+        assert_eq!(v["reported"], 2);
+
+        let tabs = dispatch(&ctx, "list_tabs", &json!({})).unwrap();
+        assert_eq!(tabs["count"], 2);
+        assert_eq!(tabs["tabs"][0]["id"], "t1");
+        assert_eq!(tabs["tabs"][0]["tileIds"], json!(["aa", "bb"]));
+        assert_eq!(tabs["tabs"][1]["name"], "ops");
+
+        // A later report REPLACES wholesale (last writer wins, webview parity).
+        dispatch(&ctx, "report_workspace_tabs", &json!({"tabs": []})).unwrap();
+        assert_eq!(dispatch(&ctx, "list_tabs", &json!({})).unwrap()["count"], 0);
+
+        // Malformed shapes are a clear error, not a partial replace.
+        let err = dispatch(&ctx, "report_workspace_tabs", &json!({})).unwrap_err();
+        assert!(err.contains("requires a 'tabs'"), "got: {err}");
+        let err =
+            dispatch(&ctx, "report_workspace_tabs", &json!({"tabs": [{"name": 7}]})).unwrap_err();
+        assert!(err.contains("bad 'tabs' shape"), "got: {err}");
     }
 
     #[test]
