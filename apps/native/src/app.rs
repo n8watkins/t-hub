@@ -331,7 +331,15 @@ fn run_grid() {
                 }
             }
         });
-        specs.push(TileSpec { id, term, pty: handle, cols: PROVISIONAL_COLS, rows: PROVISIONAL_ROWS });
+        specs.push(TileSpec {
+            id,
+            term,
+            pty: Some(handle),
+            cols: PROVISIONAL_COLS,
+            rows: PROVISIONAL_ROWS,
+            font: None,
+            fixture: None,
+        });
     }
 
     if specs.is_empty() {
@@ -339,7 +347,6 @@ fn run_grid() {
         std::process::exit(1);
     }
 
-    let (font_normal, font_bold) = fonts();
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);
         cx.open_window(
@@ -353,9 +360,8 @@ fn run_grid() {
             },
             |window, cx| {
                 let focus = cx.focus_handle();
-                let view = cx.new(|_| {
-                    GridView::new(specs, client, font_normal, font_bold, focus.clone())
-                });
+                let view =
+                    cx.new(|_| GridView::new(specs, Some(client), focus.clone()));
                 window.focus(&focus);
                 view
             },

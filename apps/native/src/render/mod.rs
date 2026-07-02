@@ -46,6 +46,23 @@
 //!   to cycle with wraparound, match ordinal/total readout.
 //! - **URLs:** grid-scanned links (D5 client plane), always subtly underlined;
 //!   Ctrl+click opens in the system browser.
+//!
+//! ## Font subsystem (T7)
+//! - **Segmented painting.** Rows are no longer one shaped line: [`crate::font::
+//!   segment_cells`] splits each row into independently positioned segments so
+//!   every cell paints at exactly `col * cell_w` (rationale in `font/`'s module
+//!   doc - fallback glyph advances must never push neighbors off the grid).
+//! - **Procedural sprites.** Box-drawing / block / Powerline cells paint as
+//!   quads from [`crate::font::sprites`], never through a font (§1.5 frozen).
+//! - **Cell backgrounds as quads.** SGR backgrounds are painted as explicit
+//!   grid-column quads (merged spans), not via `TextRun.background_color`, so
+//!   bg coverage is exact even under fallback glyphs with off-grid advances.
+//! - **Per-tile fonts.** Each tile carries a [`crate::font::FontSpec`] (family,
+//!   size, ligatures) resolved to its own gpui fonts + measured [`Metrics`];
+//!   `THN_FONT` overrides the default. Emoji/symbol fallback families are
+//!   attached to every tile font.
+//! - **Wide cells.** The cursor covers the full width of a wide char; column
+//!   accounting matches the T6 math (both derive from alacritty's flags).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -55,12 +72,13 @@ use std::time::{Duration, Instant};
 use gpui::prelude::*;
 use gpui::{
     canvas, div, fill, point, px, size, App, Bounds, ClipboardItem, Context, FocusHandle,
-    Focusable, Font, Hsla, IntoElement, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Render, Rgba, ScrollDelta, ScrollWheelEvent,
-    SharedString, TextRun, Window,
+    Focusable, Font, FontFallbacks, FontFeatures, FontWeight, Hsla, IntoElement, KeyDownEvent,
+    Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, Rgba,
+    ScrollDelta, ScrollWheelEvent, SharedString, TextRun, Window,
 };
 use parking_lot::Mutex;
 
+use crate::font::{self, sprites, FontSpec, SegKind};
 use crate::render_support::{
     alt_scroll_bytes, cell_from_pixel, encode_mouse, encode_paste, grid_dims, key_action,
     search_key, CellHit, KeyAction, KeyChord, MouseKind, SearchKey, MOUSE_NO_BUTTON,
@@ -76,8 +94,6 @@ use crate::wire::PtyHandle;
 // Layout / typography constants
 // ---------------------------------------------------------------------------
 
-const FONT_SIZE: f32 = 13.0;
-const LINE_H: f32 = 16.0;
 const OUTER_PAD: f32 = 6.0;
 const GAP: f32 = 6.0;
 const TILE_PAD: f32 = 4.0;
@@ -131,13 +147,32 @@ impl PaintMode {
 // Tiles and view state
 // ---------------------------------------------------------------------------
 
-/// A pre-shape row: the row text plus its merged style runs. Cached across frames
-/// and only rebuilt when the row is damaged. Shaping (`shape_line`) still runs every
-/// frame but hits gpui's `LineLayoutCache` on unchanged content, so it is ~free.
+/// A pre-shape row (T7): merged background spans plus positioned segments.
+/// Cached across frames and only rebuilt when the row is damaged. Shaping
+/// (`shape_line`) still runs every frame but hits gpui's `LineLayoutCache` on
+/// unchanged content, so it is ~free; sprite rects are precomputed here.
 #[derive(Clone, Default)]
 struct BuiltRow {
-    text: SharedString,
-    runs: Vec<TextRun>,
+    /// Non-default SGR backgrounds as merged `(col, n_cols, color)` spans,
+    /// painted as exact grid quads (never via `TextRun.background_color`).
+    bgs: Vec<(usize, usize, Rgb)>,
+    segs: Vec<BuiltSeg>,
+}
+
+/// One independently positioned slice of a row (see `font/` module doc).
+#[derive(Clone)]
+enum BuiltSeg {
+    /// Shaped text painted at `col * cell_w`.
+    Text { col: usize, text: SharedString, runs: Vec<TextRun> },
+    /// Procedural cells (box drawing / blocks / Powerline), quads precomputed.
+    Sprite { cells: Vec<SpriteCell> },
+}
+
+#[derive(Clone)]
+struct SpriteCell {
+    col: usize,
+    fg: Rgb,
+    rects: Vec<sprites::SpriteRect>,
 }
 
 /// Find-bar state for one tile (T6). The compiled regex lives in the tile's
@@ -151,17 +186,48 @@ struct SearchUi {
 }
 
 /// One live terminal tile: its session id, the shared `TermSession` (fed by a
-/// background thread), the PTY handle for write/resize, the per-row run cache,
-/// and the T6 UX state (detected URLs, find bar).
+/// background thread), the PTY handle for write/resize (`None` for offline
+/// fixture tiles, e.g. the font-torture screen), the per-row run cache, the
+/// T6 UX state (detected URLs, find bar), and the T7 font state (spec, gpui
+/// fonts, measured metrics).
 struct Tile {
     id: String,
     term: Arc<Mutex<TermSession>>,
-    pty: PtyHandle,
+    pty: Option<PtyHandle>,
     built: Vec<BuiltRow>,
     cols: u16,
     rows: u16,
     urls: Vec<UrlSpan>,
     search: SearchUi,
+    spec: FontSpec,
+    font_normal: Font,
+    font_bold: Font,
+    metrics: Option<Metrics>,
+    /// When set, a resize re-feeds these bytes into a FRESH TermSession instead
+    /// of reflowing (fixture screens must stay pixel-deterministic at any size).
+    fixture: Option<Arc<Vec<u8>>>,
+}
+
+impl Tile {
+    /// Write to the PTY if this tile has one (offline fixture tiles do not).
+    fn write(&self, bytes: &[u8]) {
+        if let Some(pty) = &self.pty {
+            pty.write(bytes);
+        }
+    }
+}
+
+/// Resolve a [`FontSpec`] into the tile's normal/bold gpui fonts: emoji/symbol
+/// fallback families attached, OpenType `calt` dropped when ligatures are off.
+fn tile_fonts(spec: &FontSpec) -> (Font, Font) {
+    let mut normal = gpui::font(spec.family.clone());
+    normal.fallbacks = Some(FontFallbacks::from_fonts(font::fallback_families()));
+    if !spec.ligatures {
+        normal.features = FontFeatures::disable_ligatures();
+    }
+    let mut bold = normal.clone();
+    bold.weight = FontWeight::BOLD;
+    (normal, bold)
 }
 
 /// An in-progress mouse drag: either extending a selection or streaming motion
@@ -190,7 +256,6 @@ struct GridState {
     tile_rects: Vec<Bounds<Pixels>>,
     /// Screen rect of each tile's scrolled-back badge (click = snap to bottom).
     badge_rects: Vec<Option<Bounds<Pixels>>>,
-    metrics: Option<Metrics>,
     paint_mode: PaintMode,
     drag: Option<Drag>,
     /// Fractional wheel lines carried between events (smooth touchpad scrolling).
@@ -199,7 +264,8 @@ struct GridState {
     hover_cell: Option<(usize, usize, usize)>,
 }
 
-/// Font-derived geometry, probed once from the real window/text system.
+/// Font-derived geometry, probed per tile from the real window/text system
+/// (each tile's [`FontSpec`] yields its own cell box).
 #[derive(Clone, Copy)]
 struct Metrics {
     font_size: f32,
@@ -207,14 +273,13 @@ struct Metrics {
     cell_w: f32,
 }
 
-/// The GPUI view: fonts, focus, shared render state, and a kept-alive control
-/// client (so its event stream and the PTY reader threads stay up).
+/// The GPUI view: focus, shared render state, and a kept-alive control client
+/// (so its event stream and the PTY reader threads stay up; `None` for offline
+/// fixture runs like the font-torture bin).
 pub struct GridView {
     state: Arc<Mutex<GridState>>,
-    font_normal: Font,
-    font_bold: Font,
     focus: FocusHandle,
-    _client: Arc<crate::wire::ControlClient>,
+    _client: Option<Arc<crate::wire::ControlClient>>,
 }
 
 impl GridView {
@@ -222,23 +287,31 @@ impl GridView {
     /// process lifetime. Called on the GPUI main thread from [`crate::app`].
     pub fn new(
         tiles: Vec<TileSpec>,
-        client: Arc<crate::wire::ControlClient>,
-        font_normal: Font,
-        font_bold: Font,
+        client: Option<Arc<crate::wire::ControlClient>>,
         focus: FocusHandle,
     ) -> Self {
         spawn_logger();
+        let default_spec = FontSpec::from_env();
         let tiles: Vec<Tile> = tiles
             .into_iter()
-            .map(|t| Tile {
-                id: t.id,
-                term: t.term,
-                pty: t.pty,
-                built: Vec::new(),
-                cols: t.cols,
-                rows: t.rows,
-                urls: Vec::new(),
-                search: SearchUi::default(),
+            .map(|t| {
+                let spec = t.font.unwrap_or_else(|| default_spec.clone());
+                let (font_normal, font_bold) = tile_fonts(&spec);
+                Tile {
+                    id: t.id,
+                    term: t.term,
+                    pty: t.pty,
+                    built: Vec::new(),
+                    cols: t.cols,
+                    rows: t.rows,
+                    urls: Vec::new(),
+                    search: SearchUi::default(),
+                    spec,
+                    font_normal,
+                    font_bold,
+                    metrics: None,
+                    fixture: t.fixture,
+                }
             })
             .collect();
         GridView {
@@ -247,14 +320,11 @@ impl GridView {
                 focused: 0,
                 tile_rects: Vec::new(),
                 badge_rects: Vec::new(),
-                metrics: None,
                 paint_mode: PaintMode::from_env(),
                 drag: None,
                 wheel_accum: 0.0,
                 hover_cell: None,
             })),
-            font_normal,
-            font_bold,
             focus,
             _client: client,
         }
@@ -262,14 +332,18 @@ impl GridView {
 }
 
 /// What [`crate::app`] hands [`GridView::new`] for each attached session: the id,
-/// the shared session, and its PTY handle. Geometry is provisional (resized to fit
-/// on the first paint).
+/// the shared session, and its PTY handle (`None` for an offline fixture tile).
+/// Geometry is provisional (resized to fit on the first paint). `font` overrides
+/// the tile's [`FontSpec`] (default: `THN_FONT` or Cascadia Mono 13). `fixture`
+/// makes resizes re-feed the bytes instead of reflowing (torture screens).
 pub struct TileSpec {
     pub id: String,
     pub term: Arc<Mutex<TermSession>>,
-    pub pty: PtyHandle,
+    pub pty: Option<PtyHandle>,
     pub cols: u16,
     pub rows: u16,
+    pub font: Option<FontSpec>,
+    pub fixture: Option<Arc<Vec<u8>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -331,57 +405,115 @@ fn ha(rgb: Rgb, a: f32) -> Hsla {
 // Paint
 // ---------------------------------------------------------------------------
 
-/// Probe font metrics from the real text system (once). cell_w is measured by
-/// shaping a run of `M`s and dividing - the honest monospace advance for this font.
-fn ensure_metrics(state: &mut GridState, font_normal: &Font, window: &mut Window) {
-    if state.metrics.is_some() {
+/// Probe a tile's font metrics from the real text system (once per tile).
+/// cell_w is measured by shaping a run of `M`s and dividing - the honest
+/// monospace advance for this tile's font at this tile's size.
+fn ensure_metrics(tile: &mut Tile, window: &mut Window) {
+    if tile.metrics.is_some() {
         return;
     }
     let probe: SharedString = "M".repeat(80).into();
     let run = TextRun {
         len: probe.len(),
-        font: font_normal.clone(),
+        font: tile.font_normal.clone(),
         color: h(DEFAULT_FG),
         background_color: None,
         underline: None,
         strikethrough: None,
     };
-    let line = window.text_system().shape_line(probe, px(FONT_SIZE), &[run], None);
+    let size = tile.spec.size;
+    let line = window.text_system().shape_line(probe, px(size), &[run], None);
     let w: f32 = line.width.into();
     let cell_w = (w / 80.0).max(1.0);
-    log::info!("render metrics: font={FONT_SIZE}px line_h={LINE_H}px cell_w={cell_w:.3}px");
-    state.metrics = Some(Metrics { font_size: FONT_SIZE, line_h: LINE_H, cell_w });
+    let line_h = tile.spec.line_height();
+    log::info!(
+        "render metrics[{}]: family={:?} font={size}px line_h={line_h}px cell_w={cell_w:.3}px",
+        tile.id,
+        tile.spec.family,
+    );
+    tile.metrics = Some(Metrics { font_size: size, line_h, cell_w });
 }
 
-/// Build one row's merged style runs from its snapshot cells (the costly transform,
-/// mirrored from the spike): consecutive same-style cells collapse into one run.
-fn build_row(cells: &[crate::term::SnapCell], font_normal: &Font, font_bold: &Font) -> BuiltRow {
-    let mut text = String::with_capacity(cells.len());
-    let mut runs: Vec<TextRun> = Vec::new();
-    let mut last: Option<(Rgb, Option<Rgb>, bool, bool)> = None;
+/// Build one row's paint plan from its snapshot cells (the costly transform):
+/// merged background spans, positioned text segments with merged style runs,
+/// and precomputed sprite quads. See the T7 section of the module doc.
+fn build_row(
+    cells: &[crate::term::SnapCell],
+    font_normal: &Font,
+    font_bold: &Font,
+    m: &Metrics,
+) -> BuiltRow {
+    // Background spans over grid columns (exact math, independent of shaping).
+    let mut bgs: Vec<(usize, usize, Rgb)> = Vec::new();
+    let mut col = 0usize;
     for c in cells {
-        let style = (c.fg, c.bg, c.bold, c.underline);
-        let ch_len = c.c.len_utf8();
-        if last == Some(style) && !runs.is_empty() {
-            runs.last_mut().unwrap().len += ch_len;
-        } else {
-            runs.push(TextRun {
-                len: ch_len,
-                font: if c.bold { font_bold.clone() } else { font_normal.clone() },
-                color: h(c.fg),
-                background_color: c.bg.map(h),
-                underline: c.underline.then(|| gpui::UnderlineStyle {
-                    thickness: px(1.0),
-                    color: Some(h(c.fg)),
-                    wavy: false,
-                }),
-                strikethrough: None,
-            });
-            last = Some(style);
+        let w = c.width.max(1) as usize;
+        if let Some(bg) = c.bg {
+            match bgs.last_mut() {
+                Some((c0, n, color)) if *c0 + *n == col && *color == bg => *n += w,
+                _ => bgs.push((col, w, bg)),
+            }
         }
-        text.push(c.c);
+        col += w;
     }
-    BuiltRow { text: text.into(), runs }
+
+    // Positioned segments.
+    let mut segs: Vec<BuiltSeg> = Vec::new();
+    for seg in font::segment_cells(cells) {
+        match seg.kind {
+            SegKind::Sprite => {
+                let mut col = seg.col;
+                let mut out = Vec::with_capacity(seg.end - seg.start);
+                for c in &cells[seg.start..seg.end] {
+                    out.push(SpriteCell {
+                        col,
+                        fg: c.fg,
+                        rects: sprites::sprite_rects(c.c, m.cell_w, m.line_h)
+                            .unwrap_or_default(),
+                    });
+                    col += c.width.max(1) as usize;
+                }
+                segs.push(BuiltSeg::Sprite { cells: out });
+            }
+            SegKind::Text => {
+                let mut text = String::new();
+                let mut runs: Vec<TextRun> = Vec::new();
+                let mut last: Option<(Rgb, bool, bool)> = None;
+                for c in &cells[seg.start..seg.end] {
+                    // bg is painted as grid quads above, so it is not part of
+                    // the run style (and never merges/splits runs).
+                    let style = (c.fg, c.bold, c.underline);
+                    let mut len = c.c.len_utf8();
+                    for z in &c.zw {
+                        len += z.len_utf8();
+                    }
+                    if last == Some(style) && !runs.is_empty() {
+                        runs.last_mut().unwrap().len += len;
+                    } else {
+                        runs.push(TextRun {
+                            len,
+                            font: if c.bold { font_bold.clone() } else { font_normal.clone() },
+                            color: h(c.fg),
+                            background_color: None,
+                            underline: c.underline.then(|| gpui::UnderlineStyle {
+                                thickness: px(1.0),
+                                color: Some(h(c.fg)),
+                                wavy: false,
+                            }),
+                            strikethrough: None,
+                        });
+                        last = Some(style);
+                    }
+                    text.push(c.c);
+                    for z in &c.zw {
+                        text.push(*z);
+                    }
+                }
+                segs.push(BuiltSeg::Text { col: seg.col, text: text.into(), runs });
+            }
+        }
+    }
+    BuiltRow { bgs, segs }
 }
 
 /// Everything paint-time about one tile that is NOT the cached rows: cursor,
@@ -397,8 +529,6 @@ struct TileOverlay {
 
 fn paint_grid(
     state: &Arc<Mutex<GridState>>,
-    font_normal: &Font,
-    font_bold: &Font,
     focused_window: bool,
     win: Bounds<Pixels>,
     window: &mut Window,
@@ -406,8 +536,6 @@ fn paint_grid(
 ) {
     let t0 = Instant::now();
     let mut st = state.lock();
-    ensure_metrics(&mut st, font_normal, window);
-    let m = st.metrics.expect("metrics set");
     let mode = st.paint_mode;
     let focused = st.focused;
 
@@ -422,14 +550,32 @@ fn paint_grid(
     for i in 0..n {
         let tbox = tile_box(i, n, win);
         rects.push(tbox);
+
+        // Per-tile font metrics (T7: each tile can carry its own family/size).
+        ensure_metrics(&mut st.tiles[i], window);
+        let m = st.tiles[i].metrics.expect("metrics set");
+        let font_n = st.tiles[i].font_normal.clone();
+        let font_b = st.tiles[i].font_bold.clone();
         let (want_cols, want_rows) = tile_geometry(tbox, &m);
 
         // --- geometry: reflow the terminal + PTY to the tile if it changed -----
         {
             let tile = &mut st.tiles[i];
             if (want_cols, want_rows) != (tile.cols, tile.rows) {
-                tile.term.lock().resize(want_cols, want_rows);
-                tile.pty.resize(want_cols, want_rows);
+                if let Some(fx) = tile.fixture.clone() {
+                    // Fixture tiles re-feed from scratch: alacritty's reflow
+                    // would scramble the deterministic torture art. Land at the
+                    // top so the screen reads first-section-first.
+                    let mut fresh = TermSession::new(want_cols, want_rows);
+                    fresh.advance(&fx);
+                    fresh.scroll_to_top();
+                    *tile.term.lock() = fresh;
+                } else {
+                    tile.term.lock().resize(want_cols, want_rows);
+                }
+                if let Some(pty) = &tile.pty {
+                    pty.resize(want_cols, want_rows);
+                }
                 tile.cols = want_cols;
                 tile.rows = want_rows;
                 tile.built.clear(); // force a full rebuild at the new size
@@ -453,7 +599,7 @@ fn paint_grid(
 
         let (cursor, selection, rebuilt) = if need_full {
             let snap = term.renderable();
-            rebuild_all(&mut st.tiles[i], &snap, font_normal, font_bold);
+            rebuild_all(&mut st.tiles[i], &snap, &font_n, &font_b, &m);
             (snap.cursor, snap.selection, rows as u64)
         } else {
             // `need_full` already covered the full-damage (None) case.
@@ -461,7 +607,7 @@ fn paint_grid(
             let partial = term.renderable_rows(&lines);
             for (r, cells) in &partial.rows {
                 if *r < st.tiles[i].built.len() {
-                    st.tiles[i].built[*r] = build_row(cells, font_normal, font_bold);
+                    st.tiles[i].built[*r] = build_row(cells, &font_n, &font_b, &m);
                 }
             }
             (partial.cursor, partial.selection, lines.len() as u64)
@@ -526,11 +672,11 @@ fn paint_grid(
 }
 
 /// Rebuild every row's run cache from a full snapshot.
-fn rebuild_all(tile: &mut Tile, snap: &Snapshot, font_normal: &Font, font_bold: &Font) {
+fn rebuild_all(tile: &mut Tile, snap: &Snapshot, font_normal: &Font, font_bold: &Font, m: &Metrics) {
     tile.built = snap
         .rows_cells
         .iter()
-        .map(|cells| build_row(cells, font_normal, font_bold))
+        .map(|cells| build_row(cells, font_normal, font_bold, m))
         .collect();
     // Guard against a snapshot shorter than the geometry (shouldn't happen).
     tile.built.resize(tile.rows as usize, BuiltRow::default());
@@ -561,26 +707,58 @@ fn paint_tile(
     let ox = tbox.origin.x + px(BORDER + TILE_PAD);
     let header_y = tbox.origin.y + px(BORDER + 1.0);
 
-    // Debug header (id + geometry) - NOT the T8 cockpit header.
-    let label = format!("{}  {}x{}", tile.id, tile.cols, tile.rows);
-    paint_text(&label, ox, header_y, h(HEADER_FG), m.font_size, window, cx);
+    // Debug header (id + geometry + font) - NOT the T8 cockpit header. Size is
+    // capped so a large tile font cannot overflow the fixed header strip.
+    let label =
+        format!("{}  {}x{}  {} {}px", tile.id, tile.cols, tile.rows, tile.spec.family, tile.spec.size);
+    let header_size = m.font_size.min(12.0);
+    paint_text(&label, ox, header_y, h(HEADER_FG), header_size, &tile.font_normal, window, cx);
 
-    // Rows.
+    // Rows (T7): bg spans as exact grid quads, then positioned segments - text
+    // shaped per segment at col * cell_w, sprites as precomputed quads.
     let grid_top = tbox.origin.y + px(BORDER + HEADER_H);
     for (i, row) in tile.built.iter().enumerate() {
-        if row.runs.is_empty() {
-            continue;
-        }
         let ry = grid_top + px(i as f32 * m.line_h);
-        let origin = point(ox, ry);
-        let shaped = window.text_system().shape_line(
-            row.text.clone(),
-            px(m.font_size),
-            &row.runs,
-            None,
-        );
-        shaped.paint_background(origin, px(m.line_h), window, cx).ok();
-        shaped.paint(origin, px(m.line_h), window, cx).ok();
+        for &(col, ncols, bg) in &row.bgs {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(ox + px(col as f32 * m.cell_w), ry),
+                    size(px(ncols as f32 * m.cell_w), px(m.line_h)),
+                ),
+                h(bg),
+            ));
+        }
+        for seg in &row.segs {
+            match seg {
+                BuiltSeg::Text { col, text, runs } => {
+                    if runs.is_empty() {
+                        continue;
+                    }
+                    let origin = point(ox + px(*col as f32 * m.cell_w), ry);
+                    let shaped = window.text_system().shape_line(
+                        text.clone(),
+                        px(m.font_size),
+                        runs,
+                        None,
+                    );
+                    shaped.paint(origin, px(m.line_h), window, cx).ok();
+                }
+                BuiltSeg::Sprite { cells } => {
+                    for sc in cells {
+                        let x0 = ox + px(sc.col as f32 * m.cell_w);
+                        for r in &sc.rects {
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(x0 + px(r.x), ry + px(r.y)),
+                                    size(px(r.w), px(r.h)),
+                                ),
+                                ha(sc.fg, r.alpha),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let rows = tile.rows as usize;
@@ -623,13 +801,15 @@ fn paint_tile(
     }
 
     // Cursor: a translucent block over the cell (solid-ish when focused).
+    // Covers both columns of a wide char (T7).
     if let Some(cur) = overlay.cursor {
         if cur.visible && cur.line < rows && cur.col < cols {
             let cxp = ox + px(cur.col as f32 * m.cell_w);
             let cyp = grid_top + px(cur.line as f32 * m.line_h);
             let alpha = if focused { 0.55 } else { 0.28 };
+            let cur_w = cur.width.max(1) as f32 * m.cell_w;
             window.paint_quad(fill(
-                Bounds::new(point(cxp, cyp), size(px(m.cell_w), px(m.line_h))),
+                Bounds::new(point(cxp, cyp), size(px(cur_w), px(m.line_h))),
                 ha(BORDER_FOCUS, alpha),
             ));
         }
@@ -645,7 +825,16 @@ fn paint_tile(
         let y = grid_top;
         let rect = Bounds::new(point(x, y), size(px(w), px(hgt)));
         window.paint_quad(fill(rect, ha(BORDER_RGB, 0.92)));
-        paint_text(&label, x + px(5.0), y + px(2.0), h(BORDER_FOCUS), m.font_size, window, cx);
+        paint_text(
+            &label,
+            x + px(5.0),
+            y + px(2.0),
+            h(BORDER_FOCUS),
+            m.font_size,
+            &tile.font_normal,
+            window,
+            cx,
+        );
         badge_rect = Some(rect);
     }
 
@@ -662,29 +851,40 @@ fn paint_tile(
             Bounds::new(point(rect.origin.x, y), size(rect.size.width, px(1.0))),
             ha(BORDER_FOCUS, 0.8),
         ));
-        paint_text(bar, rect.origin.x + px(TILE_PAD + 2.0), y + px(3.0), h(DEFAULT_FG), m.font_size, window, cx);
+        paint_text(
+            bar,
+            rect.origin.x + px(TILE_PAD + 2.0),
+            y + px(3.0),
+            h(DEFAULT_FG),
+            m.font_size,
+            &tile.font_normal,
+            window,
+            cx,
+        );
     }
 
     badge_rect
 }
 
-/// Paint a single text line with one uniform color (used for the debug header).
+/// Paint a single text line with one uniform color in the given font (debug
+/// header, scrolled-back badge, find bar).
+#[allow(clippy::too_many_arguments)]
 fn paint_text(
     text: &str,
     x: Pixels,
     y: Pixels,
     color: Hsla,
     font_size: f32,
+    font: &Font,
     window: &mut Window,
     cx: &mut App,
 ) {
     if text.is_empty() {
         return;
     }
-    // Header uses the same normal font as the grid; grab it from a 1-run shape.
     let run = TextRun {
         len: text.len(),
-        font: gpui::font("Cascadia Mono"),
+        font: font.clone(),
         color,
         background_color: None,
         underline: None,
@@ -801,7 +1001,7 @@ fn paste_into(tile: &Tile, cx: &App) {
         term.clear_selection();
         term.mode_info().bracketed_paste
     };
-    tile.pty.write(&encode_paste(&text, bracketed));
+    tile.write(&encode_paste(&text, bracketed));
 }
 
 /// Re-run the search after a query edit: recompile, jump to the first match from
@@ -869,7 +1069,7 @@ impl GridView {
         let mode_info = tile.term.lock().mode_info();
         match key_action(&chord, &mode_info) {
             KeyAction::Write(bytes) => {
-                tile.pty.write(&bytes);
+                tile.write(&bytes);
                 let mut term = tile.term.lock();
                 term.scroll_to_bottom();
                 term.clear_selection();
@@ -892,13 +1092,13 @@ impl GridView {
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let mut st = self.state.lock();
-        let Some(m) = st.metrics else { return };
         // The wheel acts on the tile under the pointer (fallback: the focused one).
         let idx =
             st.tile_rects.iter().position(|r| hit(r, ev.position)).unwrap_or(st.focused);
         if idx >= st.tiles.len() {
             return;
         }
+        let Some(m) = st.tiles[idx].metrics else { return };
         let dy = match ev.delta {
             // One wheel notch = 3 rows; pixel deltas (touchpads) map 1:1 by row
             // height, with the fraction carried across events.
@@ -922,12 +1122,12 @@ impl GridView {
                 let mods = (false, ev.modifiers.alt, ev.modifiers.control);
                 let bytes = encode_mouse(MouseKind::Press, btn, (cell.col, cell.row), mods, &mi);
                 for _ in 0..lines.unsigned_abs() {
-                    tile.pty.write(&bytes);
+                    tile.write(&bytes);
                 }
             }
         } else if mi.alt_screen && mi.alternate_scroll && !ev.modifiers.shift {
             // Alt screen without mouse mode: wheel = arrow keys (mode 1007).
-            tile.pty.write(&alt_scroll_bytes(lines, mi.app_cursor));
+            tile.write(&alt_scroll_bytes(lines, mi.app_cursor));
         } else {
             tile.term.lock().scroll(lines);
         }
@@ -951,18 +1151,18 @@ impl GridView {
         if old != idx {
             if let Some(t) = st.tiles.get(old) {
                 if t.term.lock().mode_info().focus_in_out {
-                    t.pty.write(b"\x1b[O");
+                    t.write(b"\x1b[O");
                 }
             }
             let t = &st.tiles[idx];
             if t.term.lock().mode_info().focus_in_out {
-                t.pty.write(b"\x1b[I");
+                t.write(b"\x1b[I");
             }
             st.focused = idx;
         }
 
         'actions: {
-            let Some(m) = st.metrics else { break 'actions };
+            let Some(m) = st.tiles[idx].metrics else { break 'actions };
 
             // Scrolled-back badge: click snaps to the live bottom.
             if button == MouseButton::Left {
@@ -990,7 +1190,7 @@ impl GridView {
             if mi.any_mouse() && !ev.modifiers.shift && cell.inside {
                 if let Some(btn) = report_button(button) {
                     let mods = (false, ev.modifiers.alt, ev.modifiers.control);
-                    tile.pty.write(&encode_mouse(
+                    tile.write(&encode_mouse(
                         MouseKind::Press,
                         btn,
                         (cell.col, cell.row),
@@ -1051,13 +1251,13 @@ impl GridView {
         st.drag = None;
         if let DragMode::Report(btn) = drag.mode {
             if drag.tile < st.tiles.len() {
-                if let Some(m) = st.metrics {
+                if let Some(m) = st.tiles[drag.tile].metrics {
                     let cell = tile_cell(&st, drag.tile, ev.position, &m);
                     let tile = &st.tiles[drag.tile];
                     let mi = tile.term.lock().mode_info();
                     if mi.any_mouse() {
                         let mods = (false, ev.modifiers.alt, ev.modifiers.control);
-                        tile.pty.write(&encode_mouse(
+                        tile.write(&encode_mouse(
                             MouseKind::Release,
                             btn,
                             (cell.col, cell.row),
@@ -1075,13 +1275,13 @@ impl GridView {
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let mut st = self.state.lock();
-        let Some(m) = st.metrics else { return };
 
         if let Some(drag) = st.drag {
             if drag.tile >= st.tiles.len() {
                 st.drag = None;
                 return;
             }
+            let Some(m) = st.tiles[drag.tile].metrics else { return };
             let cell = tile_cell(&st, drag.tile, ev.position, &m);
             if (cell.col, cell.row) == drag.last_cell {
                 return;
@@ -1100,7 +1300,7 @@ impl GridView {
                     let mi = tile.term.lock().mode_info();
                     if (mi.mouse_drag || mi.mouse_motion) && cell.inside {
                         let mods = (false, ev.modifiers.alt, ev.modifiers.control);
-                        tile.pty.write(&encode_mouse(
+                        tile.write(&encode_mouse(
                             MouseKind::Motion,
                             btn,
                             (cell.col, cell.row),
@@ -1124,6 +1324,7 @@ impl GridView {
             st.hover_cell = None;
             return;
         };
+        let Some(m) = st.tiles.get(idx).and_then(|t| t.metrics) else { return };
         let cell = tile_cell(&st, idx, ev.position, &m);
         if !cell.inside {
             st.hover_cell = None;
@@ -1137,7 +1338,7 @@ impl GridView {
         let mi = tile.term.lock().mode_info();
         if mi.mouse_motion {
             let mods = (false, ev.modifiers.alt, ev.modifiers.control);
-            tile.pty.write(&encode_mouse(
+            tile.write(&encode_mouse(
                 MouseKind::Motion,
                 MOUSE_NO_BUTTON,
                 (cell.col, cell.row),
@@ -1172,8 +1373,6 @@ impl Render for GridView {
         window.request_animation_frame();
 
         let state = self.state.clone();
-        let font_normal = self.font_normal.clone();
-        let font_bold = self.font_bold.clone();
         let focused_window = self.focus.is_focused(window);
 
         div()
@@ -1211,15 +1410,7 @@ impl Render for GridView {
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, cx| {
-                        paint_grid(
-                            &state,
-                            &font_normal,
-                            &font_bold,
-                            focused_window,
-                            bounds,
-                            window,
-                            cx,
-                        );
+                        paint_grid(&state, focused_window, bounds, window, cx);
                     },
                 )
                 .size_full(),
