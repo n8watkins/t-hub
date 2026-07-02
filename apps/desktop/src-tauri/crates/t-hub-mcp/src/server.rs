@@ -16,7 +16,7 @@ use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::control_client::{self, ControlEndpoint};
+use crate::control_client::{self, ControlEndpoint, Discovery};
 use crate::protocol::{self, codes, Outbound, RpcRequest};
 use crate::tools;
 
@@ -24,10 +24,21 @@ use crate::tools;
 /// we echo a known-good one in `initialize`.
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// Run the stdio server loop until stdin closes. `reader`/`writer` are injected
-/// so the loop is testable against in-memory buffers (the binary passes real
-/// stdin/stdout).
-pub fn run<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> std::io::Result<()> {
+/// Run the stdio server loop until stdin closes, discovering the control channel
+/// from the environment. `reader`/`writer` are injected so the loop is testable
+/// against in-memory buffers (the binary passes real stdin/stdout).
+pub fn run<R: BufRead, W: Write>(reader: R, writer: W) -> std::io::Result<()> {
+    run_with(reader, writer, &Discovery::from_env())
+}
+
+/// Run the server loop against an explicit control-channel [`Discovery`]. This
+/// is the injectable core: tests pass a hermetic `Discovery` so they never touch
+/// process-global `T_HUB_CONTROL_*` env vars (which would race in parallel).
+fn run_with<R: BufRead, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    discovery: &Discovery,
+) -> std::io::Result<()> {
     let mut line = String::new();
     loop {
         line.clear();
@@ -61,7 +72,7 @@ pub fn run<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> std::io::Resul
         }
 
         let id = req.id.clone().unwrap_or(Value::Null);
-        let out = dispatch(&req, id);
+        let out = dispatch(&req, id, discovery);
         write_line(&mut writer, &out)?;
     }
     Ok(())
@@ -75,11 +86,11 @@ fn write_line<W: Write>(writer: &mut W, out: &Outbound) -> std::io::Result<()> {
 }
 
 /// Dispatch one request to its handler, producing an outbound response.
-fn dispatch(req: &RpcRequest, id: Value) -> Outbound {
+fn dispatch(req: &RpcRequest, id: Value, discovery: &Discovery) -> Outbound {
     match req.method.as_str() {
         "initialize" => Outbound::Ok(protocol::success(id, initialize_result())),
         "tools/list" => Outbound::Ok(protocol::success(id, tools_list_result())),
-        "tools/call" => tools_call(req, id),
+        "tools/call" => tools_call(req, id, discovery),
         // `ping` is a common MCP keepalive; answer with an empty result.
         "ping" => Outbound::Ok(protocol::success(id, json!({}))),
         other => Outbound::Err(protocol::error(
@@ -126,7 +137,7 @@ fn tools_list_result() -> Value {
 /// process-changing tool, or T-Hub not running) are returned as MCP tool
 /// results with `isError: true` rather than transport errors, which is how MCP
 /// surfaces tool failures to the model.
-fn tools_call(req: &RpcRequest, id: Value) -> Outbound {
+fn tools_call(req: &RpcRequest, id: Value, discovery: &Discovery) -> Outbound {
     let name = match req.params.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
         None => {
@@ -155,7 +166,7 @@ fn tools_call(req: &RpcRequest, id: Value) -> Outbound {
 
     // Resolve the control channel; if T-Hub isn't running, surface it as a
     // tool error (isError) so the model gets a readable message.
-    let endpoint: ControlEndpoint = match control_client::resolve_endpoint() {
+    let endpoint: ControlEndpoint = match discovery.resolve() {
         Ok(ep) => ep,
         Err(e) => return Outbound::Ok(protocol::success(id, tool_error(&e))),
     };
@@ -192,11 +203,27 @@ mod tests {
     use std::io::Cursor;
 
     /// Drive the server with one or more request lines and collect the response
-    /// lines (parsed as JSON).
+    /// lines (parsed as JSON). Uses a `Discovery` that points at a nonexistent
+    /// handshake file so no request can reach a real control channel — and,
+    /// crucially, so the test never mutates process-global env (which would race
+    /// with other tests under parallel execution).
     fn run_lines(input: &str) -> Vec<Value> {
+        run_lines_with(input, &unreachable_discovery())
+    }
+
+    /// A hermetic `Discovery` with no addr/token override and a handshake file
+    /// that cannot exist, so `resolve` always yields "control channel not found".
+    fn unreachable_discovery() -> Discovery {
+        Discovery {
+            file: Some(std::path::PathBuf::from("/nonexistent/th-control.json")),
+            ..Default::default()
+        }
+    }
+
+    fn run_lines_with(input: &str, discovery: &Discovery) -> Vec<Value> {
         let reader = Cursor::new(input.as_bytes().to_vec());
         let mut out: Vec<u8> = Vec::new();
-        run(reader, &mut out).unwrap();
+        run_with(reader, &mut out, discovery).unwrap();
         String::from_utf8(out)
             .unwrap()
             .lines()
@@ -266,23 +293,20 @@ mod tests {
 
     #[test]
     fn tools_call_known_tool_without_app_returns_tool_error() {
-        // Point discovery at a nonexistent handshake + clear env overrides so the
-        // call cannot reach an app; the result must be a tool-level isError, not
-        // a JSON-RPC transport error (so the model sees a readable message).
-        std::env::set_var("T_HUB_CONTROL_FILE", "/nonexistent/th-control.json");
-        std::env::remove_var("T_HUB_CONTROL_ADDR");
-        std::env::remove_var("T_HUB_CONTROL_TOKEN");
-
-        let resp = run_lines(
+        // Inject a discovery that points at a nonexistent handshake and has no
+        // addr/token override, so the call cannot reach an app. The result must
+        // be a tool-level isError, not a JSON-RPC transport error (so the model
+        // sees a readable message). No env is touched, so this is hermetic under
+        // parallel runs.
+        let resp = run_lines_with(
             r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_terminals","arguments":{}}}"#,
+            &unreachable_discovery(),
         );
         // It's a success envelope at the RPC layer, with isError in the content.
         assert!(resp[0].get("error").is_none());
         assert_eq!(resp[0]["result"]["isError"], true);
         let text = resp[0]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("control channel not found"), "text: {text}");
-
-        std::env::remove_var("T_HUB_CONTROL_FILE");
     }
 
     #[test]
