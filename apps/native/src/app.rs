@@ -21,7 +21,9 @@
 //! sessions from `list_terminals`. The cockpit ignores both: it tracks the live
 //! session list and the persisted layout.
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -29,15 +31,19 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, fill, font, point, px, size, App, Application, Bounds, Context, Font, FontWeight,
-    Hsla, IntoElement, Render, Rgba, SharedString, TextRun, TitlebarOptions, Window, WindowBounds,
-    WindowOptions,
+    canvas, div, fill, font, point, px, size, AnyWindowHandle, App, Application, AsyncApp, Bounds,
+    Context, Font, FontWeight, Hsla, IntoElement, Render, Rgba, SharedString, TextRun,
+    TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use parking_lot::Mutex;
 
 use crate::chrome::model::ChromeModel;
 use crate::chrome::persist;
-use crate::chrome::view::{sync_active_sessions, CockpitState, CockpitView};
+use crate::chrome::view::{
+    close_satellite_home, log_winstat, open_satellite, sync_active_sessions, tear_off_workspace,
+    CockpitState, CockpitView, SatHandles,
+};
+use crate::chrome::windows::SatBounds;
 use crate::font::FontSpec;
 use crate::overlays::{OverlayFeed, OverlaySidebar};
 use crate::render::{GridView, Tile, TileSpec};
@@ -402,9 +408,11 @@ const RELIST_INTERVAL: Duration = Duration::from_secs(2);
 /// for frames); the chrome no longer subscribes - it reads the fold counter.
 const HINT_TICK: Duration = Duration::from_millis(250);
 
-/// T8 cockpit: tabs + per-workspace grid + headers over the live session list.
-/// Loads the persisted layout, spawns the reconcile worker (which attaches every
-/// placed session - the persistent pool), and opens the cockpit window.
+/// T8 cockpit: tabs + per-workspace grid + headers over the live session list;
+/// T10: plus one satellite window per torn-off workspace (restored from the
+/// layout at boot). Loads the persisted layout, spawns the reconcile worker
+/// (which attaches every placed session - the persistent pool), and opens the
+/// cockpit window.
 fn run_cockpit() {
     let client = match ControlClient::connect_discovered() {
         Ok(c) => Arc::new(c),
@@ -416,19 +424,26 @@ fn run_cockpit() {
     };
 
     let layout_path = persist::layout_path();
-    let model = match persist::load(&layout_path) {
-        Ok(Some(layout)) => layout.into_model(),
-        Ok(None) => ChromeModel::default(),
-        Err(e) => {
-            log::warn!("layout unreadable, starting fresh: {e:#}");
-            ChromeModel::default()
-        }
-    };
+    // Satellite seeds are (tab index, persisted window bounds); the registry is
+    // keyed by wsid, which `into_model` assigns - map through the model below.
+    let (model, sat_seed): (ChromeModel, Vec<(usize, Option<SatBounds>)>) =
+        match persist::load(&layout_path) {
+            Ok(Some(layout)) => {
+                let seed = layout.satellite_bounds();
+                (layout.into_model(), seed)
+            }
+            Ok(None) => (ChromeModel::default(), Vec::new()),
+            Err(e) => {
+                log::warn!("layout unreadable, starting fresh: {e:#}");
+                (ChromeModel::default(), Vec::new())
+            }
+        };
     log::info!(
-        "cockpit: {} tab(s) from {}, active {}",
+        "cockpit: {} tab(s) from {}, active {}, {} satellite(s)",
         model.tabs.len(),
         layout_path.display(),
-        model.active
+        model.active,
+        sat_seed.len()
     );
 
     // The T9 feed is the process's SINGLE control-event drainer; the chrome
@@ -448,9 +463,30 @@ fn run_cockpit() {
     }
 
     let state = Arc::new(Mutex::new(CockpitState::new(model, layout_path)));
+
+    // Register the persisted satellites in the window registry (their OS
+    // windows open after the main window below, inside Application::run).
+    {
+        let mut st = state.lock();
+        let seeds: Vec<(u64, Option<String>, Option<SatBounds>)> = sat_seed
+            .into_iter()
+            .filter_map(|(i, bounds)| {
+                st.model
+                    .tabs
+                    .get(i)
+                    .map(|t| (t.wsid, t.tiles.first().cloned(), bounds))
+            })
+            .collect();
+        for (wsid, first_tile, bounds) in seeds {
+            st.sats.open(wsid, first_tile, bounds);
+        }
+    }
+
     spawn_cockpit_worker(state.clone(), client.clone(), feed.clone());
+    spawn_winstat_ticker(state.clone());
 
     Application::new().run(move |cx: &mut App| {
+        let handles: SatHandles = Rc::new(RefCell::new(HashMap::new()));
         let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);
         let opened = cx.open_window(
             WindowOptions {
@@ -461,22 +497,126 @@ fn run_cockpit() {
                 }),
                 ..Default::default()
             },
-            |window, cx| {
-                let focus = cx.focus_handle();
-                let overlays = cx.new(|_| OverlaySidebar::new(feed.clone()));
-                let view = cx.new(|_| {
-                    CockpitView::new(state, overlays, feed, client, focus.clone())
-                });
-                window.focus(&focus);
-                view
+            {
+                let state = state.clone();
+                let feed = feed.clone();
+                let handles = handles.clone();
+                move |window, cx| {
+                    let focus = cx.focus_handle();
+                    let overlays = cx.new(|_| OverlaySidebar::new(feed.clone()));
+                    // Closing the main window quits the whole app; save the
+                    // layout first so satellite bounds (refreshed per paint)
+                    // land on disk even when no other mutation happened.
+                    {
+                        let state = state.clone();
+                        window.on_window_should_close(cx, move |_, _| {
+                            state.lock().save_layout();
+                            true
+                        });
+                    }
+                    let view = cx.new(|_| {
+                        CockpitView::new(state, overlays, feed, client, handles, focus.clone())
+                    });
+                    window.focus(&focus);
+                    view
+                }
             },
         );
-        if let Err(e) = opened {
-            eprintln!("t-hub-native: failed to open the cockpit window: {e:#}");
-            std::process::exit(1);
+        let main_window: AnyWindowHandle = match opened {
+            Ok(handle) => handle.into(),
+            Err(e) => {
+                eprintln!("t-hub-native: failed to open the cockpit window: {e:#}");
+                std::process::exit(1);
+            }
+        };
+
+        // The main window owns the process: when it closes, quit (satellites
+        // die with the process; their workspaces stay satellites in the layout
+        // and are restored on the next boot).
+        cx.on_window_closed(move |cx| {
+            if !cx.windows().contains(&main_window) {
+                cx.quit();
+            }
+        })
+        .detach();
+
+        // Reopen the persisted satellites.
+        let wsids = state.lock().sats.wsids();
+        for wsid in wsids {
+            open_satellite(cx, &state, &feed, &handles, wsid);
         }
+        log_winstat(&state, "boot");
+
+        spawn_sat_cycle_harness(cx, &state, &feed, &handles);
+
         cx.activate(true);
     });
+}
+
+/// Periodic winstat line (window count x visible cells vs RSS/fds), the T10
+/// watch item, on a 5s cadence. Opt-in via `THN_MEM_LOG=1` (the tear/close
+/// lifecycle events log unconditionally).
+fn spawn_winstat_ticker(state: Arc<Mutex<CockpitState>>) {
+    if std::env::var("THN_MEM_LOG").as_deref() != Ok("1") {
+        return;
+    }
+    thread::Builder::new()
+        .name("t-hub-native-winstat".into())
+        .spawn(move || loop {
+            thread::sleep(Duration::from_secs(5));
+            log_winstat(&state, "tick");
+        })
+        .expect("spawn winstat ticker thread");
+}
+
+/// The T10 acceptance harness: `THN_SAT_CYCLE=N` runs N tear-off/close-back
+/// cycles on the active workspace through the EXACT functions the sidebar
+/// clicks use, logging a winstat line per transition - the 10-cycle leak check
+/// without brittle synthetic input. `THN_SAT_CYCLE_MS` sets the dwell (default
+/// 2000ms) so terminals stream visibly inside the satellite between moves.
+fn spawn_sat_cycle_harness(
+    cx: &mut App,
+    state: &Arc<Mutex<CockpitState>>,
+    feed: &OverlayFeed,
+    handles: &SatHandles,
+) {
+    let n: u32 = std::env::var("THN_SAT_CYCLE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if n == 0 {
+        return;
+    }
+    let dwell = Duration::from_millis(
+        std::env::var("THN_SAT_CYCLE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(2000),
+    );
+    let state = state.clone();
+    let feed = feed.clone();
+    let handles = handles.clone();
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        for cycle in 1..=n {
+            cx.background_executor().timer(dwell).await;
+            let torn = cx
+                .update(|cx| {
+                    let idx = {
+                        let st = state.lock();
+                        let i = st.model.active;
+                        (!st.model.tabs[i].satellite).then_some(i)
+                    };
+                    idx.and_then(|i| tear_off_workspace(cx, &state, &feed, &handles, i))
+                })
+                .ok()
+                .flatten();
+            let Some(wsid) = torn else {
+                log::warn!("sat-cycle {cycle}/{n}: no main workspace to tear off");
+                continue;
+            };
+            log::info!("sat-cycle {cycle}/{n}: tore off wsid {wsid}");
+            cx.background_executor().timer(dwell).await;
+            cx.update(|cx| close_satellite_home(cx, &state, &feed, &handles, wsid)).ok();
+            log::info!("sat-cycle {cycle}/{n}: closed back wsid {wsid}");
+        }
+        log_winstat(&state, "cycle-done");
+        log::info!("sat-cycle: T10-SAT-CYCLE-DONE");
+    })
+    .detach();
 }
 
 /// The cockpit reconcile worker: keep the model's tile set matched to the

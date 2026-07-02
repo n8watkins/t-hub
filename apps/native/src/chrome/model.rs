@@ -102,6 +102,9 @@ const SIDEBAR_ROW_GAP: f32 = 2.0;
 pub struct SidebarLayout {
     pub rows: Vec<RectF>,
     pub closes: Vec<RectF>,
+    /// Tear-off zones (T10), one per row, just left of the close zone: tears a
+    /// main workspace into a satellite window / returns a torn-off one.
+    pub tears: Vec<RectF>,
     pub plus: RectF,
     /// The rest of the sidebar below the workspace section. T9's overlay
     /// sections mount here; the T8 chrome paints NOTHING inside it.
@@ -110,15 +113,23 @@ pub struct SidebarLayout {
 
 /// Lay out the sidebar's workspace section inside `area` (the sidebar's inner
 /// content box, below the section caption): `n` full-width rows, each with a
-/// square close zone flush right, then the `+` row, then the T9 mount.
+/// square close zone flush right and a square tear-off zone left of it, then
+/// the `+` row, then the T9 mount.
 pub fn sidebar_layout(n: usize, area: RectF) -> SidebarLayout {
     let mut rows = Vec::with_capacity(n);
     let mut closes = Vec::with_capacity(n);
+    let mut tears = Vec::with_capacity(n);
     let mut y = area.y;
     for _ in 0..n {
         rows.push(RectF::new(area.x, y, area.w, SIDEBAR_ROW_H));
         closes.push(RectF::new(
             area.x + area.w - SIDEBAR_ROW_H,
+            y,
+            SIDEBAR_ROW_H,
+            SIDEBAR_ROW_H,
+        ));
+        tears.push(RectF::new(
+            area.x + area.w - 2.0 * SIDEBAR_ROW_H,
             y,
             SIDEBAR_ROW_H,
             SIDEBAR_ROW_H,
@@ -129,7 +140,7 @@ pub fn sidebar_layout(n: usize, area: RectF) -> SidebarLayout {
     y += SIDEBAR_ROW_H + SIDEBAR_ROW_GAP;
     let overlay_mount =
         RectF::new(area.x, y, area.w, (area.h - (y - area.y)).max(0.0));
-    SidebarLayout { rows, closes, plus, overlay_mount }
+    SidebarLayout { rows, closes, tears, plus, overlay_mount }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +156,14 @@ pub struct Workspace {
     pub name: String,
     pub tiles: Vec<String>,
     pub font: Option<FontSpec>,
+    /// Torn off into its own OS window (T10 satellite). The workspace STAYS in
+    /// `tabs` - one source of truth for tiles/reconcile/persist - this flag only
+    /// says where it paints: the satellite window instead of the main grid.
+    pub satellite: bool,
+    /// Stable runtime identity binding a satellite window to its workspace (tab
+    /// indices shift as tabs close). Assigned by the model, monotonic per run;
+    /// NOT persisted - the layout file's tab order is the durable identity.
+    pub wsid: u64,
 }
 
 /// Tab-rename editing state: which tab, and the in-progress buffer.
@@ -166,6 +185,16 @@ pub struct Reconcile {
 /// mode, and the set of tiles the user closed this run (their sessions survive
 /// server-side; they stay out of the layout until they die or the client
 /// restarts - matching the webview's mid-session close-tab behavior).
+///
+/// ## Satellite invariants (T10)
+/// - `active` points at a NON-satellite tab whenever one exists ([`Self::fixup_active`]);
+///   only when every workspace is torn off may it rest on a satellite, and then
+///   the main grid paints nothing ([`Self::main_tiles`] returns `None`).
+/// - `focused` is the MAIN window's focused tile (satellite windows keep their
+///   own focus in the window registry), so it is `None` while `active` rests on
+///   a satellite.
+/// - New sessions always land in a main (non-satellite) workspace; if none
+///   exists, [`Self::reconcile`] creates one.
 #[derive(Clone, Debug)]
 pub struct ChromeModel {
     pub tabs: Vec<Workspace>,
@@ -176,6 +205,8 @@ pub struct ChromeModel {
     /// re-lists everything live (self-healing, and the only "reopen" story until
     /// the T9 recents overlay).
     hidden: HashSet<String>,
+    /// Next workspace id to assign (see [`Workspace::wsid`]).
+    next_wsid: u64,
 }
 
 impl Default for ChromeModel {
@@ -185,24 +216,36 @@ impl Default for ChromeModel {
                 name: "Workspace 1".to_string(),
                 tiles: Vec::new(),
                 font: None,
+                satellite: false,
+                wsid: 1,
             }],
             active: 0,
             focused: None,
             renaming: None,
             hidden: HashSet::new(),
+            next_wsid: 2,
         }
     }
 }
 
 impl ChromeModel {
     /// Rebuild from persisted layout, sanitized: at least one tab, `active` in
-    /// range. Tile liveness is reconciled separately against `list_terminals`.
+    /// range (and never resting on a satellite while a main tab exists), fresh
+    /// `wsid`s. Tile liveness is reconciled separately against `list_terminals`.
     pub fn from_layout(tabs: Vec<Workspace>, active: usize) -> Self {
         let mut m = ChromeModel::default();
         if !tabs.is_empty() {
             m.tabs = tabs;
             m.active = active.min(m.tabs.len() - 1);
         }
+        // Persisted wsids are meaningless (runtime identity); reassign.
+        m.next_wsid = 1;
+        for tab in &mut m.tabs {
+            tab.wsid = m.next_wsid;
+            m.next_wsid += 1;
+        }
+        m.fixup_active();
+        m.fixup_focus();
         m
     }
 
@@ -216,7 +259,10 @@ impl ChromeModel {
             name: format!("Workspace {}", self.tabs.len() + 1),
             tiles: Vec::new(),
             font: None,
+            satellite: false,
+            wsid: self.next_wsid,
         });
+        self.next_wsid += 1;
         self.active = self.tabs.len() - 1;
         self.fixup_focus();
         self.active
@@ -224,7 +270,8 @@ impl ChromeModel {
 
     /// Close tab `i`. Refuses on the last tab (webview: at least one tab always
     /// exists). Returns the tile ids that left the layout - their sessions
-    /// SURVIVE server-side, but the caller must drop their pool attachments.
+    /// SURVIVE server-side, but the caller must drop their pool attachments
+    /// (and, if the tab was a satellite, close its OS window).
     pub fn close_tab(&mut self, i: usize) -> Option<Vec<String>> {
         if self.tabs.len() <= 1 || i >= self.tabs.len() {
             return None;
@@ -237,17 +284,79 @@ impl ChromeModel {
         if self.active > i || self.active >= self.tabs.len() {
             self.active = self.active.saturating_sub(1);
         }
+        self.fixup_active();
         self.fixup_focus();
         Some(removed)
     }
 
     /// Switch to tab `i`. Cancels a rename in progress and refocuses within the
-    /// new tab (keys must never reach an invisible terminal).
+    /// new tab (keys must never reach an invisible terminal). Refuses satellite
+    /// tabs - their tiles paint in their own window, so "activating" one in the
+    /// main grid would double-paint it (the view activates the OS window instead).
     pub fn set_active(&mut self, i: usize) {
-        if i < self.tabs.len() {
+        if i < self.tabs.len() && !self.tabs[i].satellite {
             self.active = i;
             self.renaming = None;
             self.fixup_focus();
+        }
+    }
+
+    // -- satellites (T10) -----------------------------------------------------
+
+    /// The tab index currently holding workspace `wsid` (indices shift as tabs
+    /// close; the wsid is the stable handle satellite windows keep).
+    pub fn tab_by_wsid(&self, wsid: u64) -> Option<usize> {
+        self.tabs.iter().position(|t| t.wsid == wsid)
+    }
+
+    /// All torn-off workspaces, as `(tab index, wsid)` in tab order.
+    pub fn satellite_tabs(&self) -> Vec<(usize, u64)> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.satellite)
+            .map(|(i, t)| (i, t.wsid))
+            .collect()
+    }
+
+    /// Tear workspace `i` off into its own window: flag it, move `active` (and
+    /// main focus) off it. Returns its wsid, or `None` when `i` is out of range
+    /// or already torn off. The caller opens the OS window.
+    pub fn tear_off(&mut self, i: usize) -> Option<u64> {
+        let tab = self.tabs.get_mut(i)?;
+        if tab.satellite {
+            return None;
+        }
+        tab.satellite = true;
+        let wsid = tab.wsid;
+        self.renaming = None;
+        self.fixup_active();
+        self.fixup_focus();
+        Some(wsid)
+    }
+
+    /// Return a torn-off workspace to the main window and activate it (the user
+    /// just brought it home - show it). Returns its tab index, or `None` when
+    /// the wsid is unknown or not a satellite. The caller closes the OS window.
+    pub fn close_back(&mut self, wsid: u64) -> Option<usize> {
+        let i = self.tab_by_wsid(wsid)?;
+        if !self.tabs[i].satellite {
+            return None;
+        }
+        self.tabs[i].satellite = false;
+        self.active = i;
+        self.fixup_focus();
+        Some(i)
+    }
+
+    /// Keep `active` off satellite tabs whenever a main (non-satellite) tab
+    /// exists; when every workspace is torn off it stays where it is and
+    /// [`Self::main_tiles`] reports the main grid as empty.
+    fn fixup_active(&mut self) {
+        if self.tabs[self.active].satellite {
+            if let Some(i) = self.tabs.iter().position(|t| !t.satellite) {
+                self.active = i;
+            }
         }
     }
 
@@ -310,6 +419,14 @@ impl ChromeModel {
         &self.tabs[self.active].tiles
     }
 
+    /// The tiles the MAIN window's grid paints: the active workspace's, unless
+    /// every workspace is torn off (then the main grid is empty - a satellite
+    /// paints those tiles, and painting them twice would fight over damage).
+    pub fn main_tiles(&self) -> Option<&[String]> {
+        let tab = &self.tabs[self.active];
+        (!tab.satellite).then_some(tab.tiles.as_slice())
+    }
+
     /// Close one tile: remove it from the layout and hide it for this run. The
     /// session survives server-side (native close = detach; the webview's
     /// kill-with-confirm needs the busy signal and is deferred with the
@@ -346,14 +463,18 @@ impl ChromeModel {
 
     /// Keep `focused` pointing at a tile IN THE ACTIVE TAB, so key input never
     /// goes to a hidden terminal: if it left the tab (switch/close/removal),
-    /// fall back to the active tab's first tile.
+    /// fall back to the active tab's first tile. While the active tab is a
+    /// satellite (every workspace torn off), the main window focuses nothing -
+    /// each satellite window tracks its own focus in the window registry.
     fn fixup_focus(&mut self) {
-        let in_active = self
-            .focused
-            .as_ref()
-            .is_some_and(|f| self.tabs[self.active].tiles.iter().any(|x| x == f));
+        let tab = &self.tabs[self.active];
+        if tab.satellite {
+            self.focused = None;
+            return;
+        }
+        let in_active = self.focused.as_ref().is_some_and(|f| tab.tiles.iter().any(|x| x == f));
         if !in_active {
-            self.focused = self.tabs[self.active].tiles.first().cloned();
+            self.focused = tab.tiles.first().cloned();
         }
     }
 
@@ -363,7 +484,9 @@ impl ChromeModel {
     /// (`list_terminals`): sessions that died leave every tab; live sessions not
     /// in any tab (and not user-hidden) join the ACTIVE tab (the webview boots
     /// the same way: persisted order first, unknown live terminals appended).
-    /// Dead ids also leave the hidden set, so it never leaks.
+    /// Dead ids also leave the hidden set, so it never leaks. New sessions must
+    /// land where the user can see them arrive: a MAIN workspace - when every
+    /// workspace is torn off, a fresh main workspace is created to receive them.
     pub fn reconcile(&mut self, live: &[String]) -> Reconcile {
         let live_set: HashSet<&str> = live.iter().map(String::as_str).collect();
         let mut out = Reconcile::default();
@@ -380,9 +503,17 @@ impl ChromeModel {
         self.hidden.retain(|id| live_set.contains(id.as_str()));
 
         let placed: HashSet<String> = self.all_tiles().into_iter().collect();
+        let mut target: Option<usize> = None;
         for id in live {
             if !placed.contains(id) && !self.hidden.contains(id) {
-                self.tabs[self.active].tiles.push(id.clone());
+                let t = *target.get_or_insert_with(|| {
+                    if self.tabs[self.active].satellite {
+                        self.add_tab() // all torn off: new arrivals need a main home
+                    } else {
+                        self.active
+                    }
+                });
+                self.tabs[t].tiles.push(id.clone());
                 out.added.push(id.clone());
             }
         }
@@ -441,8 +572,10 @@ mod tests {
         // Full-width rows stacked with the gap.
         assert_eq!(sb.rows[0], RectF::new(10.0, 50.0, 200.0, 28.0));
         assert_eq!(sb.rows[1], RectF::new(10.0, 80.0, 200.0, 28.0));
-        // Close zones flush right inside their rows.
+        // Close zones flush right inside their rows; tear-off zones left of them.
         assert_eq!(sb.closes[0], RectF::new(182.0, 50.0, 28.0, 28.0));
+        assert_eq!(sb.tears[0], RectF::new(154.0, 50.0, 28.0, 28.0));
+        assert_eq!(sb.tears[1], RectF::new(154.0, 80.0, 28.0, 28.0));
         // "+" row after the workspaces; T9 overlay mount consumes the rest.
         assert_eq!(sb.plus, RectF::new(10.0, 110.0, 200.0, 28.0));
         assert_eq!(sb.overlay_mount, RectF::new(10.0, 140.0, 200.0, 710.0));
@@ -575,19 +708,150 @@ mod tests {
         assert_eq!(m.focused.as_deref(), Some("bb"));
     }
 
+    fn ws(name: &str, tiles: &[&str], satellite: bool) -> Workspace {
+        Workspace { name: name.into(), tiles: ids(tiles), font: None, satellite, wsid: 0 }
+    }
+
     #[test]
     fn from_layout_sanitizes() {
         let m = ChromeModel::from_layout(Vec::new(), 7);
         assert_eq!(m.tabs.len(), 1);
         assert_eq!(m.active, 0);
         let m = ChromeModel::from_layout(
-            vec![
-                Workspace { name: "a".into(), tiles: ids(&["x"]), font: None },
-                Workspace { name: "b".into(), tiles: Vec::new(), font: None },
-            ],
+            vec![ws("a", &["x"], false), ws("b", &[], false)],
             9,
         );
         assert_eq!(m.active, 1);
         assert_eq!(m.tabs[0].tiles, ids(&["x"]));
+        // Fresh, unique wsids are assigned regardless of what was loaded.
+        assert_eq!(m.tabs[0].wsid, 1);
+        assert_eq!(m.tabs[1].wsid, 2);
+    }
+
+    // -- satellites (T10) ---------------------------------------------------------
+
+    #[test]
+    fn tear_off_moves_active_and_focus_to_a_main_tab() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb"]));
+        m.add_tab();
+        m.reconcile(&ids(&["aa", "bb", "cc"])); // tab 1 holds "cc", active
+        assert_eq!(m.active, 1);
+
+        let wsid = m.tear_off(1).unwrap();
+        assert_eq!(wsid, 2);
+        assert!(m.tabs[1].satellite);
+        // Active and main focus left the torn-off tab.
+        assert_eq!(m.active, 0);
+        assert_eq!(m.focused.as_deref(), Some("aa"));
+        assert_eq!(m.main_tiles(), Some(ids(&["aa", "bb"]).as_slice()));
+        assert_eq!(m.satellite_tabs(), vec![(1, 2)]);
+        // Tearing off again refuses; out-of-range refuses.
+        assert_eq!(m.tear_off(1), None);
+        assert_eq!(m.tear_off(9), None);
+    }
+
+    #[test]
+    fn tearing_off_everything_empties_the_main_grid() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa"]));
+        let wsid = m.tear_off(0).unwrap();
+        assert!(m.tabs[0].satellite);
+        assert_eq!(m.main_tiles(), None); // main grid paints nothing
+        assert_eq!(m.focused, None); // main window focuses nothing
+        assert_eq!(m.active, 0); // parked - no main tab to move to
+
+        // close_back returns it home and activates it.
+        assert_eq!(m.close_back(wsid), Some(0));
+        assert!(!m.tabs[0].satellite);
+        assert_eq!(m.main_tiles(), Some(ids(&["aa"]).as_slice()));
+        assert_eq!(m.focused.as_deref(), Some("aa"));
+        // Closing back twice / an unknown wsid refuses.
+        assert_eq!(m.close_back(wsid), None);
+        assert_eq!(m.close_back(99), None);
+    }
+
+    #[test]
+    fn close_back_activates_the_returned_workspace() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa"]));
+        m.add_tab();
+        m.reconcile(&ids(&["aa", "bb"])); // tab 1: "bb"
+        let wsid = m.tear_off(1).unwrap();
+        assert_eq!(m.active, 0);
+        assert_eq!(m.close_back(wsid), Some(1));
+        assert_eq!(m.active, 1);
+        assert_eq!(m.focused.as_deref(), Some("bb"));
+    }
+
+    #[test]
+    fn set_active_refuses_satellite_tabs() {
+        let mut m = ChromeModel::default();
+        m.add_tab();
+        m.tear_off(1).unwrap();
+        assert_eq!(m.active, 0);
+        m.set_active(1); // a satellite: refused
+        assert_eq!(m.active, 0);
+    }
+
+    #[test]
+    fn wsid_binding_survives_tab_index_shifts() {
+        let mut m = ChromeModel::default();
+        m.add_tab(); // wsid 2
+        m.add_tab(); // wsid 3
+        let wsid = m.tear_off(2).unwrap();
+        assert_eq!(wsid, 3);
+        // Closing an EARLIER tab shifts indices; the wsid still resolves.
+        m.close_tab(0).unwrap();
+        assert_eq!(m.tab_by_wsid(wsid), Some(1));
+        assert_eq!(m.satellite_tabs(), vec![(1, 3)]);
+    }
+
+    #[test]
+    fn closing_a_tab_never_leaves_active_on_a_satellite() {
+        let mut m = ChromeModel::default();
+        m.add_tab(); // tab 1
+        m.add_tab(); // tab 2, active
+        m.tear_off(1).unwrap();
+        assert_eq!(m.active, 2);
+        // Closing the active main tab: active must skip over the satellite.
+        m.close_tab(2).unwrap();
+        assert_eq!(m.active, 0);
+        assert!(!m.tabs[m.active].satellite);
+    }
+
+    #[test]
+    fn reconcile_lands_new_sessions_in_a_main_workspace() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa"]));
+        m.tear_off(0).unwrap(); // everything torn off
+        let out = m.reconcile(&ids(&["aa", "bb"]));
+        // A fresh MAIN workspace was created to receive "bb".
+        assert_eq!(out.added, ids(&["bb"]));
+        assert_eq!(m.tabs.len(), 2);
+        assert!(!m.tabs[1].satellite);
+        assert_eq!(m.tabs[1].tiles, ids(&["bb"]));
+        assert_eq!(m.active, 1);
+        // The satellite kept its own tiles.
+        assert_eq!(m.tabs[0].tiles, ids(&["aa"]));
+
+        // With a main workspace present, new sessions land there, never in the
+        // satellite.
+        let out = m.reconcile(&ids(&["aa", "bb", "cc"]));
+        assert_eq!(out.added, ids(&["cc"]));
+        assert_eq!(m.tabs[1].tiles, ids(&["bb", "cc"]));
+    }
+
+    #[test]
+    fn dead_sessions_leave_satellite_workspaces_too() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb"]));
+        m.add_tab();
+        m.reconcile(&ids(&["aa", "bb", "cc"]));
+        m.tear_off(0).unwrap();
+        let out = m.reconcile(&ids(&["bb", "cc"])); // "aa" died in the satellite
+        assert_eq!(out.removed, ids(&["aa"]));
+        assert_eq!(m.tabs[0].tiles, ids(&["bb"]));
+        assert!(m.tabs[0].satellite); // an emptied satellite stays a satellite
     }
 }
