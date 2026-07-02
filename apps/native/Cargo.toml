@@ -54,6 +54,23 @@ name = "overlay-window"
 path = "src/bin/overlay_window.rs"
 required-features = ["gui"]
 
+# T11 acceptance runner (headless): proves Files (index/search/list/open
+# round-trip), Preview (capture-scan URL detection + client-side reachability
+# probe), and the Dev runner machine (adopt/run/URL/stop/exit/kill) against
+# the real server, on disposable th_t11* sessions only.
+[[bin]]
+name = "panels-probe"
+path = "src/bin/panels_probe.rs"
+required-features = []
+
+# T11 visual demo: a standalone window hosting only the PanelHost composite
+# (Files | Preview | Run) - the §3 "separate bin" demo entry point; app.rs is
+# T10's file this wave.
+[[bin]]
+name = "panel-window"
+path = "src/bin/panel_window.rs"
+required-features = ["gui"]
+
 [features]
 # `gui` pulls in gpui. Default on, but gated so the wire/ contract can be
 # `cargo check`ed / tested in WSL (`--no-default-features`) even when the linux

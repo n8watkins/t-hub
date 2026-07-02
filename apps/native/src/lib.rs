@@ -31,6 +31,11 @@ pub mod chrome;
 /// only `overlays::view` (feature `gui`) touches gpui.
 pub mod overlays;
 
+/// Panels (T11): Files (tree + fuzzy search), Preview (local dev URLs), Dev
+/// runner. State + reducers are gpui-free (testable under
+/// `--no-default-features`); only `panels::view` (feature `gui`) touches gpui.
+pub mod panels;
+
 #[cfg(feature = "gui")]
 pub mod app;
 
