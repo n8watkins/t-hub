@@ -37,7 +37,9 @@ use parking_lot::Mutex;
 
 use crate::chrome::model::ChromeModel;
 use crate::chrome::persist;
-use crate::chrome::view::{CockpitState, CockpitView};
+use crate::chrome::view::{sync_active_sessions, CockpitState, CockpitView};
+use crate::font::FontSpec;
+use crate::overlays::{OverlayFeed, OverlaySidebar};
 use crate::render::{GridView, Tile, TileSpec};
 use crate::term::TermSession;
 use crate::wire::{push_capped, ControlClient, Event, PtyFrame};
@@ -342,7 +344,15 @@ fn run_grid() {
                 }
             }
         });
-        specs.push(TileSpec { id, term, pty: handle, cols: PROVISIONAL_COLS, rows: PROVISIONAL_ROWS });
+        specs.push(TileSpec {
+            id,
+            term,
+            pty: Some(handle),
+            cols: PROVISIONAL_COLS,
+            rows: PROVISIONAL_ROWS,
+            font: None,
+            fixture: None,
+        });
     }
 
     if specs.is_empty() {
@@ -350,7 +360,6 @@ fn run_grid() {
         std::process::exit(1);
     }
 
-    let (font_normal, font_bold) = fonts();
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);
         let opened = cx.open_window(
@@ -364,9 +373,8 @@ fn run_grid() {
             },
             |window, cx| {
                 let focus = cx.focus_handle();
-                let view = cx.new(|_| {
-                    GridView::new(specs, client, font_normal, font_bold, focus.clone())
-                });
+                let view =
+                    cx.new(|_| GridView::new(specs, Some(client), focus.clone()));
                 window.focus(&focus);
                 view
             },
@@ -386,15 +394,13 @@ fn run_grid() {
 /// How often the cockpit worker re-lists sessions when no event hints arrive.
 /// The control socket has no terminal-lifecycle channel (§1.2 lists only
 /// status/session/supervision/agent), so adds/removals ride this poll,
-/// accelerated to ~[`EVENT_DEBOUNCE`] by any session-ish event.
+/// accelerated to ~[`HINT_TICK`] by any session-ish event.
 const RELIST_INTERVAL: Duration = Duration::from_secs(2);
-/// After an event hint, wait this long (coalescing the burst) before re-listing.
-const EVENT_DEBOUNCE: Duration = Duration::from_millis(250);
-
-/// Event channels that hint the session set (or its metadata) changed. Any of
-/// these triggers an early re-list instead of waiting out the poll interval.
-const LIFECYCLE_HINTS: [&str; 4] =
-    ["status://snapshot", "session://status", "agent://state", "agent://title"];
+/// How often the worker checks the T9 SidebarState's folded-event counter for
+/// a hint that the session set (or its metadata) changed. The T9 `OverlayFeed`
+/// is the process's SINGLE event drainer (its docs: events receivers COMPETE
+/// for frames); the chrome no longer subscribes - it reads the fold counter.
+const HINT_TICK: Duration = Duration::from_millis(250);
 
 /// T8 cockpit: tabs + per-workspace grid + headers over the live session list.
 /// Loads the persisted layout, spawns the reconcile worker (which attaches every
@@ -425,10 +431,25 @@ fn run_cockpit() {
         model.active
     );
 
-    let state = Arc::new(Mutex::new(CockpitState::new(model, layout_path)));
-    spawn_cockpit_worker(state.clone(), client.clone());
+    // The T9 feed is the process's SINGLE control-event drainer; the chrome
+    // reads its shared SidebarState instead of subscribing itself.
+    let feed = OverlayFeed::spawn(client.clone());
 
-    let (font_normal, font_bold) = fonts();
+    // Resume clicks from the recents overlay need a tile-spawn path the socket
+    // does not provide yet (`spawn_terminal` only forwards to a UI sink); log
+    // them until that lands (T11/T12 territory).
+    {
+        let host_rx = feed.host_requests();
+        thread::spawn(move || {
+            while let Ok(req) = host_rx.recv() {
+                log::info!("host request (needs a tile-spawn path, not wired yet): {req:?}");
+            }
+        });
+    }
+
+    let state = Arc::new(Mutex::new(CockpitState::new(model, layout_path)));
+    spawn_cockpit_worker(state.clone(), client.clone(), feed.clone());
+
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);
         let opened = cx.open_window(
@@ -442,8 +463,9 @@ fn run_cockpit() {
             },
             |window, cx| {
                 let focus = cx.focus_handle();
+                let overlays = cx.new(|_| OverlaySidebar::new(feed.clone()));
                 let view = cx.new(|_| {
-                    CockpitView::new(state, client, font_normal, font_bold, focus.clone())
+                    CockpitView::new(state, overlays, feed, client, focus.clone())
                 });
                 window.focus(&focus);
                 view
@@ -459,36 +481,39 @@ fn run_cockpit() {
 
 /// The cockpit reconcile worker: keep the model's tile set matched to the
 /// server's live sessions. Poll `list_terminals` every [`RELIST_INTERVAL`];
-/// any [`LIFECYCLE_HINTS`] event short-circuits the wait (debounced), so a
-/// session spawned by an agent shows up in well under a second.
-fn spawn_cockpit_worker(state: Arc<Mutex<CockpitState>>, client: Arc<ControlClient>) {
+/// a change in the T9 SidebarState's folded-event counter short-circuits the
+/// wait, so a session spawned by an agent shows up in well under a second.
+/// The chrome holds NO events receiver - the feed is the sole drainer.
+fn spawn_cockpit_worker(
+    state: Arc<Mutex<CockpitState>>,
+    client: Arc<ControlClient>,
+    feed: OverlayFeed,
+) {
     thread::Builder::new()
         .name("t-hub-native-cockpit".into())
         .spawn(move || {
-            let ev_rx = client.events();
+            let sidebar = feed.state();
+            let folded = |sb: &Arc<Mutex<crate::overlays::SidebarState>>| sb.lock().events_folded;
             loop {
                 reconcile_once(&state, &client);
+                {
+                    let st = state.lock();
+                    sync_active_sessions(&st, &feed);
+                }
 
-                // Wait out the poll interval, cutting it short on a lifecycle hint.
+                // Wait out the poll interval, cutting it short when the feed
+                // folded new events (session-ish state moved somewhere).
+                let mut seen = folded(&sidebar);
                 let deadline = Instant::now() + RELIST_INTERVAL;
                 loop {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
+                    thread::sleep(HINT_TICK);
+                    if Instant::now() >= deadline {
                         break;
                     }
-                    match ev_rx.recv_timeout(left) {
-                        Ok(ev) if LIFECYCLE_HINTS.contains(&ev.channel.as_str()) => {
-                            thread::sleep(EVENT_DEBOUNCE);
-                            while ev_rx.try_recv().is_ok() {} // coalesce the burst
-                            break;
-                        }
-                        Ok(_) => continue,
-                        Err(crossbeam::channel::RecvTimeoutError::Timeout) => break,
-                        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
-                            // Event plane gone (client dropping); fall back to polling.
-                            thread::sleep(RELIST_INTERVAL);
-                            break;
-                        }
+                    let now = folded(&sidebar);
+                    if now != seen {
+                        seen = now;
+                        break;
                     }
                 }
             }
@@ -586,9 +611,19 @@ fn attach_tile(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>, id
             }
         }
     });
+    // T7 per-tile font: the workspace's persisted override, else THN_FONT/default.
+    let spec = st.model.font_for(id).cloned().unwrap_or_else(FontSpec::from_env);
     st.tiles.insert(
         id.to_string(),
-        Tile::new(id.to_string(), term, handle, PROVISIONAL_COLS, PROVISIONAL_ROWS),
+        Tile::new(
+            id.to_string(),
+            term,
+            Some(handle),
+            PROVISIONAL_COLS,
+            PROVISIONAL_ROWS,
+            spec,
+            None,
+        ),
     );
     st.last_output_ms.insert(id.to_string(), stamp);
     if st.model.focused.is_none() {

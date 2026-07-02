@@ -23,6 +23,37 @@ name = "wire-probe"
 path = "src/bin/wire_probe.rs"
 required-features = []
 
+# T13b acceptance + bandwidth runner: proves v2 binary PTY framing end to end
+# through the real ControlClient (negotiation, round-trips, forced-v1 baseline)
+# and measures the v1-vs-v2 wire delta on a firehose. Headless, like wire-probe.
+[[bin]]
+name = "binframe-probe"
+path = "src/bin/binframe_probe.rs"
+required-features = []
+
+# T7 font torture screen: offline GPUI tiles rendering the torture fixture (one
+# tile per configured font), or `--emit` to dump the fixture bytes for a visual
+# diff in WezTerm / Windows Terminal. GUI-only (needs gpui).
+[[bin]]
+name = "font-torture"
+path = "src/bin/font_torture.rs"
+required-features = ["gui"]
+
+# T9 acceptance runner (headless): spins the OverlayFeed against the real server
+# and prints a text rendering of every sidebar section (recents, usage, wsl
+# health, supervision, toasts, event counts).
+[[bin]]
+name = "overlay-probe"
+path = "src/bin/overlay_probe.rs"
+required-features = []
+
+# T9 visual demo: a standalone window hosting only the OverlaySidebar (the §3
+# brief's "separate bin" demo entry point - app.rs is T8's file).
+[[bin]]
+name = "overlay-window"
+path = "src/bin/overlay_window.rs"
+required-features = ["gui"]
+
 [features]
 # `gui` pulls in gpui. Default on, but gated so the wire/ contract can be
 # `cargo check`ed / tested in WSL (`--no-default-features`) even when the linux
