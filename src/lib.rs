@@ -7,5 +7,13 @@
 
 pub mod wire;
 
+/// Terminal emulation core (T5). gpui-free, so it compiles and unit-tests under
+/// `--no-default-features` the same way `wire` does.
+pub mod term;
+
 #[cfg(feature = "gui")]
 pub mod app;
+
+/// Grid rendering (T5 render seam). GPUI-dependent, so gated behind `gui`.
+#[cfg(feature = "gui")]
+pub mod render;

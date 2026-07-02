@@ -39,6 +39,11 @@ parking_lot = "0.12"
 log = "0.4"
 env_logger = "0.11"
 
+# Terminal emulation core (T5 render seam). Exact versions proven in the T2 spike
+# (docs/T2-GPUI-SPIKE-RESULTS.md): alacritty_terminal 0.26 + its re-exported vte 0.15.
+# `vte` is used via `alacritty_terminal::vte`, so it is NOT a direct dep here.
+alacritty_terminal = "0.26"
+
 # GPUI is optional so the wire module compiles without a graphics backend.
 gpui = { version = "0.2.2", optional = true }
 
