@@ -16,6 +16,8 @@
 
 use std::collections::HashSet;
 
+use crate::font::FontSpec;
+
 // ---------------------------------------------------------------------------
 // Plain geometry (gpui-free)
 // ---------------------------------------------------------------------------
@@ -134,11 +136,15 @@ pub fn sidebar_layout(n: usize, area: RectF) -> SidebarLayout {
 // The chrome model
 // ---------------------------------------------------------------------------
 
-/// One workspace tab: a name and an ordered set of tile (session) ids.
+/// One workspace tab: a name, an ordered set of tile (session) ids, and an
+/// optional font override (T7 [`FontSpec`]) applied to tiles attached into this
+/// workspace. `None` falls back to the `THN_FONT` / built-in default. There is
+/// no settings UI yet - the field persists and applies (edit the layout JSON).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Workspace {
     pub name: String,
     pub tiles: Vec<String>,
+    pub font: Option<FontSpec>,
 }
 
 /// Tab-rename editing state: which tab, and the in-progress buffer.
@@ -175,7 +181,11 @@ pub struct ChromeModel {
 impl Default for ChromeModel {
     fn default() -> Self {
         ChromeModel {
-            tabs: vec![Workspace { name: "Workspace 1".to_string(), tiles: Vec::new() }],
+            tabs: vec![Workspace {
+                name: "Workspace 1".to_string(),
+                tiles: Vec::new(),
+                font: None,
+            }],
             active: 0,
             focused: None,
             renaming: None,
@@ -205,6 +215,7 @@ impl ChromeModel {
         self.tabs.push(Workspace {
             name: format!("Workspace {}", self.tabs.len() + 1),
             tiles: Vec::new(),
+            font: None,
         });
         self.active = self.tabs.len() - 1;
         self.fixup_focus();
@@ -284,6 +295,14 @@ impl ChromeModel {
 
     pub fn contains_tile(&self, id: &str) -> bool {
         self.tabs.iter().any(|t| t.tiles.iter().any(|x| x == id))
+    }
+
+    /// The font override of the workspace holding `id` (applied at attach).
+    pub fn font_for(&self, id: &str) -> Option<&FontSpec> {
+        self.tabs
+            .iter()
+            .find(|t| t.tiles.iter().any(|x| x == id))
+            .and_then(|t| t.font.as_ref())
     }
 
     /// The active workspace's tiles, in paint order.
@@ -563,8 +582,8 @@ mod tests {
         assert_eq!(m.active, 0);
         let m = ChromeModel::from_layout(
             vec![
-                Workspace { name: "a".into(), tiles: ids(&["x"]) },
-                Workspace { name: "b".into(), tiles: Vec::new() },
+                Workspace { name: "a".into(), tiles: ids(&["x"]), font: None },
+                Workspace { name: "b".into(), tiles: Vec::new(), font: None },
             ],
             9,
         );

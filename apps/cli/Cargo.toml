@@ -1,6 +1,6 @@
 [package]
 name = "t-hub-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "th — T-Hub's canonical agent+human CLI (a thin control-socket client)"
 authors = ["Nathan Watkins"]
 edition = "2021"

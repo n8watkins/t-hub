@@ -11,14 +11,25 @@ pub mod wire;
 /// `--no-default-features` the same way `wire` does.
 pub mod term;
 
+/// Font subsystem (T7): glyph classification, procedural box-drawing/Powerline
+/// sprite geometry, row segmentation, per-tile font config, and the torture-test
+/// fixture. gpui-free, so it compiles and unit-tests under
+/// `--no-default-features`; the GPUI glue lives in `render`.
+pub mod font;
+
 /// gpui-free render helpers (key encoding, layout math) - split out of `render` so
 /// they unit-test in WSL without linking the graphics backend.
 pub mod render_support;
 
-/// Cockpit chrome (T8): workspace tabs, tile grid, per-tile headers. The state
-/// machine + layout math + persistence are gpui-free (tested under
+/// Cockpit chrome (T8): the workspace sidebar, tile grid, per-tile headers. The
+/// state machine + layout math + persistence are gpui-free (tested under
 /// `--no-default-features`); only `chrome::view` is gated behind `gui`.
 pub mod chrome;
+
+/// Sidebar overlays (T9): recents, usage, host metrics, supervision, toasts.
+/// State + reducers are gpui-free (testable under `--no-default-features`);
+/// only `overlays::view` (feature `gui`) touches gpui.
+pub mod overlays;
 
 #[cfg(feature = "gui")]
 pub mod app;

@@ -18,6 +18,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use super::model::{ChromeModel, Workspace};
+use crate::font::FontSpec;
 
 /// On-disk shape, versioned for forward evolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +32,33 @@ pub struct Layout {
 pub struct LayoutTab {
     pub name: String,
     pub tiles: Vec<String>,
+    /// Optional per-workspace font override (T7). Absent in pre-T7 layouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<FontConfig>,
+}
+
+/// The serialized form of a [`FontSpec`] (mirrored locally so the gpui-free
+/// `font` module stays serde-free).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FontConfig {
+    pub family: String,
+    pub size: f32,
+    #[serde(default = "default_true")]
+    pub ligatures: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl FontConfig {
+    fn from_spec(s: &FontSpec) -> FontConfig {
+        FontConfig { family: s.family.clone(), size: s.size, ligatures: s.ligatures }
+    }
+
+    fn into_spec(self) -> FontSpec {
+        FontSpec { family: self.family, size: self.size, ligatures: self.ligatures }
+    }
 }
 
 impl Layout {
@@ -40,7 +68,11 @@ impl Layout {
             tabs: m
                 .tabs
                 .iter()
-                .map(|t| LayoutTab { name: t.name.clone(), tiles: t.tiles.clone() })
+                .map(|t| LayoutTab {
+                    name: t.name.clone(),
+                    tiles: t.tiles.clone(),
+                    font: t.font.as_ref().map(FontConfig::from_spec),
+                })
                 .collect(),
             active: m.active,
         }
@@ -50,7 +82,11 @@ impl Layout {
         ChromeModel::from_layout(
             self.tabs
                 .into_iter()
-                .map(|t| Workspace { name: t.name, tiles: t.tiles })
+                .map(|t| Workspace {
+                    name: t.name,
+                    tiles: t.tiles,
+                    font: t.font.map(FontConfig::into_spec),
+                })
                 .collect(),
             self.active,
         )
@@ -119,11 +155,23 @@ mod tests {
         m.reconcile(&["aa".to_string(), "bb".to_string()]);
         m.add_tab();
         m.tabs[1].name = "ops".to_string();
+        // Per-workspace font override (T7 FontSpec) round-trips too.
+        m.tabs[1].font =
+            Some(FontSpec { family: "Cascadia Code".to_string(), size: 15.0, ligatures: false });
 
         save(&path, &Layout::from_model(&m)).unwrap();
         let restored = load(&path).unwrap().unwrap().into_model();
         assert_eq!(restored.tabs, m.tabs);
         assert_eq!(restored.active, 1);
+        assert_eq!(restored.tabs[1].font.as_ref().unwrap().family, "Cascadia Code");
+        // A pre-T7 layout (no font field) still loads.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"tabs":[{"name":"w","tiles":["aa"]}],"active":0}"#,
+        )
+        .unwrap();
+        let old = load(&path).unwrap().unwrap().into_model();
+        assert_eq!(old.tabs[0].font, None);
 
         // Corrupt file -> an error, not a panic (the caller falls back fresh).
         std::fs::write(&path, "{ not json").unwrap();

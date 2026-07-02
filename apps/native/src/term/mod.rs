@@ -25,13 +25,18 @@
 //! only the rows that changed rather than every row every frame (§1.5).
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{point_to_viewport, Config, TermDamage};
+use alacritty_terminal::term::{point_to_viewport, viewport_to_point, Config, TermDamage, TermMode};
 use alacritty_terminal::vte;
 use alacritty_terminal::Term;
 use vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
+
+pub mod scan;
 
 /// Scrollback retained per session. Matches the spike's grid config.
 const SCROLLING_HISTORY: usize = 10_000;
@@ -64,6 +69,13 @@ pub struct SnapCell {
     pub bg: Option<Rgb>,
     pub bold: bool,
     pub underline: bool,
+    /// Grid columns this glyph occupies: 2 for a wide (CJK/emoji) char, else 1.
+    /// The spacer cell that pads a wide char is dropped (see [`to_snap_cell`]),
+    /// so the render layer uses this to advance its pen by whole cells (T7).
+    pub width: u8,
+    /// Zero-width combining chars attached to this cell (e.g. U+0301). Empty for
+    /// the common case; the shaper appends them to the base char's cluster (T7).
+    pub zw: Vec<char>,
 }
 
 /// Cursor position in viewport coordinates (row 0 == top visible line).
@@ -73,6 +85,8 @@ pub struct CursorPos {
     pub col: usize,
     /// False when the cursor is hidden (DECTCEM off) or scrolled out of view.
     pub visible: bool,
+    /// Cells the cursor block covers: 2 when it sits on a wide char, else 1 (T7).
+    pub width: u8,
 }
 
 /// A selection range in viewport coordinates (inclusive of both ends), as reported
@@ -114,6 +128,96 @@ pub enum Damage {
     Full,
     /// Only these viewport rows changed. Empty == nothing changed this interval.
     Lines(Vec<usize>),
+}
+
+/// A gpui-free snapshot of the terminal mode bits the input layer arbitrates on
+/// (T6): mouse reporting, wheel behavior, cursor keys, paste framing, focus events.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModeInfo {
+    pub app_cursor: bool,
+    pub bracketed_paste: bool,
+    pub alt_screen: bool,
+    pub alternate_scroll: bool,
+    pub mouse_click: bool,
+    pub mouse_drag: bool,
+    pub mouse_motion: bool,
+    pub sgr_mouse: bool,
+    pub utf8_mouse: bool,
+    pub focus_in_out: bool,
+}
+
+impl ModeInfo {
+    /// True when the app asked for any mouse reporting (press/drag/motion). Shift
+    /// overrides this for selection, per alacritty semantics.
+    pub fn any_mouse(&self) -> bool {
+        self.mouse_click || self.mouse_drag || self.mouse_motion
+    }
+}
+
+/// Selection kind, mapped 1:1 onto alacritty's `SelectionType` (T6: single click =
+/// Simple, ctrl+click = Block, double = Semantic/word, triple = Lines).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelKind {
+    Simple,
+    Block,
+    Semantic,
+    Lines,
+}
+
+impl From<SelKind> for SelectionType {
+    fn from(k: SelKind) -> Self {
+        match k {
+            SelKind::Simple => SelectionType::Simple,
+            SelKind::Block => SelectionType::Block,
+            SelKind::Semantic => SelectionType::Semantic,
+            SelKind::Lines => SelectionType::Lines,
+        }
+    }
+}
+
+/// A search match in **grid** coordinates (`line` may be negative into history),
+/// inclusive of both ends - stable across scrolling, unlike viewport rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub start: (i32, usize),
+    pub end: (i32, usize),
+}
+
+/// A URL detected on the visible grid: the text plus its per-viewport-row column
+/// segments (`(viewport_row, col_from, col_to)`, inclusive) for underline paint
+/// and click hit-testing. A URL wrapped across rows carries one segment per row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UrlSpan {
+    pub url: String,
+    pub segs: Vec<(usize, usize, usize)>,
+}
+
+/// Split an inclusive grid-coordinate span into per-viewport-row column segments
+/// (the same `(row, col_from, col_to)` shape [`UrlSpan`] uses). Rows scrolled out
+/// of the viewport are dropped. Pure, so it unit-tests without a terminal.
+pub fn grid_span_segs(
+    start: (i32, usize),
+    end: (i32, usize),
+    display_offset: usize,
+    rows: usize,
+    cols: usize,
+) -> Vec<(usize, usize, usize)> {
+    let mut segs = Vec::new();
+    if cols == 0 {
+        return segs;
+    }
+    for line in start.0..=end.0 {
+        let vr = line + display_offset as i32;
+        if vr < 0 || vr as usize >= rows {
+            continue;
+        }
+        let from = if line == start.0 { start.1 } else { 0 };
+        let to = if line == end.0 { end.1 } else { cols - 1 };
+        if from <= to {
+            segs.push((vr as usize, from, to.min(cols - 1)));
+        }
+    }
+    segs
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +295,15 @@ pub struct TermSession {
     parser: vte::ansi::Processor,
     cols: u16,
     rows: u16,
+    /// Compiled find-in-terminal query (T6). Kept here so next/prev and the
+    /// per-frame visible-hit walk reuse one DFA instead of recompiling.
+    search: Option<SearchCtx>,
+}
+
+/// The active search: the raw query (to skip recompiles) + its compiled regex.
+struct SearchCtx {
+    query: String,
+    regex: RegexSearch,
 }
 
 impl TermSession {
@@ -200,7 +313,7 @@ impl TermSession {
         let size = TermSize::new(cols as usize, rows as usize);
         let config = Config { scrolling_history: SCROLLING_HISTORY, ..Config::default() };
         let term = Term::new(config, &size, NullListener);
-        TermSession { term, parser: vte::ansi::Processor::new(), cols, rows }
+        TermSession { term, parser: vte::ansi::Processor::new(), cols, rows, search: None }
     }
 
     /// Feed raw PTY output bytes (a `PtyFrame::Out` payload). §1.4.
@@ -264,7 +377,12 @@ impl TermSession {
             cols: self.cols,
             rows: self.rows,
             rows_cells,
-            cursor: cursor_from(&content.cursor, display_offset, rows),
+            cursor: cursor_from(
+                &content.cursor,
+                display_offset,
+                rows,
+                self.cursor_cell_width(content.cursor.point),
+            ),
             selection: selection_from(content.selection),
         }
     }
@@ -297,8 +415,23 @@ impl TermSession {
 
         PartialSnapshot {
             rows: out,
-            cursor: cursor_from(&content.cursor, display_offset, rows),
+            cursor: cursor_from(
+                &content.cursor,
+                display_offset,
+                rows,
+                self.cursor_cell_width(content.cursor.point),
+            ),
             selection: selection_from(content.selection),
+        }
+    }
+
+    /// Cells the cursor block covers at a grid point: 2 on a wide char, else 1
+    /// (T7 - the render layer sizes the cursor quad to the glyph underneath).
+    fn cursor_cell_width(&self, point: Point) -> u8 {
+        if self.term.grid()[point].flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
         }
     }
 
@@ -314,6 +447,292 @@ impl TermSession {
         };
         self.term.reset_damage();
         damage
+    }
+
+    // -- T6: mode introspection ---------------------------------------------
+
+    /// Snapshot the mode bits the input layer arbitrates on (mouse reporting,
+    /// alt screen, cursor keys, paste framing). Screen-derived, per decision D5.
+    pub fn mode_info(&self) -> ModeInfo {
+        let m = self.term.mode();
+        ModeInfo {
+            app_cursor: m.contains(TermMode::APP_CURSOR),
+            bracketed_paste: m.contains(TermMode::BRACKETED_PASTE),
+            alt_screen: m.contains(TermMode::ALT_SCREEN),
+            alternate_scroll: m.contains(TermMode::ALTERNATE_SCROLL),
+            mouse_click: m.contains(TermMode::MOUSE_REPORT_CLICK),
+            mouse_drag: m.contains(TermMode::MOUSE_DRAG),
+            mouse_motion: m.contains(TermMode::MOUSE_MOTION),
+            sgr_mouse: m.contains(TermMode::SGR_MOUSE),
+            utf8_mouse: m.contains(TermMode::UTF8_MOUSE),
+            focus_in_out: m.contains(TermMode::FOCUS_IN_OUT),
+        }
+    }
+
+    // -- T6: scrollback viewport --------------------------------------------
+
+    /// Lines currently scrolled back from the live bottom (0 == pinned to live).
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// Total scrollback lines available above the viewport.
+    pub fn history_size(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    pub fn scroll_page_up(&mut self) {
+        self.term.scroll_display(Scroll::PageUp);
+    }
+
+    pub fn scroll_page_down(&mut self) {
+        self.term.scroll_display(Scroll::PageDown);
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.term.scroll_display(Scroll::Top);
+    }
+
+    /// Bring a grid line into view: no-op if already visible, otherwise scroll so
+    /// the line sits near the vertical center (find-jump behavior).
+    pub fn scroll_to_line(&mut self, line: i32) {
+        let rows = self.rows as i32;
+        let offset = self.term.grid().display_offset() as i32;
+        let vr = line + offset;
+        if vr >= 0 && vr < rows {
+            return;
+        }
+        let history = self.term.grid().history_size() as i32;
+        let target = (rows / 2 - line).clamp(0, history);
+        self.term.scroll_display(Scroll::Delta(target - offset));
+    }
+
+    // -- T6: selection (drives alacritty's own Selection; grid coords come from
+    //    viewport coords + the current display offset) ------------------------
+
+    /// Begin a selection at a viewport cell. `right_side` is which half of the
+    /// cell the pointer hit (alacritty anchors selections to cell sides).
+    pub fn start_selection(&mut self, kind: SelKind, vp_line: usize, col: usize, right_side: bool) {
+        let point = self.vp_point(vp_line, col);
+        let side = if right_side { Side::Right } else { Side::Left };
+        self.term.selection = Some(Selection::new(kind.into(), point, side));
+    }
+
+    /// Extend the active selection to a viewport cell (drag / shift+click).
+    pub fn update_selection(&mut self, vp_line: usize, col: usize, right_side: bool) {
+        let point = self.vp_point(vp_line, col);
+        let side = if right_side { Side::Right } else { Side::Left };
+        if let Some(sel) = self.term.selection.as_mut() {
+            sel.update(point, side);
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.term.selection.is_some()
+    }
+
+    /// The selected text (alacritty's own extraction: handles block/semantic/line
+    /// kinds, wide chars and wrapped lines). `None` when nothing is selected.
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string()
+    }
+
+    /// Viewport cell -> grid point, clamped into the grid.
+    fn vp_point(&self, vp_line: usize, col: usize) -> Point {
+        let vp = Point::new(
+            vp_line.min(self.rows as usize - 1),
+            Column(col.min(self.cols as usize - 1)),
+        );
+        viewport_to_point(self.term.grid().display_offset(), vp)
+    }
+
+    // -- T6: find in scrollback (alacritty's RegexSearch over the whole buffer) --
+
+    /// Compile a literal query (smart case, metachars escaped). Returns false and
+    /// clears the search when the query is empty or fails to compile. Recompiles
+    /// only when the query actually changed.
+    pub fn set_search(&mut self, query: &str) -> bool {
+        if query.is_empty() {
+            self.search = None;
+            return false;
+        }
+        if self.search.as_ref().is_some_and(|c| c.query == query) {
+            return true;
+        }
+        match RegexSearch::new(&scan::search_pattern(query)) {
+            Ok(regex) => {
+                self.search = Some(SearchCtx { query: query.to_string(), regex });
+                true
+            }
+            Err(_) => {
+                self.search = None;
+                false
+            }
+        }
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search = None;
+    }
+
+    /// Find the next/previous match. `from == None` starts at the viewport's top
+    /// (forward) or bottom (backward); otherwise the search continues past the
+    /// given hit. Wraps around the buffer, per alacritty search semantics.
+    pub fn find_next(&mut self, from: Option<&SearchHit>, forward: bool) -> Option<SearchHit> {
+        let TermSession { term, search, cols, rows, .. } = self;
+        let ctx = search.as_mut()?;
+        let cols_n = *cols as usize;
+        let top = -(term.grid().history_size() as i32);
+        let bottom = *rows as i32 - 1;
+        let offset = term.grid().display_offset() as i32;
+
+        let step = |p: (i32, usize), fwd: bool| -> Point {
+            let (mut line, mut col) = p;
+            if fwd {
+                col += 1;
+                if col >= cols_n {
+                    col = 0;
+                    line += 1;
+                    if line > bottom {
+                        line = top; // wrap to the oldest line
+                    }
+                }
+            } else if col > 0 {
+                col -= 1;
+            } else {
+                col = cols_n - 1;
+                line -= 1;
+                if line < top {
+                    line = bottom; // wrap to the newest line
+                }
+            }
+            Point::new(Line(line), Column(col))
+        };
+
+        let (origin, direction, side) = match from {
+            Some(h) if forward => (step(h.end, true), Direction::Right, Side::Left),
+            Some(h) => (step(h.start, false), Direction::Left, Side::Right),
+            None if forward => (Point::new(Line(-offset), Column(0)), Direction::Right, Side::Left),
+            None => {
+                (Point::new(Line(bottom - offset), Column(cols_n - 1)), Direction::Left, Side::Right)
+            }
+        };
+
+        let m = term.search_next(&mut ctx.regex, origin, direction, side, None)?;
+        Some(SearchHit {
+            start: (m.start().line.0, m.start().column.0),
+            end: (m.end().line.0, m.end().column.0),
+        })
+    }
+
+    /// All matches on the visible viewport as per-row column segments, for the
+    /// highlight overlay. Capped (a pathological query can match every cell).
+    pub fn visible_search_hits(&mut self) -> Vec<(usize, usize, usize)> {
+        const VISIBLE_HITS_CAP: usize = 256;
+        let TermSession { term, search, cols, rows, .. } = self;
+        let Some(ctx) = search.as_mut() else { return Vec::new() };
+        let offset = term.grid().display_offset();
+        let rows_n = *rows as usize;
+        let cols_n = *cols as usize;
+        let start = Point::new(Line(-(offset as i32)), Column(0));
+        let end = Point::new(Line(rows_n as i32 - 1 - offset as i32), Column(cols_n - 1));
+        RegexIter::new(start, end, Direction::Right, term, &mut ctx.regex)
+            .take(VISIBLE_HITS_CAP)
+            .flat_map(|m| {
+                grid_span_segs(
+                    (m.start().line.0, m.start().column.0),
+                    (m.end().line.0, m.end().column.0),
+                    offset,
+                    rows_n,
+                    cols_n,
+                )
+            })
+            .collect()
+    }
+
+    /// `(ordinal, total)` of `hit` among all matches in the buffer, oldest-first,
+    /// both capped at 999 (the find bar's "3/17" display). Ordinal 0 == not found.
+    pub fn match_stats(&mut self, hit: &SearchHit) -> (usize, usize) {
+        const STATS_CAP: usize = 999;
+        let TermSession { term, search, cols, .. } = self;
+        let Some(ctx) = search.as_mut() else { return (0, 0) };
+        let start = Point::new(Line(-(term.grid().history_size() as i32)), Column(0));
+        let end = Point::new(term.grid().bottommost_line(), Column(*cols as usize - 1));
+        let mut ordinal = 0;
+        let mut total = 0;
+        for m in RegexIter::new(start, end, Direction::Right, term, &mut ctx.regex).take(STATS_CAP)
+        {
+            total += 1;
+            if (m.start().line.0, m.start().column.0) == hit.start {
+                ordinal = total;
+            }
+        }
+        (ordinal, total)
+    }
+
+    // -- T6: URL detection (client-plane grid scan, decision D5) --------------
+
+    /// Scan the visible viewport for URLs, joining wrapped rows into logical
+    /// lines so a URL split across rows is detected whole. Column segments are
+    /// grid columns (wide chars occupy two).
+    pub fn visible_urls(&self) -> Vec<UrlSpan> {
+        let rows = self.rows as usize;
+        let content = self.term.renderable_content();
+        let offset = content.display_offset;
+
+        // Per viewport row: the row text, each char's (row, col, width), wrapped?
+        let mut texts: Vec<String> = vec![String::new(); rows];
+        let mut positions: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); rows];
+        let mut wrapped: Vec<bool> = vec![false; rows];
+        for indexed in content.display_iter {
+            let vr = indexed.point.line.0 + offset as i32;
+            if vr < 0 || vr as usize >= rows {
+                continue;
+            }
+            let vr = vr as usize;
+            let flags = indexed.cell.flags;
+            if flags.contains(Flags::WRAPLINE) {
+                wrapped[vr] = true;
+            }
+            if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let width = if flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+            texts[vr].push(indexed.cell.c);
+            positions[vr].push((vr, indexed.point.column.0, width));
+        }
+
+        // Join wrapped runs into logical lines, scan, map char ranges to segments.
+        let mut out = Vec::new();
+        let mut r = 0;
+        while r < rows {
+            let mut text = std::mem::take(&mut texts[r]);
+            let mut pos = std::mem::take(&mut positions[r]);
+            let mut last = r;
+            while wrapped[last] && last + 1 < rows {
+                last += 1;
+                text.push_str(&texts[last]);
+                pos.extend(positions[last].iter().copied());
+            }
+            for m in scan::scan_urls(&text) {
+                let mut segs: Vec<(usize, usize, usize)> = Vec::new();
+                for &(row, col, width) in &pos[m.start..m.end] {
+                    match segs.last_mut() {
+                        Some(s) if s.0 == row => s.2 = col + width - 1,
+                        _ => segs.push((row, col, col + width - 1)),
+                    }
+                }
+                if !segs.is_empty() {
+                    out.push(UrlSpan { url: m.url, segs });
+                }
+            }
+            r = last + 1;
+        }
+        out
     }
 }
 
@@ -343,6 +762,8 @@ fn to_snap_cell(cell: &alacritty_terminal::term::cell::Cell) -> Option<SnapCell>
         bg,
         bold: cell.flags.intersects(Flags::BOLD),
         underline: cell.flags.intersects(Flags::UNDERLINE),
+        width: if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 },
+        zw: cell.zerowidth().map(<[char]>::to_vec).unwrap_or_default(),
     })
 }
 
@@ -352,12 +773,15 @@ fn cursor_from(
     cursor: &alacritty_terminal::term::RenderableCursor,
     display_offset: usize,
     rows: usize,
+    width: u8,
 ) -> Option<CursorPos> {
     let visible = cursor.shape != CursorShape::Hidden;
     match point_to_viewport(display_offset, cursor.point) {
-        Some(p) if p.line < rows => Some(CursorPos { line: p.line, col: p.column.0, visible }),
+        Some(p) if p.line < rows => {
+            Some(CursorPos { line: p.line, col: p.column.0, visible, width })
+        }
         // Off-viewport (scrolled away): report position clamped, marked invisible.
-        _ => Some(CursorPos { line: 0, col: 0, visible: false }),
+        _ => Some(CursorPos { line: 0, col: 0, visible: false, width: 1 }),
     }
 }
 
@@ -460,5 +884,287 @@ mod tests {
         assert_eq!((t.cols(), t.rows()), (40, 10));
         let snap = t.renderable();
         assert_eq!(snap.rows_cells.len(), 10);
+    }
+
+    // -- T6: modes -----------------------------------------------------------
+
+    #[test]
+    fn mode_info_tracks_private_modes() {
+        let mut t = TermSession::new(20, 5);
+        let base = t.mode_info();
+        assert!(!base.alt_screen);
+        assert!(!base.any_mouse());
+        assert!(!base.app_cursor);
+        assert!(!base.bracketed_paste);
+
+        t.advance(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[?1h");
+        let m = t.mode_info();
+        assert!(m.alt_screen);
+        assert!(m.mouse_click);
+        assert!(m.sgr_mouse);
+        assert!(m.bracketed_paste);
+        assert!(m.app_cursor);
+        assert!(m.any_mouse());
+
+        // The three mouse modes are mutually exclusive (alacritty semantics):
+        // each newly set mode replaces the previous one.
+        t.advance(b"\x1b[?1002h");
+        let m = t.mode_info();
+        assert!(m.mouse_drag && !m.mouse_click && !m.mouse_motion);
+        t.advance(b"\x1b[?1003h");
+        let m = t.mode_info();
+        assert!(m.mouse_motion && !m.mouse_drag);
+
+        t.advance(b"\x1b[?1003l");
+        assert!(!t.mode_info().any_mouse());
+    }
+
+    // -- T6: selection -------------------------------------------------------
+
+    #[test]
+    fn simple_selection_extracts_text() {
+        let mut t = TermSession::new(20, 3);
+        t.advance(b"hello world");
+        t.start_selection(SelKind::Simple, 0, 0, false);
+        t.update_selection(0, 4, true);
+        assert_eq!(t.selection_text().as_deref(), Some("hello"));
+        assert!(t.has_selection());
+        t.clear_selection();
+        assert!(!t.has_selection());
+        assert_eq!(t.selection_text(), None);
+    }
+
+    #[test]
+    fn semantic_selection_grabs_the_word() {
+        let mut t = TermSession::new(20, 3);
+        t.advance(b"hello world");
+        t.start_selection(SelKind::Semantic, 0, 7, false);
+        assert_eq!(t.selection_text().as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn line_selection_grabs_the_line() {
+        let mut t = TermSession::new(20, 3);
+        t.advance(b"hello world");
+        t.start_selection(SelKind::Lines, 0, 3, false);
+        let text = t.selection_text().expect("line selection");
+        assert!(text.starts_with("hello world"), "text = {text:?}");
+    }
+
+    #[test]
+    fn block_selection_is_rectangular() {
+        let mut t = TermSession::new(20, 3);
+        t.advance(b"abcd\r\nefgh");
+        t.start_selection(SelKind::Block, 0, 1, false);
+        t.update_selection(1, 2, true);
+        assert_eq!(t.selection_text().as_deref(), Some("bc\nfg"));
+    }
+
+    #[test]
+    fn selection_survives_scrollback_offset() {
+        let mut t = TermSession::new(10, 3);
+        for i in 0..30 {
+            t.advance(format!("line{i}\r\n").as_bytes());
+        }
+        t.scroll(5); // scrolled back; viewport coords now map into history
+        let snap = t.renderable();
+        let row0: String = snap.rows_cells[0].iter().map(|c| c.c).collect();
+        t.start_selection(SelKind::Lines, 0, 0, false);
+        let text = t.selection_text().expect("selection in scrollback");
+        assert!(text.starts_with(row0.trim_end()), "text {text:?} vs row {row0:?}");
+    }
+
+    // -- T6: scrollback state ------------------------------------------------
+
+    #[test]
+    fn display_offset_tracks_scroll_and_snap() {
+        let mut t = TermSession::new(10, 3);
+        for i in 0..30 {
+            t.advance(format!("l{i}\r\n").as_bytes());
+        }
+        assert_eq!(t.display_offset(), 0);
+        assert!(t.history_size() > 0);
+        t.scroll(5);
+        assert_eq!(t.display_offset(), 5);
+        t.scroll_page_up();
+        assert_eq!(t.display_offset(), 8); // one page = rows(3)
+        t.scroll_to_bottom();
+        assert_eq!(t.display_offset(), 0);
+        t.scroll_to_top();
+        assert_eq!(t.display_offset(), t.history_size());
+        t.scroll_page_down();
+        assert_eq!(t.display_offset(), t.history_size() - 3);
+    }
+
+    #[test]
+    fn viewport_pins_to_content_when_scrolled_back() {
+        // alacritty semantics: scrolled-back viewport stays on the same content
+        // as new output arrives (the offset grows); typing snaps via
+        // scroll_to_bottom, which the input layer calls.
+        let mut t = TermSession::new(10, 3);
+        for i in 0..20 {
+            t.advance(format!("l{i}\r\n").as_bytes());
+        }
+        t.scroll(4);
+        let before: String = t.renderable().rows_cells[0].iter().map(|c| c.c).collect();
+        t.advance(b"new output\r\n");
+        assert_eq!(t.display_offset(), 5, "offset grows to pin content");
+        let after: String = t.renderable().rows_cells[0].iter().map(|c| c.c).collect();
+        assert_eq!(before, after, "visible content unchanged by new output");
+    }
+
+    // -- T6: search ----------------------------------------------------------
+
+    #[test]
+    fn search_finds_wraps_and_reports_stats() {
+        let mut t = TermSession::new(10, 3);
+        for i in 0..20 {
+            t.advance(format!("line{i}\r\n").as_bytes());
+        }
+        assert!(t.set_search("line3"));
+        // line3 is in history above the viewport; forward search wraps to it.
+        let hit = t.find_next(None, true).expect("wraps to history match");
+        assert!(hit.start.0 < 0, "match in history: {hit:?}");
+        let (ordinal, total) = t.match_stats(&hit);
+        assert_eq!((ordinal, total), (1, 1));
+
+        // Jump makes it visible.
+        t.scroll_to_line(hit.start.0);
+        assert!(t.display_offset() > 0);
+        let vr = hit.start.0 + t.display_offset() as i32;
+        assert!((0..3).contains(&vr), "hit row {vr} visible");
+    }
+
+    #[test]
+    fn search_next_and_prev_cycle_matches() {
+        let mut t = TermSession::new(20, 5);
+        t.advance(b"foo one\r\nfoo two\r\nfoo three");
+        assert!(t.set_search("foo"));
+        let h1 = t.find_next(None, true).expect("first");
+        let h2 = t.find_next(Some(&h1), true).expect("second");
+        let h3 = t.find_next(Some(&h2), true).expect("third");
+        assert!(h1.start.0 < h2.start.0 && h2.start.0 < h3.start.0);
+        assert_eq!(t.match_stats(&h2), (2, 3));
+        // Wraps forward past the last match back to the first.
+        let h4 = t.find_next(Some(&h3), true).expect("wrap");
+        assert_eq!(h4, h1);
+        // And backward from the first back to the last.
+        let h5 = t.find_next(Some(&h1), false).expect("wrap back");
+        assert_eq!(h5, h3);
+    }
+
+    #[test]
+    fn search_is_smart_case_and_literal() {
+        let mut t = TermSession::new(20, 4);
+        t.advance(b"HELLO a.b ab");
+        assert!(t.set_search("hello"));
+        assert!(t.find_next(None, true).is_some(), "lowercase query is insensitive");
+        assert!(t.set_search("Hello"));
+        assert!(t.find_next(None, true).is_none(), "uppercase query is sensitive");
+        assert!(t.set_search("a.b"));
+        let hit = t.find_next(None, true).expect("literal dot");
+        assert_eq!(hit.start.1, 6, "matches 'a.b', not 'ab': {hit:?}");
+    }
+
+    #[test]
+    fn visible_search_hits_map_to_viewport_segments() {
+        let mut t = TermSession::new(20, 4);
+        t.advance(b"foo bar foo");
+        assert!(t.set_search("foo"));
+        let segs = t.visible_search_hits();
+        assert_eq!(segs, vec![(0, 0, 2), (0, 8, 10)]);
+        t.clear_search();
+        assert!(t.visible_search_hits().is_empty());
+    }
+
+    #[test]
+    fn grid_span_segs_split_multi_row_spans() {
+        // Span from history row into the viewport, offset 1, 3 rows, 10 cols.
+        assert_eq!(
+            grid_span_segs((-1, 7), (1, 2), 1, 3, 10),
+            vec![(0, 7, 9), (1, 0, 9), (2, 0, 2)]
+        );
+        // Rows outside the viewport are dropped.
+        assert_eq!(grid_span_segs((-5, 0), (-4, 3), 1, 3, 10), Vec::<(usize, usize, usize)>::new());
+    }
+
+    // -- T6: URL detection ---------------------------------------------------
+
+    #[test]
+    fn visible_urls_reports_grid_columns() {
+        let mut t = TermSession::new(40, 3);
+        t.advance(b"see https://example.com/x now");
+        let urls = t.visible_urls();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "https://example.com/x");
+        assert_eq!(urls[0].segs, vec![(0, 4, 24)]);
+    }
+
+    #[test]
+    fn visible_urls_account_for_wide_chars() {
+        let mut t = TermSession::new(40, 3);
+        // A wide CJK char occupies columns 0-1, so the URL starts at column 2.
+        t.advance("你https://x.co".as_bytes());
+        let urls = t.visible_urls();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "https://x.co");
+        assert_eq!(urls[0].segs, vec![(0, 2, 13)]);
+    }
+
+    #[test]
+    fn visible_urls_join_wrapped_rows() {
+        let mut t = TermSession::new(10, 4);
+        t.advance(b"http://abc.de/fgh");
+        let urls = t.visible_urls();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].url, "http://abc.de/fgh");
+        assert_eq!(urls[0].segs, vec![(0, 0, 9), (1, 0, 6)]);
+    }
+
+    // -- T7: cell width + zero-width chars (font subsystem inputs) ------------
+
+    #[test]
+    fn wide_char_cell_reports_width_two_and_drops_spacer() {
+        let mut t = TermSession::new(20, 3);
+        t.advance("你a".as_bytes());
+        let snap = t.renderable();
+        let row0 = &snap.rows_cells[0];
+        // The wide char covers columns 0-1; its spacer is dropped, so 'a' is
+        // the very next cell in the snapshot row.
+        assert_eq!(row0[0].c, '你');
+        assert_eq!(row0[0].width, 2);
+        assert_eq!(row0[1].c, 'a');
+        assert_eq!(row0[1].width, 1);
+    }
+
+    #[test]
+    fn combining_mark_lands_in_zerowidth_of_base_cell() {
+        let mut t = TermSession::new(20, 3);
+        // 'e' + combining acute accent (U+0301), then a plain 'x'.
+        t.advance("e\u{0301}x".as_bytes());
+        let snap = t.renderable();
+        let row0 = &snap.rows_cells[0];
+        assert_eq!(row0[0].c, 'e');
+        assert_eq!(row0[0].zw, vec!['\u{0301}']);
+        assert_eq!(row0[0].width, 1);
+        assert_eq!(row0[1].c, 'x');
+        assert!(row0[1].zw.is_empty());
+    }
+
+    #[test]
+    fn cursor_width_tracks_the_cell_underneath() {
+        // Carriage return puts the cursor back on column 0 - the wide char.
+        let mut t = TermSession::new(20, 3);
+        t.advance("你".as_bytes());
+        t.advance(b"\r");
+        let cur = t.renderable().cursor.expect("cursor present");
+        assert_eq!((cur.line, cur.col), (0, 0));
+        assert_eq!(cur.width, 2);
+
+        // A narrow char under the cursor reports width 1.
+        let mut t = TermSession::new(20, 3);
+        t.advance(b"a\r");
+        let cur = t.renderable().cursor.expect("cursor present");
+        assert_eq!(cur.width, 1);
     }
 }

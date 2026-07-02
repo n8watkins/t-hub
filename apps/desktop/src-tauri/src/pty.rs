@@ -363,10 +363,21 @@ pub const BIN_MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Write one length-prefixed binary frame (`[type][u32 BE len][payload]`) and flush.
 /// Shared by the server's scrollback/error frames (control.rs) and the out/exit
 /// firehose ([`stream_reader_loop`]).
+///
+/// The length cast is checked: a payload over `u32::MAX` would silently truncate
+/// the header and desynchronize the stream, so it is refused instead. Unreachable
+/// in practice - out chunks are `READ_BUF`-sized and scrollback is one pane
+/// capture - but the invariant is now explicit rather than assumed.
 pub fn write_bin_frame(sink: &mut dyn Write, ty: u8, payload: &[u8]) -> std::io::Result<()> {
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "binary pty frame payload exceeds u32::MAX",
+        )
+    })?;
     let mut header = [0u8; BIN_HEADER_LEN];
     header[0] = ty;
-    header[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    header[1..].copy_from_slice(&len.to_be_bytes());
     sink.write_all(&header)?;
     if !payload.is_empty() {
         sink.write_all(payload)?;
