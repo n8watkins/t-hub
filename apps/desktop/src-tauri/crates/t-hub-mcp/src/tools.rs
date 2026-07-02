@@ -7,10 +7,14 @@
 //! the only place tools are declared, and the app dispatches them dynamically.
 //!
 //! Tiers (PRD §11.2):
-//!   - **Read** (allowed): `list_terminals`, `get_status`, `supervision_tree`,
-//!     `wsl_health`, `search_files`, `list_tabs`.
+//!   - **Read** (allowed): `list_terminals`, `get_status`, `wait_for_status`,
+//!     `supervision_tree`, `wsl_health`, `search_files`, `list_tabs`,
+//!     `read_terminal`.
 //!   - **Organization** (allowed, audited): `focus_session`, `move_tile`,
-//!     `rename_tab`, `spawn_terminal`, `open_file`.
+//!     `rename_tab`, `new_tab`, `focus_tab`, `open_file`, `create_worktree`,
+//!     `remove_worktree`.
+//!   - **Process-changing** (confirmation required): `spawn_terminal`,
+//!     `send_text`, `send_keys`, `close_terminal`.
 //!   - **Theme**: `get_theme`, `set_theme` — forwarded by name verbatim.
 //!
 //! Process-changing / destructive tools carry an explicit confirmation note in

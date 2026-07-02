@@ -234,6 +234,32 @@ interface WorkspaceState {
   updateTerminalsMeta: (list: TerminalInfo[]) => void;
   /** Insert a freshly-spawned terminal after the focused tile in the active tab (else append) and focus it. */
   addAfterFocused: (info: TerminalInfo) => void;
+  /** Insert an already-spawned tile into a SPECIFIC tab by id, activate that tab,
+   *  and focus the tile. Deterministic sibling of addAfterFocused that never reads
+   *  the active tab — used by the control/MCP path so a tile lands where the caller
+   *  targeted (by name/id), not where UI focus happens to be (TASK C / #22). No-op
+   *  if the tab id is unknown. */
+  addToTab: (tabId: string, info: TerminalInfo) => void;
+  /** Create a tab with a SPECIFIC id + name and activate it (the control/MCP
+   *  `new_tab` path, where the CORE mints the id so it can return it to the caller).
+   *  If a tab with this id already exists, just activate it. */
+  adoptTab: (id: string, name: string) => void;
+  /** Resolve a tab by id, else by exact name; if neither exists, create one with
+   *  the given id + name and activate it. Returns the resolved tab id. Deterministic
+   *  (never reads the active tab) — the named-placement primitive for create_worktree
+   *  (TASK C / #22). */
+  ensureTab: (id: string, name: string) => string;
+  /** Spawn a NEW terminal (the control/MCP `spawn_terminal` path) via the same
+   *  spawnTerminal IPC the "+" menu uses, then place the tile in `opts.tabId` if
+   *  given (else the tab active at call time — captured synchronously so the async
+   *  spawn can't misplace it). Best-effort: a spawn failure is logged, not thrown.
+   *  Returns the new terminal id, or null. */
+  spawnWorkspaceTerminal: (opts?: {
+    cwd?: string;
+    name?: string;
+    shell?: string;
+    tabId?: string;
+  }) => Promise<TerminalId | null>;
   /** Drop a terminal from every tab + the map, moving focus to a neighbor. */
   remove: (id: TerminalId) => void;
   /** Lifecycle: DETACH a tile — remove it from the layout but KEEP the tmux
@@ -302,7 +328,15 @@ interface WorkspaceState {
     repoRoot: string,
     worktreePath: string,
     branch?: string,
-    opts?: { tabName?: string; alreadyCreated?: boolean },
+    opts?: {
+      tabName?: string;
+      alreadyCreated?: boolean;
+      /** Deterministic placement (TASK C / #22): the control/MCP path passes a tab
+       *  id resolved CORE-side by name, so the tile lands in THAT tab (reused or
+       *  created by id+name) rather than a fresh tab / the focused one. Absent for
+       *  the UI (FilePanel) path, which creates a fresh tab as before. */
+      tabId?: string;
+    },
   ) => Promise<TerminalId | null>;
   /** Remove a git worktree SAFELY: first DETACH every live tile whose cwd is the
    *  worktree dir (or inside it) — their tmux sessions survive a detach, so no
@@ -982,6 +1016,64 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       persist();
     },
 
+    addToTab: (tabId, info) => {
+      const { tabs, terminals } = get();
+      if (!tabs.some((t) => t.id === tabId)) return; // unknown tab: no-op
+      const nextTabs = tabs.map((t) =>
+        t.id === tabId ? { ...t, order: [...t.order, info.id] } : t,
+      );
+      set({
+        terminals: { ...terminals, [info.id]: info },
+        tabs: nextTabs,
+        activeTabId: tabId,
+        focusedId: info.id,
+      });
+      persist();
+    },
+
+    adoptTab: (id, name) => {
+      const { tabs } = get();
+      if (tabs.some((t) => t.id === id)) {
+        set({ activeTabId: id });
+        return;
+      }
+      const tab: WorkspaceTab = { id, name: name.trim() || "Workspace", order: [] };
+      set({ tabs: [...tabs, tab], activeTabId: id, focusedId: null });
+      persist();
+    },
+
+    ensureTab: (id, name) => {
+      const { tabs } = get();
+      const byId = tabs.find((t) => t.id === id);
+      if (byId) return byId.id;
+      const byName = tabs.find((t) => t.name === name);
+      if (byName) return byName.id;
+      const tab: WorkspaceTab = { id, name: name.trim() || "Workspace", order: [] };
+      set({ tabs: [...tabs, tab], activeTabId: id, focusedId: null });
+      persist();
+      return id;
+    },
+
+    spawnWorkspaceTerminal: async (opts) => {
+      // Capture the target tab id SYNCHRONOUSLY (before the async spawn) so a focus
+      // change mid-spawn can't misplace the tile.
+      const tabId = opts?.tabId ?? get().activeTabId;
+      try {
+        const { spawnTerminal } = await import("../ipc/client");
+        const info = await spawnTerminal({
+          cwd: opts?.cwd?.trim() || undefined,
+          name: opts?.name?.trim() || undefined,
+          shell: opts?.shell?.trim() || undefined,
+        });
+        if (get().tabs.some((t) => t.id === tabId)) get().addToTab(tabId, info);
+        else get().addAfterFocused(info);
+        return info.id;
+      } catch (err) {
+        console.error("spawnWorkspaceTerminal failed", err);
+        return null;
+      }
+    },
+
     // --- Recall (feat/projects-sidebar, Agent A) ------------------------------
     // Re-spawn + resume a past Claude session into the active tab. This is the
     // store-side spawn helper the sidebar's Recent list uses; it deliberately
@@ -1048,21 +1140,30 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         await gitWorktreeAdd(repo, path, branch?.trim() || undefined);
       }
 
-      // 2) Open a new tab named for the worktree, then spawn a terminal in it.
+      // 2) Resolve the target tab, then spawn a terminal in it.
       try {
         const { spawnTerminal } = await import("../ipc/client");
-        const tabId = get().addTab(); // creates + activates a fresh tab
         const name =
           opts?.tabName?.trim() ||
           branch?.trim() ||
           path.split("/").filter(Boolean).pop() ||
           "Worktree";
-        get().renameTab(tabId, name);
+        // Deterministic placement (TASK C / #22): when the control/MCP path supplies
+        // a tab id (resolved CORE-side by name), reuse/create THAT tab by id+name —
+        // never the focused tab. The UI (FilePanel) path passes no id, so it creates
+        // a fresh tab as before.
+        let tabId: string;
+        if (opts?.tabId) {
+          tabId = get().ensureTab(opts.tabId, name);
+        } else {
+          tabId = get().addTab(); // creates + activates a fresh tab
+          get().renameTab(tabId, name);
+        }
 
         const info = await spawnTerminal({ cwd: path, name });
-        // Place the tile in the (now active) worktree tab and focus it. addTab()
-        // activated the tab and cleared focus, so addAfterFocused appends + focuses.
-        get().addAfterFocused(info);
+        // Place the tile in the resolved worktree tab (by id, not active state) and
+        // focus it.
+        get().addToTab(tabId, info);
         return info.id;
       } catch (err) {
         console.error("addWorktreeWorkspace: spawn failed", err);

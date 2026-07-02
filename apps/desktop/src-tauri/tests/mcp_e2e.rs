@@ -285,18 +285,21 @@ fn end_to_end_mcp_round_trip() {
         );
     }
 
-    // tools/call → spawn_terminal: the process-changing tool must come back as a
-    // tool error (gated), NOT actually spawn anything.
+    // tools/call → spawn_terminal: functional (#17) but routed through the UI
+    // ApplySink. This e2e listener is HEADLESS (no apply sink), so there is no UI
+    // to adopt the tile and the spawn is refused with a clear "no UI" error rather
+    // than creating an untracked tmux session. It still comes back as a tool error
+    // (isError), just no longer the old "gated off" refusal.
     let spawn = mcp.request(json!({
         "jsonrpc": "2.0", "id": 8, "method": "tools/call",
         "params": { "name": "spawn_terminal", "arguments": { "cwd": "/tmp" } }
     }));
     assert_eq!(
         spawn["result"]["isError"], true,
-        "spawn_terminal must be gated, got {spawn}"
+        "spawn_terminal without a UI must refuse, got {spawn}"
     );
     let msg = spawn["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(msg.contains("process-changing"), "gate message: {msg}");
+    assert!(msg.contains("no UI"), "refusal message: {msg}");
 
     // --- cleanup ---------------------------------------------------------
     if tmux_ok {

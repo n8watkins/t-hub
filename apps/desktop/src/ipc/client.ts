@@ -11,12 +11,20 @@ import {
   type OutputEvent,
   type SpawnOptions,
   type StateEvent,
+  type TabReport,
   type TerminalId,
   type TerminalInfo,
 } from "./types";
 
 export function spawnTerminal(opts: SpawnOptions = {}): Promise<TerminalInfo> {
   return invoke(Commands.spawnTerminal, { opts });
+}
+
+/** Report the live workspace-tab layout to the core's addressable tab registry
+ *  (TASK C / #22), so the control/MCP `list_tabs` reflects the UI. Best-effort:
+ *  callers ignore the (void) result. */
+export function reportWorkspaceTabs(tabs: TabReport[]): Promise<void> {
+  return invoke(Commands.reportWorkspaceTabs, { tabs });
 }
 
 /** (Re)attach to a terminal; resolves to base64 scrollback to seed xterm. */

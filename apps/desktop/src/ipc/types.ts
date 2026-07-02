@@ -61,7 +61,18 @@ export const Commands = {
   /** Stop: terminate the tmux session and its process. */
   killTerminal: "kill_terminal",
   listTerminals: "list_terminals",
+  /** Report the live workspace-tab layout up to the core's addressable tab
+   *  registry (TASK C / #22), so the control/MCP `list_tabs` mirrors the UI. */
+  reportWorkspaceTabs: "report_workspace_tabs",
 } as const;
+
+/** One workspace tab as the core's tab registry sees it (TASK C / #22). Mirrors
+ *  the Rust `control::TabRecord` (`{id, name, tileIds}`). */
+export interface TabReport {
+  id: string;
+  name: string;
+  tileIds: TerminalId[];
+}
 
 /** Event channels emitted from the backend (payloads below). */
 export const Events = {

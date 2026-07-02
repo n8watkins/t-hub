@@ -109,17 +109,17 @@ runs, and the listener only accepts loopback peers.
 | `supervision_tree` | Read | allowed | orchestrator→subagent tree for a `sessionId` |
 | `wsl_health` | Read | allowed | host metrics from `/proc` (+ supervised-session count) |
 | `search_files` | Read | allowed | fuzzy file-index search (names + metadata only, never contents) |
-| `list_tabs` | Read | allowed | workspace tabs (empty until the persistence track lands) |
+| `list_tabs` | Read | allowed | the live workspace tabs (`{id, name, tileIds}`) from the core's addressable tab registry — the frontend reports its layout up so this mirrors the UI |
 | `read_terminal` | Read | allowed | a session's recent visible output via tmux `capture-pane` (plain text; optional scrollback) |
 | `focus_session` | Organization | allowed, **audited** | accepted + audited; UI application via the frontend command |
 | `move_tile` | Organization | allowed, **audited** | accepted + audited |
 | `rename_tab` | Organization | allowed, **audited** | accepted + audited |
-| `new_tab` | Organization | allowed, **audited** | accepted + audited; UI application via the frontend command |
+| `new_tab` | Organization | allowed, **audited** | mints the tab id **core-side** and returns it (so the tab is addressable by `move_tile`/`focus_tab` and shows in `list_tabs`); forwards that id for the frontend to adopt |
 | `focus_tab` | Organization | allowed, **audited** | accepted + audited; UI application via the frontend command |
 | `open_file` | Organization | allowed, **audited** | capped text read via the Files reader |
-| `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, then forwards a new tab + spawn-in-worktree to the UI |
+| `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create by id, never the focused tab), then forwards the tab + spawn-in-worktree to the UI |
 | `remove_worktree` | Organization | allowed, **audited** | forwards removal to the UI (which detaches live tiles first, then runs `git worktree remove`); refused if no UI is connected, to avoid orphaning a process |
-| `spawn_terminal` | **Process-changing** | **confirmation required** | gated off; refused on the control channel |
+| `spawn_terminal` | **Process-changing** | **confirmation required** | functional: routes through the same UI adoption path as `create_worktree` so the frontend spawns a real, tracked tile; refused only when no UI is connected to adopt it |
 | `send_text` | **Process-changing** | **confirmation required** | types literal text into an existing session via tmux `send-keys -l` (optional trailing Enter); executes |
 | `send_keys` | **Process-changing** | **confirmation required** | sends named control keys (e.g. `C-c`, `Up`, `Escape`) to an existing session via tmux `send-keys`; executes |
 | `close_terminal` | **Process-changing** | **confirmation required** | kills an existing session + its process tree via tmux `kill-session`; executes |
@@ -143,9 +143,14 @@ runs, and the listener only accepts loopback peers.
   and an `annotations.t-hubTier:"process-changing"` string so a permission-aware
   client can gate them — that confirmation contract is the user-facing gate. On
   the app side they split:
-  - `spawn_terminal` is **gated off**: the listener refuses it with a clear error
-    rather than spawning anything (it would create an untracked tmux session the
-    UI never adopts).
+  - `spawn_terminal` is **functional** (#17): rather than refusing outright — the
+    old behavior, because a raw spawn on the listener would create an untracked
+    tmux session the UI never adopts — it routes through the SAME `ApplySink`
+    adoption path `create_worktree` uses. The listener forwards a `spawn_terminal`
+    command to the frontend, which spawns the tile via the normal `spawnTerminal`
+    IPC, so the resulting session is a real, UI-adopted tile tracked like any
+    other. It is refused only when no UI is connected (nothing would adopt the
+    tile). Its confirmation contract (description + annotations) is unchanged.
   - `send_text`, `send_keys`, and `close_terminal` **execute**: they act only on
     an existing `th_*` session the app already owns, driving tmux directly
     (`send-keys -l` / `send-keys` / `kill-session`). They return an audited
@@ -158,6 +163,30 @@ runs, and the listener only accepts loopback peers.
 Tool failures (a gated tool, or "T-Hub is not running") come back as MCP
 **tool results with `isError: true`**, not transport errors — that's how MCP
 surfaces tool-level failures to the model.
+
+### The addressable tab registry (#22)
+
+For any headless tab operation to work — discover a tab id, `move_tile` a terminal
+into it, `focus_tab` a known id, or place a `create_worktree` tile in a tab named by
+the caller — tabs must be **addressable** over the control API.
+The tab layout lives in the frontend store, so the core keeps a small in-memory
+**tab registry** (`control::TabRegistry`, one `{id, name, tileIds}` record per tab)
+that the control channel reads and writes:
+
+- The frontend is the source of truth. It reports its FULL tab list up on every
+  layout change via the `report_workspace_tabs` Tauri command (`controlBridge.ts`),
+  which replaces the registry — so `list_tabs` mirrors the live UI, including
+  UI-created tabs and real tile membership.
+- MCP-driven mutations update the registry **optimistically** using ids the core
+  chooses and forwards down: `new_tab` mints the tab id core-side (and returns it),
+  `move_tile` moves the tile between records, and `create_worktree` resolves the
+  target tab by name (reuse if it exists, else mint an id). Because the forwarded
+  id is what the frontend adopts, the two converge on the same id when the frontend
+  reports back.
+
+This is deliberately the **minimal** registry that makes named placement +
+addressable tabs work; full workspace-tab persistence is still the PRD §8 snapshot
+track and out of scope here.
 
 ---
 
@@ -255,12 +284,14 @@ snapshot, both fetched live through the control channel:
    }, "content":[{"type":"text","text":"…"}]}}
 ```
 
-`tools/call spawn_terminal` — correctly **gated** (no process is spawned):
+`tools/call spawn_terminal` against the **headless** e2e listener (no UI wired) —
+functional but refused because there's no frontend to adopt the tile (against the
+running app it instead forwards the spawn and a real tile appears):
 
 ```
 → {"id":8,"jsonrpc":"2.0","method":"tools/call","params":{"name":"spawn_terminal","arguments":{"cwd":"/tmp"}}}
 ← {"jsonrpc":"2.0","id":8,"result":{"isError":true,"content":[{"type":"text",
-     "text":"control: 'spawn_terminal' is a process-changing action (PRD §11.2) and is gated off …"}]}}
+     "text":"spawn_terminal: no UI is connected to adopt the new terminal tile …"}]}}
 ```
 
 ---
@@ -273,7 +304,7 @@ snapshot, both fetched live through the control channel:
 | Tool catalog + tiers | `crates/t-hub-mcp/src/tools.rs` | 8 |
 | Control client (forwarding, discovery) | `crates/t-hub-mcp/src/control_client.rs` | 4 |
 | MCP server dispatch (initialize/list/call) | `crates/t-hub-mcp/src/server.rs` | 9 |
-| App-side control dispatch + tiers | `src/control.rs` | 30 |
+| App-side control dispatch + tiers (incl. spawn_terminal + tab registry) | `src/control.rs` | 45 |
 | End-to-end (real binary ⇄ real listener) | `tests/mcp_e2e.rs` | 1 |
 
 Run them:
@@ -291,11 +322,13 @@ cargo test --manifest-path src-tauri/Cargo.toml -p t-hub --test mcp_e2e # end-to
 - The control channel binds **loopback only** and gates every request on a
   **per-launch token** written to a `0600` handshake file. A bad token is
   rejected before dispatch.
-- Read + Organization commands are dispatchable. Of the process-changing tier,
-  `spawn_terminal` is refused at the listener (it returns a clear gated error),
-  while `send_text`, `send_keys`, and `close_terminal` **execute** — they act
-  only on a `th_*` session the app already owns (typing into / interrupting /
-  killing an existing session via tmux), never spawning an untracked process.
+- Read + Organization commands are dispatchable. The process-changing tier is
+  **confirmation-gated** at the client (description + annotations) and executes on
+  the app side: `spawn_terminal` forwards to the UI, which spawns a real, adopted
+  tile (refused only when no UI is connected, so it never creates an untracked
+  process); `send_text`, `send_keys`, and `close_terminal` act only on a `th_*`
+  session the app already owns (typing into / interrupting / killing an existing
+  session via tmux), never spawning an untracked process.
   Their MCP descriptions carry the `CONFIRMATION REQUIRED` contract a permission-
   aware client gates on. Any command with no `match` arm (a tool not in the
   catalog) is refused outright, independent of what an MCP client advertises.
