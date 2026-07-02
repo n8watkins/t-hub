@@ -1,0 +1,46 @@
+[package]
+name = "t-hub-native"
+version = "0.1.0"
+edition = "2021"
+description = "T-Hub native GPUI client (render-pivot). A second client of the same control socket the Tauri app speaks."
+
+# Standalone crate: NOT a member of the apps/desktop cargo workspace (the pivot is
+# isolated from the shipping app - own Cargo.toml + Cargo.lock, versioned
+# independently). See docs/NATIVE-PIVOT-EXECUTION.md §1.1.
+[lib]
+name = "t_hub_native"
+path = "src/lib.rs"
+
+[[bin]]
+name = "t-hub-native"
+path = "src/main.rs"
+
+# Headless wire acceptance runner (no GPUI): lists sessions, streams events,
+# attaches a DISPOSABLE tmux session and round-trips write+resize. This is the
+# binary that proves §1.3 live in WSL where the linux GPUI backend may not build.
+[[bin]]
+name = "wire-probe"
+path = "src/bin/wire_probe.rs"
+required-features = []
+
+[features]
+# `gui` pulls in gpui. Default on, but gated so the wire/ contract can be
+# `cargo check`ed / tested in WSL (`--no-default-features`) even when the linux
+# gpui backend needs system libs the box lacks. See T4 Verify note.
+default = ["gui"]
+gui = ["dep:gpui"]
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+base64 = "0.22"
+crossbeam = "0.5"
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.11"
+
+# GPUI is optional so the wire module compiles without a graphics backend.
+gpui = { version = "0.2.2", optional = true }
+
+[profile.release]
+debug = false
