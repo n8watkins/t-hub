@@ -198,3 +198,16 @@ If two tasks must touch the same file (expected only at `main.rs` layout composi
 ## 5. Results log (append per task)
 
 - 2026-07-01 T1/T2/T3: done pre-guide; see [T1-REMOTE-VERIFICATION.md](./T1-REMOTE-VERIFICATION.md) and [T2-GPUI-SPIKE-RESULTS.md](./T2-GPUI-SPIKE-RESULTS.md).
+- 2026-07-01 T4 DONE (branch `t4-native-scaffold`): scaffolded `apps/native/` - a standalone lib+bin crate (`t-hub-native`) with `wire/` implementing the §1.3 ControlClient contract, a GPUI debug overlay (`app.rs`, feature `gui`), and a headless acceptance runner (`wire-probe` bin).
+  - **Build:** `cargo check --no-default-features` (wire only) AND full `cargo check` (with gpui 0.2.2) both compile CLEAN in WSL - the linux gpui backend (wayland/x11/blade) built without extra system libs, so the GPUI app module is compiler-validated on WSL too, not only on the Windows clone. `cargo test --no-default-features`: 6/6 green.
+  - **Acceptance (live, against the running app at 127.0.0.1:57129):** `wire-probe` printed `WIRE-PROBE-OK` - listed 12 real `th_*` sessions via `list_terminals`; received a live `status://snapshot` event; attached a DISPOSABLE `th_t4-wire-check`: seed scrollback carried the marker, `echo` write round-tripped, `resize(90x25)` moved the pane to `90x24`, the session survived detach, then was killed. Only ever touched its own disposable session.
+  - **Reconnect-with-backoff:** implemented inside `ControlClient` on all three planes (request redial loop, events resubscribe loop, PTY auto-reattach). Proven deterministically by the unit test `request_redials_after_a_dropped_connection` (mock server drops the first connection; the client redials and succeeds). The full "survives an app restart" path is left to the captain / Windows GUI run, because restarting the user's live app is a §0 do-not.
+  - **Deviations from the §1.3 contract (all invisible to consumers or additive):**
+    1. `connect(ep)` seeds discovery, but every RECONNECT re-runs `Endpoint::discover()` (falling back to the seed) because the loopback port is ephemeral and changes on app restart - this is what makes reconnect actually reconnect after a restart.
+    2. `PtyFrame::Exit(i32)` (contract has no `Option`): a null/absent wire exit code maps to `-1` (unknown/signalled).
+    3. On PTY auto-reattach the fresh scrollback is re-emitted as one `PtyFrame::Out` so the consumer's grid re-syncs (stays within the `output` channel semantics).
+    4. `write`/`resize`/`detach` keep the exact §1.3 signatures (return `()`; `detach(self)`); I/O errors are logged rather than returned, as the signatures have no `Result`.
+    5. Additive, non-breaking helpers: `ControlClient::connect_discovered()`, `list_sessions() -> Vec<SessionInfo>`, and a `push_capped` ring-buffer helper.
+    6. gpui is an OPTIONAL cargo feature (`gui`, default on) so `wire/` compiles and unit-tests without a graphics backend (`--no-default-features`); `main.rs` and the `wire-probe` bin work either way.
+    7. `crossbeam = "0.5"` provides `crossbeam::channel` exactly as the contract spelled it (it re-exports `crossbeam-channel`).
+  - **Version:** the native crate is versioned independently at `0.1.0` (§0/§1.1); the desktop `bump-version.sh` was intentionally NOT run - this commit does not touch `apps/desktop/`.
