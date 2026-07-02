@@ -752,7 +752,6 @@ pub fn push_capped(buf: &mut VecDeque<String>, line: String, cap: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::net::TcpListener;
 
     /// Serializes tests that mutate the process-global `T_HUB_REMOTE_*` env, since
