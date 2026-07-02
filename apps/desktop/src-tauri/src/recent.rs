@@ -429,7 +429,7 @@ fn make_session(
 //
 // Both platforms now use the SAME std::fs core ([`read_sessions_from_dir`]); the
 // only difference is the ROOT path. unix points at `$HOME/.claude/projects`;
-// Windows resolves the WSL `$HOME` once (via `wsl.exe -- bash -lc 'echo $HOME'`,
+// Windows resolves the WSL `$HOME` once (via `wsl.exe -e bash -lc 'echo $HOME'`,
 // the one thing that reliably works) and reads the transcripts directly over the
 // `\\wsl.localhost\<distro>\...` UNC share. We deliberately do NOT pass a complex
 // multi-line script to `wsl.exe`: the diag log showed `wsl.exe` mangling a
@@ -727,8 +727,10 @@ fn resumable_entries_from_dir(
 // ---------------------------------------------------------------------------
 
 /// Resolve the WSL `$HOME` for `distro` by shelling a login bash once (the proven
-/// pattern from claude/install.rs::wsl_home). `echo $HOME` is a SINGLE simple arg,
-/// so it doesn't trip the wsl.exe multi-arg mangling that broke the old reader.
+/// pattern from claude/install.rs::wsl_home). `-e` (exec) runs bash DIRECTLY: a
+/// bare `--` re-joins the tail through the user's DEFAULT shell (zsh), which both
+/// re-splits the quoted script and expands `$HOME` before bash ever sees it (see
+/// the note on tmux.rs::pane_info_command).
 /// Returns None on failure/empty so the caller degrades to an empty list.
 #[cfg(windows)]
 fn wsl_home(distro: &str) -> Option<String> {
@@ -736,7 +738,7 @@ fn wsl_home(distro: &str) -> Option<String> {
     let out = std::process::Command::new("wsl.exe")
         .arg("-d")
         .arg(distro)
-        .arg("--")
+        .arg("-e")
         .arg("bash")
         .arg("-lc")
         .arg("echo $HOME")

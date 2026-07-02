@@ -1,7 +1,7 @@
 //! Core-side **agent bridge** (PLAN.md Workstream A, core half).
 //!
 //! Owns the long-lived connection to the WSL-side `t-hub-agent`:
-//!   - launches `wsl.exe -d <distro> -- t-hub-agent --stdio` on Windows, or
+//!   - launches `wsl.exe -d <distro> --cd ~ -e bash -lc 'exec t-hub-agent --stdio'` on Windows, or
 //!     `t-hub-agent --stdio` directly on a unix dev box ([`launch_argv`]);
 //!   - performs the [`Hello`]/[`Ready`] handshake;
 //!   - correlates [`AgentRequest`]s with [`AgentResponse`]s by [`RequestId`];

@@ -76,7 +76,7 @@ impl From<TmuxError> for String {
 /// Build a `tmux -L t-hub` command with the given args.
 ///
 /// tmux lives inside WSL, so on Windows every control command is routed through
-/// `wsl.exe -- tmux …`; on Unix (including the WSL dev build) tmux is invoked
+/// `wsl.exe -e tmux …`; on Unix (including the WSL dev build) tmux is invoked
 /// directly. Both then carry `-L t-hub` plus the caller's args.
 fn tmux(args: &[&str]) -> Command {
     #[cfg(windows)]
@@ -85,8 +85,12 @@ fn tmux(args: &[&str]) -> Command {
         // `--cd ~` roots the tmux server (and each new session's pane) at the WSL
         // home, so new terminals open in ~ (native ext4) instead of the app's
         // /mnt/c launch dir -- matching the user's normal `~` terminal view.
+        // `-e` (exec) runs tmux DIRECTLY. A bare `--` re-joins the tail and routes
+        // it through the user's DEFAULT shell (zsh), which re-expands `$`/backticks
+        // in caller args -- e.g. a send-keys payload containing `$HOME` arrived
+        // pre-expanded (see the note on `pane_info_command`).
         let mut c = Command::new("wsl.exe");
-        c.arg("--cd").arg("~").arg("--").arg("tmux");
+        c.arg("--cd").arg("~").arg("-e").arg("tmux");
         // CREATE_NO_WINDOW: every tmux control command routes through `wsl.exe`,
         // and each `wsl.exe` spawn would otherwise flash a console (CMD) window
         // for a split second. Suppress it so terminal spawns stay invisible.
@@ -380,10 +384,12 @@ tmux -L {sock} kill-session -t '{name}'",
 /// rather than an error.
 pub fn list_sessions() -> Result<Vec<String>, TmuxError> {
     // NB: we deliberately do NOT use `-F '#{session_name}'`. On Windows every
-    // tmux command is routed through `wsl.exe`, where the leading `#` of a tmux
-    // format string is swallowed as a shell comment — leaving `list-sessions -F`
-    // with no argument ("-F expects an argument") and breaking the whole live
-    // terminal list (cwd/labels/status). The default `list-sessions` output is
+    // tmux command was historically routed through `wsl.exe --` (the default
+    // shell), where the leading `#` of a tmux format string was swallowed as a
+    // shell comment — leaving `list-sessions -F` with no argument ("-F expects
+    // an argument") and breaking the whole live terminal list (cwd/labels/
+    // status). `tmux()` now uses `-e` (no shell hop), but the format-free form
+    // is kept: it's simpler and proven. The default `list-sessions` output is
     // `<name>: <window/size info>`; tmux forbids `:` in session names, so the
     // name is everything before the first colon. This needs no format argument
     // and survives the wsl.exe round-trip intact.
@@ -439,10 +445,11 @@ pub struct PaneInfo {
 /// List every pane's `session_name|pane_current_command|pane_current_path`.
 ///
 /// Unlike [`list_sessions`], this needs a tmux FORMAT (`#{...}`). A bare
-/// `#{...}` argv word is swallowed as a shell comment over the `wsl.exe`
+/// `#{...}` argv word was swallowed as a shell comment over the old `wsl.exe --`
 /// round-trip (see the note in `list_sessions`), so we run the whole tmux call
 /// inside a `bash -lc` script where the format is SINGLE-QUOTED — inside single
-/// quotes `#` is literal, so it survives intact. Best-effort: a missing server
+/// quotes `#` is literal, so it survives intact (still correct, and shell-proof,
+/// now that the hop uses `-e`). Best-effort: a missing server
 /// (no sessions) returns an empty Vec rather than erroring.
 pub fn pane_info() -> Result<Vec<PaneInfo>, TmuxError> {
     // Built from the resolved socket name (not a hardcoded `t-hub`) so a DEV
@@ -673,6 +680,9 @@ mod tests {
         let mut cmd = {
             use std::os::windows::process::CommandExt;
             let mut c = Command::new("wsl.exe");
+            // Bare `--` is safe here ONLY because the argv is constant single-word
+            // tokens (`tmux -V`) — nothing for the default shell to re-expand (see
+            // the note on `pane_info_command`).
             c.arg("--").arg("tmux").arg("-V");
             c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
             c
