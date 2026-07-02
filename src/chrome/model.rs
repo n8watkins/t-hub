@@ -64,25 +64,258 @@ pub fn split_rows(n: usize) -> Vec<usize> {
 
 /// Pixel boxes for `n` tiles inside `area`, in tile order (row-major over the
 /// [`split_rows`] buckets): rows share the height evenly; within a row, tiles
-/// share the width evenly (the webview's even flex split - manual ratios and
-/// drag-reorder are a T8 follow-up).
+/// share the width evenly (the webview's even flex split). The T26 manual
+/// ratios ride [`tile_boxes_ratio`]; this is the no-ratio auto grid.
 pub fn tile_boxes(n: usize, area: RectF, gap: f32) -> Vec<RectF> {
+    tile_boxes_ratio(n, area, gap, None)
+}
+
+// ---------------------------------------------------------------------------
+// Adjustable pane ratios (T26)
+// ---------------------------------------------------------------------------
+
+/// Manual grid ratios for one workspace (T26): each row's height fraction and
+/// its tiles' width fractions. Fractions are of the USABLE extent (area minus
+/// gaps); rows sum to 1 and each row's cols sum to 1 once
+/// [sanitized](Self::sanitized).
+///
+/// Ratios describe ONE grid shape (the [`split_rows`] buckets at the tile
+/// count they were dragged at). When the tile count reflows to a different
+/// shape they simply do not apply (the auto grid paints) - but they are KEPT,
+/// so session churn that returns to the old count restores the user's sizes.
+/// A divider double-click clears them (back to auto for good).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridRatios {
+    pub rows: Vec<RowRatio>,
+}
+
+/// One row of [`GridRatios`]: the row's height fraction and its tiles' width
+/// fractions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowRatio {
+    pub h: f32,
+    pub cols: Vec<f32>,
+}
+
+impl GridRatios {
+    /// Even ratios for the given row buckets - the starting point when a drag
+    /// begins on an auto grid.
+    pub fn even(buckets: &[usize]) -> GridRatios {
+        let rows = buckets.len().max(1) as f32;
+        GridRatios {
+            rows: buckets
+                .iter()
+                .map(|&count| RowRatio {
+                    h: 1.0 / rows,
+                    cols: vec![1.0 / count.max(1) as f32; count.max(1)],
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether these ratios describe exactly this grid shape.
+    pub fn matches(&self, buckets: &[usize]) -> bool {
+        self.rows.len() == buckets.len()
+            && self.rows.iter().zip(buckets).all(|(r, &count)| r.cols.len() == count)
+    }
+
+    /// Validate + normalize (row heights sum to 1, each row's cols sum to 1).
+    /// `None` when the shape or numbers are unusable (empty, non-finite,
+    /// non-positive) - a hand-edited or future layout file must never poison
+    /// the paint math, it just falls back to auto.
+    pub fn sanitized(self) -> Option<GridRatios> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let ok = |v: f32| v.is_finite() && v > 0.0;
+        let h_sum: f32 = self.rows.iter().map(|r| r.h).sum();
+        if !ok(h_sum) || self.rows.iter().any(|r| !ok(r.h) || r.cols.is_empty()) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            let c_sum: f32 = row.cols.iter().copied().sum();
+            if !ok(c_sum) || row.cols.iter().any(|&c| !ok(c)) {
+                return None;
+            }
+            out.push(RowRatio {
+                h: row.h / h_sum,
+                cols: row.cols.iter().map(|c| c / c_sum).collect(),
+            });
+        }
+        Some(GridRatios { rows: out })
+    }
+}
+
+/// The usable (gap-free) row heights and per-row tile widths, in pixels, for
+/// `n` tiles in `area` - the single source [`tile_boxes_ratio`] and
+/// [`divider_zones`] both build from. Ratios apply only when they match the
+/// current shape; otherwise the even auto split.
+fn grid_dims(n: usize, area: RectF, gap: f32, ratios: Option<&GridRatios>) -> (Vec<f32>, Vec<Vec<f32>>) {
     let buckets = split_rows(n);
     let rows = buckets.len();
     if rows == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let row_h = ((area.h - gap * (rows as f32 - 1.0)) / rows as f32).max(1.0);
+    let usable_h = (area.h - gap * (rows as f32 - 1.0)).max(rows as f32);
+    let ratios = ratios.filter(|g| g.matches(&buckets));
+    let heights: Vec<f32> = match ratios {
+        Some(g) => g.rows.iter().map(|r| (r.h * usable_h).max(1.0)).collect(),
+        None => vec![(usable_h / rows as f32).max(1.0); rows],
+    };
+    let widths: Vec<Vec<f32>> = buckets
+        .iter()
+        .enumerate()
+        .map(|(r, &count)| {
+            let usable_w = (area.w - gap * (count as f32 - 1.0)).max(count as f32);
+            match ratios {
+                Some(g) => g.rows[r].cols.iter().map(|c| (c * usable_w).max(1.0)).collect(),
+                None => vec![(usable_w / count as f32).max(1.0); count],
+            }
+        })
+        .collect();
+    (heights, widths)
+}
+
+/// [`tile_boxes`] with optional per-workspace manual ratios (T26). Mismatched
+/// or absent ratios paint the auto grid.
+pub fn tile_boxes_ratio(n: usize, area: RectF, gap: f32, ratios: Option<&GridRatios>) -> Vec<RectF> {
+    let (heights, widths) = grid_dims(n, area, gap, ratios);
     let mut out = Vec::with_capacity(n);
-    for (r, &count) in buckets.iter().enumerate() {
-        let tile_w = ((area.w - gap * (count as f32 - 1.0)) / count as f32).max(1.0);
-        let y = area.y + r as f32 * (row_h + gap);
-        for c in 0..count {
-            let x = area.x + c as f32 * (tile_w + gap);
-            out.push(RectF::new(x, y, tile_w, row_h));
+    let mut y = area.y;
+    for (r, row_h) in heights.iter().enumerate() {
+        let mut x = area.x;
+        for w in &widths[r] {
+            out.push(RectF::new(x, y, *w, *row_h));
+            x += w + gap;
         }
+        y += row_h + gap;
     }
     out
+}
+
+/// One draggable divider: the boundary between two rows, or between two tiles
+/// of one row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DividerId {
+    /// Between row `r` and row `r + 1` (drag = row heights).
+    Row(usize),
+    /// Between tile `index` and `index + 1` of row `row` (drag = that row's
+    /// column widths).
+    Col { row: usize, index: usize },
+}
+
+/// The grabbable thickness of a divider hit zone, centered on the visual gap
+/// (wider than the gap itself so the zone is actually hittable; it eats ~3px
+/// off each neighboring tile's edge, well inside the tile border/padding).
+pub const DIVIDER_HIT: f32 = 12.0;
+
+/// Hit zones for every divider of the current grid, matching what
+/// [`tile_boxes_ratio`] painted: row dividers span the area's width at each
+/// row gap; column dividers span their row's height at each intra-row gap.
+pub fn divider_zones(
+    n: usize,
+    area: RectF,
+    gap: f32,
+    ratios: Option<&GridRatios>,
+) -> Vec<(DividerId, RectF)> {
+    let (heights, widths) = grid_dims(n, area, gap, ratios);
+    let mut out = Vec::new();
+    let mut y = area.y;
+    for (r, row_h) in heights.iter().enumerate() {
+        let mut x = area.x;
+        for (i, w) in widths[r].iter().enumerate() {
+            if i + 1 < widths[r].len() {
+                let cx = x + w + gap / 2.0;
+                out.push((
+                    DividerId::Col { row: r, index: i },
+                    RectF::new(cx - DIVIDER_HIT / 2.0, y, DIVIDER_HIT, *row_h),
+                ));
+            }
+            x += w + gap;
+        }
+        if r + 1 < heights.len() {
+            let cy = y + row_h + gap / 2.0;
+            out.push((
+                DividerId::Row(r),
+                RectF::new(area.x, cy - DIVIDER_HIT / 2.0, area.w, DIVIDER_HIT),
+            ));
+        }
+        y += row_h + gap;
+    }
+    out
+}
+
+/// The pixel extent a divider drags within: for [`DividerId::Row(r)`] the
+/// combined usable height of rows `r` and `r+1` plus where it starts; for a
+/// column divider the combined usable width of the two neighboring tiles.
+/// The view maps the pointer into this extent and hands the resulting split
+/// fraction to [`apply_divider_split`]. `None` when the id is stale (the grid
+/// reflowed under a drag).
+pub fn divider_extent(
+    n: usize,
+    area: RectF,
+    gap: f32,
+    ratios: Option<&GridRatios>,
+    id: DividerId,
+) -> Option<(f32, f32)> {
+    let (heights, widths) = grid_dims(n, area, gap, ratios);
+    match id {
+        DividerId::Row(r) => {
+            if r + 1 >= heights.len() {
+                return None;
+            }
+            let top = area.y + heights[..r].iter().map(|h| h + gap).sum::<f32>();
+            Some((top, heights[r] + heights[r + 1]))
+        }
+        DividerId::Col { row, index } => {
+            let w = widths.get(row)?;
+            if index + 1 >= w.len() {
+                return None;
+            }
+            let left = area.x + w[..index].iter().map(|x| x + gap).sum::<f32>();
+            Some((left, w[index] + w[index + 1]))
+        }
+    }
+}
+
+/// Re-split the two fractions a divider separates: `t` is the first
+/// neighbor's share of their combined extent (0..1), clamped so neither
+/// neighbor drops below `min_t` of that extent. A stale id or an extent too
+/// small to honor the minimum is a no-op. Returns whether anything changed.
+pub fn apply_divider_split(g: &mut GridRatios, id: DividerId, t: f32, min_t: f32) -> bool {
+    let split = |a: &mut f32, b: &mut f32| -> bool {
+        let combined = *a + *b;
+        let min_t = min_t.clamp(0.0, 0.5);
+        let t = t.clamp(min_t, 1.0 - min_t);
+        let na = combined * t;
+        if (na - *a).abs() < f32::EPSILON {
+            return false;
+        }
+        *b = combined - na;
+        *a = na;
+        true
+    };
+    if min_t > 0.5 {
+        return false; // extent too small for two minimum-sized panes
+    }
+    match id {
+        DividerId::Row(r) => {
+            if r + 1 >= g.rows.len() {
+                return false;
+            }
+            let (left, right) = g.rows.split_at_mut(r + 1);
+            split(&mut left[r].h, &mut right[0].h)
+        }
+        DividerId::Col { row, index } => {
+            let Some(cols) = g.rows.get_mut(row).map(|r| &mut r.cols) else { return false };
+            if index + 1 >= cols.len() {
+                return false;
+            }
+            let (left, right) = cols.split_at_mut(index + 1);
+            split(&mut left[index], &mut right[0])
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +392,11 @@ pub struct Workspace {
     pub name: String,
     pub tiles: Vec<String>,
     pub font: Option<FontSpec>,
+    /// Manual pane ratios (T26), persisted per workspace. `None` = the auto
+    /// grid; ratios whose shape no longer matches the tile count lie dormant
+    /// (auto paints) until the count returns or a divider double-click clears
+    /// them.
+    pub grid: Option<GridRatios>,
     /// Torn off into its own OS window (T10 satellite). The workspace STAYS in
     /// `tabs` - one source of truth for tiles/reconcile/persist - this flag only
     /// says where it paints: the satellite window instead of the main grid.
@@ -180,6 +418,7 @@ impl Workspace {
             name: name.into(),
             tiles: Vec::new(),
             font: None,
+            grid: None,
             satellite: false,
             wsid: 0,
         }
@@ -326,6 +565,7 @@ impl ChromeModel {
             name: if name.is_empty() { "Workspace".to_string() } else { name.to_string() },
             tiles: Vec::new(),
             font: None,
+            grid: None,
             satellite: false,
             wsid: self.next_wsid,
         });
@@ -671,12 +911,26 @@ impl ChromeModel {
     /// unless that is a torn-off satellite (T10: new sessions must land where
     /// the user can see them arrive), then a fresh main workspace receives them.
     pub fn reconcile_with_cwds(&mut self, live: &[(String, String)]) -> Reconcile {
+        self.reconcile_with_cwds_lingering(live, &HashSet::new())
+    }
+
+    /// [`reconcile_with_cwds`](Self::reconcile_with_cwds), keeping the
+    /// `lingering` tiles PLACED even though the server no longer lists them
+    /// (T24: a dead/exited tile stays visible with its badge for a linger
+    /// window instead of silently vanishing - the supervision cue the general
+    /// asked for). A lingering tile is never re-added or refocused; once its
+    /// id leaves the set, the next pass removes it like any dead session.
+    pub fn reconcile_with_cwds_lingering(
+        &mut self,
+        live: &[(String, String)],
+        lingering: &HashSet<String>,
+    ) -> Reconcile {
         let live_set: HashSet<&str> = live.iter().map(|(id, _)| id.as_str()).collect();
         let mut out = Reconcile::default();
 
         for tab in &mut self.tabs {
             tab.tiles.retain(|id| {
-                let alive = live_set.contains(id.as_str());
+                let alive = live_set.contains(id.as_str()) || lingering.contains(id);
                 if !alive {
                     out.removed.push(id.clone());
                 }
@@ -770,6 +1024,159 @@ mod tests {
     fn tile_boxes_honor_the_area_origin() {
         let boxes = tile_boxes(1, RectF::new(20.0, 40.0, 60.0, 30.0), 6.0);
         assert_eq!(boxes, vec![RectF::new(20.0, 40.0, 60.0, 30.0)]);
+    }
+
+    // -- grid ratios (T26) --------------------------------------------------------
+
+    #[test]
+    fn even_ratios_match_their_shape_and_reproduce_the_auto_grid() {
+        let area = RectF::new(0.0, 0.0, 100.0, 100.0);
+        let even = GridRatios::even(&split_rows(3));
+        assert!(even.matches(&[2, 1]));
+        assert!(!even.matches(&[3]));
+        assert!(!even.matches(&[2, 2]));
+        // Even ratios paint EXACTLY what the auto grid paints.
+        assert_eq!(tile_boxes_ratio(3, area, 10.0, Some(&even)), tile_boxes(3, area, 10.0));
+    }
+
+    #[test]
+    fn ratio_boxes_resize_rows_and_columns() {
+        let area = RectF::new(0.0, 0.0, 100.0, 100.0);
+        // 3 tiles -> rows [2,1]; give row 0 two thirds of the height and its
+        // first tile two thirds of the width.
+        let g = GridRatios {
+            rows: vec![
+                RowRatio { h: 2.0 / 3.0, cols: vec![2.0 / 3.0, 1.0 / 3.0] },
+                RowRatio { h: 1.0 / 3.0, cols: vec![1.0] },
+            ],
+        };
+        let boxes = tile_boxes_ratio(3, area, 10.0, Some(&g));
+        // usable_h = 90 -> rows 60/30; row 0 usable_w = 90 -> 60/30.
+        assert_eq!(boxes[0], RectF::new(0.0, 0.0, 60.0, 60.0));
+        assert_eq!(boxes[1], RectF::new(70.0, 0.0, 30.0, 60.0));
+        assert_eq!(boxes[2], RectF::new(0.0, 70.0, 100.0, 30.0));
+    }
+
+    #[test]
+    fn mismatched_ratios_fall_back_to_the_auto_grid() {
+        let area = RectF::new(0.0, 0.0, 100.0, 100.0);
+        let g = GridRatios::even(&[2, 1]); // shaped for 3 tiles
+        assert_eq!(tile_boxes_ratio(4, area, 10.0, Some(&g)), tile_boxes(4, area, 10.0));
+    }
+
+    #[test]
+    fn sanitized_normalizes_and_rejects_garbage() {
+        // Unnormalized fractions come out summing to 1.
+        let g = GridRatios {
+            rows: vec![
+                RowRatio { h: 2.0, cols: vec![3.0, 1.0] },
+                RowRatio { h: 2.0, cols: vec![5.0] },
+            ],
+        }
+        .sanitized()
+        .unwrap();
+        assert!((g.rows[0].h - 0.5).abs() < 1e-6);
+        assert!((g.rows[0].cols[0] - 0.75).abs() < 1e-6);
+        assert!((g.rows[1].cols[0] - 1.0).abs() < 1e-6);
+        // Garbage (hand-edited layout files) -> None, never a poisoned paint.
+        assert!(GridRatios { rows: vec![] }.sanitized().is_none());
+        assert!(GridRatios { rows: vec![RowRatio { h: 0.0, cols: vec![1.0] }] }
+            .sanitized()
+            .is_none());
+        assert!(GridRatios { rows: vec![RowRatio { h: f32::NAN, cols: vec![1.0] }] }
+            .sanitized()
+            .is_none());
+        assert!(GridRatios { rows: vec![RowRatio { h: 1.0, cols: vec![] }] }
+            .sanitized()
+            .is_none());
+        assert!(GridRatios { rows: vec![RowRatio { h: 1.0, cols: vec![-1.0, 2.0] }] }
+            .sanitized()
+            .is_none());
+    }
+
+    #[test]
+    fn divider_zones_sit_centered_on_the_gaps() {
+        let area = RectF::new(0.0, 0.0, 100.0, 100.0);
+        // 3 tiles -> rows [2,1]: one column divider in row 0, one row divider.
+        let zones = divider_zones(3, area, 10.0, None);
+        assert_eq!(zones.len(), 2);
+        // Column divider: gap spans x 45..55, center 50; hit band is
+        // DIVIDER_HIT wide, spanning the row's height.
+        assert_eq!(
+            zones[0],
+            (DividerId::Col { row: 0, index: 0 }, RectF::new(50.0 - DIVIDER_HIT / 2.0, 0.0, DIVIDER_HIT, 45.0))
+        );
+        // Row divider: gap spans y 45..55, center 50; band spans the full width.
+        assert_eq!(
+            zones[1],
+            (DividerId::Row(0), RectF::new(0.0, 50.0 - DIVIDER_HIT / 2.0, 100.0, DIVIDER_HIT))
+        );
+        // Counts scale with the shape: 12 tiles -> [4,4,4] = 3x3 col + 2 row.
+        assert_eq!(divider_zones(12, area, 10.0, None).len(), 11);
+        // 0/1 tiles have nothing to drag.
+        assert!(divider_zones(0, area, 10.0, None).is_empty());
+        assert!(divider_zones(1, area, 10.0, None).is_empty());
+    }
+
+    #[test]
+    fn divider_extent_locates_the_neighbor_pair() {
+        let area = RectF::new(0.0, 0.0, 100.0, 100.0);
+        // Row divider of a 3-tile grid: rows are 45px each, pair starts at y=0.
+        assert_eq!(divider_extent(3, area, 10.0, None, DividerId::Row(0)), Some((0.0, 90.0)));
+        // Column divider in row 0: tiles are 45px each, pair starts at x=0.
+        assert_eq!(
+            divider_extent(3, area, 10.0, None, DividerId::Col { row: 0, index: 0 }),
+            Some((0.0, 90.0))
+        );
+        // Stale ids (grid reflowed mid-drag) resolve to None, not a panic.
+        assert_eq!(divider_extent(3, area, 10.0, None, DividerId::Row(1)), None);
+        assert_eq!(
+            divider_extent(3, area, 10.0, None, DividerId::Col { row: 1, index: 0 }),
+            None
+        );
+        assert_eq!(
+            divider_extent(3, area, 10.0, None, DividerId::Col { row: 5, index: 0 }),
+            None
+        );
+    }
+
+    #[test]
+    fn apply_divider_split_moves_the_pair_and_clamps() {
+        let mut g = GridRatios::even(&[2, 1]);
+        // Row split at 70/30.
+        assert!(apply_divider_split(&mut g, DividerId::Row(0), 0.7, 0.1));
+        assert!((g.rows[0].h - 0.7).abs() < 1e-6);
+        assert!((g.rows[1].h - 0.3).abs() < 1e-6);
+        // Column split clamps to the minimum share.
+        assert!(apply_divider_split(&mut g, DividerId::Col { row: 0, index: 0 }, 0.01, 0.2));
+        assert!((g.rows[0].cols[0] - 0.2).abs() < 1e-6);
+        assert!((g.rows[0].cols[1] - 0.8).abs() < 1e-6);
+        // The fractions stay normalized through any sequence of drags.
+        let h_sum: f32 = g.rows.iter().map(|r| r.h).sum();
+        let c_sum: f32 = g.rows[0].cols.iter().sum();
+        assert!((h_sum - 1.0).abs() < 1e-6 && (c_sum - 1.0).abs() < 1e-6);
+        // Stale ids and an impossible minimum are no-ops.
+        assert!(!apply_divider_split(&mut g, DividerId::Row(1), 0.5, 0.1));
+        assert!(!apply_divider_split(&mut g, DividerId::Col { row: 1, index: 0 }, 0.5, 0.1));
+        assert!(!apply_divider_split(&mut g, DividerId::Row(0), 0.5, 0.6));
+    }
+
+    // -- lingering dead tiles (T24) ----------------------------------------------
+
+    #[test]
+    fn lingering_tiles_stay_placed_until_released() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb"]));
+        // "aa" dies but lingers: it stays placed, is NOT reported removed, and
+        // is not re-added either.
+        let linger: HashSet<String> = [String::from("aa")].into();
+        let out = m.reconcile_with_cwds_lingering(&[("bb".into(), String::new())], &linger);
+        assert_eq!(out, Reconcile::default());
+        assert_eq!(m.active_tiles(), ids(&["aa", "bb"]).as_slice());
+        // The linger window passes: the next pass removes it normally.
+        let out = m.reconcile_with_cwds_lingering(&[("bb".into(), String::new())], &HashSet::new());
+        assert_eq!(out.removed, ids(&["aa"]));
+        assert_eq!(m.active_tiles(), ids(&["bb"]).as_slice());
     }
 
     #[test]
@@ -921,6 +1328,7 @@ mod tests {
             name: name.into(),
             tiles: ids(tiles),
             font: None,
+            grid: None,
             satellite,
             wsid: 0,
         }

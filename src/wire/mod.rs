@@ -51,7 +51,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -367,6 +367,16 @@ struct WireStats {
     payload: AtomicU64,
 }
 
+/// Whether the attach connection is currently down and the reader thread is
+/// retrying (additive to §1.3, the T24 supervision cue). The internal
+/// auto-reattach was invisible by design ("output just keeps flowing"), which
+/// is exactly why a tile could read as frozen while the viewer had merely lost
+/// its attach - this flag lets the UI say "reconnecting" instead.
+#[derive(Default)]
+struct LinkState {
+    down: AtomicBool,
+}
+
 /// A live attach to one session (§1.3). `scrollback` is the decoded opening seed;
 /// `output` streams [`PtyFrame`]s. `write`/`resize` go back up the connection;
 /// `detach` (or drop) shuts it down (the tmux SESSION survives). A mid-stream
@@ -384,6 +394,7 @@ pub struct PtyHandle {
     /// `resize` can record it for the next reconnect.
     geom: Arc<Mutex<(u16, u16)>>,
     stats: Arc<WireStats>,
+    link: Arc<LinkState>,
     stop: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
 }
@@ -445,6 +456,13 @@ impl PtyHandle {
     /// Decoded payload bytes delivered so far (scrollback seeds + `Out` frames).
     pub fn payload_bytes_in(&self) -> u64 {
         self.stats.payload.load(Ordering::Acquire)
+    }
+
+    /// Whether the attach connection is down and the reader thread is retrying
+    /// with backoff (T24 supervision cue). `false` again once a reattach lands
+    /// (the fresh scrollback seed re-syncs the consumer's grid).
+    pub fn link_down(&self) -> bool {
+        self.link.down.load(Ordering::Acquire)
     }
 
     /// Detach: stop reconnecting, shut the socket (server detaches; tmux SESSION
@@ -752,6 +770,7 @@ fn pty_reader_loop(
     writer_slot: Arc<Mutex<PtyTx>>,
     geom: Arc<Mutex<(u16, u16)>>,
     stats: Arc<WireStats>,
+    link: Arc<LinkState>,
     stop: Arc<AtomicBool>,
 ) {
     // Bytes the opening read may have pulled past the opening frame are wire
@@ -788,11 +807,22 @@ fn pty_reader_loop(
         }
 
         // Disconnected mid-stream (no exit frame). Reconnect unless we're detaching.
+        link.down.store(true, Ordering::Release);
         loop {
             if stop.load(Ordering::Acquire) {
                 return;
             }
-            thread::sleep(backoff);
+            // Sleep in small slices so a detach/Drop mid-backoff joins this
+            // thread promptly instead of stalling up to BACKOFF_MAX (dropping a
+            // dead session's handle would otherwise block its caller - and the
+            // T24 dead-tile path drops handles exactly while they backoff).
+            let deadline = Instant::now() + backoff;
+            while Instant::now() < deadline {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
             backoff = (backoff * 2).min(BACKOFF_MAX);
             let (cols, rows) = *geom.lock();
             match pty_attach(&seed, &session, cols, rows, force_v1) {
@@ -814,6 +844,7 @@ fn pty_reader_loop(
                     stats.wire.fetch_add(acc.len() as u64, Ordering::AcqRel);
                     stream = att.reader.into_inner();
                     backoff = BACKOFF_INITIAL;
+                    link.down.store(false, Ordering::Release);
                     log::info!("pty[{session}]: reattached after disconnect ({framing:?})");
                     continue 'outer;
                 }
@@ -1005,6 +1036,7 @@ impl ControlClient {
         let geom = Arc::new(Mutex::new((cols, rows)));
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(WireStats::default());
+        let link = Arc::new(LinkState::default());
         stats.wire.fetch_add(att.opening_wire_bytes, Ordering::AcqRel);
         stats
             .payload
@@ -1019,12 +1051,13 @@ impl ControlClient {
             let geom = geom.clone();
             let stop = stop.clone();
             let stats = stats.clone();
+            let link = link.clone();
             thread::Builder::new()
                 .name(format!("t-hub-native-pty-{session}"))
                 .spawn(move || {
                     pty_reader_loop(
                         seed, session, reader, framing, force_v1, out_tx, writer_slot, geom,
-                        stats, stop,
+                        stats, link, stop,
                     )
                 })
                 .context("spawn pty reader thread")?
@@ -1036,6 +1069,7 @@ impl ControlClient {
             writer: writer_slot,
             geom,
             stats,
+            link,
             stop,
             reader: Some(handle),
         })
