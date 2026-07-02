@@ -37,6 +37,8 @@ required-features = []
 [[bin]]
 name = "font-torture"
 path = "src/bin/font_torture.rs"
+required-features = ["gui"]
+
 # T9 acceptance runner (headless): spins the OverlayFeed against the real server
 # and prints a text rendering of every sidebar section (recents, usage, wsl
 # health, supervision, toasts, event counts).
