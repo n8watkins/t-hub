@@ -713,9 +713,13 @@ fn attach_tile(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>, id
     let handle = match client.attach_pty(id, PROVISIONAL_COLS, PROVISIONAL_ROWS) {
         Ok(h) => h,
         Err(e) => {
+            // Keep the tile PLACED: reconcile attaches every placed-but-unpooled
+            // tile each pass, so this retries in place at the poll cadence.
+            // (Removing it from the layout here - the pre-T10 behavior - made
+            // reconcile re-add it to the ACTIVE tab, which live-migrated a
+            // satellite workspace's tiles into the main window during a burst
+            // of transient server-side attach failures.)
             log::warn!("cockpit: attach {id} failed ({e}); a later reconcile retries");
-            // Not hidden - just out of the layout, so reconcile can re-add it.
-            state.lock().model.remove_tile(id);
             return;
         }
     };
