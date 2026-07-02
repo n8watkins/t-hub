@@ -1166,6 +1166,15 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
 /// UI's PTY map; everything tmux reports is a live tmux session).
 fn list_terminals() -> Result<Value, String> {
     let sessions = tmux::list_sessions().map_err(|e| format!("failed to list tmux sessions: {e}"))?;
+    // Correlate each session with its pane's live cwd (the same `pane_info`
+    // source `commands::list_terminals` uses) so socket clients can map
+    // sessions to filesystem paths - `th worktree ls/prune` lease detection
+    // depends on it. Best-effort: a pane_info failure just leaves cwd empty.
+    let pane_map: std::collections::HashMap<String, (String, String)> = tmux::pane_info()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.session, (p.command, p.cwd)))
+        .collect();
     let terminals: Vec<Value> = sessions
         .iter()
         .filter(|s| s.starts_with("th_"))
@@ -1174,12 +1183,15 @@ fn list_terminals() -> Result<Value, String> {
                 .strip_prefix("th_")
                 .unwrap_or(tmux_session)
                 .to_string();
+            let cwd = pane_map
+                .get(tmux_session)
+                .map(|(_, cwd)| cwd.clone())
+                .unwrap_or_default();
             json!({
                 "id": id,
                 "tmuxSession": tmux_session,
                 "title": tmux_session,
-                // tmux owns the live cwd; we do not track it server-side.
-                "cwd": "",
+                "cwd": cwd,
                 // Source-of-truth listing: present as live tmux-backed sessions.
                 "state": "live",
             })

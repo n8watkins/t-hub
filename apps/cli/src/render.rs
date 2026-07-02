@@ -38,7 +38,7 @@ pub fn sort_terminals(result: &Value) -> Vec<Value> {
         .and_then(|t| t.as_array())
         .cloned()
         .unwrap_or_default();
-    arr.sort_by(|a, b| str_field(a, "id").cmp(&str_field(b, "id")));
+    arr.sort_by_key(|a| str_field(a, "id"));
     arr
 }
 
@@ -49,7 +49,7 @@ pub fn sort_tabs(result: &Value) -> Vec<Value> {
         .and_then(|t| t.as_array())
         .cloned()
         .unwrap_or_default();
-    arr.sort_by(|a, b| str_field(a, "id").cmp(&str_field(b, "id")));
+    arr.sort_by_key(|a| str_field(a, "id"));
     arr
 }
 
@@ -289,6 +289,109 @@ pub fn read_output(result: &Value, ui: &Ui) {
             (format!("th send {sid} <text>"), "respond into this session"),
         ],
     );
+}
+
+/// One row of the `th worktree ls` table, pre-stringified by `main.rs`.
+pub struct WorktreeRow {
+    pub path: String,
+    pub branch: String,
+    pub dirty: String,
+    pub merged: String,
+    pub leased: String,
+}
+
+/// `th worktree ls` - the lifecycle table: every worktree with its branch and
+/// the three reap-relevant facts (DIRTY / MERGED / LEASED). Rows arrive sorted
+/// (main first, then linked worktrees by path).
+pub fn worktrees(repo_root: &str, default_branch: &str, lease_note: Option<&str>, rows: &[WorktreeRow], ui: &Ui) {
+    println!(
+        "{} worktree{} on {repo_root}  (default branch: {default_branch})",
+        rows.len(),
+        plural(rows.len()),
+    );
+    if let Some(note) = lease_note {
+        println!("  note: {note}");
+    }
+    println!();
+    if rows.is_empty() {
+        println!("  (no worktrees)");
+        return;
+    }
+    let shown = if ui.all { rows.len() } else { rows.len().min(LIMIT) };
+    let slice = &rows[..shown];
+
+    let pw = slice.iter().map(|r| r.path.len()).max().unwrap_or(4).max(4);
+    let bw = slice.iter().map(|r| r.branch.len()).max().unwrap_or(6).max(6);
+    let dw = slice.iter().map(|r| r.dirty.len()).max().unwrap_or(5).max(5);
+    let mw = slice.iter().map(|r| r.merged.len()).max().unwrap_or(6).max(6);
+    println!("{}", row(ui, &["PATH", "BRANCH", "DIRTY", "MERGED", "LEASED"], &[pw, bw, dw, mw]));
+    for r in slice {
+        println!("{}", row(ui, &[&r.path, &r.branch, &r.dirty, &r.merged, &r.leased], &[pw, bw, dw, mw]));
+    }
+    if shown < rows.len() {
+        println!("  … showing {} of {} - use --all or --json for the rest", shown, rows.len());
+    }
+
+    next(
+        ui,
+        &[
+            (format!("th worktree prune {repo_root}"), "dry-run reap plan (merged + clean + unleased)"),
+            (format!("th worktree new {repo_root} <branch>"), "new worktree (recycles a reapable one first)"),
+        ],
+    );
+}
+
+/// One line of the `th worktree prune` plan: what happens to one worktree, why.
+pub struct PruneRow {
+    /// "REAP", "REAP*" (forced past an unmerged branch), or "SKIP".
+    pub action: String,
+    pub path: String,
+    pub branch: String,
+    pub detail: String,
+    /// Commits a forced reap would lose (`git log --oneline` lines).
+    pub would_lose: Vec<String>,
+}
+
+/// `th worktree prune` - the plan (dry-run) or the executed report. Skips print
+/// their protecting reason; forced reaps print exactly what would be lost.
+pub fn prune_plan(repo_root: &str, default_branch: &str, dry_run: bool, rows: &[PruneRow], ui: &Ui) {
+    let reaps = rows.iter().filter(|r| r.action.starts_with("REAP")).count();
+    println!(
+        "worktree prune on {repo_root}  (default branch: {default_branch}){}",
+        if dry_run { "  - DRY-RUN, nothing changed" } else { "" },
+    );
+    println!();
+    if rows.is_empty() {
+        println!("  (no linked worktrees - nothing to prune)");
+        return;
+    }
+
+    let aw = rows.iter().map(|r| r.action.len()).max().unwrap_or(4).max(4);
+    let pw = rows.iter().map(|r| r.path.len()).max().unwrap_or(4).max(4);
+    let bw = rows.iter().map(|r| r.branch.len()).max().unwrap_or(6).max(6);
+    for r in rows {
+        println!("{}", row(ui, &[&r.action, &r.path, &r.branch, &r.detail], &[aw, pw, bw]));
+        for c in &r.would_lose {
+            println!("{}      would lose: {c}", " ".repeat(aw));
+        }
+    }
+    println!(
+        "\n{reaps} to reap, {} skipped{}",
+        rows.len() - reaps,
+        if dry_run { "." } else { " - executed above." },
+    );
+
+    if dry_run && reaps > 0 {
+        next(
+            ui,
+            &[
+                (format!("th worktree prune {repo_root} --yes"), "execute this plan"),
+                (format!("th worktree ls {repo_root}"), "the full lifecycle table"),
+            ],
+        );
+    } else {
+        next(ui, &[(format!("th worktree ls {repo_root}"), "the full lifecycle table")]);
+    }
 }
 
 /// `th tabs`.
