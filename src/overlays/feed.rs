@@ -27,6 +27,7 @@ use super::recents::RecentEntry;
 use super::supervision::SupervisionTree;
 use super::usage::{ClaudeUsage, CodexUsage};
 use super::{fold_event, SidebarState};
+use crate::apply::{self, ApplyCommand};
 use crate::wire::ControlClient;
 
 /// Recents refresh cadence (the webview refreshes on mount + window focus; a
@@ -150,6 +151,7 @@ pub struct OverlayFeed {
     state: Arc<Mutex<SidebarState>>,
     actions_tx: Sender<OverlayAction>,
     host_rx: Receiver<HostRequest>,
+    apply_rx: Receiver<ApplyCommand>,
 }
 
 impl OverlayFeed {
@@ -162,13 +164,29 @@ impl OverlayFeed {
 
         let (actions_tx, actions_rx) = unbounded::<OverlayAction>();
         let (host_tx, host_rx) = unbounded::<HostRequest>();
+        let (apply_tx, apply_rx) = unbounded::<ApplyCommand>();
 
-        // Event thread: the process's single event drainer.
+        // Event thread: the process's single event drainer. `control://apply`
+        // frames (T12: the server's Organization-forward broadcast) are decoded
+        // onto the apply channel for the cockpit worker; folding them too keeps
+        // `events_folded` bumping, which is exactly the hint that short-circuits
+        // the worker's next reconcile.
         {
             let state = state.clone();
             let rx = client.events();
             thread::spawn(move || {
                 while let Ok(ev) = rx.recv() {
+                    if ev.channel == apply::APPLY_CHANNEL {
+                        match apply::parse_event(&ev.payload) {
+                            Some(cmd) => {
+                                let _ = apply_tx.send(cmd);
+                            }
+                            None => log::debug!(
+                                "control://apply frame with no native arm: {}",
+                                ev.payload
+                            ),
+                        }
+                    }
                     fold_event(&mut state.lock(), &ev.channel, &ev.payload, now_ms());
                 }
             });
@@ -195,7 +213,7 @@ impl OverlayFeed {
             });
         }
 
-        OverlayFeed { state, actions_tx, host_rx }
+        OverlayFeed { state, actions_tx, host_rx, apply_rx }
     }
 
     /// The shared sidebar state (lock, read/reduce, drop the guard before paint).
@@ -211,6 +229,13 @@ impl OverlayFeed {
     /// Requests only the embedding shell can fulfill (T8 wires this).
     pub fn host_requests(&self) -> Receiver<HostRequest> {
         self.host_rx.clone()
+    }
+
+    /// Organization applies decoded off the event stream (T12): the cockpit
+    /// worker drains these into the chrome model. Same competing-consumer
+    /// caveat as the wire's event channel - exactly one drainer.
+    pub fn apply_requests(&self) -> Receiver<ApplyCommand> {
+        self.apply_rx.clone()
     }
 
     /// Tab-aware toast suppression: the sessions the user is currently looking
