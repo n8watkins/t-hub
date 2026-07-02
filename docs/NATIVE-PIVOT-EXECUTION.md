@@ -247,3 +247,36 @@ If two tasks must touch the same file (expected only at `main.rs` layout composi
   - **Build/verify:** `cargo check` CLEAN; `cargo test --lib control::` 45/45 + `pty::` 5/5 green (incl. the updated version-gate test, which now also asserts a v1 client is accepted by a v2 server). Added a headless `examples/control_probe_server.rs` (reuses the public `control::ControlContext::with_shared_supervisor` + `*_for_test` constructors) so the probe runs against a REAL listener without touching the user's live app or `~/.t-hub/control.json`.
   - **Harness (`scripts/probes/t13_binframe.py`): green, `T13-BINFRAME-OK`.** On one disposable `th_t13-binframe` tmux session it proves: v2 opens a binary SCROLLBACK frame carrying the seed, a binary WRITE round-trips as binary OUT, a binary RESIZE moves the pane (100x29 -> 90x24); and v1 (regression) still opens `{"scrollback"}`, round-trips `{"write"}`->`{"out"}`, and resizes (100x29 -> 110x39).
   - **Measured reduction (representative `seq 1 50000` firehose):** for the SAME captured output frames (222 frames, 41,680 B of raw PTY payload), the v1 base64+NDJSON wire cost would be 58,390 B (a ~40% tax over the raw bytes) vs the v2 binary wire cost 42,790 B (just the 5-byte headers, ~2.7% over raw) - a **~26.7% wire reduction** (v2 is 73.3% of v1). The headline is stable at ~26-27% across runs (it varies slightly with tmux redraw coalescing). Interpretation: base64 alone inflates raw bytes 33% (4/3), so removing it recovers 25% of the transmitted bytes; dropping the per-frame JSON envelope adds the rest. The raw firehose payload itself is much smaller than 50000 lines because `tmux attach` transmits the rendered/ coalesced pane, not every scrolled line.
+- 2026-07-01 T6 DONE (branch `t6-term-ux`): terminal UX completeness on the merged T5 seam - mouse, selection + clipboard, scrollback UX, find-in-scrollback, URL detection.
+  Alacritty semantics throughout; zero `app.rs`/`wire/` changes (T8 boundary respected).
+  - **`term/`** (gpui-free, unit-tested): `ModeInfo` snapshot of the arbitration mode bits (mouse click/drag/motion, SGR + UTF-8 mouse, alt screen, alternate scroll, app cursor, bracketed paste, focus events);
+  selection driving alacritty's own `Selection` (`SelKind` Simple/Block/Semantic/Lines, viewport->grid via `viewport_to_point`, extraction via `selection_to_string`);
+  scrollback state (`display_offset`/`history_size`/`scroll_page_up`/`scroll_page_down`/`scroll_to_top`/`scroll_to_line`);
+  find over the whole buffer (alacritty `RegexSearch`/`RegexIter`: smart-case literal patterns, `find_next` with wraparound both directions, `visible_search_hits` viewport segments, `match_stats` ordinal/total capped at 999);
+  `visible_urls` (viewport scan that joins WRAPLINE-wrapped rows into logical lines and reports wide-char-aware grid-column segments);
+  plus the new pure module **`term/scan.rs`** (URL scanner: scheme allowlist, tail-punctuation trim, balanced-paren keep; `search_pattern` smart-case escaping).
+  - **`render_support.rs`** (gpui-free, unit-tested): `key_action` routing (Ctrl+Shift+C/V/F copy/paste/find; Shift+PageUp/PageDown/Home/End scrollback paging, handed to the app instead when the alt screen is active - alacritty's `~Alt` gating);
+  `encode` upgraded to full xterm coverage (SS3 arrows/Home/End in app-cursor mode, `CSI 1;m` modified cursor keys, tilde keys with modifiers, F1-F12, AltGr-types-text, ctrl+backspace);
+  `encode_mouse` (X10, UTF-8 1005 with 2-byte coords, SGR 1006; press/release/motion/wheel; shift/alt/ctrl bits; legacy coord clamp at 223);
+  `alt_scroll_bytes` (mode 1007 wheel->arrows), `encode_paste` (bracketed framing + embedded-`ESC[201~` injection guard + CRLF->CR normalization), `search_key` find-bar routing, `cell_from_pixel` hit-testing math.
+  - **`render/`** (feature `gui`): click focuses the tile under the pointer (plus mode 1004 focus-in/out reports on focus change);
+  selection by drag with double-click word / triple-click line / ctrl+click block / shift+click extend;
+  mouse-reporting passthrough with Shift override, per-cell drag motion, buttonless hover motion (1003), and release tracking;
+  wheel arbitration in priority order app-wheel-events -> alternate-scroll arrows -> viewport scroll, targeting the tile under the pointer with a fractional accumulator for pixel-delta touchpads;
+  a scrolled-back badge (top-right `^ N lines`, click = snap to bottom);
+  a per-tile find-bar overlay (all visible matches highlighted dim, the focused match strong, `ordinal/total` readout);
+  URL underlines always on with Ctrl+click to open (rundll32 / open / xdg-open per platform);
+  middle-click paste; typing and paste snap to the live bottom and clear the selection.
+  - **Polish (T5 verifier note):** the unreachable else arm in `paint_grid` is gone - damage now folds into `Option<Vec<rows>>` where `None` == full damage, so `need_full` and the partial path are exhaustive with no dead branch.
+  - **Build/verify:** `cargo check` AND `cargo clippy --all-targets` clean on BOTH feature sets; `cargo test --no-default-features` **54/54** green (T5 baseline was 20).
+  New: 17 term tests (modes, selection kinds incl. scrollback-offset selection, scroll state, viewport pinning, search wrap/stats/smart-case/segments, URL columns incl. wide-char and wrapped), 8 scan tests, 9 new render_support tests (12 total there).
+  - **Deviations / judgment calls:**
+    1. The brief's "snap to bottom on new output" is implemented as alacritty semantics: output while scrolled back PINS the viewport to its content (the offset grows - unit-tested), while typing/paste snaps to the bottom.
+    A literal output-snap would make scrollback unusable on any busy tile; the badge gives one-click return instead.
+    2. URL open is Ctrl+click (consumed, never forwarded to the app); plain click stays selection.
+    Ctrl+click on a non-URL cell starts block selection (alacritty parity).
+    3. Kitty keyboard protocol deferred: `TermMode` already tracks the kitty flags but the encoder speaks classic xterm; none of the acceptance TUIs require it.
+    4. Search is a smart-case literal (regex metachars escaped), not user-supplied regex.
+    5. Per-tile palettes (named in the §3 scope line) are NOT here - palette/config plumbing belongs with T7b's per-tile font config; flagged to the captain.
+  - **Needs a live Windows check:** real clipboard round-trip (copy/paste/middle-click), mouse-mode TUIs (vim/htop/Claude Code), URL open, wheel feel/multiplier.
+  - **Version:** native crate stays `0.1.0` (T8 runs in parallel; not bumping avoids a pointless Cargo.toml conflict). `apps/desktop/` untouched, so `bump-version.sh` intentionally not run.
