@@ -234,6 +234,117 @@ impl EventFanout {
     }
 }
 
+/// One workspace tab as the control channel sees it: a stable id, a display name,
+/// and the ids of the tiles it holds (TASK C / #22).
+///
+/// Serialized camelCase (`{id, name, tileIds}`) in BOTH directions: the frontend
+/// reports its tabs up as this shape, and `list_tabs` returns it verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabRecord {
+    pub id: String,
+    pub name: String,
+    /// Tile ids in this tab, in order. Accepts the frontend's `order` field as an
+    /// alias so either spelling deserializes.
+    #[serde(default, alias = "order")]
+    pub tile_ids: Vec<String>,
+}
+
+/// The CORE's addressable mirror of the frontend's workspace tabs (TASK C / #22).
+///
+/// Why the core owns a tab registry at all: the control/MCP API needs tabs to be
+/// *addressable* — `list_tabs` must return real `{id, name, tileIds}`, `new_tab`
+/// must return the id it created, and named placement (`create_worktree`,
+/// `spawn_terminal`) must resolve/create a tab by NAME deterministically rather
+/// than dropping the tile into whatever tab happens to be focused. None of that is
+/// possible while the tab layout lives only in the frontend store.
+///
+/// Consistency model: the frontend remains the source of truth for tabs and reports
+/// its FULL tab list up (the `report_workspace_tabs` Tauri command) on every layout
+/// change, which [`replace`](Self::replace)s this mirror — so UI-created tabs and
+/// real tile membership are reflected. MCP-driven mutations additionally update the
+/// mirror *optimistically* (a just-minted tab id is discoverable before the next
+/// report) using ids the core chose and forwarded down, so when the frontend reports
+/// back the ids already agree and the two converge. This is deliberately NOT the
+/// PRD §8 persistence layer — just the minimal in-memory registry headless tab ops
+/// need.
+#[derive(Default)]
+pub struct TabRegistry {
+    tabs: Mutex<Vec<TabRecord>>,
+}
+
+impl TabRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the whole registry with the frontend's authoritative snapshot.
+    pub fn replace(&self, tabs: Vec<TabRecord>) {
+        if let Ok(mut g) = self.tabs.lock() {
+            *g = tabs;
+        }
+    }
+
+    /// A clone of the current tab list (for `list_tabs` / tests).
+    pub fn snapshot(&self) -> Vec<TabRecord> {
+        self.tabs.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// The id of the tab whose name matches exactly, if any (named-placement reuse).
+    fn id_for_name(&self, name: &str) -> Option<String> {
+        self.tabs
+            .lock()
+            .ok()
+            .and_then(|g| g.iter().find(|t| t.name == name).map(|t| t.id.clone()))
+    }
+
+    /// Record a new (empty) tab so its id is discoverable immediately. No-op if a
+    /// tab with this id already exists.
+    fn insert_tab(&self, id: &str, name: &str) {
+        if let Ok(mut g) = self.tabs.lock() {
+            if !g.iter().any(|t| t.id == id) {
+                g.push(TabRecord {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    tile_ids: Vec::new(),
+                });
+            }
+        }
+    }
+
+    /// Optimistically move a tile: drop it from every tab, then append to `tab_id`
+    /// if that tab is known. Mirrors what the frontend does + reports back.
+    fn move_tile(&self, tile_id: &str, tab_id: &str) {
+        if let Ok(mut g) = self.tabs.lock() {
+            for t in g.iter_mut() {
+                t.tile_ids.retain(|x| x != tile_id);
+            }
+            if let Some(t) = g.iter_mut().find(|t| t.id == tab_id) {
+                t.tile_ids.push(tile_id.to_string());
+            }
+        }
+    }
+
+    /// Auto-name a new tab "Workspace N" at the lowest free index — the same scheme
+    /// the frontend's `addTab` uses, so core- and UI-created tabs share one naming.
+    fn auto_name(&self) -> String {
+        let used: std::collections::HashSet<u32> = self
+            .tabs
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .filter_map(|t| t.name.strip_prefix("Workspace ").and_then(|n| n.trim().parse().ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut n = 1u32;
+        while used.contains(&n) {
+            n += 1;
+        }
+        format!("Workspace {n}")
+    }
+}
+
 /// The shared state the control dispatcher reads. Holds exactly the handles the
 /// Read + Organization tools need.
 ///
@@ -276,6 +387,12 @@ pub struct ControlContext {
     /// in headless tests; `lib.rs` wires it from `AgentBridge`. See [`MetricsFn`]
     /// for why this is the canonical source on the Windows-host topology.
     metrics: Option<MetricsFn>,
+    /// The CORE's addressable tab registry (TASK C / #22). Read by `list_tabs`,
+    /// updated optimistically by `new_tab` / `move_tile` / named placement, and
+    /// replaced wholesale by the frontend's `report_workspace_tabs` up-sync. Shared
+    /// (`Arc`) with the Tauri command that receives those reports; own empty one in
+    /// headless tests.
+    tabs: Arc<TabRegistry>,
     /// Idle read timeout for a connection's request phase ([`CONN_READ_TIMEOUT`] by
     /// default). A field (not the bare const) so tests can drive a short timeout
     /// against a real listener; could later carry an operator override.
@@ -863,7 +980,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "search_files" => search_files(ctx, args),
         "list_dir" => list_dir(ctx, args),
         "read_text_file" => read_text_file(ctx, args),
-        "list_tabs" => list_tabs(),
+        "list_tabs" => list_tabs(ctx),
         "read_terminal" | "capture_pane" => read_terminal(args),
 
         // ---- Organization tier (PRD §11.2: allowed, audited) ---------------
@@ -872,9 +989,13 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // in the MCP tool description AND refused here unless explicitly enabled,
         // so the dev-box proof never spawns/kills anything by accident.
         "focus_session" => organization_apply(ctx, "focus_session", args),
-        "move_tile" => organization_apply(ctx, "move_tile", args),
+        // move_tile updates the CORE tab registry (TASK C: so a tile's tab
+        // membership is reflected in list_tabs) AND forwards+audits the UI mutation.
+        "move_tile" => move_tile(ctx, args),
         "rename_tab" => organization_apply(ctx, "rename_tab", args),
-        "new_tab" => organization_apply(ctx, "new_tab", args),
+        // new_tab mints the tab id CORE-side so it can return it (TASK C:
+        // addressable tabs) and forwards that id for the frontend to adopt.
+        "new_tab" => new_tab(ctx, args),
         "focus_tab" => organization_apply(ctx, "focus_tab", args),
         "open_file" => open_file(ctx, args),
         // WS-4 git worktrees: create runs git here then forwards the tab+spawn to
@@ -888,13 +1009,15 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "archive_recent_project" => archive_recent_project(args),
 
         // ---- Process-changing tier (PRD §11.2: confirmation required) ------
-        // `spawn_terminal` stays gated off (it would create an untracked tmux
-        // session the UI never adopts). The session-targeted process actions —
-        // typing into / interrupting / closing an *existing* session — are
-        // executed directly against tmux: the MCP tool descriptions mark them
-        // CONFIRMATION REQUIRED, which is the user-facing gate, and they only
-        // ever act on a `th_*` session the app already owns.
-        "spawn_terminal" => gated_process_change("spawn_terminal"),
+        // `spawn_terminal` is confirmation-gated (its MCP description carries the
+        // CONFIRMATION REQUIRED contract), but functional: it routes through the
+        // SAME ApplySink adoption path create_worktree uses, so the frontend spawns
+        // a real tile + live session it OWNS (no untracked tmux session). Refused
+        // only when no UI is connected to adopt the tile. The session-targeted
+        // process actions — typing into / interrupting / closing an *existing*
+        // session — execute directly against tmux (they only act on a `th_*`
+        // session the app already owns).
+        "spawn_terminal" => spawn_terminal(ctx, args),
         "send_text" => send_text(args),
         "send_keys" => send_keys(args),
         "close_terminal" => close_terminal(args),
@@ -1332,16 +1455,16 @@ fn read_text_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     serde_json::to_value(contents).map_err(|e| e.to_string())
 }
 
-/// `list_tabs`: the snapshot-track workspace tabs. Workspace-tab persistence is a
-/// later workstream (PRD §8 snapshot track / persistence workstream G), so there
-/// is no live tab store to read yet. We return an explicit empty list with a note
-/// rather than failing, so the tool is callable and forward-compatible.
-fn list_tabs() -> Result<Value, String> {
-    Ok(json!({
-        "tabs": [],
-        "note": "workspace-tab persistence is not yet wired (PRD §8 snapshot track); \
-                 returns an empty list until the persistence workstream lands.",
-    }))
+/// `list_tabs`: the live workspace tabs from the CORE tab registry (TASK C / #22),
+/// each `{id, name, tileIds}`. The frontend reports its full tab layout up (the
+/// `report_workspace_tabs` Tauri command) so this reflects UI-created tabs and real
+/// tile membership; MCP-driven `new_tab` / `move_tile` / named placement update it
+/// optimistically so a just-created tab is addressable immediately. This is the
+/// minimal in-memory registry that makes headless tab ops (discover an id, then
+/// `move_tile` / `focus_tab` into it) work — NOT the PRD §8 persistence layer.
+fn list_tabs(ctx: &ControlContext) -> Result<Value, String> {
+    let tabs = ctx.tabs.snapshot();
+    Ok(json!({ "tabs": tabs, "count": tabs.len() }))
 }
 
 /// `read_terminal` / `capture_pane`: return a session's recent visible output as
@@ -1432,14 +1555,31 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     // failure short-circuits here — no tab/terminal is spawned for a failed add.
     let git_output = git::worktree_add(&repo_root, &worktree_path, branch.as_deref())?;
 
-    // Forward the UI orchestration (new tab + spawn a terminal in the worktree
-    // dir). The git worktree already exists, so `alreadyCreated: true` tells the
-    // store not to run `gitWorktreeAdd` again.
+    // Resolve the TARGET TAB by NAME deterministically (TASK C / #22): the tile
+    // must land in a tab identified by name, NOT in whatever tab is focused. Reuse
+    // an existing tab with this name; otherwise mint a fresh id CORE-side. We record
+    // it in the registry now (so it's addressable immediately) and forward the
+    // chosen `tabId` so the frontend places the tile in THAT tab (creating it with
+    // this id+name if needed) rather than defaulting to the active workspace.
+    let effective_tab_name = tab_name
+        .clone()
+        .or_else(|| branch.clone())
+        .unwrap_or_else(|| final_path_component(&worktree_path));
+    let tab_id = ctx
+        .tabs
+        .id_for_name(&effective_tab_name)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    ctx.tabs.insert_tab(&tab_id, &effective_tab_name);
+
+    // Forward the UI orchestration (open/reuse the named tab + spawn a terminal in
+    // the worktree dir). The git worktree already exists, so `alreadyCreated: true`
+    // tells the store not to run `gitWorktreeAdd` again.
     let forward = json!({
         "worktreePath": worktree_path,
         "repoRoot": repo_root,
         "branch": branch,
-        "tabName": tab_name,
+        "tabId": tab_id,
+        "tabName": effective_tab_name,
         "alreadyCreated": true,
     });
     let applied = match &ctx.apply_sink {
@@ -1456,17 +1596,28 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         "accepted": "create_worktree",
         "worktreePath": worktree_path,
         "branch": branch,
+        "tabId": tab_id,
+        "tabName": effective_tab_name,
         "gitOutput": git_output,
         "audited": true,
         "applied": applied,
         "note": if applied {
-            "worktree created on disk; a new workspace tab + terminal in the \
-             worktree dir are being opened in the UI."
+            "worktree created on disk; a workspace tab (identified by tabName) + a \
+             terminal in the worktree dir are being opened in the UI."
         } else {
             "worktree created on disk; the UI tab/terminal forward was not \
              delivered (headless/no sink)."
         },
     }))
+}
+
+/// The final non-empty path component of a POSIX path (the worktree dir's name),
+/// used as a fallback tab name when neither `tabName` nor `branch` was given.
+fn final_path_component(path: &str) -> String {
+    path.rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// `remove_worktree` (WS-4): remove a git worktree WITHOUT orphaning processes.
@@ -1552,20 +1703,25 @@ fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
 /// the workspace store. `applied` reflects whether the forward happened — `true`
 /// once the app has wired its sink (the normal app path), `false` in the headless
 /// proof/tests that run the listener without an `AppHandle` (still audited).
-fn organization_apply(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, String> {
-    let applied = match &ctx.apply_sink {
+/// Forward one command + args to the frontend through the [`ApplySink`], returning
+/// whether the forward was delivered. A forward failure is non-fatal (logged), and
+/// no sink (headless proof/tests) is simply `false`. Shared by every
+/// Organization-tier handler that mutates the UI.
+fn forward_apply(ctx: &ControlContext, command: &str, args: &Value) -> bool {
+    match &ctx.apply_sink {
         Some(sink) => match sink.apply(command, args) {
             Ok(()) => true,
-            // A forward failure is non-fatal: the action is still accepted +
-            // audited. Surface the reason in the note but keep the response `ok`.
             Err(e) => {
                 eprintln!("t-hub-control: failed to forward '{command}' to the UI: {e}");
                 false
             }
         },
-        // No sink (headless proof/tests): accept + audit only.
         None => false,
-    };
+    }
+}
+
+fn organization_apply(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, String> {
+    let applied = forward_apply(ctx, command, args);
     Ok(json!({
         "accepted": command,
         "args": args,
@@ -1581,16 +1737,103 @@ fn organization_apply(ctx: &ControlContext, command: &str, args: &Value) -> Resu
     }))
 }
 
-/// Process-changing commands (PRD §11.2: confirmation required) are gated off on
-/// the control channel for the dev-box proof — they return a clear refusal rather
-/// than spawning/killing anything. The MCP tool description marks them
-/// confirmation-required; enabling real execution is a deliberate later step.
-fn gated_process_change(command: &str) -> Result<Value, String> {
-    Err(format!(
-        "control: '{command}' is a process-changing action (PRD §11.2) and is \
-         gated off in this build — it requires explicit confirmation/permission \
-         and is not executed over the control channel yet"
-    ))
+/// `new_tab` (Organization, audited): create a new workspace tab. TASK C / #22 —
+/// the CORE mints the tab id so it can RETURN it (`tabId`), making the tab
+/// immediately addressable for `move_tile` / `focus_tab`, and forwards that id to
+/// the frontend to adopt (rather than letting the frontend mint its own id the
+/// caller never learns). The id is recorded in the registry optimistically so
+/// `list_tabs` sees it before the frontend reports back. Args: `name` (optional;
+/// auto-named "Workspace N" when omitted).
+fn new_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let name = arg_str(args, "name")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ctx.tabs.auto_name());
+    let id = uuid::Uuid::new_v4().to_string();
+    ctx.tabs.insert_tab(&id, &name);
+    let applied = forward_apply(ctx, "new_tab", &json!({ "id": id, "name": name }));
+    Ok(json!({
+        "accepted": "new_tab",
+        "tabId": id,
+        "name": name,
+        "audited": true,
+        "applied": applied,
+        "note": "new tab created; its id is returned so it can be addressed by \
+                 move_tile / focus_tab and appears in list_tabs.",
+    }))
+}
+
+/// `move_tile` (Organization, audited): move a tile into another tab. TASK C / #22
+/// — updates the CORE registry (drop the tile from its old tab, add it to `tabId`)
+/// so `list_tabs` reflects the move, then forwards the raw args to the frontend to
+/// apply. The registry update is skipped when `terminalId`/`tabId` are absent (e.g.
+/// a within-tab reorder that passes `targetId` only), which still forwards + audits.
+fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    if let (Some(tile), Some(tab)) = (
+        arg_str(args, "terminalId").or_else(|| arg_str(args, "id")),
+        arg_str(args, "tabId"),
+    ) {
+        ctx.tabs.move_tile(&tile, &tab);
+    }
+    organization_apply(ctx, "move_tile", args)
+}
+
+/// `spawn_terminal` (Process-changing, PRD §11.2: confirmation required). Un-gated
+/// (#17): rather than refusing outright — the old behavior, because a raw spawn HERE
+/// would create an untracked tmux session the UI never adopts — it now routes
+/// through the SAME [`ApplySink`] adoption path `create_worktree` uses. We forward a
+/// `spawn_terminal` command to the frontend, whose `controlBridge` spawns the tile
+/// via the normal `spawnTerminal` IPC, so the resulting session IS a real,
+/// UI-adopted tile tracked like any other. If no apply sink is wired (headless), we
+/// refuse rather than spawn a session nothing will adopt. Its MCP description still
+/// carries the CONFIRMATION REQUIRED contract (the user-facing gate). Args: `cwd`
+/// (optional), `name` (optional tile title), `shell` (optional preset).
+fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let cwd = arg_str(args, "cwd");
+    let name = arg_str(args, "name");
+    let shell = arg_str(args, "shell");
+
+    // #27: a REMOTE peer may spawn ONLY with a cwd under the operator allowlist —
+    // the spawn execs a shell SERVER-SIDE at a peer-controlled dir. Loopback (the
+    // local frontend/MCP) is unrestricted. An absent cwd is fine (the UI spawns in
+    // the shell's default dir).
+    let cwd = match cwd {
+        Some(c) if !ctx.peer_is_loopback => Some(
+            files::scoped_create_path(&c, true, files::remote_file_roots())?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        other => other,
+    };
+
+    let forward = json!({ "cwd": cwd, "name": name, "shell": shell });
+    match &ctx.apply_sink {
+        Some(sink) => {
+            sink.apply("spawn_terminal", &forward)
+                .map_err(|e| format!("spawn_terminal: failed to forward the spawn to the UI: {e}"))?;
+            Ok(json!({
+                "accepted": "spawn_terminal",
+                "cwd": cwd,
+                "name": name,
+                "shell": shell,
+                "audited": true,
+                // Only *forwarded*: the real spawn runs in the frontend (the normal
+                // spawnTerminal IPC) and its new tile id isn't known synchronously
+                // over this channel, so we report `requested`, not a fabricated id.
+                "requested": true,
+                "note": "the UI was asked to spawn a new terminal tile (the same \
+                         spawn path as the \"+\" menu). Completion is not confirmed \
+                         synchronously over this channel.",
+            }))
+        }
+        // No UI to adopt the tile ⇒ refuse rather than spawn an untracked session.
+        None => Err(
+            "spawn_terminal: no UI is connected to adopt the new terminal tile; \
+             refusing to spawn an untracked session (the app must be running to \
+             spawn a terminal)"
+                .to_string(),
+        ),
+    }
 }
 
 /// `send_text`: type literal `text` into an existing session, optionally pressing
@@ -1821,10 +2064,26 @@ impl ControlContext {
             apply_sink: None,
             fanout: Arc::new(EventFanout::new()),
             metrics: None,
+            tabs: Arc::new(TabRegistry::new()),
             idle_timeout: CONN_READ_TIMEOUT,
             peer_is_loopback: true,
             token,
         }
+    }
+
+    /// The shared tab registry (TASK C / #22). `lib.rs` grabs this before starting
+    /// the listener and `.manage()`s the same `Arc` so the `report_workspace_tabs`
+    /// Tauri command feeds reports into the very registry `list_tabs` reads.
+    pub fn tab_registry(&self) -> Arc<TabRegistry> {
+        self.tabs.clone()
+    }
+
+    /// Attach an externally-shared [`TabRegistry`] (so the Tauri report command and
+    /// the control listener see one registry). Builder-style; headless tests keep
+    /// the private empty one from [`new`](Self::new).
+    pub fn with_tab_registry(mut self, tabs: Arc<TabRegistry>) -> Self {
+        self.tabs = tabs;
+        self
     }
 
     /// Share the [`EventFanout`] that backend events fan out through, so a
@@ -1984,10 +2243,39 @@ mod tests {
     }
 
     #[test]
-    fn process_changing_spawn_is_gated() {
+    fn spawn_terminal_without_sink_refuses_untracked_session() {
+        // No apply sink (headless): there is no UI to adopt the tile, so spawn is
+        // refused rather than creating an untracked tmux session (#17).
         let ctx = test_ctx("t");
         let err = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap_err();
-        assert!(err.contains("process-changing"), "got: {err}");
+        assert!(err.contains("no UI"), "got: {err}");
+    }
+
+    #[test]
+    fn spawn_terminal_with_sink_forwards_and_is_requested() {
+        // With a UI sink wired, spawn is functional: it forwards a `spawn_terminal`
+        // command (the frontend then spawns a real, adopted tile) and reports
+        // `requested` (the tile id isn't known synchronously over this channel).
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let v = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "name": "logs", "shell": "bash"}),
+        )
+        .unwrap();
+        assert_eq!(v["accepted"], "spawn_terminal");
+        assert_eq!(v["audited"], true);
+        assert_eq!(v["requested"], true);
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "spawn_terminal");
+        assert_eq!(calls[0].1["cwd"], "/tmp");
+        assert_eq!(calls[0].1["name"], "logs");
+        assert_eq!(calls[0].1["shell"], "bash");
     }
 
     #[test]
@@ -2208,19 +2496,122 @@ mod tests {
     }
 
     #[test]
-    fn new_tab_and_focus_tab_are_organization_apply() {
-        // No sink (headless): accepted + audited, but not applied — same contract
-        // as the other organization-tier actions.
+    fn focus_tab_is_organization_apply() {
+        // No sink (headless): accepted + audited, but not applied.
         let ctx = test_ctx("t");
-        for (cmd, args) in [
-            ("new_tab", json!({"name": "Logs"})),
-            ("focus_tab", json!({"tabId": "tab-1"})),
-        ] {
-            let v = dispatch(&ctx, cmd, &args).unwrap();
-            assert_eq!(v["accepted"], cmd);
-            assert_eq!(v["audited"], true);
-            assert_eq!(v["applied"], false);
-        }
+        let v = dispatch(&ctx, "focus_tab", &json!({"tabId": "tab-1"})).unwrap();
+        assert_eq!(v["accepted"], "focus_tab");
+        assert_eq!(v["audited"], true);
+        assert_eq!(v["applied"], false);
+    }
+
+    #[test]
+    fn new_tab_returns_a_tab_id_and_registers_it() {
+        // TASK C: new_tab mints an id CORE-side, returns it, and records it so
+        // list_tabs sees it immediately (addressable before any frontend report).
+        let ctx = test_ctx("t");
+        let v = dispatch(&ctx, "new_tab", &json!({"name": "Logs"})).unwrap();
+        assert_eq!(v["accepted"], "new_tab");
+        assert_eq!(v["name"], "Logs");
+        let tab_id = v["tabId"].as_str().expect("new_tab returns a tabId");
+        assert!(!tab_id.is_empty());
+
+        let tabs = dispatch(&ctx, "list_tabs", &Value::Null).unwrap();
+        let arr = tabs["tabs"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], tab_id);
+        assert_eq!(arr[0]["name"], "Logs");
+        assert_eq!(arr[0]["tileIds"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn new_tab_auto_names_when_no_name_given() {
+        let ctx = test_ctx("t");
+        let v = dispatch(&ctx, "new_tab", &Value::Null).unwrap();
+        assert_eq!(v["name"], "Workspace 1");
+        let v2 = dispatch(&ctx, "new_tab", &Value::Null).unwrap();
+        assert_eq!(v2["name"], "Workspace 2");
+    }
+
+    #[test]
+    fn new_tab_then_move_tile_reflected_in_list_tabs() {
+        // The headless acceptance for #22: new_tab -> get its id -> move_tile a
+        // terminal into it -> list_tabs shows the tile in that tab.
+        let ctx = test_ctx("t");
+        let created = dispatch(&ctx, "new_tab", &json!({"name": "Target"})).unwrap();
+        let tab_id = created["tabId"].as_str().unwrap().to_string();
+
+        dispatch(
+            &ctx,
+            "move_tile",
+            &json!({"terminalId": "term-xyz", "tabId": tab_id}),
+        )
+        .unwrap();
+
+        let tabs = dispatch(&ctx, "list_tabs", &Value::Null).unwrap();
+        let target = tabs["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == tab_id.as_str())
+            .expect("target tab present");
+        let tiles: Vec<&str> = target["tileIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(tiles, vec!["term-xyz"]);
+    }
+
+    #[test]
+    fn report_workspace_tabs_replaces_the_registry() {
+        // The frontend's up-sync (via the Tauri command, exercised here directly on
+        // the shared registry) makes list_tabs reflect the live UI, including
+        // UI-created tabs and real tile membership.
+        let ctx = test_ctx("t");
+        ctx.tab_registry().replace(vec![
+            TabRecord {
+                id: "t1".into(),
+                name: "Main".into(),
+                tile_ids: vec!["a".into(), "b".into()],
+            },
+            TabRecord {
+                id: "t2".into(),
+                name: "Side".into(),
+                tile_ids: vec![],
+            },
+        ]);
+        let tabs = dispatch(&ctx, "list_tabs", &Value::Null).unwrap();
+        assert_eq!(tabs["count"], 2);
+        assert_eq!(tabs["tabs"][0]["id"], "t1");
+        assert_eq!(tabs["tabs"][0]["tileIds"][1], "b");
+        assert_eq!(tabs["tabs"][1]["name"], "Side");
+    }
+
+    #[test]
+    fn create_worktree_named_placement_reuses_a_tab_by_name() {
+        // TASK C: a create_worktree with a tabName that already exists resolves to
+        // the SAME tab id (no duplicate), and the forward carries that id so the
+        // frontend places the tile deterministically, not into the focused tab.
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        // Seed an existing tab named "control-surface".
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "existing-tab".into(),
+            name: "control-surface".into(),
+            tile_ids: vec![],
+        }]);
+        // A create_worktree targeting that name should reuse `existing-tab`. We
+        // resolve the tab BEFORE git runs by calling the registry directly for the
+        // assertion (git::worktree_add needs a real repo, out of scope for a unit
+        // test), mirroring the handler's own resolution.
+        assert_eq!(
+            ctx.tab_registry().id_for_name("control-surface"),
+            Some("existing-tab".to_string())
+        );
     }
 
     /// Live round-trip through dispatch: spawn a real tmux session, type a line

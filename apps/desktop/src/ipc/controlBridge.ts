@@ -65,11 +65,33 @@ export function applyControl(command: string, args: ControlApply["args"]): void 
     }
 
     case "new_tab": {
-      // MCP schema: { name? } -> create a new (empty) workspace tab and switch
-      // to it. addTab() auto-names + activates; an optional `name` renames it.
-      const id = ws.addTab();
+      // Control/MCP path (TASK C / #22): the CORE mints the tab id (so it can
+      // return it to the caller) and forwards it here as `id`; adopt it verbatim so
+      // the live tab's id matches what the caller holds and can address later.
+      // Fall back to a local create if an older core sent no id.
+      const id = str(args, "id");
       const name = str(args, "name");
-      if (name) useWorkspace.getState().renameTab(id, name);
+      if (id) {
+        ws.adoptTab(id, name ?? "Workspace");
+      } else {
+        const local = ws.addTab();
+        if (name) useWorkspace.getState().renameTab(local, name);
+      }
+      return;
+    }
+
+    case "spawn_terminal": {
+      // Process-changing (PRD §11.2): the backend accepted the confirmation-gated
+      // spawn and forwarded it here (#17). Spawn a REAL tile via the normal
+      // spawnTerminal IPC — so the session is a UI-adopted terminal, not the
+      // untracked tmux session the old gate refused. Placed in the tab active at
+      // call time (captured synchronously inside spawnWorkspaceTerminal).
+      const cwd = str(args, "cwd");
+      const name = str(args, "name");
+      const shell = str(args, "shell");
+      void ws
+        .spawnWorkspaceTerminal({ cwd, name, shell })
+        .catch((e) => console.error("spawn_terminal failed", e));
       return;
     }
 
@@ -91,9 +113,14 @@ export function applyControl(command: string, args: ControlApply["args"]): void 
       const repoRoot = str(args, "repoRoot") ?? str(args, "repo_root") ?? "";
       const branch = str(args, "branch");
       const tabName = str(args, "tabName") ?? str(args, "tab_name");
+      // TASK C / #22: the backend resolved the target tab by NAME and forwards its
+      // id, so the tile lands in that tab (reused or created by id+name) rather than
+      // the focused workspace.
+      const tabId = str(args, "tabId") ?? str(args, "tab_id");
       void ws
         .addWorktreeWorkspace(repoRoot, worktreePath, branch, {
           tabName,
+          tabId,
           alreadyCreated: true,
         })
         .catch((e) => console.error("add_worktree_workspace failed", e));
@@ -168,6 +195,39 @@ export function startControlBridge(): void {
   }).catch(() => {
     // `listen` rejects when not running under Tauri — safe to ignore.
   });
+
+  startTabReporter();
+}
+
+/**
+ * Report the live workspace-tab layout up to the core's addressable tab registry
+ * (TASK C / #22) whenever it changes, so the control/MCP `list_tabs` mirrors the
+ * UI — including UI-created tabs and real tile membership. The frontend is the
+ * source of truth for tabs; this is the write half of the mirror. We report on
+ * mount and on every `tabs`-array change; a report failure (e.g. not under Tauri)
+ * is swallowed.
+ */
+function startTabReporter(): void {
+  const report = (): void => {
+    const { tabs } = useWorkspace.getState();
+    const payload = tabs.map((t) => ({
+      id: t.id,
+      name: t.name,
+      tileIds: t.order,
+    }));
+    void import("./client")
+      .then((m) => m.reportWorkspaceTabs(payload))
+      .catch(() => {
+        // Not under Tauri, or the command isn't available — safe to ignore.
+      });
+  };
+  // Fire on every tab-layout change (identity of the `tabs` array changes on any
+  // add/remove/rename/reorder/move).
+  useWorkspace.subscribe((state, prev) => {
+    if (state.tabs !== prev.tabs) report();
+  });
+  // Initial snapshot so list_tabs reflects the default tab before any change.
+  report();
 }
 
 // Run the subscription on import (side-effect module, mirroring themeBootstrap).

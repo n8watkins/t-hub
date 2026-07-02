@@ -175,10 +175,24 @@ impl control::ApplySink for AppHandleApplySink {
     }
 }
 
+/// TASK C (#22): the frontend's tab up-sync. `src/ipc/controlBridge.ts` calls this
+/// whenever the workspace-tab layout changes, reporting the FULL live tab list so
+/// the CORE's addressable tab registry (which the control/MCP `list_tabs` reads)
+/// mirrors the UI — including UI-created tabs and real tile membership. The frontend
+/// is the source of truth for tabs; this is the write half of the mirror.
+#[tauri::command]
+fn report_workspace_tabs(
+    tabs: Vec<control::TabRecord>,
+    registry: tauri::State<'_, std::sync::Arc<control::TabRegistry>>,
+) {
+    registry.replace(tabs);
+}
+
 fn start_control_listener(
     state: &AppState,
     app: &tauri::AppHandle,
     fanout: std::sync::Arc<control::EventFanout>,
+    tab_registry: std::sync::Arc<control::TabRegistry>,
 ) -> Option<control::ControlHandshake> {
     // The control auth token. Server-split M2b: a PERSISTENT key (stable across
     // restarts) so a remote client paired once doesn't have to re-pair every launch.
@@ -219,7 +233,10 @@ fn start_control_listener(
     let ctx = control::ControlContext::new(state.status.clone(), supervisor, token)
         .with_apply_sink(apply_sink)
         .with_event_fanout(fanout)
-        .with_metrics(metrics);
+        .with_metrics(metrics)
+        // TASK C (#22): share the addressable tab registry with the control listener
+        // so `list_tabs` reads what the `report_workspace_tabs` command writes.
+        .with_tab_registry(tab_registry);
     match control::start(ctx) {
         Ok(h) => {
             eprintln!(
@@ -387,7 +404,15 @@ pub fn run() {
             // server-split M1 client transport: manage the endpoint (addr+token)
             // for the `control_request` command and start the event forwarder that
             // re-emits the socket's event stream into the webview.
-            if let Some(handshake) = start_control_listener(&state, app.handle(), control_fanout) {
+            // TASK C (#22): the CORE's addressable tab registry. One Arc, shared
+            // between the control listener (which reads it for list_tabs and updates
+            // it on new_tab/move_tile/named placement) and the managed state the
+            // `report_workspace_tabs` command writes the frontend's up-sync into.
+            let tab_registry = std::sync::Arc::new(control::TabRegistry::new());
+            app.manage(tab_registry.clone());
+            if let Some(handshake) =
+                start_control_listener(&state, app.handle(), control_fanout, tab_registry)
+            {
                 control_client::install(app.handle(), &handshake);
             }
             // Install the system-tray icon + menu (#17). A tray build failure is
@@ -518,6 +543,9 @@ pub fn run() {
             // Server-split M1: thin client transport — round-trip one control
             // command over the loopback socket (the wire M2 stretches to remote).
             control_client::control_request,
+            // TASK C (#22): the frontend reports its live workspace-tab layout here
+            // so the control/MCP tab registry (list_tabs) mirrors the UI.
+            report_workspace_tabs,
             // #snap: the frontend reports the maximize button's live rect (physical
             // px, window-relative) so the Win32 WM_NCHITTEST returns HTMAXBUTTON
             // exactly over the visible button — what makes Win11 show the Snap
