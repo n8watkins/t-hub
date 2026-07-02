@@ -19,6 +19,9 @@ apps/desktop/bin/
 apps/desktop/src-tauri/target/
 apps/desktop/src-tauri/gen/
 
+# The `th` CLI crate's build output.
+apps/cli/target/
+
 # Editor / OS
 .vscode/*
 !.vscode/extensions.json
