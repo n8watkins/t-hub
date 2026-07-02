@@ -90,6 +90,11 @@ uuid = { version = "1", features = ["v4"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Filesystem walking with .gitignore semantics for the file index (files.rs).
 ignore = "0.4"
+# TCP keepalive on accepted control connections (s27 attach churn-proofing):
+# std::net::TcpStream exposes no keepalive setter, and a peer that vanishes
+# without FIN/RST would otherwise park a control/attach handler forever.
+# Already in the tree transitively; this only makes it a direct dependency.
+socket2 = "0.6"
 # Durable SQLite persistence for the workspace layout (db.rs). `bundled` compiles
 # SQLite in, so no system libsqlite3 is needed inside WSL or on a clean CI box.
 rusqlite = { version = "0.32", features = ["bundled"] }
