@@ -1029,7 +1029,8 @@ fn url_at(urls: &[UrlSpan], row: usize, col: usize) -> Option<String> {
 
 /// Open a URL with the platform handler. The scanner only produces
 /// http/https/file/ftp, but re-check defensively before shelling out.
-fn open_url(url: &str) {
+/// `pub(crate)`: the T11 panels open preview URLs through the same path.
+pub(crate) fn open_url(url: &str) {
     let lower = url.to_ascii_lowercase();
     if !["http://", "https://", "file://", "ftp://"].iter().any(|s| lower.starts_with(s)) {
         return;
