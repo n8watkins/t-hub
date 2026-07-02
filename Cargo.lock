@@ -5561,6 +5561,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

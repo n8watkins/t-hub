@@ -30,6 +30,10 @@ pub struct Layout {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutTab {
+    /// Stable tab id (T12 - the MCP addresses tabs by id). Absent in pre-T12
+    /// layouts; a fresh id is minted on load so every tab is addressable.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub tiles: Vec<String>,
     /// Optional per-workspace font override (T7). Absent in pre-T7 layouts.
@@ -69,6 +73,7 @@ impl Layout {
                 .tabs
                 .iter()
                 .map(|t| LayoutTab {
+                    id: t.id.clone(),
                     name: t.name.clone(),
                     tiles: t.tiles.clone(),
                     font: t.font.as_ref().map(FontConfig::from_spec),
@@ -83,6 +88,9 @@ impl Layout {
             self.tabs
                 .into_iter()
                 .map(|t| Workspace {
+                    // Pre-T12 layouts carry no id: mint one so the tab is
+                    // MCP-addressable; it persists on the next save.
+                    id: if t.id.is_empty() { super::model::mint_tab_id() } else { t.id },
                     name: t.name,
                     tiles: t.tiles,
                     font: t.font.map(FontConfig::into_spec),
@@ -161,10 +169,11 @@ mod tests {
 
         save(&path, &Layout::from_model(&m)).unwrap();
         let restored = load(&path).unwrap().unwrap().into_model();
-        assert_eq!(restored.tabs, m.tabs);
+        assert_eq!(restored.tabs, m.tabs); // ids round-trip too (T12)
         assert_eq!(restored.active, 1);
         assert_eq!(restored.tabs[1].font.as_ref().unwrap().family, "Cascadia Code");
-        // A pre-T7 layout (no font field) still loads.
+        // A pre-T7/pre-T12 layout (no font, no id) still loads; a fresh id is
+        // minted so the tab is MCP-addressable.
         std::fs::write(
             &path,
             r#"{"version":1,"tabs":[{"name":"w","tiles":["aa"]}],"active":0}"#,
@@ -172,6 +181,7 @@ mod tests {
         .unwrap();
         let old = load(&path).unwrap().unwrap().into_model();
         assert_eq!(old.tabs[0].font, None);
+        assert!(!old.tabs[0].id.is_empty());
 
         // Corrupt file -> an error, not a panic (the caller falls back fresh).
         std::fs::write(&path, "{ not json").unwrap();
