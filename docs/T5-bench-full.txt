@@ -1,0 +1,67 @@
+--- render run start mode=full bench_secs=Some(20) ---
+t=001 mode=full fps=176 scene_avg_ms=1.88 scene_max_ms=27.56 rebuilt_rows=57024 total_rows=57024 rebuild_pct=100.0 work_ms_per_s=331.2
+t=002 mode=full fps=180 scene_avg_ms=1.65 scene_max_ms=2.71 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=297.1
+t=003 mode=full fps=180 scene_avg_ms=1.71 scene_max_ms=2.72 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=307.0
+t=004 mode=full fps=180 scene_avg_ms=1.72 scene_max_ms=3.53 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=310.0
+t=005 mode=full fps=180 scene_avg_ms=1.66 scene_max_ms=2.35 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=298.3
+t=006 mode=full fps=180 scene_avg_ms=1.69 scene_max_ms=2.32 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=304.1
+t=007 mode=full fps=180 scene_avg_ms=1.98 scene_max_ms=3.13 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=356.7
+t=008 mode=full fps=179 scene_avg_ms=1.86 scene_max_ms=2.78 rebuilt_rows=57996 total_rows=57996 rebuild_pct=100.0 work_ms_per_s=332.8
+t=009 mode=full fps=180 scene_avg_ms=1.77 scene_max_ms=2.51 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=319.0
+t=010 mode=full fps=180 scene_avg_ms=1.73 scene_max_ms=2.38 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=312.2
+t=011 mode=full fps=180 scene_avg_ms=1.63 scene_max_ms=2.44 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=294.1
+t=012 mode=full fps=180 scene_avg_ms=1.67 scene_max_ms=2.74 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=301.0
+t=013 mode=full fps=180 scene_avg_ms=1.91 scene_max_ms=2.99 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=343.7
+t=014 mode=full fps=180 scene_avg_ms=1.76 scene_max_ms=3.25 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=316.4
+t=015 mode=full fps=180 scene_avg_ms=1.75 scene_max_ms=2.67 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=314.2
+t=016 mode=full fps=180 scene_avg_ms=1.69 scene_max_ms=2.57 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=304.0
+t=017 mode=full fps=179 scene_avg_ms=1.79 scene_max_ms=3.10 rebuilt_rows=57996 total_rows=57996 rebuild_pct=100.0 work_ms_per_s=321.3
+t=018 mode=full fps=181 scene_avg_ms=1.70 scene_max_ms=2.44 rebuilt_rows=58644 total_rows=58644 rebuild_pct=100.0 work_ms_per_s=308.4
+t=019 mode=full fps=179 scene_avg_ms=1.80 scene_max_ms=2.92 rebuilt_rows=57996 total_rows=57996 rebuild_pct=100.0 work_ms_per_s=321.4
+t=020 mode=full fps=180 scene_avg_ms=1.76 scene_max_ms=2.80 rebuilt_rows=58320 total_rows=58320 rebuild_pct=100.0 work_ms_per_s=316.8
+SUMMARY mode=full secs=18 fps_avg=179.9 fps_min=179 scene_avg_ms=1.75 scene_max_ms=1.98 rebuild_pct=100.0
+--- render run start mode=damage bench_secs=Some(18) ---
+t=001 mode=damage fps=176 scene_avg_ms=1.55 scene_max_ms=22.07 rebuilt_rows=4884 total_rows=57024 rebuild_pct=8.6 work_ms_per_s=272.4
+t=002 mode=damage fps=180 scene_avg_ms=1.43 scene_max_ms=2.52 rebuilt_rows=4139 total_rows=58320 rebuild_pct=7.1 work_ms_per_s=258.2
+t=003 mode=damage fps=179 scene_avg_ms=1.45 scene_max_ms=2.10 rebuilt_rows=4230 total_rows=57996 rebuild_pct=7.3 work_ms_per_s=258.8
+t=004 mode=damage fps=180 scene_avg_ms=1.48 scene_max_ms=2.47 rebuilt_rows=4233 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=266.2
+t=005 mode=damage fps=180 scene_avg_ms=1.37 scene_max_ms=2.10 rebuilt_rows=4243 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=246.1
+t=006 mode=damage fps=180 scene_avg_ms=1.42 scene_max_ms=2.10 rebuilt_rows=4138 total_rows=58320 rebuild_pct=7.1 work_ms_per_s=256.3
+t=007 mode=damage fps=180 scene_avg_ms=1.48 scene_max_ms=2.42 rebuilt_rows=4234 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=266.7
+t=008 mode=damage fps=180 scene_avg_ms=1.57 scene_max_ms=2.67 rebuilt_rows=4242 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=282.5
+t=009 mode=damage fps=180 scene_avg_ms=1.52 scene_max_ms=2.41 rebuilt_rows=4138 total_rows=58320 rebuild_pct=7.1 work_ms_per_s=273.8
+t=010 mode=damage fps=180 scene_avg_ms=1.44 scene_max_ms=2.36 rebuilt_rows=4337 total_rows=58320 rebuild_pct=7.4 work_ms_per_s=258.6
+t=011 mode=damage fps=179 scene_avg_ms=1.52 scene_max_ms=3.03 rebuilt_rows=4126 total_rows=57996 rebuild_pct=7.1 work_ms_per_s=272.1
+t=012 mode=damage fps=180 scene_avg_ms=1.43 scene_max_ms=2.62 rebuilt_rows=4243 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=256.9
+t=013 mode=damage fps=180 scene_avg_ms=1.47 scene_max_ms=2.93 rebuilt_rows=4234 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=264.8
+t=014 mode=damage fps=180 scene_avg_ms=1.58 scene_max_ms=2.92 rebuilt_rows=4242 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=284.2
+t=015 mode=damage fps=180 scene_avg_ms=1.44 scene_max_ms=2.16 rebuilt_rows=4139 total_rows=58320 rebuild_pct=7.1 work_ms_per_s=259.3
+t=016 mode=damage fps=180 scene_avg_ms=1.55 scene_max_ms=2.76 rebuilt_rows=4232 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=279.1
+t=017 mode=damage fps=180 scene_avg_ms=1.52 scene_max_ms=2.44 rebuilt_rows=4243 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=272.9
+t=018 mode=damage fps=179 scene_avg_ms=1.63 scene_max_ms=3.20 rebuilt_rows=4126 total_rows=57996 rebuild_pct=7.1 work_ms_per_s=291.8
+SUMMARY mode=damage secs=16 fps_avg=179.8 fps_min=179 scene_avg_ms=1.49 scene_max_ms=1.63 rebuild_pct=7.2
+--- render run start mode=damage bench_secs=Some(18) ---
+t=001 mode=damage fps=176 scene_avg_ms=1.65 scene_max_ms=25.49 rebuilt_rows=5037 total_rows=57024 rebuild_pct=8.8 work_ms_per_s=290.3
+t=002 mode=damage fps=180 scene_avg_ms=1.39 scene_max_ms=1.99 rebuilt_rows=4138 total_rows=58320 rebuild_pct=7.1 work_ms_per_s=250.2
+t=003 mode=damage fps=180 scene_avg_ms=1.47 scene_max_ms=2.30 rebuilt_rows=4241 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=264.5
+t=004 mode=damage fps=180 scene_avg_ms=1.46 scene_max_ms=2.60 rebuilt_rows=4232 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=262.3
+t=005 mode=damage fps=180 scene_avg_ms=1.50 scene_max_ms=2.71 rebuilt_rows=4243 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=270.8
+t=006 mode=damage fps=180 scene_avg_ms=1.40 scene_max_ms=2.22 rebuilt_rows=4139 total_rows=58320 rebuild_pct=7.1 work_ms_per_s=252.0
+t=007 mode=damage fps=179 scene_avg_ms=1.43 scene_max_ms=2.61 rebuilt_rows=4325 total_rows=57996 rebuild_pct=7.5 work_ms_per_s=256.5
+t=008 mode=damage fps=180 scene_avg_ms=1.52 scene_max_ms=2.94 rebuilt_rows=4137 total_rows=58320 rebuild_pct=7.1 work_ms_per_s=274.1
+t=009 mode=damage fps=177 scene_avg_ms=1.76 scene_max_ms=3.13 rebuilt_rows=4103 total_rows=57348 rebuild_pct=7.2 work_ms_per_s=310.8
+t=010 mode=damage fps=180 scene_avg_ms=1.48 scene_max_ms=3.42 rebuilt_rows=4336 total_rows=58320 rebuild_pct=7.4 work_ms_per_s=266.5
+t=011 mode=damage fps=180 scene_avg_ms=1.46 scene_max_ms=2.37 rebuilt_rows=4139 total_rows=58320 rebuild_pct=7.1 work_ms_per_s=262.5
+t=012 mode=damage fps=180 scene_avg_ms=1.46 scene_max_ms=2.39 rebuilt_rows=4242 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=262.2
+t=013 mode=damage fps=180 scene_avg_ms=1.43 scene_max_ms=2.42 rebuilt_rows=4233 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=257.5
+t=014 mode=damage fps=180 scene_avg_ms=1.46 scene_max_ms=2.51 rebuilt_rows=4243 total_rows=58320 rebuild_pct=7.3 work_ms_per_s=263.4
+t=015 mode=damage fps=179 scene_avg_ms=1.47 scene_max_ms=2.55 rebuilt_rows=4127 total_rows=57996 rebuild_pct=7.1 work_ms_per_s=263.4
+t=016 mode=damage fps=181 scene_avg_ms=1.55 scene_max_ms=3.24 rebuilt_rows=4349 total_rows=58644 rebuild_pct=7.4 work_ms_per_s=281.3
+t=017 mode=damage fps=175 scene_avg_ms=1.57 scene_max_ms=2.95 rebuilt_rows=4078 total_rows=56700 rebuild_pct=7.2 work_ms_per_s=274.8
+t=018 mode=damage fps=181 scene_avg_ms=1.47 scene_max_ms=2.39 rebuilt_rows=4149 total_rows=58644 rebuild_pct=7.1 work_ms_per_s=265.2
+SUMMARY mode=damage secs=16 fps_avg=179.5 fps_min=175 scene_avg_ms=1.49 scene_max_ms=1.76 rebuild_pct=7.2
+--- render run start mode=damage bench_secs=None ---
+t=001 mode=damage fps=168 scene_avg_ms=2.20 scene_max_ms=36.67 rebuilt_rows=4814 total_rows=54432 rebuild_pct=8.8 work_ms_per_s=370.2
+t=002 mode=damage fps=179 scene_avg_ms=1.97 scene_max_ms=2.82 rebuilt_rows=4023 total_rows=57996 rebuild_pct=6.9 work_ms_per_s=351.8
+t=003 mode=damage fps=178 scene_avg_ms=1.97 scene_max_ms=2.81 rebuilt_rows=4115 total_rows=57672 rebuild_pct=7.1 work_ms_per_s=351.5
+t=004 mode=damage fps=174 scene_avg_ms=2.03 scene_max_ms=3.17 rebuilt_rows=4057 total_rows=56376 rebuild_pct=7.2 work_ms_per_s=352.9
