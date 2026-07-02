@@ -70,6 +70,9 @@ crossbeam = "0.5"
 parking_lot = "0.12"
 log = "0.4"
 env_logger = "0.11"
+# Workspace-tab ids (T12): the MCP addresses tabs by id; ids are minted as uuid
+# v4 strings so they are interchangeable with webview/core-minted ones.
+uuid = { version = "1", features = ["v4"] }
 
 # Terminal emulation core (T5 render seam). Exact versions proven in the T2 spike
 # (docs/T2-GPUI-SPIKE-RESULTS.md): alacritty_terminal 0.26 + its re-exported vte 0.15.

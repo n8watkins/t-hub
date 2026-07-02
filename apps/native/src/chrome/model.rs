@@ -147,12 +147,15 @@ pub fn sidebar_layout(n: usize, area: RectF) -> SidebarLayout {
 // The chrome model
 // ---------------------------------------------------------------------------
 
-/// One workspace tab: a name, an ordered set of tile (session) ids, and an
-/// optional font override (T7 [`FontSpec`]) applied to tiles attached into this
-/// workspace. `None` falls back to the `THN_FONT` / built-in default. There is
-/// no settings UI yet - the field persists and applies (edit the layout JSON).
+/// One workspace tab: a stable id (T12 - the MCP addresses tabs by id, exactly
+/// like the webview's store ids), a name, an ordered set of tile (session) ids,
+/// and an optional font override (T7 [`FontSpec`]) applied to tiles attached
+/// into this workspace. `None` falls back to the `THN_FONT` / built-in default.
+/// There is no settings UI yet - the field persists and applies (edit the
+/// layout JSON).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Workspace {
+    pub id: String,
     pub name: String,
     pub tiles: Vec<String>,
     pub font: Option<FontSpec>,
@@ -164,6 +167,30 @@ pub struct Workspace {
     /// indices shift as tabs close). Assigned by the model, monotonic per run;
     /// NOT persisted - the layout file's tab order is the durable identity.
     pub wsid: u64,
+}
+
+impl Workspace {
+    /// A fresh main-window workspace with a minted id and no tiles. `wsid` is a
+    /// placeholder (0): the model stamps a real one when the workspace enters
+    /// `tabs` ([`ChromeModel::from_layout`] reassigns; `add_tab`/`adopt_tab`
+    /// mint from `next_wsid`).
+    pub fn new(name: impl Into<String>) -> Self {
+        Workspace {
+            id: mint_tab_id(),
+            name: name.into(),
+            tiles: Vec::new(),
+            font: None,
+            satellite: false,
+            wsid: 0,
+        }
+    }
+}
+
+/// Mint a workspace-tab id. Uuid v4 strings, the same shape the webview store
+/// and the core's `new_tab` mint, so ids from any source are interchangeable in
+/// the server's tab registry.
+pub fn mint_tab_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Tab-rename editing state: which tab, and the in-progress buffer.
@@ -205,24 +232,26 @@ pub struct ChromeModel {
     /// re-lists everything live (self-healing, and the only "reopen" story until
     /// the T9 recents overlay).
     hidden: HashSet<String>,
+    /// Named-placement intents from worktree applies (T12): (normalized worktree
+    /// path, target tab id). The next reconciled session whose cwd lives under
+    /// the path lands in that tab instead of the active one, consuming the
+    /// entry. NOT persisted - an intent only makes sense within this run.
+    pending_placements: Vec<(String, String)>,
     /// Next workspace id to assign (see [`Workspace::wsid`]).
     next_wsid: u64,
 }
 
 impl Default for ChromeModel {
     fn default() -> Self {
+        let mut first = Workspace::new("Workspace 1");
+        first.wsid = 1;
         ChromeModel {
-            tabs: vec![Workspace {
-                name: "Workspace 1".to_string(),
-                tiles: Vec::new(),
-                font: None,
-                satellite: false,
-                wsid: 1,
-            }],
+            tabs: vec![first],
             active: 0,
             focused: None,
             renaming: None,
             hidden: HashSet::new(),
+            pending_placements: Vec::new(),
             next_wsid: 2,
         }
     }
@@ -251,12 +280,50 @@ impl ChromeModel {
 
     // -- tabs ---------------------------------------------------------------
 
-    /// Create a new empty workspace named "Workspace N" (webview naming) and
-    /// activate it.
+    /// Create a new empty workspace named "Workspace N" and activate it. N is the
+    /// LOWEST FREE index (webview `addTab` parity: "Workspace 1" + "Workspace 3"
+    /// present -> the new tab is "Workspace 2"; the same scheme the core's
+    /// `new_tab` auto-name uses, so tabs from any source share one naming).
     pub fn add_tab(&mut self) -> usize {
         self.renaming = None;
+        let used: HashSet<u32> = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.name.strip_prefix("Workspace ").and_then(|n| n.trim().parse().ok()))
+            .collect();
+        let mut n = 1u32;
+        while used.contains(&n) {
+            n += 1;
+        }
+        let mut ws = Workspace::new(format!("Workspace {n}"));
+        ws.wsid = self.next_wsid;
+        self.next_wsid += 1;
+        self.tabs.push(ws);
+        self.active = self.tabs.len() - 1;
+        self.fixup_focus();
+        self.active
+    }
+
+    /// The index of the tab with this id, if any (T12 id-addressed mutations).
+    pub fn tab_index_of_id(&self, id: &str) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    /// Adopt a tab by id (T12 `new_tab` apply, webview `adoptTab` parity): if a
+    /// tab with this id exists, just activate it (no rename; a torn-off satellite
+    /// is NOT activated - its tiles paint in their own window); otherwise create
+    /// it with this id + name (blank name -> "Workspace") and activate it.
+    /// Returns whether a tab was created.
+    pub fn adopt_tab(&mut self, id: &str, name: &str) -> bool {
+        self.renaming = None;
+        if let Some(i) = self.tab_index_of_id(id) {
+            self.set_active(i);
+            return false;
+        }
+        let name = name.trim();
         self.tabs.push(Workspace {
-            name: format!("Workspace {}", self.tabs.len() + 1),
+            id: id.to_string(),
+            name: if name.is_empty() { "Workspace".to_string() } else { name.to_string() },
             tiles: Vec::new(),
             font: None,
             satellite: false,
@@ -265,7 +332,41 @@ impl ChromeModel {
         self.next_wsid += 1;
         self.active = self.tabs.len() - 1;
         self.fixup_focus();
-        self.active
+        true
+    }
+
+    /// Rename a tab by id (T12 `rename_tab` apply; webview parity: trims, a
+    /// blank name and an unknown id are no-ops). Returns whether a rename landed.
+    pub fn rename_tab_by_id(&mut self, id: &str, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        match self.tabs.iter_mut().find(|t| t.id == id) {
+            Some(t) => {
+                t.name = name.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Activate a tab by id (T12 `focus_tab` apply). Unknown id is a no-op, and
+    /// so is a torn-off satellite ([`Self::set_active`] refuses those - the main
+    /// grid cannot show them). Returns whether the tab is now active.
+    pub fn set_active_by_id(&mut self, id: &str) -> bool {
+        match self.tab_index_of_id(id) {
+            Some(i) => {
+                self.set_active(i);
+                self.active == i
+            }
+            None => false,
+        }
+    }
+
+    /// The index of the tab holding tile `id`, if any.
+    pub fn owning_tab_of(&self, id: &str) -> Option<usize> {
+        self.tabs.iter().position(|t| t.tiles.iter().any(|x| x == id))
     }
 
     /// Close tab `i`. Refuses on the last tab (webview: at least one tab always
@@ -461,6 +562,63 @@ impl ChromeModel {
         }
     }
 
+    /// Place a live tile into the ACTIVE tab and focus it (T12 spawn placement:
+    /// the server minted the session; the reconcile attach follows). Refused
+    /// when the tile is already placed or user-hidden, so racing the reconcile
+    /// is idempotent. Like [`Self::reconcile`], a new tile must land in a MAIN
+    /// workspace: when every workspace is torn off, a fresh one is created.
+    pub fn place_tile(&mut self, id: &str) -> bool {
+        if self.contains_tile(id) || self.hidden.contains(id) {
+            return false;
+        }
+        let target = if self.tabs[self.active].satellite { self.add_tab() } else { self.active };
+        self.tabs[target].tiles.push(id.to_string());
+        self.focused = Some(id.to_string());
+        true
+    }
+
+    /// Move a tile into another tab by tab id (T12 `move_tile` apply; webview
+    /// `moveTileToTab` parity): unknown target tab or already-there is a no-op;
+    /// the tile leaves its source tab and is APPENDED to the target's order; the
+    /// target tab is NOT activated. Returns whether the move landed.
+    pub fn move_tile_to_tab(&mut self, id: &str, tab_id: &str) -> bool {
+        let Some(source) = self.owning_tab_of(id) else { return false };
+        let Some(target) = self.tab_index_of_id(tab_id) else { return false };
+        if source == target {
+            return false;
+        }
+        self.tabs[source].tiles.retain(|x| x != id);
+        self.tabs[target].tiles.push(id.to_string());
+        self.fixup_focus();
+        true
+    }
+
+    /// Reorder a tile before/after another WITHIN THE ACTIVE TAB (T12
+    /// `move_tile` apply with `targetId`; webview `moveTile` parity): both ids
+    /// must be in the active tab, the tile is spliced to the target's position,
+    /// and the moved tile takes focus (unless the active tab is a torn-off
+    /// satellite - the main window focuses nothing then).
+    pub fn reorder_tile(&mut self, id: &str, target_id: &str) -> bool {
+        if id == target_id {
+            return false;
+        }
+        let tab = &mut self.tabs[self.active];
+        let satellite = tab.satellite;
+        let tiles = &mut tab.tiles;
+        let (Some(from), Some(to)) = (
+            tiles.iter().position(|x| x == id),
+            tiles.iter().position(|x| x == target_id),
+        ) else {
+            return false;
+        };
+        let moved = tiles.remove(from);
+        tiles.insert(to, moved);
+        if !satellite {
+            self.focused = Some(id.to_string());
+        }
+        true
+    }
+
     /// Keep `focused` pointing at a tile IN THE ACTIVE TAB, so key input never
     /// goes to a hidden terminal: if it left the tab (switch/close/removal),
     /// fall back to the active tab's first tile. While the active tab is a
@@ -480,6 +638,19 @@ impl ChromeModel {
 
     // -- live reconciliation ---------------------------------------------------
 
+    /// Record a named-placement intent (T12 `add_worktree_workspace` apply): the
+    /// next new session whose cwd is `worktree_path` (or inside it) lands in tab
+    /// `tab_id` instead of the active tab, consuming the intent. One intent per
+    /// path (a re-apply replaces it).
+    pub fn note_pending_placement(&mut self, worktree_path: &str, tab_id: &str) {
+        let path = worktree_path.trim_end_matches('/').to_string();
+        if path.is_empty() {
+            return;
+        }
+        self.pending_placements.retain(|(p, _)| *p != path);
+        self.pending_placements.push((path, tab_id.to_string()));
+    }
+
     /// Reconcile the layout against the server's live session list
     /// (`list_terminals`): sessions that died leave every tab; live sessions not
     /// in any tab (and not user-hidden) join the ACTIVE tab (the webview boots
@@ -488,7 +659,19 @@ impl ChromeModel {
     /// land where the user can see them arrive: a MAIN workspace - when every
     /// workspace is torn off, a fresh main workspace is created to receive them.
     pub fn reconcile(&mut self, live: &[String]) -> Reconcile {
-        let live_set: HashSet<&str> = live.iter().map(String::as_str).collect();
+        let with_cwds: Vec<(String, String)> =
+            live.iter().map(|id| (id.clone(), String::new())).collect();
+        self.reconcile_with_cwds(&with_cwds)
+    }
+
+    /// [`reconcile`](Self::reconcile) with each live session's cwd, so pending
+    /// worktree placements (T12) can route a new session into its named tab: a
+    /// new unplaced session whose cwd is under a pending worktree path joins
+    /// THAT tab (consuming the intent). Everything else joins the active tab -
+    /// unless that is a torn-off satellite (T10: new sessions must land where
+    /// the user can see them arrive), then a fresh main workspace receives them.
+    pub fn reconcile_with_cwds(&mut self, live: &[(String, String)]) -> Reconcile {
+        let live_set: HashSet<&str> = live.iter().map(|(id, _)| id.as_str()).collect();
         let mut out = Reconcile::default();
 
         for tab in &mut self.tabs {
@@ -501,27 +684,51 @@ impl ChromeModel {
             });
         }
         self.hidden.retain(|id| live_set.contains(id.as_str()));
+        // An intent whose target tab was closed can never place; drop it.
+        let tab_ids: HashSet<String> = self.tabs.iter().map(|t| t.id.clone()).collect();
+        self.pending_placements.retain(|(_, tab_id)| tab_ids.contains(tab_id));
 
         let placed: HashSet<String> = self.all_tiles().into_iter().collect();
-        let mut target: Option<usize> = None;
-        for id in live {
-            if !placed.contains(id) && !self.hidden.contains(id) {
-                let t = *target.get_or_insert_with(|| {
+        // The no-intent target, resolved lazily ONCE (T10) so at most one
+        // workspace is created per pass.
+        let mut fallback: Option<usize> = None;
+        for (id, cwd) in live {
+            if placed.contains(id) || self.hidden.contains(id) {
+                continue;
+            }
+            let target = match self.take_pending_for(cwd) {
+                Some(tab_id) => self.tab_index_of_id(&tab_id).unwrap_or(self.active),
+                None => *fallback.get_or_insert_with(|| {
                     if self.tabs[self.active].satellite {
                         self.add_tab() // all torn off: new arrivals need a main home
                     } else {
                         self.active
                     }
-                });
-                self.tabs[t].tiles.push(id.clone());
-                out.added.push(id.clone());
-            }
+                }),
+            };
+            self.tabs[target].tiles.push(id.clone());
+            out.added.push(id.clone());
         }
 
         if !out.added.is_empty() || !out.removed.is_empty() {
             self.fixup_focus();
         }
         out
+    }
+
+    /// Pop the pending placement matching `cwd` (exact dir or inside it), if any.
+    /// The path-segment boundary mirrors the webview's worktree cwd match
+    /// (`/x/wt` must not match `/x/wt-other`).
+    fn take_pending_for(&mut self, cwd: &str) -> Option<String> {
+        let cwd = cwd.trim_end_matches('/');
+        if cwd.is_empty() {
+            return None;
+        }
+        let i = self
+            .pending_placements
+            .iter()
+            .position(|(path, _)| cwd == path || cwd.starts_with(&format!("{path}/")))?;
+        Some(self.pending_placements.remove(i).1)
     }
 }
 
@@ -709,7 +916,14 @@ mod tests {
     }
 
     fn ws(name: &str, tiles: &[&str], satellite: bool) -> Workspace {
-        Workspace { name: name.into(), tiles: ids(tiles), font: None, satellite, wsid: 0 }
+        Workspace {
+            id: mint_tab_id(),
+            name: name.into(),
+            tiles: ids(tiles),
+            font: None,
+            satellite,
+            wsid: 0,
+        }
     }
 
     #[test]
@@ -853,5 +1067,190 @@ mod tests {
         assert_eq!(out.removed, ids(&["aa"]));
         assert_eq!(m.tabs[0].tiles, ids(&["bb"]));
         assert!(m.tabs[0].satellite); // an emptied satellite stays a satellite
+    }
+
+    // -- T12: id-addressed mutations (the MCP apply surface) ---------------------
+
+    #[test]
+    fn add_tab_reuses_the_lowest_free_workspace_index() {
+        // Webview addTab parity: with "Workspace 1" and "Workspace 3" present,
+        // the next tab is "Workspace 2", not "Workspace 4".
+        let mut m = ChromeModel::default();
+        m.add_tab(); // Workspace 2
+        m.tabs[1].name = "Workspace 3".to_string();
+        let i = m.add_tab();
+        assert_eq!(m.tabs[i].name, "Workspace 2");
+        // Ids are minted and unique.
+        assert_ne!(m.tabs[0].id, m.tabs[1].id);
+        assert!(!m.tabs[i].id.is_empty());
+    }
+
+    #[test]
+    fn adopt_tab_creates_by_id_or_activates_the_existing_one() {
+        let mut m = ChromeModel::default();
+        // Create: the tab carries the SERVER-minted id verbatim and activates.
+        assert!(m.adopt_tab("core-id-1", "Logs"));
+        assert_eq!(m.tabs[1].id, "core-id-1");
+        assert_eq!(m.tabs[1].name, "Logs");
+        assert_eq!(m.active, 1);
+        // Existing id: activate only - no rename, no duplicate (webview parity).
+        m.set_active(0);
+        assert!(!m.adopt_tab("core-id-1", "Renamed"));
+        assert_eq!(m.tabs.len(), 2);
+        assert_eq!(m.tabs[1].name, "Logs");
+        assert_eq!(m.active, 1);
+        // Blank name defaults to "Workspace".
+        m.adopt_tab("core-id-2", "   ");
+        assert_eq!(m.tabs[2].name, "Workspace");
+    }
+
+    #[test]
+    fn rename_tab_by_id_trims_and_refuses_blank_or_unknown() {
+        let mut m = ChromeModel::default();
+        let id = m.tabs[0].id.clone();
+        assert!(m.rename_tab_by_id(&id, "  ops  "));
+        assert_eq!(m.tabs[0].name, "ops");
+        assert!(!m.rename_tab_by_id(&id, "   "));
+        assert_eq!(m.tabs[0].name, "ops");
+        assert!(!m.rename_tab_by_id("nope", "x"));
+    }
+
+    #[test]
+    fn set_active_by_id_switches_and_ignores_unknown() {
+        let mut m = ChromeModel::default();
+        m.add_tab();
+        let first = m.tabs[0].id.clone();
+        assert!(m.set_active_by_id(&first));
+        assert_eq!(m.active, 0);
+        assert!(!m.set_active_by_id("nope"));
+        assert_eq!(m.active, 0);
+    }
+
+    #[test]
+    fn move_tile_to_tab_appends_without_activating() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb"]));
+        m.add_tab();
+        m.reconcile(&ids(&["aa", "bb", "cc"])); // "cc" joins tab 2
+        let target = m.tabs[1].id.clone();
+        m.set_active(0);
+
+        assert!(m.move_tile_to_tab("aa", &target));
+        assert_eq!(m.tabs[0].tiles, ids(&["bb"]));
+        assert_eq!(m.tabs[1].tiles, ids(&["cc", "aa"])); // appended at the end
+        assert_eq!(m.active, 0); // target NOT activated (webview parity)
+        assert_eq!(m.focused.as_deref(), Some("bb")); // focus stays in the active tab
+
+        // Already there / unknown target / unplaced tile: no-ops.
+        assert!(!m.move_tile_to_tab("aa", &target));
+        assert!(!m.move_tile_to_tab("bb", "nope"));
+        assert!(!m.move_tile_to_tab("ghost", &target));
+    }
+
+    #[test]
+    fn reorder_tile_splices_within_the_active_tab_and_focuses() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb", "cc"]));
+        assert!(m.reorder_tile("cc", "aa"));
+        assert_eq!(m.active_tiles(), ids(&["cc", "aa", "bb"]).as_slice());
+        assert_eq!(m.focused.as_deref(), Some("cc"));
+        // Target in another tab (or missing): refuse - active-tab-only semantics.
+        m.add_tab();
+        m.reconcile(&ids(&["aa", "bb", "cc", "dd"]));
+        assert!(!m.reorder_tile("dd", "aa"));
+        assert!(!m.reorder_tile("aa", "aa"));
+    }
+
+    #[test]
+    fn pending_placement_routes_a_matching_new_session_into_its_tab() {
+        let mut m = ChromeModel::default();
+        m.adopt_tab("wt-tab", "feature-x");
+        m.set_active(0);
+        m.note_pending_placement("/repo/wt/", "wt-tab"); // trailing slash normalized
+
+        // A new session INSIDE the worktree joins the named tab (consuming the
+        // intent); an unrelated one still joins the active tab. `/repo/wt-other`
+        // must NOT match (path-segment boundary).
+        let out = m.reconcile_with_cwds(&[
+            ("s1".into(), "/repo/wt-other".into()),
+            ("s2".into(), "/repo/wt/sub".into()),
+        ]);
+        assert_eq!(out.added, ids(&["s1", "s2"]));
+        assert_eq!(m.tabs[0].tiles, ids(&["s1"]));
+        assert_eq!(m.tabs[1].tiles, ids(&["s2"]));
+
+        // Consumed: the next worktree session lands in the active tab like any other.
+        m.reconcile_with_cwds(&[
+            ("s1".into(), "/repo/wt-other".into()),
+            ("s2".into(), "/repo/wt/sub".into()),
+            ("s3".into(), "/repo/wt".into()),
+        ]);
+        assert_eq!(m.tabs[0].tiles, ids(&["s1", "s3"]));
+    }
+
+    #[test]
+    fn pending_placement_for_a_closed_tab_is_dropped() {
+        let mut m = ChromeModel::default();
+        m.adopt_tab("wt-tab", "feature-x");
+        m.note_pending_placement("/repo/wt", "wt-tab");
+        m.set_active(0);
+        m.close_tab(1).unwrap();
+        // The intent's tab is gone: the session falls back to the active tab.
+        m.reconcile_with_cwds(&[("s1".into(), "/repo/wt".into())]);
+        assert_eq!(m.tabs[0].tiles, ids(&["s1"]));
+    }
+
+    // -- T10 x T12: satellites meet the apply surface -----------------------------
+
+    #[test]
+    fn pending_placement_routes_into_a_satellite_while_others_get_a_main_home() {
+        // Everything torn off: an intent still routes into ITS tab (even torn
+        // off - that window shows it), while the no-intent arrival gets a fresh
+        // MAIN workspace (T10 fallback), not the satellite.
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa"]));
+        m.note_pending_placement("/repo/wt", &m.tabs[0].id.clone());
+        m.tear_off(0).unwrap();
+        let out = m.reconcile_with_cwds(&[
+            ("aa".into(), String::new()),
+            ("s1".into(), "/repo/wt".into()),
+            ("s2".into(), "/elsewhere".into()),
+        ]);
+        assert_eq!(out.added, ids(&["s1", "s2"]));
+        assert_eq!(m.tabs[0].tiles, ids(&["aa", "s1"])); // intent honored
+        assert!(m.tabs[0].satellite);
+        assert_eq!(m.tabs.len(), 2);
+        assert!(!m.tabs[1].satellite); // fresh main home for the rest
+        assert_eq!(m.tabs[1].tiles, ids(&["s2"]));
+    }
+
+    #[test]
+    fn place_tile_creates_a_main_home_when_everything_is_torn_off() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa"]));
+        m.tear_off(0).unwrap();
+        assert!(m.place_tile("bb"));
+        assert_eq!(m.tabs.len(), 2);
+        assert!(!m.tabs[1].satellite);
+        assert_eq!(m.tabs[1].tiles, ids(&["bb"]));
+        assert_eq!(m.focused.as_deref(), Some("bb"));
+        // The satellite kept its own tiles.
+        assert_eq!(m.tabs[0].tiles, ids(&["aa"]));
+    }
+
+    #[test]
+    fn id_addressed_activation_refuses_satellite_tabs() {
+        let mut m = ChromeModel::default();
+        m.add_tab();
+        let torn = m.tabs[1].id.clone();
+        m.tear_off(1).unwrap();
+        assert_eq!(m.active, 0);
+        // focus_tab apply: refused - the main grid cannot show a satellite.
+        assert!(!m.set_active_by_id(&torn));
+        assert_eq!(m.active, 0);
+        // new_tab apply on an existing torn-off id: adopted (no dup), not activated.
+        assert!(!m.adopt_tab(&torn, "whatever"));
+        assert_eq!(m.tabs.len(), 2);
+        assert_eq!(m.active, 0);
     }
 }

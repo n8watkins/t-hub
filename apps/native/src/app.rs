@@ -37,16 +37,17 @@ use gpui::{
 };
 use parking_lot::Mutex;
 
+use crate::apply::{self, ApplyCommand};
 use crate::chrome::model::ChromeModel;
 use crate::chrome::persist;
 use crate::chrome::view::{
     close_satellite_home, log_winstat, open_satellite, sync_active_sessions, tear_off_workspace,
-    CockpitState, CockpitView, SatHandles,
+    CockpitState, CockpitView, SatHandles, TabsSnapshot,
 };
 use crate::chrome::windows::SatBounds;
 use crate::font::FontSpec;
 use crate::overlays::{OverlayFeed, OverlaySidebar};
-use crate::render::{GridView, Tile, TileSpec};
+use crate::render::{notify_focus, GridView, Tile, TileSpec};
 use crate::term::TermSession;
 use crate::wire::{push_capped, ControlClient, Event, PtyFrame};
 
@@ -482,6 +483,18 @@ fn run_cockpit() {
         }
     }
 
+    // T12: report the tab layout up to the server's registry mirror so
+    // `list_tabs` reflects the NATIVE layout while this client is attached
+    // (the webview's startTabReporter, over the socket). Initial snapshot
+    // now (report-on-mount parity); every save_layout re-reports.
+    {
+        let (tx, rx) = crossbeam::channel::unbounded::<TabsSnapshot>();
+        spawn_tab_reporter(rx, client.clone());
+        let mut st = state.lock();
+        st.set_report_tx(tx);
+        st.report_tabs();
+    }
+
     spawn_cockpit_worker(state.clone(), client.clone(), feed.clone());
     spawn_winstat_ticker(state.clone());
 
@@ -634,7 +647,14 @@ fn spawn_cockpit_worker(
         .spawn(move || {
             let sidebar = feed.state();
             let folded = |sb: &Arc<Mutex<crate::overlays::SidebarState>>| sb.lock().events_folded;
+            let apply_rx = feed.apply_requests();
             loop {
+                // T12: apply pending organization mutations BEFORE reconciling,
+                // so a new_tab exists and a worktree placement is noted by the
+                // time new sessions are placed. Apply frames bump the feed's
+                // fold counter, so the hint tick below gets us here within
+                // ~250ms of the server accepting the command.
+                drain_applies(&state, &feed, &apply_rx);
                 reconcile_once(&state, &client);
                 {
                     let st = state.lock();
@@ -661,8 +681,10 @@ fn spawn_cockpit_worker(
         .expect("spawn cockpit worker thread");
 }
 
-/// One reconcile pass: refresh titles, diff the layout against the live list,
-/// drop dead tiles from the pool, attach what needs attaching, persist changes.
+/// One reconcile pass: refresh titles + cwds, diff the layout against the live
+/// list, drop dead tiles from the pool, attach what needs attaching, persist
+/// changes. Live cwds ride along (T12) so pending worktree placements can route
+/// a new session into its named tab.
 fn reconcile_once(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>) {
     let sessions = match client.list_sessions() {
         Ok(s) => s,
@@ -671,17 +693,21 @@ fn reconcile_once(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>)
             return;
         }
     };
-    let live: Vec<String> =
-        sessions.iter().map(|s| s.id.clone()).filter(|id| !id.is_empty()).collect();
+    let live: Vec<(String, String)> = sessions
+        .iter()
+        .filter(|s| !s.id.is_empty())
+        .map(|s| (s.id.clone(), s.cwd.clone()))
+        .collect();
 
     let need_attach: Vec<String> = {
         let mut st = state.lock();
         for s in &sessions {
             if !s.id.is_empty() {
                 st.titles.insert(s.id.clone(), s.title.clone());
+                st.cwds.insert(s.id.clone(), s.cwd.clone());
             }
         }
-        let out = st.model.reconcile(&live);
+        let out = st.model.reconcile_with_cwds(&live);
         for id in &out.removed {
             log::info!("cockpit: session {id} gone; dropping its tile");
             st.drop_tile(id);
@@ -704,6 +730,109 @@ fn reconcile_once(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>)
     for id in need_attach {
         attach_tile(state, client, &id);
     }
+}
+
+/// Drain pending organization applies (T12) into the chrome model - the native
+/// half of the MCP apply path (server broadcast -> feed decode -> here). Side
+/// effects the model returns in the [`apply::Outcome`] run right here: pool
+/// detach, persist + registry re-report (via save_layout), focus reports
+/// (mode 1004), toast-suppression sync. Runs at the top of every worker pass.
+fn drain_applies(
+    state: &Arc<Mutex<CockpitState>>,
+    feed: &OverlayFeed,
+    apply_rx: &crossbeam::channel::Receiver<ApplyCommand>,
+) {
+    while let Ok(cmd) = apply_rx.try_recv() {
+        // A focus_session target may be a Claude session UUID (the other §1.2 id
+        // space). Resolve its tile alias through the T9 index BEFORE taking the
+        // cockpit lock (the two locks must never nest - see gather_statuses).
+        let alias = match &cmd {
+            ApplyCommand::FocusSession { id } => {
+                let sb = feed.state();
+                let alias = sb.lock().index.alias_of(id).map(|s| s.to_string());
+                alias.map(|t| t.strip_prefix("th_").unwrap_or(&t).to_string())
+            }
+            _ => None,
+        };
+
+        let mut st = state.lock();
+        let before_focus = st.model.focused.clone();
+        let out = {
+            let CockpitState { model, cwds, .. } = &mut *st;
+            let mut out = apply::apply_model(&cmd, model, cwds);
+            if !out.matched {
+                if let Some(alias) = alias {
+                    out = apply::apply_model(
+                        &ApplyCommand::FocusSession { id: alias },
+                        model,
+                        cwds,
+                    );
+                }
+            }
+            out
+        };
+        log::info!(
+            "apply: {cmd:?} -> matched={} layout_changed={} detach={:?}",
+            out.matched,
+            out.layout_changed,
+            out.detach
+        );
+        for id in &out.detach {
+            st.drop_tile(id);
+        }
+        if out.layout_changed {
+            st.save_layout();
+            sync_active_sessions(&st, feed);
+        }
+        // Focus-tracking terminals (mode 1004) hear an apply-driven focus move
+        // exactly like a click in the view would report it.
+        let after_focus = st.model.focused.clone();
+        if before_focus != after_focus {
+            if let Some(old) = &before_focus {
+                if let Some(t) = st.tiles.get(old) {
+                    notify_focus(t, false);
+                }
+            }
+            if let Some(new) = &after_focus {
+                if let Some(t) = st.tiles.get(new) {
+                    notify_focus(t, true);
+                }
+            }
+        }
+    }
+}
+
+/// Background registry reporter (T12): sends the native tab layout to the
+/// server (`report_workspace_tabs`) whenever it changes, coalescing bursts and
+/// deduping identical snapshots. A failure (e.g. an older server without the
+/// command) logs at debug; the next layout change retries.
+fn spawn_tab_reporter(rx: crossbeam::channel::Receiver<TabsSnapshot>, client: Arc<ControlClient>) {
+    thread::Builder::new()
+        .name("t-hub-native-tabs".into())
+        .spawn(move || {
+            let mut last: Option<TabsSnapshot> = None;
+            while let Ok(mut snap) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    snap = newer; // coalesce a burst to the latest layout
+                }
+                if last.as_ref() == Some(&snap) {
+                    continue;
+                }
+                let tabs: Vec<serde_json::Value> = snap
+                    .iter()
+                    .map(|(id, name, tiles)| {
+                        serde_json::json!({ "id": id, "name": name, "tileIds": tiles })
+                    })
+                    .collect();
+                match client
+                    .request("report_workspace_tabs", serde_json::json!({ "tabs": tabs }))
+                {
+                    Ok(_) => last = Some(snap),
+                    Err(e) => log::debug!("report_workspace_tabs failed (older server?): {e}"),
+                }
+            }
+        })
+        .expect("spawn tab reporter thread");
 }
 
 /// Attach one session into the pool: PTY attach at the provisional geometry
