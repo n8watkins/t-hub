@@ -18,9 +18,13 @@
 //! - [`persist`] - the client-owned layout file (the SERVER owns sessions; the
 //!   CLIENT owns layout, decision D5): tabs + active tab as JSON at
 //!   `~/.t-hub/native-layout.json` (`THN_LAYOUT` overrides).
-//! - [`view`] (feature `gui`) - the GPUI `CockpitView`: paints the tab strip,
-//!   headers and grid, routes input, and delegates every tile's terminal content
-//!   to `render::sync_and_paint_content` (the row-paint seam T6 owns).
+//! - [`windows`] - the gpui-free satellite-window registry (T10): which
+//!   workspaces are torn off into their own OS windows, each window's focused
+//!   tile and last known bounds. Unit-tested under `--no-default-features`.
+//! - [`view`] (feature `gui`) - the GPUI `CockpitView` and `SatelliteView`:
+//!   paint the sidebar, headers and grids, route input, and delegate every
+//!   tile's terminal content to `render::sync_and_paint_content` (the row-paint
+//!   seam T6 owns).
 //!
 //! ## The persistent-pool insight
 //! Every tile in every workspace keeps its PTY attached; switching tabs only
@@ -30,6 +34,7 @@
 
 pub mod model;
 pub mod persist;
+pub mod windows;
 
 #[cfg(feature = "gui")]
 pub mod view;
