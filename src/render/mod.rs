@@ -46,6 +46,7 @@ use gpui::{
 };
 use parking_lot::Mutex;
 
+use crate::render_support::{encode, grid_dims, KeyChord};
 use crate::term::{Rgb, SelSpan, Snapshot, TermSession, DEFAULT_BG, DEFAULT_FG};
 use crate::wire::PtyHandle;
 
@@ -206,17 +207,6 @@ pub struct TileSpec {
 // ---------------------------------------------------------------------------
 // Layout math
 // ---------------------------------------------------------------------------
-
-/// Near-square grid dimensions for `n` tiles: `cols = ceil(sqrt(n))`, enough rows to
-/// fit. n=12 -> 4x3, n=16 -> 4x4, n=9 -> 3x3.
-fn grid_dims(n: usize) -> (usize, usize) {
-    if n == 0 {
-        return (1, 1);
-    }
-    let cols = (n as f64).sqrt().ceil() as usize;
-    let rows = n.div_ceil(cols);
-    (cols, rows)
-}
 
 /// The screen box of tile `i` given the window bounds and tile count.
 fn tile_box(i: usize, n: usize, win: Bounds<Pixels>) -> Bounds<Pixels> {
@@ -555,88 +545,21 @@ fn paint_selection(
 // Input
 // ---------------------------------------------------------------------------
 
-/// Encode a keystroke into terminal input bytes. Baseline coverage for T5; T6 does
-/// the full job (app-cursor mode, bracketed paste, kitty protocol, mouse).
-fn encode_key(ks: &Keystroke) -> Option<Vec<u8>> {
-    let mods = &ks.modifiers;
-    let key = ks.key.as_str();
-
-    // Ctrl-letter (and a few ctrl symbols) -> control byte.
-    if mods.control && !mods.platform && key.len() == 1 {
-        let ch = key.as_bytes()[0];
-        let byte = match ch {
-            b'a'..=b'z' => Some(ch - b'a' + 1),
-            b'A'..=b'Z' => Some(ch - b'A' + 1),
-            b'@' | b' ' => Some(0),
-            b'[' => Some(27),
-            b'\\' => Some(28),
-            b']' => Some(29),
-            b'^' => Some(30),
-            b'_' => Some(31),
-            _ => None,
-        };
-        if let Some(b) = byte {
-            return Some(with_alt(mods.alt, vec![b]));
-        }
-    }
-
-    let named: Option<&[u8]> = match key {
-        "enter" => Some(b"\r"),
-        "escape" => Some(b"\x1b"),
-        "backspace" => Some(b"\x7f"),
-        "tab" => {
-            if mods.shift {
-                Some(b"\x1b[Z")
-            } else {
-                Some(b"\t")
-            }
-        }
-        "up" => Some(b"\x1b[A"),
-        "down" => Some(b"\x1b[B"),
-        "right" => Some(b"\x1b[C"),
-        "left" => Some(b"\x1b[D"),
-        "home" => Some(b"\x1b[H"),
-        "end" => Some(b"\x1b[F"),
-        "pageup" => Some(b"\x1b[5~"),
-        "pagedown" => Some(b"\x1b[6~"),
-        "insert" => Some(b"\x1b[2~"),
-        "delete" => Some(b"\x1b[3~"),
-        "space" => Some(b" "),
-        _ => None,
-    };
-    if let Some(bytes) = named {
-        return Some(with_alt(mods.alt, bytes.to_vec()));
-    }
-
-    // Printable: prefer key_char (respects shift/layout), fall back to a 1-char key.
-    if !mods.platform {
-        if let Some(kc) = &ks.key_char {
-            if !kc.is_empty() {
-                return Some(with_alt(mods.alt, kc.as_bytes().to_vec()));
-            }
-        }
-        if key.chars().count() == 1 {
-            return Some(with_alt(mods.alt, key.as_bytes().to_vec()));
-        }
-    }
-    None
-}
-
-/// Prefix ESC for Alt/Meta chords (the standard xterm meta-sends-escape).
-fn with_alt(alt: bool, mut bytes: Vec<u8>) -> Vec<u8> {
-    if alt {
-        let mut out = Vec::with_capacity(bytes.len() + 1);
-        out.push(0x1b);
-        out.append(&mut bytes);
-        out
-    } else {
-        bytes
+/// Adapt a `gpui::Keystroke` into the gpui-free [`KeyChord`] the encoder consumes.
+fn chord_of(ks: &Keystroke) -> KeyChord {
+    KeyChord {
+        control: ks.modifiers.control,
+        alt: ks.modifiers.alt,
+        shift: ks.modifiers.shift,
+        platform: ks.modifiers.platform,
+        key: ks.key.clone(),
+        key_char: ks.key_char.clone(),
     }
 }
 
 impl GridView {
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-        if let Some(bytes) = encode_key(&ev.keystroke) {
+        if let Some(bytes) = encode(&chord_of(&ev.keystroke)) {
             let st = self.state.lock();
             if let Some(tile) = st.tiles.get(st.focused) {
                 tile.pty.write(&bytes);

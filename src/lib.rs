@@ -11,6 +11,10 @@ pub mod wire;
 /// `--no-default-features` the same way `wire` does.
 pub mod term;
 
+/// gpui-free render helpers (key encoding, layout math) - split out of `render` so
+/// they unit-test in WSL without linking the graphics backend.
+pub mod render_support;
+
 #[cfg(feature = "gui")]
 pub mod app;
 
