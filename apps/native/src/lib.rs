@@ -15,6 +15,11 @@ pub mod term;
 /// they unit-test in WSL without linking the graphics backend.
 pub mod render_support;
 
+/// Cockpit chrome (T8): workspace tabs, tile grid, per-tile headers. The state
+/// machine + layout math + persistence are gpui-free (tested under
+/// `--no-default-features`); only `chrome::view` is gated behind `gui`.
+pub mod chrome;
+
 #[cfg(feature = "gui")]
 pub mod app;
 
