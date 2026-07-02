@@ -9,7 +9,7 @@
 //!
 //! Platform model (mirrors the PTY/tmux/files layers):
 //!   - `#[cfg(windows)]`:    run the command INSIDE WSL via
-//!     `wsl.exe -d <distro> --cd <cwd> -- bash -lc '<command>'`, with the console
+//!     `wsl.exe -d <distro> --cd <cwd> -e bash -lc '<command>'`, with the console
 //!     window suppressed (`CREATE_NO_WINDOW`) so no CMD window flashes. The cwd
 //!     is a native WSL path (`/home/...`) translated back from any UNC form, just
 //!     like `files.rs` does for its native-in-WSL fast paths.
@@ -174,7 +174,7 @@ fn host_binding_prefix() -> &'static str {
 /// Build the OS command that runs `command` inside `cwd`, with stdout+stderr piped
 /// so we can drain them line-by-line.
 ///
-/// On Windows we shell into WSL: `wsl.exe -d <distro> --cd <posix-cwd> -- bash -lc
+/// On Windows we shell into WSL: `wsl.exe -d <distro> --cd <posix-cwd> -e bash -lc
 /// '<command>'`, console suppressed (`CREATE_NO_WINDOW`, copying tmux.rs). `--cd`
 /// roots the dev server at the project's WSL directory. On unix we run `sh -lc
 /// '<command>'` with the cwd set on the `Command` directly. The login shell
@@ -196,7 +196,10 @@ fn build_command(cwd: &str, command: &str) -> Command {
         if !posix_cwd.is_empty() {
             c.arg("--cd").arg(&posix_cwd);
         }
-        c.arg("--").arg("bash").arg("-lc").arg(&command);
+        // `-e` (exec) runs bash DIRECTLY. A bare `--` re-joins the tail through the
+        // user's DEFAULT shell (zsh), which re-splits the quoted command string and
+        // re-expands `$`/backticks in it (see the note on tmux.rs::pane_info_command).
+        c.arg("-e").arg("bash").arg("-lc").arg(&command);
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (see tmux.rs / files.rs)
         c.stdout(Stdio::piped());
         c.stderr(Stdio::piped());
@@ -392,16 +395,19 @@ pub async fn stop_dev_server(terminal_id: String) -> Result<(), String> {
 
 /// The WSL distro's primary IPv4 address as seen from the Windows host (the
 /// shared interface in mirrored mode; the NAT'd `eth0` otherwise). Queried via
-/// `wsl.exe -- hostname -I` and trimmed to the first address. `None` if the
+/// `wsl.exe -e bash -lc 'hostname -I'` and trimmed to the first address. `None` if the
 /// lookup fails (the frontend then keeps `localhost`, which is still correct in
 /// mirrored mode for a `0.0.0.0`-bound server).
 #[cfg(windows)]
 fn wsl_host_ip() -> Option<String> {
     use std::os::windows::process::CommandExt;
     let mut c = Command::new("wsl.exe");
+    // `-e` (exec) runs bash DIRECTLY. A bare `--` re-joins the tail through the
+    // default shell, splitting the quoted `hostname -I` script into separate
+    // words (see the note on tmux.rs::pane_info_command).
     c.arg("-d")
         .arg(crate::files::host_distro())
-        .arg("--")
+        .arg("-e")
         .arg("bash")
         .arg("-lc")
         // `hostname -I` lists this host's addresses (space-separated); the first

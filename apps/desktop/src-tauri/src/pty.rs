@@ -10,8 +10,8 @@
 //! Platform model (the key abstraction that lets the nucleus run in WSL now):
 //!   - `#[cfg(unix)]`:    spawn `tmux -L t-hub attach -t NAME` directly (this
 //!     runs inside WSL2 and is testable now).
-//!   - `#[cfg(windows)]`: spawn `wsl.exe --cd CWD -- tmux -L t-hub attach -t
-//!     NAME` (ConPTY fronting the WSL distro).
+//!   - `#[cfg(windows)]`: spawn `wsl.exe -e tmux -L t-hub attach -t NAME`
+//!     (ConPTY fronting the WSL distro).
 //!
 //! `PtySession` holds only `Send` handles so it can live inside the
 //! Tauri-managed `parking_lot::Mutex<HashMap<..>>`: the boxed PTY writer, the
@@ -137,9 +137,12 @@ impl Drop for PtySession {
 pub fn attach_argv(name: &str, _cwd: &str) -> Vec<String> {
     #[cfg(windows)]
     {
+        // `-e` (exec) runs tmux DIRECTLY. A bare `--` would re-join the tail
+        // through the user's default shell (zsh), re-expanding `$`/backticks in
+        // the session name arg (see the note on tmux.rs::pane_info_command).
         vec![
             "wsl.exe".to_string(),
-            "--".to_string(),
+            "-e".to_string(),
             "tmux".to_string(),
             "-L".to_string(),
             tmux::socket().to_string(),
@@ -486,7 +489,7 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                "wsl.exe", "--", "tmux", "-L", "t-hub", "attach", "-t", "th_abc123"
+                "wsl.exe", "-e", "tmux", "-L", "t-hub", "attach", "-t", "th_abc123"
             ]
         );
     }
