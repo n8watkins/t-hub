@@ -244,6 +244,20 @@ impl Tile {
             pty.write(bytes);
         }
     }
+
+    /// Whether the attach connection is down and retrying (T24 supervision
+    /// cue; `false` for detached/fixture tiles - they have no link to lose).
+    pub(crate) fn link_down(&self) -> bool {
+        self.pty.as_ref().is_some_and(|p| p.link_down())
+    }
+
+    /// Drop the PTY attach but keep the tile (grid content stays painted).
+    /// The T24 dead-tile path: a session known-gone from `list_terminals` must
+    /// stop its reader's futile reconnect churn, while the tile lingers on
+    /// screen with its DEAD badge.
+    pub(crate) fn take_pty(&mut self) {
+        self.pty = None;
+    }
 }
 
 /// Resolve a [`FontSpec`] into the tile's normal/bold gpui fonts: emoji/symbol

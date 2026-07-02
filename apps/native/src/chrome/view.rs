@@ -46,27 +46,30 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, fill, point, px, size, App, Bounds, Context, Entity, FocusHandle, Focusable,
-    Font, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    canvas, div, fill, point, px, size, App, Bounds, Context, CursorStyle, Entity, FocusHandle,
+    Focusable, Font, Hsla, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, TextRun,
     TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use parking_lot::Mutex;
 
-use crate::chrome::model::{sidebar_layout, tile_boxes, ChromeModel, RectF, SIDEBAR_ROW_H};
+use crate::chrome::cues::{age_label, format_age, LifeTracker, TileLife, TilePulse};
+use crate::chrome::model::{
+    apply_divider_split, divider_extent, divider_zones, sidebar_layout, split_rows,
+    tile_boxes_ratio, ChromeModel, DividerId, GridRatios, RectF, SIDEBAR_ROW_H,
+};
 use crate::chrome::persist::{self, Layout};
 use crate::chrome::windows::{SatBounds, WindowRegistry};
 use crate::font::FontSpec;
 use crate::overlays::model::SessionStatus;
 use crate::overlays::{OverlayFeed, OverlaySidebar};
 use crate::render::{
-    chord_of, h, notify_focus, paint_tile_frame, record_frame, spawn_logger,
+    chord_of, h, ha, notify_focus, paint_tile_frame, record_frame, spawn_logger,
     sync_and_paint_content, tile_drag_motion, tile_hover_motion, tile_key_input,
     tile_mouse_down_dispatch, tile_report_release, tile_wheel_dispatch, DragMode, PaintMode, Tile,
 };
@@ -104,7 +107,14 @@ const ROW_BG_ACTIVE: Rgb = Rgb { r: 33, g: 42, b: 54 };
 const LIVE: Rgb = Rgb { r: 86, g: 211, b: 128 };
 const NEEDS: Rgb = Rgb { r: 230, g: 180, b: 80 };
 const IDLE_DOT: Rgb = Rgb { r: 70, g: 78, b: 90 };
+/// Dead/exited cue (T24): the badge and dot of a tile whose session is gone.
+const DEAD: Rgb = Rgb { r: 224, g: 96, b: 96 };
 const BUSY_WINDOW_MS: u64 = 2_000;
+/// A defunct tile's content dims under this overlay alpha (the badge says why).
+const DEFUNCT_DIM: f32 = 0.55;
+/// The minimum pane extent a divider drag can shrink to (T26): enough for the
+/// header plus a couple of terminal rows to stay legible.
+const MIN_TILE_PX: f32 = 80.0;
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -147,6 +157,10 @@ struct TileZones {
     tiles: Vec<(String, RectF, RectF)>,
     closes: Vec<(String, RectF)>,
     badges: Vec<(String, RectF)>,
+    /// Divider hit zones between tiles (T26), matching this paint's boxes.
+    dividers: Vec<(DividerId, RectF)>,
+    /// The grid area those boxes were laid out in (divider drag math).
+    area: RectF,
 }
 
 /// Per-window transient input state (a drag or a hover belongs to the window
@@ -154,8 +168,12 @@ struct TileZones {
 #[derive(Default)]
 struct WinInput {
     drag: Option<ChromeDrag>,
+    /// An in-progress divider drag (T26).
+    div_drag: Option<DividerId>,
     wheel_accum: f32,
     hover_cell: Option<(String, usize, usize)>,
+    /// Last pointer position in this window (divider hover cue + cursor).
+    last_pos: Option<(f32, f32)>,
 }
 
 /// Everything the cockpit paints from and the input handlers mutate. Shared
@@ -181,9 +199,13 @@ pub struct CockpitState {
     /// background reporter sends the deduped `report_workspace_tabs` command.
     /// `None` outside the cockpit (grid mode / tests).
     report_tx: Option<crossbeam::channel::Sender<TabsSnapshot>>,
-    /// Per-tile "last output" stamps (ms since `epoch`), written by the feeder
-    /// threads - the recency fallback for the header's liveness cue.
-    pub(crate) last_output_ms: HashMap<String, Arc<AtomicU64>>,
+    /// Per-tile output/exit pulses (stamps in ms since `epoch`), written by
+    /// the feeder threads - the header's output-age cue (T24) plus the exit
+    /// code once a PTY exit frame lands.
+    pub(crate) pulses: HashMap<String, Arc<TilePulse>>,
+    /// Per-tile life states (T24): live / reconnecting / exited / dead,
+    /// observed by the cockpit worker each pass, read by every paint.
+    pub(crate) lives: LifeTracker,
     /// Process epoch the stamps are measured from.
     pub(crate) epoch: Instant,
     /// Main-window sidebar hit zones (satellites have no sidebar).
@@ -213,7 +235,8 @@ impl CockpitState {
             titles: HashMap::new(),
             cwds: HashMap::new(),
             report_tx: None,
-            last_output_ms: HashMap::new(),
+            pulses: HashMap::new(),
+            lives: LifeTracker::default(),
             epoch: Instant::now(),
             hits: HitZones::default(),
             tilezones: HashMap::new(),
@@ -263,7 +286,8 @@ impl CockpitState {
     /// per-window reference to it (drags, hovers, satellite focus).
     pub fn drop_tile(&mut self, id: &str) {
         self.tiles.remove(id);
-        self.last_output_ms.remove(id);
+        self.pulses.remove(id);
+        self.lives.remove(id);
         self.cwds.remove(id);
         for input in self.input.values_mut() {
             if input.drag.as_ref().is_some_and(|d| d.id == id) {
@@ -389,6 +413,16 @@ fn set_win_focused(st: &mut CockpitState, key: WinKey, id: &str) {
     match key {
         WinKey::Main => st.model.set_focused(id),
         WinKey::Sat(wsid) => st.sats.set_focused(wsid, Some(id.to_string())),
+    }
+}
+
+/// The workspace tab a window's grid shows: main = the active tab (unless it
+/// is torn off - then the main grid is empty and there is nothing to resize);
+/// satellite = its bound workspace.
+fn win_tab_index(model: &ChromeModel, key: WinKey) -> Option<usize> {
+    match key {
+        WinKey::Main => (!model.tabs[model.active].satellite).then_some(model.active),
+        WinKey::Sat(wsid) => model.tab_by_wsid(wsid),
     }
 }
 
@@ -687,26 +721,39 @@ fn paint_tiles_area(
     let area = RectF::new(bx + PAD, by + PAD, bw - 2.0 * PAD, bh - 2.0 * PAD);
 
     let focused_id = win_focused(&st, key);
+    // The window's divider-drag/hover state, copied out before the split
+    // borrow (paint only reads it for the highlight + cursor).
+    let (div_drag, last_pos) = st
+        .input
+        .get(&key)
+        .map(|i| (i.div_drag, i.last_pos))
+        .unwrap_or((None, None));
 
     // Split-borrow the state so the tiles map can be mutated while the model,
     // titles, and stamps are read (all disjoint fields of one MutexGuard).
-    let CockpitState { model, tiles, titles, last_output_ms, epoch, .. } = &mut *st;
+    let CockpitState { model, tiles, titles, pulses, lives, epoch, .. } = &mut *st;
     let now_ms = epoch.elapsed().as_millis() as u64;
-    let (ids, empty_msg): (Vec<String>, &str) = match key {
+    let (ids, ratios, empty_msg): (Vec<String>, Option<GridRatios>, &str) = match key {
         WinKey::Main => match model.main_tiles() {
             Some(t) => (
                 t.to_vec(),
+                model.tabs[model.active].grid.clone(),
                 "This workspace is empty - new sessions land in the active workspace.",
             ),
             None => (
                 Vec::new(),
+                None,
                 "Every workspace is torn off into its own window - « brings one back.",
             ),
         },
         WinKey::Sat(wsid) => match model.tab_by_wsid(wsid) {
-            Some(i) => (model.tabs[i].tiles.clone(), "This workspace is empty."),
+            Some(i) => (
+                model.tabs[i].tiles.clone(),
+                model.tabs[i].grid.clone(),
+                "This workspace is empty.",
+            ),
             // Workspace deleted from the main sidebar; the window is closing.
-            None => (Vec::new(), ""),
+            None => (Vec::new(), None, ""),
         },
     };
 
@@ -729,8 +776,9 @@ fn paint_tiles_area(
         );
     }
 
-    for (id, bx) in ids.iter().zip(tile_boxes(ids.len(), area, GAP)) {
+    for (id, bx) in ids.iter().zip(tile_boxes_ratio(ids.len(), area, GAP, ratios.as_ref())) {
         let is_focused = focused_window && focused_id.as_deref() == Some(id.as_str());
+        let life = lives.get(id);
         paint_tile_frame(b(bx), is_focused, window);
 
         // Close zone in the header's right corner.
@@ -764,7 +812,7 @@ fn paint_tiles_area(
                 ));
             }
             geom = format!("{}x{}", tile.cols, tile.rows);
-        } else {
+        } else if !life.is_defunct() {
             paint_parts(
                 &[("attaching…".to_string(), h(FG_DIM), false)],
                 content.x,
@@ -775,32 +823,69 @@ fn paint_tiles_area(
                 cx,
             );
         }
+        // A dead/exited tile's last content stays visible but dims under a
+        // scrim - frozen-and-explained, not normal-looking (T24).
+        if life.is_defunct() {
+            window.paint_quad(fill(b(content), ha(WINDOW_BG, DEFUNCT_DIM)));
+        }
 
-        // --- the cockpit header: liveness dot, title, id, geometry, close ----
-        // Dot: semantic status when the T9 SidebarState knows this session as
-        // an agent; otherwise output-recency (busy within 2s).
-        let dot = match statuses.get(id) {
-            Some(SessionStatus::Working) | Some(SessionStatus::WaitingOnSubagents) => h(LIVE),
-            Some(SessionStatus::NeedsQuestion) | Some(SessionStatus::NeedsPermission) => {
-                h(NEEDS)
-            }
-            _ => {
-                let busy = last_output_ms
-                    .get(id)
-                    .map(|s| now_ms.saturating_sub(s.load(Ordering::Relaxed)) < BUSY_WINDOW_MS)
-                    .unwrap_or(false);
-                if busy {
-                    h(LIVE)
-                } else {
-                    h(IDLE_DOT)
+        // --- the cockpit header: liveness dot, title, id, geometry, age,
+        // life badge, close ---------------------------------------------------
+        // Dot: the T24 life state wins (a dead session's stale agent status is
+        // noise); then semantic agent status (T9); then output-recency.
+        let dot = match life {
+            TileLife::Dead { .. } | TileLife::Exited { .. } => h(DEAD),
+            TileLife::Reconnecting { .. } => h(NEEDS),
+            TileLife::Live => match statuses.get(id) {
+                Some(SessionStatus::Working) | Some(SessionStatus::WaitingOnSubagents) => h(LIVE),
+                Some(SessionStatus::NeedsQuestion) | Some(SessionStatus::NeedsPermission) => {
+                    h(NEEDS)
                 }
-            }
+                _ => {
+                    let busy = pulses
+                        .get(id)
+                        .map(|p| now_ms.saturating_sub(p.last_output_ms()) < BUSY_WINDOW_MS)
+                        .unwrap_or(false);
+                    if busy {
+                        h(LIVE)
+                    } else {
+                        h(IDLE_DOT)
+                    }
+                }
+            },
         };
         let title = titles.get(id).filter(|t| !t.is_empty()).cloned().unwrap_or_else(|| id.clone());
 
-        let avail = (((bx.w - 2.0 * (BORDER + TILE_PAD) - close_w) / ui.cell_w).floor()
+        // The right-aligned cue cluster: last-output age (T24, always) plus
+        // the life badge saying WHY a tile looks frozen. On a narrow tile the
+        // badge outranks the age, and truncates itself before it may ever
+        // overflow left across the dot/title.
+        let header_chars = (((bx.w - 2.0 * (BORDER + TILE_PAD) - close_w) / ui.cell_w).floor()
             as usize)
             .saturating_sub(2); // the dot
+        let max_cue = header_chars.saturating_sub(1);
+        let mut age =
+            pulses.get(id).map(|p| age_label(p.last_output_ms(), now_ms)).unwrap_or_default();
+        let (badge_text, badge_color, badge_bold) = match life {
+            TileLife::Live => (String::new(), h(FG_DIM), false),
+            TileLife::Reconnecting { since_ms } => (
+                format!("reconnecting {}", format_age(now_ms.saturating_sub(since_ms))),
+                h(NEEDS),
+                true,
+            ),
+            TileLife::Exited { code, .. } => (format!("EXITED {code}"), h(DEAD), true),
+            TileLife::Dead { .. } => ("DEAD".to_string(), h(DEAD), true),
+        };
+        let mut cue_gap = if !age.is_empty() && !badge_text.is_empty() { "  " } else { "" };
+        if age.chars().count() + cue_gap.len() + badge_text.chars().count() > max_cue {
+            age.clear();
+            cue_gap = "";
+        }
+        let badge_text = truncate(&badge_text, max_cue);
+        let cue_chars = age.chars().count() + cue_gap.len() + badge_text.chars().count();
+
+        let avail =
+            header_chars.saturating_sub(if cue_chars > 0 { cue_chars + 2 } else { 0 });
         let meta = if title == *id { format!("  {geom}") } else { format!("  {id}  {geom}") };
         let (title_text, meta_text) = if avail > meta.chars().count() + 8 {
             (truncate(&title, avail - meta.chars().count()), meta)
@@ -821,6 +906,21 @@ fn paint_tiles_area(
             window,
             cx,
         );
+        if cue_chars > 0 {
+            paint_parts(
+                &[
+                    (age, h(FG_DIM), false),
+                    (cue_gap.to_string(), h(FG_DIM), false),
+                    (badge_text, badge_color, badge_bold),
+                ],
+                close.x - cue_chars as f32 * ui.cell_w - 4.0,
+                header_y,
+                &font_normal,
+                &font_bold,
+                window,
+                cx,
+            );
+        }
         paint_parts(
             &[("×".to_string(), h(FG_DIM), false)],
             close.x + (close.w - ui.cell_w) / 2.0,
@@ -835,8 +935,38 @@ fn paint_tiles_area(
         close_hits.push((id.clone(), close));
     }
 
-    st.tilezones
-        .insert(key, TileZones { tiles: tile_hits, closes: close_hits, badges: badge_hits });
+    // --- dividers (T26): hover/drag highlight + resize cursor -----------------
+    let dividers = divider_zones(ids.len(), area, GAP, ratios.as_ref());
+    let hover_div = if div_drag.is_none() {
+        last_pos
+            .and_then(|(x, y)| dividers.iter().find(|(_, r)| r.contains(x, y)))
+            .map(|(d, _)| *d)
+    } else {
+        None
+    };
+    for (d, r) in &dividers {
+        let dragging = div_drag == Some(*d);
+        if !dragging && hover_div != Some(*d) {
+            continue;
+        }
+        // A thin bar centered in the visual gap (the hit band is wider).
+        let bar = match d {
+            DividerId::Row(_) => RectF::new(r.x, r.y + (r.h - 2.0) / 2.0, r.w, 2.0),
+            DividerId::Col { .. } => RectF::new(r.x + (r.w - 2.0) / 2.0, r.y, 2.0, r.h),
+        };
+        window.paint_quad(fill(b(bar), if dragging { h(ACCENT) } else { ha(ACCENT, 0.5) }));
+    }
+    if let Some(d) = div_drag.or(hover_div) {
+        window.set_window_cursor_style(match d {
+            DividerId::Row(_) => CursorStyle::ResizeRow,
+            DividerId::Col { .. } => CursorStyle::ResizeColumn,
+        });
+    }
+
+    st.tilezones.insert(
+        key,
+        TileZones { tiles: tile_hits, closes: close_hits, badges: badge_hits, dividers, area },
+    );
     st.visible_cells.insert(key, cells_frame);
     drop(st);
 
@@ -874,6 +1004,75 @@ fn chrome_cell(
 // WHICH tile of WHICH window an event belongs to).
 // ---------------------------------------------------------------------------
 
+/// A left press on a divider (T26): double-click resets the workspace to the
+/// auto grid; a single press starts a drag (materializing even ratios first
+/// when the workspace was still auto). Returns whether the press was consumed.
+fn divider_mouse_down(
+    st: &mut CockpitState,
+    key: WinKey,
+    ev: &MouseDownEvent,
+    x: f32,
+    y: f32,
+) -> bool {
+    let Some(id) = st
+        .tilezones
+        .get(&key)
+        .and_then(|z| z.dividers.iter().find(|(_, r)| r.contains(x, y)))
+        .map(|(d, _)| *d)
+    else {
+        return false;
+    };
+    let Some(tab) = win_tab_index(&st.model, key) else { return true };
+    if ev.click_count >= 2 {
+        // Reset to auto: clear the ratios for good (they were the only thing
+        // making this workspace non-auto).
+        st.input.entry(key).or_default().div_drag = None;
+        st.model.tabs[tab].grid = None;
+        st.save_layout();
+        return true;
+    }
+    let buckets = split_rows(st.model.tabs[tab].tiles.len());
+    let needs_seed =
+        !st.model.tabs[tab].grid.as_ref().is_some_and(|g| g.matches(&buckets));
+    if needs_seed {
+        st.model.tabs[tab].grid = Some(GridRatios::even(&buckets));
+    }
+    st.input.entry(key).or_default().div_drag = Some(id);
+    true
+}
+
+/// Drag a divider to the pointer (T26): map the pointer into the neighbor
+/// pair's extent and re-split their fractions, clamped to [`MIN_TILE_PX`].
+/// The reflowed boxes land next paint; each tile's PTY refits through the
+/// existing `sync_and_paint_content` geometry path. Returns whether the
+/// ratios changed (the caller repaints).
+fn divider_drag_motion(st: &mut CockpitState, key: WinKey, id: DividerId, x: f32, y: f32) -> bool {
+    let Some(tab) = win_tab_index(&st.model, key) else { return false };
+    let Some(area) = st.tilezones.get(&key).map(|z| z.area) else { return false };
+    let n = st.model.tabs[tab].tiles.len();
+    let Some(mut g) = st.model.tabs[tab].grid.clone() else { return false };
+    // A reconcile can reflow the grid mid-drag: the seeded ratios no longer
+    // describe what is painted, so the drag stops tracking instead of mutating
+    // dormant ratios (or resizing the wrong pair through a stale id).
+    if !g.matches(&split_rows(n)) {
+        return false;
+    }
+    let Some((start, combined)) = divider_extent(n, area, GAP, Some(&g), id) else {
+        return false;
+    };
+    let pointer = match id {
+        DividerId::Row(_) => y,
+        DividerId::Col { .. } => x,
+    };
+    let t = (pointer - start - GAP / 2.0) / combined.max(1.0);
+    let min_t = MIN_TILE_PX / combined.max(1.0);
+    if !apply_divider_split(&mut g, id, t, min_t) {
+        return false;
+    }
+    st.model.tabs[tab].grid = Some(g);
+    true
+}
+
 fn tiles_mouse_down(
     st: &mut CockpitState,
     key: WinKey,
@@ -884,6 +1083,19 @@ fn tiles_mouse_down(
 ) {
     let x: f32 = ev.position.x.into();
     let y: f32 = ev.position.y.into();
+    if std::env::var("THN_HIT_DEBUG").as_deref() == Ok("1") {
+        let z = st.tilezones.get(&key);
+        log::info!(
+            "hitdbg[{key:?}] down at ({x:.1},{y:.1}); dividers={:?} area={:?}",
+            z.map(|z| z.dividers.clone()),
+            z.map(|z| z.area)
+        );
+    }
+    // Dividers first: their hit bands straddle the gaps and overlap the
+    // neighboring tiles' outer edges by a few pixels.
+    if button == MouseButton::Left && divider_mouse_down(st, key, ev, x, y) {
+        return;
+    }
     let target = st.tilezones.get(&key).and_then(|z| tile_hit(z, x, y));
     match target {
         Some(TileTarget::Close(id)) if button == MouseButton::Left => {
@@ -936,6 +1148,16 @@ fn tiles_mouse_down(
 }
 
 fn tiles_mouse_up(st: &mut CockpitState, key: WinKey, button: MouseButton, ev: &MouseUpEvent) {
+    // A divider drag commits on release: persist the ratios once (not per
+    // motion event - dragging would hammer the layout file).
+    if button == MouseButton::Left {
+        if let Some(i) = st.input.get_mut(&key) {
+            if i.div_drag.take().is_some() {
+                st.save_layout();
+                return;
+            }
+        }
+    }
     let Some(drag) = st.input.get_mut(&key).and_then(|i| i.drag.take()) else { return };
     let ends_drag = match drag.mode {
         DragMode::Select => button == MouseButton::Left,
@@ -954,8 +1176,17 @@ fn tiles_mouse_up(st: &mut CockpitState, key: WinKey, button: MouseButton, ev: &
     }
 }
 
-/// Returns whether a selection drag advanced (the caller repaints).
+/// Returns whether a selection or divider drag advanced (the caller repaints).
 fn tiles_mouse_move(st: &mut CockpitState, key: WinKey, ev: &MouseMoveEvent) -> bool {
+    let x: f32 = ev.position.x.into();
+    let y: f32 = ev.position.y.into();
+    // Remember the pointer for the divider hover highlight + resize cursor.
+    st.input.entry(key).or_default().last_pos = Some((x, y));
+
+    if let Some(id) = st.input.get(&key).and_then(|i| i.div_drag) {
+        return divider_drag_motion(st, key, id, x, y);
+    }
+
     if let Some(drag) = st.input.get(&key).and_then(|i| i.drag.as_ref()) {
         let id = drag.id.clone();
         let mode = drag.mode;
@@ -977,8 +1208,6 @@ fn tiles_mouse_move(st: &mut CockpitState, key: WinKey, ev: &MouseMoveEvent) -> 
     if ev.modifiers.shift {
         return false;
     }
-    let x: f32 = ev.position.x.into();
-    let y: f32 = ev.position.y.into();
     let hovered = st
         .tilezones
         .get(&key)
