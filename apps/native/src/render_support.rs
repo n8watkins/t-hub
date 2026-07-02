@@ -409,6 +409,36 @@ pub fn cell_from_pixel(
     CellHit { col, row, right_side, inside }
 }
 
+// ---------------------------------------------------------------------------
+// Process stats (T10 instrumentation)
+// ---------------------------------------------------------------------------
+
+/// Resident set size (MiB) and open-fd count of THIS process, for the T10
+/// windows-x-cells memory watch (each gpui window carries its own renderer +
+/// sprite atlas) and the attach-leak check (every PTY attach is an fd, so a
+/// tear/close cycle that leaks attaches shows up as fd growth). Linux only
+/// (`/proc/self`); elsewhere returns zeros - the watch runs under WSLg.
+pub fn proc_stats() -> (f64, usize) {
+    #[cfg(target_os = "linux")]
+    {
+        let rss_mb = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| {
+                    l.split_whitespace().nth(1).and_then(|kb| kb.parse::<f64>().ok())
+                })
+            })
+            .map(|kb| kb / 1024.0)
+            .unwrap_or(0.0);
+        let fds = std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0);
+        (rss_mb, fds)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (0.0, 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
