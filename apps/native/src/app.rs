@@ -22,9 +22,8 @@
 //! session list and the persisted layout.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,6 +37,7 @@ use gpui::{
 use parking_lot::Mutex;
 
 use crate::apply::{self, ApplyCommand};
+use crate::chrome::cues::{LifeObs, TilePulse};
 use crate::chrome::model::ChromeModel;
 use crate::chrome::persist;
 use crate::chrome::view::{
@@ -408,6 +408,18 @@ const RELIST_INTERVAL: Duration = Duration::from_secs(2);
 /// is the process's SINGLE event drainer (its docs: events receivers COMPETE
 /// for frames); the chrome no longer subscribes - it reads the fold counter.
 const HINT_TICK: Duration = Duration::from_millis(250);
+/// How long a dead/exited tile lingers on screen with its badge (T24) before
+/// reconcile prunes it - long enough to SEE that it died and why, short enough
+/// that fleet churn does not pile up tombstones. `THN_DEAD_LINGER_MS` overrides
+/// (the acceptance harness shortens it).
+const DEAD_LINGER_MS: u64 = 45_000;
+
+fn dead_linger_ms() -> u64 {
+    std::env::var("THN_DEAD_LINGER_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEAD_LINGER_MS)
+}
 
 /// T8 cockpit: tabs + per-workspace grid + headers over the live session list;
 /// T10: plus one satellite window per torn-off workspace (restored from the
@@ -496,6 +508,7 @@ fn run_cockpit() {
     }
 
     spawn_cockpit_worker(state.clone(), client.clone(), feed.clone());
+    spawn_link_ticker(state.clone());
     spawn_winstat_ticker(state.clone());
 
     Application::new().run(move |cx: &mut App| {
@@ -564,6 +577,27 @@ fn run_cockpit() {
 
         cx.activate(true);
     });
+}
+
+/// T24: fold LINK-ONLY life observations on a fast cadence, independent of the
+/// reconcile worker. The worker can sit inside `request()`'s internal
+/// retry-with-backoff for many seconds while the server is unreachable -
+/// exactly when the "reconnecting" cue matters most - so the cue reads the
+/// wire's per-attach link flag directly instead of waiting for a session list.
+/// Death verdicts stay with the reconcile pass (they need the list).
+fn spawn_link_ticker(state: Arc<Mutex<CockpitState>>) {
+    thread::Builder::new()
+        .name("t-hub-native-links".into())
+        .spawn(move || loop {
+            thread::sleep(Duration::from_millis(500));
+            let mut st = state.lock();
+            let now_ms = st.epoch.elapsed().as_millis() as u64;
+            for id in st.model.all_tiles() {
+                let link_down = st.tiles.get(&id).is_some_and(|t| t.link_down());
+                st.lives.observe_link(&id, link_down, now_ms);
+            }
+        })
+        .expect("spawn link ticker thread");
 }
 
 /// Periodic winstat line (window count x visible cells vs RSS/fds), the T10
@@ -681,14 +715,21 @@ fn spawn_cockpit_worker(
         .expect("spawn cockpit worker thread");
 }
 
-/// One reconcile pass: refresh titles + cwds, diff the layout against the live
-/// list, drop dead tiles from the pool, attach what needs attaching, persist
-/// changes. Live cwds ride along (T12) so pending worktree placements can route
-/// a new session into its named tab.
+/// One reconcile pass: refresh titles + cwds, observe every placed tile's life
+/// (T24: listed? attach link down? exit frame seen?), diff the layout against
+/// the live list (dead tiles linger badge-visible for [`DEAD_LINGER_MS`]),
+/// drop pruned tiles from the pool, attach what needs attaching, persist
+/// changes. Live cwds ride along (T12) so pending worktree placements can
+/// route a new session into its named tab.
 fn reconcile_once(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>) {
     let sessions = match client.list_sessions() {
         Ok(s) => s,
         Err(e) => {
+            // No death verdicts without a session list: an unreachable server
+            // must not mark tiles DEAD. The reconnecting cue does not wait for
+            // this call either way - the link ticker folds the wire's attach
+            // state on its own fast cadence (request() retries with backoff
+            // for many seconds before surfacing this error).
             log::debug!("cockpit: list_terminals failed ({e}); retrying");
             return;
         }
@@ -707,7 +748,42 @@ fn reconcile_once(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>)
                 st.cwds.insert(s.id.clone(), s.cwd.clone());
             }
         }
-        let out = st.model.reconcile_with_cwds(&live);
+
+        // T24: fold one observation per placed tile into its life state.
+        let now_ms = st.epoch.elapsed().as_millis() as u64;
+        let live_ids: HashSet<&str> = live.iter().map(|(id, _)| id.as_str()).collect();
+        let mut revived: Vec<String> = Vec::new();
+        for id in st.model.all_tiles() {
+            let obs = LifeObs {
+                listed: live_ids.contains(id.as_str()),
+                link_down: st.tiles.get(&id).is_some_and(|t| t.link_down()),
+                exit: st.pulses.get(&id).and_then(|p| p.exit_code()),
+                now_ms,
+            };
+            let seen = st.lives.observe(&id, obs);
+            if seen.life.is_defunct() {
+                // The session is known-gone: drop the attach so its reader
+                // stops reconnect-churning against the server (the tile stays,
+                // frozen under its badge, until the linger window passes).
+                if let Some(tile) = st.tiles.get_mut(&id) {
+                    tile.take_pty();
+                }
+            }
+            if seen.revived {
+                // Same tmux name, new session (or the server recovered it):
+                // drop the stale pool entry; the attach loop below re-attaches
+                // fresh (new scrollback seed, new pulse).
+                log::info!("cockpit: session {id} is back; re-attaching");
+                revived.push(id);
+            }
+        }
+        for id in &revived {
+            st.tiles.remove(id);
+            st.pulses.remove(id);
+        }
+
+        let lingering = st.lives.lingering(now_ms, dead_linger_ms());
+        let out = st.model.reconcile_with_cwds_lingering(&live, &lingering);
         for id in &out.removed {
             log::info!("cockpit: session {id} gone; dropping its tile");
             st.drop_tile(id);
@@ -718,11 +794,11 @@ fn reconcile_once(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>)
         // Attach every placed tile missing from the pool - not just this pass's
         // `added`: tiles restored from the persisted layout boot un-pooled (the
         // bug the first live run caught), and a died-and-relisted session heals
-        // the same way.
+        // the same way. Defunct tiles linger UNattached (their badge says why).
         st.model
             .all_tiles()
             .into_iter()
-            .filter(|id| !st.tiles.contains_key(id))
+            .filter(|id| !st.tiles.contains_key(id) && !st.lives.get(id).is_defunct())
             .collect()
     };
 
@@ -857,27 +933,29 @@ fn attach_tile(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>, id
         term.lock().advance(&handle.scrollback);
     }
 
-    let stamp = Arc::new(AtomicU64::new(0));
     let mut st = state.lock();
     if !st.model.contains_tile(id) {
         // Closed while the attach was in flight; drop the handle (detaches).
         return;
     }
     let epoch = st.epoch;
+    // The attach seed counts as output: it IS the content now on screen.
+    let pulse = Arc::new(TilePulse::new(epoch.elapsed().as_millis() as u64));
     let rx = handle.output.clone();
     let feed_term = term.clone();
-    let feed_stamp = stamp.clone();
+    let feed_pulse = pulse.clone();
     let feed_id = id.to_string();
     thread::spawn(move || {
         while let Ok(frame) = rx.recv() {
             match frame {
                 PtyFrame::Out(bytes) => {
                     feed_term.lock().advance(&bytes);
-                    feed_stamp.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    feed_pulse.stamp_output(epoch.elapsed().as_millis() as u64);
                 }
                 PtyFrame::Exit(code) => {
-                    // The next reconcile removes the tile once the server
-                    // drops the session from list_terminals.
+                    // Sticky: the worker's next life observation turns the
+                    // tile EXITED; reconcile prunes it after the linger.
+                    feed_pulse.record_exit(code);
                     log::info!("feeder[{feed_id}]: session exited ({code})");
                     break;
                 }
@@ -898,7 +976,7 @@ fn attach_tile(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>, id
             None,
         ),
     );
-    st.last_output_ms.insert(id.to_string(), stamp);
+    st.pulses.insert(id.to_string(), pulse);
     if st.model.focused.is_none() {
         st.model.set_focused(id);
     }
