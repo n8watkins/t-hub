@@ -427,6 +427,18 @@ fn dead_linger_ms() -> u64 {
 /// (which attaches every placed session - the persistent pool), and opens the
 /// cockpit window.
 fn run_cockpit() {
+    // T-B single-instance guard, FIRST: two cockpits on one layout fight over
+    // the JSON file and the server's tab-registry reporter (last-writer-wins).
+    // Held for the process lifetime; released by the OS on any exit.
+    let layout_path = persist::layout_path();
+    let _instance_lock = match persist::acquire_instance_lock(&layout_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("t-hub-native: {e:#}");
+            std::process::exit(1);
+        }
+    };
+
     let client = match ControlClient::connect_discovered() {
         Ok(c) => Arc::new(c),
         Err(e) => {
@@ -435,8 +447,6 @@ fn run_cockpit() {
             std::process::exit(1);
         }
     };
-
-    let layout_path = persist::layout_path();
     // Satellite seeds are (tab index, persisted window bounds); the registry is
     // keyed by wsid, which `into_model` assigns - map through the model below.
     let (model, sat_seed): (ChromeModel, Vec<(usize, Option<SatBounds>)>) =
@@ -463,17 +473,15 @@ fn run_cockpit() {
     // reads its shared SidebarState instead of subscribing itself.
     let feed = OverlayFeed::spawn(client.clone());
 
-    // Resume clicks from the recents overlay need a tile-spawn path the socket
-    // does not provide yet (`spawn_terminal` only forwards to a UI sink); log
-    // them until that lands (T11/T12 territory).
-    {
-        let host_rx = feed.host_requests();
-        thread::spawn(move || {
-            while let Ok(req) = host_rx.recv() {
-                log::info!("host request (needs a tile-spawn path, not wired yet): {req:?}");
-            }
-        });
-    }
+    // T-B: resume clicks from the recents overlay complete end to end. The
+    // socket `spawn_terminal` carries a `startupCommand` (server-side T-B
+    // addition), so the server spawns `claude --resume <id>` in the session's
+    // cwd inside the same login-shell wrap the webview presets use. Placement
+    // needs no handling here: on the sink-less (native-only) path the server
+    // broadcasts the forward WITH the minted id and `drain_applies` places +
+    // focuses the tile; on the sink path the webview spawns and reconcile
+    // adopts the new session into the active workspace.
+    spawn_host_request_worker(feed.host_requests(), client.clone());
 
     let state = Arc::new(Mutex::new(CockpitState::new(model, layout_path)));
 
@@ -510,6 +518,7 @@ fn run_cockpit() {
     spawn_cockpit_worker(state.clone(), client.clone(), feed.clone());
     spawn_link_ticker(state.clone());
     spawn_winstat_ticker(state.clone());
+    spawn_resume_probe(&feed);
 
     Application::new().run(move |cx: &mut App| {
         let handles: SatHandles = Rc::new(RefCell::new(HashMap::new()));
@@ -577,6 +586,65 @@ fn run_cockpit() {
 
         cx.activate(true);
     });
+}
+
+/// T-B acceptance harness: `THN_RESUME_PROBE="<sessionId>;<cwd>"` sends ONE
+/// `OverlayAction::Resume` through the feed shortly after boot - the exact
+/// action the recents row's `on_click` sends (T10 harness precedent: drive the
+/// same functions the clicks use, no brittle synthetic input). Everything
+/// downstream runs for real: the feed's double-spawn gate, the HostRequest
+/// hop, the socket `spawn_terminal` with its `startupCommand`, the apply
+/// broadcast, and the cockpit placement.
+fn spawn_resume_probe(feed: &OverlayFeed) {
+    let Ok(spec) = std::env::var("THN_RESUME_PROBE") else { return };
+    let Some((id, cwd)) = spec.split_once(';') else {
+        log::warn!("THN_RESUME_PROBE: expected \"<sessionId>;<cwd>\", got {spec:?}");
+        return;
+    };
+    let feed = feed.clone();
+    let (id, cwd) = (id.to_string(), cwd.to_string());
+    thread::spawn(move || {
+        // Let the first reconcile settle so placement lands in a stable tab.
+        thread::sleep(Duration::from_millis(1500));
+        log::info!("resume-probe: sending OverlayAction::Resume for {id} in {cwd}");
+        feed.send(crate::overlays::OverlayAction::Resume { session_id: id, cwd });
+    });
+}
+
+/// T-B: fulfill [`HostRequest`]s from the overlay feed — work the overlays
+/// cannot do themselves. `ResumeSession` (a recents click, already behind the
+/// feed's 1.5s double-spawn gate) becomes a socket `spawn_terminal` carrying
+/// `claude --resume '<id>'` as its `startupCommand`, rooted at the recorded
+/// cwd. Failures log at warn — the server refuses e.g. when nothing could
+/// adopt the session — and the next click simply retries.
+fn spawn_host_request_worker(
+    host_rx: crossbeam::channel::Receiver<crate::overlays::HostRequest>,
+    client: Arc<ControlClient>,
+) {
+    use crate::overlays::HostRequest;
+    thread::Builder::new()
+        .name("t-hub-native-host-req".into())
+        .spawn(move || {
+            while let Ok(req) = host_rx.recv() {
+                match req {
+                    HostRequest::ResumeSession { session_id, cwd } => {
+                        let args = serde_json::json!({
+                            "cwd": cwd,
+                            "startupCommand":
+                                crate::overlays::recents::resume_command(&session_id),
+                        });
+                        match client.request("spawn_terminal", args) {
+                            Ok(v) => log::info!(
+                                "resume {session_id}: spawn accepted (id={})",
+                                v.get("id").and_then(|i| i.as_str()).unwrap_or("webview-minted")
+                            ),
+                            Err(e) => log::warn!("resume {session_id}: spawn_terminal failed: {e}"),
+                        }
+                    }
+                }
+            }
+        })
+        .expect("spawn host request worker thread");
 }
 
 /// T24: fold LINK-ONLY life observations on a fast cadence, independent of the

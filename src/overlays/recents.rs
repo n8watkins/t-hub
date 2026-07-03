@@ -133,6 +133,14 @@ pub fn norm_cwd(cwd: &str) -> &str {
     if t.is_empty() { "/" } else { t }
 }
 
+/// The startup command a resume click sends through the socket `spawn_terminal`
+/// (T-B). Mirrors the webview's `recall` exactly (`workspace.ts`): the id is
+/// single-quoted as a defensive guard — ids are plain UUIDs, but the command
+/// line passes through a shell inside the server's login-shell wrap.
+pub fn resume_command(session_id: &str) -> String {
+    format!("claude --resume '{}'", session_id.trim())
+}
+
 /// Derive a worktree hint from a cwd, mirroring the webview's FolderGroup logic:
 /// a path segment starting with `wt-` (branch worktrees), or the segment after
 /// `.claude/worktrees/` (task worktrees). `None` when the path looks like a
@@ -225,6 +233,14 @@ mod tests {
         assert!(st.begin_resume(10_000));
         assert!(!st.begin_resume(10_000 + RESUME_GATE_MS - 1));
         assert!(st.begin_resume(10_000 + RESUME_GATE_MS));
+    }
+
+    #[test]
+    fn resume_command_quotes_the_id() {
+        assert_eq!(
+            resume_command("0197-abc "),
+            "claude --resume '0197-abc'"
+        );
     }
 
     #[test]
