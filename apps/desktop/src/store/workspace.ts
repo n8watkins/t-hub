@@ -258,6 +258,10 @@ interface WorkspaceState {
     cwd?: string;
     name?: string;
     shell?: string;
+    /** Optional command run inside the new pane's login shell (the "+" presets'
+     *  field; T-B: forwarded from the socket `spawn_terminal` so a control-side
+     *  resume — `claude --resume <id>` — completes through this path too). */
+    startupCommand?: string;
     tabId?: string;
   }) => Promise<TerminalId | null>;
   /** Drop a terminal from every tab + the map, moving focus to a neighbor. */
@@ -1064,6 +1068,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
           cwd: opts?.cwd?.trim() || undefined,
           name: opts?.name?.trim() || undefined,
           shell: opts?.shell?.trim() || undefined,
+          startupCommand: opts?.startupCommand?.trim() || undefined,
         });
         if (get().tabs.some((t) => t.id === tabId)) get().addToTab(tabId, info);
         else get().addAfterFocused(info);

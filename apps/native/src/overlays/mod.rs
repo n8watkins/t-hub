@@ -17,6 +17,7 @@
 //! `archive_recent_project`; channels `status://snapshot`, `session://status`,
 //! `supervision://tree`, `agent://title`, `agent://state`.
 
+pub mod alerts;
 pub mod feed;
 pub mod metrics;
 pub mod model;

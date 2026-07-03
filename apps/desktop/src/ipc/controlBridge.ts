@@ -89,8 +89,13 @@ export function applyControl(command: string, args: ControlApply["args"]): void 
       const cwd = str(args, "cwd");
       const name = str(args, "name");
       const shell = str(args, "shell");
+      // T-B: the socket spawn's optional startup command (e.g. the native
+      // resume flow's `claude --resume <id>`) rides the same presets field the
+      // "+" menu uses — dropped here before T-B, which would strand a
+      // control-side resume in a plain shell.
+      const startupCommand = str(args, "startupCommand");
       void ws
-        .spawnWorkspaceTerminal({ cwd, name, shell })
+        .spawnWorkspaceTerminal({ cwd, name, shell, startupCommand })
         .catch((e) => console.error("spawn_terminal failed", e));
       return;
     }

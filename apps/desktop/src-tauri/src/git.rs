@@ -633,16 +633,20 @@ pub async fn git_commit(cwd: String, message: String) -> Result<String, String> 
 pub async fn git_worktree_list(cwd: String) -> Result<Vec<WorktreeInfo>, String> {
     // `run_git` is a blocking spawn (a `wsl.exe` child on Windows); run it off the
     // Tokio executor (the owned `cwd` is moved into the `'static + Send` closure).
-    tauri::async_runtime::spawn_blocking(move || {
-        match run_git(&cwd, &["worktree", "list", "--porcelain"]) {
-            Ok((true, stdout, _)) => Ok(parse_worktree_list(&stdout)),
-            // Not a repo / no worktrees / git unavailable: empty list (best-effort).
-            Ok((false, _, _)) => Ok(Vec::new()),
-            Err(e) => Err(e),
-        }
-    })
-    .await
-    .map_err(|e| format!("git_worktree_list task failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || worktree_list(&cwd))
+        .await
+        .map_err(|e| format!("git_worktree_list task failed: {e}"))?
+}
+
+/// Synchronous core of [`git_worktree_list`], shared with the control channel
+/// (`control::list_worktrees`, T-B) so both call exactly one implementation.
+pub(crate) fn worktree_list(cwd: &str) -> Result<Vec<WorktreeInfo>, String> {
+    match run_git(cwd, &["worktree", "list", "--porcelain"]) {
+        Ok((true, stdout, _)) => Ok(parse_worktree_list(&stdout)),
+        // Not a repo / no worktrees / git unavailable: empty list (best-effort).
+        Ok((false, _, _)) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Create (or check out into) a worktree at `path` for the repo containing `cwd`,

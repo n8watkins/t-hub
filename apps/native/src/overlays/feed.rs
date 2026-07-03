@@ -25,8 +25,9 @@ use super::metrics::{HostMetrics, METRICS_POLL_MS};
 use super::model::now_ms;
 use super::recents::RecentEntry;
 use super::supervision::SupervisionTree;
+use super::toasts::Toast;
 use super::usage::{ClaudeUsage, CodexUsage};
-use super::{fold_event, SidebarState};
+use super::{alerts, fold_event, SidebarState};
 use crate::apply::{self, ApplyCommand};
 use crate::wire::ControlClient;
 
@@ -62,8 +63,10 @@ pub enum OverlayAction {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostRequest {
     /// Spawn a terminal tile at `cwd` running `claude --resume <session_id>`.
-    /// (The socket's `spawn_terminal` only forwards to a connected UI sink and
-    /// carries no command argument, so the server cannot fulfill this.)
+    /// T-B: the shell fulfills this through the socket `spawn_terminal`, whose
+    /// `startupCommand` argument (server-side T-B addition) runs the resume
+    /// inside the same login-shell wrap the webview's "+" presets use;
+    /// placement rides the `control://apply` broadcast back.
     ResumeSession { session_id: String, cwd: String },
 }
 
@@ -170,11 +173,14 @@ impl OverlayFeed {
         // frames (T12: the server's Organization-forward broadcast) are decoded
         // onto the apply channel for the cockpit worker; folding them too keeps
         // `events_folded` bumping, which is exactly the hint that short-circuits
-        // the worker's next reconcile.
+        // the worker's next reconcile. T-B: every toast the fold enqueues also
+        // fires a chime + OS notification (`alerts::alert`, a no-op headless),
+        // inheriting the toasts' dedup/warmup/active-tab suppression.
         {
             let state = state.clone();
             let rx = client.events();
             thread::spawn(move || {
+                let mut alerted_seq: u64 = 0;
                 while let Ok(ev) = rx.recv() {
                     if ev.channel == apply::APPLY_CHANNEL {
                         match apply::parse_event(&ev.payload) {
@@ -187,7 +193,14 @@ impl OverlayFeed {
                             ),
                         }
                     }
-                    fold_event(&mut state.lock(), &ev.channel, &ev.payload, now_ms());
+                    let fresh = {
+                        let mut st = state.lock();
+                        fold_event(&mut st, &ev.channel, &ev.payload, now_ms());
+                        fresh_toasts(&st, &mut alerted_seq)
+                    };
+                    for t in fresh {
+                        alerts::alert(t.kind, &t.title, &t.body);
+                    }
                 }
             });
         }
@@ -244,6 +257,23 @@ impl OverlayFeed {
     pub fn set_active_sessions(&self, sessions: HashSet<String>) {
         self.state.lock().toasts.set_active_sessions(sessions);
     }
+}
+
+/// The toasts enqueued since `alerted_seq` (advancing it) - the alert trigger.
+/// Pure over the state so the once-per-toast guarantee is unit-testable: seqs
+/// are monotonic, so re-reading `visible()` never re-alerts an already-seen
+/// toast, and TTL-expired/dismissed toasts simply stop appearing.
+fn fresh_toasts(st: &SidebarState, alerted_seq: &mut u64) -> Vec<Toast> {
+    let fresh: Vec<Toast> = st
+        .toasts
+        .visible()
+        .into_iter()
+        .filter(|t| t.seq > *alerted_seq)
+        .collect();
+    if let Some(max) = fresh.iter().map(|t| t.seq).max() {
+        *alerted_seq = max;
+    }
+    fresh
 }
 
 fn run_fetch(
@@ -394,6 +424,38 @@ mod tests {
 
         // Not needed (statusline took over): never attempted.
         assert!(!plan.due(t + 2 * CLAUDE_FRESH_MS, false).contains(&Fetch::Claude));
+    }
+
+    #[test]
+    fn fresh_toasts_alert_each_toast_exactly_once() {
+        use crate::overlays::model::SessionStatus;
+        use crate::overlays::toasts::WARMUP_INITIAL_MS;
+
+        let mut st = SidebarState::default();
+        let mut seq = 0_u64;
+        let now = WARMUP_INITIAL_MS + 1000;
+
+        // No toasts yet: nothing to alert.
+        assert!(fresh_toasts(&st, &mut seq).is_empty());
+
+        // One transition -> exactly one alert, then never again.
+        st.toasts.fold_status("s1", SessionStatus::NeedsQuestion, None, now);
+        let fresh = fresh_toasts(&st, &mut seq);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].title, "Claude needs an answer");
+        assert!(fresh_toasts(&st, &mut seq).is_empty(), "no re-alert");
+
+        // Two more transitions folded before the next drain: both alert, once.
+        st.toasts.fold_status("s1", SessionStatus::Completed, None, now + 10);
+        st.toasts.fold_status("s2", SessionStatus::Failed, None, now + 20);
+        let fresh = fresh_toasts(&st, &mut seq);
+        assert_eq!(fresh.len(), 2);
+        assert!(fresh_toasts(&st, &mut seq).is_empty());
+
+        // A dismissed/expired toast never re-surfaces as fresh.
+        let gone = fresh[0].seq;
+        st.toasts.dismiss(gone);
+        assert!(fresh_toasts(&st, &mut seq).is_empty());
     }
 
     #[test]

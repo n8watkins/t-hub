@@ -1304,9 +1304,12 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "open_file" => open_file(ctx, args),
         // WS-4 git worktrees: create runs git here then forwards the tab+spawn to
         // the UI; remove forwards to the UI so it detaches live tiles BEFORE git
-        // tears the dir down (no orphaned processes).
+        // tears the dir down (no orphaned processes). list (T-B) is the read-only
+        // socket twin of the `git_worktree_list` Tauri command, for a socket UI's
+        // worktree list/re-open/remove flows.
         "create_worktree" => create_worktree(ctx, args),
         "remove_worktree" => remove_worktree(ctx, args),
+        "list_worktrees" | "git_worktree_list" => list_worktrees(ctx, args),
         // Recent list × made durable: move a project's transcripts out of the
         // scanned catalog into projects-archive (reversible). App-initiated from
         // the sidebar; filesystem-mutating like the worktree ops above.
@@ -1973,14 +1976,23 @@ fn final_path_component(path: &str) -> String {
 }
 
 /// `remove_worktree` (WS-4): remove a git worktree WITHOUT orphaning processes.
-/// We do NOT run `git worktree remove` here, because any live tiles whose cwd is
-/// inside the worktree must be detached FIRST (their tmux session survives a
-/// detach; killing the dir out from under a running process would orphan it). So
-/// we forward a `remove_worktree_workspace` command to the frontend, which (in the
-/// workspace store) detaches every tile rooted in the worktree dir AND THEN calls
-/// `gitWorktreeRemove` — keeping the detach→remove ordering correct. If no apply
-/// sink is wired (headless), we have no UI to detach tiles, so we refuse rather
-/// than risk an orphan, telling the caller why. Args: `repoRoot`, `worktreePath`
+/// With a webview attached we do NOT run `git worktree remove` here, because any
+/// live tiles whose cwd is inside the worktree must be detached FIRST (their tmux
+/// session survives a detach; killing the dir out from under a running process
+/// would orphan it). So we forward a `remove_worktree_workspace` command to the
+/// frontend, which (in the workspace store) detaches every tile rooted in the
+/// worktree dir AND THEN calls `gitWorktreeRemove` — keeping the detach→remove
+/// ordering correct.
+///
+/// T-B (closing T12 deviation 2): with NO sink but socket event subscribers
+/// present (a native cockpit), the ordering moves SERVER-side: broadcast the
+/// same `remove_worktree_workspace` forward (the native apply module detaches
+/// every tile rooted in the dir — a layout-only mutation; the tmux sessions
+/// survive exactly as on the webview path), then run `git worktree remove` here.
+/// The broadcast is queued to each subscriber's socket before git runs, and the
+/// detach never depends on the dir still existing, so the removal need not wait
+/// on the client. With neither sink nor subscribers (headless), keep refusing:
+/// nothing would even witness the removal. Args: `repoRoot`, `worktreePath`
 /// (required); `force` (optional).
 fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let repo_root = arg_str(args, "repoRoot")
@@ -2044,14 +2056,61 @@ fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
                          fail (e.g. a dirty tree without force).",
             }))
         }
-        // No UI to detach tiles ⇒ refuse rather than orphan a process.
-        None => Err(
-            "remove_worktree: no UI is connected to detach the worktree's live \
-             tiles first; refusing to remove it to avoid orphaning a running \
-             process (the app must be running for worktree removal)"
-                .to_string(),
-        ),
+        None => {
+            // No UI at all ⇒ refuse rather than orphan a process unwitnessed.
+            if ctx.fanout.subscriber_count() == 0 {
+                return Err(
+                    "remove_worktree: no UI is connected to detach the worktree's live \
+                     tiles first; refusing to remove it to avoid orphaning a running \
+                     process (the app must be running for worktree removal)"
+                        .to_string(),
+                );
+            }
+            // T-B native path: detach broadcast FIRST (queued to every
+            // subscriber's socket), then the git removal server-side. A git
+            // failure (e.g. dirty tree without force) surfaces verbatim — the
+            // detach has still been requested, exactly like the webview path
+            // where gitWorktreeRemove rejects after the tiles detached.
+            let applied = broadcast_apply(ctx, "remove_worktree_workspace", &forward) > 0;
+            git::worktree_remove(&repo_root, &worktree_path, force)?;
+            Ok(json!({
+                "accepted": "remove_worktree",
+                "worktreePath": worktree_path,
+                "force": force,
+                "audited": true,
+                "applied": applied,
+                "removed": true,
+                "note": "no webview is attached; the detach forward was broadcast to \
+                         socket UI subscribers (the native cockpit detaches its tiles \
+                         rooted in the worktree) and the server then ran `git worktree \
+                         remove` itself. The removal IS confirmed: the worktree is gone.",
+            }))
+        }
     }
+}
+
+/// `list_worktrees` (T-B, read-only): the worktrees of the repo containing `cwd`
+/// — the socket twin of the `git_worktree_list` Tauri command, sharing its
+/// implementation (`git::worktree_list`), so a socket UI can build the worktree
+/// list/re-open/remove flow the webview drives via IPC. Best-effort like the
+/// IPC twin: a non-repo yields an empty list. Args: `cwd` (or `path`/`repoRoot`).
+/// Remote peers are allowlist-gated exactly like `git_info` (the probe leaks
+/// repo topology for an arbitrary host path).
+fn list_worktrees(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let cwd = arg_str(args, "cwd")
+        .or_else(|| arg_str(args, "path"))
+        .or_else(|| arg_str(args, "repoRoot"))
+        .or_else(|| arg_str(args, "repo_root"))
+        .ok_or("list_worktrees requires a 'cwd' argument")?;
+    let cwd = if ctx.peer_is_loopback {
+        cwd
+    } else {
+        files::scoped_create_path(&cwd, true, files::remote_file_roots())?
+            .to_string_lossy()
+            .into_owned()
+    };
+    let list = git::worktree_list(&cwd)?;
+    Ok(json!({ "worktrees": list }))
 }
 
 /// Organization-tier actions whose effect is a pure UI mutation
@@ -2163,11 +2222,23 @@ fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// UI-adopted tile tracked like any other. If no apply sink is wired (headless), we
 /// refuse rather than spawn a session nothing will adopt. Its MCP description still
 /// carries the CONFIRMATION REQUIRED contract (the user-facing gate). Args: `cwd`
-/// (optional), `name` (optional tile title), `shell` (optional preset).
+/// (optional), `name` (optional tile title), `shell` (optional preset),
+/// `startupCommand` (optional; T-B).
+///
+/// `startupCommand` is the socket twin of the webview "+" presets' field: the
+/// command runs inside an interactive login shell the pane execs back into
+/// (`commands::pane_command`, the same wrap the Tauri spawn uses), which is what
+/// the native client's resume flow rides (`claude --resume <id>`). SECURITY: it
+/// is process-changing surface and deliberately stays INSIDE this command's
+/// existing confirmation-gate tier — same audit, same remote-peer cwd allowlist,
+/// no new ungated path (a caller with this tier could already run commands via
+/// the equally-gated `send_text`).
 fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let cwd = arg_str(args, "cwd");
     let name = arg_str(args, "name");
     let shell = arg_str(args, "shell");
+    let startup_command =
+        arg_str(args, "startupCommand").or_else(|| arg_str(args, "startup_command"));
 
     // #27: a REMOTE peer may spawn ONLY with a cwd under the operator allowlist —
     // the spawn execs a shell SERVER-SIDE at a peer-controlled dir. Loopback (the
@@ -2182,7 +2253,8 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         other => other,
     };
 
-    let forward = json!({ "cwd": cwd, "name": name, "shell": shell });
+    let forward =
+        json!({ "cwd": cwd, "name": name, "shell": shell, "startupCommand": startup_command });
     match &ctx.apply_sink {
         Some(sink) => {
             sink.apply("spawn_terminal", &forward)
@@ -2195,6 +2267,7 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
                 "cwd": cwd,
                 "name": name,
                 "shell": shell,
+                "startupCommand": startup_command,
                 "audited": true,
                 // Only *forwarded*: the real spawn runs in the frontend (the normal
                 // spawnTerminal IPC) and its new tile id isn't known synchronously
@@ -2221,13 +2294,24 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
                         .to_string(),
                 );
             }
-            // Mirror `commands::resolve_cwd`'s unix arm ($HOME fallback); a
-            // `shell` preset is the pane's program verbatim (`resolve_pane_command`).
+            // Mirror `commands::resolve_cwd`'s unix arm ($HOME fallback); the pane
+            // program resolves through the SAME precedence as the Tauri spawn
+            // (`commands::pane_command`): a `shell` preset verbatim, else the
+            // `startupCommand` inside the interactive-login wrap, else the plain
+            // login shell.
             let cwd_effective = cwd
                 .clone()
                 .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
-            let (id, tmux_session) = spawn_tmux_terminal(&cwd_effective, shell.as_deref())?;
-            let forward = json!({ "cwd": cwd, "name": name, "shell": shell, "id": id });
+            let pane =
+                crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
+            let (id, tmux_session) = spawn_tmux_terminal(&cwd_effective, pane.as_deref())?;
+            let forward = json!({
+                "cwd": cwd,
+                "name": name,
+                "shell": shell,
+                "startupCommand": startup_command,
+                "id": id,
+            });
             let applied = broadcast_apply(ctx, "spawn_terminal", &forward) > 0;
             Ok(json!({
                 "accepted": "spawn_terminal",
@@ -2236,6 +2320,7 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
                 "cwd": cwd,
                 "name": name,
                 "shell": shell,
+                "startupCommand": startup_command,
                 "audited": true,
                 "applied": applied,
                 "requested": true,
@@ -2706,6 +2791,39 @@ mod tests {
     }
 
     #[test]
+    fn spawn_terminal_forwards_the_startup_command() {
+        // T-B: the socket spawn carries the webview presets' `startupCommand`
+        // (the native resume flow's `claude --resume <id>`); the sink forward
+        // must pass it through verbatim so the webview's spawnTerminal IPC runs
+        // it inside the interactive-login wrap.
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let v = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "startupCommand": "claude --resume 'abc'"}),
+        )
+        .unwrap();
+        assert_eq!(v["accepted"], "spawn_terminal");
+        assert_eq!(v["startupCommand"], "claude --resume 'abc'");
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "spawn_terminal");
+        assert_eq!(calls[0].1["startupCommand"], "claude --resume 'abc'");
+        // The snake_case alias parses too (loose-args convention).
+        drop(calls);
+        dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"startup_command": "claude"}),
+        )
+        .unwrap();
+        assert_eq!(sink.calls.lock().unwrap()[1].1["startupCommand"], "claude");
+    }
+
+    #[test]
     fn wait_for_status_immediate_match_does_not_time_out() {
         // An empty Supervisor reports `unknown` for any unseen session, so a
         // target of "unknown" matches on the first poll and returns at once.
@@ -2896,6 +3014,103 @@ mod tests {
         assert!(err.contains("worktreePath"), "got: {err}");
     }
 
+    /// Scaffold a REAL throwaway git repo (initial commit) with one linked
+    /// worktree, under the OS temp dir. Returns `(base, repo, worktree)`; the
+    /// caller removes `base` when done (best-effort — a unique name per call
+    /// keeps reruns clean either way).
+    fn scratch_repo_with_worktree() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)
+    {
+        fn sh_git(cwd: &std::path::Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .expect("git spawns");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let base = std::env::temp_dir().join(format!(
+            "t-hub-tb-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        sh_git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "hi").expect("seed file");
+        sh_git(&repo, &["add", "."]);
+        sh_git(
+            &repo,
+            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        );
+        let wt = base.join("wt");
+        sh_git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        assert!(wt.exists(), "worktree dir created");
+        (base, repo, wt)
+    }
+
+    #[test]
+    fn remove_worktree_sinkless_with_subscribers_broadcasts_then_removes() {
+        // T-B (closing T12 deviation 2): with no sink but a socket subscriber,
+        // the server broadcasts the detach forward and then runs the git
+        // removal ITSELF — the native-only path stops refusing.
+        let (base, repo, wt) = scratch_repo_with_worktree();
+
+        let fanout = Arc::new(EventFanout::new());
+        let ctx = test_ctx("t").with_event_fanout(fanout.clone());
+        let mut reader = subscribe_test_reader(&fanout);
+        let v = dispatch(
+            &ctx,
+            "remove_worktree",
+            &json!({"repoRoot": repo.to_str().unwrap(), "worktreePath": wt.to_str().unwrap()}),
+        )
+        .unwrap();
+        assert_eq!(v["accepted"], "remove_worktree");
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["removed"], true, "this path CONFIRMS the removal: {v:?}");
+
+        // The detach forward was queued to the subscriber before git ran.
+        let frame = read_event_frame(&mut reader);
+        assert_eq!(frame["event"], APPLY_EVENT_CHANNEL);
+        assert_eq!(frame["payload"]["command"], "remove_worktree_workspace");
+        assert_eq!(
+            frame["payload"]["args"]["worktreePath"],
+            json!(wt.to_str().unwrap())
+        );
+
+        assert!(!wt.exists(), "the worktree dir must be gone");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn list_worktrees_lists_main_then_linked() {
+        let (base, repo, wt) = scratch_repo_with_worktree();
+        let ctx = test_ctx("t");
+        let v = dispatch(&ctx, "list_worktrees", &json!({"cwd": repo.to_str().unwrap()})).unwrap();
+        let list = v["worktrees"].as_array().expect("worktrees array");
+        assert_eq!(list.len(), 2, "main + linked: {list:?}");
+        assert_eq!(list[0]["isLinked"], false);
+        assert_eq!(list[1]["isLinked"], true);
+        assert_eq!(list[1]["path"], json!(wt.to_str().unwrap()));
+        // The IPC-twin alias resolves to the same handler.
+        let v2 =
+            dispatch(&ctx, "git_worktree_list", &json!({"cwd": repo.to_str().unwrap()})).unwrap();
+        assert_eq!(v2["worktrees"], v["worktrees"]);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn list_worktrees_requires_cwd_and_is_empty_outside_a_repo() {
+        let ctx = test_ctx("t");
+        let err = dispatch(&ctx, "list_worktrees", &json!({})).unwrap_err();
+        assert!(err.contains("cwd"), "got: {err}");
+        // Best-effort like the IPC twin: a non-repo dir yields an empty list.
+        let v = dispatch(&ctx, "list_worktrees", &json!({"cwd": "/"})).unwrap();
+        assert_eq!(v["worktrees"], json!([]));
+    }
+
     #[test]
     fn remote_worktree_ops_are_gated_to_the_allowlist() {
         // A REMOTE peer (peer_is_loopback=false) with no T_HUB_REMOTE_FILE_ROOTS is
@@ -2905,7 +3120,7 @@ mod tests {
         // local path.)
         let mut ctx = test_ctx("t");
         ctx.peer_is_loopback = false;
-        for cmd in ["create_worktree", "remove_worktree"] {
+        for cmd in ["create_worktree", "remove_worktree", "list_worktrees"] {
             let err = dispatch(
                 &ctx,
                 cmd,
@@ -3046,16 +3261,21 @@ mod tests {
     /// Needs a real tmux on PATH (WSL2 dev shell; not the Windows CI target).
     #[test]
     fn live_send_read_close_roundtrip() {
-        let id = format!(
-            "mcp3test{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        let target = format!("th_{id}");
+        // The id must honor the production invariant "the id IS the tmux session
+        // suffix, capped at 8 chars" (`tmux::target_for_id`) — the previous long
+        // `mcp3test<nanos>` id created `th_mcp3test<nanos>` but dispatched
+        // against `th_mcp3test`, so send_text hit a session that never existed.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let id = format!("{:08x}", (nanos as u64) & 0xffff_ffff);
+        let target = tmux::target_for_id(&id);
         let _ = tmux::kill_session(&target);
         tmux::new_session(&target, "/tmp", None).expect("spawn session");
+        // Deterministic geometry regardless of what the server's latest client
+        // reports (the wedged-2x24 gotcha; see tmux::resize_window_for_tests).
+        tmux::resize_window_for_tests(&target, 80, 24).expect("resize session");
 
         let ctx = test_ctx("t");
         dispatch(
