@@ -58,11 +58,14 @@ use gpui::{
 };
 use parking_lot::Mutex;
 
+use crate::chrome::actions::{dispatch_host, Effect, Region};
 use crate::chrome::cues::{age_label, format_age, LifeTracker, TileLife, TilePulse};
+use crate::chrome::keymap::{Handled, KeyController};
 use crate::chrome::model::{
     apply_divider_split, divider_extent, divider_zones, sidebar_layout, split_rows,
     tile_boxes_ratio, ChromeModel, DividerId, GridRatios, RectF, SIDEBAR_ROW_H,
 };
+use crate::chrome::palette_view;
 use crate::chrome::persist::{self, Layout};
 use crate::chrome::windows::{SatBounds, WindowRegistry};
 use crate::font::FontSpec;
@@ -216,6 +219,10 @@ pub struct CockpitState {
     /// Per-window painted-cell counts (cols x rows summed over painted tiles),
     /// for the T10 windows-x-cells memory watch.
     pub(crate) visible_cells: HashMap<WinKey, u64>,
+    /// The T-A keymap stack: bindings + armed prefix + palette + focus region.
+    /// Main-window only (the webview keymap lived in its one window; satellite
+    /// keys stay raw terminal input).
+    pub(crate) keys: KeyController,
     ui: Option<UiMetrics>,
     ui_font: Font,
     ui_font_bold: Font,
@@ -242,6 +249,7 @@ impl CockpitState {
             tilezones: HashMap::new(),
             input: HashMap::new(),
             visible_cells: HashMap::new(),
+            keys: KeyController::load_default(),
             ui: None,
             ui_font,
             ui_font_bold,
@@ -1299,6 +1307,10 @@ impl CockpitView {
     ) {
         let x: f32 = ev.position.x.into();
         let y: f32 = ev.position.y.into();
+        // Any click dismisses the palette (the webview's backdrop-click close;
+        // the native palette takes no mouse input) and, in the tile area,
+        // returns the keyboard focus region to the tiles.
+        self.state.lock().keys.palette.close();
         let target = sidebar_hit(&self.state.lock().hits, x, y);
         match target {
             Some(SidebarTarget::WorkspaceClose(i)) if button == MouseButton::Left => {
@@ -1360,6 +1372,7 @@ impl CockpitView {
             _ => {
                 let mut st = self.state.lock();
                 st.model.commit_rename();
+                st.keys.region = Region::Tiles;
                 tiles_mouse_down(&mut st, WinKey::Main, &self.feed, button, ev, cx);
             }
         }
@@ -1437,8 +1450,92 @@ impl CockpitView {
             return;
         }
 
-        tiles_key(&mut st, WinKey::Main, ks, cx);
+        // The T-A keymap sees every keystroke BEFORE the tile core (the
+        // webview's capture-phase handler): prefix chords, direct chords, and
+        // the open palette consume; everything else falls through unchanged.
+        // The focused tile's find bar is the editable-target guard.
+        let guard = win_focused(&st, WinKey::Main)
+            .and_then(|id| st.tiles.get(&id))
+            .is_some_and(|t| t.search_open());
+        let now = st.epoch.elapsed().as_millis() as u64;
+        let handled = {
+            let CockpitState { keys, model, .. } = &mut *st;
+            keys.on_key(&chord_of(ks), model, guard, now)
+        };
+        match handled {
+            Handled::Pass => tiles_key(&mut st, WinKey::Main, ks, cx),
+            Handled::Consumed(effects) => self.apply_effects(&mut st, effects, cx),
+        }
         cx.notify();
+    }
+
+    /// Run the view-side follow-ups of a keymap command (the gpui-free
+    /// executor already mutated the model): persistence, focus-notify bytes,
+    /// pool drops, satellite raising, font re-specs, PTY literals, and the
+    /// T-B host seam. Mirrors what the equivalent mouse paths do.
+    fn apply_effects(
+        &self,
+        st: &mut CockpitState,
+        effects: Vec<Effect>,
+        cx: &mut Context<Self>,
+    ) {
+        for effect in effects {
+            match effect {
+                Effect::PersistLayout => {
+                    st.save_layout();
+                    sync_active_sessions(st, &self.feed);
+                }
+                Effect::FocusChanged { old, new } => {
+                    // Model focus is already set; tell terminals that track
+                    // focus (mode 1004), like the click-to-focus path.
+                    if let Some(old) = old {
+                        if let Some(t) = st.tiles.get(&old) {
+                            notify_focus(t, false);
+                        }
+                    }
+                    if let Some(t) = st.tiles.get(&new) {
+                        notify_focus(t, true);
+                    }
+                }
+                Effect::TileClosed(id) => {
+                    // The tile-close `x` path: the model already dropped it.
+                    st.drop_tile(&id);
+                    st.save_layout();
+                    sync_active_sessions(st, &self.feed);
+                }
+                Effect::RaiseSatellite(wsid) => {
+                    if let Some(h) = self.handles.borrow().get(&wsid) {
+                        h.update(cx, |_, window, _| window.activate_window()).ok();
+                    }
+                }
+                Effect::FontChanged { tab } => {
+                    let Some(t) = st.model.tabs.get(tab) else { continue };
+                    let Some(spec) = t.font.clone() else { continue };
+                    for id in t.tiles.clone() {
+                        if let Some(tile) = st.tiles.get_mut(&id) {
+                            tile.set_font_size(spec.size);
+                        }
+                    }
+                }
+                Effect::Literal(bytes) => {
+                    // Prefix double-tap: type the leader's control byte, with
+                    // typed-input semantics (snap to bottom, drop selection).
+                    if let Some(id) = win_focused(st, WinKey::Main) {
+                        if let Some(tile) = st.tiles.get(&id) {
+                            tile.write(&bytes);
+                            let mut term = tile.term.lock();
+                            term.scroll_to_bottom();
+                            term.clear_selection();
+                        }
+                    }
+                }
+                Effect::Host(cmd) => {
+                    let cwd = win_focused(st, WinKey::Main)
+                        .and_then(|id| st.cwds.get(&id).cloned());
+                    dispatch_host(&cmd, cwd.as_deref());
+                }
+            }
+        }
     }
 
     fn on_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1461,6 +1558,14 @@ impl Render for CockpitView {
         let ws_h = workspace_section_height(self.state.lock().model.tabs.len());
         let statuses = gather_statuses(&self.feed);
         let focused_window = self.focus.is_focused(window);
+
+        // The T-A keymap overlay (palette / prefix HUD / region pill), built
+        // from the controller's state this frame; `None` almost always.
+        let key_overlay = {
+            let mut st = self.state.lock();
+            let now = st.epoch.elapsed().as_millis() as u64;
+            palette_view::key_overlay(&mut st.keys, now)
+        };
 
         let ws_state = self.state.clone();
         let grid_state = self.state.clone();
@@ -1539,6 +1644,7 @@ impl Render for CockpitView {
                     .size_full(),
                 ),
             )
+            .children(key_overlay)
     }
 }
 
