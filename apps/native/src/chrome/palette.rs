@@ -10,9 +10,9 @@
 //! down while it is open).
 //!
 //! Deviation from the webview (documented in the T-A results entry): the
-//! native palette is keyboard-only in this slice - rebind starts with `F2` on
-//! the highlighted row instead of a per-row mouse button, and rows are chosen
-//! with arrows + enter. The rebind flow itself is webview-exact: the next
+//! native palette is keyboard-only in this slice - rebind starts with `F2` (or
+//! `Ctrl+R`) on the highlighted row instead of a per-row mouse button, and
+//! rows are chosen with arrows + enter. The rebind flow itself is webview-exact: the next
 //! chord binds (conflicts strip from the old owner, persisted immediately),
 //! `Esc` cancels, lone modifiers don't bind.
 
@@ -128,6 +128,13 @@ impl PaletteState {
             keymap.set_direct(cmd, Some(chord));
             self.rebind = None;
             return PaletteOutcome::BindingsChanged;
+        }
+
+        // Ctrl+R = rebind, the F2 alias: WSLg/RAIL swallows F-keys, and inside
+        // the open palette Ctrl+R is free (the palette owns the keyboard).
+        if kc.control && !kc.alt && kc.key == "r" {
+            self.rebind = self.results.get(self.selected).copied();
+            return PaletteOutcome::Consumed;
         }
 
         match kc.key.as_str() {
@@ -319,6 +326,19 @@ mod tests {
         );
         assert_eq!(k.direct_of(CommandId::SpawnTerminal), None);
         assert!(p.open, "rebinding keeps the palette open");
+    }
+
+    #[test]
+    fn ctrl_r_also_starts_rebind() {
+        let (mut p, mut k) = open_palette();
+        let mut ctrl_r = named("r");
+        ctrl_r.control = true;
+        assert_eq!(p.handle_key(&ctrl_r, &mut k), PaletteOutcome::Consumed);
+        assert_eq!(p.rebind, Some(p.results[0]));
+        // Plain `r` still types into the query.
+        p.rebind = None;
+        p.handle_key(&kc("r"), &mut k);
+        assert_eq!(p.query, "r");
     }
 
     #[test]

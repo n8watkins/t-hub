@@ -175,7 +175,7 @@ fn palette_modal(keys: &KeyController) -> Div {
         .border_color(rgb8(BORDER))
         .text_size(px(10.))
         .text_color(rgb8(FAINT))
-        .child(t("Up/Down navigate · Enter run · F2 rebind · Esc close"));
+        .child(t("Up/Down navigate · Enter run · F2/Ctrl+R rebind · Esc close"));
     if total > VISIBLE_ROWS {
         footer = footer.child(t(format!("{} of {total}", p.selected + 1)));
     }
