@@ -251,6 +251,27 @@ impl Tile {
         self.pty.as_ref().is_some_and(|p| p.link_down())
     }
 
+    /// Whether the find bar owns the keyboard (the T-A keymap's editable-target
+    /// guard: chrome chords stand down while the user types a search query).
+    pub(crate) fn search_open(&self) -> bool {
+        self.search.open
+    }
+
+    /// Re-spec the font size in place (T-A zoom hotkeys). Fonts rebuild and the
+    /// metrics + row cache drop, so the next [`sync_and_paint_content`] re-probes
+    /// and reflows the PTY through the normal geometry path.
+    pub(crate) fn set_font_size(&mut self, size: f32) {
+        if (self.spec.size - size).abs() < 0.01 {
+            return;
+        }
+        self.spec.size = size;
+        let (normal, bold) = tile_fonts(&self.spec);
+        self.font_normal = normal;
+        self.font_bold = bold;
+        self.metrics = None;
+        self.built.clear();
+    }
+
     /// Drop the PTY attach but keep the tile (grid content stays painted).
     /// The T24 dead-tile path: a session known-gone from `list_terminals` must
     /// stop its reader's futile reconnect churn, while the tile lingers on

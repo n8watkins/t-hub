@@ -32,10 +32,15 @@
 //! `TermSession`s (damage accumulates), so a tab switch is instant - no
 //! attach/detach churn, no scrollback re-seed.
 
+pub mod actions;
 pub mod cues;
+pub mod keymap;
 pub mod model;
+pub mod palette;
 pub mod persist;
 pub mod windows;
 
+#[cfg(feature = "gui")]
+pub mod palette_view;
 #[cfg(feature = "gui")]
 pub mod view;
