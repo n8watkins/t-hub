@@ -235,6 +235,66 @@ pub fn load(path: &std::path::Path) -> Result<Option<Layout>> {
     Ok(Some(layout))
 }
 
+/// Single-instance guard (T-B): an exclusive OS file lock beside the layout
+/// file. Two cockpits on one layout would fight over the JSON (last writer
+/// wins) AND over the server's tab-registry reporter (`report_workspace_tabs`
+/// is last-writer-wins by design, §0 of the parity doc) — so the second
+/// instance must refuse to start instead. Advisory `flock`/`LockFileEx`
+/// semantics (std `File::try_lock`): the lock dies with the process, so a
+/// crash never leaves a stale guard the way a pid file would. Keep the
+/// returned guard alive for the process lifetime; dropping it releases the
+/// lock. Distinct `THN_LAYOUT` paths (e.g. acceptance harnesses on a scratch
+/// layout) lock distinct files and coexist, exactly as intended.
+#[derive(Debug)]
+pub struct InstanceLock {
+    file: std::fs::File,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Best-effort: the OS releases the lock on close anyway.
+        let _ = self.file.unlock();
+    }
+}
+
+/// Path of the lock file guarding `layout_path`: `<layout>.lock`.
+pub fn instance_lock_path(layout_path: &std::path::Path) -> PathBuf {
+    let mut os = layout_path.as_os_str().to_owned();
+    os.push(".lock");
+    PathBuf::from(os)
+}
+
+/// Try to become the single instance for `layout_path`. `Err` carries a
+/// user-facing explanation when another instance already holds the lock (or
+/// the lock file cannot be created).
+pub fn acquire_instance_lock(layout_path: &std::path::Path) -> Result<InstanceLock> {
+    use anyhow::bail;
+    let lock_path = instance_lock_path(layout_path);
+    if let Some(dir) = lock_path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create lock dir {}", dir.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open instance lock {}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(InstanceLock { file }),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "another t-hub-native instance is already running against {} \
+             (two instances would fight over the layout file and the server's \
+             tab registry). Use it, or point THN_LAYOUT at a different file \
+             for a second, isolated cockpit.",
+            layout_path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("lock {}", lock_path.display()))
+        }
+    }
+}
+
 /// Save atomically: write `<path>.tmp`, then rename over the target, so a crash
 /// mid-write never leaves a torn layout.
 pub fn save(path: &std::path::Path, layout: &Layout) -> Result<()> {
@@ -253,6 +313,34 @@ pub fn save(path: &std::path::Path, layout: &Layout) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_lock_excludes_a_second_holder_and_releases_on_drop() {
+        let dir = std::env::temp_dir().join(format!("thn-lock-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout = dir.join("native-layout.json");
+
+        // First acquire wins (and creates the dir + lock file).
+        let first = acquire_instance_lock(&layout).expect("first instance locks");
+        assert!(instance_lock_path(&layout).exists());
+
+        // A second holder is refused with the user-facing message.
+        let err = acquire_instance_lock(&layout).unwrap_err().to_string();
+        assert!(err.contains("already running"), "got: {err}");
+
+        // Dropping the guard releases the lock; the next instance may start.
+        drop(first);
+        let again = acquire_instance_lock(&layout).expect("lock is free after drop");
+        drop(again);
+
+        // A DIFFERENT layout path is a different lock: two isolated cockpits
+        // (scratch THN_LAYOUT harnesses) coexist.
+        let _a = acquire_instance_lock(&layout).unwrap();
+        let other = dir.join("scratch-layout.json");
+        let _b = acquire_instance_lock(&other).expect("distinct layouts coexist");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn round_trips_through_disk_and_model() {

@@ -47,6 +47,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 
 use gpui::prelude::*;
@@ -329,6 +330,9 @@ struct HitZones {
     ws_closes: Vec<RectF>,
     ws_tears: Vec<RectF>,
     plus: RectF,
+    /// Right half of the plus row (T-B): spawn a terminal in the active
+    /// workspace via the socket `spawn_terminal` — the webview "+" parity.
+    plus_term: RectF,
 }
 
 /// What a main-window sidebar click landed on, resolved BEFORE mutating the
@@ -340,6 +344,7 @@ enum SidebarTarget {
     WorkspaceTear(usize),
     Workspace(usize),
     Plus,
+    PlusTerminal,
 }
 
 fn sidebar_hit(hits: &HitZones, x: f32, y: f32) -> Option<SidebarTarget> {
@@ -357,6 +362,9 @@ fn sidebar_hit(hits: &HitZones, x: f32, y: f32) -> Option<SidebarTarget> {
         if r.contains(x, y) {
             return Some(SidebarTarget::Workspace(i));
         }
+    }
+    if hits.plus_term.contains(x, y) {
+        return Some(SidebarTarget::PlusTerminal);
     }
     if hits.plus.contains(x, y) {
         return Some(SidebarTarget::Plus);
@@ -446,7 +454,10 @@ pub struct CockpitView {
     feed: OverlayFeed,
     focus: FocusHandle,
     handles: SatHandles,
-    _client: Arc<crate::wire::ControlClient>,
+    client: Arc<crate::wire::ControlClient>,
+    /// T-B "+ terminal" double-click gate (webview #7 parity): one spawn in
+    /// flight at a time, released when the request round-trips.
+    spawn_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CockpitView {
@@ -459,7 +470,41 @@ impl CockpitView {
         focus: FocusHandle,
     ) -> Self {
         spawn_logger();
-        CockpitView { state, overlays, feed, focus, handles, _client: client }
+        CockpitView {
+            state,
+            overlays,
+            feed,
+            focus,
+            handles,
+            client,
+            spawn_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// T-B: spawn a plain shell tile via the socket `spawn_terminal` (the same
+    /// request path MCP/resume use, so there is exactly one way a session gets
+    /// created). No cwd — the server roots the pane at $HOME, byte-for-byte the
+    /// webview "+" Shell preset. Placement rides the `control://apply`
+    /// broadcast (server-minted id -> `drain_applies` places + focuses in the
+    /// active workspace). The request runs off-thread: it can block for the
+    /// tmux spawn round-trip, and paint must not.
+    fn spawn_terminal_local(&self) {
+        use std::sync::atomic::Ordering;
+        if self.spawn_in_flight.swap(true, Ordering::SeqCst) {
+            return; // a spawn is already in flight (double-click guard)
+        }
+        let client = self.client.clone();
+        let gate = self.spawn_in_flight.clone();
+        thread::spawn(move || {
+            match client.request("spawn_terminal", serde_json::json!({})) {
+                Ok(v) => log::info!(
+                    "+ terminal: spawn accepted (id={})",
+                    v.get("id").and_then(|i| i.as_str()).unwrap_or("webview-minted")
+                ),
+                Err(e) => log::warn!("+ terminal: spawn_terminal failed: {e}"),
+            }
+            gate.store(false, Ordering::SeqCst);
+        });
     }
 }
 
@@ -651,10 +696,29 @@ fn paint_workspace_section(
             cx,
         );
     }
+    // The plus row splits in two (T-B): "+ workspace" (new tab, the original
+    // affordance) on the left, "+ terminal" (spawn a shell tile in the active
+    // workspace over the socket — the webview "+" parity) on the right.
+    let plus_ws = RectF::new(sb.plus.x, sb.plus.y, sb.plus.w / 2.0, sb.plus.h);
+    let plus_term = RectF::new(
+        sb.plus.x + sb.plus.w / 2.0,
+        sb.plus.y,
+        sb.plus.w / 2.0,
+        sb.plus.h,
+    );
     paint_parts(
-        &[("+ new workspace".to_string(), h(FG_DIM), false)],
-        sb.plus.x + 10.0,
-        sb.plus.y + row_dy,
+        &[("+ workspace".to_string(), h(FG_DIM), false)],
+        plus_ws.x + 10.0,
+        plus_ws.y + row_dy,
+        &font_normal,
+        &font_bold,
+        window,
+        cx,
+    );
+    paint_parts(
+        &[("+ terminal".to_string(), h(FG_DIM), false)],
+        plus_term.x + 10.0,
+        plus_term.y + row_dy,
         &font_normal,
         &font_bold,
         window,
@@ -670,7 +734,8 @@ fn paint_workspace_section(
     st.hits.ws_rows = sb.rows;
     st.hits.ws_closes = sb.closes;
     st.hits.ws_tears = sb.tears;
-    st.hits.plus = sb.plus;
+    st.hits.plus = plus_ws;
+    st.hits.plus_term = plus_term;
 }
 
 // ---------------------------------------------------------------------------
@@ -1356,6 +1421,9 @@ impl CockpitView {
                 st.model.add_tab();
                 st.save_layout();
                 sync_active_sessions(&st, &self.feed);
+            }
+            Some(SidebarTarget::PlusTerminal) if button == MouseButton::Left => {
+                self.spawn_terminal_local();
             }
             _ => {
                 let mut st = self.state.lock();
