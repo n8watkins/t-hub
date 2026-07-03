@@ -51,13 +51,13 @@ Consequences:
 | Fullscreen tile (⤢ + Esc) | `Canvas.tsx:432-452` | **missing** | M | chrome crews (in flight) |
 | Close tile = detach (session survives) | webview kills after confirm | **degraded** - native close always detaches, never kills (T8 deviation, safer but not parity) | M | chrome crews / T24 supervision |
 | Kill session with busy-confirm (Ctrl+Shift+W + dialog) | `useLifecycleKeybinds.tsx:27-78` | **missing** | M | chrome crews / T24 supervision |
-| Spawn terminal locally (+ button, presets, Ctrl+T) | `Canvas.tsx:225-253`, `commands.rs:232-290` | **missing** - NO local spawn affordance; sessions arrive only via reconcile/MCP. The socket `spawn_terminal` already spawns server-side (T12), so this is UI + one request | M | **cutover blocker, no task** (§4 T-B) |
+| Spawn terminal locally (+ button, presets, Ctrl+T) | `Canvas.tsx:225-253`, `commands.rs:232-290` | **degraded** - closed in T-B: the sidebar plus row split into "+ workspace" / "+ terminal"; the latter spawns a shell tile via the socket `spawn_terminal` (server-minted id -> apply placement). Presets (Claude/Custom) and Ctrl+T ride T-A's palette/keymap | S (with T-A) | T-B (button); T-A (presets/chord) |
 | Multi-window satellites (tear-off/close-back, bounds persist) | `windows.ts` popOutTab | **present** (T10) | - | done |
 | Session restore (layout, tabs, active, satellites, per-workspace font) | `workspace.ts:668-716` + SQLite snapshots | **present** (T8/T10, `~/.t-hub/native-layout.json`) | - | done |
 | Focused-tile restore across restart | `workspace.ts` focusedId | **missing** (minor; deliberate T8 choice) | S | chrome crews if wanted |
 | Layout snapshot history (last-20 ring for recovery) | `db.rs` SNAPSHOT_HISTORY_CAP | **missing** - single JSON file, atomic write | S-M | none (nice-to-have) |
 | Sidebar collapse modes (full/rail/hidden) | `App.tsx` sidebar mode | **missing** | M | chrome crews (in flight) |
-| Single-instance guard | Tauri default | **missing** - two native instances fight over layout file + registry reporter | S-M | none (§4 T-B) |
+| Single-instance guard | Tauri default | **present** - closed in T-B: exclusive OS file lock beside the layout (`persist::acquire_instance_lock`); a second instance on the same `THN_LAYOUT` exits with a clear message, distinct layouts coexist | - | done (T-B) |
 
 ### 1.3 Keymap, palette, actions
 
@@ -77,14 +77,14 @@ Consequences:
 |---|---|---|---|---|
 | Recents list (dedup, open-project filter, worktree hints) | sidebar Recent rows | **present** (T9) | - | done |
 | Recents hide/archive | localStorage set + `archive_recent_project` | **present** (durable archive; in-memory hide resets on restart - acceptable) | - | done |
-| Resume flow (click -> `claude --resume <id>` in new tile) | `workspace.ts:1085-1120` recall | **degraded** - click emits `HostRequest::ResumeSession`, `app.rs:461` only LOGS it. Needs the socket `spawn_terminal` to carry a startup command (server change: wrap like `commands.rs:226` does) plus the app.rs arm | M | **cutover blocker, no task** (§4 T-B) |
+| Resume flow (click -> `claude --resume <id>` in new tile) | `workspace.ts:1085-1120` recall | **present** - closed in T-B end to end: the socket `spawn_terminal` carries `startupCommand` (both server paths: sink forward -> webview IPC pass-through, sink-less -> `commands::pane_command` login-shell wrap + minted-id broadcast), and the `app.rs` host-request worker sends `claude --resume '<id>'` at the recorded cwd; placement rides the apply broadcast | - | done (T-B; live-proven) |
 | `resumeStartsClaude` toggle (resume vs plain shell) | `settings.ts` | **missing** (settings task) | S after T-B | §4 T-C |
 | Claude/Codex usage meters + cost | sidebar usage | **present** (T9, statusline-first cadences) | - | done |
 | Host/WSL metrics | sidebar metrics | **present** (T9) | - | done |
 | Supervision tree | sidebar supervision | **present** (T9; fleet view deviation documented) | - | done |
 | Toast cards (dedup, warmup, tab-aware suppression, TTL) | `notify.ts` mapping | **present** (T9) | - | done |
-| Sound chimes (WebAudio synth: attention/done/error) | `notify.ts:30-113` | **missing** - needs an audio-out dep (e.g. `rodio`) + the 3 tone recipes | M | no task (§4 T-B) |
-| OS notifications | `notify.ts:115-162` (Tauri plugin) | **missing** - `notify-rust`/`winrt-notification` or Shell toast | M | no task (§4 T-B) |
+| Sound chimes (WebAudio synth: attention/done/error) | `notify.ts:30-113` | **present** - closed in T-B, zero new deps: pure sample synth of the exact notify.ts recipes (`overlays/alerts.rs`) + WAV playback via `paplay`/`pw-play`/`aplay` (unix; WSLg Pulse proven audible) / winmm `PlaySoundW` (Windows). Fires per fresh toast (inherits dedup/warmup/active-tab suppression); `THN_SOUND=0` mutes until the T-C settings hub | - | done (T-B) |
+| OS notifications | `notify.ts:115-162` (Tauri plugin) | **present** - closed in T-B, zero new deps: `notify-send` (unix; silent where no daemon exists, e.g. WSLg - toast cards remain the cue) / PowerShell WinRT toast under the PowerShell AppID (Windows, the Tauri plugin's own trick; needs a Windows-build spot-check). Same trigger + `THN_NOTIFY=0` gate | - | done (T-B) |
 | Rules engine (status-transition -> notify/sendText/spawn/restart/run) | `store/rules.ts` (WS-5b) | **missing** | L | no task (post-flip, §4 T-C) |
 | Auto-continue on usage-limit reset (`autoContinueText`) | settings + client injection | **missing** | M | no task (§4 T-C) |
 | Claude hooks install/uninstall panel | ThemeEditor HooksSection | **degraded** - no UI, but the SERVER reconciles managed hooks at boot regardless of client (`lib.rs` spawn_reconcile_managed_hooks) | S (post-flip) | §4 T-C |
@@ -105,9 +105,9 @@ Consequences:
 | Capability | Webview reference | Native status | Effort | Covered by |
 |---|---|---|---|---|
 | Worktree create via MCP/socket (`create_worktree` -> named tab + placed tile) | `controlBridge.ts` | **present** (T12, cwd-verified) | - | done |
-| Worktree create via LOCAL UX (prefix `w`: branch focused repo into sibling worktree) | `workspace.ts:1131-1172` | **missing** - no local affordance; needs keymap (T-A) + `git_worktree_add` equivalent over socket or server command | M | §4 T-A + T-B |
-| Worktree list/re-open/remove UX (prefix `l`) | worktrees list dialog | **missing** | M | §4 T-B |
-| `remove_worktree` native-only (no webview attached) | `workspace.ts:1174-1198` detach-then-remove | **degraded** - native detaches its tiles on the broadcast, but sink-less removal still REFUSES (T12 deviation 2: ordering belongs server-side) | M (server) | **no task** (§4 T-B) |
+| Worktree create via LOCAL UX (prefix `w`: branch focused repo into sibling worktree) | `workspace.ts:1131-1172` | **missing** (UI trigger only) - the server side is COMPLETE: socket `create_worktree` (T12) does git add + named tab + placed tile. The webview's trigger is itself a keymap chord (prefix `w`), so the native trigger rides T-A's keymap - one action calling `create_worktree` on the focused tile's repo | S (in T-A) | T-A (trigger); server done |
+| Worktree list/re-open/remove UX (prefix `l`) | worktrees list dialog | **missing** (UI dialog only) - the server side is now complete: T-B added `list_worktrees` (socket twin of `git_worktree_list`), joining `create_worktree`/`remove_worktree`. The webview trigger is a chord (prefix `l`); the native dialog rides T-A's palette | M (in T-A) | T-A (dialog); server done (T-B) |
+| `remove_worktree` native-only (no webview attached) | `workspace.ts:1174-1198` detach-then-remove | **present** - closed in T-B (T12 deviation 2): sink-less removal with socket subscribers broadcasts the detach forward FIRST, then runs `git worktree remove` server-side and CONFIRMS (`removed: true`); subscriber-less stays refused | - | done (T-B; live-proven) |
 | MCP organization continuity (move_tile, rename_tab, focus_*, new_tab, spawn_terminal, open_file) | `controlBridge.ts` switch | **present** (T12) | - | done |
 | Workspace-tab registry reporting (`report_workspace_tabs`) | Tauri report | **present** (T12; one-reporter rule at flip, §5) | - | done |
 
@@ -140,13 +140,15 @@ Consequences:
 
 | Status | Count |
 |---|---|
-| present | 28 |
-| degraded | 9 |
-| missing | 37 |
+| present | 33 |
+| degraded | 8 |
+| missing | 33 |
 | wontport | 3 |
 | **rows** | **77** |
 
-Of the 37 missing: 9 sit with the in-flight chrome crews (incl. the panels URL push that rides their mount), 6 fold into one keymap/palette task (T-A), 6 into the daily-drive flow-gaps task (T-B), 12 are post-flip polish (T-C, the settings/theming family), 3 are the distribution items (§3), and 1 is server-gated (M4 file write).
+> Updated by T-B (2026-07-03): resume flow, single-instance guard, chimes, OS notifications, and native-only `remove_worktree` moved to **present**; the local spawn affordance moved to **degraded** (button shipped; presets/Ctrl+T ride T-A). The two worktree UX rows stay missing but are now TRIGGER-only gaps (their server surface is complete, incl. the new `list_worktrees`).
+
+Of the 33 missing: 9 sit with the in-flight chrome crews (incl. the panels URL push that rides their mount), 6 fold into one keymap/palette task (T-A) plus the two worktree trigger rows that now ride it, 12 are post-flip polish (T-C, the settings/theming family), 3 are the distribution items (§3), and 1 is server-gated (M4 file write).
 
 ## 2. WSL-boundary checks (T14 brief item)
 
@@ -201,8 +203,9 @@ Estimated total for the Velopack path: 2-3 days of work plus signing enrollment 
 - **T-A - Keymap + action registry + command palette** (L).
   The single biggest daily-drive gap: port the 21-command registry, prefix keymap (Ctrl+B leader), direct chords, rebind persistence, and the palette.
   Blocked on the chrome crews' input-routing seam; should start immediately after they merge.
-- **T-B - Daily-drive flow gaps** (M each, ~2-3 days together).
-  Local spawn-terminal affordance; resume wiring end-to-end (server: `spawn_terminal` startup-command arg with the `commands.rs:226` login-shell wrap; client: the `app.rs` HostRequest arm); native-only `remove_worktree` ordering server-side; local worktree create/list UX; sound chimes + OS notifications; single-instance guard.
+- **T-B - Daily-drive flow gaps** - **LANDED 2026-07-03** (branch `tb-flows`; execution-doc §5 entry).
+  Shipped: resume wiring end-to-end (server `startupCommand` + `app.rs` arm), local "+ terminal" spawn affordance, native-only `remove_worktree` ordering server-side, `list_worktrees` socket command, sound chimes + OS notifications, single-instance guard.
+  Remaining from the original list: the worktree create/list TRIGGERS (keymap chords in the webview too) and the spawn presets/Ctrl+T - all ride T-A's keymap/palette on the now-complete server surface.
 - **T-C - Post-flip polish** (L).
   Settings UI + persistence hub, theming (tokens -> one struct -> JSON), work names, rules engine, auto-continue, drag-drop with `toWslPath`, hooks panel.
 - **Server attach-churn fix** (pre-flip, desktop crate).

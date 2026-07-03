@@ -161,7 +161,14 @@ pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), T
     // `-c CWD` only when we actually have a (WSL-side) directory; on Windows the
     // default is empty so the pane starts in wsl.exe's launch dir rather than an
     // invalid Windows path.
-    let mut args: Vec<&str> = vec!["new-session", "-d", "-s", name];
+    //
+    // `-x 80 -y 24`: DETERMINISTIC spawn geometry. Without it, tmux ≥3.4 sizes a
+    // detached session from the server's latest client — and a wedged/dead attach
+    // client (the task-27 churn bug) can report 2x24, so every fresh session (and
+    // any `startupCommand` booting in it, e.g. `claude --resume`) started life in
+    // a 2-column pane until the first attach resized it. 80x24 is the classic
+    // fallback; the first real attach reflows to the tile's true geometry anyway.
+    let mut args: Vec<&str> = vec!["new-session", "-d", "-x", "80", "-y", "24", "-s", name];
     if !cwd.is_empty() {
         args.push("-c");
         args.push(cwd);
@@ -207,6 +214,22 @@ pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), T
     // stick. Root-table (`-n`) bindings are server-global, so this is idempotent.
     apply_global_keybinds();
     Ok(())
+}
+
+/// Test-only: pin a window to a deterministic geometry. `resize-window` flips
+/// the window to MANUAL sizing, which production must never do (the attach path
+/// relies on `window-size latest` tracking the visible client) — but the live
+/// round-trip tests attach no client at all, and on a server whose latest
+/// client is a wedged 2x24 attach (the task-27 churn artifact) a fresh session
+/// otherwise wraps every line at 2 columns and the capture assertions fail.
+#[cfg(test)]
+pub(crate) fn resize_window_for_tests(name: &str, cols: u16, rows: u16) -> Result<(), TmuxError> {
+    let (c, r) = (cols.to_string(), rows.to_string());
+    run(
+        "resize-window",
+        &["resize-window", "-t", name, "-x", &c, "-y", &r],
+    )
+    .map(|_| ())
 }
 
 /// Disable tmux's Ctrl+B prefix and its right-click context menus, server-global.
@@ -766,6 +789,9 @@ mod tests {
         let name = unique_name();
         let _ = kill_session(&name);
         new_session(&name, "/tmp", None).expect("new_session should succeed");
+        // Deterministic geometry regardless of what the server's latest client
+        // reports (see `resize_window_for_tests` — the wedged-2x24 gotcha).
+        resize_window_for_tests(&name, 80, 24).expect("resize should succeed");
 
         // Echo a sentinel so it lands in the visible pane, then submit it.
         send_text(&name, "echo T_HUB_MCP_SENTINEL_42", true).expect("send_text should succeed");

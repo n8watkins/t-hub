@@ -202,14 +202,17 @@ fn sh_single_quote(s: &str) -> String {
 ///   3. Otherwise `None` — tmux launches the user's plain login shell, exactly
 ///      today's "Shell" behavior (no regression).
 fn resolve_pane_command(opts: &SpawnOptions) -> Option<String> {
-    if let Some(shell) = opts.shell.as_deref().filter(|s| !s.trim().is_empty()) {
+    pane_command(opts.shell.as_deref(), opts.startup_command.as_deref())
+}
+
+/// The `resolve_pane_command` core over bare parts, shared with the control
+/// channel's `spawn_terminal` (T-B: the socket spawn carries the same optional
+/// `startupCommand`, so the native client's resume flow rides one wrap).
+pub(crate) fn pane_command(shell: Option<&str>, startup_command: Option<&str>) -> Option<String> {
+    if let Some(shell) = shell.filter(|s| !s.trim().is_empty()) {
         return Some(shell.to_string());
     }
-    let startup = opts
-        .startup_command
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
+    let startup = startup_command.map(str::trim).filter(|s| !s.is_empty())?;
     // Run the startup command in an INTERACTIVE LOGIN shell, then exec back into
     // an interactive login shell so the tile survives the command exiting.
     //
@@ -697,5 +700,39 @@ mod tests {
     fn reconcile_no_candidates_is_noop() {
         let stale = stale_session_ids(&[], &live(&["th_anything"]));
         assert!(stale.is_empty());
+    }
+
+    /// `pane_command` precedence: shell preset verbatim > startup command inside
+    /// the interactive-login wrap > None (plain login shell). Shared with the
+    /// control channel's `spawn_terminal` (T-B), so the wrap details are pinned
+    /// here: `-ilc` (interactive so ~/.zshrc PATH exports load — the "Resume
+    /// opens a plain terminal" bug), and the exec-back-into-a-login-shell tail.
+    #[test]
+    fn pane_command_precedence_and_wrap() {
+        // Nothing requested: plain login shell.
+        assert_eq!(pane_command(None, None), None);
+        assert_eq!(pane_command(Some("  "), Some("  ")), None);
+
+        // A shell preset REPLACES the pane program verbatim.
+        assert_eq!(pane_command(Some("bash"), None), Some("bash".to_string()));
+        // ...and beats a startup command when both are present (legacy precedence).
+        assert_eq!(
+            pane_command(Some("bash"), Some("claude")),
+            Some("bash".to_string())
+        );
+
+        // A startup command rides inside the interactive login shell wrap.
+        let cmd = pane_command(None, Some("claude --resume 'abc-123'")).unwrap();
+        assert!(cmd.starts_with("exec \"${SHELL:-/bin/sh}\" -ilc "), "got: {cmd}");
+        assert!(cmd.contains("claude --resume '\\''abc-123'\\''"), "got: {cmd}");
+        assert!(cmd.contains("exec \"${SHELL:-/bin/sh}\" -l"), "got: {cmd}");
+    }
+
+    /// The wrap single-quotes the startup command, so embedded quotes survive
+    /// the `sh -c` round trip via the `'\''` idiom.
+    #[test]
+    fn pane_command_quotes_embedded_quotes() {
+        let cmd = pane_command(None, Some("echo 'hi there'")).unwrap();
+        assert!(cmd.contains("echo '\\''hi there'\\''"), "got: {cmd}");
     }
 }
