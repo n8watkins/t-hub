@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use super::model::{ChromeModel, Workspace};
+use super::model::{ChromeModel, GridRatios, RowRatio, Workspace};
 use super::windows::{SatBounds, WindowRegistry};
 use crate::font::FontSpec;
 
@@ -51,6 +51,46 @@ pub struct LayoutTab {
     /// for main-window workspaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub satellite: Option<SatelliteConfig>,
+    /// Manual pane ratios (T26). Absent in pre-T26 layouts and for auto-grid
+    /// workspaces; a malformed value is dropped on load (auto grid), never an
+    /// error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid: Option<GridConfig>,
+}
+
+/// The serialized form of [`GridRatios`] (mirrored locally so the gpui-free
+/// `model` stays serde-free, like [`FontConfig`] does for `font`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridConfig {
+    pub rows: Vec<GridRowConfig>,
+}
+
+/// One row's height fraction and its tiles' width fractions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridRowConfig {
+    pub h: f32,
+    pub cols: Vec<f32>,
+}
+
+impl GridConfig {
+    fn from_ratios(g: &GridRatios) -> GridConfig {
+        GridConfig {
+            rows: g
+                .rows
+                .iter()
+                .map(|r| GridRowConfig { h: r.h, cols: r.cols.clone() })
+                .collect(),
+        }
+    }
+
+    /// Into the model's ratios, sanitized: a hand-edited or future file with
+    /// unusable numbers loads as `None` (the auto grid) instead of erroring.
+    fn into_ratios(self) -> Option<GridRatios> {
+        GridRatios {
+            rows: self.rows.into_iter().map(|r| RowRatio { h: r.h, cols: r.cols }).collect(),
+        }
+        .sanitized()
+    }
 }
 
 /// Per-satellite-window persisted state (the serialized cousin of the runtime
@@ -124,6 +164,7 @@ impl Layout {
                     satellite: t.satellite.then(|| SatelliteConfig {
                         bounds: reg.bounds_of(t.wsid).map(BoundsConfig::from_sat),
                     }),
+                    grid: t.grid.as_ref().map(GridConfig::from_ratios),
                 })
                 .collect(),
             active: m.active,
@@ -153,6 +194,7 @@ impl Layout {
                     name: t.name,
                     tiles: t.tiles,
                     font: t.font.map(FontConfig::into_spec),
+                    grid: t.grid.and_then(GridConfig::into_ratios),
                     satellite: t.satellite.is_some(),
                     wsid: 0, // reassigned by from_layout
                 })
@@ -248,6 +290,44 @@ mod tests {
         // Corrupt file -> an error, not a panic (the caller falls back fresh).
         std::fs::write(&path, "{ not json").unwrap();
         assert!(load(&path).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grid_ratios_round_trip_and_tolerate_garbage() {
+        let dir = std::env::temp_dir().join(format!("thn-grid-test-{}", std::process::id()));
+        let path = dir.join("native-layout.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut m = ChromeModel::default();
+        m.reconcile(&["aa".to_string(), "bb".to_string(), "cc".to_string()]);
+        m.tabs[0].grid = Some(GridRatios {
+            rows: vec![
+                RowRatio { h: 0.7, cols: vec![0.25, 0.75] },
+                RowRatio { h: 0.3, cols: vec![1.0] },
+            ],
+        });
+        save(&path, &Layout::from_state(&m, &WindowRegistry::default())).unwrap();
+        let restored = load(&path).unwrap().unwrap().into_model();
+        assert_eq!(restored.tabs[0].grid, m.tabs[0].grid);
+
+        // A workspace with no ratios serializes WITHOUT the field (a pre-T26
+        // binary reading this file sees nothing new).
+        let mut plain = ChromeModel::default();
+        plain.reconcile(&["aa".to_string()]);
+        save(&path, &Layout::from_state(&plain, &WindowRegistry::default())).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("\"grid\""));
+
+        // Hand-edited garbage ratios load as None (auto grid), never an error;
+        // unknown fields inside grid (future versions) are skipped.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"tabs":[{"name":"w","tiles":["aa"],"grid":{"rows":[{"h":0.0,"cols":[1.0]}],"zoom":3}}],"active":0}"#,
+        )
+        .unwrap();
+        let bad = load(&path).unwrap().unwrap().into_model();
+        assert_eq!(bad.tabs[0].grid, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
