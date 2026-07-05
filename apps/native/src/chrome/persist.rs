@@ -33,6 +33,9 @@ pub struct Layout {
     pub version: u32,
     pub tabs: Vec<LayoutTab>,
     pub active: usize,
+    /// User-assigned work names by session cwd (N1). Absent in older layouts.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub work_names: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +171,7 @@ impl Layout {
                 })
                 .collect(),
             active: m.active,
+            work_names: m.work_names.clone(),
         }
     }
 
@@ -184,7 +188,8 @@ impl Layout {
     }
 
     pub fn into_model(self) -> ChromeModel {
-        ChromeModel::from_layout(
+        let work_names = self.work_names;
+        let mut m = ChromeModel::from_layout(
             self.tabs
                 .into_iter()
                 .map(|t| Workspace {
@@ -200,7 +205,9 @@ impl Layout {
                 })
                 .collect(),
             self.active,
-        )
+        );
+        m.work_names = work_names;
+        m
     }
 }
 
@@ -358,10 +365,14 @@ mod tests {
         m.tabs[1].font =
             Some(FontSpec { family: "Cascadia Code".to_string(), size: 15.0, ligatures: false });
 
+        // Work names (N1) ride the layout, keyed by cwd.
+        m.work_names.insert("/repo/app".to_string(), "auth fix".to_string());
+
         save(&path, &Layout::from_state(&m, &WindowRegistry::default())).unwrap();
         let restored = load(&path).unwrap().unwrap().into_model();
         assert_eq!(restored.tabs, m.tabs); // ids round-trip too (T12)
         assert_eq!(restored.active, 1);
+        assert_eq!(restored.work_name_for("/repo/app"), Some("auth fix"));
         assert_eq!(restored.tabs[1].font.as_ref().unwrap().family, "Cascadia Code");
         // A pre-T7/T10/T12 layout (no font, no satellite, no id) still loads; a
         // fresh id is minted so the tab is MCP-addressable.
