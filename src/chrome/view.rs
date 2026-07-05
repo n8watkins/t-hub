@@ -115,6 +115,18 @@ const NEEDS: Rgb = Rgb { r: 230, g: 180, b: 80 };
 const IDLE_DOT: Rgb = Rgb { r: 70, g: 78, b: 90 };
 /// Dead/exited cue (T24): the badge and dot of a tile whose session is gone.
 const DEAD: Rgb = Rgb { r: 224, g: 96, b: 96 };
+/// Header git-dirty dot (webview #eab308).
+const DIRTY: Rgb = Rgb { r: 234, g: 179, b: 8 };
+/// Header client glyph: Claude's clay spark (webview #D97757).
+const CLAUDE: Rgb = Rgb { r: 217, g: 119, b: 87 };
+/// Header client glyph: Codex blue.
+const CODEX: Rgb = Rgb { r: 96, g: 165, b: 250 };
+/// Context meter ramp (webview ContextMeter: emerald < 75, amber < 90, red).
+const METER_OK: Rgb = Rgb { r: 52, g: 211, b: 153 };
+const METER_WARN: Rgb = Rgb { r: 251, g: 191, b: 36 };
+const METER_HOT: Rgb = Rgb { r: 248, g: 113, b: 113 };
+/// Context meter bar width in px (the webview's 8-char track, scaled down).
+const METER_W: f32 = 36.0;
 const BUSY_WINDOW_MS: u64 = 2_000;
 /// A defunct tile's content dims under this overlay alpha (the badge says why).
 const DEFUNCT_DIM: f32 = 0.55;
@@ -145,6 +157,21 @@ struct ChromeDrag {
     last_cell: (usize, usize),
 }
 
+/// An in-progress header drag-reorder (N2): armed by a left press on a tile's
+/// header, it becomes a real drag once the pointer moves past a small
+/// threshold (so plain header clicks stay focus-only), tracking the tile under
+/// the pointer as the drop target.
+struct TileDrag {
+    id: String,
+    start: (f32, f32),
+    dragging: bool,
+    /// The drop target under the pointer (never the dragged tile itself).
+    target: Option<String>,
+}
+
+/// Pointer travel (px) before a header press becomes a reorder drag.
+const DRAG_THRESHOLD_PX: f32 = 4.0;
+
 /// Which OS window a paint or an input event belongs to. Every per-window bit
 /// of [`CockpitState`] is keyed by this: windows repaint on independent
 /// schedules, so state written by one window's paint (hit zones) or input
@@ -156,13 +183,32 @@ pub(crate) enum WinKey {
     Sat(u64),
 }
 
+/// A pending session-kill confirmation (N4): the tile and whether its agent
+/// looked mid-turn when the kill was requested (the dialog says so).
+pub(crate) struct ConfirmKill {
+    pub id: String,
+    pub busy: bool,
+}
+
+/// Per-tile header data resolved from the T9 sidebar state before the cockpit
+/// lock is taken: semantic status plus the Claude context-window fill (N1).
+#[derive(Clone, Copy, Default)]
+pub struct TileMeta {
+    pub status: Option<SessionStatus>,
+    pub context_pct: Option<f32>,
+}
+
 /// Per-window tile hit zones, refreshed by that window's every paint. Tile
 /// entries carry both the whole box and the terminal content box (cell math).
 #[derive(Default)]
 struct TileZones {
     tiles: Vec<(String, RectF, RectF)>,
     closes: Vec<(String, RectF)>,
+    /// Fullscreen toggle zones in the headers (N3), left of the close `x`.
+    fulls: Vec<(String, RectF)>,
     badges: Vec<(String, RectF)>,
+    /// The header's editable work-name region (N1), per tile.
+    names: Vec<(String, RectF)>,
     /// Divider hit zones between tiles (T26), matching this paint's boxes.
     dividers: Vec<(DividerId, RectF)>,
     /// The grid area those boxes were laid out in (divider drag math).
@@ -176,6 +222,8 @@ struct WinInput {
     drag: Option<ChromeDrag>,
     /// An in-progress divider drag (T26).
     div_drag: Option<DividerId>,
+    /// An in-progress header drag-reorder (N2).
+    tile_drag: Option<TileDrag>,
     wheel_accum: f32,
     hover_cell: Option<(String, usize, usize)>,
     /// Last pointer position in this window (divider hover cue + cursor).
@@ -212,6 +260,12 @@ pub struct CockpitState {
     /// Per-tile life states (T24): live / reconnecting / exited / dead,
     /// observed by the cockpit worker each pass, read by every paint.
     pub(crate) lives: LifeTracker,
+    /// Git awareness per session cwd (N1): branch / linked-worktree / dirty
+    /// count, polled over the socket `git_info` by the cockpit worker.
+    pub(crate) git: HashMap<String, crate::panels::files::GitInfo>,
+    /// A pending kill confirmation (N4): set by the KillSession command, shown
+    /// as a modal overlay until confirmed (kill) or dismissed.
+    pub(crate) confirm_kill: Option<ConfirmKill>,
     /// Process epoch the stamps are measured from.
     pub(crate) epoch: Instant,
     /// Main-window sidebar hit zones (satellites have no sidebar).
@@ -251,6 +305,8 @@ impl CockpitState {
             report_tx: None,
             pulses: HashMap::new(),
             lives: LifeTracker::default(),
+            git: HashMap::new(),
+            confirm_kill: None,
             epoch: Instant::now(),
             hits: HitZones::default(),
             tilezones: HashMap::new(),
@@ -308,6 +364,14 @@ impl CockpitState {
         for input in self.input.values_mut() {
             if input.drag.as_ref().is_some_and(|d| d.id == id) {
                 input.drag = None;
+            }
+            if input.tile_drag.as_ref().is_some_and(|d| d.id == id) {
+                input.tile_drag = None;
+            }
+            if let Some(d) = input.tile_drag.as_mut() {
+                if d.target.as_deref() == Some(id) {
+                    d.target = None;
+                }
             }
             if input.hover_cell.as_ref().is_some_and(|(hid, _, _)| hid == id) {
                 input.hover_cell = None;
@@ -390,7 +454,13 @@ fn sidebar_hit(hits: &HitZones, x: f32, y: f32) -> Option<SidebarTarget> {
 /// What a tile-area click landed on, per window.
 enum TileTarget {
     Close(String),
+    /// The header's fullscreen toggle (N3).
+    Fullscreen(String),
     Badge(String),
+    /// The header's editable work-name region (N1).
+    Name(String),
+    /// The header strip outside the buttons (N2: the drag-reorder handle).
+    Header(String),
     Tile(String),
 }
 
@@ -400,14 +470,30 @@ fn tile_hit(zones: &TileZones, x: f32, y: f32) -> Option<TileTarget> {
             return Some(TileTarget::Close(id.clone()));
         }
     }
+    for (id, r) in &zones.fulls {
+        if r.contains(x, y) {
+            return Some(TileTarget::Fullscreen(id.clone()));
+        }
+    }
     for (id, r) in &zones.badges {
         if r.contains(x, y) {
             return Some(TileTarget::Badge(id.clone()));
         }
     }
-    for (id, r, _) in &zones.tiles {
+    for (id, r) in &zones.names {
         if r.contains(x, y) {
-            return Some(TileTarget::Tile(id.clone()));
+            return Some(TileTarget::Name(id.clone()));
+        }
+    }
+    for (id, r, content) in &zones.tiles {
+        if r.contains(x, y) {
+            // Above the content box = the header strip (the reorder handle);
+            // T6 terminal dispatch owns everything below.
+            return Some(if y < content.y {
+                TileTarget::Header(id.clone())
+            } else {
+                TileTarget::Tile(id.clone())
+            });
         }
     }
     None
@@ -437,6 +523,24 @@ fn set_win_focused(st: &mut CockpitState, key: WinKey, id: &str) {
         WinKey::Main => st.model.set_focused(id),
         WinKey::Sat(wsid) => st.sats.set_focused(wsid, Some(id.to_string())),
     }
+}
+
+/// Move the window's focus to tile `id`, telling terminals that track focus
+/// (mode 1004) - the click-to-focus core, shared by content and header presses.
+fn focus_tile(st: &mut CockpitState, key: WinKey, id: &str) {
+    let old = win_focused(st, key);
+    if old.as_deref() == Some(id) {
+        return;
+    }
+    if let Some(old) = old {
+        if let Some(t) = st.tiles.get(&old) {
+            notify_focus(t, false);
+        }
+    }
+    if let Some(t) = st.tiles.get(id) {
+        notify_focus(t, true);
+    }
+    set_win_focused(st, key, id);
 }
 
 /// The workspace tab a window's grid shows: main = the active tab (unless it
@@ -770,15 +874,42 @@ fn paint_workspace_section(
 /// Per-tile semantic status (T9 SidebarState) for the header dots: tile id
 /// (`th_`-stripped) -> status. Gathered BEFORE the cockpit lock is taken so the
 /// two locks never nest.
-fn gather_statuses(feed: &OverlayFeed) -> HashMap<String, SessionStatus> {
+fn gather_tile_meta(feed: &OverlayFeed) -> HashMap<String, TileMeta> {
     let state = feed.state();
     let st = state.lock();
     let mut map = HashMap::new();
     for (uuid, tmux) in st.index.tmux_aliases() {
         let tile_id = tmux.strip_prefix("th_").unwrap_or(tmux);
-        map.insert(tile_id.to_string(), st.supervision.status_of(uuid));
+        map.insert(
+            tile_id.to_string(),
+            TileMeta {
+                status: Some(st.supervision.status_of(uuid)),
+                context_pct: st.usage.context_pct_of(uuid),
+            },
+        );
     }
     map
+}
+
+/// Whether a session's agent is mid-turn (webview `tmuxSessionMidTurn`): the
+/// N4 kill dialog flags these as busy.
+fn session_busy(feed: &OverlayFeed, id: &str) -> bool {
+    let state = feed.state();
+    let st = state.lock();
+    let uuid = st
+        .index
+        .tmux_aliases()
+        .find(|(_, tmux)| tmux.strip_prefix("th_").unwrap_or(tmux) == id)
+        .map(|(uuid, _)| uuid.to_string());
+    uuid.is_some_and(|uuid| {
+        matches!(
+            st.supervision.status_of(&uuid),
+            SessionStatus::Working
+                | SessionStatus::WaitingOnSubagents
+                | SessionStatus::NeedsQuestion
+                | SessionStatus::NeedsPermission
+        )
+    })
 }
 
 /// Paint one window's tile grid (the main grid area or a whole satellite
@@ -788,7 +919,7 @@ fn gather_statuses(feed: &OverlayFeed) -> HashMap<String, SessionStatus> {
 fn paint_tiles_area(
     state: &Arc<Mutex<CockpitState>>,
     key: WinKey,
-    statuses: &HashMap<String, SessionStatus>,
+    metas: &HashMap<String, TileMeta>,
     focused_window: bool,
     bounds: Bounds<Pixels>,
     window: &mut Window,
@@ -818,10 +949,17 @@ fn paint_tiles_area(
         .get(&key)
         .map(|i| (i.div_drag, i.last_pos))
         .unwrap_or((None, None));
+    // The window's active header drag-reorder (N2), for the drop highlight.
+    let drag_target = st
+        .input
+        .get(&key)
+        .and_then(|i| i.tile_drag.as_ref())
+        .filter(|d| d.dragging)
+        .and_then(|d| d.target.clone());
 
     // Split-borrow the state so the tiles map can be mutated while the model,
     // titles, and stamps are read (all disjoint fields of one MutexGuard).
-    let CockpitState { model, tiles, titles, pulses, lives, epoch, .. } = &mut *st;
+    let CockpitState { model, tiles, titles, cwds, git, pulses, lives, epoch, .. } = &mut *st;
     let now_ms = epoch.elapsed().as_millis() as u64;
     let (ids, ratios, empty_msg): (Vec<String>, Option<GridRatios>, &str) = match key {
         WinKey::Main => match model.main_tiles() {
@@ -847,9 +985,21 @@ fn paint_tiles_area(
         },
     };
 
+    // N3: a fullscreen tile takes the whole grid; the others stay attached but
+    // unpainted this frame (exactly like a workspace switch - no detach).
+    let fullscreen = win_tab_index(model, key)
+        .and_then(|i| model.tabs[i].fullscreen.clone())
+        .filter(|f| ids.iter().any(|x| x == f));
+    let (ids, ratios) = match &fullscreen {
+        Some(f) => (vec![f.clone()], None),
+        None => (ids, ratios),
+    };
+
     let mut tile_hits = Vec::with_capacity(ids.len());
     let mut close_hits = Vec::with_capacity(ids.len());
+    let mut full_hits = Vec::with_capacity(ids.len());
     let mut badge_hits = Vec::new();
+    let mut name_hits = Vec::new();
     let mut rebuilt_frame: u64 = 0;
     let mut total_frame: u64 = 0;
     let mut cells_frame: u64 = 0;
@@ -871,9 +1021,11 @@ fn paint_tiles_area(
         let life = lives.get(id);
         paint_tile_frame(b(bx), is_focused, window);
 
-        // Close zone in the header's right corner.
+        // Close zone in the header's right corner; the fullscreen toggle (N3)
+        // sits just left of it.
         let close_w = ui.cell_w + 10.0;
         let close = RectF::new(bx.x + bx.w - BORDER - close_w, bx.y + BORDER, close_w, HEADER_H);
+        let full = RectF::new(close.x - close_w, bx.y + BORDER, close_w, HEADER_H);
 
         // Content box: inside the border/padding, below the cockpit header.
         let content = RectF::new(
@@ -883,7 +1035,6 @@ fn paint_tiles_area(
             (bx.h - HEADER_H - 2.0 * BORDER - TILE_PAD).max(1.0),
         );
 
-        let mut geom = String::new();
         if let Some(tile) = tiles.get_mut(id) {
             let paint =
                 sync_and_paint_content(tile, b(content), mode, is_focused, window, cx);
@@ -901,7 +1052,6 @@ fn paint_tiles_area(
                     ),
                 ));
             }
-            geom = format!("{}x{}", tile.cols, tile.rows);
         } else if !life.is_defunct() {
             paint_parts(
                 &[("attaching…".to_string(), h(FG_DIM), false)],
@@ -919,14 +1069,16 @@ fn paint_tiles_area(
             window.paint_quad(fill(b(content), ha(WINDOW_BG, DEFUNCT_DIM)));
         }
 
-        // --- the cockpit header: liveness dot, title, id, geometry, age,
-        // life badge, close ---------------------------------------------------
+        // --- the cockpit header (N1 anatomy): liveness dot, client glyph,
+        // folder, git branch + worktree badge + dirty dot, editable work-name,
+        // context meter, age, life badge, close --------------------------------
         // Dot: the T24 life state wins (a dead session's stale agent status is
         // noise); then semantic agent status (T9); then output-recency.
+        let meta_info = metas.get(id).copied().unwrap_or_default();
         let dot = match life {
             TileLife::Dead { .. } | TileLife::Exited { .. } => h(DEAD),
             TileLife::Reconnecting { .. } => h(NEEDS),
-            TileLife::Live => match statuses.get(id) {
+            TileLife::Live => match meta_info.status {
                 Some(SessionStatus::Working) | Some(SessionStatus::WaitingOnSubagents) => h(LIVE),
                 Some(SessionStatus::NeedsQuestion) | Some(SessionStatus::NeedsPermission) => {
                     h(NEEDS)
@@ -945,13 +1097,48 @@ fn paint_tiles_area(
             },
         };
         let title = titles.get(id).filter(|t| !t.is_empty()).cloned().unwrap_or_else(|| id.clone());
+        // Client glyph off the pane's foreground command (the server already
+        // substitutes `claude`/`codex` for runtime wrappers): the webview's
+        // clay spark / ">_" icons, as colored text.
+        let (client_glyph, client_color) = match title.as_str() {
+            "claude" => ("✳ ", h(CLAUDE)),
+            "codex" => (">_ ", h(CODEX)),
+            _ => ("", h(FG_DIM)),
+        };
+        let cwd = cwds.get(id).cloned().unwrap_or_default();
+        // Folder = cwd basename (webview `cwdBasename`); the raw title is the
+        // fallback for sessions the server lists without a cwd.
+        let folder = if cwd.is_empty() {
+            title.clone()
+        } else {
+            crate::overlays::model::cwd_basename(&cwd).to_string()
+        };
+        let g = git.get(&cwd).filter(|g| g.is_repo);
+        let branch = g.and_then(|g| g.branch.clone()).unwrap_or_default();
+        let wt = g.is_some_and(|g| g.is_linked_worktree);
+        let dirty = g.is_some_and(|g| g.dirty_count > 0);
+        // Work-name (N1): the in-progress edit buffer wins; else the stored
+        // name; else the webview's "name this work…" placeholder.
+        let editing = model.naming.as_ref().filter(|n| n.tile == *id);
+        let (name_text, name_color, name_bold) = match editing {
+            Some(n) => (format!("{}_", n.buffer), h(ACCENT), true),
+            None => match model.work_name_for(&cwd) {
+                Some(n) => (n.to_string(), h(FG), false),
+                None => ("name this work…".to_string(), h(FG_DIM), false),
+            },
+        };
 
-        // The right-aligned cue cluster: last-output age (T24, always) plus
-        // the life badge saying WHY a tile looks frozen. On a narrow tile the
-        // badge outranks the age, and truncates itself before it may ever
-        // overflow left across the dot/title.
-        let header_chars = (((bx.w - 2.0 * (BORDER + TILE_PAD) - close_w) / ui.cell_w).floor()
-            as usize)
+        // The right-aligned cue cluster: context meter (Claude fill %), then
+        // last-output age (T24) plus the life badge saying WHY a tile looks
+        // frozen. On a narrow tile the badge outranks the age, and truncates
+        // itself before it may ever overflow left across the dot/title.
+        // Budget subtracts BOTH header buttons (fullscreen + close, N3) and
+        // the meter's pixel width.
+        let meter_pct = meta_info.context_pct.filter(|p| p.is_finite());
+        let meter_px = if meter_pct.is_some() { METER_W + 6.0 } else { 0.0 };
+        let header_chars = (((bx.w - 2.0 * (BORDER + TILE_PAD) - 2.0 * close_w - meter_px)
+            / ui.cell_w)
+            .floor() as usize)
             .saturating_sub(2); // the dot
         let max_cue = header_chars.saturating_sub(1);
         let mut age =
@@ -966,30 +1153,72 @@ fn paint_tiles_area(
             TileLife::Exited { code, .. } => (format!("EXITED {code}"), h(DEAD), true),
             TileLife::Dead { .. } => ("DEAD".to_string(), h(DEAD), true),
         };
+        let mut pct_text = meter_pct.map(|p| format!("{:.0}% ", p)).unwrap_or_default();
         let mut cue_gap = if !age.is_empty() && !badge_text.is_empty() { "  " } else { "" };
-        if age.chars().count() + cue_gap.len() + badge_text.chars().count() > max_cue {
+        if pct_text.chars().count() + age.chars().count() + cue_gap.len()
+            + badge_text.chars().count()
+            > max_cue
+        {
             age.clear();
             cue_gap = "";
+            pct_text.clear();
         }
         let badge_text = truncate(&badge_text, max_cue);
-        let cue_chars = age.chars().count() + cue_gap.len() + badge_text.chars().count();
+        let cue_chars = pct_text.chars().count()
+            + age.chars().count()
+            + cue_gap.len()
+            + badge_text.chars().count();
 
         let avail =
             header_chars.saturating_sub(if cue_chars > 0 { cue_chars + 2 } else { 0 });
-        let meta = if title == *id { format!("  {geom}") } else { format!("  {id}  {geom}") };
-        let (title_text, meta_text) = if avail > meta.chars().count() + 8 {
-            (truncate(&title, avail - meta.chars().count()), meta)
+        // Budget the left cluster: folder gets priority, then branch cues,
+        // then the work-name; each segment drops whole when it cannot fit.
+        let fixed = client_glyph.chars().count();
+        let folder_text = truncate(&folder, avail.saturating_sub(fixed).max(4));
+        let mut used = fixed + folder_text.chars().count();
+        let branch_text = if !branch.is_empty() && used + branch.chars().count() + 3 <= avail {
+            format!("  {}", truncate(&branch, avail - used - 2))
         } else {
-            (truncate(&title, avail), String::new())
+            String::new()
         };
+        used += branch_text.chars().count();
+        let wt_text = if wt && used + 5 <= avail { " [wt]" } else { "" };
+        used += wt_text.chars().count();
+        let dirty_text = if dirty && used + 2 <= avail { " •" } else { "" };
+        used += dirty_text.chars().count();
+        let name_text = if used + 8 <= avail {
+            format!("  {}", truncate(&name_text, avail - used - 2))
+        } else {
+            String::new()
+        };
+        let name_offset = used + 2 + 2; // dot(2) + gap(2) before the name
         let header_y = bx.y + BORDER + (HEADER_H - UI_LINE_H) / 2.0 + 1.0;
+        let header_x = bx.x + BORDER + TILE_PAD;
+        if !name_text.is_empty() {
+            // The clickable work-name zone (N1): at least 8 cells so the
+            // placeholder-less state stays targetable.
+            let name_w = (name_text.chars().count().max(8) as f32 - 2.0) * ui.cell_w;
+            name_hits.push((
+                id.clone(),
+                RectF::new(
+                    header_x + (name_offset as f32 - 2.0) * ui.cell_w,
+                    bx.y + BORDER,
+                    name_w + 2.0 * ui.cell_w,
+                    HEADER_H,
+                ),
+            ));
+        }
         paint_parts(
             &[
                 ("● ".to_string(), dot, false),
-                (title_text, if is_focused { h(ACCENT) } else { h(FG) }, true),
-                (meta_text, h(FG_DIM), false),
+                (client_glyph.to_string(), client_color, false),
+                (folder_text, if is_focused { h(ACCENT) } else { h(FG) }, true),
+                (branch_text, h(FG_DIM), false),
+                (wt_text.to_string(), h(NEEDS), false),
+                (dirty_text.to_string(), h(DIRTY), false),
+                (name_text, name_color, name_bold),
             ],
-            bx.x + BORDER + TILE_PAD,
+            header_x,
             header_y,
             &font_normal,
             &font_bold,
@@ -999,11 +1228,12 @@ fn paint_tiles_area(
         if cue_chars > 0 {
             paint_parts(
                 &[
+                    (pct_text, h(FG_DIM), false),
                     (age, h(FG_DIM), false),
                     (cue_gap.to_string(), h(FG_DIM), false),
                     (badge_text, badge_color, badge_bold),
                 ],
-                close.x - cue_chars as f32 * ui.cell_w - 4.0,
+                full.x - cue_chars as f32 * ui.cell_w - 4.0,
                 header_y,
                 &font_normal,
                 &font_bold,
@@ -1011,6 +1241,46 @@ fn paint_tiles_area(
                 cx,
             );
         }
+        // The context meter bar (N1): a small track + fill left of the cue
+        // text (which itself sits left of the fullscreen button), colored by
+        // the webview's fill ramp.
+        if let Some(pct) = meter_pct {
+            let pct = pct.clamp(0.0, 100.0);
+            let track = RectF::new(
+                full.x - cue_chars as f32 * ui.cell_w - 4.0 - meter_px,
+                bx.y + BORDER + (HEADER_H - 4.0) / 2.0,
+                METER_W,
+                4.0,
+            );
+            let fill_color = if pct >= 90.0 {
+                METER_HOT
+            } else if pct >= 75.0 {
+                METER_WARN
+            } else {
+                METER_OK
+            };
+            window.paint_quad(fill(b(track), ha(FG_DIM, 0.25)));
+            window.paint_quad(fill(
+                b(RectF::new(track.x, track.y, METER_W * pct / 100.0, track.h)),
+                h(fill_color),
+            ));
+        }
+        // Fullscreen toggle (N3): ⤢ expands this tile over the grid, ⤡ (accented
+        // while fullscreen) restores - the webview Tile header button.
+        let is_fs = fullscreen.as_deref() == Some(id.as_str());
+        paint_parts(
+            &[(
+                if is_fs { "⤡".to_string() } else { "⤢".to_string() },
+                if is_fs { h(ACCENT) } else { h(FG_DIM) },
+                false,
+            )],
+            full.x + (full.w - ui.cell_w) / 2.0,
+            header_y,
+            &font_normal,
+            &font_bold,
+            window,
+            cx,
+        );
         paint_parts(
             &[("×".to_string(), h(FG_DIM), false)],
             close.x + (close.w - ui.cell_w) / 2.0,
@@ -1021,8 +1291,23 @@ fn paint_tiles_area(
             cx,
         );
 
+        // Drop-target highlight (N2): the tile a header drag would splice at
+        // washes accent and gets a 2px frame.
+        if drag_target.as_deref() == Some(id.as_str()) {
+            window.paint_quad(fill(b(bx), ha(ACCENT, 0.12)));
+            for edge in [
+                RectF::new(bx.x, bx.y, bx.w, 2.0),
+                RectF::new(bx.x, bx.y + bx.h - 2.0, bx.w, 2.0),
+                RectF::new(bx.x, bx.y, 2.0, bx.h),
+                RectF::new(bx.x + bx.w - 2.0, bx.y, 2.0, bx.h),
+            ] {
+                window.paint_quad(fill(b(edge), h(ACCENT)));
+            }
+        }
+
         tile_hits.push((id.clone(), bx, content));
         close_hits.push((id.clone(), close));
+        full_hits.push((id.clone(), full));
     }
 
     // --- dividers (T26): hover/drag highlight + resize cursor -----------------
@@ -1055,7 +1340,15 @@ fn paint_tiles_area(
 
     st.tilezones.insert(
         key,
-        TileZones { tiles: tile_hits, closes: close_hits, badges: badge_hits, dividers, area },
+        TileZones {
+            tiles: tile_hits,
+            closes: close_hits,
+            fulls: full_hits,
+            badges: badge_hits,
+            names: name_hits,
+            dividers,
+            area,
+        },
     );
     st.visible_cells.insert(key, cells_frame);
     drop(st);
@@ -1187,7 +1480,22 @@ fn tiles_mouse_down(
         return;
     }
     let target = st.tilezones.get(&key).and_then(|z| tile_hit(z, x, y));
+    // A click anywhere but the name zone commits an in-progress work-name
+    // edit (the webview's blur-commit).
+    if !matches!(target, Some(TileTarget::Name(_)))
+        && st.model.naming.is_some()
+        && st.model.commit_name()
+    {
+        st.save_layout();
+    }
     match target {
+        Some(TileTarget::Name(id)) if button == MouseButton::Left && key == WinKey::Main => {
+            // Begin the work-name edit (N1). Names key by cwd, so a session
+            // the server lists without one has no slot to edit.
+            if let Some(cwd) = st.cwds.get(&id).cloned().filter(|c| !c.is_empty()) {
+                st.model.begin_name_edit(&id, &cwd);
+            }
+        }
         Some(TileTarget::Close(id)) if button == MouseButton::Left => {
             if st.model.close_tile(&id) {
                 st.drop_tile(&id);
@@ -1195,25 +1503,33 @@ fn tiles_mouse_down(
                 sync_active_sessions(st, feed);
             }
         }
+        Some(TileTarget::Fullscreen(id)) if button == MouseButton::Left => {
+            // N3: the header ⤢/⤡ toggles this tile fullscreen (focus follows,
+            // like the webview button's onFocus).
+            if let Some(tab) = win_tab_index(&st.model, key) {
+                if st.model.toggle_fullscreen(tab, &id) {
+                    set_win_focused(st, key, &id);
+                }
+            }
+        }
         Some(TileTarget::Badge(id)) if button == MouseButton::Left => {
             if let Some(tile) = st.tiles.get(&id) {
                 tile.term.lock().scroll_to_bottom();
             }
         }
-        Some(TileTarget::Tile(id)) => {
+        Some(TileTarget::Header(id)) if button == MouseButton::Left => {
+            // N2: a left press on the header focuses the tile and ARMS a
+            // drag-reorder; it only becomes one past the movement threshold,
+            // so a plain header click stays focus-only. Terminal selection
+            // drags never start here (they need a content-area press), and
+            // dividers were consumed above.
+            focus_tile(st, key, &id);
+            st.input.entry(key).or_default().tile_drag =
+                Some(TileDrag { id, start: (x, y), dragging: false, target: None });
+        }
+        Some(TileTarget::Header(id)) | Some(TileTarget::Tile(id)) => {
             // Focus follows click; tell terminals that track focus (1004).
-            let old = win_focused(st, key);
-            if old.as_deref() != Some(id.as_str()) {
-                if let Some(old) = old {
-                    if let Some(t) = st.tiles.get(&old) {
-                        notify_focus(t, false);
-                    }
-                }
-                if let Some(t) = st.tiles.get(&id) {
-                    notify_focus(t, true);
-                }
-                set_win_focused(st, key, &id);
-            }
+            focus_tile(st, key, &id);
             // T6 dispatch: URL open, mouse reporting, selection, paste.
             if let Some(cell) = chrome_cell(st, key, &id, ev.position) {
                 if let Some(tile) = st.tiles.get(&id) {
@@ -1247,6 +1563,19 @@ fn tiles_mouse_up(st: &mut CockpitState, key: WinKey, button: MouseButton, ev: &
                 return;
             }
         }
+        // A header drag-reorder commits on release (N2): splice the dragged
+        // tile at the drop target's slot in THIS window's workspace.
+        if let Some(d) = st.input.get_mut(&key).and_then(|i| i.tile_drag.take()) {
+            if d.dragging {
+                if let (Some(tab), Some(target)) = (win_tab_index(&st.model, key), d.target) {
+                    if st.model.reorder_tile_in(tab, &d.id, &target) {
+                        set_win_focused(st, key, &d.id);
+                        st.save_layout();
+                    }
+                }
+            }
+            return;
+        }
     }
     let Some(drag) = st.input.get_mut(&key).and_then(|i| i.drag.take()) else { return };
     let ends_drag = match drag.mode {
@@ -1275,6 +1604,31 @@ fn tiles_mouse_move(st: &mut CockpitState, key: WinKey, ev: &MouseMoveEvent) -> 
 
     if let Some(id) = st.input.get(&key).and_then(|i| i.div_drag) {
         return divider_drag_motion(st, key, id, x, y);
+    }
+
+    // A header drag-reorder in progress (N2): arm past the threshold, then
+    // track the tile under the pointer as the drop target for the highlight.
+    if st.input.get(&key).is_some_and(|i| i.tile_drag.is_some()) {
+        let target = st
+            .tilezones
+            .get(&key)
+            .and_then(|z| z.tiles.iter().find(|(_, r, _)| r.contains(x, y)))
+            .map(|(id, _, _)| id.clone());
+        let Some(d) = st.input.get_mut(&key).and_then(|i| i.tile_drag.as_mut()) else {
+            return false;
+        };
+        if !d.dragging
+            && (x - d.start.0).abs().max((y - d.start.1).abs()) > DRAG_THRESHOLD_PX
+        {
+            d.dragging = true;
+        }
+        if !d.dragging {
+            return false;
+        }
+        let target = target.filter(|t| *t != d.id);
+        let changed = d.target != target;
+        d.target = target;
+        return changed;
     }
 
     if let Some(drag) = st.input.get(&key).and_then(|i| i.drag.as_ref()) {
@@ -1331,6 +1685,15 @@ fn tiles_mouse_move(st: &mut CockpitState, key: WinKey, ev: &MouseMoveEvent) -> 
 /// scrollback keys, PTY encoding) on the window's focused tile.
 fn tiles_key(st: &mut CockpitState, key: WinKey, ks: &gpui::Keystroke, cx: &mut App) {
     let chord = chord_of(ks);
+    // Esc restores the grid while a tile is fullscreen (N3) - the webview's
+    // capture-phase Escape handler; it never reaches the terminal then.
+    if chord.key == "escape" && !chord.control && !chord.alt && !chord.shift && !chord.platform {
+        if let Some(tab) = win_tab_index(&st.model, key) {
+            if st.model.clear_fullscreen(tab) {
+                return;
+            }
+        }
+    }
     if let Some(id) = win_focused(st, key) {
         if let Some(tile) = st.tiles.get_mut(&id) {
             tile_key_input(tile, &chord, cx);
@@ -1389,6 +1752,16 @@ impl CockpitView {
     ) {
         let x: f32 = ev.position.x.into();
         let y: f32 = ev.position.y.into();
+        // A click outside the kill dialog's buttons dismisses it (the
+        // webview's backdrop-click cancel; the buttons stop propagation).
+        {
+            let mut st = self.state.lock();
+            if st.confirm_kill.is_some() {
+                st.confirm_kill = None;
+                cx.notify();
+                return;
+            }
+        }
         // Any click dismisses the palette (the webview's backdrop-click close;
         // the native palette takes no mouse input) and, in the tile area,
         // returns the keyboard focus region to the tiles.
@@ -1521,6 +1894,42 @@ impl CockpitView {
         let ks = &ev.keystroke;
         let mut st = self.state.lock();
 
+        // The kill confirm dialog (N4) captures the keyboard: Enter kills,
+        // Esc cancels, everything else is swallowed while it is up.
+        if st.confirm_kill.is_some() {
+            match ks.key.as_str() {
+                "enter" => self.kill_confirmed(&mut st),
+                "escape" => st.confirm_kill = None,
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
+
+        // Work-name edit mode (N1) captures the keyboard like rename mode.
+        if st.model.naming.is_some() {
+            match ks.key.as_str() {
+                "enter" => {
+                    if st.model.commit_name() {
+                        st.save_layout();
+                    }
+                }
+                "escape" => st.model.cancel_name(),
+                "backspace" => st.model.name_backspace(),
+                _ => {
+                    if !ks.modifiers.control && !ks.modifiers.platform {
+                        if let Some(kc) = ks.key_char.as_deref() {
+                            if !kc.is_empty() && !kc.chars().any(char::is_control) {
+                                st.model.name_push(kc);
+                            }
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         // Rename mode captures the keyboard until commit/cancel.
         if st.model.renaming.is_some() {
             match ks.key.as_str() {
@@ -1563,7 +1972,22 @@ impl CockpitView {
         let panels_focused =
             st.panels_open && self.panels.focus_handle(cx).is_focused(window);
         match handled {
-            Handled::Pass if panels_focused => {}
+            Handled::Pass if panels_focused => {
+                // Esc escalates OUT of the panels once they have nothing left
+                // to dismiss (Files: viewer -> query; Run: command draft):
+                // hand the keyboard back to the tiles, so the NEXT Esc reaches
+                // `tiles_key` and can restore a fullscreen tile (N3). Modal
+                // surfaces above (kill confirm, name edit, rename) already
+                // returned before this point - they keep Esc priority.
+                let bare_esc = ks.key == "escape"
+                    && !ks.modifiers.control
+                    && !ks.modifiers.alt
+                    && !ks.modifiers.shift
+                    && !ks.modifiers.platform;
+                if bare_esc && !self.panels.read(cx).wants_escape() {
+                    window.focus(&self.focus);
+                }
+            }
             Handled::Pass => tiles_key(&mut st, WinKey::Main, ks, cx),
             Handled::Consumed(effects) => self.apply_effects(&mut st, effects, window, cx),
         }
@@ -1644,6 +2068,12 @@ impl CockpitView {
                         .and_then(|id| st.cwds.get(&id).cloned());
                     dispatch_host(&cmd, cwd.as_deref());
                 }
+                Effect::ConfirmKill(id) => {
+                    // Kill is destructive (N4): open the confirm dialog with
+                    // the busy verdict resolved now, from the T9 state.
+                    let busy = session_busy(&self.feed, &id);
+                    st.confirm_kill = Some(ConfirmKill { id, busy });
+                }
                 Effect::TogglePanels => {
                     st.panels_open = !st.panels_open;
                     if st.panels_open {
@@ -1669,6 +2099,120 @@ impl CockpitView {
         tiles_scroll(&mut self.state.lock(), WinKey::Main, ev);
         cx.notify();
     }
+
+    /// The confirmed kill (N4): fire the socket `close_terminal` (tmux
+    /// kill-session, process tree and all) off-thread, and drop the tile
+    /// locally right away - the reconcile pass would prune it within 2s
+    /// anyway; this just skips the DEAD-badge flash.
+    fn kill_confirmed(&self, st: &mut CockpitState) {
+        let Some(ck) = st.confirm_kill.take() else { return };
+        let id = ck.id;
+        let client = self.client.clone();
+        {
+            let sid = id.clone();
+            thread::spawn(move || {
+                match client.request("close_terminal", serde_json::json!({ "sessionId": sid })) {
+                    Ok(_) => log::info!("kill: close_terminal accepted for {sid}"),
+                    Err(e) => log::warn!("kill: close_terminal failed for {sid}: {e}"),
+                }
+            });
+        }
+        st.model.close_tile(&id);
+        st.drop_tile(&id);
+        st.save_layout();
+        sync_active_sessions(st, &self.feed);
+    }
+
+    /// The N4 kill confirm dialog, palette-modal styling. The buttons stop
+    /// propagation so the root's backdrop-cancel never sees their clicks.
+    fn confirm_kill_overlay(&self, id: String, busy: bool, cx: &mut Context<Self>) -> gpui::Div {
+        let body = if busy {
+            format!(
+                "th_{id} looks busy (agent mid-turn). Killing ends the tmux \
+session and every process in it."
+            )
+        } else {
+            format!(
+                "This kills tmux session th_{id} and every process in it. \
+The tile's × only detaches; the session survives that."
+            )
+        };
+        let cancel = cx.listener(|v: &mut Self, _: &MouseDownEvent, _w, cx| {
+            v.state.lock().confirm_kill = None;
+            cx.stop_propagation();
+            cx.notify();
+        });
+        let kill = cx.listener(|v: &mut Self, _: &MouseDownEvent, _w, cx| {
+            {
+                let mut st = v.state.lock();
+                v.kill_confirmed(&mut st);
+            }
+            cx.stop_propagation();
+            cx.notify();
+        });
+        div().absolute().inset_0().flex().flex_col().items_center().text_size(px(12.)).child(
+            div()
+                .mt(px(140.))
+                .w(px(480.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .p(px(14.))
+                .bg(ha(SIDEBAR_BG, 0.97))
+                .border_1()
+                .border_color(h(ROW_BG_ACTIVE))
+                .rounded_md()
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .text_color(h(FG))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .child(SharedString::from("Kill this session?")),
+                )
+                .child(div().text_color(h(FG_DIM)).child(SharedString::from(body)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(h(FG_DIM))
+                                .child(SharedString::from("Enter kill · Esc cancel")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(h(ROW_BG))
+                                        .text_color(h(FG))
+                                        .cursor_pointer()
+                                        .on_mouse_down(MouseButton::Left, cancel)
+                                        .child(SharedString::from("Cancel")),
+                                )
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(h(DEAD))
+                                        .text_color(h(WINDOW_BG))
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .cursor_pointer()
+                                        .on_mouse_down(MouseButton::Left, kill)
+                                        .child(SharedString::from("Kill session")),
+                                ),
+                        ),
+                ),
+        )
+    }
 }
 
 impl Focusable for CockpitView {
@@ -1686,7 +2230,7 @@ impl Render for CockpitView {
             let st = self.state.lock();
             (workspace_section_height(st.model.tabs.len()), st.panels_open)
         };
-        let statuses = gather_statuses(&self.feed);
+        let metas = gather_tile_meta(&self.feed);
         let focused_window = self.focus.is_focused(window);
 
         // The T-A keymap overlay (palette / prefix HUD / region pill), built
@@ -1696,6 +2240,15 @@ impl Render for CockpitView {
             let now = st.epoch.elapsed().as_millis() as u64;
             palette_view::key_overlay(&mut st.keys, now)
         };
+
+        // The N4 kill confirm dialog, if pending (plain data out of the lock;
+        // the overlay builder needs `cx` for its button listeners).
+        let confirm = {
+            let st = self.state.lock();
+            st.confirm_kill.as_ref().map(|c| (c.id.clone(), c.busy))
+        };
+        let confirm_overlay =
+            confirm.map(|(id, busy)| self.confirm_kill_overlay(id, busy, cx));
 
         let ws_state = self.state.clone();
         let grid_state = self.state.clone();
@@ -1763,7 +2316,7 @@ impl Render for CockpitView {
                             paint_tiles_area(
                                 &grid_state,
                                 WinKey::Main,
-                                &statuses,
+                                &metas,
                                 focused_window,
                                 bounds,
                                 window,
@@ -1788,6 +2341,7 @@ impl Render for CockpitView {
                 )
             })
             .children(key_overlay)
+            .children(confirm_overlay)
     }
 }
 
@@ -2019,7 +2573,7 @@ impl Render for SatelliteView {
             }
         }
 
-        let statuses = gather_statuses(&self.feed);
+        let metas = gather_tile_meta(&self.feed);
         let focused_window = self.focus.is_focused(window);
         let grid_state = self.state.clone();
 
@@ -2090,7 +2644,7 @@ impl Render for SatelliteView {
                         paint_tiles_area(
                             &grid_state,
                             key,
-                            &statuses,
+                            &metas,
                             focused_window,
                             bounds,
                             window,
@@ -2100,5 +2654,42 @@ impl Render for SatelliteView {
                 )
                 .size_full(),
             )
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The merged header's hit routing (N1+N2+N3): the close `x`, the
+    /// fullscreen toggle, and the work-name zone each win over the header
+    /// strip; the strip (anything above the content box outside those zones)
+    /// is the N2 drag handle; the content box is terminal dispatch.
+    #[test]
+    fn tile_hit_routes_header_buttons_name_drag_and_content() {
+        let id = "t1".to_string();
+        let zones = TileZones {
+            // Tile box (0,0,200,120); content starts below the 20px header.
+            tiles: vec![(id.clone(), RectF::new(0.0, 0.0, 200.0, 120.0), RectF::new(5.0, 20.0, 190.0, 95.0))],
+            closes: vec![(id.clone(), RectF::new(170.0, 0.0, 30.0, 20.0))],
+            fulls: vec![(id.clone(), RectF::new(140.0, 0.0, 30.0, 20.0))],
+            badges: Vec::new(),
+            names: vec![(id.clone(), RectF::new(60.0, 0.0, 40.0, 20.0))],
+            dividers: Vec::new(),
+            area: RectF::new(0.0, 0.0, 200.0, 120.0),
+        };
+        assert!(matches!(tile_hit(&zones, 185.0, 10.0), Some(TileTarget::Close(t)) if t == id));
+        assert!(
+            matches!(tile_hit(&zones, 155.0, 10.0), Some(TileTarget::Fullscreen(t)) if t == id)
+        );
+        assert!(matches!(tile_hit(&zones, 70.0, 10.0), Some(TileTarget::Name(t)) if t == id));
+        // The bare header strip (left of the name zone) is the drag handle.
+        assert!(matches!(tile_hit(&zones, 20.0, 10.0), Some(TileTarget::Header(t)) if t == id));
+        // Below the header: terminal dispatch.
+        assert!(matches!(tile_hit(&zones, 100.0, 60.0), Some(TileTarget::Tile(t)) if t == id));
+        // Outside everything: no target.
+        assert!(tile_hit(&zones, 300.0, 60.0).is_none());
     }
 }

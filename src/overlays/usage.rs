@@ -74,6 +74,8 @@ struct SnapUsage {
     five_hour: Option<RateLimitWindow>,
     seven_day: Option<RateLimitWindow>,
     cost_usd: Option<f64>,
+    /// Claude context-window fill (0..=100), the tile header's meter (N1).
+    context_used_pct: Option<f32>,
     ingested_at_ms: u64,
 }
 
@@ -124,7 +126,16 @@ impl UsageState {
         if snap.cost_usd.is_some() {
             e.cost_usd = snap.cost_usd;
         }
+        if snap.context_used_pct.is_some() {
+            e.context_used_pct = snap.context_used_pct;
+        }
         e.ingested_at_ms = snap.ingested_at_ms;
+    }
+
+    /// The latest context-window fill for a session UUID (the tile header's
+    /// meter, N1). `None` until a snapshot with the field arrives.
+    pub fn context_pct_of(&self, session_id: &str) -> Option<f32> {
+        self.snapshots.get(session_id).and_then(|s| s.context_used_pct)
     }
 
     /// Fold a `claude_usage` command result (the cold-start fallback).

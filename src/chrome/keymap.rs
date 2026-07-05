@@ -173,7 +173,7 @@ fn bare_key(kc: &KeyChord) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Both binding tiers plus the leader chord. Maps are command -> binding
-/// (the webview's persisted direction); chord lookup scans - 21 entries.
+/// (the webview's persisted direction); chord lookup scans - ~22 entries.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Keymap {
     pub prefix: Chord,
@@ -188,6 +188,7 @@ impl Default for Keymap {
         for (cmd, chord) in [
             (CommandId::SpawnTerminal, "ctrl+t"),
             (CommandId::CloseTerminal, "ctrl+w"),
+            (CommandId::KillSession, "ctrl+shift+w"),
             (CommandId::CycleTileNext, "ctrl+tab"),
             (CommandId::CycleTilePrev, "ctrl+shift+tab"),
             (CommandId::FocusTab1, "ctrl+1"),
@@ -218,6 +219,9 @@ impl Default for Keymap {
             (CommandId::CycleTileNext, "n"),
             (CommandId::CycleTilePrev, "b"),
             (CommandId::OpenWorktreesList, "l"),
+            // N3: tmux's prefix+z zoom muscle memory (no webview chord exists;
+            // the webview only has the header button + Esc).
+            (CommandId::ToggleTileFullscreen, "z"),
             // Native-only (N5): the panels side surface. No webview binding
             // to mirror; `f` for Files, unused by the seeded set.
             (CommandId::TogglePanels, "f"),
@@ -674,6 +678,7 @@ mod tests {
         for (cmd, chord) in [
             (CommandId::SpawnTerminal, "ctrl+t"),
             (CommandId::CloseTerminal, "ctrl+w"),
+            (CommandId::KillSession, "ctrl+shift+w"),
             (CommandId::CycleTileNext, "ctrl+tab"),
             (CommandId::CycleTilePrev, "ctrl+shift+tab"),
             (CommandId::FocusTab1, "ctrl+1"),
@@ -696,6 +701,7 @@ mod tests {
             (CommandId::CycleTileNext, "n"),
             (CommandId::CycleTilePrev, "b"),
             (CommandId::OpenWorktreesList, "l"),
+            (CommandId::ToggleTileFullscreen, "z"),
         ] {
             assert_eq!(k.prefixed_of(cmd), Some(key), "{cmd:?}");
         }
@@ -750,7 +756,8 @@ mod tests {
         let mut c = controller();
         let mut m = model2();
         c.on_key(&ctrl("b"), &mut m, false, 0);
-        assert_eq!(c.on_key(&kc("z"), &mut m, false, 100), Handled::Pass);
+        // "q" has no prefixed binding ("z" gained one with N3 fullscreen).
+        assert_eq!(c.on_key(&kc("q"), &mut m, false, 100), Handled::Pass);
         assert!(!c.armed(101));
     }
 
