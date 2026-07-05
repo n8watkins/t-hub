@@ -155,6 +155,21 @@ struct ChromeDrag {
     last_cell: (usize, usize),
 }
 
+/// An in-progress header drag-reorder (N2): armed by a left press on a tile's
+/// header, it becomes a real drag once the pointer moves past a small
+/// threshold (so plain header clicks stay focus-only), tracking the tile under
+/// the pointer as the drop target.
+struct TileDrag {
+    id: String,
+    start: (f32, f32),
+    dragging: bool,
+    /// The drop target under the pointer (never the dragged tile itself).
+    target: Option<String>,
+}
+
+/// Pointer travel (px) before a header press becomes a reorder drag.
+const DRAG_THRESHOLD_PX: f32 = 4.0;
+
 /// Which OS window a paint or an input event belongs to. Every per-window bit
 /// of [`CockpitState`] is keyed by this: windows repaint on independent
 /// schedules, so state written by one window's paint (hit zones) or input
@@ -187,6 +202,8 @@ pub struct TileMeta {
 struct TileZones {
     tiles: Vec<(String, RectF, RectF)>,
     closes: Vec<(String, RectF)>,
+    /// Fullscreen toggle zones in the headers (N3), left of the close `x`.
+    fulls: Vec<(String, RectF)>,
     badges: Vec<(String, RectF)>,
     /// The header's editable work-name region (N1), per tile.
     names: Vec<(String, RectF)>,
@@ -203,6 +220,8 @@ struct WinInput {
     drag: Option<ChromeDrag>,
     /// An in-progress divider drag (T26).
     div_drag: Option<DividerId>,
+    /// An in-progress header drag-reorder (N2).
+    tile_drag: Option<TileDrag>,
     wheel_accum: f32,
     hover_cell: Option<(String, usize, usize)>,
     /// Last pointer position in this window (divider hover cue + cursor).
@@ -339,6 +358,14 @@ impl CockpitState {
             if input.drag.as_ref().is_some_and(|d| d.id == id) {
                 input.drag = None;
             }
+            if input.tile_drag.as_ref().is_some_and(|d| d.id == id) {
+                input.tile_drag = None;
+            }
+            if let Some(d) = input.tile_drag.as_mut() {
+                if d.target.as_deref() == Some(id) {
+                    d.target = None;
+                }
+            }
             if input.hover_cell.as_ref().is_some_and(|(hid, _, _)| hid == id) {
                 input.hover_cell = None;
             }
@@ -420,8 +447,13 @@ fn sidebar_hit(hits: &HitZones, x: f32, y: f32) -> Option<SidebarTarget> {
 /// What a tile-area click landed on, per window.
 enum TileTarget {
     Close(String),
+    /// The header's fullscreen toggle (N3).
+    Fullscreen(String),
     Badge(String),
+    /// The header's editable work-name region (N1).
     Name(String),
+    /// The header strip outside the buttons (N2: the drag-reorder handle).
+    Header(String),
     Tile(String),
 }
 
@@ -429,6 +461,11 @@ fn tile_hit(zones: &TileZones, x: f32, y: f32) -> Option<TileTarget> {
     for (id, r) in &zones.closes {
         if r.contains(x, y) {
             return Some(TileTarget::Close(id.clone()));
+        }
+    }
+    for (id, r) in &zones.fulls {
+        if r.contains(x, y) {
+            return Some(TileTarget::Fullscreen(id.clone()));
         }
     }
     for (id, r) in &zones.badges {
@@ -441,9 +478,15 @@ fn tile_hit(zones: &TileZones, x: f32, y: f32) -> Option<TileTarget> {
             return Some(TileTarget::Name(id.clone()));
         }
     }
-    for (id, r, _) in &zones.tiles {
+    for (id, r, content) in &zones.tiles {
         if r.contains(x, y) {
-            return Some(TileTarget::Tile(id.clone()));
+            // Above the content box = the header strip (the reorder handle);
+            // T6 terminal dispatch owns everything below.
+            return Some(if y < content.y {
+                TileTarget::Header(id.clone())
+            } else {
+                TileTarget::Tile(id.clone())
+            });
         }
     }
     None
@@ -473,6 +516,24 @@ fn set_win_focused(st: &mut CockpitState, key: WinKey, id: &str) {
         WinKey::Main => st.model.set_focused(id),
         WinKey::Sat(wsid) => st.sats.set_focused(wsid, Some(id.to_string())),
     }
+}
+
+/// Move the window's focus to tile `id`, telling terminals that track focus
+/// (mode 1004) - the click-to-focus core, shared by content and header presses.
+fn focus_tile(st: &mut CockpitState, key: WinKey, id: &str) {
+    let old = win_focused(st, key);
+    if old.as_deref() == Some(id) {
+        return;
+    }
+    if let Some(old) = old {
+        if let Some(t) = st.tiles.get(&old) {
+            notify_focus(t, false);
+        }
+    }
+    if let Some(t) = st.tiles.get(id) {
+        notify_focus(t, true);
+    }
+    set_win_focused(st, key, id);
 }
 
 /// The workspace tab a window's grid shows: main = the active tab (unless it
@@ -871,6 +932,13 @@ fn paint_tiles_area(
         .get(&key)
         .map(|i| (i.div_drag, i.last_pos))
         .unwrap_or((None, None));
+    // The window's active header drag-reorder (N2), for the drop highlight.
+    let drag_target = st
+        .input
+        .get(&key)
+        .and_then(|i| i.tile_drag.as_ref())
+        .filter(|d| d.dragging)
+        .and_then(|d| d.target.clone());
 
     // Split-borrow the state so the tiles map can be mutated while the model,
     // titles, and stamps are read (all disjoint fields of one MutexGuard).
@@ -900,8 +968,19 @@ fn paint_tiles_area(
         },
     };
 
+    // N3: a fullscreen tile takes the whole grid; the others stay attached but
+    // unpainted this frame (exactly like a workspace switch - no detach).
+    let fullscreen = win_tab_index(model, key)
+        .and_then(|i| model.tabs[i].fullscreen.clone())
+        .filter(|f| ids.iter().any(|x| x == f));
+    let (ids, ratios) = match &fullscreen {
+        Some(f) => (vec![f.clone()], None),
+        None => (ids, ratios),
+    };
+
     let mut tile_hits = Vec::with_capacity(ids.len());
     let mut close_hits = Vec::with_capacity(ids.len());
+    let mut full_hits = Vec::with_capacity(ids.len());
     let mut badge_hits = Vec::new();
     let mut name_hits = Vec::new();
     let mut rebuilt_frame: u64 = 0;
@@ -925,9 +1004,11 @@ fn paint_tiles_area(
         let life = lives.get(id);
         paint_tile_frame(b(bx), is_focused, window);
 
-        // Close zone in the header's right corner.
+        // Close zone in the header's right corner; the fullscreen toggle (N3)
+        // sits just left of it.
         let close_w = ui.cell_w + 10.0;
         let close = RectF::new(bx.x + bx.w - BORDER - close_w, bx.y + BORDER, close_w, HEADER_H);
+        let full = RectF::new(close.x - close_w, bx.y + BORDER, close_w, HEADER_H);
 
         // Content box: inside the border/padding, below the cockpit header.
         let content = RectF::new(
@@ -1034,9 +1115,11 @@ fn paint_tiles_area(
         // last-output age (T24) plus the life badge saying WHY a tile looks
         // frozen. On a narrow tile the badge outranks the age, and truncates
         // itself before it may ever overflow left across the dot/title.
+        // Budget subtracts BOTH header buttons (fullscreen + close, N3) and
+        // the meter's pixel width.
         let meter_pct = meta_info.context_pct.filter(|p| p.is_finite());
         let meter_px = if meter_pct.is_some() { METER_W + 6.0 } else { 0.0 };
-        let header_chars = (((bx.w - 2.0 * (BORDER + TILE_PAD) - close_w - meter_px)
+        let header_chars = (((bx.w - 2.0 * (BORDER + TILE_PAD) - 2.0 * close_w - meter_px)
             / ui.cell_w)
             .floor() as usize)
             .saturating_sub(2); // the dot
@@ -1133,7 +1216,7 @@ fn paint_tiles_area(
                     (cue_gap.to_string(), h(FG_DIM), false),
                     (badge_text, badge_color, badge_bold),
                 ],
-                close.x - cue_chars as f32 * ui.cell_w - 4.0,
+                full.x - cue_chars as f32 * ui.cell_w - 4.0,
                 header_y,
                 &font_normal,
                 &font_bold,
@@ -1142,11 +1225,12 @@ fn paint_tiles_area(
             );
         }
         // The context meter bar (N1): a small track + fill left of the cue
-        // text, colored by the webview's fill ramp.
+        // text (which itself sits left of the fullscreen button), colored by
+        // the webview's fill ramp.
         if let Some(pct) = meter_pct {
             let pct = pct.clamp(0.0, 100.0);
             let track = RectF::new(
-                close.x - cue_chars as f32 * ui.cell_w - 4.0 - meter_px,
+                full.x - cue_chars as f32 * ui.cell_w - 4.0 - meter_px,
                 bx.y + BORDER + (HEADER_H - 4.0) / 2.0,
                 METER_W,
                 4.0,
@@ -1164,6 +1248,22 @@ fn paint_tiles_area(
                 h(fill_color),
             ));
         }
+        // Fullscreen toggle (N3): ⤢ expands this tile over the grid, ⤡ (accented
+        // while fullscreen) restores - the webview Tile header button.
+        let is_fs = fullscreen.as_deref() == Some(id.as_str());
+        paint_parts(
+            &[(
+                if is_fs { "⤡".to_string() } else { "⤢".to_string() },
+                if is_fs { h(ACCENT) } else { h(FG_DIM) },
+                false,
+            )],
+            full.x + (full.w - ui.cell_w) / 2.0,
+            header_y,
+            &font_normal,
+            &font_bold,
+            window,
+            cx,
+        );
         paint_parts(
             &[("×".to_string(), h(FG_DIM), false)],
             close.x + (close.w - ui.cell_w) / 2.0,
@@ -1174,8 +1274,23 @@ fn paint_tiles_area(
             cx,
         );
 
+        // Drop-target highlight (N2): the tile a header drag would splice at
+        // washes accent and gets a 2px frame.
+        if drag_target.as_deref() == Some(id.as_str()) {
+            window.paint_quad(fill(b(bx), ha(ACCENT, 0.12)));
+            for edge in [
+                RectF::new(bx.x, bx.y, bx.w, 2.0),
+                RectF::new(bx.x, bx.y + bx.h - 2.0, bx.w, 2.0),
+                RectF::new(bx.x, bx.y, 2.0, bx.h),
+                RectF::new(bx.x + bx.w - 2.0, bx.y, 2.0, bx.h),
+            ] {
+                window.paint_quad(fill(b(edge), h(ACCENT)));
+            }
+        }
+
         tile_hits.push((id.clone(), bx, content));
         close_hits.push((id.clone(), close));
+        full_hits.push((id.clone(), full));
     }
 
     // --- dividers (T26): hover/drag highlight + resize cursor -----------------
@@ -1211,6 +1326,7 @@ fn paint_tiles_area(
         TileZones {
             tiles: tile_hits,
             closes: close_hits,
+            fulls: full_hits,
             badges: badge_hits,
             names: name_hits,
             dividers,
@@ -1369,25 +1485,33 @@ fn tiles_mouse_down(
                 sync_active_sessions(st, feed);
             }
         }
+        Some(TileTarget::Fullscreen(id)) if button == MouseButton::Left => {
+            // N3: the header ⤢/⤡ toggles this tile fullscreen (focus follows,
+            // like the webview button's onFocus).
+            if let Some(tab) = win_tab_index(&st.model, key) {
+                if st.model.toggle_fullscreen(tab, &id) {
+                    set_win_focused(st, key, &id);
+                }
+            }
+        }
         Some(TileTarget::Badge(id)) if button == MouseButton::Left => {
             if let Some(tile) = st.tiles.get(&id) {
                 tile.term.lock().scroll_to_bottom();
             }
         }
-        Some(TileTarget::Tile(id)) => {
+        Some(TileTarget::Header(id)) if button == MouseButton::Left => {
+            // N2: a left press on the header focuses the tile and ARMS a
+            // drag-reorder; it only becomes one past the movement threshold,
+            // so a plain header click stays focus-only. Terminal selection
+            // drags never start here (they need a content-area press), and
+            // dividers were consumed above.
+            focus_tile(st, key, &id);
+            st.input.entry(key).or_default().tile_drag =
+                Some(TileDrag { id, start: (x, y), dragging: false, target: None });
+        }
+        Some(TileTarget::Header(id)) | Some(TileTarget::Tile(id)) => {
             // Focus follows click; tell terminals that track focus (1004).
-            let old = win_focused(st, key);
-            if old.as_deref() != Some(id.as_str()) {
-                if let Some(old) = old {
-                    if let Some(t) = st.tiles.get(&old) {
-                        notify_focus(t, false);
-                    }
-                }
-                if let Some(t) = st.tiles.get(&id) {
-                    notify_focus(t, true);
-                }
-                set_win_focused(st, key, &id);
-            }
+            focus_tile(st, key, &id);
             // T6 dispatch: URL open, mouse reporting, selection, paste.
             if let Some(cell) = chrome_cell(st, key, &id, ev.position) {
                 if let Some(tile) = st.tiles.get(&id) {
@@ -1421,6 +1545,19 @@ fn tiles_mouse_up(st: &mut CockpitState, key: WinKey, button: MouseButton, ev: &
                 return;
             }
         }
+        // A header drag-reorder commits on release (N2): splice the dragged
+        // tile at the drop target's slot in THIS window's workspace.
+        if let Some(d) = st.input.get_mut(&key).and_then(|i| i.tile_drag.take()) {
+            if d.dragging {
+                if let (Some(tab), Some(target)) = (win_tab_index(&st.model, key), d.target) {
+                    if st.model.reorder_tile_in(tab, &d.id, &target) {
+                        set_win_focused(st, key, &d.id);
+                        st.save_layout();
+                    }
+                }
+            }
+            return;
+        }
     }
     let Some(drag) = st.input.get_mut(&key).and_then(|i| i.drag.take()) else { return };
     let ends_drag = match drag.mode {
@@ -1449,6 +1586,31 @@ fn tiles_mouse_move(st: &mut CockpitState, key: WinKey, ev: &MouseMoveEvent) -> 
 
     if let Some(id) = st.input.get(&key).and_then(|i| i.div_drag) {
         return divider_drag_motion(st, key, id, x, y);
+    }
+
+    // A header drag-reorder in progress (N2): arm past the threshold, then
+    // track the tile under the pointer as the drop target for the highlight.
+    if st.input.get(&key).is_some_and(|i| i.tile_drag.is_some()) {
+        let target = st
+            .tilezones
+            .get(&key)
+            .and_then(|z| z.tiles.iter().find(|(_, r, _)| r.contains(x, y)))
+            .map(|(id, _, _)| id.clone());
+        let Some(d) = st.input.get_mut(&key).and_then(|i| i.tile_drag.as_mut()) else {
+            return false;
+        };
+        if !d.dragging
+            && (x - d.start.0).abs().max((y - d.start.1).abs()) > DRAG_THRESHOLD_PX
+        {
+            d.dragging = true;
+        }
+        if !d.dragging {
+            return false;
+        }
+        let target = target.filter(|t| *t != d.id);
+        let changed = d.target != target;
+        d.target = target;
+        return changed;
     }
 
     if let Some(drag) = st.input.get(&key).and_then(|i| i.drag.as_ref()) {
@@ -1505,6 +1667,15 @@ fn tiles_mouse_move(st: &mut CockpitState, key: WinKey, ev: &MouseMoveEvent) -> 
 /// scrollback keys, PTY encoding) on the window's focused tile.
 fn tiles_key(st: &mut CockpitState, key: WinKey, ks: &gpui::Keystroke, cx: &mut App) {
     let chord = chord_of(ks);
+    // Esc restores the grid while a tile is fullscreen (N3) - the webview's
+    // capture-phase Escape handler; it never reaches the terminal then.
+    if chord.key == "escape" && !chord.control && !chord.alt && !chord.shift && !chord.platform {
+        if let Some(tab) = win_tab_index(&st.model, key) {
+            if st.model.clear_fullscreen(tab) {
+                return;
+            }
+        }
+    }
     if let Some(id) = win_focused(st, key) {
         if let Some(tile) = st.tiles.get_mut(&id) {
             tile_key_input(tile, &chord, cx);
@@ -2392,5 +2563,42 @@ impl Render for SatelliteView {
                 )
                 .size_full(),
             )
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The merged header's hit routing (N1+N2+N3): the close `x`, the
+    /// fullscreen toggle, and the work-name zone each win over the header
+    /// strip; the strip (anything above the content box outside those zones)
+    /// is the N2 drag handle; the content box is terminal dispatch.
+    #[test]
+    fn tile_hit_routes_header_buttons_name_drag_and_content() {
+        let id = "t1".to_string();
+        let zones = TileZones {
+            // Tile box (0,0,200,120); content starts below the 20px header.
+            tiles: vec![(id.clone(), RectF::new(0.0, 0.0, 200.0, 120.0), RectF::new(5.0, 20.0, 190.0, 95.0))],
+            closes: vec![(id.clone(), RectF::new(170.0, 0.0, 30.0, 20.0))],
+            fulls: vec![(id.clone(), RectF::new(140.0, 0.0, 30.0, 20.0))],
+            badges: Vec::new(),
+            names: vec![(id.clone(), RectF::new(60.0, 0.0, 40.0, 20.0))],
+            dividers: Vec::new(),
+            area: RectF::new(0.0, 0.0, 200.0, 120.0),
+        };
+        assert!(matches!(tile_hit(&zones, 185.0, 10.0), Some(TileTarget::Close(t)) if t == id));
+        assert!(
+            matches!(tile_hit(&zones, 155.0, 10.0), Some(TileTarget::Fullscreen(t)) if t == id)
+        );
+        assert!(matches!(tile_hit(&zones, 70.0, 10.0), Some(TileTarget::Name(t)) if t == id));
+        // The bare header strip (left of the name zone) is the drag handle.
+        assert!(matches!(tile_hit(&zones, 20.0, 10.0), Some(TileTarget::Header(t)) if t == id));
+        // Below the header: terminal dispatch.
+        assert!(matches!(tile_hit(&zones, 100.0, 60.0), Some(TileTarget::Tile(t)) if t == id));
+        // Outside everything: no target.
+        assert!(tile_hit(&zones, 300.0, 60.0).is_none());
     }
 }
