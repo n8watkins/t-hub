@@ -869,7 +869,11 @@ impl ChromeModel {
             return false;
         };
         let moved = tiles.remove(from);
-        tiles.insert(to, moved);
+        // Removing a lower slot shifts the target left: re-aim the insert so
+        // the moved tile lands AT the target's slot in BOTH directions (the
+        // webview's stale-index splice drops one-after when dragging forward;
+        // this deliberately fixes that instead of porting it).
+        tiles.insert(if from < to { to - 1 } else { to }, moved);
         if tab == self.active && !satellite {
             self.focused = Some(id.to_string());
         }
@@ -1611,6 +1615,22 @@ mod tests {
         assert!(m.reorder_tile("cc", "aa"));
         assert_eq!(m.active_tiles(), ids(&["cc", "aa", "bb"]).as_slice());
         assert_eq!(m.focused.as_deref(), Some("cc"));
+        // Forward (from < to): the removal shifts the target left, so the
+        // insert index re-aims - the moved tile splices directly at the
+        // target, never one slot past it (the stale-index off-by-one).
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb", "cc", "dd"]));
+        assert!(m.reorder_tile("aa", "cc"));
+        assert_eq!(m.active_tiles(), ids(&["bb", "aa", "cc", "dd"]).as_slice());
+        assert!(m.reorder_tile("bb", "dd"));
+        assert_eq!(m.active_tiles(), ids(&["aa", "cc", "bb", "dd"]).as_slice());
+        // A tile already directly before its forward target stays put (the
+        // splice-before-target slot is where it is).
+        assert!(m.reorder_tile("bb", "dd"));
+        assert_eq!(m.active_tiles(), ids(&["aa", "cc", "bb", "dd"]).as_slice());
+
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb", "cc"]));
         // Target in another tab (or missing): refuse - active-tab-only semantics.
         m.add_tab();
         m.reconcile(&ids(&["aa", "bb", "cc", "dd"]));
