@@ -765,6 +765,10 @@ fn spawn_cockpit_worker(
             let sidebar = feed.state();
             let folded = |sb: &Arc<Mutex<crate::overlays::SidebarState>>| sb.lock().events_folded;
             let apply_rx = feed.apply_requests();
+            // N1: per-cwd git_info poll throttle (the server's own TTL cache
+            // collapses tiles sharing a cwd; this just avoids re-asking every
+            // 250ms hint tick).
+            let mut git_last: HashMap<String, Instant> = HashMap::new();
             loop {
                 // T12: apply pending organization mutations BEFORE reconciling,
                 // so a new_tab exists and a worktree placement is noted by the
@@ -773,6 +777,7 @@ fn spawn_cockpit_worker(
                 // ~250ms of the server accepting the command.
                 drain_applies(&state, &feed, &apply_rx);
                 reconcile_once(&state, &client);
+                poll_git_info(&state, &client, &mut git_last);
                 {
                     let st = state.lock();
                     sync_active_sessions(&st, &feed);
@@ -888,6 +893,43 @@ fn reconcile_once(state: &Arc<Mutex<CockpitState>>, client: &Arc<ControlClient>)
     // Attach outside the lock (each attach is a network round-trip).
     for id in need_attach {
         attach_tile(state, client, &id);
+    }
+}
+
+/// How often each cwd's `git_info` is re-polled for the tile headers (N1).
+/// Matches the webview Files-panel cadence; the server caches per cwd anyway.
+const GIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Refresh git awareness (branch / linked-worktree / dirty count) for every
+/// unique live session cwd, over the socket `git_info` (N1 tile headers).
+/// Requests run on this worker thread, outside the cockpit lock.
+fn poll_git_info(
+    state: &Arc<Mutex<CockpitState>>,
+    client: &Arc<ControlClient>,
+    git_last: &mut HashMap<String, Instant>,
+) {
+    let mut cwds: Vec<String> = {
+        let st = state.lock();
+        st.cwds.values().filter(|c| !c.is_empty()).cloned().collect()
+    };
+    cwds.sort();
+    cwds.dedup();
+    git_last.retain(|c, _| cwds.iter().any(|x| x == c));
+    let now = Instant::now();
+    for cwd in cwds {
+        if git_last.get(&cwd).is_some_and(|t| now.duration_since(*t) < GIT_POLL_INTERVAL) {
+            continue;
+        }
+        git_last.insert(cwd.clone(), now);
+        match client.request("git_info", serde_json::json!({ "path": cwd.clone() })) {
+            Ok(v) => match serde_json::from_value::<crate::panels::files::GitInfo>(v) {
+                Ok(info) => {
+                    state.lock().git.insert(cwd, info);
+                }
+                Err(e) => log::debug!("git_info parse failed for {cwd}: {e}"),
+            },
+            Err(e) => log::debug!("git_info failed for {cwd}: {e}"),
+        }
     }
 }
 
