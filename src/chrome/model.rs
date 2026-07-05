@@ -14,7 +14,7 @@
 //! rows take the extras, each row's tiles span the full width - no holes, unlike
 //! the T5 uniform grid).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::font::FontSpec;
 
@@ -439,6 +439,15 @@ pub struct Rename {
     pub buffer: String,
 }
 
+/// Work-name editing state (N1): which tile's header is being edited, the cwd
+/// the name will be stored under, and the in-progress buffer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NameEdit {
+    pub tile: String,
+    pub cwd: String,
+    pub buffer: String,
+}
+
 /// What a reconcile pass changed: `added` need a PTY attach; `removed` (sessions
 /// gone from the server) need their pool entries dropped.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -467,6 +476,12 @@ pub struct ChromeModel {
     pub active: usize,
     pub focused: Option<String>,
     pub renaming: Option<Rename>,
+    /// In-progress work-name edit (N1), captured by the header click.
+    pub naming: Option<NameEdit>,
+    /// User-assigned work names, keyed by session cwd (webview parity:
+    /// `t-hub.theme.workNames` keys by project path, so every tile on that
+    /// cwd shares the name). Persisted with the layout.
+    pub work_names: HashMap<String, String>,
     /// Tiles closed by the user this run. NOT persisted: a client restart
     /// re-lists everything live (self-healing, and the only "reopen" story until
     /// the T9 recents overlay).
@@ -489,6 +504,8 @@ impl Default for ChromeModel {
             active: 0,
             focused: None,
             renaming: None,
+            naming: None,
+            work_names: HashMap::new(),
             hidden: HashSet::new(),
             pending_placements: Vec::new(),
             next_wsid: 2,
@@ -734,6 +751,52 @@ impl ChromeModel {
 
     pub fn cancel_rename(&mut self) {
         self.renaming = None;
+    }
+
+    // -- work names (N1) ------------------------------------------------------
+
+    /// The user-assigned work name for a cwd, if any.
+    pub fn work_name_for(&self, cwd: &str) -> Option<&str> {
+        self.work_names.get(cwd).map(String::as_str)
+    }
+
+    /// Begin editing tile `id`'s work name (header click). Seeds the buffer
+    /// with the current name so Enter without typing keeps it.
+    pub fn begin_name_edit(&mut self, id: &str, cwd: &str) {
+        let buffer = self.work_names.get(cwd).cloned().unwrap_or_default();
+        self.naming = Some(NameEdit { tile: id.to_string(), cwd: cwd.to_string(), buffer });
+    }
+
+    pub fn name_push(&mut self, s: &str) {
+        if let Some(n) = &mut self.naming {
+            n.buffer.push_str(s);
+        }
+    }
+
+    pub fn name_backspace(&mut self) {
+        if let Some(n) = &mut self.naming {
+            n.buffer.pop();
+        }
+    }
+
+    /// Commit the work-name edit: a trimmed non-empty buffer stores the name,
+    /// a blank buffer clears the slot (webview `setWorkName` semantics).
+    /// Returns whether anything changed (the caller persists).
+    pub fn commit_name(&mut self) -> bool {
+        let Some(n) = self.naming.take() else { return false };
+        let name = n.buffer.trim();
+        if name.is_empty() {
+            self.work_names.remove(&n.cwd).is_some()
+        } else if self.work_names.get(&n.cwd).map(String::as_str) == Some(name) {
+            false
+        } else {
+            self.work_names.insert(n.cwd, name.to_string());
+            true
+        }
+    }
+
+    pub fn cancel_name(&mut self) {
+        self.naming = None;
     }
 
     // -- tiles ----------------------------------------------------------------
@@ -992,6 +1055,45 @@ mod tests {
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // -- work names (N1) --------------------------------------------------------
+
+    #[test]
+    fn work_name_edit_commits_clears_and_cancels() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["t1"]));
+
+        // Commit stores the trimmed name under the cwd.
+        m.begin_name_edit("t1", "/repo/app");
+        m.name_push("  auth");
+        m.name_push(" fix ");
+        assert!(m.commit_name());
+        assert_eq!(m.work_name_for("/repo/app"), Some("auth fix"));
+        assert!(m.naming.is_none());
+
+        // Re-editing seeds the buffer with the current name; committing the
+        // same name changes nothing.
+        m.begin_name_edit("t1", "/repo/app");
+        assert_eq!(m.naming.as_ref().unwrap().buffer, "auth fix");
+        assert!(!m.commit_name());
+
+        // Backspace edits; Esc cancels without touching the stored name.
+        m.begin_name_edit("t1", "/repo/app");
+        m.name_backspace();
+        m.cancel_name();
+        assert_eq!(m.work_name_for("/repo/app"), Some("auth fix"));
+
+        // A blanked buffer clears the slot (webview setWorkName semantics).
+        m.begin_name_edit("t1", "/repo/app");
+        for _ in 0.."auth fix".len() {
+            m.name_backspace();
+        }
+        assert!(m.commit_name());
+        assert_eq!(m.work_name_for("/repo/app"), None);
+        // Clearing an already-empty slot is a no-op.
+        m.begin_name_edit("t1", "/repo/app");
+        assert!(!m.commit_name());
     }
 
     // -- splitRows / tile_boxes -------------------------------------------------
