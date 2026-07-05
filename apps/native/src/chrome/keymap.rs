@@ -173,7 +173,7 @@ fn bare_key(kc: &KeyChord) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Both binding tiers plus the leader chord. Maps are command -> binding
-/// (the webview's persisted direction); chord lookup scans - 21 entries.
+/// (the webview's persisted direction); chord lookup scans - ~22 entries.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Keymap {
     pub prefix: Chord,
@@ -188,6 +188,7 @@ impl Default for Keymap {
         for (cmd, chord) in [
             (CommandId::SpawnTerminal, "ctrl+t"),
             (CommandId::CloseTerminal, "ctrl+w"),
+            (CommandId::KillSession, "ctrl+shift+w"),
             (CommandId::CycleTileNext, "ctrl+tab"),
             (CommandId::CycleTilePrev, "ctrl+shift+tab"),
             (CommandId::FocusTab1, "ctrl+1"),
@@ -674,6 +675,7 @@ mod tests {
         for (cmd, chord) in [
             (CommandId::SpawnTerminal, "ctrl+t"),
             (CommandId::CloseTerminal, "ctrl+w"),
+            (CommandId::KillSession, "ctrl+shift+w"),
             (CommandId::CycleTileNext, "ctrl+tab"),
             (CommandId::CycleTilePrev, "ctrl+shift+tab"),
             (CommandId::FocusTab1, "ctrl+1"),

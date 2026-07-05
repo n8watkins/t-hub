@@ -2410,14 +2410,16 @@ fn send_keys(args: &Value) -> Result<Value, String> {
 
 /// `close_terminal`: kill an existing session and its process tree. Process-
 /// changing/destructive (confirmation-required). Backend-only via tmux
-/// `kill-session`, which is idempotent (already-gone ⇒ success). Args:
-/// `sessionId` (required).
+/// `kill_session_tree` - the same guarantee the webview's `kill_terminal`
+/// gives: `kill-session` alone only SIGHUPs, which agents like `claude`
+/// survive and leak; the tree kill SIGKILLs the pane's descendants first.
+/// Idempotent (already-gone ⇒ success). Args: `sessionId` (required).
 fn close_terminal(args: &Value) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("close_terminal requires a 'sessionId' argument")?;
     let target = tmux_target(&session_id);
-    tmux::kill_session(&target)
+    tmux::kill_session_tree(&target)
         .map_err(|e| format!("failed to close terminal '{session_id}': {e}"))?;
     Ok(json!({
         "accepted": "close_terminal",

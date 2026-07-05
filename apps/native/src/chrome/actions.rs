@@ -24,12 +24,16 @@ use crate::font::FontSpec;
 // The registry
 // ---------------------------------------------------------------------------
 
-/// The 21 webview commands, ids matching `lib/commands.ts` exactly (the
-/// persisted keymap file uses these strings).
+/// The webview's 21 commands (ids matching `lib/commands.ts` exactly - the
+/// persisted keymap file uses these strings) plus the native-only
+/// `killSession` (N4): the webview hard-codes Ctrl+Shift+W in
+/// `useLifecycleKeybinds.tsx`, native routes it through the registry so the
+/// palette and rebinding get it for free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommandId {
     SpawnTerminal,
     CloseTerminal,
+    KillSession,
     NewPlainWorkspace,
     NewWorktreeWorkspace,
     OpenWorktreesList,
@@ -55,10 +59,12 @@ pub enum CommandId {
 }
 
 /// Registry order = the webview's COMMANDS list order (palette tie-break);
-/// native-only commands append after.
-pub const ALL_COMMANDS: [CommandId; 22] = [
+/// native-only commands (killSession slots after its close sibling,
+/// toggleTileFullscreen appends) ride along.
+pub const ALL_COMMANDS: [CommandId; 23] = [
     CommandId::SpawnTerminal,
     CommandId::CloseTerminal,
+    CommandId::KillSession,
     CommandId::NewPlainWorkspace,
     CommandId::NewWorktreeWorkspace,
     CommandId::OpenWorktreesList,
@@ -87,6 +93,7 @@ impl CommandId {
         match self {
             CommandId::SpawnTerminal => "spawnTerminal",
             CommandId::CloseTerminal => "closeTerminal",
+            CommandId::KillSession => "killSession",
             CommandId::NewPlainWorkspace => "newPlainWorkspace",
             CommandId::NewWorktreeWorkspace => "newWorktreeWorkspace",
             CommandId::OpenWorktreesList => "openWorktreesList",
@@ -119,6 +126,7 @@ impl CommandId {
         match self {
             CommandId::SpawnTerminal => "New terminal",
             CommandId::CloseTerminal => "Close terminal",
+            CommandId::KillSession => "Kill session",
             CommandId::NewPlainWorkspace => "New workspace",
             CommandId::NewWorktreeWorkspace => "New worktree workspace",
             CommandId::OpenWorktreesList => "List worktrees",
@@ -146,6 +154,9 @@ impl CommandId {
         match self {
             CommandId::SpawnTerminal => "Spawn a terminal after the focused tile",
             CommandId::CloseTerminal => "Close the focused terminal's tile (session survives)",
+            CommandId::KillSession => {
+                "Kill the focused terminal's tmux session for real (asks to confirm)"
+            }
             CommandId::NewPlainWorkspace => "Open a new empty tab (no repo, no worktree)",
             CommandId::NewWorktreeWorkspace => {
                 "Branch the focused repo into a sibling worktree and open it in a new tab"
@@ -181,6 +192,7 @@ impl CommandId {
         match self {
             CommandId::SpawnTerminal
             | CommandId::CloseTerminal
+            | CommandId::KillSession
             | CommandId::ToggleTileFullscreen => "Terminals",
             CommandId::NewPlainWorkspace
             | CommandId::NewWorktreeWorkspace
@@ -266,6 +278,9 @@ pub enum Effect {
     /// Dispatch a host/server flow through [`dispatch_host`] (T-B seam), with
     /// the focused tile's cwd attached by the view.
     Host(HostCommand),
+    /// The user asked to KILL a session (N4): the view opens the confirm
+    /// dialog (busy-aware); nothing is mutated until the user confirms there.
+    ConfirmKill(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +315,15 @@ pub fn execute(cmd: CommandId, model: &mut ChromeModel, region: &mut Region) -> 
             vec![Effect::Host(HostCommand::NewWorktreeWorkspace)]
         }
         CommandId::OpenWorktreesList => vec![Effect::Host(HostCommand::OpenWorktreesList)],
+        CommandId::KillSession => {
+            // No model mutation here: killing is destructive, so the view
+            // confirms first and runs the whole flow (server kill + tile drop)
+            // on confirm.
+            match model.focused.clone() {
+                Some(id) => vec![Effect::ConfirmKill(id)],
+                None => Vec::new(),
+            }
+        }
         CommandId::CloseTerminal => {
             let Some(id) = model.focused.clone() else { return Vec::new() };
             if model.close_tile(&id) {
@@ -600,6 +624,21 @@ mod tests {
         assert_eq!(m.active, 0, "wraps");
         execute(CommandId::ToggleFocusRegion, &mut m, &mut r);
         assert_eq!(r, Region::Tiles);
+    }
+
+    #[test]
+    fn kill_session_confirms_without_mutating() {
+        let mut m = model_with(vec![("A", vec!["t1", "t2"], false)]);
+        m.set_focused("t1");
+        let mut r = Region::Tiles;
+        // Kill is destructive: the executor only asks the view to confirm;
+        // the tile stays until the user does.
+        let fx = execute(CommandId::KillSession, &mut m, &mut r);
+        assert_eq!(fx, vec![Effect::ConfirmKill("t1".into())]);
+        assert!(m.contains_tile("t1"));
+        // Nothing focused: no effects.
+        let mut m = model_with(vec![("A", vec![], false)]);
+        assert!(execute(CommandId::KillSession, &mut m, &mut r).is_empty());
     }
 
     #[test]
