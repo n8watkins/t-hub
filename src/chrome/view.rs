@@ -88,6 +88,8 @@ const PAD: f32 = 6.0;
 const GAP: f32 = 6.0;
 /// Width of the left sidebar (workspace list on top, T9 overlays below).
 const SIDEBAR_W: f32 = 220.0;
+/// The panels side surface width (N5): the `panel-window` bin's proven width.
+const PANELS_W: f32 = 420.0;
 /// The real cockpit header (title + id + geometry + close), replacing T5's
 /// one-line debug label.
 const HEADER_H: f32 = 20.0;
@@ -224,6 +226,10 @@ pub struct CockpitState {
     /// Main-window only (the webview keymap lived in its one window; satellite
     /// keys stay raw terminal input).
     pub(crate) keys: KeyController,
+    /// Whether the panels side surface (N5: Files / Preview / Dev runner) is
+    /// shown beside the grid. View state like the palette - transient, not
+    /// persisted, main window only.
+    pub(crate) panels_open: bool,
     ui: Option<UiMetrics>,
     ui_font: Font,
     ui_font_bold: Font,
@@ -251,6 +257,7 @@ impl CockpitState {
             input: HashMap::new(),
             visible_cells: HashMap::new(),
             keys: KeyController::load_default(),
+            panels_open: false,
             ui: None,
             ui_font,
             ui_font_bold,
@@ -463,12 +470,18 @@ pub struct CockpitView {
     focus: FocusHandle,
     handles: SatHandles,
     client: Arc<crate::wire::ControlClient>,
+    /// The T11 panels side surface (N5): the pre-built composite entity and
+    /// its poll-only feed (composes beside the [`OverlayFeed`] - it takes no
+    /// event subscription, honoring the single-drainer rule).
+    panels: Entity<crate::panels::PanelHost>,
+    panels_feed: crate::panels::PanelsFeed,
     /// T-B "+ terminal" double-click gate (webview #7 parity): one spawn in
     /// flight at a time, released when the request round-trips.
     spawn_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CockpitView {
+    #[allow(clippy::too_many_arguments)] // the cockpit boot wires every subsystem once, here
     pub fn new(
         state: Arc<Mutex<CockpitState>>,
         overlays: Entity<OverlaySidebar>,
@@ -476,6 +489,8 @@ impl CockpitView {
         client: Arc<crate::wire::ControlClient>,
         handles: SatHandles,
         focus: FocusHandle,
+        panels: Entity<crate::panels::PanelHost>,
+        panels_feed: crate::panels::PanelsFeed,
     ) -> Self {
         spawn_logger();
         CockpitView {
@@ -485,6 +500,8 @@ impl CockpitView {
             focus,
             handles,
             client,
+            panels,
+            panels_feed,
             spawn_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -1444,7 +1461,16 @@ impl CockpitView {
                 tiles_mouse_down(&mut st, WinKey::Main, &self.feed, button, ev, cx);
             }
         }
-        window.focus(&self.focus);
+        // Clicks route the keyboard: inside the open panels column they focus
+        // the PanelHost (its Files search / Run command line take typing -
+        // never the focused tile's PTY); anywhere else, back to the cockpit.
+        let in_panels = self.state.lock().panels_open
+            && x >= f32::from(window.viewport_size().width) - PANELS_W;
+        if in_panels {
+            window.focus(&self.panels.focus_handle(cx));
+        } else {
+            window.focus(&self.focus);
+        }
         cx.notify();
     }
 
@@ -1491,7 +1517,7 @@ impl CockpitView {
         }
     }
 
-    fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let mut st = self.state.lock();
 
@@ -1530,9 +1556,16 @@ impl CockpitView {
             let CockpitState { keys, model, .. } = &mut *st;
             keys.on_key(&chord_of(ks), model, guard, now)
         };
+        // While the panels side surface holds keyboard focus, its own key
+        // handler (a child of this root, so it already ran) owns plain keys -
+        // typing a Files search must never fall through into the focused
+        // tile's PTY. Keymap chords above still work (prefix `f` closes it).
+        let panels_focused =
+            st.panels_open && self.panels.focus_handle(cx).is_focused(window);
         match handled {
+            Handled::Pass if panels_focused => {}
             Handled::Pass => tiles_key(&mut st, WinKey::Main, ks, cx),
-            Handled::Consumed(effects) => self.apply_effects(&mut st, effects, cx),
+            Handled::Consumed(effects) => self.apply_effects(&mut st, effects, window, cx),
         }
         cx.notify();
     }
@@ -1545,6 +1578,7 @@ impl CockpitView {
         &self,
         st: &mut CockpitState,
         effects: Vec<Effect>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         for effect in effects {
@@ -1563,6 +1597,14 @@ impl CockpitView {
                     }
                     if let Some(t) = st.tiles.get(&new) {
                         notify_focus(t, true);
+                    }
+                    // Open panels follow the focused tile's project (the
+                    // webview panels are per-tile; the side surface tracks
+                    // focus instead). Sticky in the feed if the cwd repeats.
+                    if st.panels_open {
+                        if let Some(cwd) = st.cwds.get(&new) {
+                            self.panels_feed.set_root(cwd);
+                        }
                     }
                 }
                 Effect::TileClosed(id) => {
@@ -1602,6 +1644,23 @@ impl CockpitView {
                         .and_then(|id| st.cwds.get(&id).cloned());
                     dispatch_host(&cmd, cwd.as_deref());
                 }
+                Effect::TogglePanels => {
+                    st.panels_open = !st.panels_open;
+                    if st.panels_open {
+                        // Root the panels at the focused tile's project and
+                        // hand them the keyboard (Files fuzzy search types
+                        // immediately - the panel-window wiring).
+                        if let Some(cwd) = win_focused(st, WinKey::Main)
+                            .and_then(|id| st.cwds.get(&id).cloned())
+                        {
+                            self.panels_feed.set_root(&cwd);
+                        }
+                        window.focus(&self.panels.focus_handle(cx));
+                    } else {
+                        // Keyboard back to the cockpit (tiles).
+                        window.focus(&self.focus);
+                    }
+                }
             }
         }
     }
@@ -1623,7 +1682,10 @@ impl Render for CockpitView {
         // Continuous repaint like the grid; damage clipping bounds the work.
         window.request_animation_frame();
 
-        let ws_h = workspace_section_height(self.state.lock().model.tabs.len());
+        let (ws_h, panels_open) = {
+            let st = self.state.lock();
+            (workspace_section_height(st.model.tabs.len()), st.panels_open)
+        };
         let statuses = gather_statuses(&self.feed);
         let focused_window = self.focus.is_focused(window);
 
@@ -1712,6 +1774,19 @@ impl Render for CockpitView {
                     .size_full(),
                 ),
             )
+            .when(panels_open, |root| {
+                // The N5 panels side surface: the T11 PanelHost in a fixed
+                // right column (the panel-window bin's width), toggled by the
+                // `togglePanels` command. It handles its own keys/clicks.
+                root.child(
+                    div()
+                        .w(px(PANELS_W))
+                        .h_full()
+                        .border_l_1()
+                        .border_color(h(SIDEBAR_BG))
+                        .child(self.panels.clone()),
+                )
+            })
             .children(key_overlay)
     }
 }
