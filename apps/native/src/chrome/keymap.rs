@@ -218,6 +218,9 @@ impl Default for Keymap {
             (CommandId::CycleTileNext, "n"),
             (CommandId::CycleTilePrev, "b"),
             (CommandId::OpenWorktreesList, "l"),
+            // Native-only (N5): the panels side surface. No webview binding
+            // to mirror; `f` for Files, unused by the seeded set.
+            (CommandId::TogglePanels, "f"),
         ] {
             prefixed.insert(cmd, key.to_string());
         }

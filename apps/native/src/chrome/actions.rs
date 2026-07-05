@@ -25,7 +25,10 @@ use crate::font::FontSpec;
 // ---------------------------------------------------------------------------
 
 /// The 21 webview commands, ids matching `lib/commands.ts` exactly (the
-/// persisted keymap file uses these strings).
+/// persisted keymap file uses these strings), plus native-only additions
+/// ([`CommandId::TogglePanels`] - the webview exposes panels as per-tile
+/// header tabs, which need no command; the native cockpit mounts them as a
+/// toggleable side surface, N5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommandId {
     SpawnTerminal,
@@ -49,10 +52,12 @@ pub enum CommandId {
     ZoomOut,
     ZoomReset,
     CommandPalette,
+    TogglePanels,
 }
 
-/// Registry order = the webview's COMMANDS list order (palette tie-break).
-pub const ALL_COMMANDS: [CommandId; 21] = [
+/// Registry order = the webview's COMMANDS list order (palette tie-break),
+/// native-only commands appended.
+pub const ALL_COMMANDS: [CommandId; 22] = [
     CommandId::SpawnTerminal,
     CommandId::CloseTerminal,
     CommandId::NewPlainWorkspace,
@@ -74,6 +79,7 @@ pub const ALL_COMMANDS: [CommandId; 21] = [
     CommandId::ZoomOut,
     CommandId::ZoomReset,
     CommandId::CommandPalette,
+    CommandId::TogglePanels,
 ];
 
 impl CommandId {
@@ -101,6 +107,7 @@ impl CommandId {
             CommandId::ZoomOut => "zoomOut",
             CommandId::ZoomReset => "zoomReset",
             CommandId::CommandPalette => "commandPalette",
+            CommandId::TogglePanels => "togglePanels",
         }
     }
 
@@ -132,6 +139,7 @@ impl CommandId {
             CommandId::ZoomOut => "Zoom out",
             CommandId::ZoomReset => "Reset zoom",
             CommandId::CommandPalette => "Command palette",
+            CommandId::TogglePanels => "Toggle panels",
         }
     }
 
@@ -164,6 +172,9 @@ impl CommandId {
             CommandId::ZoomOut => "Decrease terminal font size",
             CommandId::ZoomReset => "Reset terminal font size",
             CommandId::CommandPalette => "Open the fuzzy command palette",
+            CommandId::TogglePanels => {
+                "Show or hide the Files / Preview / Dev panels beside the grid"
+            }
         }
     }
 
@@ -186,7 +197,7 @@ impl CommandId {
             | CommandId::FocusTab8
             | CommandId::FocusTab9 => "Navigation",
             CommandId::ZoomIn | CommandId::ZoomOut | CommandId::ZoomReset => "Zoom",
-            CommandId::CommandPalette => "App",
+            CommandId::CommandPalette | CommandId::TogglePanels => "App",
         }
     }
 
@@ -254,6 +265,10 @@ pub enum Effect {
     /// Dispatch a host/server flow through [`dispatch_host`] (T-B seam), with
     /// the focused tile's cwd attached by the view.
     Host(HostCommand),
+    /// Show/hide the panels side surface (N5). The open flag is view state
+    /// (like the palette), not model state - the view flips it, roots the
+    /// panels feed at the focused tile's cwd, and routes keyboard focus.
+    TogglePanels,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +328,7 @@ pub fn execute(cmd: CommandId, model: &mut ChromeModel, region: &mut Region) -> 
         CommandId::ZoomOut => zoom(model, -1.0),
         CommandId::ZoomReset => zoom_reset(model),
         CommandId::CommandPalette => Vec::new(),
+        CommandId::TogglePanels => vec![Effect::TogglePanels],
         _ => unreachable!("focusTab handled above"),
     }
 }
@@ -482,6 +498,20 @@ mod tests {
         for cat in ["Terminals", "Workspaces", "Navigation", "Zoom", "App"] {
             assert!(ALL_COMMANDS.iter().any(|c| c.category() == cat), "{cat} empty");
         }
+    }
+
+    #[test]
+    fn toggle_panels_emits_view_effect_only() {
+        let mut m = model_with(vec![("A", vec!["t1"], false)]);
+        let mut r = Region::Tiles;
+        let focused_before = m.focused.clone();
+        let fx = execute(CommandId::TogglePanels, &mut m, &mut r);
+        assert_eq!(fx, vec![Effect::TogglePanels]);
+        // Panels visibility is view state, not model state: nothing mutated.
+        assert_eq!(m.tabs.len(), 1);
+        assert_eq!(m.active, 0);
+        assert_eq!(m.focused, focused_before);
+        assert_eq!(r, Region::Tiles);
     }
 
     #[test]

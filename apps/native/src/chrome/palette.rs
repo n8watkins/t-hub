@@ -1,5 +1,5 @@
 //! The command palette model (T-A): the webview `CommandPalette.tsx` ported
-//! gpui-free - fuzzy search over the 21-command registry, keyboard
+//! gpui-free - fuzzy search over the 22-command registry, keyboard
 //! navigation, execute-on-enter, and the rebind capture flow.
 //!
 //! Everything here is plain state + reducers; the gui layer
