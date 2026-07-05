@@ -182,37 +182,56 @@ pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), T
     // Raise the scrollback cap for the window we're about to create. history-limit
     // is per-window and fixed at creation, so it must be the GLOBAL default BEFORE
     // new-session. start-server first so `set -g` has a server to set it on (fresh
-    // boot). Best-effort: a failure just falls back to tmux's 2000 default.
+    // boot).
+    //
+    // All three run as ONE tmux command sequence (`;`-separated argv, no shell
+    // involved) so the whole critical path costs a single process launch — on
+    // Windows each tmux call is a full `wsl.exe` spawn (hundreds of ms), and this
+    // path used to make ~13 of them per Ctrl+T.
     let limit = HISTORY_LIMIT.to_string();
-    let _ = run("start-server", &["start-server"]);
-    let _ = run(
+    let mut seq: Vec<&str> = vec![
+        "start-server",
+        ";",
         "set-option",
-        &["set-option", "-g", "history-limit", &limit],
-    );
+        "-g",
+        "history-limit",
+        &limit,
+        ";",
+    ];
+    seq.extend_from_slice(&args);
+    run("new-session", &seq)?;
 
-    run("new-session", &args)?;
-
-    // Pin the pane to the latest active client. Best-effort: if this fails the
-    // session still exists, so we surface it as an error only if tmux reports
-    // one (the session create above already succeeded).
-    run("set-option", &["set-option", "-t", name, "window-size", "latest"])?;
-
-    // T-Hub draws its own tile chrome, so suppress tmux's status bar (the green
-    // "0:zsh" line). Best-effort -- purely cosmetic, never fail the spawn.
-    let _ = run("set-option", &["set-option", "-t", name, "status", "off"]);
-    // Mouse ON (global): full-screen apps that request mouse mode (Claude Code,
-    // vim, less, ...) receive the wheel and scroll their OWN content instead of
-    // the terminal translating the wheel into Up/Down arrow keys; a plain shell's
-    // wheel enters tmux copy-mode scrollback. Set globally (`-g`) so it also
-    // applies to already-running sessions, not just this new one. Trade-off:
-    // mouse text-selection now needs Shift+drag (which bypasses tmux's capture).
-    let _ = run("set-option", &["set-option", "-g", "mouse", "on"]);
-    // Re-apply the server-global keybinds (prefix-disable + right-click unbinds).
-    // `ensure_mouse_on()` already does this at startup, but it runs ONCE and may
-    // fire before any tmux server exists (fresh boot), so its unbinds silently
-    // no-op. Re-running here — once a server is guaranteed to exist — makes them
-    // stick. Root-table (`-n`) bindings are server-global, so this is idempotent.
-    apply_global_keybinds();
+    // Post-create tuning, batched into one more tmux call. All best-effort — the
+    // session already exists, so never fail the spawn over these:
+    //   - window-size latest: pin the pane to the latest active client.
+    //   - status off: T-Hub draws its own tile chrome, suppress tmux's status bar.
+    //   - mouse on (global): full-screen apps that request mouse mode receive the
+    //     wheel and scroll their OWN content; applies to existing sessions too.
+    //     Trade-off: mouse text-selection needs Shift+drag.
+    //   - global keybinds: prefix-disable + right-click unbinds. `ensure_mouse_on()`
+    //     applies these at startup but may fire before any tmux server exists;
+    //     re-running here — once a server is guaranteed to exist — makes them stick.
+    let mut post: Vec<&str> = vec![
+        "set-option",
+        "-t",
+        name,
+        "window-size",
+        "latest",
+        ";",
+        "set-option",
+        "-t",
+        name,
+        "status",
+        "off",
+        ";",
+        "set-option",
+        "-g",
+        "mouse",
+        "on",
+        ";",
+    ];
+    post.extend_from_slice(GLOBAL_KEYBIND_ARGS);
+    let _ = run("set-option", &post);
     Ok(())
 }
 
@@ -246,18 +265,21 @@ pub(crate) fn resize_window_for_tests(name: &str, cols: u16, rows: u16) -> Resul
 ///    has its own tile chrome. Unbind the four root-table MouseDown3 events.
 ///
 /// Best-effort: every error is swallowed (no server yet, etc.).
+///
+/// The whole set is one `;`-separated tmux command sequence so it costs a single
+/// process launch (one `wsl.exe` spawn on Windows) instead of seven.
+const GLOBAL_KEYBIND_ARGS: &[&str] = &[
+    "set-option", "-g", "prefix", "None", ";",
+    "unbind", "-n", "C-b", ";",
+    "unbind", "C-b", ";",
+    "unbind", "-n", "MouseDown3Pane", ";",
+    "unbind", "-n", "MouseDown3Status", ";",
+    "unbind", "-n", "MouseDown3StatusLeft", ";",
+    "unbind", "-n", "MouseDown3StatusRight",
+];
+
 fn apply_global_keybinds() {
-    let _ = run("set-option", &["set-option", "-g", "prefix", "None"]);
-    let _ = run("unbind", &["unbind", "-n", "C-b"]);
-    let _ = run("unbind", &["unbind", "C-b"]);
-    for ev in [
-        "MouseDown3Pane",
-        "MouseDown3Status",
-        "MouseDown3StatusLeft",
-        "MouseDown3StatusRight",
-    ] {
-        let _ = run("unbind", &["unbind", "-n", ev]);
-    }
+    let _ = run("set-option", GLOBAL_KEYBIND_ARGS);
 }
 
 /// Force `mouse on` for the whole server AND every existing session.
