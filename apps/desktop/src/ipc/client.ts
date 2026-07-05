@@ -12,6 +12,7 @@ import {
   type SpawnOptions,
   type StateEvent,
   type TabReport,
+  type TabReportResult,
   type TerminalId,
   type TerminalInfo,
 } from "./types";
@@ -20,11 +21,17 @@ export function spawnTerminal(opts: SpawnOptions = {}): Promise<TerminalInfo> {
   return invoke(Commands.spawnTerminal, { opts });
 }
 
-/** Report the live workspace-tab layout to the core's addressable tab registry
- *  (TASK C / #22), so the control/MCP `list_tabs` reflects the UI. Best-effort:
- *  callers ignore the (void) result. */
-export function reportWorkspaceTabs(tabs: TabReport[]): Promise<void> {
-  return invoke(Commands.reportWorkspaceTabs, { tabs });
+/** Up-sync the live workspace-tab layout to the core's AUTHORITATIVE tab
+ *  registry (TASK C / #22, headless-org). Carries the active tab and the last
+ *  registry revision this window applied (`baseSeq`); the core rejects a stale
+ *  report (returning the snapshot to adopt) so a server-side mutation the UI
+ *  has not applied yet is never clobbered. */
+export function reportWorkspaceTabs(
+  tabs: TabReport[],
+  activeTabId?: string,
+  baseSeq?: number,
+): Promise<TabReportResult> {
+  return invoke(Commands.reportWorkspaceTabs, { tabs, activeTabId, baseSeq });
 }
 
 /** (Re)attach to a terminal; resolves to base64 scrollback to seed xterm. */

@@ -13,7 +13,7 @@
 // `terminals` map is NOT persisted -- it is re-fetched from the backend on
 // mount via listTerminals() and reconciled back onto the persisted tabs.
 import { create } from "zustand";
-import type { TerminalInfo, TerminalId, TerminalState } from "../ipc/types";
+import type { TabReport, TerminalInfo, TerminalId, TerminalState } from "../ipc/types";
 import { usePanels } from "./panels";
 import { useTheme } from "./theme";
 import { useSupervision } from "./supervision";
@@ -249,6 +249,18 @@ interface WorkspaceState {
    *  (never reads the active tab) — the named-placement primitive for create_worktree
    *  (TASK C / #22). */
   ensureTab: (id: string, name: string) => string;
+  /** Adopt the SERVER's authoritative tab-registry snapshot (headless-org): the
+   *  tab set, tab names, and tile membership come from the registry; activeTabId,
+   *  focus, and per-tab sizes stay LOCAL (kept valid, never stolen - a headless
+   *  placement/move/close must not switch the user's view). Tiles that vanish
+   *  from every rendered tab (and are not popped out) were closed headlessly:
+   *  their live entries + side state are dropped. Deep-equal snapshots are a
+   *  no-op so apply echoes don't churn persistence or the tab reporter. */
+  adoptRegistry: (tabs: TabReport[]) => void;
+  /** Register a SERVER-spawned terminal in the live map without placing or
+   *  focusing anything (placement arrives via the registry snapshot; metadata is
+   *  refreshed by the ~5s poll). No-op if the id is already known. */
+  adoptTerminal: (info: TerminalInfo) => void;
   /** Spawn a NEW terminal (the control/MCP `spawn_terminal` path) via the same
    *  spawnTerminal IPC the "+" menu uses, then place the tile in `opts.tabId` if
    *  given (else the tab active at call time — captured synchronously so the async
@@ -732,11 +744,13 @@ function saveToBackend(json: string): void {
   if (SATELLITE_TAB) return;
   void import("../ipc/persistence")
     .then((m) => {
-      // Per-variant durable copy (SQLite) — the primary durable store.
-      void m.saveWorkspaceSnapshot(json);
+      // Per-variant durable copy (SQLite) - the primary durable store. Each call
+      // carries its own catch: "failures are swallowed" must hold for the invoke
+      // itself too (without a backend these reject asynchronously).
+      m.saveWorkspaceSnapshot(json).catch(() => {});
       // Shared, all-variants copy (~/.config/t-hub/workspaces.json, #9): the
       // cross-variant carrier so a dev↔prod switch keeps your workspaces.
-      void m.saveSharedLayout(json);
+      m.saveSharedLayout(json).catch(() => {});
     })
     .catch(() => {});
 }
@@ -868,6 +882,14 @@ const loaded = loadPersisted();
 const initial = SATELLITE_TAB
   ? scopeToSatellite(loaded, SATELLITE_TAB)
   : adoptOrphans(loaded);
+
+/** Whether this window is a satellite (popped-out tab) window. Exported for the
+ *  control bridge: a satellite holds ONE tab of the layout, so it must neither
+ *  apply global organization mutations nor up-sync its scoped tab list over the
+ *  main window's report (which would clobber the registry down to one tab). */
+export function isSatelliteWindow(): boolean {
+  return SATELLITE_TAB !== null;
+}
 
 export const useWorkspace = create<WorkspaceState>((set, get) => {
   // Persist the current (tabs, activeTabId, focusedId, fontSize, poppedOutTabs).
@@ -1056,6 +1078,84 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       set({ tabs: [...tabs, tab], activeTabId: id, focusedId: null });
       persist();
       return id;
+    },
+
+    adoptRegistry: (regTabs) => {
+      // Defensive: the server never sends an empty snapshot (close_tab refuses
+      // the last tab); an empty one would zero the canvas, so ignore it.
+      if (regTabs.length === 0) return;
+      const { tabs, activeTabId, focusedId, terminals, poppedOutTabs } = get();
+
+      const byId = new Map(tabs.map((t) => [t.id, t]));
+      const nextTabs: WorkspaceTab[] = regTabs.map((r) => {
+        const existing = byId.get(r.id);
+        const sameOrder =
+          existing !== undefined &&
+          existing.order.length === r.tileIds.length &&
+          existing.order.every((x, i) => x === r.tileIds[i]);
+        return {
+          id: r.id,
+          name: r.name.trim() || existing?.name || "Workspace",
+          order: [...r.tileIds],
+          // Manual grid ratios survive only if the tile set didn't change.
+          sizes: sameOrder ? existing.sizes : undefined,
+        };
+      });
+
+      // Deep-equal snapshots are a no-op (apply echoes must not churn persist /
+      // the tab reporter).
+      const unchanged =
+        nextTabs.length === tabs.length &&
+        nextTabs.every((t, i) => {
+          const o = tabs[i];
+          return (
+            t.id === o.id &&
+            t.name === o.name &&
+            t.order.length === o.order.length &&
+            t.order.every((x, j) => x === o.order[j])
+          );
+        });
+      if (unchanged) return;
+
+      // Keep the user's view valid but NEVER steal it: activeTabId moves only if
+      // its tab was closed; focus moves only if the focused tile left the active
+      // tab.
+      let nextActive = activeTabId;
+      if (!nextTabs.some((t) => t.id === nextActive)) nextActive = nextTabs[0].id;
+      const active = nextTabs.find((t) => t.id === nextActive)!;
+      const nextFocus =
+        focusedId && active.order.includes(focusedId)
+          ? focusedId
+          : active.order[0] ?? null;
+
+      // Tiles gone from every rendered tab (and not popped out) were closed
+      // headlessly - drop their live entries + side state like closeTab does.
+      const after = new Set(nextTabs.flatMap((t) => t.order));
+      const popped = new Set(poppedOutTabs.flatMap((t) => t.order));
+      const nextTerminals = { ...terminals };
+      for (const t of tabs) {
+        for (const id of t.order) {
+          if (!after.has(id) && !popped.has(id)) {
+            delete nextTerminals[id];
+            cleanupTileSideState(id);
+          }
+        }
+      }
+
+      set({
+        tabs: nextTabs,
+        activeTabId: nextActive,
+        focusedId: nextFocus,
+        terminals: nextTerminals,
+      });
+      persist();
+    },
+
+    adoptTerminal: (info) => {
+      const { terminals } = get();
+      if (terminals[info.id]) return;
+      // Live map only: placement/persist ride the registry snapshot adopt.
+      set({ terminals: { ...terminals, [info.id]: info } });
     },
 
     spawnWorkspaceTerminal: async (opts) => {

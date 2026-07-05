@@ -165,7 +165,29 @@ struct AppHandleApplySink {
 
 impl control::ApplySink for AppHandleApplySink {
     fn apply(&self, command: &str, args: &serde_json::Value) -> Result<(), String> {
-        use tauri::Emitter;
+        use tauri::{Emitter, Manager};
+        // Headless-org: control-spawned sessions are created SERVER-side (the id
+        // rides the forward), bypassing `commands::spawn_terminal`'s bookkeeping.
+        // Recreate it here so the adopted tile behaves exactly like a "+" spawn:
+        // mark the id FRESH (first attach returns empty scrollback → one clean
+        // prompt) and emit Live so the tile skips the "starting" placeholder.
+        if matches!(command, "spawn_terminal" | "add_worktree_workspace") {
+            let id = args
+                .get("id")
+                .or_else(|| args.get("terminalId"))
+                .and_then(|v| v.as_str());
+            if let Some(id) = id {
+                let remote = self.app.state::<remote_pty::RemotePtyManager>();
+                remote.fresh.lock().insert(id.to_string());
+                let _ = self.app.emit(
+                    events::STATE,
+                    &events::StateEvent {
+                        id: id.to_string(),
+                        state: commands::TerminalState::Live,
+                    },
+                );
+            }
+        }
         self.app
             .emit(
                 CONTROL_APPLY_EVENT,
@@ -175,17 +197,28 @@ impl control::ApplySink for AppHandleApplySink {
     }
 }
 
-/// TASK C (#22): the frontend's tab up-sync. `src/ipc/controlBridge.ts` calls this
-/// whenever the workspace-tab layout changes, reporting the FULL live tab list so
-/// the CORE's addressable tab registry (which the control/MCP `list_tabs` reads)
-/// mirrors the UI — including UI-created tabs and real tile membership. The frontend
-/// is the source of truth for tabs; this is the write half of the mirror.
+/// The frontend's tab up-sync (TASK C #22, headless-org). `src/ipc/controlBridge.ts`
+/// calls this on every layout change, reporting the FULL live tab list, the active
+/// tab, and the last registry revision it applied (`baseSeq`). The SERVER registry
+/// is authoritative: a stale report (a server-side mutation the UI has not applied
+/// yet) is rejected and answered with the authoritative snapshot so the UI
+/// converges instead of clobbering the mutation.
 #[tauri::command]
 fn report_workspace_tabs(
     tabs: Vec<control::TabRecord>,
+    active_tab_id: Option<String>,
+    base_seq: Option<u64>,
     registry: tauri::State<'_, std::sync::Arc<control::TabRegistry>>,
-) {
-    registry.replace(tabs);
+) -> serde_json::Value {
+    match registry.report(tabs, active_tab_id, base_seq) {
+        control::ReportOutcome::Accepted { seq } => serde_json::json!({ "seq": seq }),
+        control::ReportOutcome::Stale(snap) => serde_json::json!({
+            "stale": true,
+            "seq": snap.seq,
+            "activeTabId": snap.active_tab_id,
+            "tabs": snap.tabs,
+        }),
+    }
 }
 
 fn start_control_listener(

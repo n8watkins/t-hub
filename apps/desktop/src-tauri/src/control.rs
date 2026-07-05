@@ -290,27 +290,57 @@ pub struct TabRecord {
     pub tile_ids: Vec<String>,
 }
 
-/// The CORE's addressable mirror of the frontend's workspace tabs (TASK C / #22).
+/// A full, versioned copy of the registry: what `list_tabs` returns and what every
+/// organization forward carries down to the UI (the UI renders FROM this).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistrySnapshot {
+    pub seq: u64,
+    pub active_tab_id: Option<String>,
+    pub tabs: Vec<TabRecord>,
+}
+
+/// Outcome of a UI up-sync report (see [`TabRegistry::report`]).
+pub enum ReportOutcome {
+    /// The report was based on the current revision and replaced the registry.
+    Accepted { seq: u64 },
+    /// The report predates a server-side mutation the reporter has not applied
+    /// yet; the registry is unchanged and the caller gets the authoritative
+    /// snapshot to converge on.
+    Stale(RegistrySnapshot),
+}
+
+#[derive(Default)]
+struct RegistryInner {
+    tabs: Vec<TabRecord>,
+    /// The UI's active (visible) tab, mirrored from its reports and from
+    /// `focus_tab`. Used as the default placement target for un-named spawns and
+    /// exposed via `list_tabs` so a socket caller can prove focus did NOT move.
+    active_tab_id: Option<String>,
+    /// Monotonic revision. Bumped on every accepted mutation, server- or
+    /// UI-originated. A UI report carrying a stale `baseSeq` is rejected, which is
+    /// what makes server-side mutations durable against the old lost-update race
+    /// (UI report clobbering a headless `move_tile`).
+    seq: u64,
+}
+
+/// The CORE's authoritative workspace-tab registry.
 ///
-/// Why the core owns a tab registry at all: the control/MCP API needs tabs to be
-/// *addressable* — `list_tabs` must return real `{id, name, tileIds}`, `new_tab`
-/// must return the id it created, and named placement (`create_worktree`,
-/// `spawn_terminal`) must resolve/create a tab by NAME deterministically rather
-/// than dropping the tile into whatever tab happens to be focused. None of that is
-/// possible while the tab layout lives only in the frontend store.
+/// Ownership model (headless-org): the SERVER owns the tab/tile organization -
+/// every organization-tier command applies to this registry first (and errors on
+/// invalid targets), then the authoritative [`RegistrySnapshot`] is forwarded to
+/// the UI, which renders from it. The frontend up-syncs USER-originated layout
+/// changes via `report_workspace_tabs`, but a report based on a stale revision
+/// (`baseSeq < seq`) is rejected and answered with the current snapshot, so a
+/// hidden tab or a minimized/suspended webview can never silently undo a headless
+/// mutation. This replaces the earlier mirror model where the frontend was the
+/// source of truth and `move_tile` could be accepted-then-lost.
 ///
-/// Consistency model: the frontend remains the source of truth for tabs and reports
-/// its FULL tab list up (the `report_workspace_tabs` Tauri command) on every layout
-/// change, which [`replace`](Self::replace)s this mirror — so UI-created tabs and
-/// real tile membership are reflected. MCP-driven mutations additionally update the
-/// mirror *optimistically* (a just-minted tab id is discoverable before the next
-/// report) using ids the core chose and forwarded down, so when the frontend reports
-/// back the ids already agree and the two converge. This is deliberately NOT the
-/// PRD §8 persistence layer — just the minimal in-memory registry headless tab ops
-/// need.
+/// Deliberately NOT the PRD §8 persistence layer - in-memory, per app run; the
+/// frontend still persists layout for restarts and seeds this via its first report.
 #[derive(Default)]
 pub struct TabRegistry {
-    tabs: Mutex<Vec<TabRecord>>,
+    inner: Mutex<RegistryInner>,
 }
 
 impl TabRegistry {
@@ -318,65 +348,215 @@ impl TabRegistry {
         Self::default()
     }
 
-    /// Replace the whole registry with the frontend's authoritative snapshot.
-    pub fn replace(&self, tabs: Vec<TabRecord>) {
-        if let Ok(mut g) = self.tabs.lock() {
-            *g = tabs;
-        }
+    fn lock(&self) -> std::sync::MutexGuard<'_, RegistryInner> {
+        // A poisoned registry lock means a panic mid-mutation; the data is a plain
+        // Vec so continuing with it is safe (same policy as recovering the guard).
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// A clone of the current tab list (for `list_tabs` / tests).
+    /// Replace the whole registry (legacy up-sync; no staleness check). Kept for
+    /// reporters that predate `baseSeq` (native cockpit) and for tests.
+    pub fn replace(&self, tabs: Vec<TabRecord>) {
+        let mut g = self.lock();
+        g.tabs = tabs;
+        g.seq += 1;
+    }
+
+    /// A UI up-sync with optimistic-concurrency: accepted (and revision bumped)
+    /// only when `base_seq` matches the current revision; `None` means a legacy
+    /// reporter and is accepted unconditionally.
+    pub fn report(
+        &self,
+        tabs: Vec<TabRecord>,
+        active_tab_id: Option<String>,
+        base_seq: Option<u64>,
+    ) -> ReportOutcome {
+        let mut g = self.lock();
+        if let Some(base) = base_seq {
+            if base != g.seq {
+                return ReportOutcome::Stale(RegistrySnapshot {
+                    seq: g.seq,
+                    active_tab_id: g.active_tab_id.clone(),
+                    tabs: g.tabs.clone(),
+                });
+            }
+        }
+        g.tabs = tabs;
+        if let Some(active) = active_tab_id {
+            g.active_tab_id = Some(active);
+        }
+        g.seq += 1;
+        ReportOutcome::Accepted { seq: g.seq }
+    }
+
+    /// A clone of the current tab list (for tests / callers that only need tabs).
     pub fn snapshot(&self) -> Vec<TabRecord> {
-        self.tabs.lock().map(|g| g.clone()).unwrap_or_default()
+        self.lock().tabs.clone()
+    }
+
+    /// The full versioned snapshot (`list_tabs` + every organization forward).
+    pub fn snapshot_full(&self) -> RegistrySnapshot {
+        let g = self.lock();
+        RegistrySnapshot {
+            seq: g.seq,
+            active_tab_id: g.active_tab_id.clone(),
+            tabs: g.tabs.clone(),
+        }
     }
 
     /// The id of the tab whose name matches exactly, if any (named-placement reuse).
     fn id_for_name(&self, name: &str) -> Option<String> {
-        self.tabs
-            .lock()
-            .ok()
-            .and_then(|g| g.iter().find(|t| t.name == name).map(|t| t.id.clone()))
+        self.lock()
+            .tabs
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.id.clone())
     }
 
-    /// Record a new (empty) tab so its id is discoverable immediately. No-op if a
-    /// tab with this id already exists.
+    /// True if a tab with this id exists.
+    fn has_tab(&self, id: &str) -> bool {
+        self.lock().tabs.iter().any(|t| t.id == id)
+    }
+
+    /// Record a new (empty) tab so its id is addressable immediately. No-op (no
+    /// revision bump) if a tab with this id already exists.
     fn insert_tab(&self, id: &str, name: &str) {
-        if let Ok(mut g) = self.tabs.lock() {
-            if !g.iter().any(|t| t.id == id) {
-                g.push(TabRecord {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    tile_ids: Vec::new(),
-                });
-            }
+        let mut g = self.lock();
+        if !g.tabs.iter().any(|t| t.id == id) {
+            g.tabs.push(TabRecord {
+                id: id.to_string(),
+                name: name.to_string(),
+                tile_ids: Vec::new(),
+            });
+            g.seq += 1;
         }
     }
 
-    /// Optimistically move a tile: drop it from every tab, then append to `tab_id`
-    /// if that tab is known. Mirrors what the frontend does + reports back.
-    fn move_tile(&self, tile_id: &str, tab_id: &str) {
-        if let Ok(mut g) = self.tabs.lock() {
-            for t in g.iter_mut() {
-                t.tile_ids.retain(|x| x != tile_id);
-            }
-            if let Some(t) = g.iter_mut().find(|t| t.id == tab_id) {
-                t.tile_ids.push(tile_id.to_string());
-            }
+    /// Move a tile into `tab_id`: drop it from every tab, then append. Errors when
+    /// the target tab is unknown (the old silent no-op is exactly how a headless
+    /// `move_tile` got accepted-then-lost). A tile id not currently placed anywhere
+    /// is still placed (it may be a live session the UI has not adopted yet).
+    fn move_tile(&self, tile_id: &str, tab_id: &str) -> Result<(), String> {
+        let mut g = self.lock();
+        if !g.tabs.iter().any(|t| t.id == tab_id) {
+            return Err(format!(
+                "move_tile: unknown tabId '{tab_id}' (list_tabs shows valid ids; new_tab creates one)"
+            ));
         }
+        for t in g.tabs.iter_mut() {
+            t.tile_ids.retain(|x| x != tile_id);
+        }
+        if let Some(t) = g.tabs.iter_mut().find(|t| t.id == tab_id) {
+            t.tile_ids.push(tile_id.to_string());
+        }
+        g.seq += 1;
+        Ok(())
+    }
+
+    /// Place a freshly-spawned tile into `tab_id` (same semantics as `move_tile`
+    /// but tolerates a registry with no such tab by leaving the tile unplaced -
+    /// the UI adopts it into its active tab and reports back).
+    fn place_tile(&self, tile_id: &str, tab_id: &str) -> bool {
+        let mut g = self.lock();
+        if !g.tabs.iter().any(|t| t.id == tab_id) {
+            return false;
+        }
+        for t in g.tabs.iter_mut() {
+            t.tile_ids.retain(|x| x != tile_id);
+        }
+        if let Some(t) = g.tabs.iter_mut().find(|t| t.id == tab_id) {
+            t.tile_ids.push(tile_id.to_string());
+        }
+        g.seq += 1;
+        true
+    }
+
+    /// Drop a tile from every tab (a terminal was closed). Returns true (and bumps
+    /// the revision) only if the tile was actually placed somewhere.
+    fn remove_tile(&self, tile_id: &str) -> bool {
+        let mut g = self.lock();
+        let mut removed = false;
+        for t in g.tabs.iter_mut() {
+            let before = t.tile_ids.len();
+            t.tile_ids.retain(|x| x != tile_id);
+            removed |= t.tile_ids.len() != before;
+        }
+        if removed {
+            g.seq += 1;
+        }
+        removed
+    }
+
+    /// Rename a tab. Errors when the tab is unknown.
+    fn rename_tab(&self, tab_id: &str, name: &str) -> Result<(), String> {
+        let mut g = self.lock();
+        match g.tabs.iter_mut().find(|t| t.id == tab_id) {
+            Some(t) => {
+                t.name = name.to_string();
+                g.seq += 1;
+                Ok(())
+            }
+            None => Err(format!("rename_tab: unknown tabId '{tab_id}'")),
+        }
+    }
+
+    /// Close a tab (headless tab lifecycle). Policy:
+    ///   - unknown tab → error;
+    ///   - the LAST tab is never closed (mirrors the UI's guard) → error;
+    ///   - a NON-EMPTY tab is refused unless `force` (close its terminals first
+    ///     via `close_terminal`, or pass `force: true` - the tab record is dropped
+    ///     and any still-live sessions are re-adopted into the UI's active tab by
+    ///     its reconciler, so nothing is orphaned).
+    /// Returns the closed tab's tile ids.
+    fn remove_tab(&self, tab_id: &str, force: bool) -> Result<Vec<String>, String> {
+        let mut g = self.lock();
+        let Some(idx) = g.tabs.iter().position(|t| t.id == tab_id) else {
+            return Err(format!("close_tab: unknown tabId '{tab_id}'"));
+        };
+        if g.tabs.len() <= 1 {
+            return Err("close_tab: refusing to close the last tab".to_string());
+        }
+        if !g.tabs[idx].tile_ids.is_empty() && !force {
+            return Err(format!(
+                "close_tab: tab '{tab_id}' still holds {} tile(s); close its terminals first \
+                 (close_terminal) or pass force: true",
+                g.tabs[idx].tile_ids.len()
+            ));
+        }
+        let removed = g.tabs.remove(idx);
+        if g.active_tab_id.as_deref() == Some(tab_id) {
+            g.active_tab_id = g.tabs.first().map(|t| t.id.clone());
+        }
+        g.seq += 1;
+        Ok(removed.tile_ids)
+    }
+
+    /// Mirror the UI's active tab (from `focus_tab` - the one organization command
+    /// that intentionally moves the user's view).
+    fn set_active_tab(&self, tab_id: &str) {
+        let mut g = self.lock();
+        g.active_tab_id = Some(tab_id.to_string());
+    }
+
+    /// The default placement target for an un-named spawn: the UI's active tab if
+    /// known, else the first tab.
+    fn default_tab_id(&self) -> Option<String> {
+        let g = self.lock();
+        g.active_tab_id
+            .clone()
+            .filter(|id| g.tabs.iter().any(|t| &t.id == id))
+            .or_else(|| g.tabs.first().map(|t| t.id.clone()))
     }
 
     /// Auto-name a new tab "Workspace N" at the lowest free index — the same scheme
     /// the frontend's `addTab` uses, so core- and UI-created tabs share one naming.
     fn auto_name(&self) -> String {
         let used: std::collections::HashSet<u32> = self
-            .tabs
             .lock()
-            .map(|g| {
-                g.iter()
-                    .filter_map(|t| t.name.strip_prefix("Workspace ").and_then(|n| n.trim().parse().ok()))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .tabs
+            .iter()
+            .filter_map(|t| t.name.strip_prefix("Workspace ").and_then(|n| n.trim().parse().ok()))
+            .collect();
         let mut n = 1u32;
         while used.contains(&n) {
             n += 1;
@@ -1293,14 +1473,16 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // in the MCP tool description AND refused here unless explicitly enabled,
         // so the dev-box proof never spawns/kills anything by accident.
         "focus_session" => organization_apply(ctx, "focus_session", args),
-        // move_tile updates the CORE tab registry (TASK C: so a tile's tab
-        // membership is reflected in list_tabs) AND forwards+audits the UI mutation.
+        // Headless-org: the organization mutations below apply to the SERVER tab
+        // registry first (authoritative; hard error on an invalid target) and then
+        // forward the registry snapshot for the UI to render from.
         "move_tile" => move_tile(ctx, args),
-        "rename_tab" => organization_apply(ctx, "rename_tab", args),
+        "rename_tab" => rename_tab(ctx, args),
         // new_tab mints the tab id CORE-side so it can return it (TASK C:
         // addressable tabs) and forwards that id for the frontend to adopt.
         "new_tab" => new_tab(ctx, args),
-        "focus_tab" => organization_apply(ctx, "focus_tab", args),
+        "close_tab" | "remove_tab" => close_tab(ctx, args),
+        "focus_tab" => focus_tab(ctx, args),
         "open_file" => open_file(ctx, args),
         // WS-4 git worktrees: create runs git here then forwards the tab+spawn to
         // the UI; remove forwards to the UI so it detaches live tiles BEFORE git
@@ -1327,7 +1509,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "spawn_terminal" => spawn_terminal(ctx, args),
         "send_text" => send_text(args),
         "send_keys" => send_keys(args),
-        "close_terminal" => close_terminal(args),
+        "close_terminal" => close_terminal(ctx, args),
 
         // ---- Theme (forwarded by name; parallel track owns the handlers) ----
         "get_theme" | "set_theme" => Err(format!(
@@ -1782,17 +1964,25 @@ fn read_text_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// minimal in-memory registry that makes headless tab ops (discover an id, then
 /// `move_tile` / `focus_tab` into it) work — NOT the PRD §8 persistence layer.
 fn list_tabs(ctx: &ControlContext) -> Result<Value, String> {
-    let tabs = ctx.tabs.snapshot();
-    Ok(json!({ "tabs": tabs, "count": tabs.len() }))
+    let snap = ctx.tabs.snapshot_full();
+    Ok(json!({
+        "tabs": snap.tabs,
+        "count": snap.tabs.len(),
+        "seq": snap.seq,
+        "activeTabId": snap.active_tab_id,
+    }))
 }
 
-/// `report_workspace_tabs` (T12): a UI client replaces the CORE tab registry
-/// with its full live tab layout - the control-socket twin of the Tauri command
-/// of the same name (the native cockpit is a socket client and cannot call
-/// Tauri). Same consistency model as the webview's report: the reporting client
-/// is the source of truth, the registry is replaced wholesale (last writer
-/// wins), and MCP-driven mutations keep updating it optimistically in between.
-/// Args: `tabs`: `[{id, name, tileIds}]`.
+/// `report_workspace_tabs` (T12 / headless-org): a UI client up-syncs its live tab
+/// layout - the control-socket twin of the Tauri command of the same name (the
+/// native cockpit is a socket client and cannot call Tauri). Consistency model
+/// (headless-org): the SERVER registry is authoritative; a report carrying
+/// `baseSeq` is accepted only when it matches the current revision, otherwise it
+/// is rejected as stale and answered with the authoritative snapshot so the
+/// reporter converges instead of clobbering a server-side mutation it has not
+/// applied yet. A report WITHOUT `baseSeq` (legacy reporter) is accepted
+/// unconditionally. Args: `tabs`: `[{id, name, tileIds}]`; `activeTabId`
+/// (optional); `baseSeq` (optional).
 fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let tabs: Vec<TabRecord> = serde_json::from_value(
         args.get("tabs")
@@ -1801,8 +1991,22 @@ fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, St
     )
     .map_err(|e| format!("report_workspace_tabs: bad 'tabs' shape: {e}"))?;
     let count = tabs.len();
-    ctx.tabs.replace(tabs);
-    Ok(json!({ "reported": count }))
+    let active = arg_str(args, "activeTabId").or_else(|| arg_str(args, "active_tab_id"));
+    let base_seq = args
+        .get("baseSeq")
+        .or_else(|| args.get("base_seq"))
+        .and_then(|v| v.as_u64());
+    match ctx.tabs.report(tabs, active, base_seq) {
+        ReportOutcome::Accepted { seq } => Ok(json!({ "reported": count, "seq": seq })),
+        ReportOutcome::Stale(snap) => Ok(json!({
+            "stale": true,
+            "seq": snap.seq,
+            "activeTabId": snap.active_tab_id,
+            "tabs": snap.tabs,
+            "note": "report based on a stale revision; adopt the returned snapshot \
+                     and re-report on the next local change.",
+        })),
+    }
 }
 
 /// `read_terminal` / `capture_pane`: return a session's recent visible output as
@@ -1909,56 +2113,58 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     ctx.tabs.insert_tab(&tab_id, &effective_tab_name);
 
-    // Forward the UI orchestration (open/reuse the named tab + spawn a terminal in
-    // the worktree dir). The git worktree already exists, so `alreadyCreated: true`
-    // tells the store not to run `gitWorktreeAdd` again.
-    let mut forward = json!({
-        "worktreePath": worktree_path,
-        "repoRoot": repo_root,
-        "branch": branch,
-        "tabId": tab_id,
-        "tabName": effective_tab_name,
-        "alreadyCreated": true,
-    });
-    let applied = match &ctx.apply_sink {
-        // The webview spawns the worktree terminal client-side; forward_apply
-        // also broadcasts to event subscribers, so a native cockpit attached to
-        // this same server opens the named tab and places the tile when it
-        // appears (cwd match).
-        Some(_) => forward_apply(ctx, "add_worktree_workspace", &forward),
-        None => {
-            // T12 (native path): no webview means nobody runs the client-side
-            // spawn. When event subscribers exist (a native cockpit), spawn the
-            // worktree terminal HERE - the server owns tmux either way (the
-            // webview's spawnTerminal IPC lands in this same process) - and
-            // carry the minted id so the client places the tile in the named
-            // tab. With no subscribers, keep the headless behavior: worktree
-            // created on disk, nothing forwarded.
-            if ctx.fanout.subscriber_count() > 0 {
-                match spawn_tmux_terminal(&worktree_path, None) {
-                    Ok((id, _)) => forward["terminalId"] = json!(id),
-                    Err(e) => eprintln!(
-                        "t-hub-control: create_worktree: worktree terminal spawn failed: {e}"
-                    ),
-                }
-                broadcast_apply(ctx, "add_worktree_workspace", &forward) > 0
-            } else {
-                false
+    // Headless-org: spawn the worktree terminal SERVER-side (the server owns tmux
+    // either way - the webview's spawnTerminal IPC lands in this same process) and
+    // place the tile in the named tab in the authoritative registry, so placement
+    // holds even when that tab is hidden or the window is minimized, and the
+    // terminal id is returned synchronously. With NO UI at all (no sink, no
+    // subscribers), keep the headless behavior: worktree created on disk, tab
+    // recorded, no terminal spawned (nothing would render it).
+    let has_ui = ctx.apply_sink.is_some() || ctx.fanout.subscriber_count() > 0;
+    let mut terminal_id: Option<String> = None;
+    if has_ui {
+        match spawn_tmux_terminal(&worktree_path, None) {
+            Ok((id, _)) => {
+                ctx.tabs.place_tile(&id, &tab_id);
+                terminal_id = Some(id);
+            }
+            Err(e) => {
+                eprintln!("t-hub-control: create_worktree: worktree terminal spawn failed: {e}")
             }
         }
-    };
+    }
+
+    // Forward the UI orchestration (open/reuse the named tab + adopt the spawned
+    // terminal, rendered from the attached registry snapshot). The git worktree
+    // already exists, so `alreadyCreated: true` tells any legacy consumer not to
+    // run `gitWorktreeAdd` again.
+    let forward = with_sync(
+        ctx,
+        json!({
+            "worktreePath": worktree_path,
+            "repoRoot": repo_root,
+            "branch": branch,
+            "tabId": tab_id,
+            "tabName": effective_tab_name,
+            "terminalId": terminal_id,
+            "alreadyCreated": true,
+        }),
+    );
+    let applied = has_ui && forward_apply(ctx, "add_worktree_workspace", &forward);
     Ok(json!({
         "accepted": "create_worktree",
         "worktreePath": worktree_path,
         "branch": branch,
         "tabId": tab_id,
         "tabName": effective_tab_name,
+        "terminalId": terminal_id,
         "gitOutput": git_output,
         "audited": true,
         "applied": applied,
         "note": if applied {
-            "worktree created on disk; a workspace tab (identified by tabName) + a \
-             terminal in the worktree dir are being opened in the UI."
+            "worktree created on disk; the terminal was spawned server-side and \
+             placed in the tab identified by tabName in the authoritative registry \
+             (the user's active tab is not switched)."
         } else {
             "worktree created on disk; the UI tab/terminal forward was not \
              delivered (headless/no sink)."
@@ -2172,6 +2378,38 @@ fn organization_apply(ctx: &ControlContext, command: &str, args: &Value) -> Resu
     }))
 }
 
+/// Merge the authoritative registry snapshot into a forward's args (under `sync`)
+/// so the UI renders FROM the registry instead of re-deriving the mutation -
+/// the headless-org apply contract. Applied AFTER the registry mutation, so the
+/// snapshot already reflects it.
+fn with_sync(ctx: &ControlContext, mut args: Value) -> Value {
+    let snap = ctx.tabs.snapshot_full();
+    args["sync"] = serde_json::to_value(&snap).unwrap_or(Value::Null);
+    args
+}
+
+/// Registry-first organization mutation: the registry was already updated; forward
+/// the args + authoritative snapshot to the UI and answer with the new revision.
+fn organization_sync_apply(
+    ctx: &ControlContext,
+    command: &str,
+    args: Value,
+) -> Result<Value, String> {
+    let forward = with_sync(ctx, args);
+    let applied = forward_apply(ctx, command, &forward);
+    let snap = ctx.tabs.snapshot_full();
+    Ok(json!({
+        "accepted": command,
+        "audited": true,
+        "applied": applied,
+        "seq": snap.seq,
+        "tabs": snap.tabs,
+        "note": "applied to the server tab registry (authoritative) and forwarded \
+                 to the UI with the registry snapshot; a hidden tab or unfocused \
+                 window cannot lose this update.",
+    }))
+}
+
 /// `new_tab` (Organization, audited): create a new workspace tab. TASK C / #22 —
 /// the CORE mints the tab id so it can RETURN it (`tabId`), making the tab
 /// immediately addressable for `move_tile` / `focus_tab`, and forwards that id to
@@ -2186,44 +2424,110 @@ fn new_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .unwrap_or_else(|| ctx.tabs.auto_name());
     let id = uuid::Uuid::new_v4().to_string();
     ctx.tabs.insert_tab(&id, &name);
-    let applied = forward_apply(ctx, "new_tab", &json!({ "id": id, "name": name }));
-    Ok(json!({
-        "accepted": "new_tab",
-        "tabId": id,
-        "name": name,
-        "audited": true,
-        "applied": applied,
-        "note": "new tab created; its id is returned so it can be addressed by \
-                 move_tile / focus_tab and appears in list_tabs.",
-    }))
+    let mut res =
+        organization_sync_apply(ctx, "new_tab", json!({ "id": id, "name": name }))?;
+    res["tabId"] = json!(id);
+    res["name"] = json!(name);
+    Ok(res)
 }
 
-/// `move_tile` (Organization, audited): move a tile into another tab. TASK C / #22
-/// — updates the CORE registry (drop the tile from its old tab, add it to `tabId`)
-/// so `list_tabs` reflects the move, then forwards the raw args to the frontend to
-/// apply. The registry update is skipped when `terminalId`/`tabId` are absent (e.g.
-/// a within-tab reorder that passes `targetId` only), which still forwards + audits.
-fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    if let (Some(tile), Some(tab)) = (
-        arg_str(args, "terminalId").or_else(|| arg_str(args, "id")),
-        arg_str(args, "tabId"),
-    ) {
-        ctx.tabs.move_tile(&tile, &tab);
+/// `close_tab` (Organization, audited; headless-org): close a workspace tab over
+/// the socket - the missing half of the headless tab lifecycle (an auto-created
+/// tab emptied by `close_terminal` was previously only closeable by hand in the
+/// UI). Policy (see [`TabRegistry::remove_tab`]): unknown tab and the last tab
+/// are errors; a non-empty tab is refused unless `force: true` (its still-live
+/// sessions are then re-adopted into the UI's active tab, never orphaned).
+/// Auto-created empty tabs are NOT reaped implicitly - an agent staging a
+/// workspace may empty and refill a tab, so closing is always an explicit call.
+/// Args: `tabId` (or `tabName` to resolve by exact name); `force` (optional).
+fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let tab_id = arg_str(args, "tabId")
+        .or_else(|| arg_str(args, "id"))
+        .or_else(|| {
+            arg_str(args, "tabName")
+                .or_else(|| arg_str(args, "tab_name"))
+                .and_then(|n| ctx.tabs.id_for_name(&n))
+        })
+        .ok_or("close_tab requires a 'tabId' (or a 'tabName' that resolves to one)")?;
+    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let orphaned = ctx.tabs.remove_tab(&tab_id, force)?;
+    let mut res = organization_sync_apply(
+        ctx,
+        "close_tab",
+        json!({ "tabId": tab_id, "force": force }),
+    )?;
+    res["tabId"] = json!(tab_id);
+    res["orphanedTileIds"] = json!(orphaned);
+    Ok(res)
+}
+
+/// `rename_tab` (Organization, audited; headless-org): rename a tab. Registry-
+/// first + strict (unknown tab is an error), then forwards the snapshot so the
+/// rename applies even when the tab is hidden or the window is unfocused.
+/// Args: `tabId` (or `id`), `name`.
+fn rename_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let tab_id = arg_str(args, "tabId")
+        .or_else(|| arg_str(args, "id"))
+        .ok_or("rename_tab requires a 'tabId' argument")?;
+    let name = arg_str(args, "name")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or("rename_tab requires a non-empty 'name' argument")?;
+    ctx.tabs.rename_tab(&tab_id, &name)?;
+    organization_sync_apply(ctx, "rename_tab", json!({ "tabId": tab_id, "name": name }))
+}
+
+/// `focus_tab` (Organization, audited): activate a tab - the ONE organization
+/// command that intentionally moves the user's view. Validates the tab against
+/// the registry (strict), mirrors the new active tab there (so `list_tabs` and
+/// default spawn placement track it), and forwards to the UI.
+fn focus_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let tab_id = arg_str(args, "tabId")
+        .or_else(|| arg_str(args, "id"))
+        .ok_or("focus_tab requires a 'tabId' argument")?;
+    if !ctx.tabs.has_tab(&tab_id) {
+        return Err(format!("focus_tab: unknown tabId '{tab_id}'"));
     }
-    organization_apply(ctx, "move_tile", args)
+    ctx.tabs.set_active_tab(&tab_id);
+    organization_apply(ctx, "focus_tab", &json!({ "tabId": tab_id }))
 }
 
-/// `spawn_terminal` (Process-changing, PRD §11.2: confirmation required). Un-gated
-/// (#17): rather than refusing outright — the old behavior, because a raw spawn HERE
-/// would create an untracked tmux session the UI never adopts — it now routes
-/// through the SAME [`ApplySink`] adoption path `create_worktree` uses. We forward a
-/// `spawn_terminal` command to the frontend, whose `controlBridge` spawns the tile
-/// via the normal `spawnTerminal` IPC, so the resulting session IS a real,
-/// UI-adopted tile tracked like any other. If no apply sink is wired (headless), we
-/// refuse rather than spawn a session nothing will adopt. Its MCP description still
-/// carries the CONFIRMATION REQUIRED contract (the user-facing gate). Args: `cwd`
-/// (optional), `name` (optional tile title), `shell` (optional preset),
-/// `startupCommand` (optional; T-B).
+/// `move_tile` (Organization, audited; headless-org): move a tile into another
+/// tab. Registry-FIRST and STRICT: the server registry is updated (or the command
+/// errors - an unknown `tabId` is a hard error now, not the silent accept-then-
+/// lose of the mirror model), then the authoritative snapshot is forwarded so the
+/// UI applies it even when the target tab is hidden. A `targetId`-only call is
+/// the legacy within-tab reorder: forwarded for the UI to apply and report back
+/// (visual order is a UI concern).
+fn move_tile(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let tile = arg_str(args, "terminalId").or_else(|| arg_str(args, "id"));
+    let tab = arg_str(args, "tabId");
+    match (tile, tab) {
+        (Some(tile), Some(tab)) => {
+            ctx.tabs.move_tile(&tile, &tab)?;
+            organization_sync_apply(
+                ctx,
+                "move_tile",
+                json!({ "terminalId": tile, "tabId": tab }),
+            )
+        }
+        _ => organization_apply(ctx, "move_tile", args),
+    }
+}
+
+/// `spawn_terminal` (Process-changing, PRD §11.2: confirmation required).
+/// Headless-org: the SERVER spawns the tmux session (same id minting + pane wrap
+/// as the Tauri `commands::spawn_terminal`), resolves the target tab against the
+/// authoritative registry - `tabName` reuses-or-creates a tab WITHOUT switching
+/// the user's active tab - places the tile there, and forwards the registry
+/// snapshot for the UI (webview sink and/or socket subscribers) to render. The
+/// real terminal id is therefore returned synchronously, and a hidden target tab
+/// or a minimized window cannot lose the spawn or its placement. Refused only
+/// when NO UI is connected at all (nothing would render the tile). Its MCP
+/// description still carries the CONFIRMATION REQUIRED contract (the user-facing
+/// gate). Args: `cwd`, `name`, `shell`, `startupCommand` (T-B), `tabName`,
+/// `tabId` (all optional; `tabId` must exist, default placement is the user's
+/// active tab).
 ///
 /// `startupCommand` is the socket twin of the webview "+" presets' field: the
 /// command runs inside an interactive login shell the pane execs back into
@@ -2253,83 +2557,86 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         other => other,
     };
 
-    let forward =
-        json!({ "cwd": cwd, "name": name, "shell": shell, "startupCommand": startup_command });
-    match &ctx.apply_sink {
-        Some(sink) => {
-            sink.apply("spawn_terminal", &forward)
-                .map_err(|e| format!("spawn_terminal: failed to forward the spawn to the UI: {e}"))?;
-            // T12: subscribers also hear the forward (no id - the webview mints
-            // it); a native cockpit adopts the new session via its reconcile.
-            let _ = broadcast_apply(ctx, "spawn_terminal", &forward);
-            Ok(json!({
-                "accepted": "spawn_terminal",
-                "cwd": cwd,
-                "name": name,
-                "shell": shell,
-                "startupCommand": startup_command,
-                "audited": true,
-                // Only *forwarded*: the real spawn runs in the frontend (the normal
-                // spawnTerminal IPC) and its new tile id isn't known synchronously
-                // over this channel, so we report `requested`, not a fabricated id.
-                "requested": true,
-                "note": "the UI was asked to spawn a new terminal tile (the same \
-                         spawn path as the \"+\" menu). Completion is not confirmed \
-                         synchronously over this channel.",
-            }))
-        }
-        None => {
-            // T12 (native path): a socket UI can't run the webview's spawnTerminal
-            // IPC, but the server owns tmux either way - that IPC lands in this
-            // same process. So with event subscribers present, spawn the session
-            // HERE (same id minting as `commands::spawn_terminal`) and broadcast
-            // the forward carrying the minted id; the native apply module places
-            // and attaches the tile. With no subscribers, keep refusing: nothing
-            // would adopt the session.
-            if ctx.fanout.subscriber_count() == 0 {
-                return Err(
-                    "spawn_terminal: no UI is connected to adopt the new terminal tile; \
-                     refusing to spawn an untracked session (the app must be running to \
-                     spawn a terminal)"
-                        .to_string(),
-                );
-            }
-            // Mirror `commands::resolve_cwd`'s unix arm ($HOME fallback); the pane
-            // program resolves through the SAME precedence as the Tauri spawn
-            // (`commands::pane_command`): a `shell` preset verbatim, else the
-            // `startupCommand` inside the interactive-login wrap, else the plain
-            // login shell.
-            let cwd_effective = cwd
-                .clone()
-                .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
-            let pane =
-                crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
-            let (id, tmux_session) = spawn_tmux_terminal(&cwd_effective, pane.as_deref())?;
-            let forward = json!({
-                "cwd": cwd,
-                "name": name,
-                "shell": shell,
-                "startupCommand": startup_command,
-                "id": id,
-            });
-            let applied = broadcast_apply(ctx, "spawn_terminal", &forward) > 0;
-            Ok(json!({
-                "accepted": "spawn_terminal",
-                "id": id,
-                "tmuxSession": tmux_session,
-                "cwd": cwd,
-                "name": name,
-                "shell": shell,
-                "startupCommand": startup_command,
-                "audited": true,
-                "applied": applied,
-                "requested": true,
-                "note": "no webview is attached; the server spawned the tmux session \
-                         directly and broadcast the placement to socket UI \
-                         subscribers (the native cockpit adopts it).",
-            }))
-        }
+    // A UI must exist to render the tile (webview sink or socket subscribers);
+    // with neither, keep refusing rather than spawn a session nothing shows.
+    if ctx.apply_sink.is_none() && ctx.fanout.subscriber_count() == 0 {
+        return Err(
+            "spawn_terminal: no UI is connected to adopt the new terminal tile; \
+             refusing to spawn an untracked session (the app must be running to \
+             spawn a terminal)"
+                .to_string(),
+        );
     }
+
+    // Headless-org: resolve the TARGET TAB server-side, against the authoritative
+    // registry, BEFORE spawning - `tabId` must exist (strict), `tabName` reuses an
+    // existing tab or mints one (created hidden; the user's active tab is NOT
+    // switched), and neither means the UI's active tab per the registry mirror.
+    let tab_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
+    let tab_id = match (arg_str(args, "tabId").or_else(|| arg_str(args, "tab_id")), &tab_name) {
+        (Some(id), _) => {
+            if !ctx.tabs.has_tab(&id) {
+                return Err(format!("spawn_terminal: unknown tabId '{id}'"));
+            }
+            Some(id)
+        }
+        (None, Some(name)) => Some(match ctx.tabs.id_for_name(name) {
+            Some(id) => id,
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                ctx.tabs.insert_tab(&id, name);
+                id
+            }
+        }),
+        (None, None) => ctx.tabs.default_tab_id(),
+    };
+
+    // Spawn the tmux session SERVER-side (same id minting + pane wrap as the Tauri
+    // `commands::spawn_terminal`) so the real id is known synchronously, the tile
+    // can be placed in the registry atomically, and a hidden/suspended webview
+    // cannot lose the spawn. Mirror `commands::resolve_cwd`'s unix arm ($HOME
+    // fallback).
+    let cwd_effective = cwd
+        .clone()
+        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
+    let pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
+    let (id, tmux_session) = spawn_tmux_terminal(&cwd_effective, pane.as_deref())?;
+
+    let placed = match &tab_id {
+        Some(tab) => ctx.tabs.place_tile(&id, tab),
+        None => false,
+    };
+
+    let forward = with_sync(
+        ctx,
+        json!({
+            "id": id,
+            "tmuxSession": tmux_session,
+            "cwd": cwd_effective,
+            "name": name,
+            "shell": shell,
+            "startupCommand": startup_command,
+            "tabId": tab_id,
+            "tabName": tab_name,
+        }),
+    );
+    let applied = forward_apply(ctx, "spawn_terminal", &forward);
+    Ok(json!({
+        "accepted": "spawn_terminal",
+        "id": id,
+        "tmuxSession": tmux_session,
+        "cwd": cwd_effective,
+        "name": name,
+        "shell": shell,
+        "startupCommand": startup_command,
+        "tabId": tab_id,
+        "placed": placed,
+        "audited": true,
+        "applied": applied,
+        "note": "the server spawned the session, placed the tile in the target tab \
+                 in the authoritative registry (without switching the user's active \
+                 tab), and forwarded the snapshot for the UI to render.",
+    }))
 }
 
 /// Mint a terminal id + create its detached tmux session. The id IS the tmux
@@ -2413,14 +2720,25 @@ fn send_keys(args: &Value) -> Result<Value, String> {
 /// `kill_session_tree` - the same guarantee the webview's `kill_terminal`
 /// gives: `kill-session` alone only SIGHUPs, which agents like `claude`
 /// survive and leak; the tree kill SIGKILLs the pane's descendants first.
-/// Idempotent (already-gone ⇒ success). Args: `sessionId` (required).
-fn close_terminal(args: &Value) -> Result<Value, String> {
+/// Idempotent (already-gone ⇒ success).
+///
+/// Headless-org: the dead tile is also dropped from the server tab registry and
+/// a `sync_tabs` snapshot is forwarded, so the tile leaves its tab cleanly even
+/// when that tab is hidden or the window is minimized (previously removal relied
+/// on the UI's ~5s live-terminal reconcile). Args: `sessionId` (required).
+fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("close_terminal requires a 'sessionId' argument")?;
     let target = tmux_target(&session_id);
     tmux::kill_session_tree(&target)
         .map_err(|e| format!("failed to close terminal '{session_id}': {e}"))?;
+    // The registry keys tiles by the bare terminal id; strip an already-prefixed
+    // caller the same way tmux_target normalizes the other direction.
+    let tile_id = session_id.strip_prefix("th_").unwrap_or(&session_id);
+    if ctx.tabs.remove_tile(tile_id) {
+        let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
+    }
     Ok(json!({
         "accepted": "close_terminal",
         "sessionId": session_id,
@@ -2766,38 +3084,62 @@ mod tests {
     }
 
     #[test]
-    fn spawn_terminal_with_sink_forwards_and_is_requested() {
-        // With a UI sink wired, spawn is functional: it forwards a `spawn_terminal`
-        // command (the frontend then spawns a real, adopted tile) and reports
-        // `requested` (the tile id isn't known synchronously over this channel).
+    fn spawn_terminal_with_sink_spawns_places_and_returns_id() {
+        // Headless-org: with a UI sink wired, the SERVER spawns the real session,
+        // resolves `tabName` against the authoritative registry (minting a hidden
+        // tab without switching the active one), places the tile there, returns
+        // the real id synchronously, and forwards id + registry snapshot.
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
         let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
         let v = dispatch(
             &ctx,
             "spawn_terminal",
-            &json!({"cwd": "/tmp", "name": "logs", "shell": "bash"}),
+            &json!({"cwd": "/tmp", "name": "logs", "tabName": "hidden-ops"}),
         )
         .unwrap();
         assert_eq!(v["accepted"], "spawn_terminal");
         assert_eq!(v["audited"], true);
-        assert_eq!(v["requested"], true);
+        let id = v["id"].as_str().expect("real id returned synchronously").to_string();
+        assert_eq!(v["placed"], true);
+        let tab_id = v["tabId"].as_str().unwrap().to_string();
+        assert_ne!(tab_id, "tab-1", "a NEW hidden tab is minted for the new name");
 
-        let calls = sink.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "spawn_terminal");
-        assert_eq!(calls[0].1["cwd"], "/tmp");
-        assert_eq!(calls[0].1["name"], "logs");
-        assert_eq!(calls[0].1["shell"], "bash");
+        // The registry (authoritative) holds the placement, and the active tab
+        // was NOT touched (no focus steal).
+        let snap = ctx.tab_registry().snapshot_full();
+        let tab = snap.tabs.iter().find(|t| t.id == tab_id).expect("tab minted");
+        assert_eq!(tab.name, "hidden-ops");
+        assert_eq!(tab.tile_ids, vec![id.clone()]);
+        assert_eq!(snap.active_tab_id, None);
+
+        // The forward carries the id + snapshot for the UI to render from.
+        {
+            let calls = sink.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, "spawn_terminal");
+            assert_eq!(calls[0].1["id"], json!(id));
+            assert_eq!(calls[0].1["cwd"], "/tmp");
+            assert_eq!(calls[0].1["name"], "logs");
+            assert_eq!(calls[0].1["tabId"], json!(tab_id));
+            assert!(calls[0].1["sync"]["seq"].as_u64().is_some());
+        }
+        // Reap the real session this spawned.
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
     }
 
     #[test]
     fn spawn_terminal_forwards_the_startup_command() {
         // T-B: the socket spawn carries the webview presets' `startupCommand`
-        // (the native resume flow's `claude --resume <id>`); the sink forward
-        // must pass it through verbatim so the webview's spawnTerminal IPC runs
-        // it inside the interactive-login wrap.
+        // (the resume flow's `claude --resume <id>` in production; a harmless
+        // echo here - headless-org spawns the REAL session server-side now, so
+        // the command actually runs). The forward must carry it verbatim.
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -2805,24 +3147,32 @@ mod tests {
         let v = dispatch(
             &ctx,
             "spawn_terminal",
-            &json!({"cwd": "/tmp", "startupCommand": "claude --resume 'abc'"}),
+            &json!({"cwd": "/tmp", "startupCommand": "echo resume-proof"}),
         )
         .unwrap();
         assert_eq!(v["accepted"], "spawn_terminal");
-        assert_eq!(v["startupCommand"], "claude --resume 'abc'");
+        assert_eq!(v["startupCommand"], "echo resume-proof");
+        let first_id = v["id"].as_str().unwrap().to_string();
 
         let calls = sink.calls.lock().unwrap();
         assert_eq!(calls[0].0, "spawn_terminal");
-        assert_eq!(calls[0].1["startupCommand"], "claude --resume 'abc'");
+        assert_eq!(calls[0].1["startupCommand"], "echo resume-proof");
         // The snake_case alias parses too (loose-args convention).
         drop(calls);
-        dispatch(
+        let v2 = dispatch(
             &ctx,
             "spawn_terminal",
-            &json!({"startup_command": "claude"}),
+            &json!({"cwd": "/tmp", "startup_command": "echo alias-proof"}),
         )
         .unwrap();
-        assert_eq!(sink.calls.lock().unwrap()[1].1["startupCommand"], "claude");
+        assert_eq!(
+            sink.calls.lock().unwrap()[1].1["startupCommand"],
+            "echo alias-proof"
+        );
+        // Reap the real sessions these spawned.
+        for id in [first_id.as_str(), v2["id"].as_str().unwrap()] {
+            dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+        }
     }
 
     #[test]
@@ -3141,12 +3491,26 @@ mod tests {
 
     #[test]
     fn focus_tab_is_organization_apply() {
-        // No sink (headless): accepted + audited, but not applied.
+        // Headless-org: focus_tab is STRICT (the tab must exist in the registry)
+        // and mirrors the new active tab there. No sink (headless): accepted +
+        // audited, but not applied.
         let ctx = test_ctx("t");
+        let err = dispatch(&ctx, "focus_tab", &json!({"tabId": "tab-1"})).unwrap_err();
+        assert!(err.contains("unknown tabId"), "got: {err}");
+
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
         let v = dispatch(&ctx, "focus_tab", &json!({"tabId": "tab-1"})).unwrap();
         assert_eq!(v["accepted"], "focus_tab");
         assert_eq!(v["audited"], true);
         assert_eq!(v["applied"], false);
+        assert_eq!(
+            ctx.tab_registry().snapshot_full().active_tab_id.as_deref(),
+            Some("tab-1")
+        );
     }
 
     #[test]
@@ -3206,6 +3570,132 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(tiles, vec!["term-xyz"]);
+    }
+
+    #[test]
+    fn stale_report_is_rejected_and_answers_with_the_snapshot() {
+        // Headless-org acceptance for requirement 2: a server-side move_tile must
+        // survive a UI report that predates it (the exact lost-update repro: three
+        // accepted move_tile calls, registry silently reverted by the reporter).
+        let ctx = test_ctx("t");
+        // UI boots and reports its layout (legacy/no baseSeq → accepted).
+        let v = dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({"tabs": [
+                {"id": "t1", "name": "Workspace 1", "tileIds": ["aa"]},
+                {"id": "t2", "name": "hidden", "tileIds": []},
+            ], "activeTabId": "t1", "baseSeq": 0}),
+        )
+        .unwrap();
+        let seq = v["seq"].as_u64().unwrap();
+
+        // A headless move into the hidden tab bumps the revision.
+        dispatch(&ctx, "move_tile", &json!({"terminalId": "aa", "tabId": "t2"})).unwrap();
+
+        // The UI (which never applied the move - hidden tab, suspended webview…)
+        // reports its stale layout: REJECTED, answered with the snapshot.
+        let v = dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({"tabs": [
+                {"id": "t1", "name": "Workspace 1", "tileIds": ["aa"]},
+                {"id": "t2", "name": "hidden", "tileIds": []},
+            ], "activeTabId": "t1", "baseSeq": seq}),
+        )
+        .unwrap();
+        assert_eq!(v["stale"], true);
+        let tabs = v["tabs"].as_array().unwrap();
+        let t2 = tabs.iter().find(|t| t["id"] == "t2").unwrap();
+        assert_eq!(t2["tileIds"], json!(["aa"]), "the move survives the stale report");
+
+        // list_tabs stays truthful: the tile is in the hidden tab.
+        let tabs = dispatch(&ctx, "list_tabs", &Value::Null).unwrap();
+        let t2 = tabs["tabs"].as_array().unwrap().iter().find(|t| t["id"] == "t2").unwrap();
+        assert_eq!(t2["tileIds"], json!(["aa"]));
+
+        // A report based on the CURRENT revision is accepted (normal UI flow).
+        let cur = tabs["seq"].as_u64().unwrap();
+        let v = dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({"tabs": [
+                {"id": "t1", "name": "Workspace 1", "tileIds": []},
+                {"id": "t2", "name": "hidden", "tileIds": ["aa"]},
+            ], "activeTabId": "t1", "baseSeq": cur}),
+        )
+        .unwrap();
+        assert_eq!(v["reported"], 2);
+    }
+
+    #[test]
+    fn close_tab_headless_lifecycle_policy() {
+        // Requirement 3: tiles leave their tab on close_terminal, and an emptied
+        // auto-created tab is closeable headlessly - with the documented guards.
+        let ctx = test_ctx("t");
+        ctx.tab_registry().replace(vec![
+            TabRecord {
+                id: "t1".into(),
+                name: "Workspace 1".into(),
+                tile_ids: vec!["keep".into()],
+            },
+            TabRecord {
+                id: "t2".into(),
+                name: "staging".into(),
+                tile_ids: vec!["dead".into()],
+            },
+        ]);
+
+        // A non-empty tab is refused without force.
+        let err = dispatch(&ctx, "close_tab", &json!({"tabId": "t2"})).unwrap_err();
+        assert!(err.contains("close its terminals first"), "got: {err}");
+
+        // close_terminal drops the tile from its tab (tmux kill is idempotent on
+        // an already-gone session, so this exercises the registry path headlessly).
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": "dead"})).unwrap();
+        let t2 = ctx
+            .tab_registry()
+            .snapshot()
+            .into_iter()
+            .find(|t| t.id == "t2")
+            .unwrap();
+        assert!(t2.tile_ids.is_empty(), "the closed tile left its tab");
+
+        // The emptied tab closes headlessly (by name here - id also works).
+        let v = dispatch(&ctx, "close_tab", &json!({"tabName": "staging"})).unwrap();
+        assert_eq!(v["accepted"], "close_tab");
+        assert_eq!(v["tabId"], "t2");
+        assert!(ctx.tab_registry().snapshot().iter().all(|t| t.id != "t2"));
+
+        // The LAST tab is never closed.
+        let err = dispatch(&ctx, "close_tab", &json!({"tabId": "t1"})).unwrap_err();
+        assert!(err.contains("last tab"), "got: {err}");
+    }
+
+    #[test]
+    fn spawn_terminal_default_placement_is_the_active_tab_without_switching() {
+        // No tabName/tabId: the tile lands in the tab the USER has active (per the
+        // registry mirror) - matching the "+" menu - and never switches it.
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({"tabs": [
+                {"id": "t1", "name": "Workspace 1", "tileIds": []},
+                {"id": "t2", "name": "Workspace 2", "tileIds": []},
+            ], "activeTabId": "t2"}),
+        )
+        .unwrap();
+
+        let v = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap();
+        let id = v["id"].as_str().unwrap().to_string();
+        assert_eq!(v["tabId"], "t2", "default placement is the active tab");
+        let snap = ctx.tab_registry().snapshot_full();
+        assert_eq!(snap.active_tab_id.as_deref(), Some("t2"), "focus untouched");
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
     }
 
     #[test]
@@ -3487,12 +3977,27 @@ mod tests {
     #[test]
     fn organization_actions_are_accepted_and_audited() {
         // No apply sink (headless): accepted + audited, but not applied.
+        // focus_session and a targetId-only move_tile (within-tab reorder) stay
+        // legacy pass-through forwards.
         let ctx = test_ctx("t");
-        for cmd in ["focus_session", "move_tile", "rename_tab"] {
-            let v = dispatch(&ctx, cmd, &json!({"x": 1})).unwrap();
+        for (cmd, args) in [
+            ("focus_session", json!({"sessionId": "s1"})),
+            ("move_tile", json!({"terminalId": "t1", "targetId": "t2"})),
+        ] {
+            let v = dispatch(&ctx, cmd, &args).unwrap();
             assert_eq!(v["accepted"], cmd);
             assert_eq!(v["audited"], true);
             assert_eq!(v["applied"], false);
+        }
+        // Headless-org: registry-first mutations are STRICT - an unknown target
+        // is a hard error, not the old silent accept-then-lose.
+        for (cmd, args) in [
+            ("move_tile", json!({"terminalId": "t1", "tabId": "nope"})),
+            ("rename_tab", json!({"tabId": "nope", "name": "x"})),
+            ("close_tab", json!({"tabId": "nope"})),
+        ] {
+            let err = dispatch(&ctx, cmd, &args).unwrap_err();
+            assert!(err.contains("unknown tabId"), "{cmd}: {err}");
         }
     }
 
@@ -3517,9 +4022,25 @@ mod tests {
             calls: StdMutex::new(Vec::new()),
         });
         let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![
+            TabRecord {
+                id: "tab-1".into(),
+                name: "Main".into(),
+                tile_ids: vec!["term-1".into()],
+            },
+            TabRecord {
+                id: "tab-2".into(),
+                name: "Side".into(),
+                tile_ids: vec![],
+            },
+        ]);
 
-        for cmd in ["focus_session", "move_tile", "rename_tab"] {
-            let v = dispatch(&ctx, cmd, &json!({"tabId": "tab-1"})).unwrap();
+        for (cmd, args) in [
+            ("focus_session", json!({"sessionId": "term-1"})),
+            ("move_tile", json!({"terminalId": "term-1", "tabId": "tab-2"})),
+            ("rename_tab", json!({"tabId": "tab-2", "name": "Ops"})),
+        ] {
+            let v = dispatch(&ctx, cmd, &args).unwrap();
             assert_eq!(v["accepted"], cmd);
             assert_eq!(v["audited"], true);
             // With a sink wired, the action is forwarded to the UI and applied.
@@ -3530,7 +4051,17 @@ mod tests {
         let calls = sink.calls.lock().unwrap();
         let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
         assert_eq!(names, ["focus_session", "move_tile", "rename_tab"]);
-        assert_eq!(calls[0].1, json!({"tabId": "tab-1"}));
+        assert_eq!(calls[0].1, json!({"sessionId": "term-1"}));
+
+        // Headless-org: registry-first forwards carry the authoritative snapshot
+        // (`sync.seq` / `sync.tabs`) so the UI renders FROM the registry - the
+        // move is visible in the snapshot even before any UI report.
+        let sync = &calls[1].1["sync"];
+        assert!(sync["seq"].as_u64().unwrap() >= 1);
+        let tabs = sync["tabs"].as_array().unwrap();
+        let tab2 = tabs.iter().find(|t| t["id"] == "tab-2").unwrap();
+        assert_eq!(tab2["tileIds"], json!(["term-1"]));
+        assert_eq!(calls[2].1["name"], "Ops");
     }
 
     /// Register a real loopback socket as an event subscriber on `fanout`,
@@ -3568,6 +4099,11 @@ mod tests {
         let ctx = test_ctx("t")
             .with_apply_sink(sink.clone())
             .with_event_fanout(fanout.clone());
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
         let mut reader = subscribe_test_reader(&fanout);
 
         // A plain organization apply: broadcast mirrors the sink call.
@@ -3585,14 +4121,16 @@ mod tests {
         assert_eq!(frame["payload"]["args"]["id"], v["tabId"]);
         assert_eq!(frame["payload"]["args"]["name"], "Logs");
 
-        // spawn_terminal (sink path): forwarded to the webview AND broadcast
-        // (without an id - the webview mints it).
+        // spawn_terminal: the server spawns + places (headless-org), so sink AND
+        // subscribers both hear the forward WITH the real id + registry snapshot.
         let v = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "name": "n"})).unwrap();
         assert_eq!(v["accepted"], "spawn_terminal");
+        let spawned_id = v["id"].as_str().unwrap().to_string();
         let frame = read_event_frame(&mut reader);
         assert_eq!(frame["payload"]["command"], "spawn_terminal");
         assert_eq!(frame["payload"]["args"]["cwd"], "/tmp");
-        assert!(frame["payload"]["args"].get("id").is_none());
+        assert_eq!(frame["payload"]["args"]["id"], json!(spawned_id));
+        assert!(frame["payload"]["args"]["sync"]["seq"].as_u64().is_some());
 
         // remove_worktree (sink path): subscribers hear the detach forward too.
         let v = dispatch(
@@ -3612,6 +4150,9 @@ mod tests {
             names,
             ["focus_tab", "new_tab", "spawn_terminal", "remove_worktree_workspace"]
         );
+
+        // Reap the real session the spawn created.
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": spawned_id})).unwrap();
     }
 
     #[test]
@@ -3620,6 +4161,11 @@ mod tests {
         // reaching an event subscriber is what "applied" means there.
         let fanout = Arc::new(EventFanout::new());
         let ctx = test_ctx("t").with_event_fanout(fanout.clone());
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "x".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
         let mut reader = subscribe_test_reader(&fanout);
 
         let v = dispatch(&ctx, "rename_tab", &json!({"tabId": "x", "name": "ops"})).unwrap();
