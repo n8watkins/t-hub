@@ -405,6 +405,10 @@ pub struct Workspace {
     /// indices shift as tabs close). Assigned by the model, monotonic per run;
     /// NOT persisted - the layout file's tab order is the durable identity.
     pub wsid: u64,
+    /// The tile taking this workspace's whole grid (N3), if any. Transient like
+    /// the webview's `fullscreenId` (NOT persisted); cleared when the tile
+    /// leaves the workspace.
+    pub fullscreen: Option<String>,
 }
 
 impl Workspace {
@@ -421,6 +425,7 @@ impl Workspace {
             grid: None,
             satellite: false,
             wsid: 0,
+            fullscreen: None,
         }
     }
 }
@@ -585,6 +590,7 @@ impl ChromeModel {
             grid: None,
             satellite: false,
             wsid: self.next_wsid,
+            fullscreen: None,
         });
         self.next_wsid += 1;
         self.active = self.tabs.len() - 1;
@@ -854,6 +860,7 @@ impl ChromeModel {
         }
         if present {
             self.fixup_focus();
+            self.fixup_fullscreen();
         }
         present
     }
@@ -893,6 +900,7 @@ impl ChromeModel {
         self.tabs[source].tiles.retain(|x| x != id);
         self.tabs[target].tiles.push(id.to_string());
         self.fixup_focus();
+        self.fixup_fullscreen();
         true
     }
 
@@ -902,12 +910,21 @@ impl ChromeModel {
     /// and the moved tile takes focus (unless the active tab is a torn-off
     /// satellite - the main window focuses nothing then).
     pub fn reorder_tile(&mut self, id: &str, target_id: &str) -> bool {
+        self.reorder_tile_in(self.active, id, target_id)
+    }
+
+    /// [`reorder_tile`](Self::reorder_tile) within an explicit tab (N2: a
+    /// header drag in a satellite window reorders THAT window's workspace,
+    /// which is never the main-grid active tab). The moved tile takes the main
+    /// focus only when the tab is the active main-grid one; a satellite
+    /// window's own focus is the registry's business.
+    pub fn reorder_tile_in(&mut self, tab: usize, id: &str, target_id: &str) -> bool {
         if id == target_id {
             return false;
         }
-        let tab = &mut self.tabs[self.active];
-        let satellite = tab.satellite;
-        let tiles = &mut tab.tiles;
+        let Some(tab_ws) = self.tabs.get_mut(tab) else { return false };
+        let satellite = tab_ws.satellite;
+        let tiles = &mut tab_ws.tiles;
         let (Some(from), Some(to)) = (
             tiles.iter().position(|x| x == id),
             tiles.iter().position(|x| x == target_id),
@@ -915,11 +932,45 @@ impl ChromeModel {
             return false;
         };
         let moved = tiles.remove(from);
-        tiles.insert(to, moved);
-        if !satellite {
+        // Removing a lower slot shifts the target left: re-aim the insert so
+        // the moved tile lands AT the target's slot in BOTH directions (the
+        // webview's stale-index splice drops one-after when dragging forward;
+        // this deliberately fixes that instead of porting it).
+        tiles.insert(if from < to { to - 1 } else { to }, moved);
+        if tab == self.active && !satellite {
             self.focused = Some(id.to_string());
         }
         true
+    }
+
+    /// Toggle tile `id` fullscreen in tab `tab` (N3, webview `toggleFullscreen`
+    /// parity): fullscreen if it was not, restore if it was. The tile must be
+    /// in that tab. Returns whether anything changed.
+    pub fn toggle_fullscreen(&mut self, tab: usize, id: &str) -> bool {
+        let Some(tab_ws) = self.tabs.get_mut(tab) else { return false };
+        if !tab_ws.tiles.iter().any(|x| x == id) {
+            return false;
+        }
+        tab_ws.fullscreen =
+            if tab_ws.fullscreen.as_deref() == Some(id) { None } else { Some(id.to_string()) };
+        true
+    }
+
+    /// Clear tab `tab`'s fullscreen (N3: the Esc restore). Returns whether one
+    /// was set.
+    pub fn clear_fullscreen(&mut self, tab: usize) -> bool {
+        self.tabs.get_mut(tab).is_some_and(|t| t.fullscreen.take().is_some())
+    }
+
+    /// Keep every tab's `fullscreen` pointing at one of ITS tiles: a fullscreen
+    /// tile that left the tab (close / reconcile removal / cross-tab move)
+    /// restores the grid instead of blanking it.
+    fn fixup_fullscreen(&mut self) {
+        for tab in &mut self.tabs {
+            if tab.fullscreen.as_ref().is_some_and(|f| !tab.tiles.iter().any(|x| x == f)) {
+                tab.fullscreen = None;
+            }
+        }
     }
 
     /// Keep `focused` pointing at a tile IN THE ACTIVE TAB, so key input never
@@ -1029,6 +1080,7 @@ impl ChromeModel {
 
         if !out.added.is_empty() || !out.removed.is_empty() {
             self.fixup_focus();
+            self.fixup_fullscreen();
         }
         out
     }
@@ -1433,6 +1485,7 @@ mod tests {
             grid: None,
             satellite,
             wsid: 0,
+            fullscreen: None,
         }
     }
 
@@ -1664,11 +1717,88 @@ mod tests {
         assert!(m.reorder_tile("cc", "aa"));
         assert_eq!(m.active_tiles(), ids(&["cc", "aa", "bb"]).as_slice());
         assert_eq!(m.focused.as_deref(), Some("cc"));
+        // Forward (from < to): the removal shifts the target left, so the
+        // insert index re-aims - the moved tile splices directly at the
+        // target, never one slot past it (the stale-index off-by-one).
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb", "cc", "dd"]));
+        assert!(m.reorder_tile("aa", "cc"));
+        assert_eq!(m.active_tiles(), ids(&["bb", "aa", "cc", "dd"]).as_slice());
+        assert!(m.reorder_tile("bb", "dd"));
+        assert_eq!(m.active_tiles(), ids(&["aa", "cc", "bb", "dd"]).as_slice());
+        // A tile already directly before its forward target stays put (the
+        // splice-before-target slot is where it is).
+        assert!(m.reorder_tile("bb", "dd"));
+        assert_eq!(m.active_tiles(), ids(&["aa", "cc", "bb", "dd"]).as_slice());
+
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb", "cc"]));
         // Target in another tab (or missing): refuse - active-tab-only semantics.
         m.add_tab();
         m.reconcile(&ids(&["aa", "bb", "cc", "dd"]));
         assert!(!m.reorder_tile("dd", "aa"));
         assert!(!m.reorder_tile("aa", "aa"));
+    }
+
+    #[test]
+    fn reorder_tile_in_splices_a_non_active_tab_without_stealing_focus() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb"]));
+        m.add_tab();
+        m.reconcile(&ids(&["aa", "bb", "cc", "dd"]));
+        m.set_active(0);
+        m.set_focused("aa");
+        // Reorder within tab 1 while tab 0 is active (a satellite-window drag).
+        assert!(m.reorder_tile_in(1, "dd", "cc"));
+        assert_eq!(m.tabs[1].tiles, ids(&["dd", "cc"]));
+        assert_eq!(m.focused.as_deref(), Some("aa"), "main focus untouched");
+        // Ids in different tabs (or missing) refuse; so does a bad tab index.
+        assert!(!m.reorder_tile_in(1, "aa", "cc"));
+        assert!(!m.reorder_tile_in(9, "cc", "dd"));
+    }
+
+    #[test]
+    fn fullscreen_toggles_and_clears() {
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb"]));
+        assert!(m.toggle_fullscreen(0, "aa"));
+        assert_eq!(m.tabs[0].fullscreen.as_deref(), Some("aa"));
+        // Toggling another tile switches; toggling the same restores.
+        assert!(m.toggle_fullscreen(0, "bb"));
+        assert_eq!(m.tabs[0].fullscreen.as_deref(), Some("bb"));
+        assert!(m.toggle_fullscreen(0, "bb"));
+        assert_eq!(m.tabs[0].fullscreen, None);
+        // Unknown tile / tab: refused.
+        assert!(!m.toggle_fullscreen(0, "zz"));
+        assert!(!m.toggle_fullscreen(5, "aa"));
+        // Esc path.
+        m.toggle_fullscreen(0, "aa");
+        assert!(m.clear_fullscreen(0));
+        assert!(!m.clear_fullscreen(0));
+    }
+
+    #[test]
+    fn fullscreen_clears_when_its_tile_leaves_the_tab() {
+        // Close path.
+        let mut m = ChromeModel::default();
+        m.reconcile(&ids(&["aa", "bb"]));
+        m.toggle_fullscreen(0, "aa");
+        m.close_tile("aa");
+        assert_eq!(m.tabs[0].fullscreen, None);
+        // Reconcile removal (session died server-side).
+        m.toggle_fullscreen(0, "bb");
+        m.reconcile(&ids(&["cc"]));
+        assert_eq!(m.tabs[0].fullscreen, None);
+        // Cross-tab move; a survivor's fullscreen stays.
+        m.adopt_tab("t2", "two");
+        m.set_active(0);
+        m.reconcile(&ids(&["cc", "dd"]));
+        m.toggle_fullscreen(0, "cc");
+        m.move_tile_to_tab("cc", "t2");
+        assert_eq!(m.tabs[0].fullscreen, None);
+        m.toggle_fullscreen(0, "dd");
+        m.reconcile(&ids(&["cc", "dd"]));
+        assert_eq!(m.tabs[0].fullscreen.as_deref(), Some("dd"));
     }
 
     #[test]

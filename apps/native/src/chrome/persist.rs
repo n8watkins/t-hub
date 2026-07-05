@@ -202,6 +202,8 @@ impl Layout {
                     grid: t.grid.and_then(GridConfig::into_ratios),
                     satellite: t.satellite.is_some(),
                     wsid: 0, // reassigned by from_layout
+                    // Transient (webview parity): fullscreen never persists.
+                    fullscreen: None,
                 })
                 .collect(),
             self.active,

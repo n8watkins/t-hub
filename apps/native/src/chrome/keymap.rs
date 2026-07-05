@@ -219,6 +219,9 @@ impl Default for Keymap {
             (CommandId::CycleTileNext, "n"),
             (CommandId::CycleTilePrev, "b"),
             (CommandId::OpenWorktreesList, "l"),
+            // N3: tmux's prefix+z zoom muscle memory (no webview chord exists;
+            // the webview only has the header button + Esc).
+            (CommandId::ToggleTileFullscreen, "z"),
         ] {
             prefixed.insert(cmd, key.to_string());
         }
@@ -695,6 +698,7 @@ mod tests {
             (CommandId::CycleTileNext, "n"),
             (CommandId::CycleTilePrev, "b"),
             (CommandId::OpenWorktreesList, "l"),
+            (CommandId::ToggleTileFullscreen, "z"),
         ] {
             assert_eq!(k.prefixed_of(cmd), Some(key), "{cmd:?}");
         }
@@ -749,7 +753,8 @@ mod tests {
         let mut c = controller();
         let mut m = model2();
         c.on_key(&ctrl("b"), &mut m, false, 0);
-        assert_eq!(c.on_key(&kc("z"), &mut m, false, 100), Handled::Pass);
+        // "q" has no prefixed binding ("z" gained one with N3 fullscreen).
+        assert_eq!(c.on_key(&kc("q"), &mut m, false, 100), Handled::Pass);
         assert!(!c.armed(101));
     }
 
