@@ -25,10 +25,13 @@ use crate::font::FontSpec;
 // ---------------------------------------------------------------------------
 
 /// The webview's 21 commands (ids matching `lib/commands.ts` exactly - the
-/// persisted keymap file uses these strings) plus the native-only
-/// `killSession` (N4): the webview hard-codes Ctrl+Shift+W in
+/// persisted keymap file uses these strings) plus the native-only additions:
+/// `killSession` (N4: the webview hard-codes Ctrl+Shift+W in
 /// `useLifecycleKeybinds.tsx`, native routes it through the registry so the
-/// palette and rebinding get it for free.
+/// palette and rebinding get it for free), `toggleTileFullscreen` (N3), and
+/// `togglePanels` (N5: the webview exposes panels as per-tile header tabs,
+/// which need no command; the native cockpit mounts them as a toggleable
+/// side surface).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CommandId {
     SpawnTerminal,
@@ -56,12 +59,13 @@ pub enum CommandId {
     /// N3: fullscreen the focused tile / restore the grid. Native-first (the
     /// webview toggles this from the tile header button only).
     ToggleTileFullscreen,
+    TogglePanels,
 }
 
 /// Registry order = the webview's COMMANDS list order (palette tie-break);
 /// native-only commands (killSession slots after its close sibling,
-/// toggleTileFullscreen appends) ride along.
-pub const ALL_COMMANDS: [CommandId; 23] = [
+/// toggleTileFullscreen and togglePanels append) ride along.
+pub const ALL_COMMANDS: [CommandId; 24] = [
     CommandId::SpawnTerminal,
     CommandId::CloseTerminal,
     CommandId::KillSession,
@@ -85,6 +89,7 @@ pub const ALL_COMMANDS: [CommandId; 23] = [
     CommandId::ZoomReset,
     CommandId::CommandPalette,
     CommandId::ToggleTileFullscreen,
+    CommandId::TogglePanels,
 ];
 
 impl CommandId {
@@ -114,6 +119,7 @@ impl CommandId {
             CommandId::ZoomReset => "zoomReset",
             CommandId::CommandPalette => "commandPalette",
             CommandId::ToggleTileFullscreen => "toggleTileFullscreen",
+            CommandId::TogglePanels => "togglePanels",
         }
     }
 
@@ -147,6 +153,7 @@ impl CommandId {
             CommandId::ZoomReset => "Reset zoom",
             CommandId::CommandPalette => "Command palette",
             CommandId::ToggleTileFullscreen => "Toggle tile fullscreen",
+            CommandId::TogglePanels => "Toggle panels",
         }
     }
 
@@ -185,6 +192,9 @@ impl CommandId {
             CommandId::ToggleTileFullscreen => {
                 "Expand the focused tile to fill the grid, or restore the grid"
             }
+            CommandId::TogglePanels => {
+                "Show or hide the Files / Preview / Dev panels beside the grid"
+            }
         }
     }
 
@@ -210,7 +220,7 @@ impl CommandId {
             | CommandId::FocusTab8
             | CommandId::FocusTab9 => "Navigation",
             CommandId::ZoomIn | CommandId::ZoomOut | CommandId::ZoomReset => "Zoom",
-            CommandId::CommandPalette => "App",
+            CommandId::CommandPalette | CommandId::TogglePanels => "App",
         }
     }
 
@@ -281,6 +291,10 @@ pub enum Effect {
     /// The user asked to KILL a session (N4): the view opens the confirm
     /// dialog (busy-aware); nothing is mutated until the user confirms there.
     ConfirmKill(String),
+    /// Show/hide the panels side surface (N5). The open flag is view state
+    /// (like the palette), not model state - the view flips it, roots the
+    /// panels feed at the focused tile's cwd, and routes keyboard focus.
+    TogglePanels,
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +371,7 @@ pub fn execute(cmd: CommandId, model: &mut ChromeModel, region: &mut Region) -> 
             Vec::new()
         }
         CommandId::CommandPalette => Vec::new(),
+        CommandId::TogglePanels => vec![Effect::TogglePanels],
         _ => unreachable!("focusTab handled above"),
     }
 }
@@ -526,6 +541,20 @@ mod tests {
         for cat in ["Terminals", "Workspaces", "Navigation", "Zoom", "App"] {
             assert!(ALL_COMMANDS.iter().any(|c| c.category() == cat), "{cat} empty");
         }
+    }
+
+    #[test]
+    fn toggle_panels_emits_view_effect_only() {
+        let mut m = model_with(vec![("A", vec!["t1"], false)]);
+        let mut r = Region::Tiles;
+        let focused_before = m.focused.clone();
+        let fx = execute(CommandId::TogglePanels, &mut m, &mut r);
+        assert_eq!(fx, vec![Effect::TogglePanels]);
+        // Panels visibility is view state, not model state: nothing mutated.
+        assert_eq!(m.tabs.len(), 1);
+        assert_eq!(m.active, 0);
+        assert_eq!(m.focused, focused_before);
+        assert_eq!(r, Region::Tiles);
     }
 
     #[test]

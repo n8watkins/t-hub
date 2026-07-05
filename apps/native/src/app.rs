@@ -549,8 +549,23 @@ fn run_cockpit() {
                             true
                         });
                     }
+                    // The N5 panels side surface: one poll-only feed for the
+                    // process (no event subscription - the OverlayFeed stays
+                    // the sole drainer) + the T11 PanelHost entity, mounted
+                    // by CockpitView when `togglePanels` opens it.
+                    let (panels, panels_feed) =
+                        crate::panels::PanelHost::mount(client.clone(), cx);
                     let view = cx.new(|_| {
-                        CockpitView::new(state, overlays, feed, client, handles, focus.clone())
+                        CockpitView::new(
+                            state,
+                            overlays,
+                            feed,
+                            client,
+                            handles,
+                            focus.clone(),
+                            panels,
+                            panels_feed,
+                        )
                     });
                     window.focus(&focus);
                     view

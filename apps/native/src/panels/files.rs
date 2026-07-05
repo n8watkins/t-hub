@@ -163,6 +163,14 @@ impl FilesState {
         Self { hide_dotfiles: true, ..Self::default() }
     }
 
+    /// Whether Escape still has a panel-internal target (the viewer, then the
+    /// query - the Files tab's Esc stack). When false, a host embedding the
+    /// panels (N5 cockpit) should let Esc escalate out - e.g. hand keyboard
+    /// focus back to the tiles so the next Esc can restore a fullscreen tile.
+    pub fn wants_escape(&self) -> bool {
+        self.viewer.is_some() || !self.query.is_empty()
+    }
+
     /// Point the panel at a project root, resetting tree/search/viewer state.
     /// Returns the root fetch to issue (or None if unchanged).
     pub fn set_root(&mut self, root: &str) -> Option<FetchDir> {
@@ -489,6 +497,20 @@ mod tests {
 
     fn entry(name: &str, path: &str, is_dir: bool) -> DirEntry {
         DirEntry { name: name.into(), path: path.into(), is_dir, size: 0 }
+    }
+
+    #[test]
+    fn wants_escape_follows_the_viewer_then_query_stack() {
+        let mut st = FilesState::new();
+        st.set_root("/proj");
+        assert!(!st.wants_escape(), "idle Files tab: Esc escalates to the host");
+        st.set_query("cargo", 1000);
+        assert!(st.wants_escape(), "a live query is an Esc target");
+        st.open("/proj/README.md");
+        assert!(st.wants_escape(), "an open viewer is an Esc target");
+        st.close_viewer();
+        st.set_query("", 1100);
+        assert!(!st.wants_escape(), "cleared: Esc escalates again");
     }
 
     #[test]

@@ -110,6 +110,17 @@ impl PanelHost {
         (view, feed)
     }
 
+    /// Whether Escape still has a panel-internal target on the current tab
+    /// (Files: viewer then query; Run: the command draft). A host embedding
+    /// the panels (N5 cockpit) checks this to decide when Esc escalates out.
+    pub fn wants_escape(&self) -> bool {
+        match self.tab {
+            PanelTab::Files => self.feed.state().lock().files.wants_escape(),
+            PanelTab::Run => self.cmd_draft.is_some(),
+            PanelTab::Preview => false,
+        }
+    }
+
     fn set_tab(&mut self, tab: PanelTab) {
         self.tab = tab;
         self.input = match tab {

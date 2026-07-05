@@ -222,6 +222,9 @@ impl Default for Keymap {
             // N3: tmux's prefix+z zoom muscle memory (no webview chord exists;
             // the webview only has the header button + Esc).
             (CommandId::ToggleTileFullscreen, "z"),
+            // Native-only (N5): the panels side surface. No webview binding
+            // to mirror; `f` for Files, unused by the seeded set.
+            (CommandId::TogglePanels, "f"),
         ] {
             prefixed.insert(cmd, key.to_string());
         }
