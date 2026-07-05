@@ -49,10 +49,14 @@ pub enum CommandId {
     ZoomOut,
     ZoomReset,
     CommandPalette,
+    /// N3: fullscreen the focused tile / restore the grid. Native-first (the
+    /// webview toggles this from the tile header button only).
+    ToggleTileFullscreen,
 }
 
-/// Registry order = the webview's COMMANDS list order (palette tie-break).
-pub const ALL_COMMANDS: [CommandId; 21] = [
+/// Registry order = the webview's COMMANDS list order (palette tie-break);
+/// native-only commands append after.
+pub const ALL_COMMANDS: [CommandId; 22] = [
     CommandId::SpawnTerminal,
     CommandId::CloseTerminal,
     CommandId::NewPlainWorkspace,
@@ -74,6 +78,7 @@ pub const ALL_COMMANDS: [CommandId; 21] = [
     CommandId::ZoomOut,
     CommandId::ZoomReset,
     CommandId::CommandPalette,
+    CommandId::ToggleTileFullscreen,
 ];
 
 impl CommandId {
@@ -101,6 +106,7 @@ impl CommandId {
             CommandId::ZoomOut => "zoomOut",
             CommandId::ZoomReset => "zoomReset",
             CommandId::CommandPalette => "commandPalette",
+            CommandId::ToggleTileFullscreen => "toggleTileFullscreen",
         }
     }
 
@@ -132,6 +138,7 @@ impl CommandId {
             CommandId::ZoomOut => "Zoom out",
             CommandId::ZoomReset => "Reset zoom",
             CommandId::CommandPalette => "Command palette",
+            CommandId::ToggleTileFullscreen => "Toggle tile fullscreen",
         }
     }
 
@@ -164,12 +171,17 @@ impl CommandId {
             CommandId::ZoomOut => "Decrease terminal font size",
             CommandId::ZoomReset => "Reset terminal font size",
             CommandId::CommandPalette => "Open the fuzzy command palette",
+            CommandId::ToggleTileFullscreen => {
+                "Expand the focused tile to fill the grid, or restore the grid"
+            }
         }
     }
 
     pub fn category(self) -> &'static str {
         match self {
-            CommandId::SpawnTerminal | CommandId::CloseTerminal => "Terminals",
+            CommandId::SpawnTerminal
+            | CommandId::CloseTerminal
+            | CommandId::ToggleTileFullscreen => "Terminals",
             CommandId::NewPlainWorkspace
             | CommandId::NewWorktreeWorkspace
             | CommandId::OpenWorktreesList => "Workspaces",
@@ -312,6 +324,14 @@ pub fn execute(cmd: CommandId, model: &mut ChromeModel, region: &mut Region) -> 
         CommandId::ZoomIn => zoom(model, 1.0),
         CommandId::ZoomOut => zoom(model, -1.0),
         CommandId::ZoomReset => zoom_reset(model),
+        CommandId::ToggleTileFullscreen => {
+            // Toggle on the active tab's focused tile (N3). Transient state
+            // like the webview's `fullscreenId`: nothing to persist; the view
+            // repaints and the PTY refits through the normal geometry path.
+            let Some(id) = model.focused.clone() else { return Vec::new() };
+            model.toggle_fullscreen(model.active, &id);
+            Vec::new()
+        }
         CommandId::CommandPalette => Vec::new(),
         _ => unreachable!("focusTab handled above"),
     }
@@ -621,6 +641,21 @@ mod tests {
             execute(CommandId::OpenWorktreesList, &mut m, &mut r),
             vec![Effect::Host(HostCommand::OpenWorktreesList)]
         );
+    }
+
+    #[test]
+    fn toggle_tile_fullscreen_acts_on_the_focused_tile() {
+        let mut m = model_with(vec![("A", vec!["t1", "t2"], false)]);
+        m.set_focused("t2");
+        let mut r = Region::Tiles;
+        assert!(execute(CommandId::ToggleTileFullscreen, &mut m, &mut r).is_empty());
+        assert_eq!(m.tabs[0].fullscreen.as_deref(), Some("t2"));
+        execute(CommandId::ToggleTileFullscreen, &mut m, &mut r);
+        assert_eq!(m.tabs[0].fullscreen, None);
+        // Nothing focused: no-op.
+        let mut m = model_with(vec![("A", vec![], false)]);
+        execute(CommandId::ToggleTileFullscreen, &mut m, &mut r);
+        assert_eq!(m.tabs[0].fullscreen, None);
     }
 
     #[test]
