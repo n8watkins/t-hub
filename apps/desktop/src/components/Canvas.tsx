@@ -27,6 +27,7 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { useWorkspace } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
 import { usePanels } from "../store/panels";
+import { useCaptain } from "../store/captain";
 import { spawnTerminal, listTerminals, onState } from "../ipc/client";
 import { Tile } from "./Tile";
 import { TerminalPoolProvider } from "./TerminalPool";
@@ -147,6 +148,12 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   // placeholder automatically. Esc / the ⤢ toggle returns to the grid.
   const fullscreenId = usePanels((s) => s.fullscreenId);
   const setFullscreen = usePanels((s) => s.setFullscreen);
+
+  // Captain overlay (captain-overlay): while summoned, the overlay owns the
+  // captain's pool placeholder, so BOTH tile copies (grid + fullscreen) must
+  // yield the slot - mirrors the fullscreen slotActive gating.
+  const captainId = useCaptain((s) => s.captainId);
+  const captainOpen = useCaptain((s) => s.open);
 
   // Seed the live terminal set and keep lifecycle state in sync with the backend.
   useEffect(() => {
@@ -373,6 +380,10 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     if (fullscreenId == null) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        // The captain overlay floats above fullscreen and has its own Esc
+        // handler; let that one Esc close ONLY the overlay (both handlers are
+        // window-capture listeners, so stopPropagation can't order them).
+        if (useCaptain.getState().open) return;
         e.preventDefault();
         setFullscreen(null);
       }
@@ -439,6 +450,9 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
                 key={`fs-${fullscreenId}`}
                 terminalId={fullscreenId}
                 focused={fullscreenId === focusedId}
+                // If the fullscreen tile IS the summoned captain, the captain
+                // overlay owns the pool placeholder - this copy yields too.
+                slotActive={!(captainOpen && fullscreenId === captainId)}
                 onFocus={() => setFocus(fullscreenId)}
                 onClose={() => {
                   // Closing the fullscreen tile KILLS its session AND drops
@@ -589,6 +603,10 @@ function TabGrid({
   const layout = splitRows(tab.order);
   const setTabSizes = useWorkspace((s) => s.setTabSizes);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // While the captain overlay is summoned it owns the captain's pool
+  // placeholder; that tile's grid copy must not register/steal it (exactly the
+  // fullscreen slotActive rule). Null when the overlay is closed.
+  const summonedCaptainId = useCaptain((s) => (s.open ? s.captainId : null));
 
   // Local, editable copy of the flex weights so dragging is smooth (we only
   // write through to the store at pointer-up). Re-derived whenever the tab's
@@ -966,8 +984,9 @@ function TabGrid({
                     focused={active && id === focusedId}
                     // When this tile is fullscreen, its fullscreen copy (Canvas)
                     // owns the pool placeholder; this covered grid copy must not
-                    // re-register and steal it, so it yields the slot.
-                    slotActive={id !== fullscreenId}
+                    // re-register and steal it, so it yields the slot. Same rule
+                    // when it's the summoned captain (the overlay owns the slot).
+                    slotActive={id !== fullscreenId && id !== summonedCaptainId}
                     // #20: the xterm body lives in the persistent pool overlay,
                     // not in the tile — the tile renders header + placeholder.
                     onFocus={() => onFocus(id)}

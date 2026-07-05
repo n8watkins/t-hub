@@ -32,7 +32,9 @@ import {
 } from "react";
 import { useWorkspace } from "../store/workspace";
 import { usePanels } from "../store/panels";
+import { useCaptain } from "../store/captain";
 import { TerminalView } from "./Terminal";
+import { CaptainOverlay } from "./CaptainOverlay";
 import type { TerminalId } from "../ipc/types";
 // Diagnostics: tlog mirrors every pool show/park decision into a file the
 // orchestrator can read from a RELEASE build (no devtools). Importing this here
@@ -80,6 +82,24 @@ const PoolContext = createContext<PoolRegistry | null>(null);
  * the calling component. The pool positions `id`'s pooled terminal over it.
  * No-op outside a <TerminalPoolProvider> (so Tile still works standalone).
  */
+// ---------------------------------------------------------------------------
+// External imperative re-sync (captain-overlay). The overlay's drag/resize
+// gestures move its slot placeholder WITHOUT any store/layout change the pool
+// would notice (ResizeObserver only fires on SIZE changes, and we deliberately
+// avoid a React version-bump per pointermove). This module-level hook lets the
+// gesture call straight into the live layer's imperative sync(), which measures
+// and repositions without a render. Null outside a mounted pool layer.
+// ---------------------------------------------------------------------------
+
+let externalSync: ((trigger: string) => void) | null = null;
+
+/** Imperatively re-measure + reposition every pooled terminal now. No-op when
+ *  no pool layer is mounted. Safe to call at pointer-move rate (the caller
+ *  should still rAF-coalesce). */
+export function requestPoolSync(trigger: string): void {
+  externalSync?.(trigger);
+}
+
 export function useTerminalSlot(id: TerminalId) {
   const reg = useContext(PoolContext);
   const ref = useRef<HTMLDivElement | null>(null);
@@ -191,6 +211,13 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // Also re-sync when any tile's panel is expanded/collapsed: that flips whether
   // the terminal half exists, so its xterm must show (split) or park (expanded).
   const panelExpanded = usePanels((s) => s.panelExpanded);
+  // Captain overlay (captain-overlay): while OPEN, the captain terminal is
+  // eligible to show regardless of which tab is active (its slot is the
+  // overlay's body placeholder) and its wrapper is lifted above the overlay
+  // panel chrome (z-index 2 vs the panel's 1) inside this layer's stacking
+  // context. Subscribed so an open/pin change re-runs the visibility sync.
+  const captainId = useCaptain((s) => s.captainId);
+  const captainOpen = useCaptain((s) => s.open);
 
   // THE FIX (mutedbug): poolIds must be a STABLE DOM order that does NOT change
   // when a tile is reordered or moved between tabs. Positioning is absolute
@@ -274,6 +301,12 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   const foregroundIds = useMemo(() => {
     const ids = new Set<TerminalId>();
     for (const id of poolIds) {
+      // The summoned captain is always foreground: its overlay floats above
+      // every tab (and above a fullscreen tile), so it must flush at rAF rate.
+      if (captainOpen && id === captainId) {
+        ids.add(id);
+        continue;
+      }
       const onNonTerminal = (panelTab[id] ?? "terminal") !== "terminal";
       if (onNonTerminal && (panelExpanded[id] ?? true)) continue;
       if (fullscreenId != null) {
@@ -283,7 +316,16 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       if (tabOfId.get(id) === activeTabId) ids.add(id);
     }
     return ids;
-  }, [poolIds, panelTab, panelExpanded, fullscreenId, tabOfId, activeTabId]);
+  }, [
+    poolIds,
+    panelTab,
+    panelExpanded,
+    fullscreenId,
+    tabOfId,
+    activeTabId,
+    captainOpen,
+    captainId,
+  ]);
 
   // A deferred re-sync scheduled on the next animation frame. A sync that lands
   // mid-reflow (transient zero rect / zero container base) is always followed by
@@ -430,7 +472,16 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       // does the terminal show, in its half over the placeholder. On the Terminal
       // tab it always shows. Then the usual gates: a fullscreen tile shows only
       // itself; otherwise only active-workspace-tab terminals show.
+      // Captain overlay: read the LIVE store (same pattern as panels above) so
+      // a deferred-rAF sync sees the current open/pin state; the layout-effect
+      // still re-runs sync when captainOpen/captainId change (they're deps).
+      const cap = useCaptain.getState();
       const shouldShow = (id: TerminalId): boolean => {
+        // The summoned captain shows on EVERY tab (its placeholder is the
+        // overlay's body), even while another tile is fullscreen - the overlay
+        // floats above the fullscreen layer too. Checked FIRST so none of the
+        // per-tab / fullscreen gates below can park it while it's summoned.
+        if (cap.open && id === cap.captainId) return true;
         const onNonTerminal = (tabMap[id] ?? "terminal") !== "terminal";
         if (onNonTerminal && (expandedMap[id] ?? true)) return false;
         if (fsId != null) return id === fsId;
@@ -609,6 +660,8 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       panelTab,
       panelExpanded,
       fullscreenId,
+      captainOpen,
+      captainId,
       applyVisible,
       scheduleDeferredSync,
     ],
@@ -641,7 +694,26 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
     sync("layout-effect");
     const raf = requestAnimationFrame(() => sync("layout-rAF"));
     return () => cancelAnimationFrame(raf);
-  }, [sync, version, tabs, activeTabId, panelTab, panelExpanded, fullscreenId]);
+  }, [
+    sync,
+    version,
+    tabs,
+    activeTabId,
+    panelTab,
+    panelExpanded,
+    fullscreenId,
+    captainOpen,
+    captainId,
+  ]);
+
+  // Publish the imperative sync for external callers (the captain overlay's
+  // drag/resize gestures) for this layer's lifetime. See requestPoolSync.
+  useEffect(() => {
+    externalSync = (trigger) => syncRef.current(trigger);
+    return () => {
+      externalSync = null;
+    };
+  }, []);
 
   // Re-sync after a FOCUS/SELECTION change (mutedbug fix). Clicking a tile header
   // calls setFocus, which mutates ONLY `focusedId` — not `tabs`/`activeTabId` —
@@ -726,9 +798,16 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       // stays pointer-events:none except over the terminal itself, so the
       // fullscreen header/tab bar (below the terminal body, in the z-40 layer)
       // stays clickable.
+      // CAPTAIN OVERLAY: while summoned (and no fullscreen), lift the layer to
+      // z-30 so the floating panel paints over the grid gutters/intersection
+      // handles (z-10/z-20) - otherwise their seams would draw across (and win
+      // the pointer over) the overlay. The layer stays click-through outside
+      // the panel/terminals, so tiles remain interactive; only the gutters'
+      // overhang strips lose the pointer to terminal bodies while summoned -
+      // the same tradeoff fullscreen already makes at z-50.
       className={
         "pointer-events-none absolute inset-0 " +
-        (fullscreenId != null ? "z-50" : "z-0")
+        (fullscreenId != null ? "z-50" : captainOpen ? "z-30" : "z-0")
       }
       aria-hidden={false}
     >
@@ -766,7 +845,15 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
             }
           }}
           className="pointer-events-auto absolute left-0 top-0 overflow-hidden"
-          style={{ visibility: "hidden" }}
+          // The summoned captain's wrapper lifts above the overlay panel chrome
+          // (z 2 vs the panel's 1) so its xterm paints inside the floating
+          // frame; every other wrapper stays z-auto, BELOW the panel. React's
+          // style diff only touches zIndex here - visibility/transform remain
+          // owned by the imperative sync().
+          style={{
+            visibility: "hidden",
+            zIndex: captainOpen && id === captainId ? 2 : undefined,
+          }}
         >
           {/* Rendered ONCE, here, for this terminal's whole lifetime. Stable key
               + stable parent => xterm is never remounted on a tab move/reorder.
@@ -780,6 +867,13 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
           />
         </div>
       ))}
+      {/* Captain overlay panel (captain-overlay). Rendered INSIDE this layer -
+          appended AFTER the wrappers so mounting it never moves a wrapper's
+          <canvas> in the DOM (the mutedbug constraint) - because the z-order
+          contract (panel above other terminals, captain's xterm above the
+          panel) only works within this layer's own stacking context. The host
+          renders null while the overlay is closed. */}
+      <CaptainOverlay />
     </div>
   );
 }

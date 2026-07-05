@@ -54,10 +54,11 @@ import { startPointerDrag, type PointerDragCanceller } from "../lib/pointerDrag"
 import { resolveDropTarget } from "../lib/dropTarget";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { refreshTerminal } from "../lib/repaint";
+import { useCaptain } from "../store/captain";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { gitInfo, type GitInfo } from "../ipc/git";
 import { runWhenIdle } from "../lib/windowInteraction";
-import { GitBranch } from "lucide-react";
+import { Anchor, GitBranch } from "lucide-react";
 
 /** Poll git facts (branch / worktree / dirty count) for a tile's cwd. Refreshes
  *  on mount and whenever the window regains focus (cheap; the backend best-efforts
@@ -241,6 +242,10 @@ export function Tile({
   const setTab = usePanels((s) => s.setTab);
   const toggleFullscreen = usePanels((s) => s.toggleFullscreen);
   const isFullscreen = usePanels((s) => s.fullscreenId === terminalId);
+  // Captain designation (captain-overlay): whether THIS tile is the pinned
+  // captain, for the context-menu Pin/Unpin item. Toggling is a store action.
+  const isCaptain = useCaptain((s) => s.captainId === terminalId);
+  const toggleCaptain = useCaptain((s) => s.toggleCaptain);
   // Per-terminal color override (the ⋯ menu): the effective color comes from
   // this terminal's override first, then the global theme, then a fallback.
   const termPalette = useTheme((s) => s.active.terminal);
@@ -608,6 +613,17 @@ export function Tile({
             xterm lifecycle — matching the sidebar row. Hover for the exact xterm
             state. Kept small/low-key (#5) so it doesn't read as a "selected"
             marker. */}
+        {/* Captain marker (captain-overlay): a small anchor on the pinned
+            captain's header, so the summon target is identifiable at a glance. */}
+        {isCaptain && (
+          <span
+            className="inline-flex shrink-0 items-center leading-none"
+            style={{ color: "var(--th-accent)" }}
+            title="Captain session - summon with Ctrl+B C"
+          >
+            <Anchor size="0.95em" aria-label="Captain session" />
+          </span>
+        )}
         <StatusIndicator
           variant={tileVariant}
           size={9}
@@ -956,6 +972,18 @@ export function Tile({
               onClick={() => {
                 setCtxMenu(null);
                 refreshTerminal(terminalId);
+              }}
+            />
+            <CtxItem
+              label={isCaptain ? "Unpin captain" : "Pin as captain"}
+              hint={
+                isCaptain
+                  ? "This is the captain - unpin to drop the summon target"
+                  : "Make this the captain session the overlay summons (Ctrl+B C)"
+              }
+              onClick={() => {
+                setCtxMenu(null);
+                toggleCaptain(terminalId);
               }}
             />
             <CtxItem
