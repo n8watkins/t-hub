@@ -227,6 +227,7 @@ fn start_control_listener(
     app: &tauri::AppHandle,
     fanout: std::sync::Arc<control::EventFanout>,
     tab_registry: std::sync::Arc<control::TabRegistry>,
+    captains_registry: std::sync::Arc<control::CaptainsRegistry>,
 ) -> Option<control::ControlHandshake> {
     // The control auth token. Server-split M2b: a PERSISTENT key (stable across
     // restarts) so a remote client paired once doesn't have to re-pair every launch.
@@ -270,7 +271,10 @@ fn start_control_listener(
         .with_metrics(metrics)
         // TASK C (#22): share the addressable tab registry with the control listener
         // so `list_tabs` reads what the `report_workspace_tabs` command writes.
-        .with_tab_registry(tab_registry);
+        .with_tab_registry(tab_registry)
+        // Captain-chat phase 2: the persistent captains registry (claims survive
+        // restarts server-side; the UI's localStorage keeps only view state).
+        .with_captains_registry(captains_registry);
     match control::start(ctx) {
         Ok(h) => {
             eprintln!(
@@ -312,6 +316,9 @@ fn apply_devbuild_isolation() {
         }
         if std::env::var_os("T_HUB_DIAG_FILE").is_none() {
             std::env::set_var("T_HUB_DIAG_FILE", dir.join("diag.log"));
+        }
+        if std::env::var_os("T_HUB_CAPTAINS_FILE").is_none() {
+            std::env::set_var("T_HUB_CAPTAINS_FILE", dir.join("captains.json"));
         }
     }
 }
@@ -444,9 +451,18 @@ pub fn run() {
             // `report_workspace_tabs` command writes the frontend's up-sync into.
             let tab_registry = std::sync::Arc::new(control::TabRegistry::new());
             app.manage(tab_registry.clone());
-            if let Some(handshake) =
-                start_control_listener(&state, app.handle(), control_fanout, tab_registry)
-            {
+            // Captain-chat phase 2: the captains registry, loaded from its
+            // persistence file so claims survive app restarts (unlike tabs, whose
+            // layout the frontend re-seeds on boot).
+            let captains_registry =
+                std::sync::Arc::new(control::CaptainsRegistry::load(control::captains_path()));
+            if let Some(handshake) = start_control_listener(
+                &state,
+                app.handle(),
+                control_fanout,
+                tab_registry,
+                captains_registry,
+            ) {
                 control_client::install(app.handle(), &handshake);
             }
             // Install the system-tray icon + menu (#17). A tray build failure is
