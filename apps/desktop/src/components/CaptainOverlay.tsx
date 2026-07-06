@@ -285,7 +285,7 @@ function CaptainPanel({ captainId }: { captainId: string }) {
       {/* Header: drag handle + identity + close. */}
       <div
         onPointerDown={beginGesture("move")}
-        className="flex h-7 shrink-0 cursor-grab touch-none select-none items-center gap-2 border-b px-2 active:cursor-grabbing"
+        className="th-captain-drag-handle flex h-7 shrink-0 cursor-grab touch-none select-none items-center gap-2 border-b px-2 active:cursor-grabbing"
         style={{
           backgroundColor:
             "color-mix(in srgb, var(--th-accent) 12%, var(--th-header-bg))",
@@ -345,7 +345,7 @@ function CaptainPanel({ captainId }: { captainId: string }) {
           role="separator"
           aria-label="Resize captain overlay"
           title="Drag to resize"
-          className="flex h-3 w-6 cursor-nwse-resize touch-none items-center justify-center"
+          className="th-captain-resize-handle flex h-3 w-6 cursor-nwse-resize touch-none items-center justify-center"
         >
           <svg
             width="14"

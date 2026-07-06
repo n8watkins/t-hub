@@ -176,6 +176,12 @@ const HANDLERS: Record<CommandId, () => void> = {
   // Captain overlay (captain-overlay): summon/dismiss the pinned captain
   // terminal. The store action owns the focus save/restore contract.
   toggleCaptainOverlay: () => useCaptain.getState().toggleOverlay(),
+  // Keyboard parity for the tile-header context item: pin/unpin the FOCUSED
+  // tile without reaching for the mouse (palette-only by default).
+  pinCaptainFocused: () => {
+    const id = useWorkspace.getState().focusedId;
+    if (id) useCaptain.getState().toggleCaptain(id);
+  },
 };
 
 /** Run a command by id. Safe to call from any trigger (Canvas keydown, the

@@ -40,6 +40,7 @@ export const COMMAND_IDS = [
   "newWorktreeWorkspace",
   "openWorktreesList",
   "toggleCaptainOverlay",
+  "pinCaptainFocused",
 ] as const;
 
 export type CommandId = (typeof COMMAND_IDS)[number];
@@ -149,6 +150,13 @@ export const COMMANDS: CommandMeta[] = [
     label: "Toggle captain overlay",
     description:
       "Summon the pinned captain terminal in a floating panel over any workspace",
+    category: "App",
+  },
+  {
+    id: "pinCaptainFocused",
+    label: "Pin as captain",
+    description:
+      "Pin (or unpin) the focused tile as the captain the overlay summons",
     category: "App",
   },
 ];
