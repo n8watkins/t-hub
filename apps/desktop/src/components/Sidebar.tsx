@@ -1,19 +1,23 @@
-// The sidebar — Workspaces + Projects navigation + Recent recall.
+// The sidebar - Captains supervision + Workspaces navigation + Recent recall.
 //
 // In the product model the sidebar is three lists:
-//   1. Workspaces — EVERY workspace tab as a collapsible row over the terminals
+//   1. Captains - one row per PINNED captain (docs/CAPTAIN-SIDEBAR-PRD.md,
+//      slice A): status, workspace, subagent activity, attention roll-up,
+//      context meter; click summons, chevron expands the supervision tree.
+//      Hidden entirely while nothing is pinned.
+//   2. Workspaces - EVERY workspace tab as a collapsible row over the terminals
 //      inside it (feat/workspaces-lifecycle). Clicking a row switches to that
 //      workspace; clicking a nested terminal switches to it AND focuses it. The
 //      active workspace is expanded + subtly highlighted.
-//   2. Projects — the projects (terminals) open in the CURRENT (active) workspace
-//      tab, named by directory. Clicking one reveals + focuses that tile.
 //   3. Recent  — past Claude sessions you can RECALL: clicking re-spawns a
 //      terminal in that session's directory and resumes it (`claude --resume`).
+//      Capped to ~3 rows (scrolls internally) so history can't crowd the
+//      supervision surface above.
 //
-// Gone (vs. the old 0.5 supervision sidebar): the Workspaces list (tabs live in
-// the titlebar strip), the Attention queue, the Claude supervision tree, and the
-// global Files tree (Files is moving into each tile). The supervision/telemetry
-// STORES still exist app-wide; this surface just no longer reads supervision.
+// Gone (vs. the old 0.5 supervision sidebar): the old Workspaces tab strip, the
+// Attention queue, and the global Files tree (Files moved into each tile). The
+// supervision store is read again since the Captains section (via
+// CaptainsList); telemetry feeds the bottom WSL/host-metrics strip.
 //
 // Kept working: the 3-state collapse (full / rail / hidden), the bottom-pinned
 // WSL health strip, the secondary settings gear, and the public exports
@@ -34,6 +38,8 @@ import {
   useCodexUsage,
 } from "./UsageStrip";
 import { useState } from "react";
+import { useCaptain } from "../store/captain";
+import { CaptainsList } from "./CaptainsList";
 import { WorkspacesList } from "./WorkspacesList";
 import { RecentList } from "./RecentList";
 import { ClaudeIcon } from "./ClaudeIcon";
@@ -62,6 +68,12 @@ export type SidebarMode = "full" | "rail" | "hidden";
 
 /** Pixel width of the rail strip (kept in sync with App's RAIL width). */
 export const SIDEBAR_RAIL_WIDTH = 48;
+
+/** Max height of the RECENT section body: about 3 rows (a row is ~30px:
+ *  py-1.5 + the xs line) plus the list's own padding, per the captain-sidebar
+ *  PRD - a short scrollable tail instead of the old 38vh wall, freeing the
+ *  vertical space the Captains section moves into. Exported for the test. */
+export const RECENT_BODY_MAX_PX = 104;
 
 export interface SidebarProps {
   /** RECALL a past Claude session: spawn `claude --resume <id>` in `cwd`, add the
@@ -130,6 +142,9 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
   // The Recent section's count is owned by RecentList (it does the fetch +
   // hidden-filter); it reports its filtered length up so the header shows it.
   const [recentCount, setRecentCount] = useState(0);
+  // Pinned captains drive the Captains section; zero pins = no section at all
+  // (the titlebar anchor's tooltip explains how to pin).
+  const captainCount = useCaptain((s) => s.captainIds.length);
 
   return (
     <aside
@@ -151,6 +166,24 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
           a safety net on a short window. The old separate "Projects" section is
           gone — a workspace's terminals live under it in Workspaces. */}
       <div className="th-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
+        {/* Captains - the persistent supervision surface (PRD slice A): one row
+            per pinned captain, above Workspaces (command view over terrain
+            view). Collapsible + internally capped so a long fleet scrolls;
+            hidden entirely while nothing is pinned. */}
+        {captainCount > 0 && (
+          <Section
+            title="Captains"
+            count={captainCount}
+            className="border-b"
+            collapsible
+            storageKey="t-hub.sidebar.captains.open"
+            bodyClassName="th-scroll overflow-y-auto"
+            bodyStyle={{ maxHeight: "30vh" }}
+          >
+            <CaptainsList />
+          </Section>
+        )}
+
         {/* Workspaces — every workspace tab as a collapsible row over its
             terminals: switch workspace/terminal, rename, close. Self-contained
             (reads the store directly). The header carries the sidebar-collapse
@@ -188,9 +221,9 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
         </Section>
 
         {/* Recent — past Claude sessions to resume. Collapsible, and capped to
-            half the viewport with its own scroll so a long history can't swallow
-            the whole sidebar; the list scrolls inside this region, not the page.
-            The count is reported up from RecentList (post hidden-filter). */}
+            ~3 rows with its own scroll (PRD: a short scrollable tail, not a
+            wall); the list scrolls inside this region, not the page. The count
+            is reported up from RecentList (post hidden-filter). */}
         <Section
           title="Recent"
           count={recentCount}
@@ -198,7 +231,7 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
           collapsible
           storageKey="t-hub.sidebar.recent.open"
           bodyClassName="th-scroll overflow-y-auto"
-          bodyStyle={{ maxHeight: "38vh" }}
+          bodyStyle={{ maxHeight: RECENT_BODY_MAX_PX }}
         >
           <RecentList
             onRecall={(id, cwd) => onRecall?.(id, cwd)}
