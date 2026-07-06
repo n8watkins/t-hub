@@ -382,8 +382,17 @@ impl TabRegistry {
             }
         }
         g.tabs = tabs;
-        if let Some(active) = active_tab_id {
+        // Adopt the reported active tab only if it names a tab in the SAME report
+        // (defensive: a torn report must not leave the pointer dangling), and
+        // heal a pointer the new tab set invalidated either way.
+        if let Some(active) = active_tab_id.filter(|id| g.tabs.iter().any(|t| &t.id == id)) {
             g.active_tab_id = Some(active);
+        } else if !g
+            .active_tab_id
+            .as_ref()
+            .is_some_and(|id| g.tabs.iter().any(|t| &t.id == id))
+        {
+            g.active_tab_id = g.tabs.first().map(|t| t.id.clone());
         }
         g.seq += 1;
         ReportOutcome::Accepted { seq: g.seq }
@@ -453,22 +462,33 @@ impl TabRegistry {
         Ok(())
     }
 
-    /// Place a freshly-spawned tile into `tab_id` (same semantics as `move_tile`
-    /// but tolerates a registry with no such tab by leaving the tile unplaced -
-    /// the UI adopts it into its active tab and reports back).
-    fn place_tile(&self, tile_id: &str, tab_id: &str) -> bool {
+    /// Place a freshly-spawned tile, resolving the target ATOMICALLY under the
+    /// registry lock: `tab_id` if it still exists, else the active tab, else the
+    /// first tab. A spawned session must ALWAYS land in the registry - the target
+    /// tab may have been closed in the race window between spawn and placement,
+    /// and leaving the tile unplaced would orphan it outside every tab. Returns
+    /// the tab id actually used; `None` only when the registry holds no tabs at
+    /// all (headless boot - the UI adopts the tile into its active tab and
+    /// reports back).
+    fn place_tile_with_fallback(&self, tile_id: &str, tab_id: Option<&str>) -> Option<String> {
         let mut g = self.lock();
-        if !g.tabs.iter().any(|t| t.id == tab_id) {
-            return false;
-        }
+        let target = tab_id
+            .filter(|id| g.tabs.iter().any(|t| &t.id == id))
+            .map(str::to_string)
+            .or_else(|| {
+                g.active_tab_id
+                    .clone()
+                    .filter(|id| g.tabs.iter().any(|t| &t.id == id))
+            })
+            .or_else(|| g.tabs.first().map(|t| t.id.clone()))?;
         for t in g.tabs.iter_mut() {
             t.tile_ids.retain(|x| x != tile_id);
         }
-        if let Some(t) = g.tabs.iter_mut().find(|t| t.id == tab_id) {
+        if let Some(t) = g.tabs.iter_mut().find(|t| t.id == target) {
             t.tile_ids.push(tile_id.to_string());
         }
         g.seq += 1;
-        true
+        Some(target)
     }
 
     /// Drop a tile from every tab (a terminal was closed). Returns true (and bumps
@@ -524,7 +544,14 @@ impl TabRegistry {
             ));
         }
         let removed = g.tabs.remove(idx);
-        if g.active_tab_id.as_deref() == Some(tab_id) {
+        // Heal the active pointer under the SAME lock as the removal, and against
+        // the post-removal tab set rather than just the removed id - a concurrent
+        // close/focus interleaving must never leave it referencing a deleted tab.
+        let active_valid = g
+            .active_tab_id
+            .as_ref()
+            .is_some_and(|id| g.tabs.iter().any(|t| &t.id == id));
+        if !active_valid {
             g.active_tab_id = g.tabs.first().map(|t| t.id.clone());
         }
         g.seq += 1;
@@ -532,20 +559,16 @@ impl TabRegistry {
     }
 
     /// Mirror the UI's active tab (from `focus_tab` - the one organization command
-    /// that intentionally moves the user's view).
-    fn set_active_tab(&self, tab_id: &str) {
+    /// that intentionally moves the user's view). Validate-and-set ATOMICALLY:
+    /// returns false (pointer untouched) when the tab no longer exists, so a
+    /// focus_tab racing a close_tab cannot point the registry at a deleted tab.
+    fn set_active_tab(&self, tab_id: &str) -> bool {
         let mut g = self.lock();
+        if !g.tabs.iter().any(|t| t.id == tab_id) {
+            return false;
+        }
         g.active_tab_id = Some(tab_id.to_string());
-    }
-
-    /// The default placement target for an un-named spawn: the UI's active tab if
-    /// known, else the first tab.
-    fn default_tab_id(&self) -> Option<String> {
-        let g = self.lock();
-        g.active_tab_id
-            .clone()
-            .filter(|id| g.tabs.iter().any(|t| &t.id == id))
-            .or_else(|| g.tabs.first().map(|t| t.id.clone()))
+        true
     }
 
     /// Auto-name a new tab "Workspace N" at the lowest free index — the same scheme
@@ -2122,10 +2145,17 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     // recorded, no terminal spawned (nothing would render it).
     let has_ui = ctx.apply_sink.is_some() || ctx.fanout.subscriber_count() > 0;
     let mut terminal_id: Option<String> = None;
+    let mut tab_id = tab_id;
     if has_ui {
         match spawn_tmux_terminal(&worktree_path, None) {
             Ok((id, _)) => {
-                ctx.tabs.place_tile(&id, &tab_id);
+                // Atomic placement with fallback: if the named tab was closed in
+                // the race window between resolution and placement, the tile
+                // lands in the active (else first) tab - never orphaned outside
+                // the registry. tab_id then reflects the ACTUAL placement.
+                if let Some(placed) = ctx.tabs.place_tile_with_fallback(&id, Some(&tab_id)) {
+                    tab_id = placed;
+                }
                 terminal_id = Some(id);
             }
             Err(e) => {
@@ -2485,10 +2515,11 @@ fn focus_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let tab_id = arg_str(args, "tabId")
         .or_else(|| arg_str(args, "id"))
         .ok_or("focus_tab requires a 'tabId' argument")?;
-    if !ctx.tabs.has_tab(&tab_id) {
+    // Validate-and-set atomically (a focus racing a close must fail cleanly, not
+    // leave the registry's active pointer on a deleted tab).
+    if !ctx.tabs.set_active_tab(&tab_id) {
         return Err(format!("focus_tab: unknown tabId '{tab_id}'"));
     }
-    ctx.tabs.set_active_tab(&tab_id);
     organization_apply(ctx, "focus_tab", &json!({ "tabId": tab_id }))
 }
 
@@ -2588,7 +2619,9 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
                 id
             }
         }),
-        (None, None) => ctx.tabs.default_tab_id(),
+        // No target given: resolved atomically at placement time (active/first
+        // tab) inside place_tile_with_fallback below.
+        (None, None) => None,
     };
 
     // Spawn the tmux session SERVER-side (same id minting + pane wrap as the Tauri
@@ -2602,10 +2635,11 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
     let (id, tmux_session) = spawn_tmux_terminal(&cwd_effective, pane.as_deref())?;
 
-    let placed = match &tab_id {
-        Some(tab) => ctx.tabs.place_tile(&id, tab),
-        None => false,
-    };
+    // Atomic placement with fallback: if the resolved tab was closed in the race
+    // window between spawn and placement, the tile lands in the active (else
+    // first) tab instead - never orphaned outside the registry. The response
+    // carries the ACTUAL placement.
+    let placed_tab = ctx.tabs.place_tile_with_fallback(&id, tab_id.as_deref());
 
     let forward = with_sync(
         ctx,
@@ -2616,7 +2650,7 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             "name": name,
             "shell": shell,
             "startupCommand": startup_command,
-            "tabId": tab_id,
+            "tabId": placed_tab,
             "tabName": tab_name,
         }),
     );
@@ -2629,13 +2663,15 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         "name": name,
         "shell": shell,
         "startupCommand": startup_command,
-        "tabId": tab_id,
-        "placed": placed,
+        "tabId": placed_tab,
+        "placed": placed_tab.is_some(),
         "audited": true,
         "applied": applied,
         "note": "the server spawned the session, placed the tile in the target tab \
                  in the authoritative registry (without switching the user's active \
-                 tab), and forwarded the snapshot for the UI to render.",
+                 tab), and forwarded the snapshot for the UI to render. tabId is the \
+                 ACTUAL placement (falls back to the active tab if the target was \
+                 closed mid-spawn).",
     }))
 }
 
@@ -3670,6 +3706,165 @@ mod tests {
         // The LAST tab is never closed.
         let err = dispatch(&ctx, "close_tab", &json!({"tabId": "t1"})).unwrap_err();
         assert!(err.contains("last tab"), "got: {err}");
+    }
+
+    #[test]
+    fn placement_falls_back_when_the_target_tab_vanished() {
+        // The tab-closed-during-spawn race, at the placement primitive: the tab
+        // resolved before the tmux spawn may be gone by placement time. The tile
+        // must ALWAYS land in the registry - active tab first, else first tab -
+        // and the actual tab id is returned.
+        let ctx = test_ctx("t");
+        ctx.tab_registry().replace(vec![
+            TabRecord {
+                id: "t1".into(),
+                name: "Workspace 1".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: "t2".into(),
+                name: "Workspace 2".into(),
+                tile_ids: vec![],
+            },
+        ]);
+        assert!(ctx.tab_registry().set_active_tab("t2"));
+
+        // Target vanished -> falls back to the ACTIVE tab.
+        let placed = ctx
+            .tab_registry()
+            .place_tile_with_fallback("tile-a", Some("closed-mid-spawn"));
+        assert_eq!(placed.as_deref(), Some("t2"));
+        // Target vanished AND no active pointer -> first tab.
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "only".into(),
+            name: "Solo".into(),
+            tile_ids: vec![],
+        }]);
+        let placed = ctx
+            .tab_registry()
+            .place_tile_with_fallback("tile-b", Some("also-gone"));
+        assert_eq!(placed.as_deref(), Some("only"));
+        let snap = ctx.tab_registry().snapshot();
+        assert_eq!(snap[0].tile_ids, vec!["tile-b"]);
+        // Empty registry -> unplaced (None), the only case a tile stays out.
+        ctx.tab_registry().replace(vec![]);
+        assert_eq!(
+            ctx.tab_registry().place_tile_with_fallback("tile-c", Some("x")),
+            None
+        );
+    }
+
+    #[test]
+    fn spawn_survives_a_concurrent_close_of_its_target_tab() {
+        // Dispatch-level tab-closed-during-spawn race: close_tab races the spawn's
+        // resolve->tmux->place window. Whichever side wins, the invariant holds:
+        // the spawned session ends up in EXACTLY ONE registry tab, and the
+        // response's tabId names that tab (fallback placement is reflected).
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink);
+        ctx.tab_registry().replace(vec![
+            TabRecord {
+                id: "keep".into(),
+                name: "Workspace 1".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: "doomed".into(),
+                name: "staging".into(),
+                tile_ids: vec![],
+            },
+        ]);
+        assert!(ctx.tab_registry().set_active_tab("keep"));
+
+        let closer = {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                // Either outcome is legal: the close wins (spawn falls back to
+                // "keep") or the placement wins (close refuses the non-empty tab).
+                let _ = dispatch(&ctx, "close_tab", &json!({"tabId": "doomed"}));
+            })
+        };
+        let v = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "doomed"}))
+            .unwrap();
+        closer.join().unwrap();
+
+        let id = v["id"].as_str().unwrap().to_string();
+        let placed_tab = v["tabId"].as_str().expect("always placed").to_string();
+        assert_eq!(v["placed"], true);
+        let owners: Vec<String> = ctx
+            .tab_registry()
+            .snapshot()
+            .into_iter()
+            .filter(|t| t.tile_ids.iter().any(|x| x == &id))
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(owners, vec![placed_tab], "tile in exactly the reported tab");
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+    }
+
+    #[test]
+    fn back_to_back_close_tab_keeps_the_active_pointer_valid() {
+        // A second close (or a close racing a focus) must never leave the
+        // registry's activeTabId pointing at a deleted tab: removal + pointer
+        // fixup are atomic under the registry lock, and focus_tab's validate+set
+        // is a single atomic operation.
+        let ctx = test_ctx("t");
+        ctx.tab_registry().replace(vec![
+            TabRecord { id: "a".into(), name: "A".into(), tile_ids: vec![] },
+            TabRecord { id: "b".into(), name: "B".into(), tile_ids: vec![] },
+            TabRecord { id: "c".into(), name: "C".into(), tile_ids: vec![] },
+        ]);
+        assert!(ctx.tab_registry().set_active_tab("c"));
+
+        let active_is_valid = |ctx: &ControlContext| {
+            let snap = ctx.tab_registry().snapshot_full();
+            let active = snap.active_tab_id.expect("active pointer set");
+            assert!(
+                snap.tabs.iter().any(|t| t.id == active),
+                "active '{active}' must reference an existing tab; tabs: {:?}",
+                snap.tabs.iter().map(|t| t.id.clone()).collect::<Vec<_>>()
+            );
+        };
+
+        // Close the ACTIVE tab, then immediately close the tab the pointer
+        // healed onto - the pointer must stay valid after each step.
+        dispatch(&ctx, "close_tab", &json!({"tabId": "c"})).unwrap();
+        active_is_valid(&ctx);
+        let healed = ctx.tab_registry().snapshot_full().active_tab_id.unwrap();
+        dispatch(&ctx, "close_tab", &json!({"tabId": healed})).unwrap();
+        active_is_valid(&ctx);
+
+        // focus_tab on the now-deleted tab fails cleanly, pointer untouched.
+        let err = dispatch(&ctx, "focus_tab", &json!({"tabId": "c"})).unwrap_err();
+        assert!(err.contains("unknown tabId"), "got: {err}");
+        active_is_valid(&ctx);
+
+        // Concurrent closes from a 3-tab registry: whichever interleaving wins,
+        // the surviving pointer references a live tab.
+        ctx.tab_registry().replace(vec![
+            TabRecord { id: "a".into(), name: "A".into(), tile_ids: vec![] },
+            TabRecord { id: "b".into(), name: "B".into(), tile_ids: vec![] },
+            TabRecord { id: "c".into(), name: "C".into(), tile_ids: vec![] },
+        ]);
+        assert!(ctx.tab_registry().set_active_tab("b"));
+        let t1 = {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = ctx.tab_registry().remove_tab("b", false);
+            })
+        };
+        let t2 = {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = ctx.tab_registry().remove_tab("c", false);
+            })
+        };
+        t1.join().unwrap();
+        t2.join().unwrap();
+        active_is_valid(&ctx);
     }
 
     #[test]
