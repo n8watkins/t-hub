@@ -16,6 +16,7 @@
 // data-tauri-drag-region, or a click would start a window drag instead.
 import { useEffect, useRef } from "react";
 import type { RefObject } from "react";
+import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { exit } from "@tauri-apps/plugin-process";
@@ -305,9 +306,12 @@ function CaptainButton() {
   const open = useCaptain((s) => s.open);
   const menuOpen = useCaptain((s) => s.anchorMenuOpen);
   const count = captainIds.length;
+  // Anchor rect source for the portaled dropdown (see CaptainDropdown).
+  const btnRef = useRef<HTMLButtonElement>(null);
   return (
-    <div className="relative flex items-stretch">
+    <div className="flex items-stretch">
       <button
+        ref={btnRef}
         type="button"
         aria-label="Captain menu"
         aria-pressed={open}
@@ -343,25 +347,67 @@ function CaptainButton() {
           </span>
         )}
       </button>
-      {menuOpen && <CaptainDropdown captainIds={captainIds} />}
+      {menuOpen && (
+        <CaptainDropdown captainIds={captainIds} anchorRef={btnRef} />
+      )}
     </div>
   );
 }
 
-/** The anchor's dropdown: pinned captains in MRU order; click = summon that
- *  one. A click-away backdrop closes it (Esc closes via lib/escOverlays). */
-function CaptainDropdown({ captainIds }: { captainIds: string[] }) {
+/** The dropdown menu's width in px (Tailwind w-64), for viewport clamping. */
+const CAPTAIN_MENU_W = 256;
+
+/**
+ * The anchor's dropdown: pinned captains in MRU order; click = summon that
+ * one. A click-away backdrop closes it (Esc closes via lib/escOverlays).
+ *
+ * PORTALED to document.body (like WorkspacesList's color picker): App.tsx's
+ * default titlebar wrapper is a height:TITLEBAR_H, overflow:hidden box (the
+ * auto-hide height animation needs the clip), so anything rendered inside the
+ * titlebar subtree below the 32px row is fully clipped - the menu would open
+ * invisibly while its fixed backdrop escaped the clip and swallowed the next
+ * click. The menu is anchored under the button via its measured rect; the
+ * titlebar never scrolls and the anchor lives in the left chrome cluster, so
+ * one render-time measurement stays valid for the menu's lifetime.
+ *
+ * Stacking: z-[59]/z-[60] matches the app's portaled-dropdown tier
+ * (WorkspacesList uses 60/61). The captain overlay panel can't be slotted
+ * ABOVE this menu - it paints at z-index 1 inside TerminalPoolLayer's z-0
+ * stacking context, so any body-level portal paints over it. That's the
+ * normal ordering for a transient, user-invoked menu over a passive panel,
+ * and clicking a row summons + closes the menu immediately anyway.
+ */
+function CaptainDropdown({
+  captainIds,
+  anchorRef,
+}: {
+  captainIds: string[];
+  anchorRef: RefObject<HTMLButtonElement | null>;
+}) {
   const activeCaptainId = useCaptain((s) => s.activeCaptainId);
   const close = () => useCaptain.getState().setAnchorMenu(false);
-  return (
+  // The anchor button is mounted before the menu can open (its click sets the
+  // flag), so the rect is always available; the fallbacks only guard jsdom.
+  const rect = anchorRef.current?.getBoundingClientRect();
+  const top = rect?.bottom ?? 32;
+  const left = rect
+    ? Math.max(8, Math.min(rect.left, window.innerWidth - CAPTAIN_MENU_W - 8))
+    : 8;
+  return createPortal(
     <>
       {/* Click-away backdrop - no document listener needed. */}
       <div className="fixed inset-0 z-[59]" onPointerDown={close} aria-hidden />
       <div
         role="menu"
         aria-label="Pinned captains"
-        className="absolute left-0 top-full z-[60] w-64 overflow-hidden rounded-md border py-1 shadow-2xl"
+        className="th-scroll fixed z-[60] w-64 overflow-y-auto rounded-md border py-1 shadow-2xl"
         style={{
+          top,
+          left,
+          // Clamp to the viewport below the anchor so a long pin list scrolls
+          // instead of overflowing past the bottom (th-scroll: the app's thin
+          // scrollbar styling, same as WorktreePrompt's list body).
+          maxHeight: Math.max(48, window.innerHeight - top - 8),
           backgroundColor: "var(--th-sidebar-bg)",
           borderColor: "var(--th-border)",
         }}
@@ -375,7 +421,8 @@ function CaptainDropdown({ captainIds }: { captainIds: string[] }) {
           />
         ))}
       </div>
-    </>
+    </>,
+    document.body,
   );
 }
 
