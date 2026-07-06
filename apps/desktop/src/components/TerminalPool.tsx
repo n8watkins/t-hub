@@ -216,7 +216,7 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // overlay's body placeholder) and its wrapper is lifted above the overlay
   // panel chrome (z-index 2 vs the panel's 1) inside this layer's stacking
   // context. Subscribed so an open/pin change re-runs the visibility sync.
-  const captainId = useCaptain((s) => s.captainId);
+  const captainId = useCaptain((s) => s.activeCaptainId);
   const captainOpen = useCaptain((s) => s.open);
 
   // THE FIX (mutedbug): poolIds must be a STABLE DOM order that does NOT change
@@ -481,7 +481,7 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
         // overlay's body), even while another tile is fullscreen - the overlay
         // floats above the fullscreen layer too. Checked FIRST so none of the
         // per-tab / fullscreen gates below can park it while it's summoned.
-        if (cap.open && id === cap.captainId) return true;
+        if (cap.open && id === cap.activeCaptainId) return true;
         const onNonTerminal = (tabMap[id] ?? "terminal") !== "terminal";
         if (onNonTerminal && (expandedMap[id] ?? true)) return false;
         if (fsId != null) return id === fsId;

@@ -242,9 +242,9 @@ export function Tile({
   const setTab = usePanels((s) => s.setTab);
   const toggleFullscreen = usePanels((s) => s.toggleFullscreen);
   const isFullscreen = usePanels((s) => s.fullscreenId === terminalId);
-  // Captain designation (captain-overlay): whether THIS tile is the pinned
-  // captain, for the context-menu Pin/Unpin item. Toggling is a store action.
-  const isCaptain = useCaptain((s) => s.captainId === terminalId);
+  // Captain designation (captain-list): whether THIS tile is one of the pinned
+  // captains, for the context-menu Pin/Unpin item. Toggling is a store action.
+  const isCaptain = useCaptain((s) => s.captainIds.includes(terminalId));
   const toggleCaptain = useCaptain((s) => s.toggleCaptain);
   // Per-terminal color override (the ⋯ menu): the effective color comes from
   // this terminal's override first, then the global theme, then a fallback.
@@ -619,7 +619,7 @@ export function Tile({
           <span
             className="inline-flex shrink-0 items-center leading-none"
             style={{ color: "var(--th-accent)" }}
-            title="Captain session - summon with Ctrl+B C"
+            title="Pinned captain - summon with Ctrl+B C"
           >
             <Anchor size="0.95em" aria-label="Captain session" />
           </span>
@@ -978,8 +978,8 @@ export function Tile({
               label={isCaptain ? "Unpin captain" : "Pin as captain"}
               hint={
                 isCaptain
-                  ? "This is the captain - unpin to drop the summon target"
-                  : "Make this the captain session the overlay summons (Ctrl+B C)"
+                  ? "This is a pinned captain - unpin to drop it from the summon list"
+                  : "Add this session to the captains the overlay summons (Ctrl+B C)"
               }
               onClick={() => {
                 setCtxMenu(null);

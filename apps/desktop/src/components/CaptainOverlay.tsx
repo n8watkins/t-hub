@@ -1,7 +1,10 @@
-// The CAPTAIN OVERLAY (captain-overlay): a floating, draggable, resizable panel
-// that summons the pinned captain terminal above whatever workspace tab is
-// active. Toggled by the `toggleCaptainOverlay` command (Ctrl+B C by default),
-// the titlebar anchor, or the palette; Esc closes it and restores focus.
+// The CAPTAIN OVERLAY (captain-overlay + captain-list): ONE floating,
+// draggable, resizable panel that summons the ACTIVE pinned captain above
+// whatever workspace tab is active. Summoned by the `toggleCaptainOverlay`
+// command (Ctrl+B C by default - pressing it again CYCLES pinned captains),
+// the titlebar anchor dropdown, the header switcher chips, or the palette;
+// Esc closes it and restores focus. Switching captains reuses the same panel
+// geometry - only the terminal slot re-targets.
 //
 // RENDERING CONTRACT (why this mounts inside TerminalPoolLayer): the xterm for
 // every terminal lives in the pool overlay (#20), whose `z-0` class makes it a
@@ -26,7 +29,11 @@ import {
   CAPTAIN_MIN_HEIGHT,
 } from "../store/captain";
 import { useWorkspace, deriveLabel } from "../store/workspace";
+import { useSupervision, sessionStatusForTmux } from "../store/supervision";
+import { sessionNameForTerminal } from "../store/sessionContext";
+import { useActivity } from "../store/activity";
 import { useTerminalSlot, requestPoolSync } from "./TerminalPool";
+import { StatusIndicator, terminalVariant } from "./StatusIndicator";
 import { repaintAllTerminals } from "../lib/repaint";
 
 /** Margin kept between the panel and the canvas edges when clamping. */
@@ -51,6 +58,47 @@ function clampGeometry(
   return { x, y, width, height };
 }
 
+/** The user-facing display label for a captain terminal: user label first,
+ *  then the derived command · dir shape (store/workspace deriveLabel). Shared
+ *  by the overlay switcher, the titlebar dropdown, and the palette entries so
+ *  a captain reads identically everywhere. */
+export function useCaptainDisplayLabel(terminalId: string): string {
+  const info = useWorkspace((s) => s.terminals[terminalId]);
+  const userLabel = useWorkspace((s) => s.labels[terminalId]);
+  return deriveLabel({
+    id: terminalId,
+    label: userLabel,
+    title: info?.title,
+    cwd: info?.cwd,
+  });
+}
+
+/** The per-captain status dot: the same precise indicator the tiles/sidebar
+ *  render (bound agent session status, falling back to output activity for a
+ *  session-less shell). Shared by the overlay switcher + titlebar dropdown. */
+export function CaptainStatusDot({
+  terminalId,
+  size = 8,
+}: {
+  terminalId: string;
+  size?: number;
+}) {
+  const state = useWorkspace(
+    (s) => s.terminals[terminalId]?.state ?? "starting",
+  );
+  const sessionStatus = useSupervision((s) =>
+    sessionStatusForTmux(s, sessionNameForTerminal(terminalId)),
+  );
+  const outputActive = useActivity((s) => !!s.active[terminalId]);
+  return (
+    <StatusIndicator
+      variant={terminalVariant(state, sessionStatus, outputActive)}
+      size={size}
+      className="shrink-0"
+    />
+  );
+}
+
 /**
  * The overlay host. Always mounted (inside TerminalPoolLayer); renders nothing
  * until the overlay is open with a live captain. Splitting the inner panel out
@@ -58,7 +106,7 @@ function clampGeometry(
  */
 export function CaptainOverlay() {
   const open = useCaptain((s) => s.open);
-  const captainId = useCaptain((s) => s.captainId);
+  const captainId = useCaptain((s) => s.activeCaptainId);
 
   // Toggling a floating surface over the WebGL terminals can leave WebView2 on
   // a stale blank frame (the "muted" bug) - force a repaint on every open/close
@@ -90,14 +138,7 @@ function CaptainPanel({ captainId }: { captainId: string }) {
   const slotRef = useTerminalSlot(captainId);
   const panelRef = useRef<HTMLDivElement | null>(null);
 
-  const info = useWorkspace((s) => s.terminals[captainId]);
-  const userLabel = useWorkspace((s) => s.labels[captainId]);
-  const label = deriveLabel({
-    id: captainId,
-    label: userLabel,
-    title: info?.title,
-    cwd: info?.cwd,
-  });
+  const captainIds = useCaptain((s) => s.captainIds);
 
   const x = useCaptain((s) => s.x);
   const y = useCaptain((s) => s.y);
@@ -292,23 +333,31 @@ function CaptainPanel({ captainId }: { captainId: string }) {
           style={{ color: "var(--th-accent)" }}
           aria-hidden
         />
-        <span
-          className="min-w-0 truncate text-xs font-semibold"
-          style={{ color: "var(--th-fg)" }}
-        >
-          Captain - {label}
-        </span>
+        {/* Captain switcher (captain-list): one chip per pinned captain, MRU
+            order, status dot + name; clicking switches the SAME panel to that
+            captain (geometry untouched). The active captain reads highlighted. */}
+        <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
+          {captainIds.map((id) => (
+            <CaptainSwitcherChip
+              key={id}
+              terminalId={id}
+              active={id === captainId}
+            />
+          ))}
+        </div>
         <span
           className="ml-auto shrink-0 text-[10px]"
           style={{ color: "var(--th-fg-muted)" }}
-          title="Esc dismisses the overlay · Shift+Esc sends a literal Esc to the captain (interrupt)"
+          title="Esc dismisses the overlay · Shift+Esc sends a literal Esc to the captain (interrupt) · Ctrl+B C cycles pinned captains"
         >
-          Esc dismiss · Shift+Esc interrupt
+          {captainIds.length > 1
+            ? "Ctrl+B C cycle · Esc dismiss"
+            : "Esc dismiss · Shift+Esc interrupt"}
         </span>
         <button
           type="button"
           aria-label="Close captain overlay"
-          title="Close (Esc / Ctrl+B C)"
+          title="Close (Esc)"
           className="flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-neutral-700"
           style={{ color: "var(--th-fg-muted)" }}
           onPointerDown={(e) => e.stopPropagation()}
@@ -359,5 +408,51 @@ function CaptainPanel({ captainId }: { captainId: string }) {
         </div>
       </div>
     </div>
+  );
+}
+
+/** One switcher chip: status dot + truncated name. Clicking summons that
+ *  captain into the same panel (summonCaptain: MRU front + focus). A pin whose
+ *  tile is gone (tab popped out to a satellite) renders dimmed - summoning it
+ *  is a store-level no-op until the tile returns. */
+function CaptainSwitcherChip({
+  terminalId,
+  active,
+}: {
+  terminalId: string;
+  active: boolean;
+}) {
+  const label = useCaptainDisplayLabel(terminalId);
+  const hasTile = useWorkspace((s) =>
+    s.tabs.some((t) => t.order.includes(terminalId)),
+  );
+  return (
+    <button
+      type="button"
+      // Chips live on the drag handle: swallow pointerdown so a click never
+      // starts a panel drag (mirrors the close button).
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={() => useCaptain.getState().summonCaptain(terminalId)}
+      title={
+        !hasTile
+          ? `${label} - tile not available (tab popped out?)`
+          : active
+            ? `Captain - ${label} (shown)`
+            : `Switch to captain - ${label}`
+      }
+      aria-pressed={active}
+      className="flex min-w-0 shrink items-center gap-1 rounded px-1.5 py-0.5 text-xs"
+      style={{
+        backgroundColor: active
+          ? "color-mix(in srgb, var(--th-accent) 25%, transparent)"
+          : "transparent",
+        color: active ? "var(--th-fg)" : "var(--th-fg-muted)",
+        fontWeight: active ? 600 : 400,
+        opacity: hasTile ? 1 : 0.5,
+      }}
+    >
+      <CaptainStatusDot terminalId={terminalId} size={8} />
+      <span className="max-w-[9rem] truncate">{label}</span>
+    </button>
   );
 }

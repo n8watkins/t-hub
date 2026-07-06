@@ -173,11 +173,13 @@ const HANDLERS: Record<CommandId, () => void> = {
   newPlainWorkspace: doNewPlainWorkspace,
   newWorktreeWorkspace: doNewWorktreeWorkspace,
   openWorktreesList: doOpenWorktreesList,
-  // Captain overlay (captain-overlay): summon/dismiss the pinned captain
-  // terminal. The store action owns the focus save/restore contract.
+  // Captain overlay (captain-list): closed -> summon the active captain;
+  // already summoned -> CYCLE to the next pinned captain in MRU order (Esc
+  // dismisses). The store action owns the focus save/restore contract.
   toggleCaptainOverlay: () => useCaptain.getState().toggleOverlay(),
   // Keyboard parity for the tile-header context item: pin/unpin the FOCUSED
-  // tile without reaching for the mouse (palette-only by default).
+  // tile without reaching for the mouse (palette-only by default). Pinning is
+  // ADDITIVE - other captains stay pinned.
   pinCaptainFocused: () => {
     const id = useWorkspace.getState().focusedId;
     if (id) useCaptain.getState().toggleCaptain(id);
