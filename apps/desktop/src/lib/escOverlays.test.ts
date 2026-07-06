@@ -1,6 +1,6 @@
-// Unit tests for the single Escape dispatch point (captain-overlay fix round):
-// explicit overlay-vs-fullscreen precedence + the Shift+Esc literal-Esc
-// passthrough to the captain terminal.
+// Unit tests for the single Escape dispatch point (captain-overlay fix round,
+// extended for captain-list): explicit anchor-dropdown-vs-overlay-vs-fullscreen
+// precedence + the Shift+Esc literal-Esc passthrough to the ACTIVE captain.
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // escOverlays writes the passthrough byte via the IPC client; stub the whole
@@ -32,7 +32,12 @@ beforeEach(() => {
   vi.mocked(writeTerminal).mockClear();
   seedWorkspace();
   usePanels.setState({ fullscreenId: null });
-  useCaptain.setState({ captainId: "cap00001", open: false });
+  useCaptain.setState({
+    captainIds: ["cap00001"],
+    activeCaptainId: "cap00001",
+    open: false,
+    anchorMenuOpen: false,
+  });
 });
 
 describe("handleOverlayEscape precedence", () => {
@@ -61,6 +66,20 @@ describe("handleOverlayEscape precedence", () => {
     usePanels.setState({ fullscreenId: "aaa00001" });
     expect(handleOverlayEscape(false)).toBe(true);
     expect(usePanels.getState().fullscreenId).toBeNull();
+  });
+
+  it("dismisses the titlebar anchor dropdown BEFORE the overlay", () => {
+    useCaptain.getState().openOverlay();
+    useCaptain.getState().setAnchorMenu(true);
+
+    // First Esc: the dropdown closes, the overlay stays up.
+    expect(handleOverlayEscape(false)).toBe(true);
+    expect(useCaptain.getState().anchorMenuOpen).toBe(false);
+    expect(useCaptain.getState().open).toBe(true);
+
+    // Second Esc: the overlay closes.
+    expect(handleOverlayEscape(false)).toBe(true);
+    expect(useCaptain.getState().open).toBe(false);
   });
 });
 

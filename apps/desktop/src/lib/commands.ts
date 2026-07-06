@@ -147,16 +147,16 @@ export const COMMANDS: CommandMeta[] = [
   },
   {
     id: "toggleCaptainOverlay",
-    label: "Toggle captain overlay",
+    label: "Summon captain",
     description:
-      "Summon the pinned captain terminal in a floating panel over any workspace",
+      "Summon the active captain in a floating panel; while summoned, cycles to the next pinned captain (Esc dismisses)",
     category: "App",
   },
   {
     id: "pinCaptainFocused",
     label: "Pin as captain",
     description:
-      "Pin (or unpin) the focused tile as the captain the overlay summons",
+      "Pin (or unpin) the focused tile as a captain the overlay can summon - pinning is additive",
     category: "App",
   },
 ];

@@ -153,7 +153,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   // Captain overlay (captain-overlay): while summoned, the overlay owns the
   // captain's pool placeholder, so BOTH tile copies (grid + fullscreen) must
   // yield the slot - mirrors the fullscreen slotActive gating.
-  const captainId = useCaptain((s) => s.captainId);
+  const captainId = useCaptain((s) => s.activeCaptainId);
   const captainOpen = useCaptain((s) => s.open);
 
   // Seed the live terminal set and keep lifecycle state in sync with the backend.
@@ -607,7 +607,7 @@ function TabGrid({
   // While the captain overlay is summoned it owns the captain's pool
   // placeholder; that tile's grid copy must not register/steal it (exactly the
   // fullscreen slotActive rule). Null when the overlay is closed.
-  const summonedCaptainId = useCaptain((s) => (s.open ? s.captainId : null));
+  const summonedCaptainId = useCaptain((s) => (s.open ? s.activeCaptainId : null));
 
   // Local, editable copy of the flex weights so dragging is smooth (we only
   // write through to the store at pointer-up). Re-derived whenever the tab's

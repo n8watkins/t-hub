@@ -13,8 +13,10 @@
 // next key is being captured.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { create } from "zustand";
-import { COMMANDS, type CommandId, type CommandMeta } from "../lib/commands";
+import { COMMANDS, type CommandId } from "../lib/commands";
 import { useKeybindings } from "../store/keybindings";
+import { useCaptain } from "../store/captain";
+import { useWorkspace, deriveLabel } from "../store/workspace";
 import { runCommand, registerPaletteOpener } from "../lib/keymapExecutor";
 import { chordFromEvent, formatChord } from "../lib/chord";
 import { usePrefixHud } from "../lib/prefixKeyHandler";
@@ -61,10 +63,33 @@ function fuzzyScore(text: string, q: string): number | null {
   return score + firstIdx; // prefer earlier first-hit + tighter runs
 }
 
+/**
+ * One palette row. Static commands (from lib/commands) carry a `commandId` and
+ * are rebindable; DYNAMIC rows (captain-list: one "Summon captain: <name>" per
+ * pinned captain) carry a `captainId` and execute a store action directly -
+ * they have no CommandId, no chord, and no rebind affordance.
+ */
+interface PaletteEntry {
+  key: string;
+  label: string;
+  description: string;
+  category: string;
+  commandId?: CommandId;
+  captainId?: string;
+}
+
 interface Scored {
-  cmd: CommandMeta;
+  entry: PaletteEntry;
   score: number;
 }
+
+const STATIC_ENTRIES: PaletteEntry[] = COMMANDS.map((c) => ({
+  key: c.id,
+  label: c.label,
+  description: c.description,
+  category: c.category,
+  commandId: c.id,
+}));
 
 export function CommandPalette() {
   const open = usePalette((s) => s.open);
@@ -95,22 +120,46 @@ export function CommandPalette() {
     return () => cancelAnimationFrame(id);
   }, [open]);
 
+  // Dynamic per-captain entries (captain-list): "Summon captain: <name>" for
+  // every pinned captain, MRU order, keyboard parity with the titlebar
+  // dropdown / overlay switcher. Labels derive exactly like the tiles/sidebar.
+  const captainIds = useCaptain((s) => s.captainIds);
+  const terminals = useWorkspace((s) => s.terminals);
+  const labels = useWorkspace((s) => s.labels);
+  const captainEntries = useMemo<PaletteEntry[]>(
+    () =>
+      captainIds.map((id) => ({
+        key: `summonCaptain:${id}`,
+        label: `Summon captain: ${deriveLabel({
+          id,
+          label: labels[id],
+          title: terminals[id]?.title,
+          cwd: terminals[id]?.cwd,
+        })}`,
+        description: "Summon this pinned captain in the overlay",
+        category: "App",
+        captainId: id,
+      })),
+    [captainIds, terminals, labels],
+  );
+
   // Ranked, filtered command list.
   const results = useMemo<Scored[]>(() => {
+    const entries = [...STATIC_ENTRIES, ...captainEntries];
     const scored: Scored[] = [];
-    for (const cmd of COMMANDS) {
-      const hay = `${cmd.label} ${cmd.description} ${cmd.category}`;
+    for (const entry of entries) {
+      const hay = `${entry.label} ${entry.description} ${entry.category}`;
       const s = fuzzyScore(hay, query.trim());
-      if (s !== null) scored.push({ cmd, score: s });
+      if (s !== null) scored.push({ entry, score: s });
     }
-    // Stable-ish: by score, then original order (COMMANDS index).
+    // Stable-ish: by score, then original order (entry index).
     scored.sort(
       (a, b) =>
         a.score - b.score ||
-        COMMANDS.indexOf(a.cmd) - COMMANDS.indexOf(b.cmd),
+        entries.indexOf(a.entry) - entries.indexOf(b.entry),
     );
     return scored;
-  }, [query]);
+  }, [query, captainEntries]);
 
   // Keep the selection in range as the result set shrinks/grows.
   useEffect(() => {
@@ -123,11 +172,15 @@ export function CommandPalette() {
   }, [setOpen]);
 
   const execute = useCallback(
-    (id: CommandId) => {
+    (entry: PaletteEntry) => {
       close();
       // Run AFTER the palette tears down so a command that itself touches focus
-      // (e.g. toggleFocusRegion) doesn't fight the closing modal.
-      requestAnimationFrame(() => runCommand(id));
+      // (e.g. toggleFocusRegion, summonCaptain) doesn't fight the closing modal.
+      requestAnimationFrame(() => {
+        if (entry.commandId) runCommand(entry.commandId);
+        else if (entry.captainId)
+          useCaptain.getState().summonCaptain(entry.captainId);
+      });
     },
     [close],
   );
@@ -184,7 +237,7 @@ export function CommandPalette() {
       } else if (e.key === "Enter") {
         e.preventDefault();
         const hit = results[selected];
-        if (hit) execute(hit.cmd.id);
+        if (hit) execute(hit.entry);
       }
     },
     [rebindFor, close, results, selected, execute],
@@ -252,18 +305,19 @@ export function CommandPalette() {
               No matching commands
             </div>
           ) : (
-            results.map(({ cmd }, i) => {
+            results.map(({ entry }, i) => {
               const isSel = i === selected;
-              const isRebinding = rebindFor === cmd.id;
-              const chord = direct[cmd.id];
+              const isRebinding =
+                entry.commandId != null && rebindFor === entry.commandId;
+              const chord = entry.commandId ? direct[entry.commandId] : undefined;
               return (
                 <div
-                  key={cmd.id}
+                  key={entry.key}
                   data-idx={i}
                   onMouseMove={() => setSelected(i)}
                   onMouseDown={(e) => {
                     e.preventDefault();
-                    if (!isRebinding) execute(cmd.id);
+                    if (!isRebinding) execute(entry);
                   }}
                   className="mx-1 flex cursor-pointer items-center justify-between gap-3 rounded px-2.5 py-2"
                   style={{
@@ -272,52 +326,57 @@ export function CommandPalette() {
                 >
                   <div className="min-w-0">
                     <div className="truncate text-sm" style={{ color: "var(--th-fg)" }}>
-                      {cmd.label}
+                      {entry.label}
                     </div>
                     <div
                       className="truncate text-xs"
                       style={{ color: "var(--th-fg-muted)" }}
                     >
-                      {cmd.description}
+                      {entry.description}
                     </div>
                   </div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    {isRebinding ? (
-                      <span
-                        className="rounded border px-1.5 py-0.5 text-xs"
-                        style={{
-                          borderColor: "var(--th-accent)",
-                          color: "var(--th-accent)",
+                  {/* Dynamic captain rows have no CommandId: no chord to show,
+                      nothing to rebind (Ctrl+B C cycles; the entry is mouse/
+                      Enter parity for a SPECIFIC captain). */}
+                  {entry.commandId != null && (
+                    <div className="flex shrink-0 items-center gap-2">
+                      {isRebinding ? (
+                        <span
+                          className="rounded border px-1.5 py-0.5 text-xs"
+                          style={{
+                            borderColor: "var(--th-accent)",
+                            color: "var(--th-accent)",
+                          }}
+                        >
+                          press a key…
+                        </span>
+                      ) : (
+                        <kbd
+                          className="rounded border px-1.5 py-0.5 font-mono text-xs"
+                          style={{
+                            borderColor: "var(--th-border)",
+                            color: chord ? "var(--th-fg)" : "var(--th-fg-muted)",
+                            backgroundColor: "var(--th-tile-bg)",
+                          }}
+                        >
+                          {chord ? formatChord(chord) : "unbound"}
+                        </kbd>
+                      )}
+                      <button
+                        type="button"
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setRebindFor(isRebinding ? null : entry.commandId!);
                         }}
+                        className="rounded px-1.5 py-0.5 text-xs transition-colors hover:bg-neutral-700/40"
+                        style={{ color: "var(--th-fg-muted)" }}
+                        title="Rebind this command's direct shortcut"
                       >
-                        press a key…
-                      </span>
-                    ) : (
-                      <kbd
-                        className="rounded border px-1.5 py-0.5 font-mono text-xs"
-                        style={{
-                          borderColor: "var(--th-border)",
-                          color: chord ? "var(--th-fg)" : "var(--th-fg-muted)",
-                          backgroundColor: "var(--th-tile-bg)",
-                        }}
-                      >
-                        {chord ? formatChord(chord) : "unbound"}
-                      </kbd>
-                    )}
-                    <button
-                      type="button"
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setRebindFor(isRebinding ? null : cmd.id);
-                      }}
-                      className="rounded px-1.5 py-0.5 text-xs transition-colors hover:bg-neutral-700/40"
-                      style={{ color: "var(--th-fg-muted)" }}
-                      title="Rebind this command's direct shortcut"
-                    >
-                      {isRebinding ? "cancel" : "rebind"}
-                    </button>
-                  </div>
+                        {isRebinding ? "cancel" : "rebind"}
+                      </button>
+                    </div>
+                  )}
                 </div>
               );
             })

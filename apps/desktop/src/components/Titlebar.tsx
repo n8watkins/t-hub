@@ -23,7 +23,7 @@ import { Anchor } from "lucide-react";
 import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
 import { useCaptain } from "../store/captain";
-import { runCommand } from "../lib/keymapExecutor";
+import { CaptainStatusDot, useCaptainDisplayLabel } from "./CaptainOverlay";
 import { useWindowMaximized } from "../lib/windowMaximized";
 import { closeSatellite, readSatelliteTab } from "../lib/windows";
 import { useAppName, useAppVersion } from "../lib/appName";
@@ -291,35 +291,129 @@ function LeftChrome({
 }
 
 /**
- * The captain summon anchor (captain-overlay): the always-visible affordance for
- * toggling the captain overlay. Accent-lit while the overlay is up, normal when
- * a captain is pinned, dimmed when none is (clicking then is a no-op - the
- * tooltip explains how to pin one from a tile header's right-click menu).
+ * The captain summon anchor (captain-overlay, captain-list): the always-visible
+ * affordance for the captain overlay. With pins it shows a COUNT BADGE and
+ * clicking opens a dropdown of every pinned captain (MRU order, status dot +
+ * name) - clicking one summons it. Accent-lit while the overlay is up, dimmed
+ * when nothing is pinned (clicking then is a no-op - the tooltip explains how
+ * to pin from a tile header's right-click menu). The dropdown's open flag
+ * lives in the captain store so lib/escOverlays' single Esc dispatch point can
+ * dismiss it (never a second Esc listener).
  */
 function CaptainButton() {
-  const captainId = useCaptain((s) => s.captainId);
+  const captainIds = useCaptain((s) => s.captainIds);
   const open = useCaptain((s) => s.open);
+  const menuOpen = useCaptain((s) => s.anchorMenuOpen);
+  const count = captainIds.length;
+  return (
+    <div className="relative flex items-stretch">
+      <button
+        type="button"
+        aria-label="Captain menu"
+        aria-pressed={open}
+        aria-expanded={menuOpen}
+        title={
+          count > 0
+            ? "Pinned captains - click to list, Ctrl+B C summons/cycles"
+            : "No captain pinned - right-click a tile header → Pin as captain"
+        }
+        onClick={() => {
+          if (count > 0) useCaptain.getState().setAnchorMenu(!menuOpen);
+        }}
+        className="relative flex h-8 w-9 items-center justify-center transition-colors hover:bg-neutral-700"
+        style={{
+          color: open
+            ? "var(--th-accent)"
+            : count > 0
+              ? "var(--th-fg)"
+              : "var(--th-fg-muted)",
+        }}
+      >
+        <Anchor size={14} className="pointer-events-none" aria-hidden />
+        {count > 0 && (
+          <span
+            aria-label={`${count} pinned captain${count === 1 ? "" : "s"}`}
+            className="pointer-events-none absolute right-0.5 top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full px-0.5 text-[9px] font-semibold leading-none"
+            style={{
+              backgroundColor: "var(--th-accent)",
+              color: "var(--th-tile-bg)",
+            }}
+          >
+            {count}
+          </span>
+        )}
+      </button>
+      {menuOpen && <CaptainDropdown captainIds={captainIds} />}
+    </div>
+  );
+}
+
+/** The anchor's dropdown: pinned captains in MRU order; click = summon that
+ *  one. A click-away backdrop closes it (Esc closes via lib/escOverlays). */
+function CaptainDropdown({ captainIds }: { captainIds: string[] }) {
+  const activeCaptainId = useCaptain((s) => s.activeCaptainId);
+  const close = () => useCaptain.getState().setAnchorMenu(false);
+  return (
+    <>
+      {/* Click-away backdrop - no document listener needed. */}
+      <div className="fixed inset-0 z-[59]" onPointerDown={close} aria-hidden />
+      <div
+        role="menu"
+        aria-label="Pinned captains"
+        className="absolute left-0 top-full z-[60] w-64 overflow-hidden rounded-md border py-1 shadow-2xl"
+        style={{
+          backgroundColor: "var(--th-sidebar-bg)",
+          borderColor: "var(--th-border)",
+        }}
+      >
+        {captainIds.map((id) => (
+          <CaptainDropdownRow
+            key={id}
+            terminalId={id}
+            active={id === activeCaptainId}
+            onSummon={close}
+          />
+        ))}
+      </div>
+    </>
+  );
+}
+
+function CaptainDropdownRow({
+  terminalId,
+  active,
+  onSummon,
+}: {
+  terminalId: string;
+  active: boolean;
+  onSummon: () => void;
+}) {
+  const label = useCaptainDisplayLabel(terminalId);
   return (
     <button
       type="button"
-      aria-label="Toggle captain overlay"
-      aria-pressed={open}
-      title={
-        captainId
-          ? "Summon the captain (Ctrl+B C)"
-          : "No captain pinned - right-click a tile header → Pin as captain"
-      }
-      onClick={() => runCommand("toggleCaptainOverlay")}
-      className="flex h-8 w-9 items-center justify-center transition-colors hover:bg-neutral-700"
+      role="menuitem"
+      title={`Summon captain - ${label}`}
+      onClick={() => {
+        onSummon();
+        useCaptain.getState().summonCaptain(terminalId);
+      }}
+      className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-neutral-700/40"
       style={{
-        color: open
-          ? "var(--th-accent)"
-          : captainId
-            ? "var(--th-fg)"
-            : "var(--th-fg-muted)",
+        color: "var(--th-fg)",
+        fontWeight: active ? 600 : 400,
       }}
     >
-      <Anchor size={14} className="pointer-events-none" aria-hidden />
+      <CaptainStatusDot terminalId={terminalId} size={9} />
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {active && (
+        <span
+          className="shrink-0 text-[9px] uppercase tracking-wide"
+          style={{ color: "var(--th-accent)" }}
+        >
+          active
+        </span>
+      )}
     </button>
   );
 }
