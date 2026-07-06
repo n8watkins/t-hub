@@ -338,10 +338,15 @@ pub fn has_session(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Kill the tmux session named `name` (terminating its process tree).
+/// Kill the tmux session named `name` via plain `kill-session` (SIGHUP).
 ///
 /// Treated as success if the session (or the whole server) is already gone, so
 /// killing an already-dead terminal is idempotent.
+///
+/// Production callers use [`kill_session_tree`] (SIGHUP-ignoring processes like
+/// `claude` survive a bare kill-session and leak); this lighter primitive is
+/// kept for tests, which spawn plain shells and don't need the tree sweep.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn kill_session(name: &str) -> Result<(), TmuxError> {
     let output = tmux(&["kill-session", "-t", name])
         .output()

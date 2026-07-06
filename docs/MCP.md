@@ -112,17 +112,18 @@ runs, and the listener only accepts loopback peers.
 | `list_tabs` | Read | allowed | the live workspace tabs (`{id, name, tileIds}`) from the core's addressable tab registry — the frontend reports its layout up so this mirrors the UI |
 | `read_terminal` | Read | allowed | a session's recent visible output via tmux `capture-pane` (plain text; optional scrollback) |
 | `focus_session` | Organization | allowed, **audited** | accepted + audited; UI application via the frontend command |
-| `move_tile` | Organization | allowed, **audited** | accepted + audited |
-| `rename_tab` | Organization | allowed, **audited** | accepted + audited |
-| `new_tab` | Organization | allowed, **audited** | mints the tab id **core-side** and returns it (so the tab is addressable by `move_tile`/`focus_tab` and shows in `list_tabs`); forwards that id for the frontend to adopt |
-| `focus_tab` | Organization | allowed, **audited** | accepted + audited; UI application via the frontend command |
+| `move_tile` | Organization | allowed, **audited** | applies to the authoritative server registry FIRST (unknown `tabId` is a hard error), then forwards the registry snapshot; lands even when the target tab is hidden or the window is unfocused |
+| `rename_tab` | Organization | allowed, **audited** | registry-first + strict (unknown `tabId` is an error), then forwards the snapshot |
+| `new_tab` | Organization | allowed, **audited** | mints the tab id **core-side** and returns it (so the tab is addressable by `move_tile`/`focus_tab` and shows in `list_tabs`); the tab is created in the BACKGROUND (the user's active tab is not switched - use `focus_tab`) |
+| `focus_tab` | Organization | allowed, **audited** | the one organization command that intentionally moves the user's view; strict (the tab must exist) and mirrored into the registry's `activeTabId` |
+| `close_tab` | Organization | allowed, **audited** | closes a workspace tab headlessly; refused for the LAST tab, and for a non-empty tab unless `force: true` (see the tab-lifecycle policy below) |
 | `open_file` | Organization | allowed, **audited** | capped text read via the Files reader |
-| `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create by id, never the focused tab), then forwards the tab + spawn-in-worktree to the UI |
+| `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create, never the focused tab), spawns the worktree terminal **server-side**, places it in the registry, and forwards the snapshot; returns `tabId` + `terminalId` synchronously |
 | `remove_worktree` | Organization | allowed, **audited** | forwards removal to the UI (which detaches live tiles first, then runs `git worktree remove`); refused if no UI is connected, to avoid orphaning a process |
-| `spawn_terminal` | **Process-changing** | **confirmation required** | functional: routes through the same UI adoption path as `create_worktree` so the frontend spawns a real, tracked tile; refused only when no UI is connected to adopt it |
+| `spawn_terminal` | **Process-changing** | **confirmation required** | the server spawns the session itself, resolves `tabName`/`tabId` against the registry (reuse-or-create, WITHOUT switching the user's active tab), places the tile, and returns the real `id` synchronously; refused only when no UI is connected at all |
 | `send_text` | **Process-changing** | **confirmation required** | types literal text into an existing session via tmux `send-keys -l` (optional trailing Enter); executes |
 | `send_keys` | **Process-changing** | **confirmation required** | sends named control keys (e.g. `C-c`, `Up`, `Escape`) to an existing session via tmux `send-keys`; executes |
-| `close_terminal` | **Process-changing** | **confirmation required** | kills an existing session + its process tree via tmux `kill-session`; executes |
+| `close_terminal` | **Process-changing** | **confirmation required** | kills an existing session + its process tree via tmux `kill-session`; also drops the dead tile from the server registry and pushes a `sync_tabs` snapshot, so the tile leaves its tab even when that tab is hidden |
 | `get_theme` / `set_theme` | Theme | forwarded by name | see the theme contract below |
 
 ### How tiers are enforced
@@ -143,13 +144,12 @@ runs, and the listener only accepts loopback peers.
   and an `annotations.t-hubTier:"process-changing"` string so a permission-aware
   client can gate them — that confirmation contract is the user-facing gate. On
   the app side they split:
-  - `spawn_terminal` is **functional** (#17): rather than refusing outright — the
-    old behavior, because a raw spawn on the listener would create an untracked
-    tmux session the UI never adopts — it routes through the SAME `ApplySink`
-    adoption path `create_worktree` uses. The listener forwards a `spawn_terminal`
-    command to the frontend, which spawns the tile via the normal `spawnTerminal`
-    IPC, so the resulting session is a real, UI-adopted tile tracked like any
-    other. It is refused only when no UI is connected (nothing would adopt the
+  - `spawn_terminal` is **functional** (#17, headless-org): the SERVER spawns the
+    tmux session itself (same id minting + pane wrap as the Tauri spawn), places
+    the tile in the registry (resolving `tabName`/`tabId`; default is the user's
+    active tab), and forwards the id + snapshot for the UI to adopt.
+    The real terminal id is returned synchronously.
+    It is refused only when no UI is connected at all (nothing would render the
     tile). Its confirmation contract (description + annotations) is unchanged.
   - `send_text`, `send_keys`, and `close_terminal` **execute**: they act only on
     an existing `th_*` session the app already owns, driving tmux directly
@@ -164,29 +164,27 @@ Tool failures (a gated tool, or "T-Hub is not running") come back as MCP
 **tool results with `isError: true`**, not transport errors — that's how MCP
 surfaces tool-level failures to the model.
 
-### The addressable tab registry (#22)
+### The authoritative tab registry (#22, headless-org)
 
-For any headless tab operation to work — discover a tab id, `move_tile` a terminal
-into it, `focus_tab` a known id, or place a `create_worktree` tile in a tab named by
-the caller — tabs must be **addressable** over the control API.
-The tab layout lives in the frontend store, so the core keeps a small in-memory
-**tab registry** (`control::TabRegistry`, one `{id, name, tileIds}` record per tab)
-that the control channel reads and writes:
+For any headless tab operation to work - discover a tab id, `move_tile` a terminal into it, `focus_tab` a known id, or place a `create_worktree`/`spawn_terminal` tile in a tab named by the caller - tabs must be **addressable** over the control API, and the operation must survive the target tab being hidden or the window being minimized.
+The core therefore owns the tab organization in an in-memory **tab registry** (`control::TabRegistry`: a monotonic revision `seq`, the mirrored `activeTabId`, and one `{id, name, tileIds}` record per tab).
+The SERVER is the source of truth for organization:
 
-- The frontend is the source of truth. It reports its FULL tab list up on every
-  layout change via the `report_workspace_tabs` Tauri command (`controlBridge.ts`),
-  which replaces the registry — so `list_tabs` mirrors the live UI, including
-  UI-created tabs and real tile membership.
-- MCP-driven mutations update the registry **optimistically** using ids the core
-  chooses and forwards down: `new_tab` mints the tab id core-side (and returns it),
-  `move_tile` moves the tile between records, and `create_worktree` resolves the
-  target tab by name (reuse if it exists, else mint an id). Because the forwarded
-  id is what the frontend adopts, the two converge on the same id when the frontend
-  reports back.
+- Every organization mutation applies to the registry FIRST (an invalid target is a hard error, never a silent accept-then-lose), then the command forwards the full registry snapshot to the UI under `args.sync` on `control://apply`.
+  The UI renders FROM the snapshot (`adoptRegistry` in the workspace store), so a hidden tab or an unfocused/minimized window cannot lose the update.
+- Control-originated placement NEVER switches the user's active tab or steals focus.
+  `focus_tab`/`focus_session` are the explicit, intentional view switches.
+- The frontend up-syncs USER-originated layout changes (drag, UI close, UI rename) via `report_workspace_tabs`, carrying the active tab and the last revision it applied (`baseSeq`).
+  A report whose `baseSeq` is stale - a server mutation the UI has not applied yet - is REJECTED and answered with the authoritative snapshot to adopt, closing the lost-update race where a UI report clobbered a headless `move_tile`.
+- Satellite (popped-out) windows neither apply organization forwards nor report: they hold a single tab, and reporting it would collapse the registry.
 
-This is deliberately the **minimal** registry that makes named placement +
-addressable tabs work; full workspace-tab persistence is still the PRD §8 snapshot
-track and out of scope here.
+**Tab lifecycle policy (headless close).**
+`close_terminal` kills the session AND drops its tile from the registry, pushing a `sync_tabs` snapshot so the tile leaves its (possibly hidden) tab immediately.
+An auto-created tab (from `tabName` placement) that becomes empty is NOT reaped implicitly - an agent staging a workspace may empty and refill it - so closing is always an explicit `close_tab`.
+`close_tab` refuses the last tab, and refuses a non-empty tab unless `force: true`; a force-closed tab's still-live sessions are re-adopted into the active tab by the UI reconciler, never orphaned.
+
+The registry is still in-memory, per app run; the frontend persists layout for restarts and seeds the registry with its first report.
+Full workspace-tab persistence remains the PRD §8 snapshot track and out of scope here.
 
 ---
 
