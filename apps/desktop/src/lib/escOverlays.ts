@@ -26,6 +26,27 @@ import { writeTerminal } from "../ipc/client";
 export const ESC_BYTE = "\u001b";
 
 /**
+ * The ARMING predicate for Canvas's window-capture Escape listener: true while
+ * ANY surface this dispatch point can consume Esc for is up. Canvas subscribes
+ * these three flags and only attaches the listener while this holds - kept as
+ * a pure function (mirroring handleOverlayEscape's precedence list) so the
+ * arming condition is unit-testable and can never drift to a SUBSET of the
+ * surfaces handled below (the bug class: a surface handled here but never
+ * armed for is a dead Esc key).
+ */
+export function overlayEscapeArmed(surfaces: {
+  fullscreenId: string | null;
+  captainOpen: boolean;
+  anchorMenuOpen: boolean;
+}): boolean {
+  return (
+    surfaces.fullscreenId != null ||
+    surfaces.captainOpen ||
+    surfaces.anchorMenuOpen
+  );
+}
+
+/**
  * Handle one Escape keydown against the overlay surfaces, in the explicit
  * precedence order above. Returns true when the key was consumed (the caller
  * must preventDefault + stop the event) and false to let it fall through to

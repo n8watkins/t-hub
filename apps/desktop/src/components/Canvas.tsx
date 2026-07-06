@@ -44,7 +44,7 @@ import {
   handlePrefixedKey,
   disarm,
 } from "../lib/prefixKeyHandler";
-import { handleOverlayEscape } from "../lib/escOverlays";
+import { handleOverlayEscape, overlayEscapeArmed } from "../lib/escOverlays";
 import { runWhenIdle } from "../lib/windowInteraction";
 
 /**
@@ -155,6 +155,10 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   // yield the slot - mirrors the fullscreen slotActive gating.
   const captainId = useCaptain((s) => s.activeCaptainId);
   const captainOpen = useCaptain((s) => s.open);
+  // The titlebar anchor's captain dropdown (captain-list): its Esc-dismiss
+  // also routes through the single dispatch point, so it must ARM the
+  // listener below even when nothing else is up.
+  const anchorMenuOpen = useCaptain((s) => s.anchorMenuOpen);
 
   // Seed the live terminal set and keep lifecycle state in sync with the backend.
   useEffect(() => {
@@ -374,14 +378,17 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     if (!stillExists) setFullscreen(null);
   }, [fullscreenId, tabs, setFullscreen]);
 
-  // Esc for the stacked overlay surfaces - the captain overlay and per-tile
-  // fullscreen. ONE window-capture listener, armed only while either surface
-  // is up, routing to the single dispatch point (lib/escOverlays) so the
-  // precedence is explicit rather than decided by listener registration
-  // order: Shift+Esc interrupts the summoned captain (literal Esc
-  // passthrough), plain Esc dismisses the overlay, else Esc exits fullscreen.
+  // Esc for the stacked overlay surfaces - the captain overlay, the titlebar
+  // anchor's captain dropdown, and per-tile fullscreen. ONE window-capture
+  // listener, armed only while some surface is up (overlayEscapeArmed - the
+  // predicate lives beside the dispatch so the two can't drift apart),
+  // routing to the single dispatch point (lib/escOverlays) so the precedence
+  // is explicit rather than decided by listener registration order: Shift+Esc
+  // interrupts the summoned captain (literal Esc passthrough), plain Esc
+  // dismisses the dropdown, then the overlay, else exits fullscreen.
   useEffect(() => {
-    if (fullscreenId == null && !captainOpen) return;
+    if (!overlayEscapeArmed({ fullscreenId, captainOpen, anchorMenuOpen }))
+      return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       if (handleOverlayEscape(e.shiftKey)) {
@@ -391,7 +398,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [fullscreenId, captainOpen]);
+  }, [fullscreenId, captainOpen, anchorMenuOpen]);
 
   return (
     <div

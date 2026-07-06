@@ -389,11 +389,21 @@ function CaptainDropdownRow({
   onSummon: () => void;
 }) {
   const label = useCaptainDisplayLabel(terminalId);
+  // Same liveness affordance as the overlay switcher chip: a pin whose tile
+  // is gone (tab popped out to a satellite) summons as a store-level no-op,
+  // so it must READ unavailable instead of silently doing nothing.
+  const hasTile = useWorkspace((s) =>
+    s.tabs.some((t) => t.order.includes(terminalId)),
+  );
   return (
     <button
       type="button"
       role="menuitem"
-      title={`Summon captain - ${label}`}
+      title={
+        hasTile
+          ? `Summon captain - ${label}`
+          : `${label} - tile not available (tab popped out?)`
+      }
       onClick={() => {
         onSummon();
         useCaptain.getState().summonCaptain(terminalId);
@@ -402,6 +412,7 @@ function CaptainDropdownRow({
       style={{
         color: "var(--th-fg)",
         fontWeight: active ? 600 : 400,
+        opacity: hasTile ? 1 : 0.5,
       }}
     >
       <CaptainStatusDot terminalId={terminalId} size={9} />

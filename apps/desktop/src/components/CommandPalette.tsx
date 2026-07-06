@@ -76,6 +76,9 @@ interface PaletteEntry {
   category: string;
   commandId?: CommandId;
   captainId?: string;
+  /** Render at half opacity (captain-list: a pinned captain whose tile is
+   *  gone - summoning it is a store-level no-op until the tile returns). */
+  dimmed?: boolean;
 }
 
 interface Scored {
@@ -126,21 +129,31 @@ export function CommandPalette() {
   const captainIds = useCaptain((s) => s.captainIds);
   const terminals = useWorkspace((s) => s.terminals);
   const labels = useWorkspace((s) => s.labels);
+  const tabs = useWorkspace((s) => s.tabs);
   const captainEntries = useMemo<PaletteEntry[]>(
     () =>
-      captainIds.map((id) => ({
-        key: `summonCaptain:${id}`,
-        label: `Summon captain: ${deriveLabel({
-          id,
-          label: labels[id],
-          title: terminals[id]?.title,
-          cwd: terminals[id]?.cwd,
-        })}`,
-        description: "Summon this pinned captain in the overlay",
-        category: "App",
-        captainId: id,
-      })),
-    [captainIds, terminals, labels],
+      captainIds.map((id) => {
+        // Same liveness affordance as the overlay switcher chip / titlebar
+        // dropdown row: a tile-less pin summons as a store-level no-op, so
+        // the entry must read unavailable instead of silently doing nothing.
+        const hasTile = tabs.some((t) => t.order.includes(id));
+        return {
+          key: `summonCaptain:${id}`,
+          label: `Summon captain: ${deriveLabel({
+            id,
+            label: labels[id],
+            title: terminals[id]?.title,
+            cwd: terminals[id]?.cwd,
+          })}`,
+          description: hasTile
+            ? "Summon this pinned captain in the overlay"
+            : "Tile not available (tab popped out?) - summon is a no-op",
+          category: "App",
+          captainId: id,
+          dimmed: !hasTile,
+        };
+      }),
+    [captainIds, terminals, labels, tabs],
   );
 
   // Ranked, filtered command list.
@@ -322,6 +335,7 @@ export function CommandPalette() {
                   className="mx-1 flex cursor-pointer items-center justify-between gap-3 rounded px-2.5 py-2"
                   style={{
                     backgroundColor: isSel ? "var(--th-tile-bg)" : "transparent",
+                    opacity: entry.dimmed ? 0.5 : 1,
                   }}
                 >
                   <div className="min-w-0">

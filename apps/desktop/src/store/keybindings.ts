@@ -73,7 +73,7 @@ const DEFAULT_PREFIXED: Partial<Record<CommandId, string>> = {
   // prefix tier. newPlainWorkspace (WS-9c's original owner of `c`, see
   // docs/WORKTREE-WORKFLOW.md) RELOCATES to `s` ("new workSpace"); both remain
   // rebindable, and persisted user overrides are untouched by this default.
-  toggleCaptainOverlay: "c", // summon/dismiss the captain overlay
+  toggleCaptainOverlay: "c", // summon the captain / cycle pinned captains
   newPlainWorkspace: "s", // new plain tab (workspace) - RELOCATED off `c`
   newWorktreeWorkspace: "w", // new tab that is a git worktree
   spawnTerminal: "t", // RELOCATED off `c` (now newPlainWorkspace)

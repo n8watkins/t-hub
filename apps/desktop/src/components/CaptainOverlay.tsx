@@ -357,7 +357,7 @@ function CaptainPanel({ captainId }: { captainId: string }) {
         <button
           type="button"
           aria-label="Close captain overlay"
-          title="Close (Esc / Ctrl+B C)"
+          title="Close (Esc)"
           className="flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-neutral-700"
           style={{ color: "var(--th-fg-muted)" }}
           onPointerDown={(e) => e.stopPropagation()}

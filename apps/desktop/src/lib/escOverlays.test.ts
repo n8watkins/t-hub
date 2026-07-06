@@ -9,7 +9,7 @@ vi.mock("../ipc/client", () => ({
   writeTerminal: vi.fn(() => Promise.resolve()),
 }));
 
-import { handleOverlayEscape, ESC_BYTE } from "./escOverlays";
+import { handleOverlayEscape, overlayEscapeArmed, ESC_BYTE } from "./escOverlays";
 import { writeTerminal } from "../ipc/client";
 import { useCaptain } from "../store/captain";
 import { usePanels } from "../store/panels";
@@ -68,6 +68,15 @@ describe("handleOverlayEscape precedence", () => {
     expect(usePanels.getState().fullscreenId).toBeNull();
   });
 
+  it("dismisses the anchor dropdown when it is the ONLY surface up", () => {
+    // Regression (captain review round 1): with just the dropdown open the
+    // listener must still arm and Esc must consume + close it.
+    useCaptain.getState().setAnchorMenu(true);
+    expect(handleOverlayEscape(false)).toBe(true);
+    expect(useCaptain.getState().anchorMenuOpen).toBe(false);
+    expect(handleOverlayEscape(false)).toBe(false); // nothing left
+  });
+
   it("dismisses the titlebar anchor dropdown BEFORE the overlay", () => {
     useCaptain.getState().openOverlay();
     useCaptain.getState().setAnchorMenu(true);
@@ -80,6 +89,24 @@ describe("handleOverlayEscape precedence", () => {
     // Second Esc: the overlay closes.
     expect(handleOverlayEscape(false)).toBe(true);
     expect(useCaptain.getState().open).toBe(false);
+  });
+});
+
+describe("overlayEscapeArmed (Canvas listener arming predicate)", () => {
+  // The arming condition must cover EVERY surface handleOverlayEscape can
+  // consume Esc for - a surface handled but not armed for is a dead Esc key
+  // (the round-1 dropdown bug: armed only on fullscreen/overlay, so a
+  // dropdown-only Esc never even reached the dispatch).
+  const off = { fullscreenId: null, captainOpen: false, anchorMenuOpen: false };
+
+  it("is disarmed when no surface is up", () => {
+    expect(overlayEscapeArmed(off)).toBe(false);
+  });
+
+  it("arms for EACH surface alone - including the anchor dropdown", () => {
+    expect(overlayEscapeArmed({ ...off, fullscreenId: "aaa00001" })).toBe(true);
+    expect(overlayEscapeArmed({ ...off, captainOpen: true })).toBe(true);
+    expect(overlayEscapeArmed({ ...off, anchorMenuOpen: true })).toBe(true);
   });
 });
 

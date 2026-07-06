@@ -104,10 +104,12 @@ function defaults(): PersistedCaptain {
 }
 
 /**
- * Load the persisted captain state: the v2 list when present, else the v1
- * single pin migrated into a one-entry list (never losing an existing pin),
- * else empty defaults. A PRESENT v2 blob always wins - an empty v2 list means
- * the user unpinned after migrating, so the stale v1 pin must NOT resurrect.
+ * Load the persisted captain state: the v2 list when present and parseable,
+ * else the v1 single pin migrated into a one-entry list (never losing an
+ * existing pin), else empty defaults. A parseable v2 blob wins even when its
+ * list is EMPTY (the user unpinned after migrating - the stale v1 pin must
+ * not resurrect); only an absent or CORRUPT/unparseable v2 blob falls back to
+ * the migrated v1 pin (pin preservation beats staleness on that edge).
  * Exported for the migration tests (the store computes this once at load).
  */
 export function loadCaptainPersisted(): PersistedCaptain {
@@ -223,6 +225,10 @@ export const useCaptain = create<CaptainState>((set, get) => {
       // restore runs while the pre-summon tile is still resolvable.
       if (id === s.activeCaptainId && s.open) s.closeOverlay();
       commitIds(s.captainIds.filter((c) => c !== id));
+      // Last pin gone: drop the anchor dropdown too - the anchor button's
+      // click is gated on count > 0, so an orphaned empty popover would have
+      // no dismiss affordance left (Esc aside).
+      if (get().captainIds.length === 0) get().setAnchorMenu(false);
     },
 
     toggleCaptain: (id) => {
@@ -232,10 +238,18 @@ export const useCaptain = create<CaptainState>((set, get) => {
 
     summonCaptain: (id) => {
       const s = get();
+      // Any summon path retires the anchor dropdown - a chord/palette summon
+      // while it is open must not leave its full-window click-away backdrop
+      // up to swallow the next pointerdown.
+      s.setAnchorMenu(false);
       if (!s.captainIds.includes(id) || !terminalHasTile(id)) return;
       const ws = useWorkspace.getState();
-      // Most recently summoned wins: move to the MRU front.
-      commitIds([id, ...s.captainIds.filter((c) => c !== id)]);
+      // Most recently summoned wins: move to the MRU front (skip the write
+      // when it already leads - re-summoning the active captain must not
+      // persist/re-render for nothing).
+      if (s.captainIds[0] !== id) {
+        commitIds([id, ...s.captainIds.filter((c) => c !== id)]);
+      }
       if (!get().open) {
         prevFocusedId = ws.focusedId;
         set({ open: true });
@@ -246,7 +260,10 @@ export const useCaptain = create<CaptainState>((set, get) => {
     },
 
     openOverlay: () => {
-      const { captainIds, open, summonCaptain } = get();
+      const { captainIds, open, summonCaptain, setAnchorMenu } = get();
+      // Defensive mirror of summonCaptain's dropdown retire: even a no-op
+      // open (no live pin) must not strand the backdrop.
+      setAnchorMenu(false);
       if (open) return;
       // Summon the first captain (MRU order) whose tile is still live. A pin
       // whose tab popped out to a satellite is skipped, not dropped - it can be

@@ -300,6 +300,52 @@ describe("designation lifecycle", () => {
     expect(useCaptain.getState().captainIds).toEqual(["cap00001"]);
   });
 
+  it("unpinning persists the updated list to t-hub.captain.v2 (round-trip)", () => {
+    // Guards commitIds' persist call: a dropped write would leave a ghost pin
+    // to resurrect on the next app start.
+    useCaptain.getState().unpinCaptain("cap00001");
+    const raw = localStorage.getItem("t-hub.captain.v2");
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw!).captainIds).toEqual([]);
+    expect(loadCaptainPersisted().captainIds).toEqual([]);
+  });
+
+  it("unpinning the LAST captain closes the anchor dropdown (no orphaned popover)", () => {
+    useCaptain.getState().setAnchorMenu(true);
+    useCaptain.getState().unpinCaptain("cap00001");
+    expect(useCaptain.getState().captainIds).toEqual([]);
+    expect(useCaptain.getState().anchorMenuOpen).toBe(false);
+  });
+
+  it("unpinning with pins remaining leaves the anchor dropdown up", () => {
+    seedCaptains(["cap00001", "bbb00001"]);
+    useCaptain.getState().setAnchorMenu(true);
+    useCaptain.getState().unpinCaptain("bbb00001");
+    expect(useCaptain.getState().anchorMenuOpen).toBe(true);
+  });
+
+  it("summoning (chord or palette) retires the anchor dropdown", () => {
+    useCaptain.getState().setAnchorMenu(true);
+    useCaptain.getState().summonCaptain("cap00001");
+    expect(useCaptain.getState().anchorMenuOpen).toBe(false);
+    expect(useCaptain.getState().open).toBe(true);
+
+    useCaptain.getState().closeOverlay();
+    useCaptain.getState().setAnchorMenu(true);
+    useCaptain.getState().openOverlay();
+    expect(useCaptain.getState().anchorMenuOpen).toBe(false);
+  });
+
+  it("re-summoning the MRU-front captain skips the redundant persist write", () => {
+    seedCaptains(["cap00001", "bbb00001"]);
+    useCaptain.getState().summonCaptain("cap00001"); // writes (open flip aside)
+    localStorage.removeItem("t-hub.captain.v2");
+    useCaptain.getState().summonCaptain("cap00001"); // already front: no write
+    expect(localStorage.getItem("t-hub.captain.v2")).toBeNull();
+    useCaptain.getState().summonCaptain("bbb00001"); // reorder: writes
+    expect(localStorage.getItem("t-hub.captain.v2")).not.toBeNull();
+  });
+
   it("forgetCaptain (kill path) unpins only the matching terminal", () => {
     seedCaptains(["cap00001", "bbb00001"]);
     forgetCaptain("ccc00001"); // not pinned: no-op
