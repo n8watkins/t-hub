@@ -42,7 +42,9 @@ import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   attachTerminal,
+  closeTerminal,
   decodeBase64,
+  listTerminals,
   onExit,
   onOutput,
   resizeTerminal,
@@ -173,6 +175,15 @@ const MAX_BACKGROUND_PENDING_BYTES = 512 * 1024;
 // threshold so a normal background burst is unaffected.
 const MAX_BACKGROUND_QUEUE_BYTES = 2 * 1024 * 1024;
 const TERMINAL_FOREGROUND_EVENT = "th-terminal-foreground";
+
+// AUTO-REATTACH backoff (attach-loss recovery). An attach stream can drop while
+// the tmux session lives on (control-server churn, a server-side detach-client);
+// the tile then reads "reconnecting", and a foreground tile retries the attach on
+// this schedule until it lands or tmux says the session is really gone. The
+// constants mirror the native client's reconnect semantics (apps/native/src/wire:
+// BACKOFF_INITIAL 250ms, x2 per attempt, capped at 5s, reset on success).
+const RECONNECT_INITIAL_MS = 250;
+const RECONNECT_MAX_MS = 5000;
 
 interface TerminalForegroundDetail {
   id: TerminalId;
@@ -350,6 +361,17 @@ export function TerminalView({
   // selector returns a stable ref unless THIS id's override changes, so other
   // terminals' edits don't re-render us.
   const termOverride = useTheme((s) => s.termOverrides[terminalId]);
+  // This terminal's lifecycle state from the store — fed by terminal://state
+  // events (Canvas.onState) and the ~15s listTerminals poll. "detached" while
+  // this tile is MOUNTED means its tmux session is alive but no PTY streams it:
+  // either the attach stream dropped, or the tile never attached at all (seen
+  // with tiles materialized via the control-socket create_worktree path). Both
+  // are healed by the same reattach sweep below.
+  const termState = useWorkspace((s) => s.terminals[terminalId]?.state);
+  // Bridge into the init effect's closure: the attach block assigns its reattach
+  // trigger here once it exists; before that (or after teardown) it is null and
+  // the sweep is a no-op (the initial attach flow owns recovery until then).
+  const reattachRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     foregroundRef.current = foreground;
@@ -390,6 +412,10 @@ export function TerminalView({
     // old synchronous path's completeness. Stays null if teardown beats setup.
     let drainPending: (() => void) | null = null;
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    // The reattach loop's pending backoff timer, held at effect scope so cleanup
+    // can cancel it — a cleared timer never resolves its sleep, which (with the
+    // `disposed` checks) abandons any in-flight reconnect on unmount.
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const term = new Terminal({
       allowProposedApi: true,
@@ -758,6 +784,12 @@ export function TerminalView({
           /* container detached; ignore */
         }
         void (async () => {
+          // Recovery hook for a FAILED initial attach, assigned inside the try
+          // (where the reattach helpers live — `try` block scope hides them from
+          // the catch). Null only if the failure precedes the helpers' setup, in
+          // which case there is nothing to recover with yet.
+          let recoverInitialAttach: ((err: unknown) => Promise<void>) | null =
+            null;
           try {
             // STARTUP-FREEZE FIX (BUG 1): subscribe to terminal://output BEFORE
             // requesting attach, so the backend never streams PTY bytes into a
@@ -933,12 +965,177 @@ export function TerminalView({
               flushTimer = setTimeout(flushPendingTimer, delay);
             };
 
+            // -----------------------------------------------------------------
+            // ATTACH-LOSS RECOVERY: verify-before-exit + auto-reattach.
+            //
+            // An `exit` event or a dropped attach stream does NOT prove the
+            // process exited — server-side attach churn closes the stream while
+            // the tmux session keeps running (the false "[process exited]" over a
+            // live session). So: (1) never declare exited on the stream ending
+            // alone — verify liveness against the session list first; (2) if the
+            // session is alive but unattached, reattach with capped backoff
+            // (native-client semantics: 250ms, x2, 5s cap). Only a FOREGROUND
+            // tile retries; a parked/background one just marks itself and resumes
+            // the moment it is foregrounded, so we never fight the pool's
+            // deliberate handling of hidden tiles. A deliberate close/kill
+            // unmounts this component (`disposed`) and removes the store record,
+            // both of which stop the loop.
+            // -----------------------------------------------------------------
+            let reconnecting = false;
+            let needsReattach = false;
+            let initialAttachSettled = false;
+
+            const reconnectSleep = (ms: number): Promise<void> =>
+              new Promise((resolve) => {
+                reconnectTimer = setTimeout(() => {
+                  reconnectTimer = null;
+                  resolve();
+                }, ms);
+              });
+
+            // Is this terminal's tmux session still alive? Asks the backend for
+            // the reconciled session list (the same tmux walk the sidebar poll
+            // uses). On a FAILED probe err on the side of "alive": a liveness
+            // check that can't run must never paint a false [process exited] —
+            // the reattach loop keeps verifying on every retry anyway.
+            const sessionAlive = async (): Promise<boolean> => {
+              try {
+                const list = await listTerminals();
+                return list.some((t) => t.id === terminalId);
+              } catch {
+                return true;
+              }
+            };
+
+            // The VERIFIED death path — the only place the exited banner renders.
+            const declareExited = (): void => {
+              // Flush queued output first so the process's final bytes land
+              // before the banner (same ordering the old exit handler kept).
+              drainQueue();
+              term.writeln("\r\n[process exited]");
+              useWorkspace.getState().updateState(terminalId, "exited");
+            };
+
+            // Retry the attach until it lands, the session turns out dead, or the
+            // tile goes away. Reuses the normal attach + scrollback-seed path: on
+            // success the grid is reset and repopulated from the fresh seed, so
+            // the pane picks up exactly where the session is (no duplicated
+            // history from the pre-drop buffer).
+            const reattachLoop = async (): Promise<void> => {
+              if (disposed || reconnecting || !initialAttachSettled) return;
+              reconnecting = true;
+              needsReattach = false;
+              term.writeln("\r\n[session detached - reconnecting...]");
+              let delay = RECONNECT_INITIAL_MS;
+              for (;;) {
+                await reconnectSleep(delay);
+                if (disposed) return;
+                // Tile removed from the workspace while we waited → deliberate
+                // close/kill in flight; stand down.
+                if (!useWorkspace.getState().terminals[terminalId]) {
+                  reconnecting = false;
+                  return;
+                }
+                // Backgrounded: park the retry; onForegroundChanged resumes it.
+                if (!foregroundRef.current) {
+                  reconnecting = false;
+                  needsReattach = true;
+                  return;
+                }
+                if (!(await sessionAlive())) {
+                  if (!disposed) declareExited();
+                  reconnecting = false;
+                  return;
+                }
+                if (disposed) return;
+                try {
+                  // Evict any DEAD RemotePty conn for this id first: after a
+                  // drop the backend map still holds it, and attach_terminal
+                  // would see "already streaming" and return an empty seed
+                  // without opening a new socket. close_terminal detaches +
+                  // removes it (a no-op when absent); the tmux session survives.
+                  await closeTerminal(terminalId);
+                  if (disposed) return;
+                  // Buffer live output while we await the fresh seed, exactly
+                  // like the mount path: bytes from the new conn replay AFTER
+                  // the seed. Pre-drop queue contents are superseded by the
+                  // seed, so drop them.
+                  seeded = false;
+                  pending.length = 0;
+                  pendingBytes = 0;
+                  liveBuffer.length = 0;
+                  const scrollback = await attachTerminal(
+                    terminalId,
+                    term.cols,
+                    term.rows,
+                  );
+                  if (disposed) return;
+                  // Repopulate: reset the grid so the stale pre-drop frame (and
+                  // the reconnecting banner) never duplicates under the seed.
+                  term.reset();
+                  const seed = decodeBase64(scrollback);
+                  if (seed.length > 0) term.write(seed);
+                  seeded = true;
+                  if (liveBuffer.length > 0) {
+                    for (const chunk of liveBuffer) term.write(chunk);
+                    liveBuffer.length = 0;
+                  }
+                  // An empty capture renders nothing — nudge the shell to
+                  // repaint its prompt, exactly like the fresh-spawn path.
+                  if (seed.length === 0) void writeTerminal(terminalId, "\x0c");
+                  reconnecting = false;
+                  tlog(
+                    "attach",
+                    `reattached ${terminalId} after attach loss (seed ${seed.length}B)`,
+                  );
+                  return;
+                } catch (err) {
+                  // Attach refused (session raced away, control socket down,…):
+                  // restore live-write mode and back off. The next iteration
+                  // re-verifies liveness, so a genuinely-dead session converges
+                  // to the exited banner instead of retrying forever.
+                  seeded = true;
+                  tlog(
+                    "attach",
+                    `reattach ${terminalId} failed (${String(err)}); retrying in ${delay}ms`,
+                  );
+                  delay = Math.min(delay * 2, RECONNECT_MAX_MS);
+                }
+              }
+            };
+
+            // Expose the trigger to the store-state sweep effect (a mounted tile
+            // whose store state reads "detached" — dropped OR never attached —
+            // schedules a reattach through this).
+            reattachRef.current = () => void reattachLoop();
+
+            // And to the catch below (block scoping hides these helpers there):
+            // a failed INITIAL attach recovers exactly like a dropped one.
+            recoverInitialAttach = async (err: unknown): Promise<void> => {
+              initialAttachSettled = true;
+              tlog(
+                "attach",
+                `initial attach ${terminalId} failed: ${String(err)}`,
+              );
+              if (disposed) return;
+              if (await sessionAlive()) {
+                if (!disposed) void reattachLoop();
+              } else if (!disposed) {
+                declareExited();
+              }
+            };
+
             const onForegroundChanged = (
               event: Event,
             ): void => {
               const detail = (event as CustomEvent<TerminalForegroundDetail>).detail;
               if (detail?.id !== terminalId) return;
-              if (detail.foreground) scheduleFlush();
+              if (detail.foreground) {
+                scheduleFlush();
+                // A drop noticed while parked resumes its reattach here, the
+                // moment the tile is foregrounded again.
+                if (needsReattach) void reattachLoop();
+              }
             };
             const onVisibilityChanged = (): void => {
               if (documentHidden()) {
@@ -988,13 +1185,20 @@ export function TerminalView({
             });
 
             const offExit = await onExit((e) => {
-              if (e.id === terminalId && !disposed) {
-                // Flush any queued output FIRST so the process's final bytes land
-                // before the banner — the rAF queue could otherwise write them
-                // AFTER this synchronous writeln (out of order).
-                drainQueue();
-                term.writeln("\r\n[process exited]");
-              }
+              if (e.id !== terminalId || disposed) return;
+              // VERIFY BEFORE EXIT: an exit event alone doesn't prove the
+              // process died — the server-side attach client also exits on a
+              // detach while the tmux session lives on. (The backend now
+              // verifies too and emits Detached instead, but the tile must
+              // never render death on attach loss even if an unverified emit
+              // slips through.) Session alive → treat as attach loss and
+              // reattach; gone → the real exited banner.
+              void (async () => {
+                const alive = await sessionAlive();
+                if (disposed) return;
+                if (alive) void reattachLoop();
+                else declareExited();
+              })();
             });
             if (disposed) {
               void offExit();
@@ -1046,8 +1250,15 @@ export function TerminalView({
                 if (!disposed) void writeTerminal(terminalId, "\x0c");
               }, 250);
             }
-          } catch {
-            // attach failed (e.g. session gone); leave the tile rendered but inert.
+            initialAttachSettled = true;
+          } catch (err) {
+            // Initial attach failed. Previously this left the tile rendered but
+            // INERT forever — the "tile never attached" signature (seen with
+            // control-socket create_worktree spawns). Recover exactly like a
+            // dropped attach: session alive → reattach with backoff; session
+            // really gone → the verified exited banner. (Null hook = the failure
+            // preceded the recovery setup; nothing to retry with.)
+            await recoverInitialAttach?.(err);
           }
         })();
       });
@@ -1268,6 +1479,13 @@ export function TerminalView({
       if (promptTimer) clearTimeout(promptTimer);
       if (resizeTimer) clearTimeout(resizeTimer);
       if (copyTimer) clearTimeout(copyTimer);
+      // Abandon any in-flight reattach: the cleared timer never resolves its
+      // sleep, and the loop's `disposed` checks bail on every other await.
+      reattachRef.current = null;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       resizeObserver?.disconnect();
       resizeObserver = null;
       visObserver?.disconnect();
@@ -1310,6 +1528,19 @@ export function TerminalView({
       fitRef.current = null;
     };
   }, [terminalId, visible]);
+
+  // REATTACH SWEEP: a mounted, visible tile whose store state reads "detached"
+  // has a live tmux session with no PTY streaming it — the attach dropped (the
+  // backend's verified stream-end emits Detached), or the tile never attached in
+  // the first place (the ~15s listTerminals poll flips it to detached). Either
+  // way, schedule a reattach. The trigger is a no-op until the init effect's
+  // attach block has installed it (the initial attach owns recovery until then),
+  // and the loop itself re-checks foreground/liveness before doing anything, so
+  // this can never fight a deliberate close (which unmounts and clears the ref).
+  useEffect(() => {
+    if (!visible || termState !== "detached") return;
+    reattachRef.current?.();
+  }, [termState, visible, terminalId]);
 
   // Apply global zoom changes live, without recreating the terminal. Skips the
   // first (mount) run -- the init effect already fits once, so fitting again

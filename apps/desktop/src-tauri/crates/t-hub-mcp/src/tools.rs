@@ -277,7 +277,23 @@ fn schema_spawn_terminal() -> Value {
         "properties": {
             "cwd":   { "type": "string", "description": "Working directory for the new terminal." },
             "shell": { "type": "string", "description": "Optional shell/command preset." },
-            "name":  { "type": "string", "description": "Optional tile title." }
+            "name":  { "type": "string", "description": "Optional tile title." },
+            "startupCommand": { "type": "string", "description": "Optional command run inside an interactive login shell the pane execs back into (e.g. claude --resume <id>)." },
+            "tabName": { "type": "string", "description": "Optional target workspace tab, by name: reused if it exists, created (hidden - the user's active tab is NOT switched) if not." },
+            "tabId":   { "type": "string", "description": "Optional target workspace tab, by id (must exist; see list_tabs). Defaults to the user's active tab." }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// `close_tab` schema: close a workspace tab headlessly.
+fn schema_close_tab() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tabId":   { "type": "string", "description": "Workspace tab id to close (see list_tabs)." },
+            "tabName": { "type": "string", "description": "Alternative to tabId: resolve the tab by exact name." },
+            "force":   { "type": "boolean", "description": "Close even if the tab still holds tiles (their live sessions are re-adopted into the active tab, never orphaned). Default false: a non-empty tab is refused - close its terminals first." }
         },
         "additionalProperties": false
     })
@@ -400,7 +416,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "new_tab",
             tier: Tier::Organization,
-            summary: "Create a new (empty) workspace tab and switch to it.",
+            summary: "Create a new (empty) workspace tab in the background (use focus_tab to switch to it).",
             input_schema: schema_new_tab,
         },
         ToolDef {
@@ -410,11 +426,17 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_focus_tab,
         },
         ToolDef {
+            name: "close_tab",
+            tier: Tier::Organization,
+            summary: "Close a workspace tab (refused while it still holds tiles unless force; the last tab is never closed).",
+            input_schema: schema_close_tab,
+        },
+        ToolDef {
             // Spawning a process is the process-changing subset of the
             // organization actions; it carries the confirmation contract.
             name: "spawn_terminal",
             tier: Tier::ProcessChanging,
-            summary: "Spawn a new terminal in a directory.",
+            summary: "Spawn a new terminal in a directory (optionally into a named workspace tab, without switching the user's view).",
             input_schema: schema_spawn_terminal,
         },
         ToolDef {

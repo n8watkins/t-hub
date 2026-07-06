@@ -74,6 +74,19 @@ export interface TabReport {
   tileIds: TerminalId[];
 }
 
+/**
+ * The core's answer to a `report_workspace_tabs` up-sync (headless-org). The
+ * SERVER tab registry is authoritative: a report based on a stale revision
+ * (`baseSeq` older than a server-side mutation the UI has not applied yet) is
+ * rejected with `stale: true` plus the authoritative snapshot to adopt.
+ */
+export interface TabReportResult {
+  seq: number;
+  stale?: boolean;
+  activeTabId?: string | null;
+  tabs?: TabReport[];
+}
+
 /** Event channels emitted from the backend (payloads below). */
 export const Events = {
   output: "terminal://output",
