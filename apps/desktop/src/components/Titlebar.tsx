@@ -364,7 +364,7 @@ const CAPTAIN_MENU_W = 256;
  * PORTALED to document.body (like WorkspacesList's color picker): App.tsx's
  * default titlebar wrapper is a height:TITLEBAR_H, overflow:hidden box (the
  * auto-hide height animation needs the clip), so anything rendered inside the
- * titlebar subtree below the 32px row is fully clipped — the menu would open
+ * titlebar subtree below the 32px row is fully clipped - the menu would open
  * invisibly while its fixed backdrop escaped the clip and swallowed the next
  * click. The menu is anchored under the button via its measured rect; the
  * titlebar never scrolls and the anchor lives in the left chrome cluster, so
@@ -372,7 +372,7 @@ const CAPTAIN_MENU_W = 256;
  *
  * Stacking: z-[59]/z-[60] matches the app's portaled-dropdown tier
  * (WorkspacesList uses 60/61). The captain overlay panel can't be slotted
- * ABOVE this menu — it paints at z-index 1 inside TerminalPoolLayer's z-0
+ * ABOVE this menu - it paints at z-index 1 inside TerminalPoolLayer's z-0
  * stacking context, so any body-level portal paints over it. That's the
  * normal ordering for a transient, user-invoked menu over a passive panel,
  * and clicking a row summons + closes the menu immediately anyway.
@@ -400,10 +400,14 @@ function CaptainDropdown({
       <div
         role="menu"
         aria-label="Pinned captains"
-        className="fixed z-[60] w-64 overflow-hidden rounded-md border py-1 shadow-2xl"
+        className="th-scroll fixed z-[60] w-64 overflow-y-auto rounded-md border py-1 shadow-2xl"
         style={{
           top,
           left,
+          // Clamp to the viewport below the anchor so a long pin list scrolls
+          // instead of overflowing past the bottom (th-scroll: the app's thin
+          // scrollbar styling, same as WorktreePrompt's list body).
+          maxHeight: Math.max(48, window.innerHeight - top - 8),
           backgroundColor: "var(--th-sidebar-bg)",
           borderColor: "var(--th-border)",
         }}
