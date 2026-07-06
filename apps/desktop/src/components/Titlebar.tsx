@@ -19,8 +19,11 @@ import type { RefObject } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { exit } from "@tauri-apps/plugin-process";
+import { Anchor } from "lucide-react";
 import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
+import { useCaptain } from "../store/captain";
+import { runCommand } from "../lib/keymapExecutor";
 import { useWindowMaximized } from "../lib/windowMaximized";
 import { closeSatellite, readSatelliteTab } from "../lib/windows";
 import { useAppName, useAppVersion } from "../lib/appName";
@@ -282,7 +285,42 @@ function LeftChrome({
           <SidebarToggleIcon />
         </button>
       )}
+      <CaptainButton />
     </div>
+  );
+}
+
+/**
+ * The captain summon anchor (captain-overlay): the always-visible affordance for
+ * toggling the captain overlay. Accent-lit while the overlay is up, normal when
+ * a captain is pinned, dimmed when none is (clicking then is a no-op - the
+ * tooltip explains how to pin one from a tile header's right-click menu).
+ */
+function CaptainButton() {
+  const captainId = useCaptain((s) => s.captainId);
+  const open = useCaptain((s) => s.open);
+  return (
+    <button
+      type="button"
+      aria-label="Toggle captain overlay"
+      aria-pressed={open}
+      title={
+        captainId
+          ? "Summon the captain (Ctrl+B C)"
+          : "No captain pinned - right-click a tile header → Pin as captain"
+      }
+      onClick={() => runCommand("toggleCaptainOverlay")}
+      className="flex h-8 w-9 items-center justify-center transition-colors hover:bg-neutral-700"
+      style={{
+        color: open
+          ? "var(--th-accent)"
+          : captainId
+            ? "var(--th-fg)"
+            : "var(--th-fg-muted)",
+      }}
+    >
+      <Anchor size={14} className="pointer-events-none" aria-hidden />
+    </button>
   );
 }
 

@@ -68,11 +68,13 @@ const DEFAULT_DIRECT: Partial<Record<CommandId, string>> = {
  * more via the command palette's rebind flow. Keys here are single bare keys.
  */
 const DEFAULT_PREFIXED: Partial<Record<CommandId, string>> = {
-  // WS-9c: the two "new" actions are the canonical owners of `c`/`w` per the
-  // worktree-workflow design (docs/WORKTREE-WORKFLOW.md). `c` previously seeded
-  // spawnTerminal — RELOCATED to `t` (mirrors its direct Ctrl+T; spawnTerminal is
-  // also the Ctrl+T direct chord, so the prefix tier is just an alias).
-  newPlainWorkspace: "c", // new plain tab (workspace)
+  // captain-overlay: `c` now SUMMONS THE CAPTAIN (Ctrl+B C - "captain"), per
+  // the orchestration design: the summon must be the cheapest chord in the
+  // prefix tier. newPlainWorkspace (WS-9c's original owner of `c`, see
+  // docs/WORKTREE-WORKFLOW.md) RELOCATES to `s` ("new workSpace"); both remain
+  // rebindable, and persisted user overrides are untouched by this default.
+  toggleCaptainOverlay: "c", // summon/dismiss the captain overlay
+  newPlainWorkspace: "s", // new plain tab (workspace) - RELOCATED off `c`
   newWorktreeWorkspace: "w", // new tab that is a git worktree
   spawnTerminal: "t", // RELOCATED off `c` (now newPlainWorkspace)
   closeTerminal: "x", // tmux: prefix-x = kill pane
@@ -81,7 +83,7 @@ const DEFAULT_PREFIXED: Partial<Record<CommandId, string>> = {
   cycleTileNext: "n",
   cycleTilePrev: "p", // (overridden below — kept distinct from palette)
   // WS-9e: list/re-open worktrees. `l` = "list" — free (the seeded set above uses
-  // c/w/t/x/p/o/n/b). Prefix-only by default (no direct chord); rebindable.
+  // c/s/w/t/x/p/o/n/b). Prefix-only by default (no direct chord); rebindable.
   openWorktreesList: "l",
 };
 // Keep the seeded prefixed map free of duplicate keys (the last writer in the
@@ -145,18 +147,40 @@ function defaults(): Persisted {
 
 /** Validate one persisted blob: a normalized prefix (default on a bad/empty
  *  chord) plus the two sanitized command->key maps. Owns this store's coerce
- *  logic; the SSR guard + corrupt-fallback plumbing lives in lib/persist. */
-function coercePersisted(raw: unknown): Persisted {
+ *  logic; the SSR guard + corrupt-fallback plumbing lives in lib/persist.
+ *  Exported for the migration unit tests (keybindings.test.ts). */
+export function coercePersisted(raw: unknown): Persisted {
   const p = (raw ?? {}) as Partial<Persisted>;
   const prefixKey =
     typeof p.prefixKey === "string" && normalizeChord(p.prefixKey)
       ? normalizeChord(p.prefixKey)
       : DEFAULT_PREFIX;
+  // Prefixed values are bare single keys - lowercase + trim, no modifiers.
+  const prefixed = sanitizeMap(p.prefixed, (s) => s.trim().toLowerCase());
+  // captain-overlay migration: a map persisted BEFORE the captain command
+  // existed fully replaces the defaults, so existing users would never get the
+  // summon chord. Detect the definitive pre-captain signature - `c` still
+  // owned by newPlainWorkspace (its old shipped default) with no captain
+  // binding - and apply the same relocation the new defaults ship: captain
+  // takes `c`, newPlainWorkspace moves to `s`. ONLY when `s` is free: a
+  // binding is never deleted without a landing spot, so if the user already
+  // rebound some command to `s`, newPlainWorkspace keeps `c` and the captain
+  // chord is not seeded at all (the palette and the titlebar anchor still
+  // reach the overlay). Any OTHER owner of `c` (a user rebind) or a
+  // deliberately cleared captain binding (`c` unowned) is left untouched.
+  // Idempotent across loads.
+  if (
+    !("toggleCaptainOverlay" in prefixed) &&
+    prefixed.newPlainWorkspace === "c" &&
+    !Object.values(prefixed).includes("s")
+  ) {
+    prefixed.newPlainWorkspace = "s";
+    prefixed.toggleCaptainOverlay = "c";
+  }
   return {
     prefixKey,
     direct: sanitizeMap(p.direct, normalizeChord),
-    // Prefixed values are bare single keys — lowercase + trim, no modifiers.
-    prefixed: sanitizeMap(p.prefixed, (s) => s.trim().toLowerCase()),
+    prefixed,
   };
 }
 

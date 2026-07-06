@@ -27,6 +27,7 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import { useWorkspace } from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
 import { usePanels } from "../store/panels";
+import { useCaptain } from "../store/captain";
 import { spawnTerminal, listTerminals, onState } from "../ipc/client";
 import { Tile } from "./Tile";
 import { TerminalPoolProvider } from "./TerminalPool";
@@ -43,6 +44,7 @@ import {
   handlePrefixedKey,
   disarm,
 } from "../lib/prefixKeyHandler";
+import { handleOverlayEscape } from "../lib/escOverlays";
 import { runWhenIdle } from "../lib/windowInteraction";
 
 /**
@@ -147,6 +149,12 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   // placeholder automatically. Esc / the ⤢ toggle returns to the grid.
   const fullscreenId = usePanels((s) => s.fullscreenId);
   const setFullscreen = usePanels((s) => s.setFullscreen);
+
+  // Captain overlay (captain-overlay): while summoned, the overlay owns the
+  // captain's pool placeholder, so BOTH tile copies (grid + fullscreen) must
+  // yield the slot - mirrors the fullscreen slotActive gating.
+  const captainId = useCaptain((s) => s.captainId);
+  const captainOpen = useCaptain((s) => s.open);
 
   // Seed the live terminal set and keep lifecycle state in sync with the backend.
   useEffect(() => {
@@ -366,20 +374,24 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     if (!stillExists) setFullscreen(null);
   }, [fullscreenId, tabs, setFullscreen]);
 
-  // Esc exits fullscreen (the ⤢ toggle in the tile header is the other way out).
-  // Only armed while a tile is fullscreen; captured so it wins before any other
-  // Esc consumer when the fullscreen layer is up.
+  // Esc for the stacked overlay surfaces - the captain overlay and per-tile
+  // fullscreen. ONE window-capture listener, armed only while either surface
+  // is up, routing to the single dispatch point (lib/escOverlays) so the
+  // precedence is explicit rather than decided by listener registration
+  // order: Shift+Esc interrupts the summoned captain (literal Esc
+  // passthrough), plain Esc dismisses the overlay, else Esc exits fullscreen.
   useEffect(() => {
-    if (fullscreenId == null) return;
+    if (fullscreenId == null && !captainOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+      if (e.key !== "Escape") return;
+      if (handleOverlayEscape(e.shiftKey)) {
         e.preventDefault();
-        setFullscreen(null);
+        e.stopPropagation();
       }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [fullscreenId, setFullscreen]);
+  }, [fullscreenId, captainOpen]);
 
   return (
     <div
@@ -439,6 +451,9 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
                 key={`fs-${fullscreenId}`}
                 terminalId={fullscreenId}
                 focused={fullscreenId === focusedId}
+                // If the fullscreen tile IS the summoned captain, the captain
+                // overlay owns the pool placeholder - this copy yields too.
+                slotActive={!(captainOpen && fullscreenId === captainId)}
                 onFocus={() => setFocus(fullscreenId)}
                 onClose={() => {
                   // Closing the fullscreen tile KILLS its session AND drops
@@ -589,6 +604,10 @@ function TabGrid({
   const layout = splitRows(tab.order);
   const setTabSizes = useWorkspace((s) => s.setTabSizes);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // While the captain overlay is summoned it owns the captain's pool
+  // placeholder; that tile's grid copy must not register/steal it (exactly the
+  // fullscreen slotActive rule). Null when the overlay is closed.
+  const summonedCaptainId = useCaptain((s) => (s.open ? s.captainId : null));
 
   // Local, editable copy of the flex weights so dragging is smooth (we only
   // write through to the store at pointer-up). Re-derived whenever the tab's
@@ -966,8 +985,9 @@ function TabGrid({
                     focused={active && id === focusedId}
                     // When this tile is fullscreen, its fullscreen copy (Canvas)
                     // owns the pool placeholder; this covered grid copy must not
-                    // re-register and steal it, so it yields the slot.
-                    slotActive={id !== fullscreenId}
+                    // re-register and steal it, so it yields the slot. Same rule
+                    // when it's the summoned captain (the overlay owns the slot).
+                    slotActive={id !== fullscreenId && id !== summonedCaptainId}
                     // #20: the xterm body lives in the persistent pool overlay,
                     // not in the tile — the tile renders header + placeholder.
                     onFocus={() => onFocus(id)}

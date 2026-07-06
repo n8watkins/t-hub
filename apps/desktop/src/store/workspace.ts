@@ -86,6 +86,16 @@ function cleanupTileSideState(id: TerminalId): void {
     .catch(() => {
       /* no dev server for this id, or no Tauri runtime — nothing to stop */
     });
+
+  // Captain designation (captain-overlay): if this terminal was the pinned
+  // captain, unpin it (which also closes the overlay) so the designation never
+  // points at a dead id. Dynamic import like DevTab above - captain.ts imports
+  // this store, so a static import here would form a cycle.
+  void import("./captain")
+    .then((m) => m.forgetCaptain(id))
+    .catch(() => {
+      /* captain store never loaded - nothing pinned */
+    });
 }
 
 /**

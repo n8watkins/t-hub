@@ -39,6 +39,8 @@ export const COMMAND_IDS = [
   "newPlainWorkspace",
   "newWorktreeWorkspace",
   "openWorktreesList",
+  "toggleCaptainOverlay",
+  "pinCaptainFocused",
 ] as const;
 
 export type CommandId = (typeof COMMAND_IDS)[number];
@@ -141,6 +143,20 @@ export const COMMANDS: CommandMeta[] = [
     id: "commandPalette",
     label: "Command palette",
     description: "Open the fuzzy command palette",
+    category: "App",
+  },
+  {
+    id: "toggleCaptainOverlay",
+    label: "Toggle captain overlay",
+    description:
+      "Summon the pinned captain terminal in a floating panel over any workspace",
+    category: "App",
+  },
+  {
+    id: "pinCaptainFocused",
+    label: "Pin as captain",
+    description:
+      "Pin (or unpin) the focused tile as the captain the overlay summons",
     category: "App",
   },
 ];
