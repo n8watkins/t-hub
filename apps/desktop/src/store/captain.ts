@@ -203,8 +203,10 @@ export interface CaptainState {
    *  palette entry): it becomes active (MRU front), the overlay opens if
    *  closed, and keyboard focus moves to it. No-op if unpinned or tile-less. */
   summonCaptain: (id: TerminalId) => void;
-  /** Open the overlay on the first pinned captain (MRU order) that still has a
-   *  live tile; no-op when none qualifies. */
+  /** Open the overlay CONTEXT-AWARE (phase 2): the captain whose registry claim
+   *  OWNS the active workspace tab wins (MRU order among multiple owners), then
+   *  the MRU fallback - the first pinned captain with a live tile. Summoning
+   *  from an unclaimed tab is therefore plain MRU. No-op when none qualifies. */
   openOverlay: () => void;
   /** Close the overlay and restore focus to the previously focused tile. */
   closeOverlay: () => void;
@@ -331,16 +333,28 @@ export const useCaptain = create<CaptainState>((set, get) => {
     },
 
     openOverlay: () => {
-      const { captainIds, open, summonCaptain, setAnchorMenu } = get();
+      const { captainIds, claims, open, summonCaptain, setAnchorMenu } = get();
       // Defensive mirror of summonCaptain's dropdown retire: even a no-op
       // open (no live pin) must not strand the backdrop.
       setAnchorMenu(false);
       if (open) return;
-      // Summon the first captain (MRU order) whose tile is still live. A pin
-      // whose tab popped out to a satellite is skipped, not dropped - it can be
-      // summoned again when the tab returns. No live pin: nothing to summon
-      // (the titlebar anchor tooltip explains how to pin one).
-      const target = captainIds.find((id) => terminalHasTile(id));
+      // Context-aware summon (phase 2): a chord pressed ON a claimed workspace
+      // summons the captain OWNING that workspace (per the server registry's
+      // workspaceTabIds), MRU order breaking a tie between multiple owners.
+      // An unclaimed tab (or an owner whose tile is gone) falls back to plain
+      // MRU: the first captain whose tile is still live. A pin whose tab
+      // popped out to a satellite is skipped, not dropped - it can be summoned
+      // again when the tab returns. No live pin: nothing to summon (the
+      // titlebar anchor tooltip explains how to pin one).
+      const activeTabId = useWorkspace.getState().activeTabId;
+      const owner = activeTabId
+        ? captainIds.find(
+            (id) =>
+              terminalHasTile(id) &&
+              (claims[id]?.workspaceTabIds.includes(activeTabId) ?? false),
+          )
+        : undefined;
+      const target = owner ?? captainIds.find((id) => terminalHasTile(id));
       if (target) summonCaptain(target);
     },
 

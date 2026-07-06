@@ -487,6 +487,49 @@ describe("phase 2: pinning is claiming (server captains registry)", () => {
     expect(localStorage.getItem("t-hub.captain.v2")).toBeNull();
   });
 
+  it("Ctrl+B C summons the captain OWNING the active workspace tab first", () => {
+    // MRU order says cap00001, but the active tab (t2) is claimed by ddd00001.
+    seedCaptains(["cap00001", "ddd00001"]);
+    useCaptain.getState().adoptCaptainsRegistry([
+      claim("cap00001", ["t1"]),
+      claim("ddd00001", ["t2"]),
+    ]);
+    useCaptain.getState().toggleOverlay();
+    expect(useCaptain.getState().open).toBe(true);
+    expect(useCaptain.getState().activeCaptainId).toBe("ddd00001");
+    expect(useCaptain.getState().captainIds).toEqual(["ddd00001", "cap00001"]);
+  });
+
+  it("summoning from an UNCLAIMED tab falls back to MRU", () => {
+    seedCaptains(["cap00001", "ddd00001"]);
+    useCaptain.getState().adoptCaptainsRegistry([
+      claim("cap00001", ["t1"]),
+      claim("ddd00001", []), // nobody claims the active tab t2
+    ]);
+    useCaptain.getState().toggleOverlay();
+    expect(useCaptain.getState().activeCaptainId).toBe("cap00001");
+  });
+
+  it("MRU breaks a tie between multiple owners of the active tab", () => {
+    seedCaptains(["ddd00001", "cap00001"]);
+    useCaptain.getState().adoptCaptainsRegistry([
+      claim("cap00001", ["t2"]),
+      claim("ddd00001", ["t2"]),
+    ]);
+    useCaptain.getState().toggleOverlay();
+    expect(useCaptain.getState().activeCaptainId).toBe("ddd00001");
+  });
+
+  it("an owner whose tile is gone yields to the MRU fallback", () => {
+    seedCaptains(["gone0001", "cap00001"]);
+    useCaptain.getState().adoptCaptainsRegistry([
+      claim("gone0001", ["t2"]), // owns the active tab but has no live tile
+      claim("cap00001", ["t1"]),
+    ]);
+    useCaptain.getState().toggleOverlay();
+    expect(useCaptain.getState().activeCaptainId).toBe("cap00001");
+  });
+
   it("an EMPTY snapshot clears every designation and the anchor dropdown", () => {
     useCaptain.getState().setAnchorMenu(true);
     useCaptain.getState().adoptCaptainsRegistry([]);
