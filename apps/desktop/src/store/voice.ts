@@ -51,28 +51,64 @@ interface VoiceState extends VoiceSettings {
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
+/** Fields THIS store instance changed since the last successful load/persist.
+ *  Persist is read-MERGE-write over this set: dirty fields carry the store's
+ *  value, everything else re-adopts the FILE's current value - so an external
+ *  edit (a captain script flipping `enabled` off) survives an unrelated
+ *  slider drag instead of being resurrected from stale store state. */
+let dirtyFields = new Set<keyof VoiceSettings>();
+
 export const useVoice = create<VoiceState>((set, get) => {
-  /** Write the five persisted fields to voice.json now. Read-modify-write on
-   *  the Rust side, so unknown keys survive. */
-  const persistNow = () => {
+  /** Flush to voice.json now: re-read the file, merge (dirty fields win from
+   *  the store, the rest from the file), adopt the merged view into the live
+   *  store, write it back. The Rust side additionally preserves unknown keys. */
+  const persistNow = async () => {
     persistTimer = null;
+    const dirtyNow = new Set(dirtyFields);
+    let fileSettings: VoiceSettings | null = null;
+    try {
+      fileSettings = (await readVoiceSettings()) ?? null;
+    } catch {
+      // Unreadable/no backend: fall back to writing the store's view wholesale.
+    }
     const s = get();
-    void writeVoiceSettings({
+    const owned: VoiceSettings = {
       enabled: s.enabled,
       voice: s.voice,
       volume: s.volume,
       sapiRate: s.sapiRate,
       announceOnAttention: s.announceOnAttention,
-    }).catch(() => {
+    };
+    const merged: VoiceSettings = fileSettings
+      ? {
+          enabled: dirtyNow.has("enabled") ? owned.enabled : fileSettings.enabled,
+          voice: dirtyNow.has("voice") ? owned.voice : fileSettings.voice,
+          volume: dirtyNow.has("volume") ? owned.volume : fileSettings.volume,
+          sapiRate: dirtyNow.has("sapiRate")
+            ? owned.sapiRate
+            : fileSettings.sapiRate,
+          announceOnAttention: dirtyNow.has("announceOnAttention")
+            ? owned.announceOnAttention
+            : fileSettings.announceOnAttention,
+        }
+      : owned;
+    // Surface externally-changed (non-dirty) values in the UI immediately.
+    if (fileSettings) set(merged);
+    try {
+      await writeVoiceSettings(merged);
+      // Only the fields THIS flush covered come clean - a setter that fired
+      // mid-flight re-dirtied its field and scheduled another persist.
+      for (const f of dirtyNow) dirtyFields.delete(f);
+    } catch {
       // Best-effort: outside Tauri (plain `pnpm dev`) there is no backend;
-      // the in-memory state still drives the session.
-    });
+      // the fields stay dirty so a later flush retries them.
+    }
   };
 
   /** Debounced flush (a slider drag becomes one write, not dozens). */
   const schedulePersist = () => {
     if (persistTimer) clearTimeout(persistTimer);
-    persistTimer = setTimeout(persistNow, VOICE_PERSIST_DEBOUNCE_MS);
+    persistTimer = setTimeout(() => void persistNow(), VOICE_PERSIST_DEBOUNCE_MS);
   };
 
   // A change made within the debounce window of closing the window must not
@@ -83,7 +119,7 @@ export const useVoice = create<VoiceState>((set, get) => {
     window.addEventListener("pagehide", () => {
       if (persistTimer) {
         clearTimeout(persistTimer);
-        persistNow();
+        void persistNow();
       }
     });
   }
@@ -95,9 +131,14 @@ export const useVoice = create<VoiceState>((set, get) => {
     voicesUnavailable: false,
 
     load: async () => {
+      // Unflushed local intent (a pending debounce or an unpersisted dirty
+      // field) must not be clobbered by stale file values - the imminent
+      // merge-persist re-reads the file itself, so skipping here loses nothing.
+      if (persistTimer !== null || dirtyFields.size > 0) return;
       try {
         const s = await readVoiceSettings();
         set({ ...s, loaded: true });
+        dirtyFields.clear();
       } catch {
         set({ ...DEFAULT_VOICE_SETTINGS, loaded: true });
       }
@@ -114,19 +155,31 @@ export const useVoice = create<VoiceState>((set, get) => {
 
     setEnabled: (v) => {
       set({ enabled: v });
+      dirtyFields.add("enabled");
       schedulePersist();
     },
     setVoice: (v) => {
       set({ voice: v });
+      dirtyFields.add("voice");
       schedulePersist();
     },
     setVolume: (v) => {
       set({ volume: Math.max(0, Math.min(1, v)) });
+      dirtyFields.add("volume");
       schedulePersist();
     },
     setAnnounceOnAttention: (v) => {
       set({ announceOnAttention: v });
+      dirtyFields.add("announceOnAttention");
       schedulePersist();
     },
   };
 });
+
+/** Test-only: clear the module-level persist machinery (pending timer + dirty
+ *  set) so cases can't leak debounced writes into each other. */
+export function _resetVoicePersistForTest(): void {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = null;
+  dirtyFields = new Set();
+}

@@ -16,7 +16,24 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Cap on the /tts `text` from the webview: announcements are one short
+/// phrase ("<label> needs your attention" / the test phrase), so anything
+/// beyond a few KB is a bug or abuse, not a request to honor.
+const MAX_TTS_TEXT_BYTES: usize = 4096;
+
+/// Cap on the /tts response body. Piper WAVs for a short phrase run
+/// ~100-400 KB; a response past this is a misbehaving server, and truncating
+/// silently would hand the webview a corrupt WAV - error instead.
+const MAX_TTS_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A loopback-only agent: no redirect following (a local TTS server has no
+/// business redirecting, and following one could leak the request elsewhere).
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().redirects(0).build()
+}
 
 /// The Piper TTS server base URL; `T_HUB_TTS_URL` overrides for tests/E2E.
 fn tts_base_url() -> String {
@@ -124,7 +141,15 @@ fn write_settings(settings: &VoiceSettings) -> Result<(), String> {
     // Atomic replace (temp + rename): external tooling polls this file, and a
     // plain in-place write could hand it a truncated read mid-write. std's
     // rename replaces the destination on Windows too (MOVEFILE_REPLACE_EXISTING).
-    let tmp = path.with_extension("json.tmp");
+    // The temp name carries pid + a process-wide counter so two concurrent
+    // writers (or two app instances) can never interleave on the same temp
+    // file - each renames its own complete body; last rename wins whole.
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
     std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
@@ -163,7 +188,8 @@ fn voice_entry_name(v: &serde_json::Value) -> Option<String> {
 /// "voice server unavailable" degradation state.
 fn fetch_voices() -> Result<Vec<String>, String> {
     let url = format!("{}/voices", tts_base_url());
-    let body = ureq::get(&url)
+    let body = agent()
+        .get(&url)
         .timeout(Duration::from_secs(3))
         .call()
         .map_err(|e| format!("voices request failed: {e}"))?
@@ -189,20 +215,32 @@ pub async fn voice_list_voices() -> Result<Vec<String>, String> {
 /// webview plays them via an Audio data URI - it must not fetch the server
 /// itself, see the module header).
 fn synthesize(text: &str, voice: &str) -> Result<String, String> {
+    if text.len() > MAX_TTS_TEXT_BYTES {
+        return Err(format!(
+            "tts text too long: {} bytes (max {MAX_TTS_TEXT_BYTES})",
+            text.len(),
+        ));
+    }
     let url = format!("{}/tts", tts_base_url());
     let body = serde_json::json!({ "text": text, "voice": voice }).to_string();
-    let resp = ureq::post(&url)
+    let resp = agent()
+        .post(&url)
         .timeout(Duration::from_secs(10))
         .set("Content-Type", "application/json")
         .send_string(&body)
         .map_err(|e| format!("tts request failed: {e}"))?;
     let mut wav = Vec::new();
+    // Read one byte past the cap so an oversized response is DETECTED and
+    // rejected rather than silently truncated into a corrupt WAV.
     resp.into_reader()
-        // Piper WAVs for a short phrase are ~100-400 KB; 16 MB is a generous
-        // ceiling that still stops a runaway response from ballooning memory.
-        .take(16 * 1024 * 1024)
+        .take(MAX_TTS_RESPONSE_BYTES + 1)
         .read_to_end(&mut wav)
         .map_err(|e| format!("tts response read failed: {e}"))?;
+    if wav.len() as u64 > MAX_TTS_RESPONSE_BYTES {
+        return Err(format!(
+            "tts response exceeds {MAX_TTS_RESPONSE_BYTES} bytes",
+        ));
+    }
     Ok(STANDARD.encode(wav))
 }
 

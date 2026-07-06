@@ -1,8 +1,15 @@
 // Announce-on-attention gating tests: OFF by default (opt-in), never speaks
 // while the master enable is off, speaks exactly once per transition INTO a
 // needs-input state, a needs-input-to-needs-input flip stays quiet, bursts
-// debounce to one cue per window, and transitions that happened while the
-// feature was off never replay when it turns on.
+// debounce to one cue per window (charged only on synthesis SUCCESS), the
+// startup warmup swallows the journal-replay burst while seeding the
+// baseline, and transitions that happened while the feature was off never
+// replay when it turns on.
+//
+// Outside warmup, a session APPEARING already-blocked (undefined ->
+// needs-input) is a real transition - a crew spawned mid-flight that
+// immediately hit a permission prompt should speak. The startup case where
+// that same shape is a stale replay is exactly what the warmup window covers.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
 vi.mock("../ipc/voice", () => ({
@@ -159,4 +166,26 @@ describe("announce gating", () => {
     await flush();
     expect(synthesizeVoice).not.toHaveBeenCalled();
   });
+
+  it("a FAILED synthesis does not eat the debounce window", async () => {
+    vi.mocked(synthesizeVoice).mockRejectedValueOnce(new Error("server down"));
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
+    expect(synthesizeVoice).toHaveBeenCalledTimes(1);
+    expect(playWavBase64).not.toHaveBeenCalled();
+    // Well inside the 5s window: because the failure never charged
+    // lastSpokenAt, the next transition still speaks.
+    handleStatusesChange(statuses({ "sess-1": "working" }), 500);
+    handleStatusesChange(statuses({ "sess-1": "needsQuestion" }), 1000);
+    await flush();
+    expect(synthesizeVoice).toHaveBeenCalledTimes(2);
+    expect(playWavBase64).toHaveBeenCalledTimes(1);
+  });
 });
+
+// The startup-warmup (journal replay) coverage lives in its own file,
+// voiceAnnounce.warmup.test.ts: the warmup window latches OFF the first time
+// inWarmup() runs before start() (deadline 0), so a test that starts warmup
+// cannot share a module instance with these gating tests, which exercise the
+// post-warmup path first. Production is safe by construction - mount starts
+// warmup before the store subscription that feeds handleStatusesChange exists.

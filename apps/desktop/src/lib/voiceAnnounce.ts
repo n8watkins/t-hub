@@ -17,10 +17,25 @@ import { useVoice } from "../store/voice";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import { synthesizeVoice } from "../ipc/voice";
 import { playWavBase64 } from "./voiceAudio";
+import { createWarmup } from "./warmup";
 import type { SessionStatus } from "../ipc/model";
 
 /** Minimum gap between spoken announcements (the burst debounce). */
 export const ANNOUNCE_MIN_GAP_MS = 5000;
+
+// Startup warmup - swallow the journal-replay burst. On the first connect the
+// agent replays every existing session's last status, so a session that was
+// ALREADY blocked before launch re-emits needsPermission/needsQuestion; those
+// are not new transitions and must not speak (they would, twice, if the
+// replay spanned the debounce window). Same machinery + tuning as
+// lib/notify.ts: during warmup the transitions are RECORDED (prevStatuses
+// seeds) but never spoken.
+const WARMUP_INITIAL_MS = 6000;
+const WARMUP_GRACE_MS = 1500;
+const warmup = createWarmup({
+  initialMs: WARMUP_INITIAL_MS,
+  graceMs: WARMUP_GRACE_MS,
+});
 
 const NEEDS_INPUT: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
   "needsQuestion",
@@ -29,6 +44,9 @@ const NEEDS_INPUT: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
 
 let prevStatuses: Record<string, SessionStatus> = {};
 let lastSpokenAt = Number.NEGATIVE_INFINITY;
+/** One synthesis in flight at a time (keeps the burst gate closed while the
+ *  request runs WITHOUT charging the debounce window before success). */
+let speaking = false;
 let mounted = false;
 
 /** The human label for a session, via the statusline's tmux index (the same
@@ -69,6 +87,10 @@ export function handleStatusesChange(
   prevStatuses = statuses;
   if (statuses === prev) return; // same snapshot object: nothing changed
 
+  // Startup replay window: the baseline above is seeded, but nothing speaks.
+  // (inWarmup() also re-arms the grace timer, so a slow replay stays covered.)
+  if (warmup.inWarmup()) return;
+
   // Sessions that ENTERED a needs-input state this snapshot (a flip between
   // the two needs-input states is not an entry - the user is already alerted).
   const entered = Object.entries(statuses).filter(([sid, st]) => {
@@ -84,14 +106,23 @@ export function handleStatusesChange(
   if (!voice.enabled || !voice.announceOnAttention) return;
 
   // Burst debounce: one spoken cue per window, however many sessions flipped.
-  if (now - lastSpokenAt < ANNOUNCE_MIN_GAP_MS) return;
-  lastSpokenAt = now;
+  // The in-flight flag holds the gate while a request runs; lastSpokenAt is
+  // charged only on SUCCESS, so a failed synthesis does not eat the window.
+  if (speaking || now - lastSpokenAt < ANNOUNCE_MIN_GAP_MS) return;
+  speaking = true;
 
   const label = labelForSession(entered[0][0]) ?? "A session";
   void synthesizeVoice(`${label} needs your attention`, voice.voice)
-    .then((b64) => playWavBase64(b64, useVoice.getState().volume))
+    .then((b64) => {
+      lastSpokenAt = now;
+      playWavBase64(b64, useVoice.getState().volume);
+    })
     .catch(() => {
-      // TTS server down / no backend: the visual attention cues still stand.
+      // TTS server down / no backend: the visual attention cues still stand,
+      // and the debounce window stays open for the next transition.
+    })
+    .finally(() => {
+      speaking = false;
     });
 }
 
@@ -101,6 +132,7 @@ export function handleStatusesChange(
 export function mountVoiceAnnounce(): void {
   if (mounted) return;
   mounted = true;
+  warmup.start();
   prevStatuses = useSupervision.getState().statuses;
   useSupervision.subscribe((s) => handleStatusesChange(s.statuses));
 }
@@ -109,4 +141,12 @@ export function mountVoiceAnnounce(): void {
 export function _resetVoiceAnnounceForTest(): void {
   prevStatuses = {};
   lastSpokenAt = Number.NEGATIVE_INFINITY;
+  speaking = false;
+}
+
+/** Test-only: start the startup warmup window (production starts it in
+ *  mountVoiceAnnounce; tests must not mount, which would leave a live store
+ *  subscription behind). */
+export function _startVoiceAnnounceWarmupForTest(): void {
+  warmup.start();
 }

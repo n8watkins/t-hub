@@ -1,7 +1,8 @@
 // Voice store tests (Settings > Voice): the persistence round-trip through
 // the (mocked) Tauri command seam - voice.json is the source of truth, no
-// localStorage - plus the debounced write coalescing and the /voices
-// degradation flags the Settings section renders from.
+// localStorage - the debounced READ-MERGE-WRITE (external edits to fields the
+// UI did not touch survive a persist), the load-vs-pending-persist guard, and
+// the /voices degradation flags the Settings section renders from.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../ipc/voice", () => ({
@@ -21,6 +22,7 @@ import {
   useVoice,
   DEFAULT_VOICE_SETTINGS,
   VOICE_PERSIST_DEBOUNCE_MS,
+  _resetVoicePersistForTest,
 } from "./voice";
 
 const FILE_SETTINGS: VoiceSettings = {
@@ -31,11 +33,19 @@ const FILE_SETTINGS: VoiceSettings = {
   announceOnAttention: true,
 };
 
+/** Advance past the debounce and flush the async read-merge-write chain. */
+async function flushPersist(): Promise<void> {
+  await vi.advanceTimersByTimeAsync(VOICE_PERSIST_DEBOUNCE_MS);
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.mocked(readVoiceSettings).mockReset();
   vi.mocked(writeVoiceSettings).mockClear();
   vi.mocked(listVoices).mockReset();
+  _resetVoicePersistForTest();
   useVoice.setState({
     ...DEFAULT_VOICE_SETTINGS,
     loaded: false,
@@ -44,9 +54,9 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   // Flush any pending debounced write so it can't leak into the next case.
-  vi.runAllTimers();
+  await vi.runAllTimersAsync();
   vi.useRealTimers();
 });
 
@@ -78,7 +88,7 @@ describe("voice settings round-trip", () => {
 
     useVoice.getState().setVolume(0.3);
     expect(writeVoiceSettings).not.toHaveBeenCalled(); // debounced
-    vi.advanceTimersByTime(VOICE_PERSIST_DEBOUNCE_MS);
+    await flushPersist();
     expect(writeVoiceSettings).toHaveBeenCalledTimes(1);
     expect(writeVoiceSettings).toHaveBeenCalledWith({
       enabled: true,
@@ -89,12 +99,12 @@ describe("voice settings round-trip", () => {
     });
   });
 
-  it("a burst of setter calls coalesces into ONE debounced write", () => {
+  it("a burst of setter calls coalesces into ONE debounced write", async () => {
     useVoice.getState().setVolume(0.1);
     useVoice.getState().setVolume(0.2);
     useVoice.getState().setEnabled(true);
     useVoice.getState().setVoice("x.onnx");
-    vi.advanceTimersByTime(VOICE_PERSIST_DEBOUNCE_MS);
+    await flushPersist();
     expect(writeVoiceSettings).toHaveBeenCalledTimes(1);
     expect(writeVoiceSettings).toHaveBeenCalledWith(
       expect.objectContaining({ enabled: true, voice: "x.onnx", volume: 0.2 }),
@@ -106,6 +116,47 @@ describe("voice settings round-trip", () => {
     expect(useVoice.getState().volume).toBe(1);
     useVoice.getState().setVolume(-1);
     expect(useVoice.getState().volume).toBe(0);
+  });
+});
+
+describe("external edits (shared file)", () => {
+  it("persist is read-MERGE-write: an external flip of a non-dirty field survives", async () => {
+    vi.mocked(readVoiceSettings).mockResolvedValue(FILE_SETTINGS);
+    await useVoice.getState().load();
+    expect(useVoice.getState().enabled).toBe(true);
+
+    // A captain script flips enabled OFF in the file behind our back...
+    vi.mocked(readVoiceSettings).mockResolvedValue({
+      ...FILE_SETTINGS,
+      enabled: false,
+    });
+    // ...then the user drags the volume slider (only `volume` is dirty).
+    useVoice.getState().setVolume(0.3);
+    await flushPersist();
+
+    // The write must carry the FILE's enabled:false, not resurrect our stale
+    // true - and the live store adopts the external value too.
+    expect(writeVoiceSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ enabled: false, volume: 0.3 }),
+    );
+    expect(useVoice.getState().enabled).toBe(false);
+    expect(useVoice.getState().volume).toBe(0.3);
+  });
+
+  it("load() is skipped while a persist is pending (no stale clobber)", async () => {
+    vi.mocked(readVoiceSettings).mockResolvedValue(FILE_SETTINGS);
+    await useVoice.getState().load();
+
+    useVoice.getState().setVolume(0.9);
+    // Settings re-mount triggers a load within the debounce window: it must
+    // NOT overwrite the un-persisted 0.9 with the file's 0.55.
+    await useVoice.getState().load();
+    expect(useVoice.getState().volume).toBe(0.9);
+
+    await flushPersist();
+    expect(writeVoiceSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ volume: 0.9 }),
+    );
   });
 });
 
