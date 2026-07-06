@@ -29,6 +29,7 @@ mod theme; // live theming contract: get_theme/set_theme + theme://changed (MCP-
 mod tray; // system-tray icon + close-to-tray (hide instead of quit) (#17)
 mod usage; // Claude plan usage via `claude -p /usage` (sidebar Usage strip)
 mod codex; // Codex plan usage, read from ~/.codex/sessions rollout files (sidebar)
+mod voice; // Settings > Voice: voice.json persistence + loopback Piper TTS proxy (no browser Origin)
 mod win_snap; // Windows 11 Snap Layouts + native edge-resize on the frameless window (no-op on unix)
 
 use agent::AgentBridge;
@@ -584,6 +585,13 @@ pub fn run() {
             // exactly over the visible button — what makes Win11 show the Snap
             // Layouts flyout on hover. No-op effect on unix (stored but unread).
             win_snap::set_maximize_button_rect,
+            // Settings > Voice: voice.json read/write (shared with external
+            // captain tooling) + the loopback TTS proxy (the server rejects
+            // browser-Origin requests, so the webview never fetches it).
+            voice::voice_settings_read,
+            voice::voice_settings_write,
+            voice::voice_list_voices,
+            voice::voice_tts,
         ])
         .run(tauri::generate_context!())
         .expect("error while running T-Hub");
