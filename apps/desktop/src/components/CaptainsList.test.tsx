@@ -146,13 +146,18 @@ describe("CaptainsList summon wiring", () => {
 });
 
 describe("CaptainsList attention roll-up", () => {
-  it("pulses on needsPermission and needsQuestion", () => {
+  it("pulses on needsPermission and needsQuestion (with an aria status)", () => {
     render(<CaptainsList />);
     expect(row("cap00001").querySelector("[data-attention]")).toBeNull();
     setStatus("needsPermission");
     expect(row("cap00001").querySelector("[data-attention]")).toBeTruthy();
+    // The pulse is not color-only: a role="status" sibling announces it.
+    expect(
+      within(row("cap00001")).getByRole("status").textContent,
+    ).toContain("needs attention");
     setStatus("needsQuestion");
     expect(row("cap00001").querySelector("[data-attention]")).toBeTruthy();
+    expect(within(row("cap00001")).getByRole("status")).toBeTruthy();
   });
 
   it("does not pulse for working, and the rate-limit overlay warms the meter instead", () => {

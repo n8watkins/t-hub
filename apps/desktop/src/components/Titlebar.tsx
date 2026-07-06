@@ -23,7 +23,11 @@ import { Anchor } from "lucide-react";
 import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
 import { useCaptain } from "../store/captain";
-import { CaptainStatusDot, useCaptainDisplayLabel } from "./CaptainOverlay";
+import {
+  CaptainStatusDot,
+  useCaptainDisplayLabel,
+  useWorkspaceNameForTerminal,
+} from "./CaptainOverlay";
 import { useWindowMaximized } from "../lib/windowMaximized";
 import { closeSatellite, readSatelliteTab } from "../lib/windows";
 import { useAppName, useAppVersion } from "../lib/appName";
@@ -393,10 +397,9 @@ function CaptainDropdownRow({
   // is gone (tab popped out to a satellite) summons as a store-level no-op,
   // so it must READ unavailable instead of silently doing nothing. The tab
   // NAME doubles as the row's second line (captain-sidebar PRD: dropdown
-  // polish - taller rows + workspace context).
-  const workspaceName = useWorkspace(
-    (s) => s.tabs.find((t) => t.order.includes(terminalId))?.name,
-  );
+  // polish - taller rows + workspace context); the lookup is the shared hook
+  // so this row and the sidebar captain rows cannot drift.
+  const workspaceName = useWorkspaceNameForTerminal(terminalId);
   const hasTile = workspaceName != null;
   return (
     <button

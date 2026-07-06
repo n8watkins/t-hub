@@ -35,7 +35,7 @@ vi.mock("./TerminalPool", () => ({
   requestPoolSync: () => {},
 }));
 
-import { Sidebar, RECENT_BODY_MAX_PX } from "./Sidebar";
+import { Sidebar, RECENT_BODY_MAX_PX, RECENT_ROW_APPROX_PX } from "./Sidebar";
 import { useCaptain } from "../store/captain";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import type { TerminalInfo } from "../ipc/types";
@@ -90,6 +90,16 @@ describe("Sidebar captains section", () => {
 });
 
 describe("Sidebar recent cap", () => {
+  it("fits about THREE two-line rows (not fewer, not four)", () => {
+    // jsdom has no layout engine, so visible-row-count is asserted as
+    // arithmetic against the exported per-row height the cap is derived
+    // from: three full rows fit, a fourth cannot. RecentList rows are
+    // TWO-line (13px title + 11px subtitle + py-1.5), which is what sank
+    // the first 104px cap (it assumed one-line rows and showed ~2).
+    expect(RECENT_BODY_MAX_PX).toBeGreaterThanOrEqual(3 * RECENT_ROW_APPROX_PX);
+    expect(RECENT_BODY_MAX_PX).toBeLessThan(4 * RECENT_ROW_APPROX_PX);
+  });
+
   it(`caps the Recent body at ${RECENT_BODY_MAX_PX}px with internal scroll`, () => {
     const { container } = render(<Sidebar mode="full" />);
     const capped = [...container.querySelectorAll<HTMLElement>("div")].find(

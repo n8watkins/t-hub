@@ -28,7 +28,7 @@ import {
   CAPTAIN_MIN_WIDTH,
   CAPTAIN_MIN_HEIGHT,
 } from "../store/captain";
-import { useWorkspace, deriveLabel } from "../store/workspace";
+import { useWorkspace, deriveLabel, tabIdForTerminal } from "../store/workspace";
 import { useSupervision, sessionStatusForTmux } from "../store/supervision";
 import { sessionNameForTerminal } from "../store/sessionContext";
 import { useActivity } from "../store/activity";
@@ -70,6 +70,22 @@ export function useCaptainDisplayLabel(terminalId: string): string {
     label: userLabel,
     title: info?.title,
     cwd: info?.cwd,
+  });
+}
+
+/** The NAME of the workspace tab holding `terminalId`'s tile, or undefined
+ *  when the tile is gone (tab popped out to a satellite / terminal killed) -
+ *  undefined doubles as the liveness affordance (dim + "tile not available").
+ *  Shared by the titlebar dropdown rows and the sidebar captain rows so the
+ *  workspace-context lookup cannot drift between the two surfaces. Built on
+ *  tabIdForTerminal (memoized O(1) per tile) rather than a per-row scan. */
+export function useWorkspaceNameForTerminal(
+  terminalId: string,
+): string | undefined {
+  return useWorkspace((s) => {
+    const tabId = tabIdForTerminal(s, terminalId);
+    if (tabId === undefined) return undefined;
+    return s.tabs.find((t) => t.id === tabId)?.name;
   });
 }
 

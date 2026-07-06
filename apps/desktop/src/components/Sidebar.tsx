@@ -69,11 +69,18 @@ export type SidebarMode = "full" | "rail" | "hidden";
 /** Pixel width of the rail strip (kept in sync with App's RAIL width). */
 export const SIDEBAR_RAIL_WIDTH = 48;
 
-/** Max height of the RECENT section body: about 3 rows (a row is ~30px:
- *  py-1.5 + the xs line) plus the list's own padding, per the captain-sidebar
- *  PRD - a short scrollable tail instead of the old 38vh wall, freeing the
- *  vertical space the Captains section moves into. Exported for the test. */
-export const RECENT_BODY_MAX_PX = 104;
+/** Approximate height of ONE RecentList row. The rows are TWO-line
+ *  (ProjectRow: a 13px title line over an 11px subtitle, ~36px of text at the
+ *  inherited 1.5 leading) plus py-1.5 (12px) - about 47px each. Exported so
+ *  the layout test can tie the cap to the row height instead of a bare
+ *  constant. */
+export const RECENT_ROW_APPROX_PX = 47;
+
+/** Max height of the RECENT section body: THREE full two-line rows plus the
+ *  list's own chrome (2 gap-0.5 seams between rows + the container's py-1),
+ *  per the captain-sidebar PRD - a short scrollable tail instead of the old
+ *  38vh wall, freeing the vertical space the Captains section moves into. */
+export const RECENT_BODY_MAX_PX = 3 * RECENT_ROW_APPROX_PX + 2 * 2 + 8;
 
 export interface SidebarProps {
   /** RECALL a past Claude session: spawn `claude --resume <id>` in `cwd`, add the

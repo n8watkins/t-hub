@@ -34,7 +34,8 @@ One row per pinned captain, MRU order matching the store, with:
 - Workspace: the tab the captain's tile lives in (already derivable - the liveness check does this lookup today); dimmed "tile not available" when the tab is popped out, same affordance as the dropdown rows.
 - Crew summary: "3 running - 1 done", plus an amber outstanding-tasks badge when `outstandingTasks > 0`.
   Sourced from the supervision tree for the captain's session (see data notes for what "crew" means before and after phase 2).
-- Attention roll-up: if the captain's session or any of its children is in needs-permission or needs-question, the row pulses amber even when the general is on another workspace tab.
+- Attention roll-up: the row pulses amber while the captain's own session is in needs-permission or needs-question, even when the general is on another workspace tab.
+  Slice A scope note: subagent children cannot express needs-input today (SubagentNode carries only running/completed), so the roll-up covers the captain session's own status; child and crew attention states join the roll-up in slice B once the registry links crew sessions.
   This is the single highest-value cue a persistent surface adds over the dropdown, and it is the webview port of the T24-style supervision cues phase 3 already promises.
 - Context meter: a thin bar fed by the per-session `StatusSnapshot` (context percent, rate-limit state); rate-limited renders amber.
 - Interactions: click a row = `summonCaptain` (same path as the dropdown, MRU front + focus); a chevron on the row expands the existing `SupervisionTree` component inline underneath (it already renders the orchestrator header plus per-subagent child rows - it just is not mounted anywhere near the captain list today).
@@ -78,7 +79,7 @@ Trivial change; it frees the vertical space the CAPTAINS section moves into and 
 Slice A - UI-only (no server changes, can ship before phase 2 starts):
 
 - RECENT capped to about 3 rows.
-- CAPTAINS sidebar section with everything derivable today: status dot, name, workspace, subagent-based activity summary plus outstanding-tasks badge, attention roll-up from the captain session and its subagent children, context meter, inline SupervisionTree expansion, click to summon.
+- CAPTAINS sidebar section with everything derivable today: status dot, name, workspace, subagent-based activity summary plus outstanding-tasks badge, attention roll-up from the captain session's own needs-permission and needs-question statuses (subagent nodes cannot express needs-input yet - child and crew attention arrive in slice B), context meter, inline SupervisionTree expansion, click to summon.
 - Label the summary honestly at this stage (subagent activity, not crew) so the UI never claims data it does not have.
 - Dropdown polish: taller rows, workspace second line.
 - Tests: section render from seeded stores, summon wiring, attention roll-up precedence, RECENT cap.

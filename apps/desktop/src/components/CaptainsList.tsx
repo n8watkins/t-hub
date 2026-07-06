@@ -20,14 +20,17 @@
 // roll-up in slice B when the registry links them.
 import { useState } from "react";
 import { useCaptain } from "../store/captain";
-import { useWorkspace } from "../store/workspace";
 import {
   useSupervision,
   sessionStatusForTmux,
   isRateLimited,
 } from "../store/supervision";
 import { sessionNameForTerminal } from "../store/sessionContext";
-import { CaptainStatusDot, useCaptainDisplayLabel } from "./CaptainOverlay";
+import {
+  CaptainStatusDot,
+  useCaptainDisplayLabel,
+  useWorkspaceNameForTerminal,
+} from "./CaptainOverlay";
 import { SupervisionTreeView } from "./SupervisionTree";
 import { ContextMeter } from "./ContextMeter";
 import { ChevronIcon } from "./SidebarChrome";
@@ -61,11 +64,9 @@ function CaptainRow({
 
   const label = useCaptainDisplayLabel(terminalId);
   // The tab the captain's tile lives in; undefined = popped out / gone, the
-  // same liveness lookup the overlay + dropdown use (summon is then a
-  // store-level no-op, so the row must READ unavailable).
-  const workspaceName = useWorkspace(
-    (s) => s.tabs.find((t) => t.order.includes(terminalId))?.name,
-  );
+  // same liveness lookup the dropdown rows use (shared hook, cannot drift).
+  // Summon is then a store-level no-op, so the row must READ unavailable.
+  const workspaceName = useWorkspaceNameForTerminal(terminalId);
   const hasTile = workspaceName != null;
 
   // Resolve the bound agent session via the statusline's tmux index, then the
@@ -97,15 +98,22 @@ function CaptainRow({
         data-attention={attention || undefined}
       >
         {/* Amber attention pulse behind the row content (Tailwind animate-pulse
-            on a tint layer - the dot's own halo pulse stays the fine signal). */}
+            on a tint layer - the dot's own halo pulse stays the fine signal).
+            The visual tint is aria-hidden; the sr-only role="status" sibling
+            carries the same signal to assistive tech (announced on change). */}
         {attention && (
-          <span
-            className="pointer-events-none absolute inset-0 animate-pulse rounded-lg"
-            style={{
-              backgroundColor: "color-mix(in srgb, #f59e0b 12%, transparent)",
-            }}
-            aria-hidden
-          />
+          <>
+            <span
+              className="pointer-events-none absolute inset-0 animate-pulse rounded-lg"
+              style={{
+                backgroundColor: "color-mix(in srgb, #f59e0b 12%, transparent)",
+              }}
+              aria-hidden
+            />
+            <span role="status" className="sr-only">
+              Captain {label} needs attention
+            </span>
+          </>
         )}
 
         {/* Expand: the existing supervision tree, inline under the row. */}
@@ -178,6 +186,11 @@ function CaptainRow({
               {tasks} task{tasks === 1 ? "" : "s"}
             </span>
           )}
+          {/* Accepted edge: a rate-limited snapshot WITHOUT contextUsedPct
+              renders no meter at all (ContextMeter's null contract), so the
+              amber meter cue is absent there - the status dot still carries
+              the rateLimited overlay (attention amber), so the state is never
+              silent. */}
           <ContextMeter
             usedPct={snap?.contextUsedPct ?? null}
             warn={isRateLimited(snap)}
