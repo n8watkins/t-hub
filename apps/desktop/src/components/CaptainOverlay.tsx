@@ -134,19 +134,11 @@ function CaptainPanel({ captainId }: { captainId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Esc closes and restores focus. Capture phase on window so it wins over the
-  // focused xterm (xterm handles keys in the target phase); preventDefault so
-  // the Esc never ALSO reaches the captain's terminal as an interrupt.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.preventDefault();
-      e.stopPropagation();
-      useCaptain.getState().closeOverlay();
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, []);
+  // NOTE: Esc handling deliberately does NOT live here. Canvas owns the one
+  // window-capture Escape listener and routes it through lib/escOverlays, so
+  // the overlay-vs-fullscreen precedence (and the Shift+Esc literal-Esc
+  // passthrough to the captain) is a single explicit order instead of two
+  // competing capture listeners racing on registration order.
 
   // Focus nudge on open: setFocus(captainId) (done by openOverlay) re-focuses
   // the pooled xterm via Terminal.tsx's focus effect, but that effect only
@@ -292,7 +284,7 @@ function CaptainPanel({ captainId }: { captainId: string }) {
           borderColor: "var(--th-border)",
           fontSize: "var(--th-font-size)",
         }}
-        title="Captain - drag to move"
+        title="Captain - drag to move · Esc dismisses · Shift+Esc sends Esc to the captain (interrupt)"
       >
         <Anchor
           size="1em"
@@ -309,8 +301,9 @@ function CaptainPanel({ captainId }: { captainId: string }) {
         <span
           className="ml-auto shrink-0 text-[10px]"
           style={{ color: "var(--th-fg-muted)" }}
+          title="Esc dismisses the overlay · Shift+Esc sends a literal Esc to the captain (interrupt)"
         >
-          Esc to dismiss
+          Esc dismiss · Shift+Esc interrupt
         </span>
         <button
           type="button"

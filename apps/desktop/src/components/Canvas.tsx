@@ -44,6 +44,7 @@ import {
   handlePrefixedKey,
   disarm,
 } from "../lib/prefixKeyHandler";
+import { handleOverlayEscape } from "../lib/escOverlays";
 import { runWhenIdle } from "../lib/windowInteraction";
 
 /**
@@ -373,24 +374,24 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     if (!stillExists) setFullscreen(null);
   }, [fullscreenId, tabs, setFullscreen]);
 
-  // Esc exits fullscreen (the ⤢ toggle in the tile header is the other way out).
-  // Only armed while a tile is fullscreen; captured so it wins before any other
-  // Esc consumer when the fullscreen layer is up.
+  // Esc for the stacked overlay surfaces - the captain overlay and per-tile
+  // fullscreen. ONE window-capture listener, armed only while either surface
+  // is up, routing to the single dispatch point (lib/escOverlays) so the
+  // precedence is explicit rather than decided by listener registration
+  // order: Shift+Esc interrupts the summoned captain (literal Esc
+  // passthrough), plain Esc dismisses the overlay, else Esc exits fullscreen.
   useEffect(() => {
-    if (fullscreenId == null) return;
+    if (fullscreenId == null && !captainOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        // The captain overlay floats above fullscreen and has its own Esc
-        // handler; let that one Esc close ONLY the overlay (both handlers are
-        // window-capture listeners, so stopPropagation can't order them).
-        if (useCaptain.getState().open) return;
+      if (e.key !== "Escape") return;
+      if (handleOverlayEscape(e.shiftKey)) {
         e.preventDefault();
-        setFullscreen(null);
+        e.stopPropagation();
       }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [fullscreenId, setFullscreen]);
+  }, [fullscreenId, captainOpen]);
 
   return (
     <div

@@ -151,11 +151,21 @@ export const useCaptain = create<CaptainState>((set, get) => {
     closeOverlay: () => {
       if (!get().open) return;
       set({ open: false });
-      // Return focus to the tile that had it before the summon (if it still
-      // exists); otherwise leave focus wherever it is.
+      // Return focus to the tile that had it before the summon. The saved id
+      // can be STALE - that tile may have been closed while the overlay was
+      // open - so validate it against the live workspace first and fall back
+      // to the active tab's first tile, so focus never stays parked on the
+      // (now hidden) captain or on a dead id.
+      const ws = useWorkspace.getState();
       const prev = prevFocusedId;
       prevFocusedId = null;
-      if (prev && terminalHasTile(prev)) useWorkspace.getState().setFocus(prev);
+      if (prev && terminalHasTile(prev)) {
+        ws.setFocus(prev);
+        return;
+      }
+      const active = ws.tabs.find((t) => t.id === ws.activeTabId);
+      const first = active?.order[0];
+      if (first) ws.setFocus(first);
     },
 
     toggleOverlay: () => {

@@ -742,11 +742,14 @@ function saveToBackend(json: string): void {
   if (SATELLITE_TAB) return;
   void import("../ipc/persistence")
     .then((m) => {
-      // Per-variant durable copy (SQLite) — the primary durable store.
-      void m.saveWorkspaceSnapshot(json);
+      // Per-variant durable copy (SQLite) — the primary durable store. Each
+      // save is caught individually: the outer .catch only guards the import,
+      // and a bare `void` here leaked UNHANDLED rejections whenever the Tauri
+      // backend was absent (plain web / jsdom tests).
+      void m.saveWorkspaceSnapshot(json).catch(() => {});
       // Shared, all-variants copy (~/.config/t-hub/workspaces.json, #9): the
       // cross-variant carrier so a dev↔prod switch keeps your workspaces.
-      void m.saveSharedLayout(json);
+      void m.saveSharedLayout(json).catch(() => {});
     })
     .catch(() => {});
 }

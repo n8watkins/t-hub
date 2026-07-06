@@ -147,8 +147,9 @@ function defaults(): Persisted {
 
 /** Validate one persisted blob: a normalized prefix (default on a bad/empty
  *  chord) plus the two sanitized command->key maps. Owns this store's coerce
- *  logic; the SSR guard + corrupt-fallback plumbing lives in lib/persist. */
-function coercePersisted(raw: unknown): Persisted {
+ *  logic; the SSR guard + corrupt-fallback plumbing lives in lib/persist.
+ *  Exported for the migration unit tests (keybindings.test.ts). */
+export function coercePersisted(raw: unknown): Persisted {
   const p = (raw ?? {}) as Partial<Persisted>;
   const prefixKey =
     typeof p.prefixKey === "string" && normalizeChord(p.prefixKey)
@@ -161,15 +162,19 @@ function coercePersisted(raw: unknown): Persisted {
   // summon chord. Detect the definitive pre-captain signature - `c` still
   // owned by newPlainWorkspace (its old shipped default) with no captain
   // binding - and apply the same relocation the new defaults ship: captain
-  // takes `c`, newPlainWorkspace moves to `s` (or unbinds if `s` is taken).
-  // Any OTHER owner of `c` (a user rebind) or a deliberately cleared captain
-  // binding (`c` unowned) is left untouched. Idempotent across loads.
+  // takes `c`, newPlainWorkspace moves to `s`. ONLY when `s` is free: a
+  // binding is never deleted without a landing spot, so if the user already
+  // rebound some command to `s`, newPlainWorkspace keeps `c` and the captain
+  // chord is not seeded at all (the palette and the titlebar anchor still
+  // reach the overlay). Any OTHER owner of `c` (a user rebind) or a
+  // deliberately cleared captain binding (`c` unowned) is left untouched.
+  // Idempotent across loads.
   if (
     !("toggleCaptainOverlay" in prefixed) &&
-    prefixed.newPlainWorkspace === "c"
+    prefixed.newPlainWorkspace === "c" &&
+    !Object.values(prefixed).includes("s")
   ) {
-    if (Object.values(prefixed).includes("s")) delete prefixed.newPlainWorkspace;
-    else prefixed.newPlainWorkspace = "s";
+    prefixed.newPlainWorkspace = "s";
     prefixed.toggleCaptainOverlay = "c";
   }
   return {
