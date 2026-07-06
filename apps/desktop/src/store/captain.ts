@@ -18,11 +18,16 @@
 //     the ACTIVE captain is always the front: explicit summons move-to-front,
 //     cycling ROTATES the list (so repeated Ctrl+B C round-robins through every
 //     pinned captain instead of ping-ponging between the two most recent).
-//   - Persistence follows the workspace-store pattern (lib/persist codec on a
-//     versioned localStorage key): the DESIGNATIONS and the overlay GEOMETRY
-//     survive an app restart; the open/closed state deliberately does not (the
-//     app always starts with the overlay closed). The v1 single-captain blob
-//     migrates to a one-entry v2 list - an existing pin is never lost.
+//   - Persistence (phase 2, ship-registry unification): the SERVER captains
+//     registry is the source of truth for WHO is a captain - pinning IS
+//     claiming (a claim_captain control mutation, audited) and every registry
+//     mutation syncs back as a sync_captains apply the bridge adopts here.
+//     localStorage keeps only view state: the overlay GEOMETRY plus the MRU
+//     ORDER of the designations (which doubles as the one-time migration seed -
+//     pre-phase-2 pins are claimed server-side at boot, never lost). The
+//     open/closed state deliberately does not persist (the app always starts
+//     with the overlay closed). The v1 single-captain blob migrates to a
+//     one-entry v2 list.
 //   - Focus contract: opening moves keyboard focus to the captain terminal
 //     (via the workspace store's setFocus, which the pooled TerminalView
 //     follows); closing restores focus to the tile that had it before. Cycling
@@ -122,6 +127,30 @@ export function loadCaptainPersisted(): PersistedCaptain {
 
 const initial = loadCaptainPersisted();
 
+/** One claim from the SERVER captains registry (captain-chat phase 2): the ship,
+ *  the captain's terminal/session id, the workspace tabs it controls, and the
+ *  crew sessions it spawned (`spawnedBy` recorded at the spawn paths). */
+export interface CaptainClaimRecord {
+  shipSlug: string;
+  captainSessionId: string;
+  workspaceTabIds: string[];
+  crew: string[];
+}
+
+/** Fire-and-forget server captaincy mutation (pin = claim, unpin = release).
+ *  Best-effort by design: outside Tauri (tests / dev browser) or with the
+ *  control channel down the local designation stands and the next adopted
+ *  registry snapshot reconciles - the same optimistic-then-converge contract
+ *  the workspace tab reporter follows. */
+function serverCaptaincy(command: "claim_captain" | "release_captain", id: TerminalId): void {
+  void import("../ipc/controlClient")
+    .then((m) => m.controlRequest(command, { captainSessionId: id }))
+    .catch(() => {
+      // Control channel unavailable or the claim/release raced a server-side
+      // mutation (e.g. releasing an already-released claim) - safe to ignore.
+    });
+}
+
 /** The tile focused before the overlay opened, restored on close. Module-level
  *  (not store state): it's transient plumbing, never rendered or persisted. */
 let prevFocusedId: TerminalId | null = null;
@@ -135,6 +164,10 @@ function terminalHasTile(id: TerminalId): boolean {
 export interface CaptainState {
   /** Pinned captains in MRU order (front = most recently summoned). Persisted. */
   captainIds: TerminalId[];
+  /** The SERVER captains registry records, keyed by captain session id (phase 2:
+   *  workspaceTabIds + crew for the sidebar and context-aware summon). Empty for
+   *  a fresh optimistic pin until the next sync_captains snapshot lands. */
+  claims: Record<TerminalId, CaptainClaimRecord>;
   /** The captain the overlay shows / the next summon target. Invariant:
    *  `captainIds[0] ?? null` - kept explicit so every consumer reads one field. */
   activeCaptainId: TerminalId | null;
@@ -159,6 +192,13 @@ export interface CaptainState {
   unpinCaptain: (id: TerminalId) => void;
   /** Tile-menu / palette toggle: pin this terminal, or unpin it if pinned. */
   toggleCaptain: (id: TerminalId) => void;
+  /** Adopt a SERVER captains-registry snapshot (a sync_captains apply or the
+   *  boot-time list_captains fetch). Server-authoritative for MEMBERSHIP: ids
+   *  present locally but absent from the snapshot are dropped (closing the
+   *  overlay first if the summoned captain lost its claim), new claims append
+   *  at the MRU tail, and the local MRU order of surviving ids is preserved
+   *  (MRU is view state - the server does not track summon recency). */
+  adoptCaptainsRegistry: (records: CaptainClaimRecord[]) => void;
   /** Summon a SPECIFIC pinned captain (switcher chip, titlebar dropdown,
    *  palette entry): it becomes active (MRU front), the overlay opens if
    *  closed, and keyboard focus moves to it. No-op if unpinned or tile-less. */
@@ -201,6 +241,7 @@ export const useCaptain = create<CaptainState>((set, get) => {
 
   return {
     captainIds: initial.captainIds,
+    claims: {},
     activeCaptainId: initial.captainIds[0] ?? null,
     open: false,
     anchorMenuOpen: false,
@@ -215,6 +256,10 @@ export const useCaptain = create<CaptainState>((set, get) => {
       // New pins land at the END (least recently summoned): pinning is a
       // designation, not a summon, so it never steals the active slot.
       commitIds([...ids, id]);
+      // Phase 2: pinning IS claiming - the optimistic local designation above
+      // keeps the UI immediate; the server registry (the source of truth) is
+      // mutated best-effort and its sync_captains snapshot reconciles.
+      serverCaptaincy("claim_captain", id);
     },
 
     unpinCaptain: (id) => {
@@ -229,6 +274,32 @@ export const useCaptain = create<CaptainState>((set, get) => {
       // click is gated on count > 0, so an orphaned empty popover would have
       // no dismiss affordance left (Esc aside).
       if (get().captainIds.length === 0) get().setAnchorMenu(false);
+      // Phase 2: unpinning releases the server-side claim (audited). Releasing
+      // an id the server already dropped (e.g. close_terminal beat us) is a
+      // swallowed error inside the helper.
+      serverCaptaincy("release_captain", id);
+    },
+
+    adoptCaptainsRegistry: (records) => {
+      const s = get();
+      const claims: Record<TerminalId, CaptainClaimRecord> = {};
+      for (const r of records) claims[r.captainSessionId] = r;
+      const kept = s.captainIds.filter((id) => claims[id] !== undefined);
+      const added = records
+        .map((r) => r.captainSessionId)
+        .filter((id) => !kept.includes(id));
+      const next = [...kept, ...added];
+      // Mirror unpinCaptain's ordering: close BEFORE the summoned captain's
+      // designation drops, so the focus restore still resolves.
+      if (s.open && s.activeCaptainId !== null && !next.includes(s.activeCaptainId)) {
+        s.closeOverlay();
+      }
+      set({ claims });
+      const unchanged =
+        next.length === s.captainIds.length &&
+        next.every((id, i) => id === s.captainIds[i]);
+      if (!unchanged) commitIds(next);
+      if (next.length === 0) get().setAnchorMenu(false);
     },
 
     toggleCaptain: (id) => {

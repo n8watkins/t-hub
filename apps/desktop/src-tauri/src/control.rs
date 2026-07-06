@@ -427,6 +427,16 @@ impl TabRegistry {
         self.lock().tabs.iter().any(|t| t.id == id)
     }
 
+    /// The tab currently holding `tile_id`, if any (captains: a claim with no
+    /// explicit `workspaceTabIds` defaults to the tab the captain's tile lives in).
+    fn tab_for_tile(&self, tile_id: &str) -> Option<String> {
+        self.lock()
+            .tabs
+            .iter()
+            .find(|t| t.tile_ids.iter().any(|x| x == tile_id))
+            .map(|t| t.id.clone())
+    }
+
     /// Record a new (empty) tab so its id is addressable immediately. No-op (no
     /// revision bump) if a tab with this id already exists.
     fn insert_tab(&self, id: &str, name: &str) {
@@ -1830,6 +1840,11 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // scanned catalog into projects-archive (reversible). App-initiated from
         // the sidebar; filesystem-mutating like the worktree ops above.
         "archive_recent_project" => archive_recent_project(args),
+        // Captain-chat phase 2: captaincy is a SERVER mutation (audited) - the
+        // UI's pin action and an MCP captain's self-registration both land here,
+        // and every mutation forwards the authoritative captains snapshot.
+        "claim_captain" => claim_captain(ctx, args),
+        "release_captain" => release_captain(ctx, args),
 
         // ---- Process-changing tier (PRD §11.2: confirmation required) ------
         // `spawn_terminal` is confirmation-gated (its MCP description carries the
@@ -2806,6 +2821,11 @@ fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .ok_or("close_tab requires a 'tabId' (or a 'tabName' that resolves to one)")?;
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let orphaned = ctx.tabs.remove_tab(&tab_id, force)?;
+    // Captains must never advertise ownership of a tab that no longer exists
+    // (the claim itself survives - a captain can control zero tabs).
+    if ctx.captains.prune_tab(&tab_id) {
+        let _ = captains_sync_apply(ctx);
+    }
     let mut res = organization_sync_apply(
         ctx,
         "close_tab",
@@ -2830,6 +2850,91 @@ fn rename_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .ok_or("rename_tab requires a non-empty 'name' argument")?;
     ctx.tabs.rename_tab(&tab_id, &name)?;
     organization_sync_apply(ctx, "rename_tab", json!({ "tabId": tab_id, "name": name }))
+}
+
+/// Forward the authoritative captains snapshot to the UI as a `sync_captains`
+/// apply (captain-chat phase 2) - the captains twin of [`with_sync`]'s tab
+/// snapshot, emitted AFTER a registry mutation so the UI renders FROM the
+/// registry. Rides the same [`forward_apply`] path (webview sink + T12 socket
+/// broadcast). Returns whether the forward was delivered.
+fn captains_sync_apply(ctx: &ControlContext) -> bool {
+    let snap = ctx.captains.snapshot();
+    let args = json!({ "sync": serde_json::to_value(&snap).unwrap_or(Value::Null) });
+    forward_apply(ctx, "sync_captains", &args)
+}
+
+/// `claim_captain` (Organization, audited; captain-chat phase 2): claim captaincy
+/// of a ship. The UI's pin action and an MCP captain's self-registration are the
+/// SAME mutation - registry-first (strict: a ship already captained by another
+/// session is refused), then the authoritative captains snapshot is forwarded via
+/// `sync_captains` so every client renders from it. Args: `captainSessionId` (or
+/// `sessionId`) required; `shipSlug` optional (slugified; defaults to
+/// `ship-<sessionId>`); `workspaceTabIds` optional (defaults to the tab currently
+/// holding the captain's tile, when the tab registry knows one).
+fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let captain_session_id = arg_str(args, "captainSessionId")
+        .or_else(|| arg_str(args, "captain_session_id"))
+        .or_else(|| arg_str(args, "sessionId"))
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("claim_captain requires a 'captainSessionId' argument")?;
+    let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
+    let workspace_tab_ids: Vec<String> = args
+        .get("workspaceTabIds")
+        .or_else(|| args.get("workspace_tab_ids"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            // No explicit tabs: default to the tab the captain's tile lives in
+            // (the same lookup the UI's liveness check does, but server-side).
+            ctx.tabs
+                .tab_for_tile(&captain_session_id)
+                .into_iter()
+                .collect()
+        });
+    let record = ctx
+        .captains
+        .claim(&captain_session_id, ship_slug.as_deref(), workspace_tab_ids)?;
+    let applied = captains_sync_apply(ctx);
+    let snap = ctx.captains.snapshot();
+    Ok(json!({
+        "accepted": "claim_captain",
+        "audited": true,
+        "applied": applied,
+        "captain": record,
+        "seq": snap.seq,
+        "captains": snap.captains,
+        "note": "captaincy claimed in the server captains registry (authoritative, \
+                 persistent) and the snapshot forwarded to the UI (sync_captains).",
+    }))
+}
+
+/// `release_captain` (Organization, audited; captain-chat phase 2): release a
+/// claimed captaincy, addressed by `captainSessionId` (or `sessionId`) or
+/// `shipSlug`. Strict (an unknown claim is an error), then the snapshot is
+/// forwarded via `sync_captains` exactly like `claim_captain`.
+fn release_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let target = arg_str(args, "captainSessionId")
+        .or_else(|| arg_str(args, "captain_session_id"))
+        .or_else(|| arg_str(args, "sessionId"))
+        .or_else(|| arg_str(args, "session_id"))
+        .or_else(|| arg_str(args, "shipSlug"))
+        .or_else(|| arg_str(args, "ship_slug"))
+        .ok_or("release_captain requires a 'captainSessionId' (or 'shipSlug') argument")?;
+    let released = ctx.captains.release(&target)?;
+    let applied = captains_sync_apply(ctx);
+    let snap = ctx.captains.snapshot();
+    Ok(json!({
+        "accepted": "release_captain",
+        "audited": true,
+        "applied": applied,
+        "released": released,
+        "seq": snap.seq,
+        "captains": snap.captains,
+    }))
 }
 
 /// `focus_tab` (Organization, audited): activate a tab - the ONE organization
@@ -5291,5 +5396,84 @@ mod tests {
         assert_eq!(v["captains"][0]["captainSessionId"], "cap-1");
         assert_eq!(v["captains"][0]["workspaceTabIds"][0], "tab-1");
         assert_eq!(v["captains"][0]["crew"], json!([]));
+    }
+
+    #[test]
+    fn claim_and_release_are_audited_and_forward_the_captains_snapshot() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec!["cap-1".into()],
+        }]);
+
+        // Claim with NO explicit workspaceTabIds: defaults to the tab holding
+        // the captain's tile (the UI pin path sends exactly this shape).
+        let v = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": "cap-1"})).unwrap();
+        assert_eq!(v["accepted"], "claim_captain");
+        assert_eq!(v["audited"], true);
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["captain"]["shipSlug"], "ship-cap-1");
+        assert_eq!(v["captain"]["workspaceTabIds"], json!(["tab-1"]));
+        assert_eq!(v["seq"], 1);
+
+        let v = dispatch(&ctx, "release_captain", &json!({"shipSlug": "ship-cap-1"})).unwrap();
+        assert_eq!(v["accepted"], "release_captain");
+        assert_eq!(v["released"]["captainSessionId"], "cap-1");
+        assert_eq!(v["captains"], json!([]));
+
+        // Both mutations forwarded the authoritative captains snapshot to the
+        // UI as sync_captains (the captains twin of the tab sync contract).
+        let calls = sink.calls.lock().unwrap();
+        let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(names, ["sync_captains", "sync_captains"]);
+        assert_eq!(calls[0].1["sync"]["seq"], 1);
+        assert_eq!(calls[0].1["sync"]["captains"][0]["captainSessionId"], "cap-1");
+        assert_eq!(calls[1].1["sync"]["seq"], 2);
+        assert_eq!(calls[1].1["sync"]["captains"], json!([]));
+    }
+
+    #[test]
+    fn claim_conflicts_and_bad_release_are_dispatch_errors() {
+        let ctx = test_ctx("t");
+        dispatch(&ctx, "claim_captain", &json!({"captainSessionId": "cap-1", "shipSlug": "alpha"}))
+            .unwrap();
+        let err = dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({"captainSessionId": "cap-2", "shipSlug": "alpha"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("already captained"), "got: {err}");
+        let err = dispatch(&ctx, "release_captain", &json!({"shipSlug": "nope"})).unwrap_err();
+        assert!(err.contains("no claim matches"), "got: {err}");
+        assert!(dispatch(&ctx, "claim_captain", &json!({})).is_err());
+        assert!(dispatch(&ctx, "release_captain", &json!({})).is_err());
+    }
+
+    #[test]
+    fn close_tab_prunes_captain_workspace_ownership() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![
+            TabRecord { id: "tab-1".into(), name: "Main".into(), tile_ids: vec![] },
+            TabRecord { id: "tab-2".into(), name: "Side".into(), tile_ids: vec![] },
+        ]);
+        ctx.captains
+            .claim("cap-1", Some("alpha"), vec!["tab-2".into()])
+            .unwrap();
+
+        dispatch(&ctx, "close_tab", &json!({"tabId": "tab-2"})).unwrap();
+        let snap = ctx.captains.snapshot();
+        assert_eq!(snap.captains[0].workspace_tab_ids, Vec::<String>::new());
+        // The prune rode a sync_captains forward ahead of the close_tab apply.
+        let calls = sink.calls.lock().unwrap();
+        let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(names, ["sync_captains", "close_tab"]);
     }
 }

@@ -15,9 +15,21 @@ import {
   loadCaptainPersisted,
   CAPTAIN_DEFAULT_WIDTH,
   CAPTAIN_DEFAULT_HEIGHT,
+  type CaptainClaimRecord,
 } from "./captain";
 import { useWorkspace, type WorkspaceTab } from "./workspace";
 import type { TerminalInfo } from "../ipc/types";
+
+// Capture the store's fire-and-forget server captaincy mutations (phase 2:
+// pin = claim_captain, unpin = release_captain) without a control channel.
+const controlRequests: Array<{ command: string; args: unknown }> = [];
+vi.mock("../ipc/controlClient", () => ({
+  controlRequest: (command: string, args: unknown) => {
+    controlRequests.push({ command, args });
+    return Promise.resolve({});
+  },
+  onControlEvent: () => () => {},
+}));
 
 function term(id: string): TerminalInfo {
   return { id, tmuxSession: `th_${id}`, cwd: "/tmp", title: id, state: "live" };
@@ -54,8 +66,10 @@ function seedCaptains(ids: string[]): void {
 
 beforeEach(() => {
   localStorage.clear();
+  controlRequests.length = 0;
   seedWorkspace();
   seedCaptains(["cap00001"]);
+  useCaptain.setState({ claims: {} });
 });
 
 describe("v1 -> v2 persistence migration", () => {
@@ -406,5 +420,79 @@ describe("server registry adoption (headless-org PR #8)", () => {
     });
     expect(useCaptain.getState().activeCaptainId).toBe("cap00001");
     expect(useCaptain.getState().open).toBe(true);
+  });
+});
+
+describe("phase 2: pinning is claiming (server captains registry)", () => {
+  const claim = (
+    id: string,
+    tabs: string[] = [],
+    crew: string[] = [],
+  ): CaptainClaimRecord => ({
+    captainSessionId: id,
+    shipSlug: `ship-${id}`,
+    workspaceTabIds: tabs,
+    crew,
+  });
+
+  it("pin fires claim_captain and unpin fires release_captain (best-effort)", async () => {
+    useCaptain.getState().pinCaptain("bbb00001");
+    await vi.waitFor(() => {
+      expect(controlRequests).toEqual([
+        { command: "claim_captain", args: { captainSessionId: "bbb00001" } },
+      ]);
+    });
+    useCaptain.getState().unpinCaptain("bbb00001");
+    await vi.waitFor(() => {
+      expect(controlRequests[1]).toEqual({
+        command: "release_captain",
+        args: { captainSessionId: "bbb00001" },
+      });
+    });
+    // Re-pinning an already-pinned id is a full no-op (no duplicate claim).
+    useCaptain.getState().pinCaptain("cap00001");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(controlRequests).toHaveLength(2);
+  });
+
+  it("adoption preserves local MRU for survivors and appends new claims at the tail", () => {
+    seedCaptains(["ddd00001", "cap00001"]);
+    useCaptain.getState().adoptCaptainsRegistry([
+      claim("cap00001", ["t1"]),
+      claim("bbb00001", ["t2"], ["crew0001"]),
+      claim("ddd00001"),
+    ]);
+    const s = useCaptain.getState();
+    // Survivors keep the LOCAL MRU order (ddd before cap despite server order).
+    expect(s.captainIds).toEqual(["ddd00001", "cap00001", "bbb00001"]);
+    expect(s.activeCaptainId).toBe("ddd00001");
+    expect(s.claims["bbb00001"].crew).toEqual(["crew0001"]);
+    expect(s.claims["cap00001"].workspaceTabIds).toEqual(["t1"]);
+  });
+
+  it("adoption drops a local pin the server no longer holds, closing the overlay if summoned", () => {
+    seedCaptains(["cap00001", "bbb00001"]);
+    useCaptain.getState().openOverlay(); // summons cap00001
+    useCaptain.getState().adoptCaptainsRegistry([claim("bbb00001")]);
+    const s = useCaptain.getState();
+    expect(s.captainIds).toEqual(["bbb00001"]);
+    expect(s.open).toBe(false);
+    expect(useWorkspace.getState().focusedId).toBe("ccc00001"); // focus restored
+  });
+
+  it("adoption of an unchanged membership refreshes claims without a persist write", () => {
+    localStorage.removeItem("t-hub.captain.v2");
+    useCaptain.getState().adoptCaptainsRegistry([claim("cap00001", ["t1"])]);
+    expect(useCaptain.getState().claims["cap00001"].workspaceTabIds).toEqual(["t1"]);
+    expect(localStorage.getItem("t-hub.captain.v2")).toBeNull();
+  });
+
+  it("an EMPTY snapshot clears every designation and the anchor dropdown", () => {
+    useCaptain.getState().setAnchorMenu(true);
+    useCaptain.getState().adoptCaptainsRegistry([]);
+    const s = useCaptain.getState();
+    expect(s.captainIds).toEqual([]);
+    expect(s.activeCaptainId).toBeNull();
+    expect(s.anchorMenuOpen).toBe(false);
   });
 });
