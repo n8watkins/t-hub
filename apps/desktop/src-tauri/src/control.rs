@@ -2435,6 +2435,10 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         .ok_or("create_worktree requires a 'worktreePath' argument")?;
     let branch = arg_str(args, "branch");
     let tab_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
+    // Captain-chat phase 2: a captain staging a crew worktree identifies itself
+    // so the worktree terminal is recorded as crew (same contract as
+    // spawn_terminal's spawnedBy).
+    let spawned_by = arg_str(args, "spawnedBy").or_else(|| arg_str(args, "spawned_by"));
 
     // #27: a REMOTE peer may create worktrees ONLY under the operator allowlist —
     // this execs `git worktree add` SERVER-SIDE at peer-controlled paths (a write/
@@ -2504,6 +2508,16 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         }
     }
 
+    // Captain-chat phase 2: link the spawned worktree terminal to its captain.
+    // No terminal (headless boot / spawn failure) = no crew session to record.
+    let crew_recorded = match (&spawned_by, &terminal_id) {
+        (Some(cap), Some(id)) => ctx.captains.record_crew(cap, id),
+        _ => false,
+    };
+    if crew_recorded {
+        let _ = captains_sync_apply(ctx);
+    }
+
     // Forward the UI orchestration (open/reuse the named tab + adopt the spawned
     // terminal, rendered from the attached registry snapshot). The git worktree
     // already exists, so `alreadyCreated: true` tells any legacy consumer not to
@@ -2529,6 +2543,8 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         "tabName": effective_tab_name,
         "terminalId": terminal_id,
         "gitOutput": git_output,
+        "spawnedBy": spawned_by,
+        "crewRecorded": crew_recorded,
         "audited": true,
         "applied": applied,
         "note": if applied {
@@ -3004,6 +3020,9 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let shell = arg_str(args, "shell");
     let startup_command =
         arg_str(args, "startupCommand").or_else(|| arg_str(args, "startup_command"));
+    // Captain-chat phase 2: a captain spawning crew identifies itself so the
+    // spawned session is recorded as crew in the captains registry.
+    let spawned_by = arg_str(args, "spawnedBy").or_else(|| arg_str(args, "spawned_by"));
 
     // #27: a REMOTE peer may spawn ONLY with a cwd under the operator allowlist —
     // the spawn execs a shell SERVER-SIDE at a peer-controlled dir. Loopback (the
@@ -3071,6 +3090,16 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // carries the ACTUAL placement.
     let placed_tab = ctx.tabs.place_tile_with_fallback(&id, tab_id.as_deref());
 
+    // Captain-chat phase 2: record the crew link under the spawning captain.
+    // The spawn NEVER fails on this - an unclaimed spawnedBy simply records
+    // nothing (crewRecorded: false tells the caller to claim_captain first).
+    let crew_recorded = spawned_by
+        .as_deref()
+        .is_some_and(|cap| ctx.captains.record_crew(cap, &id));
+    if crew_recorded {
+        let _ = captains_sync_apply(ctx);
+    }
+
     let forward = with_sync(
         ctx,
         json!({
@@ -3082,6 +3111,7 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             "startupCommand": startup_command,
             "tabId": placed_tab,
             "tabName": tab_name,
+            "spawnedBy": spawned_by,
         }),
     );
     let applied = forward_apply(ctx, "spawn_terminal", &forward);
@@ -3095,6 +3125,8 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         "startupCommand": startup_command,
         "tabId": placed_tab,
         "placed": placed_tab.is_some(),
+        "spawnedBy": spawned_by,
+        "crewRecorded": crew_recorded,
         "audited": true,
         "applied": applied,
         "note": "the server spawned the session, placed the tile in the target tab \
@@ -3204,6 +3236,11 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let tile_id = session_id.strip_prefix("th_").unwrap_or(&session_id);
     if ctx.tabs.remove_tile(tile_id) {
         let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
+    }
+    // Captain-chat phase 2: a dead session leaves the captains registry too -
+    // its captaincy is released and it drops out of every crew list.
+    if ctx.captains.remove_session(tile_id) {
+        let _ = captains_sync_apply(ctx);
     }
     Ok(json!({
         "accepted": "close_terminal",
@@ -5452,6 +5489,83 @@ mod tests {
         assert!(err.contains("no claim matches"), "got: {err}");
         assert!(dispatch(&ctx, "claim_captain", &json!({})).is_err());
         assert!(dispatch(&ctx, "release_captain", &json!({})).is_err());
+    }
+
+    #[test]
+    fn spawn_with_spawned_by_records_crew_and_close_terminal_removes_it() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
+        ctx.captains.claim("cap-1", Some("alpha"), vec![]).unwrap();
+
+        // A claimed captain spawns crew: the link is recorded + synced.
+        let v = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "spawnedBy": "cap-1"}),
+        )
+        .unwrap();
+        assert_eq!(v["crewRecorded"], true);
+        assert_eq!(v["spawnedBy"], "cap-1");
+        let crew_id = v["id"].as_str().unwrap().to_string();
+        let snap = ctx.captains.snapshot();
+        assert_eq!(snap.captains[0].crew, vec![crew_id.clone()]);
+
+        // The dead crew session leaves the registry (and forwards a sync).
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": crew_id.clone()})).unwrap();
+        assert!(ctx.captains.snapshot().captains[0].crew.is_empty());
+
+        // Forwards: sync_captains (crew add), spawn_terminal (with spawnedBy),
+        // sync_tabs (tile drop), sync_captains (crew removal).
+        let calls = sink.calls.lock().unwrap();
+        let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            names,
+            ["sync_captains", "spawn_terminal", "sync_tabs", "sync_captains"]
+        );
+        assert_eq!(calls[0].1["sync"]["captains"][0]["crew"], json!([crew_id]));
+        assert_eq!(calls[1].1["spawnedBy"], "cap-1");
+        assert_eq!(calls[3].1["sync"]["captains"][0]["crew"], json!([]));
+    }
+
+    #[test]
+    fn spawn_with_an_unclaimed_spawned_by_still_spawns_without_a_crew_link() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let v = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "spawnedBy": "cap-ghost"}),
+        )
+        .unwrap();
+        assert_eq!(v["accepted"], "spawn_terminal");
+        assert_eq!(v["crewRecorded"], false, "no claim = no crew link, spawn unaffected");
+        assert!(ctx.captains.snapshot().captains.is_empty());
+        let id = v["id"].as_str().unwrap().to_string();
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+        let calls = sink.calls.lock().unwrap();
+        assert!(
+            calls.iter().all(|(c, _)| c != "sync_captains"),
+            "nothing captain-shaped changed, so no captains sync may be forwarded"
+        );
+    }
+
+    #[test]
+    fn close_terminal_of_a_captain_releases_its_claim() {
+        let ctx = test_ctx("t");
+        ctx.captains.claim("cap-1", Some("alpha"), vec![]).unwrap();
+        // The captain's own session dies (already-gone tmux session: the kill
+        // is idempotent, so dispatch succeeds and the registry cleanup runs).
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": "cap-1"})).unwrap();
+        assert!(ctx.captains.snapshot().captains.is_empty());
     }
 
     #[test]
