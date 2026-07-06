@@ -1,7 +1,8 @@
 # Captain Chat - multi-captain phases
 
 Status: outline agreed 2026-07-06; phase 1 SHIPPED 2026-07-06 (PR #10, 0.3.40).
-Phase 2 is the next candidate and must not start without the general's explicit go.
+Sidebar fleet surface (slice A of CAPTAIN-SIDEBAR-PRD.md) + voice settings SHIPPED 2026-07-06 (PRs #11-#13, 0.3.41).
+Phase 2 GREEN-LIT by the general 2026-07-06 (with slice B of the sidebar PRD riding on it).
 Context: the single-captain overlay shipped in 0.3.39 (PR #9): pin one session, Ctrl+B C summons it over any tab, Shift+Esc interrupts it, Esc dismisses.
 The fleet doctrine runs one captain per ship and the general runs several ships at once, so the overlay must grow to multiple captains.
 Decision from the general: keep ONE overlay panel and ONE chord; multi-captain means fast switching, not simultaneous floating panels.
