@@ -24,7 +24,11 @@ import { Anchor } from "lucide-react";
 import { useWorkspace } from "../store/workspace";
 import { useSettings } from "../store/settings";
 import { useCaptain } from "../store/captain";
-import { CaptainStatusDot, useCaptainDisplayLabel } from "./CaptainOverlay";
+import {
+  CaptainStatusDot,
+  useCaptainDisplayLabel,
+  useWorkspaceNameForTerminal,
+} from "./CaptainOverlay";
 import { useWindowMaximized } from "../lib/windowMaximized";
 import { closeSatellite, readSatelliteTab } from "../lib/windows";
 import { useAppName, useAppVersion } from "../lib/appName";
@@ -438,10 +442,12 @@ function CaptainDropdownRow({
   const label = useCaptainDisplayLabel(terminalId);
   // Same liveness affordance as the overlay switcher chip: a pin whose tile
   // is gone (tab popped out to a satellite) summons as a store-level no-op,
-  // so it must READ unavailable instead of silently doing nothing.
-  const hasTile = useWorkspace((s) =>
-    s.tabs.some((t) => t.order.includes(terminalId)),
-  );
+  // so it must READ unavailable instead of silently doing nothing. The tab
+  // NAME doubles as the row's second line (captain-sidebar PRD: dropdown
+  // polish - taller rows + workspace context); the lookup is the shared hook
+  // so this row and the sidebar captain rows cannot drift.
+  const workspaceName = useWorkspaceNameForTerminal(terminalId);
+  const hasTile = workspaceName != null;
   return (
     <button
       type="button"
@@ -455,15 +461,24 @@ function CaptainDropdownRow({
         onSummon();
         useCaptain.getState().summonCaptain(terminalId);
       }}
-      className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-neutral-700/40"
+      className="flex w-full items-center gap-2 px-2.5 py-2 text-left text-xs transition-colors hover:bg-neutral-700/40"
       style={{
         color: "var(--th-fg)",
         fontWeight: active ? 600 : 400,
         opacity: hasTile ? 1 : 0.5,
       }}
     >
-      <CaptainStatusDot terminalId={terminalId} size={9} />
-      <span className="min-w-0 flex-1 truncate">{label}</span>
+      <CaptainStatusDot terminalId={terminalId} size={10} />
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="min-w-0 truncate">{label}</span>
+        {/* Second line: which workspace the captain's tile lives in. */}
+        <span
+          className="min-w-0 truncate text-[10px] font-normal"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          {workspaceName ?? "tile not available"}
+        </span>
+      </span>
       {active && (
         <span
           className="shrink-0 text-[9px] uppercase tracking-wide"

@@ -30,6 +30,11 @@ export interface ContextMeterProps {
   /** Context-window fullness 0..=100, or null when no session is matched (then
    *  the component renders nothing). */
   usedPct: number | null;
+  /** Force AT LEAST the amber warning hue regardless of used % - the sidebar
+   *  captain rows pass the session's rate-limit state here (supervision
+   *  isRateLimited), so a rate-limited session reads amber even with context
+   *  headroom left. Red (nearly-full context) still wins over amber. */
+  warn?: boolean;
 }
 
 /**
@@ -37,20 +42,20 @@ export interface ContextMeterProps {
  * tabular "NN%" label. Renders `null` when `usedPct` is null so the tile header
  * is unchanged for unmatched tiles (graceful degradation per the task).
  */
-export function ContextMeter({ usedPct }: ContextMeterProps) {
+export function ContextMeter({ usedPct, warn = false }: ContextMeterProps) {
   if (usedPct == null) return null;
   // Clamp into range; round for the label (the bar uses the precise value).
   const used = Math.max(0, Math.min(100, usedPct));
   const rounded = Math.round(used);
-  const color = fillColor(used);
+  const color = fillColor(warn ? Math.max(used, AMBER_AT) : used);
   return (
     <span
       // Stop the header's pointer-drag from starting on the meter, and keep it
       // from shrinking away when the header is tight on space.
       onPointerDown={(e) => e.stopPropagation()}
       className="flex shrink-0 items-center gap-1"
-      title={`Claude context window: ${rounded}% full`}
-      aria-label={`Context window ${rounded} percent full`}
+      title={`Claude context window: ${rounded}% full${warn ? " - rate limit near cap" : ""}`}
+      aria-label={`Context window ${rounded} percent full${warn ? ", rate limit near cap" : ""}`}
     >
       {/* Track + fill. Width is the used %. */}
       <span
