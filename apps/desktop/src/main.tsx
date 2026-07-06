@@ -4,6 +4,10 @@ import "./index.css";
 // Side-effect import: mounts session-event notification sounds/desktop toasts
 // once at startup (idempotent). See src/lib/notifyMount.ts.
 import "./lib/notifyMount";
+// Side-effect import: hydrates voice settings from ~/.t-hub/voice.json and
+// arms the announce-on-attention voice watcher (Settings > Voice). Idempotent.
+// See src/lib/voiceAnnounceMount.ts.
+import "./lib/voiceAnnounceMount";
 // Side-effect import: mounts the always-on Claude USAGE feed — subscribes
 // status://snapshot into the supervision store so the sidebar USAGE strip
 // populates app-wide (not just while the Sidebar is mounted). Idempotent.
