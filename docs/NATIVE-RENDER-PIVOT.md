@@ -1,5 +1,10 @@
 # T-Hub - Native Render Pivot (Design + Plan)
 
+> **ARCHIVED 2026-07-05.** The native pivot is paused - the general ended it after Lane N merged ("too much work for efficiency gains I can't quantify").
+> The code and this doc's living copy moved to the `native-archive` branch (tag `native-pivot-final`); `apps/native` is removed from main.
+> The webview app is the product. Survivors shipped in 0.3.39: attach stability (PR 7), headless server-authoritative organization (PR 8), captain overlay (PR 9).
+> Next active work: docs/CAPTAIN-CHAT-PHASES.md.
+
 > **STATUS (2026-07-01) - DECIDED; GATES RUN; FRAMEWORK CONFIRMED.**
 > The owner has chosen a full-native client: retire the webview renderer and rebuild the frontend on a native Rust GPU stack.
 > Framework: **GPUI - CONFIRMED by the T2 spike (both §6 gates PASSED**; evidence in [T2-GPUI-SPIKE-RESULTS.md](./T2-GPUI-SPIKE-RESULTS.md)); Iced 0.14 remains the documented fallback.

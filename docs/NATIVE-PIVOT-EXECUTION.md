@@ -1,5 +1,10 @@
 # Native Pivot - Zero-Context Parallel Execution Guide
 
+> **ARCHIVED 2026-07-05.** The native pivot is paused - the general ended it after Lane N merged ("too much work for efficiency gains I can't quantify").
+> The code and this doc's living copy moved to the `native-archive` branch (tag `native-pivot-final`); `apps/native` is removed from main.
+> The webview app is the product. Survivors shipped in 0.3.39: attach stability (PR 7), headless server-authoritative organization (PR 8), captain overlay (PR 9).
+> Next active work: docs/CAPTAIN-CHAT-PHASES.md.
+
 > **Purpose:** run the remaining pivot tasks (T4-T14 + S16) with fresh, context-free workers, in parallel where the dependency graph allows.
 > Each worker gets: §0 (preamble) + §1 (contracts) + its own §3 brief.
 > Nothing else from any prior conversation is required.

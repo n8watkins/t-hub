@@ -1,5 +1,10 @@
 # Native Finish Plan - from parity to sole cockpit
 
+> **ARCHIVED 2026-07-05.** The native pivot is paused - the general ended it after Lane N merged ("too much work for efficiency gains I can't quantify").
+> The code and this doc's living copy moved to the `native-archive` branch (tag `native-pivot-final`); `apps/native` is removed from main.
+> The webview app is the product. Survivors shipped in 0.3.39: attach stability (PR 7), headless server-authoritative organization (PR 8), captain overlay (PR 9).
+> Next active work: docs/CAPTAIN-CHAT-PHASES.md.
+
 Status snapshot date: 2026-07-05, main at 0.3.37.
 This is the execution plan to FINISH the native pivot: close the flip-gating gaps, flip the default cockpit, land post-flip polish, and end with a distributable native app.
 It supersedes the open items in [T14-PARITY.md](./T14-PARITY.md) §4-5 and picks up where [NATIVE-PIVOT-EXECUTION.md](./NATIVE-PIVOT-EXECUTION.md) §5 left off.
