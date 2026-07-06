@@ -331,14 +331,65 @@ fn emit_batch(app: &AppHandle, id: &str, batch: &mut Vec<u8>) {
     batch.clear();
 }
 
+/// The attach stream ended — an explicit `{"exit"}` frame, or EOF/error on the
+/// socket. Neither PROVES the pane's process exited: the server-side attach
+/// client also exits on a detach (`tmux detach-client`), and the connection also
+/// drops when the control server churns/restarts — in both cases the tmux
+/// session (and the user's process) is alive and well. Emitting `Exited` there
+/// is the false-dead-tile bug: the tile renders "[process exited]" over a live
+/// session.
+///
+/// So verify against tmux — the source of truth for liveness — before declaring
+/// death:
+///   - session gone  → the process really ended: emit `EXIT` + `STATE Exited`,
+///     exactly the old behavior;
+///   - session alive → this was only an ATTACH loss: emit `STATE Detached` (no
+///     `EXIT`), which the frontend's auto-reattach picks up. A clean local
+///     `detach()`/`close_terminal` also lands here — `Detached` is the truthful
+///     state for that too (the tile is gone, the event is a harmless no-op).
+///
+/// The `has_session` probe shells out to tmux; this runs on the (terminating)
+/// reader thread, so the cost is off every hot path. NOTE: the check runs on the
+/// CLIENT host — correct while the control endpoint is loopback (M2a); when M2
+/// points this at a remote host, liveness must be asked of the remote server
+/// instead.
+fn emit_stream_end(app: &AppHandle, id: &str, code: Option<i32>) {
+    let alive = crate::tmux::has_session(&crate::tmux::target_for_id(id));
+    if alive {
+        let _ = app.emit(
+            events::STATE,
+            &StateEvent {
+                id: id.to_string(),
+                state: TerminalState::Detached,
+            },
+        );
+        return;
+    }
+    let _ = app.emit(
+        events::EXIT,
+        &ExitEvent {
+            id: id.to_string(),
+            code,
+        },
+    );
+    let _ = app.emit(
+        events::STATE,
+        &StateEvent {
+            id: id.to_string(),
+            state: TerminalState::Exited,
+        },
+    );
+}
+
 /// Drain the socket's frames, re-emitting into the webview like
 /// [`crate::pty::reader_loop`], but COALESCING bursts of `{"out"}` frames into one
 /// `terminal://output` emit per [`COALESCE_WINDOW`] (or per [`MAX_BATCH_BYTES`]):
 ///   - `{"out":"<b64>"}`  → decoded + appended to the pending batch,
-///   - `{"exit":<code>}`  → flush the batch, then `app.emit(EXIT)` + `app.emit(STATE Exited)`,
-///   - EOF (connection closed without an `{"exit"}`) → flush, then the same Exited
-///     transition with `code: None`, so a server/connection drop still tears the
-///     tile down cleanly rather than leaving it stuck "live".
+///   - `{"exit":<code>}`  → flush the batch, then [`emit_stream_end`] (verified
+///     against tmux: Exited only when the session is really gone, Detached else),
+///   - EOF (connection closed without an `{"exit"}`) → flush, then the same
+///     verified transition with `code: None`, so a server/connection drop over a
+///     LIVE session reads as an attach loss (Detached), not a false exit.
 fn reader_loop(app: AppHandle, id: String, reader: BufReader<TcpStream>) {
     // The handshake's BufReader may already hold bytes past the scrollback frame
     // (the first `out` frames can ride the same TCP segment). Drain that buffered
@@ -366,14 +417,7 @@ fn reader_loop(app: AppHandle, id: String, reader: BufReader<TcpStream>) {
                 PtyFrame::Exit(code) => {
                     // Flush any output that preceded the exit so order is preserved.
                     emit_batch(&app, &id, &mut batch);
-                    let _ = app.emit(events::EXIT, &ExitEvent { id: id.clone(), code });
-                    let _ = app.emit(
-                        events::STATE,
-                        &StateEvent {
-                            id: id.clone(),
-                            state: TerminalState::Exited,
-                        },
-                    );
+                    emit_stream_end(&app, &id, code);
                     saw_exit = true;
                     break 'read;
                 }
@@ -406,18 +450,13 @@ fn reader_loop(app: AppHandle, id: String, reader: BufReader<TcpStream>) {
     emit_batch(&app, &id, &mut batch);
 
     // If the stream ended WITHOUT an explicit {"exit"} (a server/connection drop
-    // mid-stream), still emit a terminal Exited transition so the tile doesn't hang
-    // "live". On a clean `detach()` the user already removed the tile, so this is a
-    // harmless idempotent state event into a webview that no longer renders it.
+    // mid-stream), still emit a verified terminal transition so the tile doesn't
+    // hang "live": Exited when the tmux session is really gone, Detached when the
+    // session survived the drop (attach churn — the frontend auto-reattaches). On
+    // a clean `detach()` the user already removed the tile, so the (Detached)
+    // state event lands in a webview that no longer renders it.
     if !saw_exit {
-        let _ = app.emit(events::EXIT, &ExitEvent { id: id.clone(), code: None });
-        let _ = app.emit(
-            events::STATE,
-            &StateEvent {
-                id,
-                state: TerminalState::Exited,
-            },
-        );
+        emit_stream_end(&app, &id, None);
     }
 }
 
