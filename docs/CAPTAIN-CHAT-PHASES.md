@@ -1,11 +1,12 @@
 # Captain Chat - multi-captain phases
 
-Status: outline agreed 2026-07-06; phase 1 is the next active task.
+Status: outline agreed 2026-07-06; phase 1 SHIPPED 2026-07-06 (PR #10, 0.3.40).
+Phase 2 is the next candidate and must not start without the general's explicit go.
 Context: the single-captain overlay shipped in 0.3.39 (PR #9): pin one session, Ctrl+B C summons it over any tab, Shift+Esc interrupts it, Esc dismisses.
 The fleet doctrine runs one captain per ship and the general runs several ships at once, so the overlay must grow to multiple captains.
 Decision from the general: keep ONE overlay panel and ONE chord; multi-captain means fast switching, not simultaneous floating panels.
 
-## Phase 1 - captain list + switcher (UI-only, small)
+## Phase 1 - captain list + switcher (UI-only, small) - SHIPPED (PR #10, 0.3.40)
 
 - The captain store becomes a LIST of pinned session ids plus an `activeCaptainId` (most-recently-summoned wins).
 - Migration: `t-hub.captain.v1` single id loads as a one-entry list (`t-hub.captain.v2`); never lose an existing pin.

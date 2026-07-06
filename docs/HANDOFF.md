@@ -34,7 +34,7 @@ All merged to `main` and running in the installed 0.3.39 app:
 
 ## 3. Next steps (in order)
 
-1. **Phase 1 of [CAPTAIN-CHAT-PHASES.md](./CAPTAIN-CHAT-PHASES.md) — captain list + switcher.** UI-only. Captain store becomes a list + `activeCaptainId` (MRU), migration from `t-hub.captain.v1` to `.v2`, Ctrl+B C cycles pinned captains while summoned (Esc still dismisses), overlay-header switcher, titlebar anchor count badge + dropdown, per-captain palette entries, tests per the doc. Key files: `apps/desktop/src/store/captain.ts`, `components/CaptainOverlay.tsx`, `lib/escOverlays.ts`, `lib/keymapExecutor.ts`, `store/keybindings.ts`.
+1. ~~Phase 1 of [CAPTAIN-CHAT-PHASES.md](./CAPTAIN-CHAT-PHASES.md) — captain list + switcher.~~ **DONE 2026-07-06** (PR #10, merged `2d9bd3e`, version 0.3.40): captain store is now an MRU list + `activeCaptainId` under `t-hub.captain.v2` (v1 migrated losslessly), Ctrl+B C cycles pinned captains while summoned (Esc dismisses), overlay-header switcher, titlebar anchor count badge + dropdown, per-captain palette entries, 116 tests green.
 2. Phase 2+ per the phases doc (ship-registry unification, fleet view) — do NOT start without the general.
 3. Standing adjacent goals (tracked in the phases doc §Standing): server split M2-M4 (remote — the settled priority), MCP parity for `create_worktree`/`remove_worktree`/`wait_for_status`, wire read-timeouts.
 
