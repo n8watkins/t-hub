@@ -27,6 +27,17 @@ Decision from the general: keep ONE overlay panel and ONE chord; multi-captain m
 - MCP surface: `list_captains` (read tier), `claim_captain`/`release_captain` (organization tier, audited) so captains can self-register on claim instead of hand-editing ship files.
 - Survives restarts server-side; localStorage keeps only view state (panel geometry).
 
+## Phase 2.5 - captain-owns-a-workspace + orchestrator-as-home (general's direction 2026-07-06)
+
+- A captain OWNS a home workspace (the tab holding its tile; the mapping is phase 2's `workspaceTabIds`).
+The UI's behavior becomes location-aware:
+  - On the captain's OWN home workspace ("main view") the summon affordance (anchor dropdown / overlay) HIDES for that captain - you are already with it, so there is nothing to summon.
+  - On any OTHER workspace the affordance shows, and navigating to a workspace sets the ACTIVE captain to that workspace's owner (context-aware summon made automatic on tab nav, not just Ctrl+B C).
+  - The sidebar CAPTAINS section stays the always-available cross-captain navigator; the overlay is re-scoped to "reach a captain you are away from," not a thing you need at home.
+- The ORCHESTRATOR is not a separate dock. It is a designated captain whose home workspace is the default/main view: you talk to it by being on its workspace (and can read its terminal history there when you want), and reach it from elsewhere via overlay or voice (the `speak` tool).
+This dissolves the earlier bottom-dock idea - a dock would only duplicate "go to the orchestrator's workspace."
+- Depends on phase 2 (the captain to workspace mapping); build as a UI slice on top of the registry. Voice input remains a later, separate add.
+
 ## Phase 3 - fleet view (the general's altitude in the UI)
 
 - The titlebar anchor becomes a fleet menu: each ship with its captain, workspace, and a status dot fed by the supervision tree (working / needs-input / failed / idle).
