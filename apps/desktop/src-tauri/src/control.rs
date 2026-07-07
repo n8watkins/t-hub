@@ -1187,18 +1187,24 @@ pub fn persistent_read_key() -> String {
 /// control token to `control.json` and publishes only the read token there, so a
 /// process that merely scrapes the discovery file gets read-only; elevated sessions
 /// then rely on the control token injected down the spawn tree (Phase 2b). DEFAULT
-/// OFF - Phase 2 keeps `control.json` fully backward-compatible; this only reads the
-/// env, it does not flip anything on its own.
+/// ON (Phase 3) - ambient discovery is least-privilege out of the box. The escape
+/// hatch `T_HUB_CONTROL_HARDEN=0` (or `false`) disables it, restoring the Phase 2
+/// behavior where `control.json` publishes the full-power control token. Any other
+/// value (or unset) leaves hardening ON.
 fn phase3_harden_enabled() -> bool {
-    std::env::var("T_HUB_CONTROL_HARDEN")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    match std::env::var("T_HUB_CONTROL_HARDEN") {
+        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+        Err(_) => true,
+    }
 }
 
 /// Pick the token published in the `token` field of `control.json`. With hardening
-/// OFF (default) this is the full-power control token (every current caller keeps
-/// full power); with hardening ON it is the read token (ambient discovery becomes
-/// read-only). Pure so it is directly unit-testable.
+/// ON (the Phase 3 default) this is the read token (ambient discovery becomes
+/// read-only); with hardening OFF (`T_HUB_CONTROL_HARDEN=0`) it is the full-power
+/// control token (Phase 2 backward-compatible behavior). An empty read token falls
+/// back to the control token even when hardening is ON, so a context that never
+/// minted a read token (e.g. a bare probe server) is never locked out. Pure so it
+/// is directly unit-testable.
 fn select_published_token<'a>(control_token: &'a str, read_token: &'a str, harden: bool) -> &'a str {
     if harden && !read_token.is_empty() {
         read_token
@@ -1238,10 +1244,13 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     // Phase 2b: record the bound loopback address on the context so `spawn_terminal`
     // can inject it (with a capability token) into the sessions it spawns.
     ctx.addr = addr.to_string();
-    // Phase 2 / Phase 3: `token` stays the full-power control token by default
-    // (backward-compatible discovery); the harden flag (default OFF) flips it to
-    // publish only the read token. `read_token` is always published so a
-    // least-privilege consumer can discover a read-only credential.
+    // Phase 3: `token` publishes only the READ token by default (the harden flag
+    // is now ON by default), so a process that merely scrapes `control.json` gets
+    // read-only. `T_HUB_CONTROL_HARDEN=0` restores the Phase 2 behavior (publish the
+    // full-power control token). `read_token` is always published so a
+    // least-privilege consumer can discover a read-only credential. Elevated
+    // sessions receive the control token via the Phase 2b spawn-tree env injection
+    // (T_HUB_CONTROL_ADDR + T_HUB_CONTROL_TOKEN), not this file.
     let harden = phase3_harden_enabled();
     let handshake = ControlHandshake {
         addr: addr.to_string(),
@@ -6626,15 +6635,69 @@ mod tests {
     }
 
     #[test]
-    fn phase3_flag_is_off_by_default_and_selects_control_token() {
-        // The Phase 3 harden flag exists but is OFF unless explicitly set, and with
-        // it off the published token is the control token (backward-compatible).
-        assert!(!phase3_harden_enabled(), "harden flag must default OFF");
-        assert_eq!(select_published_token("ctl", "rd", false), "ctl");
-        // When flipped, discovery would publish the read token instead...
+    fn phase3_flag_is_on_by_default_and_selects_read_token() {
+        // Phase 3: hardening is ON by default (unset ⇒ enabled), and with it on the
+        // published token is the READ token (ambient discovery is read-only). The
+        // escape hatch `T_HUB_CONTROL_HARDEN=0`/`false` disables it; any other value
+        // leaves it on. This mutates a process-global env var; no other test reads
+        // this var, and it is saved/restored around the mutation to stay hermetic.
+        let saved = std::env::var("T_HUB_CONTROL_HARDEN").ok();
+        std::env::remove_var("T_HUB_CONTROL_HARDEN");
+        assert!(phase3_harden_enabled(), "harden flag must default ON");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "0");
+        assert!(!phase3_harden_enabled(), "'0' must disable hardening");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "false");
+        assert!(!phase3_harden_enabled(), "'false' must disable hardening");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "1");
+        assert!(phase3_harden_enabled(), "'1' keeps hardening on");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "yes");
+        assert!(phase3_harden_enabled(), "any non-disabling value keeps it on");
+        match saved {
+            Some(v) => std::env::set_var("T_HUB_CONTROL_HARDEN", v),
+            None => std::env::remove_var("T_HUB_CONTROL_HARDEN"),
+        }
+
+        // The pure selector: ON ⇒ read token, OFF ⇒ control token.
         assert_eq!(select_published_token("ctl", "rd", true), "rd");
-        // ...but never an empty read token (falls back to control to stay usable).
+        assert_eq!(select_published_token("ctl", "rd", false), "ctl");
+        // Never an empty read token (falls back to control so a context that never
+        // minted a read token is not locked out).
         assert_eq!(select_published_token("ctl", "", true), "ctl");
+    }
+
+    #[test]
+    fn phase3_hardened_publishes_read_token_yet_spawn_env_carries_control() {
+        // With hardening ON (the default): what `control.json` publishes as `token`
+        // is the READ token (so a raw scraper is read-only), while the spawn-tree env
+        // injection still hands a spawned session the CONTROL token, preserving
+        // orchestration. These two facts together are the whole Phase 3 contract.
+        let ctx = test_ctx("ctl"); // read token is "read-ctl" (see test_ctx)
+        // Discovery, hardened: publishes the read token, NOT the control token.
+        let published = select_published_token(&ctx.token, &ctx.read_token, true);
+        assert_eq!(published, ctx.read_token, "hardened discovery must publish read token");
+        assert_ne!(published, ctx.token, "hardened discovery must NOT publish control token");
+        assert_eq!(
+            resolve_capability(&ctx, published),
+            Some(Capability::ReadOnly),
+            "published token must resolve to read-only"
+        );
+
+        // Spawn-tree env injection: still carries the CONTROL token so the spawned
+        // session's in-session MCP authenticates with full power.
+        let mut ctx = ctx;
+        ctx.addr = "127.0.0.1:4242".to_string();
+        let env = elevation_env(&ctx, &json!({}));
+        let injected = env
+            .iter()
+            .find(|(k, _)| k == "T_HUB_CONTROL_TOKEN")
+            .map(|(_, v)| v.clone())
+            .expect("spawn env injects T_HUB_CONTROL_TOKEN");
+        assert_eq!(injected, ctx.token, "spawn env must inject the control token");
+        assert_eq!(
+            resolve_capability(&ctx, &injected),
+            Some(Capability::Full),
+            "injected token must grant full control"
+        );
     }
 
     #[test]
