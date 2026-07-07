@@ -1,16 +1,18 @@
-// The sidebar CAPTAINS section body (docs/CAPTAIN-SIDEBAR-PRD.md, slice A +
-// the captain-rows feedback round): one row per PINNED captain - the
-// persistent supervision surface the anchor dropdown (a transient switcher)
-// deliberately is not.
+// The sidebar CAPTAINS section body (docs/CAPTAIN-SIDEBAR-PRD.md, slice B on
+// top of the captain-rows round): one row per PINNED captain - the persistent
+// supervision surface the anchor dropdown (a transient switcher) deliberately
+// is not.
 //
 // Rows are IDENTITY-FIRST per the general's feedback: the prominent line is
 // the user's rename (or, unnamed, the repo/worktree the captain lives in) -
 // never the derived last-command text. The second line is location context
-// (workspace tab + worktree branch); the turn-scoped subagent summary sits
-// below, de-emphasized. Rows are ordered WORKSPACE-FIRST: captains whose tile
-// lives in the ACTIVE workspace tab float to the top (accent-marked), so
-// switching tabs surfaces the relevant captain; MRU order holds within each
-// group.
+// (the workspaces the captain CONTROLS, from the phase 2 registry's
+// workspaceTabIds, falling back to the tile's own tab; + worktree branch). The
+// activity line below shows REAL crew (the sessions the captain spawned, from
+// the registry's spawnedBy links - NOT a count of Task-tool subagents),
+// de-emphasized. Rows are ordered WORKSPACE-FIRST: captains whose tile lives in
+// the ACTIVE workspace tab float to the top (accent-marked), so switching tabs
+// surfaces the relevant captain; MRU order holds within each group.
 //
 // Rename: the hover pencil swaps the identity block for an input (Enter
 // commits, Esc cancels, blur commits - plain input handling, mirroring
@@ -22,11 +24,12 @@
 // which every label surface (tiles, dropdown, overlay chips, palette) already
 // reads first.
 //
-// Attention roll-up scope (slice A honesty note): SubagentNode carries only
-// running/completed, so a CHILD cannot express needs-permission today - the
-// roll-up covers the captain session's own status. Crew sessions join the
-// roll-up in slice B when the registry links them.
-import { useState } from "react";
+// Attention roll-up (slice B): the row pulses amber while the captain's OWN
+// session OR any of its crew needs permission or a question - a crewmate stuck
+// on a prompt bubbles amber onto its captain. Expanding a captain lists its
+// crewmates (each with its own status dot) above the captain's own subagent
+// tree.
+import { useMemo, useState } from "react";
 import { Pencil } from "lucide-react";
 import { useCaptain } from "../store/captain";
 import { useWorkspace } from "../store/workspace";
@@ -35,6 +38,7 @@ import {
   sessionStatusForTmux,
   isRateLimited,
 } from "../store/supervision";
+import type { SessionStatus } from "../ipc/model";
 import { sessionNameForTerminal } from "../store/sessionContext";
 import {
   CaptainStatusDot,
@@ -43,6 +47,20 @@ import {
 import { SupervisionTreeView } from "./SupervisionTree";
 import { ContextMeter } from "./ContextMeter";
 import { ChevronIcon } from "./SidebarChrome";
+
+/** Raw reducer statuses that mean a crew session is MID-TURN (mirrors the
+ *  supervision store's ACTIVE_TURN set - kept local so this reads without
+ *  reaching into the store's private constant). */
+const CREW_RUNNING: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
+  "working",
+  "needsQuestion",
+  "needsPermission",
+  "waitingOnSubagents",
+]);
+
+/** Stable empty crew list so the summary memo's dep identity does not churn for
+ *  a captain with no claim/crew yet. */
+const NO_CREW: readonly string[] = [];
 
 /** Path segments of a cwd, tolerant of either separator and trailing slashes. */
 function cwdParts(cwd: string): string[] {
@@ -64,10 +82,10 @@ function cwdBranch(cwd: string): string {
   return "";
 }
 
-/** The identity line for a captain row: the user's RENAME when set, else the
- *  repo/worktree folder the captain lives in (cwd basename), else the short
- *  id. Deliberately NOT deriveLabel: its "command · dir" shape leads with the
- *  derived last-command text the general called useless - identity first. */
+/** The identity line for a captain (or crew) row: the user's RENAME when set,
+ *  else the repo/worktree folder the session lives in (cwd basename), else the
+ *  short id. Deliberately NOT deriveLabel: its "command · dir" shape leads with
+ *  the derived last-command text the general called useless - identity first. */
 function captainIdentity(
   userLabel: string | undefined,
   cwd: string | undefined,
@@ -120,7 +138,7 @@ function CaptainRow({
    *  floats to the top and carries the accent marker. */
   inActiveWorkspace: boolean;
 }) {
-  // Inline SupervisionTree expansion - per-row, transient (not persisted).
+  // Inline expansion (crew sub-rows + supervision tree) - per-row, transient.
   const [expanded, setExpanded] = useState(false);
   // Inline rename (WorkspacesList's editing/draft/commit shape).
   const [editing, setEditing] = useState(false);
@@ -131,15 +149,21 @@ function CaptainRow({
   const identity = captainIdentity(userLabel, cwd, terminalId);
   const branch = cwd ? cwdBranch(cwd) : "";
 
+  // Phase 2: the captain's server-registry claim - the real crew it spawned
+  // (spawnedBy) and the workspaces it controls (workspaceTabIds). Absent for a
+  // just-pinned captain until the first sync_captains snapshot lands.
+  const claim = useCaptain((s) => s.claims[terminalId]);
+  const crewIds = claim?.crew ?? NO_CREW;
+
   // The tab the captain's tile lives in; undefined = popped out / gone, the
   // same liveness lookup the dropdown rows use (shared hook, cannot drift).
   // Summon is then a store-level no-op, so the row must READ unavailable.
   const workspaceName = useWorkspaceNameForTerminal(terminalId);
   const hasTile = workspaceName != null;
 
-  // Resolve the bound agent session via the statusline's tmux index, then the
-  // supervision tree / status / snapshot for that session. All best-effort:
-  // a captain with no session yet renders identity + location only.
+  // Resolve the captain's bound agent session via the statusline's tmux index,
+  // then the supervision tree / status / snapshot for that session. All
+  // best-effort: a captain with no session yet renders identity + location only.
   const tmux = sessionNameForTerminal(terminalId);
   const sessionId = useSupervision((s) => s.sessionIdByTmux[tmux]);
   const tree = useSupervision((s) =>
@@ -150,13 +174,48 @@ function CaptainRow({
   );
   const status = useSupervision((s) => sessionStatusForTmux(s, tmux));
 
-  // Attention roll-up: the captain needs the general. Scoped to the two
-  // needs-input statuses per the PRD (rate-limit shows amber via the meter +
-  // dot instead of a whole-row pulse).
-  const attention = status === "needsQuestion" || status === "needsPermission";
+  // Crew activity from the registry (slice B: real crew, not subagents).
+  // Resolve each crew session's raw reducer status through the tmux index; only
+  // the two maps are subscribed, so a snapshot storm does not re-render the list.
+  const statuses = useSupervision((s) => s.statuses);
+  const sessionIdByTmux = useSupervision((s) => s.sessionIdByTmux);
+  const crew = useMemo(
+    () =>
+      crewIds.map((id) => {
+        const sid = sessionIdByTmux[sessionNameForTerminal(id)];
+        const st = sid !== undefined ? statuses[sid] : undefined;
+        return {
+          id,
+          known: st !== undefined,
+          running: st !== undefined && CREW_RUNNING.has(st),
+          needsInput: st === "needsQuestion" || st === "needsPermission",
+        };
+      }),
+    [crewIds, statuses, sessionIdByTmux],
+  );
+  const crewRunning = crew.filter((c) => c.running).length;
+  // "Done" = a crew session that has reported a status and is no longer mid-turn;
+  // a just-spawned crewmate with no status yet counts as neither (not "done").
+  const crewDone = crew.filter((c) => c.known && !c.running).length;
 
-  const running = tree?.children.filter((c) => c.state === "running").length ?? 0;
-  const done = tree ? tree.children.length - running : 0;
+  // The workspaces the captain CONTROLS (registry workspaceTabIds -> names),
+  // falling back to the tile's own tab when no claim has synced yet.
+  const tabs = useWorkspace((s) => s.tabs);
+  const controlling = (claim?.workspaceTabIds ?? [])
+    .map((id) => tabs.find((t) => t.id === id)?.name)
+    .filter((n): n is string => n != null && n !== "");
+  const workspaceText =
+    controlling.length > 0
+      ? controlling.join(", ")
+      : (workspaceName ?? "tile not available");
+
+  // Attention roll-up: the captain OR any crewmate needs the general. Scoped to
+  // the two needs-input statuses per the PRD (rate-limit shows amber via the
+  // meter + dot instead of a whole-row pulse).
+  const ownAttention =
+    status === "needsQuestion" || status === "needsPermission";
+  const attention = ownAttention || crew.some((c) => c.needsInput);
+
   const tasks = tree?.outstandingTasks ?? 0;
 
   const commitRename = () => {
@@ -204,13 +263,13 @@ function CaptainRow({
           </>
         )}
 
-        {/* Expand: the existing supervision tree, inline under the row. */}
+        {/* Expand: crew sub-rows + the captain's own supervision tree, inline. */}
         <button
           type="button"
           onClick={() => setExpanded((e) => !e)}
           aria-expanded={expanded}
-          aria-label={`${expanded ? "Collapse" : "Expand"} subagent activity - ${identity}`}
-          title={expanded ? "Collapse subagent activity" : "Expand subagent activity"}
+          aria-label={`${expanded ? "Collapse" : "Expand"} crew and subagents - ${identity}`}
+          title={expanded ? "Collapse crew and subagents" : "Expand crew and subagents"}
           className="relative flex h-6 w-5 shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100"
         >
           <ChevronIcon open={expanded} />
@@ -275,24 +334,24 @@ function CaptainRow({
                   </span>
                 )}
               </span>
-              {/* LOCATION line: workspace tab + worktree branch context. */}
+              {/* LOCATION line: controlling workspaces + worktree branch. */}
               <span
                 className="min-w-0 truncate text-[10px]"
                 style={{ color: "var(--th-fg-muted)" }}
               >
-                {workspaceName ?? "tile not available"}
+                {workspaceText}
                 {branch && <> · ⎇ {branch}</>}
               </span>
-              {/* ACTIVITY line (de-emphasized): the TURN-scoped subagent
-                  summary - the supervision reducer resets counts at every
-                  UserPromptSubmit, so this reads "for this turn". */}
-              {tree && (
+              {/* ACTIVITY line (de-emphasized): the REAL crew summary (registry
+                  spawnedBy links) - supersedes the turn-scoped subagent summary
+                  on the row; the subagent tree still shows in the expansion. */}
+              {crew.length > 0 && (
                 <span
                   className="min-w-0 truncate text-[10px] opacity-75"
                   style={{ color: "var(--th-fg-muted)" }}
-                  title="Subagent activity this turn (Task-tool spawns). Separate crew sessions are not linked until the phase 2 captains registry."
+                  title="Crew: the sessions this captain spawned (registry spawnedBy links), by running/done."
                 >
-                  this turn: {running} running · {done} done
+                  crew: {crewRunning} running · {crewDone} done
                 </span>
               )}
             </span>
@@ -340,12 +399,53 @@ function CaptainRow({
         )}
       </div>
 
-      {/* Inline supervision tree (the existing component; it renders its own
-          muted hint when the captain has no session/tree yet). */}
+      {/* Expanded: the real crew (registry spawnedBy links), each with its own
+          status dot, then the captain's own subagent tree (Task-tool spawns -
+          a distinct thing from crew sessions). */}
       {expanded && (
-        <div className="pl-4">
+        <div className="flex flex-col gap-0.5 pl-4">
+          {crew.length > 0 && (
+            <div className="flex flex-col">
+              {crewIds.map((id) => (
+                <CrewRow key={id} terminalId={id} />
+              ))}
+            </div>
+          )}
           <SupervisionTreeView sessionId={sessionId ?? ""} label={identity} />
         </div>
+      )}
+    </div>
+  );
+}
+
+/** One crewmate sub-row under an expanded captain (slice B): the shared status
+ *  dot + identity + the workspace tab it lives in. Its own component so it can
+ *  use the shared per-terminal hooks without a hook loop; identity-first like
+ *  the captain rows (rename, else cwd basename). */
+function CrewRow({ terminalId }: { terminalId: string }) {
+  const userLabel = useWorkspace((s) => s.userLabels[terminalId]);
+  const cwd = useWorkspace((s) => s.terminals[terminalId]?.cwd);
+  const identity = captainIdentity(userLabel, cwd, terminalId);
+  const workspaceName = useWorkspaceNameForTerminal(terminalId);
+  return (
+    <div
+      className="flex items-center gap-2 py-0.5"
+      data-crew-row={terminalId}
+    >
+      <CaptainStatusDot terminalId={terminalId} size={8} />
+      <span
+        className="min-w-0 flex-1 truncate text-[10px]"
+        style={{ color: "var(--th-fg)" }}
+      >
+        {identity}
+      </span>
+      {workspaceName != null && (
+        <span
+          className="shrink-0 truncate text-[9px]"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          {workspaceName}
+        </span>
       )}
     </div>
   );

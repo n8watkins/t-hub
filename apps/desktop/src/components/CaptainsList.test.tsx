@@ -1,10 +1,11 @@
-// Tests for the sidebar CAPTAINS section body (captain-sidebar PRD slice A +
-// the captain-rows round): row render from seeded stores (workspace-first
-// ordering, identity line, turn-scoped subagent summary, tasks badge, context
-// meter), the inline rename round-trip through setTerminalLabel, summon wiring
-// through the captain store, the attention roll-up precedence (needs-input
-// pulses; working and the rate-limit overlay do NOT pulse the row - rate-limit
-// reads amber on the meter instead), and the inline SupervisionTree expansion.
+// Tests for the sidebar CAPTAINS section body (captain-sidebar PRD slice B on
+// top of the captain-rows round): row render from seeded stores (workspace-first
+// ordering, identity line, controlling workspaces + REAL crew summary, tasks
+// badge, context meter), the inline rename round-trip through setTerminalLabel,
+// summon wiring through the captain store, the attention roll-up precedence (the
+// captain's OR a crewmate's needs-input pulses; working and the rate-limit
+// overlay do NOT pulse the row - rate-limit reads amber on the meter instead),
+// and the crewmate sub-rows + inline SupervisionTree expansion.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 
@@ -17,7 +18,7 @@ vi.mock("./TerminalPool", () => ({
 }));
 
 import { CaptainsList } from "./CaptainsList";
-import { useCaptain } from "../store/captain";
+import { useCaptain, type CaptainClaimRecord } from "../store/captain";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import { useSupervision } from "../store/supervision";
 import type { SessionStatus, StatusSnapshot, SupervisionTree } from "../ipc/model";
@@ -27,18 +28,32 @@ function term(id: string): TerminalInfo {
   return { id, tmuxSession: `th_${id}`, cwd: "/tmp", title: id, state: "live" };
 }
 
-/** Two pinned captains: cap00001 (MRU front / active, with a bound session)
- *  in Workspace 1, bbb00001 (no session yet) in Workspace 2. */
+function claim(
+  id: string,
+  workspaceTabIds: string[],
+  crew: string[],
+): CaptainClaimRecord {
+  return { captainSessionId: id, shipSlug: `ship-${id}`, workspaceTabIds, crew };
+}
+
+/** Two pinned captains: cap00001 (MRU front / active, with a bound session and
+ *  two crew - one mid-turn, one done) controlling Workspace 1; bbb00001 (no
+ *  session, no claim yet) whose tile lives in Workspace 2. */
 beforeEach(() => {
   const tabs: WorkspaceTab[] = [
-    { id: "t1", name: "Workspace 1", order: ["cap00001"] },
+    { id: "t1", name: "Workspace 1", order: ["cap00001", "crewrun0", "crewdon0"] },
     { id: "t2", name: "Workspace 2", order: ["bbb00001"] },
   ];
   useWorkspace.setState({
     tabs,
     activeTabId: "t1",
     focusedId: "cap00001",
-    terminals: { cap00001: term("cap00001"), bbb00001: term("bbb00001") },
+    terminals: {
+      cap00001: term("cap00001"),
+      bbb00001: term("bbb00001"),
+      crewrun0: term("crewrun0"),
+      crewdon0: term("crewdon0"),
+    },
     poppedOutTabs: [],
     // Reset renames between cases (setTerminalLabel writes these maps).
     userLabels: {},
@@ -46,6 +61,7 @@ beforeEach(() => {
   });
   useCaptain.setState({
     captainIds: ["cap00001", "bbb00001"],
+    claims: { cap00001: claim("cap00001", ["t1"], ["crewrun0", "crewdon0"]) },
     activeCaptainId: "cap00001",
     open: false,
     anchorMenuOpen: false,
@@ -74,9 +90,14 @@ beforeEach(() => {
   };
   useSupervision.setState({
     trees: { "sess-1": tree },
-    statuses: { "sess-1": "working" },
+    // The captain works; one crew mid-turn, one crew completed.
+    statuses: { "sess-1": "working", "sess-run": "working", "sess-don": "completed" },
     snapshots: { "sess-1": snap },
-    sessionIdByTmux: { th_cap00001: "sess-1" },
+    sessionIdByTmux: {
+      th_cap00001: "sess-1",
+      th_crewrun0: "sess-run",
+      th_crewdon0: "sess-don",
+    },
   });
 });
 
@@ -88,26 +109,27 @@ function row(terminalId: string): HTMLElement {
   return el!;
 }
 
-function setStatus(status: SessionStatus): void {
+function setStatus(sessionId: string, status: SessionStatus): void {
   act(() => {
-    useSupervision.getState().setStatus("sess-1", status);
+    useSupervision.getState().setStatus(sessionId, status);
   });
 }
 
 describe("CaptainsList render", () => {
-  it("renders one row per pinned captain in MRU order with workspace + summary", () => {
+  it("renders one row per pinned captain in MRU order with controlling workspace + crew summary", () => {
     render(<CaptainsList />);
     const rows = [...document.querySelectorAll("[data-captain-row]")].map((r) =>
       r.getAttribute("data-captain-row"),
     );
     expect(rows).toEqual(["cap00001", "bbb00001"]);
 
-    // The session-bound captain: identity (cwd basename - no rename set),
-    // workspace, turn-scoped subagent counts, tasks badge, context meter.
+    // The claim-bound captain: identity (cwd basename - no rename set),
+    // controlling workspace from workspaceTabIds, REAL crew counts, tasks
+    // badge, context meter.
     const capRow = row("cap00001");
     expect(capRow.textContent).toContain("tmp"); // identity line (cwd /tmp)
     expect(capRow.textContent).toContain("Workspace 1");
-    expect(capRow.textContent).toContain("this turn: 1 running · 1 done");
+    expect(capRow.textContent).toContain("crew: 1 running · 1 done");
     expect(within(capRow).getByTitle(/outstanding background task/).textContent).toBe(
       "2 tasks",
     );
@@ -115,20 +137,19 @@ describe("CaptainsList render", () => {
       within(capRow).getByLabelText(/Context window 42 percent full/),
     ).toBeTruthy();
 
-    // The session-less captain: identity + workspace only - no invented
-    // activity.
+    // The claim-less captain: identity + workspace only - no invented crew.
     const bbbRow = row("bbb00001");
     expect(bbbRow.textContent).toContain("Workspace 2");
-    expect(bbbRow.textContent).not.toContain("this turn:");
+    expect(bbbRow.textContent).not.toContain("crew:");
     expect(bbbRow.textContent).not.toContain("task");
   });
 
   it("dims a captain whose tile is gone (tab popped out)", () => {
-    // Drop bbb00001's tile: its tab no longer lists it.
+    // Drop bbb00001's tile: its tab no longer lists it, and it has no claim.
     act(() => {
       useWorkspace.setState({
         tabs: [
-          { id: "t1", name: "Workspace 1", order: ["cap00001"] },
+          { id: "t1", name: "Workspace 1", order: ["cap00001", "crewrun0", "crewdon0"] },
           { id: "t2", name: "Workspace 2", order: [] },
         ],
       });
@@ -240,23 +261,31 @@ describe("CaptainsList summon wiring", () => {
 });
 
 describe("CaptainsList attention roll-up", () => {
-  it("pulses on needsPermission and needsQuestion (with an aria status)", () => {
+  it("pulses on the captain's own needsPermission and needsQuestion (with an aria status)", () => {
     render(<CaptainsList />);
     expect(row("cap00001").querySelector("[data-attention]")).toBeNull();
-    setStatus("needsPermission");
+    setStatus("sess-1", "needsPermission");
     expect(row("cap00001").querySelector("[data-attention]")).toBeTruthy();
     // The pulse is not color-only: a role="status" sibling announces it.
     expect(
       within(row("cap00001")).getByRole("status").textContent,
     ).toContain("needs attention");
-    setStatus("needsQuestion");
+    setStatus("sess-1", "needsQuestion");
     expect(row("cap00001").querySelector("[data-attention]")).toBeTruthy();
     expect(within(row("cap00001")).getByRole("status")).toBeTruthy();
   });
 
+  it("pulses the captain row when a CREW session needs input (slice B roll-up)", () => {
+    render(<CaptainsList />);
+    expect(row("cap00001").querySelector("[data-attention]")).toBeNull();
+    // A crewmate hits a permission prompt: it bubbles amber onto its captain.
+    setStatus("sess-run", "needsPermission");
+    expect(row("cap00001").querySelector("[data-attention]")).toBeTruthy();
+  });
+
   it("does not pulse for working, and the rate-limit overlay warms the meter instead", () => {
     render(<CaptainsList />);
-    setStatus("working");
+    setStatus("sess-1", "working");
     expect(row("cap00001").querySelector("[data-attention]")).toBeNull();
     // Rate-limit overlay: working + a window at/over the threshold displays as
     // rateLimited - the ROW stays calm (no pulse), the METER flags it.
@@ -277,22 +306,24 @@ describe("CaptainsList attention roll-up", () => {
   });
 });
 
-describe("CaptainsList inline supervision tree", () => {
-  it("chevron expands the SupervisionTree for the bound session", () => {
+describe("CaptainsList expansion (crew + subagent tree)", () => {
+  it("chevron expands crewmate sub-rows AND the captain's SupervisionTree", () => {
     render(<CaptainsList />);
-    fireEvent.click(
-      within(row("cap00001")).getByLabelText(/Expand subagent activity/),
+    fireEvent.click(within(row("cap00001")).getByLabelText(/Expand crew and subagents/));
+    // Crewmate sub-rows: one per registry crew id.
+    const crewRows = [...document.querySelectorAll("[data-crew-row]")].map((r) =>
+      r.getAttribute("data-crew-row"),
     );
-    // The tree body's counts line (distinct from the row's summary line).
+    expect(crewRows).toEqual(["crewrun0", "crewdon0"]);
+    // The captain's own subagent tree still renders below (distinct from crew).
     expect(screen.getByTitle("running subagents").textContent).toBe("1 running");
     expect(screen.getByTitle("finished subagents").textContent).toBe("1 done");
   });
 
-  it("shows the muted hint for a captain with no session yet", () => {
+  it("shows the muted subagent hint for a captain with no session/crew yet", () => {
     render(<CaptainsList />);
-    fireEvent.click(
-      within(row("bbb00001")).getByLabelText(/Expand subagent activity/),
-    );
+    fireEvent.click(within(row("bbb00001")).getByLabelText(/Expand crew and subagents/));
+    expect(document.querySelectorAll("[data-crew-row]")).toHaveLength(0);
     expect(
       screen.getByText(/No subagent activity for this session yet/),
     ).toBeTruthy();
