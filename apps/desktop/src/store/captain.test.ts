@@ -720,3 +720,23 @@ describe("agent hierarchy + deck focus", () => {
     expect(useCaptain.getState().deckFocusId).toBeNull();
   });
 });
+
+describe("deck / overlay mutual exclusion", () => {
+  it("summoning a captain while the deck is open retires the deck (no double-attach)", () => {
+    // Both full-view surfaces must never be open at once - else the captain's
+    // pooled terminal has two active placeholders (deck panel + overlay body).
+    useCaptain.setState({ deckOpen: true, deckFocusId: "cap00001" });
+    useCaptain.getState().summonCaptain("cap00001");
+    const s = useCaptain.getState();
+    expect(s.open).toBe(true); // overlay summoned
+    expect(s.deckOpen).toBe(false); // deck retired
+  });
+
+  it("closing the deck clears the spotlight so the next open defaults to the orchestrator", () => {
+    useCaptain.setState({ orchestratorId: "cap00001", deckOpen: true, deckFocusId: "bbb00001" });
+    useCaptain.getState().setDeckOpen(false);
+    expect(useCaptain.getState().deckFocusId).toBeNull();
+    useCaptain.getState().setDeckOpen(true);
+    expect(useCaptain.getState().deckFocusId).toBe("cap00001"); // orchestrator
+  });
+});

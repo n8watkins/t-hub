@@ -401,6 +401,11 @@ export const useCaptain = create<CaptainState>((set, get) => {
       // while it is open must not leave its full-window click-away backdrop
       // up to swallow the next pointerdown.
       s.setAnchorMenu(false);
+      // The overlay and the DECK are mutually-exclusive full-view surfaces:
+      // summoning a captain (from the dropdown / palette / Ctrl+B C) while the
+      // deck is open retires the deck, so the captain's pooled terminal never
+      // has TWO active placeholders (deck panel + overlay body) fighting for it.
+      if (s.deckOpen) set({ deckOpen: false });
       if (!s.captainIds.includes(id) || !terminalHasTile(id)) return;
       const ws = useWorkspace.getState();
       // Most recently summoned wins: move to the MRU front (skip the write
@@ -513,7 +518,11 @@ export const useCaptain = create<CaptainState>((set, get) => {
           anchorMenuOpen: false,
         });
       } else {
-        set({ deckOpen: false });
+        // Clear the spotlight on close so the NEXT open defaults to the
+        // orchestrator (the docstring contract), rather than the last-focused
+        // agent. The sidebar/panel click path sets deckFocusId before opening,
+        // so it is unaffected.
+        set({ deckOpen: false, deckFocusId: null });
       }
     },
 
