@@ -32,6 +32,27 @@ import { useCaptain, type CaptainClaimRecord } from "../store/captain";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import { useSupervision } from "../store/supervision";
 import type { TerminalInfo } from "../ipc/types";
+import {
+  registerTerminalTail,
+  unregisterTerminalTail,
+  type XtermTailSource,
+} from "../lib/terminalTail";
+
+/** A fake xterm buffer whose visible rows are `lines` (top -> bottom). */
+function fakeTerm(lines: string[]): XtermTailSource {
+  return {
+    rows: lines.length,
+    buffer: {
+      active: {
+        baseY: 0,
+        getLine: (y: number) =>
+          lines[y] !== undefined
+            ? { translateToString: () => lines[y] }
+            : undefined,
+      },
+    },
+  };
+}
 
 function term(id: string, cwd = "/tmp"): TerminalInfo {
   return { id, tmuxSession: `th_${id}`, cwd, title: id, state: "live" };
@@ -52,6 +73,8 @@ function tile(terminalId: string): HTMLElement {
 beforeEach(() => {
   localStorage.clear();
   writes.length = 0;
+  unregisterTerminalTail("cap00001");
+  unregisterTerminalTail("cap00002");
   const tabs: WorkspaceTab[] = [
     { id: "t1", name: "Workspace 1", order: ["cap00001", "crewrun0"] },
     { id: "t2", name: "Backend", order: ["cap00002"] },
@@ -196,5 +219,21 @@ describe("CaptainsDeck orchestrator input", () => {
     );
     expect(mic).toBeTruthy();
     expect(mic!.disabled).toBe(true);
+  });
+});
+
+describe("CaptainsDeck orchestrator output strip", () => {
+  it("shows the latest visible line of the orchestrator terminal", () => {
+    registerTerminalTail("cap00002", fakeTerm(["booting up", "ready > _"]));
+    act(() => useCaptain.getState().setOrchestratorId("cap00002"));
+    render(<CaptainsDeck />);
+    const strip = document.querySelector("[data-orchestrator-strip]");
+    expect(strip).toBeTruthy();
+    expect(strip!.textContent).toContain("ready > _");
+  });
+
+  it("renders no strip until an orchestrator is designated", () => {
+    render(<CaptainsDeck />); // orchestratorId null from beforeEach
+    expect(document.querySelector("[data-orchestrator-strip]")).toBeNull();
   });
 });

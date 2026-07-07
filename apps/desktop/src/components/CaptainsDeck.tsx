@@ -17,6 +17,7 @@ import { Mic, Send, X } from "lucide-react";
 import { useCaptain } from "../store/captain";
 import { useWorkspace } from "../store/workspace";
 import { writeTerminal } from "../ipc/client";
+import { readTerminalTailLine } from "../lib/terminalTail";
 import {
   CaptainStatusDot,
   useCaptainDisplayLabel,
@@ -70,10 +71,56 @@ export function CaptainsDeck() {
       {/* (1) The DECK: all pinned captains as large tiles. */}
       <DeckTiles />
 
-      {/* (2) output strip arrives in stage 3. */}
+      {/* (2) The orchestrator output strip (latest line of its terminal). */}
+      <OrchestratorStrip />
 
       {/* (3) The persistent bottom input, targeting the orchestrator. */}
       <OrchestratorInput />
+    </div>
+  );
+}
+
+/** A thin strip above the input showing the latest visible line of the
+ *  designated orchestrator's terminal. Polls the xterm buffer tail (~600ms) so
+ *  there is no per-output-chunk cost; renders nothing until an orchestrator is
+ *  designated. */
+function OrchestratorStrip() {
+  const orchestratorId = useCaptain((s) => s.orchestratorId);
+  const label = useCaptainDisplayLabel(orchestratorId ?? "");
+  const [line, setLine] = useState("");
+
+  useEffect(() => {
+    if (!orchestratorId) {
+      setLine("");
+      return;
+    }
+    const tick = () => setLine(readTerminalTailLine(orchestratorId));
+    tick();
+    const timer = setInterval(tick, 600);
+    return () => clearInterval(timer);
+  }, [orchestratorId]);
+
+  if (!orchestratorId) return null;
+
+  return (
+    <div
+      className="flex shrink-0 items-center gap-2 border-t px-3 py-1.5"
+      style={{ borderColor: "var(--th-border)" }}
+      data-orchestrator-strip
+    >
+      <span
+        className="shrink-0 text-[10px] font-semibold uppercase tracking-wide"
+        style={{ color: "var(--th-accent)" }}
+      >
+        {label}
+      </span>
+      <span
+        className="min-w-0 flex-1 truncate font-mono text-[11px]"
+        style={{ color: "var(--th-fg-muted)" }}
+        title={line}
+      >
+        {line || "(no output yet)"}
+      </span>
     </div>
   );
 }

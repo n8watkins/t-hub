@@ -61,6 +61,7 @@ import { useTheme, DEFAULT_THEME, type TerminalPalette } from "../store/theme";
 import { useActivity } from "../store/activity";
 import { tlog } from "../lib/diag";
 import { REPAINT_ALL_EVENT, REFRESH_TERMINAL_EVENT } from "../lib/repaint";
+import { registerTerminalTail, unregisterTerminalTail } from "../lib/terminalTail";
 import type { ITheme, ILink } from "@xterm/xterm";
 import {
   readText as tauriReadText,
@@ -434,6 +435,9 @@ export function TerminalView({
       ),
     });
     termRef.current = term;
+    // Register this xterm so the captains-deck orchestrator output strip can read
+    // its latest visible line on demand (no per-chunk work; the strip polls).
+    registerTerminalTail(terminalId, term);
 
     // Unicode 11 width tables must be loaded + selected before output is written
     // so wide glyphs / emoji line up with what the PTY computed.
@@ -1523,6 +1527,7 @@ export function TerminalView({
       // point of assigning `drainPending` (teardown beat the async attach).
       drainPending?.();
 
+      unregisterTerminalTail(terminalId, term);
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
