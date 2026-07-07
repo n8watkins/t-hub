@@ -69,7 +69,7 @@ beforeEach(() => {
   controlRequests.length = 0;
   seedWorkspace();
   seedCaptains(["cap00001"]);
-  useCaptain.setState({ claims: {} });
+  useCaptain.setState({ claims: {}, orchestratorId: null, deckOpen: false });
 });
 
 describe("v1 -> v2 persistence migration", () => {
@@ -554,5 +554,50 @@ describe("phase 2: pinning is claiming (server captains registry)", () => {
     const s = useCaptain.getState();
     expect(s.captainIds).toEqual([]);
     expect(s.anchorMenuOpen).toBe(false);
+  });
+});
+
+describe("orchestrator designation (captains deck)", () => {
+  it("setOrchestratorId designates the terminal and persists (round-trip)", () => {
+    useCaptain.getState().setOrchestratorId("cap00001");
+    expect(useCaptain.getState().orchestratorId).toBe("cap00001");
+    // Persisted to the v2 blob and re-read on load (survives a relaunch).
+    const raw = localStorage.getItem("t-hub.captain.v2");
+    expect(JSON.parse(raw!).orchestratorId).toBe("cap00001");
+    expect(loadCaptainPersisted().orchestratorId).toBe("cap00001");
+  });
+
+  it("setOrchestratorId(null) clears the designation and persists the clear", () => {
+    useCaptain.getState().setOrchestratorId("cap00001");
+    useCaptain.getState().setOrchestratorId(null);
+    expect(useCaptain.getState().orchestratorId).toBeNull();
+    expect(loadCaptainPersisted().orchestratorId).toBeNull();
+  });
+
+  it("re-designating the same id is a no-op (no redundant persist write)", () => {
+    useCaptain.getState().setOrchestratorId("cap00001");
+    localStorage.removeItem("t-hub.captain.v2");
+    useCaptain.getState().setOrchestratorId("cap00001"); // unchanged
+    expect(localStorage.getItem("t-hub.captain.v2")).toBeNull();
+  });
+
+  it("forgetCaptain clears the orchestrator when ITS terminal dies", () => {
+    useCaptain.getState().setOrchestratorId("cap00001");
+    forgetCaptain("cap00001");
+    expect(useCaptain.getState().orchestratorId).toBeNull();
+  });
+
+  it("forgetCaptain leaves a different terminal's orchestrator designation intact", () => {
+    useCaptain.getState().setOrchestratorId("cap00001");
+    forgetCaptain("bbb00001"); // a different tile closing
+    expect(useCaptain.getState().orchestratorId).toBe("cap00001");
+  });
+
+  it("the orchestrator can be any tile, not only a pinned captain", () => {
+    // ccc00001 is a live tile but not pinned as a captain.
+    expect(useCaptain.getState().captainIds).not.toContain("ccc00001");
+    useCaptain.getState().setOrchestratorId("ccc00001");
+    expect(useCaptain.getState().orchestratorId).toBe("ccc00001");
+    expect(loadCaptainPersisted().orchestratorId).toBe("ccc00001");
   });
 });
