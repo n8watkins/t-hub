@@ -14,13 +14,16 @@ import {
   listVoices,
   readVoiceSettings,
   writeVoiceSettings,
+  type VoiceEngine,
   type VoiceSettings,
 } from "../ipc/voice";
 
 /** Defaults when voice.json is missing/unreadable - mirrors the Rust side
- *  (voice.rs VoiceSettings::default): announcements opt-in, Ryan voice. */
+ *  (voice.rs VoiceSettings::default): announcements opt-in, Piper engine, Ryan
+ *  voice. */
 export const DEFAULT_VOICE_SETTINGS: VoiceSettings = {
   enabled: false,
+  engine: "piper",
   voice: "en_US-ryan-high.onnx",
   volume: 0.8,
   sapiRate: 0,
@@ -41,9 +44,14 @@ interface VoiceState extends VoiceSettings {
 
   /** Hydrate from voice.json (defaults when missing). Safe to re-run. */
   load: () => Promise<void>;
-  /** Re-query the TTS server's voice list; flips voicesUnavailable on error. */
+  /** Re-query the SELECTED engine's voice list; flips voicesUnavailable on
+   *  error. Clears the stale list first so a slow/failed switch never shows the
+   *  previous engine's voices. */
   refreshVoices: () => Promise<void>;
   setEnabled: (v: boolean) => void;
+  /** Switch the TTS engine and immediately re-query its voice list (the two
+   *  engines have disjoint voice sets). */
+  setEngine: (v: VoiceEngine) => void;
   setVoice: (v: string) => void;
   setVolume: (v: number) => void;
   setAnnounceOnAttention: (v: boolean) => void;
@@ -74,6 +82,7 @@ export const useVoice = create<VoiceState>((set, get) => {
     const s = get();
     const owned: VoiceSettings = {
       enabled: s.enabled,
+      engine: s.engine,
       voice: s.voice,
       volume: s.volume,
       sapiRate: s.sapiRate,
@@ -82,6 +91,7 @@ export const useVoice = create<VoiceState>((set, get) => {
     const merged: VoiceSettings = fileSettings
       ? {
           enabled: dirtyNow.has("enabled") ? owned.enabled : fileSettings.enabled,
+          engine: dirtyNow.has("engine") ? owned.engine : fileSettings.engine,
           voice: dirtyNow.has("voice") ? owned.voice : fileSettings.voice,
           volume: dirtyNow.has("volume") ? owned.volume : fileSettings.volume,
           sapiRate: dirtyNow.has("sapiRate")
@@ -145,10 +155,15 @@ export const useVoice = create<VoiceState>((set, get) => {
     },
 
     refreshVoices: async () => {
+      const engine = get().engine;
       try {
-        const voices = await listVoices();
+        const voices = await listVoices(engine);
+        // Ignore a stale response if the engine changed while in flight (a fast
+        // dropdown toggle): only the latest engine's list should win.
+        if (get().engine !== engine) return;
         set({ voices, voicesUnavailable: false });
       } catch {
+        if (get().engine !== engine) return;
         set({ voices: null, voicesUnavailable: true });
       }
     },
@@ -156,6 +171,16 @@ export const useVoice = create<VoiceState>((set, get) => {
     setEnabled: (v) => {
       set({ enabled: v });
       dirtyFields.add("enabled");
+      schedulePersist();
+    },
+    setEngine: (v) => {
+      if (get().engine === v) return;
+      // Drop the old engine's voice list immediately so the UI never shows the
+      // wrong set mid-switch. The NEW engine's list is loaded by the Settings
+      // section's engine-keyed effect (the single refreshVoices seam), so this
+      // action stays pure state + persist and never double-queries.
+      set({ engine: v, voices: null, voicesUnavailable: false });
+      dirtyFields.add("engine");
       schedulePersist();
     },
     setVoice: (v) => {
