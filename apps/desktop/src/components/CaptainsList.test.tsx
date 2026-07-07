@@ -123,11 +123,10 @@ describe("CaptainsList render", () => {
     );
     expect(rows).toEqual(["cap00001", "bbb00001"]);
 
-    // The claim-bound captain: identity (cwd basename - no rename set),
-    // controlling workspace from workspaceTabIds, REAL crew counts, tasks
-    // badge, context meter.
+    // The claim-bound captain: STABLE identity (no rename -> the workspace tab
+    // name "Workspace 1"), controlling workspace from workspaceTabIds, REAL crew
+    // counts, tasks badge, context meter.
     const capRow = row("cap00001");
-    expect(capRow.textContent).toContain("tmp"); // identity line (cwd /tmp)
     expect(capRow.textContent).toContain("Workspace 1");
     expect(capRow.textContent).toContain("crew: 1 running · 1 done");
     expect(within(capRow).getByTitle(/outstanding background task/).textContent).toBe(
@@ -171,9 +170,9 @@ describe("CaptainsList rename", () => {
     render(<CaptainsList />);
     const input = startRename("cap00001");
     // Draft seeds from the CURRENT override (none yet), placeholder shows the
-    // derived identity.
+    // derived STABLE identity (the workspace tab name, no rename set).
     expect(input.value).toBe("");
-    expect(input.placeholder).toBe("tmp");
+    expect(input.placeholder).toBe("Workspace 1");
     fireEvent.change(input, { target: { value: "Flagship" } });
     fireEvent.keyDown(input, { key: "Enter" });
     // Round-trip: the store carries the rename and the row leads with it.
@@ -212,7 +211,8 @@ describe("CaptainsList rename", () => {
     fireEvent.change(input, { target: { value: "" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(useWorkspace.getState().userLabels["cap00001"]).toBeUndefined();
-    expect(row("cap00001").textContent).toContain("tmp");
+    // Cleared rename reverts to the stable identity (the workspace tab name).
+    expect(row("cap00001").textContent).toContain("Workspace 1");
   });
 });
 
