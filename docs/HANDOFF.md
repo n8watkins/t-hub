@@ -1,61 +1,61 @@
-# T-Hub — Session Handoff
+# T-Hub - Session Handoff
 
-**Last updated:** 2026-07-06 · **Branch:** `main` at `82b3486`, fully pushed · **App version:** `0.3.39` (built locally, installed, running).
+**Last updated:** 2026-07-06 (orchestration + security wave) - **Branch:** `main`, fully pushed - **App version on main:** `0.3.45` code + PR #23/#24 merged on top (the next install is `0.3.46`). **Installed:** `0.3.45`.
 
-> **Zero-context handoff.** Read this file in full, plus [CAPTAIN-CHAT-PHASES.md](./CAPTAIN-CHAT-PHASES.md) (the next task lives there).
-> Every decision below is already made — **do not re-ask the user anything answered here.**
+> Zero-context handoff. Read this in full, plus [CAPTAIN-CHAT-PHASES.md](./CAPTAIN-CHAT-PHASES.md) and the orders at `~/.t-hub/captain/orders/t-hub-2026-07-06.md`.
+> Ship identity: you are captain of ship **t-hub** (ship file `~/.t-hub/captain/ships/t-hub.md`, captain terminal `e4348ddf`). The old "t-hub-native" slug is retired; the native pivot is archived.
 > Working dir: `/home/natkins/projects/tools/t-hub/t-hub-app`.
 
 ---
 
 ## 1. What this is
 
-**T-Hub** — a Tauri 2 desktop "command center" for running and supervising many Claude Code / Codex agent sessions at once.
+T-Hub is a Tauri 2 desktop command-center for running and supervising many Claude Code / Codex agent sessions.
+Rust backend (`apps/desktop/src-tauri`) + React/TS/Tailwind frontend (`apps/desktop/src`) with xterm.js terminals.
+On Windows it drives WSL tmux (`tmux -L t-hub`, sessions `th_<id>`); a loopback control socket (`control.rs`, handshake `~/.t-hub/control.json`) is the spine every crew/captain/orchestrator/MCP command flows through.
 
-- **Stack:** Rust backend (`apps/desktop/src-tauri`) + React/TypeScript/Tailwind frontend (`apps/desktop/src`) with xterm.js terminals; pnpm monorepo (`apps/site` = marketing site, `apps/cli` = CLI).
-- **Terminals:** on Windows it drives WSL tmux (`tmux -L t-hub`, sessions named `th_<id[..8]>`); `#[cfg(unix)]` attaches tmux directly (WSLg dev variant).
-- **Backend surface:** Tauri commands + the `t-hub-mcp` MCP server + a loopback control channel (`control.rs`, 127.0.0.1 NDJSON + per-launch token, handshake at `~/.t-hub/control.json`) — the control channel is the spine.
-- **THE NATIVE (GPUI) PIVOT IS OVER.** The general ended it 2026-07-05; code + docs live on the `native-archive` branch (tag `native-pivot-final`); `apps/native` is removed from main. Do not propose native work. The webview app is the product.
+## 2. What landed this wave (0.3.40 -> 0.3.45, all on main)
 
-## 2. State — what shipped in the 2026-07-05/06 session
+- **Multi-captain + sidebar** (earlier): captain list/switcher, CAPTAINS sidebar section, identity rows.
+- **Voice** (0.3.41-0.3.43): Settings > Voice (engine selector), **Kokoro** TTS added as a selectable engine (local server `~/projects/extensions/kokoro-tts`, `127.0.0.1:7478`, 54 voices, detached from crews - restart via its `start.sh`); Piper still on `7477`. Announce-on-attention with a Scribe voice-gate (holds announcements while the general dictates - Scribe writes `%LOCALAPPDATA%\com.natkins.scribe\status.json`, T-Hub reads it, `scribe_status` MCP tool). Voice-title bug fixed (speaks the captain identity, not the typed input).
+- **Identity fix** (0.3.44, PR #19): `stableCaptainIdentity` prefers cwd basename over tab name (fixed captains all showing "appturnity" when sharing a tab).
+- **Captains surface** (0.3.44 -> 0.3.45): built a custom deck (PR #20), then RETIRED it per the general's correction (PR #22) in favor of a **reserved "Captains" workspace tab** (id `captains-reserved`) - a normal workspace tab holding captain + orchestrator tiles as ordinary terminals, kept out of the work tabs; net -494 lines. Polish (PR #24): last-work-tab close guard + keep work spawns out of Captains.
+- **Orchestrator** (Cortana): a `fleet-orchestrator` skill session (terminal `e05764f5`, cwd `~/.t-hub/orchestrator`, ship slug `fleet`, file `~/.t-hub/captain/ships/fleet.md`), **adopt-only** (T-Hub adopts + designates an existing orchestrator on launch; NO permissionless auto-spawn - an adversarial audit killed auto-spawn as premature at 1-ship scale). It commands captains via the raw control socket. General drives it directly; it relays orders to captains (this handoff came through it).
+- **SECURITY - socket-gate** (design `docs/SOCKET-AUTH-DESIGN.md`):
+  - **Phase 1** (PR #21, on 0.3.45): fleet spawn governor (concurrent cap 64 from live tmux, spawn rate 20/min burst 8, hard ceiling 128, destructive throttle 15/min) + tamper-evident audit log (`~/.t-hub/audit/`, `send_text` content redacted to a hash, hash-chained). Refuses runaway/injection fan-out; normal orchestration bursts pass.
+  - **Phase 2 + 2b** (PR #23, merged - in 0.3.46): capability-scoped tokens. `control.json` `token` = full-power `control_token` (backward-compatible; every current caller keeps working); a `read_token` (Read tier only) added. Gate at `dispatch_authenticated` maps token -> capability -> command tier. Elevate-by-default (crews keep control unless explicitly opted read-only, fail-safe to control). Remote (Tailscale) peers capped to read. `create_worktree`/`remove_worktree` are control-tier.
+  - **Phase 3** (PARKED - built, flag OFF): `T_HUB_CONTROL_HARDEN` env, default false. Flipping it stops publishing `control_token` to `control.json` so the control capability only flows via the spawn-tree env injection - closes the "scrape control.json -> full power" hole. **Step 4a below is to do Phase 3 in this fresh context.**
 
-All merged to `main` and running in the installed 0.3.39 app:
+## 3. PARKED / next steps (Step 4 of the orders - resume here)
 
-- **Spawn latency** (`517f880`, 0.3.37): `tmux.rs new_session` batched ~13 wsl.exe launches into 2 `;`-chained tmux command sequences. `kill_session` is now a test-only primitive (`93012fa`); production uses `kill_session_tree`.
-- **Lane N** (PRs #4 `81c2ba6`, #5 `3ad0262`, #6 `7c056d9`): native chrome parity work, now archived along with the crate.
-- **PR #7** (`c535d78`) attach stability: `remote_pty.rs` verifies `tmux has_session` before emitting EXIT (alive → `STATE Detached`); `Terminal.tsx` verifies liveness before the exited banner, auto-reattaches visible tiles with capped backoff (250ms ×2 → 5s), heals never-attached tiles via a detached-state sweep. Killed the recurring false "process exited" tiles.
-- **PR #8** (`ed42edf`) headless server-authoritative organization: `control::TabRegistry` (monotonic seq) owns tabs/tiles; `spawn_terminal`/`create_worktree` take `tabName`/`tabId`, spawn server-side, place without focus steal; stale UI reports rejected with snapshot-to-adopt; new `close_tab` command (refuses last tab; `force` re-adopts live sessions); satellites' reporters are inert. E2E: `scripts/probes/headless_org_e2e.py` (24 checks).
-- **PR #9** (`8ebef40`) captain overlay: pin a session as captain (tile right-click or palette), **Ctrl+B C** summons it as a floating panel over any tab (pooled TerminalView takeover — no second attach), **Shift+Esc** passes a literal Esc to the captain (interrupt Claude), **Esc** dismisses with validated focus restore; geometry persisted (`t-hub.captain.v1` + geometry store); `newPlainWorkspace` chord relocated **Ctrl+B C → Ctrl+B S** with a rebind-respecting migration; one unified Esc dispatch point in `lib/escOverlays` (overlay → fullscreen order).
-- **Docs:** `docs/CAPTAIN-CHAT-PHASES.md` (next work, phases agreed), archive banners on the three NATIVE-*.md docs, `docs/NATIVE-FINISH-PLAN.md` marked archived.
+Per `~/.t-hub/captain/orders/t-hub-2026-07-06.md`, after the 0.3.46 install + fresh context, delegate these to crew worktrees (reproduce E2E first, review, test, merge, bump):
 
-**Verified working:** 0.3.39 installed via local NSIS build and relaunched; all tmux sessions survived; crews were reaped through the new headless close path.
+- **(a) Socket-gate Phase 3** - implement/flip the final lockdown (stop publishing the full-power token; control capability only via the spawn tree). It is built behind `T_HUB_CONTROL_HARDEN` (default off). The general green-lit doing it now. Verify probes/MCP/app all still spawn once the flip is on (the app must inject `control_token` into elevated sessions - Phase 2b - for this to keep working).
+- **(b) Cortana (orchestrator) UI parity** - in the app, rename the "orchestrator" entity to **Cortana**. Give it the SAME status/sidebar treatment as the captains (a peer entry in the sidebar / Captains tab with the same live status/context display captains have) PLUS a special icon marking it as the orchestrator. Cortana's live terminal is `e05764f5`. The `orchestratorId` designation + `ensureOrchestrator` adopt-only already exist in `store/captain.ts` - build the naming + icon + status-parity on that.
+- **(c) Workspace stray-terminal bug** - repro: creating a NEW workspace shows a "new terminal" placeholder on the back of the workspace even when that workspace already has terminals. Expected: do not show the placeholder when terminals already exist. Reproduce E2E, fix, land.
 
-**Known deferred items:** overlay pixel-level drag/resize never E2E'd (WSLg cannot send mouse input; the general does the manual pass); `remote_pty.rs` liveness check probes LOCAL tmux — must be revisited for remote endpoints (M2b); PR #6's wire read-timeout note still open for other socket clients.
+Also parked (lower priority): the deck's one-click "start orchestrator" affordance for the rare cold-start (deferred since the orchestrator persists in tmux).
 
-## 3. Next steps (in order)
+## 4. Conventions and gotchas (hard-won)
 
-1. ~~Phase 1 of [CAPTAIN-CHAT-PHASES.md](./CAPTAIN-CHAT-PHASES.md) — captain list + switcher.~~ **DONE 2026-07-06** (PR #10, merged `2d9bd3e`, version 0.3.40): captain store is now an MRU list + `activeCaptainId` under `t-hub.captain.v2` (v1 migrated losslessly), Ctrl+B C cycles pinned captains while summoned (Esc dismisses), overlay-header switcher, titlebar anchor count badge + dropdown, per-captain palette entries, 116 tests green.
-2. Phase 2+ per the phases doc (ship-registry unification, fleet view) — do NOT start without the general.
-3. Standing adjacent goals (tracked in the phases doc §Standing): server split M2-M4 (remote — the settled priority), MCP parity for `create_worktree`/`remove_worktree`/`wait_for_status`, wire read-timeouts.
+- **Version bump every code commit** (`apps/desktop/scripts/bump-version.sh`, then `cargo check` in `src-tauri` to sync `Cargo.lock` - never hand-edit the lock). One bump per landed change; the captain/orchestrator bumps at merge, crews never bump.
+- **Local Windows build**: clone at `C:\Users\natha\projects\Tools\t-hub\t-hub-app` - do NOT `git merge` into it; rsync `apps/desktop/src` + `src-tauri/src` + Cargo.toml/lock + package.json over it, `sed` its `tauri.conf.json` version, then `powershell.exe ... pnpm tauri build`. Output `...\bundle\nsis\T-Hub_<v>_x64-setup.exe`; install `/S`; relaunch `%LOCALAPPDATA%\T-Hub\t-hub.exe`. Verify "Finished 1 bundle". Sanity-grep a new symbol in the synced sources before trusting the installer.
+- **Session-kill-on-install regression**: the 0.3.40 install killed 5 of 7 tmux sessions; later installs (0.3.41-0.3.45) preserved ALL sessions (attached ones survive). Still a latent risk - this handoff exists because the install may kill the captain session.
+- **Crew orchestration**: spawn via the control socket `create_worktree` (reference client `scripts/probes/t1_lib.py`); crews run `claude --dangerously-skip-permissions --model opus` (the auto-mode classifier requires the general's fresh authorization per launch - it will block, ask the general). Crew brief ends with `touch /tmp/t-hub-crew-done/<ship>/<name>.done`; captain arms a background watcher over that dir. Review pattern: focused Opus finder agents + adversarial verify before presenting; fix rounds on the same branch.
+- **Fable model is walled** (usage credits) - crews + subagents run **Opus** (`--model opus`, `/model opus`, `model: "opus"`).
+- **Sparse/vertical tmux render** on some crew tiles is a WSLg capture glitch, not a stuck crew - verify via `tmux capture-pane` process check, not the garbled pane.
 
-## 4. Conventions & gotchas (hard-won this session)
+## 5. Key files
 
-- **Version bump on EVERY code commit** (`apps/desktop/scripts/bump-version.sh`, then `cargo check` in `src-tauri` to sync `Cargo.lock` — NEVER hand-edit the lock). Docs commits exempt. One bump per landed change — crews never bump; the captain/orchestrator bumps at merge.
-- **Local Windows build** (docs: memory `local-windows-build`): Windows clone at `C:\Users\natha\projects\Tools\t-hub\t-hub-app` — do NOT `git merge` into it (it has local `tauri.conf.json` mods: `targets: ["nsis"]`, `createUpdaterArtifacts: false`); **rsync sources over it** (`apps/desktop/src`, `src-tauri/src`, Cargo.toml/lock, package.json), `sed` its `tauri.conf.json` version, then `powershell.exe … pnpm tauri build`. Output: `…\bundle\nsis\T-Hub_<v>_x64-setup.exe`; install with `/S`; PowerShell flags cargo's stderr as an error — check for "Finished 1 bundle".
-- **A build that says `Aborting` on the first line still "succeeds"** — that's the clone's git merge failing before rsync'd sources build; verify the synced sources contain your change (grep a symbol) before trusting an installer.
-- **Orchestration:** crews are spawned via the control socket (`create_worktree`; reference client `scripts/probes/t1_lib.py` — `connect()` returns `(sock, hs)`, use `LineReader`, pass `v=None`). Crew shipping: PR per branch, captain merges after review. The auto-mode classifier hard-blocks: launching `claude --dangerously-skip-permissions` via send_text (needs the general's explicit fresh words), pushing to a NEWLY created external repo (hand the general the command), and sometimes `git push origin main` (ask for the words "push main").
-- **Review pattern that worked:** per-PR focused Explore agents (finders) + adversarial verify; findings sent back to the same crew as a fix round on the same branch.
-- **WSLg E2E gotchas** (memory `wslg-webview-e2e-gotchas`): X11 backend broken, keyboard-only via RAIL, rendering can freeze — verify via `tmux capture-pane` + localStorage/SQLite ground truth, not pixels. Timebox crews' E2E environment fights; ship with unit tests + deferred manual pass instead.
-- **MCP `read_terminal` can transiently fail** (`os error 11`) while heavy E2E churns the app; `tmux -L t-hub capture-pane -t th_<id> -p` is the reliable fallback.
-- **Ship registry:** `~/.t-hub/captain/ships/*.md` (this ship: `t-hub-native.md`, captain terminal `7bb9bb2f`). Sentinel dir `/tmp/t-hub-crew-done/t-hub-native/`. The three `audit-*` worktrees under `.claude/worktrees/` belong to ANOTHER ship (unlanded commits — hands off).
+- `apps/desktop/src/store/captain.ts` - orchestratorId designation, ensureOrchestrator adopt-only, captain pins.
+- `apps/desktop/src/store/workspace.ts` - reserved Captains tab (`CAPTAINS_TAB_ID`), tile placement (moveTileToCaptainsTab / placeWorkTile), tab close guards.
+- `apps/desktop/src/components/CaptainsList.tsx`, `Sidebar.tsx` - the agents/captains sidebar list (where Cortana status parity + icon go, Step 4b).
+- `apps/desktop/src/components/CaptainOverlay.tsx` - `stableCaptainIdentity`, status dot.
+- `apps/desktop/src-tauri/src/control.rs` - the control socket, capability gate (`dispatch_authenticated`, `resolve_capability`, `required_tier`), `T_HUB_CONTROL_HARDEN` Phase 3 flag.
+- `apps/desktop/src-tauri/src/governor.rs`, `audit.rs` - Phase 1 spawn budget + audit log.
+- `docs/SOCKET-AUTH-DESIGN.md` - the full socket-auth design (Phases 1-3).
+- `~/.t-hub/captain/ships/t-hub.md` - this ship's roster + landed log. `~/.t-hub/captain/ships/fleet.md` - Cortana's roster.
 
-## 5. File map (for the next task)
+## 6. Kickoff prompt for the next context
 
-- `docs/CAPTAIN-CHAT-PHASES.md` — the phase plan; phase 1 is the task.
-- `apps/desktop/src/store/captain.ts` — captain designation store (single id today; becomes a list).
-- `apps/desktop/src/components/CaptainOverlay.tsx` — the floating panel (geometry, focus contract, pool takeover).
-- `apps/desktop/src/lib/escOverlays.ts` — THE single Esc/Shift+Esc dispatch point; extend, don't add listeners.
-- `apps/desktop/src/lib/keymapExecutor.ts` + `src/lib/commands.ts` — command registry (`toggleCaptainOverlay`, `pinCaptainFocused`).
-- `apps/desktop/src/store/keybindings.ts` — chords + the v1 migration pattern to copy for v2.
-- `apps/desktop/src/store/workspace.ts` — `adoptRegistry` (PR #8), `cleanupTileSideState` → `forgetCaptain` unpin path.
-- `apps/desktop/src-tauri/src/control.rs` — TabRegistry + socket commands (phase 2 territory).
+> You are the captain of ship **t-hub** (terminal `e4348ddf`), resuming after a `/clear`. Read `docs/HANDOFF.md` in full, then `~/.t-hub/captain/orders/t-hub-2026-07-06.md`. State: main at 0.3.45 + PR #23/#24 (Phase 2 tokens + polish) merged; 0.3.46 is being/was installed. Resume Step 4: delegate to crew worktrees, reproduce E2E first, review + test + merge + bump each, and report each land back to Cortana (orchestrator, terminal `e05764f5`): **(a)** socket-gate Phase 3 - implement/flip the `T_HUB_CONTROL_HARDEN` final token lockdown (built, flag-off); **(b)** rename the orchestrator entity to **Cortana** in the app with the same sidebar/status treatment as captains plus a special orchestrator icon (Cortana terminal `e05764f5`); **(c)** fix the new-workspace stray "new terminal" placeholder bug (don't show it when the workspace already has terminals). One warm crew may exist at `0d179f8e` (worktree `.claude/worktrees/anchor-dropdown-portal`); the orchestrator `e05764f5` lives in the reserved Captains tab.
