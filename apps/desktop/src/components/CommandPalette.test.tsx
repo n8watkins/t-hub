@@ -42,7 +42,6 @@ beforeEach(() => {
     claims: {},
     open: false,
     anchorMenuOpen: false,
-    deckOpen: false,
   });
 });
 

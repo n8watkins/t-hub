@@ -50,6 +50,15 @@ import { SupervisionTreeView } from "./SupervisionTree";
 import { ContextMeter } from "./ContextMeter";
 import { ChevronIcon } from "./SidebarChrome";
 
+/** Navigate to the reserved Captains workspace tab and focus an agent's live
+ *  terminal tile - the sidebar-row click behavior now that agents live as
+ *  ordinary tiles in the Captains tab (no custom deck). */
+function revealAgent(terminalId: string): void {
+  const ws = useWorkspace.getState();
+  ws.setActiveTab(ws.ensureCaptainsTab());
+  ws.setFocus(terminalId);
+}
+
 /** Path segments of a cwd, tolerant of either separator and trailing slashes. */
 function cwdParts(cwd: string): string[] {
   return cwd
@@ -73,9 +82,10 @@ function cwdBranch(cwd: string): string {
 /** The list body: captains whose tile lives in the ACTIVE workspace tab float
  *  to the top (workspace-relevant context), MRU order within each group. */
 /** The sidebar's top-of-hierarchy ORCHESTRATOR row: status dot + stable
- *  identity + an orchestrator badge; clicking opens the deck focused on it.
- *  Renders only when an orchestrator is designated AND it is not already shown
- *  as a pinned captain in the list below (dedupe the hierarchy). */
+ *  identity + an orchestrator badge; clicking navigates to the Captains tab and
+ *  focuses its tile. Renders only when an orchestrator is designated AND it is
+ *  not already shown as a pinned captain in the list below (dedupe the
+ *  hierarchy). */
 export function OrchestratorRow() {
   const orchestratorId = useCaptain((s) => s.orchestratorId);
   const isAlsoCaptain = useCaptain(
@@ -87,8 +97,8 @@ export function OrchestratorRow() {
     <div className="flex flex-col gap-0.5 px-2 pt-1" data-orchestrator-row>
       <button
         type="button"
-        onClick={() => useCaptain.getState().focusAgent(orchestratorId)}
-        title={`Open in the deck - ${identity} (orchestrator)`}
+        onClick={() => revealAgent(orchestratorId)}
+        title={`Open in Captains - ${identity} (orchestrator)`}
         className="group relative flex min-w-0 items-center gap-2 rounded-lg py-1.5 pr-2 text-left transition-colors hover:bg-neutral-800/25"
       >
         <CaptainStatusDot terminalId={orchestratorId} size={10} />
@@ -167,7 +177,7 @@ function CaptainRow({
   const hasTile = workspaceName != null;
   // STABLE identity: rename -> cwd basename -> workspace tab name (NEVER the
   // volatile Claude title). cwd beats the tab name so unrelated captains
-  // sharing one tab stay distinct. Shared with the overlay + deck.
+  // sharing one tab stay distinct. Shared with the overlay.
   const identity = stableCaptainIdentity(userLabel, workspaceName, cwd, terminalId);
   const branch = cwd ? cwdBranch(cwd) : "";
 
@@ -187,8 +197,7 @@ function CaptainRow({
   );
   const status = useSupervision((s) => sessionStatusForTmux(s, tmux));
 
-  // Crew activity from the registry (slice B: real crew, not subagents) - the
-  // shared hook the deck tiles also use.
+  // Crew activity from the registry (slice B: real crew, not subagents).
   const crew = useCrewSummary(terminalId);
 
   // The workspaces the captain CONTROLS (registry workspaceTabIds -> names),
@@ -295,13 +304,13 @@ function CaptainRow({
             />
           </div>
         ) : (
-          /* Click focuses this agent's live panel in the deck (opens the deck). */
+          /* Click navigates to the Captains tab and focuses this agent's tile. */
           <button
             type="button"
-            onClick={() => useCaptain.getState().focusAgent(terminalId)}
+            onClick={() => revealAgent(terminalId)}
             title={
               hasTile
-                ? `Open in the deck - ${identity}`
+                ? `Open in Captains - ${identity}`
                 : `${identity} - terminal not available (tab popped out?)`
             }
             className="relative flex min-w-0 flex-1 items-center gap-2 py-2 pr-1 text-left"

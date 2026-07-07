@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { Canvas } from "./components/Canvas";
-import { useCaptain } from "./store/captain";
+import { useCaptain, agentOrder } from "./store/captain";
 import { resolveOrchestrator } from "./lib/ensureOrchestrator";
 import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
@@ -207,10 +207,12 @@ export default function App() {
     };
   }, []);
 
-  // Deck startup (main window only): once the live terminal list has seeded,
-  // ADOPT an existing orchestrator (persisted-alive, else by cwd ~/.t-hub/
-  // orchestrator - never spawn), and open the captains deck by default when the
-  // setting is on and at least one agent exists. Runs at most once.
+  // Orchestrator startup (main window only): once the live terminal list has
+  // seeded, ADOPT an existing orchestrator (persisted-alive, else by cwd
+  // ~/.t-hub/orchestrator - never spawn), then RECONCILE every designated agent
+  // (orchestrator + pinned captains) into the reserved Captains workspace tab.
+  // The reconcile also migrates an upgrading user whose captains were persisted
+  // in work tabs before this tab existed. Runs at most once.
   useEffect(() => {
     if (SATELLITE) return;
     let done = false;
@@ -222,10 +224,12 @@ export default function App() {
       if (designate && designate !== cap.orchestratorId) {
         cap.setOrchestratorId(designate);
       }
-      const c = useCaptain.getState();
-      const hasAgent = c.orchestratorId != null || c.captainIds.length > 0;
-      if (useSettings.getState().openDeckOnLaunch && hasAgent) {
-        c.setDeckOpen(true);
+      // Place every live agent tile in the Captains tab (idempotent - a tile
+      // already there is a no-op). setOrchestratorId above already moved the
+      // orchestrator; this catches persisted captains still sitting in work tabs.
+      const ws = useWorkspace.getState();
+      for (const id of agentOrder(useCaptain.getState())) {
+        if (terminals[id]) ws.moveTileToCaptainsTab(id);
       }
     };
     // Terminals may already be seeded when this runs; check now, then watch.
@@ -405,9 +409,6 @@ export default function App() {
           </>
         )}
         <div className="relative min-w-0 flex-1">
-          {/* The captains deck (agents view) mounts INSIDE the terminal pool
-              (Canvas) so its live agent panels share the pool's stacking context;
-              it self-gates on deckOpen. App only drives the default-open effect. */}
           <Canvas onFocusSidebar={ensureSidebarVisible} />
         </div>
       </div>

@@ -183,8 +183,8 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
       <div className="th-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
         {/* Agents - the fleet hierarchy: the orchestrator (top) over the pinned
             captains, above Workspaces (command view over terrain view). Clicking
-            an agent opens the deck focused on its live terminal panel. Hidden
-            entirely while no agent exists. */}
+            an agent navigates to the reserved Captains workspace tab and focuses
+            its live terminal tile. Hidden entirely while no agent exists. */}
         {agentCount > 0 && (
           <Section
             title="Agents"
@@ -197,9 +197,12 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
             action={
               <button
                 type="button"
-                onClick={() => useCaptain.getState().toggleDeck()}
-                aria-label="Open captains deck"
-                title="Open captains deck"
+                onClick={() => {
+                  const ws = useWorkspace.getState();
+                  ws.setActiveTab(ws.ensureCaptainsTab());
+                }}
+                aria-label="Open Captains workspace"
+                title="Open Captains workspace"
                 className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
               >
                 <LayoutGrid size={13} aria-hidden />
