@@ -744,6 +744,7 @@ impl CaptainsRegistry {
     ///     and keeps its crew (idempotent designation refresh);
     ///   - a ship slug already held by a DIFFERENT captain is refused (fleet
     ///     doctrine: one captain per ship - release first, explicitly).
+    ///
     /// `ship_slug` is slugified; empty/absent falls back to `ship-<sessionId>` so
     /// a UI pin (which has no ship name) always claims something addressable.
     pub fn claim(
