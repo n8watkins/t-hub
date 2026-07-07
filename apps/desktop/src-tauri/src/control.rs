@@ -50,7 +50,9 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::audit::{AuditLog, AuditMeta};
 use crate::claude::StatusBridge;
+use crate::governor::SpawnGovernor;
 use crate::supervision::Supervisor;
 use crate::{files, git, pty, tmux};
 
@@ -1032,6 +1034,14 @@ pub struct ControlContext {
     peer_is_loopback: bool,
     /// The per-launch auth token.
     token: String,
+    /// Fleet spawn budget + rate limits (socket-gate Phase 1). Shared `Arc` so one
+    /// fleet-wide budget is enforced across every connection handler thread.
+    /// Consulted from [`dispatch_authenticated`] for the ProcessChanging tier only.
+    governor: Arc<SpawnGovernor>,
+    /// Tamper-evident audit sink for Organization/ProcessChanging commands and
+    /// governor refusals (socket-gate Phase 1). Shared `Arc`; cheap to hold (no I/O
+    /// until the first record).
+    audit: Arc<AuditLog>,
 }
 
 impl ControlContext {
@@ -1820,16 +1830,185 @@ fn ct_token_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Check the token, then dispatch. A bad token is rejected before any command
-/// runs (no information about which commands exist is leaked).
+/// The authorization/audit tier of a control command (socket-gate Phase 1). The
+/// SINGLE server-side source of truth for command classification, derived from the
+/// same grouping the [`dispatch`] match uses. Phase 1 uses it to decide which
+/// commands the governor gates (ProcessChanging) and which the audit log records
+/// (Organization + ProcessChanging); Phase 2 reuses it for the capability gate, so
+/// the annotation-vs-enforcement drift that motivated this work cannot recur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandTier {
+    Read,
+    Organization,
+    ProcessChanging,
+}
+
+impl CommandTier {
+    fn label(self) -> &'static str {
+        match self {
+            CommandTier::Read => "read",
+            CommandTier::Organization => "organization",
+            CommandTier::ProcessChanging => "process-changing",
+        }
+    }
+}
+
+/// Classify a command by tier. Mirrors the tier blocks in [`dispatch`] and the
+/// MCP `Tier` enum. Filesystem-mutating "Organization-destructive" commands
+/// (`create_worktree`, `remove_worktree`, `archive_recent_project`) are
+/// Organization tier for Phase 1 (audited, not budget-gated); the governor only
+/// throttles the true process-spawn/kill surface.
+fn command_tier(command: &str) -> CommandTier {
+    match command {
+        "spawn_terminal" | "send_text" | "send_keys" | "close_terminal" => {
+            CommandTier::ProcessChanging
+        }
+        "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
+        | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
+        | "archive_recent_project" | "claim_captain" | "release_captain" => {
+            CommandTier::Organization
+        }
+        _ => CommandTier::Read,
+    }
+}
+
+/// The authoritative count of live `th_*` tmux sessions, reconciled from the tmux
+/// source of truth on every spawn (never a free-running counter that drifts when a
+/// session dies without a `close_terminal`).
+///
+/// Fails OPEN (returns 0) when tmux cannot be queried, because the hard constraint
+/// is that a transient tmux hiccup must NOT block legitimate orchestration - and
+/// the spawn-rate token bucket still bounds runaway spawning to 20/min regardless
+/// of the count, so the concurrent cap/ceiling degrading to the rate limiter is a
+/// bounded, deliberate fallback. The failure is logged (not silent) so a query
+/// outage that softens the cap is observable in the audit/stderr trail.
+fn live_session_count() -> usize {
+    match tmux::list_sessions() {
+        Ok(sessions) => sessions.iter().filter(|n| n.starts_with("th_")).count(),
+        Err(e) => {
+            eprintln!(
+                "t-hub-control: could not derive live-session count from tmux ({e}); \
+                 spawn concurrent-cap/ceiling fall back to the spawn-rate limiter for this spawn"
+            );
+            0
+        }
+    }
+}
+
+/// Whether a `send_keys` payload carries a process-signal / kill-style key. The
+/// destructive throttle applies to these (interrupt / quit / EOF / suspend), not
+/// to benign navigation keys, so typing `Up`/`Enter` is never rate-limited.
+fn keys_are_kill_style(args: &Value) -> bool {
+    args.get("keys")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|k| k.as_str()).any(is_kill_key))
+        .unwrap_or(false)
+}
+
+fn is_kill_key(k: &str) -> bool {
+    matches!(
+        k.trim().to_ascii_uppercase().as_str(),
+        "C-C" | "C-\\" | "C-D" | "C-Z"
+    )
+}
+
+/// The fleet gate (socket-gate Phase 1 §4): consult the governor for the
+/// process-changing command about to run. `spawn_terminal` is bounded by the
+/// concurrent-session cap + spawn rate; `close_terminal` and kill-style `send_keys`
+/// by the destructive throttle; `send_text` and benign `send_keys` are not
+/// throttled (only audited).
+fn governor_gate(ctx: &ControlContext, command: &str, args: &Value) -> Result<(), crate::governor::Refusal> {
+    let now = std::time::Instant::now();
+    match command {
+        "spawn_terminal" => ctx.governor.check_spawn(live_session_count(), now),
+        "close_terminal" => ctx.governor.check_destructive(now),
+        "send_keys" if keys_are_kill_style(args) => ctx.governor.check_destructive(now),
+        _ => Ok(()),
+    }
+}
+
+/// Write one audit record for an Organization/ProcessChanging command (or a
+/// governor refusal). `decision` is the gate outcome (`allowed` / `refused-*`);
+/// `error` carries a downstream dispatch failure for an allowed command.
+fn audit_command(
+    ctx: &ControlContext,
+    req: &ControlRequest,
+    tier: CommandTier,
+    decision: &str,
+    error: Option<&str>,
+) {
+    let session = req
+        .args
+        .get("sessionId")
+        .or_else(|| req.args.get("session_id"))
+        .and_then(|v| v.as_str());
+    let spawned_by = req
+        .args
+        .get("spawnedBy")
+        .or_else(|| req.args.get("spawned_by"))
+        .and_then(|v| v.as_str());
+    ctx.audit.record(
+        &req.command,
+        tier.label(),
+        decision,
+        &req.args,
+        AuditMeta {
+            peer: if ctx.peer_is_loopback { "loopback" } else { "remote" },
+            // Phase 1 has a single full-power token; the field is forward-compat.
+            token_tier: "control",
+            session,
+            spawned_by,
+            error,
+        },
+    );
+}
+
+/// Check the token, gate + audit, then dispatch. A bad token is rejected before
+/// any command runs (no information about which commands exist is leaked). For the
+/// ProcessChanging tier the fleet governor runs first (refuse-past-ceiling); every
+/// Organization/ProcessChanging command - allowed or refused - lands in the audit
+/// log, and a governor refusal is also mirrored live onto the event fanout.
 fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
     if !ct_token_eq(&req.token, &ctx.token) {
         return ControlResponse::err("unauthorized: bad control token");
     }
-    match dispatch(ctx, &req.command, &req.args) {
+
+    let tier = command_tier(&req.command);
+
+    // Phase 1 fleet gate: budget + rate limits for process-changing commands only.
+    // Read/Organization tiers never touch the governor.
+    if tier == CommandTier::ProcessChanging {
+        if let Err(refusal) = governor_gate(ctx, &req.command, &req.args) {
+            audit_command(ctx, &req, tier, refusal.code, None);
+            ctx.fanout.emit_event(
+                "control://governor",
+                &json!({
+                    "command": req.command.as_str(),
+                    "decision": refusal.code,
+                    "error": refusal.message.as_str(),
+                }),
+            );
+            return ControlResponse::err(refusal.message);
+        }
+    }
+
+    let response = match dispatch(ctx, &req.command, &req.args) {
         Ok(value) => ControlResponse::ok(value),
         Err(e) => ControlResponse::err(e),
+    };
+
+    // Audit every Organization + ProcessChanging command on the allowed path,
+    // capturing the dispatch outcome. Read-tier commands are not audited.
+    if tier != CommandTier::Read {
+        let err = if response.ok {
+            None
+        } else {
+            response.error.as_deref()
+        };
+        audit_command(ctx, &req, tier, "allowed", err);
     }
+
+    response
 }
 
 /// The set of commands the control channel will execute. Read + Organization
@@ -3502,7 +3681,25 @@ impl ControlContext {
             max_attach_forwarders: MAX_ATTACH_FORWARDERS,
             peer_is_loopback: true,
             token,
+            governor: Arc::new(SpawnGovernor::from_env()),
+            audit: Arc::new(AuditLog::from_env()),
         }
+    }
+
+    /// Replace the [`SpawnGovernor`] (tests inject tiny limits; production keeps the
+    /// env-configured one from [`new`](Self::new)).
+    #[cfg(test)]
+    pub fn with_governor(mut self, governor: Arc<SpawnGovernor>) -> Self {
+        self.governor = governor;
+        self
+    }
+
+    /// Replace the [`AuditLog`] (tests point it at a temp dir so they never write to
+    /// the real `~/.t-hub/audit`).
+    #[cfg(test)]
+    pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
+        self.audit = audit;
+        self
     }
 
     /// The shared tab registry (TASK C / #22). `lib.rs` grabs this before starting
@@ -3592,7 +3789,11 @@ mod tests {
                 let guard = sup_for_closure.lock().unwrap();
                 f(&guard);
             });
+        // Point the audit sink at a per-token temp dir so dispatch_authenticated
+        // tests never write to the real ~/.t-hub/audit.
+        let audit_dir = std::env::temp_dir().join(format!("t-hub-ctl-test-{token}"));
         ControlContext::new(Arc::new(StatusBridge::new()), visitor, token.to_string())
+            .with_audit(Arc::new(crate::audit::AuditLog::new(audit_dir)))
     }
 
     #[test]
@@ -5825,5 +6026,218 @@ mod tests {
         let calls = sink.calls.lock().unwrap();
         let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
         assert_eq!(names, ["sync_captains", "close_tab"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // socket-gate Phase 1: fleet governor + audit wiring at dispatch_authenticated
+    // -----------------------------------------------------------------------
+
+    /// Read every audit record written under `dir` (order within a single day file
+    /// is append order). Empty when nothing was audited.
+    fn read_audit(dir: &std::path::Path) -> Vec<Value> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                if let Ok(txt) = std::fs::read_to_string(entry.path()) {
+                    for line in txt.lines() {
+                        if !line.trim().is_empty() {
+                            out.push(serde_json::from_str(line).unwrap());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn req(token: &str, command: &str, args: Value) -> ControlRequest {
+        ControlRequest {
+            token: token.to_string(),
+            command: command.to_string(),
+            args,
+            v: None,
+        }
+    }
+
+    #[test]
+    fn normal_captain_fanout_burst_not_refused_at_gate() {
+        // THE most important test (design spec): a captain fanning out 6 crew in an
+        // instant burst must NOT be refused by the fleet gate. With the default
+        // burst of 8 the governor admits all six; they fail downstream only because
+        // this headless ctx has no UI sink, never because of the budget.
+        let dir = std::env::temp_dir().join("t-hub-gate-burst");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = test_ctx("burst")
+            .with_governor(Arc::new(SpawnGovernor::default()))
+            .with_audit(Arc::new(AuditLog::new(dir.clone())));
+        for i in 0..6 {
+            let resp = dispatch_authenticated(
+                &ctx,
+                req("burst", "spawn_terminal", json!({"cwd": "/tmp", "name": format!("crew-{i}")})),
+            );
+            let err = resp.error.clone().unwrap_or_default();
+            assert!(!err.contains("rate limit"), "spawn {i} was rate-limited: {err}");
+            assert!(
+                !err.contains("concurrent-session cap"),
+                "spawn {i} hit the concurrent cap: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_rate_limit_refuses_with_exact_message_and_audits() {
+        // Burst 1: the first spawn spends the only token; the second is refused with
+        // the exact §5 message and recorded as `refused-rate`.
+        let dir = std::env::temp_dir().join("t-hub-gate-rate");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = test_ctx("rate")
+            .with_governor(Arc::new(SpawnGovernor::new(64, 20.0, 1.0)))
+            .with_audit(Arc::new(AuditLog::new(dir.clone())));
+        let r1 = dispatch_authenticated(&ctx, req("rate", "spawn_terminal", json!({"cwd": "/tmp"})));
+        // Governor admitted r1; it fails downstream on the missing UI sink.
+        assert!(r1.error.clone().unwrap_or_default().contains("no UI"), "got: {:?}", r1.error);
+        let r2 = dispatch_authenticated(&ctx, req("rate", "spawn_terminal", json!({"cwd": "/tmp"})));
+        assert!(
+            r2.error.clone().unwrap().contains("spawn rate limit (20/min); retry shortly"),
+            "got: {:?}",
+            r2.error
+        );
+
+        let recs = read_audit(&dir);
+        assert_eq!(recs.len(), 2, "expected an allowed + a refused record");
+        assert_eq!(recs[0]["decision"], "allowed");
+        assert_eq!(recs[0]["command"], "spawn_terminal");
+        assert_eq!(recs[1]["decision"], "refused-rate");
+        // The hash chain links the refusal to the prior line.
+        assert_eq!(recs[1]["prev"], recs[0]["hash"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_tier_is_not_gated_or_audited() {
+        // list_terminals is Read tier: it must never touch the governor or the audit
+        // log, whether or not tmux is reachable in the test env.
+        let dir = std::env::temp_dir().join("t-hub-gate-read");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = test_ctx("read").with_audit(Arc::new(AuditLog::new(dir.clone())));
+        let _ = dispatch_authenticated(&ctx, req("read", "list_terminals", json!({})));
+        assert!(read_audit(&dir).is_empty(), "a read-tier command was audited");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn send_text_is_audited_with_redaction_through_gate() {
+        // send_text is process-changing (audited) but NOT rate-limited. The literal
+        // text must never reach the audit log - only a length + hash.
+        let dir = std::env::temp_dir().join("t-hub-gate-sendtext");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = test_ctx("st").with_audit(Arc::new(AuditLog::new(dir.clone())));
+        let resp = dispatch_authenticated(
+            &ctx,
+            req("st", "send_text", json!({"sessionId": "ghost", "text": "SUPERSECRET", "enter": true})),
+        );
+        assert!(!resp.ok); // no such session, but the audit still lands
+        let recs = read_audit(&dir);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["command"], "send_text");
+        assert_eq!(recs[0]["decision"], "allowed");
+        let blob = serde_json::to_string(&recs[0]).unwrap();
+        assert!(!blob.contains("SUPERSECRET"), "literal text leaked into audit: {blob}");
+        assert_eq!(recs[0]["args"]["textLen"], 11);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_token_is_rejected_and_not_audited() {
+        // A bad token is rejected before the gate and never audited (no leak of the
+        // process-changing surface to an unauthenticated probe).
+        let dir = std::env::temp_dir().join("t-hub-gate-badtok");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = test_ctx("good").with_audit(Arc::new(AuditLog::new(dir.clone())));
+        let resp = dispatch_authenticated(&ctx, req("WRONG", "spawn_terminal", json!({})));
+        assert!(resp.error.unwrap().contains("bad control token"));
+        assert!(read_audit(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kill_style_send_keys_is_throttled_but_navigation_is_not() {
+        // The destructive throttle covers kill-style keys (C-c) but not navigation
+        // (Up/Enter) - proven at the classifier the gate uses.
+        assert!(keys_are_kill_style(&json!({"keys": ["C-c"]})));
+        assert!(keys_are_kill_style(&json!({"keys": ["Up", "C-d"]})));
+        assert!(!keys_are_kill_style(&json!({"keys": ["Up", "Enter"]})));
+        assert!(!keys_are_kill_style(&json!({"keys": []})));
+    }
+
+    #[test]
+    fn command_tiers_are_classified() {
+        assert_eq!(command_tier("spawn_terminal"), CommandTier::ProcessChanging);
+        assert_eq!(command_tier("close_terminal"), CommandTier::ProcessChanging);
+        assert_eq!(command_tier("send_text"), CommandTier::ProcessChanging);
+        assert_eq!(command_tier("new_tab"), CommandTier::Organization);
+        assert_eq!(command_tier("create_worktree"), CommandTier::Organization);
+        assert_eq!(command_tier("list_terminals"), CommandTier::Read);
+        assert_eq!(command_tier("get_status"), CommandTier::Read);
+    }
+
+    #[test]
+    fn legit_spawn_send_close_through_gate_is_admitted_and_audited() {
+        // End-to-end through dispatch_authenticated (governor + audit) against a
+        // REAL tmux session: a legitimate crew spawn -> send_text -> close must all
+        // be ADMITTED and audited allowed. This is the "legit orchestration still
+        // works over the exact socket" guarantee, exercised through the gate.
+        let dir = std::env::temp_dir().join("t-hub-gate-e2e");
+        let _ = std::fs::remove_dir_all(&dir);
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("e2e")
+            .with_apply_sink(sink.clone())
+            .with_audit(Arc::new(AuditLog::new(dir.clone())));
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
+
+        // Spawn a real session through the authenticated gate.
+        let sresp = dispatch_authenticated(
+            &ctx,
+            req("e2e", "spawn_terminal", json!({"cwd": "/tmp", "name": "crew", "tabId": "tab-1"})),
+        );
+        assert!(sresp.ok, "legit spawn was refused by the gate: {:?}", sresp.error);
+        let id = sresp.result.as_ref().unwrap()["id"].as_str().unwrap().to_string();
+        let target = tmux::target_for_id(&id);
+        assert!(tmux::has_session(&target), "the real tmux session should exist");
+        let _ = tmux::resize_window_for_tests(&target, 80, 24);
+
+        // Type into it through the gate (send_text is not throttled).
+        let tresp = dispatch_authenticated(
+            &ctx,
+            req("e2e", "send_text", json!({"sessionId": id, "text": "echo GATE_E2E_OK", "enter": true})),
+        );
+        assert!(tresp.ok, "legit send_text was refused: {:?}", tresp.error);
+
+        // Close it through the gate (destructive, but the first teardown is under
+        // the burst of 10 so it is admitted).
+        let cresp = dispatch_authenticated(&ctx, req("e2e", "close_terminal", json!({"sessionId": id})));
+        assert!(cresp.ok, "legit close_terminal was refused: {:?}", cresp.error);
+        assert!(!tmux::has_session(&target), "session should be gone after close");
+
+        // All three land in the audit log, allowed and hash-chained. send_text's
+        // literal payload is NOT present (redacted).
+        let recs = read_audit(&dir);
+        assert_eq!(recs.len(), 3, "expected spawn+send+close audited: {recs:?}");
+        let cmds: Vec<&str> = recs.iter().map(|r| r["command"].as_str().unwrap()).collect();
+        assert_eq!(cmds, ["spawn_terminal", "send_text", "close_terminal"]);
+        assert!(recs.iter().all(|r| r["decision"] == "allowed"), "a legit command was not allowed: {recs:?}");
+        for w in recs.windows(2) {
+            assert_eq!(w[1]["prev"], w[0]["hash"], "hash chain broken");
+        }
+        let blob = serde_json::to_string(&recs).unwrap();
+        assert!(!blob.contains("GATE_E2E_OK"), "send_text literal leaked into audit");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
