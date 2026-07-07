@@ -4041,6 +4041,7 @@ version = "0.3.42"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "dirs",
  "ignore",
  "image",
  "parking_lot",

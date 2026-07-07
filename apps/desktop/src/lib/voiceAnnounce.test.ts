@@ -69,16 +69,21 @@ beforeEach(() => {
     sessionIdByTmux: { th_cap00001: "sess-1" },
   });
   useWorkspace.setState({
+    tabs: [],
     terminals: {
       cap00001: {
         id: "cap00001",
         tmuxSession: "th_cap00001",
         cwd: "/tmp/ship",
-        title: "captain",
+        // A volatile Claude title reflecting the user's typed input - the
+        // spoken name must NEVER be this (it must be the stable rename below).
+        title: "please fix the bug",
         state: "live",
       },
     },
-    labels: {},
+    // The stable identity the announcement should speak (a persisted rename).
+    userLabels: { cap00001: "captain" },
+    labels: { cap00001: "captain" },
   });
 });
 
@@ -188,6 +193,64 @@ describe("announce gating", () => {
   });
 });
 
+describe("spoken label is the STABLE identity, never the typed input", () => {
+  it("speaks the user rename, not the volatile Claude title", async () => {
+    // beforeEach seeds title 'please fix the bug' (the typed input) + rename
+    // 'captain'. The announcement must speak the rename.
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
+    const spoken = vi.mocked(synthesizeVoice).mock.calls[0][0];
+    expect(spoken).toContain("captain");
+    expect(spoken).not.toContain("please fix the bug");
+  });
+
+  it("falls back to the workspace TAB NAME (not the title) when there is no rename", async () => {
+    useWorkspace.setState({
+      tabs: [{ id: "t1", name: "Flagship", order: ["cap00001"] }],
+      terminals: {
+        cap00001: {
+          id: "cap00001",
+          tmuxSession: "th_cap00001",
+          cwd: "/tmp/ship",
+          title: "summarize this transcript",
+          state: "live",
+        },
+      },
+      userLabels: {},
+      // The merged `labels` still carries the volatile title - proof we do NOT
+      // read it (we read userLabels + the tab name instead).
+      labels: { cap00001: "summarize this transcript" },
+    });
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
+    const spoken = vi.mocked(synthesizeVoice).mock.calls[0][0];
+    expect(spoken).toContain("Flagship");
+    expect(spoken).not.toContain("summarize this transcript");
+  });
+
+  it("falls back to the cwd basename when there is no rename or tab", async () => {
+    useWorkspace.setState({
+      tabs: [],
+      terminals: {
+        cap00001: {
+          id: "cap00001",
+          tmuxSession: "th_cap00001",
+          cwd: "/home/n/wt-feature/webapp",
+          title: "typed input here",
+          state: "live",
+        },
+      },
+      userLabels: {},
+      labels: {},
+    });
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
+    const spoken = vi.mocked(synthesizeVoice).mock.calls[0][0];
+    expect(spoken).toContain("webapp");
+    expect(spoken).not.toContain("typed input here");
+  });
+});
+
 describe("Scribe voice-gate (hold while dictating, deliver when stopped)", () => {
   /** Seed the store statuses so flushPending's "still blocked?" re-scan sees
    *  them, and mirror them into handleStatusesChange for transition detection. */
@@ -233,17 +296,19 @@ describe("Scribe voice-gate (hold while dictating, deliver when stopped)", () =>
   });
 
   it("COALESCES multiple held transitions into one (latest wins, no backlog)", async () => {
-    // Two sessions map to two terminals so their labels differ.
+    // Two sessions map to two terminals so their (stable) labels differ.
     useSupervision.setState({
       statuses: {},
       sessionIdByTmux: { th_cap00001: "sess-1", th_cap00002: "sess-2" },
     });
     useWorkspace.setState({
+      tabs: [],
       terminals: {
-        cap00001: { id: "cap00001", tmuxSession: "th_cap00001", cwd: "/tmp/a", title: "captain", state: "live" },
-        cap00002: { id: "cap00002", tmuxSession: "th_cap00002", cwd: "/tmp/b", title: "crewmate", state: "live" },
+        cap00001: { id: "cap00001", tmuxSession: "th_cap00001", cwd: "/tmp/a", title: "typed a", state: "live" },
+        cap00002: { id: "cap00002", tmuxSession: "th_cap00002", cwd: "/tmp/b", title: "typed b", state: "live" },
       },
-      labels: {},
+      userLabels: { cap00001: "captain", cap00002: "crewmate" },
+      labels: { cap00001: "captain", cap00002: "crewmate" },
     });
     _setScribeListeningForTest(true);
     // A blocks, then B blocks (a later, separate transition).

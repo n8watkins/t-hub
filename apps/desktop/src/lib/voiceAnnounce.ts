@@ -24,7 +24,7 @@
 // silences T-Hub.
 import { useSupervision } from "../store/supervision";
 import { useVoice } from "../store/voice";
-import { useWorkspace, deriveLabel } from "../store/workspace";
+import { useWorkspace, tabIdForTerminal } from "../store/workspace";
 import { synthesizeVoice } from "../ipc/voice";
 import { scribeStatus } from "../ipc/scribe";
 import { playWavBase64 } from "./voiceAudio";
@@ -77,6 +77,9 @@ let scribeListening = false;
 let pending: { text: string } | null = null;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let tailTimer: ReturnType<typeof setTimeout> | null = null;
+/** True while a scribe_status IPC is in flight, so a slow read never stacks
+ *  overlapping poll ticks. */
+let scribePolling = false;
 
 /** Synthesize + play one announcement. Guards a single in-flight request and
  *  charges the burst-debounce clock only on SUCCESS (a failed synthesis leaves
@@ -103,10 +106,20 @@ function speak(text: string, now: number): boolean {
   return true;
 }
 
-/** The human label for a session, via the statusline's tmux index (the same
- *  sessionId -> th_<terminalId> chain rulesMount walks) and the workspace
- *  store's deriveLabel - so the spoken name matches the tile/sidebar name.
- *  Null when the session has no resolvable terminal (label falls back). */
+/** A STABLE spoken name for a session, via the statusline's tmux index (the
+ *  same sessionId -> th_<terminalId> chain rulesMount walks). Null when the
+ *  session has no resolvable terminal (caller falls back to "A session").
+ *
+ *  Deliberately does NOT use deriveLabel / info.title: the Claude-suggested
+ *  session title is volatile and reflects the user's TYPED INPUT, so speaking
+ *  it announced the wrong thing (the general's dictated text instead of the
+ *  captain). We use only stable sources, in order:
+ *    1. the user's persisted rename (userLabels - not the merged `labels`,
+ *       which folds in the volatile claudeTitles that caused the bug);
+ *    2. the name of the workspace TAB holding the tile (the same
+ *       tabIdForTerminal -> tabs.find(name) path the sidebar uses);
+ *    3. the cwd basename.
+ *  Plain function (not a hook), so it reads the store via getState(). */
 function labelForSession(sessionId: string): string | null {
   const sup = useSupervision.getState();
   const tmux = Object.entries(sup.sessionIdByTmux).find(
@@ -115,13 +128,22 @@ function labelForSession(sessionId: string): string | null {
   if (!tmux || !tmux.startsWith("th_")) return null;
   const terminalId = tmux.slice("th_".length);
   const ws = useWorkspace.getState();
-  const info = ws.terminals[terminalId];
-  return deriveLabel({
-    id: terminalId,
-    label: ws.labels[terminalId],
-    title: info?.title,
-    cwd: info?.cwd,
-  });
+
+  const rename = ws.userLabels[terminalId]?.trim();
+  if (rename) return rename;
+
+  const tabId = tabIdForTerminal(ws, terminalId);
+  const tabName = tabId
+    ? ws.tabs.find((t) => t.id === tabId)?.name?.trim()
+    : undefined;
+  if (tabName) return tabName;
+
+  const cwd = ws.terminals[terminalId]?.cwd ?? "";
+  const parts = cwd
+    .replace(/[/\\]+$/, "")
+    .split(/[/\\]+/)
+    .filter(Boolean);
+  return parts[parts.length - 1] ?? null;
 }
 
 /**
@@ -267,9 +289,14 @@ export function mountVoiceAnnounce(): void {
 export function startScribePoll(): void {
   if (pollTimer) return;
   const tick = () => {
+    if (scribePolling) return; // a prior read is still in flight - skip
+    scribePolling = true;
     void scribeStatus()
       .then((s) => applyScribeListening(!!s.listening, Date.now()))
-      .catch(() => applyScribeListening(false, Date.now()));
+      .catch(() => applyScribeListening(false, Date.now()))
+      .finally(() => {
+        scribePolling = false;
+      });
   };
   tick(); // seed immediately so the gate reflects reality without a poll wait
   pollTimer = setInterval(tick, SCRIBE_POLL_MS);
@@ -282,6 +309,7 @@ export function _resetVoiceAnnounceForTest(): void {
   speaking = false;
   scribeListening = false;
   pending = null;
+  scribePolling = false;
   if (tailTimer) {
     clearTimeout(tailTimer);
     tailTimer = null;
