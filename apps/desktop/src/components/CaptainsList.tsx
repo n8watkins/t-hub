@@ -123,8 +123,9 @@ function CaptainRow({
   // Summon is then a store-level no-op, so the row must READ unavailable.
   const workspaceName = useWorkspaceNameForTerminal(terminalId);
   const hasTile = workspaceName != null;
-  // STABLE identity: rename -> workspace tab name -> cwd basename (NEVER the
-  // volatile Claude title). Shared with the overlay + deck.
+  // STABLE identity: rename -> cwd basename -> workspace tab name (NEVER the
+  // volatile Claude title). cwd beats the tab name so unrelated captains
+  // sharing one tab stay distinct. Shared with the overlay + deck.
   const identity = stableCaptainIdentity(userLabel, workspaceName, cwd, terminalId);
   const branch = cwd ? cwdBranch(cwd) : "";
 

@@ -24,8 +24,8 @@ import { useSupervision } from "../store/supervision";
 import type { SessionStatus, StatusSnapshot, SupervisionTree } from "../ipc/model";
 import type { TerminalInfo } from "../ipc/types";
 
-function term(id: string): TerminalInfo {
-  return { id, tmuxSession: `th_${id}`, cwd: "/tmp", title: id, state: "live" };
+function term(id: string, cwd = "/tmp"): TerminalInfo {
+  return { id, tmuxSession: `th_${id}`, cwd, title: id, state: "live" };
 }
 
 function claim(
@@ -49,7 +49,9 @@ beforeEach(() => {
     activeTabId: "t1",
     focusedId: "cap00001",
     terminals: {
-      cap00001: term("cap00001"),
+      // cap00001's cwd basename "monorepo-app" is its stable identity - it must
+      // win over the tab name "Workspace 1" (a grouping, not an identity).
+      cap00001: term("cap00001", "/home/n/appturnity/monorepo-app"),
       bbb00001: term("bbb00001"),
       crewrun0: term("crewrun0"),
       crewdon0: term("crewdon0"),
@@ -123,11 +125,12 @@ describe("CaptainsList render", () => {
     );
     expect(rows).toEqual(["cap00001", "bbb00001"]);
 
-    // The claim-bound captain: STABLE identity (no rename -> the workspace tab
-    // name "Workspace 1"), controlling workspace from workspaceTabIds, REAL crew
-    // counts, tasks badge, context meter.
+    // The claim-bound captain: STABLE identity (no rename -> the cwd basename
+    // "monorepo-app", NOT the tab name), plus its controlling workspace
+    // "Workspace 1" from workspaceTabIds, REAL crew counts, tasks badge, meter.
     const capRow = row("cap00001");
-    expect(capRow.textContent).toContain("Workspace 1");
+    expect(capRow.textContent).toContain("monorepo-app"); // identity (cwd basename)
+    expect(capRow.textContent).toContain("Workspace 1"); // controlling workspace line
     expect(capRow.textContent).toContain("crew: 1 running · 1 done");
     expect(within(capRow).getByTitle(/outstanding background task/).textContent).toBe(
       "2 tasks",
@@ -170,9 +173,9 @@ describe("CaptainsList rename", () => {
     render(<CaptainsList />);
     const input = startRename("cap00001");
     // Draft seeds from the CURRENT override (none yet), placeholder shows the
-    // derived STABLE identity (the workspace tab name, no rename set).
+    // derived STABLE identity (the cwd basename, no rename set).
     expect(input.value).toBe("");
-    expect(input.placeholder).toBe("Workspace 1");
+    expect(input.placeholder).toBe("monorepo-app");
     fireEvent.change(input, { target: { value: "Flagship" } });
     fireEvent.keyDown(input, { key: "Enter" });
     // Round-trip: the store carries the rename and the row leads with it.
