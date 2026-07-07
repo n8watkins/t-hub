@@ -726,6 +726,13 @@ impl CaptainsRegistry {
     /// snapshots are serialized and never interleave. A write failure is logged
     /// and never fails the mutation (the in-memory registry stays authoritative
     /// for this run; the next successful write heals the file).
+    ///
+    /// ATOMIC (temp + rename), mirroring `voice.rs`: the loader treats a corrupt
+    /// file as empty (silently dropping every claim), so a crash mid-write must
+    /// never leave a torn file. We write a full body to a unique temp path, then
+    /// `rename` it over the target - `rename` replaces atomically (on Windows too,
+    /// MOVEFILE_REPLACE_EXISTING), so a reader/loader always sees either the old
+    /// complete file or the new complete file, never a partial one.
     fn persist_locked(&self, g: &CaptainsInner) {
         let Some(path) = &self.path else { return };
         let snap = CaptainsSnapshot { seq: g.seq, captains: g.captains.clone() };
@@ -739,11 +746,28 @@ impl CaptainsRegistry {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = std::fs::write(path, &body) {
+        // A unique temp name (pid + a process-wide counter) so two writers can
+        // never interleave on the same temp file - each renames its own complete
+        // body; last rename wins whole.
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let tmp = path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        if let Err(e) = std::fs::write(&tmp, &body) {
             eprintln!(
-                "t-hub-control: captains registry write to {} failed: {e}",
+                "t-hub-control: captains registry temp write to {} failed: {e}",
+                tmp.display()
+            );
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            eprintln!(
+                "t-hub-control: captains registry rename to {} failed: {e}",
                 path.display()
             );
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -5432,6 +5456,18 @@ mod tests {
         // And keeps counting monotonically from there.
         reg.claim("cap-2", Some("beta"), vec![]).unwrap();
         assert_eq!(CaptainsRegistry::load(path.clone()).snapshot().seq, 3);
+
+        // Atomic write discipline: the temp file is renamed over the target, so
+        // no `.tmp` sibling is ever left behind after the writes above.
+        let stem = path.file_name().unwrap().to_string_lossy().into_owned();
+        let leftover_tmp = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(&stem) && n.ends_with(".tmp")
+            });
+        assert!(!leftover_tmp, "atomic write must leave no .tmp file behind");
         let _ = std::fs::remove_file(&path);
     }
 
