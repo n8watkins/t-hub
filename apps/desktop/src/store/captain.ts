@@ -209,6 +209,11 @@ export interface CaptainState {
    *  starts closed). The deck tiles every pinned captain and hosts the
    *  orchestrator input; App swaps it in over the workspace canvas. */
   deckOpen: boolean;
+  /** The agent panel the deck is FOCUSED / spotlighted on (view-state, not
+   *  persisted). Clicking a sidebar agent row or a deck panel sets this; the
+   *  deck enlarges that panel while keeping every agent visible + live. Defaults
+   *  to the orchestrator when the deck opens. */
+  deckFocusId: TerminalId | null;
   /** The terminal designated as the ORCHESTRATOR - the deck's bottom input
    *  targets it (writeTerminal). null = none designated. Persisted. */
   orchestratorId: TerminalId | null;
@@ -258,6 +263,12 @@ export interface CaptainState {
   setDeckOpen: (open: boolean) => void;
   /** Toggle the captains deck. */
   toggleDeck: () => void;
+  /** Focus a specific agent panel in the deck (spotlight/enlarge it). Null
+   *  clears the focus. Does NOT open the deck by itself - see focusAgent. */
+  setDeckFocus: (id: TerminalId | null) => void;
+  /** Open the deck AND focus a specific agent panel (the sidebar / deck-panel
+   *  click path): the deck opens if closed and spotlights `id`. */
+  focusAgent: (id: TerminalId) => void;
   /** Designate (or clear, with null) the orchestrator terminal. Persisted. */
   setOrchestratorId: (id: TerminalId | null) => void;
   /** Commit dragged/resized geometry (persisted). */
@@ -290,6 +301,7 @@ export const useCaptain = create<CaptainState>((set, get) => {
     open: false,
     anchorMenuOpen: false,
     deckOpen: false,
+    deckFocusId: null,
     orchestratorId: initial.orchestratorId,
     x: initial.x,
     y: initial.y,
@@ -389,6 +401,11 @@ export const useCaptain = create<CaptainState>((set, get) => {
       // while it is open must not leave its full-window click-away backdrop
       // up to swallow the next pointerdown.
       s.setAnchorMenu(false);
+      // The overlay and the DECK are mutually-exclusive full-view surfaces:
+      // summoning a captain (from the dropdown / palette / Ctrl+B C) while the
+      // deck is open retires the deck, so the captain's pooled terminal never
+      // has TWO active placeholders (deck panel + overlay body) fighting for it.
+      if (s.deckOpen) set({ deckOpen: false });
       if (!s.captainIds.includes(id) || !terminalHasTile(id)) return;
       const ws = useWorkspace.getState();
       // Most recently summoned wins: move to the MRU front (skip the write
@@ -488,13 +505,37 @@ export const useCaptain = create<CaptainState>((set, get) => {
       // ambiguous between exiting fullscreen and closing the deck).
       if (open) {
         usePanels.getState().setFullscreen(null);
-        set({ deckOpen: true, open: false, anchorMenuOpen: false });
+        // Default the spotlight to the orchestrator (top of the hierarchy), else
+        // the MRU captain, unless a focus is already set (the sidebar/panel click
+        // path sets it before opening).
+        const s = get();
+        const focus =
+          s.deckFocusId ?? s.orchestratorId ?? s.captainIds[0] ?? null;
+        set({
+          deckOpen: true,
+          deckFocusId: focus,
+          open: false,
+          anchorMenuOpen: false,
+        });
       } else {
-        set({ deckOpen: false });
+        // Clear the spotlight on close so the NEXT open defaults to the
+        // orchestrator (the docstring contract), rather than the last-focused
+        // agent. The sidebar/panel click path sets deckFocusId before opening,
+        // so it is unaffected.
+        set({ deckOpen: false, deckFocusId: null });
       }
     },
 
     toggleDeck: () => get().setDeckOpen(!get().deckOpen),
+
+    setDeckFocus: (id) => {
+      if (get().deckFocusId !== id) set({ deckFocusId: id });
+    },
+
+    focusAgent: (id) => {
+      set({ deckFocusId: id });
+      get().setDeckOpen(true);
+    },
 
     setOrchestratorId: (id) => {
       if (get().orchestratorId === id) return;
@@ -514,6 +555,19 @@ export const useCaptain = create<CaptainState>((set, get) => {
   };
 });
 
+/** The deck / sidebar AGENT order: the orchestrator FIRST (top of the fleet
+ *  hierarchy), then the pinned captains, deduped (the orchestrator may itself be
+ *  a pinned captain). This is the single source of "which agents, in what order"
+ *  the deck panels and the sidebar hierarchy both render. */
+export function agentOrder(
+  s: Pick<CaptainState, "orchestratorId" | "captainIds">,
+): TerminalId[] {
+  const out: TerminalId[] = [];
+  if (s.orchestratorId) out.push(s.orchestratorId);
+  for (const id of s.captainIds) if (!out.includes(id)) out.push(id);
+  return out;
+}
+
 /**
  * Lifecycle cleanup: when a terminal is killed/removed, unpin it if it was a
  * captain (and drop the overlay if it was the SUMMONED one) so no designation
@@ -528,5 +582,9 @@ export function forgetCaptain(id: TerminalId): void {
   // the orchestrator target (persisted).
   if (useCaptain.getState().orchestratorId === id) {
     useCaptain.getState().setOrchestratorId(null);
+  }
+  // Likewise clear a dead deck spotlight so the deck never focuses a gone panel.
+  if (useCaptain.getState().deckFocusId === id) {
+    useCaptain.getState().setDeckFocus(null);
   }
 }

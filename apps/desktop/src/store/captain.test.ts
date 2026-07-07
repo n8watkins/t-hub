@@ -13,6 +13,7 @@ import {
   useCaptain,
   forgetCaptain,
   loadCaptainPersisted,
+  agentOrder,
   CAPTAIN_DEFAULT_WIDTH,
   CAPTAIN_DEFAULT_HEIGHT,
   type CaptainClaimRecord,
@@ -70,7 +71,12 @@ beforeEach(() => {
   controlRequests.length = 0;
   seedWorkspace();
   seedCaptains(["cap00001"]);
-  useCaptain.setState({ claims: {}, orchestratorId: null, deckOpen: false });
+  useCaptain.setState({
+    claims: {},
+    orchestratorId: null,
+    deckOpen: false,
+    deckFocusId: null,
+  });
 });
 
 describe("v1 -> v2 persistence migration", () => {
@@ -655,5 +661,82 @@ describe("orchestrator reconcile on adopt", () => {
       { captainSessionId: "cap00001", shipSlug: "s", workspaceTabIds: [], crew: [] },
     ]);
     expect(useCaptain.getState().orchestratorId).toBe("cap00001");
+  });
+});
+
+describe("agent hierarchy + deck focus", () => {
+  it("agentOrder puts the orchestrator FIRST, then captains, deduped", () => {
+    expect(agentOrder({ orchestratorId: null, captainIds: ["a", "b"] })).toEqual([
+      "a",
+      "b",
+    ]);
+    expect(agentOrder({ orchestratorId: "o", captainIds: ["a", "b"] })).toEqual([
+      "o",
+      "a",
+      "b",
+    ]);
+    // The orchestrator may itself be a captain - not listed twice.
+    expect(agentOrder({ orchestratorId: "b", captainIds: ["a", "b"] })).toEqual([
+      "b",
+      "a",
+    ]);
+  });
+
+  it("focusAgent opens the deck spotlighted on that agent", () => {
+    useCaptain.getState().focusAgent("cap00001");
+    const s = useCaptain.getState();
+    expect(s.deckOpen).toBe(true);
+    expect(s.deckFocusId).toBe("cap00001");
+    // Opening the deck retires the floating overlay (mutually exclusive).
+    expect(s.open).toBe(false);
+  });
+
+  it("opening the deck with no explicit focus defaults to the orchestrator", () => {
+    useCaptain.setState({ orchestratorId: "cap00001", deckFocusId: null });
+    useCaptain.getState().setDeckOpen(true);
+    expect(useCaptain.getState().deckFocusId).toBe("cap00001");
+  });
+
+  it("opening the deck falls back to the MRU captain when no orchestrator", () => {
+    useCaptain.setState({
+      captainIds: ["cap00001", "bbb00001"],
+      orchestratorId: null,
+      deckFocusId: null,
+    });
+    useCaptain.getState().setDeckOpen(true);
+    expect(useCaptain.getState().deckFocusId).toBe("cap00001");
+  });
+
+  it("setDeckFocus changes the spotlight without opening/closing the deck", () => {
+    useCaptain.setState({ deckOpen: true, deckFocusId: "cap00001" });
+    useCaptain.getState().setDeckFocus("bbb00001");
+    expect(useCaptain.getState().deckFocusId).toBe("bbb00001");
+    expect(useCaptain.getState().deckOpen).toBe(true);
+  });
+
+  it("forgetCaptain clears a dead deck focus", () => {
+    useCaptain.setState({ deckFocusId: "cap00001" });
+    forgetCaptain("cap00001");
+    expect(useCaptain.getState().deckFocusId).toBeNull();
+  });
+});
+
+describe("deck / overlay mutual exclusion", () => {
+  it("summoning a captain while the deck is open retires the deck (no double-attach)", () => {
+    // Both full-view surfaces must never be open at once - else the captain's
+    // pooled terminal has two active placeholders (deck panel + overlay body).
+    useCaptain.setState({ deckOpen: true, deckFocusId: "cap00001" });
+    useCaptain.getState().summonCaptain("cap00001");
+    const s = useCaptain.getState();
+    expect(s.open).toBe(true); // overlay summoned
+    expect(s.deckOpen).toBe(false); // deck retired
+  });
+
+  it("closing the deck clears the spotlight so the next open defaults to the orchestrator", () => {
+    useCaptain.setState({ orchestratorId: "cap00001", deckOpen: true, deckFocusId: "bbb00001" });
+    useCaptain.getState().setDeckOpen(false);
+    expect(useCaptain.getState().deckFocusId).toBeNull();
+    useCaptain.getState().setDeckOpen(true);
+    expect(useCaptain.getState().deckFocusId).toBe("cap00001"); // orchestrator
   });
 });

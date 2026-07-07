@@ -41,6 +41,7 @@ import {
 import { sessionNameForTerminal } from "../store/sessionContext";
 import {
   CaptainStatusDot,
+  useCaptainDisplayLabel,
   useWorkspaceNameForTerminal,
   stableCaptainIdentity,
 } from "./CaptainOverlay";
@@ -71,6 +72,47 @@ function cwdBranch(cwd: string): string {
 
 /** The list body: captains whose tile lives in the ACTIVE workspace tab float
  *  to the top (workspace-relevant context), MRU order within each group. */
+/** The sidebar's top-of-hierarchy ORCHESTRATOR row: status dot + stable
+ *  identity + an orchestrator badge; clicking opens the deck focused on it.
+ *  Renders only when an orchestrator is designated AND it is not already shown
+ *  as a pinned captain in the list below (dedupe the hierarchy). */
+export function OrchestratorRow() {
+  const orchestratorId = useCaptain((s) => s.orchestratorId);
+  const isAlsoCaptain = useCaptain(
+    (s) => orchestratorId != null && s.captainIds.includes(orchestratorId),
+  );
+  const identity = useCaptainDisplayLabel(orchestratorId ?? "");
+  if (!orchestratorId || isAlsoCaptain) return null;
+  return (
+    <div className="flex flex-col gap-0.5 px-2 pt-1" data-orchestrator-row>
+      <button
+        type="button"
+        onClick={() => useCaptain.getState().focusAgent(orchestratorId)}
+        title={`Open in the deck - ${identity} (orchestrator)`}
+        className="group relative flex min-w-0 items-center gap-2 rounded-lg py-1.5 pr-2 text-left transition-colors hover:bg-neutral-800/25"
+      >
+        <CaptainStatusDot terminalId={orchestratorId} size={10} />
+        <span
+          className="min-w-0 flex-1 truncate text-xs font-semibold"
+          style={{ color: "var(--th-fg)" }}
+        >
+          {identity}
+        </span>
+        <span
+          className="shrink-0 rounded px-1 text-[8px] font-semibold uppercase tracking-wide"
+          style={{
+            color: "var(--th-accent)",
+            backgroundColor:
+              "color-mix(in srgb, var(--th-accent) 15%, transparent)",
+          }}
+        >
+          orchestrator
+        </span>
+      </button>
+    </div>
+  );
+}
+
 export function CaptainsList() {
   const captainIds = useCaptain((s) => s.captainIds);
   const activeCaptainId = useCaptain((s) => s.activeCaptainId);
@@ -253,14 +295,14 @@ function CaptainRow({
             />
           </div>
         ) : (
-          /* Summon: the same path as the anchor dropdown rows. */
+          /* Click focuses this agent's live panel in the deck (opens the deck). */
           <button
             type="button"
-            onClick={() => useCaptain.getState().summonCaptain(terminalId)}
+            onClick={() => useCaptain.getState().focusAgent(terminalId)}
             title={
               hasTile
-                ? `Summon captain - ${identity}`
-                : `${identity} - tile not available (tab popped out?)`
+                ? `Open in the deck - ${identity}`
+                : `${identity} - terminal not available (tab popped out?)`
             }
             className="relative flex min-w-0 flex-1 items-center gap-2 py-2 pr-1 text-left"
             style={{ opacity: hasTile ? 1 : 0.5 }}

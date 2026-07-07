@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { Canvas } from "./components/Canvas";
-import { CaptainsDeck } from "./components/CaptainsDeck";
 import { useCaptain } from "./store/captain";
+import { resolveOrchestrator } from "./lib/ensureOrchestrator";
 import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { CommandPalette, PrefixHint } from "./components/CommandPalette";
@@ -207,12 +207,34 @@ export default function App() {
     };
   }, []);
 
+  // Deck startup (main window only): once the live terminal list has seeded,
+  // ADOPT an existing orchestrator (persisted-alive, else by cwd ~/.t-hub/
+  // orchestrator - never spawn), and open the captains deck by default when the
+  // setting is on and at least one agent exists. Runs at most once.
+  useEffect(() => {
+    if (SATELLITE) return;
+    let done = false;
+    const run = (terminals: Record<string, { cwd?: string; state?: string }>) => {
+      if (done || Object.keys(terminals).length === 0) return;
+      done = true;
+      const cap = useCaptain.getState();
+      const designate = resolveOrchestrator(cap.orchestratorId, terminals);
+      if (designate && designate !== cap.orchestratorId) {
+        cap.setOrchestratorId(designate);
+      }
+      const c = useCaptain.getState();
+      const hasAgent = c.orchestratorId != null || c.captainIds.length > 0;
+      if (useSettings.getState().openDeckOnLaunch && hasAgent) {
+        c.setDeckOpen(true);
+      }
+    };
+    // Terminals may already be seeded when this runs; check now, then watch.
+    run(useWorkspace.getState().terminals);
+    const unsub = useWorkspace.subscribe((s) => run(s.terminals));
+    return unsub;
+  }, []);
+
   const maximized = useWindowMaximized();
-  // The captains deck (orchestrator UI): a full-view overlay over the workspace
-  // canvas. Main window only - a satellite renders a single tab. Canvas stays
-  // mounted underneath (the deck is opaque) so the terminal pool keeps every
-  // session attached and the orchestrator input can write to its terminal.
-  const deckOpen = useCaptain((s) => s.deckOpen) && !SATELLITE;
   const revealPushesContent = useSettings((s) => s.revealPushesContent);
   const autoHide = useSettings((s) => s.autoHideTitlebarMaximized);
   // Configurable auto-hide timings (Settings -> General -> Titlebar).
@@ -383,8 +405,10 @@ export default function App() {
           </>
         )}
         <div className="relative min-w-0 flex-1">
+          {/* The captains deck (agents view) mounts INSIDE the terminal pool
+              (Canvas) so its live agent panels share the pool's stacking context;
+              it self-gates on deckOpen. App only drives the default-open effect. */}
           <Canvas onFocusSidebar={ensureSidebarVisible} />
-          {deckOpen && <CaptainsDeck />}
         </div>
       </div>
     </div>
