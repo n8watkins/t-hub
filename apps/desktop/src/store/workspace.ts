@@ -153,13 +153,50 @@ const DEFAULT_TAB_NAME = "Workspace 1";
 export const CAPTAINS_TAB_ID = "captains-reserved";
 export const CAPTAINS_TAB_NAME = "Captains";
 
-/** Return `tabs` guaranteed to contain the reserved Captains tab: if absent,
- *  append a fresh empty one. Preserves an existing Captains tab as-is. Shared by
- *  finalizeLayout (load) and adoptRegistry (server sync) so the reserved tab can
- *  never be lost. */
+/** Return `tabs` guaranteed to contain EXACTLY ONE reserved Captains tab: if
+ *  absent, append a fresh empty one; if duplicated (a stale persisted snapshot,
+ *  or a server report that echoed the client-only reserved tab back), collapse
+ *  every copy into a single tab that keeps the first copy's slot and unions their
+ *  orders. Shared by finalizeLayout (load) and adoptRegistry (server sync) so the
+ *  reserved tab can never be lost NOR duplicated - a duplicate empty copy would
+ *  render a stray "new terminal" placeholder next to the real, populated one. */
 function ensureReservedCaptainsTab(tabs: WorkspaceTab[]): WorkspaceTab[] {
-  if (tabs.some((t) => t.id === CAPTAINS_TAB_ID)) return tabs;
-  return [...tabs, { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: [] }];
+  const copies = tabs.filter((t) => t.id === CAPTAINS_TAB_ID);
+  if (copies.length === 0) {
+    return [...tabs, { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: [] }];
+  }
+  if (copies.length === 1) return tabs;
+  // Merge duplicates: union their orders (dedup, first-seen wins) into the first
+  // copy's slot; drop the rest.
+  const mergedOrder: TerminalId[] = [];
+  const seen = new Set<TerminalId>();
+  for (const c of copies) {
+    for (const id of c.order) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        mergedOrder.push(id);
+      }
+    }
+  }
+  const merged: WorkspaceTab = {
+    ...copies[0],
+    id: CAPTAINS_TAB_ID,
+    name: CAPTAINS_TAB_NAME,
+    order: mergedOrder,
+    // A changed tile set invalidates manual grid ratios.
+    sizes: copies[0].order.length === mergedOrder.length ? copies[0].sizes : undefined,
+  };
+  let injected = false;
+  const out: WorkspaceTab[] = [];
+  for (const t of tabs) {
+    if (t.id !== CAPTAINS_TAB_ID) {
+      out.push(t);
+    } else if (!injected) {
+      out.push(merged);
+      injected = true;
+    }
+  }
+  return out;
 }
 
 /**
@@ -1207,21 +1244,31 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       );
       const agentSet = new Set(captainsOrder);
 
-      const serverTabs: WorkspaceTab[] = regTabs.map((r) => {
-        const existing = byId.get(r.id);
-        const order = r.tileIds.filter((id) => !agentSet.has(id));
-        const sameOrder =
-          existing !== undefined &&
-          existing.order.length === order.length &&
-          existing.order.every((x, i) => x === order[i]);
-        return {
-          id: r.id,
-          name: r.name.trim() || existing?.name || "Workspace",
-          order,
-          // Manual grid ratios survive only if the tile set didn't change.
-          sizes: sameOrder ? existing.sizes : undefined,
-        };
-      });
+      // The reserved Captains tab is CLIENT-ONLY, but the tab reporter up-syncs it
+      // to the server like any other tab, so the server echoes it back in this
+      // snapshot. Drop every incoming copy of it here (its agent tiles are held in
+      // `captainsOrder` and re-appended authoritatively below) - otherwise the
+      // echoed copy would render ALONGSIDE the re-appended one as a duplicate tab,
+      // and since the echoed copy's tiles are all agent tiles filtered out by
+      // `agentSet`, that duplicate has an empty `order` and shows the stray "new
+      // terminal" placeholder even though the real Captains tab has terminals.
+      const serverTabs: WorkspaceTab[] = regTabs
+        .filter((r) => r.id !== CAPTAINS_TAB_ID)
+        .map((r) => {
+          const existing = byId.get(r.id);
+          const order = r.tileIds.filter((id) => !agentSet.has(id));
+          const sameOrder =
+            existing !== undefined &&
+            existing.order.length === order.length &&
+            existing.order.every((x, i) => x === order[i]);
+          return {
+            id: r.id,
+            name: r.name.trim() || existing?.name || "Workspace",
+            order,
+            // Manual grid ratios survive only if the tile set didn't change.
+            sizes: sameOrder ? existing.sizes : undefined,
+          };
+        });
       // Re-append the reserved Captains tab (never dropped by a server sync).
       const nextTabs: WorkspaceTab[] = [
         ...serverTabs,
