@@ -18,11 +18,16 @@
 //     the ACTIVE captain is always the front: explicit summons move-to-front,
 //     cycling ROTATES the list (so repeated Ctrl+B C round-robins through every
 //     pinned captain instead of ping-ponging between the two most recent).
-//   - Persistence follows the workspace-store pattern (lib/persist codec on a
-//     versioned localStorage key): the DESIGNATIONS and the overlay GEOMETRY
-//     survive an app restart; the open/closed state deliberately does not (the
-//     app always starts with the overlay closed). The v1 single-captain blob
-//     migrates to a one-entry v2 list - an existing pin is never lost.
+//   - Persistence (phase 2, ship-registry unification): the SERVER captains
+//     registry is the source of truth for WHO is a captain - pinning IS
+//     claiming (a claim_captain control mutation, audited) and every registry
+//     mutation syncs back as a sync_captains apply the bridge adopts here.
+//     localStorage keeps only view state: the overlay GEOMETRY plus the MRU
+//     ORDER of the designations (which doubles as the one-time migration seed -
+//     pre-phase-2 pins are claimed server-side at boot, never lost). The
+//     open/closed state deliberately does not persist (the app always starts
+//     with the overlay closed). The v1 single-captain blob migrates to a
+//     one-entry v2 list.
 //   - Focus contract: opening moves keyboard focus to the captain terminal
 //     (via the workspace store's setFocus, which the pooled TerminalView
 //     follows); closing restores focus to the tile that had it before. Cycling
@@ -122,6 +127,44 @@ export function loadCaptainPersisted(): PersistedCaptain {
 
 const initial = loadCaptainPersisted();
 
+/** One claim from the SERVER captains registry (captain-chat phase 2): the ship,
+ *  the captain's terminal/session id, the workspace tabs it controls, and the
+ *  crew sessions it spawned (`spawnedBy` recorded at the spawn paths). */
+export interface CaptainClaimRecord {
+  shipSlug: string;
+  captainSessionId: string;
+  workspaceTabIds: string[];
+  crew: string[];
+}
+
+/** Count of in-flight `release_captain` calls this window initiated. An empty
+ *  server snapshot is LEGITIMATE while we are releasing (the last pin dropping to
+ *  zero); otherwise an empty snapshot is treated as a transient (registry load
+ *  failure / reconnect-before-load) and must not wipe local pins - see
+ *  {@link CaptainState.adoptCaptainsRegistry}. Exported read-only for tests. */
+let pendingReleases = 0;
+export function captainReleasesInFlight(): number {
+  return pendingReleases;
+}
+
+/** Fire-and-forget server captaincy mutation (pin = claim, unpin = release).
+ *  Best-effort by design: outside Tauri (tests / dev browser) or with the
+ *  control channel down the local designation stands and the next adopted
+ *  registry snapshot reconciles - the same optimistic-then-converge contract
+ *  the workspace tab reporter follows. */
+function serverCaptaincy(command: "claim_captain" | "release_captain", id: TerminalId): void {
+  if (command === "release_captain") pendingReleases += 1;
+  void import("../ipc/controlClient")
+    .then((m) => m.controlRequest(command, { captainSessionId: id }))
+    .catch(() => {
+      // Control channel unavailable or the claim/release raced a server-side
+      // mutation (e.g. releasing an already-released claim) - safe to ignore.
+    })
+    .finally(() => {
+      if (command === "release_captain") pendingReleases -= 1;
+    });
+}
+
 /** The tile focused before the overlay opened, restored on close. Module-level
  *  (not store state): it's transient plumbing, never rendered or persisted. */
 let prevFocusedId: TerminalId | null = null;
@@ -135,6 +178,10 @@ function terminalHasTile(id: TerminalId): boolean {
 export interface CaptainState {
   /** Pinned captains in MRU order (front = most recently summoned). Persisted. */
   captainIds: TerminalId[];
+  /** The SERVER captains registry records, keyed by captain session id (phase 2:
+   *  workspaceTabIds + crew for the sidebar and context-aware summon). Empty for
+   *  a fresh optimistic pin until the next sync_captains snapshot lands. */
+  claims: Record<TerminalId, CaptainClaimRecord>;
   /** The captain the overlay shows / the next summon target. Invariant:
    *  `captainIds[0] ?? null` - kept explicit so every consumer reads one field. */
   activeCaptainId: TerminalId | null;
@@ -159,12 +206,21 @@ export interface CaptainState {
   unpinCaptain: (id: TerminalId) => void;
   /** Tile-menu / palette toggle: pin this terminal, or unpin it if pinned. */
   toggleCaptain: (id: TerminalId) => void;
+  /** Adopt a SERVER captains-registry snapshot (a sync_captains apply or the
+   *  boot-time list_captains fetch). Server-authoritative for MEMBERSHIP: ids
+   *  present locally but absent from the snapshot are dropped (closing the
+   *  overlay first if the summoned captain lost its claim), new claims append
+   *  at the MRU tail, and the local MRU order of surviving ids is preserved
+   *  (MRU is view state - the server does not track summon recency). */
+  adoptCaptainsRegistry: (records: CaptainClaimRecord[]) => void;
   /** Summon a SPECIFIC pinned captain (switcher chip, titlebar dropdown,
    *  palette entry): it becomes active (MRU front), the overlay opens if
    *  closed, and keyboard focus moves to it. No-op if unpinned or tile-less. */
   summonCaptain: (id: TerminalId) => void;
-  /** Open the overlay on the first pinned captain (MRU order) that still has a
-   *  live tile; no-op when none qualifies. */
+  /** Open the overlay CONTEXT-AWARE (phase 2): the captain whose registry claim
+   *  OWNS the active workspace tab wins (MRU order among multiple owners), then
+   *  the MRU fallback - the first pinned captain with a live tile. Summoning
+   *  from an unclaimed tab is therefore plain MRU. No-op when none qualifies. */
   openOverlay: () => void;
   /** Close the overlay and restore focus to the previously focused tile. */
   closeOverlay: () => void;
@@ -201,6 +257,7 @@ export const useCaptain = create<CaptainState>((set, get) => {
 
   return {
     captainIds: initial.captainIds,
+    claims: {},
     activeCaptainId: initial.captainIds[0] ?? null,
     open: false,
     anchorMenuOpen: false,
@@ -215,6 +272,10 @@ export const useCaptain = create<CaptainState>((set, get) => {
       // New pins land at the END (least recently summoned): pinning is a
       // designation, not a summon, so it never steals the active slot.
       commitIds([...ids, id]);
+      // Phase 2: pinning IS claiming - the optimistic local designation above
+      // keeps the UI immediate; the server registry (the source of truth) is
+      // mutated best-effort and its sync_captains snapshot reconciles.
+      serverCaptaincy("claim_captain", id);
     },
 
     unpinCaptain: (id) => {
@@ -229,6 +290,47 @@ export const useCaptain = create<CaptainState>((set, get) => {
       // click is gated on count > 0, so an orphaned empty popover would have
       // no dismiss affordance left (Esc aside).
       if (get().captainIds.length === 0) get().setAnchorMenu(false);
+      // Phase 2: unpinning releases the server-side claim (audited). Releasing
+      // an id the server already dropped (e.g. close_terminal beat us) is a
+      // swallowed error inside the helper.
+      serverCaptaincy("release_captain", id);
+    },
+
+    adoptCaptainsRegistry: (records) => {
+      const s = get();
+      // A1 guard: a server snapshot with ZERO captains, while the local store
+      // still holds pins and we did NOT initiate a release, is almost certainly
+      // transient (a registry load failure or a reconnect-before-load) - honoring
+      // it would clear captainIds AND persist the empty list, destroying the
+      // designations (including the boot migration seed). Keep the pins; a real
+      // subsequent snapshot reconciles. A legitimate empty (the user released
+      // their last captain) is unaffected: unpinCaptain clears the store FIRST
+      // (so it is already empty here), and any release we drove is counted.
+      if (
+        records.length === 0 &&
+        s.captainIds.length > 0 &&
+        pendingReleases === 0
+      ) {
+        return;
+      }
+      const claims: Record<TerminalId, CaptainClaimRecord> = {};
+      for (const r of records) claims[r.captainSessionId] = r;
+      const kept = s.captainIds.filter((id) => claims[id] !== undefined);
+      const added = records
+        .map((r) => r.captainSessionId)
+        .filter((id) => !kept.includes(id));
+      const next = [...kept, ...added];
+      // Mirror unpinCaptain's ordering: close BEFORE the summoned captain's
+      // designation drops, so the focus restore still resolves.
+      if (s.open && s.activeCaptainId !== null && !next.includes(s.activeCaptainId)) {
+        s.closeOverlay();
+      }
+      set({ claims });
+      const unchanged =
+        next.length === s.captainIds.length &&
+        next.every((id, i) => id === s.captainIds[i]);
+      if (!unchanged) commitIds(next);
+      if (next.length === 0) get().setAnchorMenu(false);
     },
 
     toggleCaptain: (id) => {
@@ -260,16 +362,28 @@ export const useCaptain = create<CaptainState>((set, get) => {
     },
 
     openOverlay: () => {
-      const { captainIds, open, summonCaptain, setAnchorMenu } = get();
+      const { captainIds, claims, open, summonCaptain, setAnchorMenu } = get();
       // Defensive mirror of summonCaptain's dropdown retire: even a no-op
       // open (no live pin) must not strand the backdrop.
       setAnchorMenu(false);
       if (open) return;
-      // Summon the first captain (MRU order) whose tile is still live. A pin
-      // whose tab popped out to a satellite is skipped, not dropped - it can be
-      // summoned again when the tab returns. No live pin: nothing to summon
-      // (the titlebar anchor tooltip explains how to pin one).
-      const target = captainIds.find((id) => terminalHasTile(id));
+      // Context-aware summon (phase 2): a chord pressed ON a claimed workspace
+      // summons the captain OWNING that workspace (per the server registry's
+      // workspaceTabIds), MRU order breaking a tie between multiple owners.
+      // An unclaimed tab (or an owner whose tile is gone) falls back to plain
+      // MRU: the first captain whose tile is still live. A pin whose tab
+      // popped out to a satellite is skipped, not dropped - it can be summoned
+      // again when the tab returns. No live pin: nothing to summon (the
+      // titlebar anchor tooltip explains how to pin one).
+      const activeTabId = useWorkspace.getState().activeTabId;
+      const owner = activeTabId
+        ? captainIds.find(
+            (id) =>
+              terminalHasTile(id) &&
+              (claims[id]?.workspaceTabIds.includes(activeTabId) ?? false),
+          )
+        : undefined;
+      const target = owner ?? captainIds.find((id) => terminalHasTile(id));
       if (target) summonCaptain(target);
     },
 

@@ -24,6 +24,8 @@
 // reporting its scoped tab list would corrupt the main window's layout/registry.
 import { listen } from "@tauri-apps/api/event";
 import { isSatelliteWindow, useWorkspace } from "../store/workspace";
+import { useCaptain, type CaptainClaimRecord } from "../store/captain";
+import { controlRequest } from "./controlClient";
 import type { TabReport, TabReportResult } from "./types";
 
 /** Exact Tauri event the backend control listener emits to apply a UI mutation. */
@@ -72,6 +74,54 @@ function adoptSync(args: ControlApply["args"]): boolean {
     adoptingRegistry = false;
   }
   return true;
+}
+
+// The last captains-registry revision this window adopted. Guards against a
+// stale snapshot applying over a newer one (the boot fetch racing a live
+// sync_captains forward). The server seq is persisted, so it is monotonic even
+// across app restarts.
+let lastCaptainsSeq = -1;
+// True while the boot bootstrap is claiming legacy pins. Each claim forwards a
+// PARTIAL sync_captains snapshot (only the ids claimed so far); adopting those
+// mid-loop would transiently drop the not-yet-claimed pins from the store (and
+// persist the shrunk list). We suppress those forwards and adopt only the final
+// full snapshot the bootstrap fetches, so membership never flickers.
+let captainsBootstrapping = false;
+
+/** Loosely validate + adopt one captains snapshot `{seq, captains}` into the
+ *  captain store (records missing arrays coerce to empty - the store renders
+ *  from whatever the server sent). Returns true when adopted. Exported for the
+ *  reconciliation tests (the seq guard + the A1 empty guard). */
+export function adoptCaptainsSnapshot(sync: unknown): boolean {
+  if (!sync || typeof sync !== "object") return false;
+  const { seq, captains } = sync as { seq?: unknown; captains?: unknown };
+  if (typeof seq !== "number" || !Array.isArray(captains)) return false;
+  if (seq < lastCaptainsSeq) return false;
+  lastCaptainsSeq = seq;
+  const records: CaptainClaimRecord[] = [];
+  for (const c of captains) {
+    const r = c as Partial<CaptainClaimRecord> | null;
+    if (!r || typeof r.captainSessionId !== "string" || !r.captainSessionId) continue;
+    records.push({
+      captainSessionId: r.captainSessionId,
+      shipSlug: typeof r.shipSlug === "string" ? r.shipSlug : "",
+      workspaceTabIds: Array.isArray(r.workspaceTabIds)
+        ? r.workspaceTabIds.filter((t): t is string => typeof t === "string")
+        : [],
+      crew: Array.isArray(r.crew)
+        ? r.crew.filter((t): t is string => typeof t === "string")
+        : [],
+    });
+  }
+  useCaptain.getState().adoptCaptainsRegistry(records);
+  return true;
+}
+
+/** Adopt a `sync_captains` apply's `args.sync` snapshot. Suppressed while the
+ *  boot bootstrap is running (it adopts only its own final full snapshot). */
+function adoptCaptainsSync(args: ControlApply["args"]): boolean {
+  if (captainsBootstrapping) return false;
+  return adoptCaptainsSnapshot(args?.sync);
 }
 
 /**
@@ -129,6 +179,14 @@ export function applyControl(command: string, args: ControlApply["args"]): void 
       // close_tab: the tab left the registry; sync_tabs: a bare snapshot push
       // (e.g. close_terminal dropped a tile). Adopting handles both.
       adoptSync(args);
+      return;
+    }
+
+    case "sync_captains": {
+      // Captain-chat phase 2: every captains-registry mutation (claim/release/
+      // crew/prune, whoever originated it) forwards the authoritative snapshot;
+      // the captain store renders FROM it, exactly like tabs render from sync.
+      adoptCaptainsSync(args);
       return;
     }
 
@@ -278,6 +336,78 @@ export function startControlBridge(): void {
   });
 
   startTabReporter();
+  startCaptainsBootstrap();
+}
+
+/**
+ * Seed the captain store from the SERVER captains registry at boot (captain-chat
+ * phase 2), and migrate any pre-phase-2 localStorage pins by CLAIMING them
+ * server-side - an existing pin is never lost. Only pins whose tile is still
+ * live are claimed (a stale pin for a dead terminal must not create a garbage
+ * server claim; it simply drops when the adopted snapshot omits it). Failures
+ * (not under Tauri, control channel down) are swallowed: the store keeps its
+ * locally-persisted designations and the next sync_captains reconciles.
+ */
+/**
+ * The bootstrap body (exported for tests): fetch the server registry, claim any
+ * live-tile local pins the server does not yet know, then adopt the final
+ * snapshot. `captainsBootstrapping` is held true for the whole run so mid-loop
+ * partial `sync_captains` forwards are suppressed (see {@link adoptCaptainsSync}).
+ */
+export async function bootstrapCaptains(): Promise<void> {
+  captainsBootstrapping = true;
+  try {
+    const res = (await controlRequest("list_captains")) as {
+      seq?: number;
+      captains?: CaptainClaimRecord[];
+    };
+    const server = new Set(
+      (res.captains ?? []).map((c) => c.captainSessionId),
+    );
+    const ws = useWorkspace.getState();
+    const missing = useCaptain
+      .getState()
+      .captainIds.filter(
+        (id) => !server.has(id) && ws.tabs.some((t) => t.order.includes(id)),
+      );
+    for (const id of missing) {
+      try {
+        await controlRequest("claim_captain", { captainSessionId: id });
+      } catch (e) {
+        console.warn("captains bootstrap: claim failed", id, e);
+      }
+    }
+    // Adopt the final registry state. Each claim above also forwarded a
+    // sync_captains apply (suppressed while bootstrapping); re-fetching (only
+    // when we claimed) makes the final adopt deterministic rather than relying
+    // on event ordering.
+    const finalRes = missing.length
+      ? ((await controlRequest("list_captains")) as typeof res)
+      : res;
+    adoptCaptainsSnapshot(finalRes);
+  } catch {
+    // Not under Tauri or the control channel is down - locally persisted
+    // designations stand until a sync_captains forward arrives.
+  } finally {
+    captainsBootstrapping = false;
+  }
+}
+
+function startCaptainsBootstrap(): void {
+  void bootstrapCaptains();
+}
+
+/** Test-only: reset the captains reconciliation singletons between cases (this
+ *  is a side-effect module whose state persists across a test file's imports). */
+export function __resetCaptainsReconcileForTest(): void {
+  lastCaptainsSeq = -1;
+  captainsBootstrapping = false;
+}
+
+/** Test-only: force the bootstrapping flag, to prove `sync_captains` forwards are
+ *  suppressed while a bootstrap is in flight. */
+export function __setCaptainsBootstrappingForTest(v: boolean): void {
+  captainsBootstrapping = v;
 }
 
 /**

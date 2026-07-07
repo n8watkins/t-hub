@@ -206,13 +206,30 @@ impl control::ApplySink for AppHandleApplySink {
 /// converges instead of clobbering the mutation.
 #[tauri::command]
 fn report_workspace_tabs(
+    app: tauri::AppHandle,
     tabs: Vec<control::TabRecord>,
     active_tab_id: Option<String>,
     base_seq: Option<u64>,
     registry: tauri::State<'_, std::sync::Arc<control::TabRegistry>>,
+    captains: tauri::State<'_, std::sync::Arc<control::CaptainsRegistry>>,
+    fanout: tauri::State<'_, std::sync::Arc<control::EventFanout>>,
 ) -> serde_json::Value {
     match registry.report(tabs, active_tab_id, base_seq) {
-        control::ReportOutcome::Accepted { seq } => serde_json::json!({ "seq": seq }),
+        control::ReportOutcome::Accepted { seq, removed_tab_ids } => {
+            // Captain-chat phase 2: the webview's normal tab-close lands here (not
+            // the socket close_tab), so a closed tab must be pruned from every
+            // captain's workspaceTabIds here too - else it lingers as a phantom
+            // controlled-workspace in the persistent captains.json. Forward a
+            // captains snapshot (webview + socket clients) when anything changed.
+            let mut pruned = false;
+            for tab_id in &removed_tab_ids {
+                pruned |= captains.prune_tab(tab_id);
+            }
+            if pruned {
+                commands::forward_captains_sync(&app, &captains, &fanout);
+            }
+            serde_json::json!({ "seq": seq })
+        }
         control::ReportOutcome::Stale(snap) => serde_json::json!({
             "stale": true,
             "seq": snap.seq,
@@ -227,6 +244,7 @@ fn start_control_listener(
     app: &tauri::AppHandle,
     fanout: std::sync::Arc<control::EventFanout>,
     tab_registry: std::sync::Arc<control::TabRegistry>,
+    captains_registry: std::sync::Arc<control::CaptainsRegistry>,
 ) -> Option<control::ControlHandshake> {
     // The control auth token. Server-split M2b: a PERSISTENT key (stable across
     // restarts) so a remote client paired once doesn't have to re-pair every launch.
@@ -270,7 +288,10 @@ fn start_control_listener(
         .with_metrics(metrics)
         // TASK C (#22): share the addressable tab registry with the control listener
         // so `list_tabs` reads what the `report_workspace_tabs` command writes.
-        .with_tab_registry(tab_registry);
+        .with_tab_registry(tab_registry)
+        // Captain-chat phase 2: the persistent captains registry (claims survive
+        // restarts server-side; the UI's localStorage keeps only view state).
+        .with_captains_registry(captains_registry);
     match control::start(ctx) {
         Ok(h) => {
             eprintln!(
@@ -312,6 +333,9 @@ fn apply_devbuild_isolation() {
         }
         if std::env::var_os("T_HUB_DIAG_FILE").is_none() {
             std::env::set_var("T_HUB_DIAG_FILE", dir.join("diag.log"));
+        }
+        if std::env::var_os("T_HUB_CAPTAINS_FILE").is_none() {
+            std::env::set_var("T_HUB_CAPTAINS_FILE", dir.join("captains.json"));
         }
     }
 }
@@ -405,6 +429,12 @@ pub fn run() {
             let emitter: std::sync::Arc<dyn agent::EventEmitter> = std::sync::Arc::new(
                 control_client::SocketEmitter::new(control_fanout.clone()),
             );
+            // Manage the SAME fanout Arc so UI-driven Tauri commands that mutate
+            // the captains registry (kill_terminal, the tab-close report) can
+            // broadcast a captains snapshot to socket clients (the native cockpit)
+            // as well as the webview - the Tauri-side twin of control.rs's
+            // forward_apply (ApplySink + fanout broadcast).
+            app.manage(control_fanout.clone());
             state.agent.set_emitter(emitter);
             state.agent.set_status_bridge(state.status.clone());
             // --- WS-6: open the durable DB now (before the status bridge ingests
@@ -444,9 +474,24 @@ pub fn run() {
             // `report_workspace_tabs` command writes the frontend's up-sync into.
             let tab_registry = std::sync::Arc::new(control::TabRegistry::new());
             app.manage(tab_registry.clone());
-            if let Some(handshake) =
-                start_control_listener(&state, app.handle(), control_fanout, tab_registry)
-            {
+            // Captain-chat phase 2: the captains registry, loaded from its
+            // persistence file so claims survive app restarts (unlike tabs, whose
+            // layout the frontend re-seeds on boot).
+            let captains_registry =
+                std::sync::Arc::new(control::CaptainsRegistry::load(control::captains_path()));
+            // Manage the SAME Arc so the Tauri `kill_terminal` command can drop a
+            // dead session (captain or crew) from the registry - the UI kills tiles
+            // via that command, not the control socket, so without this a killed
+            // crew tile would leave a stale claim/crew entry in the persistent
+            // captains.json to re-hydrate as a phantom pin after restart.
+            app.manage(captains_registry.clone());
+            if let Some(handshake) = start_control_listener(
+                &state,
+                app.handle(),
+                control_fanout,
+                tab_registry,
+                captains_registry,
+            ) {
                 control_client::install(app.handle(), &handshake);
             }
             // Install the system-tray icon + menu (#17). A tray build failure is

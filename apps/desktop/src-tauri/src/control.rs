@@ -303,7 +303,14 @@ pub struct RegistrySnapshot {
 /// Outcome of a UI up-sync report (see [`TabRegistry::report`]).
 pub enum ReportOutcome {
     /// The report was based on the current revision and replaced the registry.
-    Accepted { seq: u64 },
+    /// `removed_tab_ids` are the tabs that existed before this report but are
+    /// absent from it (the primary UI tab-close path): the caller prunes them
+    /// from the captains registry's `workspaceTabIds` so a normally-closed tab
+    /// never lingers as a phantom controlled-workspace.
+    Accepted {
+        seq: u64,
+        removed_tab_ids: Vec<String>,
+    },
     /// The report predates a server-side mutation the reporter has not applied
     /// yet; the registry is unchanged and the caller gets the authoritative
     /// snapshot to converge on.
@@ -381,6 +388,15 @@ impl TabRegistry {
                 });
             }
         }
+        // Which tabs is this report dropping? Computed atomically under the lock
+        // (old ids not present in the new set) so captains-registry pruning can
+        // never race a concurrent tab mutation.
+        let removed_tab_ids: Vec<String> = g
+            .tabs
+            .iter()
+            .filter(|old| !tabs.iter().any(|t| t.id == old.id))
+            .map(|t| t.id.clone())
+            .collect();
         g.tabs = tabs;
         // Adopt the reported active tab only if it names a tab in the SAME report
         // (defensive: a torn report must not leave the pointer dangling), and
@@ -395,7 +411,7 @@ impl TabRegistry {
             g.active_tab_id = g.tabs.first().map(|t| t.id.clone());
         }
         g.seq += 1;
-        ReportOutcome::Accepted { seq: g.seq }
+        ReportOutcome::Accepted { seq: g.seq, removed_tab_ids }
     }
 
     /// A clone of the current tab list (for tests / callers that only need tabs).
@@ -425,6 +441,16 @@ impl TabRegistry {
     /// True if a tab with this id exists.
     fn has_tab(&self, id: &str) -> bool {
         self.lock().tabs.iter().any(|t| t.id == id)
+    }
+
+    /// The tab currently holding `tile_id`, if any (captains: a claim with no
+    /// explicit `workspaceTabIds` defaults to the tab the captain's tile lives in).
+    fn tab_for_tile(&self, tile_id: &str) -> Option<String> {
+        self.lock()
+            .tabs
+            .iter()
+            .find(|t| t.tile_ids.iter().any(|x| x == tile_id))
+            .map(|t| t.id.clone())
     }
 
     /// Record a new (empty) tab so its id is addressable immediately. No-op (no
@@ -588,6 +614,351 @@ impl TabRegistry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Captains registry (captain-chat phase 2: ship-registry unification)
+// ---------------------------------------------------------------------------
+
+/// One claimed captaincy as the control channel sees it (captain-chat phase 2):
+/// the ship, the captain's terminal/session id (the same id every other control
+/// command uses - the tmux session is `th_<id>`), the workspace tabs the captain
+/// controls, and the crew sessions it spawned (recorded at the
+/// `spawn_terminal`/`create_worktree` paths via `spawnedBy`).
+///
+/// Serialized camelCase in BOTH directions: the persistence file, `list_captains`,
+/// and every `sync_captains` forward all carry this exact shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptainRecord {
+    pub ship_slug: String,
+    pub captain_session_id: String,
+    #[serde(default)]
+    pub workspace_tab_ids: Vec<String>,
+    #[serde(default)]
+    pub crew: Vec<String>,
+}
+
+/// A full, versioned copy of the captains registry: what `list_captains` returns,
+/// what every `sync_captains` forward carries down to the UI (the UI renders FROM
+/// this, exactly like the tab [`RegistrySnapshot`]), and the on-disk persistence
+/// shape (so a restart resumes at the same revision).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptainsSnapshot {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub captains: Vec<CaptainRecord>,
+}
+
+#[derive(Default)]
+struct CaptainsInner {
+    captains: Vec<CaptainRecord>,
+    /// Monotonic revision, bumped on every accepted mutation - the same
+    /// convergence contract as [`RegistryInner::seq`]. Persisted, so it stays
+    /// monotonic across app restarts.
+    seq: u64,
+}
+
+/// The CORE's authoritative captains registry (captain-chat phase 2).
+///
+/// Captain identity previously lived in two disconnected places: the UI's
+/// localStorage designation and the captain's own ship files. This registry is
+/// the ONE source of truth the UI and MCP both read: pinning in the UI is a
+/// `claim_captain` server mutation, captains self-register over MCP the same
+/// way, and every mutation forwards a seq'd [`CaptainsSnapshot`] to the UI
+/// exactly like the tab registry does.
+///
+/// Unlike [`TabRegistry`] this IS persistent (the phases doc: "survives restarts
+/// server-side; localStorage keeps only view state"): every mutation is written
+/// through to `captains.json` under the registry lock, and `load` seeds from it.
+pub struct CaptainsRegistry {
+    inner: Mutex<CaptainsInner>,
+    /// Persistence target; `None` = in-memory only (unit tests / headless proofs).
+    path: Option<PathBuf>,
+}
+
+/// Normalize a caller-supplied ship name into a slug: lowercase, runs of
+/// non-alphanumerics collapse to single dashes, trimmed. Empty in = empty out
+/// (the caller falls back to a derived slug).
+fn slugify_ship(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut dash = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            dash = false;
+        } else if !out.is_empty() && !dash {
+            out.push('-');
+            dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+impl CaptainsRegistry {
+    /// An empty, in-memory registry (tests / headless proofs - no persistence).
+    pub fn new() -> Self {
+        Self { inner: Mutex::new(CaptainsInner::default()), path: None }
+    }
+
+    /// Load the registry from `path`, seeding from the persisted snapshot when
+    /// present + parseable (a missing or corrupt file starts empty - never a
+    /// startup failure). Every subsequent mutation writes back through.
+    pub fn load(path: PathBuf) -> Self {
+        let inner = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|body| serde_json::from_str::<CaptainsSnapshot>(&body).ok())
+            .map(|snap| CaptainsInner { captains: snap.captains, seq: snap.seq })
+            .unwrap_or_default();
+        Self { inner: Mutex::new(inner), path: Some(path) }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CaptainsInner> {
+        // Same poisoned-lock policy as TabRegistry: the data is a plain Vec, so
+        // recovering the guard and continuing is safe.
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Best-effort write-through, called under the registry lock so persisted
+    /// snapshots are serialized and never interleave. A write failure is logged
+    /// and never fails the mutation (the in-memory registry stays authoritative
+    /// for this run; the next successful write heals the file).
+    ///
+    /// ATOMIC (temp + rename), mirroring `voice.rs`: the loader treats a corrupt
+    /// file as empty (silently dropping every claim), so a crash mid-write must
+    /// never leave a torn file. We write a full body to a unique temp path, then
+    /// `rename` it over the target - `rename` replaces atomically (on Windows too,
+    /// MOVEFILE_REPLACE_EXISTING), so a reader/loader always sees either the old
+    /// complete file or the new complete file, never a partial one.
+    fn persist_locked(&self, g: &CaptainsInner) {
+        let Some(path) = &self.path else { return };
+        let snap = CaptainsSnapshot { seq: g.seq, captains: g.captains.clone() };
+        let body = match serde_json::to_vec_pretty(&snap) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("t-hub-control: captains registry serialize failed: {e}");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // A unique temp name (pid + a process-wide counter) so two writers can
+        // never interleave on the same temp file - each renames its own complete
+        // body; last rename wins whole.
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let tmp = path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        if let Err(e) = std::fs::write(&tmp, &body) {
+            eprintln!(
+                "t-hub-control: captains registry temp write to {} failed: {e}",
+                tmp.display()
+            );
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            eprintln!(
+                "t-hub-control: captains registry rename to {} failed: {e}",
+                path.display()
+            );
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// The full versioned snapshot (`list_captains` + every `sync_captains` forward).
+    pub fn snapshot(&self) -> CaptainsSnapshot {
+        let g = self.lock();
+        CaptainsSnapshot { seq: g.seq, captains: g.captains.clone() }
+    }
+
+    /// Claim captaincy (UPSERT by captain session id):
+    ///   - a NEW captain gets a record `{shipSlug, captainSessionId, workspaceTabIds}`
+    ///     (crew starts empty);
+    ///   - RE-claiming by the same captain updates its ship slug / workspace tabs
+    ///     and keeps its crew (idempotent designation refresh);
+    ///   - a ship slug already held by a DIFFERENT captain is refused (fleet
+    ///     doctrine: one captain per ship - release first, explicitly).
+    ///
+    /// `ship_slug` is slugified; empty/absent falls back to `ship-<sessionId>` so
+    /// a UI pin (which has no ship name) always claims something addressable.
+    ///
+    /// Idempotent: a re-claim that would change NOTHING (same slug, and no new
+    /// workspace tabs) does not bump the revision or persist - the caller sees an
+    /// unchanged `seq` and skips the redundant `sync_captains` forward.
+    pub fn claim(
+        &self,
+        captain_session_id: &str,
+        ship_slug: Option<&str>,
+        workspace_tab_ids: Vec<String>,
+    ) -> Result<CaptainRecord, String> {
+        if captain_session_id.trim().is_empty() {
+            return Err("claim_captain requires a non-empty 'captainSessionId'".into());
+        }
+        let slug = ship_slug
+            .map(slugify_ship)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| slugify_ship(&format!("ship-{captain_session_id}")));
+        let mut g = self.lock();
+        if let Some(other) = g
+            .captains
+            .iter()
+            .find(|c| c.ship_slug == slug && c.captain_session_id != captain_session_id)
+        {
+            return Err(format!(
+                "claim_captain: ship '{slug}' is already captained by session '{}' \
+                 (release_captain it first - one captain per ship)",
+                other.captain_session_id
+            ));
+        }
+        let mut changed = true;
+        let record = match g
+            .captains
+            .iter_mut()
+            .find(|c| c.captain_session_id == captain_session_id)
+        {
+            Some(c) => {
+                // Would this re-claim actually change anything? An empty
+                // workspace_tab_ids means "leave the tabs as they are".
+                let tabs_change =
+                    !workspace_tab_ids.is_empty() && c.workspace_tab_ids != workspace_tab_ids;
+                if c.ship_slug == slug && !tabs_change {
+                    changed = false;
+                } else {
+                    c.ship_slug = slug;
+                    if !workspace_tab_ids.is_empty() {
+                        c.workspace_tab_ids = workspace_tab_ids;
+                    }
+                }
+                c.clone()
+            }
+            None => {
+                let record = CaptainRecord {
+                    ship_slug: slug,
+                    captain_session_id: captain_session_id.to_string(),
+                    workspace_tab_ids,
+                    crew: Vec::new(),
+                };
+                g.captains.push(record.clone());
+                record
+            }
+        };
+        if changed {
+            g.seq += 1;
+            self.persist_locked(&g);
+        }
+        Ok(record)
+    }
+
+    /// Release a captaincy, addressed by captain session id OR ship slug.
+    /// Unknown target is an error (strict, like the tab mutations - a silent
+    /// no-op is how state drifts). Returns the released record.
+    pub fn release(&self, target: &str) -> Result<CaptainRecord, String> {
+        let mut g = self.lock();
+        let Some(idx) = g
+            .captains
+            .iter()
+            .position(|c| c.captain_session_id == target || c.ship_slug == target)
+        else {
+            return Err(format!(
+                "release_captain: no claim matches '{target}' (list_captains shows \
+                 captainSessionId + shipSlug of every claim)"
+            ));
+        };
+        let removed = g.captains.remove(idx);
+        g.seq += 1;
+        self.persist_locked(&g);
+        Ok(removed)
+    }
+
+    /// Record a spawned crew session under its captain (`spawnedBy` at the
+    /// `spawn_terminal`/`create_worktree` paths). Returns true (revision bumped)
+    /// when the captain is claimed and the crew id was newly added; false when
+    /// the captain has no claim (the spawn still proceeds - crew linkage simply
+    /// requires the captain to have claimed first) or the id is already crew.
+    pub fn record_crew(&self, spawned_by: &str, crew_session_id: &str) -> bool {
+        let mut g = self.lock();
+        let Some(c) = g
+            .captains
+            .iter_mut()
+            .find(|c| c.captain_session_id == spawned_by)
+        else {
+            return false;
+        };
+        if c.crew.iter().any(|id| id == crew_session_id) {
+            return false;
+        }
+        c.crew.push(crew_session_id.to_string());
+        g.seq += 1;
+        self.persist_locked(&g);
+        true
+    }
+
+    /// Lifecycle cleanup for a closed/killed session: drop its captaincy (a dead
+    /// captain must not hold a ship) and remove it from every crew list. Returns
+    /// true (revision bumped) if anything changed.
+    pub fn remove_session(&self, session_id: &str) -> bool {
+        let mut g = self.lock();
+        let before_caps = g.captains.len();
+        g.captains.retain(|c| c.captain_session_id != session_id);
+        let mut changed = g.captains.len() != before_caps;
+        for c in g.captains.iter_mut() {
+            let before = c.crew.len();
+            c.crew.retain(|id| id != session_id);
+            changed |= c.crew.len() != before;
+        }
+        if changed {
+            g.seq += 1;
+            self.persist_locked(&g);
+        }
+        changed
+    }
+
+    /// Drop a closed workspace tab from every captain's `workspaceTabIds` (the
+    /// registry must never advertise ownership of a tab that no longer exists).
+    /// The claim itself survives - a captain can control zero tabs. Returns true
+    /// (revision bumped) if anything changed.
+    pub fn prune_tab(&self, tab_id: &str) -> bool {
+        let mut g = self.lock();
+        let mut changed = false;
+        for c in g.captains.iter_mut() {
+            let before = c.workspace_tab_ids.len();
+            c.workspace_tab_ids.retain(|id| id != tab_id);
+            changed |= c.workspace_tab_ids.len() != before;
+        }
+        if changed {
+            g.seq += 1;
+            self.persist_locked(&g);
+        }
+        changed
+    }
+}
+
+impl Default for CaptainsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Resolve the captains persistence file: `$T_HUB_CAPTAINS_FILE` if set, else
+/// `~/.t-hub/captains.json`. Mirrors [`handshake_path`] so dev-isolation can
+/// point it elsewhere via the env var.
+pub fn captains_path() -> PathBuf {
+    if let Ok(p) = std::env::var("T_HUB_CAPTAINS_FILE") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".t-hub").join("captains.json")
+}
+
 /// The shared state the control dispatcher reads. Holds exactly the handles the
 /// Read + Organization tools need.
 ///
@@ -636,6 +1007,11 @@ pub struct ControlContext {
     /// (`Arc`) with the Tauri command that receives those reports; own empty one in
     /// headless tests.
     tabs: Arc<TabRegistry>,
+    /// The CORE's authoritative captains registry (captain-chat phase 2). Read by
+    /// `list_captains`, mutated by `claim_captain`/`release_captain` and the
+    /// `spawnedBy` crew plumbing; persistent across restarts (unlike `tabs`).
+    /// Own empty in-memory one in headless tests.
+    captains: Arc<CaptainsRegistry>,
     /// Idle read timeout for a connection's request phase ([`CONN_READ_TIMEOUT`] by
     /// default). A field (not the bare const) so tests can drive a short timeout
     /// against a real listener; could later carry an operator override.
@@ -1483,6 +1859,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "list_dir" => list_dir(ctx, args),
         "read_text_file" => read_text_file(ctx, args),
         "list_tabs" => list_tabs(ctx),
+        "list_captains" => list_captains(ctx),
         // T12: the socket twin of the `report_workspace_tabs` Tauri command - a
         // socket UI (the native cockpit) reports its tab layout into the same
         // registry the webview reports into, so `list_tabs` stays truthful
@@ -1519,6 +1896,11 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // scanned catalog into projects-archive (reversible). App-initiated from
         // the sidebar; filesystem-mutating like the worktree ops above.
         "archive_recent_project" => archive_recent_project(args),
+        // Captain-chat phase 2: captaincy is a SERVER mutation (audited) - the
+        // UI's pin action and an MCP captain's self-registration both land here,
+        // and every mutation forwards the authoritative captains snapshot.
+        "claim_captain" => claim_captain(ctx, args),
+        "release_captain" => release_captain(ctx, args),
 
         // ---- Process-changing tier (PRD §11.2: confirmation required) ------
         // `spawn_terminal` is confirmation-gated (its MCP description carries the
@@ -1996,6 +2378,20 @@ fn list_tabs(ctx: &ControlContext) -> Result<Value, String> {
     }))
 }
 
+/// `list_captains`: the claimed captains from the CORE captains registry
+/// (captain-chat phase 2), each `{shipSlug, captainSessionId, workspaceTabIds,
+/// crew}` plus the registry revision - the same versioned-snapshot contract as
+/// `list_tabs`. This is the ONE source of truth the UI's sidebar/overlay and an
+/// MCP captain both read; ship files remain the captain-side roster only.
+fn list_captains(ctx: &ControlContext) -> Result<Value, String> {
+    let snap = ctx.captains.snapshot();
+    Ok(json!({
+        "captains": snap.captains,
+        "count": snap.captains.len(),
+        "seq": snap.seq,
+    }))
+}
+
 /// `report_workspace_tabs` (T12 / headless-org): a UI client up-syncs its live tab
 /// layout - the control-socket twin of the Tauri command of the same name (the
 /// native cockpit is a socket client and cannot call Tauri). Consistency model
@@ -2020,7 +2416,20 @@ fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, St
         .or_else(|| args.get("base_seq"))
         .and_then(|v| v.as_u64());
     match ctx.tabs.report(tabs, active, base_seq) {
-        ReportOutcome::Accepted { seq } => Ok(json!({ "reported": count, "seq": seq })),
+        ReportOutcome::Accepted { seq, removed_tab_ids } => {
+            // Captain-chat phase 2: a normally-closed tab (the primary UI path)
+            // must leave every captain's workspaceTabIds too - prune, and forward
+            // a captains snapshot when anything changed so the UI/native cockpit
+            // converge.
+            let mut pruned = false;
+            for tab_id in &removed_tab_ids {
+                pruned |= ctx.captains.prune_tab(tab_id);
+            }
+            if pruned {
+                let _ = captains_sync_apply(ctx);
+            }
+            Ok(json!({ "reported": count, "seq": seq }))
+        }
         ReportOutcome::Stale(snap) => Ok(json!({
             "stale": true,
             "seq": snap.seq,
@@ -2095,6 +2504,10 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         .ok_or("create_worktree requires a 'worktreePath' argument")?;
     let branch = arg_str(args, "branch");
     let tab_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
+    // Captain-chat phase 2: a captain staging a crew worktree identifies itself
+    // so the worktree terminal is recorded as crew (same contract as
+    // spawn_terminal's spawnedBy).
+    let spawned_by = arg_str(args, "spawnedBy").or_else(|| arg_str(args, "spawned_by"));
 
     // #27: a REMOTE peer may create worktrees ONLY under the operator allowlist —
     // this execs `git worktree add` SERVER-SIDE at peer-controlled paths (a write/
@@ -2164,6 +2577,16 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         }
     }
 
+    // Captain-chat phase 2: link the spawned worktree terminal to its captain.
+    // No terminal (headless boot / spawn failure) = no crew session to record.
+    let crew_recorded = match (&spawned_by, &terminal_id) {
+        (Some(cap), Some(id)) => ctx.captains.record_crew(cap, id),
+        _ => false,
+    };
+    if crew_recorded {
+        let _ = captains_sync_apply(ctx);
+    }
+
     // Forward the UI orchestration (open/reuse the named tab + adopt the spawned
     // terminal, rendered from the attached registry snapshot). The git worktree
     // already exists, so `alreadyCreated: true` tells any legacy consumer not to
@@ -2189,6 +2612,8 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         "tabName": effective_tab_name,
         "terminalId": terminal_id,
         "gitOutput": git_output,
+        "spawnedBy": spawned_by,
+        "crewRecorded": crew_recorded,
         "audited": true,
         "applied": applied,
         "note": if applied {
@@ -2481,6 +2906,11 @@ fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .ok_or("close_tab requires a 'tabId' (or a 'tabName' that resolves to one)")?;
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let orphaned = ctx.tabs.remove_tab(&tab_id, force)?;
+    // Captains must never advertise ownership of a tab that no longer exists
+    // (the claim itself survives - a captain can control zero tabs).
+    if ctx.captains.prune_tab(&tab_id) {
+        let _ = captains_sync_apply(ctx);
+    }
     let mut res = organization_sync_apply(
         ctx,
         "close_tab",
@@ -2505,6 +2935,107 @@ fn rename_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .ok_or("rename_tab requires a non-empty 'name' argument")?;
     ctx.tabs.rename_tab(&tab_id, &name)?;
     organization_sync_apply(ctx, "rename_tab", json!({ "tabId": tab_id, "name": name }))
+}
+
+/// Forward the authoritative captains snapshot to the UI as a `sync_captains`
+/// apply (captain-chat phase 2) - the captains twin of [`with_sync`]'s tab
+/// snapshot, emitted AFTER a registry mutation so the UI renders FROM the
+/// registry. Rides the same [`forward_apply`] path (webview sink + T12 socket
+/// broadcast). Returns whether the forward was delivered.
+fn captains_sync_apply(ctx: &ControlContext) -> bool {
+    let snap = ctx.captains.snapshot();
+    let args = json!({ "sync": serde_json::to_value(&snap).unwrap_or(Value::Null) });
+    forward_apply(ctx, "sync_captains", &args)
+}
+
+/// `claim_captain` (Organization, audited; captain-chat phase 2): claim captaincy
+/// of a ship. The UI's pin action and an MCP captain's self-registration are the
+/// SAME mutation - registry-first (strict: a ship already captained by another
+/// session is refused), then the authoritative captains snapshot is forwarded via
+/// `sync_captains` so every client renders from it. Args: `captainSessionId` (or
+/// `sessionId`) required; `shipSlug` optional (slugified; defaults to
+/// `ship-<sessionId>`); `workspaceTabIds` optional (defaults to the tab currently
+/// holding the captain's tile, when the tab registry knows one).
+///
+/// LIVENESS: the session must be a LIVE terminal (`th_<id>` exists in tmux) - a
+/// claim for a dead/unknown session would persist and linger forever (nothing
+/// ever kills a session that never existed). A re-claim that changes nothing is
+/// idempotent: `seq` is unchanged and no redundant `sync_captains` is forwarded.
+fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let captain_session_id = arg_str(args, "captainSessionId")
+        .or_else(|| arg_str(args, "captain_session_id"))
+        .or_else(|| arg_str(args, "sessionId"))
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("claim_captain requires a 'captainSessionId' argument")?;
+    // Liveness: refuse a claim for a session with no live terminal, so a bogus
+    // or raced id can never be persisted into captains.json to linger forever.
+    if !tmux::has_session(&tmux_target(&captain_session_id)) {
+        return Err(format!(
+            "claim_captain: no live terminal for session '{captain_session_id}' \
+             (spawn or attach it first - a claim for a dead session would linger)"
+        ));
+    }
+    let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
+    let workspace_tab_ids: Vec<String> = args
+        .get("workspaceTabIds")
+        .or_else(|| args.get("workspace_tab_ids"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            // No explicit tabs: default to the tab the captain's tile lives in
+            // (the same lookup the UI's liveness check does, but server-side).
+            ctx.tabs
+                .tab_for_tile(&captain_session_id)
+                .into_iter()
+                .collect()
+        });
+    let before_seq = ctx.captains.snapshot().seq;
+    let record = ctx
+        .captains
+        .claim(&captain_session_id, ship_slug.as_deref(), workspace_tab_ids)?;
+    let snap = ctx.captains.snapshot();
+    // Idempotent re-claim (unchanged): the registry left `seq` alone, so skip the
+    // redundant forward. A real change bumps `seq` and forwards the snapshot.
+    let applied = snap.seq != before_seq && captains_sync_apply(ctx);
+    Ok(json!({
+        "accepted": "claim_captain",
+        "audited": true,
+        "applied": applied,
+        "captain": record,
+        "seq": snap.seq,
+        "captains": snap.captains,
+        "note": "captaincy claimed in the server captains registry (authoritative, \
+                 persistent) and the snapshot forwarded to the UI (sync_captains).",
+    }))
+}
+
+/// `release_captain` (Organization, audited; captain-chat phase 2): release a
+/// claimed captaincy, addressed by `captainSessionId` (or `sessionId`) or
+/// `shipSlug`. Strict (an unknown claim is an error), then the snapshot is
+/// forwarded via `sync_captains` exactly like `claim_captain`.
+fn release_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let target = arg_str(args, "captainSessionId")
+        .or_else(|| arg_str(args, "captain_session_id"))
+        .or_else(|| arg_str(args, "sessionId"))
+        .or_else(|| arg_str(args, "session_id"))
+        .or_else(|| arg_str(args, "shipSlug"))
+        .or_else(|| arg_str(args, "ship_slug"))
+        .ok_or("release_captain requires a 'captainSessionId' (or 'shipSlug') argument")?;
+    let released = ctx.captains.release(&target)?;
+    let applied = captains_sync_apply(ctx);
+    let snap = ctx.captains.snapshot();
+    Ok(json!({
+        "accepted": "release_captain",
+        "audited": true,
+        "applied": applied,
+        "released": released,
+        "seq": snap.seq,
+        "captains": snap.captains,
+    }))
 }
 
 /// `focus_tab` (Organization, audited): activate a tab - the ONE organization
@@ -2574,6 +3105,9 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let shell = arg_str(args, "shell");
     let startup_command =
         arg_str(args, "startupCommand").or_else(|| arg_str(args, "startup_command"));
+    // Captain-chat phase 2: a captain spawning crew identifies itself so the
+    // spawned session is recorded as crew in the captains registry.
+    let spawned_by = arg_str(args, "spawnedBy").or_else(|| arg_str(args, "spawned_by"));
 
     // #27: a REMOTE peer may spawn ONLY with a cwd under the operator allowlist —
     // the spawn execs a shell SERVER-SIDE at a peer-controlled dir. Loopback (the
@@ -2641,6 +3175,16 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // carries the ACTUAL placement.
     let placed_tab = ctx.tabs.place_tile_with_fallback(&id, tab_id.as_deref());
 
+    // Captain-chat phase 2: record the crew link under the spawning captain.
+    // The spawn NEVER fails on this - an unclaimed spawnedBy simply records
+    // nothing (crewRecorded: false tells the caller to claim_captain first).
+    let crew_recorded = spawned_by
+        .as_deref()
+        .is_some_and(|cap| ctx.captains.record_crew(cap, &id));
+    if crew_recorded {
+        let _ = captains_sync_apply(ctx);
+    }
+
     let forward = with_sync(
         ctx,
         json!({
@@ -2652,6 +3196,7 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             "startupCommand": startup_command,
             "tabId": placed_tab,
             "tabName": tab_name,
+            "spawnedBy": spawned_by,
         }),
     );
     let applied = forward_apply(ctx, "spawn_terminal", &forward);
@@ -2665,6 +3210,8 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         "startupCommand": startup_command,
         "tabId": placed_tab,
         "placed": placed_tab.is_some(),
+        "spawnedBy": spawned_by,
+        "crewRecorded": crew_recorded,
         "audited": true,
         "applied": applied,
         "note": "the server spawned the session, placed the tile in the target tab \
@@ -2774,6 +3321,11 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let tile_id = session_id.strip_prefix("th_").unwrap_or(&session_id);
     if ctx.tabs.remove_tile(tile_id) {
         let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
+    }
+    // Captain-chat phase 2: a dead session leaves the captains registry too -
+    // its captaincy is released and it drops out of every crew list.
+    if ctx.captains.remove_session(tile_id) {
+        let _ = captains_sync_apply(ctx);
     }
     Ok(json!({
         "accepted": "close_terminal",
@@ -2931,6 +3483,7 @@ impl ControlContext {
             fanout: Arc::new(EventFanout::new()),
             metrics: None,
             tabs: Arc::new(TabRegistry::new()),
+            captains: Arc::new(CaptainsRegistry::new()),
             idle_timeout: CONN_READ_TIMEOUT,
             attach_write_timeout: ATTACH_WRITE_TIMEOUT,
             max_attach_forwarders: MAX_ATTACH_FORWARDERS,
@@ -2951,6 +3504,15 @@ impl ControlContext {
     /// the private empty one from [`new`](Self::new).
     pub fn with_tab_registry(mut self, tabs: Arc<TabRegistry>) -> Self {
         self.tabs = tabs;
+        self
+    }
+
+    /// Attach a persistent [`CaptainsRegistry`] (captain-chat phase 2). `lib.rs`
+    /// builds it with [`CaptainsRegistry::load`] over [`captains_path`] so claims
+    /// survive app restarts; headless tests keep the in-memory one from
+    /// [`new`](Self::new).
+    pub fn with_captains_registry(mut self, captains: Arc<CaptainsRegistry>) -> Self {
+        self.captains = captains;
         self
     }
 
@@ -4807,5 +5369,435 @@ mod tests {
         eventually("forwarder table drained at test end", Duration::from_secs(10), || {
             attach_forwarder_count() == 0
         });
+    }
+
+    // ---- Captains registry (captain-chat phase 2) -------------------------
+
+    /// A unique temp path for a captains persistence file (removed by the caller).
+    fn captains_tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "t-hub-captains-test-{tag}-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    #[test]
+    fn claim_registers_updates_and_bumps_seq() {
+        let reg = CaptainsRegistry::new();
+        let rec = reg.claim("cap-1", Some("Ship Alpha!"), vec!["tab-1".into()]).unwrap();
+        assert_eq!(rec.ship_slug, "ship-alpha");
+        assert_eq!(rec.captain_session_id, "cap-1");
+        assert_eq!(rec.workspace_tab_ids, vec!["tab-1".to_string()]);
+        assert!(rec.crew.is_empty());
+        let snap = reg.snapshot();
+        assert_eq!(snap.seq, 1);
+        assert_eq!(snap.captains.len(), 1);
+
+        // Re-claim by the SAME captain is an upsert: slug/tabs refresh, crew kept.
+        assert!(reg.record_crew("cap-1", "crew-1"));
+        let rec = reg.claim("cap-1", Some("ship-beta"), vec!["tab-2".into()]).unwrap();
+        assert_eq!(rec.ship_slug, "ship-beta");
+        assert_eq!(rec.workspace_tab_ids, vec!["tab-2".to_string()]);
+        assert_eq!(rec.crew, vec!["crew-1".to_string()]);
+        let snap = reg.snapshot();
+        assert_eq!(snap.captains.len(), 1, "upsert must not duplicate the claim");
+        assert_eq!(snap.seq, 3);
+    }
+
+    #[test]
+    fn claim_defaults_slug_and_refuses_a_taken_ship() {
+        let reg = CaptainsRegistry::new();
+        // No ship name (a UI pin): slug falls back to ship-<sessionId>.
+        let rec = reg.claim("cap-1", None, vec![]).unwrap();
+        assert_eq!(rec.ship_slug, "ship-cap-1");
+        // One captain per ship: a DIFFERENT captain claiming the slug is refused.
+        let err = reg.claim("cap-2", Some("ship-cap-1"), vec![]).unwrap_err();
+        assert!(err.contains("already captained by session 'cap-1'"), "got: {err}");
+        // Empty session id is refused before touching the registry.
+        assert!(reg.claim("  ", None, vec![]).is_err());
+        assert_eq!(reg.snapshot().seq, 1, "refusals must not bump the revision");
+    }
+
+    #[test]
+    fn release_is_strict_and_addresses_by_id_or_slug() {
+        let reg = CaptainsRegistry::new();
+        reg.claim("cap-1", Some("alpha"), vec![]).unwrap();
+        reg.claim("cap-2", Some("beta"), vec![]).unwrap();
+        // By ship slug.
+        assert_eq!(reg.release("alpha").unwrap().captain_session_id, "cap-1");
+        // By captain session id.
+        assert_eq!(reg.release("cap-2").unwrap().ship_slug, "beta");
+        // Unknown target is an error, not a silent no-op.
+        let err = reg.release("cap-2").unwrap_err();
+        assert!(err.contains("no claim matches"), "got: {err}");
+        assert!(reg.snapshot().captains.is_empty());
+    }
+
+    #[test]
+    fn crew_lifecycle_record_dedupe_and_session_removal() {
+        let reg = CaptainsRegistry::new();
+        reg.claim("cap-1", Some("alpha"), vec![]).unwrap();
+        // Recording under an UNclaimed captain is a no-op (spawn still proceeds).
+        assert!(!reg.record_crew("cap-ghost", "crew-1"));
+        assert!(reg.record_crew("cap-1", "crew-1"));
+        assert!(!reg.record_crew("cap-1", "crew-1"), "duplicate crew must not re-add");
+        assert!(reg.record_crew("cap-1", "crew-2"));
+        assert_eq!(reg.snapshot().captains[0].crew.len(), 2);
+
+        // A killed crew session leaves every crew list.
+        assert!(reg.remove_session("crew-1"));
+        assert_eq!(reg.snapshot().captains[0].crew, vec!["crew-2".to_string()]);
+        // A killed CAPTAIN loses its claim.
+        assert!(reg.remove_session("cap-1"));
+        assert!(reg.snapshot().captains.is_empty());
+        // Removing an unknown session changes nothing (no revision bump).
+        let seq = reg.snapshot().seq;
+        assert!(!reg.remove_session("nobody"));
+        assert_eq!(reg.snapshot().seq, seq);
+    }
+
+    #[test]
+    fn prune_tab_drops_the_tab_but_keeps_the_claim() {
+        let reg = CaptainsRegistry::new();
+        reg.claim("cap-1", Some("alpha"), vec!["tab-1".into(), "tab-2".into()]).unwrap();
+        assert!(reg.prune_tab("tab-1"));
+        let snap = reg.snapshot();
+        assert_eq!(snap.captains[0].workspace_tab_ids, vec!["tab-2".to_string()]);
+        assert!(!reg.prune_tab("tab-1"), "already-pruned tab must not bump the revision");
+        assert!(reg.prune_tab("tab-2"));
+        // Zero controlled tabs is a valid claim state.
+        assert_eq!(reg.snapshot().captains.len(), 1);
+    }
+
+    #[test]
+    fn registry_persists_across_reloads_including_seq() {
+        let path = captains_tmp("roundtrip");
+        {
+            let reg = CaptainsRegistry::load(path.clone());
+            reg.claim("cap-1", Some("alpha"), vec!["tab-1".into()]).unwrap();
+            reg.record_crew("cap-1", "crew-1");
+        }
+        // A fresh load (an app restart) resumes the same claims AND revision.
+        let reg = CaptainsRegistry::load(path.clone());
+        let snap = reg.snapshot();
+        assert_eq!(snap.seq, 2);
+        assert_eq!(snap.captains.len(), 1);
+        assert_eq!(snap.captains[0].ship_slug, "alpha");
+        assert_eq!(snap.captains[0].crew, vec!["crew-1".to_string()]);
+        // And keeps counting monotonically from there.
+        reg.claim("cap-2", Some("beta"), vec![]).unwrap();
+        assert_eq!(CaptainsRegistry::load(path.clone()).snapshot().seq, 3);
+
+        // Atomic write discipline: the temp file is renamed over the target, so
+        // no `.tmp` sibling is ever left behind after the writes above.
+        let stem = path.file_name().unwrap().to_string_lossy().into_owned();
+        let leftover_tmp = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(&stem) && n.ends_with(".tmp")
+            });
+        assert!(!leftover_tmp, "atomic write must leave no .tmp file behind");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn corrupt_or_missing_persistence_starts_empty() {
+        let missing = CaptainsRegistry::load(captains_tmp("missing"));
+        assert_eq!(missing.snapshot().seq, 0);
+        assert!(missing.snapshot().captains.is_empty());
+
+        let path = captains_tmp("corrupt");
+        std::fs::write(&path, b"{not json").unwrap();
+        let reg = CaptainsRegistry::load(path.clone());
+        assert!(reg.snapshot().captains.is_empty());
+        // The first mutation heals the file.
+        reg.claim("cap-1", None, vec![]).unwrap();
+        let healed = CaptainsRegistry::load(path.clone());
+        assert_eq!(healed.snapshot().captains.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_captains_returns_the_versioned_snapshot() {
+        let ctx = test_ctx("secret");
+        ctx.captains.claim("cap-1", Some("alpha"), vec!["tab-1".into()]).unwrap();
+        let v = dispatch(&ctx, "list_captains", &json!({})).unwrap();
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["seq"], 1);
+        assert_eq!(v["captains"][0]["shipSlug"], "alpha");
+        assert_eq!(v["captains"][0]["captainSessionId"], "cap-1");
+        assert_eq!(v["captains"][0]["workspaceTabIds"][0], "tab-1");
+        assert_eq!(v["captains"][0]["crew"], json!([]));
+    }
+
+    #[test]
+    fn claim_and_release_are_audited_and_forward_the_captains_snapshot() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
+        // A LIVE terminal to claim (the liveness gate): spawn it into tab-1.
+        let cap_id = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Claim with NO explicit workspaceTabIds: defaults to the tab holding
+        // the captain's tile (the UI pin path sends exactly this shape).
+        let v = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": cap_id})).unwrap();
+        assert_eq!(v["accepted"], "claim_captain");
+        assert_eq!(v["audited"], true);
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["captain"]["shipSlug"], format!("ship-{cap_id}"));
+        assert_eq!(v["captain"]["workspaceTabIds"], json!(["tab-1"]));
+        assert_eq!(v["captain"]["captainSessionId"], cap_id);
+
+        let v = dispatch(&ctx, "release_captain", &json!({"captainSessionId": cap_id})).unwrap();
+        assert_eq!(v["accepted"], "release_captain");
+        assert_eq!(v["released"]["captainSessionId"], cap_id);
+        assert_eq!(v["captains"], json!([]));
+
+        // The claim + release each forwarded a sync_captains snapshot (filtering
+        // out the spawn_terminal forward that seeded the live session).
+        let sync_calls: Vec<_> = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| c == "sync_captains")
+            .cloned()
+            .collect();
+        assert_eq!(sync_calls.len(), 2);
+        assert_eq!(sync_calls[0].1["sync"]["captains"][0]["captainSessionId"], cap_id);
+        assert_eq!(sync_calls[1].1["sync"]["captains"], json!([]));
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": cap_id})).unwrap();
+    }
+
+    #[test]
+    fn claim_conflicts_liveness_and_bad_release_are_dispatch_errors() {
+        let ctx = test_ctx("t").with_apply_sink(Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        }));
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
+        let id1 = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let id2 = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        dispatch(&ctx, "claim_captain", &json!({"captainSessionId": id1, "shipSlug": "alpha"}))
+            .unwrap();
+        // A DIFFERENT live captain claiming the same ship is refused.
+        let err = dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({"captainSessionId": id2, "shipSlug": "alpha"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("already captained"), "got: {err}");
+        // A claim for a DEAD/unknown session is refused by the liveness gate
+        // (else it would persist and linger forever).
+        let err =
+            dispatch(&ctx, "claim_captain", &json!({"captainSessionId": "nonexistent"})).unwrap_err();
+        assert!(err.contains("no live terminal"), "got: {err}");
+        let err = dispatch(&ctx, "release_captain", &json!({"shipSlug": "nope"})).unwrap_err();
+        assert!(err.contains("no claim matches"), "got: {err}");
+        assert!(dispatch(&ctx, "claim_captain", &json!({})).is_err());
+        assert!(dispatch(&ctx, "release_captain", &json!({})).is_err());
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id1})).unwrap();
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id2})).unwrap();
+    }
+
+    #[test]
+    fn idempotent_reclaim_does_not_bump_seq_or_forward() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
+        let id = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let v1 = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": id})).unwrap();
+        assert_eq!(v1["applied"], true);
+        let seq1 = v1["seq"].as_u64().unwrap();
+        // An identical re-claim changes nothing: seq stays put, no second forward.
+        let v2 = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": id})).unwrap();
+        assert_eq!(v2["seq"].as_u64().unwrap(), seq1, "unchanged re-claim must not bump seq");
+        assert_eq!(v2["applied"], false, "unchanged re-claim must not forward");
+        let sync_count = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| c == "sync_captains")
+            .count();
+        assert_eq!(sync_count, 1, "only the first (changing) claim forwards");
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+    }
+
+    #[test]
+    fn spawn_with_spawned_by_records_crew_and_close_terminal_removes_it() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
+        ctx.captains.claim("cap-1", Some("alpha"), vec![]).unwrap();
+
+        // A claimed captain spawns crew: the link is recorded + synced.
+        let v = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "spawnedBy": "cap-1"}),
+        )
+        .unwrap();
+        assert_eq!(v["crewRecorded"], true);
+        assert_eq!(v["spawnedBy"], "cap-1");
+        let crew_id = v["id"].as_str().unwrap().to_string();
+        let snap = ctx.captains.snapshot();
+        assert_eq!(snap.captains[0].crew, vec![crew_id.clone()]);
+
+        // The dead crew session leaves the registry (and forwards a sync).
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": crew_id.clone()})).unwrap();
+        assert!(ctx.captains.snapshot().captains[0].crew.is_empty());
+
+        // Forwards: sync_captains (crew add), spawn_terminal (with spawnedBy),
+        // sync_tabs (tile drop), sync_captains (crew removal).
+        let calls = sink.calls.lock().unwrap();
+        let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            names,
+            ["sync_captains", "spawn_terminal", "sync_tabs", "sync_captains"]
+        );
+        assert_eq!(calls[0].1["sync"]["captains"][0]["crew"], json!([crew_id]));
+        assert_eq!(calls[1].1["spawnedBy"], "cap-1");
+        assert_eq!(calls[3].1["sync"]["captains"][0]["crew"], json!([]));
+    }
+
+    #[test]
+    fn spawn_with_an_unclaimed_spawned_by_still_spawns_without_a_crew_link() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let v = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "spawnedBy": "cap-ghost"}),
+        )
+        .unwrap();
+        assert_eq!(v["accepted"], "spawn_terminal");
+        assert_eq!(v["crewRecorded"], false, "no claim = no crew link, spawn unaffected");
+        assert!(ctx.captains.snapshot().captains.is_empty());
+        let id = v["id"].as_str().unwrap().to_string();
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+        let calls = sink.calls.lock().unwrap();
+        assert!(
+            calls.iter().all(|(c, _)| c != "sync_captains"),
+            "nothing captain-shaped changed, so no captains sync may be forwarded"
+        );
+    }
+
+    #[test]
+    fn close_terminal_of_a_captain_releases_its_claim() {
+        let ctx = test_ctx("t");
+        ctx.captains.claim("cap-1", Some("alpha"), vec![]).unwrap();
+        // The captain's own session dies (already-gone tmux session: the kill
+        // is idempotent, so dispatch succeeds and the registry cleanup runs).
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": "cap-1"})).unwrap();
+        assert!(ctx.captains.snapshot().captains.is_empty());
+    }
+
+    #[test]
+    fn report_workspace_tabs_prunes_closed_tabs_from_captains() {
+        // The PRIMARY UI tab-close path is report_workspace_tabs (the webview
+        // reports its new tab set), NOT the socket close_tab. A tab dropped from
+        // the report must leave every captain's workspaceTabIds and forward a
+        // captains snapshot - else it lingers as a phantom controlled-workspace.
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![
+            TabRecord { id: "t1".into(), name: "Main".into(), tile_ids: vec![] },
+            TabRecord { id: "t2".into(), name: "Side".into(), tile_ids: vec![] },
+        ]);
+        ctx.captains
+            .claim("cap-1", Some("alpha"), vec!["t1".into(), "t2".into()])
+            .unwrap();
+
+        // Report a tab set WITHOUT t2 (the user closed it): t2 is pruned from the
+        // captain, and a sync_captains forward carries the pruned snapshot.
+        dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({"tabs": [{"id": "t1", "name": "Main", "tileIds": []}]}),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.captains.snapshot().captains[0].workspace_tab_ids,
+            vec!["t1".to_string()],
+        );
+        let calls = sink.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|(c, a)| c == "sync_captains"
+                && a["sync"]["captains"][0]["workspaceTabIds"] == json!(["t1"])),
+            "a sync_captains forward must carry the pruned workspaceTabIds"
+        );
+    }
+
+    #[test]
+    fn close_tab_prunes_captain_workspace_ownership() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![
+            TabRecord { id: "tab-1".into(), name: "Main".into(), tile_ids: vec![] },
+            TabRecord { id: "tab-2".into(), name: "Side".into(), tile_ids: vec![] },
+        ]);
+        ctx.captains
+            .claim("cap-1", Some("alpha"), vec!["tab-2".into()])
+            .unwrap();
+
+        dispatch(&ctx, "close_tab", &json!({"tabId": "tab-2"})).unwrap();
+        let snap = ctx.captains.snapshot();
+        assert_eq!(snap.captains[0].workspace_tab_ids, Vec::<String>::new());
+        // The prune rode a sync_captains forward ahead of the close_tab apply.
+        let calls = sink.calls.lock().unwrap();
+        let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(names, ["sync_captains", "close_tab"]);
     }
 }
