@@ -1187,15 +1187,20 @@ pub fn persistent_read_key() -> String {
 /// control token to `control.json` and publishes only the read token there, so a
 /// process that merely scrapes the discovery file gets read-only; elevated sessions
 /// then rely on the control token injected down the spawn tree (Phase 2b). DEFAULT
-/// ON (Phase 3) - ambient discovery is least-privilege out of the box. The escape
-/// hatch `T_HUB_CONTROL_HARDEN=0` (or `false`) disables it, restoring the Phase 2
-/// behavior where `control.json` publishes the full-power control token. Any other
-/// value (or unset) leaves hardening ON.
+/// OFF - opt in with `T_HUB_CONTROL_HARDEN=1` (or `true`).
+///
+/// NOTE (2026-07-07 incident): the default was briefly flipped ON (0.3.47) and
+/// reverted the same day. The app's OWN frontend authenticates to the control
+/// socket with the token published in `control.json`; hardening downgraded that to
+/// the read token, so the webview lost control and terminals could not re-attach
+/// ("session detached - reconnecting"). Phase 3 stays behind this flag until the
+/// frontend receives the control token via a trusted internal channel (a Tauri
+/// command / spawn-injected env) instead of scraping the discovery file. See
+/// `docs/SOCKET-AUTH-DESIGN.md`.
 fn phase3_harden_enabled() -> bool {
-    match std::env::var("T_HUB_CONTROL_HARDEN") {
-        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
-        Err(_) => true,
-    }
+    std::env::var("T_HUB_CONTROL_HARDEN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Pick the token published in the `token` field of `control.json`. With hardening
@@ -1244,13 +1249,14 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     // Phase 2b: record the bound loopback address on the context so `spawn_terminal`
     // can inject it (with a capability token) into the sessions it spawns.
     ctx.addr = addr.to_string();
-    // Phase 3: `token` publishes only the READ token by default (the harden flag
-    // is now ON by default), so a process that merely scrapes `control.json` gets
-    // read-only. `T_HUB_CONTROL_HARDEN=0` restores the Phase 2 behavior (publish the
-    // full-power control token). `read_token` is always published so a
-    // least-privilege consumer can discover a read-only credential. Elevated
-    // sessions receive the control token via the Phase 2b spawn-tree env injection
-    // (T_HUB_CONTROL_ADDR + T_HUB_CONTROL_TOKEN), not this file.
+    // Phase 2 / Phase 3: `token` stays the full-power control token by DEFAULT
+    // (the app's own frontend authenticates to this socket with the published token,
+    // so publishing read-only breaks terminal attach - see the 2026-07-07 incident
+    // note on `phase3_harden_enabled`). Opt in with `T_HUB_CONTROL_HARDEN=1` to
+    // publish only the read token; elevated sessions then receive the control token
+    // via the Phase 2b spawn-tree env injection (T_HUB_CONTROL_ADDR +
+    // T_HUB_CONTROL_TOKEN), not this file. `read_token` is always published so a
+    // least-privilege consumer can discover a read-only credential.
     let harden = phase3_harden_enabled();
     let handshake = ControlHandshake {
         addr: addr.to_string(),
@@ -6635,23 +6641,24 @@ mod tests {
     }
 
     #[test]
-    fn phase3_flag_is_on_by_default_and_selects_read_token() {
-        // Phase 3: hardening is ON by default (unset ⇒ enabled), and with it on the
-        // published token is the READ token (ambient discovery is read-only). The
-        // escape hatch `T_HUB_CONTROL_HARDEN=0`/`false` disables it; any other value
-        // leaves it on. This mutates a process-global env var; no other test reads
-        // this var, and it is saved/restored around the mutation to stay hermetic.
+    fn phase3_flag_is_off_by_default_and_selects_control_token() {
+        // Phase 3 hardening is OFF by default (unset ⇒ disabled), so `control.json`
+        // keeps publishing the full control token - the app's own frontend depends on
+        // that until it gets the control token via a trusted internal channel (see
+        // the 2026-07-07 incident note on `phase3_harden_enabled`). Opt in with `1`/
+        // `true`. This mutates a process-global env var; no other test reads this var,
+        // and it is saved/restored around the mutation to stay hermetic.
         let saved = std::env::var("T_HUB_CONTROL_HARDEN").ok();
         std::env::remove_var("T_HUB_CONTROL_HARDEN");
-        assert!(phase3_harden_enabled(), "harden flag must default ON");
-        std::env::set_var("T_HUB_CONTROL_HARDEN", "0");
-        assert!(!phase3_harden_enabled(), "'0' must disable hardening");
-        std::env::set_var("T_HUB_CONTROL_HARDEN", "false");
-        assert!(!phase3_harden_enabled(), "'false' must disable hardening");
+        assert!(!phase3_harden_enabled(), "harden flag must default OFF");
         std::env::set_var("T_HUB_CONTROL_HARDEN", "1");
-        assert!(phase3_harden_enabled(), "'1' keeps hardening on");
+        assert!(phase3_harden_enabled(), "'1' must enable hardening");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "true");
+        assert!(phase3_harden_enabled(), "'true' must enable hardening");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "0");
+        assert!(!phase3_harden_enabled(), "'0' stays off");
         std::env::set_var("T_HUB_CONTROL_HARDEN", "yes");
-        assert!(phase3_harden_enabled(), "any non-disabling value keeps it on");
+        assert!(!phase3_harden_enabled(), "only 1/true enable; other values stay off");
         match saved {
             Some(v) => std::env::set_var("T_HUB_CONTROL_HARDEN", v),
             None => std::env::remove_var("T_HUB_CONTROL_HARDEN"),
@@ -6667,10 +6674,12 @@ mod tests {
 
     #[test]
     fn phase3_hardened_publishes_read_token_yet_spawn_env_carries_control() {
-        // With hardening ON (the default): what `control.json` publishes as `token`
-        // is the READ token (so a raw scraper is read-only), while the spawn-tree env
-        // injection still hands a spawned session the CONTROL token, preserving
-        // orchestration. These two facts together are the whole Phase 3 contract.
+        // With hardening ON (opt-in via `T_HUB_CONTROL_HARDEN=1`): what `control.json`
+        // publishes as `token` is the READ token (so a raw scraper is read-only), while
+        // the spawn-tree env injection still hands a spawned session the CONTROL token,
+        // preserving orchestration. These two facts together are the whole Phase 3
+        // contract - kept green so the flag is ready to re-enable once the frontend
+        // stops depending on the published control token.
         let ctx = test_ctx("ctl"); // read token is "read-ctl" (see test_ctx)
         // Discovery, hardened: publishes the read token, NOT the control token.
         let published = select_published_token(&ctx.token, &ctx.read_token, true);
