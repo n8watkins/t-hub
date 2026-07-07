@@ -32,6 +32,7 @@ import { useWorkspace, tabIdForTerminal } from "../store/workspace";
 import { useSupervision, sessionStatusForTmux } from "../store/supervision";
 import { sessionNameForTerminal } from "../store/sessionContext";
 import { useActivity } from "../store/activity";
+import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
 import { useTerminalSlot, requestPoolSync } from "./TerminalPool";
 import { StatusIndicator, terminalVariant } from "./StatusIndicator";
 import { repaintAllTerminals } from "../lib/repaint";
@@ -474,7 +475,11 @@ function CaptainSwitcherChip({
   terminalId: string;
   active: boolean;
 }) {
-  const label = useCaptainDisplayLabel(terminalId);
+  const derived = useCaptainDisplayLabel(terminalId);
+  // The designated orchestrator reads as its fixed brand name here too, so the
+  // switcher chip matches the sidebar row (parity in every surface).
+  const isOrchestrator = useCaptain((s) => s.orchestratorId === terminalId);
+  const label = isOrchestrator ? ORCHESTRATOR_DISPLAY_NAME : derived;
   const hasTile = useWorkspace((s) =>
     s.tabs.some((t) => t.order.includes(terminalId)),
   );
