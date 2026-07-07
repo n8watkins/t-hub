@@ -158,6 +158,21 @@ fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxErro
 /// track the most recently active client instead of shrinking to the smallest,
 /// which would otherwise corrupt the visible layout (REVIEW.md risk #4).
 pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), TmuxError> {
+    new_session_with_env(name, cwd, command, &[])
+}
+
+/// Like [`new_session`], but sets per-session environment variables via tmux `-e`
+/// (socket-gate Phase 2b). tmux applies `-e KEY=VALUE` to the session BEFORE the
+/// first pane execs, so an in-session process (e.g. the MCP server the pane later
+/// launches) inherits them - and, unlike prefixing the pane command, the values
+/// never appear in `ps`/`pane_start_command`. `env` empty ⇒ identical to
+/// [`new_session`].
+pub fn new_session_with_env(
+    name: &str,
+    cwd: &str,
+    command: Option<&str>,
+    env: &[(String, String)],
+) -> Result<(), TmuxError> {
     // `-c CWD` only when we actually have a (WSL-side) directory; on Windows the
     // default is empty so the pane starts in wsl.exe's launch dir rather than an
     // invalid Windows path.
@@ -169,6 +184,14 @@ pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), T
     // a 2-column pane until the first attach resized it. 80x24 is the classic
     // fallback; the first real attach reflows to the tile's true geometry anyway.
     let mut args: Vec<&str> = vec!["new-session", "-d", "-x", "80", "-y", "24", "-s", name];
+    // Session environment (`-e KEY=VALUE`, socket-gate Phase 2b). Pre-format so the
+    // backing strings outlive `args`. tmux ≥3.2 supports `-e`; this codebase already
+    // targets ≥3.4 (see the geometry note above).
+    let env_pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    for pair in &env_pairs {
+        args.push("-e");
+        args.push(pair);
+    }
     if !cwd.is_empty() {
         args.push("-c");
         args.push(cwd);
