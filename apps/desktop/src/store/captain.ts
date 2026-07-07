@@ -137,17 +137,31 @@ export interface CaptainClaimRecord {
   crew: string[];
 }
 
+/** Count of in-flight `release_captain` calls this window initiated. An empty
+ *  server snapshot is LEGITIMATE while we are releasing (the last pin dropping to
+ *  zero); otherwise an empty snapshot is treated as a transient (registry load
+ *  failure / reconnect-before-load) and must not wipe local pins - see
+ *  {@link CaptainState.adoptCaptainsRegistry}. Exported read-only for tests. */
+let pendingReleases = 0;
+export function captainReleasesInFlight(): number {
+  return pendingReleases;
+}
+
 /** Fire-and-forget server captaincy mutation (pin = claim, unpin = release).
  *  Best-effort by design: outside Tauri (tests / dev browser) or with the
  *  control channel down the local designation stands and the next adopted
  *  registry snapshot reconciles - the same optimistic-then-converge contract
  *  the workspace tab reporter follows. */
 function serverCaptaincy(command: "claim_captain" | "release_captain", id: TerminalId): void {
+  if (command === "release_captain") pendingReleases += 1;
   void import("../ipc/controlClient")
     .then((m) => m.controlRequest(command, { captainSessionId: id }))
     .catch(() => {
       // Control channel unavailable or the claim/release raced a server-side
       // mutation (e.g. releasing an already-released claim) - safe to ignore.
+    })
+    .finally(() => {
+      if (command === "release_captain") pendingReleases -= 1;
     });
 }
 
@@ -284,6 +298,21 @@ export const useCaptain = create<CaptainState>((set, get) => {
 
     adoptCaptainsRegistry: (records) => {
       const s = get();
+      // A1 guard: a server snapshot with ZERO captains, while the local store
+      // still holds pins and we did NOT initiate a release, is almost certainly
+      // transient (a registry load failure or a reconnect-before-load) - honoring
+      // it would clear captainIds AND persist the empty list, destroying the
+      // designations (including the boot migration seed). Keep the pins; a real
+      // subsequent snapshot reconciles. A legitimate empty (the user released
+      // their last captain) is unaffected: unpinCaptain clears the store FIRST
+      // (so it is already empty here), and any release we drove is counted.
+      if (
+        records.length === 0 &&
+        s.captainIds.length > 0 &&
+        pendingReleases === 0
+      ) {
+        return;
+      }
       const claims: Record<TerminalId, CaptainClaimRecord> = {};
       for (const r of records) claims[r.captainSessionId] = r;
       const kept = s.captainIds.filter((id) => claims[id] !== undefined);

@@ -530,12 +530,29 @@ describe("phase 2: pinning is claiming (server captains registry)", () => {
     expect(useCaptain.getState().activeCaptainId).toBe("cap00001");
   });
 
-  it("an EMPTY snapshot clears every designation and the anchor dropdown", () => {
+  it("IGNORES a spurious empty snapshot while local pins exist and no release is in flight (A1 guard)", () => {
+    // A newer zero-captain snapshot from a registry load failure / reconnect-
+    // before-load must NOT wipe the persisted designations (the migration seed).
+    localStorage.removeItem("t-hub.captain.v2");
+    useCaptain.getState().setAnchorMenu(true);
+    useCaptain.getState().adoptCaptainsRegistry([]);
+    const s = useCaptain.getState();
+    expect(s.captainIds).toEqual(["cap00001"]); // pins KEPT
+    expect(s.activeCaptainId).toBe("cap00001");
+    // Nothing was cleared, so nothing was persisted (the empty list never wrote).
+    expect(localStorage.getItem("t-hub.captain.v2")).toBeNull();
+  });
+
+  it("adopts an empty snapshot when the local store is already empty (legitimate clear)", () => {
+    // The legitimate empty path: unpinning the last captain clears the store
+    // FIRST, so by the time the empty snapshot arrives the store is already
+    // empty - the guard does not fire and the adopt is a clean no-op.
+    seedCaptains([]);
+    useCaptain.setState({ claims: {} });
     useCaptain.getState().setAnchorMenu(true);
     useCaptain.getState().adoptCaptainsRegistry([]);
     const s = useCaptain.getState();
     expect(s.captainIds).toEqual([]);
-    expect(s.activeCaptainId).toBeNull();
     expect(s.anchorMenuOpen).toBe(false);
   });
 });
