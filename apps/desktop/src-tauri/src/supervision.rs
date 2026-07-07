@@ -52,8 +52,19 @@ const SESSION_MAP_CAP: usize = 256;
 /// otherwise accumulate completed nodes without bound. We keep at most this many
 /// of the most-recently-finished completed children and prune the oldest beyond
 /// it. Running children are never pruned (they're still outstanding). 64 keeps the
-/// recently-finished tail visible while bounding the tree.
+/// recently-finished tail visible while bounding the tree. (Counts additionally
+/// reset at every `UserPromptSubmit` turn boundary, so this cap is a per-turn
+/// backstop, not the thing the UI counts against.)
 const COMPLETED_CHILDREN_CAP: usize = 64;
+
+/// A child still `Running` after this long is presumed ORPHANED and reaped to
+/// `Completed`. Real subagents finish in seconds-to-minutes; the one way a child
+/// stays running forever is a missed `SubagentStop` (Escape-interrupting a turn
+/// kills the subagents without firing their stop hooks - 7 of 98 real sessions
+/// showed permanently-running phantoms, one pinned at 4). Generous on purpose:
+/// this is the last-resort backstop behind the turn-boundary reap below, so it
+/// only has to beat "forever", not be tight.
+const ORPHAN_RUNNING_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 
 /// Per-session supervision state.
 #[derive(Debug, Default, Clone)]
@@ -86,6 +97,44 @@ impl SessionEntry {
     /// True when nothing is outstanding (no running children, no open tasks).
     fn idle(&self) -> bool {
         self.running_children() == 0 && self.outstanding_tasks == 0
+    }
+
+    /// Mark every still-`Running` child `Completed` at `ended_at`. Used when the
+    /// session reaches a state where nothing can still be running (a terminal
+    /// status, or a new turn beginning): any `Running` child left at that point
+    /// is an orphan whose `SubagentStop` never arrived (Escape-interrupt kills
+    /// subagents without firing their stop hooks). Returns true when anything
+    /// was reaped.
+    fn reap_running_children(&mut self, ended_at: u64) -> bool {
+        let mut any = false;
+        for c in self.children.values_mut() {
+            if c.state == SubagentState::Running {
+                c.state = SubagentState::Completed;
+                c.ended_at = Some(ended_at);
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Reap `Running` children older than [`ORPHAN_RUNNING_TIMEOUT_MS`] - the
+    /// lazy timeout backstop for phantoms on sessions that never hit a turn
+    /// boundary or terminal status again. Runs on every ingest for the session
+    /// (no sweeper machinery exists; the reducer is event-driven), so a stuck
+    /// child clears as soon as ANY event for its session arrives after the
+    /// deadline. Returns true when anything was reaped.
+    fn reap_timed_out_children(&mut self, now_ms: u64) -> bool {
+        let mut any = false;
+        for c in self.children.values_mut() {
+            if c.state == SubagentState::Running
+                && now_ms.saturating_sub(c.started_at) >= ORPHAN_RUNNING_TIMEOUT_MS
+            {
+                c.state = SubagentState::Completed;
+                c.ended_at = Some(now_ms);
+                any = true;
+            }
+        }
+        any
     }
 
     /// Bound the number of *completed* children to [`COMPLETED_CHILDREN_CAP`],
@@ -181,6 +230,17 @@ impl Supervisor {
         // is `Copy`, so this is a cheap snapshot.
         let prev_status = entry.status;
 
+        // Normalize the hook's agent_type: Claude Code's implicit internal
+        // agents report an EMPTY string (and never fire SubagentStart at all -
+        // see the SubagentStop arm); treat "" as absent everywhere.
+        let agent_type = agent_type.filter(|t| !t.is_empty());
+
+        // Lazy phantom sweep: any event for this session is an opportunity to
+        // reap children stuck Running past the orphan timeout. Runs BEFORE the
+        // reducer so e.g. a `Stop` arriving after the deadline classifies
+        // against the reaped truth (Completed, not WaitingOnSubagents).
+        let timed_out = entry.reap_timed_out_children(timestamp_ms);
+
         match event {
             JournalEventType::SessionStart => {
                 entry.status = SessionStatus::Working;
@@ -189,6 +249,18 @@ impl Supervisor {
 
             JournalEventType::UserPromptSubmit => {
                 // A new turn began — back to Working regardless of prior state.
+                //
+                // TURN BOUNDARY for the subagent tree: drop ALL children.
+                //  - Still-Running ones are orphans: a subagent cannot span a
+                //    user turn, so a Running child here means its SubagentStop
+                //    never fired (Escape-interrupt kills subagents without
+                //    running their stop hooks) - the phantom that used to pin
+                //    "N running" (and WaitingOnSubagents) forever.
+                //  - Completed ones belong to the finished turn: the tree now
+                //    reads "N running · M done" for THIS turn instead of a
+                //    lifetime accumulation capped at 64. History lives in the
+                //    transition log; the tree is the live display.
+                entry.children.clear();
                 entry.status = SessionStatus::Working;
                 entry.main_stopped = false;
             }
@@ -212,9 +284,33 @@ impl Supervisor {
 
             JournalEventType::SubagentStop => {
                 if let Some(aid) = agent_id {
-                    if let Some(child) = entry.children.get_mut(aid) {
-                        child.state = SubagentState::Completed;
-                        child.ended_at = Some(timestamp_ms);
+                    match entry.children.get_mut(aid) {
+                        Some(child) => {
+                            child.state = SubagentState::Completed;
+                            child.ended_at = Some(timestamp_ms);
+                        }
+                        // No matching SubagentStart. This is the NORMAL case
+                        // for Claude Code's implicit internal agents: in the
+                        // real journal 995 of 1005 orphan stops carried an
+                        // empty agent_type, and none of those ever emitted a
+                        // start hook (every matched stop had a real type). The
+                        // starts are skipped at the SOURCE, not dropped in our
+                        // pipeline - so synthesize the node at stop time so the
+                        // completion still counts. Zero-duration on purpose:
+                        // the true start time is unknown.
+                        None => {
+                            entry.children.insert(
+                                aid.to_string(),
+                                SubagentNode {
+                                    parent_session_id: session_id.to_string(),
+                                    agent_id: aid.to_string(),
+                                    agent_type: agent_type.map(str::to_string),
+                                    state: SubagentState::Completed,
+                                    started_at: timestamp_ms,
+                                    ended_at: Some(timestamp_ms),
+                                },
+                            );
+                        }
                     }
                 }
                 // Bound the completed-children tail so a parallel-agent-heavy
@@ -271,6 +367,11 @@ impl Supervisor {
 
             JournalEventType::StopFailure => {
                 entry.status = SessionStatus::Failed;
+                // Terminal status: nothing can still be running - reap any
+                // orphans so the tree never shows phantom Running children on
+                // a failed session.
+                entry.reap_running_children(timestamp_ms);
+                entry.prune_completed_children();
             }
 
             JournalEventType::SessionEnd => {
@@ -280,6 +381,10 @@ impl Supervisor {
                 if entry.status != SessionStatus::Completed {
                     entry.status = SessionStatus::Failed;
                 }
+                // Terminal status either way: reap phantom Running children
+                // (the session is gone; they can never stop on their own).
+                entry.reap_running_children(timestamp_ms);
+                entry.prune_completed_children();
                 // We KEEP the entry (with its terminal status) rather than evicting
                 // here: the live-UI emit (`emit_session`) and a late `wait_for_status`
                 // poller both read the current `status()` right after this ingest, so
@@ -294,6 +399,14 @@ impl Supervisor {
             // snapshots/agent lifecycle) leave status unchanged here; the status
             // bridge handles rate-limit/context elsewhere.
             _ => {}
+        }
+
+        // A timeout reap may have made the session idle without any arm above
+        // noticing (e.g. the triggering event was a passthrough snapshot):
+        // unpin a stuck WaitingOnSubagents and re-bound the completed tail.
+        if timed_out {
+            Self::recompute_after_completion(entry);
+            entry.prune_completed_children();
         }
 
         // Read the post-reducer status while the entry still exists, so we can log
@@ -489,6 +602,109 @@ mod tests {
         s.ingest(Some("o1"), None, None, JournalEventType::SessionStart, 1);
         s.ingest(Some("o1"), None, None, JournalEventType::Stop, 2);
         assert_eq!(s.status("o1"), SessionStatus::Completed);
+    }
+
+    #[test]
+    fn escape_interrupt_phantom_reaped_at_turn_boundary() {
+        let mut s = sup();
+        s.ingest(Some("o1"), None, None, JournalEventType::SessionStart, 1);
+        s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 2);
+        s.ingest(
+            Some("o1"),
+            Some("a1"),
+            Some("Explore"),
+            JournalEventType::SubagentStart,
+            3,
+        );
+        // Escape-interrupt: the subagent is killed WITHOUT its SubagentStop
+        // hook firing; the main Stop then classifies against the phantom.
+        s.ingest(Some("o1"), None, None, JournalEventType::Stop, 4);
+        assert_eq!(s.status("o1"), SessionStatus::WaitingOnSubagents);
+        // The next prompt is the turn boundary: phantom cleared, tree empty,
+        // session Working - no permanent "1 running" pin.
+        s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 5);
+        assert_eq!(s.status("o1"), SessionStatus::Working);
+        assert!(s.tree("o1").unwrap().children.is_empty());
+    }
+
+    #[test]
+    fn counts_are_turn_scoped() {
+        let mut s = sup();
+        s.ingest(Some("o1"), None, None, JournalEventType::SessionStart, 1);
+        s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 2);
+        s.ingest(Some("o1"), Some("a1"), None, JournalEventType::SubagentStart, 3);
+        s.ingest(Some("o1"), Some("a1"), None, JournalEventType::SubagentStop, 4);
+        assert_eq!(s.tree("o1").unwrap().children.len(), 1);
+        // A new turn resets the display: last turn's completed child no longer
+        // counts - the tree reads "N running · M done" for THIS turn.
+        s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 5);
+        s.ingest(Some("o1"), Some("a2"), None, JournalEventType::SubagentStart, 6);
+        let tree = s.tree("o1").unwrap();
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].agent_id, "a2");
+        assert_eq!(tree.children[0].state, SubagentState::Running);
+    }
+
+    #[test]
+    fn orphan_stop_synthesizes_completed_child() {
+        let mut s = sup();
+        s.ingest(Some("o1"), None, None, JournalEventType::SessionStart, 1);
+        s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 2);
+        // The real-journal shape: an implicit internal agent fires SubagentStop
+        // with an EMPTY agent_type and never fired SubagentStart (995/1005
+        // orphan stops in the 2026-07 journal).
+        s.ingest(Some("o1"), Some("ghost"), Some(""), JournalEventType::SubagentStop, 3);
+        let tree = s.tree("o1").unwrap();
+        assert_eq!(tree.children.len(), 1, "orphan stop must synthesize a node");
+        assert_eq!(tree.children[0].state, SubagentState::Completed);
+        assert_eq!(tree.children[0].agent_type, None, "empty type normalized to absent");
+        assert_eq!(tree.children[0].started_at, 3);
+        assert_eq!(tree.children[0].ended_at, Some(3));
+        // The synthesized completion never blocks a clean Completed.
+        s.ingest(Some("o1"), None, None, JournalEventType::Stop, 4);
+        assert_eq!(s.status("o1"), SessionStatus::Completed);
+    }
+
+    #[test]
+    fn timed_out_running_child_is_reaped_and_unpins_waiting() {
+        let mut s = sup();
+        s.ingest(Some("o1"), None, None, JournalEventType::SessionStart, 1);
+        s.ingest(Some("o1"), None, None, JournalEventType::UserPromptSubmit, 2);
+        s.ingest(Some("o1"), Some("a1"), None, JournalEventType::SubagentStart, 3);
+        s.ingest(Some("o1"), None, None, JournalEventType::Stop, 4);
+        assert_eq!(s.status("o1"), SessionStatus::WaitingOnSubagents);
+        // No turn boundary ever arrives; ANY later event past the orphan
+        // deadline (here a reducer-passthrough status snapshot) reaps the
+        // phantom and unpins the stuck WaitingOnSubagents.
+        let late = 3 + ORPHAN_RUNNING_TIMEOUT_MS;
+        s.ingest(Some("o1"), None, None, JournalEventType::StatusSnapshot, late);
+        assert_eq!(s.status("o1"), SessionStatus::Completed);
+        let tree = s.tree("o1").unwrap();
+        assert_eq!(tree.children[0].state, SubagentState::Completed);
+        assert_eq!(tree.children[0].ended_at, Some(late));
+    }
+
+    #[test]
+    fn terminal_status_reaps_running_children() {
+        let mut s = sup();
+        s.ingest(Some("o1"), None, None, JournalEventType::SessionStart, 1);
+        s.ingest(Some("o1"), Some("a1"), None, JournalEventType::SubagentStart, 2);
+        s.ingest(Some("o1"), None, None, JournalEventType::SessionEnd, 3);
+        let tree = s.tree("o1").unwrap();
+        assert_eq!(tree.children[0].state, SubagentState::Completed);
+        assert_eq!(tree.children[0].ended_at, Some(3));
+    }
+
+    #[test]
+    fn stop_failure_reaps_running_children() {
+        let mut s = sup();
+        s.ingest(Some("o1"), None, None, JournalEventType::SessionStart, 1);
+        s.ingest(Some("o1"), Some("a1"), None, JournalEventType::SubagentStart, 2);
+        s.ingest(Some("o1"), None, None, JournalEventType::StopFailure, 3);
+        assert_eq!(s.status("o1"), SessionStatus::Failed);
+        let tree = s.tree("o1").unwrap();
+        assert_eq!(tree.children[0].state, SubagentState::Completed);
+        assert_eq!(tree.children[0].ended_at, Some(3));
     }
 
     #[test]

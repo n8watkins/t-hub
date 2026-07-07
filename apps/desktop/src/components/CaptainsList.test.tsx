@@ -1,9 +1,10 @@
-// Tests for the sidebar CAPTAINS section body (captain-sidebar PRD, slice A):
-// row render from seeded stores (MRU order, workspace name, honest subagent
-// summary, tasks badge, context meter), summon wiring through the captain
-// store, the attention roll-up precedence (needs-input pulses; working and the
-// rate-limit overlay do NOT pulse the row - rate-limit reads amber on the
-// meter instead), and the inline SupervisionTree expansion.
+// Tests for the sidebar CAPTAINS section body (captain-sidebar PRD slice A +
+// the captain-rows round): row render from seeded stores (workspace-first
+// ordering, identity line, turn-scoped subagent summary, tasks badge, context
+// meter), the inline rename round-trip through setTerminalLabel, summon wiring
+// through the captain store, the attention roll-up precedence (needs-input
+// pulses; working and the rate-limit overlay do NOT pulse the row - rate-limit
+// reads amber on the meter instead), and the inline SupervisionTree expansion.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 
@@ -39,6 +40,9 @@ beforeEach(() => {
     focusedId: "cap00001",
     terminals: { cap00001: term("cap00001"), bbb00001: term("bbb00001") },
     poppedOutTabs: [],
+    // Reset renames between cases (setTerminalLabel writes these maps).
+    userLabels: {},
+    labels: {},
   });
   useCaptain.setState({
     captainIds: ["cap00001", "bbb00001"],
@@ -98,11 +102,12 @@ describe("CaptainsList render", () => {
     );
     expect(rows).toEqual(["cap00001", "bbb00001"]);
 
-    // The session-bound captain: workspace, honest subagent counts, tasks
-    // badge, context meter from the snapshot.
+    // The session-bound captain: identity (cwd basename - no rename set),
+    // workspace, turn-scoped subagent counts, tasks badge, context meter.
     const capRow = row("cap00001");
+    expect(capRow.textContent).toContain("tmp"); // identity line (cwd /tmp)
     expect(capRow.textContent).toContain("Workspace 1");
-    expect(capRow.textContent).toContain("subagents: 1 running · 1 done");
+    expect(capRow.textContent).toContain("this turn: 1 running · 1 done");
     expect(within(capRow).getByTitle(/outstanding background task/).textContent).toBe(
       "2 tasks",
     );
@@ -110,10 +115,11 @@ describe("CaptainsList render", () => {
       within(capRow).getByLabelText(/Context window 42 percent full/),
     ).toBeTruthy();
 
-    // The session-less captain: workspace only - no invented activity.
+    // The session-less captain: identity + workspace only - no invented
+    // activity.
     const bbbRow = row("bbb00001");
     expect(bbbRow.textContent).toContain("Workspace 2");
-    expect(bbbRow.textContent).not.toContain("subagents:");
+    expect(bbbRow.textContent).not.toContain("this turn:");
     expect(bbbRow.textContent).not.toContain("task");
   });
 
@@ -131,6 +137,94 @@ describe("CaptainsList render", () => {
     const summon = within(row("bbb00001")).getByTitle(/tile not available/);
     expect(summon).toBeTruthy();
     expect(row("bbb00001").textContent).toContain("tile not available");
+  });
+});
+
+describe("CaptainsList rename", () => {
+  function startRename(terminalId: string): HTMLInputElement {
+    fireEvent.click(within(row(terminalId)).getByTitle("Rename captain"));
+    return within(row(terminalId)).getByRole("textbox") as HTMLInputElement;
+  }
+
+  it("pencil -> type -> Enter commits through setTerminalLabel (persisted rename)", () => {
+    render(<CaptainsList />);
+    const input = startRename("cap00001");
+    // Draft seeds from the CURRENT override (none yet), placeholder shows the
+    // derived identity.
+    expect(input.value).toBe("");
+    expect(input.placeholder).toBe("tmp");
+    fireEvent.change(input, { target: { value: "Flagship" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    // Round-trip: the store carries the rename and the row leads with it.
+    expect(useWorkspace.getState().userLabels["cap00001"]).toBe("Flagship");
+    expect(row("cap00001").textContent).toContain("Flagship");
+    expect(within(row("cap00001")).queryByRole("textbox")).toBeNull();
+  });
+
+  it("Esc cancels without touching the store", () => {
+    render(<CaptainsList />);
+    const input = startRename("cap00001");
+    fireEvent.change(input, { target: { value: "Nope" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(useWorkspace.getState().userLabels["cap00001"]).toBeUndefined();
+    expect(row("cap00001").textContent).not.toContain("Nope");
+    expect(within(row("cap00001")).queryByRole("textbox")).toBeNull();
+  });
+
+  it("blur commits the draft (click-away does not lose the rename)", () => {
+    render(<CaptainsList />);
+    const input = startRename("cap00001");
+    fireEvent.change(input, { target: { value: "Blurred" } });
+    fireEvent.blur(input);
+    expect(useWorkspace.getState().userLabels["cap00001"]).toBe("Blurred");
+    expect(within(row("cap00001")).queryByRole("textbox")).toBeNull();
+  });
+
+  it("committing an emptied draft clears the override back to the derived identity", () => {
+    act(() => {
+      useWorkspace.getState().setTerminalLabel("cap00001", "Flagship");
+    });
+    render(<CaptainsList />);
+    expect(row("cap00001").textContent).toContain("Flagship");
+    const input = startRename("cap00001");
+    expect(input.value).toBe("Flagship"); // seeded with the current override
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(useWorkspace.getState().userLabels["cap00001"]).toBeUndefined();
+    expect(row("cap00001").textContent).toContain("tmp");
+  });
+});
+
+describe("CaptainsList workspace-relevant ordering", () => {
+  it("floats the ACTIVE workspace's captain to the top with the accent marker", () => {
+    render(<CaptainsList />);
+    // Active tab t1 -> cap00001 (already MRU front) leads and is marked.
+    let rows = [...document.querySelectorAll("[data-captain-row]")].map((r) =>
+      r.getAttribute("data-captain-row"),
+    );
+    expect(rows).toEqual(["cap00001", "bbb00001"]);
+    expect(
+      row("cap00001").querySelector("[data-in-active-workspace]"),
+    ).toBeTruthy();
+    expect(
+      row("bbb00001").querySelector("[data-in-active-workspace]"),
+    ).toBeNull();
+
+    // Switch to Workspace 2: bbb00001 floats to the top and takes the marker,
+    // even though cap00001 is still the MRU-front / active captain.
+    act(() => {
+      useWorkspace.setState({ activeTabId: "t2" });
+    });
+    rows = [...document.querySelectorAll("[data-captain-row]")].map((r) =>
+      r.getAttribute("data-captain-row"),
+    );
+    expect(rows).toEqual(["bbb00001", "cap00001"]);
+    expect(
+      row("bbb00001").querySelector("[data-in-active-workspace]"),
+    ).toBeTruthy();
+    expect(
+      row("cap00001").querySelector("[data-in-active-workspace]"),
+    ).toBeNull();
   });
 });
 
