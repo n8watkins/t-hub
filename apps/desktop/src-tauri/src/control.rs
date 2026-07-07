@@ -112,8 +112,18 @@ impl ControlResponse {
 pub struct ControlHandshake {
     /// `127.0.0.1:<port>` the listener bound to.
     pub addr: String,
-    /// Per-launch shared secret the client must present.
+    /// Per-launch shared secret the client must present. Backward-compatible: this
+    /// is the full-power **control** token by default (every existing caller that
+    /// reads `token` keeps full power). The Phase 3 harden flag
+    /// (`T_HUB_CONTROL_HARDEN`, default OFF) flips it to publish only the read token
+    /// here; Phase 2 never flips it.
     pub token: String,
+    /// Per-launch **read** capability token (socket-gate Phase 2). Grants the Read
+    /// tier only. Added alongside `token` so a least-privilege consumer can discover
+    /// a read-only credential; `#[serde(default)]` keeps older handshake
+    /// files/readers parseable.
+    #[serde(default)]
+    pub read_token: String,
     /// PID of the app that owns this listener (diagnostics / staleness checks).
     pub pid: u32,
     /// The control wire protocol version this server speaks ([`PROTOCOL_VERSION`]).
@@ -1032,8 +1042,21 @@ pub struct ControlContext {
     /// `true` by default (tests + the loopback case). Gates the file-read scope (#23):
     /// remote peers are restricted to indexed roots, loopback is unrestricted.
     peer_is_loopback: bool,
-    /// The per-launch auth token.
+    /// The per-launch full-power **control** auth token. Authorizes every tier
+    /// (Read + Organization + ProcessChanging). Published to `control.json` as
+    /// `token` (backward-compatible) unless the Phase 3 harden flag flips it.
     token: String,
+    /// The per-launch **read** capability token (socket-gate Phase 2). Authorizes
+    /// the Read tier ONLY; a holder cannot spawn, type into, or kill sessions.
+    /// Empty when unconfigured (headless tests) — an empty read token authorizes
+    /// nothing (guarded in [`resolve_capability`]).
+    read_token: String,
+    /// The loopback address the listener bound to (`127.0.0.1:<port>`), set in
+    /// [`start`] after bind. Injected (with a capability token) into the
+    /// environment of spawned sessions so their in-session MCP/clients authenticate
+    /// as the capability the spawn was granted (Phase 2b). Empty in headless tests
+    /// (then no capability env is injected, and spawns behave exactly as before).
+    addr: String,
     /// Fleet spawn budget + rate limits (socket-gate Phase 1). Shared `Arc` so one
     /// fleet-wide budget is enforced across every connection handler thread.
     /// Consulted from [`dispatch_authenticated`] for the ProcessChanging tier only.
@@ -1118,6 +1141,72 @@ pub fn persistent_key() -> String {
     key
 }
 
+/// Resolve the persistent **read**-key file: `$T_HUB_SERVER_READ_KEY_FILE` if set,
+/// else `~/.t-hub/server-read-key`. Mirrors [`key_path`] so dev-isolation can point
+/// it elsewhere; kept separate from the control key so the two secrets never share
+/// a file.
+fn read_key_path() -> PathBuf {
+    if let Ok(p) = std::env::var("T_HUB_SERVER_READ_KEY_FILE") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".t-hub").join("server-read-key")
+}
+
+/// The PERSISTENT **read** capability key (socket-gate Phase 2): a distinct,
+/// stable-across-restarts secret from [`persistent_key`] (the control key), so a
+/// read-only consumer paired once keeps working. Read from [`read_key_path`] if
+/// present + non-empty, else a fresh UUID is minted and written (best-effort
+/// `0600`). Always returns a usable in-memory key on any I/O failure.
+pub fn persistent_read_key() -> String {
+    let path = read_key_path();
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let k = existing.trim().to_string();
+        if !k.is_empty() {
+            return k;
+        }
+    }
+    let key = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&path, &key).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    key
+}
+
+/// Phase 3 hardening flag (socket-gate). When ON, [`start`] stops publishing the
+/// control token to `control.json` and publishes only the read token there, so a
+/// process that merely scrapes the discovery file gets read-only; elevated sessions
+/// then rely on the control token injected down the spawn tree (Phase 2b). DEFAULT
+/// OFF - Phase 2 keeps `control.json` fully backward-compatible; this only reads the
+/// env, it does not flip anything on its own.
+fn phase3_harden_enabled() -> bool {
+    std::env::var("T_HUB_CONTROL_HARDEN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Pick the token published in the `token` field of `control.json`. With hardening
+/// OFF (default) this is the full-power control token (every current caller keeps
+/// full power); with hardening ON it is the read token (ambient discovery becomes
+/// read-only). Pure so it is directly unit-testable.
+fn select_published_token<'a>(control_token: &'a str, read_token: &'a str, harden: bool) -> &'a str {
+    if harden && !read_token.is_empty() {
+        read_token
+    } else {
+        control_token
+    }
+}
+
 /// Write the handshake file (best-effort `0600` on unix) so the MCP binary can
 /// discover the live listener.
 fn write_handshake(handshake: &ControlHandshake) -> std::io::Result<()> {
@@ -1143,12 +1232,21 @@ fn write_handshake(handshake: &ControlHandshake) -> std::io::Result<()> {
 /// caller (and tests) know where it landed. A bind failure is returned to the
 /// caller; the app logs it and continues (the control channel is optional, like
 /// the agent bridge).
-pub fn start(ctx: ControlContext) -> std::io::Result<ControlHandshake> {
+pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
+    // Phase 2b: record the bound loopback address on the context so `spawn_terminal`
+    // can inject it (with a capability token) into the sessions it spawns.
+    ctx.addr = addr.to_string();
+    // Phase 2 / Phase 3: `token` stays the full-power control token by default
+    // (backward-compatible discovery); the harden flag (default OFF) flips it to
+    // publish only the read token. `read_token` is always published so a
+    // least-privilege consumer can discover a read-only credential.
+    let harden = phase3_harden_enabled();
     let handshake = ControlHandshake {
         addr: addr.to_string(),
-        token: ctx.token.clone(),
+        token: select_published_token(&ctx.token, &ctx.read_token, harden).to_string(),
+        read_token: ctx.read_token.clone(),
         pid: std::process::id(),
         protocol_version: PROTOCOL_VERSION,
     };
@@ -1511,7 +1609,10 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
                 // event stream. After the ack we send no per-line responses — the
                 // fanout owns the socket and the read loop just parks until disconnect.
                 if req.command == SUBSCRIBE_COMMAND {
-                    if !ct_token_eq(&req.token, &ctx.token) {
+                    // Read-tier stream: the read token may subscribe too (a
+                    // least-privilege monitor legitimately needs the event feed).
+                    // PTY attach below stays control-token-only (it can type).
+                    if !token_is_valid(&ctx, &req.token) {
                         write_response(
                             &mut writer,
                             &ControlResponse::err("unauthorized: bad control token"),
@@ -1853,12 +1954,18 @@ impl CommandTier {
     }
 }
 
-/// Classify a command by tier. Mirrors the tier blocks in [`dispatch`] and the
-/// MCP `Tier` enum. Filesystem-mutating "Organization-destructive" commands
-/// (`create_worktree`, `remove_worktree`, `archive_recent_project`) are
-/// Organization tier for Phase 1 (audited, not budget-gated); the governor only
-/// throttles the true process-spawn/kill surface.
-fn command_tier(command: &str) -> CommandTier {
+/// The **single table-driven source of truth** mapping a command name to the tier
+/// it requires (socket-gate Phase 2, §3). Mirrors the tier blocks in [`dispatch`]
+/// and the MCP `Tier` enum (`crates/t-hub-mcp/src/tools.rs`) so the
+/// annotation-vs-enforcement drift that motivated this whole effort cannot recur.
+///
+/// Filesystem-mutating "Organization-destructive" commands (`create_worktree`,
+/// `remove_worktree`, `archive_recent_project`) are Organization tier: since the
+/// read token authorizes the Read tier ONLY, Organization already requires the
+/// control token (§3's "control-tier" treatment), and keeping them out of
+/// ProcessChanging leaves them un-throttled by the spawn governor (they are not raw
+/// process spawns).
+fn required_tier(command: &str) -> CommandTier {
     match command {
         "spawn_terminal" | "send_text" | "send_keys" | "close_terminal" => {
             CommandTier::ProcessChanging
@@ -1870,6 +1977,104 @@ fn command_tier(command: &str) -> CommandTier {
         }
         _ => CommandTier::Read,
     }
+}
+
+/// A resolved caller capability (socket-gate Phase 2). The read token resolves to
+/// [`ReadOnly`](Capability::ReadOnly) (Read tier only); the control token to
+/// [`Full`](Capability::Full) (every tier).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Capability {
+    ReadOnly,
+    Full,
+}
+
+impl Capability {
+    /// Whether this capability may run a command of the given required tier. The
+    /// read token is strictly Read-only (the general's chosen default); everything
+    /// else requires the full control token.
+    fn allows(self, tier: CommandTier) -> bool {
+        match self {
+            Capability::Full => true,
+            Capability::ReadOnly => tier == CommandTier::Read,
+        }
+    }
+
+    /// The audit `tokenTier` label for this capability.
+    fn tier_label(self) -> &'static str {
+        match self {
+            Capability::Full => "control",
+            Capability::ReadOnly => "read",
+        }
+    }
+}
+
+/// Resolve the presented token to a [`Capability`], or `None` if it matches no
+/// known token (⇒ `unauthorized: bad control token`, byte-identical to before).
+///
+/// The presented token is compared against BOTH known tokens in constant time with
+/// **no early return**, so timing never reveals which (if any) matched. The control
+/// token wins if both somehow match. An empty configured read token authorizes
+/// nothing (guards the headless-default case where no read token is set).
+///
+/// Belt-and-suspenders (open Q4): a REMOTE (non-loopback) peer is capped to
+/// `ReadOnly` even with the control token, so a token leaked over the opt-in
+/// network bind cannot spawn/type/kill via the command channel. (The separate
+/// PTY-attach path keeps its own control-token check, preserving the remote
+/// cockpit.)
+fn resolve_capability(ctx: &ControlContext, presented: &str) -> Option<Capability> {
+    let is_control = ct_token_eq(presented, &ctx.token);
+    let is_read = !ctx.read_token.is_empty() && ct_token_eq(presented, &ctx.read_token);
+    let cap = if is_control {
+        Some(Capability::Full)
+    } else if is_read {
+        Some(Capability::ReadOnly)
+    } else {
+        None
+    };
+    match cap {
+        Some(Capability::Full) if !ctx.peer_is_loopback => Some(Capability::ReadOnly),
+        other => other,
+    }
+}
+
+/// Whether a presented token is valid at all (either capability). Used by the
+/// read-tier event-subscribe handshake, which a read-only monitor legitimately
+/// needs. (PTY attach stays control-token-only - it can type.)
+fn token_is_valid(ctx: &ControlContext, presented: &str) -> bool {
+    resolve_capability(ctx, presented).is_some()
+}
+
+/// The capability-token env injected into a spawned session so its in-session
+/// MCP/clients authenticate as the capability the spawn was granted (Phase 2b).
+///
+/// DEFAULT is the full control token - every spawned session can orchestrate,
+/// exactly as today (where the in-session MCP reads the control token from
+/// `control.json`), so nothing that spawns today breaks. An explicit
+/// `capability: "read"` spawn arg downgrades the new session to the read token
+/// (a pure-work crew that can observe but not spawn/type/kill). Any other/absent
+/// `capability` value fails SAFE to the control token (a typo never silently
+/// under-privileges a session that needed to orchestrate).
+///
+/// Injects BOTH `T_HUB_CONTROL_ADDR` and `T_HUB_CONTROL_TOKEN` because the MCP's
+/// env override is all-or-nothing (it needs both, else it falls back to
+/// `control.json` and ignores the env token). Empty when the bound addr is unknown
+/// (headless tests) - then nothing is injected and the session behaves as before.
+fn elevation_env(ctx: &ControlContext, args: &Value) -> Vec<(String, String)> {
+    if ctx.addr.is_empty() {
+        return Vec::new();
+    }
+    let read_only = arg_str(args, "capability")
+        .map(|c| c.eq_ignore_ascii_case("read"))
+        .unwrap_or(false);
+    let token = if read_only && !ctx.read_token.is_empty() {
+        ctx.read_token.clone()
+    } else {
+        ctx.token.clone()
+    };
+    vec![
+        ("T_HUB_CONTROL_ADDR".to_string(), ctx.addr.clone()),
+        ("T_HUB_CONTROL_TOKEN".to_string(), token),
+    ]
 }
 
 /// The authoritative count of live `th_*` tmux sessions, reconciled from the tmux
@@ -1934,6 +2139,7 @@ fn audit_command(
     ctx: &ControlContext,
     req: &ControlRequest,
     tier: CommandTier,
+    cap: Capability,
     decision: &str,
     error: Option<&str>,
 ) {
@@ -1954,8 +2160,8 @@ fn audit_command(
         &req.args,
         AuditMeta {
             peer: if ctx.peer_is_loopback { "loopback" } else { "remote" },
-            // Phase 1 has a single full-power token; the field is forward-compat.
-            token_tier: "control",
+            // Phase 2: the capability the presented token resolved to.
+            token_tier: cap.tier_label(),
             session,
             spawned_by,
             error,
@@ -1963,23 +2169,47 @@ fn audit_command(
     );
 }
 
-/// Check the token, gate + audit, then dispatch. A bad token is rejected before
-/// any command runs (no information about which commands exist is leaked). For the
-/// ProcessChanging tier the fleet governor runs first (refuse-past-ceiling); every
-/// Organization/ProcessChanging command - allowed or refused - lands in the audit
-/// log, and a governor refusal is also mirrored live onto the event fanout.
+/// Resolve capability, gate + audit, then dispatch. A bad token is rejected before
+/// any command runs (byte-identical message, no leak of which commands exist).
+///
+/// Order (§3): (1) resolve the presented token to a [`Capability`]; (2) the
+/// command's [`required_tier`] must be covered by that capability, else refuse
+/// `refused-authz` and audit it; (3) for ProcessChanging the fleet governor runs
+/// (Phase 1, refuse-past-ceiling); (4) dispatch. Every Organization/ProcessChanging
+/// command - allowed or refused - lands in the audit log with its `tokenTier`, and
+/// a refusal is mirrored live onto the event fanout.
 fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
-    if !ct_token_eq(&req.token, &ctx.token) {
+    let Some(cap) = resolve_capability(ctx, &req.token) else {
         return ControlResponse::err("unauthorized: bad control token");
-    }
+    };
 
-    let tier = command_tier(&req.command);
+    let tier = required_tier(&req.command);
+
+    // Phase 2 capability gate: the presented token's capability must cover the
+    // command's required tier. The read token authorizes Read only; Organization
+    // and ProcessChanging require the control token.
+    if !cap.allows(tier) {
+        let message = format!(
+            "unauthorized: '{}' requires the control capability (this token is read-only)",
+            req.command
+        );
+        audit_command(ctx, &req, tier, cap, "refused-authz", None);
+        ctx.fanout.emit_event(
+            "control://governor",
+            &json!({
+                "command": req.command.as_str(),
+                "decision": "refused-authz",
+                "error": message.as_str(),
+            }),
+        );
+        return ControlResponse::err(message);
+    }
 
     // Phase 1 fleet gate: budget + rate limits for process-changing commands only.
     // Read/Organization tiers never touch the governor.
     if tier == CommandTier::ProcessChanging {
         if let Err(refusal) = governor_gate(ctx, &req.command, &req.args) {
-            audit_command(ctx, &req, tier, refusal.code, None);
+            audit_command(ctx, &req, tier, cap, refusal.code, None);
             ctx.fanout.emit_event(
                 "control://governor",
                 &json!({
@@ -2005,7 +2235,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         } else {
             response.error.as_deref()
         };
-        audit_command(ctx, &req, tier, "allowed", err);
+        audit_command(ctx, &req, tier, cap, "allowed", err);
     }
 
     response
@@ -2752,7 +2982,10 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     let mut terminal_id: Option<String> = None;
     let mut tab_id = tab_id;
     if has_ui {
-        match spawn_tmux_terminal(&worktree_path, None) {
+        // Phase 2b: elevate the worktree's terminal the same way spawn_terminal does
+        // (control token by default; `capability: "read"` downgrades it).
+        let elevation = elevation_env(ctx, args);
+        match spawn_tmux_terminal(&worktree_path, None, &elevation) {
             Ok((id, _)) => {
                 // Atomic placement with fallback: if the named tab was closed in
                 // the race window between resolution and placement, the tile
@@ -3359,7 +3592,11 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .clone()
         .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
     let pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
-    let (id, tmux_session) = spawn_tmux_terminal(&cwd_effective, pane.as_deref())?;
+    // Phase 2b: grant this session its capability token via env (control by default,
+    // read_token when `capability: "read"`), so its in-session MCP authenticates as
+    // the granted capability.
+    let elevation = elevation_env(ctx, args);
+    let (id, tmux_session) = spawn_tmux_terminal(&cwd_effective, pane.as_deref(), &elevation)?;
 
     // Atomic placement with fallback: if the resolved tab was closed in the race
     // window between spawn and placement, the tile lands in the active (else
@@ -3419,11 +3656,18 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// id and session name must never disagree). Shared by the T12 native-path arms
 /// of `spawn_terminal` / `create_worktree`, where no webview exists to run the
 /// spawn client-side.
-fn spawn_tmux_terminal(cwd: &str, command: Option<&str>) -> Result<(String, String), String> {
+fn spawn_tmux_terminal(
+    cwd: &str,
+    command: Option<&str>,
+    env: &[(String, String)],
+) -> Result<(String, String), String> {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let id = suffix[..8].to_string();
     let tmux_session = format!("th_{id}");
-    tmux::new_session(&tmux_session, cwd, command)
+    // Phase 2b: `env` carries the capability token (+ addr) for the new session, set
+    // via tmux `-e` so it is present BEFORE the first pane execs and never lands in
+    // argv. Empty ⇒ a plain session (headless tests / addr unknown).
+    tmux::new_session_with_env(&tmux_session, cwd, command, env)
         .map_err(|e| format!("failed to create tmux session: {e}"))?;
     Ok((id, tmux_session))
 }
@@ -3681,9 +3925,19 @@ impl ControlContext {
             max_attach_forwarders: MAX_ATTACH_FORWARDERS,
             peer_is_loopback: true,
             token,
+            read_token: String::new(),
+            addr: String::new(),
             governor: Arc::new(SpawnGovernor::from_env()),
             audit: Arc::new(AuditLog::from_env()),
         }
+    }
+
+    /// Attach the per-launch **read** capability token (socket-gate Phase 2).
+    /// `lib.rs` mints it alongside the control token; headless tests set a known
+    /// value so they can exercise read-only capability resolution.
+    pub fn with_read_token(mut self, read_token: String) -> Self {
+        self.read_token = read_token;
+        self
     }
 
     /// Replace the [`SpawnGovernor`] (tests inject tiny limits; production keeps the
@@ -3792,7 +4046,10 @@ mod tests {
         // Point the audit sink at a per-token temp dir so dispatch_authenticated
         // tests never write to the real ~/.t-hub/audit.
         let audit_dir = std::env::temp_dir().join(format!("t-hub-ctl-test-{token}"));
+        // A known read token so capability tests can present it; distinct from the
+        // control token so ReadOnly vs Full resolution is exercised.
         ControlContext::new(Arc::new(StatusBridge::new()), visitor, token.to_string())
+            .with_read_token(format!("read-{token}"))
             .with_audit(Arc::new(crate::audit::AuditLog::new(audit_dir)))
     }
 
@@ -5286,6 +5543,7 @@ mod tests {
         let h = ControlHandshake {
             addr: "127.0.0.1:5000".into(),
             token: "abc".into(),
+            read_token: "rdonly".into(),
             pid: 42,
             protocol_version: PROTOCOL_VERSION,
         };
@@ -5293,8 +5551,19 @@ mod tests {
         let back: ControlHandshake = serde_json::from_str(&s).unwrap();
         assert_eq!(back.addr, "127.0.0.1:5000");
         assert_eq!(back.token, "abc");
+        assert_eq!(back.read_token, "rdonly");
         assert_eq!(back.pid, 42);
         assert_eq!(back.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn old_handshake_without_read_token_still_parses() {
+        // Backward-compat: a control.json written before Phase 2 (no read_token
+        // field) must still deserialize - the field defaults to empty.
+        let json = r#"{"addr":"127.0.0.1:9","token":"t","pid":1,"protocol_version":2}"#;
+        let hs: ControlHandshake = serde_json::from_str(json).unwrap();
+        assert_eq!(hs.token, "t");
+        assert_eq!(hs.read_token, "");
     }
 
     // ---- s27: attach path vs client churn -----------------------------------
@@ -6173,13 +6442,14 @@ mod tests {
 
     #[test]
     fn command_tiers_are_classified() {
-        assert_eq!(command_tier("spawn_terminal"), CommandTier::ProcessChanging);
-        assert_eq!(command_tier("close_terminal"), CommandTier::ProcessChanging);
-        assert_eq!(command_tier("send_text"), CommandTier::ProcessChanging);
-        assert_eq!(command_tier("new_tab"), CommandTier::Organization);
-        assert_eq!(command_tier("create_worktree"), CommandTier::Organization);
-        assert_eq!(command_tier("list_terminals"), CommandTier::Read);
-        assert_eq!(command_tier("get_status"), CommandTier::Read);
+        assert_eq!(required_tier("spawn_terminal"), CommandTier::ProcessChanging);
+        assert_eq!(required_tier("close_terminal"), CommandTier::ProcessChanging);
+        assert_eq!(required_tier("send_text"), CommandTier::ProcessChanging);
+        assert_eq!(required_tier("new_tab"), CommandTier::Organization);
+        assert_eq!(required_tier("create_worktree"), CommandTier::Organization);
+        assert_eq!(required_tier("remove_worktree"), CommandTier::Organization);
+        assert_eq!(required_tier("list_terminals"), CommandTier::Read);
+        assert_eq!(required_tier("get_status"), CommandTier::Read);
     }
 
     #[test]
@@ -6239,5 +6509,149 @@ mod tests {
         let blob = serde_json::to_string(&recs).unwrap();
         assert!(!blob.contains("GATE_E2E_OK"), "send_text literal leaked into audit");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // socket-gate Phase 2/2b: capability-scoped tokens
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capability_resolution_maps_each_token() {
+        // control token -> Full; read token -> ReadOnly; anything else -> None.
+        let ctx = test_ctx("t"); // control="t", read="read-t"
+        assert_eq!(resolve_capability(&ctx, "t"), Some(Capability::Full));
+        assert_eq!(resolve_capability(&ctx, "read-t"), Some(Capability::ReadOnly));
+        assert_eq!(resolve_capability(&ctx, "nope"), None);
+        assert_eq!(resolve_capability(&ctx, ""), None);
+    }
+
+    #[test]
+    fn empty_read_token_authorizes_nothing() {
+        // A ctx with no read token configured must not let an empty presented token
+        // resolve to ReadOnly (the empty==empty trap).
+        let ctx = ControlContext::new(
+            Arc::new(StatusBridge::new()),
+            Arc::new(|_: &mut dyn FnMut(&Supervisor)| {}),
+            "ctl".to_string(),
+        );
+        assert!(ctx.read_token.is_empty());
+        assert_eq!(resolve_capability(&ctx, ""), None);
+        assert_eq!(resolve_capability(&ctx, "ctl"), Some(Capability::Full));
+    }
+
+    #[test]
+    fn control_token_still_grants_full_power_backward_compat() {
+        // THE make-or-break: the existing control token (published in control.json)
+        // resolves to Full and is authorized for EVERY tier - zero client breakage.
+        let ctx = test_ctx("t");
+        assert!(Capability::Full.allows(CommandTier::Read));
+        assert!(Capability::Full.allows(CommandTier::Organization));
+        assert!(Capability::Full.allows(CommandTier::ProcessChanging));
+        // Through the gate: a ProcessChanging command with the control token is NOT
+        // authz-refused (it fails downstream only because this headless ctx has no
+        // UI sink - proving authz passed).
+        let resp = dispatch_authenticated(&ctx, req("t", "spawn_terminal", json!({"cwd": "/tmp"})));
+        let err = resp.error.unwrap_or_default();
+        assert!(!err.contains("requires the control capability"), "control token was authz-refused: {err}");
+        assert!(err.contains("no UI"), "expected the downstream no-UI failure, got: {err}");
+    }
+
+    #[test]
+    fn read_token_reads_but_cannot_spawn_or_kill() {
+        let dir = std::env::temp_dir().join("t-hub-p2-readonly");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = test_ctx("t").with_audit(Arc::new(AuditLog::new(dir.clone())));
+
+        // Read tier: allowed (not authz-refused). May fail on tmux, but never authz.
+        let r = dispatch_authenticated(&ctx, req("read-t", "list_terminals", json!({})));
+        assert!(
+            !r.error.clone().unwrap_or_default().contains("requires the control capability"),
+            "read token was refused a Read command"
+        );
+
+        // ProcessChanging + Organization-destructive: authz-refused with the exact msg.
+        for cmd in ["spawn_terminal", "send_text", "send_keys", "close_terminal", "create_worktree"] {
+            let resp = dispatch_authenticated(&ctx, req("read-t", cmd, json!({"cwd": "/tmp", "sessionId": "x", "text": "y", "keys": ["C-c"]})));
+            let err = resp.error.unwrap_or_default();
+            assert!(
+                err == format!("unauthorized: '{cmd}' requires the control capability (this token is read-only)"),
+                "read token should be authz-refused for {cmd}, got: {err}"
+            );
+        }
+
+        // Every refusal is audited with tokenTier=read and decision=refused-authz.
+        let recs = read_audit(&dir);
+        assert!(!recs.is_empty());
+        assert!(recs.iter().all(|r| r["decision"] == "refused-authz"));
+        assert!(recs.iter().all(|r| r["tokenTier"] == "read"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn control_token_command_audits_token_tier_control() {
+        let dir = std::env::temp_dir().join("t-hub-p2-ctltier");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = test_ctx("t").with_audit(Arc::new(AuditLog::new(dir.clone())));
+        // An Organization command with the control token: allowed, audited control.
+        let _ = dispatch_authenticated(&ctx, req("t", "new_tab", json!({"name": "T"})));
+        let recs = read_audit(&dir);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["tokenTier"], "control");
+        assert_eq!(recs[0]["decision"], "allowed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_peer_is_capped_to_read_even_with_control_token() {
+        // Belt-and-suspenders (open Q4): a non-loopback peer presenting the CONTROL
+        // token is capped to ReadOnly, so it cannot spawn/kill over the network bind.
+        let mut ctx = test_ctx("t");
+        ctx.peer_is_loopback = false;
+        assert_eq!(resolve_capability(&ctx, "t"), Some(Capability::ReadOnly));
+        // Read still works remotely; ProcessChanging is authz-refused.
+        let spawn = dispatch_authenticated(&ctx, req("t", "spawn_terminal", json!({"cwd": "/tmp"})));
+        assert!(spawn.error.unwrap().contains("requires the control capability"));
+        let read = dispatch_authenticated(&ctx, req("t", "list_terminals", json!({})));
+        assert!(!read.error.clone().unwrap_or_default().contains("requires the control capability"));
+    }
+
+    #[test]
+    fn read_token_is_valid_for_subscribe() {
+        // token_is_valid (the event-subscribe gate) accepts either capability so a
+        // least-privilege monitor can subscribe; a bad token is rejected.
+        let ctx = test_ctx("t");
+        assert!(token_is_valid(&ctx, "t"));
+        assert!(token_is_valid(&ctx, "read-t"));
+        assert!(!token_is_valid(&ctx, "bad"));
+    }
+
+    #[test]
+    fn phase3_flag_is_off_by_default_and_selects_control_token() {
+        // The Phase 3 harden flag exists but is OFF unless explicitly set, and with
+        // it off the published token is the control token (backward-compatible).
+        assert!(!phase3_harden_enabled(), "harden flag must default OFF");
+        assert_eq!(select_published_token("ctl", "rd", false), "ctl");
+        // When flipped, discovery would publish the read token instead...
+        assert_eq!(select_published_token("ctl", "rd", true), "rd");
+        // ...but never an empty read token (falls back to control to stay usable).
+        assert_eq!(select_published_token("ctl", "", true), "ctl");
+    }
+
+    #[test]
+    fn elevation_env_defaults_control_and_downgrades_to_read() {
+        let mut ctx = test_ctx("t");
+        ctx.addr = "127.0.0.1:4242".to_string();
+        // Default: full control token injected (preserve current behavior).
+        let def = elevation_env(&ctx, &json!({}));
+        assert_eq!(def, vec![
+            ("T_HUB_CONTROL_ADDR".to_string(), "127.0.0.1:4242".to_string()),
+            ("T_HUB_CONTROL_TOKEN".to_string(), "t".to_string()),
+        ]);
+        // Opt-in read-only: the read token is injected instead.
+        let ro = elevation_env(&ctx, &json!({"capability": "read"}));
+        assert_eq!(ro[1], ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string()));
+        // No bound addr (headless): nothing injected, so spawns behave as before.
+        ctx.addr = String::new();
+        assert!(elevation_env(&ctx, &json!({"capability": "read"})).is_empty());
     }
 }

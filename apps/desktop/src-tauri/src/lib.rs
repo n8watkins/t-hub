@@ -260,6 +260,14 @@ fn start_control_listener(
         .filter(|t| !t.is_empty())
         .unwrap_or_else(control::persistent_key);
 
+    // socket-gate Phase 2: a distinct, persistent READ capability token minted
+    // alongside the control token. Published in control.json as `read_token`; grants
+    // the Read tier only. An explicit T_HUB_CONTROL_READ_TOKEN overrides (harnesses).
+    let read_token = std::env::var("T_HUB_CONTROL_READ_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(control::persistent_read_key);
+
     // A visitor closure that locks the bridge's Supervisor and runs `f`. Capturing
     // a clone of the bridge keeps `control` decoupled from `agent` internals.
     let bridge = state.agent.clone();
@@ -286,6 +294,7 @@ fn start_control_listener(
     // Share the event fanout (server-split M1) so a subscribed control connection
     // receives the same stream the backend emits through the SocketEmitter.
     let ctx = control::ControlContext::new(state.status.clone(), supervisor, token)
+        .with_read_token(read_token)
         .with_apply_sink(apply_sink)
         .with_event_fanout(fanout)
         .with_metrics(metrics)
