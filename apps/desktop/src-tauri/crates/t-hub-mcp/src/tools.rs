@@ -428,6 +428,12 @@ pub fn catalog() -> Vec<ToolDef> {
             summary: "Read a session's recent visible output (plain text; optional scrollback) so you can see what it currently shows.",
             input_schema: schema_read_terminal,
         },
+        ToolDef {
+            name: "scribe_status",
+            tier: Tier::Read,
+            summary: "Is the general dictating right now? Reads the Scribe voice-gate status file and returns {listening, status, since}; fails open to listening=false when it can't tell (missing/stale/dead-pid file).",
+            input_schema: schema_empty,
+        },
         // ---- Organization tier -----------------------------------------
         ToolDef {
             name: "focus_session",
@@ -560,6 +566,7 @@ mod tests {
             "list_tabs",
             "list_captains",
             "read_terminal",
+            "scribe_status",
             "focus_session",
             "move_tile",
             "rename_tab",
@@ -618,6 +625,16 @@ mod tests {
                 "{name} should not require confirmation"
             );
         }
+    }
+
+    #[test]
+    fn scribe_status_is_read_tier_and_unconfirmed() {
+        let mcp = find("scribe_status").unwrap().to_mcp();
+        assert_eq!(mcp["annotations"]["t-hubTier"], "read");
+        assert_eq!(mcp["annotations"]["confirmationRequired"], false);
+        // Takes no arguments (an empty object schema).
+        let schema = (find("scribe_status").unwrap().input_schema)();
+        assert_eq!(schema["type"], "object");
     }
 
     #[test]

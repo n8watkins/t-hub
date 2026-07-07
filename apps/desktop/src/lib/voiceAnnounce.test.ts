@@ -26,8 +26,13 @@ import { synthesizeVoice } from "../ipc/voice";
 import { playWavBase64 } from "./voiceAudio";
 import {
   handleStatusesChange,
+  applyScribeListening,
+  flushPending,
   _resetVoiceAnnounceForTest,
+  _setScribeListeningForTest,
+  _pendingTextForTest,
   ANNOUNCE_MIN_GAP_MS,
+  SCRIBE_TAIL_MS,
 } from "./voiceAnnounce";
 import { useVoice, DEFAULT_VOICE_SETTINGS } from "../store/voice";
 import { useSupervision } from "../store/supervision";
@@ -180,6 +185,176 @@ describe("announce gating", () => {
     await flush();
     expect(synthesizeVoice).toHaveBeenCalledTimes(2);
     expect(playWavBase64).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Scribe voice-gate (hold while dictating, deliver when stopped)", () => {
+  /** Seed the store statuses so flushPending's "still blocked?" re-scan sees
+   *  them, and mirror them into handleStatusesChange for transition detection. */
+  function seedStoreStatuses(map: Record<string, SessionStatus>): void {
+    useSupervision.setState({ statuses: { ...map } });
+  }
+
+  it("HOLDS the cue while the general is dictating (does not speak)", async () => {
+    _setScribeListeningForTest(true);
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
+    expect(synthesizeVoice).not.toHaveBeenCalled();
+    expect(_pendingTextForTest()).toMatch(/needs your attention$/);
+    expect(_pendingTextForTest()).toContain("captain");
+  });
+
+  it("DELIVERS the held cue when dictation stops, if something is still blocked", async () => {
+    _setScribeListeningForTest(true);
+    seedStoreStatuses({ "sess-1": "needsPermission" });
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
+    expect(synthesizeVoice).not.toHaveBeenCalled();
+    // The general stops: the tail flush finds sess-1 still blocked -> speak.
+    flushPending(1000);
+    await flush();
+    expect(synthesizeVoice).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(synthesizeVoice).mock.calls[0][0]).toContain("captain");
+    expect(_pendingTextForTest()).toBeNull();
+  });
+
+  it("DROPS the held cue silently if the situation resolved during dictation", async () => {
+    _setScribeListeningForTest(true);
+    seedStoreStatuses({ "sess-1": "needsPermission" });
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
+    expect(_pendingTextForTest()).not.toBeNull();
+    // While they talked, the captain unblocked (no longer needs input).
+    seedStoreStatuses({ "sess-1": "working" });
+    flushPending(1000);
+    await flush();
+    expect(synthesizeVoice).not.toHaveBeenCalled();
+    expect(_pendingTextForTest()).toBeNull();
+  });
+
+  it("COALESCES multiple held transitions into one (latest wins, no backlog)", async () => {
+    // Two sessions map to two terminals so their labels differ.
+    useSupervision.setState({
+      statuses: {},
+      sessionIdByTmux: { th_cap00001: "sess-1", th_cap00002: "sess-2" },
+    });
+    useWorkspace.setState({
+      terminals: {
+        cap00001: { id: "cap00001", tmuxSession: "th_cap00001", cwd: "/tmp/a", title: "captain", state: "live" },
+        cap00002: { id: "cap00002", tmuxSession: "th_cap00002", cwd: "/tmp/b", title: "crewmate", state: "live" },
+      },
+      labels: {},
+    });
+    _setScribeListeningForTest(true);
+    // A blocks, then B blocks (a later, separate transition).
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    handleStatusesChange(
+      statuses({ "sess-1": "needsPermission", "sess-2": "needsQuestion" }),
+      100,
+    );
+    await flush();
+    expect(synthesizeVoice).not.toHaveBeenCalled();
+    // Only the LATEST is held.
+    expect(_pendingTextForTest()).toContain("crewmate");
+    // Deliver: both still blocked -> exactly ONE cue (the latest).
+    useSupervision.setState({
+      statuses: { "sess-1": "needsPermission", "sess-2": "needsQuestion" },
+    });
+    flushPending(1000);
+    await flush();
+    expect(synthesizeVoice).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(synthesizeVoice).mock.calls[0][0]).toContain("crewmate");
+  });
+
+  it("the true->false falling edge arms the tail flush (injected clock)", async () => {
+    vi.useFakeTimers();
+    try {
+      _setScribeListeningForTest(true);
+      seedStoreStatuses({ "sess-1": "needsPermission" });
+      handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+      // The general stops talking: applyScribeListening(false) arms the tail.
+      applyScribeListening(false, 0);
+      expect(synthesizeVoice).not.toHaveBeenCalled(); // not yet - within the tail
+      vi.advanceTimersByTime(SCRIBE_TAIL_MS);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(synthesizeVoice).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a resume within the tail cancels delivery (keeps holding)", async () => {
+    vi.useFakeTimers();
+    try {
+      _setScribeListeningForTest(true);
+      seedStoreStatuses({ "sess-1": "needsPermission" });
+      handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+      applyScribeListening(false, 0); // stopped: arms the tail
+      applyScribeListening(true, 100); // resumed before the tail: cancels it
+      vi.advanceTimersByTime(SCRIBE_TAIL_MS * 2);
+      await Promise.resolve();
+      expect(synthesizeVoice).not.toHaveBeenCalled();
+      expect(_pendingTextForTest()).not.toBeNull(); // still held
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("speaks immediately (no hold) when the general is NOT dictating", async () => {
+    _setScribeListeningForTest(false);
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
+    expect(synthesizeVoice).toHaveBeenCalledTimes(1);
+    expect(_pendingTextForTest()).toBeNull();
+  });
+
+  it("re-arms rather than dropping the held cue if a synthesis is in flight at flush time", async () => {
+    vi.useFakeTimers();
+    try {
+      // The first synthesis HANGS (stays in flight); later ones resolve.
+      let releaseFirst: () => void = () => {};
+      const firstPending = new Promise<string>((res) => {
+        releaseFirst = () => res("d2F2");
+      });
+      vi.mocked(synthesizeVoice).mockReturnValueOnce(firstPending);
+
+      // Not dictating: a normal cue for sess-1 starts and hangs.
+      _setScribeListeningForTest(false);
+      useSupervision.setState({ statuses: { "sess-1": "needsPermission" } });
+      handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+      expect(synthesizeVoice).toHaveBeenCalledTimes(1);
+
+      // Now the general dictates: a fresh sess-2 transition is HELD.
+      _setScribeListeningForTest(true);
+      useSupervision.setState({
+        statuses: { "sess-1": "needsPermission", "sess-2": "needsQuestion" },
+      });
+      handleStatusesChange(
+        statuses({ "sess-1": "needsPermission", "sess-2": "needsQuestion" }),
+        1,
+      );
+      expect(_pendingTextForTest()).not.toBeNull();
+
+      // Flush WHILE the first synth is still in flight -> the held cue must not
+      // be lost: pending kept, no new synth started.
+      flushPending(2);
+      expect(_pendingTextForTest()).not.toBeNull();
+      expect(synthesizeVoice).toHaveBeenCalledTimes(1);
+
+      // The first synth resolves (frees the in-flight slot: its .finally clears
+      // `speaking`); the re-armed tail then delivers the held cue.
+      releaseFirst();
+      await flush(); // 3 microtask ticks: let .then/.catch/.finally settle
+      vi.advanceTimersByTime(SCRIBE_TAIL_MS);
+      expect(synthesizeVoice).toHaveBeenCalledTimes(2);
+      expect(_pendingTextForTest()).toBeNull();
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
   });
 });
 
