@@ -6,16 +6,20 @@
 // nondeterministic from the user's point of view. Canvas now owns the one
 // window listener and routes every Escape here, where the order is explicit:
 //
-//   1. Shift+Esc while the captain overlay is up: pass a LITERAL Esc through
+//   1. Esc while the captains DECK is up: close it. The deck is a full-view
+//      surface (opening it already retires the overlay/dropdown/fullscreen), so
+//      it consumes Esc first and exclusively - routing it here (rather than the
+//      deck's own listener) keeps the ordering deterministic.
+//   2. Shift+Esc while the captain overlay is up: pass a LITERAL Esc through
 //      to the ACTIVE captain terminal and keep the overlay open. The captain
 //      is a Claude session - Esc is how the general interrupts a running turn
 //      and dismisses its dialogs - so a summoned captain must still be able to
 //      receive one.
-//   2. Esc while the titlebar anchor's captain dropdown is up: dismiss it (the
+//   3. Esc while the titlebar anchor's captain dropdown is up: dismiss it (the
 //      dropdown's open flag lives in the captain store precisely so this
 //      single dispatch point can close it - no second listener).
-//   3. Esc while the captain overlay is up: dismiss it (restores focus).
-//   4. Esc otherwise, while a tile is fullscreen: exit fullscreen.
+//   4. Esc while the captain overlay is up: dismiss it (restores focus).
+//   5. Esc otherwise, while a tile is fullscreen: exit fullscreen.
 //
 // Kept UI-free so the precedence is unit-testable against the live stores.
 import { useCaptain } from "../store/captain";
@@ -38,8 +42,10 @@ export function overlayEscapeArmed(surfaces: {
   fullscreenId: string | null;
   captainOpen: boolean;
   anchorMenuOpen: boolean;
+  deckOpen: boolean;
 }): boolean {
   return (
+    surfaces.deckOpen ||
     surfaces.fullscreenId != null ||
     surfaces.captainOpen ||
     surfaces.anchorMenuOpen
@@ -54,6 +60,13 @@ export function overlayEscapeArmed(surfaces: {
  */
 export function handleOverlayEscape(shiftKey: boolean): boolean {
   const cap = useCaptain.getState();
+  if (cap.deckOpen) {
+    // The deck is the top-level full-view surface (mutually exclusive with the
+    // overlay/dropdown/fullscreen, which opening it already retired), so Esc
+    // closes it first and unconditionally.
+    cap.setDeckOpen(false);
+    return true;
+  }
   if (cap.open && shiftKey) {
     // Passthrough: interrupt the ACTIVE captain, don't dismiss the overlay.
     if (cap.activeCaptainId) {

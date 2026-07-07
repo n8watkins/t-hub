@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { Canvas } from "./components/Canvas";
+import { CaptainsDeck } from "./components/CaptainsDeck";
+import { useCaptain } from "./store/captain";
 import { Sidebar, SIDEBAR_RAIL_WIDTH, type SidebarMode } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { CommandPalette, PrefixHint } from "./components/CommandPalette";
@@ -206,6 +208,11 @@ export default function App() {
   }, []);
 
   const maximized = useWindowMaximized();
+  // The captains deck (orchestrator UI): a full-view overlay over the workspace
+  // canvas. Main window only - a satellite renders a single tab. Canvas stays
+  // mounted underneath (the deck is opaque) so the terminal pool keeps every
+  // session attached and the orchestrator input can write to its terminal.
+  const deckOpen = useCaptain((s) => s.deckOpen) && !SATELLITE;
   const revealPushesContent = useSettings((s) => s.revealPushesContent);
   const autoHide = useSettings((s) => s.autoHideTitlebarMaximized);
   // Configurable auto-hide timings (Settings -> General -> Titlebar).
@@ -377,6 +384,7 @@ export default function App() {
         )}
         <div className="relative min-w-0 flex-1">
           <Canvas onFocusSidebar={ensureSidebarVisible} />
+          {deckOpen && <CaptainsDeck />}
         </div>
       </div>
     </div>

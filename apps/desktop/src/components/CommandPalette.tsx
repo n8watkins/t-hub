@@ -16,7 +16,8 @@ import { create } from "zustand";
 import { COMMANDS, type CommandId } from "../lib/commands";
 import { useKeybindings } from "../store/keybindings";
 import { useCaptain } from "../store/captain";
-import { useWorkspace, deriveLabel } from "../store/workspace";
+import { useWorkspace } from "../store/workspace";
+import { stableCaptainIdentity } from "./CaptainOverlay";
 import { runCommand, registerPaletteOpener } from "../lib/keymapExecutor";
 import { chordFromEvent, formatChord } from "../lib/chord";
 import { usePrefixHud } from "../lib/prefixKeyHandler";
@@ -125,26 +126,30 @@ export function CommandPalette() {
 
   // Dynamic per-captain entries (captain-list): "Summon captain: <name>" for
   // every pinned captain, MRU order, keyboard parity with the titlebar
-  // dropdown / overlay switcher. Labels derive exactly like the tiles/sidebar.
+  // dropdown / overlay switcher. Names use the STABLE identity (user rename ->
+  // workspace tab name -> cwd basename, NEVER the volatile Claude title),
+  // exactly like the overlay / deck / sidebar.
   const captainIds = useCaptain((s) => s.captainIds);
   const terminals = useWorkspace((s) => s.terminals);
-  const labels = useWorkspace((s) => s.labels);
+  const userLabels = useWorkspace((s) => s.userLabels);
   const tabs = useWorkspace((s) => s.tabs);
   const captainEntries = useMemo<PaletteEntry[]>(
     () =>
       captainIds.map((id) => {
-        // Same liveness affordance as the overlay switcher chip / titlebar
-        // dropdown row: a tile-less pin summons as a store-level no-op, so
-        // the entry must read unavailable instead of silently doing nothing.
-        const hasTile = tabs.some((t) => t.order.includes(id));
+        // Resolve the owning tab ONCE - it gives both the workspace-name
+        // identity step and the liveness flag. A tile-less pin summons as a
+        // store-level no-op, so the entry must read unavailable rather than
+        // silently do nothing (same affordance as the switcher chip / row).
+        const owningTab = tabs.find((t) => t.order.includes(id));
+        const hasTile = owningTab != null;
         return {
           key: `summonCaptain:${id}`,
-          label: `Summon captain: ${deriveLabel({
+          label: `Summon captain: ${stableCaptainIdentity(
+            userLabels[id],
+            owningTab?.name,
+            terminals[id]?.cwd,
             id,
-            label: labels[id],
-            title: terminals[id]?.title,
-            cwd: terminals[id]?.cwd,
-          })}`,
+          )}`,
           description: hasTile
             ? "Summon this pinned captain in the overlay"
             : "Tile not available (tab popped out?) - summon is a no-op",
@@ -153,7 +158,7 @@ export function CommandPalette() {
           dimmed: !hasTile,
         };
       }),
-    [captainIds, terminals, labels, tabs],
+    [captainIds, terminals, userLabels, tabs],
   );
 
   // Ranked, filtered command list.

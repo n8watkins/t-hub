@@ -29,7 +29,7 @@
 // on a prompt bubbles amber onto its captain. Expanding a captain lists its
 // crewmates (each with its own status dot) above the captain's own subagent
 // tree.
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Pencil } from "lucide-react";
 import { useCaptain } from "../store/captain";
 import { useWorkspace } from "../store/workspace";
@@ -38,29 +38,16 @@ import {
   sessionStatusForTmux,
   isRateLimited,
 } from "../store/supervision";
-import type { SessionStatus } from "../ipc/model";
 import { sessionNameForTerminal } from "../store/sessionContext";
 import {
   CaptainStatusDot,
   useWorkspaceNameForTerminal,
+  stableCaptainIdentity,
 } from "./CaptainOverlay";
+import { useCrewSummary } from "../hooks/useCrewSummary";
 import { SupervisionTreeView } from "./SupervisionTree";
 import { ContextMeter } from "./ContextMeter";
 import { ChevronIcon } from "./SidebarChrome";
-
-/** Raw reducer statuses that mean a crew session is MID-TURN (mirrors the
- *  supervision store's ACTIVE_TURN set - kept local so this reads without
- *  reaching into the store's private constant). */
-const CREW_RUNNING: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
-  "working",
-  "needsQuestion",
-  "needsPermission",
-  "waitingOnSubagents",
-]);
-
-/** Stable empty crew list so the summary memo's dep identity does not churn for
- *  a captain with no claim/crew yet. */
-const NO_CREW: readonly string[] = [];
 
 /** Path segments of a cwd, tolerant of either separator and trailing slashes. */
 function cwdParts(cwd: string): string[] {
@@ -80,21 +67,6 @@ function cwdBranch(cwd: string): string {
     if (/^wt-/.test(parts[i])) return parts[i].replace(/^wt-/, "");
   }
   return "";
-}
-
-/** The identity line for a captain (or crew) row: the user's RENAME when set,
- *  else the repo/worktree folder the session lives in (cwd basename), else the
- *  short id. Deliberately NOT deriveLabel: its "command · dir" shape leads with
- *  the derived last-command text the general called useless - identity first. */
-function captainIdentity(
-  userLabel: string | undefined,
-  cwd: string | undefined,
-  terminalId: string,
-): string {
-  const named = (userLabel ?? "").trim();
-  if (named) return named;
-  const parts = cwd ? cwdParts(cwd) : [];
-  return parts[parts.length - 1] ?? terminalId.slice(0, 8);
 }
 
 /** The list body: captains whose tile lives in the ACTIVE workspace tab float
@@ -146,20 +118,18 @@ function CaptainRow({
 
   const userLabel = useWorkspace((s) => s.userLabels[terminalId]);
   const cwd = useWorkspace((s) => s.terminals[terminalId]?.cwd);
-  const identity = captainIdentity(userLabel, cwd, terminalId);
-  const branch = cwd ? cwdBranch(cwd) : "";
-
-  // Phase 2: the captain's server-registry claim - the real crew it spawned
-  // (spawnedBy) and the workspaces it controls (workspaceTabIds). Absent for a
-  // just-pinned captain until the first sync_captains snapshot lands.
-  const claim = useCaptain((s) => s.claims[terminalId]);
-  const crewIds = claim?.crew ?? NO_CREW;
-
   // The tab the captain's tile lives in; undefined = popped out / gone, the
   // same liveness lookup the dropdown rows use (shared hook, cannot drift).
   // Summon is then a store-level no-op, so the row must READ unavailable.
   const workspaceName = useWorkspaceNameForTerminal(terminalId);
   const hasTile = workspaceName != null;
+  // STABLE identity: rename -> workspace tab name -> cwd basename (NEVER the
+  // volatile Claude title). Shared with the overlay + deck.
+  const identity = stableCaptainIdentity(userLabel, workspaceName, cwd, terminalId);
+  const branch = cwd ? cwdBranch(cwd) : "";
+
+  // Phase 2: the captain's server-registry claim - the workspaces it controls.
+  const claim = useCaptain((s) => s.claims[terminalId]);
 
   // Resolve the captain's bound agent session via the statusline's tmux index,
   // then the supervision tree / status / snapshot for that session. All
@@ -174,29 +144,9 @@ function CaptainRow({
   );
   const status = useSupervision((s) => sessionStatusForTmux(s, tmux));
 
-  // Crew activity from the registry (slice B: real crew, not subagents).
-  // Resolve each crew session's raw reducer status through the tmux index; only
-  // the two maps are subscribed, so a snapshot storm does not re-render the list.
-  const statuses = useSupervision((s) => s.statuses);
-  const sessionIdByTmux = useSupervision((s) => s.sessionIdByTmux);
-  const crew = useMemo(
-    () =>
-      crewIds.map((id) => {
-        const sid = sessionIdByTmux[sessionNameForTerminal(id)];
-        const st = sid !== undefined ? statuses[sid] : undefined;
-        return {
-          id,
-          known: st !== undefined,
-          running: st !== undefined && CREW_RUNNING.has(st),
-          needsInput: st === "needsQuestion" || st === "needsPermission",
-        };
-      }),
-    [crewIds, statuses, sessionIdByTmux],
-  );
-  const crewRunning = crew.filter((c) => c.running).length;
-  // "Done" = a crew session that has reported a status and is no longer mid-turn;
-  // a just-spawned crewmate with no status yet counts as neither (not "done").
-  const crewDone = crew.filter((c) => c.known && !c.running).length;
+  // Crew activity from the registry (slice B: real crew, not subagents) - the
+  // shared hook the deck tiles also use.
+  const crew = useCrewSummary(terminalId);
 
   // The workspaces the captain CONTROLS (registry workspaceTabIds -> names),
   // falling back to the tile's own tab when no claim has synced yet.
@@ -214,7 +164,7 @@ function CaptainRow({
   // meter + dot instead of a whole-row pulse).
   const ownAttention =
     status === "needsQuestion" || status === "needsPermission";
-  const attention = ownAttention || crew.some((c) => c.needsInput);
+  const attention = ownAttention || crew.needsInput;
 
   const tasks = tree?.outstandingTasks ?? 0;
 
@@ -345,13 +295,13 @@ function CaptainRow({
               {/* ACTIVITY line (de-emphasized): the REAL crew summary (registry
                   spawnedBy links) - supersedes the turn-scoped subagent summary
                   on the row; the subagent tree still shows in the expansion. */}
-              {crew.length > 0 && (
+              {crew.members.length > 0 && (
                 <span
                   className="min-w-0 truncate text-[10px] opacity-75"
                   style={{ color: "var(--th-fg-muted)" }}
                   title="Crew: the sessions this captain spawned (registry spawnedBy links), by running/done."
                 >
-                  crew: {crewRunning} running · {crewDone} done
+                  crew: {crew.running} running · {crew.done} done
                 </span>
               )}
             </span>
@@ -404,10 +354,10 @@ function CaptainRow({
           a distinct thing from crew sessions). */}
       {expanded && (
         <div className="flex flex-col gap-0.5 pl-4">
-          {crew.length > 0 && (
+          {crew.members.length > 0 && (
             <div className="flex flex-col">
-              {crewIds.map((id) => (
-                <CrewRow key={id} terminalId={id} />
+              {crew.members.map((m) => (
+                <CrewRow key={m.id} terminalId={m.id} />
               ))}
             </div>
           )}
@@ -425,8 +375,8 @@ function CaptainRow({
 function CrewRow({ terminalId }: { terminalId: string }) {
   const userLabel = useWorkspace((s) => s.userLabels[terminalId]);
   const cwd = useWorkspace((s) => s.terminals[terminalId]?.cwd);
-  const identity = captainIdentity(userLabel, cwd, terminalId);
   const workspaceName = useWorkspaceNameForTerminal(terminalId);
+  const identity = stableCaptainIdentity(userLabel, workspaceName, cwd, terminalId);
   return (
     <div
       className="flex items-center gap-2 py-0.5"

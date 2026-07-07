@@ -37,6 +37,7 @@ import { create } from "zustand";
 import type { TerminalId } from "../ipc/types";
 import { loadPersisted, savePersisted } from "../lib/persist";
 import { useWorkspace } from "./workspace";
+import { usePanels } from "./panels";
 
 const PERSIST_KEY = "t-hub.captain.v2";
 /** The pre-list single-captain key (PR #9). Read-only now: migrated into the
@@ -54,6 +55,10 @@ export const CAPTAIN_DEFAULT_HEIGHT = 400;
 interface PersistedCaptain {
   /** Pinned captains, MRU order (front = most recently summoned = active). */
   captainIds: TerminalId[];
+  /** The terminal designated as the ORCHESTRATOR (the captains-deck bottom input
+   *  targets it; marked via a tile's right-click menu). null = none. Persisted
+   *  so the designation survives a relaunch. */
+  orchestratorId: TerminalId | null;
   /** Overlay top-left, relative to the canvas/pool container. null until the
    *  first open computes a default placement (bottom-right-ish). */
   x: number | null;
@@ -79,13 +84,21 @@ function coerceGeometry(p: {
   };
 }
 
+/** A persisted terminal id: a non-empty string, else null. */
+const coerceId = (v: unknown): TerminalId | null =>
+  typeof v === "string" && v !== "" ? v : null;
+
 /** Sanitize a v2 blob: `captainIds` must be a deduped list of non-empty ids. */
 export function coercePersisted(raw: unknown): PersistedCaptain {
   const p = (raw ?? {}) as Partial<PersistedCaptain>;
   const ids = Array.isArray(p.captainIds)
     ? [...new Set(p.captainIds.filter((v): v is string => typeof v === "string" && v !== ""))]
     : [];
-  return { captainIds: ids, ...coerceGeometry(p) };
+  return {
+    captainIds: ids,
+    orchestratorId: coerceId(p.orchestratorId),
+    ...coerceGeometry(p),
+  };
 }
 
 /** Convert a v1 single-captain blob (`{ captainId, x, y, width, height }`) into
@@ -95,12 +108,13 @@ export function migrateLegacyCaptain(raw: unknown): PersistedCaptain {
   const p = (raw ?? {}) as { captainId?: unknown } & Partial<PersistedCaptain>;
   const captainIds =
     typeof p.captainId === "string" && p.captainId ? [p.captainId] : [];
-  return { captainIds, ...coerceGeometry(p) };
+  return { captainIds, orchestratorId: null, ...coerceGeometry(p) };
 }
 
 function defaults(): PersistedCaptain {
   return {
     captainIds: [],
+    orchestratorId: null,
     x: null,
     y: null,
     width: CAPTAIN_DEFAULT_WIDTH,
@@ -191,6 +205,13 @@ export interface CaptainState {
    *  Lives here (not component state) so lib/escOverlays can dismiss it from
    *  the single Esc dispatch point without a second listener. */
   anchorMenuOpen: boolean;
+  /** Whether the full-screen CAPTAINS DECK view is up (not persisted; always
+   *  starts closed). The deck tiles every pinned captain and hosts the
+   *  orchestrator input; App swaps it in over the workspace canvas. */
+  deckOpen: boolean;
+  /** The terminal designated as the ORCHESTRATOR - the deck's bottom input
+   *  targets it (writeTerminal). null = none designated. Persisted. */
+  orchestratorId: TerminalId | null;
   /** Overlay geometry, relative to the canvas container. x/y null = not yet
    *  placed (the overlay computes + commits a default on first open). */
   x: number | null;
@@ -233,6 +254,12 @@ export interface CaptainState {
   toggleOverlay: () => void;
   /** Show/hide the titlebar anchor dropdown. */
   setAnchorMenu: (open: boolean) => void;
+  /** Open/close the full-screen captains deck. */
+  setDeckOpen: (open: boolean) => void;
+  /** Toggle the captains deck. */
+  toggleDeck: () => void;
+  /** Designate (or clear, with null) the orchestrator terminal. Persisted. */
+  setOrchestratorId: (id: TerminalId | null) => void;
   /** Commit dragged/resized geometry (persisted). */
   setGeometry: (g: { x: number; y: number; width: number; height: number }) => void;
 }
@@ -242,6 +269,7 @@ export const useCaptain = create<CaptainState>((set, get) => {
     const s = get();
     savePersisted(PERSIST_KEY, {
       captainIds: s.captainIds,
+      orchestratorId: s.orchestratorId,
       x: s.x,
       y: s.y,
       width: s.width,
@@ -261,6 +289,8 @@ export const useCaptain = create<CaptainState>((set, get) => {
     activeCaptainId: initial.captainIds[0] ?? null,
     open: false,
     anchorMenuOpen: false,
+    deckOpen: false,
+    orchestratorId: initial.orchestratorId,
     x: initial.x,
     y: initial.y,
     width: initial.width,
@@ -331,6 +361,21 @@ export const useCaptain = create<CaptainState>((set, get) => {
         next.every((id, i) => id === s.captainIds[i]);
       if (!unchanged) commitIds(next);
       if (next.length === 0) get().setAnchorMenu(false);
+      // Reconcile a STALE orchestrator: after a relaunch where the designated
+      // session did not return, its id dangles (the strip shows a raw id, the
+      // input stays disabled). Clear it if the terminal is no longer present.
+      // Guarded on a non-empty terminals map so a not-yet-loaded workspace at
+      // boot never false-clears a valid designation.
+      const orch = s.orchestratorId;
+      if (orch != null) {
+        const terminals = useWorkspace.getState().terminals;
+        if (
+          Object.keys(terminals).length > 0 &&
+          terminals[orch] === undefined
+        ) {
+          get().setOrchestratorId(null);
+        }
+      }
     },
 
     toggleCaptain: (id) => {
@@ -435,6 +480,28 @@ export const useCaptain = create<CaptainState>((set, get) => {
       if (get().anchorMenuOpen !== open) set({ anchorMenuOpen: open });
     },
 
+    setDeckOpen: (open) => {
+      if (get().deckOpen === open) return;
+      // The deck is a full-view surface; opening it retires the floating overlay,
+      // the anchor dropdown, AND any fullscreen tile - the pool goes z-50 for a
+      // fullscreen tile, which would paint OVER the z-40 deck (and would make Esc
+      // ambiguous between exiting fullscreen and closing the deck).
+      if (open) {
+        usePanels.getState().setFullscreen(null);
+        set({ deckOpen: true, open: false, anchorMenuOpen: false });
+      } else {
+        set({ deckOpen: false });
+      }
+    },
+
+    toggleDeck: () => get().setDeckOpen(!get().deckOpen),
+
+    setOrchestratorId: (id) => {
+      if (get().orchestratorId === id) return;
+      set({ orchestratorId: id });
+      persist();
+    },
+
     setGeometry: (g) => {
       set({
         x: g.x,
@@ -456,4 +523,10 @@ export const useCaptain = create<CaptainState>((set, get) => {
  */
 export function forgetCaptain(id: TerminalId): void {
   useCaptain.getState().unpinCaptain(id);
+  // The orchestrator can be ANY tile (not only a pinned captain), so clear the
+  // designation here too when its terminal dies - a dead id must never remain
+  // the orchestrator target (persisted).
+  if (useCaptain.getState().orchestratorId === id) {
+    useCaptain.getState().setOrchestratorId(null);
+  }
 }

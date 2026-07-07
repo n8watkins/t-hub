@@ -38,6 +38,7 @@ import {
   useCodexUsage,
 } from "./UsageStrip";
 import { useState } from "react";
+import { LayoutGrid } from "lucide-react";
 import { useCaptain } from "../store/captain";
 import { CaptainsList } from "./CaptainsList";
 import { WorkspacesList } from "./WorkspacesList";
@@ -186,6 +187,17 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
             storageKey="t-hub.sidebar.captains.open"
             bodyClassName="th-scroll overflow-y-auto"
             bodyStyle={{ maxHeight: "30vh" }}
+            action={
+              <button
+                type="button"
+                onClick={() => useCaptain.getState().toggleDeck()}
+                aria-label="Open captains deck"
+                title="Open captains deck"
+                className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
+              >
+                <LayoutGrid size={13} aria-hidden />
+              </button>
+            }
           >
             <CaptainsList />
           </Section>

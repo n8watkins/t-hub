@@ -159,6 +159,9 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   // also routes through the single dispatch point, so it must ARM the
   // listener below even when nothing else is up.
   const anchorMenuOpen = useCaptain((s) => s.anchorMenuOpen);
+  // The captains deck (a full-view surface) also dismisses via the single Esc
+  // dispatch point, so it arms the listener below too.
+  const deckOpen = useCaptain((s) => s.deckOpen);
 
   // Seed the live terminal set and keep lifecycle state in sync with the backend.
   useEffect(() => {
@@ -387,7 +390,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   // interrupts the summoned captain (literal Esc passthrough), plain Esc
   // dismisses the dropdown, then the overlay, else exits fullscreen.
   useEffect(() => {
-    if (!overlayEscapeArmed({ fullscreenId, captainOpen, anchorMenuOpen }))
+    if (!overlayEscapeArmed({ fullscreenId, captainOpen, anchorMenuOpen, deckOpen }))
       return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
@@ -398,7 +401,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [fullscreenId, captainOpen, anchorMenuOpen]);
+  }, [fullscreenId, captainOpen, anchorMenuOpen, deckOpen]);
 
   return (
     <div
