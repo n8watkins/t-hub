@@ -110,6 +110,7 @@ runs, and the listener only accepts loopback peers.
 | `wsl_health` | Read | allowed | host metrics from `/proc` (+ supervised-session count) |
 | `search_files` | Read | allowed | fuzzy file-index search (names + metadata only, never contents) |
 | `list_tabs` | Read | allowed | the live workspace tabs (`{id, name, tileIds}`) from the core's addressable tab registry — the frontend reports its layout up so this mirrors the UI |
+| `list_captains` | Read | allowed | the claimed captains (`{shipSlug, captainSessionId, workspaceTabIds, crew}` + revision) from the server captains registry — the one source of truth the UI and MCP share |
 | `read_terminal` | Read | allowed | a session's recent visible output via tmux `capture-pane` (plain text; optional scrollback) |
 | `focus_session` | Organization | allowed, **audited** | accepted + audited; UI application via the frontend command |
 | `move_tile` | Organization | allowed, **audited** | applies to the authoritative server registry FIRST (unknown `tabId` is a hard error), then forwards the registry snapshot; lands even when the target tab is hidden or the window is unfocused |
@@ -117,10 +118,12 @@ runs, and the listener only accepts loopback peers.
 | `new_tab` | Organization | allowed, **audited** | mints the tab id **core-side** and returns it (so the tab is addressable by `move_tile`/`focus_tab` and shows in `list_tabs`); the tab is created in the BACKGROUND (the user's active tab is not switched - use `focus_tab`) |
 | `focus_tab` | Organization | allowed, **audited** | the one organization command that intentionally moves the user's view; strict (the tab must exist) and mirrored into the registry's `activeTabId` |
 | `close_tab` | Organization | allowed, **audited** | closes a workspace tab headlessly; refused for the LAST tab, and for a non-empty tab unless `force: true` (see the tab-lifecycle policy below) |
+| `claim_captain` | Organization | allowed, **audited** | claims captaincy of a ship in the server captains registry (registry-first + strict: one captain per ship), then forwards the captains snapshot (`sync_captains`); a captain self-registers with its own session id instead of hand-editing ship files (see the captains-registry policy below) |
+| `release_captain` | Organization | allowed, **audited** | releases a claim by `captainSessionId` or `shipSlug` (unknown claims are refused), then forwards the snapshot |
 | `open_file` | Organization | allowed, **audited** | capped text read via the Files reader |
-| `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create, never the focused tab), spawns the worktree terminal **server-side**, places it in the registry, and forwards the snapshot; returns `tabId` + `terminalId` synchronously |
+| `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create, never the focused tab), spawns the worktree terminal **server-side**, places it in the registry, and forwards the snapshot; returns `tabId` + `terminalId` synchronously; optional `spawnedBy` records the worktree terminal as a captain's crew |
 | `remove_worktree` | Organization | allowed, **audited** | forwards removal to the UI (which detaches live tiles first, then runs `git worktree remove`); refused if no UI is connected, to avoid orphaning a process |
-| `spawn_terminal` | **Process-changing** | **confirmation required** | the server spawns the session itself, resolves `tabName`/`tabId` against the registry (reuse-or-create, WITHOUT switching the user's active tab), places the tile, and returns the real `id` synchronously; refused only when no UI is connected at all |
+| `spawn_terminal` | **Process-changing** | **confirmation required** | the server spawns the session itself, resolves `tabName`/`tabId` against the registry (reuse-or-create, WITHOUT switching the user's active tab), places the tile, and returns the real `id` synchronously; refused only when no UI is connected at all; optional `spawnedBy` records the session as a captain's crew |
 | `send_text` | **Process-changing** | **confirmation required** | types literal text into an existing session via tmux `send-keys -l` (optional trailing Enter); executes |
 | `send_keys` | **Process-changing** | **confirmation required** | sends named control keys (e.g. `C-c`, `Up`, `Escape`) to an existing session via tmux `send-keys`; executes |
 | `close_terminal` | **Process-changing** | **confirmation required** | kills an existing session + its process tree via tmux `kill-session`; also drops the dead tile from the server registry and pushes a `sync_tabs` snapshot, so the tile leaves its tab even when that tab is hidden |
@@ -139,6 +142,12 @@ runs, and the listener only accepts loopback peers.
   spawn to the UI, while `remove_worktree` forwards the removal to the UI (which
   detaches any live tiles before `git worktree remove`) and refuses outright when
   no UI is connected, so a running process is never orphaned.
+  The captain tools (`claim_captain`, `release_captain`) are Organization tier
+  too: they mutate the authoritative captains registry FIRST (strict - one
+  captain per ship, an unknown release is a hard error) and forward the captains
+  snapshot to the UI under `args.sync` on a `sync_captains` `control://apply`, the
+  captains twin of the tab-registry sync contract (see the captains-registry
+  policy below).
 - **Process-changing** tools all carry an explicit `CONFIRMATION REQUIRED` notice
   in their MCP `description`, an `annotations.confirmationRequired:true` boolean,
   and an `annotations.t-hubTier:"process-changing"` string so a permission-aware
@@ -185,6 +194,20 @@ An auto-created tab (from `tabName` placement) that becomes empty is NOT reaped 
 
 The registry is still in-memory, per app run; the frontend persists layout for restarts and seeds the registry with its first report.
 Full workspace-tab persistence remains the PRD §8 snapshot track and out of scope here.
+
+### The authoritative captains registry (captain-chat phase 2)
+
+Captain identity used to live in two disconnected places: the UI's localStorage designation and the captain's own ship files (`~/.t-hub/captain/ships/<ship>.md`).
+Phase 2 moves the mapping into the SERVER - a **captains registry** (`control::CaptainsRegistry`) beside the tab registry, holding one `{shipSlug, captainSessionId, workspaceTabIds, crew}` record per claim plus a monotonic revision `seq`.
+It is the ONE source of truth the UI and MCP both read; ship files remain the captain-side roster only.
+The contract mirrors the tab registry, with one difference (it is **persistent**):
+
+- **Pinning in the UI IS claiming.** A pin fires `claim_captain` (unpin fires `release_captain`); a captain self-registers over MCP with the same call. Every mutation applies to the registry FIRST (strict: one captain per ship, unknown release is an error), then forwards the authoritative snapshot to every client under `args.sync` on a `sync_captains` `control://apply`. The UI renders FROM the snapshot (`adoptCaptainsRegistry` in the captain store), server-authoritative for membership; the local MRU order is kept as view state only.
+- **`spawnedBy` links crew.** `spawn_terminal` and `create_worktree` accept a `spawnedBy` captain session id and record the spawned session under that captain's `crew` (an unclaimed `spawnedBy` never fails the spawn - `crewRecorded: false` tells the caller to `claim_captain` first). This is what makes the sidebar's crew counts and per-crewmate rows real rather than a count of Task-tool subagents.
+- **Lifecycle cleanup is server-side.** `close_terminal` drops the dead session from the registry - a captain's death releases its claim, a crewmate's death leaves every crew list. `close_tab` prunes the closed tab from every captain's `workspaceTabIds` (the claim survives; a captain can control zero tabs). Each cleanup forwards a `sync_captains` snapshot.
+- **Survives restarts.** Unlike tabs (which the frontend re-seeds on boot), the captains registry is written through to `~/.t-hub/captains.json` (override `T_HUB_CAPTAINS_FILE`; the dev build isolates it under `~/.t-hub-dev`) on every mutation, including the revision, and reloaded on launch. localStorage keeps only view state (overlay geometry, MRU order). A missing or corrupt file starts empty and heals on the first write.
+
+At boot the UI fetches `list_captains` and migrates any pre-phase-2 localStorage pins by claiming them (only pins whose tile is still live), so an existing pin is never lost.
 
 ---
 

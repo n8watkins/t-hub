@@ -280,7 +280,8 @@ fn schema_spawn_terminal() -> Value {
             "name":  { "type": "string", "description": "Optional tile title." },
             "startupCommand": { "type": "string", "description": "Optional command run inside an interactive login shell the pane execs back into (e.g. claude --resume <id>)." },
             "tabName": { "type": "string", "description": "Optional target workspace tab, by name: reused if it exists, created (hidden - the user's active tab is NOT switched) if not." },
-            "tabId":   { "type": "string", "description": "Optional target workspace tab, by id (must exist; see list_tabs). Defaults to the user's active tab." }
+            "tabId":   { "type": "string", "description": "Optional target workspace tab, by id (must exist; see list_tabs). Defaults to the user's active tab." },
+            "spawnedBy": { "type": "string", "description": "Optional captain session id: records the spawned session as that captain's CREW in the captains registry (requires the captain to have claim_captain'd; an unclaimed id records nothing - crewRecorded: false)." }
         },
         "additionalProperties": false
     })
@@ -308,9 +309,36 @@ fn schema_create_worktree() -> Value {
             "repoRoot":     { "type": "string", "description": "Path inside the repo to create the worktree from (any path in the working tree)." },
             "worktreePath": { "type": "string", "description": "Absolute POSIX path for the new worktree's working-tree dir." },
             "branch":       { "type": "string", "description": "Optional branch to check out at the worktree (must not be checked out elsewhere). Omitted => git creates a new branch named after the path's final component." },
-            "tabName":      { "type": "string", "description": "Optional name for the new workspace tab (defaults to the branch / final path component)." }
+            "tabName":      { "type": "string", "description": "Optional name for the new workspace tab (defaults to the branch / final path component)." },
+            "spawnedBy":    { "type": "string", "description": "Optional captain session id: records the worktree terminal as that captain's CREW in the captains registry (same contract as spawn_terminal's spawnedBy)." }
         },
         "required": ["repoRoot", "worktreePath"],
+        "additionalProperties": false
+    })
+}
+
+/// `claim_captain` schema (captain-chat phase 2): claim captaincy of a ship.
+fn schema_claim_captain() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "captainSessionId": { "type": "string", "description": "The captain's own session/terminal id (the tmux target is th_<id>)." },
+            "shipSlug":         { "type": "string", "description": "Optional ship name (slugified server-side; defaults to ship-<captainSessionId>). One captain per ship: a slug held by another captain is refused." },
+            "workspaceTabIds":  { "type": "array", "items": { "type": "string" }, "description": "Optional workspace tab ids this captain controls (defaults to the tab currently holding the captain's tile)." }
+        },
+        "required": ["captainSessionId"],
+        "additionalProperties": false
+    })
+}
+
+/// `release_captain` schema (captain-chat phase 2): release a claimed captaincy.
+fn schema_release_captain() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "captainSessionId": { "type": "string", "description": "The claiming session id to release." },
+            "shipSlug":         { "type": "string", "description": "Alternative to captainSessionId: release by ship slug." }
+        },
         "additionalProperties": false
     })
 }
@@ -389,6 +417,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_empty,
         },
         ToolDef {
+            name: "list_captains",
+            tier: Tier::Read,
+            summary: "List the claimed captains from the server captains registry ({shipSlug, captainSessionId, workspaceTabIds, crew} + revision).",
+            input_schema: schema_empty,
+        },
+        ToolDef {
             name: "read_terminal",
             tier: Tier::Read,
             summary: "Read a session's recent visible output (plain text; optional scrollback) so you can see what it currently shows.",
@@ -430,6 +464,18 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Organization,
             summary: "Close a workspace tab (refused while it still holds tiles unless force; the last tab is never closed).",
             input_schema: schema_close_tab,
+        },
+        ToolDef {
+            name: "claim_captain",
+            tier: Tier::Organization,
+            summary: "Claim captaincy of a ship in the server captains registry (one captain per ship; a captain self-registers with its own session id instead of hand-editing ship files).",
+            input_schema: schema_claim_captain,
+        },
+        ToolDef {
+            name: "release_captain",
+            tier: Tier::Organization,
+            summary: "Release a claimed captaincy (by captainSessionId or shipSlug; unknown claims are refused).",
+            input_schema: schema_release_captain,
         },
         ToolDef {
             // Spawning a process is the process-changing subset of the
@@ -512,6 +558,7 @@ mod tests {
             "wsl_health",
             "search_files",
             "list_tabs",
+            "list_captains",
             "read_terminal",
             "focus_session",
             "move_tile",
@@ -525,6 +572,8 @@ mod tests {
             "open_file",
             "create_worktree",
             "remove_worktree",
+            "claim_captain",
+            "release_captain",
             "get_theme",
             "set_theme",
         ] {
@@ -575,6 +624,34 @@ mod tests {
     fn organization_tools_note_audit() {
         let mcp = find("rename_tab").unwrap().to_mcp();
         assert!(mcp["description"].as_str().unwrap().contains("audited"));
+    }
+
+    #[test]
+    fn captain_tools_carry_the_phase2_tiers() {
+        // list_captains reads the registry; claim/release mutate it (audited,
+        // organization tier - never confirmation-gated like process changes).
+        let list = find("list_captains").unwrap().to_mcp();
+        assert_eq!(list["annotations"]["t-hubTier"], "read");
+        assert_eq!(list["annotations"]["confirmationRequired"], false);
+        for name in ["claim_captain", "release_captain"] {
+            let mcp = find(name).unwrap().to_mcp();
+            assert_eq!(mcp["annotations"]["t-hubTier"], "organization", "{name}");
+            assert_eq!(mcp["annotations"]["confirmationRequired"], false, "{name}");
+            assert!(mcp["description"].as_str().unwrap().contains("audited"), "{name}");
+        }
+        let claim_schema = (find("claim_captain").unwrap().input_schema)();
+        assert_eq!(claim_schema["required"], json!(["captainSessionId"]));
+    }
+
+    #[test]
+    fn spawn_paths_expose_spawned_by_for_crew_linkage() {
+        for name in ["spawn_terminal", "create_worktree"] {
+            let schema = (find(name).unwrap().input_schema)();
+            assert!(
+                schema["properties"]["spawnedBy"].is_object(),
+                "{name} must accept spawnedBy"
+            );
+        }
     }
 
     #[test]
