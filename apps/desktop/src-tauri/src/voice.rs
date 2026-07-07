@@ -1,11 +1,15 @@
 // Voice announcements (Settings > Voice): persistence for ~/.t-hub/voice.json
-// plus a loopback proxy to the local Piper TTS server.
+// plus a loopback proxy to a local TTS server, selectable between two ENGINES -
+// Piper (port 7477) and Kokoro (port 7478).
 //
-// Why a backend proxy at all: the TTS server (default http://127.0.0.1:7477)
-// REJECTS requests that carry a browser Origin header, so the webview must
-// never fetch it directly. ureq sends no Origin, so routing /voices and /tts
-// through these commands sidesteps that wholesale (and keeps the webview free
-// of mixed-content/CORS concerns).
+// Why a backend proxy at all: the TTS servers REJECT requests that carry a
+// browser Origin header, so the webview must never fetch them directly. ureq
+// sends no Origin, so routing /voices and /tts through these commands sidesteps
+// that wholesale (and keeps the webview free of mixed-content/CORS concerns).
+// Both engines expose the SAME API (GET /health, GET /voices, POST /tts) so a
+// single proxy serves either one - only the base URL (port) differs by engine,
+// chosen live per call (the frontend passes the selected engine) so switching
+// the Settings dropdown re-targets immediately, before the debounced save.
 //
 // voice.json sits beside control.json in the app home (same HOME/USERPROFILE
 // resolution as control::handshake_path) because EXTERNAL captain tooling
@@ -24,10 +28,59 @@ use std::time::Duration;
 /// beyond a few KB is a bug or abuse, not a request to honor.
 const MAX_TTS_TEXT_BYTES: usize = 4096;
 
-/// Cap on the /tts response body. Piper WAVs for a short phrase run
-/// ~100-400 KB; a response past this is a misbehaving server, and truncating
-/// silently would hand the webview a corrupt WAV - error instead.
+/// Cap on the /tts response body. A short-phrase WAV runs ~100-400 KB (Piper)
+/// or a bit more at Kokoro's 24 kHz; a response past this is a misbehaving
+/// server, and truncating silently would hand the webview a corrupt WAV - so
+/// error instead.
 const MAX_TTS_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The selectable TTS backend. Serialized lowercase ("piper" / "kokoro") in
+/// voice.json and over IPC so external tooling reads the same token. Piper is
+/// the default (the pre-existing engine; Kokoro is additive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceEngine {
+    #[default]
+    Piper,
+    Kokoro,
+}
+
+impl VoiceEngine {
+    /// Parse the lenient wire token; anything unrecognized falls back to Piper
+    /// (the safe default engine) rather than erroring a whole settings read.
+    fn from_token(s: &str) -> Self {
+        match s {
+            "kokoro" => VoiceEngine::Kokoro,
+            _ => VoiceEngine::Piper,
+        }
+    }
+
+    /// The lowercase token written to voice.json / sent over IPC.
+    fn token(self) -> &'static str {
+        match self {
+            VoiceEngine::Piper => "piper",
+            VoiceEngine::Kokoro => "kokoro",
+        }
+    }
+
+    /// The loopback port each engine's local server listens on. Piper owns
+    /// 7477 (pre-existing); Kokoro owns 7478.
+    fn default_port(self) -> u16 {
+        match self {
+            VoiceEngine::Piper => 7477,
+            VoiceEngine::Kokoro => 7478,
+        }
+    }
+
+    /// The per-engine env override key, so E2E / tests can point an engine at a
+    /// stub server without a real Piper/Kokoro running.
+    fn url_env_key(self) -> &'static str {
+        match self {
+            VoiceEngine::Piper => "T_HUB_PIPER_URL",
+            VoiceEngine::Kokoro => "T_HUB_KOKORO_URL",
+        }
+    }
+}
 
 /// A loopback-only agent: no redirect following (a local TTS server has no
 /// business redirecting, and following one could leak the request elsewhere).
@@ -35,10 +88,16 @@ fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().redirects(0).build()
 }
 
-/// The Piper TTS server base URL; `T_HUB_TTS_URL` overrides for tests/E2E.
-fn tts_base_url() -> String {
-    std::env::var("T_HUB_TTS_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:7477".to_string())
+/// The TTS server base URL for `engine`: the per-engine env override when set,
+/// else `http://127.0.0.1:<default_port>`. The port is the ONLY thing that
+/// differs between engines (identical API), so routing is pure port selection.
+fn base_url_for_engine(engine: VoiceEngine) -> String {
+    if let Ok(u) = std::env::var(engine.url_env_key()) {
+        if !u.trim().is_empty() {
+            return u;
+        }
+    }
+    format!("http://127.0.0.1:{}", engine.default_port())
 }
 
 /// `~/.t-hub/voice.json`, beside control.json. `T_HUB_VOICE_FILE` overrides
@@ -60,6 +119,9 @@ fn voice_settings_path() -> PathBuf {
 #[serde(rename_all = "camelCase")]
 pub struct VoiceSettings {
     pub enabled: bool,
+    /// The selected TTS backend (default Piper). The voices list + /tts target
+    /// follow this.
+    pub engine: VoiceEngine,
     pub voice: String,
     pub volume: f64,
     /// SAPI fallback speech rate for the external announce.sh path; the app
@@ -72,6 +134,7 @@ impl Default for VoiceSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            engine: VoiceEngine::Piper,
             voice: "en_US-ryan-high.onnx".to_string(),
             volume: 0.8,
             sapi_rate: 0,
@@ -80,21 +143,20 @@ impl Default for VoiceSettings {
     }
 }
 
-/// Read voice.json leniently: missing file or unparseable content yields the
-/// defaults; each field falls back independently so a partial file written by
-/// external tooling never zeroes the rest.
-fn read_settings() -> VoiceSettings {
+/// Extract settings from an already-parsed JSON object, field-by-field, each
+/// falling back to the default independently - so a partial file written by
+/// external tooling (or a pre-Kokoro file with no `engine` key) never zeroes
+/// the rest. Split out from `read_settings` so the lenient contract is unit
+/// testable without touching the filesystem.
+fn parse_settings(v: &serde_json::Value) -> VoiceSettings {
     let d = VoiceSettings::default();
-    let raw = match std::fs::read_to_string(voice_settings_path()) {
-        Ok(s) if !s.trim().is_empty() => s,
-        _ => return d,
-    };
-    let v: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return d,
-    };
     VoiceSettings {
         enabled: v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(d.enabled),
+        engine: v
+            .get("engine")
+            .and_then(|x| x.as_str())
+            .map(VoiceEngine::from_token)
+            .unwrap_or(d.engine),
         voice: v
             .get("voice")
             .and_then(|x| x.as_str())
@@ -113,6 +175,19 @@ fn read_settings() -> VoiceSettings {
     }
 }
 
+/// Read voice.json leniently: missing file or unparseable content yields the
+/// defaults.
+fn read_settings() -> VoiceSettings {
+    let raw = match std::fs::read_to_string(voice_settings_path()) {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => return VoiceSettings::default(),
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(v) => parse_settings(&v),
+        Err(_) => VoiceSettings::default(),
+    }
+}
+
 /// Write the five owned fields into voice.json, PRESERVING any unknown keys an
 /// external script may have added (read-modify-write on the JSON object).
 fn write_settings(settings: &VoiceSettings) -> Result<(), String> {
@@ -124,6 +199,7 @@ fn write_settings(settings: &VoiceSettings) -> Result<(), String> {
         .unwrap_or_else(|| serde_json::json!({}));
     let obj = root.as_object_mut().expect("filtered to object above");
     obj.insert("enabled".into(), serde_json::json!(settings.enabled));
+    obj.insert("engine".into(), serde_json::json!(settings.engine.token()));
     obj.insert("voice".into(), serde_json::json!(settings.voice));
     obj.insert(
         "volume".into(),
@@ -182,12 +258,13 @@ fn voice_entry_name(v: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// GET /voices on the local TTS server. Liberal in what it accepts: a JSON
-/// array (of strings or objects) or an object wrapping one under "voices".
-/// An unreachable server surfaces as Err - the UI renders that as the
-/// "voice server unavailable" degradation state.
-fn fetch_voices() -> Result<Vec<String>, String> {
-    let url = format!("{}/voices", tts_base_url());
+/// GET /voices on the selected engine's local server. Liberal in what it
+/// accepts: a JSON array (of strings or objects) or an object wrapping one
+/// under "voices" (Piper returns the latter; the Kokoro server matches it). An
+/// unreachable server surfaces as Err - the UI renders that as the "voice
+/// server unavailable" degradation state.
+fn fetch_voices(engine: VoiceEngine) -> Result<Vec<String>, String> {
+    let url = format!("{}/voices", base_url_for_engine(engine));
     let body = agent()
         .get(&url)
         .timeout(Duration::from_secs(3))
@@ -205,23 +282,23 @@ fn fetch_voices() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-pub async fn voice_list_voices() -> Result<Vec<String>, String> {
-    tauri::async_runtime::spawn_blocking(fetch_voices)
+pub async fn voice_list_voices(engine: VoiceEngine) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || fetch_voices(engine))
         .await
         .map_err(|e| format!("voice_list_voices task failed: {e}"))?
 }
 
-/// POST /tts {text, voice} and return the WAV bytes base64-encoded (the
-/// webview plays them via an Audio data URI - it must not fetch the server
-/// itself, see the module header).
-fn synthesize(text: &str, voice: &str) -> Result<String, String> {
+/// POST /tts {text, voice} to the selected engine and return the WAV bytes
+/// base64-encoded (the webview plays them via an Audio data URI - it must not
+/// fetch the server itself, see the module header).
+fn synthesize(text: &str, voice: &str, engine: VoiceEngine) -> Result<String, String> {
     if text.len() > MAX_TTS_TEXT_BYTES {
         return Err(format!(
             "tts text too long: {} bytes (max {MAX_TTS_TEXT_BYTES})",
             text.len(),
         ));
     }
-    let url = format!("{}/tts", tts_base_url());
+    let url = format!("{}/tts", base_url_for_engine(engine));
     let body = serde_json::json!({ "text": text, "voice": voice }).to_string();
     let resp = agent()
         .post(&url)
@@ -245,8 +322,97 @@ fn synthesize(text: &str, voice: &str) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn voice_tts(text: String, voice: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || synthesize(&text, &voice))
+pub async fn voice_tts(
+    text: String,
+    voice: String,
+    engine: VoiceEngine,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || synthesize(&text, &voice, engine))
         .await
         .map_err(|e| format!("voice_tts task failed: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Engine-selection routing: each engine's default base URL targets its own
+    /// loopback port (Piper 7477, Kokoro 7478), so /voices and /tts reach the
+    /// right server. Guarded against ambient env overrides so the mapping under
+    /// test is the pure default.
+    #[test]
+    fn base_url_routes_by_engine_default_ports() {
+        // Only meaningful when the per-engine override envs are unset (they are
+        // in a normal test run; skip the assertion if some outer env set one).
+        if std::env::var(VoiceEngine::Piper.url_env_key()).is_err() {
+            assert_eq!(
+                base_url_for_engine(VoiceEngine::Piper),
+                "http://127.0.0.1:7477"
+            );
+        }
+        if std::env::var(VoiceEngine::Kokoro.url_env_key()).is_err() {
+            assert_eq!(
+                base_url_for_engine(VoiceEngine::Kokoro),
+                "http://127.0.0.1:7478"
+            );
+        }
+        // The port mapping itself is pure - always assert that.
+        assert_eq!(VoiceEngine::Piper.default_port(), 7477);
+        assert_eq!(VoiceEngine::Kokoro.default_port(), 7478);
+    }
+
+    #[test]
+    fn engine_token_round_trips() {
+        assert_eq!(VoiceEngine::from_token("piper"), VoiceEngine::Piper);
+        assert_eq!(VoiceEngine::from_token("kokoro"), VoiceEngine::Kokoro);
+        // Unknown / legacy tokens fall back to the safe default engine.
+        assert_eq!(VoiceEngine::from_token("festival"), VoiceEngine::Piper);
+        assert_eq!(VoiceEngine::from_token(""), VoiceEngine::Piper);
+        assert_eq!(VoiceEngine::Piper.token(), "piper");
+        assert_eq!(VoiceEngine::Kokoro.token(), "kokoro");
+    }
+
+    /// voice.json engine round-trip: a settings blob carrying engine "kokoro"
+    /// reads back as Kokoro (and serializes as the lowercase token).
+    #[test]
+    fn engine_persists_in_voice_json_shape() {
+        let json = serde_json::json!({
+            "enabled": true,
+            "engine": "kokoro",
+            "voice": "af_heart",
+            "volume": 0.5,
+            "sapiRate": 0,
+            "announceOnAttention": false,
+        });
+        let parsed: VoiceSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.engine, VoiceEngine::Kokoro);
+        // Serializes back to the lowercase wire token external tooling reads.
+        let out = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(out.get("engine").and_then(|v| v.as_str()), Some("kokoro"));
+    }
+
+    /// A voice.json with NO engine key (a pre-Kokoro file) parses to Piper via
+    /// the lenient reader, so the upgrade never breaks an existing install -
+    /// and the other fields still come through.
+    #[test]
+    fn missing_engine_key_defaults_to_piper() {
+        let parsed = parse_settings(&serde_json::json!({
+            "enabled": true,
+            "voice": "en_US-ryan-high.onnx",
+            "volume": 0.6,
+            "sapiRate": 0,
+            "announceOnAttention": false,
+        }));
+        assert_eq!(parsed.engine, VoiceEngine::Piper);
+        assert!(parsed.enabled);
+        assert_eq!(parsed.voice, "en_US-ryan-high.onnx");
+        assert_eq!(parsed.volume, 0.6);
+    }
+
+    /// The lenient reader picks up an explicit Kokoro engine too.
+    #[test]
+    fn parse_settings_reads_kokoro_engine() {
+        let parsed = parse_settings(&serde_json::json!({ "engine": "kokoro" }));
+        assert_eq!(parsed.engine, VoiceEngine::Kokoro);
+    }
 }

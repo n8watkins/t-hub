@@ -27,6 +27,7 @@ import {
 
 const FILE_SETTINGS: VoiceSettings = {
   enabled: true,
+  engine: "piper",
   voice: "en_US-lessac-medium.onnx",
   volume: 0.55,
   sapiRate: 2,
@@ -92,6 +93,7 @@ describe("voice settings round-trip", () => {
     expect(writeVoiceSettings).toHaveBeenCalledTimes(1);
     expect(writeVoiceSettings).toHaveBeenCalledWith({
       enabled: true,
+      engine: "piper",
       voice: "en_US-lessac-medium.onnx",
       volume: 0.3,
       sapiRate: 2, // untouched by the UI, faithfully round-tripped
@@ -168,6 +170,13 @@ describe("voices endpoint degradation", () => {
     expect(useVoice.getState().voicesUnavailable).toBe(false);
   });
 
+  it("refreshVoices() queries the SELECTED engine", async () => {
+    vi.mocked(listVoices).mockResolvedValue(["af_heart"]);
+    useVoice.setState({ engine: "kokoro" });
+    await useVoice.getState().refreshVoices();
+    expect(listVoices).toHaveBeenCalledWith("kokoro");
+  });
+
   it("refreshVoices() failure flips voicesUnavailable (server down)", async () => {
     vi.mocked(listVoices).mockRejectedValue(new Error("connection refused"));
     await useVoice.getState().refreshVoices();
@@ -183,5 +192,46 @@ describe("voices endpoint degradation", () => {
     await useVoice.getState().refreshVoices();
     expect(useVoice.getState().voicesUnavailable).toBe(false);
     expect(useVoice.getState().voices).toEqual(["a.onnx"]);
+  });
+});
+
+describe("engine switching", () => {
+  it("load() round-trips the engine from the file (kokoro)", async () => {
+    vi.mocked(readVoiceSettings).mockResolvedValue({
+      ...FILE_SETTINGS,
+      engine: "kokoro",
+      voice: "af_heart",
+    });
+    await useVoice.getState().load();
+    expect(useVoice.getState().engine).toBe("kokoro");
+    expect(useVoice.getState().voice).toBe("af_heart");
+  });
+
+  it("setEngine switches, drops the stale voice list, and persists the engine", async () => {
+    // Start on Piper with a loaded list.
+    vi.mocked(listVoices).mockResolvedValue(["en_US-ryan-high.onnx"]);
+    await useVoice.getState().refreshVoices();
+    expect(useVoice.getState().voices).toEqual(["en_US-ryan-high.onnx"]);
+
+    // Switch to Kokoro: the stale list is dropped synchronously (the NEW
+    // engine's list is loaded by the Settings section's engine effect, tested
+    // in VoiceSettings.test.tsx - the store action itself stays pure).
+    useVoice.getState().setEngine("kokoro");
+    expect(useVoice.getState().engine).toBe("kokoro");
+    expect(useVoice.getState().voices).toBeNull();
+
+    // The engine change persists through the merge-write.
+    await flushPersist();
+    expect(writeVoiceSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ engine: "kokoro" }),
+    );
+  });
+
+  it("setEngine to the SAME engine is a no-op (no re-query, no dirty)", async () => {
+    vi.mocked(listVoices).mockClear();
+    useVoice.getState().setEngine("piper"); // already piper
+    expect(listVoices).not.toHaveBeenCalled();
+    await flushPersist();
+    expect(writeVoiceSettings).not.toHaveBeenCalled();
   });
 });

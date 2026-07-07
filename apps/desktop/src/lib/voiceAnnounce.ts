@@ -112,7 +112,7 @@ export function handleStatusesChange(
   speaking = true;
 
   const label = labelForSession(entered[0][0]) ?? "A session";
-  void synthesizeVoice(`${label} needs your attention`, voice.voice)
+  void synthesizeVoice(`${label} needs your attention`, voice.voice, voice.engine)
     .then((b64) => {
       lastSpokenAt = now;
       playWavBase64(b64, useVoice.getState().volume);
