@@ -426,6 +426,7 @@ pub async fn close_terminal(
 
 #[tauri::command]
 pub async fn kill_terminal(
+    app: tauri::AppHandle,
     remote: tauri::State<'_, RemotePtyManager>,
     id: String,
 ) -> Result<(), String> {
@@ -436,6 +437,23 @@ pub async fn kill_terminal(
     // Drop any lingering "fresh" mark for this id (spawned but never attached) so
     // it can't accumulate — the id is gone for good after a kill.
     remote.fresh.lock().remove(&id);
+
+    // Captain-chat phase 2: a killed tile leaves the captains registry too - its
+    // captaincy is released, and it drops out of every crew list. The UI kills
+    // via this command (the × and the closeWorkspace reap), so this is the UI's
+    // twin of the control-socket `close_terminal` cleanup; without it a killed
+    // crew tile would linger in the persistent captains.json. On a real change we
+    // forward a `sync_captains` snapshot so the sidebar drops the crewmate live.
+    // (The captain case is ALSO handled UI-side via forgetCaptain -> release_captain;
+    // remove_session is idempotent, so the overlap is a harmless no-op.)
+    let captains = app.state::<std::sync::Arc<crate::control::CaptainsRegistry>>();
+    if captains.remove_session(&id) {
+        let snap = serde_json::to_value(captains.snapshot()).unwrap_or_default();
+        let _ = app.emit(
+            crate::control::APPLY_EVENT_CHANNEL,
+            serde_json::json!({ "command": "sync_captains", "args": { "sync": snap } }),
+        );
+    }
 
     // The tmux session name is reconstructed from the id (the RemotePty doesn't
     // carry it); this is the same `th_<id[..8]>` derivation as everywhere else.

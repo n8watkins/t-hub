@@ -81,6 +81,12 @@ function adoptSync(args: ControlApply["args"]): boolean {
 // sync_captains forward). The server seq is persisted, so it is monotonic even
 // across app restarts.
 let lastCaptainsSeq = -1;
+// True while the boot bootstrap is claiming legacy pins. Each claim forwards a
+// PARTIAL sync_captains snapshot (only the ids claimed so far); adopting those
+// mid-loop would transiently drop the not-yet-claimed pins from the store (and
+// persist the shrunk list). We suppress those forwards and adopt only the final
+// full snapshot the bootstrap fetches, so membership never flickers.
+let captainsBootstrapping = false;
 
 /** Loosely validate + adopt one captains snapshot `{seq, captains}` into the
  *  captain store (records missing arrays coerce to empty - the store renders
@@ -110,8 +116,10 @@ function adoptCaptainsSnapshot(sync: unknown): boolean {
   return true;
 }
 
-/** Adopt a `sync_captains` apply's `args.sync` snapshot. */
+/** Adopt a `sync_captains` apply's `args.sync` snapshot. Suppressed while the
+ *  boot bootstrap is running (it adopts only its own final full snapshot). */
 function adoptCaptainsSync(args: ControlApply["args"]): boolean {
+  if (captainsBootstrapping) return false;
   return adoptCaptainsSnapshot(args?.sync);
 }
 
@@ -340,6 +348,7 @@ export function startControlBridge(): void {
  * locally-persisted designations and the next sync_captains reconciles.
  */
 function startCaptainsBootstrap(): void {
+  captainsBootstrapping = true;
   void (async () => {
     const res = (await controlRequest("list_captains")) as {
       seq?: number;
@@ -362,16 +371,21 @@ function startCaptainsBootstrap(): void {
       }
     }
     // Adopt the final registry state. Each claim above also forwarded a
-    // sync_captains apply; re-fetching (only when we claimed) keeps this
-    // deterministic rather than relying on event ordering.
+    // sync_captains apply (suppressed while bootstrapping); re-fetching (only
+    // when we claimed) makes the final adopt deterministic rather than relying
+    // on event ordering.
     const finalRes = missing.length
       ? ((await controlRequest("list_captains")) as typeof res)
       : res;
     adoptCaptainsSnapshot(finalRes);
-  })().catch(() => {
-    // Not under Tauri or the control channel is down - locally persisted
-    // designations stand until a sync_captains forward arrives.
-  });
+  })()
+    .catch(() => {
+      // Not under Tauri or the control channel is down - locally persisted
+      // designations stand until a sync_captains forward arrives.
+    })
+    .finally(() => {
+      captainsBootstrapping = false;
+    });
 }
 
 /**

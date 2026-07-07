@@ -456,6 +456,12 @@ pub fn run() {
             // layout the frontend re-seeds on boot).
             let captains_registry =
                 std::sync::Arc::new(control::CaptainsRegistry::load(control::captains_path()));
+            // Manage the SAME Arc so the Tauri `kill_terminal` command can drop a
+            // dead session (captain or crew) from the registry - the UI kills tiles
+            // via that command, not the control socket, so without this a killed
+            // crew tile would leave a stale claim/crew entry in the persistent
+            // captains.json to re-hydrate as a phantom pin after restart.
+            app.manage(captains_registry.clone());
             if let Some(handshake) = start_control_listener(
                 &state,
                 app.handle(),
