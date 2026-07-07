@@ -968,6 +968,47 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     return tabs.find((t) => t.id === activeTabId) ?? tabs[0];
   };
 
+  /** Place a spawned WORK tile into a work tab, never the reserved Captains tab
+   *  (only captain/orchestrator AGENT tiles belong there, placed via
+   *  moveTileToCaptainsTab). Prefers `preferredTabId` when it names a real work
+   *  tab, else the first existing work tab, else a freshly minted one. Activates
+   *  the target tab and focuses the tile. Used by the spawn primitives to keep a
+   *  plain spawn out of Captains when it happens to be the active tab. */
+  const placeWorkTile = (info: TerminalInfo, preferredTabId?: string): void => {
+    const { tabs, terminals } = get();
+    const isWork = (t: WorkspaceTab): boolean => t.id !== CAPTAINS_TAB_ID;
+    const preferred =
+      preferredTabId && preferredTabId !== CAPTAINS_TAB_ID
+        ? tabs.find((t) => t.id === preferredTabId && isWork(t))
+        : undefined;
+    const target = preferred ?? tabs.find(isWork);
+    if (target) {
+      set({
+        terminals: { ...terminals, [info.id]: info },
+        tabs: tabs.map((t) =>
+          t.id === target.id ? { ...t, order: [...t.order, info.id] } : t,
+        ),
+        activeTabId: target.id,
+        focusedId: info.id,
+      });
+    } else {
+      // All-reserved edge: no work tab exists. Mint one BEFORE the reserved tab
+      // so Captains stays last.
+      const fresh: WorkspaceTab = {
+        id: newTabId(),
+        name: DEFAULT_TAB_NAME,
+        order: [info.id],
+      };
+      set({
+        terminals: { ...terminals, [info.id]: info },
+        tabs: [...tabs.filter(isWork), fresh, ...tabs.filter((t) => !isWork(t))],
+        activeTabId: fresh.id,
+        focusedId: info.id,
+      });
+    }
+    persist();
+  };
+
   return {
     terminals: {},
     tabs: initial.tabs,
@@ -1074,8 +1115,15 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     },
 
     addAfterFocused: (info) => {
-      const { tabs, focusedId, terminals } = get();
       const active = activeTab();
+      // A plain work spawn must never land in the reserved Captains tab (only
+      // agent tiles belong there, via moveTileToCaptainsTab): if the active tab
+      // is Captains, redirect the tile into a work tab instead.
+      if (active.id === CAPTAINS_TAB_ID) {
+        placeWorkTile(info);
+        return;
+      }
+      const { tabs, focusedId, terminals } = get();
       const nextOrder = active.order.slice();
       const focusIdx = focusedId ? nextOrder.indexOf(focusedId) : -1;
       if (focusIdx >= 0) nextOrder.splice(focusIdx + 1, 0, info.id);
@@ -1094,6 +1142,14 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     },
 
     addToTab: (tabId, info) => {
+      // A work tile targeting the reserved Captains tab (e.g. a "+" spawn while
+      // Captains is the active tab, which spawnWorkspaceTerminal forwards as the
+      // target) is redirected into a work tab - only agent tiles belong in
+      // Captains (via moveTileToCaptainsTab).
+      if (tabId === CAPTAINS_TAB_ID) {
+        placeWorkTile(info);
+        return;
+      }
       const { tabs, terminals } = get();
       if (!tabs.some((t) => t.id === tabId)) return; // unknown tab: no-op
       const nextTabs = tabs.map((t) =>
@@ -1559,7 +1615,10 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // they can't kill. Mirror closeTab's last-tab guard BEFORE killing so a kill
       // never fires when closeTab would refuse to remove the tab.
       const { tabs } = get();
-      if (tabs.length <= 1) return;
+      // Guard on the WORK-tab count: the reserved Captains tab is ALWAYS present,
+      // so it must not count toward the last-tab check - else the last work tab
+      // could be closed, parking the user on the Captains-only view.
+      if (tabs.filter((t) => t.id !== CAPTAINS_TAB_ID).length <= 1) return;
       const target = tabs.find((t) => t.id === id);
       if (!target) return;
       const ids = target.order.slice();
@@ -1604,7 +1663,10 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     closeTab: (id) => {
       const { tabs, activeTabId, focusedId, terminals } = get();
       if (id === CAPTAINS_TAB_ID) return []; // reserved: never closeable
-      if (tabs.length <= 1) return []; // keep at least one tab
+      // Keep at least one WORK tab: the reserved Captains tab is always present
+      // and must not count toward the guard, so closing the last work tab is
+      // refused (else the user is parked on the Captains-only view).
+      if (tabs.filter((t) => t.id !== CAPTAINS_TAB_ID).length <= 1) return [];
       const target = tabs.find((t) => t.id === id);
       if (!target) return [];
 

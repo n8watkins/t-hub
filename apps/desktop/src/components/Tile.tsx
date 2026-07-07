@@ -246,8 +246,10 @@ export function Tile({
   // captains, for the context-menu Pin/Unpin item. Toggling is a store action.
   const isCaptain = useCaptain((s) => s.captainIds.includes(terminalId));
   const toggleCaptain = useCaptain((s) => s.toggleCaptain);
-  // Orchestrator designation (captains deck): whether THIS tile is the terminal
-  // the deck's bottom input talks to, for the context-menu Mark/Unmark item.
+  // Orchestrator designation: whether THIS tile is the designated orchestrator
+  // agent, for the context-menu Mark/Unmark item. (The captains-deck bottom
+  // input this once fed was retired in PR #22 - the orchestrator is now just the
+  // designated agent, no bottom input exists.)
   const isOrchestrator = useCaptain((s) => s.orchestratorId === terminalId);
   const setOrchestratorId = useCaptain((s) => s.setOrchestratorId);
   // Per-terminal color override (the ⋯ menu): the effective color comes from
@@ -994,8 +996,8 @@ export function Tile({
               label={isOrchestrator ? "Unmark orchestrator" : "Mark as orchestrator"}
               hint={
                 isOrchestrator
-                  ? "This session receives the captains-deck bottom input - unmark to clear it"
-                  : "Make this session the orchestrator the captains-deck input talks to"
+                  ? "This session is the designated orchestrator - unmark to clear it"
+                  : "Designate this session as the orchestrator"
               }
               onClick={() => {
                 setCtxMenu(null);
