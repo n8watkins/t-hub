@@ -186,6 +186,50 @@ describe("adoptRegistry preserves the reserved Captains tab", () => {
   });
 });
 
+describe("adoptRegistry never duplicates the reserved Captains tab (stray-placeholder bug)", () => {
+  // ROOT CAUSE: the tab reporter up-syncs the client-only Captains tab to the
+  // server, so the server echoes it back inside its snapshot. adoptRegistry used
+  // to map EVERY server tab into `serverTabs` AND re-append a fresh Captains tab,
+  // yielding TWO Captains tabs. The echoed copy's tiles are all agent tiles
+  // (filtered out by agentSet), so its `order` is empty and it renders the stray
+  // "new terminal" placeholder next to the real, populated Captains tab.
+  it("collapses an echoed Captains tab into exactly one populated reserved tab", () => {
+    seed(
+      [
+        { id: "t1", name: "Workspace 1", order: ["a"] },
+        { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: ["cap"] },
+      ],
+      "t1",
+      "a",
+    );
+    // The server snapshot ECHOES the reserved tab back (its agent tile listed
+    // there), exactly as the running registry does after the reporter up-syncs it.
+    useWorkspace.getState().adoptRegistry([
+      { id: "t1", name: "Workspace 1", tileIds: ["a"] },
+      { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, tileIds: ["cap"] },
+    ]);
+    const s = useWorkspace.getState();
+    const reserved = s.tabs.filter((t) => t.id === CAPTAINS_TAB_ID);
+    // Exactly one reserved tab...
+    expect(reserved).toHaveLength(1);
+    // ...and it keeps its agent tile (order non-empty -> no stray placeholder).
+    expect(reserved[0].order).toEqual(["cap"]);
+    // The reserved tab stays LAST.
+    expect(s.tabs[s.tabs.length - 1].id).toBe(CAPTAINS_TAB_ID);
+  });
+
+  it("re-appends a single empty reserved tab when the server omits it (baseline)", () => {
+    seed([{ id: "t1", name: "Workspace 1", order: ["a"] }], "t1", "a");
+    useWorkspace.getState().adoptRegistry([
+      { id: "t1", name: "Workspace 1", tileIds: ["a"] },
+    ]);
+    const reserved = useWorkspace
+      .getState()
+      .tabs.filter((t) => t.id === CAPTAINS_TAB_ID);
+    expect(reserved).toHaveLength(1);
+  });
+});
+
 describe("reserved Captains tab is not closeable", () => {
   beforeEach(() => {
     seed(
