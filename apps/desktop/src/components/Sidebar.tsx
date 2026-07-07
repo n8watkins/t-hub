@@ -40,7 +40,7 @@ import {
 import { useState } from "react";
 import { LayoutGrid } from "lucide-react";
 import { useCaptain } from "../store/captain";
-import { CaptainsList } from "./CaptainsList";
+import { CaptainsList, OrchestratorRow } from "./CaptainsList";
 import { WorkspacesList } from "./WorkspacesList";
 import { RecentList } from "./RecentList";
 import { ClaudeIcon } from "./ClaudeIcon";
@@ -153,6 +153,13 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
   // Pinned captains drive the Captains section; zero pins = no section at all
   // (the titlebar anchor's tooltip explains how to pin).
   const captainCount = useCaptain((s) => s.captainIds.length);
+  // The AGENTS hierarchy: the orchestrator (top) + the pinned captains. Shown
+  // whenever either exists; the count is the distinct agent count (the
+  // orchestrator may also be a pinned captain).
+  const hasOrchestrator = useCaptain(
+    (s) => s.orchestratorId != null && !s.captainIds.includes(s.orchestratorId),
+  );
+  const agentCount = captainCount + (hasOrchestrator ? 1 : 0);
 
   return (
     <aside
@@ -174,14 +181,14 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
           a safety net on a short window. The old separate "Projects" section is
           gone — a workspace's terminals live under it in Workspaces. */}
       <div className="th-scroll flex min-h-0 flex-1 flex-col overflow-y-auto">
-        {/* Captains - the persistent supervision surface (PRD slice A): one row
-            per pinned captain, above Workspaces (command view over terrain
-            view). Collapsible + internally capped so a long fleet scrolls;
-            hidden entirely while nothing is pinned. */}
-        {captainCount > 0 && (
+        {/* Agents - the fleet hierarchy: the orchestrator (top) over the pinned
+            captains, above Workspaces (command view over terrain view). Clicking
+            an agent opens the deck focused on its live terminal panel. Hidden
+            entirely while no agent exists. */}
+        {agentCount > 0 && (
           <Section
-            title="Captains"
-            count={captainCount}
+            title="Agents"
+            count={agentCount}
             className="border-b"
             collapsible
             storageKey="t-hub.sidebar.captains.open"
@@ -199,6 +206,7 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
               </button>
             }
           >
+            <OrchestratorRow />
             <CaptainsList />
           </Section>
         )}

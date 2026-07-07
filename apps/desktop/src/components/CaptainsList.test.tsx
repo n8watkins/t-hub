@@ -154,7 +154,7 @@ describe("CaptainsList render", () => {
       });
     });
     render(<CaptainsList />);
-    const summon = within(row("bbb00001")).getByTitle(/tile not available/);
+    const summon = within(row("bbb00001")).getByTitle(/terminal not available/);
     expect(summon).toBeTruthy();
     expect(row("bbb00001").textContent).toContain("tile not available");
   });
@@ -249,14 +249,15 @@ describe("CaptainsList workspace-relevant ordering", () => {
   });
 });
 
-describe("CaptainsList summon wiring", () => {
-  it("clicking a row summons that captain (overlay open, MRU front)", () => {
+describe("CaptainsList click-to-focus wiring", () => {
+  it("clicking a row opens the deck FOCUSED on that agent (not the overlay)", () => {
     render(<CaptainsList />);
-    fireEvent.click(within(row("bbb00001")).getByTitle(/Summon captain/));
+    fireEvent.click(within(row("bbb00001")).getByTitle(/Open in the deck/));
     const s = useCaptain.getState();
-    expect(s.open).toBe(true);
-    expect(s.activeCaptainId).toBe("bbb00001");
-    expect(s.captainIds[0]).toBe("bbb00001");
+    expect(s.deckOpen).toBe(true);
+    expect(s.deckFocusId).toBe("bbb00001");
+    // The floating overlay is NOT opened by the deck-focus click.
+    expect(s.open).toBe(false);
   });
 });
 

@@ -83,7 +83,8 @@ describe("Sidebar captains section", () => {
     useCaptain.setState({ captainIds: ["cap00001"], activeCaptainId: "cap00001" });
     const { container } = render(<Sidebar mode="full" />);
     const titles = sectionTitles(container);
-    expect(titles[0]).toBe("Captains");
+    // The section is the AGENTS hierarchy (orchestrator over captains).
+    expect(titles[0]).toBe("Agents");
     expect(titles[1]).toBe("Workspaces");
     expect(container.querySelector('[data-captain-row="cap00001"]')).toBeTruthy();
   });

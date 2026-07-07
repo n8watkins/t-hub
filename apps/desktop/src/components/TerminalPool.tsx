@@ -35,6 +35,7 @@ import { usePanels } from "../store/panels";
 import { useCaptain } from "../store/captain";
 import { TerminalView } from "./Terminal";
 import { CaptainOverlay } from "./CaptainOverlay";
+import { CaptainsDeck } from "./CaptainsDeck";
 import type { TerminalId } from "../ipc/types";
 // Diagnostics: tlog mirrors every pool show/park decision into a file the
 // orchestrator can read from a RELEASE build (no devtools). Importing this here
@@ -218,6 +219,20 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
   // context. Subscribed so an open/pin change re-runs the visibility sync.
   const captainId = useCaptain((s) => s.activeCaptainId);
   const captainOpen = useCaptain((s) => s.open);
+  // The captains DECK shows the AGENT terminals (orchestrator + captains) as
+  // live panels: while the deck is open, each agent's pooled terminal is shown
+  // over the deck's placeholder (on EVERY tab, like the summoned captain) and
+  // its wrapper is lifted above the deck panel chrome - the exact extension of
+  // the overlay takeover, from one captain to N agents. Subscribed so an
+  // open/agent change re-runs the visibility sync.
+  const deckOpen = useCaptain((s) => s.deckOpen);
+  const deckOrchestratorId = useCaptain((s) => s.orchestratorId);
+  const deckCaptainIds = useCaptain((s) => s.captainIds);
+  const deckAgentIds = useMemo(() => {
+    const set = new Set<TerminalId>(deckCaptainIds);
+    if (deckOrchestratorId) set.add(deckOrchestratorId);
+    return set;
+  }, [deckCaptainIds, deckOrchestratorId]);
 
   // THE FIX (mutedbug): poolIds must be a STABLE DOM order that does NOT change
   // when a tile is reordered or moved between tabs. Positioning is absolute
@@ -325,6 +340,8 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
     activeTabId,
     captainOpen,
     captainId,
+    deckOpen,
+    deckAgentIds,
   ]);
 
   // A deferred re-sync scheduled on the next animation frame. A sync that lands
@@ -476,7 +493,14 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       // a deferred-rAF sync sees the current open/pin state; the layout-effect
       // still re-runs sync when captainOpen/captainId change (they're deps).
       const cap = useCaptain.getState();
+      const deckAgentIdsNow = new Set<TerminalId>(cap.captainIds);
+      if (cap.orchestratorId) deckAgentIdsNow.add(cap.orchestratorId);
       const shouldShow = (id: TerminalId): boolean => {
+        // The captains DECK shows every AGENT terminal (orchestrator + captains)
+        // over its deck panel placeholder, on EVERY tab, while the deck is open -
+        // the deck is the agents' home. Checked FIRST (like the summoned captain)
+        // so the per-tab / fullscreen gates never park a deck agent.
+        if (cap.deckOpen && deckAgentIdsNow.has(id)) return true;
         // The summoned captain shows on EVERY tab (its placeholder is the
         // overlay's body), even while another tile is fullscreen - the overlay
         // floats above the fullscreen layer too. Checked FIRST so none of the
@@ -662,6 +686,8 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       fullscreenId,
       captainOpen,
       captainId,
+      deckOpen,
+      deckAgentIds,
       applyVisible,
       scheduleDeferredSync,
     ],
@@ -704,6 +730,8 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
     fullscreenId,
     captainOpen,
     captainId,
+    deckOpen,
+    deckAgentIds,
   ]);
 
   // Publish the imperative sync for external callers (the captain overlay's
@@ -807,7 +835,13 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
       // the same tradeoff fullscreen already makes at z-50.
       className={
         "pointer-events-none absolute inset-0 " +
-        (fullscreenId != null ? "z-50" : captainOpen ? "z-30" : "z-0")
+        (fullscreenId != null
+          ? "z-50"
+          : deckOpen
+            ? "z-40"
+            : captainOpen
+              ? "z-30"
+              : "z-0")
       }
       aria-hidden={false}
     >
@@ -852,7 +886,15 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
           // owned by the imperative sync().
           style={{
             visibility: "hidden",
-            zIndex: captainOpen && id === captainId ? 2 : undefined,
+            // Lift a wrapper above the panel chrome sharing this layer's stacking
+            // context: a deck agent above its deck panel (z 2 vs the panel's 1),
+            // or the summoned captain above the overlay panel. Everything else
+            // stays z-auto, BELOW the panels.
+            zIndex:
+              (deckOpen && deckAgentIds.has(id)) ||
+              (captainOpen && id === captainId)
+                ? 2
+                : undefined,
           }}
         >
           {/* Rendered ONCE, here, for this terminal's whole lifetime. Stable key
@@ -874,6 +916,13 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
           panel) only works within this layer's own stacking context. The host
           renders null while the overlay is closed. */}
       <CaptainOverlay />
+      {/* Captains DECK panels (agents view). Rendered INSIDE this layer, AFTER
+          the wrappers (same mutedbug constraint as the overlay), so the deck's
+          panel bodies are placeholders the pooled agent terminals paint into
+          within this layer's stacking context: panel chrome at z-1, each agent
+          xterm lifted to z-2 above it. The host renders null while the deck is
+          closed. */}
+      <CaptainsDeck />
     </div>
   );
 }

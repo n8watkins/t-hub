@@ -43,6 +43,9 @@ const DEFAULTS = {
   /** The titlebar × hides the window to the system tray (true) vs. quits the app
    *  (false). Default ON — close-to-tray, matching the tray's keep-running model. */
   closeToTray: true,
+  /** Open the CAPTAINS DECK (the agents view) by default on launch, instead of
+   *  the workspace canvas. Default ON — the deck is the agents' home. */
+  openDeckOnLaunch: true,
   /** Periodically check GitHub Releases for a newer signed build (feat/auto-updater). */
   autoUpdateCheckEnabled: true,
   /** Silently download + install a found update on launch, then relaunch. Only
@@ -78,6 +81,7 @@ interface PersistedSettings {
   soundsEnabled: boolean;
   notificationsEnabled: boolean;
   closeToTray: boolean;
+  openDeckOnLaunch: boolean;
   autoUpdateCheckEnabled: boolean;
   autoInstallUpdates: boolean;
   resumeStartsClaude: boolean;
@@ -132,6 +136,10 @@ function coerceSettings(raw: unknown): PersistedSettings {
       typeof p.closeToTray === "boolean"
         ? p.closeToTray
         : DEFAULTS.closeToTray,
+    openDeckOnLaunch:
+      typeof p.openDeckOnLaunch === "boolean"
+        ? p.openDeckOnLaunch
+        : DEFAULTS.openDeckOnLaunch,
     autoUpdateCheckEnabled:
       typeof p.autoUpdateCheckEnabled === "boolean"
         ? p.autoUpdateCheckEnabled
@@ -209,6 +217,11 @@ interface SettingsState {
   closeToTray: boolean;
   setCloseToTray: (v: boolean) => void;
 
+  /** Open the captains deck (agents view) by default on launch. Read by App's
+   *  startup effect. */
+  openDeckOnLaunch: boolean;
+  setOpenDeckOnLaunch: (v: boolean) => void;
+
   /** Periodically check for app updates. Respected by lib/updateMount.ts and the
    *  Updates settings section. */
   autoUpdateCheckEnabled: boolean;
@@ -255,6 +268,7 @@ export const useSettings = create<SettingsState>((set, get) => {
       soundsEnabled: s.soundsEnabled,
       notificationsEnabled: s.notificationsEnabled,
       closeToTray: s.closeToTray,
+      openDeckOnLaunch: s.openDeckOnLaunch,
       autoUpdateCheckEnabled: s.autoUpdateCheckEnabled,
       autoInstallUpdates: s.autoInstallUpdates,
       resumeStartsClaude: s.resumeStartsClaude,
@@ -325,6 +339,12 @@ export const useSettings = create<SettingsState>((set, get) => {
     closeToTray: initial.closeToTray,
     setCloseToTray: (v) => {
       set({ closeToTray: v });
+      persistAll();
+    },
+
+    openDeckOnLaunch: initial.openDeckOnLaunch,
+    setOpenDeckOnLaunch: (v) => {
+      set({ openDeckOnLaunch: v });
       persistAll();
     },
 

@@ -618,6 +618,15 @@ function TabGrid({
   // placeholder; that tile's grid copy must not register/steal it (exactly the
   // fullscreen slotActive rule). Null when the overlay is closed.
   const summonedCaptainId = useCaptain((s) => (s.open ? s.activeCaptainId : null));
+  // While the DECK is open it owns every AGENT's pool placeholder (the deck
+  // panel body). Those agents' grid tiles must YIELD their slot (exactly the
+  // overlay/fullscreen rule) so only the deck's placeholder is registered per id
+  // - no double-attach, no last-writer race.
+  const deckOpen = useCaptain((s) => s.deckOpen);
+  const deckOrchestratorId = useCaptain((s) => s.orchestratorId);
+  const deckCaptainIds = useCaptain((s) => s.captainIds);
+  const yieldsToDeck = (id: TerminalId): boolean =>
+    deckOpen && (id === deckOrchestratorId || deckCaptainIds.includes(id));
 
   // Local, editable copy of the flex weights so dragging is smooth (we only
   // write through to the store at pointer-up). Re-derived whenever the tab's
@@ -996,8 +1005,14 @@ function TabGrid({
                     // When this tile is fullscreen, its fullscreen copy (Canvas)
                     // owns the pool placeholder; this covered grid copy must not
                     // re-register and steal it, so it yields the slot. Same rule
-                    // when it's the summoned captain (the overlay owns the slot).
-                    slotActive={id !== fullscreenId && id !== summonedCaptainId}
+                    // when it's the summoned captain (the overlay owns the slot)
+                    // or when it's an agent the deck is showing (the deck panel
+                    // owns the slot).
+                    slotActive={
+                      id !== fullscreenId &&
+                      id !== summonedCaptainId &&
+                      !yieldsToDeck(id)
+                    }
                     // #20: the xterm body lives in the persistent pool overlay,
                     // not in the tile — the tile renders header + placeholder.
                     onFocus={() => onFocus(id)}

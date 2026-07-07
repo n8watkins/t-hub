@@ -62,9 +62,9 @@ function claim(id: string, crew: string[] = []): CaptainClaimRecord {
   return { captainSessionId: id, shipSlug: `ship-${id}`, workspaceTabIds: [], crew };
 }
 
-function tile(terminalId: string): HTMLElement {
+function panel(terminalId: string): HTMLElement {
   const el = document.querySelector<HTMLElement>(
-    `[data-deck-tile="${terminalId}"]`,
+    `[data-deck-panel="${terminalId}"]`,
   );
   expect(el).toBeTruthy();
   return el!;
@@ -111,56 +111,62 @@ beforeEach(() => {
   });
 });
 
-describe("CaptainsDeck", () => {
-  it("tiles every pinned captain (MRU order)", () => {
+describe("CaptainsDeck agent panels", () => {
+  it("renders a live panel per agent, orchestrator FIRST then captains", () => {
+    // No orchestrator: panels are the captains in order.
     render(<CaptainsDeck />);
-    const tiles = [...document.querySelectorAll("[data-deck-tile]")].map((t) =>
-      t.getAttribute("data-deck-tile"),
+    let panels = [...document.querySelectorAll("[data-deck-panel]")].map((p) =>
+      p.getAttribute("data-deck-panel"),
     );
-    expect(tiles).toEqual(["cap00001", "cap00002"]);
+    expect(panels).toEqual(["cap00001", "cap00002"]);
+
+    // Designating cap00002 the orchestrator floats it to the top.
+    act(() => useCaptain.getState().setOrchestratorId("cap00002"));
+    panels = [...document.querySelectorAll("[data-deck-panel]")].map((p) =>
+      p.getAttribute("data-deck-panel"),
+    );
+    expect(panels).toEqual(["cap00002", "cap00001"]);
+  });
+
+  it("each panel has a LIVE terminal body (the pool placeholder)", () => {
+    render(<CaptainsDeck />);
+    expect(panel("cap00001").querySelector("[data-deck-terminal]")).toBeTruthy();
   });
 
   it("shows the STABLE identity (workspace tab name), never the volatile Claude title", () => {
-    // cap00002 has a junk Claude title but no rename: the tile must show its
-    // workspace tab name "Backend", not "task notification".
     act(() => {
       useWorkspace.getState().setClaudeTitle("cap00002", "task notification");
     });
     render(<CaptainsDeck />);
-    expect(tile("cap00002").textContent).toContain("Backend");
-    expect(tile("cap00002").textContent).not.toContain("task notification");
+    expect(panel("cap00002").textContent).toContain("Backend");
+    expect(panel("cap00002").textContent).not.toContain("task notification");
   });
 
-  it("renders the real crew summary from the registry", () => {
+  it("renders the real crew summary in the panel header", () => {
     render(<CaptainsDeck />);
-    // cap00001 has one crew (crewrun0, working -> running).
-    expect(tile("cap00001").textContent).toContain("crew: 1 running · 0 done");
-    // cap00002 has no claim -> no crew line.
-    expect(tile("cap00002").textContent).not.toContain("crew:");
+    expect(panel("cap00001").textContent).toContain("crew: 1 running · 0 done");
+    expect(panel("cap00002").textContent).not.toContain("crew:");
   });
 
-  it("marks the designated orchestrator tile", () => {
-    act(() => {
-      useCaptain.getState().setOrchestratorId("cap00002");
-    });
+  it("marks the designated orchestrator panel", () => {
+    act(() => useCaptain.getState().setOrchestratorId("cap00002"));
     render(<CaptainsDeck />);
-    expect(tile("cap00002").getAttribute("data-orchestrator")).toBe("true");
-    expect(tile("cap00002").textContent).toContain("orchestrator");
-    expect(tile("cap00001").getAttribute("data-orchestrator")).toBeNull();
+    expect(panel("cap00002").getAttribute("data-orchestrator")).toBe("true");
+    expect(panel("cap00002").textContent).toContain("orchestrator");
+    expect(panel("cap00001").getAttribute("data-orchestrator")).toBeNull();
   });
 
-  it("clicking a tile summons that captain and closes the deck", () => {
+  it("clicking a panel FOCUSES it in the deck (stays open, no overlay)", () => {
     render(<CaptainsDeck />);
-    fireEvent.click(tile("cap00002"));
+    fireEvent.click(panel("cap00002"));
     const s = useCaptain.getState();
-    expect(s.deckOpen).toBe(false);
-    expect(s.activeCaptainId).toBe("cap00002");
-    expect(s.open).toBe(true);
+    expect(s.deckOpen).toBe(true); // stays in the deck
+    expect(s.deckFocusId).toBe("cap00002"); // spotlighted
+    expect(s.open).toBe(false); // no overlay
+    expect(panel("cap00002").getAttribute("data-focused")).toBe("true");
   });
 
-  it("does NOT leave the deck when a TILE-LESS captain is clicked", () => {
-    // Drop cap00002's tile (tab popped out / killed): summon would be a store
-    // no-op, so the click must keep the deck open, not drop onto a blank view.
+  it("a tile-less agent shows the unavailable affordance (no terminal body)", () => {
     act(() => {
       useWorkspace.setState({
         tabs: [
@@ -170,21 +176,24 @@ describe("CaptainsDeck", () => {
       });
     });
     render(<CaptainsDeck />);
-    expect(tile("cap00002").getAttribute("data-tile-available")).toBeNull();
-    expect(tile("cap00002").textContent).toContain("tile not available");
-    fireEvent.click(tile("cap00002"));
-    const s = useCaptain.getState();
-    expect(s.deckOpen).toBe(true); // still open
-    expect(s.open).toBe(false); // no overlay summoned
+    expect(panel("cap00002").getAttribute("data-tile-available")).toBeNull();
+    expect(panel("cap00002").textContent).toContain("Terminal not available");
+    expect(panel("cap00002").querySelector("[data-deck-terminal]")).toBeNull();
   });
 
-  it("shows the empty state when no captains are pinned", () => {
+  it("shows the empty state when there are no agents", () => {
     act(() => {
-      useCaptain.setState({ captainIds: [], activeCaptainId: null });
+      useCaptain.setState({ captainIds: [], activeCaptainId: null, orchestratorId: null });
     });
     render(<CaptainsDeck />);
-    expect(document.querySelectorAll("[data-deck-tile]")).toHaveLength(0);
-    expect(document.body.textContent).toContain("No captains pinned yet");
+    expect(document.querySelectorAll("[data-deck-panel]")).toHaveLength(0);
+    expect(document.body.textContent).toContain("No agents yet");
+  });
+
+  it("renders nothing when the deck is closed", () => {
+    act(() => useCaptain.setState({ deckOpen: false }));
+    render(<CaptainsDeck />);
+    expect(document.querySelector("[data-captains-deck]")).toBeNull();
   });
 });
 

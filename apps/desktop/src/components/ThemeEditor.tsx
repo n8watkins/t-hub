@@ -322,6 +322,8 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
   const setTitlebarRevealAnimMs = useSettings((s) => s.setTitlebarRevealAnimMs);
   const closeToTray = useSettings((s) => s.closeToTray);
   const setCloseToTray = useSettings((s) => s.setCloseToTray);
+  const openDeckOnLaunch = useSettings((s) => s.openDeckOnLaunch);
+  const setOpenDeckOnLaunch = useSettings((s) => s.setOpenDeckOnLaunch);
   const resumeStartsClaude = useSettings((s) => s.resumeStartsClaude);
   const setResumeStartsClaude = useSettings((s) => s.setResumeStartsClaude);
   const fileIconTheme = useSettings((s) => s.fileIconTheme);
@@ -419,6 +421,12 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
           hint="The titlebar × hides T-Hub to the system tray and keeps it running, so your sessions stay alive — reopen it from the tray icon. Turn off to make the × quit the app instead."
           value={closeToTray}
           onChange={setCloseToTray}
+        />
+        <SettingToggleRow
+          label="Open the captains deck on launch"
+          hint="Start on the captains deck (the agents view — the orchestrator and captains as live terminal panels) instead of the workspace canvas. Turn off to start on the workspace canvas."
+          value={openDeckOnLaunch}
+          onChange={setOpenDeckOnLaunch}
         />
       </Group>
 
