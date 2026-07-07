@@ -7,10 +7,34 @@ def handshake():
     with open(HS_PATH) as f:
         return json.load(f)
 
+def control_token(hs):
+    """The token to use for CONTROL-tier calls, socket-gate Phase 3 aware.
+
+    Prefer the spawn-tree-injected `T_HUB_CONTROL_TOKEN` (the full-power control
+    token the app hands a session it spawns) when it is set. Fall back to
+    `control.json`'s `token` for backward compatibility - but note that once Phase
+    3 hardening is ON (its default), the file's `token` is the READ token, so a
+    caller that is NOT running inside an app-spawned session gets read-only.
+    """
+    env_tok = os.environ.get("T_HUB_CONTROL_TOKEN")
+    if env_tok:
+        return env_tok
+    return hs["token"]
+
 def connect(timeout=15.0):
     hs = handshake()
-    host, port = hs["addr"].rsplit(":", 1)
+    # Discovery of the address still comes from control.json; the endpoint address
+    # is not a secret. An explicit T_HUB_CONTROL_ADDR (paired with the env token)
+    # overrides it - the same all-or-nothing pairing the Rust MCP client uses.
+    env_addr = os.environ.get("T_HUB_CONTROL_ADDR")
+    addr = env_addr if (env_addr and os.environ.get("T_HUB_CONTROL_TOKEN")) else hs["addr"]
+    host, port = addr.rsplit(":", 1)
     s = socket.create_connection((host, int(port)), timeout=timeout)
+    # Expose the Phase 3-aware control token on the handshake dict so callers that
+    # do `tok = hs["token"]` keep working after the flip by reading hs["token"]
+    # (now the effective control token when the env injects one).
+    hs = dict(hs)
+    hs["token"] = control_token(hs)
     return s, hs
 
 def send_line(sock, obj):
