@@ -1850,6 +1850,10 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "wsl_health" => wsl_health(ctx),
         "recent_sessions" => recent_sessions(),
         "invalidate_recent_cache" => invalidate_recent_cache(),
+        // "Is the general dictating?" - reads the Scribe voice-gate status file
+        // (fails open to listening=false when it can't tell). Lets agents defer
+        // a spoken cue / a barge-in while the user is talking.
+        "scribe_status" => scribe_status(),
         "claude_usage" => claude_usage(),
         "codex_usage" => codex_usage(),
         "host_metrics" => host_metrics(ctx),
@@ -2165,6 +2169,15 @@ fn wsl_health(ctx: &ControlContext) -> Result<Value, String> {
 /// rather than the `wsl.exe`/UNC hop.
 fn recent_sessions() -> Result<Value, String> {
     serde_json::to_value(crate::recent::recent_sessions_cached()).map_err(|e| e.to_string())
+}
+
+/// `scribe_status` (read tier): the Scribe voice-gate - reads
+/// `~/.cache/com.natkins.scribe/status.json` and returns
+/// `{listening, status, since}`, failing open to `listening: false` on a
+/// missing / torn / stale / dead-pid file (see crate::scribe). Lets an agent
+/// ask "is the general dictating right now?".
+fn scribe_status() -> Result<Value, String> {
+    serde_json::to_value(crate::scribe::read_scribe_status()).map_err(|e| e.to_string())
 }
 
 /// `invalidate_recent_cache` (Tier 3 reap): drop the recent-sessions cache so a
@@ -5530,6 +5543,19 @@ mod tests {
         assert_eq!(v["captains"][0]["captainSessionId"], "cap-1");
         assert_eq!(v["captains"][0]["workspaceTabIds"][0], "tab-1");
         assert_eq!(v["captains"][0]["crew"], json!([]));
+    }
+
+    #[test]
+    fn scribe_status_dispatches_and_returns_a_listening_bool() {
+        // The read-tier scribe voice-gate: dispatches to crate::scribe and
+        // always returns an object with a boolean `listening` field, whatever
+        // the on-disk file says (fail-open guarantees the shape). Asserting the
+        // shape (not the value) keeps this deterministic whether or not a real
+        // Scribe status file exists on the test machine.
+        let ctx = test_ctx("secret");
+        let v = dispatch(&ctx, "scribe_status", &Value::Null).unwrap();
+        assert!(v.is_object());
+        assert!(v["listening"].is_boolean());
     }
 
     #[test]

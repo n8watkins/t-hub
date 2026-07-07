@@ -30,6 +30,7 @@ mod tray; // system-tray icon + close-to-tray (hide instead of quit) (#17)
 mod usage; // Claude plan usage via `claude -p /usage` (sidebar Usage strip)
 mod codex; // Codex plan usage, read from ~/.codex/sessions rollout files (sidebar)
 mod voice; // Settings > Voice: voice.json persistence + loopback Piper TTS proxy (no browser Origin)
+mod scribe; // Scribe voice-gate: read ~/.cache/com.natkins.scribe/status.json ("is the general dictating?")
 mod win_snap; // Windows 11 Snap Layouts + native edge-resize on the frameless window (no-op on unix)
 
 use agent::AgentBridge;
@@ -637,6 +638,8 @@ pub fn run() {
             voice::voice_settings_write,
             voice::voice_list_voices,
             voice::voice_tts,
+            // Scribe voice-gate: "is the general dictating?" (fails open).
+            scribe::scribe_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running T-Hub");

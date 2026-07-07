@@ -89,6 +89,11 @@ base64 = "0.22"
 # server rejects browser-origin requests.
 ureq = { version = "2", default-features = false }
 uuid = { version = "1", features = ["v4"] }
+# OS cache-dir resolution for the Scribe voice-gate status file (scribe.rs):
+# LOCALAPPDATA on Windows, ~/.cache on Linux, ~/Library/Caches on macOS - so the
+# reader points at Scribe's Tauri app_cache_dir on whatever OS T-Hub runs on.
+# Already in the tree transitively; this makes it a direct dependency.
+dirs = "6"
 # PNG-encode a pasted clipboard image to a temp file (dropin.rs / Lane C). Only
 # the png codec is enabled to keep the build lean; `image` is already in the tree
 # transitively, so this just turns on the encoder we need.
@@ -115,6 +120,10 @@ t-hub-protocol = { path = "crates/t-hub-protocol" }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    # OpenProcess/CloseHandle for the Scribe voice-gate pid-liveness check
+    # (scribe.rs): T-Hub-on-Windows confirms Scribe's pid is alive so a long
+    # continuous dictation holds regardless of the status file's mtime.
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_HiDpi",
