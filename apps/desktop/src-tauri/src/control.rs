@@ -787,6 +787,10 @@ impl CaptainsRegistry {
     ///
     /// `ship_slug` is slugified; empty/absent falls back to `ship-<sessionId>` so
     /// a UI pin (which has no ship name) always claims something addressable.
+    ///
+    /// Idempotent: a re-claim that would change NOTHING (same slug, and no new
+    /// workspace tabs) does not bump the revision or persist - the caller sees an
+    /// unchanged `seq` and skips the redundant `sync_captains` forward.
     pub fn claim(
         &self,
         captain_session_id: &str,
@@ -812,15 +816,24 @@ impl CaptainsRegistry {
                 other.captain_session_id
             ));
         }
+        let mut changed = true;
         let record = match g
             .captains
             .iter_mut()
             .find(|c| c.captain_session_id == captain_session_id)
         {
             Some(c) => {
-                c.ship_slug = slug;
-                if !workspace_tab_ids.is_empty() {
-                    c.workspace_tab_ids = workspace_tab_ids;
+                // Would this re-claim actually change anything? An empty
+                // workspace_tab_ids means "leave the tabs as they are".
+                let tabs_change =
+                    !workspace_tab_ids.is_empty() && c.workspace_tab_ids != workspace_tab_ids;
+                if c.ship_slug == slug && !tabs_change {
+                    changed = false;
+                } else {
+                    c.ship_slug = slug;
+                    if !workspace_tab_ids.is_empty() {
+                        c.workspace_tab_ids = workspace_tab_ids;
+                    }
                 }
                 c.clone()
             }
@@ -835,8 +848,10 @@ impl CaptainsRegistry {
                 record
             }
         };
-        g.seq += 1;
-        self.persist_locked(&g);
+        if changed {
+            g.seq += 1;
+            self.persist_locked(&g);
+        }
         Ok(record)
     }
 
@@ -2941,12 +2956,25 @@ fn captains_sync_apply(ctx: &ControlContext) -> bool {
 /// `sessionId`) required; `shipSlug` optional (slugified; defaults to
 /// `ship-<sessionId>`); `workspaceTabIds` optional (defaults to the tab currently
 /// holding the captain's tile, when the tab registry knows one).
+///
+/// LIVENESS: the session must be a LIVE terminal (`th_<id>` exists in tmux) - a
+/// claim for a dead/unknown session would persist and linger forever (nothing
+/// ever kills a session that never existed). A re-claim that changes nothing is
+/// idempotent: `seq` is unchanged and no redundant `sync_captains` is forwarded.
 fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let captain_session_id = arg_str(args, "captainSessionId")
         .or_else(|| arg_str(args, "captain_session_id"))
         .or_else(|| arg_str(args, "sessionId"))
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("claim_captain requires a 'captainSessionId' argument")?;
+    // Liveness: refuse a claim for a session with no live terminal, so a bogus
+    // or raced id can never be persisted into captains.json to linger forever.
+    if !tmux::has_session(&tmux_target(&captain_session_id)) {
+        return Err(format!(
+            "claim_captain: no live terminal for session '{captain_session_id}' \
+             (spawn or attach it first - a claim for a dead session would linger)"
+        ));
+    }
     let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
     let workspace_tab_ids: Vec<String> = args
         .get("workspaceTabIds")
@@ -2965,11 +2993,14 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
                 .into_iter()
                 .collect()
         });
+    let before_seq = ctx.captains.snapshot().seq;
     let record = ctx
         .captains
         .claim(&captain_session_id, ship_slug.as_deref(), workspace_tab_ids)?;
-    let applied = captains_sync_apply(ctx);
     let snap = ctx.captains.snapshot();
+    // Idempotent re-claim (unchanged): the registry left `seq` alone, so skip the
+    // redundant forward. A real change bumps `seq` and forwards the snapshot.
+    let applied = snap.seq != before_seq && captains_sync_apply(ctx);
     Ok(json!({
         "accepted": "claim_captain",
         "audited": true,
@@ -5510,51 +5541,126 @@ mod tests {
         ctx.tab_registry().replace(vec![TabRecord {
             id: "tab-1".into(),
             name: "Main".into(),
-            tile_ids: vec!["cap-1".into()],
+            tile_ids: vec![],
         }]);
+        // A LIVE terminal to claim (the liveness gate): spawn it into tab-1.
+        let cap_id = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // Claim with NO explicit workspaceTabIds: defaults to the tab holding
         // the captain's tile (the UI pin path sends exactly this shape).
-        let v = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": "cap-1"})).unwrap();
+        let v = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": cap_id})).unwrap();
         assert_eq!(v["accepted"], "claim_captain");
         assert_eq!(v["audited"], true);
         assert_eq!(v["applied"], true);
-        assert_eq!(v["captain"]["shipSlug"], "ship-cap-1");
+        assert_eq!(v["captain"]["shipSlug"], format!("ship-{cap_id}"));
         assert_eq!(v["captain"]["workspaceTabIds"], json!(["tab-1"]));
-        assert_eq!(v["seq"], 1);
+        assert_eq!(v["captain"]["captainSessionId"], cap_id);
 
-        let v = dispatch(&ctx, "release_captain", &json!({"shipSlug": "ship-cap-1"})).unwrap();
+        let v = dispatch(&ctx, "release_captain", &json!({"captainSessionId": cap_id})).unwrap();
         assert_eq!(v["accepted"], "release_captain");
-        assert_eq!(v["released"]["captainSessionId"], "cap-1");
+        assert_eq!(v["released"]["captainSessionId"], cap_id);
         assert_eq!(v["captains"], json!([]));
 
-        // Both mutations forwarded the authoritative captains snapshot to the
-        // UI as sync_captains (the captains twin of the tab sync contract).
-        let calls = sink.calls.lock().unwrap();
-        let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
-        assert_eq!(names, ["sync_captains", "sync_captains"]);
-        assert_eq!(calls[0].1["sync"]["seq"], 1);
-        assert_eq!(calls[0].1["sync"]["captains"][0]["captainSessionId"], "cap-1");
-        assert_eq!(calls[1].1["sync"]["seq"], 2);
-        assert_eq!(calls[1].1["sync"]["captains"], json!([]));
+        // The claim + release each forwarded a sync_captains snapshot (filtering
+        // out the spawn_terminal forward that seeded the live session).
+        let sync_calls: Vec<_> = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| c == "sync_captains")
+            .cloned()
+            .collect();
+        assert_eq!(sync_calls.len(), 2);
+        assert_eq!(sync_calls[0].1["sync"]["captains"][0]["captainSessionId"], cap_id);
+        assert_eq!(sync_calls[1].1["sync"]["captains"], json!([]));
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": cap_id})).unwrap();
     }
 
     #[test]
-    fn claim_conflicts_and_bad_release_are_dispatch_errors() {
-        let ctx = test_ctx("t");
-        dispatch(&ctx, "claim_captain", &json!({"captainSessionId": "cap-1", "shipSlug": "alpha"}))
+    fn claim_conflicts_liveness_and_bad_release_are_dispatch_errors() {
+        let ctx = test_ctx("t").with_apply_sink(Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        }));
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
+        let id1 = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let id2 = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        dispatch(&ctx, "claim_captain", &json!({"captainSessionId": id1, "shipSlug": "alpha"}))
             .unwrap();
+        // A DIFFERENT live captain claiming the same ship is refused.
         let err = dispatch(
             &ctx,
             "claim_captain",
-            &json!({"captainSessionId": "cap-2", "shipSlug": "alpha"}),
+            &json!({"captainSessionId": id2, "shipSlug": "alpha"}),
         )
         .unwrap_err();
         assert!(err.contains("already captained"), "got: {err}");
+        // A claim for a DEAD/unknown session is refused by the liveness gate
+        // (else it would persist and linger forever).
+        let err =
+            dispatch(&ctx, "claim_captain", &json!({"captainSessionId": "nonexistent"})).unwrap_err();
+        assert!(err.contains("no live terminal"), "got: {err}");
         let err = dispatch(&ctx, "release_captain", &json!({"shipSlug": "nope"})).unwrap_err();
         assert!(err.contains("no claim matches"), "got: {err}");
         assert!(dispatch(&ctx, "claim_captain", &json!({})).is_err());
         assert!(dispatch(&ctx, "release_captain", &json!({})).is_err());
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id1})).unwrap();
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id2})).unwrap();
+    }
+
+    #[test]
+    fn idempotent_reclaim_does_not_bump_seq_or_forward() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "tab-1".into(),
+            name: "Main".into(),
+            tile_ids: vec![],
+        }]);
+        let id = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let v1 = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": id})).unwrap();
+        assert_eq!(v1["applied"], true);
+        let seq1 = v1["seq"].as_u64().unwrap();
+        // An identical re-claim changes nothing: seq stays put, no second forward.
+        let v2 = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": id})).unwrap();
+        assert_eq!(v2["seq"].as_u64().unwrap(), seq1, "unchanged re-claim must not bump seq");
+        assert_eq!(v2["applied"], false, "unchanged re-claim must not forward");
+        let sync_count = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| c == "sync_captains")
+            .count();
+        assert_eq!(sync_count, 1, "only the first (changing) claim forwards");
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
     }
 
     #[test]

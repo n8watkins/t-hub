@@ -9,10 +9,10 @@
 //! Tiers (PRD §11.2):
 //!   - **Read** (allowed): `list_terminals`, `get_status`, `wait_for_status`,
 //!     `supervision_tree`, `wsl_health`, `search_files`, `list_tabs`,
-//!     `read_terminal`.
+//!     `list_captains`, `read_terminal`.
 //!   - **Organization** (allowed, audited): `focus_session`, `move_tile`,
-//!     `rename_tab`, `new_tab`, `focus_tab`, `open_file`, `create_worktree`,
-//!     `remove_worktree`.
+//!     `rename_tab`, `new_tab`, `focus_tab`, `close_tab`, `claim_captain`,
+//!     `release_captain`, `open_file`, `create_worktree`, `remove_worktree`.
 //!   - **Process-changing** (confirmation required): `spawn_terminal`,
 //!     `send_text`, `send_keys`, `close_terminal`.
 //!   - **Theme**: `get_theme`, `set_theme` — forwarded by name verbatim.
