@@ -20,7 +20,11 @@
 import { useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
-import { useWorkspace, deriveLabel } from "../store/workspace";
+import {
+  useWorkspace,
+  deriveLabel,
+  CAPTAINS_TAB_ID,
+} from "../store/workspace";
 import type { WorkspaceTab } from "../store/workspace";
 import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
 import { useSupervision, sessionStatusForTmux } from "../store/supervision";
@@ -316,7 +320,9 @@ export function WorkspacesList() {
           // projects become recallable from Recent immediately. Hidden on the last
           // remaining workspace (closeWorkspace keeps at least one).
           onClose={() => closeWorkspace(tab.id)}
-          canClose={tabs.length > 1}
+          // The reserved Captains tab is never closeable (the store refuses it
+          // too); hide its × so the affordance matches the behavior.
+          canClose={tabs.length > 1 && tab.id !== CAPTAINS_TAB_ID}
         />
       ))}
     </ul>
@@ -583,19 +589,23 @@ function WorkspaceRow({
           </button>
         )}
         {/* Item 4: pop this workspace out into its own window (re-homed here from
-            the removed top tab strip). Reveals on row hover. */}
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            void popOutTab(tab.id);
-          }}
-          className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-neutral-400 opacity-0 transition-opacity hover:bg-neutral-700/50 hover:text-white group-hover:opacity-100"
-          title="Pop out into a new window"
-          aria-label={`Pop out ${tab.name} into a new window`}
-        >
-          <PopOutIcon />
-        </button>
+            the removed top tab strip). Reveals on row hover. The reserved Captains
+            tab stays in the main window (its tiles are the agents' home), so it
+            offers no pop-out. */}
+        {tab.id !== CAPTAINS_TAB_ID && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              void popOutTab(tab.id);
+            }}
+            className="mr-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded text-neutral-400 opacity-0 transition-opacity hover:bg-neutral-700/50 hover:text-white group-hover:opacity-100"
+            title="Pop out into a new window"
+            aria-label={`Pop out ${tab.name} into a new window`}
+          >
+            <PopOutIcon />
+          </button>
+        )}
         {/* Close the whole workspace (hover-revealed; hidden on the last one). */}
         {canClose && (
           <button

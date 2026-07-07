@@ -19,7 +19,11 @@ vi.mock("./TerminalPool", () => ({
 
 import { CaptainsList } from "./CaptainsList";
 import { useCaptain, type CaptainClaimRecord } from "../store/captain";
-import { useWorkspace, type WorkspaceTab } from "../store/workspace";
+import {
+  useWorkspace,
+  CAPTAINS_TAB_ID,
+  type WorkspaceTab,
+} from "../store/workspace";
 import { useSupervision } from "../store/supervision";
 import type { SessionStatus, StatusSnapshot, SupervisionTree } from "../ipc/model";
 import type { TerminalInfo } from "../ipc/types";
@@ -253,14 +257,15 @@ describe("CaptainsList workspace-relevant ordering", () => {
 });
 
 describe("CaptainsList click-to-focus wiring", () => {
-  it("clicking a row opens the deck FOCUSED on that agent (not the overlay)", () => {
+  it("clicking a row navigates to the Captains tab and focuses that agent's tile", () => {
     render(<CaptainsList />);
-    fireEvent.click(within(row("bbb00001")).getByTitle(/Open in the deck/));
-    const s = useCaptain.getState();
-    expect(s.deckOpen).toBe(true);
-    expect(s.deckFocusId).toBe("bbb00001");
-    // The floating overlay is NOT opened by the deck-focus click.
-    expect(s.open).toBe(false);
+    fireEvent.click(within(row("bbb00001")).getByTitle(/Open in Captains/));
+    const ws = useWorkspace.getState();
+    // The reserved Captains tab is now active and the agent's tile is focused.
+    expect(ws.activeTabId).toBe(CAPTAINS_TAB_ID);
+    expect(ws.focusedId).toBe("bbb00001");
+    // The floating overlay is NOT opened by a row click.
+    expect(useCaptain.getState().open).toBe(false);
   });
 });
 

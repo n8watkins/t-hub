@@ -18,8 +18,11 @@ import {
   CAPTAIN_DEFAULT_HEIGHT,
   type CaptainClaimRecord,
 } from "./captain";
-import { useWorkspace, type WorkspaceTab } from "./workspace";
-import { usePanels } from "./panels";
+import {
+  useWorkspace,
+  CAPTAINS_TAB_ID,
+  type WorkspaceTab,
+} from "./workspace";
 import type { TerminalInfo } from "../ipc/types";
 
 // Capture the store's fire-and-forget server captaincy mutations (phase 2:
@@ -74,8 +77,6 @@ beforeEach(() => {
   useCaptain.setState({
     claims: {},
     orchestratorId: null,
-    deckOpen: false,
-    deckFocusId: null,
   });
 });
 
@@ -564,7 +565,7 @@ describe("phase 2: pinning is claiming (server captains registry)", () => {
   });
 });
 
-describe("orchestrator designation (captains deck)", () => {
+describe("orchestrator designation", () => {
   it("setOrchestratorId designates the terminal and persists (round-trip)", () => {
     useCaptain.getState().setOrchestratorId("cap00001");
     expect(useCaptain.getState().orchestratorId).toBe("cap00001");
@@ -572,6 +573,58 @@ describe("orchestrator designation (captains deck)", () => {
     const raw = localStorage.getItem("t-hub.captain.v2");
     expect(JSON.parse(raw!).orchestratorId).toBe("cap00001");
     expect(loadCaptainPersisted().orchestratorId).toBe("cap00001");
+  });
+
+  it("designating the orchestrator moves its tile INTO the reserved Captains tab", () => {
+    // cap00001 starts in the work tab "t1".
+    useCaptain.getState().setOrchestratorId("cap00001");
+    const ws = useWorkspace.getState();
+    const captains = ws.tabs.find((t) => t.id === CAPTAINS_TAB_ID);
+    expect(captains?.order).toContain("cap00001");
+    // ...and OUT of the work tab.
+    expect(ws.tabs.find((t) => t.id === "t1")?.order).not.toContain("cap00001");
+  });
+
+  it("un-designating the orchestrator returns its tile to a work tab", () => {
+    // ccc00001 is a plain tile (not a pinned captain), so clearing the
+    // orchestrator returns it to a work tab.
+    useCaptain.getState().setOrchestratorId("ccc00001");
+    useCaptain.getState().setOrchestratorId(null);
+    const ws = useWorkspace.getState();
+    expect(
+      ws.tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order,
+    ).not.toContain("ccc00001");
+    // Back in a normal (non-reserved) work tab.
+    const workTab = ws.tabs.find(
+      (t) => t.id !== CAPTAINS_TAB_ID && t.order.includes("ccc00001"),
+    );
+    expect(workTab).toBeTruthy();
+  });
+
+  it("pinning a captain moves its tile into the Captains tab; unpinning returns it", () => {
+    useCaptain.getState().pinCaptain("ddd00001");
+    expect(
+      useWorkspace.getState().tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order,
+    ).toContain("ddd00001");
+    useCaptain.getState().unpinCaptain("ddd00001");
+    const ws = useWorkspace.getState();
+    expect(
+      ws.tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order,
+    ).not.toContain("ddd00001");
+    expect(
+      ws.tabs.some(
+        (t) => t.id !== CAPTAINS_TAB_ID && t.order.includes("ddd00001"),
+      ),
+    ).toBe(true);
+  });
+
+  it("unpinning a captain that is STILL the orchestrator keeps its tile in the Captains tab", () => {
+    useCaptain.getState().setOrchestratorId("ddd00001");
+    useCaptain.getState().pinCaptain("ddd00001");
+    useCaptain.getState().unpinCaptain("ddd00001"); // still orchestrator
+    expect(
+      useWorkspace.getState().tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order,
+    ).toContain("ddd00001");
   });
 
   it("setOrchestratorId(null) clears the designation and persists the clear", () => {
@@ -609,30 +662,6 @@ describe("orchestrator designation (captains deck)", () => {
   });
 });
 
-describe("captains deck view state", () => {
-  it("opening the deck clears a fullscreen tile, the overlay, and the anchor dropdown", () => {
-    // A fullscreen tile puts the pool at z-50 (over the z-40 deck); the deck
-    // must clear it on open, or the tile paints over the deck (and Esc would be
-    // ambiguous between exiting fullscreen and closing the deck).
-    usePanels.setState({ fullscreenId: "cap00001" });
-    useCaptain.setState({ open: true, anchorMenuOpen: true });
-    useCaptain.getState().setDeckOpen(true);
-    expect(useCaptain.getState().deckOpen).toBe(true);
-    expect(useCaptain.getState().open).toBe(false);
-    expect(useCaptain.getState().anchorMenuOpen).toBe(false);
-    expect(usePanels.getState().fullscreenId).toBeNull();
-  });
-
-  it("toggleDeck flips deckOpen and clears fullscreen when opening", () => {
-    usePanels.setState({ fullscreenId: "cap00001" });
-    useCaptain.getState().toggleDeck();
-    expect(useCaptain.getState().deckOpen).toBe(true);
-    expect(usePanels.getState().fullscreenId).toBeNull();
-    useCaptain.getState().toggleDeck();
-    expect(useCaptain.getState().deckOpen).toBe(false);
-  });
-});
-
 describe("orchestrator reconcile on adopt", () => {
   it("clears a STALE orchestrator whose terminal is no longer present", () => {
     useCaptain.getState().setOrchestratorId("cap00001");
@@ -664,7 +693,7 @@ describe("orchestrator reconcile on adopt", () => {
   });
 });
 
-describe("agent hierarchy + deck focus", () => {
+describe("agent hierarchy", () => {
   it("agentOrder puts the orchestrator FIRST, then captains, deduped", () => {
     expect(agentOrder({ orchestratorId: null, captainIds: ["a", "b"] })).toEqual([
       "a",
@@ -680,63 +709,5 @@ describe("agent hierarchy + deck focus", () => {
       "b",
       "a",
     ]);
-  });
-
-  it("focusAgent opens the deck spotlighted on that agent", () => {
-    useCaptain.getState().focusAgent("cap00001");
-    const s = useCaptain.getState();
-    expect(s.deckOpen).toBe(true);
-    expect(s.deckFocusId).toBe("cap00001");
-    // Opening the deck retires the floating overlay (mutually exclusive).
-    expect(s.open).toBe(false);
-  });
-
-  it("opening the deck with no explicit focus defaults to the orchestrator", () => {
-    useCaptain.setState({ orchestratorId: "cap00001", deckFocusId: null });
-    useCaptain.getState().setDeckOpen(true);
-    expect(useCaptain.getState().deckFocusId).toBe("cap00001");
-  });
-
-  it("opening the deck falls back to the MRU captain when no orchestrator", () => {
-    useCaptain.setState({
-      captainIds: ["cap00001", "bbb00001"],
-      orchestratorId: null,
-      deckFocusId: null,
-    });
-    useCaptain.getState().setDeckOpen(true);
-    expect(useCaptain.getState().deckFocusId).toBe("cap00001");
-  });
-
-  it("setDeckFocus changes the spotlight without opening/closing the deck", () => {
-    useCaptain.setState({ deckOpen: true, deckFocusId: "cap00001" });
-    useCaptain.getState().setDeckFocus("bbb00001");
-    expect(useCaptain.getState().deckFocusId).toBe("bbb00001");
-    expect(useCaptain.getState().deckOpen).toBe(true);
-  });
-
-  it("forgetCaptain clears a dead deck focus", () => {
-    useCaptain.setState({ deckFocusId: "cap00001" });
-    forgetCaptain("cap00001");
-    expect(useCaptain.getState().deckFocusId).toBeNull();
-  });
-});
-
-describe("deck / overlay mutual exclusion", () => {
-  it("summoning a captain while the deck is open retires the deck (no double-attach)", () => {
-    // Both full-view surfaces must never be open at once - else the captain's
-    // pooled terminal has two active placeholders (deck panel + overlay body).
-    useCaptain.setState({ deckOpen: true, deckFocusId: "cap00001" });
-    useCaptain.getState().summonCaptain("cap00001");
-    const s = useCaptain.getState();
-    expect(s.open).toBe(true); // overlay summoned
-    expect(s.deckOpen).toBe(false); // deck retired
-  });
-
-  it("closing the deck clears the spotlight so the next open defaults to the orchestrator", () => {
-    useCaptain.setState({ orchestratorId: "cap00001", deckOpen: true, deckFocusId: "bbb00001" });
-    useCaptain.getState().setDeckOpen(false);
-    expect(useCaptain.getState().deckFocusId).toBeNull();
-    useCaptain.getState().setDeckOpen(true);
-    expect(useCaptain.getState().deckFocusId).toBe("cap00001"); // orchestrator
   });
 });

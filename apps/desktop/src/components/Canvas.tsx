@@ -159,9 +159,6 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   // also routes through the single dispatch point, so it must ARM the
   // listener below even when nothing else is up.
   const anchorMenuOpen = useCaptain((s) => s.anchorMenuOpen);
-  // The captains deck (a full-view surface) also dismisses via the single Esc
-  // dispatch point, so it arms the listener below too.
-  const deckOpen = useCaptain((s) => s.deckOpen);
 
   // Seed the live terminal set and keep lifecycle state in sync with the backend.
   useEffect(() => {
@@ -390,7 +387,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   // interrupts the summoned captain (literal Esc passthrough), plain Esc
   // dismisses the dropdown, then the overlay, else exits fullscreen.
   useEffect(() => {
-    if (!overlayEscapeArmed({ fullscreenId, captainOpen, anchorMenuOpen, deckOpen }))
+    if (!overlayEscapeArmed({ fullscreenId, captainOpen, anchorMenuOpen }))
       return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
@@ -401,7 +398,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [fullscreenId, captainOpen, anchorMenuOpen, deckOpen]);
+  }, [fullscreenId, captainOpen, anchorMenuOpen]);
 
   return (
     <div
@@ -618,15 +615,6 @@ function TabGrid({
   // placeholder; that tile's grid copy must not register/steal it (exactly the
   // fullscreen slotActive rule). Null when the overlay is closed.
   const summonedCaptainId = useCaptain((s) => (s.open ? s.activeCaptainId : null));
-  // While the DECK is open it owns every AGENT's pool placeholder (the deck
-  // panel body). Those agents' grid tiles must YIELD their slot (exactly the
-  // overlay/fullscreen rule) so only the deck's placeholder is registered per id
-  // - no double-attach, no last-writer race.
-  const deckOpen = useCaptain((s) => s.deckOpen);
-  const deckOrchestratorId = useCaptain((s) => s.orchestratorId);
-  const deckCaptainIds = useCaptain((s) => s.captainIds);
-  const yieldsToDeck = (id: TerminalId): boolean =>
-    deckOpen && (id === deckOrchestratorId || deckCaptainIds.includes(id));
 
   // Local, editable copy of the flex weights so dragging is smooth (we only
   // write through to the store at pointer-up). Re-derived whenever the tab's
@@ -1005,13 +993,9 @@ function TabGrid({
                     // When this tile is fullscreen, its fullscreen copy (Canvas)
                     // owns the pool placeholder; this covered grid copy must not
                     // re-register and steal it, so it yields the slot. Same rule
-                    // when it's the summoned captain (the overlay owns the slot)
-                    // or when it's an agent the deck is showing (the deck panel
-                    // owns the slot).
+                    // when it's the summoned captain (the overlay owns the slot).
                     slotActive={
-                      id !== fullscreenId &&
-                      id !== summonedCaptainId &&
-                      !yieldsToDeck(id)
+                      id !== fullscreenId && id !== summonedCaptainId
                     }
                     // #20: the xterm body lives in the persistent pool overlay,
                     // not in the tile — the tile renders header + placeholder.

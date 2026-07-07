@@ -137,6 +137,32 @@ const MAX_FONT_SIZE = 28;
 const DEFAULT_TAB_NAME = "Workspace 1";
 
 /**
+ * The RESERVED "Captains" workspace tab (captains-workspace-tab). A normal
+ * workspace tab - it renders ordinary terminal tiles through the same Canvas /
+ * pool as any tab - but it is the agents' home: the orchestrator tile and every
+ * pinned captain tile live here, kept OUT of the work tabs. It is:
+ *   - fixed-id (a stable well-known id, so no `reserved` field is needed and the
+ *     backend tab registry can't drift a second copy into existence);
+ *   - always present (finalizeLayout auto-creates it; adoptRegistry re-injects it
+ *     so a server snapshot can't drop it);
+ *   - not closeable (closeTab/closeWorkspace refuse it).
+ * Its `order` is the authoritative record of which tiles are placed as agents,
+ * which is how placement survives a server registry sync without coupling this
+ * store to the captain store.
+ */
+export const CAPTAINS_TAB_ID = "captains-reserved";
+export const CAPTAINS_TAB_NAME = "Captains";
+
+/** Return `tabs` guaranteed to contain the reserved Captains tab: if absent,
+ *  append a fresh empty one. Preserves an existing Captains tab as-is. Shared by
+ *  finalizeLayout (load) and adoptRegistry (server sync) so the reserved tab can
+ *  never be lost. */
+function ensureReservedCaptainsTab(tabs: WorkspaceTab[]): WorkspaceTab[] {
+  if (tabs.some((t) => t.id === CAPTAINS_TAB_ID)) return tabs;
+  return [...tabs, { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: [] }];
+}
+
+/**
  * Manual-mode size ratios for one tab's grid. `rows` holds a flex-grow weight
  * per grid row; `cols[r]` holds a weight per tile within row `r`. Weights are
  * relative (the grid normalizes them), so any positive numbers work. Empty /
@@ -436,6 +462,18 @@ interface WorkspaceState {
    *  current tab and append it to `tabId`. The terminal/agent stay attached and
    *  alive; the active tab and (where possible) focus are left untouched. */
   moveTileToTab: (id: TerminalId, tabId: string) => void;
+  /** Ensure the reserved Captains tab exists; returns its id (CAPTAINS_TAB_ID). */
+  ensureCaptainsTab: () => string;
+  /** Place a tile in the reserved Captains tab - designating it as an agent
+   *  (orchestrator / captain). Creates the tab if needed, then pulls the tile
+   *  from whatever tab it's in (or appends it if unplaced). Never steals the
+   *  active tab; hands focus to a neighbor if the moved tile was the active tab's
+   *  focused tile. No-op if the tile is already in the Captains tab. */
+  moveTileToCaptainsTab: (id: TerminalId) => void;
+  /** Return a tile from the Captains tab to a normal work tab - un-designating an
+   *  agent. Moves it to the first non-reserved tab (creating one if none exists).
+   *  No-op if the tile is not currently in the Captains tab. */
+  moveTileToWorkTab: (id: TerminalId) => void;
   /** Mark a tab as the active drag source (reorder), or null to clear. */
   setDraggingTab: (id: string | null) => void;
   /** Set the tile currently under the drag pointer (highlight only), or null. */
@@ -645,6 +683,9 @@ function finalizeLayout(layout: PersistedLayout): PersistedLayout {
       layout.tabs = [{ id: newTabId(), name: DEFAULT_TAB_NAME, order: [] }];
     }
   }
+  // The reserved Captains tab is always present (appended last so it never
+  // becomes the default-active tab, which is the first work tab).
+  layout.tabs = ensureReservedCaptainsTab(layout.tabs);
   if (!layout.tabs.some((t) => t.id === layout.activeTabId)) {
     layout.activeTabId = layout.tabs[0].id;
   }
@@ -1097,20 +1138,49 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       const { tabs, activeTabId, focusedId, terminals, poppedOutTabs } = get();
 
       const byId = new Map(tabs.map((t) => [t.id, t]));
-      const nextTabs: WorkspaceTab[] = regTabs.map((r) => {
+      // The reserved Captains tab is CLIENT-ONLY (the backend registry doesn't
+      // track it), and its `order` is the authoritative list of tiles placed as
+      // agents. Keep only agent tiles the server still reports live (a server-
+      // closed captain drops out of Captains and is cleaned up below like any
+      // gone tile), then hold those ids out of the server-derived work tabs so an
+      // agent tile never reappears in a work tab after a sync.
+      const serverTileIds = new Set(regTabs.flatMap((r) => r.tileIds));
+      const localCaptains = tabs.find((t) => t.id === CAPTAINS_TAB_ID);
+      const captainsOrder = (localCaptains?.order ?? []).filter((id) =>
+        serverTileIds.has(id),
+      );
+      const agentSet = new Set(captainsOrder);
+
+      const serverTabs: WorkspaceTab[] = regTabs.map((r) => {
         const existing = byId.get(r.id);
+        const order = r.tileIds.filter((id) => !agentSet.has(id));
         const sameOrder =
           existing !== undefined &&
-          existing.order.length === r.tileIds.length &&
-          existing.order.every((x, i) => x === r.tileIds[i]);
+          existing.order.length === order.length &&
+          existing.order.every((x, i) => x === order[i]);
         return {
           id: r.id,
           name: r.name.trim() || existing?.name || "Workspace",
-          order: [...r.tileIds],
+          order,
           // Manual grid ratios survive only if the tile set didn't change.
           sizes: sameOrder ? existing.sizes : undefined,
         };
       });
+      // Re-append the reserved Captains tab (never dropped by a server sync).
+      const nextTabs: WorkspaceTab[] = [
+        ...serverTabs,
+        {
+          id: CAPTAINS_TAB_ID,
+          name: CAPTAINS_TAB_NAME,
+          order: captainsOrder,
+          sizes:
+            localCaptains &&
+            localCaptains.order.length === captainsOrder.length &&
+            localCaptains.order.every((x, i) => x === captainsOrder[i])
+              ? localCaptains.sizes
+              : undefined,
+        },
+      ];
 
       // Deep-equal snapshots are a no-op (apply echoes must not churn persist /
       // the tab reporter).
@@ -1483,6 +1553,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     },
 
     closeWorkspace: (id) => {
+      // The reserved Captains tab is never closeable.
+      if (id === CAPTAINS_TAB_ID) return;
       // Tier 3 reap. ONLY the workspace × calls this; switch/pop-out never do, so
       // they can't kill. Mirror closeTab's last-tab guard BEFORE killing so a kill
       // never fires when closeTab would refuse to remove the tab.
@@ -1531,6 +1603,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
 
     closeTab: (id) => {
       const { tabs, activeTabId, focusedId, terminals } = get();
+      if (id === CAPTAINS_TAB_ID) return []; // reserved: never closeable
       if (tabs.length <= 1) return []; // keep at least one tab
       const target = tabs.find((t) => t.id === id);
       if (!target) return [];
@@ -1769,6 +1842,87 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       }
 
       set({ tabs: nextTabs, focusedId: nextFocus });
+      persist();
+    },
+
+    ensureCaptainsTab: () => {
+      const { tabs } = get();
+      if (tabs.some((t) => t.id === CAPTAINS_TAB_ID)) return CAPTAINS_TAB_ID;
+      set({
+        tabs: [
+          ...tabs,
+          { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: [] },
+        ],
+      });
+      persist();
+      return CAPTAINS_TAB_ID;
+    },
+
+    moveTileToCaptainsTab: (id) => {
+      get().ensureCaptainsTab();
+      const { tabs, activeTabId, focusedId } = get();
+      const source = tabOf(tabs, id);
+      if (source && source.id === CAPTAINS_TAB_ID) return; // already placed
+
+      const nextTabs = tabs.map((t) => {
+        if (source && t.id === source.id) {
+          return { ...t, order: t.order.filter((x) => x !== id), sizes: undefined };
+        }
+        if (t.id === CAPTAINS_TAB_ID) {
+          const order = t.order.includes(id) ? t.order : [...t.order, id];
+          return { ...t, order, sizes: undefined };
+        }
+        return t;
+      });
+
+      // Only touch focus if the moved tile was the active work tab's focused
+      // tile - never steal the active tab or the user's view.
+      let nextFocus = focusedId;
+      if (source && source.id === activeTabId && focusedId === id) {
+        const newOrder = source.order.filter((x) => x !== id);
+        nextFocus = neighborFocus(source.order, newOrder, id, focusedId);
+      }
+
+      set({ tabs: nextTabs, focusedId: nextFocus });
+      persist();
+    },
+
+    moveTileToWorkTab: (id) => {
+      const { tabs } = get();
+      const captains = tabs.find((t) => t.id === CAPTAINS_TAB_ID);
+      if (!captains || !captains.order.includes(id)) return; // not an agent tile
+
+      const target = tabs.find((t) => t.id !== CAPTAINS_TAB_ID);
+      if (target) {
+        const nextTabs = tabs.map((t) => {
+          if (t.id === CAPTAINS_TAB_ID) {
+            return {
+              ...t,
+              order: t.order.filter((x) => x !== id),
+              sizes: undefined,
+            };
+          }
+          if (t.id === target.id) {
+            return { ...t, order: [...t.order, id], sizes: undefined };
+          }
+          return t;
+        });
+        set({ tabs: nextTabs });
+      } else {
+        // No work tab exists (all-reserved edge): mint a fresh one, work tabs
+        // first so the reserved tab stays at the end.
+        const fresh: WorkspaceTab = {
+          id: newTabId(),
+          name: DEFAULT_TAB_NAME,
+          order: [id],
+        };
+        const pruned = tabs.map((t) =>
+          t.id === CAPTAINS_TAB_ID
+            ? { ...t, order: t.order.filter((x) => x !== id), sizes: undefined }
+            : t,
+        );
+        set({ tabs: [fresh, ...pruned] });
+      }
       persist();
     },
 

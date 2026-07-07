@@ -5,7 +5,11 @@
 // not re-spawned.
 import { beforeEach, describe, expect, it } from "vitest";
 import { applyControl } from "./controlBridge";
-import { useWorkspace, type WorkspaceTab } from "../store/workspace";
+import {
+  useWorkspace,
+  CAPTAINS_TAB_ID,
+  type WorkspaceTab,
+} from "../store/workspace";
 import type { TerminalInfo } from "./types";
 
 function term(id: string): TerminalInfo {
@@ -85,7 +89,13 @@ describe("applyControl (headless-org forwards)", () => {
       ]),
     });
     const s = useWorkspace.getState();
-    expect(s.tabs.map((t) => t.id)).toEqual(["t1", "t2", "t3"]);
+    // The reserved Captains tab is always re-appended by adoptRegistry.
+    expect(s.tabs.map((t) => t.id)).toEqual([
+      "t1",
+      "t2",
+      "t3",
+      CAPTAINS_TAB_ID,
+    ]);
     expect(s.activeTabId).toBe("t1");
   });
 
@@ -115,7 +125,7 @@ describe("applyControl (headless-org forwards)", () => {
       sync: sync([{ id: "t1", name: "Workspace 1", tileIds: ["a"] }]),
     });
     const s = useWorkspace.getState();
-    expect(s.tabs.map((t) => t.id)).toEqual(["t1"]);
+    expect(s.tabs.map((t) => t.id)).toEqual(["t1", CAPTAINS_TAB_ID]);
     expect(s.activeTabId).toBe("t1");
   });
 
