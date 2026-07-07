@@ -41,7 +41,6 @@ import {
 import { sessionNameForTerminal } from "../store/sessionContext";
 import {
   CaptainStatusDot,
-  useCaptainDisplayLabel,
   useWorkspaceNameForTerminal,
   stableCaptainIdentity,
 } from "./CaptainOverlay";
@@ -49,6 +48,7 @@ import { useCrewSummary } from "../hooks/useCrewSummary";
 import { SupervisionTreeView } from "./SupervisionTree";
 import { ContextMeter } from "./ContextMeter";
 import { ChevronIcon } from "./SidebarChrome";
+import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
 
 /** Navigate to the reserved Captains workspace tab and focus an agent's live
  *  terminal tile - the sidebar-row click behavior now that agents live as
@@ -79,46 +79,60 @@ function cwdBranch(cwd: string): string {
   return "";
 }
 
-/** The list body: captains whose tile lives in the ACTIVE workspace tab float
- *  to the top (workspace-relevant context), MRU order within each group. */
-/** The sidebar's top-of-hierarchy ORCHESTRATOR row: status dot + stable
- *  identity + an orchestrator badge; clicking navigates to the Captains tab and
- *  focuses its tile. Renders only when an orchestrator is designated AND it is
- *  not already shown as a pinned captain in the list below (dedupe the
- *  hierarchy). */
+/** The SPECIAL orchestrator glyph: a crown, marking Cortana as the entity that
+ *  commands the fleet (visually distinct from the captains below it while the
+ *  status dot / context stay at full parity). Inline SVG in the app's icon
+ *  idiom (viewBox 24, currentColor stroke) so its color tracks the accent in
+ *  both themes; sized to sit next to the row's status dot. */
+function OrchestratorCrownIcon({ size = 13 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      className="pointer-events-none shrink-0"
+      aria-hidden
+    >
+      {/* A five-point crown: outer points + a base band. */}
+      <path d="M3 8l3.5 3L12 5l5.5 6L21 8l-1.8 9.2a1 1 0 0 1-.98.8H5.78a1 1 0 0 1-.98-.8L3 8z" />
+    </svg>
+  );
+}
+
+/** The sidebar's top-of-hierarchy ORCHESTRATOR row (Cortana): the SAME rich
+ *  agent row the captains get - live status dot, supervision status, workspace
+ *  context chips, claim / needs-input treatment - differing only by (a) the
+ *  fixed "Cortana" name and (b) the crown badge marking it as the orchestrator.
+ *  It renders the shared `AgentRow` body so parity can never drift. Clicking
+ *  navigates to the Captains tab and focuses its tile. Renders only when an
+ *  orchestrator is designated AND it is not already shown as a pinned captain in
+ *  the list below (dedupe the hierarchy). */
 export function OrchestratorRow() {
   const orchestratorId = useCaptain((s) => s.orchestratorId);
   const isAlsoCaptain = useCaptain(
     (s) => orchestratorId != null && s.captainIds.includes(orchestratorId),
   );
-  const identity = useCaptainDisplayLabel(orchestratorId ?? "");
+  const activeCaptainId = useCaptain((s) => s.activeCaptainId);
+  // The active tab's tile order: the orchestrator row floats + flags the accent
+  // marker when its tile lives in the active workspace, exactly like captains.
+  const inActiveWorkspace = useWorkspace((s) => {
+    if (orchestratorId == null) return false;
+    return (
+      s.tabs
+        .find((t) => t.id === s.activeTabId)
+        ?.order.includes(orchestratorId) ?? false
+    );
+  });
   if (!orchestratorId || isAlsoCaptain) return null;
   return (
-    <div className="flex flex-col gap-0.5 px-2 pt-1" data-orchestrator-row>
-      <button
-        type="button"
-        onClick={() => revealAgent(orchestratorId)}
-        title={`Open in Captains - ${identity} (orchestrator)`}
-        className="group relative flex min-w-0 items-center gap-2 rounded-lg py-1.5 pr-2 text-left transition-colors hover:bg-neutral-800/25"
-      >
-        <CaptainStatusDot terminalId={orchestratorId} size={10} />
-        <span
-          className="min-w-0 flex-1 truncate text-xs font-semibold"
-          style={{ color: "var(--th-fg)" }}
-        >
-          {identity}
-        </span>
-        <span
-          className="shrink-0 rounded px-1 text-[8px] font-semibold uppercase tracking-wide"
-          style={{
-            color: "var(--th-accent)",
-            backgroundColor:
-              "color-mix(in srgb, var(--th-accent) 15%, transparent)",
-          }}
-        >
-          orchestrator
-        </span>
-      </button>
+    <div className="px-2 pt-1" data-orchestrator-row>
+      <AgentRow
+        terminalId={orchestratorId}
+        active={orchestratorId === activeCaptainId}
+        inActiveWorkspace={inActiveWorkspace}
+        orchestrator
+      />
     </div>
   );
 }
@@ -140,7 +154,7 @@ export function CaptainsList() {
   return (
     <div className="flex flex-col gap-0.5 px-2 py-1">
       {ordered.map((id) => (
-        <CaptainRow
+        <AgentRow
           key={id}
           terminalId={id}
           active={id === activeCaptainId}
@@ -151,20 +165,32 @@ export function CaptainsList() {
   );
 }
 
-function CaptainRow({
+/** ONE agent row - shared by the pinned captains AND the top-of-hierarchy
+ *  orchestrator (Cortana) so their live status / context render IDENTICALLY.
+ *  The only differences the `orchestrator` flag introduces are cosmetic: the
+ *  fixed "Cortana" display name, the crown badge (in place of the pencil
+ *  rename), and a slightly larger status dot. Everything else - the supervision
+ *  status dot color, workspace-tab context, crew summary, needs-input amber
+ *  pulse, context meter, workspace-relevant accent marker - is one code path. */
+function AgentRow({
   terminalId,
   active,
   inActiveWorkspace,
+  orchestrator = false,
 }: {
   terminalId: string;
   active: boolean;
-  /** True when the captain's tile lives in the ACTIVE workspace tab - the row
+  /** True when the agent's tile lives in the ACTIVE workspace tab - the row
    *  floats to the top and carries the accent marker. */
   inActiveWorkspace: boolean;
+  /** True for the designated orchestrator (Cortana): fixed name + crown badge,
+   *  rename suppressed. Defaults false (a plain pinned captain). */
+  orchestrator?: boolean;
 }) {
   // Inline expansion (crew sub-rows + supervision tree) - per-row, transient.
   const [expanded, setExpanded] = useState(false);
-  // Inline rename (WorkspacesList's editing/draft/commit shape).
+  // Inline rename (WorkspacesList's editing/draft/commit shape). Never armed
+  // for the orchestrator - its name is the fixed brand label.
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
 
@@ -177,9 +203,14 @@ function CaptainRow({
   const hasTile = workspaceName != null;
   // STABLE identity: rename -> cwd basename -> workspace tab name (NEVER the
   // volatile Claude title). cwd beats the tab name so unrelated captains
-  // sharing one tab stay distinct. Shared with the overlay.
-  const identity = stableCaptainIdentity(userLabel, workspaceName, cwd, terminalId);
+  // sharing one tab stay distinct. Shared with the overlay. The orchestrator
+  // shows its fixed brand name ("Cortana") instead of the derived basename
+  // (which would read the bland "orchestrator").
+  const identity = orchestrator
+    ? ORCHESTRATOR_DISPLAY_NAME
+    : stableCaptainIdentity(userLabel, workspaceName, cwd, terminalId);
   const branch = cwd ? cwdBranch(cwd) : "";
+  const roleLabel = orchestrator ? "orchestrator" : "captain";
 
   // Phase 2: the captain's server-registry claim - the workspaces it controls.
   const claim = useCaptain((s) => s.claims[terminalId]);
@@ -260,7 +291,7 @@ function CaptainRow({
               aria-hidden
             />
             <span role="status" className="sr-only">
-              Captain {identity} needs attention
+              {identity} needs attention
             </span>
           </>
         )}
@@ -287,7 +318,7 @@ function CaptainRow({
               autoFocus
               value={draft}
               placeholder={identity}
-              aria-label={`Rename captain - ${identity}`}
+              aria-label={`Rename ${roleLabel} - ${identity}`}
               onChange={(e) => setDraft(e.target.value)}
               onFocus={(e) => e.target.select()}
               onBlur={commitRename}
@@ -310,13 +341,26 @@ function CaptainRow({
             onClick={() => revealAgent(terminalId)}
             title={
               hasTile
-                ? `Open in Captains - ${identity}`
+                ? `Open in Captains - ${identity}${orchestrator ? " (orchestrator)" : ""}`
                 : `${identity} - terminal not available (tab popped out?)`
             }
             className="relative flex min-w-0 flex-1 items-center gap-2 py-2 pr-1 text-left"
             style={{ opacity: hasTile ? 1 : 0.5 }}
           >
             <CaptainStatusDot terminalId={terminalId} size={11} />
+            {orchestrator && (
+              // The special orchestrator marker: the crown sits between the live
+              // status dot (parity signal) and the name, accent-colored so it
+              // reads in both themes. title/aria carry the role for a11y.
+              <span
+                className="shrink-0"
+                style={{ color: "var(--th-accent)" }}
+                title="Orchestrator - commands the fleet"
+                aria-label="Orchestrator"
+              >
+                <OrchestratorCrownIcon size={13} />
+              </span>
+            )}
             <span className="flex min-w-0 flex-1 flex-col gap-0.5">
               {/* IDENTITY line: the rename, else the repo folder - prominent. */}
               <span
@@ -381,8 +425,10 @@ function CaptainRow({
         )}
 
         {/* Rename affordance: hover-revealed pencil (a separate control, not
-            double-click, so a rename can never accidentally summon). */}
-        {!editing && (
+            double-click, so a rename can never accidentally summon). Suppressed
+            for the orchestrator - "Cortana" is a fixed brand label, not a
+            per-session rename. */}
+        {!editing && !orchestrator && (
           <button
             type="button"
             aria-label={`Rename captain - ${identity}`}

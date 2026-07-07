@@ -10,6 +10,15 @@
 /** The canonical orchestrator home, as a path suffix. */
 export const ORCHESTRATOR_CWD_SUFFIX = ".t-hub/orchestrator";
 
+/** The user-facing NAME of the orchestrator agent. The orchestrator's cwd
+ *  basename is "orchestrator", so the derived stable identity would read
+ *  "orchestrator" - a bland, technical label. Wherever the DESIGNATED
+ *  orchestrator is rendered to the user (the sidebar Agents row, the overlay
+ *  switcher chip) we substitute this name instead. This is a display-only
+ *  concern: the store's `orchestratorId` / `ensureOrchestrator` adopt logic is
+ *  untouched, and a captain's own derived identity logic never sees it. */
+export const ORCHESTRATOR_DISPLAY_NAME = "Cortana";
+
 /** Normalize a cwd for suffix comparison: unify separators, drop trailing
  *  slashes, lowercase (Windows paths are case-insensitive; WSL paths here are
  *  lowercase for `.t-hub` anyway). */
