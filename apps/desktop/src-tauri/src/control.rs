@@ -303,7 +303,14 @@ pub struct RegistrySnapshot {
 /// Outcome of a UI up-sync report (see [`TabRegistry::report`]).
 pub enum ReportOutcome {
     /// The report was based on the current revision and replaced the registry.
-    Accepted { seq: u64 },
+    /// `removed_tab_ids` are the tabs that existed before this report but are
+    /// absent from it (the primary UI tab-close path): the caller prunes them
+    /// from the captains registry's `workspaceTabIds` so a normally-closed tab
+    /// never lingers as a phantom controlled-workspace.
+    Accepted {
+        seq: u64,
+        removed_tab_ids: Vec<String>,
+    },
     /// The report predates a server-side mutation the reporter has not applied
     /// yet; the registry is unchanged and the caller gets the authoritative
     /// snapshot to converge on.
@@ -381,6 +388,15 @@ impl TabRegistry {
                 });
             }
         }
+        // Which tabs is this report dropping? Computed atomically under the lock
+        // (old ids not present in the new set) so captains-registry pruning can
+        // never race a concurrent tab mutation.
+        let removed_tab_ids: Vec<String> = g
+            .tabs
+            .iter()
+            .filter(|old| !tabs.iter().any(|t| t.id == old.id))
+            .map(|t| t.id.clone())
+            .collect();
         g.tabs = tabs;
         // Adopt the reported active tab only if it names a tab in the SAME report
         // (defensive: a torn report must not leave the pointer dangling), and
@@ -395,7 +411,7 @@ impl TabRegistry {
             g.active_tab_id = g.tabs.first().map(|t| t.id.clone());
         }
         g.seq += 1;
-        ReportOutcome::Accepted { seq: g.seq }
+        ReportOutcome::Accepted { seq: g.seq, removed_tab_ids }
     }
 
     /// A clone of the current tab list (for tests / callers that only need tabs).
@@ -2361,7 +2377,20 @@ fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, St
         .or_else(|| args.get("base_seq"))
         .and_then(|v| v.as_u64());
     match ctx.tabs.report(tabs, active, base_seq) {
-        ReportOutcome::Accepted { seq } => Ok(json!({ "reported": count, "seq": seq })),
+        ReportOutcome::Accepted { seq, removed_tab_ids } => {
+            // Captain-chat phase 2: a normally-closed tab (the primary UI path)
+            // must leave every captain's workspaceTabIds too - prune, and forward
+            // a captains snapshot when anything changed so the UI/native cockpit
+            // converge.
+            let mut pruned = false;
+            for tab_id in &removed_tab_ids {
+                pruned |= ctx.captains.prune_tab(tab_id);
+            }
+            if pruned {
+                let _ = captains_sync_apply(ctx);
+            }
+            Ok(json!({ "reported": count, "seq": seq }))
+        }
         ReportOutcome::Stale(snap) => Ok(json!({
             "stale": true,
             "seq": snap.seq,
@@ -5567,6 +5596,44 @@ mod tests {
         // is idempotent, so dispatch succeeds and the registry cleanup runs).
         dispatch(&ctx, "close_terminal", &json!({"sessionId": "cap-1"})).unwrap();
         assert!(ctx.captains.snapshot().captains.is_empty());
+    }
+
+    #[test]
+    fn report_workspace_tabs_prunes_closed_tabs_from_captains() {
+        // The PRIMARY UI tab-close path is report_workspace_tabs (the webview
+        // reports its new tab set), NOT the socket close_tab. A tab dropped from
+        // the report must leave every captain's workspaceTabIds and forward a
+        // captains snapshot - else it lingers as a phantom controlled-workspace.
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        ctx.tab_registry().replace(vec![
+            TabRecord { id: "t1".into(), name: "Main".into(), tile_ids: vec![] },
+            TabRecord { id: "t2".into(), name: "Side".into(), tile_ids: vec![] },
+        ]);
+        ctx.captains
+            .claim("cap-1", Some("alpha"), vec!["t1".into(), "t2".into()])
+            .unwrap();
+
+        // Report a tab set WITHOUT t2 (the user closed it): t2 is pruned from the
+        // captain, and a sync_captains forward carries the pruned snapshot.
+        dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({"tabs": [{"id": "t1", "name": "Main", "tileIds": []}]}),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.captains.snapshot().captains[0].workspace_tab_ids,
+            vec!["t1".to_string()],
+        );
+        let calls = sink.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|(c, a)| c == "sync_captains"
+                && a["sync"]["captains"][0]["workspaceTabIds"] == json!(["t1"])),
+            "a sync_captains forward must carry the pruned workspaceTabIds"
+        );
     }
 
     #[test]

@@ -424,6 +424,32 @@ pub async fn close_terminal(
     Ok(())
 }
 
+/// Forward the authoritative captains snapshot to BOTH the webview (a
+/// `control://apply` Tauri event) and socket-connected clients (the native
+/// cockpit, via the shared [`control::EventFanout`]) - the Tauri-side twin of
+/// control.rs's `captains_sync_apply` / `forward_apply` (ApplySink + broadcast).
+/// Used by the UI-driven paths (kill_terminal, the tab-close report) that mutate
+/// the captains registry outside the control socket, so every client converges.
+pub(crate) fn forward_captains_sync(
+    app: &tauri::AppHandle,
+    captains: &crate::control::CaptainsRegistry,
+    fanout: &crate::control::EventFanout,
+) {
+    let snap = match serde_json::to_value(captains.snapshot()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("t-hub: captains snapshot serialize failed: {e}");
+            return;
+        }
+    };
+    let payload =
+        serde_json::json!({ "command": "sync_captains", "args": { "sync": snap } });
+    // Webview (the raw control://apply Tauri event controlBridge listens to).
+    let _ = app.emit(crate::control::APPLY_EVENT_CHANNEL, &payload);
+    // Socket clients (the native cockpit's apply module).
+    fanout.emit_event(crate::control::APPLY_EVENT_CHANNEL, &payload);
+}
+
 #[tauri::command]
 pub async fn kill_terminal(
     app: tauri::AppHandle,
@@ -443,16 +469,14 @@ pub async fn kill_terminal(
     // via this command (the × and the closeWorkspace reap), so this is the UI's
     // twin of the control-socket `close_terminal` cleanup; without it a killed
     // crew tile would linger in the persistent captains.json. On a real change we
-    // forward a `sync_captains` snapshot so the sidebar drops the crewmate live.
-    // (The captain case is ALSO handled UI-side via forgetCaptain -> release_captain;
-    // remove_session is idempotent, so the overlap is a harmless no-op.)
+    // forward a `sync_captains` snapshot (webview + socket clients) so every
+    // surface drops the crewmate live. (The captain case is ALSO handled UI-side
+    // via forgetCaptain -> release_captain; remove_session is idempotent, so the
+    // overlap is a harmless no-op.)
     let captains = app.state::<std::sync::Arc<crate::control::CaptainsRegistry>>();
     if captains.remove_session(&id) {
-        let snap = serde_json::to_value(captains.snapshot()).unwrap_or_default();
-        let _ = app.emit(
-            crate::control::APPLY_EVENT_CHANNEL,
-            serde_json::json!({ "command": "sync_captains", "args": { "sync": snap } }),
-        );
+        let fanout = app.state::<std::sync::Arc<crate::control::EventFanout>>();
+        forward_captains_sync(&app, &captains, &fanout);
     }
 
     // The tmux session name is reconstructed from the id (the RemotePty doesn't

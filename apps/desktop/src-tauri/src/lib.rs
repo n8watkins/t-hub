@@ -206,13 +206,30 @@ impl control::ApplySink for AppHandleApplySink {
 /// converges instead of clobbering the mutation.
 #[tauri::command]
 fn report_workspace_tabs(
+    app: tauri::AppHandle,
     tabs: Vec<control::TabRecord>,
     active_tab_id: Option<String>,
     base_seq: Option<u64>,
     registry: tauri::State<'_, std::sync::Arc<control::TabRegistry>>,
+    captains: tauri::State<'_, std::sync::Arc<control::CaptainsRegistry>>,
+    fanout: tauri::State<'_, std::sync::Arc<control::EventFanout>>,
 ) -> serde_json::Value {
     match registry.report(tabs, active_tab_id, base_seq) {
-        control::ReportOutcome::Accepted { seq } => serde_json::json!({ "seq": seq }),
+        control::ReportOutcome::Accepted { seq, removed_tab_ids } => {
+            // Captain-chat phase 2: the webview's normal tab-close lands here (not
+            // the socket close_tab), so a closed tab must be pruned from every
+            // captain's workspaceTabIds here too - else it lingers as a phantom
+            // controlled-workspace in the persistent captains.json. Forward a
+            // captains snapshot (webview + socket clients) when anything changed.
+            let mut pruned = false;
+            for tab_id in &removed_tab_ids {
+                pruned |= captains.prune_tab(tab_id);
+            }
+            if pruned {
+                commands::forward_captains_sync(&app, &captains, &fanout);
+            }
+            serde_json::json!({ "seq": seq })
+        }
         control::ReportOutcome::Stale(snap) => serde_json::json!({
             "stale": true,
             "seq": snap.seq,
@@ -412,6 +429,12 @@ pub fn run() {
             let emitter: std::sync::Arc<dyn agent::EventEmitter> = std::sync::Arc::new(
                 control_client::SocketEmitter::new(control_fanout.clone()),
             );
+            // Manage the SAME fanout Arc so UI-driven Tauri commands that mutate
+            // the captains registry (kill_terminal, the tab-close report) can
+            // broadcast a captains snapshot to socket clients (the native cockpit)
+            // as well as the webview - the Tauri-side twin of control.rs's
+            // forward_apply (ApplySink + fanout broadcast).
+            app.manage(control_fanout.clone());
             state.agent.set_emitter(emitter);
             state.agent.set_status_bridge(state.status.clone());
             // --- WS-6: open the durable DB now (before the status bridge ingests
