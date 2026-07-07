@@ -17,7 +17,7 @@
 //     working on right from here.
 //
 // Reads the workspace store directly (no props), so App needs no extra wiring.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -65,7 +65,24 @@ function PopOutIcon() {
 }
 
 export function WorkspacesList() {
-  const tabs = useWorkspace((s) => s.tabs);
+  // The reserved Captains tab is the AGENTS' home surface: its tiles (the
+  // orchestrator + every pinned captain) are already the top "Agents" list, and
+  // each captain sits inside its own agent workspace there. It must NOT also
+  // render as an ordinary workspace row here - that double-surfaces every captain
+  // as an unwanted, un-closeable bottom tile (the reserved tab is intentionally
+  // non-closeable). So drop it from what this list renders. Filtering by the
+  // stable well-known id (not a name match) keeps this stable across an
+  // adoptRegistry / tab-reporter round-trip: adoptRegistry always re-appends
+  // exactly this reserved tab, so it is excluded again on every sync and can
+  // never reappear. Ordinary user workspaces are untouched and still close.
+  // Select the STABLE `s.tabs` reference and derive the filtered list in useMemo:
+  // a `.filter()` inside the selector would return a fresh array every render and
+  // loop-render under Zustand's Object.is equality.
+  const allTabs = useWorkspace((s) => s.tabs);
+  const tabs = useMemo(
+    () => allTabs.filter((t) => t.id !== CAPTAINS_TAB_ID),
+    [allTabs],
+  );
   const activeTabId = useWorkspace((s) => s.activeTabId);
   const terminals = useWorkspace((s) => s.terminals);
   const labels = useWorkspace((s) => s.labels);
@@ -320,9 +337,11 @@ export function WorkspacesList() {
           // projects become recallable from Recent immediately. Hidden on the last
           // remaining workspace (closeWorkspace keeps at least one).
           onClose={() => closeWorkspace(tab.id)}
-          // The reserved Captains tab is never closeable (the store refuses it
-          // too); hide its × so the affordance matches the behavior.
-          canClose={tabs.length > 1 && tab.id !== CAPTAINS_TAB_ID}
+          // `tabs` here already excludes the reserved Captains tab, so its length
+          // is the WORK-tab count: the last remaining work workspace is never
+          // closeable (the store's closeTab/closeWorkspace refuse it too), hiding
+          // its × so the affordance matches the behavior.
+          canClose={tabs.length > 1}
         />
       ))}
     </ul>

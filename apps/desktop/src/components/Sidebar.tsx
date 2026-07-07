@@ -25,7 +25,11 @@
 // against. Telemetry is still read for the bottom WSL/host-metrics strip.
 import { useAgentTelemetry } from "../store/telemetry";
 import { useSettings } from "../store/settings";
-import { useWorkspace, type WorkspaceTab } from "../store/workspace";
+import {
+  useWorkspace,
+  CAPTAINS_TAB_ID,
+  type WorkspaceTab,
+} from "../store/workspace";
 import { useTheme } from "../store/theme";
 import { useHasCodexSession } from "../store/clientType";
 import { WslHealth, gib, usedFraction } from "./WslHealth";
@@ -37,7 +41,7 @@ import {
   CodexUsageInline,
   useCodexUsage,
 } from "./UsageStrip";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { LayoutGrid } from "lucide-react";
 import { useCaptain } from "../store/captain";
 import { CaptainsList, OrchestratorRow } from "./CaptainsList";
@@ -108,7 +112,15 @@ export function Sidebar({
 }: SidebarProps) {
   // Active workspace tab + its live terminals drive the Projects list; the
   // titlebar owns tab switching, so the sidebar only ever reads the ACTIVE tab.
-  const tabs = useWorkspace((s) => s.tabs);
+  // The reserved Captains tab is the agents' home (top Agents list), never an
+  // ordinary workspace square in the rail either - exclude it so the rail matches
+  // the full-mode Workspaces list. Select the stable `s.tabs` ref and filter in
+  // useMemo: a `.filter()` inside the selector loop-renders under Object.is.
+  const allTabs = useWorkspace((s) => s.tabs);
+  const tabs = useMemo(
+    () => allTabs.filter((t) => t.id !== CAPTAINS_TAB_ID),
+    [allTabs],
+  );
   const activeTabId = useWorkspace((s) => s.activeTabId);
   const setActiveTab = useWorkspace((s) => s.setActiveTab);
 
@@ -144,9 +156,13 @@ interface FullProps {
 function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
   const { metrics, agent } = useAgentTelemetry();
 
-  // Only the tab list is needed here now (the Workspaces section count); the
-  // Workspaces list itself reads everything else from the store directly.
-  const tabs = useWorkspace((s) => s.tabs);
+  // The Workspaces section count must match what WorkspacesList renders, which
+  // EXCLUDES the reserved Captains tab (the agents' home surface lives in the top
+  // Agents list, never as a bottom workspace row). Count only the work tabs so
+  // the header number can't over-count by including the hidden reserved tab.
+  const workspaceCount = useWorkspace(
+    (s) => s.tabs.filter((t) => t.id !== CAPTAINS_TAB_ID).length,
+  );
   // The Recent section's count is owned by RecentList (it does the fetch +
   // hidden-filter); it reports its filtered length up so the header shows it.
   const [recentCount, setRecentCount] = useState(0);
@@ -220,7 +236,7 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
             toggle (leading) and a "+" to create a new workspace (action). */}
         <Section
           title="Workspaces"
-          count={tabs.length}
+          count={workspaceCount}
           className="border-b"
           leading={
             onToggleSidebar ? (
