@@ -90,8 +90,9 @@ let captainsBootstrapping = false;
 
 /** Loosely validate + adopt one captains snapshot `{seq, captains}` into the
  *  captain store (records missing arrays coerce to empty - the store renders
- *  from whatever the server sent). Returns true when adopted. */
-function adoptCaptainsSnapshot(sync: unknown): boolean {
+ *  from whatever the server sent). Returns true when adopted. Exported for the
+ *  reconciliation tests (the seq guard + the A1 empty guard). */
+export function adoptCaptainsSnapshot(sync: unknown): boolean {
   if (!sync || typeof sync !== "object") return false;
   const { seq, captains } = sync as { seq?: unknown; captains?: unknown };
   if (typeof seq !== "number" || !Array.isArray(captains)) return false;
@@ -347,9 +348,15 @@ export function startControlBridge(): void {
  * (not under Tauri, control channel down) are swallowed: the store keeps its
  * locally-persisted designations and the next sync_captains reconciles.
  */
-function startCaptainsBootstrap(): void {
+/**
+ * The bootstrap body (exported for tests): fetch the server registry, claim any
+ * live-tile local pins the server does not yet know, then adopt the final
+ * snapshot. `captainsBootstrapping` is held true for the whole run so mid-loop
+ * partial `sync_captains` forwards are suppressed (see {@link adoptCaptainsSync}).
+ */
+export async function bootstrapCaptains(): Promise<void> {
   captainsBootstrapping = true;
-  void (async () => {
+  try {
     const res = (await controlRequest("list_captains")) as {
       seq?: number;
       captains?: CaptainClaimRecord[];
@@ -378,14 +385,29 @@ function startCaptainsBootstrap(): void {
       ? ((await controlRequest("list_captains")) as typeof res)
       : res;
     adoptCaptainsSnapshot(finalRes);
-  })()
-    .catch(() => {
-      // Not under Tauri or the control channel is down - locally persisted
-      // designations stand until a sync_captains forward arrives.
-    })
-    .finally(() => {
-      captainsBootstrapping = false;
-    });
+  } catch {
+    // Not under Tauri or the control channel is down - locally persisted
+    // designations stand until a sync_captains forward arrives.
+  } finally {
+    captainsBootstrapping = false;
+  }
+}
+
+function startCaptainsBootstrap(): void {
+  void bootstrapCaptains();
+}
+
+/** Test-only: reset the captains reconciliation singletons between cases (this
+ *  is a side-effect module whose state persists across a test file's imports). */
+export function __resetCaptainsReconcileForTest(): void {
+  lastCaptainsSeq = -1;
+  captainsBootstrapping = false;
+}
+
+/** Test-only: force the bootstrapping flag, to prove `sync_captains` forwards are
+ *  suppressed while a bootstrap is in flight. */
+export function __setCaptainsBootstrappingForTest(v: boolean): void {
+  captainsBootstrapping = v;
 }
 
 /**
