@@ -6,7 +6,9 @@ mod tmux;
 
 // --- 0.5 additions ---
 mod agent; // core-side agent bridge (Workstream A, core half)
+mod audit; // control-socket audit log with teeth (socket-gate Phase 1, hash-chained JSONL)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
+mod governor; // fleet spawn budget + rate limits for process-changing control commands (socket-gate Phase 1)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.
 mod control_client; // server-split M1: client-side socket transport (control_request command + event forwarder)

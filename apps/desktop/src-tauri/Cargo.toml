@@ -83,6 +83,13 @@ portable-pty = "0.8"
 anyhow = { workspace = true }
 parking_lot = "0.12"
 base64 = "0.22"
+# SHA-256 for the control-socket audit log's tamper-evident hash chain
+# (audit.rs, socket-gate Phase 1). Already in the tree transitively; this only
+# makes it a direct dependency (no lockfile resolution change).
+sha2 = "0.10"
+# RFC3339 timestamps for the control-socket audit log (audit.rs). Already in the
+# tree transitively; this only makes it a direct dependency.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Plain-HTTP client for the LOOPBACK Piper TTS proxy (voice.rs). Deliberately
 # no default features (no TLS): the server is 127.0.0.1-only, and going through
 # the backend (which sends no Origin header) is the whole point - the TTS
