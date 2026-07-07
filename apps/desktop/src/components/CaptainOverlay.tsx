@@ -70,11 +70,17 @@ function cwdBasename(cwd: string | undefined): string {
 }
 
 /** The STABLE captain identity, derivation order: the user's RENAME first, then
- *  the WORKSPACE TAB name the tile lives in, then the cwd basename, then the
- *  short id. It DELIBERATELY never uses the volatile Claude-suggested session
- *  title (which shows junk like "task notification") - identity must be stable
- *  across turns. Pure function so callers pass already-subscribed values (the
- *  sidebar rows) or use the hook below (the overlay + deck). */
+ *  the cwd basename (the folder/worktree the session lives in), then the
+ *  WORKSPACE TAB name, then the short id. cwd beats the tab name because a tab
+ *  is a GROUPING, not a per-captain identity: several unrelated captains can
+ *  share one tab (e.g. an "appturnity" tab holding an appturnity session, the
+ *  orchestrator, and the t-hub captain), and preferring the tab name collapsed
+ *  them all to "appturnity". Their cwds are distinct, so cwd-first keeps them
+ *  apart (orchestrator, t-hub-app, monorepo-app, appturnity). It DELIBERATELY
+ *  never uses the volatile Claude-suggested session title (which shows junk like
+ *  "task notification") - identity must be stable across turns. Pure function so
+ *  callers pass already-subscribed values (the sidebar rows) or use the hook
+ *  below (the overlay + deck). */
 export function stableCaptainIdentity(
   userLabel: string | undefined,
   workspaceName: string | undefined,
@@ -83,10 +89,10 @@ export function stableCaptainIdentity(
 ): string {
   const named = (userLabel ?? "").trim();
   if (named) return named;
-  const ws = (workspaceName ?? "").trim();
-  if (ws) return ws;
   const base = cwdBasename(cwd);
   if (base) return base;
+  const ws = (workspaceName ?? "").trim();
+  if (ws) return ws;
   return terminalId.slice(0, 8);
 }
 

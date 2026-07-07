@@ -1,5 +1,5 @@
 // The command palette's "Summon captain" entries must use the STABLE identity
-// (user rename -> workspace tab name -> cwd basename), never the volatile Claude
+// (user rename -> cwd basename -> workspace tab name), never the volatile Claude
 // session title - this was the one surface the deck's identity fix missed.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { act, fireEvent, render } from "@testing-library/react";
@@ -30,7 +30,7 @@ beforeEach(() => {
     tabs,
     activeTabId: "t1",
     focusedId: "cap00001",
-    terminals: { cap00001: term("cap00001") },
+    terminals: { cap00001: term("cap00001", "/home/n/appturnity/monorepo-app") },
     userLabels: {},
     labels: {},
     claudeTitles: {},
@@ -47,9 +47,10 @@ beforeEach(() => {
 });
 
 describe("CommandPalette Summon captain identity", () => {
-  it("uses the STABLE identity (workspace tab name), never the Claude title", () => {
-    // cap00001 has a junk Claude title but no rename: the entry must read the
-    // tab name "Backend", not "task notification".
+  it("uses the STABLE identity (cwd basename), never the tab name or Claude title", () => {
+    // cap00001 has a junk Claude title and no rename, and its tab "Backend" is
+    // a grouping - the entry must read the cwd basename "monorepo-app", not the
+    // tab name and not "task notification".
     act(() => useWorkspace.getState().setClaudeTitle("cap00001", "task notification"));
     act(() => openKeyboardPalette());
     render(<CommandPalette />);
@@ -57,11 +58,12 @@ describe("CommandPalette Summon captain identity", () => {
     const input = document.querySelector<HTMLInputElement>("input")!;
     fireEvent.change(input, { target: { value: "Summon captain" } });
 
-    expect(document.body.textContent).toContain("Summon captain: Backend");
+    expect(document.body.textContent).toContain("Summon captain: monorepo-app");
+    expect(document.body.textContent).not.toContain("Summon captain: Backend");
     expect(document.body.textContent).not.toContain("task notification");
   });
 
-  it("prefers the user rename over the tab name", () => {
+  it("prefers the user rename over the cwd basename", () => {
     act(() => {
       useWorkspace.getState().setTerminalLabel("cap00001", "Flagship");
       useWorkspace.getState().setClaudeTitle("cap00001", "task notification");
