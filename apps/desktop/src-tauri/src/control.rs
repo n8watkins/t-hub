@@ -131,6 +131,17 @@ pub struct ControlHandshake {
     /// when absent so older handshake readers/files stay parseable.
     #[serde(default)]
     pub protocol_version: u32,
+    /// In-process-only full-power **control** token for the TRUSTED local frontend.
+    /// The app's own webview drives terminals through the in-process `control_request`
+    /// command, which must authenticate with full control even under Phase 3 hardening
+    /// (where `token` above is only the read token). This handshake struct is returned
+    /// directly to `control_client::install` over the trusted in-process channel, so
+    /// the local frontend reads its full token here rather than from the published
+    /// (possibly read-only) `token`. `#[serde(skip_serializing)]` guarantees it is
+    /// NEVER written to `control.json` (external scrapers stay read-only under
+    /// hardening); `#[serde(default)]` keeps older handshake files/readers parseable.
+    #[serde(skip_serializing, default)]
+    pub local_control_token: String,
 }
 
 /// A sink that delivers an Organization-tier UI mutation to the frontend. The
@@ -1264,6 +1275,12 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
         read_token: ctx.read_token.clone(),
         pid: std::process::id(),
         protocol_version: PROTOCOL_VERSION,
+        // The full-power control token, carried ONLY in this returned struct (never
+        // serialized - see the field's `#[serde(skip_serializing)]`). Under Phase 3
+        // hardening `token` above is the read token, so the trusted local frontend
+        // takes its credential from here to keep terminal attach working while
+        // `control.json` still withholds full power from external scrapers.
+        local_control_token: ctx.token.clone(),
     };
     write_handshake(&handshake)?;
 
@@ -5561,6 +5578,7 @@ mod tests {
             read_token: "rdonly".into(),
             pid: 42,
             protocol_version: PROTOCOL_VERSION,
+            local_control_token: "full".into(),
         };
         let s = serde_json::to_string(&h).unwrap();
         let back: ControlHandshake = serde_json::from_str(&s).unwrap();
@@ -5569,6 +5587,11 @@ mod tests {
         assert_eq!(back.read_token, "rdonly");
         assert_eq!(back.pid, 42);
         assert_eq!(back.protocol_version, PROTOCOL_VERSION);
+        // `local_control_token` is in-process-only: it is NEVER serialized, so it
+        // does not survive the JSON round-trip and comes back empty (its default).
+        assert!(!s.contains("local_control_token"), "field must not serialize");
+        assert!(!s.contains("full"), "in-process token must not appear in JSON");
+        assert_eq!(back.local_control_token, "");
     }
 
     #[test]
@@ -5579,6 +5602,8 @@ mod tests {
         let hs: ControlHandshake = serde_json::from_str(json).unwrap();
         assert_eq!(hs.token, "t");
         assert_eq!(hs.read_token, "");
+        // The Phase-3 in-process field is absent from old files and defaults empty.
+        assert_eq!(hs.local_control_token, "");
     }
 
     // ---- s27: attach path vs client churn -----------------------------------
@@ -6670,6 +6695,64 @@ mod tests {
         // Never an empty read token (falls back to control so a context that never
         // minted a read token is not locked out).
         assert_eq!(select_published_token("ctl", "", true), "ctl");
+    }
+
+    #[test]
+    fn hardened_control_json_withholds_full_token_but_handshake_carries_it() {
+        // The security-critical Phase-3-safety invariant. Build the handshake exactly
+        // as `start` does with hardening ON, write it, and assert BOTH halves of the
+        // contract:
+        //   (a) the SERIALIZED control.json `token` == read_token (full token withheld
+        //       from external scrapers), and the full token appears nowhere in the file;
+        //   (b) the RETURNED handshake's `local_control_token` == the full control token,
+        //       so the trusted in-process frontend still gets full power.
+        let full = "FULL-SECRET-abc123";
+        let read = "READ-only-xyz789";
+        let handshake = ControlHandshake {
+            addr: "127.0.0.1:5000".into(),
+            // Mirrors `start`: published token is the read token under hardening.
+            token: select_published_token(full, read, true).to_string(),
+            read_token: read.into(),
+            pid: 7,
+            protocol_version: PROTOCOL_VERSION,
+            local_control_token: full.into(),
+        };
+
+        // (a) Published discovery is read-only and never leaks the full token.
+        assert_eq!(handshake.token, read, "published token must be the read token");
+        let file = std::env::temp_dir()
+            .join(format!("t-hub-ctl-harden-{}.json", std::process::id()));
+        let prev = std::env::var("T_HUB_CONTROL_FILE").ok();
+        std::env::set_var("T_HUB_CONTROL_FILE", &file);
+        write_handshake(&handshake).expect("write handshake");
+        let on_disk = std::fs::read_to_string(&file).expect("read control.json");
+        match prev {
+            Some(v) => std::env::set_var("T_HUB_CONTROL_FILE", v),
+            None => std::env::remove_var("T_HUB_CONTROL_FILE"),
+        }
+        let _ = std::fs::remove_file(&file);
+
+        assert!(
+            !on_disk.contains(full),
+            "control.json must NOT contain the full control token; got: {on_disk}"
+        );
+        assert!(
+            !on_disk.contains("local_control_token"),
+            "the in-process field must not be serialized; got: {on_disk}"
+        );
+        let parsed: ControlHandshake =
+            serde_json::from_str(&on_disk).expect("control.json parses");
+        assert_eq!(parsed.token, read, "on-disk token must be the read token");
+        assert_eq!(
+            parsed.local_control_token, "",
+            "in-process token must not survive to disk"
+        );
+
+        // (b) The RETURNED handshake still carries the full token for the frontend.
+        assert_eq!(
+            handshake.local_control_token, full,
+            "local frontend must receive the full control token in-process"
+        );
     }
 
     #[test]

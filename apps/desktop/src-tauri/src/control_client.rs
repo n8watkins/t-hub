@@ -270,22 +270,102 @@ pub fn install(app: &AppHandle, handshake: &control::ControlHandshake) {
     // control_request, the event forwarder, AND the terminal RemotePty (all read
     // ControlEndpoint) target the remote control socket instead of this machine's
     // loopback. Unset (the default) ⇒ the local loopback server, exactly as today.
-    let (addr, token) = match (
+    let remote = (
         std::env::var("T_HUB_REMOTE_ADDR").ok().filter(|a| !a.is_empty()),
         std::env::var("T_HUB_REMOTE_TOKEN").ok().filter(|t| !t.is_empty()),
-    ) {
-        (Some(addr), Some(token)) => {
+    );
+    if matches!(remote, (Some(_), Some(_))) {
+        // Log only in the remote branch; `resolve_endpoint` stays pure/testable.
+        if let (Some(addr), _) = &remote {
             eprintln!(
                 "t-hub: REMOTE client mode — control endpoint = {addr} (T_HUB_REMOTE_ADDR); \
                  tiles + events + reads target the remote server"
             );
-            (addr, token)
         }
-        _ => (handshake.addr.clone(), handshake.token.clone()),
-    };
+    }
+    let (addr, token) = resolve_endpoint(handshake, remote);
     app.manage(ControlEndpoint {
         addr: addr.clone(),
         token: token.clone(),
     });
     spawn_event_forwarder(app.clone(), addr, token);
+}
+
+/// Pick the (addr, token) the LOCAL webview authenticates the control socket with.
+///
+/// Two cases, kept pure so they are directly unit-testable:
+/// - REMOTE thin-client (`T_HUB_REMOTE_ADDR` + `T_HUB_REMOTE_TOKEN` both set): use
+///   the remote addr + remote token verbatim; this GUI talks to another host's
+///   server and must present that host's credential.
+/// - LOCAL loopback (the default): use the handshake addr and the FULL-power
+///   `local_control_token`, NOT the published `token`. Under Phase 3 hardening
+///   (`T_HUB_CONTROL_HARDEN=1`) the published `token` is only the read token, so
+///   authenticating the app's own frontend with it would drop the webview to
+///   read-only and break terminal attach. The full token travels solely in this
+///   in-process handshake struct (never in `control.json`), so the trusted local
+///   frontend keeps full control regardless of hardening.
+fn resolve_endpoint(
+    handshake: &control::ControlHandshake,
+    remote: (Option<String>, Option<String>),
+) -> (String, String) {
+    match remote {
+        (Some(addr), Some(token)) => (addr, token),
+        _ => (handshake.addr.clone(), handshake.local_control_token.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::{ControlHandshake, PROTOCOL_VERSION};
+
+    /// A handshake as `control::start` builds it under Phase 3 hardening: the
+    /// published `token` is the READ token, while `local_control_token` carries the
+    /// full-power control token for the trusted in-process frontend.
+    fn hardened_handshake() -> ControlHandshake {
+        ControlHandshake {
+            addr: "127.0.0.1:5000".into(),
+            token: "read-only".into(),
+            read_token: "read-only".into(),
+            pid: 1,
+            protocol_version: PROTOCOL_VERSION,
+            local_control_token: "full-control".into(),
+        }
+    }
+
+    #[test]
+    fn local_arm_authenticates_with_the_full_control_token() {
+        // The whole Phase-3-safety fix: with no remote override, the local webview
+        // takes its credential from `local_control_token` (full power), NOT the
+        // published `token` (read-only under hardening). This is what keeps terminal
+        // attach working when hardening is enabled.
+        let hs = hardened_handshake();
+        let (addr, token) = resolve_endpoint(&hs, (None, None));
+        assert_eq!(addr, "127.0.0.1:5000");
+        assert_eq!(token, "full-control", "local frontend must get the FULL token");
+        assert_ne!(token, hs.token, "must NOT use the published (read-only) token");
+    }
+
+    #[test]
+    fn remote_arm_uses_the_remote_token_verbatim() {
+        // A remote thin client must keep presenting its remote credential; the fix
+        // does not disturb the T_HUB_REMOTE_* override branch.
+        let hs = hardened_handshake();
+        let (addr, token) = resolve_endpoint(
+            &hs,
+            (Some("10.0.0.9:8787".into()), Some("remote-secret".into())),
+        );
+        assert_eq!(addr, "10.0.0.9:8787");
+        assert_eq!(token, "remote-secret");
+    }
+
+    #[test]
+    fn partial_remote_env_falls_back_to_local() {
+        // Only one of the two remote vars set ⇒ not remote; use the local full token.
+        let hs = hardened_handshake();
+        let (_, token) = resolve_endpoint(&hs, (Some("10.0.0.9:8787".into()), None));
+        assert_eq!(token, "full-control");
+        let (_, token) = resolve_endpoint(&hs, (None, Some("remote-secret".into())));
+        assert_eq!(token, "full-control");
+    }
 }
