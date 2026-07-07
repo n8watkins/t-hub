@@ -211,6 +211,16 @@ describe("CaptainsDeck orchestrator input", () => {
     expect(writes).toEqual([]);
   });
 
+  it("Esc with a draft clears it and keeps the deck open", () => {
+    act(() => useCaptain.getState().setOrchestratorId("cap00002"));
+    render(<CaptainsDeck />);
+    const input = field();
+    fireEvent.change(input, { target: { value: "half-typed" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(field().value).toBe("");
+    expect(useCaptain.getState().deckOpen).toBe(true); // did NOT close the deck
+  });
+
   it("offers a disabled Scribe voice placeholder", () => {
     act(() => useCaptain.getState().setOrchestratorId("cap00002"));
     render(<CaptainsDeck />);

@@ -139,8 +139,11 @@ function OrchestratorInput() {
   const state = useWorkspace((s) =>
     orchestratorId ? s.terminals[orchestratorId]?.state : undefined,
   );
+  // A live (or detached-but-alive) tile is writable - the pool keeps every
+  // session attached, so an orchestrator in any tab receives input. A starting /
+  // exited / errored tile is not yet (or no longer) ready.
   const writable =
-    orchestratorId != null && state != null && state !== "exited" && state !== "error";
+    orchestratorId != null && (state === "live" || state === "detached");
 
   const [draft, setDraft] = useState("");
   const canSend = writable && draft.trim().length > 0;
@@ -173,6 +176,14 @@ function OrchestratorInput() {
           type="text"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            // Esc with a draft clears it (and keeps the deck open); Esc on an
+            // empty input falls through to the deck's window listener -> close.
+            if (e.key === "Escape" && draft.length > 0) {
+              e.stopPropagation();
+              setDraft("");
+            }
+          }}
           disabled={!writable}
           aria-label="Message the orchestrator"
           placeholder={
