@@ -14,6 +14,19 @@ vi.mock("./TerminalPool", () => ({
   requestPoolSync: () => {},
 }));
 
+// Capture the orchestrator input's writes without a real Tauri backend.
+const writes: Array<{ id: string; data: string }> = [];
+vi.mock("../ipc/client", async (orig) => {
+  const actual = await orig<typeof import("../ipc/client")>();
+  return {
+    ...actual,
+    writeTerminal: (id: string, data: string) => {
+      writes.push({ id, data });
+      return Promise.resolve();
+    },
+  };
+});
+
 import { CaptainsDeck } from "./CaptainsDeck";
 import { useCaptain, type CaptainClaimRecord } from "../store/captain";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
@@ -38,6 +51,7 @@ function tile(terminalId: string): HTMLElement {
 
 beforeEach(() => {
   localStorage.clear();
+  writes.length = 0;
   const tabs: WorkspaceTab[] = [
     { id: "t1", name: "Workspace 1", order: ["cap00001", "crewrun0"] },
     { id: "t2", name: "Backend", order: ["cap00002"] },
@@ -128,5 +142,59 @@ describe("CaptainsDeck", () => {
     render(<CaptainsDeck />);
     expect(document.querySelectorAll("[data-deck-tile]")).toHaveLength(0);
     expect(document.body.textContent).toContain("No captains pinned yet");
+  });
+});
+
+describe("CaptainsDeck orchestrator input", () => {
+  function field(): HTMLInputElement {
+    return document.querySelector<HTMLInputElement>("[data-orchestrator-field]")!;
+  }
+
+  it("writes the typed line + carriage return to the designated orchestrator on Enter", () => {
+    act(() => useCaptain.getState().setOrchestratorId("cap00002"));
+    render(<CaptainsDeck />);
+    const input = field();
+    expect(input.disabled).toBe(false);
+    fireEvent.change(input, { target: { value: "status report please" } });
+    fireEvent.submit(input.closest("form")!);
+    expect(writes).toEqual([{ id: "cap00002", data: "status report please\r" }]);
+    // The input clears after sending.
+    expect(field().value).toBe("");
+  });
+
+  it("the Send button submits the same way", () => {
+    act(() => useCaptain.getState().setOrchestratorId("cap00002"));
+    render(<CaptainsDeck />);
+    fireEvent.change(field(), { target: { value: "go" } });
+    fireEvent.click(document.querySelector("[data-orchestrator-send]")!);
+    expect(writes).toEqual([{ id: "cap00002", data: "go\r" }]);
+  });
+
+  it("is disabled with a hint when no orchestrator is designated", () => {
+    render(<CaptainsDeck />); // orchestratorId null from beforeEach
+    const input = field();
+    expect(input.disabled).toBe(true);
+    expect(input.placeholder).toContain("No orchestrator set");
+    fireEvent.change(input, { target: { value: "ignored" } });
+    fireEvent.submit(input.closest("form")!);
+    expect(writes).toEqual([]);
+  });
+
+  it("does not send whitespace-only input", () => {
+    act(() => useCaptain.getState().setOrchestratorId("cap00002"));
+    render(<CaptainsDeck />);
+    fireEvent.change(field(), { target: { value: "   " } });
+    fireEvent.submit(field().closest("form")!);
+    expect(writes).toEqual([]);
+  });
+
+  it("offers a disabled Scribe voice placeholder", () => {
+    act(() => useCaptain.getState().setOrchestratorId("cap00002"));
+    render(<CaptainsDeck />);
+    const mic = document.querySelector<HTMLButtonElement>(
+      '[aria-label="Voice input coming via Scribe"]',
+    );
+    expect(mic).toBeTruthy();
+    expect(mic!.disabled).toBe(true);
   });
 });

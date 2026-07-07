@@ -12,9 +12,11 @@
 // Canvas, higher z-index) so the terminal pool stays mounted underneath and the
 // orchestrator terminal remains attached + writable. Esc or the close button
 // dismisses it.
-import { useEffect } from "react";
-import { X } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Mic, Send, X } from "lucide-react";
 import { useCaptain } from "../store/captain";
+import { useWorkspace } from "../store/workspace";
+import { writeTerminal } from "../ipc/client";
 import {
   CaptainStatusDot,
   useCaptainDisplayLabel,
@@ -68,7 +70,103 @@ export function CaptainsDeck() {
       {/* (1) The DECK: all pinned captains as large tiles. */}
       <DeckTiles />
 
-      {/* (2)+(3) output strip + bottom input arrive in stages 3 and 2. */}
+      {/* (2) output strip arrives in stage 3. */}
+
+      {/* (3) The persistent bottom input, targeting the orchestrator. */}
+      <OrchestratorInput />
+    </div>
+  );
+}
+
+/** The persistent bottom input: on Enter (or Send) it writes the typed line +
+ *  carriage return to the DESIGNATED orchestrator terminal via the same
+ *  writeTerminal IPC xterm uses. A disabled mic placeholder (voice input is
+ *  coming via Scribe) sits to its right, then Send. Disabled when no orchestrator
+ *  is designated or its terminal is gone. */
+function OrchestratorInput() {
+  const orchestratorId = useCaptain((s) => s.orchestratorId);
+  const label = useCaptainDisplayLabel(orchestratorId ?? "");
+  // The orchestrator terminal must exist to receive input (the pool keeps every
+  // session attached, so a live/detached tile in any tab is writable; an exited
+  // or unknown one is not).
+  const state = useWorkspace((s) =>
+    orchestratorId ? s.terminals[orchestratorId]?.state : undefined,
+  );
+  const writable =
+    orchestratorId != null && state != null && state !== "exited" && state !== "error";
+
+  const [draft, setDraft] = useState("");
+  const canSend = writable && draft.trim().length > 0;
+
+  const send = () => {
+    if (!canSend || orchestratorId == null) return;
+    const line = draft;
+    setDraft("");
+    // Append a carriage return - the byte xterm sends for Enter, which the PTY's
+    // line discipline turns into a submit (a TUI like Claude reads \r as Enter).
+    void writeTerminal(orchestratorId, `${line}\r`).catch((e) => {
+      console.error("orchestrator input: writeTerminal failed", e);
+    });
+  };
+
+  return (
+    <div
+      className="shrink-0 border-t p-2"
+      style={{ borderColor: "var(--th-border)" }}
+      data-orchestrator-input
+    >
+      <form
+        className="flex items-end gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          send();
+        }}
+      >
+        <input
+          type="text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          disabled={!writable}
+          aria-label="Message the orchestrator"
+          placeholder={
+            orchestratorId == null
+              ? "No orchestrator set - right-click a tile and Mark as orchestrator"
+              : writable
+                ? `Message ${label}...`
+                : `${label} - terminal not available`
+          }
+          className="min-w-0 flex-1 rounded-md border bg-transparent px-3 py-2 text-sm outline-none disabled:opacity-50"
+          style={{
+            color: "var(--th-fg)",
+            borderColor: "var(--th-border)",
+          }}
+          data-orchestrator-field
+        />
+
+        {/* Voice input placeholder - Scribe backend is a sibling crew's track. */}
+        <button
+          type="button"
+          disabled
+          aria-label="Voice input coming via Scribe"
+          title="Voice input coming via Scribe"
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border opacity-40"
+          style={{ borderColor: "var(--th-border)", color: "var(--th-fg-muted)" }}
+        >
+          <Mic size={16} aria-hidden />
+        </button>
+
+        <button
+          type="submit"
+          disabled={!canSend}
+          aria-label="Send to orchestrator"
+          title="Send (Enter)"
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-white transition-opacity disabled:opacity-40"
+          style={{ backgroundColor: "var(--th-accent)" }}
+          data-orchestrator-send
+        >
+          <Send size={16} aria-hidden />
+        </button>
+      </form>
     </div>
   );
 }
