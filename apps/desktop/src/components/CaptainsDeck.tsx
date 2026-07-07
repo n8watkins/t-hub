@@ -10,8 +10,9 @@
 //
 // It renders as an OPAQUE overlay covering the workspace canvas (a sibling of
 // Canvas, higher z-index) so the terminal pool stays mounted underneath and the
-// orchestrator terminal remains attached + writable. Esc or the close button
-// dismisses it.
+// orchestrator terminal remains attached + writable. Esc (routed through the
+// single dispatch point, lib/escOverlays - Canvas owns the listener) or the
+// close button dismisses it.
 import { useEffect, useState } from "react";
 import { Mic, Send, X } from "lucide-react";
 import { useCaptain } from "../store/captain";
@@ -28,17 +29,6 @@ import { useCrewSummary } from "../hooks/useCrewSummary";
 /** The deck host: mounted by App only while `deckOpen`. Full-screen opaque. */
 export function CaptainsDeck() {
   const setDeckOpen = useCaptain((s) => s.setDeckOpen);
-
-  // Esc closes the deck (a single window-level listener; the input's own Esc
-  // handler stops propagation only when it has text to clear - see stage 2).
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setDeckOpen(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [setDeckOpen]);
-
   return (
     <div
       className="absolute inset-0 z-40 flex flex-col"
@@ -150,7 +140,9 @@ function OrchestratorInput() {
 
   const send = () => {
     if (!canSend || orchestratorId == null) return;
-    const line = draft;
+    // Send the TRIMMED text (we gate on draft.trim(), so trailing/leading
+    // whitespace the user didn't mean shouldn't reach the orchestrator).
+    const line = draft.trim();
     setDraft("");
     // Append a carriage return - the byte xterm sends for Enter, which the PTY's
     // line discipline turns into a submit (a TUI like Claude reads \r as Enter).
@@ -176,14 +168,6 @@ function OrchestratorInput() {
           type="text"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            // Esc with a draft clears it (and keeps the deck open); Esc on an
-            // empty input falls through to the deck's window listener -> close.
-            if (e.key === "Escape" && draft.length > 0) {
-              e.stopPropagation();
-              setDraft("");
-            }
-          }}
           disabled={!writable}
           aria-label="Message the orchestrator"
           placeholder={
@@ -265,6 +249,10 @@ function DeckTiles() {
 function DeckTile({ terminalId }: { terminalId: string }) {
   const identity = useCaptainDisplayLabel(terminalId);
   const workspaceName = useWorkspaceNameForTerminal(terminalId);
+  // undefined workspace name = the tile is gone (popped out / killed); summon
+  // would be a store-level no-op, so a click must NOT close the deck onto a
+  // blank workspace - the same liveness affordance the switcher chips use.
+  const hasTile = workspaceName != null;
   const crew = useCrewSummary(terminalId);
   const isOrchestrator = useCaptain((s) => s.orchestratorId === terminalId);
   const summonCaptain = useCaptain((s) => s.summonCaptain);
@@ -274,17 +262,25 @@ function DeckTile({ terminalId }: { terminalId: string }) {
     <button
       type="button"
       onClick={() => {
+        // Guard: only leave the deck for a captain whose tile is live.
+        if (!hasTile) return;
         setDeckOpen(false);
         summonCaptain(terminalId);
       }}
-      title={`Go to captain - ${identity}`}
+      title={
+        hasTile
+          ? `Go to captain - ${identity}`
+          : `${identity} - tile not available (tab popped out?)`
+      }
       className="group flex min-h-[120px] flex-col gap-2 rounded-lg border p-3 text-left transition-colors hover:bg-neutral-800/30"
       style={{
         backgroundColor: "var(--th-tile-bg)",
         borderColor: isOrchestrator ? "var(--th-accent)" : "var(--th-border)",
+        opacity: hasTile ? 1 : 0.5,
       }}
       data-deck-tile={terminalId}
       data-orchestrator={isOrchestrator || undefined}
+      data-tile-available={hasTile || undefined}
     >
       <div className="flex items-center gap-2">
         <CaptainStatusDot terminalId={terminalId} size={12} />

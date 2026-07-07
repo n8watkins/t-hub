@@ -37,12 +37,24 @@ beforeEach(() => {
     activeCaptainId: "cap00001",
     open: false,
     anchorMenuOpen: false,
+    deckOpen: false,
   });
 });
 
 describe("handleOverlayEscape precedence", () => {
   it("consumes nothing when neither surface is up", () => {
     expect(handleOverlayEscape(false)).toBe(false);
+  });
+
+  it("closes the captains deck FIRST (top-level full-view surface)", () => {
+    // Opening the deck already retires the overlay/dropdown/fullscreen, so Esc
+    // closes it exclusively - routed here (not the deck's own listener) so the
+    // ordering is deterministic.
+    useCaptain.getState().setDeckOpen(true);
+    expect(useCaptain.getState().deckOpen).toBe(true);
+    expect(handleOverlayEscape(false)).toBe(true);
+    expect(useCaptain.getState().deckOpen).toBe(false);
+    expect(handleOverlayEscape(false)).toBe(false); // nothing left
   });
 
   it("dismisses the overlay FIRST when overlay + fullscreen are both up", () => {
@@ -97,16 +109,22 @@ describe("overlayEscapeArmed (Canvas listener arming predicate)", () => {
   // consume Esc for - a surface handled but not armed for is a dead Esc key
   // (the round-1 dropdown bug: armed only on fullscreen/overlay, so a
   // dropdown-only Esc never even reached the dispatch).
-  const off = { fullscreenId: null, captainOpen: false, anchorMenuOpen: false };
+  const off = {
+    fullscreenId: null,
+    captainOpen: false,
+    anchorMenuOpen: false,
+    deckOpen: false,
+  };
 
   it("is disarmed when no surface is up", () => {
     expect(overlayEscapeArmed(off)).toBe(false);
   });
 
-  it("arms for EACH surface alone - including the anchor dropdown", () => {
+  it("arms for EACH surface alone - including the deck and the anchor dropdown", () => {
     expect(overlayEscapeArmed({ ...off, fullscreenId: "aaa00001" })).toBe(true);
     expect(overlayEscapeArmed({ ...off, captainOpen: true })).toBe(true);
     expect(overlayEscapeArmed({ ...off, anchorMenuOpen: true })).toBe(true);
+    expect(overlayEscapeArmed({ ...off, deckOpen: true })).toBe(true);
   });
 });
 

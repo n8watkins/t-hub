@@ -37,6 +37,7 @@ import { create } from "zustand";
 import type { TerminalId } from "../ipc/types";
 import { loadPersisted, savePersisted } from "../lib/persist";
 import { useWorkspace } from "./workspace";
+import { usePanels } from "./panels";
 
 const PERSIST_KEY = "t-hub.captain.v2";
 /** The pre-list single-captain key (PR #9). Read-only now: migrated into the
@@ -360,6 +361,21 @@ export const useCaptain = create<CaptainState>((set, get) => {
         next.every((id, i) => id === s.captainIds[i]);
       if (!unchanged) commitIds(next);
       if (next.length === 0) get().setAnchorMenu(false);
+      // Reconcile a STALE orchestrator: after a relaunch where the designated
+      // session did not return, its id dangles (the strip shows a raw id, the
+      // input stays disabled). Clear it if the terminal is no longer present.
+      // Guarded on a non-empty terminals map so a not-yet-loaded workspace at
+      // boot never false-clears a valid designation.
+      const orch = s.orchestratorId;
+      if (orch != null) {
+        const terminals = useWorkspace.getState().terminals;
+        if (
+          Object.keys(terminals).length > 0 &&
+          terminals[orch] === undefined
+        ) {
+          get().setOrchestratorId(null);
+        }
+      }
     },
 
     toggleCaptain: (id) => {
@@ -466,10 +482,16 @@ export const useCaptain = create<CaptainState>((set, get) => {
 
     setDeckOpen: (open) => {
       if (get().deckOpen === open) return;
-      // The deck is a full-view surface; opening it retires the floating overlay
-      // and the anchor dropdown (mutually exclusive with the deck).
-      if (open) set({ deckOpen: true, open: false, anchorMenuOpen: false });
-      else set({ deckOpen: false });
+      // The deck is a full-view surface; opening it retires the floating overlay,
+      // the anchor dropdown, AND any fullscreen tile - the pool goes z-50 for a
+      // fullscreen tile, which would paint OVER the z-40 deck (and would make Esc
+      // ambiguous between exiting fullscreen and closing the deck).
+      if (open) {
+        usePanels.getState().setFullscreen(null);
+        set({ deckOpen: true, open: false, anchorMenuOpen: false });
+      } else {
+        set({ deckOpen: false });
+      }
     },
 
     toggleDeck: () => get().setDeckOpen(!get().deckOpen),

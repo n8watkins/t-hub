@@ -158,6 +158,26 @@ describe("CaptainsDeck", () => {
     expect(s.open).toBe(true);
   });
 
+  it("does NOT leave the deck when a TILE-LESS captain is clicked", () => {
+    // Drop cap00002's tile (tab popped out / killed): summon would be a store
+    // no-op, so the click must keep the deck open, not drop onto a blank view.
+    act(() => {
+      useWorkspace.setState({
+        tabs: [
+          { id: "t1", name: "Workspace 1", order: ["cap00001", "crewrun0"] },
+          { id: "t2", name: "Backend", order: [] },
+        ],
+      });
+    });
+    render(<CaptainsDeck />);
+    expect(tile("cap00002").getAttribute("data-tile-available")).toBeNull();
+    expect(tile("cap00002").textContent).toContain("tile not available");
+    fireEvent.click(tile("cap00002"));
+    const s = useCaptain.getState();
+    expect(s.deckOpen).toBe(true); // still open
+    expect(s.open).toBe(false); // no overlay summoned
+  });
+
   it("shows the empty state when no captains are pinned", () => {
     act(() => {
       useCaptain.setState({ captainIds: [], activeCaptainId: null });
@@ -211,14 +231,12 @@ describe("CaptainsDeck orchestrator input", () => {
     expect(writes).toEqual([]);
   });
 
-  it("Esc with a draft clears it and keeps the deck open", () => {
+  it("sends the TRIMMED text (leading/trailing whitespace dropped)", () => {
     act(() => useCaptain.getState().setOrchestratorId("cap00002"));
     render(<CaptainsDeck />);
-    const input = field();
-    fireEvent.change(input, { target: { value: "half-typed" } });
-    fireEvent.keyDown(input, { key: "Escape" });
-    expect(field().value).toBe("");
-    expect(useCaptain.getState().deckOpen).toBe(true); // did NOT close the deck
+    fireEvent.change(field(), { target: { value: "  hello world  " } });
+    fireEvent.submit(field().closest("form")!);
+    expect(writes).toEqual([{ id: "cap00002", data: "hello world\r" }]);
   });
 
   it("offers a disabled Scribe voice placeholder", () => {

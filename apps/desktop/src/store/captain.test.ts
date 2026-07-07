@@ -18,6 +18,7 @@ import {
   type CaptainClaimRecord,
 } from "./captain";
 import { useWorkspace, type WorkspaceTab } from "./workspace";
+import { usePanels } from "./panels";
 import type { TerminalInfo } from "../ipc/types";
 
 // Capture the store's fire-and-forget server captaincy mutations (phase 2:
@@ -599,5 +600,60 @@ describe("orchestrator designation (captains deck)", () => {
     useCaptain.getState().setOrchestratorId("ccc00001");
     expect(useCaptain.getState().orchestratorId).toBe("ccc00001");
     expect(loadCaptainPersisted().orchestratorId).toBe("ccc00001");
+  });
+});
+
+describe("captains deck view state", () => {
+  it("opening the deck clears a fullscreen tile, the overlay, and the anchor dropdown", () => {
+    // A fullscreen tile puts the pool at z-50 (over the z-40 deck); the deck
+    // must clear it on open, or the tile paints over the deck (and Esc would be
+    // ambiguous between exiting fullscreen and closing the deck).
+    usePanels.setState({ fullscreenId: "cap00001" });
+    useCaptain.setState({ open: true, anchorMenuOpen: true });
+    useCaptain.getState().setDeckOpen(true);
+    expect(useCaptain.getState().deckOpen).toBe(true);
+    expect(useCaptain.getState().open).toBe(false);
+    expect(useCaptain.getState().anchorMenuOpen).toBe(false);
+    expect(usePanels.getState().fullscreenId).toBeNull();
+  });
+
+  it("toggleDeck flips deckOpen and clears fullscreen when opening", () => {
+    usePanels.setState({ fullscreenId: "cap00001" });
+    useCaptain.getState().toggleDeck();
+    expect(useCaptain.getState().deckOpen).toBe(true);
+    expect(usePanels.getState().fullscreenId).toBeNull();
+    useCaptain.getState().toggleDeck();
+    expect(useCaptain.getState().deckOpen).toBe(false);
+  });
+});
+
+describe("orchestrator reconcile on adopt", () => {
+  it("clears a STALE orchestrator whose terminal is no longer present", () => {
+    useCaptain.getState().setOrchestratorId("cap00001");
+    // A relaunch where cap00001's session did NOT return: the workspace has
+    // terminals, but not that one.
+    useWorkspace.setState({ terminals: { bbb00001: term("bbb00001") } });
+    useCaptain.getState().adoptCaptainsRegistry([
+      { captainSessionId: "bbb00001", shipSlug: "s", workspaceTabIds: [], crew: [] },
+    ]);
+    expect(useCaptain.getState().orchestratorId).toBeNull();
+  });
+
+  it("keeps a LIVE orchestrator that is still present", () => {
+    useCaptain.getState().setOrchestratorId("cap00001");
+    useWorkspace.setState({ terminals: { cap00001: term("cap00001") } });
+    useCaptain.getState().adoptCaptainsRegistry([
+      { captainSessionId: "cap00001", shipSlug: "s", workspaceTabIds: [], crew: [] },
+    ]);
+    expect(useCaptain.getState().orchestratorId).toBe("cap00001");
+  });
+
+  it("does NOT clear the orchestrator when the workspace has no terminals yet (boot)", () => {
+    useCaptain.getState().setOrchestratorId("cap00001");
+    useWorkspace.setState({ terminals: {} }); // not loaded yet
+    useCaptain.getState().adoptCaptainsRegistry([
+      { captainSessionId: "cap00001", shipSlug: "s", workspaceTabIds: [], crew: [] },
+    ]);
+    expect(useCaptain.getState().orchestratorId).toBe("cap00001");
   });
 });
