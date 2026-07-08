@@ -565,10 +565,21 @@ fn stream_reader_loop(
     keepalive: Duration,
 ) {
     let (tx, rx) = sync_channel::<Vec<u8>>(FEED_DEPTH);
-    let feeder = std::thread::Builder::new()
+    let feeder = match std::thread::Builder::new()
         .name("t-hub-pty-feed".into())
         .spawn(move || feed_pty(reader, tx))
-        .ok();
+    {
+        Ok(handle) => handle,
+        Err(_) => {
+            // Feeder spawn failed (thread/resource exhaustion): nobody drains the
+            // attach child, so `rx` is already disconnected and the `wait()` below
+            // would block forever - leaking this forwarder's slot, the exact leak
+            // this path exists to prevent. Reap the child and tear down instead.
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+    };
 
     // Precompute the idle keepalive frame once (framing-aware, ignorable by any
     // client) so the timer path is a plain buffer write.
@@ -634,9 +645,7 @@ fn stream_reader_loop(
             }
         };
     }
-    if let Some(feeder) = feeder {
-        let _ = feeder.join();
-    }
+    let _ = feeder.join();
 }
 
 /// Blocking PTY drain feeding [`stream_reader_loop`] over a bounded channel: it
