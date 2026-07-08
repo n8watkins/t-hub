@@ -57,10 +57,12 @@ pub struct StatusSnapshot {
     /// The exact session id this snapshot is for.
     pub session_id: String,
     /// The session's working directory, lifted straight from the statusline
-    /// payload's `cwd`. Carried so the per-tile context meter has a FALLBACK
-    /// correlation when the robust tmux binding below is unavailable (e.g. an
-    /// un-upgraded agent that doesn't stamp the pane). Absent when the statusline
-    /// omitted it. See `store/sessionContext.ts`.
+    /// payload's `cwd`. NOT a tile↔session key: the frontend context meter binds
+    /// strictly by `tmux_session` below (a shared cwd once leaked one session's
+    /// reading onto another tile, so the cwd fallback was removed - see
+    /// `store/sessionContext.ts`). Still carried because `record_for_restore`
+    /// needs it to restore a session in the right place. Absent when the
+    /// statusline omitted it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     /// The tmux PANE id (`$TMUX_PANE`, e.g. `%37`) the statusline ran inside, as
@@ -74,7 +76,8 @@ pub struct StatusSnapshot {
     /// `th_<terminalId>`), resolved by the agent from `$TMUX_PANE`. This is the
     /// ROBUST tile↔session key: T-Hub names every session `th_<terminalId>`, so
     /// a tile computes its own session name and looks itself up by it — no cwd
-    /// guessing. Absent ⇒ frontend degrades to the `cwd` match above.
+    /// guessing. This is now the ONLY key: a reading with no session is dropped
+    /// (never guessed by the `cwd` above), so tiles sharing a folder can't leak.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tmux_session: Option<String>,
     /// Context window used %, derived from `context_window.*` (0..=100).
@@ -118,16 +121,16 @@ impl StatusSnapshot {
     /// `session_id`. Tolerant of missing fields/blocks (returns a snapshot with
     /// `None`s rather than failing). `now_ms` is injected for testability.
     pub fn from_statusline(session_id: &str, raw: &serde_json::Value, now_ms: u64) -> Self {
-        // Statusline `cwd` is a top-level string; kept verbatim as the FALLBACK
-        // correlation when the tmux binding below is absent.
+        // Statusline `cwd` is a top-level string; kept verbatim for the durable
+        // restore map (`record_for_restore`), NOT as a context-meter fallback.
         let cwd = raw
             .get("cwd")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         // Robust tile binding: the agent stamps the owning tmux pane + session
         // (`tmux_pane`/`tmux_session`) onto the statusline before journaling. Lift
-        // both verbatim; the frontend keys context by `tmux_session` and falls
-        // back to `cwd` when these are absent (un-upgraded agent / not under tmux).
+        // both verbatim; the frontend keys context STRICTLY by `tmux_session` and
+        // drops a reading that lacks it (no cwd guessing across same-folder tiles).
         let tmux_pane = raw
             .get("tmux_pane")
             .and_then(|v| v.as_str())
@@ -421,7 +424,7 @@ mod tests {
         let snap = StatusSnapshot::from_statusline("s1", &raw, 1);
         assert_eq!(snap.tmux_pane.as_deref(), Some("%37"));
         assert_eq!(snap.tmux_session.as_deref(), Some("th_abcd1234"));
-        // cwd still carried as the fallback correlation.
+        // cwd still carried (for the restore map), no longer a context-meter key.
         assert_eq!(snap.cwd.as_deref(), Some("/work"));
     }
 
