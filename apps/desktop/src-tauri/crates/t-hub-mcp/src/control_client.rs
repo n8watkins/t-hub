@@ -9,7 +9,7 @@
 //! from an injected config rather than process-global env (which keeps the tests
 //! hermetic under parallel execution). Each call opens a short-lived TCP
 //! connection to `addr`, sends one NDJSON request line, and reads one NDJSON
-//! response line. Connections are not pooled — `tools/call` is infrequent and a
+//! response line. Connections are not pooled - `tools/call` is infrequent and a
 //! fresh connection keeps the client stateless and robust to app restarts.
 
 use std::io::{BufRead, BufReader, Write};
@@ -78,7 +78,11 @@ impl Discovery {
     /// the handshake file is missing, so the MCP server can surface "T-Hub is
     /// not running" as a tool error rather than crashing.
     pub fn resolve(&self) -> Result<ControlEndpoint, String> {
-        // 1. Explicit addr + token override — used by the proof harness.
+        // 1. Explicit addr + token override - used by the proof harness and the
+        //    app's spawn-tree env injection (`T_HUB_CONTROL_ADDR` +
+        //    `T_HUB_CONTROL_TOKEN`). The fast path while the app stays bound; if it
+        //    later goes stale (restart onto a new port), `resolve_and_call` falls
+        //    back to `resolve_from_file` instead of re-trusting this pair.
         if let (Some(addr), Some(token)) = (&self.addr, &self.token) {
             if !addr.is_empty() && !token.is_empty() {
                 return Ok(ControlEndpoint {
@@ -89,6 +93,18 @@ impl Discovery {
         }
 
         // 2. The handshake file the running app wrote.
+        self.resolve_from_file()
+    }
+
+    /// Read the endpoint from the handshake file ONLY, ignoring any
+    /// `$T_HUB_CONTROL_ADDR`/`$T_HUB_CONTROL_TOKEN` override.
+    ///
+    /// This is the recovery path after a transport failure: the app rebinds to a
+    /// fresh ephemeral port on every restart and rewrites control.json, but a
+    /// session's MCP captured the old addr+token in its env at spawn time. Once
+    /// that env pin points at a dead port, the live endpoint lives only in the
+    /// file - so we re-read it here rather than re-trusting the stale env pair.
+    pub fn resolve_from_file(&self) -> Result<ControlEndpoint, String> {
         let path = self.handshake_path();
         let body = std::fs::read_to_string(&path).map_err(|e| {
             format!(
@@ -134,17 +150,89 @@ struct ControlResponse {
     error: Option<String>,
 }
 
+/// Why a single control round-trip failed, so the retry layer can tell a moved
+/// endpoint apart from a command the app deliberately rejected.
+enum CallError {
+    /// Transport-level: connect refused/timed out, or the stream died (or spoke
+    /// garbage) mid round-trip. A restarted app on a new ephemeral port looks
+    /// exactly like this, so the caller re-reads control.json and retries.
+    Transport(String),
+    /// The app answered and rejected the command (bad token, unknown command,
+    /// governor refusal). A different endpoint won't change the verdict.
+    App(String),
+}
+
+impl CallError {
+    fn into_message(self) -> String {
+        match self {
+            CallError::Transport(m) | CallError::App(m) => m,
+        }
+    }
+}
+
+/// Resolve the control endpoint and run one command, transparently recovering
+/// from an app restart.
+///
+/// The app rebinds to a fresh ephemeral port on every launch and rewrites
+/// control.json, but a session's MCP captured the old addr+token in its env at
+/// spawn time (see `elevation_env` on the app side). So when the resolved
+/// endpoint is dead (a transport failure), we re-read control.json - dropping
+/// the stale env pair entirely - and retry once against the addr+token the
+/// running app just wrote, instead of wrongly concluding "T-Hub is down".
+/// App-level rejections are returned verbatim (a new endpoint won't change them).
+pub fn resolve_and_call(
+    discovery: &Discovery,
+    command: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let endpoint = discovery.resolve()?;
+    match call_classified(&endpoint, command, args) {
+        Ok(v) => Ok(v),
+        Err(CallError::App(msg)) => Err(msg),
+        Err(CallError::Transport(first)) => {
+            // The endpoint we tried is unreachable. If control.json now names a
+            // *different* endpoint (the app restarted onto a new port, so our env
+            // pin went stale), retry once against the freshly-read addr+token.
+            match discovery.resolve_from_file() {
+                Ok(fresh) if fresh.addr != endpoint.addr || fresh.token != endpoint.token => {
+                    call_classified(&fresh, command, args).map_err(CallError::into_message)
+                }
+                // Nothing fresher on disk (same endpoint, or the file is
+                // gone/unreadable): surface the original transport error, which
+                // already reads "is the app running?".
+                _ => Err(first),
+            }
+        }
+    }
+}
+
 /// Forward one command to the app and return its `result` JSON, or an error
-/// string. `endpoint` carries the resolved addr + token.
-pub fn call(endpoint: &ControlEndpoint, command: &str, args: &Value) -> Result<Value, String> {
+/// string - the single-shot primitive used by the crate's tests. Production code
+/// goes through [`resolve_and_call`], which adds the restart-recovery retry.
+#[cfg(test)]
+fn call(endpoint: &ControlEndpoint, command: &str, args: &Value) -> Result<Value, String> {
+    call_classified(endpoint, command, args).map_err(CallError::into_message)
+}
+
+/// The single round-trip, with its failure classified so [`resolve_and_call`]
+/// knows whether re-reading control.json could recover it.
+fn call_classified(
+    endpoint: &ControlEndpoint,
+    command: &str,
+    args: &Value,
+) -> Result<Value, CallError> {
     let request = serde_json::json!({
         "token": endpoint.token,
         "command": command,
         "args": args,
     });
 
-    let stream = TcpStream::connect(&endpoint.addr)
-        .map_err(|e| format!("failed to connect to T-Hub control channel {}: {e}", endpoint.addr))?;
+    let stream = TcpStream::connect(&endpoint.addr).map_err(|e| {
+        CallError::Transport(format!(
+            "failed to connect to T-Hub control channel {}: {e}",
+            endpoint.addr
+        ))
+    })?;
     // Bounded timeouts so a hung app surfaces as a tool error, not a stuck MCP
     // server. The control handler answers a single round-trip quickly.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
@@ -152,34 +240,40 @@ pub fn call(endpoint: &ControlEndpoint, command: &str, args: &Value) -> Result<V
 
     let mut writer = stream
         .try_clone()
-        .map_err(|e| format!("failed to clone control stream: {e}"))?;
-    let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+        .map_err(|e| CallError::Transport(format!("failed to clone control stream: {e}")))?;
+    let mut line = serde_json::to_vec(&request).map_err(|e| CallError::Transport(e.to_string()))?;
     line.push(b'\n');
     writer
         .write_all(&line)
-        .map_err(|e| format!("failed to send control request: {e}"))?;
+        .map_err(|e| CallError::Transport(format!("failed to send control request: {e}")))?;
     writer
         .flush()
-        .map_err(|e| format!("failed to flush control request: {e}"))?;
+        .map_err(|e| CallError::Transport(format!("failed to flush control request: {e}")))?;
 
     let mut reader = BufReader::new(stream);
     let mut resp_line = String::new();
     let n = reader
         .read_line(&mut resp_line)
-        .map_err(|e| format!("failed to read control response: {e}"))?;
+        .map_err(|e| CallError::Transport(format!("failed to read control response: {e}")))?;
     if n == 0 {
-        return Err("T-Hub control channel closed without responding".to_string());
+        return Err(CallError::Transport(
+            "T-Hub control channel closed without responding".to_string(),
+        ));
     }
 
-    let resp: ControlResponse = serde_json::from_str(resp_line.trim_end())
-        .map_err(|e| format!("malformed control response: {e} (raw: {})", resp_line.trim_end()))?;
+    let resp: ControlResponse = serde_json::from_str(resp_line.trim_end()).map_err(|e| {
+        CallError::Transport(format!(
+            "malformed control response: {e} (raw: {})",
+            resp_line.trim_end()
+        ))
+    })?;
 
     if resp.ok {
         Ok(resp.result.unwrap_or(Value::Null))
     } else {
-        Err(resp
-            .error
-            .unwrap_or_else(|| "control command failed (no error message)".to_string()))
+        Err(CallError::App(resp.error.unwrap_or_else(|| {
+            "control command failed (no error message)".to_string()
+        })))
     }
 }
 
@@ -294,5 +388,70 @@ mod tests {
             err.contains("control channel not found"),
             "err: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_and_call_recovers_after_app_restart() {
+        // Reproduce the real failure: a session's MCP was spawned BEFORE an app
+        // restart, so its env pins the now-dead addr+token, while control.json
+        // carries the addr+token the restarted app just wrote. (Both change here - // proving the recovery drops the stale env PAIR, not just the addr.)
+        let dir = std::env::temp_dir().join(format!("th-mcp-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+
+        // The "restarted" app: a fresh listener on a new port with a new token,
+        // and control.json pointing at it (what the live app wrote on relaunch).
+        let live_addr = fake_server("filetok", r#"{"ok":true,"result":{"hello":"world"}}"#);
+        std::fs::write(
+            &file,
+            format!(r#"{{"addr":"{live_addr}","token":"filetok","pid":1}}"#),
+        )
+        .unwrap();
+
+        // The dead pre-restart endpoint: bind to grab a port, then drop it so
+        // connects are refused (the old ephemeral port the app abandoned).
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap().to_string();
+        drop(dead);
+
+        let discovery = Discovery {
+            addr: Some(dead_addr.clone()),
+            token: Some("envtok".into()),
+            file: Some(file.clone()),
+            ..Default::default()
+        };
+
+        // Red path: the naive single-shot against the env-pinned endpoint fails,
+        // because that port died when the app restarted.
+        let stale = discovery.resolve().unwrap();
+        assert_eq!(stale.addr, dead_addr, "resolve still prefers the env pin");
+        assert!(
+            call(&stale, "list_tabs", &Value::Null).is_err(),
+            "the dead endpoint must fail to connect"
+        );
+
+        // Green path: resolve_and_call drops the stale env pair, re-reads
+        // control.json, and reconnects to the live post-restart endpoint+token.
+        let v = resolve_and_call(&discovery, "list_tabs", &Value::Null).unwrap();
+        assert_eq!(v["hello"], "world");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_and_call_app_error_is_not_retried() {
+        // An app that answers with a rejection is NOT a moved endpoint: the error
+        // surfaces verbatim without a control.json re-read/retry.
+        let addr = fake_server("tok", r#"{"ok":false,"error":"boom"}"#);
+        let discovery = Discovery {
+            addr: Some(addr),
+            token: Some("tok".into()),
+            // A file that does not exist: if this path retried on disk it would
+            // change the error; asserting "boom" proves it did not.
+            file: Some(PathBuf::from("/nonexistent/th-control.json")),
+            ..Default::default()
+        };
+        let err = resolve_and_call(&discovery, "list_tabs", &Value::Null).unwrap_err();
+        assert_eq!(err, "boom");
     }
 }
