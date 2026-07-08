@@ -24,7 +24,10 @@
 //! Then the server streams newline-delimited JSON frames:
 //!   - `{"scrollback":"<b64>"}` once (the opening frame; we decode + return it),
 //!   - `{"out":"<b64>"}` per output chunk,
-//!   - `{"exit":<code|null>}` once on the attach client's exit.
+//!   - `{"exit":<code|null>}` once on the attach client's exit,
+//!   - `{"keepalive":"..."}` on an idle stream (ignorable padding the server writes
+//!     to reap a gone/stalled client; [`parse_pty_frame`] drops it like any frame
+//!     without `out`/`exit`).
 //! And we send back:
 //!   - `{"write":"<b64>"}` for keystrokes,
 //!   - `{"resize":{"cols":C,"rows":R}}` for geometry.
@@ -287,7 +290,8 @@ enum PtyFrame {
     /// The process exited; `Option<i32>` is the exit code when known.
     Exit(Option<i32>),
     /// A blank line, a malformed frame, or any other shape (e.g. a late
-    /// `{"scrollback"}`) — skipped without tearing the stream down.
+    /// `{"scrollback"}` or the server's idle `{"keepalive"}`) — skipped without
+    /// tearing the stream down.
     Ignore,
 }
 
