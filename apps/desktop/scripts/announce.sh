@@ -130,27 +130,33 @@ fi
 
 VOICE="${2:-$CFG_VOICE}"
 if [ "$ENGINE" = "piper" ]; then PORT=7477; else PORT=7478; fi
-WAV="/mnt/c/Users/natha/Downloads/.thub-announce.wav"
+
+WAV="$(mktemp /mnt/c/Users/natha/Downloads/.thub-announce-XXXXXX.wav)"
+trap 'rm -f "$WAV"' EXIT
+WAV_WIN="C:/Users/natha/Downloads/$(basename "$WAV")"
+
+BODY="$(TEXT="$TEXT" VOICE="$VOICE" python3 -c 'import json, os; print(json.dumps({"text": os.environ["TEXT"], "voice": os.environ["VOICE"]}))')"
 
 CODE=$(curl -s -m 30 -X POST http://127.0.0.1:$PORT/tts \
   -H 'Content-Type: application/json' \
-  -d "{\"text\":$(printf '%s' "$TEXT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),\"voice\":\"$VOICE\"}" \
+  -d "$BODY" \
   -o "$WAV" -w "%{http_code}")
 
 if [ "$CODE" = "200" ]; then
   powershell.exe -NoProfile -Command "
     Add-Type -AssemblyName PresentationCore;
     \$p = New-Object System.Windows.Media.MediaPlayer;
-    \$p.Open([uri]'file:///C:/Users/natha/Downloads/.thub-announce.wav');
+    \$p.Open([uri]'file:///$WAV_WIN');
     \$p.Volume = $VOLUME;
     while (-not \$p.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 50 };
     \$p.Play();
     Start-Sleep -Milliseconds ([int]\$p.NaturalDuration.TimeSpan.TotalMilliseconds + 200);
     \$p.Close()" >/dev/null 2>&1
 else
+  TEXT_PS="$(printf '%s' "$TEXT" | sed "s/'/''/g")"
   powershell.exe -NoProfile -Command "
     Add-Type -AssemblyName System.Speech;
     \$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;
     \$s.Rate = $SAPI_RATE; \$s.Volume = [int]($VOLUME * 100);
-    \$s.Speak(\"$TEXT\")" >/dev/null 2>&1
+    \$s.Speak('$TEXT_PS')" >/dev/null 2>&1
 fi

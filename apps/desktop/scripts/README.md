@@ -12,7 +12,8 @@ These are thin clients of the running app; they are not built or bundled.
 ## announce.sh
 
 Speaks a line of text through the local TTS servers (Kokoro `127.0.0.1:7478`, Piper `127.0.0.1:7477`), falling back to Windows SAPI when the selected engine's server is down.
-Settings come from `~/.t-hub/captain/voice.json` (`enabled`, `engine`, `voice`, `volume`, `sapiRate`) - the same file the app reads (see `src-tauri/src/voice.rs`).
+Settings come from `~/.t-hub/captain/voice.json` (`enabled`, `engine`, `voice`, `volume`, `sapiRate`).
+This is the captain path's own config file, separate from the app's own voice settings at `~/.t-hub/voice.json` (see `src-tauri/src/voice.rs`); toggling Voice in the app UI does not silence captain announcements.
 
 ```
 announce.sh "crew one is blocked" [voice]
