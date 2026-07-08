@@ -1048,6 +1048,10 @@ pub struct ControlContext {
     /// ([`MAX_ATTACH_FORWARDERS`] by default; a field so tests can drive a tiny
     /// one). Defense in depth under client churn - see [`AttachForwarderGuard`].
     max_attach_forwarders: usize,
+    /// How often an idle forwarder writes a keepalive so a gone/stalled client is
+    /// reaped instead of leaking the slot ([`ATTACH_KEEPALIVE_INTERVAL`] by default;
+    /// a field so tests can drive a short one). See [`serve_pty_attach`].
+    attach_keepalive_interval: std::time::Duration,
     /// Whether the connection being served is from the LOCAL loopback (same machine,
     /// fully trusted) vs a REMOTE tailnet peer. Set per-connection in `handle_conn`;
     /// `true` by default (tests + the loopback case). Gates the file-read scope (#23):
@@ -1448,6 +1452,18 @@ const ATTACH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const MAX_ATTACH_FORWARDERS: usize = 64;
 static ACTIVE_ATTACH_FORWARDERS: AtomicUsize = AtomicUsize::new(0);
 
+/// How often an idle PTY attach forwarder writes a keepalive frame to its client
+/// (s27 idle-leak fix). The forwarder used to notice a dead client ONLY when it
+/// had real output to write; an IDLE terminal produces none, so a client that
+/// stopped draining or vanished holding the socket (no FIN the input read could
+/// see) was never noticed - the forwarder parked forever on the silent PTY read
+/// and leaked, wedging the table at [`MAX_ATTACH_FORWARDERS`]. A periodic keepalive
+/// forces a write on the otherwise-silent stream, so a gone/stalled client surfaces
+/// as a write error or a full-buffer [`ATTACH_WRITE_TIMEOUT`] and reaps like any
+/// other. A healthy client drains it as a no-op. A field on [`ControlContext`] so
+/// tests can drive a short one.
+const ATTACH_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Number of live PTY attach forwarders (diagnostics / the churn regression
 /// test's return-to-baseline assertion).
 pub fn attach_forwarder_count() -> usize {
@@ -1809,6 +1825,7 @@ fn serve_pty_attach(
         rows,
         Box::new(sink),
         framing,
+        ctx.attach_keepalive_interval,
         Some(on_stream_end),
     ) {
         Ok(h) => h,
@@ -3955,6 +3972,7 @@ impl ControlContext {
             idle_timeout: CONN_READ_TIMEOUT,
             attach_write_timeout: ATTACH_WRITE_TIMEOUT,
             max_attach_forwarders: MAX_ATTACH_FORWARDERS,
+            attach_keepalive_interval: ATTACH_KEEPALIVE_INTERVAL,
             peer_is_loopback: true,
             token,
             read_token: String::new(),
@@ -5891,6 +5909,75 @@ mod tests {
         let _ = tmux::kill_session(&target);
         eventually("forwarder table drained at test end", Duration::from_secs(10), || {
             attach_forwarder_count() == 0
+        });
+    }
+
+    /// THE s27 idle-leak regression: a client attached to an IDLE terminal that
+    /// stops draining and then vanishes WITHOUT a clean close (no FIN reaches the
+    /// server's input read) must still be reaped. The forwarder only ever noticed
+    /// a dead client when it had real output to write; an idle terminal produces
+    /// none, so the write path never fired and the forwarder parked forever on the
+    /// silent PTY read - leaking the slot and, at scale, wedging the table so new
+    /// cockpit tiles could not attach. The sibling churn test above never catches
+    /// this because every one of its clients either closes (FIN/RST -> the input
+    /// read unblocks) or drives a firehose (the sink write blocks -> write
+    /// timeout); only a SILENT idle client exercises the gap. The periodic idle
+    /// keepalive must now force the stalled client to surface (its socket buffers
+    /// fill, the attach write timeout fires) so the forwarder reaps on its own.
+    #[test]
+    fn attach_reaps_idle_terminal_with_stalled_client() {
+        let _serial = attach_serial_guard();
+        eventually("forwarder table to drain before the test", Duration::from_secs(10), || {
+            attach_forwarder_count() == 0
+        });
+
+        let mut ctx = test_ctx("idle-secret");
+        ctx.idle_timeout = Duration::from_millis(500);
+        ctx.attach_write_timeout = Duration::from_millis(300);
+        // A short keepalive so the idle liveness probe fires within the test window
+        // (production drives seconds). Without the probe an idle forwarder never
+        // writes, so a stalled client is never noticed and the slot leaks forever.
+        ctx.attach_keepalive_interval = Duration::from_millis(50);
+        let addr = spawn_attach_listener(ctx);
+        let conns_baseline = ACTIVE_CONNS.load(Ordering::Relaxed);
+
+        let (id, target) = churn_tmux_session("idle");
+
+        // A tiny-receive-buffer client attaches to an IDLE session, reads the seed,
+        // then STOPS reading and holds the socket in silence - the idle analogue of
+        // the firehose wedge (case f above), but with no output to force the issue.
+        // Only the idle keepalive can fill the small buffer and trip the write
+        // timeout; without it this forwarder never reaps.
+        let stalled = {
+            let sock =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            sock.set_recv_buffer_size(4096).unwrap();
+            sock.connect(&addr.into()).expect("connect stalled client");
+            TcpStream::from(sock)
+        };
+        stalled.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut stalled_writer = stalled.try_clone().unwrap();
+        send_attach_request(&mut stalled_writer, "idle-secret", &id);
+        let mut stalled_reader = BufReader::new(stalled);
+        let seed = read_json_frame(&mut stalled_reader);
+        assert!(seed.get("scrollback").is_some(), "expected a seed, got {seed}");
+        assert_eq!(attach_forwarder_count(), 1, "forwarder up after attach");
+
+        // Do NOT read, do NOT close: the client is gone but its socket lingers. The
+        // server must reap this idle forwarder on its own, driven by the keepalive.
+        eventually(
+            "idle-terminal forwarder reaps a stalled client via the keepalive probe",
+            Duration::from_secs(15),
+            || attach_forwarder_count() == 0,
+        );
+
+        // Hold the client until AFTER the assertion so the reap is proven to be
+        // driven by the server's probe, not by the socket finally closing.
+        drop(stalled_reader);
+        drop(stalled_writer);
+        let _ = tmux::kill_session(&target);
+        eventually("connection handlers to drain", Duration::from_secs(10), || {
+            ACTIVE_CONNS.load(Ordering::Relaxed) <= conns_baseline
         });
     }
 

@@ -510,6 +510,9 @@ mod tests {
         assert_eq!(parse_pty_frame(br#"{"out":"!!!not base64!!!"}"#), PtyFrame::Ignore);
         // A late/unknown frame shape (e.g. scrollback) is ignored.
         assert_eq!(parse_pty_frame(br#"{"scrollback":"x"}"#), PtyFrame::Ignore);
+        // The server's idle keepalive is a no-op here: it carries no `out`/`exit`,
+        // so it must drop silently (the s27 idle-leak fix relies on this contract).
+        assert_eq!(parse_pty_frame(br#"{"keepalive":"...."}"#), PtyFrame::Ignore);
     }
 
     #[test]
