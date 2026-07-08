@@ -90,8 +90,9 @@ HANDSHAKE_PATH, _SERVER = launch_probe_server()
 def connect():
     return connect_to(HANDSHAKE_PATH)
 
-# Binary frame type tags (mirror pty::binframe in the Rust server).
-OUT, EXIT, SCROLLBACK, ERROR, WRITE, RESIZE = 0x01, 0x02, 0x03, 0x04, 0x10, 0x11
+# Binary frame type tags (mirror pty::binframe in the Rust server). KEEPALIVE
+# (0x05) is the idle-liveness frame clients skip as an unknown type; unused here.
+OUT, EXIT, SCROLLBACK, ERROR, KEEPALIVE, WRITE, RESIZE = 0x01, 0x02, 0x03, 0x04, 0x05, 0x10, 0x11
 
 
 def tmux(*args):
