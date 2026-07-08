@@ -519,6 +519,13 @@ impl Supervisor {
         }
     }
 
+    /// Whether the reducer has ever ingested an event for this session id. Used by
+    /// the control layer to decide whether a caller-supplied id is a supervisor key
+    /// (a Claude UUID) already, or a tile id that must first be resolved to its UUID.
+    pub fn knows(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
+    }
+
     /// Current status for a session (Unknown if unseen).
     pub fn status(&self, session_id: &str) -> SessionStatus {
         self.sessions

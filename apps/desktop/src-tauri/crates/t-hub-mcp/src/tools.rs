@@ -9,10 +9,11 @@
 //! Tiers (PRD §11.2):
 //!   - **Read** (allowed): `list_terminals`, `get_status`, `wait_for_status`,
 //!     `supervision_tree`, `wsl_health`, `search_files`, `list_tabs`,
-//!     `list_captains`, `read_terminal`.
+//!     `list_captains`, `list_fleet_watches`, `read_terminal`.
 //!   - **Organization** (allowed, audited): `focus_session`, `move_tile`,
 //!     `rename_tab`, `new_tab`, `focus_tab`, `close_tab`, `claim_captain`,
-//!     `release_captain`, `open_file`, `create_worktree`, `remove_worktree`.
+//!     `release_captain`, `watch_fleet`, `unwatch_fleet`, `open_file`,
+//!     `create_worktree`, `remove_worktree`.
 //!   - **Process-changing** (confirmation required): `spawn_terminal`,
 //!     `send_text`, `send_keys`, `close_terminal`.
 //!   - **Theme**: `get_theme`, `set_theme` — forwarded by name verbatim.
@@ -343,6 +344,43 @@ fn schema_release_captain() -> Value {
     })
 }
 
+/// `watch_fleet` schema (orchestrator wake): arm a server-side push that
+/// re-invokes THIS orchestrator's loop when a watched session changes state.
+fn schema_watch_fleet() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "orchestratorSessionId": { "type": "string", "description": "YOUR OWN session/terminal id (where the wake is injected). Get it from list_terminals / list_captains." },
+            "scope": {
+                "description": "Which sessions to be woken about: \"captains\" (default - every claimed captain), \"all\" (every supervised session), or an array of specific session ids.",
+                "oneOf": [
+                    { "type": "string", "enum": ["captains", "all"] },
+                    { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+                ]
+            },
+            "states": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Which states fire a wake (camelCase, e.g. \"completed\", \"needsQuestion\", \"needsPermission\", \"failed\"). Omit for the default actionable set (idle/turn-complete, needs-input, completed/exited)."
+            }
+        },
+        "required": ["orchestratorSessionId"],
+        "additionalProperties": false
+    })
+}
+
+/// `unwatch_fleet` schema (orchestrator wake): disarm this orchestrator's wake.
+fn schema_unwatch_fleet() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "orchestratorSessionId": { "type": "string", "description": "The orchestrator session id whose watch to disarm (the one passed to watch_fleet)." }
+        },
+        "required": ["orchestratorSessionId"],
+        "additionalProperties": false
+    })
+}
+
 /// `remove_worktree` schema (WS-4): remove a git worktree (its live tiles are
 /// detached first so no process is orphaned).
 fn schema_remove_worktree() -> Value {
@@ -423,6 +461,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_empty,
         },
         ToolDef {
+            name: "list_fleet_watches",
+            tier: Tier::Read,
+            summary: "List the armed orchestrator wakes (who gets woken, for which sessions + states).",
+            input_schema: schema_empty,
+        },
+        ToolDef {
             name: "read_terminal",
             tier: Tier::Read,
             summary: "Read a session's recent visible output (plain text; optional scrollback) so you can see what it currently shows.",
@@ -482,6 +526,18 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Organization,
             summary: "Release a claimed captaincy (by captainSessionId or shipSlug; unknown claims are refused).",
             input_schema: schema_release_captain,
+        },
+        ToolDef {
+            name: "watch_fleet",
+            tier: Tier::Organization,
+            summary: "Arm an orchestrator wake: T-Hub re-invokes YOUR loop (injects a prompt into your terminal) when a watched session (default: any captain) goes idle / needs-input / completes. Ends the need to poll. Idempotent; re-arming replaces the prior watch.",
+            input_schema: schema_watch_fleet,
+        },
+        ToolDef {
+            name: "unwatch_fleet",
+            tier: Tier::Organization,
+            summary: "Disarm the orchestrator wake previously armed with watch_fleet.",
+            input_schema: schema_unwatch_fleet,
         },
         ToolDef {
             // Spawning a process is the process-changing subset of the
@@ -658,6 +714,26 @@ mod tests {
         }
         let claim_schema = (find("claim_captain").unwrap().input_schema)();
         assert_eq!(claim_schema["required"], json!(["captainSessionId"]));
+    }
+
+    #[test]
+    fn fleet_wake_tools_are_exposed_with_the_right_tiers() {
+        // list_fleet_watches reads; watch/unwatch mutate (organization, audited,
+        // never confirmation-gated).
+        let list = find("list_fleet_watches").unwrap().to_mcp();
+        assert_eq!(list["annotations"]["t-hubTier"], "read");
+        assert_eq!(list["annotations"]["confirmationRequired"], false);
+        for name in ["watch_fleet", "unwatch_fleet"] {
+            let mcp = find(name).unwrap().to_mcp();
+            assert_eq!(mcp["annotations"]["t-hubTier"], "organization", "{name}");
+            assert_eq!(mcp["annotations"]["confirmationRequired"], false, "{name}");
+            let schema = (find(name).unwrap().input_schema)();
+            assert_eq!(
+                schema["required"],
+                json!(["orchestratorSessionId"]),
+                "{name} keys the wake on the orchestrator's own id"
+            );
+        }
     }
 
     #[test]

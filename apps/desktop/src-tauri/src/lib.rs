@@ -18,6 +18,7 @@ mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/d
 mod hangwatch; // host main-thread hang watchdog (sporadic Not-Responding/ghost hunt)
 mod dropin; // feat/terminal-input (Lane C): clipboard-image -> temp PNG for image paste
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
+mod fleet; // orchestrator wake: FleetWatchRegistry + FleetNotifier (server-side push on supervised transitions)
 // --- feat/git-panel ---
 mod git; // git awareness for the Files panel: branch/worktree info + commit
 // ----------------------
@@ -248,6 +249,7 @@ fn start_control_listener(
     fanout: std::sync::Arc<control::EventFanout>,
     tab_registry: std::sync::Arc<control::TabRegistry>,
     captains_registry: std::sync::Arc<control::CaptainsRegistry>,
+    fleet_watches: std::sync::Arc<fleet::FleetWatchRegistry>,
 ) -> Option<control::ControlHandshake> {
     // The control auth token. Server-split M2b: a PERSISTENT key (stable across
     // restarts) so a remote client paired once doesn't have to re-pair every launch.
@@ -303,7 +305,10 @@ fn start_control_listener(
         .with_tab_registry(tab_registry)
         // Captain-chat phase 2: the persistent captains registry (claims survive
         // restarts server-side; the UI's localStorage keeps only view state).
-        .with_captains_registry(captains_registry);
+        .with_captains_registry(captains_registry)
+        // Orchestrator wake: share the SAME watch registry the notifier reads, so
+        // `watch_fleet` / `unwatch_fleet` arm the wakes the notifier delivers.
+        .with_fleet_watches(fleet_watches);
     match control::start(ctx) {
         Ok(h) => {
             eprintln!(
@@ -497,12 +502,47 @@ pub fn run() {
             // crew tile would leave a stale claim/crew entry in the persistent
             // captains.json to re-hydrate as a phantom pin after restart.
             app.manage(captains_registry.clone());
+            // Orchestrator wake: the fleet watch registry (armed by `watch_fleet`)
+            // and the notifier that reads it. The notifier observes every session
+            // status edge and, when a watched session goes idle / needs-input /
+            // completes, injects a wake prompt into the orchestrator's terminal -
+            // re-invoking its agent loop instead of only painting a UI badge. All
+            // opt-in: no armed watch => no wakes => no behaviour change.
+            let fleet_watches = std::sync::Arc::new(fleet::FleetWatchRegistry::new());
+            {
+                // The injector: type + submit a line into a tile's Claude session
+                // over tmux (the only thing that re-invokes an idle agent loop).
+                let inject: fleet::Injector = std::sync::Arc::new(|tile: &str, text: &str| {
+                    tmux::send_text(&tmux::target_for_id(tile), text, true)
+                        .map_err(|e| e.to_string())
+                });
+                // Bonus UI/voice cue: fan out `fleet://wake` alongside the injection.
+                let sink_fanout = control_fanout.clone();
+                let event_sink: fleet::EventSink = std::sync::Arc::new(move |payload| {
+                    sink_fanout.emit_event("fleet://wake", payload);
+                });
+                let notifier = std::sync::Arc::new(
+                    fleet::FleetNotifier::new(
+                        fleet_watches.clone(),
+                        captains_registry.clone(),
+                        state.status.clone(),
+                        inject,
+                    )
+                    .with_event_sink(event_sink),
+                );
+                // Install as the AgentBridge status observer. The Arc is kept alive
+                // by the observer closure the bridge holds for the app's lifetime.
+                let observer: agent::StatusObserver =
+                    std::sync::Arc::new(move |uuid: &str, status| notifier.on_status(uuid, status));
+                state.agent.set_status_observer(observer);
+            }
             if let Some(handshake) = start_control_listener(
                 &state,
                 app.handle(),
                 control_fanout,
                 tab_registry,
                 captains_registry,
+                fleet_watches,
             ) {
                 control_client::install(app.handle(), &handshake);
             }

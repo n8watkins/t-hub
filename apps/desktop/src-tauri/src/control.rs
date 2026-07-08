@@ -800,6 +800,17 @@ impl CaptainsRegistry {
         CaptainsSnapshot { seq: g.seq, captains: g.captains.clone() }
     }
 
+    /// The captain record for a given captain session id (a tile id), if that
+    /// session currently holds a captaincy. Used by the fleet notifier to label a
+    /// transition as belonging to a captain (and name its ship).
+    pub fn captain_for_session(&self, session_id: &str) -> Option<CaptainRecord> {
+        self.lock()
+            .captains
+            .iter()
+            .find(|c| c.captain_session_id == session_id)
+            .cloned()
+    }
+
     /// Claim captaincy (UPSERT by captain session id):
     ///   - a NEW captain gets a record `{shipSlug, captainSessionId, workspaceTabIds}`
     ///     (crew starts empty);
@@ -1035,6 +1046,12 @@ pub struct ControlContext {
     /// `spawnedBy` crew plumbing; persistent across restarts (unlike `tabs`).
     /// Own empty in-memory one in headless tests.
     captains: Arc<CaptainsRegistry>,
+    /// The orchestrator-wake watch registry. Armed by `watch_fleet` / cleared by
+    /// `unwatch_fleet`; read by the [`crate::fleet::FleetNotifier`] wired in
+    /// `setup()`, which shares the same `Arc`. In-memory only (a watch is
+    /// meaningful only while its orchestrator session is live). Own empty one in
+    /// headless tests.
+    fleet_watches: Arc<crate::fleet::FleetWatchRegistry>,
     /// Idle read timeout for a connection's request phase ([`CONN_READ_TIMEOUT`] by
     /// default). A field (not the bare const) so tests can drive a short timeout
     /// against a real listener; could later carry an operator override.
@@ -2004,9 +2021,8 @@ fn required_tier(command: &str) -> CommandTier {
         }
         "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
-        | "archive_recent_project" | "claim_captain" | "release_captain" => {
-            CommandTier::Organization
-        }
+        | "archive_recent_project" | "claim_captain" | "release_captain" | "watch_fleet"
+        | "unwatch_fleet" => CommandTier::Organization,
         _ => CommandTier::Read,
     }
 }
@@ -2305,6 +2321,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         "read_text_file" => read_text_file(ctx, args),
         "list_tabs" => list_tabs(ctx),
         "list_captains" => list_captains(ctx),
+        "list_fleet_watches" => list_fleet_watches(ctx),
         // T12: the socket twin of the `report_workspace_tabs` Tauri command - a
         // socket UI (the native cockpit) reports its tab layout into the same
         // registry the webview reports into, so `list_tabs` stays truthful
@@ -2346,6 +2363,12 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // and every mutation forwards the authoritative captains snapshot.
         "claim_captain" => claim_captain(ctx, args),
         "release_captain" => release_captain(ctx, args),
+        // Orchestrator wake: arm/disarm a server-side push that re-invokes the
+        // orchestrator's loop when a watched session goes idle / needs-input /
+        // completes. Organization tier (audited); the wake itself injects via the
+        // same backend send_text path the ProcessChanging tier gates.
+        "watch_fleet" => watch_fleet(ctx, args),
+        "unwatch_fleet" => unwatch_fleet(ctx, args),
 
         // ---- Process-changing tier (PRD §11.2: confirmation required) ------
         // `spawn_terminal` is confirmation-gated (its MCP description carries the
@@ -2426,13 +2449,34 @@ fn get_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("get_status requires a 'sessionId' argument")?;
-    let status = ctx.with_supervisor(|s| s.status(&session_id));
-    let snapshot = ctx.status.get(&session_id);
+    let key = resolve_supervisor_key(ctx, &session_id);
+    let status = ctx.with_supervisor(|s| s.status(&key));
+    let snapshot = ctx.status.get(&key);
     Ok(json!({
         "sessionId": session_id,
+        "resolvedSessionId": key,
         "status": status,
         "snapshot": snapshot,
     }))
+}
+
+/// Resolve a caller-supplied `sessionId` to the supervision reducer's key (a Claude
+/// session UUID). The reducer keys sessions by the Claude UUID, but callers routinely
+/// pass a T-Hub **tile id** — that is what `list_terminals` / `list_captains` expose
+/// (a captain's `captainSessionId` is a tile id). If the id is already a known
+/// supervisor key we keep it; otherwise we map `tile -> live UUID` via the status
+/// bridge; otherwise we return it unchanged (an unknown id still resolves to
+/// `Unknown` / `null`, exactly as before this bridge existed). This closes the split
+/// where `get_status` / `supervision_tree` / `wait_for_status` returned `unknown` for
+/// a captain addressed by its `captainSessionId`.
+fn resolve_supervisor_key(ctx: &ControlContext, id: &str) -> String {
+    if ctx.with_supervisor(|s| s.knows(id)) {
+        return id.to_string();
+    }
+    if let Some(uuid) = ctx.status.session_for_terminal(id) {
+        return uuid;
+    }
+    id.to_string()
 }
 
 /// `wait_for_status`: long-poll the supervision reducer until a session reaches a
@@ -2479,12 +2523,18 @@ fn wait_for_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
 
     let started = std::time::Instant::now();
     loop {
+        // Resolve the caller id to a supervisor key each iteration: a captain passed
+        // by its tile id may not have a `tile -> uuid` binding yet on the first poll
+        // (no statusline ingested), but it appears once the session emits — so a wait
+        // armed a hair early still latches on. Resolved OUTSIDE `with_supervisor`
+        // because the resolver itself takes the supervisor lock.
+        let key = resolve_supervisor_key(ctx, &session_id);
         // (a) current status, and (b) any transition edge for this session since
         // `consumed` that matches a target — both read under one lock acquisition.
         // We advance `consumed` past every inspected edge so we never re-scan.
         let (status, edge_match) = ctx.with_supervisor(|s| {
-            let status = s.status(&session_id);
-            let edge = s.matched_since(&session_id, &target_enums, consumed);
+            let status = s.status(&key);
+            let edge = s.matched_since(&key, &target_enums, consumed);
             (status, edge)
         });
         let status_str = status_camel(status);
@@ -2585,7 +2635,8 @@ fn supervision_tree(ctx: &ControlContext, args: &Value) -> Result<Value, String>
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("supervision_tree requires a 'sessionId' argument")?;
-    let tree = ctx.with_supervisor(|s| s.tree(&session_id));
+    let key = resolve_supervisor_key(ctx, &session_id);
+    let tree = ctx.with_supervisor(|s| s.tree(&key));
     Ok(serde_json::to_value(tree).map_err(|e| e.to_string())?)
 }
 
@@ -3495,6 +3546,106 @@ fn release_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     }))
 }
 
+/// Parse the `scope` argument of `watch_fleet` into a [`crate::fleet::WatchScope`].
+/// Accepts the string `"captains"` (default) or `"all"`, or an array of tile ids
+/// (an explicit session list). An empty/absent scope defaults to captains.
+fn parse_watch_scope(args: &Value) -> Result<crate::fleet::WatchScope, String> {
+    use crate::fleet::WatchScope;
+    match args.get("scope") {
+        None | Some(Value::Null) => Ok(WatchScope::Captains),
+        Some(Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+            "captains" | "" => Ok(WatchScope::Captains),
+            "all" => Ok(WatchScope::All),
+            other => Err(format!(
+                "watch_fleet: unknown scope '{other}' (use \"captains\", \"all\", or an array of session ids)"
+            )),
+        },
+        Some(Value::Array(arr)) => {
+            let ids: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            if ids.is_empty() {
+                return Err("watch_fleet: scope array must contain at least one session id".into());
+            }
+            Ok(WatchScope::Sessions(ids))
+        }
+        Some(_) => Err(
+            "watch_fleet: 'scope' must be \"captains\", \"all\", or an array of session ids".into(),
+        ),
+    }
+}
+
+/// `watch_fleet` (Organization, audited): arm an orchestrator wake. The CALLING
+/// orchestrator (identified by its own tile id in `orchestratorSessionId`) asks to
+/// be re-invoked - a wake prompt injected into its terminal - whenever a session in
+/// `scope` (default: every claimed captain) transitions into one of `states`
+/// (default: the actionable set - idle/turn-complete, needs-input, completed/exited).
+/// Requires a live terminal (like `claim_captain`), so a bogus id can't arm a dead
+/// watch. Idempotent: re-arming replaces the prior watch for that orchestrator.
+fn watch_fleet(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let orchestrator = arg_str(args, "orchestratorSessionId")
+        .or_else(|| arg_str(args, "orchestrator_session_id"))
+        .or_else(|| arg_str(args, "sessionId"))
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("watch_fleet requires an 'orchestratorSessionId' argument (the orchestrator's own session id)")?;
+    if !tmux::has_session(&tmux_target(&orchestrator)) {
+        return Err(format!(
+            "watch_fleet: no live terminal for orchestrator '{orchestrator}' \
+             (a wake could never be delivered to a dead session)"
+        ));
+    }
+    let scope = parse_watch_scope(args)?;
+    // `states`: an array of camelCase status strings, or absent for the default
+    // actionable set. Unrecognized strings are dropped (they can never match a real
+    // status); an all-unrecognized list falls back to the default rather than a
+    // watch that can never fire.
+    let states = match args.get("states").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            let strs: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            target_statuses(&strs)
+        }
+        None => Vec::new(),
+    };
+    let watch = ctx.fleet_watches.arm(&orchestrator, scope, states);
+    Ok(json!({
+        "accepted": "watch_fleet",
+        "audited": true,
+        "watch": watch,
+        "note": "armed - this session will be woken (a prompt injected into its \
+                 terminal) when a watched session transitions into a target state.",
+    }))
+}
+
+/// `unwatch_fleet` (Organization, audited): disarm an orchestrator wake previously
+/// armed by `watch_fleet`, addressed by `orchestratorSessionId`. Idempotent-ish:
+/// reports whether a watch was actually removed.
+fn unwatch_fleet(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let orchestrator = arg_str(args, "orchestratorSessionId")
+        .or_else(|| arg_str(args, "orchestrator_session_id"))
+        .or_else(|| arg_str(args, "sessionId"))
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("unwatch_fleet requires an 'orchestratorSessionId' argument")?;
+    let removed = ctx.fleet_watches.disarm(&orchestrator);
+    Ok(json!({
+        "accepted": "unwatch_fleet",
+        "audited": true,
+        "removed": removed,
+    }))
+}
+
+/// `list_fleet_watches` (Read): the armed orchestrator wakes.
+fn list_fleet_watches(ctx: &ControlContext) -> Result<Value, String> {
+    let watches = ctx.fleet_watches.snapshot();
+    Ok(json!({
+        "watches": watches,
+        "count": watches.len(),
+    }))
+}
+
 /// `focus_tab` (Organization, audited): activate a tab - the ONE organization
 /// command that intentionally moves the user's view. Validates the tab against
 /// the registry (strict), mirrors the new active tab there (so `list_tabs` and
@@ -3952,6 +4103,7 @@ impl ControlContext {
             metrics: None,
             tabs: Arc::new(TabRegistry::new()),
             captains: Arc::new(CaptainsRegistry::new()),
+            fleet_watches: Arc::new(crate::fleet::FleetWatchRegistry::new()),
             idle_timeout: CONN_READ_TIMEOUT,
             attach_write_timeout: ATTACH_WRITE_TIMEOUT,
             max_attach_forwarders: MAX_ATTACH_FORWARDERS,
@@ -4009,6 +4161,15 @@ impl ControlContext {
     /// [`new`](Self::new).
     pub fn with_captains_registry(mut self, captains: Arc<CaptainsRegistry>) -> Self {
         self.captains = captains;
+        self
+    }
+
+    /// Share the [`crate::fleet::FleetWatchRegistry`] with the fleet notifier so
+    /// `watch_fleet` / `unwatch_fleet` arm the same registry the notifier reads.
+    /// `lib.rs` builds the `Arc` once and hands the same clone to the notifier;
+    /// headless tests keep the in-memory one from [`new`](Self::new).
+    pub fn with_fleet_watches(mut self, watches: Arc<crate::fleet::FleetWatchRegistry>) -> Self {
+        self.fleet_watches = watches;
         self
     }
 
@@ -4118,6 +4279,114 @@ mod tests {
         let ctx = test_ctx("t");
         let err = dispatch(&ctx, "definitely_not_a_command", &Value::Null).unwrap_err();
         assert!(err.contains("not exposed over the control channel"));
+    }
+
+    /// The id-namespace bridge: the supervisor keys by the Claude UUID, but callers
+    /// address a captain by its tile id (`captainSessionId`). `get_status` must
+    /// resolve tile -> UUID via the status bridge, so a captain's status is no longer
+    /// a spurious `unknown`. A UUID passed directly is unchanged.
+    #[test]
+    fn get_status_resolves_a_captain_tile_id_to_its_claude_uuid() {
+        use t_hub_protocol::JournalEventType;
+        let supervisor = Arc::new(StdMutex::new(Supervisor::new()));
+        supervisor.lock().unwrap().ingest(
+            Some("uuid-abc"),
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        let sup_for_closure = supervisor.clone();
+        let visitor: Arc<dyn Fn(&mut dyn FnMut(&Supervisor)) + Send + Sync> =
+            Arc::new(move |f: &mut dyn FnMut(&Supervisor)| {
+                let guard = sup_for_closure.lock().unwrap();
+                f(&guard);
+            });
+        let status = Arc::new(StatusBridge::new());
+        // The tile `cap01234` currently hosts Claude session `uuid-abc`.
+        status.ingest(
+            "uuid-abc",
+            &json!({ "cwd": "/p", "tmux_session": "th_cap01234" }),
+            1,
+        );
+        let ctx = ControlContext::new(status, visitor, "t".to_string());
+
+        // Poll by the CAPTAIN tile id -> resolves to the UUID, returns the real status.
+        let v = get_status(&ctx, &json!({ "sessionId": "cap01234" })).unwrap();
+        assert_eq!(
+            v.get("resolvedSessionId").and_then(|x| x.as_str()),
+            Some("uuid-abc"),
+            "tile id must resolve to the Claude UUID"
+        );
+        assert_eq!(
+            v.get("status").and_then(|x| x.as_str()),
+            Some("working"),
+            "status must be the real supervisor status, not 'unknown'"
+        );
+        // A UUID (already a supervisor key) is passed through untouched.
+        let v2 = get_status(&ctx, &json!({ "sessionId": "uuid-abc" })).unwrap();
+        assert_eq!(
+            v2.get("resolvedSessionId").and_then(|x| x.as_str()),
+            Some("uuid-abc")
+        );
+        // A genuinely unknown id still resolves to unknown (no regression).
+        let v3 = get_status(&ctx, &json!({ "sessionId": "ghostzzzz" })).unwrap();
+        assert_eq!(v3.get("status").and_then(|x| x.as_str()), Some("unknown"));
+    }
+
+    #[test]
+    fn watch_fleet_requires_a_live_orchestrator_terminal() {
+        let ctx = test_ctx("t");
+        // No live tmux for this id -> the arm is refused so a bogus id can't arm a
+        // watch that could never deliver.
+        let err = watch_fleet(&ctx, &json!({ "orchestratorSessionId": "nolivetile" }))
+            .unwrap_err();
+        assert!(err.contains("no live terminal"), "got: {err}");
+        // And it requires the id at all.
+        assert!(watch_fleet(&ctx, &json!({})).unwrap_err().contains("orchestratorSessionId"));
+    }
+
+    #[test]
+    fn unwatch_and_list_fleet_watches_on_empty_registry() {
+        let ctx = test_ctx("t");
+        let v = unwatch_fleet(&ctx, &json!({ "orchestratorSessionId": "whoever" })).unwrap();
+        assert_eq!(v.get("removed").and_then(|x| x.as_bool()), Some(false));
+        let list = list_fleet_watches(&ctx).unwrap();
+        assert_eq!(list.get("count").and_then(|x| x.as_u64()), Some(0));
+    }
+
+    #[test]
+    fn arm_then_list_and_disarm_a_watch_via_the_registry() {
+        // The command's tmux liveness guard needs a real session, so exercise the
+        // arm/list/disarm round-trip through the shared registry directly (the
+        // command is a thin validate-then-arm wrapper over exactly this).
+        let ctx = test_ctx("t");
+        ctx.fleet_watches
+            .arm("orc12345", crate::fleet::WatchScope::Captains, vec![]);
+        let list = list_fleet_watches(&ctx).unwrap();
+        assert_eq!(list.get("count").and_then(|x| x.as_u64()), Some(1));
+        let removed = unwatch_fleet(&ctx, &json!({ "orchestratorSessionId": "orc12345" })).unwrap();
+        assert_eq!(removed.get("removed").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(
+            list_fleet_watches(&ctx).unwrap().get("count").and_then(|x| x.as_u64()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn parse_watch_scope_accepts_captains_all_and_explicit_lists() {
+        use crate::fleet::WatchScope;
+        assert_eq!(parse_watch_scope(&json!({})).unwrap(), WatchScope::Captains);
+        assert_eq!(
+            parse_watch_scope(&json!({ "scope": "all" })).unwrap(),
+            WatchScope::All
+        );
+        assert_eq!(
+            parse_watch_scope(&json!({ "scope": ["a", "b"] })).unwrap(),
+            WatchScope::Sessions(vec!["a".into(), "b".into()])
+        );
+        assert!(parse_watch_scope(&json!({ "scope": "bogus" })).is_err());
+        assert!(parse_watch_scope(&json!({ "scope": [] })).is_err());
     }
 
     #[test]
