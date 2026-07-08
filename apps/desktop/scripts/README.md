@@ -15,7 +15,7 @@ Speaks a line of text through the local TTS servers (Kokoro `127.0.0.1:7478`, Pi
 Settings come from `~/.t-hub/captain/voice.json` (`enabled`, `engine`, `voice`, `volume`, `sapiRate`).
 This is the captain path's own config file, separate from the app's own voice settings at `~/.t-hub/voice.json` (see `src-tauri/src/voice.rs`); toggling Voice in the app UI does not silence captain announcements.
 
-```
+```sh
 announce.sh "crew one is blocked" [voice]
 ```
 
