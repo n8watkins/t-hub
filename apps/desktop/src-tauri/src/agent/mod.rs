@@ -144,7 +144,19 @@ struct BridgeInner {
     /// `None` until wired in `setup()` (and under unit tests). Held as a trait-
     /// free `Arc<StatusBridge>` to avoid a cycle with `claude`.
     status: Mutex<Option<Arc<crate::claude::StatusBridge>>>,
+    /// Optional observer invoked with `(session_uuid, status)` every time
+    /// [`AgentBridge::emit_session`] emits a session's status. Wired in `setup()` to
+    /// the fleet notifier so a supervised session's transition can wake the
+    /// orchestrator. `None` pre-setup and under unit tests (then a no-op). Kept
+    /// trait-free (a boxed closure) so the `agent` module needs no fleet types.
+    status_observer: Mutex<Option<StatusObserver>>,
 }
+
+/// A callback fired on every session status emit: `(session_uuid, status)`. The
+/// fleet notifier installs one via [`AgentBridge::set_status_observer`]; it is the
+/// server-side seam that turns a supervised session's transition into an
+/// orchestrator wake, without coupling the `agent` module to fleet concepts.
+pub type StatusObserver = Arc<dyn Fn(&str, crate::model::SessionStatus) + Send + Sync>;
 
 impl BridgeInner {
     /// Emit a `Serialize` payload on `channel` if an emitter is installed; a
@@ -168,6 +180,7 @@ impl Default for AgentBridge {
                 transport: Mutex::new(None),
                 emitter: Mutex::new(None),
                 status: Mutex::new(None),
+                status_observer: Mutex::new(None),
             }),
         }
     }
@@ -224,6 +237,12 @@ impl AgentBridge {
     /// `status://snapshot`. Called once from `setup()` alongside the emitter.
     pub fn set_status_bridge(&self, status: Arc<crate::claude::StatusBridge>) {
         *self.inner.status.lock() = Some(status);
+    }
+
+    /// Install the status observer (see [`StatusObserver`]). Called once from
+    /// `setup()` after the fleet notifier is built. Replaces any prior observer.
+    pub fn set_status_observer(&self, observer: StatusObserver) {
+        *self.inner.status_observer.lock() = Some(observer);
     }
 
     /// Transition the connection state **and** emit `agent://state` so the UI's
@@ -632,6 +651,13 @@ impl AgentBridge {
                 status,
             },
         );
+        // Notify the fleet observer (if wired) so a supervised session's transition
+        // can wake the orchestrator. Cloned out of the lock first so the observer's
+        // own locking can't deadlock against this emit path.
+        let observer = self.inner.status_observer.lock().clone();
+        if let Some(obs) = observer {
+            obs(session_id, status);
+        }
     }
 
     /// Derive a Claude-suggested title from a title-bearing hook entry and emit
@@ -927,6 +953,34 @@ mod tests {
             .unwrap();
         assert_eq!(tree_ev.1["sessionId"], "o1");
         assert_eq!(tree_ev.1["status"], "working");
+    }
+
+    /// The fleet status observer fires on the REAL journal-consume path (the
+    /// wiring the orchestrator wake depends on): every `emit_session` invokes the
+    /// observer with `(session_uuid, status)`, and the terminal edge is the
+    /// `Completed` the notifier wakes on. This closes the loop between the
+    /// supervision reducer and `crate::fleet::FleetNotifier`.
+    #[test]
+    fn status_observer_fires_on_the_journal_consume_path() {
+        use crate::model::SessionStatus;
+        let bridge = AgentBridge::new();
+        let seen: Arc<Mutex<Vec<(String, SessionStatus)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        bridge.set_status_observer(Arc::new(move |uuid: &str, status| {
+            sink.lock().push((uuid.to_string(), status));
+        }));
+
+        bridge.consume_journal_entry(&entry(1, "o1", None, JournalEventType::SessionStart));
+        bridge.consume_journal_entry(&entry(2, "o1", None, JournalEventType::Stop));
+
+        let got = seen.lock().clone();
+        assert!(!got.is_empty(), "observer must fire on the emit path");
+        assert!(got.iter().all(|(u, _)| u == "o1"), "always the affected session");
+        assert_eq!(
+            got.last().map(|(_, s)| *s),
+            Some(SessionStatus::Completed),
+            "the terminal edge is Completed - what the fleet notifier wakes on"
+        );
     }
 
     #[test]

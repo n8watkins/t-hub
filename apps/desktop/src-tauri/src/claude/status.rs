@@ -364,6 +364,36 @@ impl StatusBridge {
     pub fn all(&self) -> Vec<StatusSnapshot> {
         self.latest.read().values().map(|(_, snap)| snap.clone()).collect()
     }
+
+    /// Reverse-lookup: the T-Hub **tile id** (`th_<id>` ⇒ `<id>`) currently bound to
+    /// a Claude session UUID, from that session's latest statusline snapshot. This is
+    /// the live bridge between the two id namespaces — the supervision reducer /
+    /// `session://status` key sessions by the Claude UUID, while tmux / the captains
+    /// registry key by the tile id. `None` if no snapshot carries a tmux binding for
+    /// this UUID (un-upgraded agent, or a session we've never seen a statusline for).
+    pub fn terminal_for_session(&self, session_id: &str) -> Option<String> {
+        let snap = self.latest.read().get(session_id).map(|(_, s)| s.clone())?;
+        snap.tmux_session
+            .as_deref()
+            .map(|t| t.strip_prefix("th_").unwrap_or(t).to_string())
+    }
+
+    /// Reverse-lookup: the Claude session UUID currently bound to a T-Hub **tile id**.
+    /// Accepts a bare tile id or a full `th_`-prefixed name. Scans the snapshot map for
+    /// the entry whose `tmux_session` matches. `None` if no live session maps to that
+    /// tile. A tile hosts one live Claude session at a time, so at most one matches.
+    pub fn session_for_terminal(&self, terminal_id: &str) -> Option<String> {
+        let want = if terminal_id.starts_with("th_") {
+            terminal_id.to_string()
+        } else {
+            format!("th_{terminal_id}")
+        };
+        self.latest
+            .read()
+            .values()
+            .find(|(_, snap)| snap.tmux_session.as_deref() == Some(want.as_str()))
+            .map(|(_, snap)| snap.session_id.clone())
+    }
 }
 
 #[cfg(test)]
@@ -490,6 +520,48 @@ mod tests {
         drop(bridge);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The reverse-lookup helpers bridge the two id namespaces from a live snapshot:
+    /// UUID -> tile id and tile id -> UUID, with the `th_` prefix handled either way.
+    /// An un-tmux-bound snapshot yields no tile; an unknown id yields None.
+    #[test]
+    fn reverse_lookups_bridge_tile_and_session_ids() {
+        let bridge = StatusBridge::new(); // no DB needed for the in-memory map
+        bridge.ingest(
+            "sess-uuid-1",
+            &serde_json::json!({
+                "cwd": "/home/u/proj",
+                "tmux_session": "th_abcd1234",
+                "context_window": { "used_percentage": 10.0 }
+            }),
+            1,
+        );
+        // A snapshot with no tmux binding: stored for usage, but not tile-mappable.
+        bridge.ingest(
+            "sess-uuid-2",
+            &serde_json::json!({ "cwd": "/home/u/x", "context_window": { "used_percentage": 5.0 } }),
+            2,
+        );
+
+        // UUID -> tile (th_ prefix stripped).
+        assert_eq!(
+            bridge.terminal_for_session("sess-uuid-1").as_deref(),
+            Some("abcd1234")
+        );
+        assert_eq!(bridge.terminal_for_session("sess-uuid-2"), None);
+        assert_eq!(bridge.terminal_for_session("nope"), None);
+
+        // tile -> UUID, accepting a bare id OR a full th_-prefixed name.
+        assert_eq!(
+            bridge.session_for_terminal("abcd1234").as_deref(),
+            Some("sess-uuid-1")
+        );
+        assert_eq!(
+            bridge.session_for_terminal("th_abcd1234").as_deref(),
+            Some("sess-uuid-1")
+        );
+        assert_eq!(bridge.session_for_terminal("deadbeef"), None);
     }
 
     /// #8: a repeating statusline for the SAME (terminal, session, cwd) is
