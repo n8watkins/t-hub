@@ -30,6 +30,10 @@ apps/cli/target/
 Thumbs.db
 *.log
 
+# Python (test probes under scripts/)
+__pycache__/
+*.pyc
+
 # Env
 .env
 .env.*
