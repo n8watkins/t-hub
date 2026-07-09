@@ -2682,11 +2682,15 @@ fn recent_sessions() -> Result<Value, String> {
     serde_json::to_value(crate::recent::recent_sessions_cached()).map_err(|e| e.to_string())
 }
 
-/// `scribe_status` (read tier): the Scribe voice-gate - reads
-/// `~/.cache/com.natkins.scribe/status.json` and returns
-/// `{listening, status, since}`, failing open to `listening: false` on a
-/// missing / torn / stale / dead-pid file (see crate::scribe). Lets an agent
-/// ask "is the general dictating right now?".
+/// `scribe_status` (read tier): the Scribe voice-gate - asks Scribe's v1
+/// status endpoint (loopback HTTP, discovered via `~/.scribe/control.json`)
+/// whether the general is inside a dictation cycle, falling back to Scribe's
+/// status.json file (pid + 15s updatedAt TTL) only when the endpoint is
+/// unavailable. Returns `{listening, status, since, source}` - `listening` is
+/// sourced from the snapshot's level-triggered `busy` flag - and fails open to
+/// `listening: false` whenever it cannot positively confirm an active
+/// dictation (see crate::scribe). Lets an agent ask "is the general dictating
+/// right now?".
 fn scribe_status() -> Result<Value, String> {
     serde_json::to_value(crate::scribe::read_scribe_status()).map_err(|e| e.to_string())
 }

@@ -475,7 +475,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "scribe_status",
             tier: Tier::Read,
-            summary: "Is the general dictating right now? Reads the Scribe voice-gate status file and returns {listening, status, since}; fails open to listening=false when it can't tell (missing/stale/dead-pid file).",
+            summary: "Is the general dictating right now? Asks Scribe's v1 status endpoint (discovered via ~/.scribe/control.json; status.json file fallback with pid + 15s TTL) and returns {listening, status, since, source} - listening mirrors Scribe's level-triggered `busy` flag; fails open to listening=false when it can't tell (unreachable endpoint, missing/stale/dead-pid file).",
             input_schema: schema_empty,
         },
         // ---- Organization tier -----------------------------------------
