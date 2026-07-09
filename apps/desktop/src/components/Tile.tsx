@@ -61,7 +61,7 @@ import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { gitInfo, type GitInfo } from "../ipc/git";
 import { runWhenIdle } from "../lib/windowInteraction";
-import { Anchor, GitBranch } from "lucide-react";
+import { Anchor, GitBranch, RotateCcw } from "lucide-react";
 
 /** Poll git facts (branch / worktree / dirty count) for a tile's cwd. Refreshes
  *  on mount and whenever the window regains focus (cheap; the backend best-efforts
@@ -197,6 +197,9 @@ export function Tile({
   const userLabel = useWorkspace((s) => s.labels[terminalId]);
   const moveTile = useWorkspace((s) => s.moveTile);
   const moveTileToTab = useWorkspace((s) => s.moveTileToTab);
+  // Kill + restart: recover a frozen session by spawning a fresh one in the same
+  // cwd + tab slot and killing the old one. Always confirm-guarded (below).
+  const restartTerminal = useWorkspace((s) => s.restartTerminal);
   // Lifecycle: the × KILLS this terminal's tmux session for good. The actual kill
   // is the `onClose` prop, which Canvas wires to deleteTerminal -> killTerminal
   // (and, for the fullscreen copy, also drops the fullscreen layer). We confirm
@@ -391,6 +394,10 @@ export function Tile({
   // BUSY (a dev server running) — an idle session is killed immediately. Once up,
   // the kill runs on confirm (button / Enter); cancel/Esc/backdrop dismiss it.
   const [confirmKill, setConfirmKill] = useState(false);
+  // Whether the kill+restart confirm is up. ALWAYS confirmed (unlike ×, which
+  // skips the dialog when idle): an accidental click here kills a live session
+  // and spins up a fresh one, so it must never fire on a stray click.
+  const [confirmRestart, setConfirmRestart] = useState(false);
   // Right-click context menu position (null = closed). Right-clicking the header
   // opens a single "Kill session" action at the pointer.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
@@ -416,6 +423,8 @@ export function Tile({
     if (busy) setConfirmKill(true);
     else onClose();
   };
+  // Kill + restart is ALWAYS confirmed first, busy or not.
+  const requestRestart = () => setConfirmRestart(true);
 
   // Abort any in-flight header drag if this tile unmounts mid-gesture (#3): the
   // canceller runs the controller's full cleanup (listeners + grabbing cursor +
@@ -865,6 +874,27 @@ export function Tile({
           ⟳
         </button>
 
+        {/* Kill + restart (↺): recover a FROZEN session. Kills this tile's tmux
+            session (process tree) and spawns a FRESH one in the same folder, in
+            this exact tab + slot. Always confirm-guarded (requestRestart) — a
+            stray click would kill a live agent. Distinct counter-clockwise glyph
+            (vs. the ⟳ refresh, which is only a cosmetic re-fit). */}
+        <button
+          type="button"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            onFocus();
+            requestRestart();
+          }}
+          className="flex shrink-0 items-center rounded px-1 leading-none hover:bg-neutral-800"
+          style={{ color: "var(--th-fg-muted)" }}
+          title="Kill & restart session (fresh session, same folder)"
+          aria-label="Kill and restart session"
+        >
+          <RotateCcw width="0.9em" height="0.9em" aria-hidden />
+        </button>
+
         {/* ⋯ menu: per-terminal color overrides so you can tell this terminal
             apart from the rest. Opens a small popover anchored under the button;
             edits apply live and persist (see store/theme termOverrides). */}
@@ -987,6 +1017,30 @@ export function Tile({
           onClose();
         }}
         onCancel={() => setConfirmKill(false)}
+      />
+
+      {/* Kill + restart confirm — ALWAYS shown (busy or not): this ends the
+          session and starts a fresh one, so it must never fire on a stray click. */}
+      <ConfirmDialog
+        open={confirmRestart}
+        title="Kill & restart this session?"
+        body={
+          <>
+            This kills the tmux session{" "}
+            <span className="font-mono" style={{ color: "var(--th-fg)" }}>
+              {terminalId}
+            </span>{" "}
+            — ending everything running in it — and opens a fresh session in the
+            same folder, in this tile's place. Use it to recover a frozen
+            terminal.
+          </>
+        }
+        confirmLabel="Kill & restart"
+        onConfirm={() => {
+          setConfirmRestart(false);
+          void restartTerminal(terminalId);
+        }}
+        onCancel={() => setConfirmRestart(false)}
       />
 
       {/* Right-click context menu: a single "Kill session" action that runs the
