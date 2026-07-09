@@ -29,6 +29,7 @@ import { synthesizeVoice } from "../ipc/voice";
 import { scribeStatus } from "../ipc/scribe";
 import { playWavBase64 } from "./voiceAudio";
 import { createWarmup } from "./warmup";
+import { captainSubjectForSession } from "./captainAttribution";
 import type { SessionStatus } from "../ipc/model";
 
 /** Minimum gap between spoken announcements (the burst debounce). */
@@ -181,8 +182,13 @@ export function handleStatusesChange(
   // OFF per the PRD - the general opts in explicitly).
   if (!voice.enabled || !voice.announceOnAttention) return;
 
-  const label = labelForSession(entered[0][0]) ?? "A session";
-  const text = `${label} needs your attention`;
+  // Attribution: a CAPTAIN's cue names the ship ("Captain alpha needs your
+  // attention") so the general knows WHICH captain wants them; a regular session
+  // keeps its stable label. (Naming only - the gate above is untouched.)
+  const sid = entered[0][0];
+  const subject =
+    captainSubjectForSession(sid) ?? labelForSession(sid) ?? "A session";
+  const text = `${subject} needs your attention`;
 
   // Scribe voice-gate: the general is dictating - HOLD the cue in the single
   // pending slot (coalesced to the latest) instead of talking over them. It

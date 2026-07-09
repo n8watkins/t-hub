@@ -16,6 +16,7 @@ import { onSessionStatus, onSupervision } from "../ipc/client05";
 import { onExit, onState } from "../ipc/client";
 import type { SessionStatus } from "../ipc/model";
 import { createWarmup } from "./warmup";
+import { captainSubjectForSession } from "./captainAttribution";
 
 /** The three event flavors the rest of the app fires. */
 export type NotifyKind = "attention" | "done" | "error";
@@ -179,44 +180,56 @@ export function notify(kind: NotifyKind, title: string, body = ""): void {
 
 /** Map an FR-012 session status onto a notification, or null to stay silent.
  *  Only *actionable* transitions notify — `working`/`detached`/`restoring`/etc.
- *  are routine and would be noisy. */
+ *  are routine and would be noisy.
+ *
+ *  `subject` NAMES the originating captain ("Captain alpha", or the orchestrator
+ *  brand) when the session is a captain, so the general can tell WHICH captain
+ *  wants attention. Null for a regular session → the generic wording stands. */
 function statusToNotification(
   status: SessionStatus,
+  subject?: string | null,
 ): { kind: NotifyKind; title: string; body: string } | null {
+  // The actor named in the notification: the captain's ship when known, else a
+  // generic noun so non-captain sessions read exactly as before.
+  const who = subject ?? "Claude";
+  const whoSession = subject ?? "A session";
+  const whoAgent = subject ?? "An agent";
   switch (status) {
     // The "Claude is asking for input" signals — exactly the asks-signal the
     // task hoped for. These ARE first-class statuses on the bridge.
     case "needsQuestion":
       return {
         kind: "attention",
-        title: "Claude needs an answer",
-        body: "A session is waiting on your input.",
+        title: `${who} needs an answer`,
+        body: `${whoSession} is waiting on your input.`,
       };
     case "needsPermission":
       return {
         kind: "attention",
-        title: "Claude needs permission",
-        body: "A session is asking to use a tool.",
+        title: `${who} needs permission`,
+        body: `${whoSession} is asking to use a tool.`,
       };
     // A turn finished cleanly.
     case "completed":
       return {
         kind: "done",
-        title: "Session completed",
-        body: "An agent finished its turn.",
+        title: subject ? `${subject} completed` : "Session completed",
+        body: `${whoAgent} finished its turn.`,
       };
     // Hard failure — alert sound + notification.
     case "failed":
       return {
         kind: "error",
-        title: "Session failed",
-        body: "An agent run ended with an error.",
+        title: subject ? `${subject} failed` : "Session failed",
+        body: subject
+          ? `${subject}'s run ended with an error.`
+          : "An agent run ended with an error.",
       };
     case "rateLimited":
       return {
         kind: "error",
         title: "Rate limited",
-        body: "A session hit a rate limit.",
+        body: `${whoSession} hit a rate limit.`,
       };
     default:
       // working / waitingOnSubagents / detached / restoring / expired / unknown
@@ -277,7 +290,9 @@ export async function installSessionNotifications(): Promise<() => void> {
       lastNotifiedStatus.set(sessionId, status);
       // Warmup: record the baseline but don't sound the replayed status.
       if (inWarmup()) return;
-      const n = statusToNotification(status);
+      // Attribution: name the captain/ship when this session is one, so the
+      // general knows which captain wants attention (null → generic wording).
+      const n = statusToNotification(status, captainSubjectForSession(sessionId));
       if (n) notify(n.kind, n.title, n.body);
     }),
   );
@@ -290,7 +305,10 @@ export async function installSessionNotifications(): Promise<() => void> {
       if (lastNotifiedStatus.get(tree.sessionId) === tree.status) return;
       lastNotifiedStatus.set(tree.sessionId, tree.status);
       if (inWarmup()) return;
-      const n = statusToNotification(tree.status);
+      const n = statusToNotification(
+        tree.status,
+        captainSubjectForSession(tree.sessionId),
+      );
       if (n) notify(n.kind, n.title, n.body);
     }),
   );
