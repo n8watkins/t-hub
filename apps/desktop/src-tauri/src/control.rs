@@ -203,10 +203,11 @@ pub const SUBSCRIBE_COMMAND: &str = "__subscribe_events";
 ///
 /// **Framing (T13, negotiated here):** with `binary` absent/false the connection
 /// speaks **v1** — newline-delimited JSON, base64 payloads: opening
-/// `{"scrollback":"<b64>"}`, then `{"out":"<b64>"}` / `{"exit":code}` down and
-/// `{"write":"<b64>"}` / `{"resize":{cols,rows}}` up. With `"binary": true` it
-/// speaks **v2** — length-prefixed binary frames ([`pty::binframe`]): a SCROLLBACK
-/// frame opens, then OUT / EXIT down and WRITE / RESIZE up, with no base64 and no
+/// `{"scrollback":"<b64>"}`, then `{"out":"<b64>"}` / `{"exit":code}` (plus an
+/// ignorable idle `{"keepalive":"..."}`) down and `{"write":"<b64>"}` /
+/// `{"resize":{cols,rows}}` up. With `"binary": true` it speaks **v2** —
+/// length-prefixed binary frames ([`pty::binframe`]): a SCROLLBACK frame opens,
+/// then OUT / EXIT / KEEPALIVE down and WRITE / RESIZE up, with no base64 and no
 /// JSON envelope on the firehose. The webview (v1) is unaffected; only a client
 /// that asks for `binary` gets v2.
 pub const ATTACH_PTY_COMMAND: &str = "attach_pty";
@@ -1726,8 +1727,9 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
 ///
 /// Framing is negotiated from `args.binary` (T13): `true` ⇒ v2 length-prefixed
 /// BINARY frames, else v1 base64-NDJSON. The choice governs BOTH directions — the
-/// scrollback/out/exit/error frames written down AND the write/resize frames read
-/// up — so a v1 client is byte-for-byte unchanged and a v2 client never sees base64.
+/// scrollback/out/exit/error/keepalive frames written down AND the write/resize
+/// frames read up — so a v1 client is byte-for-byte unchanged and a v2 client never
+/// sees base64.
 ///
 /// Churn-proofing (s27) - every leak path a dying client can take is bounded:
 ///   - a slot in the forwarder table is acquired first (refused with a clear
