@@ -7,11 +7,14 @@
 #
 # SCRIBE VOICE-GATE (canonical): before speaking, this consults the T-Hub app's
 # AUTHORITATIVE scribe_status over the control socket - the SAME source of truth
-# the in-app voice watcher (voiceAnnounce.ts) uses. The app (scribe.rs) computes
-# "is the general dictating?" from Scribe's status file WITH pid-liveness and a
-# staleness backstop, and already FAILS OPEN (reports not-listening) whenever it
-# cannot positively confirm active dictation. So this script does NOT re-read the
-# status file or re-implement a weaker file-only check; it asks the one gate.
+# the in-app voice watcher (voiceAnnounce.ts) uses. The app (scribe.rs) asks
+# Scribe's v1 status endpoint (loopback HTTP, discovered via ~/.scribe/
+# control.json) whether the general is inside a dictation cycle (the `busy`
+# flag), falling back to Scribe's status.json file (pid-liveness + 15s TTL)
+# only when the endpoint is unavailable, and already FAILS OPEN (reports
+# not-listening) whenever it cannot positively confirm active dictation. So
+# this script does NOT re-read Scribe state or re-implement a weaker check
+# of its own; it asks the one gate.
 #
 # Behavior while the general dictates: DEFER (wait, bounded), then speak shortly
 # after they stop - matching the in-app hold+flush, so a cue is never dropped.
