@@ -1,20 +1,33 @@
-// Auto-continue on usage reset — installed once at startup (idempotent side-effect
+// Auto-continue on usage limit — installed once at startup (idempotent side-effect
 // import from main.tsx, like notifyMount/statusMount).
 //
-// For each terminal the user opted into (useAutoContinue), we watch its Claude
-// session's statusline snapshot (resolved via the supervision sessionIdByTmux
-// index). When a rate-limit window is EXHAUSTED (used % at its cap) and carries a
-// known reset time, we wait until that reset (+ a short grace) and inject the
-// continue command into the PTY, so a session that ran out of usage resumes on
-// its own. Fires once per (terminal, resetsAt) window.
+// DEFAULT ON fleet-wide (opt-out per tile via store/autoContinue). Every watched
+// terminal is recovered automatically when its agent runs out of usage, via TWO
+// independent triggers into the SAME recovery action:
 //
-// Imperative store subscriptions (no React) with one timer per terminal; we
-// re-evaluate on every supervision / opt-in change. An app restart mid-wait
-// re-arms naturally — a reset already in the past yields a ~0 delay and fires
-// promptly on the next snapshot.
+//   1. PANE-TEXT trigger — poll each watched Claude tile's visible pane
+//      (readTerminalTailText, read-only) and match the on-screen usage-limit
+//      MODAL (matchesUsageLimitDialog). Edge-triggered: fires ONCE when the
+//      dialog appears, not every poll, and re-arms after it clears. This is the
+//      trigger the old feature lacked — it dismisses the actual dialog.
+//   2. STATUSLINE/CODEX TIMER trigger — the pre-existing path: when a rate-limit
+//      window is EXHAUSTED (used % at its cap) and carries a reset time, wait
+//      until that reset (+ a short grace) and recover. Retained for when
+//      `rate_limits` data is present (Claude) / Codex account usage says so.
+//
+// RECOVERY (both triggers) = ESC then the continue text (buildRecoveryInput):
+// ESC dismisses the modal's numbered menu WITHOUT selecting a paid option, then
+// the continue text resumes the turn. See lib/usageLimit for the guardrail.
+//
+// On a recovery of a BLOCKED session we emit an ATTRIBUTION notification naming
+// the captain/ship the tile belongs to (lib/captainAttribution).
+//
+// Imperative store subscriptions (no React). An app restart mid-wait re-arms
+// naturally — a reset already in the past yields a ~0 delay and fires promptly.
 import { useSupervision } from "../store/supervision";
 import { useAutoContinue } from "../store/autoContinue";
 import { useSettings } from "../store/settings";
+import { useWorkspace, deriveLabel } from "../store/workspace";
 import { sessionNameForTerminal } from "../store/sessionContext";
 import { clientForTerminal } from "../store/clientType";
 import { writeTerminal } from "../ipc/client";
@@ -23,6 +36,10 @@ import type { StatusSnapshot } from "../ipc/model";
 import type { TerminalId } from "../ipc/types";
 import { tlog } from "./diag";
 import { isSatellite } from "./windows";
+import { readTerminalTailText } from "./terminalTail";
+import { matchesUsageLimitDialog, buildRecoveryInput } from "./usageLimit";
+import { captainAttribution } from "./captainAttribution";
+import { notify } from "./notify";
 
 // A window counts as EXHAUSTED (the session has actually run out, not merely "near
 // the cap") at/above this used %. Higher than supervision's RATE_LIMIT_THRESHOLD
@@ -32,15 +49,46 @@ const EXHAUSTED_PCT = 99;
 // Wait this long PAST the reset before injecting, so the window is definitively
 // open again when the agent reads the continue.
 const GRACE_MS = 5000;
+// How often to scan watched Claude tiles' pane text for the usage-limit modal.
+// Read-only viewport reads — cheap enough to poll frequently, frequent enough to
+// notice a modal promptly.
+const PANE_SCAN_MS = 4000;
 
 interface Pending {
   resetsAt: number; // unix seconds we're waiting on
   timer: ReturnType<typeof setTimeout>;
 }
-/** terminalId -> the armed wait (one at a time). */
+/** terminalId -> the armed TIMER wait (one at a time). */
 const pending = new Map<TerminalId, Pending>();
-/** terminalId -> the last resetsAt we already injected for (fire once per window). */
+/** terminalId -> the last resetsAt we already recovered for (timer path fires
+ *  once per window). */
 const handled = new Map<TerminalId, number>();
+/** Terminals whose pane currently shows the modal — the pane trigger is EDGE
+ *  triggered off this set, so one dialog fires once (and a later, distinct dialog
+ *  re-fires once it re-appears). */
+const paneActive = new Set<TerminalId>();
+
+/** Every terminal currently WATCHED (exists in the workspace AND not opted out).
+ *  Default ON: a tile is watched unless the user opted it out. */
+function watchedTerminals(): TerminalId[] {
+  const ac = useAutoContinue.getState();
+  return Object.keys(useWorkspace.getState().terminals).filter((id) =>
+    ac.isWatched(id),
+  );
+}
+
+/** A human label for a tile (for notifications): the same derivation the tile
+ *  header uses (rename → command·dir → short id). */
+function tileLabel(id: TerminalId): string {
+  const ws = useWorkspace.getState();
+  const info = ws.terminals[id];
+  return deriveLabel({
+    id,
+    label: ws.labels[id],
+    title: info?.title,
+    cwd: info?.cwd,
+  });
+}
 
 /** The soonest reset time (unix s) among EXHAUSTED windows in this snapshot, or
  *  null when nothing is exhausted / no reset time is known. */
@@ -83,8 +131,7 @@ function codexExhaustedReset(): number | null {
 
 /** The reset time to wait on for terminal `id`, resolved by WHICH agent it runs:
  *  a Codex tile uses the account-level Codex usage; everything else (Claude) uses
- *  its statusline snapshot. The continue INJECTION is agent-agnostic (just typing
- *  into the PTY) — only this "ran out + resets when" detection differs by agent. */
+ *  its statusline snapshot. */
 function resetForTerminal(id: TerminalId): number | null {
   if (clientForTerminal(id) === "codex") return codexExhaustedReset();
   const sup = useSupervision.getState();
@@ -100,35 +147,87 @@ function cancel(id: TerminalId): void {
   }
 }
 
-function fire(id: TerminalId, resetsAt: number): void {
-  pending.delete(id);
-  handled.set(id, resetsAt); // never re-inject for this same window
-  if (!useAutoContinue.getState().enabled[id]) return; // toggled off while waiting
+/** The single recovery action for BOTH triggers: dismiss the modal (ESC) and
+ *  inject the continue text, then emit the captain-attributed resume
+ *  notification. Best-effort: a closed tile just rejects the write. */
+function recover(id: TerminalId, reason: string): void {
+  if (!useAutoContinue.getState().isWatched(id)) return; // opted out meanwhile
   const text = (useSettings.getState().autoContinueText || "continue").trim();
-  if (!text) return;
-  tlog("autocontinue", `injecting "${text}" into ${id} (reset ${resetsAt})`);
-  // Type the command + Enter into the PTY. The session was blocked on the limit,
-  // so this lands at its prompt and resumes the turn. Best-effort: a closed tile
-  // just rejects the write.
-  void writeTerminal(id, text + "\r").catch(() => {
+  const input = buildRecoveryInput(text);
+  tlog("autocontinue", `recovering ${id} (${reason}): ESC + "${text}"`);
+  void writeTerminal(id, input).catch(() => {
     /* terminal gone — ignore */
   });
+  notifyResumed(id, text);
+}
+
+/** Notify the general that a BLOCKED session was auto-resumed, naming the
+ *  captain/ship it belongs to. Attribution-first title (falls back to the tile
+ *  label when the tile has no captain). Reconcile the notification CLASS with
+ *  PR #44's strict chime policy at merge (this uses "attention" today — the
+ *  richest class this branch has; #44 introduces a blocker class this deserves).
+ *  Do NOT alter #44's chime policy here; this only ADDS the resume cue. */
+function notifyResumed(id: TerminalId, text: string): void {
+  const label = tileLabel(id);
+  const attribution = captainAttribution(id);
+  notify(
+    "attention",
+    `${attribution ?? label} auto-resumed`,
+    `${label} hit its usage limit; T-Hub dismissed the dialog and sent "${text}".`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Trigger 1 — pane-text (the on-screen usage-limit modal)
+// ---------------------------------------------------------------------------
+
+/** Scan every watched CLAUDE tile's visible pane for the usage-limit modal and
+ *  recover on the RISING edge (dialog appeared). Codex tiles are excluded — the
+ *  modal wording is Claude's; Codex stays on the timer trigger. */
+function scanPanes(): void {
+  const watched = new Set(watchedTerminals());
+  // Forget stale edge state for tiles no longer watched/present, so a future
+  // dialog on a re-created id fires cleanly.
+  for (const id of [...paneActive]) if (!watched.has(id)) paneActive.delete(id);
+
+  for (const id of watched) {
+    if (clientForTerminal(id) === "codex") continue;
+    const present = matchesUsageLimitDialog(readTerminalTailText(id));
+    if (present) {
+      if (!paneActive.has(id)) {
+        paneActive.add(id); // rising edge — recover once
+        recover(id, "pane-dialog");
+      }
+    } else if (paneActive.has(id)) {
+      paneActive.delete(id); // dialog cleared — re-arm for the next one
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Trigger 2 — statusline / Codex reset timer
+// ---------------------------------------------------------------------------
+
+function fireTimer(id: TerminalId, resetsAt: number): void {
+  pending.delete(id);
+  handled.set(id, resetsAt); // never re-inject for this same window
+  recover(id, `timer reset ${resetsAt}`);
 }
 
 function evaluate(): void {
-  const enabled = useAutoContinue.getState().enabled;
+  const watched = new Set(watchedTerminals());
 
-  // Drop any armed wait for a terminal that's no longer opted in.
-  for (const id of [...pending.keys()]) {
-    if (!enabled[id]) cancel(id);
-  }
+  // Drop any armed wait / handled marker for a terminal no longer watched or
+  // gone (isWatched is true for any non-opted-out id, so gate on the live set).
+  for (const id of [...pending.keys()]) if (!watched.has(id)) cancel(id);
+  for (const id of [...handled.keys()]) if (!watched.has(id)) handled.delete(id);
 
-  for (const id of Object.keys(enabled)) {
+  for (const id of watched) {
     const resetsAt = resetForTerminal(id);
 
     if (resetsAt === null) {
-      // Not exhausted (cleared, resumed, or never hit) — drop any pending wait and
-      // forget the handled marker so a FUTURE exhaustion re-arms cleanly.
+      // Not exhausted (cleared, resumed, or never hit) — drop any pending wait
+      // and forget the handled marker so a FUTURE exhaustion re-arms cleanly.
       cancel(id);
       handled.delete(id);
       continue;
@@ -139,7 +238,7 @@ function evaluate(): void {
     if (existing) clearTimeout(existing.timer);
 
     const delay = Math.max(0, resetsAt * 1000 + GRACE_MS - Date.now());
-    const timer = setTimeout(() => fire(id, resetsAt), delay);
+    const timer = setTimeout(() => fireTimer(id, resetsAt), delay);
     pending.set(id, { resetsAt, timer });
     tlog(
       "autocontinue",
@@ -151,25 +250,24 @@ function evaluate(): void {
 let installed = false;
 function installAutoContinue(): void {
   // Satellites (popped-out tab windows) load the same bundle; the auto-continue
-  // watcher must run in exactly ONE window or every open window arms its own
-  // timer and double-injects the continue. The main window owns it.
+  // watcher must run in exactly ONE window or every open window recovers the
+  // same tile and double-injects. The main window owns it.
   if (isSatellite()) return;
   if (installed) return;
   installed = true;
-  // Claude is event-driven: re-evaluate whenever a snapshot/status lands or the
-  // opt-in set changes.
+
+  // Timer trigger: re-evaluate whenever a snapshot/status lands, the opt-out set
+  // changes, or the workspace terminal set changes (a new default-ON tile).
   useSupervision.subscribe(evaluate);
   useAutoContinue.subscribe(evaluate);
+  useWorkspace.subscribe(evaluate);
+
   // Codex has NO event stream (its usage lives in session files), so poll it and
-  // re-evaluate. The precise wait is still a per-window timer; this poll only has
-  // to be frequent enough to NOTICE a Codex session ran out. Adopt only good
-  // readings (keep last-known on a failed poll), like the sidebar usage strip.
+  // re-evaluate. Adopt only good readings (keep last-known on a failed poll).
   const pollCodex = (): void => {
-    // Only hit the (file-reading) codex_usage command when at least one opted-in
-    // terminal is actually a Codex tile — no point polling when the feature isn't
-    // armed for any Codex session.
-    const enabled = useAutoContinue.getState().enabled;
-    const anyCodex = Object.keys(enabled).some(
+    // Only hit the (file-reading) codex_usage command when at least one WATCHED
+    // terminal is actually a Codex tile.
+    const anyCodex = watchedTerminals().some(
       (id) => clientForTerminal(id) === "codex",
     );
     if (!anyCodex) return;
@@ -186,6 +284,12 @@ function installAutoContinue(): void {
   };
   pollCodex();
   setInterval(pollCodex, 2 * 60 * 1000);
+
+  // Pane trigger: poll the visible modal. Independent of the event-driven timer
+  // path, since terminal output is not delivered through a store subscription.
+  scanPanes();
+  setInterval(scanPanes, PANE_SCAN_MS);
+
   evaluate(); // initial pass (covers app-restart-mid-wait)
 }
 
