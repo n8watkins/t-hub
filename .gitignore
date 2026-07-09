@@ -22,6 +22,11 @@ apps/desktop/src-tauri/gen/
 # The `th` CLI crate's build output.
 apps/cli/target/
 
+# Python bytecode cache (the `scripts/probes/*.py` probes compile these on run;
+# machine/version-specific, never committed).
+__pycache__/
+*.pyc
+
 # Editor / OS
 .vscode/*
 !.vscode/extensions.json

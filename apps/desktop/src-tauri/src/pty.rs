@@ -21,7 +21,9 @@
 //! `AppHandle` clone captured by the reader thread, never through shared state.
 
 use std::io::{Read, Write};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use portable_pty::{
@@ -36,6 +38,20 @@ use crate::tmux;
 
 /// Size of the read buffer for draining the PTY (8 KiB).
 const READ_BUF: usize = 8 * 1024;
+
+/// How many PTY output chunks the feeder thread may queue ahead of the forwarder
+/// loop ([`stream_reader_loop`]). Small on purpose: it keeps the original
+/// read-then-write backpressure (a stalled client can't make the feeder drain the
+/// PTY into unbounded memory) while still decoupling the blocking PTY read from
+/// the forwarder's keepalive timer.
+const FEED_DEPTH: usize = 8;
+
+/// Padding carried by the idle keepalive frame ([`keepalive_frame`]). Sized so a
+/// client that has stopped draining fills its socket buffers within a few keepalive
+/// intervals and trips the attach write timeout, rather than leaving the forwarder
+/// parked on a silent PTY. A healthy client drains it as a no-op, so it costs only
+/// idle bandwidth.
+const KEEPALIVE_PAD: usize = 8 * 1024;
 
 /// A live terminal tile: its T-Hub id, the backing tmux session name, and the
 /// `Send` handles for the PTY attach client.
@@ -346,6 +362,10 @@ pub mod binframe {
     pub const SCROLLBACK: u8 = 0x03;
     /// server→client: an attach error raised before the stream starts (UTF-8 message).
     pub const ERROR: u8 = 0x04;
+    /// server→client: an idle keepalive (payload = ignorable padding). Forces a
+    /// socket write on an otherwise-silent stream so a gone/stalled client is
+    /// reaped; clients skip it like any unknown type. See [`stream_reader_loop`].
+    pub const KEEPALIVE: u8 = 0x05;
     /// client→server: raw bytes for the PTY stdin (payload = the bytes verbatim).
     pub const WRITE: u8 = 0x10;
     /// client→server: a resize. Payload is 4 bytes: `[u16 BE cols][u16 BE rows]`.
@@ -452,6 +472,12 @@ impl Drop for PtyStreamHandle {
 /// owning connection passes a socket-shutdown closure here so its input read
 /// unblocks the moment the stream dies, instead of parking until the client
 /// deigns to close - the leak that let dead-client forwarders accumulate.
+///
+/// `keepalive` bounds how long the stream may stay silent before the forwarder
+/// writes an idle keepalive frame (s27 idle-leak fix); see [`stream_reader_loop`].
+// A low-level PTY spawn primitive: session, cwd, size, sink, framing, keepalive and
+// the end hook are each independent inputs, so the arg count is inherent.
+#[allow(clippy::too_many_arguments)]
 pub fn stream_attach_to_sink(
     tmux_session: &str,
     cwd: &str,
@@ -459,6 +485,7 @@ pub fn stream_attach_to_sink(
     rows: u16,
     sink: Box<dyn Write + Send>,
     framing: PtyFraming,
+    keepalive: Duration,
     on_stream_end: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<PtyStreamHandle, String> {
     let size = PtySize {
@@ -499,7 +526,7 @@ pub fn stream_attach_to_sink(
     let handle = std::thread::Builder::new()
         .name(format!("t-hub-pty-stream-{tmux_session}"))
         .spawn(move || {
-            stream_reader_loop(reader, child, sink, framing);
+            stream_reader_loop(reader, child, sink, framing, keepalive);
             if let Some(f) = on_stream_end {
                 f();
             }
@@ -518,24 +545,55 @@ pub fn stream_attach_to_sink(
 /// Drain the PTY reader, writing output frames to `sink` in the negotiated
 /// `framing` until EOF or a sink write error (the client disconnected); then write
 /// one exit frame. V1: `{"out":"<b64>"}` … `{"exit":code}`. V2: binary OUT … EXIT.
+///
+/// The blocking PTY read runs on a dedicated [`feed_pty`] thread that hands chunks
+/// over a small bounded channel, so THIS loop can wake on a `keepalive` timer even
+/// when the terminal is idle and the PTY produces nothing. That timer is the s27
+/// idle-leak fix: the forwarder used to detect a dead client ONLY on a sink write,
+/// so an IDLE terminal (no output to write) left it parked forever on the PTY read.
+/// A client that stopped draining or vanished holding the socket (no FIN the owning
+/// connection's input read could see) went unnoticed and the forwarder leaked,
+/// wedging the table. Now an idle keepalive forces a write on the silent
+/// stream, so a gone/stalled client surfaces here as a write error / full-buffer
+/// write timeout - the same teardown a firehose client hits when it stops draining.
+/// The bounded channel preserves the original read-then-write backpressure.
 fn stream_reader_loop(
-    mut reader: Box<dyn Read + Send>,
+    reader: Box<dyn Read + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     mut sink: Box<dyn Write + Send>,
     framing: PtyFraming,
+    keepalive: Duration,
 ) {
-    let mut buf = [0u8; READ_BUF];
+    let (tx, rx) = sync_channel::<Vec<u8>>(FEED_DEPTH);
+    let feeder = match std::thread::Builder::new()
+        .name("t-hub-pty-feed".into())
+        .spawn(move || feed_pty(reader, tx))
+    {
+        Ok(handle) => handle,
+        Err(_) => {
+            // Feeder spawn failed (thread/resource exhaustion): nobody drains the
+            // attach child, so `rx` is already disconnected and the `wait()` below
+            // would block forever - leaking this forwarder's slot, the exact leak
+            // this path exists to prevent. Reap the child and tear down instead.
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+    };
+
+    // Precompute the idle keepalive frame once (framing-aware, ignorable by any
+    // client) so the timer path is a plain buffer write.
+    let keepalive_bytes = keepalive_frame(framing);
+
     let mut sink_dead = false;
     loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break, // EOF: the attach client closed.
-            Ok(n) => {
-                let chunk = &buf[..n];
+        match rx.recv_timeout(keepalive) {
+            Ok(chunk) => {
                 let wrote = match framing {
                     PtyFraming::V1Json => {
-                        write_frame(&mut sink, &json!({ "out": STANDARD.encode(chunk) }))
+                        write_frame(&mut sink, &json!({ "out": STANDARD.encode(&chunk) }))
                     }
-                    PtyFraming::V2Binary => write_bin_frame(&mut *sink, binframe::OUT, chunk),
+                    PtyFraming::V2Binary => write_bin_frame(&mut *sink, binframe::OUT, &chunk),
                 };
                 if wrote.is_err() {
                     // The client (socket) is gone; stop draining + tear down.
@@ -543,12 +601,18 @@ fn stream_reader_loop(
                     break;
                 }
             }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
+            Err(RecvTimeoutError::Timeout) => {
+                // Idle keepalive (s27 idle-leak fix): force a write on the silent
+                // stream so a gone/stalled client surfaces as a write error / a
+                // full-buffer write timeout instead of leaking this forwarder. A
+                // healthy client drains and ignores it.
+                if sink.write_all(&keepalive_bytes).and_then(|()| sink.flush()).is_err() {
+                    sink_dead = true;
+                    break;
                 }
-                break;
             }
+            // The feeder ended: PTY EOF (attach client exited) or a read error.
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -561,6 +625,9 @@ fn stream_reader_loop(
         // that wedged the live server. This thread owns `child`, so reap it here.
         let _ = child.kill();
     }
+    // Retire the feeder: killing the child drops the PTY slave so a read-blocked
+    // feeder hits EOF; dropping the receiver ends a send-blocked one.
+    drop(rx);
     let code = child
         .wait()
         .ok()
@@ -577,6 +644,49 @@ fn stream_reader_loop(
                 write_bin_frame(&mut *sink, binframe::EXIT, &payload)
             }
         };
+    }
+    let _ = feeder.join();
+}
+
+/// Blocking PTY drain feeding [`stream_reader_loop`] over a bounded channel: it
+/// does the reads so that loop can wait on a keepalive timer instead of parking on
+/// a silent PTY. Ends on PTY EOF, a read error, or once the consumer drops the
+/// receiver (teardown).
+fn feed_pty(mut reader: Box<dyn Read + Send>, tx: SyncSender<Vec<u8>>) {
+    let mut buf = [0u8; READ_BUF];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break, // EOF: the attach client closed.
+            Ok(n) => {
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    break; // the forwarder loop is gone (teardown): stop draining.
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Build the idle keepalive frame for `framing`: an ignorable, padded no-op that a
+/// healthy client drops (V1: a `keepalive` key [`crate::remote_pty`]'s parser skips;
+/// V2: an unknown frame type clients skip). Its only job is to force a socket write
+/// on an otherwise-silent stream so a gone/stalled client is reaped - see
+/// [`stream_reader_loop`].
+fn keepalive_frame(framing: PtyFraming) -> Vec<u8> {
+    match framing {
+        PtyFraming::V1Json => {
+            let mut line =
+                serde_json::to_vec(&json!({ "keepalive": ".".repeat(KEEPALIVE_PAD) }))
+                    .unwrap_or_default();
+            line.push(b'\n');
+            line
+        }
+        PtyFraming::V2Binary => {
+            let mut frame = Vec::with_capacity(BIN_HEADER_LEN + KEEPALIVE_PAD);
+            let _ = write_bin_frame(&mut frame, binframe::KEEPALIVE, &vec![b'.'; KEEPALIVE_PAD]);
+            frame
+        }
     }
 }
 
