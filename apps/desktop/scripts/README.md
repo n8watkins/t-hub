@@ -22,8 +22,9 @@ announce.sh "crew one is blocked" [voice]
 ### Scribe voice-gate (canonical)
 
 Before speaking, `announce.sh` asks the T-Hub app's **authoritative** `scribe_status` over the control socket - the exact same source of truth the in-app voice watcher (`src/lib/voiceAnnounce.ts`) polls.
-The app (`src-tauri/src/scribe.rs`) decides "is the general dictating?" from Scribe's live status file **with pid-liveness plus a staleness backstop**, and already **fails open** (reports not-listening) whenever it cannot positively confirm active dictation.
-So this script does not re-read the status file or keep its own weaker copy of the gate logic; it consults the one gate.
+The app (`src-tauri/src/scribe.rs`) decides "is the general dictating?" from Scribe's **v1 dictation-state interface**: it discovers the loopback status endpoint via `~/.scribe/control.json` and gates on the snapshot's level-triggered `busy` flag, falling back to Scribe's `status.json` file (**pid-liveness plus a 15s `updatedAt` TTL**, contract section 7.2) only when the endpoint is unavailable.
+It already **fails open** (reports not-listening) whenever it cannot positively confirm active dictation.
+So this script does not re-read Scribe state or keep its own weaker copy of the gate logic; it consults the one gate.
 
 Behavior:
 
@@ -57,5 +58,6 @@ Run that from the repo root of your primary checkout (not a throwaway git worktr
 
 ### Verifying the gate
 
-`scripts/probes/scribe_gate_e2e.py` drives the real Scribe status file and checks the live app's `scribe_status` answer (pid-liveness + fail-open) over the control socket.
+`scripts/probes/scribe_gate_e2e.py` drives the real Scribe status **fallback file** and checks the live app's `scribe_status` answer (busy gate, pid-liveness, 15s TTL, fail-open) over the control socket.
+Because the app prefers the v1 endpoint, the probe only exercises the fallback while Scribe itself is **not** running; it detects a live v1 endpoint up front and exits with a SKIP telling you to quit Scribe first.
 The in-app watcher's hold/coalesce/flush logic is covered by `src/lib/voiceAnnounce.test.ts`.
