@@ -1,11 +1,12 @@
 // Headless-org: the store's server-registry adopt path. The SERVER owns the
 // tab/tile organization; `adoptRegistry` merges its snapshot into the store —
 // these tests pin the no-focus-steal and lifecycle-cleanup semantics.
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   useWorkspace,
   CAPTAINS_TAB_ID,
   CAPTAINS_TAB_NAME,
+  registerCaptainRegistry,
   type WorkspaceTab,
 } from "./workspace";
 import type { TerminalInfo } from "../ipc/types";
@@ -177,6 +178,58 @@ describe("adoptRegistry preserves the reserved Captains tab", () => {
       "a",
     );
     // The server snapshot no longer lists "cap" anywhere - it was killed.
+    useWorkspace.getState().adoptRegistry([
+      { id: "t1", name: "Workspace 1", tileIds: ["a"] },
+    ]);
+    const s = useWorkspace.getState();
+    expect(s.tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order).toEqual([]);
+    expect(s.terminals["cap"]).toBeUndefined();
+  });
+});
+
+describe("adoptRegistry keeps an externally-claimed captain (registry liveness)", () => {
+  // The captain store registers this accessor at load; the tests drive it
+  // directly so the workspace store's liveness fallback is exercised in isolation
+  // (no captain-store coupling). Reset after each so it never leaks into the
+  // suites above/below, which assume the empty default.
+  afterEach(() => {
+    registerCaptainRegistry(() => []);
+  });
+
+  it("keeps a captain tile in the registry even when the server omits it as a live work-tab tile", () => {
+    // "cap" is an externally-claimed captain (e.g. the orchestrator claimed it
+    // over the control socket): placed in the reserved Captains tab and present in
+    // the captain registry, but the server's tab report never echoes it as a live
+    // work-tab tile. It must survive the sync (this is the render bug being fixed).
+    registerCaptainRegistry(() => ["cap"]);
+    seed(
+      [
+        { id: "t1", name: "Workspace 1", order: ["a"] },
+        { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: ["cap"] },
+      ],
+      "t1",
+      "a",
+    );
+    useWorkspace.getState().adoptRegistry([
+      { id: "t1", name: "Workspace 1", tileIds: ["a"] },
+    ]);
+    const s = useWorkspace.getState();
+    expect(s.tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order).toEqual(["cap"]);
+    expect(s.terminals["cap"]).toBeDefined(); // preserved, not cleaned up
+  });
+
+  it("still drops a captain tile once it is gone from BOTH the server and the registry", () => {
+    // Not in serverTileIds AND not in the registry (released via sync_captains):
+    // genuinely gone, so it drops out of Captains and is cleaned up.
+    registerCaptainRegistry(() => []);
+    seed(
+      [
+        { id: "t1", name: "Workspace 1", order: ["a"] },
+        { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: ["cap"] },
+      ],
+      "t1",
+      "a",
+    );
     useWorkspace.getState().adoptRegistry([
       { id: "t1", name: "Workspace 1", tileIds: ["a"] },
     ]);
