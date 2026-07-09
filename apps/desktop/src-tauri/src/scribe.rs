@@ -1002,6 +1002,60 @@ mod tests {
         );
     }
 
+    /// F2 golden cross-check: the SAME decision matrix drives both this Rust
+    /// suite and the shell gate conformance test (scripts/announce_gate.test.sh
+    /// via `announce.sh --gate`). Feeding one shared fixtures file to BOTH the
+    /// v1 evaluator and the file-fallback evaluator here - and to the shell gate
+    /// there - means any divergence from the golden `hold` value turns a test
+    /// red, so contract drift between the Rust and shell implementations cannot
+    /// land silently. Fixtures carry `app=="scribe"` and omit `schemaVersion`,
+    /// so the v1 evaluator's extra guards are satisfied and it must agree with
+    /// the file evaluator on every row.
+    #[test]
+    fn gate_matches_golden_fixtures_cross_impl() {
+        use chrono::TimeZone;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/gate-fixtures.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let manifest: serde_json::Value = serde_json::from_str(&raw).expect("fixtures parse");
+        let base = parse_rfc3339_ms(manifest["base"].as_str().expect("base string"))
+            .expect("base parses");
+        // The fixtures pin the shared TTL; if scribe.rs's TTL ever changes, the
+        // manifest (and the shell) must change with it - assert they still match.
+        assert_eq!(
+            manifest["ttlMs"].as_i64(),
+            Some(SCRIBE_SNAPSHOT_TTL_MS),
+            "fixtures ttlMs must track SCRIBE_SNAPSHOT_TTL_MS",
+        );
+        let cases = manifest["cases"].as_array().expect("cases array");
+        assert!(!cases.is_empty(), "fixtures must have cases");
+        for case in cases {
+            let name = case["name"].as_str().unwrap_or("?");
+            let offset = case["offsetMs"].as_i64().expect("offsetMs");
+            let hold = case["hold"].as_bool().expect("hold");
+            // updatedAt = now - offset (its age); a negative offset dates it in
+            // the future. `now` is the fixed `base`, so freshness is exact here.
+            let updated_at = chrono::Utc
+                .timestamp_millis_opt(base - offset)
+                .single()
+                .expect("valid ts")
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let mut snap = case["snapshot"].clone();
+            snap["updatedAt"] = serde_json::Value::String(updated_at);
+
+            // File-fallback evaluator: pid ALIVE so only the TTL + booleans decide.
+            let file_hold = evaluate_fallback(&snap, base, ALIVE).listening;
+            assert_eq!(file_hold, hold, "{name}: evaluate_fallback hold != golden");
+
+            // v1 evaluator: None (fall-through) counts as not-holding.
+            let v1_hold = eval_v1_snapshot(&snap, base)
+                .map(|c| c.status.listening)
+                .unwrap_or(false);
+            assert_eq!(v1_hold, hold, "{name}: eval_v1_snapshot hold != golden");
+        }
+    }
+
     /// Host verification (the captain's ground truth): when the REAL Scribe
     /// fallback file is present on this machine (via /mnt/c on WSL), the
     /// reader FINDS + parses it and surfaces a status. The general is not

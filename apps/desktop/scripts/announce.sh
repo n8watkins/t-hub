@@ -52,10 +52,18 @@
 #                           mirroring scribe.rs's override seam; when unset the
 #                           fallback resolves prod + dev from the host defaults
 set -u
-TEXT="${1:?usage: announce.sh \"text\" [voice]}"
+# Test/E2E seam: `announce.sh --gate` runs ONLY the dictation gate and prints its
+# raw single-shot decision ("<state> <source>"), with no voice.json read, no
+# deferral, no log, no TTS. The conformance + golden cross-check tests drive this
+# via the override env (T_HUB_CONTROL_FILE / T_HUB_SCRIBE_CONTROL_FILE /
+# T_HUB_SCRIBE_STATUS_FILE), so they exercise the SHIPPED gate, not a copy.
+GATE_ONLY=0
+[ "${1:-}" = "--gate" ] && GATE_ONLY=1
+TEXT="${1:?usage: announce.sh \"text\" [voice]  (or: announce.sh --gate)}"
 CFG="$HOME/.t-hub/captain/voice.json"
 
-read -r ENABLED ENGINE CFG_VOICE VOLUME SAPI_RATE <<EOF
+if [ "$GATE_ONLY" -eq 0 ]; then
+  read -r ENABLED ENGINE CFG_VOICE VOLUME SAPI_RATE <<EOF
 $(python3 - "$CFG" <<'PY'
 import json, sys
 try:
@@ -72,8 +80,8 @@ print(str(c.get("enabled", True)).lower(),
 PY
 )
 EOF
-
-[ "$ENABLED" = "true" ] || exit 0
+  [ "$ENABLED" = "true" ] || exit 0
+fi
 
 # --- Scribe dictation gate -------------------------------------------------
 # Ask the app's authoritative gate: prints "listening" | "idle" | "unknown".
@@ -83,7 +91,7 @@ EOF
 # env-injected control token when present).
 scribe_state() {
   python3 - <<'PY'
-import json, os, re, socket, sys, urllib.request
+import json, os, re, socket, sys, time, urllib.request
 from datetime import datetime, timezone
 
 SOCK_TIMEOUT = 2.0        # T-Hub control-socket round-trip budget (per poll)
@@ -147,13 +155,22 @@ def thub_gate():
     if not addr or not tok:
         return "unknown"
     try:
+        # Absolute wall-clock deadline: a slow trickle (many partial recvs, each
+        # under the per-read timeout) must not let a wedged socket outlast the
+        # whole SOCK_TIMEOUT budget. We shrink the per-read timeout toward the
+        # deadline and bail the instant it passes -> "unknown" -> fail toward the
+        # Scribe-direct fallback rather than parking the poll.
+        deadline = time.monotonic() + SOCK_TIMEOUT
         host, port = addr.rsplit(":", 1)
         s = socket.create_connection((host, int(port)), timeout=SOCK_TIMEOUT)
-        s.settimeout(SOCK_TIMEOUT)
         req = {"token": tok, "command": "scribe_status", "args": {}, "v": 1}
         s.sendall((json.dumps(req) + "\n").encode())
         buf = b""
         while b"\n" not in buf:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            s.settimeout(remaining)
             chunk = s.recv(65536)
             if not chunk:
                 break
@@ -202,7 +219,11 @@ def v1_flavor(control_path):
         req = urllib.request.Request(
             base.rstrip("/") + path, headers={"Authorization": "Bearer " + tok}
         )
-        with urllib.request.urlopen(req, timeout=SCRIBE_HTTP_TIMEOUT) as r:
+        # Force a DIRECT connection: an http(s)_proxy / ALL_PROXY env var must not
+        # reroute a 127.0.0.1 GET (a proxy would mangle or refuse the loopback
+        # call and silently break the gate). An empty ProxyHandler disables all.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=SCRIBE_HTTP_TIMEOUT) as r:
             snap = json.loads(r.read().decode("utf-8", "replace"))
     except Exception:
         return None  # refused/closed/timeout/401 -> endpoint unavailable
@@ -267,18 +288,36 @@ announce_log() {
   mkdir -p "$(dirname "$logf")" 2>/dev/null || true
   # Size guard (~1 MiB): keep the last 500 lines, no cron/rotation needed.
   if [ -f "$logf" ] && [ "$(wc -c <"$logf" 2>/dev/null || echo 0)" -gt 1048576 ]; then
-    tail -n 500 "$logf" > "$logf.tmp" 2>/dev/null && mv -f "$logf.tmp" "$logf"
+    # Concurrent announce.sh invocations can trim at the same moment; a per-run
+    # mktemp in the SAME dir (then an atomic rename) keeps them from clobbering
+    # a shared fixed-name tmp and truncating each other's rewrite.
+    local tmp
+    tmp="$(mktemp "$(dirname "$logf")/.announce.log.XXXXXX" 2>/dev/null)" || tmp=""
+    if [ -n "$tmp" ] && tail -n 500 "$logf" > "$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$logf" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    elif [ -n "$tmp" ]; then
+      rm -f "$tmp" 2>/dev/null
+    fi
   fi
   local ts caller text
   ts="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
   # Caller: explicit override wins; else best-effort parent process name.
   caller="${T_HUB_ANNOUNCE_CALLER:-$(ps -o comm= -p "$PPID" 2>/dev/null | tr -d '[:space:]')}"
   caller="${caller:-unknown}"
-  # One line, bounded: strip newlines/tabs from the utterance and cap length.
+  # One line, bounded: strip newlines/tabs, cap length, then escape backslashes
+  # and double-quotes so the quoted text="..." field can never be broken open.
   text="$(printf '%s' "$TEXT" | tr '\n\t' '  ' | cut -c1-200)"
+  text="${text//\\/\\\\}"
+  text="${text//\"/\\\"}"
   printf '%s\tcaller=%s\tdecision=%s\tsource=%s\tstate=%s\ttext="%s"\n' \
     "$ts" "$caller" "$decision" "$source" "$state" "$text" >> "$logf" 2>/dev/null || true
 }
+
+# --gate seam: print the raw single-shot gate decision and exit (no defer/log/TTS).
+if [ "$GATE_ONLY" -eq 1 ]; then
+  scribe_state
+  exit 0
+fi
 
 DECISION="speak"; GATE_ST="unknown"; GATE_SRC="disabled"
 if [ "${SCRIBE_GATE_DISABLE:-0}" != "1" ]; then
