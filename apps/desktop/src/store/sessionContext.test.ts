@@ -74,6 +74,33 @@ describe("sessionContext — strictly per-session context binding", () => {
     expect(readContextPct(state(), "aaa")).toBe(40);
   });
 
+  it("resets a session's reading when a fresher snapshot reports no context (/clear)", () => {
+    // A session at 80% full.
+    state().ingest(
+      snap({ tmuxSession: "th_aaa", contextUsedPct: 80, ingestedAtMs: 1000 }),
+    );
+    expect(readContextPct(state(), "aaa")).toBe(80);
+    // /clear empties the window: the statusline stops reporting a context_window,
+    // so the next (fresher) snapshot for this session has no contextUsedPct. The
+    // header must RESET, not keep pinning the stale 80%.
+    state().ingest(snap({ tmuxSession: "th_aaa", ingestedAtMs: 2000 }));
+    expect(readContextPct(state(), "aaa")).toBeNull();
+    // A real turn after the clear repopulates it from a low baseline.
+    state().ingest(
+      snap({ tmuxSession: "th_aaa", contextUsedPct: 6, ingestedAtMs: 3000 }),
+    );
+    expect(readContextPct(state(), "aaa")).toBe(6);
+  });
+
+  it("a STALE no-context snapshot does not clobber a fresher reading", () => {
+    state().ingest(
+      snap({ tmuxSession: "th_aaa", contextUsedPct: 42, ingestedAtMs: 2000 }),
+    );
+    // An older no-context frame must not reset the newer reading.
+    state().ingest(snap({ tmuxSession: "th_aaa", ingestedAtMs: 1000 }));
+    expect(readContextPct(state(), "aaa")).toBe(42);
+  });
+
   it("forget() drops only the given tile's reading", () => {
     state().ingest(snap({ tmuxSession: "th_aaa", contextUsedPct: 30 }));
     state().ingest(snap({ tmuxSession: "th_bbb", contextUsedPct: 60 }));

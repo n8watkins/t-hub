@@ -41,6 +41,7 @@ import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
 import { clientForTerminal } from "../store/clientType";
 import { useAutoContinue } from "../store/autoContinue";
+import { useSettings } from "../store/settings";
 import { ContextMeter } from "./ContextMeter";
 import { useContextPctForTile, sessionNameForTerminal } from "../store/sessionContext";
 import {
@@ -350,6 +351,10 @@ export function Tile({
   // has reported nothing yet — then <ContextMeter> renders nothing, so non-Claude
   // / not-yet-reported tiles are unchanged.
   const contextUsedPct = useContextPctForTile(terminalId);
+  // Opt-in (default OFF): show the ctx% meter in this tile's header. The header
+  // is tight on space, so it's hidden here unless the user turns it on in
+  // Settings; the sidebar captain rows show context regardless of this flag.
+  const showHeaderContextMeter = useSettings((s) => s.showHeaderContextMeter);
   // Display path: strip the home prefix (`/home/<user>` -> `~`) so the header
   // shows `~/n8builds/tools` instead of the noisy `/home/natkins/n8builds/tools`.
   // The full path stays in the title tooltip.
@@ -785,8 +790,13 @@ export function Tile({
         {/* Context-window meter: how full THIS tile's Claude session context is.
             Shown ONLY when the tile is actually running Claude — the cwd-matched
             reading can otherwise leak onto a plain shell that shares a directory
-            with a (past) Claude session, so gate on the client being claude. */}
-        <ContextMeter usedPct={client === "claude" ? contextUsedPct : null} />
+            with a (past) Claude session, so gate on the client being claude. Also
+            gated on the opt-in header setting (default OFF): the header is tight
+            on space, so the ctx% lives here only when the user turns it on. The
+            sidebar captain rows show it regardless. */}
+        {showHeaderContextMeter && (
+          <ContextMeter usedPct={client === "claude" ? contextUsedPct : null} />
+        )}
 
         {/* Per-tile view switcher: Terminal / Files / Preview. Clicking a tab
             sets THIS tile's usePanels tab; the body (below) swaps to that surface

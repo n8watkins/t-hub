@@ -40,6 +40,11 @@ const DEFAULTS = {
   /** Show desktop (OS) notifications for key session events. Default OFF (opt-in,
    *  paired with soundsEnabled). */
   notificationsEnabled: false,
+  /** Show the context-window meter in each tile's HEADER. Default OFF — the
+   *  header is tight on space, so the ctx% indicator is opt-in there. The bottom
+   *  Claude-config bar / sidebar captain rows show it regardless (untouched by
+   *  this flag). Read by components/Tile.tsx. */
+  showHeaderContextMeter: false,
   /** The titlebar × hides the window to the system tray (true) vs. quits the app
    *  (false). Default ON — close-to-tray, matching the tray's keep-running model. */
   closeToTray: true,
@@ -77,6 +82,7 @@ interface PersistedSettings {
   titlebarRevealAnimMs: number;
   soundsEnabled: boolean;
   notificationsEnabled: boolean;
+  showHeaderContextMeter: boolean;
   closeToTray: boolean;
   autoUpdateCheckEnabled: boolean;
   autoInstallUpdates: boolean;
@@ -128,6 +134,10 @@ function coerceSettings(raw: unknown): PersistedSettings {
       typeof p.notificationsEnabled === "boolean"
         ? p.notificationsEnabled
         : DEFAULTS.notificationsEnabled,
+    showHeaderContextMeter:
+      typeof p.showHeaderContextMeter === "boolean"
+        ? p.showHeaderContextMeter
+        : DEFAULTS.showHeaderContextMeter,
     closeToTray:
       typeof p.closeToTray === "boolean"
         ? p.closeToTray
@@ -204,6 +214,11 @@ interface SettingsState {
   notificationsEnabled: boolean;
   setNotificationsEnabled: (v: boolean) => void;
 
+  /** Show the context-window meter in each tile's header (default OFF). Read by
+   *  components/Tile.tsx; the bottom/sidebar readouts ignore it. */
+  showHeaderContextMeter: boolean;
+  setShowHeaderContextMeter: (v: boolean) => void;
+
   /** The titlebar × hides to tray (true) vs. quits (false). Read by Titlebar's
    *  close handler. */
   closeToTray: boolean;
@@ -254,6 +269,7 @@ export const useSettings = create<SettingsState>((set, get) => {
       titlebarRevealAnimMs: s.titlebarRevealAnimMs,
       soundsEnabled: s.soundsEnabled,
       notificationsEnabled: s.notificationsEnabled,
+      showHeaderContextMeter: s.showHeaderContextMeter,
       closeToTray: s.closeToTray,
       autoUpdateCheckEnabled: s.autoUpdateCheckEnabled,
       autoInstallUpdates: s.autoInstallUpdates,
@@ -319,6 +335,12 @@ export const useSettings = create<SettingsState>((set, get) => {
     notificationsEnabled: initial.notificationsEnabled,
     setNotificationsEnabled: (v) => {
       set({ notificationsEnabled: v });
+      persistAll();
+    },
+
+    showHeaderContextMeter: initial.showHeaderContextMeter,
+    setShowHeaderContextMeter: (v) => {
+      set({ showHeaderContextMeter: v });
       persistAll();
     },
 

@@ -324,6 +324,10 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
   const setCloseToTray = useSettings((s) => s.setCloseToTray);
   const resumeStartsClaude = useSettings((s) => s.resumeStartsClaude);
   const setResumeStartsClaude = useSettings((s) => s.setResumeStartsClaude);
+  const showHeaderContextMeter = useSettings((s) => s.showHeaderContextMeter);
+  const setShowHeaderContextMeter = useSettings(
+    (s) => s.setShowHeaderContextMeter,
+  );
   const fileIconTheme = useSettings((s) => s.fileIconTheme);
   const setFileIconTheme = useSettings((s) => s.setFileIconTheme);
   // Recovery review modal open state (#recovery) — local to this section; the
@@ -338,6 +342,18 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
           hint="When you Resume a session from the sidebar's Recent list, run `claude --resume` to reopen that conversation. Turn off to just open a terminal in the session's directory instead."
           value={resumeStartsClaude}
           onChange={setResumeStartsClaude}
+        />
+      </Group>
+
+      <Group
+        title="Tiles"
+        description="Chrome shown in each terminal tile's header."
+      >
+        <SettingToggleRow
+          label="Show context meter in tile header"
+          hint="Show a Claude session's context-window fullness (a thin bar + percentage) in the tile header. Off by default to keep the header uncluttered; the sidebar captain rows show context either way."
+          value={showHeaderContextMeter}
+          onChange={setShowHeaderContextMeter}
         />
       </Group>
 
