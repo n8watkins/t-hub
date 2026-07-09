@@ -12,9 +12,20 @@
 # control.json) whether the general is inside a dictation cycle (the `busy`
 # flag), falling back to Scribe's status.json file (pid-liveness + 15s TTL)
 # only when the endpoint is unavailable, and already FAILS OPEN (reports
-# not-listening) whenever it cannot positively confirm active dictation. So
-# this script does NOT re-read Scribe state or re-implement a weaker check
-# of its own; it asks the one gate.
+# not-listening) whenever it cannot positively confirm active dictation.
+#
+# WEDGE DEFENSE (P0 fix): the T-Hub control socket is a proxy, and it can be
+# unreachable OR wedged (flapping windows where a bare TCP connect succeeds but
+# the request round-trips hang until timeout). In that case the socket gate
+# returns "unknown" and we would fail open and SPEAK - talking over the general
+# even though Scribe itself is healthy and reporting busy:true, because we never
+# asked Scribe. So the T-Hub socket stays the PRIMARY gate (authoritative,
+# combines prod+dev, matches the in-app path), but when it answers "unknown" we
+# fall back to asking SCRIBE DIRECTLY - a faithful reimplementation of the same
+# v1-first + status.json check scribe.rs performs (app=="scribe", 15s updatedAt
+# TTL, future-reject, busy flag, prod+dev OR'd). We only fail open and speak
+# when BOTH T-Hub and Scribe cannot positively confirm state, so a wedged T-Hub
+# can no longer make us talk over an active dictation.
 #
 # Behavior while the general dictates: DEFER (wait, bounded), then speak shortly
 # after they stop - matching the in-app hold+flush, so a cue is never dropped.
@@ -36,6 +47,10 @@
 #   SCRIBE_POLL_S=0.3       re-poll interval while deferring
 #   SCRIBE_TAIL_S=0.5       quiet tail after dictation stops before speaking
 #   T_HUB_CONTROL_FILE / T_HUB_CONTROL_ADDR / T_HUB_CONTROL_TOKEN  (see control.json)
+#   T_HUB_SCRIBE_CONTROL_FILE / T_HUB_SCRIBE_STATUS_FILE  pin the direct-Scribe
+#                           fallback to exact files (tests / single-flavor E2E),
+#                           mirroring scribe.rs's override seam; when unset the
+#                           fallback resolves prod + dev from the host defaults
 set -u
 TEXT="${1:?usage: announce.sh \"text\" [voice]}"
 CFG="$HOME/.t-hub/captain/voice.json"
@@ -68,67 +83,227 @@ EOF
 # env-injected control token when present).
 scribe_state() {
   python3 - <<'PY'
-import json, os, socket, sys
+import json, os, re, socket, sys, urllib.request
+from datetime import datetime, timezone
 
-def out(s):
-    print(s)
-    sys.exit(0)
+SOCK_TIMEOUT = 2.0        # T-Hub control-socket round-trip budget (per poll)
+SCRIBE_HTTP_TIMEOUT = 1.5 # direct GET /v1/status budget (loopback, tight)
+SNAPSHOT_TTL_MS = 15000   # same 15s updatedAt TTL scribe.rs enforces
 
-hs_path = os.environ.get("T_HUB_CONTROL_FILE") or os.path.expanduser("~/.t-hub/control.json")
-try:
-    hs = json.load(open(hs_path))
-except Exception:
-    out("unknown")
+def now_ms():
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
-env_tok = os.environ.get("T_HUB_CONTROL_TOKEN")
-env_addr = os.environ.get("T_HUB_CONTROL_ADDR")
-addr = env_addr if (env_addr and env_tok) else hs.get("addr")
-tok = env_tok or hs.get("read_token") or hs.get("token")
-if not addr or not tok:
-    out("unknown")
+def parse_iso_ms(s):
+    """Scribe emits RFC3339 UTC with a Z and up to 9 sub-second digits;
+    truncate the fraction to 6 so fromisoformat can parse it."""
+    if not isinstance(s, str):
+        return None
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    m = re.match(r"^(.*\.\d{6})\d*([+-]\d{2}:\d{2})$", s)
+    if m:
+        s = m.group(1) + m.group(2)
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
 
-try:
-    host, port = addr.rsplit(":", 1)
-    s = socket.create_connection((host, int(port)), timeout=2.0)
-    s.settimeout(2.0)
-    req = {"token": tok, "command": "scribe_status", "args": {}, "v": 1}
-    s.sendall((json.dumps(req) + "\n").encode())
-    buf = b""
-    while b"\n" not in buf:
-        chunk = s.recv(65536)
-        if not chunk:
-            break
-        buf += chunk
-    s.close()
-    resp = json.loads(buf.split(b"\n", 1)[0].decode("utf-8", "replace"))
-except Exception:
-    out("unknown")
+def fresh(updated_at, now):
+    t = parse_iso_ms(updated_at)
+    # present, parseable, not future, within the TTL (mirrors snapshot_is_fresh)
+    return t is not None and t <= now and now - t <= SNAPSHOT_TTL_MS
 
-if not resp.get("ok"):
-    out("unknown")
-result = resp.get("result") or {}
-out("listening" if result.get("listening") else "idle")
+def snapshot_state(snap):
+    """One parsed snapshot (v1 or file) -> 'listening'/'idle'/None(untrusted).
+    None means fall through: not Scribe, stale/future updatedAt, or no boolean."""
+    if not isinstance(snap, dict):
+        return None
+    if snap.get("app") is not None and snap.get("app") != "scribe":
+        return None
+    if not fresh(snap.get("updatedAt"), now_ms()):
+        return None
+    busy = snap.get("busy")
+    if busy is None:
+        busy = snap.get("dictating")  # dictating stands in only when busy absent
+    if busy is None:
+        return None
+    return "listening" if busy else "idle"
+
+# --- Primary: the T-Hub app's authoritative control-socket gate --------------
+def thub_gate():
+    hs_path = os.environ.get("T_HUB_CONTROL_FILE") or os.path.expanduser("~/.t-hub/control.json")
+    try:
+        hs = json.load(open(hs_path))
+    except Exception:
+        return "unknown"
+    env_tok = os.environ.get("T_HUB_CONTROL_TOKEN")
+    env_addr = os.environ.get("T_HUB_CONTROL_ADDR")
+    addr = env_addr if (env_addr and env_tok) else hs.get("addr")
+    tok = env_tok or hs.get("read_token") or hs.get("token")
+    if not addr or not tok:
+        return "unknown"
+    try:
+        host, port = addr.rsplit(":", 1)
+        s = socket.create_connection((host, int(port)), timeout=SOCK_TIMEOUT)
+        s.settimeout(SOCK_TIMEOUT)
+        req = {"token": tok, "command": "scribe_status", "args": {}, "v": 1}
+        s.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        resp = json.loads(buf.split(b"\n", 1)[0].decode("utf-8", "replace"))
+    except Exception:
+        return "unknown"  # unreachable OR wedged (connect ok, round-trip hangs)
+    if not resp.get("ok"):
+        return "unknown"
+    result = resp.get("result") or {}
+    return "listening" if result.get("listening") else "idle"
+
+# --- Fallback: ask Scribe directly when T-Hub can't answer -------------------
+def first_existing(*paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+def scribe_control_dir():
+    # Native Linux Scribe first, then the WSL->Windows home this host uses.
+    return first_existing(os.path.expanduser("~/.scribe"), "/mnt/c/Users/natha/.scribe")
+
+def scribe_cache_file(bundle):
+    # status.json in the Tauri per-app cache dir (Linux ~/.cache, else Windows LOCALAPPDATA).
+    return first_existing(
+        os.path.join(os.path.expanduser("~/.cache"), bundle, "status.json"),
+        os.path.join("/mnt/c/Users/natha/AppData/Local", bundle, "status.json"),
+    )
+
+def v1_flavor(control_path):
+    """GET this flavor's /v1/status -> 'listening'/'idle'/None(unreachable/untrusted)."""
+    if not control_path:
+        return None
+    try:
+        c = json.load(open(control_path))
+    except Exception:
+        return None
+    base = c.get("baseUrl")
+    tok = c.get("readToken")
+    if not base or not tok:
+        return None
+    path = (c.get("endpoints") or {}).get("status") or "/v1/status"
+    try:
+        req = urllib.request.Request(
+            base.rstrip("/") + path, headers={"Authorization": "Bearer " + tok}
+        )
+        with urllib.request.urlopen(req, timeout=SCRIBE_HTTP_TIMEOUT) as r:
+            snap = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None  # refused/closed/timeout/401 -> endpoint unavailable
+    return snapshot_state(snap)
+
+def file_flavor(status_path):
+    """This flavor's status.json -> 'listening'/'idle'/None. pid-liveness is
+    skipped (a Windows pid is not checkable from the WSL shell); the 15s TTL +
+    v1 reachability cover a dead producer in the safe (defer) direction."""
+    if not status_path:
+        return None
+    try:
+        snap = json.load(open(status_path))
+    except Exception:
+        return None
+    return snapshot_state(snap)
+
+def scribe_direct():
+    ctl_override = os.environ.get("T_HUB_SCRIBE_CONTROL_FILE")
+    file_override = os.environ.get("T_HUB_SCRIBE_STATUS_FILE")
+    if ctl_override or file_override:
+        # Test / single-flavor seam: exactly the pinned source(s).
+        r = v1_flavor(ctl_override) if ctl_override else None
+        if r is None:
+            r = file_flavor(file_override)
+        return r or "unknown"
+    ctl_dir = scribe_control_dir()
+    flavors = [
+        (os.path.join(ctl_dir, "control.json") if ctl_dir else None, scribe_cache_file("com.natkins.scribe")),
+        (os.path.join(ctl_dir, "control.dev.json") if ctl_dir else None, scribe_cache_file("com.natkins.scribe.dev")),
+    ]
+    saw_idle = False
+    for ctl, status_file in flavors:
+        r = v1_flavor(ctl)
+        if r is None:
+            r = file_flavor(status_file)
+        if r == "listening":
+            return "listening"  # OR: either flavor busy holds
+        if r == "idle":
+            saw_idle = True
+    return "idle" if saw_idle else "unknown"
+
+# Print "<state> <source>": the final gate state and which source decided it,
+# so the caller can log WHY it spoke or held (thub-gate / scribe-direct / fail-open).
+st = thub_gate()
+src = "thub-gate"
+if st == "unknown":
+    st = scribe_direct()  # T-Hub can't answer -> ask Scribe before speaking
+    src = "scribe-direct" if st != "unknown" else "fail-open"
+print(st, src)
 PY
 }
 
+# Append one line per invocation to the captain announce log: timestamp, caller,
+# gate decision + deciding source + state, and the (bounded) utterance. This
+# closes the "exact utterance unrecoverable" gap the P0 report called out - a
+# talked-over-the-general event is now always attributable after the fact.
+# Cheap: a plain append, with a trivial size guard that keeps the tail.
+announce_log() {
+  local decision="$1" state="$2" source="$3"
+  local logf="$HOME/.t-hub/captain/announce.log"
+  mkdir -p "$(dirname "$logf")" 2>/dev/null || true
+  # Size guard (~1 MiB): keep the last 500 lines, no cron/rotation needed.
+  if [ -f "$logf" ] && [ "$(wc -c <"$logf" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+    tail -n 500 "$logf" > "$logf.tmp" 2>/dev/null && mv -f "$logf.tmp" "$logf"
+  fi
+  local ts caller text
+  ts="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Caller: explicit override wins; else best-effort parent process name.
+  caller="${T_HUB_ANNOUNCE_CALLER:-$(ps -o comm= -p "$PPID" 2>/dev/null | tr -d '[:space:]')}"
+  caller="${caller:-unknown}"
+  # One line, bounded: strip newlines/tabs from the utterance and cap length.
+  text="$(printf '%s' "$TEXT" | tr '\n\t' '  ' | cut -c1-200)"
+  printf '%s\tcaller=%s\tdecision=%s\tsource=%s\tstate=%s\ttext="%s"\n' \
+    "$ts" "$caller" "$decision" "$source" "$state" "$text" >> "$logf" 2>/dev/null || true
+}
+
+DECISION="speak"; GATE_ST="unknown"; GATE_SRC="disabled"
 if [ "${SCRIBE_GATE_DISABLE:-0}" != "1" ]; then
   DEFER_MAX_S="${SCRIBE_DEFER_MAX_S:-120}"
   POLL_S="${SCRIBE_POLL_S:-0.3}"
   TAIL_S="${SCRIBE_TAIL_S:-0.5}"
-  ST="$(scribe_state)"
-  if [ "$ST" = "listening" ]; then
+  read -r GATE_ST GATE_SRC <<< "$(scribe_state)"
+  if [ "$GATE_ST" = "listening" ]; then
     # Defer: wait (bounded) for dictation to stop, re-polling the authoritative
     # gate. Any non-"listening" answer (idle OR unknown/fail-open) breaks the
     # loop and we speak. At the cap we speak anyway so a cue is never lost.
+    DECISION="deferred"
     SECONDS=0
-    while [ "$ST" = "listening" ] && [ "$SECONDS" -lt "$DEFER_MAX_S" ]; do
+    while [ "$GATE_ST" = "listening" ] && [ "$SECONDS" -lt "$DEFER_MAX_S" ]; do
       sleep "$POLL_S"
-      ST="$(scribe_state)"
+      read -r GATE_ST GATE_SRC <<< "$(scribe_state)"
     done
     # Quiet tail in case they resume immediately (mirrors the in-app flush delay).
     sleep "$TAIL_S"
   fi
+else
+  DECISION="gate-disabled"
 fi
+# Record the decision (final state + deciding source) before we speak.
+announce_log "$DECISION" "$GATE_ST" "$GATE_SRC"
 # --- end Scribe dictation gate ---------------------------------------------
 
 VOICE="${2:-$CFG_VOICE}"

@@ -602,6 +602,31 @@ mod tests {
     }
 
     #[test]
+    fn v1_snapshot_long_dictation_holds_while_heartbeat_is_fresh() {
+        // Regression guard for the voice-gate P0 hypothesis (H1): does a LONG
+        // continuous dictation defeat the 15s `updatedAt` TTL? It does NOT.
+        // Scribe heartbeats `updatedAt` (~5s) independent of state transitions
+        // (contract s1/s6, verified live against Scribe 0.7.0), so a recording
+        // running for minutes carries a `since` far in the past but an
+        // `updatedAt` re-stamped to ~now. The TTL keys off `updatedAt`, not
+        // `since`, so the busy snapshot stays trusted and voice stays held.
+        let now = t0_ms();
+        let v = json!({
+            "schemaVersion": 1, "app": "scribe", "status": "Recording",
+            "dictating": true, "busy": true,
+            // Entered Recording 10 minutes ago (a long dictation)...
+            "since": "2026-07-08T11:50:00.000Z",
+            // ...but the heartbeat re-stamped updatedAt 2s ago: still fresh.
+            "updatedAt": "2026-07-08T11:59:58.000Z",
+        });
+        let c = eval_v1_snapshot(&v, now).expect("fresh heartbeat within TTL");
+        assert!(
+            c.status.listening,
+            "a long recording holds voice as long as the heartbeat keeps updatedAt fresh",
+        );
+    }
+
+    #[test]
     fn v1_snapshot_future_updated_at_is_rejected() {
         // F5: a FUTURE updatedAt (a clock-skewed or wedged producer post-dating
         // its heartbeat) must not defeat the TTL - a bare saturating_sub would
