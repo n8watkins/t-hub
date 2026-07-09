@@ -5,7 +5,7 @@
 // substitution tracks the designation live (display-only - the store's
 // orchestratorId is the single input).
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { act, render, within } from "@testing-library/react";
+import { act, fireEvent, render, within } from "@testing-library/react";
 
 // Tile -> TerminalPool -> xterm, whose import-time color math needs a real
 // <canvas>; and Tile -> TilePanel -> Files/Preview surfaces. Nothing here
@@ -104,5 +104,42 @@ describe("Tile header orchestrator identity", () => {
     expect(header.textContent).toContain("Cortana");
     expect(header.textContent).not.toContain("orchestrator");
     expect(within(header).getByLabelText("Orchestrator")).toBeTruthy();
+  });
+});
+
+describe("Tile kill+restart confirm (captain de-captain warning)", () => {
+  /** Click the header's kill+restart control and return the open confirm dialog. */
+  function openRestartConfirm(terminalId: string): HTMLElement {
+    const header = renderTile(terminalId);
+    act(() => {
+      fireEvent.click(
+        within(header).getByLabelText("Kill and restart session"),
+      );
+    });
+    const dialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
+    expect(dialog).toBeTruthy();
+    return dialog!;
+  }
+
+  it("warns that a CAPTAIN tile will be de-captained and its crew detached", () => {
+    useCaptain.setState({ orchestratorId: null, captainIds: ["cap00001"] });
+    const dialog = openRestartConfirm("cap00001");
+    expect(dialog.textContent).toContain("a captain");
+    expect(dialog.textContent).toContain("de-captain the ship");
+    expect(dialog.textContent).toContain("detach its crew");
+  });
+
+  it("names the ORCHESTRATOR specifically in the warning", () => {
+    useCaptain.setState({ orchestratorId: "orch0001", captainIds: [] });
+    const dialog = openRestartConfirm("orch0001");
+    expect(dialog.textContent).toContain("the orchestrator");
+    expect(dialog.textContent).toContain("de-captain the ship");
+  });
+
+  it("omits the de-captain warning for a plain (non-captain) tile", () => {
+    useCaptain.setState({ orchestratorId: null, captainIds: [] });
+    const dialog = openRestartConfirm("cap00001");
+    expect(dialog.textContent).toContain("recover a frozen terminal");
+    expect(dialog.textContent).not.toContain("de-captain");
   });
 });

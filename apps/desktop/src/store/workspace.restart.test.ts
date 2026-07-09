@@ -6,11 +6,16 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 const spawnTerminal = vi.fn();
 const killTerminal = vi.fn((_id?: string) => Promise.resolve());
+const notify = vi.fn();
 
 vi.mock("../ipc/client", () => ({
   spawnTerminal: (opts: unknown) => spawnTerminal(opts),
   killTerminal: (id: string) => killTerminal(id),
   closeTerminal: () => Promise.resolve(),
+}));
+vi.mock("../lib/notify", () => ({
+  notify: (kind: string, title: string, body?: string) =>
+    notify(kind, title, body),
 }));
 
 import { useWorkspace } from "./workspace";
@@ -23,6 +28,7 @@ function term(id: string, cwd = "/repo"): TerminalInfo {
 beforeEach(() => {
   spawnTerminal.mockReset();
   killTerminal.mockReset();
+  notify.mockReset();
   killTerminal.mockResolvedValue(undefined);
   // Two tabs; the target tile sits at index 1 of tab t1, between two siblings.
   useWorkspace.setState({
@@ -83,5 +89,37 @@ describe("restartTerminal", () => {
     const newId = await useWorkspace.getState().restartTerminal("ghost");
     expect(newId).toBeNull();
     expect(spawnTerminal).not.toHaveBeenCalled();
+  });
+
+  it("retries the kill once and surfaces a notice when the old session won't die", async () => {
+    spawnTerminal.mockResolvedValue(term("new1", "/repo/frozen"));
+    killTerminal.mockRejectedValue(new Error("kill boom"));
+
+    const newId = await useWorkspace.getState().restartTerminal("old1");
+    // The swap still stands — a kill failure must not block the recovery.
+    expect(newId).toBe("new1");
+    expect(useWorkspace.getState().tabs.find((t) => t.id === "t1")?.order).toEqual([
+      "a",
+      "new1",
+      "b",
+    ]);
+    // Kill attempted TWICE (initial + one retry), then a visible error notice.
+    await vi.waitFor(() => expect(killTerminal).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    expect(notify.mock.calls[0][0]).toBe("error");
+    expect(notify.mock.calls[0][2]).toContain("old1");
+  });
+
+  it("recovers on the retry: no notice when the second kill succeeds", async () => {
+    spawnTerminal.mockResolvedValue(term("new1", "/repo/frozen"));
+    killTerminal
+      .mockRejectedValueOnce(new Error("transient"))
+      .mockResolvedValueOnce(undefined);
+
+    await useWorkspace.getState().restartTerminal("old1");
+    await vi.waitFor(() => expect(killTerminal).toHaveBeenCalledTimes(2));
+    // Let any (should-not-exist) notice path settle, then assert it stayed quiet.
+    await Promise.resolve();
+    expect(notify).not.toHaveBeenCalled();
   });
 });

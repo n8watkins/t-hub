@@ -1020,7 +1020,11 @@ export function Tile({
       />
 
       {/* Kill + restart confirm — ALWAYS shown (busy or not): this ends the
-          session and starts a fresh one, so it must never fire on a stray click. */}
+          session and starts a fresh one, so it must never fire on a stray click.
+          For a CAPTAIN / orchestrator tile it also warns that the fresh session
+          (a NEW Claude id that has not claimed captaincy) is NOT re-pinned, so the
+          ship is de-captained and its crew detached — a plain regular tile keeps
+          the shorter copy. */}
       <ConfirmDialog
         open={confirmRestart}
         title="Kill & restart this session?"
@@ -1033,6 +1037,16 @@ export function Tile({
             — ending everything running in it — and opens a fresh session in the
             same folder, in this tile's place. Use it to recover a frozen
             terminal.
+            {(isCaptain || isOrchestrator) && (
+              <>
+                {" "}
+                <span style={{ color: "var(--th-dot-error, #f87171)" }}>
+                  This tile is {isOrchestrator ? "the orchestrator" : "a captain"}
+                  : restarting will de-captain the ship and detach its crew. The
+                  fresh session starts as a plain terminal, not a captain.
+                </span>
+              </>
+            )}
           </>
         }
         confirmLabel="Kill & restart"
