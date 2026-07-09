@@ -12,7 +12,7 @@
 //! ## CLI
 //! - (default)        Run the stdio MCP server (what the client launches).
 //! - `--list-tools`   Print the tool catalog as JSON and exit (offline; no app
-//!                    needed). Handy for docs / debugging / the `.mcp.json` proof.
+//!   needed). Handy for docs / debugging / the `.mcp.json` proof.
 //! - `--version`      Print the version and exit.
 //!
 //! stderr is reserved for human-readable diagnostics so it never corrupts the

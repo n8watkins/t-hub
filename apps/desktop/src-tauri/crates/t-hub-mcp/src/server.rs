@@ -16,7 +16,7 @@ use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::control_client::{self, ControlEndpoint, Discovery};
+use crate::control_client::{self, Discovery};
 use crate::protocol::{self, codes, Outbound, RpcRequest};
 use crate::tools;
 
@@ -164,14 +164,13 @@ fn tools_call(req: &RpcRequest, id: Value, discovery: &Discovery) -> Outbound {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // Resolve the control channel; if T-Hub isn't running, surface it as a
-    // tool error (isError) so the model gets a readable message.
-    let endpoint: ControlEndpoint = match discovery.resolve() {
-        Ok(ep) => ep,
-        Err(e) => return Outbound::Ok(protocol::success(id, tool_error(&e))),
-    };
-
-    match control_client::call(&endpoint, name, &arguments) {
+    // Forward to the app over the control channel. `resolve_and_call` re-reads
+    // control.json and retries once if the resolved endpoint is dead, so a
+    // session whose MCP was spawned before an app restart recovers onto the new
+    // port instead of concluding "T-Hub is down". If the app truly isn't running,
+    // the descriptive error surfaces as a tool error (isError) so the model gets
+    // a readable message.
+    match control_client::resolve_and_call(discovery, name, &arguments) {
         Ok(result) => Outbound::Ok(protocol::success(id, tool_ok(&result))),
         Err(e) => Outbound::Ok(protocol::success(id, tool_error(&e))),
     }
@@ -274,8 +273,9 @@ mod tests {
 
     #[test]
     fn tools_call_without_name_is_invalid_params() {
-        let resp =
-            run_lines(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"arguments":{}}}"#);
+        let resp = run_lines(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"arguments":{}}}"#,
+        );
         assert_eq!(resp[0]["error"]["code"], codes::INVALID_PARAMS);
     }
 

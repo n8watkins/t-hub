@@ -48,7 +48,7 @@ shared types to keep in lockstep.
 | MCP server binary | `src-tauri/crates/t-hub-mcp/` | Speaks MCP JSON-RPC on stdio; owns the tool catalog; forwards `tools/call` to the app. |
 | `protocol.rs` | `…/t-hub-mcp/src/protocol.rs` | Minimal JSON-RPC 2.0 framing (request/notification/response/error). |
 | `tools.rs` | `…/t-hub-mcp/src/tools.rs` | The static tool catalog + tiers + JSON schemas. |
-| `control_client.rs` | `…/t-hub-mcp/src/control_client.rs` | Discovers the app (handshake file / env) and forwards one command. |
+| `control_client.rs` | `…/t-hub-mcp/src/control_client.rs` | Discovers the app (handshake file / env), forwards one command, and re-reads `control.json` to reconnect once when the endpoint is dead (recovers across an app restart). |
 | `server.rs` | `…/t-hub-mcp/src/server.rs` | The stdio loop: `initialize`, `tools/list`, `tools/call`, `ping`. |
 | App control listener | `src-tauri/src/control.rs` | Loopback TCP listener; authenticates the token; dispatches by command name. |
 | Registration line | `src-tauri/src/lib.rs` (`start_control_listener`) | Starts the listener in `setup()` with a supervisor-visitor closure. |
@@ -96,6 +96,27 @@ installs):
 
 The token gates every request: a bad token is rejected **before** any command
 runs, and the listener only accepts loopback peers.
+
+### Recovering from an app restart
+
+The app rebinds to a **fresh ephemeral port and a new token on every launch**,
+rewriting `control.json`. A running `t-hub-mcp`, though, may have captured the
+old `addr` + `token` in its env at spawn time - the app injects
+`T_HUB_CONTROL_ADDR` / `T_HUB_CONTROL_TOKEN` down the spawn tree - so after a
+restart that pin points at the dead pre-restart endpoint. Rather than reporting
+"T-Hub is not running" until the MCP client itself is relaunched,
+`resolve_and_call` recovers transparently:
+
+- A `tools/call` whose round-trip fails at the **transport** level (connect
+  refused, or the stream dies mid-exchange - exactly how a restarted app on a
+  new port looks) triggers a **re-read of `control.json`**, dropping the stale
+  env pair, and **one retry** against the `addr` + `token` the running app just
+  wrote.
+- An **app-level** rejection (bad token, unknown command, a governor refusal) is
+  not a moved endpoint, so it surfaces verbatim - no re-read, no retry.
+- If `control.json` names the same endpoint (or is gone/unreadable), there is
+  nothing fresher to retry, so the original transport error stands - a
+  genuinely-down app is still reported as a tool error, never silently swallowed.
 
 ---
 
@@ -323,7 +344,7 @@ running app it instead forwards the spawn and a real tile appears):
 | --- | --- | --- |
 | MCP protocol framing | `crates/t-hub-mcp/src/protocol.rs` | 4 |
 | Tool catalog + tiers | `crates/t-hub-mcp/src/tools.rs` | 8 |
-| Control client (forwarding, discovery) | `crates/t-hub-mcp/src/control_client.rs` | 4 |
+| Control client (forwarding, discovery, restart recovery) | `crates/t-hub-mcp/src/control_client.rs` | 8 |
 | MCP server dispatch (initialize/list/call) | `crates/t-hub-mcp/src/server.rs` | 9 |
 | App-side control dispatch + tiers (incl. spawn_terminal + tab registry) | `src/control.rs` | 45 |
 | End-to-end (real binary ⇄ real listener) | `tests/mcp_e2e.rs` | 1 |
