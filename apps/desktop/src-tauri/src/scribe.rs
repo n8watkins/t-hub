@@ -15,7 +15,11 @@
 // cached address can never wedge the gate (the same lesson as t-hub's own
 // control.json). scribe_status is a per-request pull polled at ~250ms, so a
 // plain GET per call is the right shape; the SSE stream (/v1/events) would
-// only add connection state without making the gate faster.
+// only add connection state without making the gate faster. The v1 snapshot is
+// held to the same 15s `updatedAt` TTL as the fallback (below): a
+// wedged-but-serving Scribe frozen on `busy:true` must not hold voice forever
+// - stronger than contract s7.1's intrinsic-liveness, per the fail-open
+// doctrine.
 //
 // FALLBACK (contract s6, used ONLY when the endpoint is unavailable): Scribe
 // mirrors the same snapshot to a status.json file in its Tauri app_cache_dir:
@@ -39,8 +43,8 @@
 // lacks `busy`.
 //
 // The general sometimes runs the DEV Scribe build alongside prod; we resolve
-// both flavors (each v1-first, then its own file fallback) and OR their busy
-// states, reporting status/since from the freshest snapshot.
+// both flavors concurrently (each v1-first, then its own file fallback) and OR
+// their busy states, reporting status/since from the freshest snapshot.
 //
 // FAIL-OPEN doctrine (unchanged): this returns `listening: false` (T-Hub
 // speaks) whenever it cannot positively confirm an active dictation - endpoint
@@ -62,10 +66,11 @@ const SCRIBE_BUNDLE_DEV: &str = "com.natkins.scribe.dev";
 const SCRIBE_CONTROL_PROD: &str = "control.json";
 const SCRIBE_CONTROL_DEV: &str = "control.dev.json";
 
-/// Fallback staleness TTL on the snapshot's `updatedAt` field (contract s7.2):
-/// Scribe re-writes status.json on a ~5s heartbeat while alive, so a snapshot
-/// older than 3x that means a wedged/dead producer -> unknown -> fail open.
-const SCRIBE_FALLBACK_TTL_MS: i64 = 15_000;
+/// Snapshot staleness TTL on the `updatedAt` field (contract s7.2), enforced on
+/// BOTH the v1 primary snapshot and the file fallback: Scribe re-writes its
+/// state on a ~5s heartbeat while alive, so a snapshot older than 3x that (or
+/// one dated in the future) means a wedged/dead producer -> unknown -> fail open.
+const SCRIBE_SNAPSHOT_TTL_MS: i64 = 15_000;
 
 /// HTTP budget for the loopback GET /v1/status. Tight on purpose: the endpoint
 /// is 127.0.0.1-only and voiceAnnounce polls this whole gate at ~250ms, so a
@@ -120,6 +125,18 @@ fn parse_rfc3339_ms(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|t| t.timestamp_millis())
+}
+
+/// Is a snapshot fresh: is its `updatedAt` present, parseable, not in the
+/// future, and no older than the TTL? Shared by the v1 primary and the file
+/// fallback (contract s7.2). A FUTURE timestamp is rejected too - a
+/// clock-skewed or wedged producer must not defeat the TTL by post-dating its
+/// heartbeat (a bare `now - t` via `saturating_sub` reads the future as age 0
+/// and would wrongly pass).
+fn snapshot_is_fresh(updated_at: Option<&str>, now: i64) -> bool {
+    updated_at
+        .and_then(parse_rfc3339_ms)
+        .is_some_and(|t| t <= now && now - t <= SCRIBE_SNAPSHOT_TTL_MS)
 }
 
 /// Windows pid-liveness via OpenProcess: T-Hub-on-Windows and Scribe-on-Windows
@@ -236,14 +253,32 @@ fn fetch_v1_snapshot(d: &Discovery) -> Option<serde_json::Value> {
 }
 
 /// Evaluate a v1 snapshot into the gate result. `None` when the payload is not
-/// a usable Scribe v1 snapshot (future schemaVersion, a foreign `app`, or
-/// neither boolean present - e.g. a non-Scribe local server squatting a reused
-/// port), so the caller falls through to the file fallback.
-fn eval_v1_snapshot(v: &serde_json::Value) -> Option<CandidateEval> {
+/// a usable, fresh Scribe v1 snapshot (future schemaVersion, a missing/foreign
+/// `app`, a stale/future `updatedAt`, or neither boolean present - e.g. a
+/// non-Scribe local server squatting a reused port), so the caller falls
+/// through to the file fallback.
+fn eval_v1_snapshot(v: &serde_json::Value, now: i64) -> Option<CandidateEval> {
     if v.get("schemaVersion").and_then(|x| x.as_u64()).is_some_and(|n| n > 1) {
         return None;
     }
-    if v.get("app").and_then(|x| x.as_str()).is_some_and(|a| a != "scribe") {
+    // F2: require `app == "scribe"` present AND equal, not merely "not wrong".
+    // Contract 1 makes `app` a constant that is always present, so this rejects
+    // zero real snapshots; but it forces a port-squatter that omits `app` (a
+    // non-Scribe server answering `{"busy":true}` on a reused ephemeral port,
+    // ignoring the bearer token) to fall through to the file fallback rather
+    // than force a false `listening:true`.
+    if v.get("app").and_then(|x| x.as_str()) != Some("scribe") {
+        return None;
+    }
+    // F1: the same 15s `updatedAt` TTL the file fallback enforces (contract
+    // s7.2), applied to the canonical HTTP path too - stronger than contract
+    // s7.1's intrinsic-liveness, per t-hub's fail-open doctrine. A
+    // wedged-but-serving Scribe (HTTP thread alive, dictation frozen on
+    // `busy:true`) would otherwise hold voice indefinitely; a healthy Scribe
+    // heartbeats `updatedAt` so this is free. Missing/unparseable/stale/future
+    // -> untrusted -> fall through to the fallback (which itself fails open).
+    let updated_at = v.get("updatedAt").and_then(|x| x.as_str());
+    if !snapshot_is_fresh(updated_at, now) {
         return None;
     }
     // The gate: `busy` (see module doc), with `dictating` standing in only
@@ -259,10 +294,7 @@ fn eval_v1_snapshot(v: &serde_json::Value) -> Option<CandidateEval> {
             since: v.get("since").cloned(),
             source: Some("v1"),
         },
-        updated_at: v
-            .get("updatedAt")
-            .and_then(|x| x.as_str())
-            .map(str::to_string),
+        updated_at: updated_at.map(str::to_string),
     })
 }
 
@@ -307,12 +339,8 @@ fn evaluate_fallback(
     // Step 3: the TTL, on the `updatedAt` FIELD (not the file mtime). Even a
     // live pid with a stale snapshot means a WEDGED producer, not a long
     // dictation - Scribe's heartbeat guarantees freshness while it is healthy.
-    let fresh = v
-        .get("updatedAt")
-        .and_then(|x| x.as_str())
-        .and_then(parse_rfc3339_ms)
-        .is_some_and(|t| now.saturating_sub(t) <= SCRIBE_FALLBACK_TTL_MS);
-    if !fresh {
+    // A future `updatedAt` is rejected too (see `snapshot_is_fresh`).
+    if !snapshot_is_fresh(v.get("updatedAt").and_then(|x| x.as_str()), now) {
         return fail_open;
     }
 
@@ -369,7 +397,7 @@ fn eval_flavor(control: Option<&Path>, status_file: Option<&Path>) -> Option<Can
         .and_then(read_control_at)
         .and_then(|d| fetch_v1_snapshot(&d))
     {
-        if let Some(c) = eval_v1_snapshot(&snap) {
+        if let Some(c) = eval_v1_snapshot(&snap, now_ms()) {
             return Some(c);
         }
     }
@@ -426,17 +454,29 @@ pub fn read_scribe_status() -> ScribeStatus {
         };
     }
 
-    let mut cands: Vec<CandidateEval> = Vec::new();
-    for (control_name, bundle) in [
-        (SCRIBE_CONTROL_PROD, SCRIBE_BUNDLE_PROD),
-        (SCRIBE_CONTROL_DEV, SCRIBE_BUNDLE_DEV),
-    ] {
-        let control = scribe_control_file_for(control_name);
-        let status_file = scribe_status_file_for(bundle);
-        if let Some(c) = eval_flavor(control.as_deref(), status_file.as_deref()) {
-            cands.push(c);
-        }
-    }
+    // Resolve prod + dev CONCURRENTLY. Each flavor's v1 GET can park up to the
+    // HTTP timeout, so a sequential resolve would sum them (~1.5s worst case)
+    // against the ~250ms poll; two scoped threads bound the wait to a single
+    // flavor's timeout. The intermediate collect() starts BOTH threads before
+    // either is joined (a lazy map+filter_map would spawn-then-join serially).
+    // Order is preserved (prod first) so combine_candidates keeps its
+    // prod-wins-a-tie rule; a panicked resolve drops to `None` (fail-open).
+    let cands: Vec<CandidateEval> = std::thread::scope(|s| {
+        [
+            (SCRIBE_CONTROL_PROD, SCRIBE_BUNDLE_PROD),
+            (SCRIBE_CONTROL_DEV, SCRIBE_BUNDLE_DEV),
+        ]
+        .into_iter()
+        .map(|(control_name, bundle)| {
+            let control = scribe_control_file_for(control_name);
+            let status_file = scribe_status_file_for(bundle);
+            s.spawn(move || eval_flavor(control.as_deref(), status_file.as_deref()))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .filter_map(|h| h.join().ok().flatten())
+        .collect()
+    });
     combine_candidates(&cands)
 }
 
@@ -494,10 +534,13 @@ mod tests {
     fn v1_snapshot_gates_on_busy_not_dictating() {
         // Transcribing: mic closed (dictating=false) but the cycle is not done
         // (busy=true) - speaking now would land on top of the transcript.
-        let c = eval_v1_snapshot(&json!({
-            "schemaVersion": 1, "app": "scribe", "status": "Transcribing",
-            "dictating": false, "busy": true, "updatedAt": T0,
-        }))
+        let c = eval_v1_snapshot(
+            &json!({
+                "schemaVersion": 1, "app": "scribe", "status": "Transcribing",
+                "dictating": false, "busy": true, "updatedAt": T0,
+            }),
+            t0_ms() + 1_000,
+        )
         .expect("valid snapshot");
         assert!(c.status.listening, "busy=true must hold even when dictating=false");
         assert_eq!(c.status.source, Some("v1"));
@@ -506,10 +549,13 @@ mod tests {
 
     #[test]
     fn v1_snapshot_idle_is_not_listening() {
-        let c = eval_v1_snapshot(&json!({
-            "schemaVersion": 1, "app": "scribe", "status": "Idle",
-            "dictating": false, "busy": false, "since": T0,
-        }))
+        let c = eval_v1_snapshot(
+            &json!({
+                "schemaVersion": 1, "app": "scribe", "status": "Idle",
+                "dictating": false, "busy": false, "since": T0, "updatedAt": T0,
+            }),
+            t0_ms(),
+        )
         .expect("valid snapshot");
         assert!(!c.status.listening);
         assert_eq!(c.status.status.as_deref(), Some("Idle"));
@@ -518,19 +564,66 @@ mod tests {
 
     #[test]
     fn v1_snapshot_uses_dictating_when_busy_is_absent() {
-        let c = eval_v1_snapshot(&json!({ "app": "scribe", "dictating": true }))
-            .expect("dictating alone is usable");
+        let c = eval_v1_snapshot(
+            &json!({ "app": "scribe", "dictating": true, "updatedAt": T0 }),
+            t0_ms(),
+        )
+        .expect("dictating alone is usable");
         assert!(c.status.listening);
     }
 
     #[test]
     fn v1_snapshot_rejects_unusable_payloads() {
-        // A future major contract version.
-        assert!(eval_v1_snapshot(&json!({ "schemaVersion": 2, "app": "scribe", "busy": true })).is_none());
+        let now = t0_ms();
+        // A future major contract version (fresh, so the TTL is not the reason).
+        assert!(eval_v1_snapshot(&json!({ "schemaVersion": 2, "app": "scribe", "busy": true, "updatedAt": T0 }), now).is_none());
         // A non-Scribe local server squatting a reused port.
-        assert!(eval_v1_snapshot(&json!({ "schemaVersion": 1, "app": "other", "busy": true })).is_none());
+        assert!(eval_v1_snapshot(&json!({ "schemaVersion": 1, "app": "other", "busy": true, "updatedAt": T0 }), now).is_none());
         // Neither boolean present: not a snapshot at all.
-        assert!(eval_v1_snapshot(&json!({ "schemaVersion": 1, "app": "scribe" })).is_none());
+        assert!(eval_v1_snapshot(&json!({ "schemaVersion": 1, "app": "scribe", "updatedAt": T0 }), now).is_none());
+    }
+
+    #[test]
+    fn v1_snapshot_stale_updated_at_is_rejected() {
+        // F1: a wedged-but-serving Scribe frozen on busy:true past the TTL must
+        // NOT hold voice - the stale snapshot is untrusted, so the caller falls
+        // through to the file fallback (which itself fails open). Contrast the
+        // fallback's own stale-guard test below: this proves the canonical HTTP
+        // path enforces the same TTL, closing the fail-CLOSED gap the file path
+        // never had.
+        let v = json!({ "schemaVersion": 1, "app": "scribe", "busy": true, "updatedAt": T0 });
+        assert!(
+            eval_v1_snapshot(&v, t0_ms() + SCRIBE_SNAPSHOT_TTL_MS + 1).is_none(),
+            "stale v1 snapshot -> fall through to the fallback",
+        );
+        // At exactly the TTL boundary it still holds.
+        let c = eval_v1_snapshot(&v, t0_ms() + SCRIBE_SNAPSHOT_TTL_MS).expect("fresh at the boundary");
+        assert!(c.status.listening);
+    }
+
+    #[test]
+    fn v1_snapshot_future_updated_at_is_rejected() {
+        // F5: a FUTURE updatedAt (a clock-skewed or wedged producer post-dating
+        // its heartbeat) must not defeat the TTL - a bare saturating_sub would
+        // read it as age 0 (fresh); the `t <= now` guard rejects it.
+        let v = json!({ "schemaVersion": 1, "app": "scribe", "busy": true, "updatedAt": T0 });
+        assert!(
+            eval_v1_snapshot(&v, t0_ms() - 1_000).is_none(),
+            "updatedAt in the future -> rejected, never a false busy",
+        );
+    }
+
+    #[test]
+    fn v1_snapshot_missing_app_is_rejected() {
+        // F2: a 200 body with NO `app` field is a port-squatter (a non-Scribe
+        // server on a reused ephemeral port), not Scribe. Contract 1 always
+        // emits `app`, so requiring it present-and-equal rejects zero real
+        // snapshots but forces this one to fall through to the file fallback.
+        let v = json!({ "schemaVersion": 1, "busy": true, "updatedAt": T0 });
+        assert!(
+            eval_v1_snapshot(&v, t0_ms()).is_none(),
+            "missing app -> not a Scribe snapshot -> fall through",
+        );
     }
 
     // -- v1 discovery (control.json) ------------------------------------------
@@ -617,10 +710,13 @@ mod tests {
 
     #[test]
     fn v1_end_to_end_gates_on_busy_over_real_http() {
+        // `updatedAt` is a live heartbeat: the v1 path now enforces the 15s TTL
+        // through the real clock, so a fixed T0 would read as stale and fall
+        // through to the (absent) fallback.
         let body = json!({
             "schemaVersion": 1, "app": "scribe", "status": "Transcribing",
             "dictating": false, "busy": true,
-            "since": T0, "updatedAt": T0, "pid": std::process::id(),
+            "since": T0, "updatedAt": iso_now(), "pid": std::process::id(),
         })
         .to_string();
         let port = serve_v1_once(body, "sekret");
@@ -734,9 +830,9 @@ mod tests {
         // every ~5s while alive, so live-pid-but-stale-snapshot now means a
         // WEDGED producer, not a long dictation - it must fail open.
         let v = json!({ "dictating": true, "busy": true, "updatedAt": T0, "pid": 42 });
-        assert!(!evaluate_fallback(&v, t0_ms() + SCRIBE_FALLBACK_TTL_MS + 1, ALIVE).listening);
+        assert!(!evaluate_fallback(&v, t0_ms() + SCRIBE_SNAPSHOT_TTL_MS + 1, ALIVE).listening);
         // At exactly the TTL the snapshot still holds.
-        assert!(evaluate_fallback(&v, t0_ms() + SCRIBE_FALLBACK_TTL_MS, ALIVE).listening);
+        assert!(evaluate_fallback(&v, t0_ms() + SCRIBE_SNAPSHOT_TTL_MS, ALIVE).listening);
     }
 
     #[test]
@@ -752,14 +848,14 @@ mod tests {
     fn fallback_uncheckable_pid_relies_on_the_ttl_alone() {
         let v = json!({ "dictating": true, "busy": true, "updatedAt": T0, "pid": 42 });
         assert!(evaluate_fallback(&v, t0_ms() + 1_000, UNCHECKABLE).listening);
-        assert!(!evaluate_fallback(&v, t0_ms() + SCRIBE_FALLBACK_TTL_MS + 1, UNCHECKABLE).listening);
+        assert!(!evaluate_fallback(&v, t0_ms() + SCRIBE_SNAPSHOT_TTL_MS + 1, UNCHECKABLE).listening);
     }
 
     #[test]
     fn fallback_missing_pid_relies_on_the_ttl_alone() {
         let v = json!({ "dictating": true, "busy": true, "updatedAt": T0 });
         assert!(evaluate_fallback(&v, t0_ms() + 1_000, ALIVE).listening);
-        assert!(!evaluate_fallback(&v, t0_ms() + SCRIBE_FALLBACK_TTL_MS + 1, ALIVE).listening);
+        assert!(!evaluate_fallback(&v, t0_ms() + SCRIBE_SNAPSHOT_TTL_MS + 1, ALIVE).listening);
     }
 
     #[test]
