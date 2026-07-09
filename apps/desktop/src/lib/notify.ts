@@ -7,15 +7,16 @@
 // we degrade gracefully to sound-only (see the dynamic import in `osNotify`).
 //
 // Wiring: `installSessionNotifications()` subscribes once to the backend session
-// events (see ./client05 + ./client) and maps them onto three notification
-// "kinds". Both sounds and notifications respect the persisted settings toggles
-// (`soundsEnabled` / `notificationsEnabled`) read live from the settings store.
+// status events (see ./client05) and maps the few attention-worthy edges onto
+// three notification "kinds". Both sounds and notifications respect the persisted
+// settings toggles (`soundsEnabled` / `notificationsEnabled`) read live from the
+// settings store.
 
 import { useSettings } from "../store/settings";
 import { onSessionStatus, onSupervision } from "../ipc/client05";
-import { onExit, onState } from "../ipc/client";
 import type { SessionStatus } from "../ipc/model";
 import { createWarmup } from "./warmup";
+import { captainSubjectForSession } from "./captainAttribution";
 
 /** The three event flavors the rest of the app fires. */
 export type NotifyKind = "attention" | "done" | "error";
@@ -178,48 +179,62 @@ export function notify(kind: NotifyKind, title: string, body = ""): void {
 // ---------------------------------------------------------------------------
 
 /** Map an FR-012 session status onto a notification, or null to stay silent.
- *  Only *actionable* transitions notify — `working`/`detached`/`restoring`/etc.
- *  are routine and would be noisy. */
-function statusToNotification(
+ *
+ *  STRICT chime policy (mirrors the voice-announce doctrine): fire ONLY on the
+ *  handful of edges that actually deserve the general's attention -
+ *    - a DECISION is needed  (needsQuestion / needsPermission),
+ *    - a captain/crew FINISHED (completed),
+ *    - a BLOCKER hit          (failed).
+ *  Everything else is narration / progress / routine noise and stays SILENT:
+ *  `working`/`waitingOnSubagents`/`detached`/`restoring`/`expired`/`unknown`,
+ *  and deliberately `rateLimited` too - a rate limit is a transient overlay on a
+ *  still-working session (auto-continue rides it out), exactly what the
+ *  voice-announce model refuses to speak, so it must not chime either.
+ *
+ *  `subject` NAMES the originating captain ("Captain alpha", or the orchestrator
+ *  brand) when the session is a captain, so the general can tell WHICH captain
+ *  wants attention. Null for a regular session → the generic wording stands. */
+export function statusToNotification(
   status: SessionStatus,
+  subject?: string | null,
 ): { kind: NotifyKind; title: string; body: string } | null {
+  // The actor named in the notification: the captain's ship when known, else a
+  // generic noun so non-captain sessions read exactly as before.
+  const who = subject ?? "Claude";
+  const whoSession = subject ?? "A session";
+  const whoAgent = subject ?? "An agent";
   switch (status) {
-    // The "Claude is asking for input" signals — exactly the asks-signal the
-    // task hoped for. These ARE first-class statuses on the bridge.
+    // DECISION needed — the agent is asking a question / for a tool permission.
     case "needsQuestion":
       return {
         kind: "attention",
-        title: "Claude needs an answer",
-        body: "A session is waiting on your input.",
+        title: `${who} needs an answer`,
+        body: `${whoSession} is waiting on your input.`,
       };
     case "needsPermission":
       return {
         kind: "attention",
-        title: "Claude needs permission",
-        body: "A session is asking to use a tool.",
+        title: `${who} needs permission`,
+        body: `${whoSession} is asking to use a tool.`,
       };
-    // A turn finished cleanly.
+    // FINISHED — a turn ended cleanly; it's the general's turn again.
     case "completed":
       return {
         kind: "done",
-        title: "Session completed",
-        body: "An agent finished its turn.",
+        title: subject ? `${subject} completed` : "Session completed",
+        body: `${whoAgent} finished its turn.`,
       };
-    // Hard failure — alert sound + notification.
+    // BLOCKER — a hard failure that stops the run.
     case "failed":
       return {
         kind: "error",
-        title: "Session failed",
-        body: "An agent run ended with an error.",
-      };
-    case "rateLimited":
-      return {
-        kind: "error",
-        title: "Rate limited",
-        body: "A session hit a rate limit.",
+        title: subject ? `${subject} failed` : "Session failed",
+        body: subject
+          ? `${subject}'s run ended with an error.`
+          : "An agent run ended with an error.",
       };
     default:
-      // working / waitingOnSubagents / detached / restoring / expired / unknown
+      // Everything else (incl. rateLimited) is routine — stay silent.
       return null;
   }
 }
@@ -233,8 +248,8 @@ const lastNotifiedStatus = new Map<string, SessionStatus>();
 // Startup warmup — swallow the journal-replay burst
 //
 // On the FIRST connect, the agent replays its event journal: every existing
-// session re-emits its last status, and historical exits/errors fire too. With
-// many sessions that was a wall of chimes at launch. We treat the launch window
+// session re-emits its last status. With many sessions that was a wall of chimes
+// at launch. We treat the launch window
 // as "warmup": events are recorded (so the dedup baseline is seeded) but NOT
 // sounded. The window ends a short, quiet interval after the last startup event
 // (so a slow connect's burst is still covered), or after a hard cap if no events
@@ -264,11 +279,11 @@ const { start: startWarmup, inWarmup } = warmup;
 export async function installSessionNotifications(): Promise<() => void> {
   const unlisteners: Array<() => void> = [];
 
-  // Primary signal: FR-012 session status (needs-question / completed / failed
-  // / rate-limited). This is the richest event and carries the asks-signal.
-  // Kick off the warmup window so the journal-replay burst at first connect is
-  // seeded (for dedup) but silent. The absolute deadline holds even under a
-  // steady event stream; `inWarmup()`'s grace re-arm can only end it sooner.
+  // Primary signal: FR-012 session status. Only the attention-worthy edges chime
+  // (a decision needed, a finish, a blocker — see statusToNotification). Kick off
+  // the warmup window so the journal-replay burst at first connect is seeded (for
+  // dedup) but silent. The absolute deadline holds even under a steady event
+  // stream; `inWarmup()`'s grace re-arm can only end it sooner.
   startWarmup();
 
   unlisteners.push(
@@ -277,7 +292,9 @@ export async function installSessionNotifications(): Promise<() => void> {
       lastNotifiedStatus.set(sessionId, status);
       // Warmup: record the baseline but don't sound the replayed status.
       if (inWarmup()) return;
-      const n = statusToNotification(status);
+      // Attribution: name the captain/ship when this session is one, so the
+      // general knows which captain wants attention (null → generic wording).
+      const n = statusToNotification(status, captainSubjectForSession(sessionId));
       if (n) notify(n.kind, n.title, n.body);
     }),
   );
@@ -290,35 +307,20 @@ export async function installSessionNotifications(): Promise<() => void> {
       if (lastNotifiedStatus.get(tree.sessionId) === tree.status) return;
       lastNotifiedStatus.set(tree.sessionId, tree.status);
       if (inWarmup()) return;
-      const n = statusToNotification(tree.status);
+      const n = statusToNotification(
+        tree.status,
+        captainSubjectForSession(tree.sessionId),
+      );
       if (n) notify(n.kind, n.title, n.body);
     }),
   );
 
-  // Terminal lifecycle: a tile that transitions to `error` is a backend-level
-  // failure worth an alert even when no agent status exists.
-  unlisteners.push(
-    await onState(({ state }) => {
-      if (state === "error") {
-        if (inWarmup()) return; // swallow replayed historical errors at launch
-        notify("error", "Terminal error", "A terminal entered an error state.");
-      }
-    }),
-  );
-
-  // A non-zero process exit is an error; a clean exit (code 0) is a soft "done".
-  unlisteners.push(
-    await onExit(({ code }) => {
-      if (code != null && code !== 0) {
-        if (inWarmup()) return; // swallow replayed historical exits at launch
-        notify(
-          "error",
-          "Terminal exited",
-          `A terminal exited with code ${code}.`,
-        );
-      }
-    }),
-  );
+  // NOTE: terminal lifecycle chimes were removed as routine noise. A backend
+  // terminal `error` state is a low-level transport edge (often teardown) that a
+  // genuine agent failure already surfaces via the `failed` status above, and a
+  // non-zero process EXIT fires on any ordinary command that returns non-zero (a
+  // failing test, a grep with no match, a Ctrl-C = 130) — neither deserves the
+  // general's attention. The tile's own error indicator still shows both.
 
   // TODO(asks-signal): `needsQuestion` / `needsPermission` already give us the
   // "Claude is asking for input" cue via the status bridge. If a finer-grained

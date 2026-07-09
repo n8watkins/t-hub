@@ -99,6 +99,47 @@ function cleanupTileSideState(id: TerminalId): void {
 }
 
 /**
+ * Kill the OLD tmux session behind a restart, retrying ONCE. `restartTerminal`
+ * has already swapped in the fresh tile, so this runs detached from the return —
+ * but a silently-failed kill would leak a frozen tmux session with no tile bound
+ * to it, so on a SECOND failure we surface a visible notice (an OS toast via
+ * lib/notify + a console.error) so the user knows the old session may still be
+ * running and can kill it manually. `killTerminal` is injected so the store stays
+ * free of a hard Tauri dependency (and the retry path is unit-testable).
+ */
+async function killOldSessionWithRetry(
+  id: TerminalId,
+  killTerminal: (id: TerminalId) => Promise<void>,
+): Promise<void> {
+  try {
+    await killTerminal(id);
+    return;
+  } catch (first) {
+    console.error("restartTerminal: kill old session failed, retrying", first);
+  }
+  try {
+    await killTerminal(id);
+  } catch (second) {
+    console.error(
+      "restartTerminal: kill old session failed after retry",
+      second,
+    );
+    // Surface it: the old tmux session may still be running with no tile bound.
+    void import("../lib/notify")
+      .then((m) =>
+        m.notify(
+          "error",
+          "Old session may still be running",
+          `Couldn't kill the old tmux session ${id} after restarting it. It may still be running in the background — kill it manually if it lingers.`,
+        ),
+      )
+      .catch(() => {
+        /* no notify runtime (web/test) — the console.error above stands */
+      });
+  }
+}
+
+/**
  * Delete a terminal's entries from all three label maps (effective `labels`, the
  * persisted `userLabels` source of truth, and the live `claudeTitles`). A module
  * helper rather than a store action because `cleanupTileSideState` runs outside
@@ -380,6 +421,12 @@ interface WorkspaceState {
    *  `kill_terminal`, terminating the process tree) then drop the tile via
    *  `remove`. Destructive; callers gate this behind a confirm. */
   deleteTerminal: (id: TerminalId) => void;
+  /** Lifecycle: KILL + RESTART — recover a frozen session. Spawns a FRESH tmux
+   *  session rooted at the same cwd, drops it into the SAME tab at the SAME slot
+   *  the old tile held, then kills the old session (process tree). Reuses the
+   *  spawn + kill IPCs (no new tmux logic). Destructive; callers gate it behind a
+   *  confirm. Returns the new terminal id, or null on spawn failure. */
+  restartTerminal: (id: TerminalId) => Promise<TerminalId | null>;
   /** Set the focused tile. Focusing a tile also returns navigation focus to the
    *  terminal region (a click/keypress on a terminal implies you're working in
    *  the canvas, not the sidebar). */
@@ -1559,6 +1606,68 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         .then((m) => m.killTerminal(id))
         .catch((err) => console.error("killTerminal failed", err));
       get().remove(id);
+    },
+
+    restartTerminal: async (id) => {
+      // Recover a frozen session: spawn a FRESH tmux session in the same cwd,
+      // swap it into the OLD tile's exact tab + slot, then kill the old session.
+      // Reuses the same spawnTerminal / killTerminal IPCs the "+" and "×" use, so
+      // there is no new tmux logic and the tile lands exactly where it was.
+      const info = get().terminals[id];
+      if (!info) return null;
+      const cwd = (info.cwd ?? "").trim();
+      try {
+        const { spawnTerminal, killTerminal } = await import("../ipc/client");
+        const fresh = await spawnTerminal({ cwd: cwd || undefined });
+        // Drop the old tile's per-tile side state (panel view, dev server,
+        // captain pin, context reading, …) BEFORE the swap — same cleanup
+        // `remove` runs, but here we place the fresh tile in the vacated slot
+        // rather than closing the cell.
+        cleanupTileSideState(id);
+        const s = get();
+        let placed = false;
+        const nextTabs = s.tabs.map((t) => {
+          const at = t.order.indexOf(id);
+          if (at === -1) return t;
+          const order = [...t.order];
+          order[at] = fresh.id; // in-place: SAME slot the old tile held
+          placed = true;
+          return { ...t, order };
+        });
+        // Fallback: if the old tile had already left every tab mid-restart, drop
+        // the fresh tile into the active tab so it is never orphaned.
+        if (!placed) {
+          const active = s.activeTabId;
+          for (let i = 0; i < nextTabs.length; i++) {
+            if (nextTabs[i].id === active) {
+              nextTabs[i] = {
+                ...nextTabs[i],
+                order: [...nextTabs[i].order, fresh.id],
+              };
+              break;
+            }
+          }
+        }
+        const nextTerminals = { ...s.terminals, [fresh.id]: fresh };
+        delete nextTerminals[id];
+        set({
+          tabs: nextTabs,
+          terminals: nextTerminals,
+          focusedId: s.focusedId === id ? fresh.id : s.focusedId,
+        });
+        persist();
+        // Kill the OLD tmux session (process tree) now that the tile is replaced.
+        // Fire-and-forget relative to the swap (which already stands), but retry
+        // once and surface a visible notice on a second failure — otherwise a
+        // failed kill leaks a frozen tmux session with no tile bound to it.
+        void killOldSessionWithRetry(id, killTerminal);
+        return fresh.id;
+      } catch (err) {
+        // The only await before the synchronous swap is the spawn, so a throw
+        // here means the fresh session never came up: the old tile is untouched.
+        console.error("restartTerminal failed", err);
+        return null;
+      }
     },
 
     setFocus: (id) => {

@@ -41,6 +41,7 @@ import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
 import { clientForTerminal } from "../store/clientType";
 import { useAutoContinue } from "../store/autoContinue";
+import { useSettings } from "../store/settings";
 import { ContextMeter } from "./ContextMeter";
 import { useContextPctForTile, sessionNameForTerminal } from "../store/sessionContext";
 import {
@@ -60,7 +61,7 @@ import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { gitInfo, type GitInfo } from "../ipc/git";
 import { runWhenIdle } from "../lib/windowInteraction";
-import { Anchor, GitBranch } from "lucide-react";
+import { Anchor, GitBranch, RotateCcw } from "lucide-react";
 
 /** Poll git facts (branch / worktree / dirty count) for a tile's cwd. Refreshes
  *  on mount and whenever the window regains focus (cheap; the backend best-efforts
@@ -196,6 +197,9 @@ export function Tile({
   const userLabel = useWorkspace((s) => s.labels[terminalId]);
   const moveTile = useWorkspace((s) => s.moveTile);
   const moveTileToTab = useWorkspace((s) => s.moveTileToTab);
+  // Kill + restart: recover a frozen session by spawning a fresh one in the same
+  // cwd + tab slot and killing the old one. Always confirm-guarded (below).
+  const restartTerminal = useWorkspace((s) => s.restartTerminal);
   // Lifecycle: the × KILLS this terminal's tmux session for good. The actual kill
   // is the `onClose` prop, which Canvas wires to deleteTerminal -> killTerminal
   // (and, for the fullscreen copy, also drops the fullscreen layer). We confirm
@@ -351,6 +355,10 @@ export function Tile({
   // has reported nothing yet — then <ContextMeter> renders nothing, so non-Claude
   // / not-yet-reported tiles are unchanged.
   const contextUsedPct = useContextPctForTile(terminalId);
+  // Opt-in (default OFF): show the ctx% meter in this tile's header. The header
+  // is tight on space, so it's hidden here unless the user turns it on in
+  // Settings; the sidebar captain rows show context regardless of this flag.
+  const showHeaderContextMeter = useSettings((s) => s.showHeaderContextMeter);
   // Display path: strip the home prefix (`/home/<user>` -> `~`) so the header
   // shows `~/n8builds/tools` instead of the noisy `/home/natkins/n8builds/tools`.
   // The full path stays in the title tooltip.
@@ -387,6 +395,10 @@ export function Tile({
   // BUSY (a dev server running) — an idle session is killed immediately. Once up,
   // the kill runs on confirm (button / Enter); cancel/Esc/backdrop dismiss it.
   const [confirmKill, setConfirmKill] = useState(false);
+  // Whether the kill+restart confirm is up. ALWAYS confirmed (unlike ×, which
+  // skips the dialog when idle): an accidental click here kills a live session
+  // and spins up a fresh one, so it must never fire on a stray click.
+  const [confirmRestart, setConfirmRestart] = useState(false);
   // Right-click context menu position (null = closed). Right-clicking the header
   // opens a single "Kill session" action at the pointer.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
@@ -412,6 +424,8 @@ export function Tile({
     if (busy) setConfirmKill(true);
     else onClose();
   };
+  // Kill + restart is ALWAYS confirmed first, busy or not.
+  const requestRestart = () => setConfirmRestart(true);
 
   // Abort any in-flight header drag if this tile unmounts mid-gesture (#3): the
   // canceller runs the controller's full cleanup (listeners + grabbing cursor +
@@ -786,8 +800,13 @@ export function Tile({
         {/* Context-window meter: how full THIS tile's Claude session context is.
             Shown ONLY when the tile is actually running Claude — the cwd-matched
             reading can otherwise leak onto a plain shell that shares a directory
-            with a (past) Claude session, so gate on the client being claude. */}
-        <ContextMeter usedPct={client === "claude" ? contextUsedPct : null} />
+            with a (past) Claude session, so gate on the client being claude. Also
+            gated on the opt-in header setting (default OFF): the header is tight
+            on space, so the ctx% lives here only when the user turns it on. The
+            sidebar captain rows show it regardless. */}
+        {showHeaderContextMeter && (
+          <ContextMeter usedPct={client === "claude" ? contextUsedPct : null} />
+        )}
 
         {/* Per-tile view switcher: Terminal / Files / Preview. Clicking a tab
             sets THIS tile's usePanels tab; the body (below) swaps to that surface
@@ -854,6 +873,27 @@ export function Tile({
           aria-label="Refresh terminal"
         >
           ⟳
+        </button>
+
+        {/* Kill + restart (↺): recover a FROZEN session. Kills this tile's tmux
+            session (process tree) and spawns a FRESH one in the same folder, in
+            this exact tab + slot. Always confirm-guarded (requestRestart) — a
+            stray click would kill a live agent. Distinct counter-clockwise glyph
+            (vs. the ⟳ refresh, which is only a cosmetic re-fit). */}
+        <button
+          type="button"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            onFocus();
+            requestRestart();
+          }}
+          className="flex shrink-0 items-center rounded px-1 leading-none hover:bg-neutral-800"
+          style={{ color: "var(--th-fg-muted)" }}
+          title="Kill & restart session (fresh session, same folder)"
+          aria-label="Kill and restart session"
+        >
+          <RotateCcw width="0.9em" height="0.9em" aria-hidden />
         </button>
 
         {/* ⋯ menu: per-terminal color overrides so you can tell this terminal
@@ -978,6 +1018,44 @@ export function Tile({
           onClose();
         }}
         onCancel={() => setConfirmKill(false)}
+      />
+
+      {/* Kill + restart confirm — ALWAYS shown (busy or not): this ends the
+          session and starts a fresh one, so it must never fire on a stray click.
+          For a CAPTAIN / orchestrator tile it also warns that the fresh session
+          (a NEW Claude id that has not claimed captaincy) is NOT re-pinned, so the
+          ship is de-captained and its crew detached — a plain regular tile keeps
+          the shorter copy. */}
+      <ConfirmDialog
+        open={confirmRestart}
+        title="Kill & restart this session?"
+        body={
+          <>
+            This kills the tmux session{" "}
+            <span className="font-mono" style={{ color: "var(--th-fg)" }}>
+              {terminalId}
+            </span>{" "}
+            — ending everything running in it — and opens a fresh session in the
+            same folder, in this tile's place. Use it to recover a frozen
+            terminal.
+            {(isCaptain || isOrchestrator) && (
+              <>
+                {" "}
+                <span style={{ color: "var(--th-dot-error, #f87171)" }}>
+                  This tile is {isOrchestrator ? "the orchestrator" : "a captain"}
+                  : restarting will de-captain the ship and detach its crew. The
+                  fresh session starts as a plain terminal, not a captain.
+                </span>
+              </>
+            )}
+          </>
+        }
+        confirmLabel="Kill & restart"
+        onConfirm={() => {
+          setConfirmRestart(false);
+          void restartTerminal(terminalId);
+        }}
+        onCancel={() => setConfirmRestart(false)}
       />
 
       {/* Right-click context menu: a single "Kill session" action that runs the

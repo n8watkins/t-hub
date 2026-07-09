@@ -38,7 +38,7 @@ import { tlog } from "./diag";
 import { isSatellite } from "./windows";
 import { readTerminalTailText } from "./terminalTail";
 import { matchesUsageLimitDialog, buildRecoveryInput } from "./usageLimit";
-import { captainAttribution } from "./captainAttribution";
+import { captainSubjectForSession } from "./captainAttribution";
 import { notify } from "./notify";
 
 // A window counts as EXHAUSTED (the session has actually run out, not merely "near
@@ -153,6 +153,14 @@ function cancel(id: TerminalId): void {
 function recover(id: TerminalId, reason: string): void {
   if (!useAutoContinue.getState().isWatched(id)) return; // opted out meanwhile
   const text = (useSettings.getState().autoContinueText || "continue").trim();
+  // ONE recovery sequence for both triggers, from the single source
+  // usageLimit.ts::buildRecoveryInput: ESC FIRST (dismiss the modal's numbered
+  // menu without ever selecting a paid "Add funds / Switch to Team" option), then
+  // the continue text + Enter so the agent resumes once its window resets. This is
+  // the fleet's binding doctrine — the automation must ONLY ever take the
+  // Esc+continue path. #46 injected the equivalent `"\x1b" + text + "\r"` inline;
+  // we converge on buildRecoveryInput so there is no divergent copy (a blank text
+  // safely collapses to ESC-alone there, never a stray digit/Enter).
   const input = buildRecoveryInput(text);
   tlog("autocontinue", `recovering ${id} (${reason}): ESC + "${text}"`);
   void writeTerminal(id, input).catch(() => {
@@ -163,15 +171,26 @@ function recover(id: TerminalId, reason: string): void {
 
 /** Notify the general that a BLOCKED session was auto-resumed, naming the
  *  captain/ship it belongs to. Attribution-first title (falls back to the tile
- *  label when the tile has no captain). Reconcile the notification CLASS with
- *  PR #44's strict chime policy at merge (this uses "attention" today — the
- *  richest class this branch has; #44 introduces a blocker class this deserves).
- *  Do NOT alter #44's chime policy here; this only ADDS the resume cue. */
+ *  label when the tile has no captain).
+ *
+ *  CLASS = "error" — #44's strict chime policy reserves the `error` kind for a
+ *  BLOCKER (a hard stop that ends the run). A usage-limit lockout IS that blocker,
+ *  so the auto-resume cue rides #44's blocker chime rather than the softer
+ *  "attention" (decision-needed) tone: the general hears the fleet-blocking event
+ *  distinctly, even though T-Hub already cleared it. We only WIRE the new cue into
+ *  #44's existing classes; we do not add or alter a class.
+ *
+ *  Attribution comes from #44's canonical captainAttribution
+ *  (captainSubjectForSession), which keys off the CLAUDE SESSION id, so we resolve
+ *  this tile's session id first; a non-captain tile resolves to null and the tile
+ *  label stands. */
 function notifyResumed(id: TerminalId, text: string): void {
   const label = tileLabel(id);
-  const attribution = captainAttribution(id);
+  const sessionId =
+    useSupervision.getState().sessionIdByTmux[sessionNameForTerminal(id)];
+  const attribution = sessionId ? captainSubjectForSession(sessionId) : null;
   notify(
-    "attention",
+    "error",
     `${attribution ?? label} auto-resumed`,
     `${label} hit its usage limit; T-Hub dismissed the dialog and sent "${text}".`,
   );
