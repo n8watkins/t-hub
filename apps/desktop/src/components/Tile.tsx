@@ -55,6 +55,8 @@ import { resolveDropTarget } from "../lib/dropTarget";
 import { createDragGhost, type DragGhost } from "../lib/dragGhost";
 import { refreshTerminal } from "../lib/repaint";
 import { useCaptain } from "../store/captain";
+import { OrchestratorCrownIcon } from "./OrchestratorCrownIcon";
+import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { gitInfo, type GitInfo } from "../ipc/git";
 import { runWhenIdle } from "../lib/windowInteraction";
@@ -356,12 +358,16 @@ export function Tile({
   const folderName = cwdBasename(cwd) || null;
   // Friendly display name (user label > derived preset·cwd > short id). Kept for
   // the drag ghost / fallbacks; the header chrome itself now shows folder+Claude.
-  const label = deriveLabel({
-    id: terminalId,
-    label: userLabel,
-    title: info?.title,
-    cwd: info?.cwd,
-  });
+  // The designated orchestrator reads as its fixed brand name here too, so the
+  // drag ghost matches the header's "Cortana".
+  const label = isOrchestrator
+    ? ORCHESTRATOR_DISPLAY_NAME
+    : deriveLabel({
+        id: terminalId,
+        label: userLabel,
+        title: info?.title,
+        cwd: info?.cwd,
+      });
   // Which client runs in this tile — Claude / Codex / a plain shell — from the
   // workspace store (spawn command/title + any live label). Drives the header
   // client icon below. clientForTerminal reads three signals: the terminal
@@ -642,15 +648,42 @@ export function Tile({
         />
         {/* Folder name (Feature 1). The path display is gone — the folder
             basename is enough to place the work. The full cwd stays in the
-            header tooltip (the header's `title={cwd}`). */}
-        {folderName && (
-          <span
-            className="shrink-0 truncate"
-            style={{ color: "var(--th-fg)", fontSize: "1.05em" }}
-            title={cwd || undefined}
-          >
-            {folderName}
-          </span>
+            header tooltip (the header's `title={cwd}`).
+
+            The DESIGNATED ORCHESTRATOR instead reads as its fixed brand name
+            ("Cortana") with the crown, mirroring the sidebar's dot / crown /
+            name treatment (OrchestratorRow) - its cwd basename would be the
+            bland "orchestrator", and the crown keeps it visually distinct from
+            the captains' anchor. Display-only: the derived label logic and the
+            designation store are untouched. */}
+        {isOrchestrator ? (
+          <>
+            <span
+              className="shrink-0"
+              style={{ color: "var(--th-accent)" }}
+              title="Orchestrator - commands the fleet"
+              aria-label="Orchestrator"
+            >
+              <OrchestratorCrownIcon size={13} />
+            </span>
+            <span
+              className="shrink-0 truncate"
+              style={{ color: "var(--th-fg)", fontSize: "1.05em" }}
+              title={cwd || undefined}
+            >
+              {ORCHESTRATOR_DISPLAY_NAME}
+            </span>
+          </>
+        ) : (
+          folderName && (
+            <span
+              className="shrink-0 truncate"
+              style={{ color: "var(--th-fg)", fontSize: "1.05em" }}
+              title={cwd || undefined}
+            >
+              {folderName}
+            </span>
+          )
         )}
 
         {/* Current worktree / branch, PROMINENT in the title line (not a muted side

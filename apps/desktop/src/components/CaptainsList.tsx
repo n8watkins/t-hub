@@ -48,6 +48,7 @@ import { useCrewSummary } from "../hooks/useCrewSummary";
 import { SupervisionTreeView } from "./SupervisionTree";
 import { ContextMeter } from "./ContextMeter";
 import { ChevronIcon } from "./SidebarChrome";
+import { OrchestratorCrownIcon } from "./OrchestratorCrownIcon";
 import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
 
 /** Navigate to the reserved Captains workspace tab and focus an agent's live
@@ -77,27 +78,6 @@ function cwdBranch(cwd: string): string {
     if (/^wt-/.test(parts[i])) return parts[i].replace(/^wt-/, "");
   }
   return "";
-}
-
-/** The SPECIAL orchestrator glyph: a crown, marking Cortana as the entity that
- *  commands the fleet (visually distinct from the captains below it while the
- *  status dot / context stay at full parity). Inline SVG in the app's icon
- *  idiom (viewBox 24, currentColor stroke) so its color tracks the accent in
- *  both themes; sized to sit next to the row's status dot. */
-function OrchestratorCrownIcon({ size = 13 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="currentColor"
-      className="pointer-events-none shrink-0"
-      aria-hidden
-    >
-      {/* A five-point crown: outer points + a base band. */}
-      <path d="M3 8l3.5 3L12 5l5.5 6L21 8l-1.8 9.2a1 1 0 0 1-.98.8H5.78a1 1 0 0 1-.98-.8L3 8z" />
-    </svg>
-  );
 }
 
 /** The sidebar's top-of-hierarchy ORCHESTRATOR row (Cortana): the SAME rich
