@@ -107,10 +107,15 @@ function fire(id: TerminalId, resetsAt: number): void {
   const text = (useSettings.getState().autoContinueText || "continue").trim();
   if (!text) return;
   tlog("autocontinue", `injecting "${text}" into ${id} (reset ${resetsAt})`);
-  // Type the command + Enter into the PTY. The session was blocked on the limit,
-  // so this lands at its prompt and resumes the turn. Best-effort: a closed tile
-  // just rejects the write.
-  void writeTerminal(id, text + "\r").catch(() => {
+  // Escape FIRST, then the command + Enter. When Claude froze on the usage-limit
+  // dialog ("Add funds / Switch to Team / Stop and wait for limit to reset"), the
+  // only safe recovery is Esc (dismisses the dialog without paying, session keeps
+  // full context) then `continue`. This is the fleet's binding doctrine — the
+  // automation must ONLY ever take the Esc+continue path, never a paid option. If
+  // the session already recovered to a plain prompt, the leading Esc just clears
+  // the (empty) input line and the continue still lands. Best-effort: a closed
+  // tile just rejects the write.
+  void writeTerminal(id, "\x1b" + text + "\r").catch(() => {
     /* terminal gone — ignore */
   });
 }
