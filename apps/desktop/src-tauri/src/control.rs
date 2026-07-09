@@ -1109,6 +1109,17 @@ impl RequestCache {
         }
     }
 
+    /// Test-only constructor with explicit bounds so eviction/TTL behavior can be
+    /// exercised without inserting the full production capacity.
+    #[cfg(test)]
+    fn with_bounds(capacity: usize, ttl: std::time::Duration) -> Self {
+        Self {
+            inner: Mutex::new(RequestCacheInner::default()),
+            capacity,
+            ttl,
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, RequestCacheInner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -7617,5 +7628,223 @@ mod tests {
         // No bound addr (headless): nothing injected, so spawns behave as before.
         ctx.addr = String::new();
         assert!(elevation_env(&ctx, &json!({"capability": "read"})).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotency: RequestCache (ask #1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn request_cache_replays_a_completed_outcome() {
+        let cache = RequestCache::new();
+        // First sighting reserves the id and must run the command.
+        assert!(matches!(cache.begin("r1"), BeginOutcome::Fresh));
+        let stored = cache.finish("r1", Ok(json!({"id": "abc"})));
+        assert_eq!(stored.unwrap()["id"], "abc");
+        // A retry of the SAME id replays the stored outcome - it does NOT re-run.
+        match cache.begin("r1") {
+            BeginOutcome::Duplicate(Ok(v)) => assert_eq!(v["id"], "abc"),
+            BeginOutcome::Duplicate(Err(e)) => panic!("expected Ok replay, got Err: {e}"),
+            BeginOutcome::Fresh => panic!("a completed id must not be reserved Fresh again"),
+            BeginOutcome::InFlight => panic!("a completed id must replay, not report InFlight"),
+        }
+    }
+
+    #[test]
+    fn request_cache_reports_in_flight_for_a_concurrent_duplicate() {
+        let cache = RequestCache::new();
+        // A first caller reserved the id and is still running (no finish yet).
+        assert!(matches!(cache.begin("r2"), BeginOutcome::Fresh));
+        // A retry that races the original must NOT run the command again.
+        assert!(matches!(cache.begin("r2"), BeginOutcome::InFlight));
+        // Once it completes, the same id replays the outcome.
+        cache.finish("r2", Ok(json!({"ok": true})));
+        assert!(matches!(cache.begin("r2"), BeginOutcome::Duplicate(_)));
+    }
+
+    #[test]
+    fn request_cache_cancel_frees_a_reservation_for_retry() {
+        let cache = RequestCache::new();
+        assert!(matches!(cache.begin("r3"), BeginOutcome::Fresh));
+        // A governor refusal cancels the reservation (no outcome recorded)...
+        cache.cancel("r3");
+        // ...so a later retry is Fresh again (it can succeed once budget frees),
+        // not stuck InFlight or replaying a refusal.
+        assert!(matches!(cache.begin("r3"), BeginOutcome::Fresh));
+    }
+
+    #[test]
+    fn request_cache_status_reports_unknown_inflight_and_completed() {
+        let cache = RequestCache::new();
+        assert!(matches!(cache.status("nope"), RequestStatus::Unknown));
+        cache.begin("r4");
+        assert!(matches!(cache.status("r4"), RequestStatus::InFlight));
+        cache.finish("r4", Err("boom".to_string()));
+        match cache.status("r4") {
+            RequestStatus::Completed(Err(e)) => assert_eq!(e, "boom"),
+            _ => panic!("expected Completed(Err)"),
+        }
+    }
+
+    #[test]
+    fn request_cache_evicts_oldest_completed_beyond_capacity() {
+        let cache = RequestCache::with_bounds(2, std::time::Duration::from_secs(600));
+        for id in ["a", "b", "c"] {
+            cache.begin(id);
+            cache.finish(id, Ok(json!({"id": id})));
+        }
+        // "a" was evicted when "c" pushed past the capacity of 2.
+        assert!(matches!(cache.status("a"), RequestStatus::Unknown));
+        assert!(matches!(cache.status("b"), RequestStatus::Completed(_)));
+        assert!(matches!(cache.status("c"), RequestStatus::Completed(_)));
+    }
+
+    #[test]
+    fn request_cache_evicts_a_done_entry_past_its_ttl() {
+        // A completed outcome ages out of the cache after its TTL, keeping the cache
+        // self-cleaning. (The same retain reaps a stale InFlight reservation past
+        // REQUEST_INFLIGHT_REAP - the safety valve for a panicked/hung handler.)
+        let cache = RequestCache::with_bounds(8, std::time::Duration::from_millis(1));
+        cache.begin("done");
+        cache.finish("done", Ok(json!({})));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // status() runs eviction; the expired Done entry is gone -> Unknown, so a
+        // fresh retry would be safe.
+        assert!(matches!(cache.status("done"), RequestStatus::Unknown));
+    }
+
+    #[test]
+    fn spawn_terminal_retry_with_same_request_id_does_not_duplicate() {
+        // Repro of Incident A/B at the dispatch layer: a spawn that is RETRIED with
+        // the same requestId (the client's recovery from an ambiguous response leg)
+        // must apply exactly once - one tmux session, one tile, one UI forward - and
+        // the retry must replay the original outcome, never spawn a second session.
+        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let args = json!({"cwd": "/tmp", "requestId": "spawn-retry-1"});
+        let first = dispatch_authenticated(&ctx, ControlRequest {
+            token: "t".into(),
+            command: "spawn_terminal".into(),
+            args: args.clone(),
+            v: None,
+        });
+        assert!(first.ok, "first spawn failed: {:?}", first.error);
+        let id = first.result.as_ref().unwrap()["id"].as_str().unwrap().to_string();
+
+        // The retry: identical requestId. It must NOT spawn again.
+        let retry = dispatch_authenticated(&ctx, ControlRequest {
+            token: "t".into(),
+            command: "spawn_terminal".into(),
+            args,
+            v: None,
+        });
+        assert!(retry.ok, "retry failed: {:?}", retry.error);
+        let retry_result = retry.result.unwrap();
+        assert_eq!(retry_result["id"].as_str().unwrap(), id, "retry replays the same id");
+        assert_eq!(retry_result["idempotentReplay"], json!(true), "retry is tagged a replay");
+
+        // Exactly ONE real session materialized, and ONE UI forward was emitted.
+        let live: Vec<String> = tmux::list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s == &format!("th_{id}"))
+            .collect();
+        assert_eq!(live.len(), 1, "exactly one tmux session for the id");
+        assert_eq!(sink.calls.lock().unwrap().len(), 1, "the retry did NOT re-forward a spawn");
+
+        // Reap the real session.
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+    }
+
+    #[test]
+    fn get_request_status_command_resolves_a_completed_spawn() {
+        // The queryable half of ask #1: after a spawn with a requestId, a caller
+        // whose response leg failed can learn the outcome (and the real id) without
+        // guessing. An unknown id reports unknown (safe to retry).
+        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let ctx = test_ctx("t").with_apply_sink(sink);
+        let spawn = dispatch_authenticated(&ctx, ControlRequest {
+            token: "t".into(),
+            command: "spawn_terminal".into(),
+            args: json!({"cwd": "/tmp", "requestId": "spawn-status-1"}),
+            v: None,
+        });
+        assert!(spawn.ok);
+        let id = spawn.result.unwrap()["id"].as_str().unwrap().to_string();
+
+        let status = dispatch(&ctx, "get_request_status", &json!({"requestId": "spawn-status-1"})).unwrap();
+        assert_eq!(status["status"], "completed");
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["result"]["id"].as_str().unwrap(), id);
+
+        let unknown = dispatch(&ctx, "get_request_status", &json!({"requestId": "never-seen"})).unwrap();
+        assert_eq!(unknown["status"], "unknown");
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry-vs-reality: close_terminal outcome (ask #3, Incident C)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn close_terminal_reports_already_gone_for_a_phantom() {
+        // Incident C: closing a session that never existed must not look like a real
+        // kill. ok:true (idempotent) stays, but the outcome discriminates it.
+        let ctx = test_ctx("t");
+        let v = dispatch(&ctx, "close_terminal", &json!({"sessionId": "f0f3207b"})).unwrap();
+        assert_eq!(v["accepted"], "close_terminal");
+        assert_eq!(v["outcome"], "already_gone");
+    }
+
+    #[test]
+    fn close_terminal_reports_killed_for_a_live_session() {
+        // A real session reports outcome=killed, so a caller can tell a genuine kill
+        // from a phantom close.
+        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let ctx = test_ctx("t").with_apply_sink(sink);
+        let spawn = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap();
+        let id = spawn["id"].as_str().unwrap().to_string();
+        let closed = dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+        assert_eq!(closed["outcome"], "killed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Incident D: captains persistence no longer holds the registry lock
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn captains_persist_writes_through_off_the_lock() {
+        // The write-through still happens (durability preserved), now via the
+        // off-lock `persist` path.
+        let dir = std::env::temp_dir().join(format!("t-hub-captains-persist-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("captains.json");
+        let _ = std::fs::remove_file(&path);
+        let reg = CaptainsRegistry::load(path.clone());
+        reg.claim("cap-1", Some("alpha"), vec![]).unwrap();
+        let body = std::fs::read_to_string(&path).expect("captains.json written through");
+        assert!(body.contains("alpha"), "persisted body must carry the claim: {body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn captains_persist_is_monotonic_and_drops_a_stale_snapshot() {
+        // Two writers that dropped `inner` in one order but reach disk in the other
+        // must not regress the file: an older-seq snapshot is dropped.
+        let dir = std::env::temp_dir().join(format!("t-hub-captains-mono-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("captains.json");
+        let _ = std::fs::remove_file(&path);
+        let reg = CaptainsRegistry::load(path.clone());
+        reg.claim("cap-1", Some("alpha"), vec![]).unwrap(); // seq -> 1 on disk
+        let newer = reg.snapshot(); // seq 1
+        // Hand-persist a STALE snapshot (seq 0): it must be dropped, not clobber.
+        reg.persist(CaptainsSnapshot { seq: 0, captains: vec![] });
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("alpha"), "stale seq-0 snapshot must not clobber the claim: {body}");
+        // A NEWER snapshot (seq 1, already on disk) is allowed to (re)write.
+        reg.persist(newer);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
