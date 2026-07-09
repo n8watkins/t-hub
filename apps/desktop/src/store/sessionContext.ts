@@ -8,19 +8,24 @@
 // catch was the KEY: snapshots are keyed by Claude `session_id`, and the
 // frontend has NO terminal-id→session-id bridge.
 //
-// ROBUST binding (this store): the agent now stamps the OWNING TMUX SESSION onto
+// STRICTLY PER-SESSION binding: the agent stamps the OWNING TMUX SESSION onto
 // each statusline before journaling — it reads `$TMUX_PANE` (the pane the
 // statusline runs in) and resolves `#{session_name}` on the `t-hub` socket.
 // T-Hub names every session `th_<terminalId>`, so the frontend keys context by
 // that session name and a tile looks itself up by its OWN `th_<id>` (which it can
-// compute directly). This is precise even when two tiles share a directory — the
-// old cwd match could not tell them apart.
+// compute directly). This is the ONLY key — it is precise even when two tiles
+// share a directory.
 //
-// FALLBACK (graceful degradation): if a snapshot carries no `tmuxSession` (an
-// older agent that doesn't stamp it yet, or a session not under tmux), we still
-// index it by NORMALIZED cwd and a tile can match on its `info.cwd` — the prior
-// behavior. So the meter keeps working before the rebuilt agent is installed; it
-// just gets more precise once it is.
+// NO cwd fallback (glitch-header): an earlier build ALSO indexed each reading by
+// normalized cwd as a fallback for un-upgraded agents. That was a CROSS-SESSION
+// LEAK: two sessions in the SAME directory (e.g. a captain and a crew both in the
+// main worktree) share one `byCwd` bucket, so one session's reading surfaced on
+// the OTHER's tile — most visibly right after an app restart, before a tile's own
+// snapshot re-lands. Every T-Hub session runs under tmux and stamps
+// `tmux_session`, so the fallback protected a case that cannot occur here while
+// silently mis-attributing readings across sessions. Showing the WRONG session's
+// number is worse than showing none, so the meter now binds ONLY by the owning
+// tmux session; a reading with no `tmux_session` is dropped rather than guessed.
 //
 // It deliberately keeps its OWN `status://snapshot` subscription (server-split
 // M1: the snapshot now arrives over the control socket and the demux hub fans it
@@ -30,16 +35,8 @@
 import { create } from "zustand";
 import { onStatus, type StatusSnapshotWire } from "../ipc/client05";
 
-/** Normalize a cwd for correlation: drop trailing separators and lower-case it
- *  (WSL paths are case-insensitive in practice). Mirrors workspace.ts `normCwd`
- *  so a tile's cwd and a snapshot's cwd compare the same way. Empty → "". */
-export function normCwd(cwd: string | undefined | null): string {
-  if (!cwd) return "";
-  return cwd.replace(/[/\\]+$/, "").toLowerCase();
-}
-
 /** The tmux session name T-Hub gives a terminal: `th_<terminalId>`. This is
- *  the robust binding key — a tile computes it from its own id and looks up the
+ *  the binding key — a tile computes it from its own id and looks up the
  *  context reading the agent reported for that exact session. Mirrors the
  *  backend (`tmux.rs` / `pty.rs` name every session `th_<id>`). */
 export function sessionNameForTerminal(terminalId: string): string {
@@ -55,60 +52,38 @@ interface CtxReading {
 }
 
 interface SessionContextState {
-  /** context-window fullness per TMUX SESSION NAME (`th_<id>`) — the robust key
-   *  the agent reports. Checked FIRST by a tile (it knows its own session name). */
+  /** context-window fullness per TMUX SESSION NAME (`th_<id>`) — the owning
+   *  session key the agent reports. This is the ONLY index; a tile reads its own
+   *  `th_<id>`, so a reading can never surface on a tile that merely shares the
+   *  reporting session's directory. */
   bySession: Record<string, CtxReading>;
-  /** context-window fullness per NORMALIZED cwd (see normCwd) — the FALLBACK key,
-   *  used only for snapshots that carry no tmux session (older agent / no tmux). */
-  byCwd: Record<string, CtxReading>;
-  /** Fold a status snapshot in. Indexes by tmux session when present (robust) and
-   *  ALWAYS also by cwd when present (fallback for tiles that can't match the
-   *  session). No-op unless it has a context % and at least one usable key. */
+  /** Fold a status snapshot in. Files it under the owning tmux session only.
+   *  No-op unless it has a context % AND a `tmux_session` (a reading we cannot
+   *  attribute to a specific session is dropped, never guessed by cwd). */
   ingest: (snap: StatusSnapshotWire) => void;
   /** Drop a terminal's context reading when its tile goes away for good (close /
    *  detach / close-tab). Deletes the `bySession` entry for the terminal's
-   *  `th_<id>` session name so this map can't grow without bound across spawns.
-   *  Leaves `byCwd` untouched: it is keyed by NORMALIZED project directory, not
-   *  per-terminal, so it is bounded by the set of project dirs the user opens
-   *  (and a re-opened dir simply overwrites its single entry) — pruning it on a
-   *  tile close could also drop a reading another live tile in the same dir still
-   *  reads via the fallback path. */
+   *  `th_<id>` session name so this map can't grow without bound across spawns. */
   forget: (terminalId: string) => void;
 }
 
 export const useSessionContext = create<SessionContextState>((set) => ({
   bySession: {},
-  byCwd: {},
   ingest: (snap) =>
     set((s) => {
       // Need an actual context % to show; nothing to record without it.
       if (snap.contextUsedPct == null) return s;
+      const session = (snap.tmuxSession ?? "").trim();
+      // No owning session → we cannot bind it to a tile without guessing (which
+      // would leak across same-cwd tiles). Drop it.
+      if (!session) return s;
+      const prev = s.bySession[session];
+      if (prev && prev.ts >= snap.ingestedAtMs) return s; // stale/out-of-order
       const reading: CtxReading = {
         usedPct: snap.contextUsedPct,
         ts: snap.ingestedAtMs,
       };
-
-      const session = (snap.tmuxSession ?? "").trim();
-      const cwdKey = normCwd(snap.cwd);
-      if (!session && !cwdKey) return s; // no key to file it under
-
-      let next = s;
-      // Robust index: by tmux session name (`th_<id>`). Freshest wins.
-      if (session) {
-        const prev = s.bySession[session];
-        if (!prev || prev.ts < snap.ingestedAtMs) {
-          next = { ...next, bySession: { ...next.bySession, [session]: reading } };
-        }
-      }
-      // Fallback index: by cwd, kept current too so a tile that can't match the
-      // session (e.g. before the agent is rebuilt) still reads a value.
-      if (cwdKey) {
-        const prev = s.byCwd[cwdKey];
-        if (!prev || prev.ts < snap.ingestedAtMs) {
-          next = { ...next, byCwd: { ...next.byCwd, [cwdKey]: reading } };
-        }
-      }
-      return next;
+      return { bySession: { ...s.bySession, [session]: reading } };
     }),
   forget: (terminalId) =>
     set((s) => {
@@ -121,28 +96,32 @@ export const useSessionContext = create<SessionContextState>((set) => ({
 }));
 
 /**
- * Look up a tile's context-window fullness (0..=100), preferring the ROBUST tmux
- * binding and falling back to cwd. Pass the tile's terminal id (for its
- * `th_<id>` session name) and its cwd; returns null when neither matches a known
- * session (then the <ContextMeter> renders nothing). Starts the singleton
- * snapshot feed on first use (idempotent), so the meter works without a separate
- * always-mounted subscriber component.
+ * Pure lookup of a tile's context-window fullness (0..=100) from a store
+ * snapshot, keyed STRICTLY by the tile's owning tmux session (`th_<id>`).
+ * Returns null when this session has reported no reading yet. Exported so the
+ * hook and its test share one definition.
+ */
+export function readContextPct(
+  state: Pick<SessionContextState, "bySession">,
+  terminalId: string | undefined,
+): number | null {
+  if (!terminalId) return null;
+  const reading = state.bySession[sessionNameForTerminal(terminalId)];
+  return reading ? reading.usedPct : null;
+}
+
+/**
+ * Look up a tile's context-window fullness (0..=100), keyed STRICTLY by the
+ * tile's own tmux session (`th_<id>`). Returns null when this tile's session has
+ * reported no reading (then the <ContextMeter> renders nothing). Starts the
+ * singleton snapshot feed on first use (idempotent), so the meter works without a
+ * separate always-mounted subscriber component.
  */
 export function useContextPctForTile(
   terminalId: string | undefined,
-  cwd: string | undefined,
 ): number | null {
   ensureFeed();
-  const session = terminalId ? sessionNameForTerminal(terminalId) : "";
-  const cwdKey = normCwd(cwd);
-  return useSessionContext((s) => {
-    // Robust first: the reading the agent reported for THIS tile's tmux session.
-    const bySession = session ? s.bySession[session] : undefined;
-    if (bySession) return bySession.usedPct;
-    // Fallback: cwd match (older agent that didn't stamp the session, or no tmux).
-    const byCwd = s.byCwd[cwdKey];
-    return byCwd ? byCwd.usedPct : null;
-  });
+  return useSessionContext((s) => readContextPct(s, terminalId));
 }
 
 /**

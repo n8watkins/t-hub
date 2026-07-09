@@ -168,7 +168,8 @@ pub fn run(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
 /// tile directly and key context by. Returns `(pane, session)`:
 ///   - `pane`:    the raw `$TMUX_PANE` value, or `None` if unset (not under tmux).
 ///   - `session`: the resolved session name, or `None` if tmux can't resolve it
-///     (server gone, pane vanished) — the frontend then degrades to cwd matching.
+///     (server gone, pane vanished); the frontend then drops that context
+///     reading rather than degrading to cwd (a shared cwd leaked across tiles).
 ///
 /// Best-effort and side-effect-free on failure: a missing tmux / unset env / a
 /// non-zero exit all collapse to `None` so a statusline render is never blocked.
@@ -281,8 +282,9 @@ pub fn run_statusline(journal_dir: Option<&str>) -> anyhow::Result<()> {
     // 2b. Stamp the tmux pane + session this statusline runs inside onto the
     //     payload, so the core/frontend can bind the snapshot to the EXACT tile
     //     that owns the pane (robust) instead of correlating by cwd (fragile).
-    //     Only set when actually under tmux + resolvable; absent keys degrade the
-    //     frontend to its cwd fallback (so an un-upgraded agent still works).
+    //     Only set when actually under tmux + resolvable; absent keys mean the
+    //     frontend drops the context reading (no cwd fallback - a shared cwd
+    //     would leak one session's reading onto another tile).
     let (tmux_pane, tmux_session) = resolve_tmux_pane();
     if statusline.is_object() {
         let obj = statusline.as_object_mut().expect("checked is_object");

@@ -190,13 +190,14 @@ export function onAgentState(
  * Binding fields (all optional — absent ones degrade the meter, never break it):
  *   - `tmuxSession`: the tmux session NAME (`th_<terminalId>`) that owns the pane
  *     the statusline ran inside, resolved by the agent from `$TMUX_PANE`. This is
- *     the ROBUST tile↔session key — a tile computes its own `th_<id>` and looks
+ *     the ONLY tile↔session key - a tile computes its own `th_<id>` and looks
  *     itself up by it (see store/sessionContext.ts), so two tiles in the same
- *     directory no longer collide.
+ *     directory can never collide. A reading with no `tmuxSession` is dropped.
  *   - `tmuxPane`: the raw `$TMUX_PANE` id (e.g. `%37`); diagnostic / underlying
  *     signal the session name was resolved from.
- *   - `cwd`: the session's working directory — the FALLBACK match used only when
- *     `tmuxSession` is absent (un-upgraded agent / not under tmux).
+ *   - `cwd`: the session's working directory. NOT used to bind the meter to a
+ *     tile (a shared cwd once leaked across same-folder tiles); carried for the
+ *     backend restore map only.
  */
 export type StatusSnapshotWire = StatusSnapshot & {
   cwd?: string;

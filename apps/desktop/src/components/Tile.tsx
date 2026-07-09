@@ -340,14 +340,14 @@ export function Tile({
   // Git facts for this tile's project (branch / worktree / dirty) — header chip.
   const git = useGitInfo(cwd);
   // Context-window fullness for the Claude session running in THIS tile. Bound
-  // ROBUSTLY by tmux session name: the agent stamps each statusline with the
+  // STRICTLY by tmux session name: the agent stamps each statusline with the
   // owning tmux session (`th_<id>`), and this tile looks itself up by its own
   // `th_<terminalId>` (store/sessionContext.ts) — precise even when two tiles
-  // share a directory. Falls back to a cwd match when the snapshot carries no
-  // session (un-upgraded agent / not under tmux). null when nothing matches —
-  // then <ContextMeter> renders nothing, so non-Claude / not-yet-reported tiles
-  // are unchanged.
-  const contextUsedPct = useContextPctForTile(terminalId, info?.cwd);
+  // share a directory, and it can never read another session's reading (the old
+  // cwd fallback leaked across same-folder tiles). null when this tile's session
+  // has reported nothing yet — then <ContextMeter> renders nothing, so non-Claude
+  // / not-yet-reported tiles are unchanged.
+  const contextUsedPct = useContextPctForTile(terminalId);
   // Display path: strip the home prefix (`/home/<user>` -> `~`) so the header
   // shows `~/n8builds/tools` instead of the noisy `/home/natkins/n8builds/tools`.
   // The full path stays in the title tooltip.

@@ -152,13 +152,16 @@ export interface StatusSnapshot {
   sevenDay?: RateLimitWindow;
   rateLimitsPresent: boolean;
   ingestedAtMs: number;
-  /** The session's cwd, lifted from the statusline (a fallback tile<->session key
-   *  by directory). Optional — older snapshots / un-upgraded agents omit it. */
+  /** The session's cwd, lifted from the statusline. NOT a tile<->session key:
+   *  the per-tile context meter binds strictly by `tmuxSession` below (a shared
+   *  cwd once leaked one session's reading onto another tile). Still carried for
+   *  the backend restore map. Optional - older snapshots / un-upgraded agents
+   *  omit it. */
   cwd?: string;
   /** The tmux pane the statusline ran in (`%N`), when resolvable. */
   tmuxPane?: string;
-  /** The owning tmux session name (`th_<terminalId>`) — the ROBUST tile<->session
-   *  key, so a tile can look itself up by `th_<its id>`. Absent on un-upgraded
-   *  agents (consumers then fall back to the cwd match). */
+  /** The owning tmux session name (`th_<terminalId>`) - the ONLY tile<->session
+   *  key, so a tile looks itself up by `th_<its id>`. Absent on un-upgraded
+   *  agents; a reading with no session is then dropped, not guessed by cwd. */
   tmuxSession?: string;
 }

@@ -4,7 +4,9 @@
 // Each terminal tile runs `wsl → tmux → claude`; this sits in the tile header
 // and shows that session's `context_window` fullness as a thin bar + a "78%"
 // label. The value comes from the statusline snapshot matched to the tile by
-// cwd (store/sessionContext.ts). It is BEST-EFFORT: when no Claude session is
+// its owning tmux session (`th_<id>`, store/sessionContext.ts), never by cwd
+// (which used to leak one session's reading onto another tile in the same
+// directory). It is BEST-EFFORT: when no Claude session is
 // matched (`usedPct == null`) it renders nothing, so a plain shell tile or a
 // session that hasn't emitted a statusline yet shows no meter at all.
 //
