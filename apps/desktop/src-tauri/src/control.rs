@@ -711,6 +711,12 @@ pub struct CaptainsRegistry {
     /// the Incident-D flapping wedge (one slow persist parked every
     /// captains-touching command, and its handler thread, until it drained).
     persist: Mutex<u64>,
+    /// Test-only injection point: a callback run INSIDE [`persist`](Self::persist)
+    /// while it holds the `persist` mutex (never `inner`), so a test can SIMULATE a
+    /// stalled disk write and assert a concurrent reader/mutator on `inner` is not
+    /// blocked by it. `None` in every non-test path.
+    #[cfg(test)]
+    persist_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// Normalize a caller-supplied ship name into a slug: lowercase, runs of
@@ -737,7 +743,13 @@ fn slugify_ship(name: &str) -> String {
 impl CaptainsRegistry {
     /// An empty, in-memory registry (tests / headless proofs - no persistence).
     pub fn new() -> Self {
-        Self { inner: Mutex::new(CaptainsInner::default()), path: None, persist: Mutex::new(0) }
+        Self {
+            inner: Mutex::new(CaptainsInner::default()),
+            path: None,
+            persist: Mutex::new(0),
+            #[cfg(test)]
+            persist_hook: Mutex::new(None),
+        }
     }
 
     /// Load the registry from `path`, seeding from the persisted snapshot when
@@ -749,7 +761,13 @@ impl CaptainsRegistry {
             .and_then(|body| serde_json::from_str::<CaptainsSnapshot>(&body).ok())
             .map(|snap| CaptainsInner { captains: snap.captains, seq: snap.seq })
             .unwrap_or_default();
-        Self { inner: Mutex::new(inner), path: Some(path), persist: Mutex::new(0) }
+        Self {
+            inner: Mutex::new(inner),
+            path: Some(path),
+            persist: Mutex::new(0),
+            #[cfg(test)]
+            persist_hook: Mutex::new(None),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, CaptainsInner> {
@@ -790,6 +808,12 @@ impl CaptainsRegistry {
             // clobber it.
             return;
         }
+        // Test seam: stand in for a slow/stalled disk write, holding `persist` but
+        // NOT `inner`, so a test can prove a concurrent reader/mutator is unblocked.
+        #[cfg(test)]
+        if let Some(hook) = self.persist_hook.lock().unwrap().as_ref() {
+            hook();
+        }
         let body = match serde_json::to_vec_pretty(&snap) {
             Ok(b) => b,
             Err(e) => {
@@ -825,6 +849,12 @@ impl CaptainsRegistry {
             return;
         }
         *last = snap.seq;
+    }
+
+    /// Install the test-only persist hook (see [`persist_hook`](Self::persist_hook)).
+    #[cfg(test)]
+    fn set_persist_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *self.persist_hook.lock().unwrap() = Some(hook);
     }
 
     /// The full versioned snapshot (`list_captains` + every `sync_captains` forward).
@@ -7658,7 +7688,7 @@ mod tests {
         // A retry that races the original must NOT run the command again.
         assert!(matches!(cache.begin("r2"), BeginOutcome::InFlight));
         // Once it completes, the same id replays the outcome.
-        cache.finish("r2", Ok(json!({"ok": true})));
+        let _ = cache.finish("r2", Ok(json!({"ok": true})));
         assert!(matches!(cache.begin("r2"), BeginOutcome::Duplicate(_)));
     }
 
@@ -7679,7 +7709,7 @@ mod tests {
         assert!(matches!(cache.status("nope"), RequestStatus::Unknown));
         cache.begin("r4");
         assert!(matches!(cache.status("r4"), RequestStatus::InFlight));
-        cache.finish("r4", Err("boom".to_string()));
+        let _ = cache.finish("r4", Err("boom".to_string()));
         match cache.status("r4") {
             RequestStatus::Completed(Err(e)) => assert_eq!(e, "boom"),
             _ => panic!("expected Completed(Err)"),
@@ -7691,7 +7721,7 @@ mod tests {
         let cache = RequestCache::with_bounds(2, std::time::Duration::from_secs(600));
         for id in ["a", "b", "c"] {
             cache.begin(id);
-            cache.finish(id, Ok(json!({"id": id})));
+            let _ = cache.finish(id, Ok(json!({"id": id})));
         }
         // "a" was evicted when "c" pushed past the capacity of 2.
         assert!(matches!(cache.status("a"), RequestStatus::Unknown));
@@ -7706,7 +7736,7 @@ mod tests {
         // REQUEST_INFLIGHT_REAP - the safety valve for a panicked/hung handler.)
         let cache = RequestCache::with_bounds(8, std::time::Duration::from_millis(1));
         cache.begin("done");
-        cache.finish("done", Ok(json!({})));
+        let _ = cache.finish("done", Ok(json!({})));
         std::thread::sleep(std::time::Duration::from_millis(5));
         // status() runs eviction; the expired Done entry is gone -> Unknown, so a
         // fresh retry would be safe.
@@ -7845,6 +7875,63 @@ mod tests {
         assert!(body.contains("alpha"), "stale seq-0 snapshot must not clobber the claim: {body}");
         // A NEWER snapshot (seq 1, already on disk) is allowed to (re)write.
         reg.persist(newer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stalled_persist_does_not_block_a_concurrent_registry_reader_or_mutator() {
+        // The core Incident-D proof: with persistence moved OFF the `inner` lock, a
+        // STALLED disk write (here a hook that blocks while holding only the
+        // `persist` mutex) must NOT block a concurrent reader or mutator that only
+        // touches `inner`. Under the OLD code (persist under the registry lock) the
+        // reader below would hang for the duration of the stall - so this test would
+        // TIME OUT and fail, which is exactly the regression guard we want.
+        use std::sync::mpsc;
+        let dir = std::env::temp_dir().join(format!("t-hub-captains-stall-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("captains.json");
+        let _ = std::fs::remove_file(&path);
+        let reg = Arc::new(CaptainsRegistry::load(path));
+
+        // The hook stands in for a stalled OneDrive-backed write: it signals that a
+        // persist is in progress, then blocks (holding `persist`, NOT `inner`) until
+        // the test releases it.
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = StdMutex::new(release_rx);
+        reg.set_persist_hook(Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.lock().unwrap().recv(); // block: the write is stalled
+        }));
+
+        // A background mutator triggers a persist and stalls inside it. Its `inner`
+        // mutation (the claim) has ALREADY committed + released `inner` by the time
+        // persist runs, so `inner` is free while this stalls.
+        let writer_reg = reg.clone();
+        let writer = std::thread::spawn(move || {
+            writer_reg.claim("cap-1", Some("alpha"), vec![]).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the persist hook should have started (mutation reached persist)");
+
+        // NOW, while the persist is stalled: a concurrent reader must return promptly
+        // (it only takes `inner`). Run it on a thread so a REGRESSION (reader blocked
+        // on `inner`) surfaces as a timeout instead of hanging the suite forever.
+        let reader_reg = reg.clone();
+        let (read_tx, read_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let snap = reader_reg.snapshot();
+            let _ = read_tx.send(snap.captains.len());
+        });
+        let n = read_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a reader was BLOCKED by a stalled persist (regression: persist holds `inner`)");
+        assert_eq!(n, 1, "the reader sees the already-committed claim");
+
+        // Release the stalled write; the mutator finishes cleanly.
+        let _ = release_tx.send(());
+        writer.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
