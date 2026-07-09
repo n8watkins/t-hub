@@ -45,13 +45,13 @@ shared types to keep in lockstep.
 
 | Piece | Path | Role |
 | --- | --- | --- |
-| MCP server binary | `src-tauri/crates/t-hub-mcp/` | Speaks MCP JSON-RPC on stdio; owns the tool catalog; forwards `tools/call` to the app. |
+| MCP server binary | `apps/desktop/src-tauri/crates/t-hub-mcp/` | Speaks MCP JSON-RPC on stdio; owns the tool catalog; forwards `tools/call` to the app. |
 | `protocol.rs` | `…/t-hub-mcp/src/protocol.rs` | Minimal JSON-RPC 2.0 framing (request/notification/response/error). |
 | `tools.rs` | `…/t-hub-mcp/src/tools.rs` | The static tool catalog + tiers + JSON schemas. |
 | `control_client.rs` | `…/t-hub-mcp/src/control_client.rs` | Discovers the app (handshake file / env), forwards one command, and re-reads `control.json` to reconnect once when the endpoint is dead (recovers across an app restart). |
 | `server.rs` | `…/t-hub-mcp/src/server.rs` | The stdio loop: `initialize`, `tools/list`, `tools/call`, `ping`. |
-| App control listener | `src-tauri/src/control.rs` | Loopback TCP listener; authenticates the token; dispatches by command name. |
-| Registration line | `src-tauri/src/lib.rs` (`start_control_listener`) | Starts the listener in `setup()` with a supervisor-visitor closure. |
+| App control listener | `apps/desktop/src-tauri/src/control.rs` | Loopback TCP listener; authenticates the token; dispatches by command name. |
+| Registration line | `apps/desktop/src-tauri/src/lib.rs` (`start_control_listener`) | Starts the listener in `setup()` with a supervisor-visitor closure. |
 
 The listener uses **loopback TCP** (not a Unix socket) because T-Hub's primary
 target is Windows, where AF_UNIX support is inconsistent; loopback TCP behaves
@@ -133,6 +133,8 @@ restart that pin points at the dead pre-restart endpoint. Rather than reporting
 | `list_tabs` | Read | allowed | the live workspace tabs (`{id, name, tileIds}`) from the core's addressable tab registry — the frontend reports its layout up so this mirrors the UI |
 | `list_captains` | Read | allowed | the claimed captains (`{shipSlug, captainSessionId, workspaceTabIds, crew}` + revision) from the server captains registry — the one source of truth the UI and MCP share |
 | `read_terminal` | Read | allowed | a session's recent visible output via tmux `capture-pane` (plain text; optional scrollback) |
+| `list_fleet_watches` | Read | allowed | the armed orchestrator wakes (who gets woken, for which sessions + states) from the fleet-watch registry |
+| `scribe_status` | Read | allowed | whether the general is dictating right now - Scribe's v1 status endpoint (discovered via `~/.scribe/control.json`; `status.json` file fallback with pid + 15s TTL); `listening` mirrors Scribe's level-triggered `busy` flag and fails open to `false` when it can't tell |
 | `focus_session` | Organization | allowed, **audited** | accepted + audited; UI application via the frontend command |
 | `move_tile` | Organization | allowed, **audited** | applies to the authoritative server registry FIRST (unknown `tabId` is a hard error), then forwards the registry snapshot; lands even when the target tab is hidden or the window is unfocused |
 | `rename_tab` | Organization | allowed, **audited** | registry-first + strict (unknown `tabId` is an error), then forwards the snapshot |
@@ -141,6 +143,8 @@ restart that pin points at the dead pre-restart endpoint. Rather than reporting
 | `close_tab` | Organization | allowed, **audited** | closes a workspace tab headlessly; refused for the LAST tab, and for a non-empty tab unless `force: true` (see the tab-lifecycle policy below) |
 | `claim_captain` | Organization | allowed, **audited** | claims captaincy of a ship in the server captains registry (registry-first + strict: one captain per ship), then forwards the captains snapshot (`sync_captains`); a captain self-registers with its own session id instead of hand-editing ship files (see the captains-registry policy below) |
 | `release_captain` | Organization | allowed, **audited** | releases a claim by `captainSessionId` or `shipSlug` (unknown claims are refused), then forwards the snapshot |
+| `watch_fleet` | Organization | allowed, **audited** | arms a server-side push that re-invokes THIS orchestrator's loop (injects a prompt into its terminal) when a watched session (default: any captain) goes idle / needs-input / completes; idempotent (re-arming replaces the prior watch) |
+| `unwatch_fleet` | Organization | allowed, **audited** | disarms the orchestrator wake previously armed with `watch_fleet` |
 | `open_file` | Organization | allowed, **audited** | capped text read via the Files reader |
 | `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create, never the focused tab), spawns the worktree terminal **server-side**, places it in the registry, and forwards the snapshot; returns `tabId` + `terminalId` synchronously; optional `spawnedBy` records the worktree terminal as a captain's crew |
 | `remove_worktree` | Organization | allowed, **audited** | forwards removal to the UI (which detaches live tiles first, then runs `git worktree remove`); refused if no UI is connected, to avoid orphaning a process |
@@ -259,7 +263,7 @@ forward.
 {
   "mcpServers": {
     "t-hub": {
-      "command": "./src-tauri/target/debug/t-hub-mcp",
+      "command": "./apps/desktop/src-tauri/target/debug/t-hub-mcp",
       "args": [],
       "env": {}
     }
@@ -267,7 +271,7 @@ forward.
 }
 ```
 
-- Build the binary first: `cargo build -p t-hub-mcp --manifest-path src-tauri/Cargo.toml`.
+- Build the binary first: `cargo build -p t-hub-mcp --manifest-path apps/desktop/src-tauri/Cargo.toml`.
 - For a **packaged install**, point `command` at the bundled `t-hub-mcp`
   (e.g. the Tauri sidecar binary). On Windows use the `.exe` path.
 - The **T-Hub app must be running** for the tools to act on anything; the
@@ -278,12 +282,12 @@ forward.
 
 You can also register it imperatively with the Claude CLI:
 ```
-claude mcp add t-hub -- ./src-tauri/target/debug/t-hub-mcp
+claude mcp add t-hub -- ./apps/desktop/src-tauri/target/debug/t-hub-mcp
 ```
 
 Quick offline sanity check (no app needed) — dump the catalog:
 ```
-./src-tauri/target/debug/t-hub-mcp --list-tools
+./apps/desktop/src-tauri/target/debug/t-hub-mcp --list-tools
 ```
 
 ---
@@ -351,10 +355,10 @@ running app it instead forwards the spawn and a real tile appears):
 
 Run them:
 ```
-cargo test --manifest-path src-tauri/Cargo.toml -p t-hub-mcp          # MCP-side units
-cargo test --manifest-path src-tauri/Cargo.toml -p t-hub --lib control # app-side units
-cargo build -p t-hub-mcp --manifest-path src-tauri/Cargo.toml          # the binary the e2e spawns
-cargo test --manifest-path src-tauri/Cargo.toml -p t-hub --test mcp_e2e # end-to-end
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml -p t-hub-mcp          # MCP-side units
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml -p t-hub --lib control # app-side units
+cargo build -p t-hub-mcp --manifest-path apps/desktop/src-tauri/Cargo.toml          # the binary the e2e spawns
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml -p t-hub --test mcp_e2e # end-to-end
 ```
 
 ---

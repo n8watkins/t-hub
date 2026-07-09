@@ -69,21 +69,21 @@ On each edge `(uuid, status)`:
 
 1. Resolve `uuid -> tile` (StatusBridge). Look up whether `tile` is a captain (captains registry) -> `shipSlug`, `captainSessionId`.
 2. For each armed `FleetWatch` whose scope includes `tile` and whose `states` includes `status`, and where `tile != orchestrator_tile_id` (never wake on your own transition):
-   build a payload `{sessionId: tile, captainSessionId, shipSlug, state, uuid, seq, ts}` and enqueue a pending wake for that orchestrator.
+   build a pending wake item `{sessionId: tile, shipSlug, isCaptain, state}` and enqueue it for that orchestrator.
 3. **Gate + coalesce**: if the orchestrator is idle, flush immediately by injecting a wake line via `tmux::send_text`.
    If the orchestrator is mid-turn (`Working` / `WaitingOnSubagents`), hold; flush (coalesced into one message listing all pending captains) when the orchestrator's own next idle edge is observed.
-   A per-orchestrator min-interval rate-limit prevents storms on idle flapping.
+   A per-orchestrator suppression gate (one inject per idle window, cleared on the orchestrator's own next `Completed` edge) prevents storms on idle flapping.
 4. Also emit `fleet://wake` on the event stream (UI badge / voice cue - the bonus, secondary to the machine wake).
 
 Injected wake line (a compact, routable prompt the fleet-orchestrator skill consumes):
 
 ```
-[T-HUB FLEET WAKE] captain "ship-280699db" (280699db) -> needsQuestion. Supervise it. (seq 42, 2026-07-08T20:15:03Z)
+[T-HUB FLEET WAKE] captain "ship-280699db" (280699db) -> needsQuestion. Supervise it (get_status / read_terminal, then act).
 ```
 
 ## Status + live validation
 
-Landed on branch `feat/orchestrator-wake` (0.3.50 -> 0.3.54), fully unit- + E2E-tested (see below).
+Merged as PR #34 (`5c6979b`, shipped in 0.3.54). Landed on branch `feat/orchestrator-wake` (0.3.50 -> 0.3.54), fully unit- + E2E-tested (see below).
 The running app when this was built was the older 0.3.49 binary, so the machine-consumable path was proven in a faithful harness (real tmux), not yet against the live app + real Claude sessions.
 Final live validation (rebuild + relaunch the Tauri app, arm `watch_fleet`, drive a real captain idle, watch Cortana's terminal get the injected turn) belongs to the merge/release step the general owns - the app cannot be relaunched from inside its own supervised session without killing that session.
 
@@ -93,7 +93,7 @@ Test coverage proving the full chain:
 - `fleet::tests::wake_lands_in_a_real_orchestrator_pane_e2e` - the REAL tmux injection: a captain going idle types the wake line into a live orchestrator pane, read back via capture-pane. Injected line observed:
   `[T-HUB FLEET WAKE] captain "ship-e2e" (e2ecap01) -> completed. Supervise it (get_status / read_terminal, then act).`
 - `control::tests::get_status_resolves_a_captain_tile_id_to_its_claude_uuid` + `claude::status::tests::reverse_lookups_bridge_tile_and_session_ids` - the id bridge.
-- `tools::tests::fleet_wake_tools_are_exposed_with_the_right_tiers` - the MCP surface.
+- `tools::tests::fleet_wake_tools_are_exposed_with_the_right_tiers` (in the `t-hub-mcp` crate) - the MCP surface.
 
 ## Separate gap: captain crew-spawn tools (surfaced, not solved here - per the order)
 
