@@ -1,0 +1,17 @@
+{
+  "_comment": "Golden dictation-gate decision matrix, shared by TWO implementations so contract drift turns CI red: the Rust evaluators in src-tauri/src/scribe.rs (test gate_matches_golden_fixtures_cross_impl) and the shell gate in announce.sh (driven by announce_gate.test.sh via `announce.sh --gate`). Each case is a Scribe snapshot minus updatedAt; the harness stamps updatedAt = now - offsetMs (a negative offset => a FUTURE timestamp). `hold` is the contract: should the gate HOLD voice (defer) rather than speak. All fixtures carry app==scribe and omit schemaVersion so the v1 evaluator's app/version guards are satisfied and it agrees with the file evaluator on every row.",
+  "base": "2026-07-08T12:00:00.000Z",
+  "ttlMs": 15000,
+  "cases": [
+    {"name": "recording_busy_fresh", "offsetMs": 2000, "snapshot": {"app": "scribe", "status": "Recording", "dictating": true, "busy": true}, "hold": true},
+    {"name": "transcribing_busy_fresh", "offsetMs": 2000, "snapshot": {"app": "scribe", "status": "Transcribing", "dictating": false, "busy": true}, "hold": true},
+    {"name": "pasting_busy_fresh", "offsetMs": 5000, "snapshot": {"app": "scribe", "status": "Pasting", "dictating": false, "busy": true}, "hold": true},
+    {"name": "dictating_only_no_busy", "offsetMs": 2000, "snapshot": {"app": "scribe", "dictating": true}, "hold": true},
+    {"name": "long_recording_heartbeat_fresh", "offsetMs": 2000, "snapshot": {"app": "scribe", "status": "Recording", "dictating": true, "busy": true, "since": "2026-07-08T11:50:00.000Z"}, "hold": true},
+    {"name": "idle_fresh", "offsetMs": 2000, "snapshot": {"app": "scribe", "status": "Idle", "dictating": false, "busy": false}, "hold": false},
+    {"name": "ready_fresh", "offsetMs": 2000, "snapshot": {"app": "scribe", "status": "Ready", "dictating": false, "busy": false}, "hold": false},
+    {"name": "busy_stale_past_ttl", "offsetMs": 20000, "snapshot": {"app": "scribe", "status": "Recording", "dictating": true, "busy": true}, "hold": false},
+    {"name": "busy_future_updatedat", "offsetMs": -60000, "snapshot": {"app": "scribe", "busy": true}, "hold": false},
+    {"name": "no_boolean_fresh", "offsetMs": 2000, "snapshot": {"app": "scribe", "status": "Idle"}, "hold": false}
+  ]
+}
