@@ -63,7 +63,9 @@ impl Discovery {
         let non_empty = |v: String| if v.is_empty() { None } else { Some(v) };
         Discovery {
             addr: std::env::var("T_HUB_CONTROL_ADDR").ok().and_then(non_empty),
-            token: std::env::var("T_HUB_CONTROL_TOKEN").ok().and_then(non_empty),
+            token: std::env::var("T_HUB_CONTROL_TOKEN")
+                .ok()
+                .and_then(non_empty),
             file: std::env::var_os("T_HUB_CONTROL_FILE").map(PathBuf::from),
             // Resolved lazily in `handshake_path` so the default branch still
             // honors the live environment in production.
@@ -384,10 +386,7 @@ mod tests {
             ..Default::default()
         };
         let err = discovery.resolve().unwrap_err();
-        assert!(
-            err.contains("control channel not found"),
-            "err: {err}"
-        );
+        assert!(err.contains("control channel not found"), "err: {err}");
     }
 
     #[test]

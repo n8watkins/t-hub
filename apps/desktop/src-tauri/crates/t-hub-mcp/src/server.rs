@@ -273,8 +273,9 @@ mod tests {
 
     #[test]
     fn tools_call_without_name_is_invalid_params() {
-        let resp =
-            run_lines(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"arguments":{}}}"#);
+        let resp = run_lines(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"arguments":{}}}"#,
+        );
         assert_eq!(resp[0]["error"]["code"], codes::INVALID_PARAMS);
     }
 
