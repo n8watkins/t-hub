@@ -58,8 +58,10 @@ interface SessionContextState {
    *  reporting session's directory. */
   bySession: Record<string, CtxReading>;
   /** Fold a status snapshot in. Files it under the owning tmux session only.
-   *  No-op unless it has a context % AND a `tmux_session` (a reading we cannot
-   *  attribute to a specific session is dropped, never guessed by cwd). */
+   *  A reading we cannot attribute to a specific session (no `tmux_session`) is
+   *  dropped, never guessed by cwd. A FRESHER snapshot for a session we already
+   *  track that carries NO context % RESETS that session's reading (the /clear
+   *  fix) rather than leaving the old, now-wrong number stale. */
   ingest: (snap: StatusSnapshotWire) => void;
   /** Drop a terminal's context reading when its tile goes away for good (close /
    *  detach / close-tab). Deletes the `bySession` entry for the terminal's
@@ -71,14 +73,23 @@ export const useSessionContext = create<SessionContextState>((set) => ({
   bySession: {},
   ingest: (snap) =>
     set((s) => {
-      // Need an actual context % to show; nothing to record without it.
-      if (snap.contextUsedPct == null) return s;
       const session = (snap.tmuxSession ?? "").trim();
       // No owning session → we cannot bind it to a tile without guessing (which
       // would leak across same-cwd tiles). Drop it.
       if (!session) return s;
       const prev = s.bySession[session];
       if (prev && prev.ts >= snap.ingestedAtMs) return s; // stale/out-of-order
+      // No context % on a FRESHER snapshot for a session we track = its context
+      // was RESET (e.g. `/clear`, which empties the window so the statusline
+      // stops reporting a `context_window`). Drop the stale reading so the meter
+      // clears immediately instead of pinning the old, now-wrong number until the
+      // next turn repopulates it. Nothing tracked yet → nothing to reset.
+      if (snap.contextUsedPct == null) {
+        if (!prev) return s;
+        const bySession = { ...s.bySession };
+        delete bySession[session];
+        return { bySession };
+      }
       const reading: CtxReading = {
         usedPct: snap.contextUsedPct,
         ts: snap.ingestedAtMs,
