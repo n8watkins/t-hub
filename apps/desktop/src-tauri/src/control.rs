@@ -761,10 +761,15 @@ impl CaptainsRegistry {
             .and_then(|body| serde_json::from_str::<CaptainsSnapshot>(&body).ok())
             .map(|snap| CaptainsInner { captains: snap.captains, seq: snap.seq })
             .unwrap_or_default();
+        // N3: seed the persist guard from the LOADED seq, not 0, so a stale
+        // in-memory snapshot (seq <= what's already on disk) can't rewrite the file
+        // redundantly on startup - the monotonic guard is correct from the first
+        // write, not just after the first mutation.
+        let loaded_seq = inner.seq;
         Self {
             inner: Mutex::new(inner),
             path: Some(path),
-            persist: Mutex::new(0),
+            persist: Mutex::new(loaded_seq),
             #[cfg(test)]
             persist_hook: Mutex::new(None),
         }
@@ -1068,13 +1073,34 @@ const REQUEST_CACHE_CAPACITY: usize = 512;
 /// the cache is self-cleaning without the eviction cap ever being the sole bound.
 const REQUEST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// How long an InFlight reservation survives before it is presumed DEAD and
+/// Default window an InFlight reservation survives before it is presumed DEAD and
 /// reaped, so a handler thread that panicked or hung (e.g. a wedged `git worktree
 /// add`, Incident D) cannot leave a request id permanently blocking every retry.
-/// Generous relative to a real spawn (tmux new-session / git worktree add finish
-/// in well under a second on a healthy box): anything still "in flight" this long
-/// is stuck, and a retry is then the right recovery.
-const REQUEST_INFLIGHT_REAP: std::time::Duration = std::time::Duration::from_secs(120);
+///
+/// 600s (matching [`REQUEST_CACHE_TTL`]) deliberately sits WELL above any realistic
+/// slow spawn - including a `git worktree add` against the OneDrive-backed store
+/// (the very slow-I/O surface Incident D was about). At 120s a slow-but-ALIVE
+/// create_worktree could be reaped mid-flight, letting a retry see `Fresh` and both
+/// apply -> the exact A/B duplicate (each spawn mints a fresh uuid). 600s makes a
+/// still-running op far less plausible than a truly dead one; the env override
+/// (`T_HUB_REQUEST_INFLIGHT_REAP_SECS`) lets an operator tune it.
+///
+/// RESIDUAL (tracked fast-follow): the FULL fix is to re-probe reality on reap
+/// (tmux has-session / worktree-exists) before allowing a re-apply, so a reaped-
+/// but-alive op can never be duplicated regardless of the window. This raise is the
+/// low-cost mitigation, not that fix.
+const REQUEST_INFLIGHT_REAP_DEFAULT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The effective InFlight reap window: `$T_HUB_REQUEST_INFLIGHT_REAP_SECS` (seconds)
+/// if set to a positive integer, else [`REQUEST_INFLIGHT_REAP_DEFAULT`].
+fn inflight_reap_window() -> std::time::Duration {
+    std::env::var("T_HUB_REQUEST_INFLIGHT_REAP_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(REQUEST_INFLIGHT_REAP_DEFAULT)
+}
 
 /// The state of a request id in the [`RequestCache`].
 enum RequestSlot {
@@ -1121,6 +1147,10 @@ pub struct RequestCache {
     inner: Mutex<RequestCacheInner>,
     capacity: usize,
     ttl: std::time::Duration,
+    /// Window after which a still-InFlight reservation is presumed dead and reaped
+    /// (see [`inflight_reap_window`]). A field (not the bare const) so a test can
+    /// drive a tiny one and an operator can tune it via env.
+    inflight_reap: std::time::Duration,
 }
 
 #[derive(Default)]
@@ -1136,17 +1166,24 @@ impl RequestCache {
             inner: Mutex::new(RequestCacheInner::default()),
             capacity: REQUEST_CACHE_CAPACITY,
             ttl: REQUEST_CACHE_TTL,
+            inflight_reap: inflight_reap_window(),
         }
     }
 
-    /// Test-only constructor with explicit bounds so eviction/TTL behavior can be
-    /// exercised without inserting the full production capacity.
+    /// Test-only constructor with explicit bounds so eviction/TTL/reap behavior can
+    /// be exercised without inserting the full production capacity or waiting out
+    /// the real windows.
     #[cfg(test)]
-    fn with_bounds(capacity: usize, ttl: std::time::Duration) -> Self {
+    fn with_bounds(
+        capacity: usize,
+        ttl: std::time::Duration,
+        inflight_reap: std::time::Duration,
+    ) -> Self {
         Self {
             inner: Mutex::new(RequestCacheInner::default()),
             capacity,
             ttl,
+            inflight_reap,
         }
     }
 
@@ -1155,15 +1192,20 @@ impl RequestCache {
     }
 
     /// Drop entries that have aged out: a Done entry past the TTL, or an InFlight
-    /// reservation past [`REQUEST_INFLIGHT_REAP`] (presumed dead - a panicked or
-    /// hung handler must never leave an id permanently blocking retries).
-    fn evict_expired(inner: &mut RequestCacheInner, now: std::time::Instant, ttl: std::time::Duration) {
+    /// reservation past `inflight_reap` (presumed dead - a panicked or hung handler
+    /// must never leave an id permanently blocking retries).
+    fn evict_expired(
+        inner: &mut RequestCacheInner,
+        now: std::time::Instant,
+        ttl: std::time::Duration,
+        inflight_reap: std::time::Duration,
+    ) {
         let RequestCacheInner { slots, order } = inner;
         order.retain(|id| {
             let expired = match slots.get(id) {
                 Some(RequestSlot::Done { at, .. }) => now.duration_since(*at) >= ttl,
                 Some(RequestSlot::InFlight { since }) => {
-                    now.duration_since(*since) >= REQUEST_INFLIGHT_REAP
+                    now.duration_since(*since) >= inflight_reap
                 }
                 None => true,
             };
@@ -1180,7 +1222,7 @@ impl RequestCache {
     fn begin(&self, id: &str) -> BeginOutcome {
         let now = std::time::Instant::now();
         let mut inner = self.lock();
-        Self::evict_expired(&mut inner, now, self.ttl);
+        Self::evict_expired(&mut inner, now, self.ttl, self.inflight_reap);
         match inner.slots.get(id) {
             Some(RequestSlot::Done { outcome, .. }) => BeginOutcome::Duplicate(outcome.clone()),
             Some(RequestSlot::InFlight { .. }) => BeginOutcome::InFlight,
@@ -1213,6 +1255,16 @@ impl RequestCache {
     /// for any future retry.
     fn finish(&self, id: &str, outcome: Result<Value, String>) -> Result<Value, String> {
         let mut inner = self.lock();
+        // M2: normally `begin` already put the id in `order`, so we must NOT
+        // double-insert. BUT if the reservation outlived the reap window (a
+        // >`inflight_reap` handler still running), `evict_expired` already dropped
+        // the id from BOTH maps - so this Done entry would be recorded in `slots`
+        // with no `order` membership: never TTL/capacity-evictable, a permanent
+        // leak that also breaches the cap and reports `completed` forever. Re-
+        // establish order membership when (and only when) it is missing.
+        if !inner.order.iter().any(|x| x == id) {
+            inner.order.push_back(id.to_string());
+        }
         inner.slots.insert(
             id.to_string(),
             RequestSlot::Done {
@@ -1220,7 +1272,6 @@ impl RequestCache {
                 outcome: outcome.clone(),
             },
         );
-        // `begin` already pushed the id into `order`; don't double-insert.
         outcome
     }
 
@@ -1240,7 +1291,7 @@ impl RequestCache {
     fn status(&self, id: &str) -> RequestStatus {
         let now = std::time::Instant::now();
         let mut inner = self.lock();
-        Self::evict_expired(&mut inner, now, self.ttl);
+        Self::evict_expired(&mut inner, now, self.ttl, self.inflight_reap);
         match inner.slots.get(id) {
             None => RequestStatus::Unknown,
             Some(RequestSlot::InFlight { .. }) => RequestStatus::InFlight,
@@ -1719,10 +1770,11 @@ static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
 /// request/response clients send their line in milliseconds and close on EOF.
 const CONN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// A socket read timeout surfaces as `WouldBlock` (SO_RCVTIMEO on unix) or
-/// `TimedOut` (windows). Both mean "idle — close this connection cleanly", not a
-/// transport error worth logging or propagating.
-fn is_read_timeout(e: &std::io::Error) -> bool {
+/// A socket timeout surfaces as `WouldBlock` (SO_RCVTIMEO/SO_SNDTIMEO on unix) or
+/// `TimedOut` (windows). On the READ path both mean "idle — close this connection
+/// cleanly"; on the WRITE path both mean "send buffer full — retry the remainder"
+/// (see [`write_response`]). Named for the condition, since both paths use it.
+fn is_would_block_or_timeout(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
@@ -1945,7 +1997,7 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
             Ok(0) => break, // EOF: client disconnected.
             Ok(_) => {}
             // Idle past CONN_READ_TIMEOUT: close cleanly (not a real error).
-            Err(e) if is_read_timeout(&e) => break,
+            Err(e) if is_would_block_or_timeout(&e) => break,
             Err(e) => return Err(e),
         }
         if line.trim().is_empty() {
@@ -2298,7 +2350,7 @@ fn write_response(writer: &mut TcpStream, resp: &ControlResponse) -> std::io::Re
     // best-effort (the bytes are already handed to the kernel by write_all).
     match writer.flush() {
         Ok(()) => Ok(()),
-        Err(e) if is_read_timeout(&e) => Ok(()),
+        Err(e) if is_would_block_or_timeout(&e) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -2329,7 +2381,7 @@ fn write_all_eagain_robust(writer: &mut TcpStream, body: &[u8]) -> std::io::Resu
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) if is_read_timeout(&e) => {
+            Err(e) if is_would_block_or_timeout(&e) => {
                 if std::time::Instant::now() >= deadline {
                     return Err(e);
                 }
@@ -4345,9 +4397,18 @@ fn spawn_tmux_terminal(
     // spawn that didn't take fails loudly (and idempotently retryable) instead of
     // registering a phantom.
     if !tmux::has_session(&tmux_session) {
+        // L1: a FALSE negative is possible (a has-session hiccup / TOCTOU) - the
+        // session may in fact have come up. Returning Err WITHOUT tearing it down
+        // would orphan it: a live pane with no tile, invisible to close_terminal,
+        // and (under a requestId) the failure is cached so the retry won't adopt
+        // it. Best-effort reap the maybe-live session before failing, so a spawn
+        // that DID take is killed, not leaked. Idempotent: a truly-absent session
+        // is a no-op.
+        let _ = tmux::kill_session_tree(&tmux_session);
         return Err(format!(
             "tmux session '{tmux_session}' did not materialize after new-session \
-             (the spawn did not take; nothing was registered)"
+             (the spawn did not take; any partial session was reaped and nothing \
+             was registered)"
         ));
     }
     Ok((id, tmux_session))
@@ -7718,7 +7779,11 @@ mod tests {
 
     #[test]
     fn request_cache_evicts_oldest_completed_beyond_capacity() {
-        let cache = RequestCache::with_bounds(2, std::time::Duration::from_secs(600));
+        let cache = RequestCache::with_bounds(
+            2,
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(600),
+        );
         for id in ["a", "b", "c"] {
             cache.begin(id);
             let _ = cache.finish(id, Ok(json!({"id": id})));
@@ -7734,13 +7799,62 @@ mod tests {
         // A completed outcome ages out of the cache after its TTL, keeping the cache
         // self-cleaning. (The same retain reaps a stale InFlight reservation past
         // REQUEST_INFLIGHT_REAP - the safety valve for a panicked/hung handler.)
-        let cache = RequestCache::with_bounds(8, std::time::Duration::from_millis(1));
+        let cache = RequestCache::with_bounds(
+            8,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(600),
+        );
         cache.begin("done");
         let _ = cache.finish("done", Ok(json!({})));
         std::thread::sleep(std::time::Duration::from_millis(5));
         // status() runs eviction; the expired Done entry is gone -> Unknown, so a
         // fresh retry would be safe.
         assert!(matches!(cache.status("done"), RequestStatus::Unknown));
+    }
+
+    #[test]
+    fn request_cache_reaps_a_stale_in_flight_reservation() {
+        // The InFlight reap safety valve: a reservation that never finished (a
+        // panicked/hung handler) is presumed dead after `inflight_reap` so a retry
+        // is not blocked forever. Tiny reap window stands in for the 600s default.
+        let cache = RequestCache::with_bounds(
+            8,
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_millis(1),
+        );
+        cache.begin("stuck"); // reserved InFlight, never finished
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // A retry now sees Fresh (the dead reservation was reaped), not a permanent
+        // InFlight.
+        assert!(matches!(cache.begin("stuck"), BeginOutcome::Fresh));
+    }
+
+    #[test]
+    fn request_cache_finish_after_reap_does_not_leak_the_entry() {
+        // M2: a handler that outlives the reap window has its reservation evicted
+        // from BOTH maps; a late finish() must re-establish `order` membership so
+        // the recorded outcome is still TTL/capacity-evictable - never a permanent
+        // leak that breaches the cap and reports `completed` forever.
+        let cache = RequestCache::with_bounds(
+            1,
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_millis(1),
+        );
+        cache.begin("x");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // status() reaps the stale InFlight "x" from slots AND order.
+        assert!(matches!(cache.status("x"), RequestStatus::Unknown));
+        // The handler finally finishes, AFTER its reservation was reaped.
+        let _ = cache.finish("x", Ok(json!({"id": "x"})));
+        assert!(matches!(cache.status("x"), RequestStatus::Completed(_)), "outcome preserved");
+        // Crucially, "x" is back in `order`: capacity pressure now evicts it. With
+        // the leak unfixed, "x" would linger in `slots` forever (never in `order`).
+        cache.begin("y");
+        let _ = cache.finish("y", Ok(json!({"id": "y"})));
+        assert!(
+            matches!(cache.status("x"), RequestStatus::Unknown),
+            "finish must re-establish order membership so the entry stays evictable (M2)"
+        );
     }
 
     #[test]
