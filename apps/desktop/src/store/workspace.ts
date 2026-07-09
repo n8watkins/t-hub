@@ -147,11 +147,31 @@ const DEFAULT_TAB_NAME = "Workspace 1";
  *     so a server snapshot can't drop it);
  *   - not closeable (closeTab/closeWorkspace refuse it).
  * Its `order` is the authoritative record of which tiles are placed as agents,
- * which is how placement survives a server registry sync without coupling this
- * store to the captain store.
+ * which is how placement survives a server registry sync. adoptRegistry consults
+ * the captain registry ONLY as a liveness fallback (see {@link captainRegistryIds}),
+ * via an accessor the captain store registers - so this store keeps NO static
+ * dependency on the captain store.
  */
 export const CAPTAINS_TAB_ID = "captains-reserved";
 export const CAPTAINS_TAB_NAME = "Captains";
+
+/** A synchronous read of the authoritative AGENT id set (the orchestrator plus
+ *  every pinned/claimed captain), registered by the captain store. captain.ts
+ *  imports THIS store, so it registers its accessor here rather than us importing
+ *  it back - keeping the workspace store free of a static captain-store cycle
+ *  (mirrors the dynamic-import `forgetCaptain` call). adoptRegistry uses it as a
+ *  liveness fallback: an externally claimed captain (e.g. one the orchestrator
+ *  claimed over the control socket) whose tile the server does not report as a
+ *  live work-tab tile is still an authoritative captain and must not be dropped.
+ *  Defaults to empty until the captain store loads, so any pre-registration sync
+ *  falls back cleanly to the plain serverTileIds liveness. */
+let captainRegistryIds: () => Iterable<TerminalId> = () => [];
+
+/** Register the captain store's agent-id accessor (see {@link captainRegistryIds}).
+ *  Called once by captain.ts at module load. */
+export function registerCaptainRegistry(fn: () => Iterable<TerminalId>): void {
+  captainRegistryIds = fn;
+}
 
 /** Return `tabs` guaranteed to contain EXACTLY ONE reserved Captains tab: if
  *  absent, append a fresh empty one; if duplicated (a stale persisted snapshot,
@@ -1233,14 +1253,21 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       const byId = new Map(tabs.map((t) => [t.id, t]));
       // The reserved Captains tab is CLIENT-ONLY (the backend registry doesn't
       // track it), and its `order` is the authoritative list of tiles placed as
-      // agents. Keep only agent tiles the server still reports live (a server-
-      // closed captain drops out of Captains and is cleaned up below like any
-      // gone tile), then hold those ids out of the server-derived work tabs so an
-      // agent tile never reappears in a work tab after a sync.
+      // agents. Keep an agent tile that is EITHER still reported live by the
+      // server (serverTileIds - which includes the reserved tab the reporter
+      // up-syncs and the server echoes back) OR still present in the authoritative
+      // CAPTAINS REGISTRY (an externally claimed captain - e.g. one the
+      // orchestrator claimed over the control socket - whose tile the server does
+      // not yet echo as a live work-tab tile). A tile in NEITHER was genuinely
+      // closed (server-closed AND released from the registry, which sync_captains
+      // keeps in step) and drops out of Captains, cleaned up below like any gone
+      // tile. The surviving ids are then held out of the server-derived work tabs
+      // so an agent tile never reappears in a work tab after a sync.
       const serverTileIds = new Set(regTabs.flatMap((r) => r.tileIds));
+      const registeredCaptains = new Set(captainRegistryIds());
       const localCaptains = tabs.find((t) => t.id === CAPTAINS_TAB_ID);
-      const captainsOrder = (localCaptains?.order ?? []).filter((id) =>
-        serverTileIds.has(id),
+      const captainsOrder = (localCaptains?.order ?? []).filter(
+        (id) => serverTileIds.has(id) || registeredCaptains.has(id),
       );
       const agentSet = new Set(captainsOrder);
 
