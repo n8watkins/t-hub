@@ -13,8 +13,9 @@
     "use the .exe path. See docs/MCP.md.",
     "",
     "Env overrides (optional): T_HUB_CONTROL_ADDR + T_HUB_CONTROL_TOKEN pin",
-    "the control endpoint explicitly (skips the handshake file); T_HUB_CONTROL_FILE",
-    "points at a non-default handshake path."
+    "the control endpoint explicitly (the fast path; if that pin later goes stale",
+    "after an app restart, the server re-reads control.json and reconnects);",
+    "T_HUB_CONTROL_FILE points at a non-default handshake path."
   ],
   "mcpServers": {
     "t-hub": {
