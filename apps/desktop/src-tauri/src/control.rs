@@ -694,11 +694,29 @@ struct CaptainsInner {
 ///
 /// Unlike [`TabRegistry`] this IS persistent (the phases doc: "survives restarts
 /// server-side; localStorage keeps only view state"): every mutation is written
-/// through to `captains.json` under the registry lock, and `load` seeds from it.
+/// through to `captains.json`, and `load` seeds from it. The write-through happens
+/// AFTER the registry lock is dropped (see [`persist`](Self::persist)) so a slow
+/// state-file write never wedges a reader on the registry lock.
 pub struct CaptainsRegistry {
     inner: Mutex<CaptainsInner>,
     /// Persistence target; `None` = in-memory only (unit tests / headless proofs).
     path: Option<PathBuf>,
+    /// Serializes disk write-throughs WITHOUT holding `inner`, guarding the last
+    /// revision that reached disk so an out-of-order write (a slower older
+    /// snapshot racing a newer one after both dropped `inner`) can never regress
+    /// the file. Held ONLY across the file write, and NEVER while `inner` is
+    /// locked - so a stalled Windows/OneDrive-backed state write can't wedge a
+    /// registry reader (`list_captains`, `get_status`) or the spawn hot path on
+    /// the `inner` lock. That coupling - disk I/O under the registry lock - was
+    /// the Incident-D flapping wedge (one slow persist parked every
+    /// captains-touching command, and its handler thread, until it drained).
+    persist: Mutex<u64>,
+    /// Test-only injection point: a callback run INSIDE [`persist`](Self::persist)
+    /// while it holds the `persist` mutex (never `inner`), so a test can SIMULATE a
+    /// stalled disk write and assert a concurrent reader/mutator on `inner` is not
+    /// blocked by it. `None` in every non-test path.
+    #[cfg(test)]
+    persist_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// Normalize a caller-supplied ship name into a slug: lowercase, runs of
@@ -725,7 +743,13 @@ fn slugify_ship(name: &str) -> String {
 impl CaptainsRegistry {
     /// An empty, in-memory registry (tests / headless proofs - no persistence).
     pub fn new() -> Self {
-        Self { inner: Mutex::new(CaptainsInner::default()), path: None }
+        Self {
+            inner: Mutex::new(CaptainsInner::default()),
+            path: None,
+            persist: Mutex::new(0),
+            #[cfg(test)]
+            persist_hook: Mutex::new(None),
+        }
     }
 
     /// Load the registry from `path`, seeding from the persisted snapshot when
@@ -737,7 +761,18 @@ impl CaptainsRegistry {
             .and_then(|body| serde_json::from_str::<CaptainsSnapshot>(&body).ok())
             .map(|snap| CaptainsInner { captains: snap.captains, seq: snap.seq })
             .unwrap_or_default();
-        Self { inner: Mutex::new(inner), path: Some(path) }
+        // N3: seed the persist guard from the LOADED seq, not 0, so a stale
+        // in-memory snapshot (seq <= what's already on disk) can't rewrite the file
+        // redundantly on startup - the monotonic guard is correct from the first
+        // write, not just after the first mutation.
+        let loaded_seq = inner.seq;
+        Self {
+            inner: Mutex::new(inner),
+            path: Some(path),
+            persist: Mutex::new(loaded_seq),
+            #[cfg(test)]
+            persist_hook: Mutex::new(None),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, CaptainsInner> {
@@ -746,10 +781,22 @@ impl CaptainsRegistry {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Best-effort write-through, called under the registry lock so persisted
-    /// snapshots are serialized and never interleave. A write failure is logged
-    /// and never fails the mutation (the in-memory registry stays authoritative
-    /// for this run; the next successful write heals the file).
+    /// Snapshot the registry for persistence - a cheap clone taken under the
+    /// caller's already-held `inner` lock. The (potentially slow) disk write then
+    /// happens in [`persist`](Self::persist) AFTER the lock is dropped.
+    fn snapshot_for_persist(g: &CaptainsInner) -> CaptainsSnapshot {
+        CaptainsSnapshot { seq: g.seq, captains: g.captains.clone() }
+    }
+
+    /// Best-effort write-through of a snapshot to disk, WITHOUT the `inner` lock
+    /// held (Incident D). Serialized by the dedicated `persist` mutex - never
+    /// taken together with `inner` - so a stalled state write can't wedge a
+    /// registry reader or the spawn hot path. The `persist` mutex also guards the
+    /// last revision that reached disk: a snapshot older than what already landed
+    /// is dropped, so two writers that dropped `inner` in one order but reach disk
+    /// in the other never regress the file. A write failure is logged and never
+    /// fails the mutation (the in-memory registry stays authoritative for this
+    /// run; the next successful write heals the file).
     ///
     /// ATOMIC (temp + rename), mirroring `voice.rs`: the loader treats a corrupt
     /// file as empty (silently dropping every claim), so a crash mid-write must
@@ -757,9 +804,21 @@ impl CaptainsRegistry {
     /// `rename` it over the target - `rename` replaces atomically (on Windows too,
     /// MOVEFILE_REPLACE_EXISTING), so a reader/loader always sees either the old
     /// complete file or the new complete file, never a partial one.
-    fn persist_locked(&self, g: &CaptainsInner) {
+    fn persist(&self, snap: CaptainsSnapshot) {
         let Some(path) = &self.path else { return };
-        let snap = CaptainsSnapshot { seq: g.seq, captains: g.captains.clone() };
+        // The ONLY lock held across the disk write. Never nested inside `inner`.
+        let mut last = self.persist.lock().unwrap_or_else(|p| p.into_inner());
+        if snap.seq < *last {
+            // A newer revision already reached disk; this stale snapshot must not
+            // clobber it.
+            return;
+        }
+        // Test seam: stand in for a slow/stalled disk write, holding `persist` but
+        // NOT `inner`, so a test can prove a concurrent reader/mutator is unblocked.
+        #[cfg(test)]
+        if let Some(hook) = self.persist_hook.lock().unwrap().as_ref() {
+            hook();
+        }
         let body = match serde_json::to_vec_pretty(&snap) {
             Ok(b) => b,
             Err(e) => {
@@ -792,7 +851,15 @@ impl CaptainsRegistry {
                 path.display()
             );
             let _ = std::fs::remove_file(&tmp);
+            return;
         }
+        *last = snap.seq;
+    }
+
+    /// Install the test-only persist hook (see [`persist_hook`](Self::persist_hook)).
+    #[cfg(test)]
+    fn set_persist_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *self.persist_hook.lock().unwrap() = Some(hook);
     }
 
     /// The full versioned snapshot (`list_captains` + every `sync_captains` forward).
@@ -885,7 +952,9 @@ impl CaptainsRegistry {
         };
         if changed {
             g.seq += 1;
-            self.persist_locked(&g);
+            let snap = Self::snapshot_for_persist(&g);
+            drop(g);
+            self.persist(snap);
         }
         Ok(record)
     }
@@ -907,7 +976,9 @@ impl CaptainsRegistry {
         };
         let removed = g.captains.remove(idx);
         g.seq += 1;
-        self.persist_locked(&g);
+        let snap = Self::snapshot_for_persist(&g);
+        drop(g);
+        self.persist(snap);
         Ok(removed)
     }
 
@@ -930,7 +1001,9 @@ impl CaptainsRegistry {
         }
         c.crew.push(crew_session_id.to_string());
         g.seq += 1;
-        self.persist_locked(&g);
+        let snap = Self::snapshot_for_persist(&g);
+        drop(g);
+        self.persist(snap);
         true
     }
 
@@ -949,7 +1022,9 @@ impl CaptainsRegistry {
         }
         if changed {
             g.seq += 1;
-            self.persist_locked(&g);
+            let snap = Self::snapshot_for_persist(&g);
+            drop(g);
+            self.persist(snap);
         }
         changed
     }
@@ -968,13 +1043,264 @@ impl CaptainsRegistry {
         }
         if changed {
             g.seq += 1;
-            self.persist_locked(&g);
+            let snap = Self::snapshot_for_persist(&g);
+            drop(g);
+            self.persist(snap);
         }
         changed
     }
 }
 
 impl Default for CaptainsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency: completed-request outcome cache (ask #1)
+// ---------------------------------------------------------------------------
+
+/// How many completed request outcomes to retain before evicting the oldest.
+/// Spawn-class traffic is low volume (a fleet spawns dozens, not thousands, of
+/// sessions), so a few hundred entries covers every realistic in-flight retry
+/// window with a trivial memory cost.
+const REQUEST_CACHE_CAPACITY: usize = 512;
+
+/// How long a completed outcome stays queryable via `get_request_status`. Longer
+/// than any client's overall retry deadline so a caller recovering from an
+/// ambiguous response leg can always still learn what happened; short enough that
+/// the cache is self-cleaning without the eviction cap ever being the sole bound.
+const REQUEST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Default window an InFlight reservation survives before it is presumed DEAD and
+/// reaped, so a handler thread that panicked or hung (e.g. a wedged `git worktree
+/// add`, Incident D) cannot leave a request id permanently blocking every retry.
+///
+/// 600s (matching [`REQUEST_CACHE_TTL`]) deliberately sits WELL above any realistic
+/// slow spawn - including a `git worktree add` against the OneDrive-backed store
+/// (the very slow-I/O surface Incident D was about). At 120s a slow-but-ALIVE
+/// create_worktree could be reaped mid-flight, letting a retry see `Fresh` and both
+/// apply -> the exact A/B duplicate (each spawn mints a fresh uuid). 600s makes a
+/// still-running op far less plausible than a truly dead one; the env override
+/// (`T_HUB_REQUEST_INFLIGHT_REAP_SECS`) lets an operator tune it.
+///
+/// RESIDUAL (tracked fast-follow): the FULL fix is to re-probe reality on reap
+/// (tmux has-session / worktree-exists) before allowing a re-apply, so a reaped-
+/// but-alive op can never be duplicated regardless of the window. This raise is the
+/// low-cost mitigation, not that fix.
+const REQUEST_INFLIGHT_REAP_DEFAULT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The effective InFlight reap window: `$T_HUB_REQUEST_INFLIGHT_REAP_SECS` (seconds)
+/// if set to a positive integer, else [`REQUEST_INFLIGHT_REAP_DEFAULT`].
+fn inflight_reap_window() -> std::time::Duration {
+    std::env::var("T_HUB_REQUEST_INFLIGHT_REAP_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(REQUEST_INFLIGHT_REAP_DEFAULT)
+}
+
+/// The state of a request id in the [`RequestCache`].
+enum RequestSlot {
+    /// A first caller reserved this id and is running the command now. A
+    /// concurrent duplicate (a retry that raced the original, Incident B) sees
+    /// this and must NOT run the command again.
+    InFlight { since: std::time::Instant },
+    /// The command finished; its outcome is cached for replay to a retry.
+    Done {
+        at: std::time::Instant,
+        outcome: Result<Value, String>,
+    },
+}
+
+/// What [`RequestCache::begin`] decided for an incoming request id.
+enum BeginOutcome {
+    /// This id is new: reserved InFlight, the caller must run the command and then
+    /// call [`RequestCache::finish`].
+    Fresh,
+    /// This exact request already completed - replay its outcome, do NOT re-run.
+    Duplicate(Result<Value, String>),
+    /// This exact request is still running on another connection - do NOT re-run;
+    /// the caller should poll `get_request_status` (or retry) until it completes.
+    InFlight,
+}
+
+/// The queryable status of a request id (`get_request_status`).
+enum RequestStatus {
+    Unknown,
+    InFlight,
+    Completed(Result<Value, String>),
+}
+
+/// A bounded, TTL'd cache of spawn-class request outcomes keyed by a
+/// client-supplied `requestId` (ask #1). It makes a spawn-class command safely
+/// RETRYABLE across an ambiguous response leg: the server applies the side effect
+/// exactly once per id, and a retry of the same id replays the stored outcome
+/// instead of double-applying (the Incident A/B duplicate-maker). A concurrent
+/// duplicate that races the original is told InFlight rather than spawning again.
+///
+/// Keyed only when the client opts in by supplying a `requestId`; a request with
+/// no id behaves exactly as before (no dedup), preserving backward compatibility.
+pub struct RequestCache {
+    inner: Mutex<RequestCacheInner>,
+    capacity: usize,
+    ttl: std::time::Duration,
+    /// Window after which a still-InFlight reservation is presumed dead and reaped
+    /// (see [`inflight_reap_window`]). A field (not the bare const) so a test can
+    /// drive a tiny one and an operator can tune it via env.
+    inflight_reap: std::time::Duration,
+}
+
+#[derive(Default)]
+struct RequestCacheInner {
+    slots: std::collections::HashMap<String, RequestSlot>,
+    /// Insertion order of ids, for capacity eviction (oldest first).
+    order: std::collections::VecDeque<String>,
+}
+
+impl RequestCache {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(RequestCacheInner::default()),
+            capacity: REQUEST_CACHE_CAPACITY,
+            ttl: REQUEST_CACHE_TTL,
+            inflight_reap: inflight_reap_window(),
+        }
+    }
+
+    /// Test-only constructor with explicit bounds so eviction/TTL/reap behavior can
+    /// be exercised without inserting the full production capacity or waiting out
+    /// the real windows.
+    #[cfg(test)]
+    fn with_bounds(
+        capacity: usize,
+        ttl: std::time::Duration,
+        inflight_reap: std::time::Duration,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(RequestCacheInner::default()),
+            capacity,
+            ttl,
+            inflight_reap,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RequestCacheInner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Drop entries that have aged out: a Done entry past the TTL, or an InFlight
+    /// reservation past `inflight_reap` (presumed dead - a panicked or hung handler
+    /// must never leave an id permanently blocking retries).
+    fn evict_expired(
+        inner: &mut RequestCacheInner,
+        now: std::time::Instant,
+        ttl: std::time::Duration,
+        inflight_reap: std::time::Duration,
+    ) {
+        let RequestCacheInner { slots, order } = inner;
+        order.retain(|id| {
+            let expired = match slots.get(id) {
+                Some(RequestSlot::Done { at, .. }) => now.duration_since(*at) >= ttl,
+                Some(RequestSlot::InFlight { since }) => {
+                    now.duration_since(*since) >= inflight_reap
+                }
+                None => true,
+            };
+            if expired {
+                slots.remove(id);
+            }
+            !expired
+        });
+    }
+
+    /// Reserve `id` for a first caller, or report that it is a duplicate/in-flight.
+    /// The reservation (InFlight) and the completed-outcome lookup are one atomic
+    /// step so two racing retries can never both reserve the same id.
+    fn begin(&self, id: &str) -> BeginOutcome {
+        let now = std::time::Instant::now();
+        let mut inner = self.lock();
+        Self::evict_expired(&mut inner, now, self.ttl, self.inflight_reap);
+        match inner.slots.get(id) {
+            Some(RequestSlot::Done { outcome, .. }) => BeginOutcome::Duplicate(outcome.clone()),
+            Some(RequestSlot::InFlight { .. }) => BeginOutcome::InFlight,
+            None => {
+                inner
+                    .slots
+                    .insert(id.to_string(), RequestSlot::InFlight { since: now });
+                inner.order.push_back(id.to_string());
+                // Capacity bound: evict the oldest COMPLETED entries (never an
+                // in-flight reservation) until back under the cap.
+                while inner.order.len() > self.capacity {
+                    let Some(oldest) = inner.order.front().cloned() else { break };
+                    match inner.slots.get(&oldest) {
+                        Some(RequestSlot::Done { .. }) | None => {
+                            inner.order.pop_front();
+                            inner.slots.remove(&oldest);
+                        }
+                        // Oldest is still running: stop evicting (the cap is soft
+                        // under a burst of concurrent in-flight requests).
+                        Some(RequestSlot::InFlight { .. }) => break,
+                    }
+                }
+                BeginOutcome::Fresh
+            }
+        }
+    }
+
+    /// Record the outcome of a request reserved by [`begin`](Self::begin), and
+    /// return it (cloned) so the caller can respond with the very value now cached
+    /// for any future retry.
+    fn finish(&self, id: &str, outcome: Result<Value, String>) -> Result<Value, String> {
+        let mut inner = self.lock();
+        // M2: normally `begin` already put the id in `order`, so we must NOT
+        // double-insert. BUT if the reservation outlived the reap window (a
+        // >`inflight_reap` handler still running), `evict_expired` already dropped
+        // the id from BOTH maps - so this Done entry would be recorded in `slots`
+        // with no `order` membership: never TTL/capacity-evictable, a permanent
+        // leak that also breaches the cap and reports `completed` forever. Re-
+        // establish order membership when (and only when) it is missing.
+        if !inner.order.iter().any(|x| x == id) {
+            inner.order.push_back(id.to_string());
+        }
+        inner.slots.insert(
+            id.to_string(),
+            RequestSlot::Done {
+                at: std::time::Instant::now(),
+                outcome: outcome.clone(),
+            },
+        );
+        outcome
+    }
+
+    /// Release an InFlight reservation WITHOUT recording an outcome - used when a
+    /// pre-side-effect gate (the spawn governor) refuses a reserved request, so a
+    /// later retry (after budget frees) is not permanently stuck seeing InFlight /
+    /// a cached refusal. A no-op if the id already completed.
+    fn cancel(&self, id: &str) {
+        let mut inner = self.lock();
+        if matches!(inner.slots.get(id), Some(RequestSlot::InFlight { .. })) {
+            inner.slots.remove(id);
+            inner.order.retain(|x| x != id);
+        }
+    }
+
+    /// Query the status of a request id (`get_request_status`).
+    fn status(&self, id: &str) -> RequestStatus {
+        let now = std::time::Instant::now();
+        let mut inner = self.lock();
+        Self::evict_expired(&mut inner, now, self.ttl, self.inflight_reap);
+        match inner.slots.get(id) {
+            None => RequestStatus::Unknown,
+            Some(RequestSlot::InFlight { .. }) => RequestStatus::InFlight,
+            Some(RequestSlot::Done { outcome, .. }) => RequestStatus::Completed(outcome.clone()),
+        }
+    }
+}
+
+impl Default for RequestCache {
     fn default() -> Self {
         Self::new()
     }
@@ -1098,6 +1424,13 @@ pub struct ControlContext {
     /// governor refusals (socket-gate Phase 1). Shared `Arc`; cheap to hold (no I/O
     /// until the first record).
     audit: Arc<AuditLog>,
+    /// Completed-request outcome cache for spawn-class idempotency (ask #1). A
+    /// spawn-class command carrying a client `requestId` applies exactly once per
+    /// id; a retry of the same id replays the stored outcome instead of
+    /// double-applying, and `get_request_status` resolves an ambiguous response
+    /// leg. Shared `Arc` so every connection handler thread dedups against one
+    /// cache. Per-launch, in-memory (a fresh launch's ids never collide).
+    requests: Arc<RequestCache>,
 }
 
 impl ControlContext {
@@ -1437,10 +1770,11 @@ static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
 /// request/response clients send their line in milliseconds and close on EOF.
 const CONN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// A socket read timeout surfaces as `WouldBlock` (SO_RCVTIMEO on unix) or
-/// `TimedOut` (windows). Both mean "idle — close this connection cleanly", not a
-/// transport error worth logging or propagating.
-fn is_read_timeout(e: &std::io::Error) -> bool {
+/// A socket timeout surfaces as `WouldBlock` (SO_RCVTIMEO/SO_SNDTIMEO on unix) or
+/// `TimedOut` (windows). On the READ path both mean "idle — close this connection
+/// cleanly"; on the WRITE path both mean "send buffer full — retry the remainder"
+/// (see [`write_response`]). Named for the condition, since both paths use it.
+fn is_would_block_or_timeout(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
@@ -1460,6 +1794,20 @@ fn is_read_timeout(e: &std::io::Error) -> bool {
 /// Generous: a healthy loopback/tailnet client drains a 30s backlog trivially;
 /// one that can't is gone, and tearing it down lets it reattach cleanly.
 const ATTACH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Write timeout for a normal request/response connection's socket. Same wedge as
+/// [`ATTACH_WRITE_TIMEOUT`], different phase: the response leg. `write_response`
+/// runs a single blocking `write_all` AFTER a command's side effects are already
+/// committed; with no SO_SNDTIMEO a client that stopped draining (suspended,
+/// wedged, dead-with-no-RST) parks the handler thread FOREVER in that write,
+/// pinning an [`ACTIVE_CONNS`] slot. Enough stuck responses and `serve` rejects
+/// every new connection - the whole control channel goes dark even though the app
+/// is alive (Incident D: bare TCP connects still complete via the kernel backlog
+/// while no request is ever answered). Bounding the write lets the thread give up,
+/// free its slot, and keep the accept loop healthy. Generous: a healthy loopback
+/// peer drains a one-line response instantly. See [`write_response`] for the
+/// per-attempt WouldBlock retry that rides on top of this bound.
+const RESPONSE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Defensive cap on concurrently live PTY attach forwarders (s27). Each
 /// forwarder costs a PTY pair, a `tmux attach` client, a reader thread, and a
@@ -1623,6 +1971,14 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
         .unwrap_or(false);
     let ctx = &ctx;
     let mut writer = stream.try_clone()?;
+    // Bound the RESPONSE leg too (Incident D): a client that stops draining must
+    // not park this handler thread forever in `write_response`'s `write_all` and
+    // pin an ACTIVE_CONNS slot until `serve` starts rejecting every new
+    // connection. SO_SNDTIMEO is a socket property shared by every `try_clone`, so
+    // this one call bounds the dispatch response here AND the fanout's frames on a
+    // subscribed connection. The long-lived PTY attach re-sets its own
+    // ([`ATTACH_WRITE_TIMEOUT`]) when it takes over the stream below.
+    writer.set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT)).ok();
     // Read lines manually (not `reader.lines()`) so a connection mode that takes
     // over the rest of the stream (the PTY attach) can be handed `&mut reader`.
     let mut reader = BufReader::new(stream);
@@ -1641,7 +1997,7 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
             Ok(0) => break, // EOF: client disconnected.
             Ok(_) => {}
             // Idle past CONN_READ_TIMEOUT: close cleanly (not a real error).
-            Err(e) if is_read_timeout(&e) => break,
+            Err(e) if is_would_block_or_timeout(&e) => break,
             Err(e) => return Err(e),
         }
         if line.trim().is_empty() {
@@ -1975,13 +2331,65 @@ fn write_json_line(writer: &mut TcpStream, frame: &Value) -> std::io::Result<()>
 
 /// Write one newline-delimited control response and flush. Shared by the normal
 /// request path and the subscribe ack.
+///
+/// EAGAIN-robust (Incident D / ask #2, server side): the command's side effects
+/// are ALREADY committed by the time we get here, so a transient full send buffer
+/// - `WouldBlock`/`TimedOut` from the [`RESPONSE_WRITE_TIMEOUT`] SO_SNDTIMEO -
+/// must NOT drop the connection and leave the caller unable to tell whether the
+/// command took effect. Instead we retry the unwritten remainder until an overall
+/// deadline, giving a briefly-backpressured but live peer time to drain. Only a
+/// peer that stays unwritable for the whole deadline is abandoned (its handler
+/// thread then exits and frees its ACTIVE_CONNS slot rather than parking forever).
 fn write_response(writer: &mut TcpStream, resp: &ControlResponse) -> std::io::Result<()> {
     let mut body = serde_json::to_vec(resp).unwrap_or_else(|_| {
         br#"{"ok":false,"error":"failed to serialize response"}"#.to_vec()
     });
     body.push(b'\n');
-    writer.write_all(&body)?;
-    writer.flush()
+    write_all_eagain_robust(writer, &body)?;
+    // A flush can itself hit WouldBlock on a backpressured socket; treat that as
+    // best-effort (the bytes are already handed to the kernel by write_all).
+    match writer.flush() {
+        Ok(()) => Ok(()),
+        Err(e) if is_would_block_or_timeout(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `write_all`, but a `WouldBlock`/`TimedOut` (a full send buffer under the
+/// socket's write timeout) retries the UNWRITTEN remainder until
+/// [`RESPONSE_WRITE_TIMEOUT`] * a small factor elapses, rather than failing after
+/// side effects are committed. Bytes already accepted by the kernel are never
+/// resent (we advance past them), so the framing stays intact. Returns the last
+/// error if the peer never drains within the deadline.
+fn write_all_eagain_robust(writer: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+    // The per-write SO_SNDTIMEO already bounds each syscall; cap the total so a
+    // permanently stuck peer is abandoned (thread freed) instead of looping.
+    let deadline = std::time::Instant::now() + RESPONSE_WRITE_TIMEOUT.saturating_mul(2);
+    let mut written = 0usize;
+    loop {
+        match writer.write(&body[written..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "control response write returned 0 (peer closed)",
+                ));
+            }
+            Ok(n) => {
+                written += n;
+                if written >= body.len() {
+                    return Ok(());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if is_would_block_or_timeout(&e) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                // Loop and retry the remainder; the peer is backpressured, not gone.
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Constant-time token comparison: avoids a timing oracle on the auth token once
@@ -2272,10 +2680,47 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         return ControlResponse::err(message);
     }
 
+    // Spawn-class idempotency (ask #1): a client-supplied `requestId` on a
+    // spawn-class command makes it safely retryable across an ambiguous response
+    // leg. We consult the outcome cache BEFORE the governor charges budget so a
+    // retry neither double-applies the side effect (the Incident A/B
+    // duplicate-maker) nor double-charges the fleet budget. A command without a
+    // requestId is unaffected - it dispatches exactly as before.
+    let request_id = if is_idempotent_command(&req.command) {
+        arg_str(&req.args, "requestId").or_else(|| arg_str(&req.args, "request_id"))
+    } else {
+        None
+    };
+    if let Some(id) = &request_id {
+        match ctx.requests.begin(id) {
+            // This exact request already completed: replay its stored outcome. Do
+            // NOT re-run, re-charge, or re-audit - the side effect is already done.
+            BeginOutcome::Duplicate(outcome) => return replay_response(outcome),
+            // A prior identical request is still running (a retry that raced the
+            // original, Incident B): refuse to spawn a second one. The caller polls
+            // get_request_status (or retries) until it resolves.
+            BeginOutcome::InFlight => {
+                return ControlResponse::err(format!(
+                    "request '{id}' is already in flight (a prior identical '{}' has \
+                     not finished); it will NOT be double-applied - poll \
+                     get_request_status or retry to get its outcome",
+                    req.command
+                ));
+            }
+            BeginOutcome::Fresh => {}
+        }
+    }
+
     // Phase 1 fleet gate: budget + rate limits for process-changing commands only.
     // Read/Organization tiers never touch the governor.
     if tier == CommandTier::ProcessChanging {
         if let Err(refusal) = governor_gate(ctx, &req.command, &req.args) {
+            // A pre-side-effect gate refusal is not an applied outcome: release the
+            // reservation so a retry after the budget frees can still succeed
+            // (rather than being permanently stuck replaying the refusal).
+            if let Some(id) = &request_id {
+                ctx.requests.cancel(id);
+            }
             audit_command(ctx, &req, tier, cap, refusal.code, None);
             ctx.fanout.emit_event(
                 "control://governor",
@@ -2289,7 +2734,14 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         }
     }
 
-    let response = match dispatch(ctx, &req.command, &req.args) {
+    // Dispatch, then record the outcome under the requestId (if any) so a later
+    // retry replays exactly this result. `finish` returns the outcome back.
+    let outcome = dispatch(ctx, &req.command, &req.args);
+    let outcome = match &request_id {
+        Some(id) => ctx.requests.finish(id, outcome),
+        None => outcome,
+    };
+    let response = match outcome {
         Ok(value) => ControlResponse::ok(value),
         Err(e) => ControlResponse::err(e),
     };
@@ -2308,6 +2760,31 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     response
 }
 
+/// Commands whose side effects are process/filesystem mutations we make idempotent
+/// via a client `requestId` (ask #1). Deliberately narrow: only the spawn-class
+/// commands from the field incidents (a create-then-register that can leave a
+/// ghost, or a spawn that can duplicate on retry). Read/organization commands are
+/// naturally re-runnable and need no dedup.
+fn is_idempotent_command(command: &str) -> bool {
+    matches!(command, "spawn_terminal" | "create_worktree")
+}
+
+/// Build the response for a replayed (idempotent-duplicate) request. The stored
+/// outcome is returned verbatim so a retrying caller transparently receives the
+/// original result; when it is a JSON object we tag it `idempotentReplay: true` so
+/// observers can see the retry resolved to the prior apply rather than a new one.
+fn replay_response(outcome: Result<Value, String>) -> ControlResponse {
+    match outcome {
+        Ok(mut value) => {
+            if let Value::Object(map) = &mut value {
+                map.insert("idempotentReplay".to_string(), Value::Bool(true));
+            }
+            ControlResponse::ok(value)
+        }
+        Err(e) => ControlResponse::err(e),
+    }
+}
+
 /// The set of commands the control channel will execute. Read + Organization
 /// tiers (PRD §11.2). Process-changing / destructive commands are intentionally
 /// **absent**: they fall through to the "not permitted over the control channel"
@@ -2320,6 +2797,9 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // ---- Read tier (PRD §11.2: allowed) --------------------------------
         "list_terminals" => list_terminals(),
         "get_status" => get_status(ctx, args),
+        // Idempotency (ask #1): "what happened to request X?" - resolves an
+        // ambiguous spawn-class response leg without guessing (Read tier).
+        "get_request_status" => get_request_status(ctx, args),
         "wait_for_status" => wait_for_status(ctx, args),
         "supervision_tree" => supervision_tree(ctx, args),
         "supervision_session_ids" => supervision_session_ids(ctx),
@@ -2477,6 +2957,39 @@ fn get_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         "status": status,
         "snapshot": snapshot,
     }))
+}
+
+/// `get_request_status` (Read tier; ask #1): resolve "what happened to request X?"
+/// for a spawn-class `requestId`, so a caller whose response leg failed can learn
+/// the true outcome instead of guessing (and risking a duplicate). Returns:
+///   - `{status:"completed", ok:true,  result}`  the command applied; here is its result
+///   - `{status:"completed", ok:false, error}`   the command ran and failed
+///   - `{status:"inFlight"}`                      still running; do not retry yet
+///   - `{status:"unknown"}`                       never seen / evicted: the command
+///                                                did NOT land under this id, so a
+///                                                retry with the same id is safe.
+/// Args: `requestId` (required).
+fn get_request_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let request_id = arg_str(args, "requestId")
+        .or_else(|| arg_str(args, "request_id"))
+        .ok_or("get_request_status requires a 'requestId' argument")?;
+    let body = match ctx.requests.status(&request_id) {
+        RequestStatus::Unknown => json!({ "requestId": request_id, "status": "unknown" }),
+        RequestStatus::InFlight => json!({ "requestId": request_id, "status": "inFlight" }),
+        RequestStatus::Completed(Ok(result)) => json!({
+            "requestId": request_id,
+            "status": "completed",
+            "ok": true,
+            "result": result,
+        }),
+        RequestStatus::Completed(Err(error)) => json!({
+            "requestId": request_id,
+            "status": "completed",
+            "ok": false,
+            "error": error,
+        }),
+    };
+    Ok(body)
 }
 
 /// Resolve a caller-supplied `sessionId` to the supervision reducer's key (a Claude
@@ -3875,6 +4388,29 @@ fn spawn_tmux_terminal(
     // argv. Empty ⇒ a plain session (headless tests / addr unknown).
     tmux::new_session_with_env(&tmux_session, cwd, command, env)
         .map_err(|e| format!("failed to create tmux session: {e}"))?;
+    // Registry-vs-reality (Incident A/B, ask #3): never hand back an id whose tmux
+    // session did not actually materialize. `new-session` returning success is not
+    // enough - a session can fail to appear (a raced server teardown, a wsl.exe
+    // relaunch dropping the detached session), and the caller would then place +
+    // record a GHOST tile keyed to a session that never existed. Verifying
+    // has-session here means the id is live BEFORE it is placed/recorded, so a
+    // spawn that didn't take fails loudly (and idempotently retryable) instead of
+    // registering a phantom.
+    if !tmux::has_session(&tmux_session) {
+        // L1: a FALSE negative is possible (a has-session hiccup / TOCTOU) - the
+        // session may in fact have come up. Returning Err WITHOUT tearing it down
+        // would orphan it: a live pane with no tile, invisible to close_terminal,
+        // and (under a requestId) the failure is cached so the retry won't adopt
+        // it. Best-effort reap the maybe-live session before failing, so a spawn
+        // that DID take is killed, not leaked. Idempotent: a truly-absent session
+        // is a no-op.
+        let _ = tmux::kill_session_tree(&tmux_session);
+        return Err(format!(
+            "tmux session '{tmux_session}' did not materialize after new-session \
+             (the spawn did not take; any partial session was reaped and nothing \
+             was registered)"
+        ));
+    }
     Ok((id, tmux_session))
 }
 
@@ -3956,8 +4492,17 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("close_terminal requires a 'sessionId' argument")?;
     let target = tmux_target(&session_id);
+    // Registry-vs-reality (Incident C, ask #3): `kill_session_tree` is idempotent -
+    // it returns Ok for an already-gone session too - so a caller could never tell
+    // a real kill from a phantom close (ghost ids f0f3207b / 709c7252). Probe
+    // liveness BEFORE the kill so we can report an HONEST outcome. We check first
+    // (not the kill's own status) because the tree sweep SIGKILLs the pane pids,
+    // which can auto-destroy the session before `kill-session` runs, making a real
+    // kill look already-gone. The kill stays idempotent; only the label is refined.
+    let existed = tmux::has_session(&target);
     tmux::kill_session_tree(&target)
         .map_err(|e| format!("failed to close terminal '{session_id}': {e}"))?;
+    let outcome = if existed { "killed" } else { "already_gone" };
     // The registry keys tiles by the bare terminal id; strip an already-prefixed
     // caller the same way tmux_target normalizes the other direction.
     let tile_id = session_id.strip_prefix("th_").unwrap_or(&session_id);
@@ -3973,6 +4518,9 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         "accepted": "close_terminal",
         "sessionId": session_id,
         "target": target,
+        // killed = a live session was reaped; already_gone = nothing was there to
+        // kill (idempotent no-op). ok:true either way, so a retry stays safe.
+        "outcome": outcome,
         "audited": true,
     }))
 }
@@ -4137,6 +4685,7 @@ impl ControlContext {
             addr: String::new(),
             governor: Arc::new(SpawnGovernor::from_env()),
             audit: Arc::new(AuditLog::from_env()),
+            requests: Arc::new(RequestCache::new()),
         }
     }
 
@@ -7170,5 +7719,333 @@ mod tests {
         // No bound addr (headless): nothing injected, so spawns behave as before.
         ctx.addr = String::new();
         assert!(elevation_env(&ctx, &json!({"capability": "read"})).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotency: RequestCache (ask #1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn request_cache_replays_a_completed_outcome() {
+        let cache = RequestCache::new();
+        // First sighting reserves the id and must run the command.
+        assert!(matches!(cache.begin("r1"), BeginOutcome::Fresh));
+        let stored = cache.finish("r1", Ok(json!({"id": "abc"})));
+        assert_eq!(stored.unwrap()["id"], "abc");
+        // A retry of the SAME id replays the stored outcome - it does NOT re-run.
+        match cache.begin("r1") {
+            BeginOutcome::Duplicate(Ok(v)) => assert_eq!(v["id"], "abc"),
+            BeginOutcome::Duplicate(Err(e)) => panic!("expected Ok replay, got Err: {e}"),
+            BeginOutcome::Fresh => panic!("a completed id must not be reserved Fresh again"),
+            BeginOutcome::InFlight => panic!("a completed id must replay, not report InFlight"),
+        }
+    }
+
+    #[test]
+    fn request_cache_reports_in_flight_for_a_concurrent_duplicate() {
+        let cache = RequestCache::new();
+        // A first caller reserved the id and is still running (no finish yet).
+        assert!(matches!(cache.begin("r2"), BeginOutcome::Fresh));
+        // A retry that races the original must NOT run the command again.
+        assert!(matches!(cache.begin("r2"), BeginOutcome::InFlight));
+        // Once it completes, the same id replays the outcome.
+        let _ = cache.finish("r2", Ok(json!({"ok": true})));
+        assert!(matches!(cache.begin("r2"), BeginOutcome::Duplicate(_)));
+    }
+
+    #[test]
+    fn request_cache_cancel_frees_a_reservation_for_retry() {
+        let cache = RequestCache::new();
+        assert!(matches!(cache.begin("r3"), BeginOutcome::Fresh));
+        // A governor refusal cancels the reservation (no outcome recorded)...
+        cache.cancel("r3");
+        // ...so a later retry is Fresh again (it can succeed once budget frees),
+        // not stuck InFlight or replaying a refusal.
+        assert!(matches!(cache.begin("r3"), BeginOutcome::Fresh));
+    }
+
+    #[test]
+    fn request_cache_status_reports_unknown_inflight_and_completed() {
+        let cache = RequestCache::new();
+        assert!(matches!(cache.status("nope"), RequestStatus::Unknown));
+        cache.begin("r4");
+        assert!(matches!(cache.status("r4"), RequestStatus::InFlight));
+        let _ = cache.finish("r4", Err("boom".to_string()));
+        match cache.status("r4") {
+            RequestStatus::Completed(Err(e)) => assert_eq!(e, "boom"),
+            _ => panic!("expected Completed(Err)"),
+        }
+    }
+
+    #[test]
+    fn request_cache_evicts_oldest_completed_beyond_capacity() {
+        let cache = RequestCache::with_bounds(
+            2,
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(600),
+        );
+        for id in ["a", "b", "c"] {
+            cache.begin(id);
+            let _ = cache.finish(id, Ok(json!({"id": id})));
+        }
+        // "a" was evicted when "c" pushed past the capacity of 2.
+        assert!(matches!(cache.status("a"), RequestStatus::Unknown));
+        assert!(matches!(cache.status("b"), RequestStatus::Completed(_)));
+        assert!(matches!(cache.status("c"), RequestStatus::Completed(_)));
+    }
+
+    #[test]
+    fn request_cache_evicts_a_done_entry_past_its_ttl() {
+        // A completed outcome ages out of the cache after its TTL, keeping the cache
+        // self-cleaning. (The same retain reaps a stale InFlight reservation past
+        // REQUEST_INFLIGHT_REAP - the safety valve for a panicked/hung handler.)
+        let cache = RequestCache::with_bounds(
+            8,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(600),
+        );
+        cache.begin("done");
+        let _ = cache.finish("done", Ok(json!({})));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // status() runs eviction; the expired Done entry is gone -> Unknown, so a
+        // fresh retry would be safe.
+        assert!(matches!(cache.status("done"), RequestStatus::Unknown));
+    }
+
+    #[test]
+    fn request_cache_reaps_a_stale_in_flight_reservation() {
+        // The InFlight reap safety valve: a reservation that never finished (a
+        // panicked/hung handler) is presumed dead after `inflight_reap` so a retry
+        // is not blocked forever. Tiny reap window stands in for the 600s default.
+        let cache = RequestCache::with_bounds(
+            8,
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_millis(1),
+        );
+        cache.begin("stuck"); // reserved InFlight, never finished
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // A retry now sees Fresh (the dead reservation was reaped), not a permanent
+        // InFlight.
+        assert!(matches!(cache.begin("stuck"), BeginOutcome::Fresh));
+    }
+
+    #[test]
+    fn request_cache_finish_after_reap_does_not_leak_the_entry() {
+        // M2: a handler that outlives the reap window has its reservation evicted
+        // from BOTH maps; a late finish() must re-establish `order` membership so
+        // the recorded outcome is still TTL/capacity-evictable - never a permanent
+        // leak that breaches the cap and reports `completed` forever.
+        let cache = RequestCache::with_bounds(
+            1,
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_millis(1),
+        );
+        cache.begin("x");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // status() reaps the stale InFlight "x" from slots AND order.
+        assert!(matches!(cache.status("x"), RequestStatus::Unknown));
+        // The handler finally finishes, AFTER its reservation was reaped.
+        let _ = cache.finish("x", Ok(json!({"id": "x"})));
+        assert!(matches!(cache.status("x"), RequestStatus::Completed(_)), "outcome preserved");
+        // Crucially, "x" is back in `order`: capacity pressure now evicts it. With
+        // the leak unfixed, "x" would linger in `slots` forever (never in `order`).
+        cache.begin("y");
+        let _ = cache.finish("y", Ok(json!({"id": "y"})));
+        assert!(
+            matches!(cache.status("x"), RequestStatus::Unknown),
+            "finish must re-establish order membership so the entry stays evictable (M2)"
+        );
+    }
+
+    #[test]
+    fn spawn_terminal_retry_with_same_request_id_does_not_duplicate() {
+        // Repro of Incident A/B at the dispatch layer: a spawn that is RETRIED with
+        // the same requestId (the client's recovery from an ambiguous response leg)
+        // must apply exactly once - one tmux session, one tile, one UI forward - and
+        // the retry must replay the original outcome, never spawn a second session.
+        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let args = json!({"cwd": "/tmp", "requestId": "spawn-retry-1"});
+        let first = dispatch_authenticated(&ctx, ControlRequest {
+            token: "t".into(),
+            command: "spawn_terminal".into(),
+            args: args.clone(),
+            v: None,
+        });
+        assert!(first.ok, "first spawn failed: {:?}", first.error);
+        let id = first.result.as_ref().unwrap()["id"].as_str().unwrap().to_string();
+
+        // The retry: identical requestId. It must NOT spawn again.
+        let retry = dispatch_authenticated(&ctx, ControlRequest {
+            token: "t".into(),
+            command: "spawn_terminal".into(),
+            args,
+            v: None,
+        });
+        assert!(retry.ok, "retry failed: {:?}", retry.error);
+        let retry_result = retry.result.unwrap();
+        assert_eq!(retry_result["id"].as_str().unwrap(), id, "retry replays the same id");
+        assert_eq!(retry_result["idempotentReplay"], json!(true), "retry is tagged a replay");
+
+        // Exactly ONE real session materialized, and ONE UI forward was emitted.
+        let live: Vec<String> = tmux::list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s == &format!("th_{id}"))
+            .collect();
+        assert_eq!(live.len(), 1, "exactly one tmux session for the id");
+        assert_eq!(sink.calls.lock().unwrap().len(), 1, "the retry did NOT re-forward a spawn");
+
+        // Reap the real session.
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+    }
+
+    #[test]
+    fn get_request_status_command_resolves_a_completed_spawn() {
+        // The queryable half of ask #1: after a spawn with a requestId, a caller
+        // whose response leg failed can learn the outcome (and the real id) without
+        // guessing. An unknown id reports unknown (safe to retry).
+        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let ctx = test_ctx("t").with_apply_sink(sink);
+        let spawn = dispatch_authenticated(&ctx, ControlRequest {
+            token: "t".into(),
+            command: "spawn_terminal".into(),
+            args: json!({"cwd": "/tmp", "requestId": "spawn-status-1"}),
+            v: None,
+        });
+        assert!(spawn.ok);
+        let id = spawn.result.unwrap()["id"].as_str().unwrap().to_string();
+
+        let status = dispatch(&ctx, "get_request_status", &json!({"requestId": "spawn-status-1"})).unwrap();
+        assert_eq!(status["status"], "completed");
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["result"]["id"].as_str().unwrap(), id);
+
+        let unknown = dispatch(&ctx, "get_request_status", &json!({"requestId": "never-seen"})).unwrap();
+        assert_eq!(unknown["status"], "unknown");
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry-vs-reality: close_terminal outcome (ask #3, Incident C)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn close_terminal_reports_already_gone_for_a_phantom() {
+        // Incident C: closing a session that never existed must not look like a real
+        // kill. ok:true (idempotent) stays, but the outcome discriminates it.
+        let ctx = test_ctx("t");
+        let v = dispatch(&ctx, "close_terminal", &json!({"sessionId": "f0f3207b"})).unwrap();
+        assert_eq!(v["accepted"], "close_terminal");
+        assert_eq!(v["outcome"], "already_gone");
+    }
+
+    #[test]
+    fn close_terminal_reports_killed_for_a_live_session() {
+        // A real session reports outcome=killed, so a caller can tell a genuine kill
+        // from a phantom close.
+        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let ctx = test_ctx("t").with_apply_sink(sink);
+        let spawn = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap();
+        let id = spawn["id"].as_str().unwrap().to_string();
+        let closed = dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+        assert_eq!(closed["outcome"], "killed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Incident D: captains persistence no longer holds the registry lock
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn captains_persist_writes_through_off_the_lock() {
+        // The write-through still happens (durability preserved), now via the
+        // off-lock `persist` path.
+        let dir = std::env::temp_dir().join(format!("t-hub-captains-persist-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("captains.json");
+        let _ = std::fs::remove_file(&path);
+        let reg = CaptainsRegistry::load(path.clone());
+        reg.claim("cap-1", Some("alpha"), vec![]).unwrap();
+        let body = std::fs::read_to_string(&path).expect("captains.json written through");
+        assert!(body.contains("alpha"), "persisted body must carry the claim: {body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn captains_persist_is_monotonic_and_drops_a_stale_snapshot() {
+        // Two writers that dropped `inner` in one order but reach disk in the other
+        // must not regress the file: an older-seq snapshot is dropped.
+        let dir = std::env::temp_dir().join(format!("t-hub-captains-mono-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("captains.json");
+        let _ = std::fs::remove_file(&path);
+        let reg = CaptainsRegistry::load(path.clone());
+        reg.claim("cap-1", Some("alpha"), vec![]).unwrap(); // seq -> 1 on disk
+        let newer = reg.snapshot(); // seq 1
+        // Hand-persist a STALE snapshot (seq 0): it must be dropped, not clobber.
+        reg.persist(CaptainsSnapshot { seq: 0, captains: vec![] });
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("alpha"), "stale seq-0 snapshot must not clobber the claim: {body}");
+        // A NEWER snapshot (seq 1, already on disk) is allowed to (re)write.
+        reg.persist(newer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stalled_persist_does_not_block_a_concurrent_registry_reader_or_mutator() {
+        // The core Incident-D proof: with persistence moved OFF the `inner` lock, a
+        // STALLED disk write (here a hook that blocks while holding only the
+        // `persist` mutex) must NOT block a concurrent reader or mutator that only
+        // touches `inner`. Under the OLD code (persist under the registry lock) the
+        // reader below would hang for the duration of the stall - so this test would
+        // TIME OUT and fail, which is exactly the regression guard we want.
+        use std::sync::mpsc;
+        let dir = std::env::temp_dir().join(format!("t-hub-captains-stall-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("captains.json");
+        let _ = std::fs::remove_file(&path);
+        let reg = Arc::new(CaptainsRegistry::load(path));
+
+        // The hook stands in for a stalled OneDrive-backed write: it signals that a
+        // persist is in progress, then blocks (holding `persist`, NOT `inner`) until
+        // the test releases it.
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = StdMutex::new(release_rx);
+        reg.set_persist_hook(Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.lock().unwrap().recv(); // block: the write is stalled
+        }));
+
+        // A background mutator triggers a persist and stalls inside it. Its `inner`
+        // mutation (the claim) has ALREADY committed + released `inner` by the time
+        // persist runs, so `inner` is free while this stalls.
+        let writer_reg = reg.clone();
+        let writer = std::thread::spawn(move || {
+            writer_reg.claim("cap-1", Some("alpha"), vec![]).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the persist hook should have started (mutation reached persist)");
+
+        // NOW, while the persist is stalled: a concurrent reader must return promptly
+        // (it only takes `inner`). Run it on a thread so a REGRESSION (reader blocked
+        // on `inner`) surfaces as a timeout instead of hanging the suite forever.
+        let reader_reg = reg.clone();
+        let (read_tx, read_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let snap = reader_reg.snapshot();
+            let _ = read_tx.send(snap.captains.len());
+        });
+        let n = read_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a reader was BLOCKED by a stalled persist (regression: persist holds `inner`)");
+        assert_eq!(n, 1, "the reader sees the already-committed claim");
+
+        // Release the stalled write; the mutator finishes cleanly.
+        let _ = release_tx.send(());
+        writer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
