@@ -41,10 +41,11 @@
 //! handler for them; until then they return a clear "not available" error.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -1503,6 +1504,10 @@ pub struct ControlContext {
     /// leg. Shared `Arc` so every connection handler thread dedups against one
     /// cache. Per-launch, in-memory (a fresh launch's ids never collide).
     requests: Arc<RequestCache>,
+    /// Coordinates control-listener rebinds for the relay-wedge self-heal (cause 2).
+    /// Shared `Arc` so the `rebind_control` handler (on any connection thread) drives
+    /// the same rate-limit + retires the same live listener. See [`RebindController`].
+    rebind: Arc<RebindController>,
 }
 
 impl ControlContext {
@@ -1658,20 +1663,102 @@ fn select_published_token<'a>(control_token: &'a str, read_token: &'a str, harde
 
 /// Write the handshake file (best-effort `0600` on unix) so the MCP binary can
 /// discover the live listener.
+///
+/// ATOMIC (temp + rename): the relay-wedge self-heal rewrites this file while live
+/// clients are re-reading it (post-#38 they re-read on every transport failure), so
+/// a reader must never observe a torn/half-written file. We write a sibling temp
+/// file, `0600` it, then `rename` it over the target - `rename` within a directory
+/// is atomic on both unix and Windows, so a concurrent reader sees either the whole
+/// old file or the whole new one, never a mix.
 fn write_handshake(handshake: &ControlHandshake) -> std::io::Result<()> {
     let path = handshake_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_vec_pretty(handshake)?;
-    std::fs::write(&path, &body)?;
-    // Tighten permissions on unix so another local user can't read the token.
+    // Temp sibling in the SAME directory (so `rename` stays on one filesystem and is
+    // truly atomic). Suffix with the pid so two processes never collide on the temp.
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, &body)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    // Atomic publish. On failure clean up the temp so we never leak it.
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     Ok(())
+}
+
+/// Minimum spacing between control-listener rebinds (relay-wedge self-heal). A
+/// misbehaving or flapping client must not be able to churn the listener port; a
+/// rebind requested sooner is refused with the remaining cooldown. Generous: a real
+/// relay wedge lasts many minutes and self-heal needs to fire at most once per
+/// episode, so 45s comfortably rate-limits abuse without blocking a legitimate heal.
+const REBIND_MIN_INTERVAL: Duration = Duration::from_secs(45);
+
+/// Coordinates control-listener rebinds for the relay-wedge self-heal (cause 2 of
+/// the control-socket wedge; see PR #49 for the two-cause analysis).
+///
+/// The WSL2 mirrored-loopback relay can wedge the flow for the app's specific port
+/// for minutes while the app is perfectly healthy - every WSL-side request times out
+/// but Windows-side requests to the same port are instant. A wedged WSL client
+/// triggers [`rebind_control`] over the Windows-side powershell bridge (the one path
+/// that works mid-wedge); the app then binds a FRESH port, atomically rewrites
+/// `control.json`, and stops the old listener. Post-#38 clients re-read `control.json`
+/// on transport failure and resume on the new port with NO app restart - which is
+/// exactly what a manual restart achieved (a fresh port ⇒ fresh relay flow state),
+/// minus the restart.
+struct RebindController {
+    inner: Mutex<RebindInner>,
+    /// Rate-limit window between successful rebinds.
+    min_interval: Duration,
+}
+
+#[derive(Default)]
+struct RebindInner {
+    /// When the last rebind completed - the rate-limit anchor. `None` until the first
+    /// rebind, so the very first heal after launch is never rate-limited.
+    last_rebind: Option<Instant>,
+    /// Stop flag for the CURRENTLY-serving loopback listener. Setting it (and waking
+    /// the blocked `accept` with a self-connect) retires the old listener when a
+    /// rebind supersedes it. `None` in headless contexts that never called [`start`].
+    current_stop: Option<Arc<AtomicBool>>,
+}
+
+impl RebindController {
+    fn new(min_interval: Duration) -> Self {
+        Self {
+            inner: Mutex::new(RebindInner::default()),
+            min_interval,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RebindInner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Record the initial listener's stop flag (called once from [`start`]). Does NOT
+    /// set `last_rebind`, so an immediate wedge right after launch can still heal.
+    fn set_initial_stop(&self, stop: Arc<AtomicBool>) {
+        self.lock().current_stop = Some(stop);
+    }
+}
+
+/// Best-effort wake of a listener blocked in `accept`: a throwaway local connection
+/// makes `accept` return so the serve loop observes its stop flag and exits promptly.
+/// App-local loopback is NOT affected by the WSL relay wedge (only WSL->Windows is),
+/// so this reaches the old listener even mid-wedge. Bounded so a refused/gone port
+/// never parks the caller.
+fn wake_accept(addr: &str) {
+    if let Ok(sock) = addr.parse::<SocketAddr>() {
+        if let Ok(stream) = TcpStream::connect_timeout(&sock, Duration::from_secs(1)) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 /// Start the control listener on a background thread.
@@ -1728,18 +1815,26 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
                      access (token-gated; loopback + Tailscale peers only)"
                 );
                 let ctx_remote = ctx.clone();
+                // The remote listener is not part of the loopback relay-wedge path
+                // and is never rebound, so it gets a stop flag that is never set.
+                let remote_stop = Arc::new(AtomicBool::new(false));
                 std::thread::Builder::new()
                     .name("t-hub-control-remote".into())
-                    .spawn(move || serve(remote_listener, ctx_remote))
+                    .spawn(move || serve(remote_listener, ctx_remote, remote_stop))
                     .ok();
             }
             Err(e) => eprintln!("t-hub: remote control bind '{bind}' failed: {e}"),
         }
     }
 
+    // Register the primary loopback listener's stop flag so a later `rebind_control`
+    // can retire it (relay-wedge self-heal). Not counted as a rebind, so the first
+    // heal after launch is never rate-limited.
+    let stop = Arc::new(AtomicBool::new(false));
+    ctx.rebind.set_initial_stop(stop.clone());
     std::thread::Builder::new()
         .name("t-hub-control".into())
-        .spawn(move || serve(listener, ctx))
+        .spawn(move || serve(listener, ctx, stop))
         .ok();
 
     Ok(handshake)
@@ -1964,8 +2059,17 @@ impl Drop for ConnGuard {
     }
 }
 
-fn serve(listener: TcpListener, ctx: ControlContext) {
+fn serve(listener: TcpListener, ctx: ControlContext, stop: Arc<AtomicBool>) {
     for stream in listener.incoming() {
+        // Relay-wedge self-heal: a rebind that superseded this listener sets `stop`
+        // and wakes this blocked `accept` with a throwaway self-connect (see
+        // `wake_accept`). Observe it BEFORE handling the woken stream so the old port
+        // stops accepting and the listener is dropped (freeing the port). A live
+        // client that raced onto the old port here is dropped and re-reads
+        // `control.json` (post-#38) onto the fresh port on its next attempt.
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         match stream {
             Ok(stream) => {
                 // Connection cap: reject (close) once at the ceiling rather than
@@ -2521,7 +2625,7 @@ fn required_tier(command: &str) -> CommandTier {
         "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
         | "archive_recent_project" | "claim_captain" | "release_captain" | "watch_fleet"
-        | "unwatch_fleet" => CommandTier::Organization,
+        | "unwatch_fleet" | "rebind_control" => CommandTier::Organization,
         _ => CommandTier::Read,
     }
 }
@@ -2964,6 +3068,110 @@ fn replay_response(outcome: Result<Value, String>) -> ControlResponse {
 ///
 /// `theme` commands are forwarded by name; until the parallel theme track lands
 /// their handlers they return a clear "not yet available" error.
+/// `rebind_control` handler (relay-wedge self-heal, cause 2 of the control-socket
+/// wedge; see PR #49 for the two-cause analysis). Binds a FRESH loopback port,
+/// atomically rewrites `control.json`, spawns a serve loop on the new port, then
+/// retires the old listener. Rate-limited to one rebind per [`REBIND_MIN_INTERVAL`].
+///
+/// TOKENS KEPT (not rotated): a rebind is a transport recovery, not a security
+/// event. Rotating would force every in-flight client - and the app's OWN webview,
+/// which authenticates to this socket with the published token - to re-read before
+/// its next call, WIDENING the outage the heal exists to close. The addr is the only
+/// thing that must change to escape the wedged relay flow.
+///
+/// EXISTING CONNECTIONS survive: retiring the old listener only stops it ACCEPTING;
+/// already-accepted handler threads (including this one, still writing its response)
+/// own independent sockets and run to completion. The app's own event subscribers
+/// reconnect through the post-#49 forwarder (exponential backoff) and re-subscribe on
+/// the fresh port after they re-read `control.json`.
+///
+/// The `rebind` lock is intentionally held across the bind + spawn + file write: it
+/// serializes concurrent rebinds (two racing heals must not both bind a port) and is
+/// contended ONLY by other `rebind_control` calls, never by the hot request path, so
+/// it cannot re-introduce the #49 serve-path stall.
+fn rebind_control(ctx: &ControlContext) -> Result<Value, String> {
+    let mut inner = ctx.rebind.lock();
+
+    // Rate limit: refuse a too-soon rebind with the remaining cooldown so a flapping
+    // client cannot churn the port.
+    if let Some(last) = inner.last_rebind {
+        let elapsed = last.elapsed();
+        if elapsed < ctx.rebind.min_interval {
+            let remaining = (ctx.rebind.min_interval - elapsed).as_secs() + 1;
+            return Err(format!(
+                "rebind_control refused: rate-limited, retry in ~{remaining}s (min interval \
+                 {}s between rebinds)",
+                ctx.rebind.min_interval.as_secs()
+            ));
+        }
+    }
+
+    // Bind a fresh port FIRST - on failure nothing has changed.
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("rebind_control: failed to bind a fresh port: {e}"))?;
+    let new_addr = listener
+        .local_addr()
+        .map_err(|e| format!("rebind_control: bound but could not read fresh addr: {e}"))?
+        .to_string();
+    let old_addr = ctx.addr.clone();
+
+    // New serve loop context: the SAME shared state (fanout, registries, governor,
+    // ...), only `addr` changes so spawns injected AFTER the rebind carry it.
+    let mut new_ctx = ctx.clone();
+    new_ctx.addr = new_addr.clone();
+    let new_stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = new_stop.clone();
+
+    // Spawn the new serve loop BEFORE publishing the addr, so `control.json` never
+    // names a port nobody is accepting on.
+    std::thread::Builder::new()
+        .name("t-hub-control".into())
+        .spawn(move || serve(listener, new_ctx, serve_stop))
+        .map_err(|e| format!("rebind_control: failed to spawn serve loop: {e}"))?;
+
+    // Publish the fresh addr atomically (temp+rename), KEEPING tokens.
+    let harden = phase3_harden_enabled();
+    let handshake = ControlHandshake {
+        addr: new_addr.clone(),
+        token: select_published_token(&ctx.token, &ctx.read_token, harden).to_string(),
+        read_token: ctx.read_token.clone(),
+        pid: std::process::id(),
+        protocol_version: PROTOCOL_VERSION,
+        local_control_token: ctx.token.clone(),
+    };
+    if let Err(e) = write_handshake(&handshake) {
+        // Roll back to a fully-consistent old state: retire the just-spawned listener
+        // (so we never leak it) and leave the old listener + old control.json intact.
+        new_stop.store(true, Ordering::Release);
+        wake_accept(&new_addr);
+        return Err(format!(
+            "rebind_control: bound fresh port {new_addr} but failed to publish control.json \
+             (old listener kept live): {e}"
+        ));
+    }
+
+    // Retire the old listener: flag it, then wake its blocked `accept` so it exits and
+    // frees the old port promptly.
+    if let Some(old_stop) = inner.current_stop.replace(new_stop) {
+        old_stop.store(true, Ordering::Release);
+        wake_accept(&old_addr);
+    }
+    inner.last_rebind = Some(Instant::now());
+
+    eprintln!(
+        "t-hub-control: rebind_control moved the listener {old_addr} -> {new_addr} \
+         (relay-wedge self-heal)"
+    );
+    Ok(json!({
+        "rebound": true,
+        "addr": new_addr,
+        "previousAddr": old_addr,
+        "tokensRotated": false,
+        "note": "control.json rewritten with the fresh addr (tokens kept); re-read it and \
+                 resume on the new port",
+    }))
+}
+
 fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, String> {
     match command {
         // ---- Read tier (PRD §11.2: allowed) --------------------------------
@@ -3040,6 +3248,13 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // same backend send_text path the ProcessChanging tier gates.
         "watch_fleet" => watch_fleet(ctx, args),
         "unwatch_fleet" => unwatch_fleet(ctx, args),
+        // Relay-wedge self-heal (cause 2): move the listener to a fresh port +
+        // rewrite control.json so a WSL client stuck behind the mirrored-loopback
+        // relay wedge recovers without an app restart. WRITE-token gated
+        // (Organization tier - a read-only token cannot churn the port) and
+        // rate-limited. Triggered by a wedged WSL client over the Windows-side
+        // powershell bridge, the one path that reaches the app mid-wedge.
+        "rebind_control" => rebind_control(ctx),
 
         // ---- Process-changing tier (PRD §11.2: confirmation required) ------
         // `spawn_terminal` is confirmation-gated (its MCP description carries the
@@ -4858,6 +5073,7 @@ impl ControlContext {
             governor: Arc::new(SpawnGovernor::from_env()),
             audit: Arc::new(AuditLog::from_env()),
             requests: Arc::new(RequestCache::new()),
+            rebind: Arc::new(RebindController::new(REBIND_MIN_INTERVAL)),
         }
     }
 
@@ -6758,9 +6974,129 @@ mod tests {
     fn spawn_attach_listener(ctx: ControlContext) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || serve(listener, ctx));
+        let stop = Arc::new(AtomicBool::new(false));
+        std::thread::spawn(move || serve(listener, ctx, stop));
         addr
     }
+
+    /// Round-trip a no-I/O `get_theme` against `addr`; returns true iff the listener
+    /// accepted, handled, and wrote back a response line. Short timeouts so a
+    /// refused/retired port returns false fast instead of hanging the test. Any
+    /// response (even the theme "not wired" error) proves the serve path is live.
+    fn listener_serves(addr: &str) -> bool {
+        use std::io::{BufRead, BufReader, Write};
+        let sock: std::net::SocketAddr = match addr.parse() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let stream = match TcpStream::connect_timeout(&sock, Duration::from_millis(300)) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .ok();
+        let mut writer = match stream.try_clone() {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+        let req = json!({"token": "secret", "command": "get_theme", "args": {}, "v": 1}).to_string();
+        if writeln!(writer, "{req}").is_err() {
+            return false;
+        }
+        let mut line = String::new();
+        matches!(BufReader::new(stream).read_line(&mut line), Ok(n) if n > 0)
+    }
+
+    /// Poll `cond` until it holds or `budget` elapses (short sleeps).
+    fn wait_until(budget: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        cond()
+    }
+
+    /// RELAY-WEDGE SELF-HEAL (cause 2): `rebind_control` binds a fresh port, atomically
+    /// rewrites control.json (tokens KEPT), serves on the new port, retires the old
+    /// listener, and rate-limits back-to-back rebinds. (The WSL relay wedge itself is
+    /// unreproducible in-process - this proves the app-side rebind mechanics the client
+    /// bridge triggers; see the PR for the honest E2E limits.)
+    #[test]
+    fn rebind_control_moves_listener_rewrites_json_and_rate_limits() {
+        // Unique temp control.json for this test; handshake_path() honors this env.
+        let cj = std::env::temp_dir().join(format!(
+            "t-hub-rebind-{}-{}.json",
+            std::process::id(),
+            REBIND_TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::env::set_var("T_HUB_CONTROL_FILE", &cj);
+        let _ = std::fs::remove_file(&cj);
+
+        // Stand up an initial loopback listener + serve loop, like `start`: bind, set
+        // addr on the ctx, register the stop flag in the rebind controller.
+        let mut ctx = test_ctx("secret");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind initial");
+        let old_addr = listener.local_addr().unwrap().to_string();
+        ctx.addr = old_addr.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        ctx.rebind.set_initial_stop(stop.clone());
+        {
+            let serve_ctx = ctx.clone();
+            let serve_stop = stop.clone();
+            std::thread::spawn(move || serve(listener, serve_ctx, serve_stop));
+        }
+        assert!(
+            wait_until(Duration::from_secs(2), || listener_serves(&old_addr)),
+            "the initial listener should serve before a rebind"
+        );
+
+        // WRITE-token gated: rebind_control is Organization tier (control token only).
+        assert_eq!(required_tier("rebind_control"), CommandTier::Organization);
+
+        // Rebind.
+        let resp = rebind_control(&ctx).expect("rebind ok");
+        assert_eq!(resp["rebound"], true);
+        assert_eq!(resp["tokensRotated"], false);
+        let new_addr = resp["addr"].as_str().unwrap().to_string();
+        assert_ne!(new_addr, old_addr, "rebind must move to a fresh port");
+
+        // control.json now names the fresh addr (atomic rewrite), tokens KEPT.
+        let written: Value =
+            serde_json::from_slice(&std::fs::read(&cj).expect("read control.json")).unwrap();
+        assert_eq!(written["addr"], json!(new_addr));
+        assert_eq!(written["token"], json!("secret"), "tokens must be kept, not rotated");
+
+        // The NEW listener serves; the OLD one is retired (stops accepting).
+        assert!(
+            wait_until(Duration::from_secs(2), || listener_serves(&new_addr)),
+            "the fresh listener should serve after a rebind"
+        );
+        assert!(
+            wait_until(Duration::from_secs(3), || !listener_serves(&old_addr)),
+            "the old listener should stop accepting after a rebind"
+        );
+
+        // A second immediate rebind is rate-limited with a clear cooldown message.
+        let err = rebind_control(&ctx).unwrap_err();
+        assert!(
+            err.contains("rate-limited"),
+            "a back-to-back rebind must be refused: {err}"
+        );
+
+        // Cleanup: retire the fresh listener + env so we leak neither a thread nor state.
+        if let Some(s) = ctx.rebind.lock().current_stop.take() {
+            s.store(true, Ordering::Release);
+        }
+        wake_accept(&new_addr);
+        std::env::remove_var("T_HUB_CONTROL_FILE");
+        let _ = std::fs::remove_file(&cj);
+    }
+
+    static REBIND_TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// A disposable real tmux session for attach tests; returns (id, tmux name).
     fn churn_tmux_session(tag: &str) -> (String, String) {
