@@ -44,6 +44,19 @@ An intermediate "WSL relay per-port flow wedge" theory (2026-07-09) is FALSE - d
 
 ## FUTURE ITINERARY
 
+### THE ORCHESTRATION PROGRAM (general-approved roadmap, 2026-07-10; DESIGN-PROPOSALS-FIRST - no implementation until he ratifies each design)
+
+Source: `~/.t-hub/captain/reviews/orchestration-adversarial-review-2026-07-10.md` + addendum (both passes; approved as roadmap).
+Captain's distillation: `~/.t-hub/captain/reviews/CAPTAIN-CRIB-SHEET-2026-07-10.md`.
+Sequenced AFTER PR 53/54 ship (joint build+install). Proposals go up ONE AT A TIME via Cortana for the general's ratification; each covers problem / design / blast-radius+migration / effort / specific general-decisions.
+Priority order:
+1. **UNIFIED COMMS PLANE** (keystone, FIRST - ahead of the orchestrator-representation build): one authenticated, attributed, receipted, ordered per-recipient channel; retires raw send-keys to break-glass; hosts the typing-guard as its drain predicate (turn-boundary EXISTS at fleet.rs is_ready_for_wake; not-being-typed-into MUST BE BUILT input-side); one-way-input policy as queue ACLs with an EMERGENCY fast-lane; receipt-on-DRAIN; applied at EVERY hop; inbox + typing-guard are ONE queue with two predicates, never two.
+2. **IDENTITY RE-KEY** to ship/role; terminal id demoted to mutable pointer; crew ownership follows the ship; auto-rebind on migration; Claude session UUID as continuity anchor.
+3. **SECURITY DEFAULTS**: read/control token split default-on (fix the webview scrape via the in-process local_control_token seam); full token off shared-readable disk; mechanical gates on push-main/spend/outward via the existing tier machinery.
+4. **RULEBOOK ENFORCEMENT**: capability matrix with LAW/GATE/NORM per cell; single-writer memory rules (registry = sole roster truth, ship files = rendered views, durable pending-decisions store); instruction-layer precedence + provenance + versioning.
+Parallel: the reap-ship design proposal (3a below) drafts alongside; orchestrator-representation (3b) builds once ITS design is ratified.
+Mandated build order within item 1 when it builds: close the raw-tmux backdoor FIRST, then inbox, then ACLs, then typing-guard LAST.
+
 ### NEAR (deferred or almost reached this session - pick up first)
 
 1. **Post-0.3.59 wedge-saga carry-items.**
