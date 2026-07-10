@@ -1,9 +1,10 @@
 // Settings > Voice section tests: the engine selector (switching engines
 // re-queries that engine's /voices and self-heals a foreign voice), the
-// /voices degradation contract (server down = unavailable hint + every control
-// disabled EXCEPT the master enable toggle AND the engine selector, so the user
-// can switch engines while one is offline), the healthy path (voice list
-// populates, Test synthesizes with the selected voice + engine), and recovery.
+// /voices degradation contract (server down = every control disabled EXCEPT the
+// master enable toggle AND the engine selector, so the user can switch engines
+// while one is offline), the dual-engine HEALTH display + selected-engine-down
+// error state (never a silent default), the healthy path (voice list populates,
+// Test synthesizes with the selected voice + engine), and recovery.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
@@ -12,6 +13,7 @@ vi.mock("../ipc/voice", () => ({
   writeVoiceSettings: vi.fn(() => Promise.resolve()),
   listVoices: vi.fn(),
   synthesizeVoice: vi.fn(() => Promise.resolve("d2F2")),
+  voiceHealth: vi.fn(),
 }));
 vi.mock("../lib/voiceAudio", () => ({
   playWavBase64: vi.fn(),
@@ -21,6 +23,8 @@ import {
   readVoiceSettings,
   listVoices,
   synthesizeVoice,
+  voiceHealth,
+  type EngineHealth,
   type VoiceEngine,
   type VoiceSettings as VoiceSettingsShape,
 } from "../ipc/voice";
@@ -44,6 +48,17 @@ const FILE_SETTINGS: VoiceSettingsShape = {
 const PIPER_VOICES = ["en_US-ryan-high.onnx", "en_US-lessac-medium.onnx"];
 const KOKORO_VOICES = ["af_heart", "am_adam"];
 
+/** Build an EngineHealth reply for the voiceHealth mock. */
+function health(engine: VoiceEngine, reachable: boolean): EngineHealth {
+  return { engine, reachable, detail: reachable ? null : "connection refused" };
+}
+/** A voiceHealth mock where each engine reports the given reachability. */
+function mockHealth(byEngine: Record<VoiceEngine, boolean>) {
+  vi.mocked(voiceHealth).mockImplementation((engine: VoiceEngine) =>
+    Promise.resolve(health(engine, byEngine[engine])),
+  );
+}
+
 /** Dropdowns in DOM order: [0] = Engine, [1] = Voice. */
 function engineSelect(): HTMLSelectElement {
   return screen.getAllByRole("combobox")[0] as HTMLSelectElement;
@@ -55,28 +70,36 @@ function voiceSelect(): HTMLSelectElement {
 beforeEach(() => {
   vi.mocked(readVoiceSettings).mockReset();
   vi.mocked(listVoices).mockReset();
+  vi.mocked(voiceHealth).mockReset();
   vi.mocked(synthesizeVoice).mockClear();
   vi.mocked(playWavBase64).mockClear();
   _resetVoicePersistForTest();
   vi.mocked(readVoiceSettings).mockResolvedValue(FILE_SETTINGS);
+  // Default: both engines reachable (the health probe fires on mount). Cases
+  // that test a down engine override this.
+  mockHealth({ piper: true, kokoro: true });
   useVoice.setState({
     ...DEFAULT_VOICE_SETTINGS,
     loaded: false,
     voices: null,
     voicesUnavailable: false,
+    health: { piper: "unknown", kokoro: "unknown" },
   });
 });
 
 describe("VoiceSection degradation (selected engine down)", () => {
   beforeEach(() => {
+    // Selected engine (Piper, per FILE_SETTINGS) is down on both probes.
     vi.mocked(listVoices).mockRejectedValue(new Error("connection refused"));
+    mockHealth({ piper: false, kokoro: false });
   });
 
-  it("shows the unavailable hint and disables everything except Enable + Engine", async () => {
+  it("raises the selected-engine-down error and disables everything except Enable + Engine", async () => {
     render(<VoiceSection />);
-    expect(
-      await screen.findByText(/server unavailable/),
-    ).toBeTruthy();
+    // The prominent, assertive error - announcements will NOT be spoken.
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/unreachable/i);
+    expect(alert.textContent).toMatch(/will NOT be spoken/i);
     expect(voiceSelect()).toHaveProperty("disabled", true);
     expect(screen.getByLabelText("Volume")).toHaveProperty("disabled", true);
     expect(
@@ -96,7 +119,7 @@ describe("VoiceSection degradation (selected engine down)", () => {
 
   it("still shows the persisted voice in the (disabled) select", async () => {
     render(<VoiceSection />);
-    await screen.findByText(/server unavailable/);
+    await screen.findByRole("alert");
     expect(
       screen.getByRole("option", { name: "en_US-ryan-high.onnx" }),
     ).toBeTruthy();
@@ -187,5 +210,58 @@ describe("VoiceSection engine switching", () => {
     await waitFor(() =>
       expect(useVoice.getState().voice).toBe("af_heart"),
     );
+  });
+});
+
+describe("VoiceSection engine health (never a silent default)", () => {
+  it("shows BOTH engines' reachability, and no error when the SELECTED engine is up", async () => {
+    // Selected = Piper (up); the OTHER engine (Kokoro) is down.
+    vi.mocked(listVoices).mockResolvedValue(PIPER_VOICES);
+    mockHealth({ piper: true, kokoro: false });
+    render(<VoiceSection />);
+
+    const status = await screen.findByLabelText("TTS engine health");
+    await waitFor(() => {
+      expect(status.textContent).toMatch(/Piper.*reachable/);
+      expect(status.textContent).toMatch(/Kokoro.*unreachable/);
+    });
+    // The selected engine is fine, so no assertive error is raised even though
+    // the other engine is down.
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("suggests switching to the other engine when the selected one is down but the other is up", async () => {
+    // Selected = Kokoro (down); Piper is up - the alert should offer the switch.
+    vi.mocked(readVoiceSettings).mockResolvedValue({
+      ...FILE_SETTINGS,
+      engine: "kokoro",
+      voice: "af_heart",
+    });
+    vi.mocked(listVoices).mockRejectedValue(new Error("connection refused"));
+    mockHealth({ piper: true, kokoro: false });
+    render(<VoiceSection />);
+
+    const alert = await screen.findByRole("alert");
+    await waitFor(() => expect(alert.textContent).toMatch(/switch to piper/i));
+    expect(alert.textContent).toMatch(/kokoro.*unreachable/i);
+  });
+
+  it("does not render the health block while voice is disabled", async () => {
+    vi.mocked(readVoiceSettings).mockResolvedValue({
+      ...FILE_SETTINGS,
+      enabled: false,
+    });
+    vi.mocked(listVoices).mockResolvedValue(PIPER_VOICES);
+    mockHealth({ piper: false, kokoro: false });
+    render(<VoiceSection />);
+    // Master off = the whole health/error region is suppressed (dependent UI).
+    await waitFor(() =>
+      expect(screen.getByLabelText("Enable voice")).toHaveProperty(
+        "disabled",
+        false,
+      ),
+    );
+    expect(screen.queryByLabelText("TTS engine health")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

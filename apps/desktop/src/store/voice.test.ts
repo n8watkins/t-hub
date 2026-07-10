@@ -10,12 +10,16 @@ vi.mock("../ipc/voice", () => ({
   writeVoiceSettings: vi.fn(() => Promise.resolve()),
   listVoices: vi.fn(),
   synthesizeVoice: vi.fn(),
+  voiceHealth: vi.fn(),
 }));
 
 import {
   readVoiceSettings,
   writeVoiceSettings,
   listVoices,
+  voiceHealth,
+  type EngineHealth,
+  type VoiceEngine,
   type VoiceSettings,
 } from "../ipc/voice";
 import {
@@ -46,12 +50,14 @@ beforeEach(() => {
   vi.mocked(readVoiceSettings).mockReset();
   vi.mocked(writeVoiceSettings).mockClear();
   vi.mocked(listVoices).mockReset();
+  vi.mocked(voiceHealth).mockReset();
   _resetVoicePersistForTest();
   useVoice.setState({
     ...DEFAULT_VOICE_SETTINGS,
     loaded: false,
     voices: null,
     voicesUnavailable: false,
+    health: { piper: "unknown", kokoro: "unknown" },
   });
 });
 
@@ -233,5 +239,35 @@ describe("engine switching", () => {
     expect(listVoices).not.toHaveBeenCalled();
     await flushPersist();
     expect(writeVoiceSettings).not.toHaveBeenCalled();
+  });
+});
+
+describe("engine health probe (dual-engine reachability)", () => {
+  const reply = (engine: VoiceEngine, reachable: boolean): EngineHealth => ({
+    engine,
+    reachable,
+    detail: reachable ? null : "connection refused",
+  });
+
+  it("probeHealth() records up/down per engine from the probe", async () => {
+    vi.mocked(voiceHealth).mockImplementation((engine: VoiceEngine) =>
+      Promise.resolve(reply(engine, engine === "piper")),
+    );
+    await useVoice.getState().probeHealth();
+    // Both engines are probed (not just the selected one) so a silent death of
+    // either is visible.
+    expect(voiceHealth).toHaveBeenCalledWith("piper");
+    expect(voiceHealth).toHaveBeenCalledWith("kokoro");
+    expect(useVoice.getState().health).toEqual({ piper: "up", kokoro: "down" });
+  });
+
+  it("probeHealth() treats a rejected probe as down (definite beats a stuck spinner)", async () => {
+    vi.mocked(voiceHealth).mockImplementation((engine: VoiceEngine) =>
+      engine === "kokoro"
+        ? Promise.reject(new Error("task failed"))
+        : Promise.resolve(reply(engine, true)),
+    );
+    await useVoice.getState().probeHealth();
+    expect(useVoice.getState().health).toEqual({ piper: "up", kokoro: "down" });
   });
 });

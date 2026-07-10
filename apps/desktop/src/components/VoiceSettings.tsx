@@ -13,8 +13,16 @@
 // server down) the section shows an "unavailable" hint and disables every
 // control EXCEPT the master enable toggle and the engine selector, so the user
 // can still switch to the other engine (or flip intent) while one is offline.
+//
+// Health visibility (never silent): a kokoro death once fell back to piper/SAPI
+// with zero surfacing - the general noticed only by ear. So the section probes
+// BOTH engines' /health (bounded, on open + a slow periodic tick) and shows a
+// live reachability line for each; when the SELECTED engine is unreachable it
+// raises a prominent error (announcements will not be spoken) with a switch/
+// start prompt. The "we just tried and couldn't" event surfaces separately as a
+// chime+toast from the announce path (lib/voiceAnnounce.ts).
 import { useEffect, useState } from "react";
-import { useVoice } from "../store/voice";
+import { useVoice, type EngineHealthStatus } from "../store/voice";
 import { synthesizeVoice, type VoiceEngine } from "../ipc/voice";
 import { playWavBase64 } from "../lib/voiceAudio";
 import {
@@ -36,6 +44,26 @@ const ENGINES: { id: VoiceEngine; label: string; port: number }[] = [
   { id: "kokoro", label: "Kokoro", port: 7478 },
 ];
 
+/** Re-probe both engines' health this often while the panel is open. Slow on
+ *  purpose - this is an ambient "is it still up?" check, not a hot loop, and
+ *  each probe is already bounded backend-side (2s/engine). */
+export const HEALTH_PROBE_INTERVAL_MS = 15000;
+
+/** Human label + dot color for an engine's reachability state. */
+function healthPresentation(status: EngineHealthStatus): {
+  label: string;
+  color: string;
+} {
+  switch (status) {
+    case "up":
+      return { label: "reachable", color: "var(--th-dot-live, #4ade80)" };
+    case "down":
+      return { label: "unreachable", color: "var(--th-dot-error, #f87171)" };
+    default:
+      return { label: "checking…", color: "var(--th-dot-detached, #9ca3af)" };
+  }
+}
+
 export function VoiceSection() {
   const enabled = useVoice((s) => s.enabled);
   const engine = useVoice((s) => s.engine);
@@ -44,6 +72,7 @@ export function VoiceSection() {
   const announceOnAttention = useVoice((s) => s.announceOnAttention);
   const voices = useVoice((s) => s.voices);
   const voicesUnavailable = useVoice((s) => s.voicesUnavailable);
+  const health = useVoice((s) => s.health);
 
   // One test synthesis in flight at a time; surface a failure inline (the
   // server can vanish between the voices fetch and the click).
@@ -62,6 +91,16 @@ export function VoiceSection() {
   useEffect(() => {
     void useVoice.getState().refreshVoices();
   }, [engine]);
+  // Probe BOTH engines' health on open, then on a slow interval while the panel
+  // stays mounted - so a silent engine death is SEEN here, not heard later. The
+  // probe fans out one bounded backend call per engine; the interval is cleared
+  // on unmount so nothing polls once Settings closes.
+  useEffect(() => {
+    const probe = () => void useVoice.getState().probeHealth();
+    probe();
+    const id = setInterval(probe, HEALTH_PROBE_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, []);
   // Self-heal a voice that isn't in the selected engine's list (switching
   // engines leaves a foreign voice behind, or a voice was uninstalled): adopt
   // the first available one so Test/announce target a real voice. Only fires
@@ -74,6 +113,15 @@ export function VoiceSection() {
   }, [voices, voice]);
 
   const activePort = ENGINES.find((e) => e.id === engine)?.port ?? 7477;
+  const selLabel = ENGINES.find((e) => e.id === engine)?.label ?? engine;
+  const otherEngine = ENGINES.find((e) => e.id !== engine);
+
+  // The SELECTED engine is unreachable: announcements can't be spoken. Keyed on
+  // the direct /health probe, with the /voices failure as a same-signal fallback
+  // for the window before the first health probe resolves.
+  const selectedDown = health[engine] === "down" || voicesUnavailable;
+  // Offer the other engine as an escape hatch only when it's actually up.
+  const otherUp = otherEngine ? health[otherEngine.id] === "up" : false;
 
   // Every control except the master toggle AND the engine selector dims while
   // the selected engine's server is down (so the user can switch engines) or
@@ -120,15 +168,47 @@ export function VoiceSection() {
         </ThemeSelect>
       </Row>
 
-      {voicesUnavailable && (
-        <p
+      {/* Dual-engine health: BOTH engines' reachability, always visible while
+          voice is on, so a silent death of EITHER server is seen here. */}
+      {enabled && (
+        <div
           role="status"
-          className="text-xs leading-snug"
-          style={{ color: "var(--th-dot-starting, #fbbf24)" }}
+          aria-label="TTS engine health"
+          className="flex flex-col gap-1 text-xs leading-snug"
         >
-          {engine === "kokoro" ? "Kokoro" : "Piper"} server unavailable - start
-          the local {engine} TTS server on port {activePort} to pick a voice and
-          test playback, or switch engines above.
+          {ENGINES.map((e) => {
+            const { label, color } = healthPresentation(health[e.id]);
+            const isSelected = e.id === engine;
+            return (
+              <div key={e.id} className="flex items-center gap-2">
+                <span
+                  aria-hidden
+                  className="inline-block h-2 w-2 shrink-0 rounded-full"
+                  style={{ backgroundColor: color }}
+                />
+                <span style={{ opacity: 0.85 }}>
+                  {e.label} (127.0.0.1:{e.port}): {label}
+                  {isSelected && " — selected"}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Prominent error when the SELECTED engine is unreachable: nothing will
+          be spoken. This is the hard "never a silent default" requirement. */}
+      {enabled && selectedDown && (
+        <p
+          role="alert"
+          className="text-xs leading-snug"
+          style={{ color: "var(--th-dot-error, #f87171)" }}
+        >
+          {selLabel} (the selected engine) is unreachable on 127.0.0.1:
+          {activePort} — attention announcements will NOT be spoken.{" "}
+          {otherUp
+            ? `Switch to ${otherEngine?.label} above (it's reachable), or start the ${engine} TTS server on port ${activePort}.`
+            : `Start the ${engine} TTS server on port ${activePort}.`}
         </p>
       )}
 

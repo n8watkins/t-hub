@@ -13,10 +13,18 @@ import { create } from "zustand";
 import {
   listVoices,
   readVoiceSettings,
+  voiceHealth,
   writeVoiceSettings,
   type VoiceEngine,
   type VoiceSettings,
 } from "../ipc/voice";
+
+/** Per-engine reachability for the Settings health display. "unknown" before
+ *  the first probe resolves (rendered as "checking…"), then "up"/"down". */
+export type EngineHealthStatus = "unknown" | "up" | "down";
+
+/** Every engine the health display covers. Order = display order. */
+export const HEALTH_ENGINES: readonly VoiceEngine[] = ["piper", "kokoro"];
 
 /** Defaults when voice.json is missing/unreadable - mirrors the Rust side
  *  (voice.rs VoiceSettings::default): announcements opt-in, Piper engine, Ryan
@@ -41,6 +49,9 @@ interface VoiceState extends VoiceSettings {
   voices: string[] | null;
   /** True when the /voices proxy failed - the server is down/unreachable. */
   voicesUnavailable: boolean;
+  /** Reachability of BOTH engines (not just the selected one) for the Settings
+   *  health display. Transient, never persisted; "unknown" until first probed. */
+  health: Record<VoiceEngine, EngineHealthStatus>;
 
   /** Hydrate from voice.json (defaults when missing). Safe to re-run. */
   load: () => Promise<void>;
@@ -48,6 +59,10 @@ interface VoiceState extends VoiceSettings {
    *  error. Clears the stale list first so a slow/failed switch never shows the
    *  previous engine's voices. */
   refreshVoices: () => Promise<void>;
+  /** Probe every engine's /health (bounded, in parallel) and update `health`.
+   *  Called on Settings open + a slow periodic tick while the panel is open, so
+   *  a silent engine death surfaces without the general noticing by ear. */
+  probeHealth: () => Promise<void>;
   setEnabled: (v: boolean) => void;
   /** Switch the TTS engine and immediately re-query its voice list (the two
    *  engines have disjoint voice sets). */
@@ -139,6 +154,7 @@ export const useVoice = create<VoiceState>((set, get) => {
     loaded: false,
     voices: null,
     voicesUnavailable: false,
+    health: { piper: "unknown", kokoro: "unknown" },
 
     load: async () => {
       // Unflushed local intent (a pending debounce or an unpersisted dirty
@@ -166,6 +182,28 @@ export const useVoice = create<VoiceState>((set, get) => {
         if (get().engine !== engine) return;
         set({ voices: null, voicesUnavailable: true });
       }
+    },
+
+    probeHealth: async () => {
+      // Probe every engine in parallel; each backend call is individually
+      // bounded (2s) and resolves even for a down server, so this settles fast
+      // and never hangs the panel. A probe that rejects outright (backend task
+      // failure) is treated as "down" - a definite state beats a stuck spinner.
+      const results = await Promise.all(
+        HEALTH_ENGINES.map(async (engine): Promise<[VoiceEngine, EngineHealthStatus]> => {
+          try {
+            const h = await voiceHealth(engine);
+            return [engine, h.reachable ? "up" : "down"];
+          } catch {
+            return [engine, "down"];
+          }
+        }),
+      );
+      set((s) => {
+        const health = { ...s.health };
+        for (const [engine, status] of results) health[engine] = status;
+        return { health };
+      });
     },
 
     setEnabled: (v) => {

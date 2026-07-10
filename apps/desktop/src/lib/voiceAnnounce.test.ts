@@ -21,9 +21,13 @@ vi.mock("../ipc/voice", () => ({
 vi.mock("./voiceAudio", () => ({
   playWavBase64: vi.fn(),
 }));
+vi.mock("./notify", () => ({
+  notify: vi.fn(),
+}));
 
 import { synthesizeVoice } from "../ipc/voice";
 import { playWavBase64 } from "./voiceAudio";
+import { notify } from "./notify";
 import {
   handleStatusesChange,
   applyScribeListening,
@@ -33,6 +37,7 @@ import {
   _pendingTextForTest,
   ANNOUNCE_MIN_GAP_MS,
   SCRIBE_TAIL_MS,
+  FALLBACK_ALERT_MIN_GAP_MS,
 } from "./voiceAnnounce";
 import { useVoice, DEFAULT_VOICE_SETTINGS } from "../store/voice";
 import { useSupervision } from "../store/supervision";
@@ -52,7 +57,9 @@ function statuses(map: Record<string, SessionStatus>): Record<string, SessionSta
 
 beforeEach(() => {
   vi.mocked(synthesizeVoice).mockClear();
+  vi.mocked(synthesizeVoice).mockResolvedValue("d2F2");
   vi.mocked(playWavBase64).mockClear();
+  vi.mocked(notify).mockClear();
   _resetVoiceAnnounceForTest();
   useVoice.setState({
     ...DEFAULT_VOICE_SETTINGS,
@@ -420,6 +427,57 @@ describe("Scribe voice-gate (hold while dictating, deliver when stopped)", () =>
       vi.runOnlyPendingTimers();
       vi.useRealTimers();
     }
+  });
+});
+
+describe("never-silent fallback alert (engine unreachable)", () => {
+  it("fires a notify('error') when synthesis fails - the dropped cue is not silent", async () => {
+    vi.mocked(synthesizeVoice).mockRejectedValue(new Error("connection refused"));
+    useVoice.setState({ engine: "kokoro" });
+
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
+
+    // No audio played (the server is down), but the failure surfaces as the
+    // error chime + toast instead of vanishing - the whole point of the fix.
+    expect(playWavBase64).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledTimes(1);
+    const [kind, title, body] = vi.mocked(notify).mock.calls[0];
+    expect(kind).toBe("error");
+    expect(title).toMatch(/unreachable/i);
+    expect(body).toMatch(/kokoro/); // names the engine that failed
+  });
+
+  it("debounces repeated failures to one alert per window, then reopens", async () => {
+    vi.mocked(synthesizeVoice).mockRejectedValue(new Error("down"));
+
+    // First failure alerts.
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    // A fresh transition inside the window fails again but must NOT re-alert
+    // (a persistently-down engine shouldn't chime on every attempt).
+    handleStatusesChange(statuses({ "sess-1": "working" }), 100);
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 6000);
+    await flush();
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    // Past the window, the next failure alerts again.
+    handleStatusesChange(statuses({ "sess-1": "working" }), FALLBACK_ALERT_MIN_GAP_MS + 100);
+    handleStatusesChange(
+      statuses({ "sess-1": "needsPermission" }),
+      FALLBACK_ALERT_MIN_GAP_MS + 200,
+    );
+    await flush();
+    expect(notify).toHaveBeenCalledTimes(2);
+  });
+
+  it("does NOT fire when synthesis succeeds (no false alarm)", async () => {
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
+    expect(playWavBase64).toHaveBeenCalledTimes(1);
+    expect(notify).not.toHaveBeenCalled();
   });
 });
 

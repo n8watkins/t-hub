@@ -28,12 +28,18 @@ import { useWorkspace, tabIdForTerminal } from "../store/workspace";
 import { synthesizeVoice } from "../ipc/voice";
 import { scribeStatus } from "../ipc/scribe";
 import { playWavBase64 } from "./voiceAudio";
+import { notify } from "./notify";
 import { createWarmup } from "./warmup";
 import { captainSubjectForSession } from "./captainAttribution";
 import type { SessionStatus } from "../ipc/model";
 
 /** Minimum gap between spoken announcements (the burst debounce). */
 export const ANNOUNCE_MIN_GAP_MS = 5000;
+
+/** Minimum gap between "voice engine unreachable" fallback alerts. A dead engine
+ *  would otherwise fire the chime on every held/attempted cue; one alert per
+ *  window is enough to break the silence without becoming its own nuisance. */
+export const FALLBACK_ALERT_MIN_GAP_MS = 60000;
 
 /** How often to poll the Scribe voice-gate status (cheap loopback file read). */
 export const SCRIBE_POLL_MS = 250;
@@ -64,6 +70,9 @@ const NEEDS_INPUT: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
 
 let prevStatuses: Record<string, SessionStatus> = {};
 let lastSpokenAt = Number.NEGATIVE_INFINITY;
+/** When we last raised the "engine unreachable" fallback alert (debounced by
+ *  FALLBACK_ALERT_MIN_GAP_MS). Negative infinity = never. */
+let lastFallbackAlertAt = Number.NEGATIVE_INFINITY;
 /** One synthesis in flight at a time (keeps the burst gate closed while the
  *  request runs WITHOUT charging the debounce window before success). */
 let speaking = false;
@@ -92,6 +101,7 @@ function speak(text: string, now: number): boolean {
   if (speaking) return false;
   speaking = true;
   const voice = useVoice.getState();
+  const engine = voice.engine;
   void synthesizeVoice(text, voice.voice, voice.engine)
     .then((b64) => {
       lastSpokenAt = now;
@@ -99,7 +109,21 @@ function speak(text: string, now: number): boolean {
     })
     .catch(() => {
       // TTS server down / no backend: the visual attention cues still stand,
-      // and the debounce window stays open for the next transition.
+      // and the debounce window stays open for the next transition. NEVER let
+      // this be silent - the incident this feature exists for was a kokoro death
+      // that fell through with zero surfacing. Raise the notify "error" chime +
+      // toast (WebAudio, independent of the dead TTS server) so a dropped
+      // announcement is heard/seen, debounced so a persistently-down engine
+      // alerts at most once per window rather than on every attempt.
+      if (now - lastFallbackAlertAt >= FALLBACK_ALERT_MIN_GAP_MS) {
+        lastFallbackAlertAt = now;
+        notify(
+          "error",
+          "Voice engine unreachable",
+          `The ${engine} TTS server didn't answer - an attention announcement ` +
+            `could not be spoken. Check Settings › Voice.`,
+        );
+      }
     })
     .finally(() => {
       speaking = false;
@@ -312,6 +336,7 @@ export function startScribePoll(): void {
 export function _resetVoiceAnnounceForTest(): void {
   prevStatuses = {};
   lastSpokenAt = Number.NEGATIVE_INFINITY;
+  lastFallbackAlertAt = Number.NEGATIVE_INFINITY;
   speaking = false;
   scribeListening = false;
   pending = null;
