@@ -39,6 +39,8 @@ import {
   DEFAULT_VOICE_SETTINGS,
   _resetVoicePersistForTest,
 } from "../store/voice";
+import { useEngineRuntime } from "../store/engineRuntime";
+import type { EngineRuntimeStatus } from "../ipc/engine";
 
 const FILE_SETTINGS: VoiceSettingsShape = {
   enabled: true,
@@ -89,7 +91,24 @@ beforeEach(() => {
     voicesUnavailable: false,
     health: { piper: "unknown", kokoro: "unknown" },
   });
+  // Default: unmanaged (flag off) so the #52 UI is exercised; managed cases set
+  // this explicitly.
+  useEngineRuntime.setState({ status: null });
 });
+
+/** A managed supervisor snapshot for the banner tests. */
+function managedStatus(over: Partial<EngineRuntimeStatus>): EngineRuntimeStatus {
+  return {
+    managed: true,
+    selectedEngine: "kokoro",
+    activeEngine: "kokoro",
+    degraded: false,
+    level: "green",
+    kokoro: "up",
+    piper: "unknown",
+    ...over,
+  };
+}
 
 describe("VoiceSection degradation (selected engine down)", () => {
   beforeEach(() => {
@@ -284,6 +303,59 @@ describe("VoiceSection engine health (never a silent default)", () => {
       vi.runOnlyPendingTimers();
       vi.useRealTimers();
     }
+  });
+
+  it("managed amber banner shows the fallback and SUPPRESSES the #52 alert", async () => {
+    // Selected engine (Kokoro) is down, but the managed supervisor has fallen
+    // back to Piper - its banner is authoritative, so the #52 "unreachable"
+    // alert must NOT also fire (no double-message).
+    vi.mocked(listVoices).mockRejectedValue(new Error("down"));
+    mockHealth({ piper: true, kokoro: false });
+    useEngineRuntime.setState({
+      status: managedStatus({
+        activeEngine: "piper",
+        degraded: true,
+        level: "amber",
+        kokoro: "down",
+        piper: "up",
+      }),
+    });
+    render(<VoiceSection />);
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/running on fallback/i);
+    expect(alert.textContent).toMatch(/piper is carrying voice/i);
+    expect(alert.textContent).toMatch(/switch back automatically/i);
+    // Only ONE alert - the #52 "will NOT be spoken" alert is suppressed.
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(screen.queryByText(/will NOT be spoken/i)).toBeNull();
+  });
+
+  it("managed red banner reports voice fully unavailable", async () => {
+    vi.mocked(listVoices).mockRejectedValue(new Error("down"));
+    mockHealth({ piper: false, kokoro: false });
+    useEngineRuntime.setState({
+      status: managedStatus({
+        activeEngine: "piper",
+        degraded: true,
+        level: "red",
+        kokoro: "down",
+        piper: "down",
+      }),
+    });
+    render(<VoiceSection />);
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/voice unavailable/i);
+    expect(alert.textContent).toMatch(/both engines are down/i);
+  });
+
+  it("managed green banner is a non-alert status line", async () => {
+    vi.mocked(listVoices).mockResolvedValue(PIPER_VOICES);
+    mockHealth({ piper: true, kokoro: true });
+    useEngineRuntime.setState({ status: managedStatus({ level: "green" }) });
+    render(<VoiceSection />);
+    expect(await screen.findByText(/Voice engine healthy/i)).toBeTruthy();
+    // Green is informational, not an alert.
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("does not render the health block while voice is disabled", async () => {

@@ -29,6 +29,8 @@ import { synthesizeVoice } from "../ipc/voice";
 import { scribeStatus } from "../ipc/scribe";
 import { playWavBase64 } from "./voiceAudio";
 import { notify } from "./notify";
+import { useEngineRuntime } from "../store/engineRuntime";
+import { effectiveTarget } from "../ipc/engine";
 import { createWarmup } from "./warmup";
 import { captainSubjectForSession } from "./captainAttribution";
 import type { SessionStatus } from "../ipc/model";
@@ -101,8 +103,16 @@ function speak(text: string, now: number): boolean {
   if (speaking) return false;
   speaking = true;
   const voice = useVoice.getState();
-  const engine = voice.engine;
-  void synthesizeVoice(text, voice.voice, voice.engine)
+  // Route to the ACTIVE engine when the managed lifecycle has fallen back, with
+  // the standby's valid voice (the selected Kokoro voice would 400 on Piper).
+  // Unmanaged: this passes through the selected engine + voice unchanged.
+  const target = effectiveTarget(
+    useEngineRuntime.getState().status,
+    voice.engine,
+    voice.voice,
+  );
+  const engine = target.engine;
+  void synthesizeVoice(text, target.voice, target.engine)
     .then((b64) => {
       lastSpokenAt = now;
       playWavBase64(b64, useVoice.getState().volume);
@@ -115,7 +125,13 @@ function speak(text: string, now: number): boolean {
       // toast (WebAudio, independent of the dead TTS server) so a dropped
       // announcement is heard/seen, debounced so a persistently-down engine
       // alerts at most once per window rather than on every attempt.
-      if (now - lastFallbackAlertAt >= FALLBACK_ALERT_MIN_GAP_MS) {
+      //
+      // F6: when the managed lifecycle is running, the SUPERVISOR owns the
+      // fallback narrative (its own "Voice fell back" toast + amber state, and
+      // effectiveTarget already rerouted to the live engine), so suppress this
+      // #52 chime to avoid a double-chime in the down-debounce window.
+      const managed = !!useEngineRuntime.getState().status?.managed;
+      if (!managed && now - lastFallbackAlertAt >= FALLBACK_ALERT_MIN_GAP_MS) {
         lastFallbackAlertAt = now;
         notify(
           "error",

@@ -63,9 +63,23 @@ impl VoiceEngine {
         }
     }
 
+    /// STRICT token parse: only the two known engines, `None` for anything else.
+    /// Unlike `from_token` (which defaults unknown -> Piper for lenient settings
+    /// reads), identity checks must NOT coerce a foreign token to a real engine -
+    /// the engine supervisor's "is the port occupant provably ours?" decision
+    /// (D2) depends on an unrecognized `/health` yielding None (a stranger).
+    pub(crate) fn from_token_strict(s: &str) -> Option<Self> {
+        match s {
+            "kokoro" => Some(VoiceEngine::Kokoro),
+            "piper" => Some(VoiceEngine::Piper),
+            _ => None,
+        }
+    }
+
     /// The loopback port each engine's local server listens on. Piper owns
-    /// 7477 (pre-existing); Kokoro owns 7478.
-    fn default_port(self) -> u16 {
+    /// 7477 (pre-existing); Kokoro owns 7478. `pub(crate)` so the engine
+    /// supervisor knows which port a spawned engine should come up on.
+    pub(crate) fn default_port(self) -> u16 {
         match self {
             VoiceEngine::Piper => 7477,
             VoiceEngine::Kokoro => 7478,
@@ -84,14 +98,17 @@ impl VoiceEngine {
 
 /// A loopback-only agent: no redirect following (a local TTS server has no
 /// business redirecting, and following one could leak the request elsewhere).
-fn agent() -> ureq::Agent {
+/// `pub(crate)` so the engine supervisor's health-watch reuses the same
+/// no-Origin, redirect-free client the proxy uses.
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().redirects(0).build()
 }
 
 /// The TTS server base URL for `engine`: the per-engine env override when set,
 /// else `http://127.0.0.1:<default_port>`. The port is the ONLY thing that
 /// differs between engines (identical API), so routing is pure port selection.
-fn base_url_for_engine(engine: VoiceEngine) -> String {
+/// `pub(crate)` so the engine supervisor probes the same base URL the proxy uses.
+pub(crate) fn base_url_for_engine(engine: VoiceEngine) -> String {
     if let Ok(u) = std::env::var(engine.url_env_key()) {
         if !u.trim().is_empty() {
             return u;
@@ -173,6 +190,13 @@ fn parse_settings(v: &serde_json::Value) -> VoiceSettings {
             .and_then(|x| x.as_bool())
             .unwrap_or(d.announce_on_attention),
     }
+}
+
+/// The currently-selected engine from voice.json (the managed lifecycle's
+/// PRIMARY). `pub(crate)` so the engine supervisor picks the same engine the
+/// user chose in Settings. Lenient: defaults to Piper if the file is absent.
+pub(crate) fn current_engine() -> VoiceEngine {
+    read_settings().engine
 }
 
 /// Read voice.json leniently: missing file or unparseable content yields the
@@ -360,7 +384,9 @@ fn probe_health(engine: VoiceEngine) -> EngineHealth {
 /// The URL-taking core of `probe_health`, split out so a test can point it at an
 /// arbitrary (e.g. deliberately-dead ephemeral) base URL WITHOUT mutating the
 /// process-global engine-URL env - hermetic under a parallel test harness.
-fn probe_health_at(engine: VoiceEngine, base_url: &str) -> EngineHealth {
+/// `pub(crate)` so the engine supervisor's health-watch reuses the exact same
+/// bounded probe the Settings health display uses.
+pub(crate) fn probe_health_at(engine: VoiceEngine, base_url: &str) -> EngineHealth {
     let url = format!("{base_url}/health");
     match agent()
         .get(&url)
@@ -391,6 +417,31 @@ fn probe_health_at(engine: VoiceEngine, base_url: &str) -> EngineHealth {
             detail: Some(e.to_string()),
         },
     }
+}
+
+/// The occupant's SELF-IDENTIFIED engine from `GET /health`, or None when the
+/// server is unreachable, answers non-2xx, isn't JSON, or its `engine` field is
+/// absent/unrecognized. Bounded (2s) via the same no-Origin agent.
+///
+/// This is the identity the engine supervisor's startup squatter policy (D2)
+/// needs: a foreign HTTP server squatting the port answers with no recognized
+/// `engine`, so it yields None -> "stranger" -> never reclaimed/adopted. Kokoro
+/// self-identifies (`{"status":"ok","engine":"kokoro",...}`); Piper's /health
+/// has no `engine` field, so it too reads as None here (fine - Piper is never
+/// the managed primary in wave 1, and the standby-adopt path uses reachability,
+/// not this identity).
+pub(crate) fn probe_identity_at(base_url: &str) -> Option<VoiceEngine> {
+    let url = format!("{base_url}/health");
+    let body = agent()
+        .get(&url)
+        .timeout(Duration::from_secs(2))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let token = v.get("engine").and_then(|x| x.as_str())?;
+    VoiceEngine::from_token_strict(token)
 }
 
 /// Probe one engine's /health for the Settings dual-engine status display.
@@ -478,6 +529,18 @@ mod tests {
         assert!(parsed.enabled);
         assert_eq!(parsed.voice, "en_US-ryan-high.onnx");
         assert_eq!(parsed.volume, 0.6);
+    }
+
+    /// STRICT identity parse (engine supervisor D2): only the two known tokens
+    /// map to an engine; ANYTHING else is None, so a foreign `/health` never
+    /// coerces to a real engine and never triggers a reclaim/adopt.
+    #[test]
+    fn from_token_strict_only_matches_known_engines() {
+        assert_eq!(VoiceEngine::from_token_strict("kokoro"), Some(VoiceEngine::Kokoro));
+        assert_eq!(VoiceEngine::from_token_strict("piper"), Some(VoiceEngine::Piper));
+        assert_eq!(VoiceEngine::from_token_strict("festival"), None);
+        assert_eq!(VoiceEngine::from_token_strict(""), None);
+        assert_eq!(VoiceEngine::from_token_strict("Kokoro"), None); // case-sensitive
     }
 
     /// The lenient reader picks up an explicit Kokoro engine too.

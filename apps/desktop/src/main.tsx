@@ -8,6 +8,10 @@ import "./lib/notifyMount";
 // arms the announce-on-attention voice watcher (Settings > Voice). Idempotent.
 // See src/lib/voiceAnnounceMount.ts.
 import "./lib/voiceAnnounceMount";
+// Side-effect import: hydrate + subscribe the managed TTS-engine runtime status
+// (auto-fallback level + fallback/recovery toasts). Inert when the managed
+// lifecycle flag is off. See src/lib/engineStatusMount.ts.
+import "./lib/engineStatusMount";
 // Side-effect import: mounts the always-on Claude USAGE feed — subscribes
 // status://snapshot into the supervision store so the sidebar USAGE strip
 // populates app-wide (not just while the Sidebar is mounted). Idempotent.
