@@ -60,6 +60,11 @@ The proposal must sequence clean removal/disable of the interim systemd unit so 
 A deterministic `reap_ship` control command keyed off the captains registry: close all crew terminals recorded under a captain, remove their worktrees, close captain-created tabs, clear the ship sentinel dir - with a HARD landed-gate per crew (refuse loudly if branch HEAD is not on origin).
 Bundled prereqs: (1) tabs need creator/owner metadata in the registry; (2) all spawns flow through the socket for spawnedBy tracking (the shipped relay self-heal largely covers the old wedge dependency); (3) registry self-heal for ghost tiles whose tmux sessions are dead - adjacent to PR #53's ghost/adopt work, fold or sequence there.
 Interim doctrine unchanged: RETIREMENT.md manual checklist.
+3b-2. **Injection typing-guard for relay traffic** (P2, general-reported 2026-07-10; sequence WITH the orchestrator-representation wave - both are general-facing comms correctness).
+Captain relay/notification sends can land in a destination terminal WHILE the human is mid-keystroke, interleaving and corrupting both streams.
+Fix shape: detect active human input at the destination (input-box non-empty or recent keystrokes) and QUEUE the injection until idle - never interleave.
+Same defer-not-drop shape as the scribe voice gate, applied to text; extends the helm/no-inject courtesy doctrine into enforced mechanism.
+INTERIM captain discipline until it ships: capture the destination pane before any send-keys relay; if the input line shows typed content, hold and retry after a beat.
 3b. **First-class ORCHESTRATOR representation in the agents workspace** (general product item, 2026-07-10; sequence AFTER the P1 adopt-harden fix).
 The orchestrator must render distinct from captains (the general objects to Cortana appearing as a captain).
 Interim state: a `claim_captain` slug `cortana` is in place and the general pinned it - remove/migrate that interim claim when the real representation ships.
