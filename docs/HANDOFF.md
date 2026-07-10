@@ -13,8 +13,10 @@ On resume: invoke `/shipmate`, claim via `claim_captain` (MCP) or `~/.t-hub/capt
 
 ## Current state (end of this wave)
 
-- **main is at 0.3.59** (bump commit `648b7c1`), installed and running.
+- **main is at 0.3.60** (bump commit `1342e1f`), installed and running.
 0.3.59 merged PRs #49 (EventFanout snapshot-then-write-unlocked) and #50 (relay-wedge self-heal: `rebind_control` + client wedge-detector + stale-pin fallback).
+0.3.60 shipped solo with PR #51 (agents plane renders socket-commissioned captains: adoptRegistry now ADOPTS server-placed reserved-tab tiles missing from the local order, gated on not-locally-placed to avoid the unpin re-adopt race).
+E2E acceptance verified post-install: the general-reported invisible captain attached and rendered (`session_attached` 0 -> 1).
 - **Two untracked files** (`.lavish/`, `docs/DECK-AGENTS-DESIGN.md`) are pre-existing, NOT this ship's work - leave them.
 - All crew reaped, all worktrees removed.
 The only other captain-adjacent tmux sessions are Cortana (`e05764f5`) and the **monorepo-app captain** (`9a32f554`, another ship) - do NOT touch them.
@@ -73,3 +75,4 @@ An intermediate "WSL relay per-port flow wedge" theory (2026-07-09) is FALSE - d
 - **0.3.58**: auto-continue full redesign default-ON (#47), control-socket flap fix - tmux+git subprocess bound + M1 full fix (#48).
 - **0.3.59**: EventFanout snapshot-then-write-unlocked (#49), relay-wedge self-heal - rebind command + client wedge-detector + stale-pin fallback (#50).
 The wedge saga is RESOLVED (see the section above); the residual "wedge on 0.3.58" turned out to be the stale-env-pin artifact.
+- **0.3.60**: agents plane renders socket-commissioned captains (#51, solo ship for a general-reported defect; E2E-verified post-install).
