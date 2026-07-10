@@ -67,6 +67,12 @@ General's endorsed design sketch (four parts):
 (2) send_text/send_keys GUARDED BY DEFAULT - active human typing at the destination defers and queues the injection until idle (defer-then-flush, same shape as the scribe voice gate), never interleave;
 (3) ATTRIBUTION SEPARATION - agent-injected text renders visibly distinct from human keystrokes (marked lane), which also closes report-spoofing ambiguity;
 (4) queryable typing-state check (MCP/socket) for senders polite beyond the enforced guard.
+PREMISE CORRECTION (Cortana architecture-review addendum, source-verified @ a93ca9f): t-hub does NOT currently track any human-typing signal - part (1) must be BUILT as input-side keystroke instrumentation, not exposed from existing state.
+What exists: a reliable turn-boundary signal (SessionStatus::Completed edge, fleet.rs is_ready_for_wake).
+What does not: keystroke-source tracking (none), backend focus state (frontend Zustand only).
+PTY-OUTPUT parsing is a DEAD END - echoed human bytes and injected agent bytes are indistinguishable on the output side.
+DESIGN STEER (binding for the proposal): the typing-guard and the durable message-inbox are ONE comms plane, not two features - a single per-terminal durable queue, drained only when the destination is BOTH at a turn boundary (exists) AND not being typed into (to be built), reusing the scribe voice-gate fail-open-safe defer pattern.
+Do NOT build them as separate queues or the two predicates will disagree.
 Live validation datum from the day it was filed: the captain's interim pane-check guard caught the general mid-keystroke TWICE while holding one relay - the race is frequent, not theoretical.
 INTERIM captain discipline until it ships: capture the destination pane before any send-keys relay; if the LAST prompt line has typed content, hold and retry (note: the prompt char is followed by a non-breaking space - match content, not whitespace shape).
 3b. **First-class ORCHESTRATOR representation in the agents workspace** (general product item, 2026-07-10; sequence AFTER the P1 adopt-harden fix).
