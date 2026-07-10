@@ -2,9 +2,9 @@
 
 T-Hub is a **terminal-first command center for running and supervising many persistent coding-agent (Claude Code) sessions at once**. The V1 target is a single personal setup: Windows 11 + WSL2 Ubuntu + zsh, with an adapter-based core so other terminal agents can be added later.
 
-## Status — released personal alpha (v0.3.56)
+## Status — released personal alpha (v0.3.58)
 
-Well past the original "playable proof" nucleus: the terminal spine, the agent-supervision layer (the 0.5 plan), Codex support, and the full Windows/WSL integration all ship in the installed app. **v0.3.56 is released** — a signed Windows installer ships from a GitHub Release with `latest.json` auto-update wired in (Tauri updater plugin).
+Well past the original "playable proof" nucleus: the terminal spine, the agent-supervision layer (the 0.5 plan), Codex support, and the full Windows/WSL integration all ship in the installed app. **v0.3.58 is released** — a signed Windows installer ships from a GitHub Release with `latest.json` auto-update wired in (Tauri updater plugin).
 
 - **Tauri 2 + React 18 + TypeScript + Tailwind** desktop shell with an xterm.js tile grid (Fit + WebGL + Search + Unicode 11), deterministic insertion/focus, and durable layout/workspace persistence.
 - **Rust PTY ↔ tmux backend:** `portable-pty` (ConPTY on Windows) drives a `tmux -L t-hub` session per terminal — one PTY client per visible tile. Closing a tile **detaches** (the process survives); stop **kills** the session. `#[cfg(windows)]` reaches into WSL via `wsl.exe -e bash` (the `-e`/`--exec` is load-bearing — `wsl.exe -- bash` runs the user's *login* shell, e.g. zsh); `#[cfg(unix)]` attaches to tmux directly.
@@ -17,8 +17,8 @@ Well past the original "playable proof" nucleus: the terminal spine, the agent-s
 - **Tray recovery actions:** light, no-restart recovery from the system tray — **Reload window** (re-renders the React UI without touching tmux/agent) and **Reconnect agent bridge** (safe disconnect → reconnect off the UI thread, preserving the journal cursor).
 - **Codex + Claude:** per-provider usage readouts, icons, and running-pulse activity in the sidebar.
 - **MCP control channel:** the `t-hub-mcp` server forwards `tools/call` to the running app over a local control socket. The catalog is **~30 tools** — read tools (`get_status`, `list_terminals`, `read_terminal`, `supervision_tree`, `wait_for_status`, `scribe_status`, …) open, organization tools (`new_tab`/`focus_tab`/`rename_tab`, `create_worktree`/`remove_worktree`, `claim_captain`/`watch_fleet`, …) audited, and process-changing tools (`spawn_terminal`, `send_text`/`send_keys`, `close_terminal`, …) confirmation-gated.
-- **~57 Tauri commands** across ~a dozen backend modules, plus a **side-by-side DEV build** (`com.t-hub.dev`, isolated `t-hub-dev` socket + `~/.t-hub-dev` state) installable alongside production — see [docs/DEV-BUILD.md](./docs/DEV-BUILD.md).
-- **Tests:** Rust unit + MCP e2e suites on the backend, plus a **vitest** frontend harness (jsdom + RTL) — 200+ tests across stores, components, and pure-function libs (`pnpm test`).
+- **~58 Tauri commands** across ~a dozen backend modules, plus a **side-by-side DEV build** (`com.t-hub.dev`, isolated `t-hub-dev` socket + `~/.t-hub-dev` state) installable alongside production — see [docs/DEV-BUILD.md](./docs/DEV-BUILD.md).
+- **Tests:** Rust unit + MCP e2e suites on the backend, plus a **vitest** frontend harness (jsdom + RTL) — 300+ tests across stores, components, and pure-function libs (`pnpm test`).
 
 ## Repository layout
 
@@ -30,13 +30,13 @@ apps/
     src/                       React frontend (xterm tiles, auto-grid canvas, Zustand stores)
       ipc/types.ts             The IPC contract (commands + events) — single source of truth
       ipc/client.ts            Typed wrappers over Tauri invoke/listen
-      components/              38 components (Terminal, Sidebar, UsageStrip, ThemeEditor,
+      components/              45 components (Terminal, Sidebar, UsageStrip, ThemeEditor,
                                CommandPalette, WorktreePrompt, WorktreesList, RecoveryReview, …)
       store/                  Zustand stores (workspace, settings, activity, supervision,
                                keybindings, rules, fileOpen, sessionContext, …)
       lib/                    Side-effect mounts + helpers (commands · chord · keymapExecutor ·
                                prefixKeyHandler · notify · rulesMount · worktreeTarget · recentRepos · …)
-    src-tauri/                 Rust/Tauri backend (~57 commands across these modules)
+    src-tauri/                 Rust/Tauri backend (~58 commands across these modules)
       src/commands.rs          0.1 terminal-nucleus commands (mirrors ipc/types.ts)
       src/commands_05.rs       Agent-bridge / supervision / status / hooks commands
       src/tmux.rs              `tmux -L t-hub` wrappers (isolated socket; `wsl.exe -e bash`)

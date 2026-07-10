@@ -347,10 +347,10 @@ running app it instead forwards the spawn and a real tile appears):
 | Scope | Where | Count |
 | --- | --- | --- |
 | MCP protocol framing | `crates/t-hub-mcp/src/protocol.rs` | 4 |
-| Tool catalog + tiers | `crates/t-hub-mcp/src/tools.rs` | 8 |
-| Control client (forwarding, discovery, restart recovery) | `crates/t-hub-mcp/src/control_client.rs` | 8 |
+| Tool catalog + tiers | `crates/t-hub-mcp/src/tools.rs` | 12 |
+| Control client (forwarding, discovery, restart recovery) | `crates/t-hub-mcp/src/control_client.rs` | 12 |
 | MCP server dispatch (initialize/list/call) | `crates/t-hub-mcp/src/server.rs` | 9 |
-| App-side control dispatch + tiers (incl. spawn_terminal + tab registry) | `src/control.rs` | 45 |
+| App-side control dispatch + tiers (incl. spawn_terminal + tab registry) | `src/control.rs` | 122 |
 | End-to-end (real binary ⇄ real listener) | `tests/mcp_e2e.rs` | 1 |
 
 Run them:
