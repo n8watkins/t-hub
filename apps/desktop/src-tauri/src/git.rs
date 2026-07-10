@@ -29,6 +29,43 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::bounded_exec::output_with_timeout;
+
+/// Default per-command timeout for a `git`/`wsl.exe` subprocess (the symmetric half
+/// of the tmux control-flap fix — see [`crate::bounded_exec`]).
+///
+/// git is a subprocess seam with the SAME hazard as tmux: on the slow (OneDrive-
+/// backed) filesystem that motivated the tmux bound, a `git` call can park the
+/// control-handler thread it runs on indefinitely — and PR #48's M1 re-probe
+/// (`reprobe_reaped_request` → [`worktree_list`], on the reap path) now issues a
+/// `git worktree list` from a control handler. A bare `.output()` there could wedge
+/// the channel exactly as an unbounded tmux call did. So every production git call
+/// routes through [`output_with_timeout`], killing + reaping a stalled child and
+/// surfacing `TimedOut` instead of parking forever.
+///
+/// The default is deliberately MUCH larger than tmux's 5s: tmux answers in well
+/// under a second, but git legitimately does real work — `git worktree add` checks
+/// out the whole tree into a NEW directory, and on a slow/large repo that can take
+/// tens of seconds. 45s is chosen to sit comfortably above a real worktree add on a
+/// healthy box (so we never false-timeout genuine work) while still bounding a TRUE
+/// hang to well under the M1 InFlight reap window (default 600s), so a wedged git
+/// call fails fast and frees the handler long before the reap safety-valve fires.
+/// An operator on an unusually slow host can widen it via the env hook below.
+const GIT_CMD_TIMEOUT_DEFAULT: Duration = Duration::from_secs(45);
+
+/// Effective per-command git timeout: `$T_HUB_GIT_CMD_TIMEOUT_SECS` (seconds) if set
+/// to a positive integer, else [`GIT_CMD_TIMEOUT_DEFAULT`]. Unset / 0 / junk ⇒ the
+/// default (NEVER unbounded — the whole point is that no git call may park a control
+/// handler forever). The env hook lets an operator widen it on a slow host.
+fn git_cmd_timeout() -> Duration {
+    std::env::var("T_HUB_GIT_CMD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(GIT_CMD_TIMEOUT_DEFAULT)
+}
+
 /// Git facts about a project cwd, surfaced to the Files panel header. Serialized
 /// camelCase to mirror the TS `GitInfo` interface in `src/ipc/git.ts`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -156,8 +193,10 @@ pub struct WorktreeInfo {
 /// and `-e` (exec) runs git directly so no shell ever re-parses the args. `cwd`
 /// here is a native POSIX path (`/home/...`); the desktop app hands us those.
 fn run_git(cwd: &str, args: &[&str]) -> Result<(bool, String, String), String> {
-    let output = build_git_command(cwd, args)
-        .output()
+    // Bounded by [`git_cmd_timeout`] so a git call on a wedged/slow filesystem
+    // surfaces as an error instead of parking the (possibly control-handler)
+    // caller forever. A timeout arrives as `ErrorKind::TimedOut` from the helper.
+    let output = output_with_timeout(build_git_command(cwd, args), git_cmd_timeout())
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -247,8 +286,11 @@ fi";
 /// commit path can't apply here. Returns `Err` only on a genuine spawn failure;
 /// a non-repo just yields the short-circuited `inside\tfalse` stdout.
 fn run_git_info_script(cwd: &str) -> Result<String, String> {
-    let output = build_git_info_command(cwd)
-        .output()
+    // Bounded exactly like [`run_git`]: this one-shot script issues several git
+    // rev-parse/status calls in a single shell, so on a wedged store it must not
+    // park its caller either. A stall surfaces as a spawn error (⇒ `not_repo` at
+    // the best-effort callers) rather than an indefinite hang.
+    let output = output_with_timeout(build_git_info_command(cwd), git_cmd_timeout())
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -796,6 +838,42 @@ pub(crate) fn worktree_remove(cwd: &str, path: &str, force: bool) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F1 invariant: the git bound is NEVER unbounded. A positive int widens it;
+    /// unset / 0 / negative / junk all fall back to the [`GIT_CMD_TIMEOUT_DEFAULT`]
+    /// (a 0 or garbage value must not disable the bound — the whole point is that no
+    /// git call may park a control handler forever). Mirrors tmux's `tmux_cmd_timeout`
+    /// contract for the symmetric git seam. Isolated to this one env var; restores it.
+    #[test]
+    fn git_cmd_timeout_honors_env_but_never_unbounded() {
+        let key = "T_HUB_GIT_CMD_TIMEOUT_SECS";
+        let saved = std::env::var(key).ok();
+
+        // A positive integer is honored verbatim.
+        std::env::set_var(key, "90");
+        assert_eq!(git_cmd_timeout(), Duration::from_secs(90));
+
+        // 0 / negative / junk / empty all fall back to the bounded default — never 0.
+        for bad in ["0", "-5", "abc", "", "  "] {
+            std::env::set_var(key, bad);
+            assert_eq!(
+                git_cmd_timeout(),
+                GIT_CMD_TIMEOUT_DEFAULT,
+                "value {bad:?} must fall back to the default, never unbounded"
+            );
+        }
+
+        // Unset ⇒ default.
+        std::env::remove_var(key);
+        assert_eq!(git_cmd_timeout(), GIT_CMD_TIMEOUT_DEFAULT);
+        // The default itself is a real, positive bound (defense against a 0 const).
+        assert!(GIT_CMD_TIMEOUT_DEFAULT > Duration::ZERO);
+
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
 
     #[test]
     fn first_line_opt_trims_and_handles_empty() {

@@ -1085,10 +1085,12 @@ const REQUEST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60
 /// still-running op far less plausible than a truly dead one; the env override
 /// (`T_HUB_REQUEST_INFLIGHT_REAP_SECS`) lets an operator tune it.
 ///
-/// RESIDUAL (tracked fast-follow): the FULL fix is to re-probe reality on reap
-/// (tmux has-session / worktree-exists) before allowing a re-apply, so a reaped-
-/// but-alive op can never be duplicated regardless of the window. This raise is the
-/// low-cost mitigation, not that fix.
+/// This window is now the OUTER BOUND, not the only guard: the full fix landed as
+/// [`reprobe_reaped_request`] - on reaping a reservation, a same-id retry re-probes
+/// reality (`git worktree list` for a `create_worktree`) BEFORE re-applying, so a
+/// reaped-but-alive op resolves against what actually happened instead of being
+/// blindly duplicated regardless of the window. The window still bounds how long a
+/// truly-dead reservation blocks retries; the re-probe removes the duplicate risk.
 const REQUEST_INFLIGHT_REAP_DEFAULT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The effective InFlight reap window: `$T_HUB_REQUEST_INFLIGHT_REAP_SECS` (seconds)
@@ -1117,9 +1119,17 @@ enum RequestSlot {
 
 /// What [`RequestCache::begin`] decided for an incoming request id.
 enum BeginOutcome {
-    /// This id is new: reserved InFlight, the caller must run the command and then
-    /// call [`RequestCache::finish`].
+    /// This id is new (never seen): reserved InFlight, the caller must run the
+    /// command and then call [`RequestCache::finish`].
     Fresh,
+    /// This id was a still-InFlight reservation that aged PAST the reap window and
+    /// was just presumed-dead + re-reserved for this caller (M1 full fix). Behaves
+    /// like [`Fresh`] EXCEPT the caller must first RE-PROBE reality
+    /// ([`reprobe_reaped_request`]): a slow-but-alive original (e.g. a `git worktree
+    /// add` on the OneDrive-backed store) may have actually LANDED before the reap,
+    /// so blindly re-applying would duplicate it. If the artifact already exists,
+    /// resolve the retry against it; otherwise the original truly died - apply fresh.
+    FreshAfterReap,
     /// This exact request already completed - replay its outcome, do NOT re-run.
     Duplicate(Result<Value, String>),
     /// This exact request is still running on another connection - do NOT re-run;
@@ -1222,6 +1232,14 @@ impl RequestCache {
     fn begin(&self, id: &str) -> BeginOutcome {
         let now = std::time::Instant::now();
         let mut inner = self.lock();
+        // M1 full fix: was THIS id a reservation that just aged out? Capture it
+        // BEFORE `evict_expired` removes it, so the re-reservation below can tell a
+        // genuinely-new request (Fresh) from a reaped-but-maybe-alive retry
+        // (FreshAfterReap) that must re-probe reality before re-applying.
+        let reaped = matches!(
+            inner.slots.get(id),
+            Some(RequestSlot::InFlight { since }) if now.duration_since(*since) >= self.inflight_reap
+        );
         Self::evict_expired(&mut inner, now, self.ttl, self.inflight_reap);
         match inner.slots.get(id) {
             Some(RequestSlot::Done { outcome, .. }) => BeginOutcome::Duplicate(outcome.clone()),
@@ -1245,7 +1263,11 @@ impl RequestCache {
                         Some(RequestSlot::InFlight { .. }) => break,
                     }
                 }
-                BeginOutcome::Fresh
+                if reaped {
+                    BeginOutcome::FreshAfterReap
+                } else {
+                    BeginOutcome::Fresh
+                }
             }
         }
     }
@@ -2708,6 +2730,20 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
                 ));
             }
             BeginOutcome::Fresh => {}
+            // M1 full fix: the prior reservation for this id was reaped (presumed
+            // dead after the reap window). Before re-applying, re-probe reality: if
+            // the artifact the original request was creating already exists, the
+            // original DID land (or is still landing) - re-applying would DUPLICATE
+            // it (the Incident A/B duplicate-maker the reap window only mitigated).
+            // Record that reality as this id's outcome so the retry - and every
+            // future one - resolves against it. Only when reality shows NOTHING was
+            // created do we fall through and apply fresh (the original truly died).
+            BeginOutcome::FreshAfterReap => {
+                if let Some(outcome) = reprobe_reaped_request(ctx, &req.command, &req.args) {
+                    let outcome = ctx.requests.finish(id, outcome);
+                    return replay_response(outcome);
+                }
+            }
         }
     }
 
@@ -2767,6 +2803,92 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
 /// naturally re-runnable and need no dedup.
 fn is_idempotent_command(command: &str) -> bool {
     matches!(command, "spawn_terminal" | "create_worktree")
+}
+
+/// M1 full fix: when an InFlight reservation was REAPED (presumed dead after the
+/// reap window) and the same `requestId` is retried, probe REALITY for the artifact
+/// the original command was creating BEFORE allowing a re-apply. Returns:
+///   - `Some(outcome)` — the artifact already exists, so the original DID land; the
+///     caller records this as the id's outcome and replays it instead of re-applying
+///     (which would duplicate). The outcome is a success payload tagged
+///     `reprobedAfterReap: true` so an observer sees the retry resolved against
+///     reality, not a fresh apply.
+///   - `None` — reality shows nothing was created (the original truly died before it
+///     applied), OR this command has no probe-able artifact, so the caller proceeds
+///     to apply fresh (the prior, mitigation-only behavior).
+///
+/// Probe-ability is per command:
+///   - `create_worktree` — the target `worktreePath` is CALLER-supplied and
+///     deterministic, so `git worktree list` for `repoRoot` is an exact reality
+///     check. This is the M1 incident (a slow `git worktree add` on the
+///     OneDrive-backed store reaped mid-flight, then re-applied → duplicate).
+///   - `spawn_terminal` — the tmux session name is SERVER-minted (a fresh uuid per
+///     apply), so a retry carries no identifier to probe by; there is nothing to
+///     resolve against and we return `None`. The reap window (default 600s, well
+///     above any real spawn) remains its guard - a spawn that hung that long is
+///     genuinely dead, so applying fresh is correct.
+fn reprobe_reaped_request(
+    ctx: &ControlContext,
+    command: &str,
+    args: &Value,
+) -> Option<Result<Value, String>> {
+    match command {
+        "create_worktree" => {
+            let repo_root = arg_str(args, "repoRoot").or_else(|| arg_str(args, "repo_root"))?;
+            let worktree_path =
+                arg_str(args, "worktreePath").or_else(|| arg_str(args, "worktree_path"))?;
+            // Loopback vs remote path scoping mirrors `create_worktree`: for a remote
+            // peer the git call there ran against the SCOPED path, so probe the same
+            // one (an out-of-scope path can't have been created, so scoping-failure =
+            // not created = None, which correctly proceeds to a fresh, re-checked apply).
+            let (repo_root, worktree_path) = if ctx.peer_is_loopback {
+                (repo_root, worktree_path)
+            } else {
+                let roots = files::remote_file_roots();
+                (
+                    files::scoped_create_path(&repo_root, true, roots)
+                        .ok()?
+                        .to_string_lossy()
+                        .into_owned(),
+                    files::scoped_create_path(&worktree_path, true, roots)
+                        .ok()?
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            };
+            // Does the worktree already exist for this repo? Compare canonicalized
+            // paths so a trailing slash / `.`-segment / symlinked ancestor can't make
+            // an existing worktree read as absent (which would wrongly re-apply and
+            // duplicate). A git failure (repo unreadable) yields an empty list ⇒ None
+            // ⇒ proceed to a fresh apply, which re-runs the real git check anyway.
+            let want = std::fs::canonicalize(&worktree_path)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&worktree_path));
+            let exists = git::worktree_list(&repo_root)
+                .unwrap_or_default()
+                .into_iter()
+                .any(|wt| {
+                    std::fs::canonicalize(&wt.path)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(&wt.path))
+                        == want
+                });
+            if exists {
+                Some(Ok(json!({
+                    "accepted": "create_worktree",
+                    "worktreePath": worktree_path,
+                    "alreadyCreated": true,
+                    "reprobedAfterReap": true,
+                    "note": "the original create_worktree for this requestId was reaped as \
+                             stale, but the worktree already exists on disk - resolved \
+                             against reality instead of re-creating it (which would \
+                             duplicate). Refresh the terminal list to adopt its tile.",
+                })))
+            } else {
+                None
+            }
+        }
+        // Server-minted artifact id (see doc comment): nothing in args to probe by.
+        _ => None,
+    }
 }
 
 /// Build the response for a replayed (idempotent-duplicate) request. The stored
@@ -5397,6 +5519,47 @@ mod tests {
     }
 
     #[test]
+    fn reprobe_reaped_create_worktree_resolves_against_reality() {
+        // M1 full fix. A create_worktree whose InFlight reservation was reaped is
+        // retried with the same requestId; before re-applying we RE-PROBE reality.
+        let (base, repo, wt) = scratch_repo_with_worktree();
+        let ctx = test_ctx("t");
+
+        // The worktree EXISTS on disk (the original DID land): the re-probe must
+        // resolve to a success outcome tagged reprobedAfterReap, NOT None (which
+        // would let dispatch re-run git worktree add and duplicate/error).
+        let args = json!({
+            "repoRoot": repo.to_str().unwrap(),
+            "worktreePath": wt.to_str().unwrap(),
+        });
+        let outcome = reprobe_reaped_request(&ctx, "create_worktree", &args)
+            .expect("existing worktree must resolve against reality");
+        let v = outcome.expect("resolved outcome is Ok");
+        assert_eq!(v["accepted"], "create_worktree");
+        assert_eq!(v["alreadyCreated"], true);
+        assert_eq!(v["reprobedAfterReap"], true);
+
+        // A worktree path that does NOT exist ⇒ None: the original truly died, so
+        // dispatch proceeds to a fresh (re-checked) apply.
+        let missing = json!({
+            "repoRoot": repo.to_str().unwrap(),
+            "worktreePath": base.join("never-created").to_str().unwrap(),
+        });
+        assert!(
+            reprobe_reaped_request(&ctx, "create_worktree", &missing).is_none(),
+            "an absent worktree must NOT resolve - it should re-apply fresh"
+        );
+
+        // spawn_terminal has a SERVER-minted id: nothing in args to probe by ⇒ None.
+        assert!(
+            reprobe_reaped_request(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).is_none(),
+            "spawn_terminal has no probe-able artifact in its args"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn list_worktrees_requires_cwd_and_is_empty_outside_a_repo() {
         let ctx = test_ctx("t");
         let err = dispatch(&ctx, "list_worktrees", &json!({})).unwrap_err();
@@ -7737,6 +7900,9 @@ mod tests {
             BeginOutcome::Duplicate(Ok(v)) => assert_eq!(v["id"], "abc"),
             BeginOutcome::Duplicate(Err(e)) => panic!("expected Ok replay, got Err: {e}"),
             BeginOutcome::Fresh => panic!("a completed id must not be reserved Fresh again"),
+            BeginOutcome::FreshAfterReap => {
+                panic!("a completed id must replay, not reap-and-re-reserve")
+            }
             BeginOutcome::InFlight => panic!("a completed id must replay, not report InFlight"),
         }
     }
@@ -7824,9 +7990,80 @@ mod tests {
         );
         cache.begin("stuck"); // reserved InFlight, never finished
         std::thread::sleep(std::time::Duration::from_millis(5));
-        // A retry now sees Fresh (the dead reservation was reaped), not a permanent
-        // InFlight.
-        assert!(matches!(cache.begin("stuck"), BeginOutcome::Fresh));
+        // A retry now sees FreshAfterReap (the dead reservation was reaped + re-
+        // reserved), not a permanent InFlight. The `AfterReap` flavor tells dispatch
+        // to RE-PROBE reality before re-applying (M1 full fix) - a genuinely-new id
+        // would be plain Fresh.
+        assert!(matches!(
+            cache.begin("stuck"),
+            BeginOutcome::FreshAfterReap
+        ));
+    }
+
+    #[test]
+    fn request_cache_reaped_id_yields_exactly_one_fresh_after_reap() {
+        // F4 (one-reprobe-per-reap): after a reservation is reaped, TWO retries of
+        // the same id must NOT both re-probe/re-apply. `begin` is atomic — the FIRST
+        // retry consumes the reap (FreshAfterReap) AND re-reserves the id InFlight in
+        // the same locked step, so the SECOND retry sees a live InFlight reservation,
+        // not a second FreshAfterReap. That is what caps the M1 re-probe (and its
+        // unbounded git worktree-list) at ONCE per reap: the loser is told InFlight
+        // and polls/retries instead of issuing a duplicate reality probe + re-apply.
+        //
+        // A comfortably large reap window (relative to two back-to-back synchronous
+        // `begin` calls) keeps this deterministic: the original ages PAST it, but the
+        // freshly re-reserved slot is far YOUNGER than it when the second retry runs.
+        let reap = std::time::Duration::from_millis(50);
+        let cache = RequestCache::with_bounds(8, std::time::Duration::from_secs(600), reap);
+
+        cache.begin("wt"); // original reservation, never finished (handler presumed dead)
+        std::thread::sleep(reap * 2); // age it past the reap window
+
+        // First retry: the dead reservation is reaped and re-reserved in one step.
+        assert!(
+            matches!(cache.begin("wt"), BeginOutcome::FreshAfterReap),
+            "the first retry after a reap must re-probe reality (FreshAfterReap)"
+        );
+        // Second retry, immediately after: the just-re-reserved slot is still well
+        // within the reap window, so this loser sees InFlight — NOT a second reprobe.
+        assert!(
+            matches!(cache.begin("wt"), BeginOutcome::InFlight),
+            "a concurrent second retry must see InFlight, not a duplicate FreshAfterReap"
+        );
+        // And a third: still InFlight until the winner calls finish(). At no point
+        // does a single reap yield two re-applies.
+        assert!(matches!(cache.begin("wt"), BeginOutcome::InFlight));
+
+        // Once the winner records the outcome, further retries replay it (Duplicate),
+        // still never a second apply.
+        let _ = cache.finish("wt", Ok(json!({"alreadyCreated": true})));
+        assert!(matches!(cache.begin("wt"), BeginOutcome::Duplicate(_)));
+    }
+
+    #[test]
+    fn request_cache_never_seen_id_is_fresh_not_fresh_after_reap() {
+        // A first-ever id must be plain Fresh (no reap happened), so dispatch does
+        // NOT waste a reality re-probe on it - FreshAfterReap is reserved for a
+        // retry whose prior reservation actually aged out.
+        let cache = RequestCache::new();
+        assert!(matches!(cache.begin("brand-new"), BeginOutcome::Fresh));
+    }
+
+    #[test]
+    fn request_cache_reap_after_completion_is_fresh_not_reap() {
+        // A COMPLETED id that TTL-expires and is retried is a fresh apply, NOT a
+        // reap: the reap flavor is strictly for an InFlight reservation that aged
+        // out (the ambiguous "did it land?" case), not for a cleanly-finished one
+        // whose cache entry simply expired.
+        let cache = RequestCache::with_bounds(
+            8,
+            std::time::Duration::from_millis(1), // TTL
+            std::time::Duration::from_secs(600), // reap window (irrelevant here)
+        );
+        cache.begin("done");
+        let _ = cache.finish("done", Ok(json!({"id": "done"})));
+        std::thread::sleep(std::time::Duration::from_millis(5)); // outlive the TTL
+        assert!(matches!(cache.begin("done"), BeginOutcome::Fresh));
     }
 
     #[test]

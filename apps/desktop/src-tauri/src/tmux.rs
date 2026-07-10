@@ -17,6 +17,9 @@
 
 use std::process::Command;
 use std::sync::LazyLock;
+use std::time::Duration;
+
+use crate::bounded_exec::output_with_timeout;
 
 /// The isolated tmux socket name; always passed as `tmux -L <socket>`.
 ///
@@ -129,10 +132,47 @@ fn is_already_gone(stderr: &str) -> bool {
         || stderr.contains("No such file or directory")
 }
 
+/// Default per-command timeout for a tmux/wsl subprocess invocation (residual
+/// control-flap fix).
+///
+/// The `-L t-hub` tmux server is SINGLE-THREADED: while it services one slow
+/// operation - a large `capture-pane`, a `new-session` blocked on slow (e.g.
+/// OneDrive-backed) filesystem I/O, a kill-tree sweep - every OTHER client command
+/// QUEUES behind it inside the server. A control handler thread that ran a bare
+/// `.output()` with no bound then PARKS for the full stall. Because the control
+/// server caps live connections ([`crate::control::MAX_CONNS`]), enough parked
+/// handlers make `serve` reject every NEW connection - which is exactly the residual
+/// flap: `list_terminals` round-trips time out for minutes (bare TCP connect still
+/// completes via the kernel backlog) while the app UI stays alive, and freshly
+/// created sessions never get adopted. #45 bounded the socket read/write legs; it
+/// did NOT bound the tmux SUBPROCESS the read handlers block on. This does.
+///
+/// Bounding the subprocess turns an indefinite park into a fast, recoverable error
+/// that frees the handler thread and its connection slot, so a transient server
+/// stall can no longer escalate into a channel-wide wedge. Generous: a healthy tmux
+/// answers in well under a second (a few hundred ms through `wsl.exe` on Windows);
+/// a call that blows past this is a stalled server, and failing fast lets the caller
+/// retry once it recovers.
+const TMUX_CMD_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
+
+/// Effective per-command tmux timeout: `$T_HUB_TMUX_CMD_TIMEOUT_SECS` (seconds) if
+/// set to a positive integer, else [`TMUX_CMD_TIMEOUT_DEFAULT`]. Unset / 0 / junk ⇒
+/// the default (NEVER unbounded - the whole point is that no tmux call may park a
+/// control handler forever). The env hook lets an operator widen it on a slow host.
+fn tmux_cmd_timeout() -> Duration {
+    std::env::var("T_HUB_TMUX_CMD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(TMUX_CMD_TIMEOUT_DEFAULT)
+}
+
 /// Run a tmux command and capture its output, mapping non-zero exits and io
-/// failures into a structured [`TmuxError`].
+/// failures into a structured [`TmuxError`]. Bounded by [`tmux_cmd_timeout`] so a
+/// wedged server surfaces as an error instead of parking the caller forever.
 fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxError> {
-    let output = tmux(args).output().map_err(|e| TmuxError {
+    let output = output_with_timeout(tmux(args), tmux_cmd_timeout()).map_err(|e| TmuxError {
         op,
         code: None,
         message: format!("failed to spawn tmux: {e}"),
@@ -355,8 +395,7 @@ pub fn target_for_id(id: &str) -> String {
 /// (including when no server is running at all), so the exit status is the
 /// single source of truth — no stderr parsing required.
 pub fn has_session(name: &str) -> bool {
-    tmux(&["has-session", "-t", name])
-        .output()
+    output_with_timeout(tmux(&["has-session", "-t", name]), tmux_cmd_timeout())
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -371,8 +410,7 @@ pub fn has_session(name: &str) -> bool {
 /// kept for tests, which spawn plain shells and don't need the tree sweep.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn kill_session(name: &str) -> Result<(), TmuxError> {
-    let output = tmux(&["kill-session", "-t", name])
-        .output()
+    let output = output_with_timeout(tmux(&["kill-session", "-t", name]), tmux_cmd_timeout())
         .map_err(|e| TmuxError {
             op: "kill-session",
             code: None,
@@ -429,11 +467,14 @@ tmux -L {sock} kill-session -t '{name}'",
         sock = socket(),
         name = name,
     );
-    let output = pane_info_command(&script).output().map_err(|e| TmuxError {
-        op: "kill-session-tree",
-        code: None,
-        message: format!("failed to spawn tmux: {e}"),
-    })?;
+    let output =
+        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|e| {
+            TmuxError {
+                op: "kill-session-tree",
+                code: None,
+                message: format!("failed to spawn tmux: {e}"),
+            }
+        })?;
     if output.status.success() {
         return Ok(());
     }
@@ -466,8 +507,7 @@ pub fn list_sessions() -> Result<Vec<String>, TmuxError> {
     // `<name>: <window/size info>`; tmux forbids `:` in session names, so the
     // name is everything before the first colon. This needs no format argument
     // and survives the wsl.exe round-trip intact.
-    let output = tmux(&["list-sessions"])
-        .output()
+    let output = output_with_timeout(tmux(&["list-sessions"]), tmux_cmd_timeout())
         .map_err(|e| TmuxError {
             op: "list-sessions",
             code: None,
@@ -547,11 +587,14 @@ case \"$line\" in *codex*) eff=codex; break;; *claude*) eff=claude; break;; esac
 done;; esac; printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done",
         sock = socket()
     );
-    let output = pane_info_command(&script).output().map_err(|e| TmuxError {
-        op: "list-panes",
-        code: None,
-        message: format!("failed to spawn tmux: {e}"),
-    })?;
+    let output =
+        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|e| {
+            TmuxError {
+                op: "list-panes",
+                code: None,
+                message: format!("failed to spawn tmux: {e}"),
+            }
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if is_no_server(&stderr) || stderr.contains("error connecting to") {
@@ -778,6 +821,11 @@ mod tests {
             .unwrap_or(0);
         format!("th_test_{ts}")
     }
+
+    // NB: the generic `output_with_timeout` bound (kill-a-hung-child, fast
+    // pass-through, no-serialization, large dual-pipe drain) is exercised in
+    // `bounded_exec.rs`, which now OWNS that shared helper. The tests below cover
+    // the tmux-specific surface that routes through it.
 
     /// Full lifecycle on the isolated socket: create → list contains it →
     /// has_session true → capture returns bytes → kill → has_session false.
