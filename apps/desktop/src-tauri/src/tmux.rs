@@ -15,8 +15,9 @@
 //!   - `list_sessions() -> Vec<String>`  (tolerates "no server running")
 //!   - `capture_pane(name) -> Vec<u8>`   (scrollback to seed xterm on attach)
 
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 /// The isolated tmux socket name; always passed as `tmux -L <socket>`.
 ///
@@ -129,10 +130,115 @@ fn is_already_gone(stderr: &str) -> bool {
         || stderr.contains("No such file or directory")
 }
 
+/// Default per-command timeout for a tmux/wsl subprocess invocation (residual
+/// control-flap fix).
+///
+/// The `-L t-hub` tmux server is SINGLE-THREADED: while it services one slow
+/// operation - a large `capture-pane`, a `new-session` blocked on slow (e.g.
+/// OneDrive-backed) filesystem I/O, a kill-tree sweep - every OTHER client command
+/// QUEUES behind it inside the server. A control handler thread that ran a bare
+/// `.output()` with no bound then PARKS for the full stall. Because the control
+/// server caps live connections ([`crate::control::MAX_CONNS`]), enough parked
+/// handlers make `serve` reject every NEW connection - which is exactly the residual
+/// flap: `list_terminals` round-trips time out for minutes (bare TCP connect still
+/// completes via the kernel backlog) while the app UI stays alive, and freshly
+/// created sessions never get adopted. #45 bounded the socket read/write legs; it
+/// did NOT bound the tmux SUBPROCESS the read handlers block on. This does.
+///
+/// Bounding the subprocess turns an indefinite park into a fast, recoverable error
+/// that frees the handler thread and its connection slot, so a transient server
+/// stall can no longer escalate into a channel-wide wedge. Generous: a healthy tmux
+/// answers in well under a second (a few hundred ms through `wsl.exe` on Windows);
+/// a call that blows past this is a stalled server, and failing fast lets the caller
+/// retry once it recovers.
+const TMUX_CMD_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
+
+/// Poll cadence for [`output_with_timeout`]'s wait loop. Small enough that
+/// completion latency is invisible next to a process spawn, large enough not to
+/// busy-spin.
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(15);
+
+/// Effective per-command tmux timeout: `$T_HUB_TMUX_CMD_TIMEOUT_SECS` (seconds) if
+/// set to a positive integer, else [`TMUX_CMD_TIMEOUT_DEFAULT`]. Unset / 0 / junk ⇒
+/// the default (NEVER unbounded - the whole point is that no tmux call may park a
+/// control handler forever). The env hook lets an operator widen it on a slow host.
+fn tmux_cmd_timeout() -> Duration {
+    std::env::var("T_HUB_TMUX_CMD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(TMUX_CMD_TIMEOUT_DEFAULT)
+}
+
+/// Run `cmd` to completion, but KILL it (and return an [`std::io::ErrorKind::TimedOut`]
+/// error) if it has not finished within `timeout`. This is the single choke point that
+/// guarantees NO tmux subprocess can park a control handler thread indefinitely (see
+/// [`tmux_cmd_timeout`] for why an unbounded `.output()` is the residual flap seam).
+///
+/// stdout/stderr are drained on dedicated threads so a child that fills a ~64 KB pipe
+/// buffer can't deadlock the wait (the classic `.output()`-by-hand trap), and a
+/// timed-out child is `kill`ed AND reaped so no zombie leaks. On Windows the child is
+/// `wsl.exe`; killing it frees THIS process's handler thread and connection slot even
+/// if the tmux inside WSL lingers (an orphan the WSL server reaps), which is the
+/// property that matters - the control channel must not stay wedged.
+fn output_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<Output> {
+    use std::io::Read;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    // Drain both pipes concurrently: a blocked reader on one pipe must not stop the
+    // child from making progress on the other (avoids a full-buffer deadlock).
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let stdout = out_handle.join().unwrap_or_default();
+                let stderr = err_handle.join().unwrap_or_default();
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    // Stalled past the bound: kill + reap (no zombie), then surface a
+                    // TimedOut error. Killing closes the pipes, so the reader threads
+                    // hit EOF and join cleanly rather than leaking.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = out_handle.join();
+                    let _ = err_handle.join();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("tmux command exceeded {}s timeout", timeout.as_secs()),
+                    ));
+                }
+                std::thread::sleep(OUTPUT_POLL_INTERVAL);
+            }
+        }
+    }
+}
+
 /// Run a tmux command and capture its output, mapping non-zero exits and io
-/// failures into a structured [`TmuxError`].
+/// failures into a structured [`TmuxError`]. Bounded by [`tmux_cmd_timeout`] so a
+/// wedged server surfaces as an error instead of parking the caller forever.
 fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxError> {
-    let output = tmux(args).output().map_err(|e| TmuxError {
+    let output = output_with_timeout(tmux(args), tmux_cmd_timeout()).map_err(|e| TmuxError {
         op,
         code: None,
         message: format!("failed to spawn tmux: {e}"),
@@ -355,8 +461,7 @@ pub fn target_for_id(id: &str) -> String {
 /// (including when no server is running at all), so the exit status is the
 /// single source of truth — no stderr parsing required.
 pub fn has_session(name: &str) -> bool {
-    tmux(&["has-session", "-t", name])
-        .output()
+    output_with_timeout(tmux(&["has-session", "-t", name]), tmux_cmd_timeout())
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -371,8 +476,7 @@ pub fn has_session(name: &str) -> bool {
 /// kept for tests, which spawn plain shells and don't need the tree sweep.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn kill_session(name: &str) -> Result<(), TmuxError> {
-    let output = tmux(&["kill-session", "-t", name])
-        .output()
+    let output = output_with_timeout(tmux(&["kill-session", "-t", name]), tmux_cmd_timeout())
         .map_err(|e| TmuxError {
             op: "kill-session",
             code: None,
@@ -429,11 +533,14 @@ tmux -L {sock} kill-session -t '{name}'",
         sock = socket(),
         name = name,
     );
-    let output = pane_info_command(&script).output().map_err(|e| TmuxError {
-        op: "kill-session-tree",
-        code: None,
-        message: format!("failed to spawn tmux: {e}"),
-    })?;
+    let output =
+        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|e| {
+            TmuxError {
+                op: "kill-session-tree",
+                code: None,
+                message: format!("failed to spawn tmux: {e}"),
+            }
+        })?;
     if output.status.success() {
         return Ok(());
     }
@@ -466,8 +573,7 @@ pub fn list_sessions() -> Result<Vec<String>, TmuxError> {
     // `<name>: <window/size info>`; tmux forbids `:` in session names, so the
     // name is everything before the first colon. This needs no format argument
     // and survives the wsl.exe round-trip intact.
-    let output = tmux(&["list-sessions"])
-        .output()
+    let output = output_with_timeout(tmux(&["list-sessions"]), tmux_cmd_timeout())
         .map_err(|e| TmuxError {
             op: "list-sessions",
             code: None,
@@ -547,11 +653,14 @@ case \"$line\" in *codex*) eff=codex; break;; *claude*) eff=claude; break;; esac
 done;; esac; printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done",
         sock = socket()
     );
-    let output = pane_info_command(&script).output().map_err(|e| TmuxError {
-        op: "list-panes",
-        code: None,
-        message: format!("failed to spawn tmux: {e}"),
-    })?;
+    let output =
+        output_with_timeout(pane_info_command(&script), tmux_cmd_timeout()).map_err(|e| {
+            TmuxError {
+                op: "list-panes",
+                code: None,
+                message: format!("failed to spawn tmux: {e}"),
+            }
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if is_no_server(&stderr) || stderr.contains("error connecting to") {
@@ -777,6 +886,83 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("th_test_{ts}")
+    }
+
+    // ---- output_with_timeout: the residual control-flap fix -----------------
+    //
+    // These prove the property the whole fix rests on: a tmux subprocess that
+    // stalls can NO LONGER park its caller indefinitely (which is what let a
+    // transient `-L t-hub` server stall pile up parked control handlers until
+    // `serve` rejected every new connection). They drive a generic hung/fast
+    // child (portable `sleep`/`echo`) so they need no live tmux and run
+    // deterministically. Unix-gated: the Windows CI target has neither on PATH.
+
+    /// A child that outlives the timeout is KILLED and surfaces `TimedOut` FAST -
+    /// the caller does not wait for the child's natural (30s) exit. This is the
+    /// wedge that used to hang a control handler forever; now it returns bounded.
+    #[cfg(unix)]
+    #[test]
+    fn output_with_timeout_kills_a_hung_child() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = Instant::now();
+        let res = output_with_timeout(cmd, Duration::from_millis(200));
+        let elapsed = start.elapsed();
+        let err = res.expect_err("a 30s sleep must time out under a 200ms bound");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "got: {err}");
+        // Must return promptly (well under the child's 30s), proving we didn't wait
+        // it out. Generous upper bound to stay non-flaky under a loaded CI box.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timed-out call should return promptly, took {elapsed:?}"
+        );
+    }
+
+    /// A fast child completes normally and its stdout/exit are captured intact -
+    /// the bound never trips on a healthy call (no behavior change for the 99%).
+    #[cfg(unix)]
+    #[test]
+    fn output_with_timeout_passes_through_a_fast_child() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("t-hub-ok");
+        let out = output_with_timeout(cmd, Duration::from_secs(5)).expect("echo should run");
+        assert!(out.status.success(), "echo should exit 0");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "t-hub-ok");
+    }
+
+    /// Two hung children run CONCURRENTLY, each finishing at its own ~timeout - the
+    /// bound is per-call, not a shared serialization point, so one stalled tmux
+    /// call cannot block a concurrent reader (the "concurrent reader is NOT blocked"
+    /// property, mirroring #45's persist_hook wedge test). If the two were
+    /// serialized, total wall-clock would be ~2x a single bound.
+    #[cfg(unix)]
+    #[test]
+    fn output_with_timeout_does_not_serialize_concurrent_calls() {
+        let start = Instant::now();
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let mut cmd = Command::new("sleep");
+                    cmd.arg("30");
+                    output_with_timeout(cmd, Duration::from_millis(400))
+                })
+            })
+            .collect();
+        for h in handles {
+            let r = h.join().expect("thread should not panic");
+            assert_eq!(
+                r.expect_err("hung child times out").kind(),
+                std::io::ErrorKind::TimedOut
+            );
+        }
+        let elapsed = start.elapsed();
+        // Both bounds are 400ms; run in parallel they finish in ~400ms, NOT ~800ms.
+        // Upper bound stays comfortably under 2x to catch accidental serialization
+        // while tolerating scheduler jitter.
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "concurrent timed-out calls should overlap (~400ms), took {elapsed:?}"
+        );
     }
 
     /// Full lifecycle on the isolated socket: create → list contains it →
