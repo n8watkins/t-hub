@@ -357,12 +357,30 @@ pub fn resolve_and_call(
                 .filter(|f| f.addr != endpoint.addr || f.token != endpoint.token);
 
             // Spawn-class command: the transport failure is AMBIGUOUS (the command may
-            // have applied server-side before the response leg died - Incident A/B/D).
-            // Resolve it authoritatively via get_request_status against the best
-            // endpoint we have, rather than blindly re-running (the historical
-            // duplicate-maker). Unchanged behavior; just reset the detector on success.
+            // have applied server-side before the response leg died - Incident A/B/D),
+            // so we resolve it authoritatively via get_request_status rather than
+            // blindly re-running (the historical duplicate-maker).
             if let Some(id) = &request_id {
-                let ep = fresh.unwrap_or(endpoint);
+                let ep = match fresh {
+                    // control.json names a different live endpoint (restart/rebind):
+                    // resolve the ambiguity against it.
+                    Some(f) => f,
+                    // No different endpoint: the one we tried is live. If it TIMED OUT
+                    // (relay wedge) and the detector fires, heal to a fresh port FIRST -
+                    // otherwise get_request_status just hangs on the wedged endpoint for
+                    // the full ambiguous-resolve deadline and fails UNHEALED (the round-1
+                    // heal this spawn-class path must keep). The requestId dedup makes
+                    // resolving/re-running against the healed port safe.
+                    None => {
+                        if first_is_timeout
+                            && wedge_detector().on_unchanged_transport_failure(WEDGE_TRIGGER_AFTER)
+                        {
+                            try_bridge_rebind(discovery, &endpoint).unwrap_or(endpoint)
+                        } else {
+                            endpoint
+                        }
+                    }
+                };
                 let r = resolve_ambiguous_request(&ep, command, &args, id, first_msg);
                 if r.is_ok() {
                     wedge_detector().on_success();
@@ -813,6 +831,27 @@ mod tests {
         d.on_success();
         // A SECOND wedge (on the now-rotated port) is a fresh episode and heals again.
         assert!(d.on_unchanged_transport_failure(1), "second wedge heals again after recovery");
+    }
+
+    #[test]
+    fn closed_connection_classifies_as_transport_not_timeout() {
+        // The self-heal (on BOTH the read and the restored spawn-class path) fires
+        // ONLY on the Timeout class = connected-but-silent, the relay-wedge signature.
+        // A connection that CLOSES without responding (app down / old listener
+        // retired) must classify as Transport so it recovers via the file re-read and
+        // never triggers a spurious rebind. This guards that gate hermetically (a true
+        // connected-but-silent Timeout would need the full 45s deadline to reproduce).
+        let (addr, _captured) = scripted_server(vec![None]); // accept, read, drop, no reply
+        let ep = ControlEndpoint {
+            addr,
+            token: "t".into(),
+        };
+        let err = call_classified(&ep, "list_terminals", &serde_json::json!({}));
+        assert!(
+            matches!(err, Err(CallError::Transport(_))),
+            "a connection closed without responding must be Transport (app-down class), \
+             not Timeout - the wedge heal must not fire on it"
+        );
     }
 
     #[test]
