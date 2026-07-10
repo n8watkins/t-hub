@@ -5,6 +5,7 @@ import {
   registerTerminalTail,
   unregisterTerminalTail,
   readTerminalTailLine,
+  readTerminalTailText,
   type XtermTailSource,
 } from "./terminalTail";
 
@@ -66,5 +67,32 @@ describe("readTerminalTailLine", () => {
     registerTerminalTail("a", newer); // remount replaced it
     unregisterTerminalTail("a", older); // stale unregister must be a no-op
     expect(readTerminalTailLine("a")).toBe("new");
+  });
+});
+
+describe("readTerminalTailText", () => {
+  it("joins the whole visible screen top-first, newline-separated", () => {
+    registerTerminalTail("a", fakeTerm(["line one", "line two", "line three"]));
+    expect(readTerminalTailText("a")).toBe("line one\nline two\nline three");
+  });
+
+  it("drops trailing blank rows but keeps interior blanks", () => {
+    registerTerminalTail(
+      "a",
+      fakeTerm(["header", "", "footer", "   ", ""]),
+    );
+    expect(readTerminalTailText("a")).toBe("header\n\nfooter");
+  });
+
+  it("honors the viewport offset (baseY)", () => {
+    registerTerminalTail("a", fakeTerm(["top", "bottom"], 100));
+    expect(readTerminalTailText("a")).toBe("top\nbottom");
+  });
+
+  it("returns '' for an unknown / null id or a blank screen", () => {
+    expect(readTerminalTailText("nope")).toBe("");
+    expect(readTerminalTailText(null)).toBe("");
+    registerTerminalTail("a", fakeTerm(["", "   ", ""]));
+    expect(readTerminalTailText("a")).toBe("");
   });
 });

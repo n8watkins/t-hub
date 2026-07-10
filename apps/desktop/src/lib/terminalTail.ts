@@ -53,3 +53,35 @@ export function readTerminalTailLine(id: string | null | undefined): string {
   }
   return "";
 }
+
+/**
+ * The whole VISIBLE screen as one newline-joined string (top row first), so a
+ * consumer can pattern-match a MULTI-LINE artifact (e.g. the Claude usage-limit
+ * modal, whose banner and numbered options span several rows). Trailing blank
+ * rows are dropped; interior blanks are preserved so the text reads as it looks.
+ * "" when the id is unknown or the screen is blank. Read on demand (polling) -
+ * no per-output-chunk work in the hot render path, same contract as
+ * {@link readTerminalTailLine}.
+ *
+ * Only the viewport is read (not the full scrollback): the dialog we scan for is
+ * a live modal occupying the visible screen, and bounding the scan to `rows`
+ * keeps each poll O(viewport).
+ */
+export function readTerminalTailText(id: string | null | undefined): string {
+  if (!id) return "";
+  const term = registry.get(id);
+  if (!term) return "";
+  const active = term.buffer.active;
+  const top = active.baseY;
+  const bottom = top + term.rows - 1;
+  const lines: string[] = [];
+  for (let y = top; y <= bottom; y += 1) {
+    lines.push(
+      active.getLine(y)?.translateToString(true).replace(/\s+$/, "") ?? "",
+    );
+  }
+  // Drop trailing blank rows (the cursor usually sits below the content) so the
+  // joined text ends at the last real line; keep interior blanks.
+  while (lines.length && lines[lines.length - 1] === "") lines.pop();
+  return lines.join("\n");
+}
