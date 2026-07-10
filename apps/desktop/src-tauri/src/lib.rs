@@ -34,6 +34,7 @@ mod tray; // system-tray icon + close-to-tray (hide instead of quit) (#17)
 mod usage; // Claude plan usage via `claude -p /usage` (sidebar Usage strip)
 mod codex; // Codex plan usage, read from ~/.codex/sessions rollout files (sidebar)
 mod voice; // Settings > Voice: voice.json persistence + loopback Piper TTS proxy (no browser Origin)
+mod engine_supervisor; // managed Kokoro lifecycle: spawn/health-watch/auto-restart + auto-fallback to Piper (default-off flag; proposal /tmp/flap-probe/LIFECYCLE-PROPOSAL.md)
 mod scribe; // Scribe voice-gate: v1 status endpoint via ~/.scribe/control.json, status.json fallback ("is the general dictating?")
 mod win_snap; // Windows 11 Snap Layouts + native edge-resize on the frameless window (no-op on unix)
 
@@ -472,6 +473,35 @@ pub fn run() {
             diag::log_startup();
             // Kick off the agent connection in the background once state exists.
             spawn_agent_connect(&state);
+
+            // Managed TTS-engine lifecycle (proposal /tmp/flap-probe/
+            // LIFECYCLE-PROPOSAL.md). The status snapshot is ALWAYS managed as
+            // state so `engine_runtime_status` answers; the watcher thread that
+            // actually spawns/health-watches/falls-back only starts behind the
+            // default-OFF `T_HUB_MANAGED_KOKORO` flag (+ configured install
+            // paths), so shipping this disturbs NOTHING live - the interim
+            // unit-owned Kokoro keeps serving until the migration flip.
+            let engine_snapshot = engine_supervisor::runtime::SharedSnapshot::new_unmanaged();
+            let engine_snapshot_handle = engine_snapshot.handle();
+            app.manage(engine_snapshot);
+            if engine_supervisor::managed_enabled() {
+                if let Some(opts) =
+                    engine_supervisor::runtime::opts_from_env(voice::current_engine())
+                {
+                    engine_supervisor::runtime::start(
+                        control_fanout.clone(),
+                        engine_snapshot_handle,
+                        opts,
+                    );
+                } else {
+                    diag::diag_log(
+                        "engine_supervisor: T_HUB_MANAGED_KOKORO set but install \
+                         paths (T_HUB_KOKORO_DIR / T_HUB_PIPER_EXE) missing - not \
+                         starting (fail-safe)"
+                            .to_string(),
+                    );
+                }
+            }
             // Best-effort startup reconcile: if the user already has T-Hub-managed
             // Claude hooks/statusLine (including stale `__termhub_managed__` ones
             // from an upgraded `termhub` build), auto-migrate them to the current
@@ -693,6 +723,10 @@ pub fn run() {
             // Bounded /health probe (2s) per engine - the Settings dual-engine
             // health display + selected-engine-down error state read this.
             voice::voice_health,
+            // Managed-lifecycle status (active vs selected engine, degraded
+            // level). Reports managed:false when the flag is off so the webview
+            // falls back to its own #52 probes.
+            engine_supervisor::engine_runtime_status,
             // Scribe voice-gate: "is the general dictating?" (fails open).
             scribe::scribe_status,
         ])

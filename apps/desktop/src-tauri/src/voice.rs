@@ -64,8 +64,9 @@ impl VoiceEngine {
     }
 
     /// The loopback port each engine's local server listens on. Piper owns
-    /// 7477 (pre-existing); Kokoro owns 7478.
-    fn default_port(self) -> u16 {
+    /// 7477 (pre-existing); Kokoro owns 7478. `pub(crate)` so the engine
+    /// supervisor knows which port a spawned engine should come up on.
+    pub(crate) fn default_port(self) -> u16 {
         match self {
             VoiceEngine::Piper => 7477,
             VoiceEngine::Kokoro => 7478,
@@ -84,14 +85,17 @@ impl VoiceEngine {
 
 /// A loopback-only agent: no redirect following (a local TTS server has no
 /// business redirecting, and following one could leak the request elsewhere).
-fn agent() -> ureq::Agent {
+/// `pub(crate)` so the engine supervisor's health-watch reuses the same
+/// no-Origin, redirect-free client the proxy uses.
+pub(crate) fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().redirects(0).build()
 }
 
 /// The TTS server base URL for `engine`: the per-engine env override when set,
 /// else `http://127.0.0.1:<default_port>`. The port is the ONLY thing that
 /// differs between engines (identical API), so routing is pure port selection.
-fn base_url_for_engine(engine: VoiceEngine) -> String {
+/// `pub(crate)` so the engine supervisor probes the same base URL the proxy uses.
+pub(crate) fn base_url_for_engine(engine: VoiceEngine) -> String {
     if let Ok(u) = std::env::var(engine.url_env_key()) {
         if !u.trim().is_empty() {
             return u;
@@ -173,6 +177,13 @@ fn parse_settings(v: &serde_json::Value) -> VoiceSettings {
             .and_then(|x| x.as_bool())
             .unwrap_or(d.announce_on_attention),
     }
+}
+
+/// The currently-selected engine from voice.json (the managed lifecycle's
+/// PRIMARY). `pub(crate)` so the engine supervisor picks the same engine the
+/// user chose in Settings. Lenient: defaults to Piper if the file is absent.
+pub(crate) fn current_engine() -> VoiceEngine {
+    read_settings().engine
 }
 
 /// Read voice.json leniently: missing file or unparseable content yields the
@@ -360,7 +371,9 @@ fn probe_health(engine: VoiceEngine) -> EngineHealth {
 /// The URL-taking core of `probe_health`, split out so a test can point it at an
 /// arbitrary (e.g. deliberately-dead ephemeral) base URL WITHOUT mutating the
 /// process-global engine-URL env - hermetic under a parallel test harness.
-fn probe_health_at(engine: VoiceEngine, base_url: &str) -> EngineHealth {
+/// `pub(crate)` so the engine supervisor's health-watch reuses the exact same
+/// bounded probe the Settings health display uses.
+pub(crate) fn probe_health_at(engine: VoiceEngine, base_url: &str) -> EngineHealth {
     let url = format!("{base_url}/health");
     match agent()
         .get(&url)
