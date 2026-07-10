@@ -1322,16 +1322,29 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // lands in the server's reserved-tab snapshot but is in NEITHER the local
       // captains order (the client never pinned it) NOR any work tab. Without this
       // it is filtered out of every rebuilt tab, so the agents plane renders no
-      // tile and never attaches a PTY client to it, and the cleanup pass below
-      // then garbage-collects its live entry. The KEEP filter above only prunes
+      // tile (the pool renders the union of tab orders) and never attaches a PTY
+      // client to it; its live entry (registered by the spawn_terminal apply's
+      // adoptTerminal) just lingers unplaced. The KEEP filter above only prunes
       // the existing local order - it can never ADD such a tile - so append it
       // here at the tail (least-recently-summoned, like a fresh local pin),
       // preserving the established order. Idempotent across the reporter round-
       // trip: once adopted it is already in the local order on the next sync.
+      //
+      // Gate on NOT-already-placed-LOCALLY (any tab), not merely not-in-
+      // captainsOrder: when the user unpins a captain, moveTileToWorkTab pulls its
+      // tile into a work tab locally BEFORE that layout up-syncs. A server snapshot
+      // from the pre-unpin window still lists the tile in captains-reserved; keying
+      // on captainsOrder alone would re-adopt it and yank it back into the plane,
+      // fighting the user's move. A tile the client already has anywhere is not a
+      // new socket commission - skip it and let the normal work-tab/registry paths
+      // reconcile.
+      // (captainsOrder is a subset of the local captains tab's order, itself a
+      // subset of locallyPlaced, so this gate also subsumes not-in-captainsOrder.)
+      const locallyPlaced = new Set(tabs.flatMap((t) => t.order));
       const serverCaptainsTiles =
         regTabs.find((r) => r.id === CAPTAINS_TAB_ID)?.tileIds ?? [];
       for (const id of serverCaptainsTiles) {
-        if (!captainsOrder.includes(id)) captainsOrder.push(id);
+        if (!locallyPlaced.has(id)) captainsOrder.push(id);
       }
       const agentSet = new Set(captainsOrder);
 

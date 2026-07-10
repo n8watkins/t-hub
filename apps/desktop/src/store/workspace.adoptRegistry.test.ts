@@ -247,7 +247,10 @@ describe("adoptRegistry adopts a socket-commissioned captain from the reserved t
   // it is in NEITHER the local captains order NOR any work tab. The KEEP filter
   // only prunes the existing local order, so before the fix the tile was dropped
   // from every rebuilt tab: the agents plane rendered no tile and never attached a
-  // PTY client (tmux session_attached=0), and the cleanup pass GC'd the terminal.
+  // PTY client (tmux session_attached=0). (The tile's live entry was NOT reaped by
+  // the client cleanup pass, which only visits ids that were in a local tab; it
+  // lingered unplaced - the gate that matters is the reserved-tab ORDER, asserted
+  // below.)
   afterEach(() => {
     registerCaptainRegistry(() => []);
   });
@@ -273,11 +276,12 @@ describe("adoptRegistry adopts a socket-commissioned captain from the reserved t
     const s = useWorkspace.getState();
     // The socket captain joins the agents plane at the tail, keeping the existing
     // one (so the plane renders + attaches its terminal like any other captain).
+    // This ORDER assertion is what carries the gate: without the fix "sock" is
+    // absent here.
     expect(s.tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order).toEqual([
       "cap1",
       "sock",
     ]);
-    expect(s.terminals["sock"]).toBeDefined(); // preserved, not cleaned up
     // Exactly one reserved tab, still last; not duplicated into a work tab.
     expect(s.tabs.filter((t) => t.id === CAPTAINS_TAB_ID)).toHaveLength(1);
     expect(s.tabs[s.tabs.length - 1].id).toBe(CAPTAINS_TAB_ID);
@@ -287,7 +291,7 @@ describe("adoptRegistry adopts a socket-commissioned captain from the reserved t
   it("adopts the reserved-tab tile even before it is in the captains registry (spawn precedes claim)", () => {
     // The tile is placed at spawn time, BEFORE claim_captain registers it - so the
     // registry-liveness fallback does not yet cover it. The server's reserved-tab
-    // placement alone must suffice, else the tile is GC'd before the claim lands.
+    // placement alone must suffice.
     registerCaptainRegistry(() => []); // not a registered captain yet
     seed([{ id: "t1", name: "Workspace 1", order: ["a"] }], "t1", "a");
     useWorkspace.setState({
@@ -299,7 +303,37 @@ describe("adoptRegistry adopts a socket-commissioned captain from the reserved t
     ]);
     const s = useWorkspace.getState();
     expect(s.tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order).toEqual(["sock"]);
-    expect(s.terminals["sock"]).toBeDefined();
+  });
+
+  it("does NOT re-adopt a captain the user just unpinned to a work tab (up-sync race)", () => {
+    // The user unpinned captain "x": moveTileToWorkTab pulled its tile from the
+    // reserved tab into a work tab LOCALLY, and that layout has not up-synced yet.
+    // A server snapshot from the pre-unpin window still lists "x" in captains-
+    // reserved (each tile lives in exactly one server tab, so the work tab is still
+    // the server's ["a"]). The adopt loop must respect the local placement - keyed
+    // on locallyPlaced, not merely the captains order - and NOT yank "x" back into
+    // the agents plane. Keying on captainsOrder alone would re-adopt it and fight
+    // the user's move on every sync until the report lands.
+    registerCaptainRegistry(() => []); // released along with the unpin
+    seed(
+      [
+        { id: "t1", name: "Workspace 1", order: ["a", "x"] },
+        { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: [] },
+      ],
+      "t1",
+      "a",
+    );
+    useWorkspace.getState().adoptRegistry([
+      { id: "t1", name: "Workspace 1", tileIds: ["a"] },
+      { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, tileIds: ["x"] },
+    ]);
+    const s = useWorkspace.getState();
+    // The gate: "x" is NOT pulled back into the reserved tab (without the
+    // locallyPlaced guard it would re-adopt as ["x"]). The server's work-tab view
+    // (["a"]) then reconciles "x" out per its authority; the reporter's baseSeq
+    // stale-rejection re-converges the user's pending move - both outside this
+    // loop's concern.
+    expect(s.tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order).toEqual([]);
   });
 });
 
