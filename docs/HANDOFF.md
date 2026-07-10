@@ -1,65 +1,62 @@
-# T-Hub - Session Handoff
+# T-Hub captain handoff (fresh, 2026-07-09 wind-down)
 
-**Last updated:** 2026-07-07 (Step 4 wave landed, Phase 3 default reverted after an incident) - **Branch:** `main`, fully pushed - **App version on main:** `0.3.47` + the Phase 3 default-off fix on top. **Installed (prod):** `0.3.46` (rolled back - see incident below).
+Zero-context resume doc for the next t-hub-app captain.
+Ship file (authoritative roster + full history): `~/.t-hub/captain/ships/t-hub-scribe.md`.
+Fleet doctrine: `~/.t-hub/captain/{ESCALATION,MODEL-POLICY,RETIREMENT}.md`; crew-brief escalation block: `~/.t-hub/captain/BRIEF-ESCALATION-BLOCK.md`.
 
-> INCIDENT + ROLLBACK (2026-07-07): 0.3.47 was built + installed, and the Phase 3 default-ON flip BROKE terminal attach for the whole app - every session showed "session detached - reconnecting". ROOT CAUSE: the app's OWN frontend authenticates to the control socket with the token published in `control.json`; Phase 3 downgraded that published token to read-only, so the webview lost control and could not attach terminals. The crew's blast-radius map covered external callers (MCP/CLI/probes) but MISSED the frontend as a consumer of the published token. FIX: rolled prod back to the 0.3.46 installer (`T-Hub_0.3.46_x64-setup.exe`, sessions preserved, terminals healthy again), and reverted the Phase 3 DEFAULT back to OFF on main (branch `fix-phase3-default-off`) - Phase 3 infra stays behind `T_HUB_CONTROL_HARDEN=1`, dormant, until the frontend gets the control token via a trusted internal channel (a Tauri command or spawn-injected env) rather than scraping `control.json`. THAT frontend-token work is the real Phase 3 prerequisite - do it before ever re-enabling the flag.
+## Who you are
 
-> STEP 4 STATUS (2026-07-07): (a) socket-gate Phase 3 - LANDED (PR #25) but DEFAULT REVERTED to OFF after the incident above; safe/dormant behind the flag. (b) Cortana UI parity - orchestrator renders as "Cortana" through a shared `AgentRow` (full captain status parity) with a crown icon (PR #26) - GOOD, not implicated. (c) stray placeholder fixed - duplicate reserved Captains tab from the registry echo path, filtered in `adoptRegistry` + self-healed in `ensureReservedCaptainsTab` (PR #27) - GOOD, not implicated. (d) NEW item from the general (captains showing as un-closeable BOTTOM workspace tiles; should be top agents list only) - LANDED (PR #30, `9b3f070`): the reserved Captains tab is now excluded from the bottom Workspaces list, the collapsed rail, and the section count. The crew died mid-flight; the captain salvaged its partial work and fixed a Zustand `.filter()`-in-selector infinite-render loop (derive the filtered list in `useMemo` off the stable `s.tabs` ref). 255 desktop tests green. NEXT: main (0.3.47 code, Phase 3 default OFF) now has (b)+(c)+(d) but INSTALLED prod is still 0.3.46 (none installed). Deliver via a side-by-side "T-Hub Dev" (`com.t-hub.dev`) build for the general to live-view (b)+(c)+(d) against the same agents, then cut a clean prod 0.3.48 (Phase 3 default-off) once green. Phase 3 re-enable is BLOCKED until the frontend gets the control token via a trusted internal channel (Tauri command / spawn-injected env), NOT `control.json` (that is what broke attach).
+You are the captain of ship **t-hub-app** (registry slug `t-hub-app`), terminal `84ce1cae`, repo `/home/natkins/projects/tools/t-hub/t-hub-app`.
+The general (user) commands via the orchestrator **Cortana** (terminal `e05764f5`).
+You DELEGATE all project work to crew; you stay at orchestration altitude.
+On resume: invoke `/shipmate`, claim via `claim_captain` (MCP) or `~/.t-hub/captain/claim-captain.sh 84ce1cae t-hub-app` (raw-socket fallback), rebuild the roster from the ship file + `list_terminals`.
 
-> Zero-context handoff. Read this in full, plus [CAPTAIN-CHAT-PHASES.md](./CAPTAIN-CHAT-PHASES.md) and the orders at `~/.t-hub/captain/orders/t-hub-2026-07-06.md`.
-> Ship identity: you are captain of ship **t-hub** (ship file `~/.t-hub/captain/ships/t-hub.md`, captain terminal `e4348ddf`). The old "t-hub-native" slug is retired; the native pivot is archived.
-> Working dir: `/home/natkins/projects/tools/t-hub/t-hub-app`.
+## Current state (end of this wave)
 
----
+- **main is at 0.3.58** (commit `a3d1700`), installed and running (pid was 8556, binary FileVersion 0.3.58). Repo tree clean.
+- This wave shipped **0.3.54 → 0.3.58**. 0.3.58 merged PRs #47 (auto-continue full redesign, DEFAULT-ON) and #48 (control-socket flap fix: tmux+git subprocess bounding via a shared `bounded_exec` helper + M1 full re-probe-on-reap).
+- **Two untracked files** (`.lavish/`, `docs/DECK-AGENTS-DESIGN.md`) are pre-existing, NOT this ship's work - leave them.
+- **All crew reaped, all worktrees removed** (except a doc-staleness crew active during wind-down - reaped as part of it). The only other tmux session, `9a32f554`, is the **monorepo-app captain** (another ship) - do NOT touch it.
 
-## 1. What this is
+## ⚠ TOP PRIORITY on resume - the flap fix did NOT work
 
-T-Hub is a Tauri 2 desktop command-center for running and supervising many Claude Code / Codex agent sessions.
-Rust backend (`apps/desktop/src-tauri`) + React/TS/Tailwind frontend (`apps/desktop/src`) with xterm.js terminals.
-On Windows it drives WSL tmux (`tmux -L t-hub`, sessions `th_<id>`); a loopback control socket (`control.rs`, handshake `~/.t-hub/control.json`) is the spine every crew/captain/orchestrator/MCP command flows through.
+0.3.58's #48 bounded every tmux and git subprocess, but a **live control-socket wedge STILL reproduces on 0.3.58**: connect succeeds, but EVERY command hangs >11-18s - including non-tmux reads (`get_theme`, `list_tabs`, `wsl_health`), not just `list_terminals`. Meanwhile the tmux server itself is fast (`list-sessions` 0.006s) and only 3 sessions exist. So the wedge is in the **accept/serve/dispatch path** (upstream of handlers), NOT the tmux subprocess #48 bounded. The flap crew explicitly ruled the accept loop out; the evidence contradicts that. This is escalated as DECISION-NEEDED and is the #1 NEAR itinerary item: reopen the flap investigation with the corrected evidence (every command hangs incl. non-tmux ⇒ serve/dispatch seam - candidate: a global lock/worker-pool/`ACTIVE_CONNS` exhaustion in `serve`, or a stuck subscribed/attach connection holding a shared resource). Until fixed, the operational workaround stands: drive crew via **raw tmux** on the `-L t-hub` socket (invisible in the webview until an app restart re-adopts them); a restart transiently clears the wedged process.
 
-## 2. What landed this wave (0.3.40 -> 0.3.45, all on main)
+## How to operate this ship (learned this wave)
 
-- **Multi-captain + sidebar** (earlier): captain list/switcher, CAPTAINS sidebar section, identity rows.
-- **Voice** (0.3.41-0.3.43): Settings > Voice (engine selector), **Kokoro** TTS added as a selectable engine (local server `~/projects/extensions/kokoro-tts`, `127.0.0.1:7478`, 54 voices, detached from crews - restart via its `start.sh`); Piper still on `7477`. Announce-on-attention with a Scribe voice-gate (holds announcements while the general dictates - Scribe writes `%LOCALAPPDATA%\com.natkins.scribe\status.json`, T-Hub reads it, `scribe_status` MCP tool). Voice-title bug fixed (speaks the captain identity, not the typed input).
-- **Identity fix** (0.3.44, PR #19): `stableCaptainIdentity` prefers cwd basename over tab name (fixed captains all showing "appturnity" when sharing a tab).
-- **Captains surface** (0.3.44 -> 0.3.45): built a custom deck (PR #20), then RETIRED it per the general's correction (PR #22) in favor of a **reserved "Captains" workspace tab** (id `captains-reserved`) - a normal workspace tab holding captain + orchestrator tiles as ordinary terminals, kept out of the work tabs; net -494 lines. Polish (PR #24): last-work-tab close guard + keep work spawns out of Captains.
-- **Orchestrator** (Cortana): a `fleet-orchestrator` skill session (terminal `e05764f5`, cwd `~/.t-hub/orchestrator`, ship slug `fleet`, file `~/.t-hub/captain/ships/fleet.md`), **adopt-only** (T-Hub adopts + designates an existing orchestrator on launch; NO permissionless auto-spawn - an adversarial audit killed auto-spawn as premature at 1-ship scale). It commands captains via the raw control socket. General drives it directly; it relays orders to captains (this handoff came through it).
-- **SECURITY - socket-gate** (design `docs/SOCKET-AUTH-DESIGN.md`):
-  - **Phase 1** (PR #21, on 0.3.45): fleet spawn governor (concurrent cap 64 from live tmux, spawn rate 20/min burst 8, hard ceiling 128, destructive throttle 15/min) + tamper-evident audit log (`~/.t-hub/audit/`, `send_text` content redacted to a hash, hash-chained). Refuses runaway/injection fan-out; normal orchestration bursts pass.
-  - **Phase 2 + 2b** (PR #23, merged - in 0.3.46): capability-scoped tokens. `control.json` `token` = full-power `control_token` (backward-compatible; every current caller keeps working); a `read_token` (Read tier only) added. Gate at `dispatch_authenticated` maps token -> capability -> command tier. Elevate-by-default (crews keep control unless explicitly opted read-only, fail-safe to control). Remote (Tailscale) peers capped to read. `create_worktree`/`remove_worktree` are control-tier.
-  - **Phase 3** (PARKED - built, flag OFF): `T_HUB_CONTROL_HARDEN` env, default false. Flipping it stops publishing `control_token` to `control.json` so the control capability only flows via the spawn-tree env injection - closes the "scrape control.json -> full power" hole. **Step 4a below is to do Phase 3 in this fresh context.**
+- **Control socket flaps/wedges** - never diagnose "app up/down" from a bare TCP connect; round-trip a real command (`list_terminals`) with a timeout. See memory `control-socket-transient-wedge`.
+- **Spawn crew via raw tmux** while the socket is wedged: `tmux -L t-hub new-session -d -s th_<id> -c <worktree> -x 220 -y 50; tmux -L t-hub set-option -t th_<id> window-size manual`, then `send-keys` the harness (`claude --model claude-opus-4-8 --effort high --dangerously-skip-permissions`) and the brief. Raw-tmux crew are native-client-adopted but NOT webview-visible until a restart.
+- **`send-keys` backtick trap**: backticks/`$()`/quotes in a message get shell-interpreted locally and mangle the send - build the message in a single-quoted heredoc and send with `-l` (literal), or write plain prose. Memory `send-keys-backtick-trap`.
+- **Completion signaling**: every crew brief ends with `touch /tmp/t-hub-crew-done/t-hub-scribe/<name>.done`; run ONE background watcher (`run_in_background` Bash loop over that dir) that exits on the first sentinel and wakes you.
+- **Model policy** (`MODEL-POLICY.md`): captain = Fable 5 high; crew = Opus 4.8 high (review crew = Opus 4.8 xhigh). Pin `--model claude-opus-4-8 --effort high|xhigh` on every spawn (session default can leak xhigh - restart with `--effort high` if so).
+- **Escalation doctrine** (`ESCALATION.md`, v2 2026-07-10): decisions at the lowest capable level; captain decides all technical/ship matters and reports STATUS, escalates only above-ship items (merge/push/install/outward, product, spend, cross-ship, security, unclear standing-order intent) to Cortana as DECISION-NEEDED (options + recommendation). Report classes: STATUS / DECISION-NEEDED / EMERGENCY. Fold `BRIEF-ESCALATION-BLOCK.md` into EVERY crew brief. Helm feature CANCELLED - courtesy no-inject-over-the-general-while-typing only.
+- **announce.sh deploy step**: the NSIS installer ships the binary, NOT the captain-dir fleet scripts. After any `apps/desktop/scripts/announce.sh` change lands, deploy it: `cp <repo>/apps/desktop/scripts/announce.sh ~/.t-hub/captain/announce.sh && chmod +x`; verify with `announce.sh --gate` + an announce.log line. Memory `captain-voice-announcements`.
+- **Version bump** on every code commit via `bump-version.sh` (docs exempt); sync Cargo.lock via `cargo check`, never hand-sed.
 
-## 3. PARKED / next steps (Step 4 of the orders - resume here)
+## FUTURE ITINERARY
 
-Per `~/.t-hub/captain/orders/t-hub-2026-07-06.md`, after the 0.3.46 install + fresh context, delegate these to crew worktrees (reproduce E2E first, review, test, merge, bump):
+### NEAR (deferred or almost reached this session - pick up first)
 
-- **(a) Socket-gate Phase 3** - implement/flip the final lockdown (stop publishing the full-power token; control capability only via the spawn tree). It is built behind `T_HUB_CONTROL_HARDEN` (default off). The general green-lit doing it now. Verify probes/MCP/app all still spawn once the flip is on (the app must inject `control_token` into elevated sessions - Phase 2b - for this to keep working).
-- **(b) Cortana (orchestrator) UI parity** - in the app, rename the "orchestrator" entity to **Cortana**. Give it the SAME status/sidebar treatment as the captains (a peer entry in the sidebar / Captains tab with the same live status/context display captains have) PLUS a special icon marking it as the orchestrator. Cortana's live terminal is `e05764f5`. The `orchestratorId` designation + `ensureOrchestrator` adopt-only already exist in `store/captain.ts` - build the naming + icon + status-parity on that.
-- **(c) Workspace stray-terminal bug** - repro: creating a NEW workspace shows a "new terminal" placeholder on the back of the workspace even when that workspace already has terminals. Expected: do not show the placeholder when terminals already exist. Reproduce E2E, fix, land.
+1. **[TOP] Reopen the control-socket flap investigation.** 0.3.58's #48 did NOT fix the live wedge (every command hangs incl. non-tmux ⇒ serve/dispatch path, not tmux; tmux server itself is healthy). Root-cause the accept/serve/dispatch seam (global lock / worker-pool / ACTIVE_CONNS exhaustion / stuck subscribed-or-attach connection). This is the general's headline pain (empty workspace, unusable MCP). Reproduce, fix, xhigh review.
+2. **F2 - EventFanout snapshot-under-lock.** `emit_event` holds the `subs` mutex across per-subscriber socket writes (bounded 5s each by SO_SNDTIMEO). The #48 flap crew flagged it as a latent seam (not the observed cause): N sequential stalled subscribers ⇒ ~N×5s emit stall, delaying event delivery/adoption forwards. Fix = snapshot subscribers under lock, write unlocked. May be related to item 1 - check first.
+3. **Bound the other-subsystem subprocesses.** The #48 F1 completeness sweep found unbounded `.output()`/`.status()` in files.rs, codex.rs, usage.rs, devserver.rs, recent.rs, claude/install.rs (and control.rs `tailscale_ip4` startup-only, benign). Route control-reachable ones through the shared `bounded_exec` helper for the same "no handler parks forever" invariant.
+4. **PR #45 M1 spawn_terminal re-probe honest-limit.** The re-probe closes the create_worktree reaped-duplicate but `spawn_terminal` returns `None` (server-minted id, nothing to probe by) and relies on the 600s reap window. If spawn duplicates recur, add a probe key (e.g. client-supplied spawn tag) so spawn is re-probable too.
+5. **PR #44 LOW watch-items** (all noted in the #44 PR body): header ctx% meter mid-turn flicker (default-OFF, small blast radius); tile-header button crowding at the narrowest widths (now 5 shrink-0 buttons); DRY the O(n) `sessionIdByTmux` reverse scan (a forward index retires it).
+6. **Auto-continue redesign follow-ups** (from the two xhigh reviews, all LOW, shipped as-is): default-ON flip surprises v1 curated opt-in users (needs a **release note** - flag to the general); re-verify the modal detection anchors against a real limited pane when one safely presents (anchors were verified against strings grepped from the Claude Code binary, not a live render); the account-wide Codex reset fans out to all watched Codex tiles at reset.
 
-Also parked (lower priority): the deck's one-click "start orchestrator" affordance for the rare cold-start (deferred since the orchestrator persists in tmux).
+### FURTHER (on our list, never got to this wave)
 
-## 4. Conventions and gotchas (hard-won)
+1. **PR #34 orchestrator-wake fast-follows** (3 MEDIUM, on hold since 0.3.54): stale-UUID handling, no-suppression-timeout, live-validate the wake path.
+2. **no-mistakes CI-step cwd bug** - the shared no-mistakes daemon runs `gh pr checks` from its non-repo cwd (`~/.no-mistakes`) so the CI step hangs forever though checks actually pass. Fix = give the CI step repo context (chdir/--repo). This is the no-mistakes TOOL repo, a different ship - route via Cortana. Memory `no-mistakes-ci-step-cwd-bug`. (Why every crew this wave ran plain commit+push+PR, never /no-mistakes.)
+3. **Registry slug-rename persistence inconsistency** - a pre-restart slug rename rolled back across a restart for this ship while monorepo-app's survived; registry persistence is inconsistent across restarts.
+4. **ensure-thub-mcp debug-binary repoint** - the per-repo `.mcp.json` provisioning points at the local DEBUG t-hub-mcp build; override via `T_HUB_MCP_BIN` once t-hub ships a packaged sidecar. Memory `captain-self-register-provisioning`.
+5. **WorkspacesList Cortana rename** - small UI follow-up (the orchestrator folder-name row), general-queued for a future batch.
+6. **Server-split M2-M4** (remote), webview supervision cues, MCP parity for `create_worktree`/`remove_worktree`/`wait_for_status` (currently raw-socket-only) - the standing longer-horizon goals from the native-pivot survivors.
 
-- **Version bump every code commit** (`apps/desktop/scripts/bump-version.sh`, then `cargo check` in `src-tauri` to sync `Cargo.lock` - never hand-edit the lock). One bump per landed change; the captain/orchestrator bumps at merge, crews never bump.
-- **Local Windows build**: clone at `C:\Users\natha\projects\Tools\t-hub\t-hub-app` - do NOT `git merge` into it; rsync `apps/desktop/src` + `src-tauri/src` + Cargo.toml/lock + package.json over it, `sed` its `tauri.conf.json` version, then `powershell.exe ... pnpm tauri build`. Output `...\bundle\nsis\T-Hub_<v>_x64-setup.exe`; install `/S`; relaunch `%LOCALAPPDATA%\T-Hub\t-hub.exe`. Verify "Finished 1 bundle". Sanity-grep a new symbol in the synced sources before trusting the installer.
-- **Session-kill-on-install regression**: the 0.3.40 install killed 5 of 7 tmux sessions; later installs (0.3.41-0.3.45) preserved ALL sessions (attached ones survive). Still a latent risk - this handoff exists because the install may kill the captain session.
-- **Crew orchestration**: spawn via the control socket `create_worktree` (reference client `scripts/probes/t1_lib.py`); crews run `claude --dangerously-skip-permissions --model opus` (the auto-mode classifier requires the general's fresh authorization per launch - it will block, ask the general). Crew brief ends with `touch /tmp/t-hub-crew-done/<ship>/<name>.done`; captain arms a background watcher over that dir. Review pattern: focused Opus finder agents + adversarial verify before presenting; fix rounds on the same branch.
-- **Fable model is walled** (usage credits) - crews + subagents run **Opus** (`--model opus`, `/model opus`, `model: "opus"`).
-- **Sparse/vertical tmux render** on some crew tiles is a WSLg capture glitch, not a stuck crew - verify via `tmux capture-pane` process check, not the garbled pane.
+## What shipped this wave (for context)
 
-## 5. Key files
-
-- `apps/desktop/src/store/captain.ts` - orchestratorId designation, ensureOrchestrator adopt-only, captain pins.
-- `apps/desktop/src/store/workspace.ts` - reserved Captains tab (`CAPTAINS_TAB_ID`), tile placement (moveTileToCaptainsTab / placeWorkTile), tab close guards.
-- `apps/desktop/src/components/CaptainsList.tsx`, `Sidebar.tsx` - the agents/captains sidebar list (where Cortana status parity + icon go, Step 4b).
-- `apps/desktop/src/components/CaptainOverlay.tsx` - `stableCaptainIdentity`, status dot.
-- `apps/desktop/src-tauri/src/control.rs` - the control socket, capability gate (`dispatch_authenticated`, `resolve_capability`, `required_tier`), `T_HUB_CONTROL_HARDEN` Phase 3 flag.
-- `apps/desktop/src-tauri/src/governor.rs`, `audit.rs` - Phase 1 spawn budget + audit log.
-- `docs/SOCKET-AUTH-DESIGN.md` - the full socket-auth design (Phases 1-3).
-- `~/.t-hub/captain/ships/t-hub.md` - this ship's roster + landed log. `~/.t-hub/captain/ships/fleet.md` - Cortana's roster.
-
-## 6. Kickoff prompt for the next context
-
-> You are the captain of ship **t-hub** (terminal `e4348ddf`), resuming after a `/clear`. Read `docs/HANDOFF.md` in full, then `~/.t-hub/captain/orders/t-hub-2026-07-06.md`. State: main at 0.3.45 + PR #23/#24 (Phase 2 tokens + polish) merged; 0.3.46 is being/was installed. Resume Step 4: delegate to crew worktrees, reproduce E2E first, review + test + merge + bump each, and report each land back to Cortana (orchestrator, terminal `e05764f5`): **(a)** socket-gate Phase 3 - implement/flip the `T_HUB_CONTROL_HARDEN` final token lockdown (built, flag-off); **(b)** rename the orchestrator entity to **Cortana** in the app with the same sidebar/status treatment as captains plus a special orchestrator icon (Cortana terminal `e05764f5`); **(c)** fix the new-workspace stray "new terminal" placeholder bug (don't show it when the workspace already has terminals). One warm crew may exist at `0d179f8e` (worktree `.claude/worktrees/anchor-dropdown-portal`); the orchestrator `e05764f5` lives in the reserved Captains tab.
+- **0.3.54**: orchestrator-wake (#34), scribe gate (#35), pty forwarder leak (#36), per-session header glitch (#37), endpoint reconnect (#38).
+- **0.3.55**: captains-render-fix (#39) - externally-claimed captains render regardless of tile placement.
+- **0.3.56**: Cortana crown pane header (#40), Scribe v1 dictation-state migration (#41).
+- **0.3.57**: doc-staleness (#42), voice-gate dual-source dictation gate + announce.log (#43), UI batch - kill+restart button / ctx% setting / attribution / chime trim (#44), spawn-retry idempotency + de-wedge (#45), auto-continue small Esc+continue fix (#46).
+- **0.3.58**: auto-continue full redesign default-ON (#47), control-socket flap fix - tmux+git subprocess bound + M1 full fix (#48). **Caveat: the live serve-path wedge is NOT resolved (see TOP PRIORITY).**
