@@ -817,9 +817,12 @@ pub mod runtime {
             // (degraded) so recovery on both is seen.
             let mut acts = Vec::new();
             for engine in engines_to_probe(&sup) {
-                let base_url = crate::voice::base_url_for_engine(engine);
-                let reachable = crate::voice::probe_health_at(engine, &base_url).reachable;
-                acts.extend(sup.on_probe(engine, reachable, now));
+                // F10: identity-aware, NOT transport-only. A stranger squatting
+                // the primary port is reachable but not usable - feeding raw
+                // reachability here would mark the primary "up" and silently
+                // switch back to the stranger (routing af_heart at it). Same
+                // identity-vs-transport fix as the startup path (F1).
+                acts.extend(sup.on_probe(engine, engine_usable(engine), now));
             }
             acts.extend(sup.on_tick(now));
             for a in acts {
@@ -881,12 +884,50 @@ pub mod runtime {
         if children.contains_key(&key(engine)) {
             return;
         }
-        let base_url = crate::voice::base_url_for_engine(engine);
-        if crate::voice::probe_health_at(engine, &base_url).reachable {
+        // F10: adopt an existing instance ONLY if it's usably OURS (identity-
+        // aware), never a stranger squatting the port. If a stranger holds it,
+        // we neither adopt nor manage to bind it - the engine stays unusable, so
+        // the state machine falls back + surfaces (consistent with startup).
+        if engine_usable(engine) {
             return; // adopt an already-running instance rather than duplicate
         }
         if let Some(c) = spawn_engine(engine, opts) {
             children.insert(key(engine), c);
+        }
+    }
+
+    /// Is `engine` reachable AND usably OURS right now? The identity-vs-transport
+    /// guard the whole "never adopt/switch-back-to a stranger" doctrine rests on
+    /// (F1 at startup, F10 in the steady loop). Splits the pure decision out from
+    /// the two bounded probes so it is unit-tested.
+    fn engine_usable(engine: VoiceEngine) -> bool {
+        let base_url = crate::voice::base_url_for_engine(engine);
+        let reachable = crate::voice::probe_health_at(engine, &base_url).reachable;
+        let identity = if reachable {
+            crate::voice::probe_identity_at(&base_url)
+        } else {
+            None
+        };
+        usable_from_signals(engine, reachable, identity)
+    }
+
+    /// Pure usability decision from the two probe signals. Kokoro self-identifies
+    /// in `/health` (`engine:kokoro`), so on its port we REQUIRE that identity -
+    /// a reachable occupant that isn't provably Kokoro is a stranger and unusable.
+    /// Piper's `/health` carries no engine field, so it can't self-prove; there
+    /// reachability is the signal (adopting an existing Piper on 7477 is the
+    /// intended D4 path, and Piper is only ever the standby in wave 1).
+    pub(crate) fn usable_from_signals(
+        engine: VoiceEngine,
+        reachable: bool,
+        identity: Option<VoiceEngine>,
+    ) -> bool {
+        if !reachable {
+            return false;
+        }
+        match engine {
+            VoiceEngine::Kokoro => identity == Some(VoiceEngine::Kokoro),
+            VoiceEngine::Piper => true,
         }
     }
 
@@ -1331,6 +1372,57 @@ mod tests {
             StartupAction::RefuseAndFallback,
             "a reachable stranger must NOT be reclaimed or adopted"
         );
+    }
+
+    /// F10: the identity-vs-transport usability decision the steady-state loop's
+    /// health probe + adopt shortcut now use. A reachable STRANGER on the Kokoro
+    /// port (identity None, or a different engine) is UNUSABLE - so the loop
+    /// never marks the primary up, never adopts it, never switches back to it.
+    #[test]
+    fn f10_usable_from_signals_refuses_a_stranger_on_the_primary_port() {
+        use super::runtime::usable_from_signals;
+        // Real Kokoro self-identifies -> usable (adopted).
+        assert!(usable_from_signals(VoiceEngine::Kokoro, true, Some(VoiceEngine::Kokoro)));
+        // Reachable but NOT provably Kokoro (foreign/4xx with no engine field) ->
+        // stranger -> UNUSABLE. This is the F10 landmine, now defused.
+        assert!(!usable_from_signals(VoiceEngine::Kokoro, true, None));
+        // A different engine squatting the Kokoro port -> unusable.
+        assert!(!usable_from_signals(VoiceEngine::Kokoro, true, Some(VoiceEngine::Piper)));
+        // Unreachable -> unusable regardless.
+        assert!(!usable_from_signals(VoiceEngine::Kokoro, false, None));
+        // Piper doesn't self-identify (no engine field), so reachability is the
+        // signal - adopting an existing Piper standby on 7477 is intended (D4).
+        assert!(usable_from_signals(VoiceEngine::Piper, true, None));
+        assert!(!usable_from_signals(VoiceEngine::Piper, false, None));
+    }
+
+    /// F10 end-to-end at the state-machine layer: after a fallback, a reachable
+    /// STRANGER appears on the primary port. Driving the loop's identity-aware
+    /// signal (`usable_from_signals(Kokoro, reachable=true, identity=None)` =
+    /// false), the supervisor must STAY degraded on Piper and NEVER silently
+    /// switch back to the stranger, no matter how long it "stays up".
+    #[test]
+    fn f10_loop_never_switches_back_to_a_stranger() {
+        use super::runtime::usable_from_signals;
+        let mut s = kokoro_primary();
+        s.on_probe(VoiceEngine::Kokoro, true, 0);
+        s.on_probe(VoiceEngine::Piper, true, 0);
+        // Kokoro dies -> fall back to Piper.
+        s.on_probe(VoiceEngine::Kokoro, false, 1);
+        s.on_probe(VoiceEngine::Kokoro, false, 2);
+        assert_eq!(s.active(), VoiceEngine::Piper);
+        // A stranger now squats 7478: transport-reachable, identity None.
+        let stranger_usable = usable_from_signals(VoiceEngine::Kokoro, true, None);
+        assert!(!stranger_usable);
+        // Feed that (identity-aware) signal for a long time - well past the
+        // switch-back window - as the loop would.
+        for t in (10..2000).step_by(50) {
+            s.on_probe(VoiceEngine::Kokoro, stranger_usable, t);
+            s.on_tick(t);
+        }
+        assert_eq!(s.active(), VoiceEngine::Piper, "must NOT adopt/switch back to the stranger");
+        assert!(s.degraded, "stays degraded - the primary is a stranger, not our Kokoro");
+        assert_eq!(s.track(VoiceEngine::Kokoro).health, Health::Down);
     }
 
     /// F2 helper: the ss-output pid parse the reclaim/marker checks rely on.
