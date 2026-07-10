@@ -52,6 +52,7 @@ On resume: invoke `/shipmate`, claim via `claim_captain` (MCP) or `~/.t-hub/capt
 4. **ensure-thub-mcp debug-binary repoint** - the per-repo `.mcp.json` provisioning points at the local DEBUG t-hub-mcp build; override via `T_HUB_MCP_BIN` once t-hub ships a packaged sidecar. Memory `captain-self-register-provisioning`.
 5. **WorkspacesList Cortana rename** - small UI follow-up (the orchestrator folder-name row), general-queued for a future batch.
 6. **Server-split M2-M4** (remote), webview supervision cues, MCP parity for `create_worktree`/`remove_worktree`/`wait_for_status` (currently raw-socket-only) - the standing longer-horizon goals from the native-pivot survivors.
+7. **Doc debt** (flagged by the 0.3.58 wind-down doc sweep, deferred as MEDIUM+ rewrites): re-baseline `docs/ROADMAP-PLAN.md` + `docs/SERVER-SPLIT-AND-ROADMAP.md` onto the 0.3.58 wave (they still cite `v0.2.0`-era figures + a pre-#42 "next build"); expand `docs/MCP.md` §2 to document #45's control-channel idempotency/retry contract (`requestId`/`RequestCache`/`get_request_status`, `close_terminal` killed|already_gone) - the tool catalog is accurate but the robustness layer is undocumented; optional one-word nit in `docs/FEATURE-PLAN.md:3` ("current 0.1.67" reads wrong at 0.3.58, but it is a historical banner - leave unless re-baselining).
 
 ## What shipped this wave (for context)
 
