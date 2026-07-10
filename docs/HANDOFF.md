@@ -6,10 +6,10 @@ Fleet doctrine: `~/.t-hub/captain/{ESCALATION,MODEL-POLICY,RETIREMENT}.md`; crew
 
 ## Who you are
 
-You are the captain of ship **t-hub-app** (registry slug `t-hub-app`), terminal `84ce1cae`, repo `/home/natkins/projects/tools/t-hub/t-hub-app`.
+You are the captain of ship **t-hub-app** (registry slug `t-hub-app`), terminal `ab440bfa`, repo `/home/natkins/projects/tools/t-hub/t-hub-app`.
 The general (user) commands via the orchestrator **Cortana** (terminal `e05764f5`).
 You DELEGATE all project work to crew; you stay at orchestration altitude.
-On resume: invoke `/shipmate`, claim via `claim_captain` (MCP) or `~/.t-hub/captain/claim-captain.sh 84ce1cae t-hub-app` (raw-socket fallback), rebuild the roster from the ship file + `list_terminals`.
+On resume: invoke `/shipmate`, claim via `claim_captain` (MCP) or `~/.t-hub/captain/claim-captain.sh ab440bfa t-hub-app` (raw-socket fallback), rebuild the roster from the ship file + `list_terminals`.
 
 ## Current state (end of this wave)
 
@@ -56,7 +56,11 @@ An intermediate "WSL relay per-port flow wedge" theory (2026-07-09) is FALSE - d
 T-Hub owns Kokoro as a managed child process: spawn on app start, health-watch, auto-restart, kill on exit, no orphan servers; keep the HTTP port (announce.sh/captain paths unchanged); no in-process model embed.
 Piper becomes a lazy standby (instantiate only on Kokoro failure); failure behavior flips from surface-and-prompt to AUTO-FALLBACK with toast + Settings error.
 The proposal must sequence clean removal/disable of the interim systemd unit so app and unit never fight over port 7478.
-4. **Amber degraded state** for a non-2xx (reachable-but-sick) TTS engine in the Settings health display (general-approved follow-up to #52; today it renders green, backstopped by the failure chime).
+3b. **First-class ORCHESTRATOR representation in the agents workspace** (general product item, 2026-07-10; sequence AFTER the P1 adopt-harden fix).
+The orchestrator must render distinct from captains (the general objects to Cortana appearing as a captain).
+Interim state: a `claim_captain` slug `cortana` is in place and the general pinned it - remove/migrate that interim claim when the real representation ships.
+Consider extending the existing Cortana-crown concept (sidebar OrchestratorRow + pane-header crown from 0.3.55/0.3.56).
+4. **Amber degraded state** for a non-2xx (reachable-but-sick) TTS engine - lands as part of the engine-supervisor fallback UX (build in flight).
 5. **Flaky test on this host**: `control::tests::attach_path_survives_abrupt_client_churn` - idle-reaper race (500ms) makes it effectively broken on this WSL host (pre-existing; 8/8 isolated failures). Fix = make the race deterministic (inject/raise idle timeout or gate reaping on churn phase); do NOT weaken the s27 regression guard.
 6. **Host load levers** (data first): dual-side load recorder running (`~/.t-hub/captain/load-recorder.sh` -> load.log; nohup, dies on WSL restart). WSL saturates CPU at compile peaks; Windows is memory-starved (WSL VM 19G of 31G + Chrome). Levers: .wslconfig memory cap, Chrome trim, more RAM; optional product item = in-app resource surfacing.
 7. **Raw-session adoption gap**: the webview cannot adopt a live raw-tmux session (`move_tile` no-ops - no tile object); workaround = socket spawn + `claude --resume <uuid>` migration; proper fix = an adopt-session path (next onion layer past #51).
