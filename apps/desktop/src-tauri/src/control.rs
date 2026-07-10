@@ -226,9 +226,16 @@ pub struct EventFanout {
 
 /// One subscribed connection: the (write half of the) socket plus an id used to
 /// prune it on clean disconnect.
+///
+/// The socket is wrapped in its OWN `Arc<Mutex<..>>` so [`emit_event`](EventFanout::emit_event)
+/// can hold the tiny registry lock only long enough to CLONE these handles, then
+/// do every blocking socket write with the registry lock RELEASED. The
+/// per-subscriber mutex still serializes writes to the SAME socket (frames never
+/// interleave) without letting one stuck subscriber's write block emits to any
+/// OTHER subscriber - or the registry lock that register/unregister need.
 struct Subscriber {
     id: u64,
-    writer: TcpStream,
+    writer: Arc<Mutex<TcpStream>>,
 }
 
 impl EventFanout {
@@ -239,17 +246,22 @@ impl EventFanout {
     /// Register a subscriber's socket; returns an id for [`unregister`](Self::unregister).
     ///
     /// We set a WRITE TIMEOUT on the subscriber's socket: [`emit_event`](Self::emit_event)
-    /// writes to every subscriber while holding `subs`, so without a bound a single
-    /// stuck/slow client (its kernel send buffer full) would block the emit — and the
-    /// whole journal-consumer path — indefinitely. On loopback the local forwarder
-    /// drains promptly so this never fires; it matters the moment M2 binds this wire
-    /// to a remote/Tailscale host. On timeout the write errors and `emit_event` prunes
-    /// the subscriber, so one wedged client self-heals instead of stalling the rest.
+    /// still does a blocking `write_all` per frame, so without a bound a single
+    /// stuck/slow client (its kernel send buffer full) would block THAT subscriber's
+    /// write - and any emit thread queued on its per-socket mutex - indefinitely. On
+    /// loopback the local forwarder drains promptly so this never fires; it matters
+    /// the moment M2 binds this wire to a remote/Tailscale host. On timeout the write
+    /// errors and `emit_event` prunes the subscriber, so one wedged client self-heals.
+    /// (The registry lock is no longer held across these writes - see `emit_event` -
+    /// so a stuck client can no longer stall other subscribers or registration.)
     fn register(&self, writer: TcpStream) -> u64 {
         let _ = writer.set_write_timeout(Some(std::time::Duration::from_secs(5)));
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut subs) = self.subs.lock() {
-            subs.push(Subscriber { id, writer });
+            subs.push(Subscriber {
+                id,
+                writer: Arc::new(Mutex::new(writer)),
+            });
         }
         id
     }
@@ -265,8 +277,19 @@ impl EventFanout {
 
     /// Write one event frame to every subscriber, pruning any whose socket errors
     /// (a disconnected client). Best-effort: a transport failure to one subscriber
-    /// never affects another or the emitting (journal-consumption) path. Holding the
-    /// lock across the writes serializes emits so frames never interleave on a socket.
+    /// never affects another or the emitting (journal-consumption) path.
+    ///
+    /// SERVE-PATH WEDGE FIX: the registry lock is held only long enough to CLONE the
+    /// per-subscriber socket handles, then RELEASED before any blocking write. The
+    /// previous version held `subs` across every `write_all`/`flush`, each bounded by
+    /// a 5s `SO_SNDTIMEO`; a single stuck/slow subscriber (a webview that stopped
+    /// draining) parked the registry lock for up to 5s PER stuck subscriber. That
+    /// serialized EVERY emit, every Organization-tier apply-broadcast, and every
+    /// `register`/`unregister`/`subscriber_count` behind the slowest peer - the exact
+    /// "one stuck peer stalls everyone" shape this channel must never have. Now each
+    /// write takes only that subscriber's OWN mutex (frames to the same socket still
+    /// never interleave), so a stuck subscriber can delay only its own delivery, and
+    /// the registry lock a new subscriber needs is never held across a socket write.
     ///
     /// Returns how many subscribers the frame was delivered to (T12: the apply
     /// broadcast reports delivery when no [`ApplySink`] is wired). Existing
@@ -280,16 +303,43 @@ impl EventFanout {
             }
         };
         frame.push(b'\n');
-        let Ok(mut subs) = self.subs.lock() else {
-            return 0;
+        // Snapshot the subscriber handles under the registry lock, then drop it
+        // BEFORE any blocking write (see the wedge note above). Cloning an
+        // `Arc<Mutex<TcpStream>>` is O(1) and never touches the socket.
+        let targets: Vec<(u64, Arc<Mutex<TcpStream>>)> = {
+            let Ok(subs) = self.subs.lock() else {
+                return 0;
+            };
+            subs.iter()
+                .map(|s| (s.id, Arc::clone(&s.writer)))
+                .collect()
         };
-        subs.retain_mut(|s| {
-            s.writer
-                .write_all(&frame)
-                .and_then(|()| s.writer.flush())
-                .is_ok()
-        });
-        subs.len()
+        // Write each frame with the registry lock released. The per-subscriber
+        // mutex serializes concurrent emits to the SAME socket (no interleaving)
+        // but never blocks writes to a different subscriber. A poisoned per-socket
+        // mutex (a panicked prior writer) is treated as a failed delivery and pruned.
+        let mut failed: Vec<u64> = Vec::new();
+        let mut delivered = 0usize;
+        for (id, writer) in &targets {
+            let ok = match writer.lock() {
+                Ok(mut w) => w.write_all(&frame).and_then(|()| w.flush()).is_ok(),
+                Err(_) => false,
+            };
+            if ok {
+                delivered += 1;
+            } else {
+                failed.push(*id);
+            }
+        }
+        // Prune the subscribers whose write failed, under a brief re-lock. A
+        // subscriber registered (or already pruned) since the snapshot is
+        // unaffected - we only drop ids we actually saw fail.
+        if !failed.is_empty() {
+            if let Ok(mut subs) = self.subs.lock() {
+                subs.retain(|s| !failed.contains(&s.id));
+            }
+        }
+        delivered
     }
 
     /// Number of live subscribers (diagnostics / tests).
@@ -6350,6 +6400,81 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).expect("read event frame");
         serde_json::from_str(line.trim()).expect("event frame is JSON")
+    }
+
+    /// SERVE-PATH WEDGE REGRESSION: a subscriber that stops draining its socket
+    /// must not stall an UNRELATED fanout operation. This reproduces the control
+    /// wedge in the small: `emit_event` used to hold the `subs` registry lock
+    /// across every blocking per-subscriber `write_all`, so a single stuck client
+    /// (its send buffer full) parked the lock for the full 5s `SO_SNDTIMEO` - and
+    /// with it every `register`/`unregister`/`subscriber_count` and every other
+    /// emit. Here a background emit blocks writing to a never-draining subscriber
+    /// while the main thread times a `register` + `subscriber_count`; with the lock
+    /// held across the write those calls block ~5s (the test's 3s bound trips),
+    /// and with the snapshot-then-write-unlocked fix they return immediately.
+    #[test]
+    fn stuck_subscriber_does_not_stall_registry_ops() {
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        let fanout = Arc::new(EventFanout::new());
+
+        // A "stuck" subscriber: a real loopback socket whose CLIENT end never
+        // reads. We shrink both buffers so a modest frame overflows the send path
+        // and the emit's `write_all` blocks (until the 5s subscriber write timeout
+        // register() installs). The client MUST stay alive and unread for the
+        // duration, so we hold it in scope and never touch it.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        let stuck_client = TcpStream::connect(addr).expect("connect stuck client");
+        {
+            let cref = socket2::SockRef::from(&stuck_client);
+            let _ = cref.set_recv_buffer_size(1024);
+        }
+        let (stuck_server, _) = listener.accept().expect("accept stuck server");
+        {
+            let sref = socket2::SockRef::from(&stuck_server);
+            let _ = sref.set_send_buffer_size(1024);
+        }
+        fanout.register(stuck_server);
+
+        // Background emit: a payload comfortably larger than the shrunk buffers so
+        // the write to the stuck subscriber blocks rather than completing.
+        let emit_fanout = Arc::clone(&fanout);
+        let emitter = std::thread::spawn(move || {
+            let big = "x".repeat(4 * 1024 * 1024);
+            emit_fanout.emit_event("control://wedge-test", &json!({ "blob": big }));
+        });
+
+        // Let the emit get into its blocking write (and, on the buggy code, take
+        // and hold the registry lock). This delay is OUTSIDE the measured window.
+        std::thread::sleep(Duration::from_millis(300));
+
+        // The unrelated registry ops. On the pre-fix code these block on the
+        // `subs` lock the stuck emit holds for ~5s; with the fix the lock is free.
+        let healthy_listener = TcpListener::bind("127.0.0.1:0").expect("bind healthy");
+        let healthy_addr = healthy_listener.local_addr().unwrap();
+        let _healthy_client = TcpStream::connect(healthy_addr).expect("connect healthy");
+        let (healthy_server, _) = healthy_listener.accept().expect("accept healthy");
+
+        let started = Instant::now();
+        let id = fanout.register(healthy_server);
+        let count = fanout.subscriber_count();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "registry ops stalled behind a stuck subscriber's emit write ({elapsed:?}); \
+             the subs lock is being held across the blocking socket write"
+        );
+        assert!(count >= 1, "the healthy subscriber should be registered");
+        let _ = id;
+
+        // The stuck subscriber's write eventually times out (5s SO_SNDTIMEO) and
+        // the emit thread returns; join so the test owns no leaked thread. Keep the
+        // stuck client alive until here so the connection never closes early.
+        emitter.join().expect("emit thread joins");
+        drop(stuck_client);
     }
 
     #[test]
