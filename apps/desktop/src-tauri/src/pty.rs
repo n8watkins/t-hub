@@ -706,9 +706,13 @@ mod tests {
     #[test]
     fn attach_argv_unix_shape() {
         let argv = attach_argv("th_abc123", "/home/user");
+        // Socket-agnostic: a `cargo test` build resolves `tmux::socket()` to the
+        // isolated `t-hub-test` default, not the live `t-hub`. Assert against the
+        // resolved socket so the shape check holds under both builds.
+        let sock = tmux::socket();
         assert_eq!(
             argv,
-            vec!["tmux", "-L", "t-hub", "attach", "-t", "th_abc123"]
+            vec!["tmux", "-L", sock, "attach", "-t", "th_abc123"]
         );
     }
 
@@ -716,10 +720,11 @@ mod tests {
     #[test]
     fn attach_argv_windows_shape() {
         let argv = attach_argv("th_abc123", "/home/user");
+        let sock = tmux::socket();
         assert_eq!(
             argv,
             vec![
-                "wsl.exe", "-e", "tmux", "-L", "t-hub", "attach", "-t", "th_abc123"
+                "wsl.exe", "-e", "tmux", "-L", sock, "attach", "-t", "th_abc123"
             ]
         );
     }

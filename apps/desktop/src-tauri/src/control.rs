@@ -7113,6 +7113,34 @@ mod tests {
         (id, target)
     }
 
+    /// A disposable churn tmux session that is ALWAYS killed on drop - including
+    /// when an assertion panics mid-test - so the attach suite can NEVER leak a
+    /// `th_s27*` session onto the socket. That leak is exactly what produced the
+    /// 13 `th_s27churn*` ghosts in the incident: a failing run of the churn test
+    /// left its sessions behind, and the app's post-restart adopt path then choked
+    /// on the debris. Paired with the `cfg(test)` socket isolation in `tmux.rs`
+    /// (THIS crate's test sessions live on `t-hub-test`, never the live `t-hub`
+    /// socket), this makes a leak from the attach suite both unable-to-hit-the-live
+    /// -app AND self-cleaning. (Other producers isolate separately - see the SCOPE
+    /// note on `tmux::SOCKET_NAME`.)
+    struct ChurnSession {
+        id: String,
+        target: String,
+    }
+
+    impl ChurnSession {
+        fn new(tag: &str) -> Self {
+            let (id, target) = churn_tmux_session(tag);
+            Self { id, target }
+        }
+    }
+
+    impl Drop for ChurnSession {
+        fn drop(&mut self) {
+            let _ = tmux::kill_session(&self.target);
+        }
+    }
+
     /// Send a v1 `attach_pty` request line on `stream`.
     fn send_attach_request(stream: &mut TcpStream, token: &str, session_id: &str) {
         let mut frame = serde_json::to_vec(&json!({
@@ -7171,7 +7199,10 @@ mod tests {
         let addr = spawn_attach_listener(ctx);
         let conns_baseline = ACTIVE_CONNS.load(Ordering::Relaxed);
 
-        let (id, target) = churn_tmux_session("churn");
+        // Drop-guarded: the session is killed even if any assertion below panics.
+        let churn = ChurnSession::new("churn");
+        let id = churn.id.clone();
+        let target = churn.target.clone();
 
         // (a) Dies before speaking: reaped by the idle read timeout.
         drop(TcpStream::connect(addr).expect("connect"));
@@ -7300,7 +7331,9 @@ mod tests {
         ctx.max_attach_forwarders = 1;
         let addr = spawn_attach_listener(ctx);
 
-        let (id, target) = churn_tmux_session("cap");
+        let churn = ChurnSession::new("cap");
+        let id = churn.id.clone();
+        let target = churn.target.clone();
 
         // First attach fills the size-1 table; reading the seed proves the slot
         // is held (the guard is acquired before the seed is written).
@@ -7389,7 +7422,9 @@ mod tests {
         let addr = spawn_attach_listener(ctx);
         let conns_baseline = ACTIVE_CONNS.load(Ordering::Relaxed);
 
-        let (id, target) = churn_tmux_session("idle");
+        let churn = ChurnSession::new("idle");
+        let id = churn.id.clone();
+        let target = churn.target.clone();
 
         // A tiny-receive-buffer client attaches to an IDLE session, reads the seed,
         // then STOPS reading and holds the socket in silence - the idle analogue of
