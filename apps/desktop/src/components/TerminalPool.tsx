@@ -34,6 +34,7 @@ import { useWorkspace } from "../store/workspace";
 import { usePanels } from "../store/panels";
 import { useCaptain } from "../store/captain";
 import { TerminalView } from "./Terminal";
+import { TileErrorBoundary } from "./TileErrorBoundary";
 import { CaptainOverlay } from "./CaptainOverlay";
 import type { TerminalId } from "../ipc/types";
 // Diagnostics: tlog mirrors every pool show/park decision into a file the
@@ -862,12 +863,19 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
               + stable parent => xterm is never remounted on a tab move/reorder.
               visible stays true (pool keeps every terminal attached); foreground
               controls whether output uses foreground rAF flushing or the
-              background throttled path. */}
-          <TerminalView
-            terminalId={id}
-            visible={true}
-            foreground={foregroundIds.has(id)}
-          />
+              background throttled path.
+
+              Per-tile fault isolation: the boundary contains any render/commit
+              throw to THIS tile, so one bad/dead/weird session can never blank the
+              whole pool (the incident's zero-attach failure mode). Siblings render
+              and attach normally; the failing tile shows an inline retry. */}
+          <TileErrorBoundary terminalId={id}>
+            <TerminalView
+              terminalId={id}
+              visible={true}
+              foreground={foregroundIds.has(id)}
+            />
+          </TileErrorBoundary>
         </div>
       ))}
       {/* Captain overlay panel (captain-overlay). Rendered INSIDE this layer -

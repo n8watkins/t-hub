@@ -356,6 +356,14 @@ interface WorkspaceState {
   draggingTabId: string | null;
   dropTileId: TerminalId | null;
   dropTabId: string | null;
+  /** True once the SERVER has delivered its authoritative tab/tile registry
+   *  (`adoptRegistry` with a non-empty snapshot). Transient, never persisted.
+   *  Gates `setTerminals`' legacy blind-append: while the server owns placement
+   *  (headless-org), an unplaced live `th_*` session must NOT be auto-dumped onto
+   *  the active tab - that is how 13 leaked ghost sessions got adopted onto the
+   *  canvas and blanked the UI. Before the first registry (a registry-less boot),
+   *  the blind-append stays as a fallback so pre-existing sessions still show. */
+  registryAdopted: boolean;
 
   /** Replace the live set from a listTerminals() result, reconciling tabs/order/focus. */
   setTerminals: (list: TerminalInfo[]) => void;
@@ -1131,6 +1139,7 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
     draggingTabId: null,
     dropTileId: null,
     dropTabId: null,
+    registryAdopted: false,
 
     setTerminals: (list) => {
       const terminals: Record<TerminalId, TerminalInfo> = {};
@@ -1161,9 +1170,20 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // unplaced terminals belong to the OTHER windows' tabs, so adopting them
       // would drag every session into the satellite. A satellite shows exactly
       // the tiles its own tab record lists.
-      const appended = SATELLITE_TAB
-        ? []
-        : list.map((t) => t.id).filter((id) => !placed.has(id));
+      //
+      // AUTHORITATIVE PLACEMENT (adopt-harden): once the SERVER has delivered its
+      // registry (`registryAdopted`), placement is server-owned - `adoptRegistry`
+      // rebuilds the tabs from the authoritative snapshot. A live `th_*` session
+      // that the server does NOT place is either debris (e.g. a leaked churn-test
+      // ghost) or a not-yet-adopted tile the server will place on its own; in
+      // NEITHER case may it be blind-dumped onto the active tab. That blind-append
+      // is exactly the gate that adopted 13 ghost sessions onto the canvas and
+      // blanked the UI. Keep the legacy append ONLY until the first registry
+      // arrives (a registry-less boot), so pre-existing sessions still surface.
+      const appended =
+        SATELLITE_TAB || get().registryAdopted
+          ? []
+          : list.map((t) => t.id).filter((id) => !placed.has(id));
       if (appended.length > 0) {
         const activeIdx = nextTabs.findIndex((t) => t.id === activeTabId);
         const idx = activeIdx >= 0 ? activeIdx : 0;
@@ -1295,6 +1315,11 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       // Defensive: the server never sends an empty snapshot (close_tab refuses
       // the last tab); an empty one would zero the canvas, so ignore it.
       if (regTabs.length === 0) return;
+      // The server has now spoken authoritatively: from here on placement is
+      // server-owned, so setTerminals must stop blind-appending unplaced sessions
+      // (debris/ghosts) onto the active tab. Set BEFORE the deep-equal early-return
+      // below so an echo snapshot that no-ops the tabs still latches the flag.
+      if (!get().registryAdopted) set({ registryAdopted: true });
       const { tabs, activeTabId, focusedId, terminals, poppedOutTabs } = get();
 
       const byId = new Map(tabs.map((t) => [t.id, t]));
