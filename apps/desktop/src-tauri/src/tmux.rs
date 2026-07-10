@@ -29,8 +29,28 @@ use crate::bounded_exec::output_with_timeout;
 /// `T_HUB_TMUX_SOCKET=t-hub-dev`) without ever sharing sessions with — or
 /// killing — production's terminals. With NO env var set the value is exactly
 /// `"t-hub"`, so default behavior is byte-for-byte unchanged.
-static SOCKET_NAME: LazyLock<String> =
-    LazyLock::new(|| std::env::var("T_HUB_TMUX_SOCKET").unwrap_or_else(|_| "t-hub".into()));
+///
+/// TEST ISOLATION: in a `cargo test` build the default flips to `"t-hub-test"`
+/// so a unit test that spins up REAL tmux sessions (the attach-churn suite) can
+/// NEVER create or reap sessions on the live `-L t-hub` socket a running app is
+/// driving - the exact hazard behind the leaked `th_s27churn*` ghosts that broke
+/// the app's post-restart adopt path. An explicit `$T_HUB_TMUX_SOCKET` still wins
+/// (so a test can pin its own unique socket); only the *default* changes, and
+/// only under `cfg(test)`, so the shipped binary is byte-for-byte unchanged.
+static SOCKET_NAME: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("T_HUB_TMUX_SOCKET").unwrap_or_else(|_| default_socket_name().into())
+});
+
+/// The compiled-in default socket name: `"t-hub"` in a normal build, but
+/// `"t-hub-test"` under `cfg(test)` so the test binary is isolated from the live
+/// app's socket (see [`SOCKET_NAME`]).
+const fn default_socket_name() -> &'static str {
+    if cfg!(test) {
+        "t-hub-test"
+    } else {
+        "t-hub"
+    }
+}
 
 /// The resolved tmux socket name (`$T_HUB_TMUX_SOCKET` or `"t-hub"`),
 /// always passed as `tmux -L <socket>`. Read once; cheap to call repeatedly.

@@ -579,10 +579,16 @@ mod tests {
     #[test]
     fn wake_lands_in_a_real_orchestrator_pane_e2e() {
         use crate::tmux;
-        if tmux::socket() == "t-hub" {
+        // Opt-in: this E2E is only meaningful when the operator EXPLICITLY points
+        // it at an isolated socket. Gate on the env override being set, not on the
+        // resolved socket value - a `cargo test` build now defaults `socket()` to
+        // the isolated `t-hub-test` (see `tmux::SOCKET_NAME`), so a value check
+        // would auto-run this heavy E2E in the normal suite. Requiring the explicit
+        // env keeps it opt-in AND still guarantees it never touches the live socket.
+        if std::env::var("T_HUB_TMUX_SOCKET").is_err() {
             eprintln!(
-                "fleet e2e: refusing to run on the default 't-hub' socket \
-                 (set T_HUB_TMUX_SOCKET to an isolated name) - skipping"
+                "fleet e2e: set T_HUB_TMUX_SOCKET to an isolated name to run this \
+                 E2E (e.g. t-hub-e2e-wake) - skipping"
             );
             return;
         }
