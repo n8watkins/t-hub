@@ -13,7 +13,8 @@ On resume: invoke `/shipmate`, claim via `claim_captain` (MCP) or `~/.t-hub/capt
 
 ## Current state (end of this wave)
 
-- **main is at 0.3.60** (bump commit `1342e1f`), installed and running.
+- **main is at 0.3.61** (bump commit `8ab809f`), installed and running.
+0.3.61 shipped solo with PR #52 (TTS engine health in Settings + never-silent fallback chime); the interim kokoro systemd user unit is live (cutover verified: health 200, journald logs, spoken line).
 0.3.59 merged PRs #49 (EventFanout snapshot-then-write-unlocked) and #50 (relay-wedge self-heal: `rebind_control` + client wedge-detector + stale-pin fallback).
 0.3.60 shipped solo with PR #51 (agents plane renders socket-commissioned captains: adoptRegistry now ADOPTS server-placed reserved-tab tiles missing from the local order, gated on not-locally-placed to avoid the unpin re-adopt race).
 E2E acceptance verified post-install: the general-reported invisible captain attached and rendered (`session_attached` 0 -> 1).
@@ -51,6 +52,14 @@ An intermediate "WSL relay per-port flow wedge" theory (2026-07-09) is FALSE - d
 (c) Fleet hygiene: after every install/restart, long-running app-spawned sessions' pinned MCP/tooling go dark on the dead port - fresh sessions in this repo get the F2-fixed client (debug `t-hub-mcp` rebuilt from post-#50 main, 2026-07-10); consider surfacing the same fallback in any other pin-preferring consumer.
 (d) PR #49 M2 design note from review: cross-client event ordering is now per-socket, not global - matters when M2 adds a second subscriber.
 2. **(done)** F2 EventFanout snapshot-under-lock - shipped as PR #49 in 0.3.59.
+3. **Managed Kokoro lifecycle (general's design directive, PROPOSE before building).**
+T-Hub owns Kokoro as a managed child process: spawn on app start, health-watch, auto-restart, kill on exit, no orphan servers; keep the HTTP port (announce.sh/captain paths unchanged); no in-process model embed.
+Piper becomes a lazy standby (instantiate only on Kokoro failure); failure behavior flips from surface-and-prompt to AUTO-FALLBACK with toast + Settings error.
+The proposal must sequence clean removal/disable of the interim systemd unit so app and unit never fight over port 7478.
+4. **Amber degraded state** for a non-2xx (reachable-but-sick) TTS engine in the Settings health display (general-approved follow-up to #52; today it renders green, backstopped by the failure chime).
+5. **Flaky test on this host**: `control::tests::attach_path_survives_abrupt_client_churn` - idle-reaper race (500ms) makes it effectively broken on this WSL host (pre-existing; 8/8 isolated failures). Fix = make the race deterministic (inject/raise idle timeout or gate reaping on churn phase); do NOT weaken the s27 regression guard.
+6. **Host load levers** (data first): dual-side load recorder running (`~/.t-hub/captain/load-recorder.sh` -> load.log; nohup, dies on WSL restart). WSL saturates CPU at compile peaks; Windows is memory-starved (WSL VM 19G of 31G + Chrome). Levers: .wslconfig memory cap, Chrome trim, more RAM; optional product item = in-app resource surfacing.
+7. **Raw-session adoption gap**: the webview cannot adopt a live raw-tmux session (`move_tile` no-ops - no tile object); workaround = socket spawn + `claude --resume <uuid>` migration; proper fix = an adopt-session path (next onion layer past #51).
 3. **Bound the other-subsystem subprocesses.** The #48 F1 completeness sweep found unbounded `.output()`/`.status()` in files.rs, codex.rs, usage.rs, devserver.rs, recent.rs, claude/install.rs (and control.rs `tailscale_ip4` startup-only, benign). Route control-reachable ones through the shared `bounded_exec` helper for the same "no handler parks forever" invariant.
 4. **PR #45 M1 spawn_terminal re-probe honest-limit.** The re-probe closes the create_worktree reaped-duplicate but `spawn_terminal` returns `None` (server-minted id, nothing to probe by) and relies on the 600s reap window. If spawn duplicates recur, add a probe key (e.g. client-supplied spawn tag) so spawn is re-probable too.
 5. **PR #44 LOW watch-items** (all noted in the #44 PR body): header ctx% meter mid-turn flicker (default-OFF, small blast radius); tile-header button crowding at the narrowest widths (now 5 shrink-0 buttons); DRY the O(n) `sessionIdByTmux` reverse scan (a forward index retires it).
@@ -76,3 +85,4 @@ An intermediate "WSL relay per-port flow wedge" theory (2026-07-09) is FALSE - d
 - **0.3.59**: EventFanout snapshot-then-write-unlocked (#49), relay-wedge self-heal - rebind command + client wedge-detector + stale-pin fallback (#50).
 The wedge saga is RESOLVED (see the section above); the residual "wedge on 0.3.58" turned out to be the stale-env-pin artifact.
 - **0.3.60**: agents plane renders socket-commissioned captains (#51, solo ship for a general-reported defect; E2E-verified post-install).
+- **0.3.61**: TTS engine health in Settings + never-silent fallback chime (#52, solo ship); interim kokoro systemd supervision cutover landed alongside (kokoro-tts repo, local master).
