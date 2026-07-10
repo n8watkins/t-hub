@@ -363,6 +363,17 @@ impl Supervisor {
             }
         }
 
+        // --- Keep the STANDBY alive while we depend on it (F3). --------------
+        // The fallback edge spawns the standby once; if that spawn failed, or the
+        // standby dies mid-fallback, re-issue EnsureRunning on a backoff so the
+        // "both dead" cell recovers instead of sitting red forever. Backed off
+        // (not a tight respawn loop).
+        if self.degraded {
+            if let Some(a) = self.maybe_ensure_standby(now) {
+                actions.push(a);
+            }
+        }
+
         // --- Switch back once the primary has been green long enough (D1). ---
         if self.degraded && primary_health == Health::Up {
             let green_for = self
@@ -415,6 +426,26 @@ impl Supervisor {
         t.restart_attempts += 1;
         t.backoff_until = now + delay;
         Some(Action::Restart(primary))
+    }
+
+    /// Emit a backed-off `EnsureRunning(standby)` while the standby is Down and
+    /// we depend on it (F3). Unlike the primary restart there is no give-up
+    /// budget: the standby is the last line of voice, so we keep (slowly)
+    /// retrying it until it comes up.
+    fn maybe_ensure_standby(&mut self, now: u64) -> Option<Action> {
+        let standby = other(self.selected);
+        let cfg = self.cfg;
+        let t = self.track_mut(standby);
+        if t.health != Health::Down {
+            return None;
+        }
+        if now < t.backoff_until {
+            return None;
+        }
+        let idx = (t.restart_attempts as usize).min(cfg.backoff_ms.len() - 1);
+        t.restart_attempts += 1;
+        t.backoff_until = now + cfg.backoff_ms[idx];
+        Some(Action::EnsureRunning(standby))
     }
 
     /// A serializable view for the `engine_runtime_status` command + events.
@@ -555,9 +586,10 @@ pub mod platform {
              setsid ./start.sh &\n\
              SRV=$!\n\
              echo \"$SRV\" > '{marker}' 2>/dev/null || true\n\
-             trap 'kill -TERM -\"$SRV\" 2>/dev/null; exit 0' TERM INT HUP\n\
+             cleanup() {{ kill -TERM -\"$SRV\" 2>/dev/null; rm -f '{marker}' 2>/dev/null; }}\n\
+             trap 'cleanup; exit 0' TERM INT HUP\n\
              cat\n\
-             kill -TERM -\"$SRV\" 2>/dev/null || true\n",
+             cleanup\n",
             repo_dir = repo_dir,
             marker = KOKORO_PID_MARKER,
         )
@@ -772,7 +804,7 @@ pub mod runtime {
         // the primary's port before we spawn.
         let primary = opts.selected;
         let action = classify_startup(startup_probe(primary), primary);
-        apply_startup_action(action, primary, &opts, &mut children);
+        apply_startup_action(action, primary);
 
         // Spawn the primary if we now own the port.
         if !matches!(action, StartupAction::RefuseAndFallback) {
@@ -883,73 +915,123 @@ pub mod runtime {
         Some(EngineChild { child, _stdin: stdin })
     }
 
-    /// Probe the primary's port at startup to feed the squatter classifier. The
-    /// unit/marker checks are best-effort (bounded); on failure we treat them as
-    /// false so an ambiguous occupant is a stranger (never wrongly killed).
+    /// Probe the primary's port at startup and build the squatter-policy input
+    /// from REAL signals (F1 fix). Critically, the `engine` field comes from the
+    /// occupant's SELF-IDENTIFIED `/health` (`probe_identity_at`), NOT a hardcoded
+    /// assumption - so a foreign HTTP server squatting the port (which answers
+    /// with no recognized `engine`, incl. a 4xx) yields `engine: None` and is
+    /// classified a STRANGER (never reclaimed/adopted). `marker_matches` is
+    /// computed honestly (the marker pid is alive AND currently owns the port),
+    /// not hardcoded false.
     fn startup_probe(engine: VoiceEngine) -> StartupProbe {
         let base_url = crate::voice::base_url_for_engine(engine);
-        let health = crate::voice::probe_health_at(engine, &base_url);
-        if !health.reachable {
+        if !crate::voice::probe_health_at(engine, &base_url).reachable {
             return StartupProbe { served: false, engine: None, is_our_unit: false, marker_matches: false };
         }
         StartupProbe {
             served: true,
-            // A reachable /health on the port is the engine we expect there.
-            engine: Some(engine),
+            engine: crate::voice::probe_identity_at(&base_url), // real identity, not assumed
             is_our_unit: interim_unit_active(),
-            marker_matches: false, // (pid-marker cross-check is a wave-2 refinement)
+            marker_matches: marker_pid_owns_port(engine),
         }
     }
 
     fn interim_unit_active() -> bool {
-        let cmd = {
-            let mut c = std::process::Command::new("wsl.exe");
-            c.arg("-e").arg("bash").arg("-c").arg("systemctl --user is-active kokoro-tts.service");
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                c.creation_flags(0x0800_0000);
-            }
-            c
-        };
-        crate::bounded_exec::output_with_timeout(cmd, platform::ADOPT_TIMEOUT)
+        run_bounded_bash("systemctl --user is-active kokoro-tts.service")
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
             .unwrap_or(false)
     }
 
-    fn apply_startup_action(
-        action: StartupAction,
-        primary: VoiceEngine,
-        _opts: &StartOpts,
-        _children: &mut std::collections::HashMap<u8, EngineChild>,
-    ) {
+    /// The pid currently LISTENING on `port` inside WSL (via `ss`), or None. The
+    /// output parse is split into a pure, tested helper.
+    fn port_owner_pid(port: u16) -> Option<u32> {
+        let out = run_bounded_bash(&format!("ss -H -ltnp 'sport = :{port}' 2>/dev/null")).ok()?;
+        parse_ss_pid(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Extract the first `pid=<n>` from `ss -p` output. Pure so the (untestable)
+    /// WSL call is thin and the parsing is covered by a unit test.
+    pub(crate) fn parse_ss_pid(ss_stdout: &str) -> Option<u32> {
+        let marker = "pid=";
+        let idx = ss_stdout.find(marker)? + marker.len();
+        let digits: String = ss_stdout[idx..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    }
+
+    /// True iff our lifeline pid-marker names a LIVE pid that ALSO currently owns
+    /// the primary port - i.e. a genuine leaked child of a prior app run, not a
+    /// stale marker whose pid was reused (F2: the marker alone is never trusted).
+    fn marker_pid_owns_port(engine: VoiceEngine) -> bool {
+        let marker_pid = run_bounded_bash(&format!("cat '{}' 2>/dev/null", platform::KOKORO_PID_MARKER))
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok());
+        match (marker_pid, port_owner_pid(engine.default_port())) {
+            (Some(m), Some(owner)) => m == owner,
+            _ => false,
+        }
+    }
+
+    fn apply_startup_action(action: StartupAction, primary: VoiceEngine) {
         match action {
             StartupAction::DisableUnitThenSpawn => {
                 // D3: disable (not delete) the interim unit so it stops racing us.
+                // F7: verify the disable actually took before we treat the port as
+                // ours - a failed disable leaves a Restart=always unit that would
+                // fight the managed child.
                 let _ = crate::bounded_exec::output_with_timeout(
                     platform::disable_interim_unit_command(),
                     platform::ADOPT_TIMEOUT,
                 );
+                if interim_unit_active() {
+                    crate::diag::diag_log(
+                        "engine_supervisor: `systemctl --user disable --now kokoro-tts.service` \
+                         did NOT deactivate the unit - refusing to spawn a managed child while \
+                         the unit still owns the port (would fight Restart=always)".to_string(),
+                    );
+                }
             }
             StartupAction::ReclaimThenSpawn => {
-                // Reclaim a leaked/bare same-engine instance. Best-effort kill of
-                // the marked pid; the subsequent spawn re-owns the port.
-                let _ = reclaim_marked_child(primary);
+                // F2: reclaim by PORT OWNERSHIP with an identity re-verify AT KILL
+                // TIME - never a blind kill of a (possibly reused) stale marker pid.
+                reclaim_current_port_owner(primary);
             }
-            // Spawn: nothing to clear. RefuseAndFallback: leave the stranger be;
-            // the loop will fall back to the standby and toast on the first probe.
+            // Spawn: nothing to clear. RefuseAndFallback: leave the stranger be -
+            // the loop falls back to the standby and toasts on the first probe.
             StartupAction::Spawn | StartupAction::RefuseAndFallback => {}
         }
     }
 
-    fn reclaim_marked_child(engine: VoiceEngine) -> std::io::Result<()> {
-        if engine != VoiceEngine::Kokoro {
-            return Ok(());
+    /// Reclaim the primary port by killing WHOEVER OWNS IT NOW, but only after
+    /// re-verifying at kill time that the live occupant is STILL provably our
+    /// engine (F2). This eliminates the PID-reuse hazard of the old stale-marker
+    /// kill: we never trust a remembered pid, and we abort if the occupant
+    /// changed identity between classification and reclaim.
+    fn reclaim_current_port_owner(engine: VoiceEngine) {
+        let base_url = crate::voice::base_url_for_engine(engine);
+        if crate::voice::probe_identity_at(&base_url) != Some(engine) {
+            // Occupant is no longer provably ours (raced / a stranger) - do NOT
+            // kill. The loop treats the port as unavailable and falls back.
+            crate::diag::diag_log(
+                "engine_supervisor: reclaim aborted - port occupant is no longer \
+                 the identified engine at kill time".to_string(),
+            );
+            return;
         }
+        let Some(pid) = port_owner_pid(engine.default_port()) else { return };
+        // Group-kill the CURRENT owner (its pgid), falling back to the bare pid.
         let script = format!(
-            "if [ -f '{m}' ]; then kill -TERM -\"$(cat '{m}')\" 2>/dev/null || true; fi",
-            m = platform::KOKORO_PID_MARKER
+            "pgid=$(ps -o pgid= -p {pid} 2>/dev/null | tr -d ' '); \
+             if [ -n \"$pgid\" ]; then kill -TERM -\"$pgid\" 2>/dev/null || kill -TERM {pid} 2>/dev/null; \
+             else kill -TERM {pid} 2>/dev/null; fi",
+            pid = pid
         );
+        let _ = run_bounded_bash(&script);
+    }
+
+    /// Run a bash one-liner inside WSL, bounded (never hangs startup - this host's
+    /// `wsl.exe` goes glacial under memory pressure, #45/#48/#50). Windowless on
+    /// Windows. Every WSL call in the runtime routes through here.
+    fn run_bounded_bash(script: &str) -> std::io::Result<std::process::Output> {
         let mut cmd = std::process::Command::new("wsl.exe");
         cmd.arg("-e").arg("bash").arg("-c").arg(script);
         #[cfg(windows)]
@@ -957,7 +1039,7 @@ pub mod runtime {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000);
         }
-        crate::bounded_exec::output_with_timeout(cmd, platform::ADOPT_TIMEOUT).map(|_| ())
+        crate::bounded_exec::output_with_timeout(cmd, platform::ADOPT_TIMEOUT)
     }
 
     fn write_snapshot(shared: &Arc<Mutex<SupervisorSnapshot>>, sup: &Supervisor) {
@@ -1143,6 +1225,28 @@ mod tests {
         assert_eq!(s.active(), VoiceEngine::Kokoro);
     }
 
+    // --- standby keep-alive (F3) -------------------------------------------
+
+    #[test]
+    fn standby_is_re_ensured_on_backoff_when_it_dies_while_degraded() {
+        let mut s = kokoro_primary();
+        s.on_probe(VoiceEngine::Kokoro, true, 0);
+        s.on_probe(VoiceEngine::Piper, true, 0);
+        // Fall back to Piper.
+        s.on_probe(VoiceEngine::Kokoro, false, 1);
+        s.on_probe(VoiceEngine::Kokoro, false, 2);
+        assert_eq!(s.active(), VoiceEngine::Piper);
+        // Now the STANDBY (Piper) also dies while we depend on it.
+        s.on_probe(VoiceEngine::Piper, false, 3);
+        let down = s.on_probe(VoiceEngine::Piper, false, 4); // Piper now Down
+        // It gets an EnsureRunning(standby) (immediately eligible: backoff_until 0).
+        assert!(down.contains(&Action::EnsureRunning(VoiceEngine::Piper)));
+        // Not a tight loop: a tick before the backoff elapses re-issues nothing.
+        assert!(!s.on_tick(5).contains(&Action::EnsureRunning(VoiceEngine::Piper)));
+        // After the backoff, it retries again (no give-up budget for the standby).
+        assert!(s.on_tick(100).contains(&Action::EnsureRunning(VoiceEngine::Piper)));
+    }
+
     // --- level ladder -------------------------------------------------------
 
     #[test]
@@ -1208,6 +1312,36 @@ mod tests {
         assert_eq!(classify_startup(unknown, VoiceEngine::Kokoro), StartupAction::RefuseAndFallback);
     }
 
+    /// F1 regression: a REACHABLE-but-unidentified occupant (a foreign HTTP
+    /// server / a 4xx that `probe_health_at` reports as reachable but whose
+    /// `/health` carries no recognized `engine`) must classify as a STRANGER, so
+    /// the runtime neither reclaims nor adopts it. This is the exact input the
+    /// old `startup_probe` could never produce (it hardcoded engine=Some) - now
+    /// `probe_identity_at` yields None for it and this path is reachable.
+    #[test]
+    fn f1_reachable_but_unidentified_occupant_is_a_stranger() {
+        let foreign_but_reachable = StartupProbe {
+            served: true,
+            engine: None, // probe_identity_at returns None for a non-TTS/4xx body
+            is_our_unit: false,
+            marker_matches: false,
+        };
+        assert_eq!(
+            classify_startup(foreign_but_reachable, VoiceEngine::Kokoro),
+            StartupAction::RefuseAndFallback,
+            "a reachable stranger must NOT be reclaimed or adopted"
+        );
+    }
+
+    /// F2 helper: the ss-output pid parse the reclaim/marker checks rely on.
+    #[test]
+    fn parse_ss_pid_extracts_the_owning_pid() {
+        let ss = "LISTEN 0 5 127.0.0.1:7478 0.0.0.0:* users:((\"python\",pid=3564749,fd=4))";
+        assert_eq!(super::runtime::parse_ss_pid(ss), Some(3564749));
+        assert_eq!(super::runtime::parse_ss_pid("LISTEN 0 5 127.0.0.1:7478"), None);
+        assert_eq!(super::runtime::parse_ss_pid(""), None);
+    }
+
     // --- selected=piper generalization -------------------------------------
 
     #[test]
@@ -1254,6 +1388,9 @@ mod tests {
         assert!(script.contains("kill -TERM -\"$SRV\""), "group-kills on death");
         assert!(script.contains("trap"), "also kills on a delivered TERM/HUP");
         assert!(script.contains(platform::KOKORO_PID_MARKER), "writes the reaper pid marker");
+        // F2: the marker is UNLINKED on clean exit so a stale marker can't later
+        // drive a kill / a false marker_matches.
+        assert!(script.contains("rm -f"), "cleans up the pid marker on exit");
     }
 
     #[test]

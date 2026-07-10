@@ -125,7 +125,13 @@ function speak(text: string, now: number): boolean {
       // toast (WebAudio, independent of the dead TTS server) so a dropped
       // announcement is heard/seen, debounced so a persistently-down engine
       // alerts at most once per window rather than on every attempt.
-      if (now - lastFallbackAlertAt >= FALLBACK_ALERT_MIN_GAP_MS) {
+      //
+      // F6: when the managed lifecycle is running, the SUPERVISOR owns the
+      // fallback narrative (its own "Voice fell back" toast + amber state, and
+      // effectiveTarget already rerouted to the live engine), so suppress this
+      // #52 chime to avoid a double-chime in the down-debounce window.
+      const managed = !!useEngineRuntime.getState().status?.managed;
+      if (!managed && now - lastFallbackAlertAt >= FALLBACK_ALERT_MIN_GAP_MS) {
         lastFallbackAlertAt = now;
         notify(
           "error",

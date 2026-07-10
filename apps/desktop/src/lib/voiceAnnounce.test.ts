@@ -40,6 +40,7 @@ import {
   FALLBACK_ALERT_MIN_GAP_MS,
 } from "./voiceAnnounce";
 import { useVoice, DEFAULT_VOICE_SETTINGS } from "../store/voice";
+import { useEngineRuntime } from "../store/engineRuntime";
 import { useSupervision } from "../store/supervision";
 import { useWorkspace } from "../store/workspace";
 import type { SessionStatus } from "../ipc/model";
@@ -60,6 +61,8 @@ beforeEach(() => {
   vi.mocked(synthesizeVoice).mockResolvedValue("d2F2");
   vi.mocked(playWavBase64).mockClear();
   vi.mocked(notify).mockClear();
+  // Default unmanaged so the #52 chime path is exercised; the F6 case sets this.
+  useEngineRuntime.setState({ status: null });
   _resetVoiceAnnounceForTest();
   useVoice.setState({
     ...DEFAULT_VOICE_SETTINGS,
@@ -477,6 +480,26 @@ describe("never-silent fallback alert (engine unreachable)", () => {
     handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
     await flush();
     expect(playWavBase64).toHaveBeenCalledTimes(1);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("F6: suppresses the #52 chime when the managed lifecycle owns the fallback", async () => {
+    // Managed + fallen back: the supervisor fires its own "Voice fell back"
+    // toast, so the announce path must NOT double-chime on a failed synthesis.
+    vi.mocked(synthesizeVoice).mockRejectedValue(new Error("down"));
+    useEngineRuntime.setState({
+      status: {
+        managed: true,
+        selectedEngine: "kokoro",
+        activeEngine: "piper",
+        degraded: true,
+        level: "amber",
+        kokoro: "down",
+        piper: "up",
+      },
+    });
+    handleStatusesChange(statuses({ "sess-1": "needsPermission" }), 0);
+    await flush();
     expect(notify).not.toHaveBeenCalled();
   });
 });

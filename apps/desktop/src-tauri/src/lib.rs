@@ -485,8 +485,20 @@ pub fn run() {
             let engine_snapshot_handle = engine_snapshot.handle();
             app.manage(engine_snapshot);
             if engine_supervisor::managed_enabled() {
-                if let Some(opts) =
-                    engine_supervisor::runtime::opts_from_env(voice::current_engine())
+                let selected = voice::current_engine();
+                if selected != voice::VoiceEngine::Kokoro {
+                    // F4 fail-safe: the platform layer (wsl.exe lifeline, the
+                    // kokoro-tts.service unit name, the pid marker) is
+                    // Kokoro-specific. Arming it with a non-Kokoro primary would,
+                    // e.g., `disable --now` the Kokoro unit for no reason. Wave 1
+                    // manages Kokoro only.
+                    diag::diag_log(
+                        "engine_supervisor: T_HUB_MANAGED_KOKORO set but the selected \
+                         engine is not Kokoro - not starting (wave-1 manages Kokoro only)"
+                            .to_string(),
+                    );
+                } else if let Some(opts) =
+                    engine_supervisor::runtime::opts_from_env(selected)
                 {
                     engine_supervisor::runtime::start(
                         control_fanout.clone(),

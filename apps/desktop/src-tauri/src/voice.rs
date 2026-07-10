@@ -63,6 +63,19 @@ impl VoiceEngine {
         }
     }
 
+    /// STRICT token parse: only the two known engines, `None` for anything else.
+    /// Unlike `from_token` (which defaults unknown -> Piper for lenient settings
+    /// reads), identity checks must NOT coerce a foreign token to a real engine -
+    /// the engine supervisor's "is the port occupant provably ours?" decision
+    /// (D2) depends on an unrecognized `/health` yielding None (a stranger).
+    pub(crate) fn from_token_strict(s: &str) -> Option<Self> {
+        match s {
+            "kokoro" => Some(VoiceEngine::Kokoro),
+            "piper" => Some(VoiceEngine::Piper),
+            _ => None,
+        }
+    }
+
     /// The loopback port each engine's local server listens on. Piper owns
     /// 7477 (pre-existing); Kokoro owns 7478. `pub(crate)` so the engine
     /// supervisor knows which port a spawned engine should come up on.
@@ -406,6 +419,31 @@ pub(crate) fn probe_health_at(engine: VoiceEngine, base_url: &str) -> EngineHeal
     }
 }
 
+/// The occupant's SELF-IDENTIFIED engine from `GET /health`, or None when the
+/// server is unreachable, answers non-2xx, isn't JSON, or its `engine` field is
+/// absent/unrecognized. Bounded (2s) via the same no-Origin agent.
+///
+/// This is the identity the engine supervisor's startup squatter policy (D2)
+/// needs: a foreign HTTP server squatting the port answers with no recognized
+/// `engine`, so it yields None -> "stranger" -> never reclaimed/adopted. Kokoro
+/// self-identifies (`{"status":"ok","engine":"kokoro",...}`); Piper's /health
+/// has no `engine` field, so it too reads as None here (fine - Piper is never
+/// the managed primary in wave 1, and the standby-adopt path uses reachability,
+/// not this identity).
+pub(crate) fn probe_identity_at(base_url: &str) -> Option<VoiceEngine> {
+    let url = format!("{base_url}/health");
+    let body = agent()
+        .get(&url)
+        .timeout(Duration::from_secs(2))
+        .call()
+        .ok()?
+        .into_string()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let token = v.get("engine").and_then(|x| x.as_str())?;
+    VoiceEngine::from_token_strict(token)
+}
+
 /// Probe one engine's /health for the Settings dual-engine status display.
 /// Always Ok (a down server is `reachable: false`); errors only if the blocking
 /// task itself panics.
@@ -491,6 +529,18 @@ mod tests {
         assert!(parsed.enabled);
         assert_eq!(parsed.voice, "en_US-ryan-high.onnx");
         assert_eq!(parsed.volume, 0.6);
+    }
+
+    /// STRICT identity parse (engine supervisor D2): only the two known tokens
+    /// map to an engine; ANYTHING else is None, so a foreign `/health` never
+    /// coerces to a real engine and never triggers a reclaim/adopt.
+    #[test]
+    fn from_token_strict_only_matches_known_engines() {
+        assert_eq!(VoiceEngine::from_token_strict("kokoro"), Some(VoiceEngine::Kokoro));
+        assert_eq!(VoiceEngine::from_token_strict("piper"), Some(VoiceEngine::Piper));
+        assert_eq!(VoiceEngine::from_token_strict("festival"), None);
+        assert_eq!(VoiceEngine::from_token_strict(""), None);
+        assert_eq!(VoiceEngine::from_token_strict("Kokoro"), None); // case-sensitive
     }
 
     /// The lenient reader picks up an explicit Kokoro engine too.
