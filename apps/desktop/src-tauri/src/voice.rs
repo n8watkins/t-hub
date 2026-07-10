@@ -353,7 +353,15 @@ pub struct EngineHealth {
 /// 2s connect/read timeout caps a single probe, and the caller (Settings, on
 /// open + a slow periodic tick) fans out at most one probe per engine at a time.
 fn probe_health(engine: VoiceEngine) -> EngineHealth {
-    let url = format!("{}/health", base_url_for_engine(engine));
+    let base = base_url_for_engine(engine);
+    probe_health_at(engine, &base)
+}
+
+/// The URL-taking core of `probe_health`, split out so a test can point it at an
+/// arbitrary (e.g. deliberately-dead ephemeral) base URL WITHOUT mutating the
+/// process-global engine-URL env - hermetic under a parallel test harness.
+fn probe_health_at(engine: VoiceEngine, base_url: &str) -> EngineHealth {
+    let url = format!("{base_url}/health");
     match agent()
         .get(&url)
         .timeout(Duration::from_secs(2))
@@ -481,16 +489,20 @@ mod tests {
 
     /// A dead server (nothing listening) probes as reachable=false with the
     /// transport error in `detail` - the exact silent-death case the Settings
-    /// error state exists to surface. Points the engine at a definitely-closed
-    /// loopback port via the test env override so no real server is touched;
-    /// connection-refused returns fast, well inside the 2s bound.
+    /// error state exists to surface. Hermetic: binds an ephemeral loopback port,
+    /// reads it, then DROPS the listener so the port is free-but-unlistened, and
+    /// points the probe straight at that URL - no process-global env mutation
+    /// (safe under the parallel test harness / Rust 2024). Connection-refused
+    /// returns fast, well inside the 2s bound.
     #[test]
     fn probe_health_reports_dead_server_unreachable() {
-        // 127.0.0.1:9 is the discard port - reliably nothing listening in a test
-        // sandbox, so .call() fails at the transport layer immediately.
-        std::env::set_var("T_HUB_KOKORO_URL", "http://127.0.0.1:9");
-        let h = probe_health(VoiceEngine::Kokoro);
-        std::env::remove_var("T_HUB_KOKORO_URL");
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // close it: the port is now reliably refusing connections
+        let base = format!("http://127.0.0.1:{port}");
+
+        let h = probe_health_at(VoiceEngine::Kokoro, &base);
         assert_eq!(h.engine, VoiceEngine::Kokoro);
         assert!(!h.reachable, "a dead server must probe as unreachable");
         assert!(h.detail.is_some(), "the transport error is carried for the UI");

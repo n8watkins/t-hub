@@ -6,7 +6,7 @@
 // error state (never a silent default), the healthy path (voice list populates,
 // Test synthesizes with the selected voice + engine), and recovery.
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 vi.mock("../ipc/voice", () => ({
   readVoiceSettings: vi.fn(),
@@ -29,7 +29,11 @@ import {
   type VoiceSettings as VoiceSettingsShape,
 } from "../ipc/voice";
 import { playWavBase64 } from "../lib/voiceAudio";
-import { VoiceSection, VOICE_TEST_PHRASE } from "./VoiceSettings";
+import {
+  VoiceSection,
+  VOICE_TEST_PHRASE,
+  HEALTH_PROBE_INTERVAL_MS,
+} from "./VoiceSettings";
 import {
   useVoice,
   DEFAULT_VOICE_SETTINGS,
@@ -244,6 +248,42 @@ describe("VoiceSection engine health (never a silent default)", () => {
     const alert = await screen.findByRole("alert");
     await waitFor(() => expect(alert.textContent).toMatch(/switch to piper/i));
     expect(alert.textContent).toMatch(/kokoro.*unreachable/i);
+  });
+
+  it("re-probes both engines on the interval and STOPS after unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(listVoices).mockResolvedValue(PIPER_VOICES);
+      mockHealth({ piper: true, kokoro: true });
+
+      let view!: ReturnType<typeof render>;
+      await act(async () => {
+        view = render(<VoiceSection />);
+      });
+      // Mount probes BOTH engines exactly once (2 voiceHealth calls).
+      expect(vi.mocked(voiceHealth).mock.calls.length).toBe(2);
+
+      // Each interval tick re-probes both engines - a silent death that happens
+      // WHILE the panel sits open is caught by the periodic re-probe.
+      await act(async () => {
+        vi.advanceTimersByTime(HEALTH_PROBE_INTERVAL_MS);
+      });
+      expect(vi.mocked(voiceHealth).mock.calls.length).toBe(4);
+      await act(async () => {
+        vi.advanceTimersByTime(HEALTH_PROBE_INTERVAL_MS);
+      });
+      expect(vi.mocked(voiceHealth).mock.calls.length).toBe(6);
+
+      // Unmount clears the interval: no probe leaks after the panel closes.
+      view.unmount();
+      await act(async () => {
+        vi.advanceTimersByTime(HEALTH_PROBE_INTERVAL_MS * 3);
+      });
+      expect(vi.mocked(voiceHealth).mock.calls.length).toBe(6);
+    } finally {
+      vi.runOnlyPendingTimers();
+      vi.useRealTimers();
+    }
   });
 
   it("does not render the health block while voice is disabled", async () => {
