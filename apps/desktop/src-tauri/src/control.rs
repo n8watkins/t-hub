@@ -8001,6 +8001,46 @@ mod tests {
     }
 
     #[test]
+    fn request_cache_reaped_id_yields_exactly_one_fresh_after_reap() {
+        // F4 (one-reprobe-per-reap): after a reservation is reaped, TWO retries of
+        // the same id must NOT both re-probe/re-apply. `begin` is atomic — the FIRST
+        // retry consumes the reap (FreshAfterReap) AND re-reserves the id InFlight in
+        // the same locked step, so the SECOND retry sees a live InFlight reservation,
+        // not a second FreshAfterReap. That is what caps the M1 re-probe (and its
+        // unbounded git worktree-list) at ONCE per reap: the loser is told InFlight
+        // and polls/retries instead of issuing a duplicate reality probe + re-apply.
+        //
+        // A comfortably large reap window (relative to two back-to-back synchronous
+        // `begin` calls) keeps this deterministic: the original ages PAST it, but the
+        // freshly re-reserved slot is far YOUNGER than it when the second retry runs.
+        let reap = std::time::Duration::from_millis(50);
+        let cache = RequestCache::with_bounds(8, std::time::Duration::from_secs(600), reap);
+
+        cache.begin("wt"); // original reservation, never finished (handler presumed dead)
+        std::thread::sleep(reap * 2); // age it past the reap window
+
+        // First retry: the dead reservation is reaped and re-reserved in one step.
+        assert!(
+            matches!(cache.begin("wt"), BeginOutcome::FreshAfterReap),
+            "the first retry after a reap must re-probe reality (FreshAfterReap)"
+        );
+        // Second retry, immediately after: the just-re-reserved slot is still well
+        // within the reap window, so this loser sees InFlight — NOT a second reprobe.
+        assert!(
+            matches!(cache.begin("wt"), BeginOutcome::InFlight),
+            "a concurrent second retry must see InFlight, not a duplicate FreshAfterReap"
+        );
+        // And a third: still InFlight until the winner calls finish(). At no point
+        // does a single reap yield two re-applies.
+        assert!(matches!(cache.begin("wt"), BeginOutcome::InFlight));
+
+        // Once the winner records the outcome, further retries replay it (Duplicate),
+        // still never a second apply.
+        let _ = cache.finish("wt", Ok(json!({"alreadyCreated": true})));
+        assert!(matches!(cache.begin("wt"), BeginOutcome::Duplicate(_)));
+    }
+
+    #[test]
     fn request_cache_never_seen_id_is_fresh_not_fresh_after_reap() {
         // A first-ever id must be plain Fresh (no reap happened), so dispatch does
         // NOT waste a reality re-probe on it - FreshAfterReap is reserved for a

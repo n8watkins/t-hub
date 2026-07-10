@@ -1,4 +1,5 @@
 // --- 0.1 nucleus (unchanged) ---
+mod bounded_exec; // shared bounded-subprocess exec (drain+kill+reap on timeout); the single choke point tmux.rs + git.rs route every child through so no control handler parks forever
 mod commands;
 mod events;
 mod pty;
