@@ -94,8 +94,8 @@ fn tmux_target(id: &str) -> String {
 /// after the control listener binds. Terminal commands run on user action (well
 /// after setup), so it is normally present; if a command somehow runs before it
 /// exists we return a clear error rather than panicking on the missing state.
-fn control_endpoint(app: &tauri::AppHandle) -> Result<ControlEndpoint, String> {
-    app.try_state::<ControlEndpoint>()
+fn control_endpoint(app: &tauri::AppHandle) -> Result<std::sync::Arc<ControlEndpoint>, String> {
+    app.try_state::<std::sync::Arc<ControlEndpoint>>()
         .map(|s| s.inner().clone())
         .ok_or_else(|| {
             "control endpoint is not available yet (the control listener has not \
@@ -344,7 +344,18 @@ pub async fn attach_terminal(
     // path returned (a base64 string of the pane scrollback).
     let endpoint = control_endpoint(&app)?;
     let (conn, scrollback_b64) =
-        RemotePty::connect(&app, &endpoint.addr, &endpoint.token, &id, cols, rows)?;
+        match RemotePty::connect(&app, &endpoint.addr(), endpoint.token(), &id, cols, rows) {
+            Ok(x) => x,
+            // A local rebind may have rotated the listener port (relay-wedge
+            // self-heal). Re-read the fresh addr from control.json and retry the
+            // attach ONCE against it, keeping the (unchanged) token.
+            Err(e) => match endpoint.refresh_addr() {
+                Some(fresh) => {
+                    RemotePty::connect(&app, &fresh, endpoint.token(), &id, cols, rows)?
+                }
+                None => return Err(e),
+            },
+        };
     remote.conns.lock().insert(id.clone(), conn);
 
     // Fresh spawn (spawn_terminal marked it) → return EMPTY scrollback so the
