@@ -224,12 +224,14 @@ async function recover(id: TerminalId, reason: string): Promise<void> {
  *  captain/ship it belongs to. Attribution-first title (falls back to the tile
  *  label when the tile has no captain).
  *
- *  CLASS = "error" — #44's strict chime policy reserves the `error` kind for a
- *  BLOCKER (a hard stop that ends the run). A usage-limit lockout IS that blocker,
- *  so the auto-resume cue rides #44's blocker chime rather than the softer
- *  "attention" (decision-needed) tone: the general hears the fleet-blocking event
- *  distinctly, even though T-Hub already cleared it. We only WIRE the new cue into
- *  #44's existing classes; we do not add or alter a class.
+ *  CLASS = "attention" — #44's strict chime policy reserves the `error` kind for a
+ *  BLOCKER (a hard stop that ends the run). A session T-Hub already RECOVERED is
+ *  not that: it's an informational "this captain was blocked and is now moving
+ *  again" cue that wants the general's eyes (WHICH captain was stuck) WITHOUT
+ *  sounding a blocker alarm. So it rides the softer `attention` chime, not the
+ *  loud `error` one — which on any edge would be an actively misleading alarm for
+ *  a self-healed session. We only WIRE this cue into #44's existing classes; we do
+ *  not add or alter a class.
  *
  *  Attribution comes from #44's canonical captainAttribution
  *  (captainSubjectForSession), which keys off the CLAUDE SESSION id, so we resolve
@@ -241,7 +243,7 @@ function notifyResumed(id: TerminalId, text: string): void {
     useSupervision.getState().sessionIdByTmux[sessionNameForTerminal(id)];
   const attribution = sessionId ? captainSubjectForSession(sessionId) : null;
   notify(
-    "error",
+    "attention",
     `${attribution ?? label} auto-resumed`,
     `${label} hit its usage limit; T-Hub dismissed the dialog and sent "${text}".`,
   );

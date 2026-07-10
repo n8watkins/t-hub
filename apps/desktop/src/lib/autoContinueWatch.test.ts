@@ -24,6 +24,7 @@ import {
 const h = vi.hoisted(() => ({
   paneText: {} as Record<string, string>,
   writes: [] as Array<[string, string]>,
+  notifies: [] as Array<[string, string, string]>,
 }));
 
 vi.mock("./terminalTail", () => ({
@@ -36,7 +37,10 @@ vi.mock("../ipc/client", async (importOriginal) => ({
     return Promise.resolve();
   },
 }));
-vi.mock("./notify", () => ({ notify: () => {} }));
+vi.mock("./notify", () => ({
+  notify: (kind: string, title: string, body: string) =>
+    h.notifies.push([kind, title, body]),
+}));
 vi.mock("./captainAttribution", () => ({ captainSubjectForSession: () => null }));
 
 import {
@@ -105,6 +109,7 @@ beforeEach(() => {
   vi.setSystemTime(NOW_MS);
   h.paneText = {};
   h.writes = [];
+  h.notifies = [];
   _resetAutoContinueForTest();
   useWorkspace.setState({ terminals: { [ID]: mkTerminal() } });
   useAutoContinue.setState({ optedOut: {} }); // default ON
@@ -197,5 +202,26 @@ describe("scanPanes RECOVERY — a genuinely-blocked, past-reset tile DOES recov
     scanPanes();
     await vi.advanceTimersByTimeAsync(RECOVERY_ESC_SETTLE_MS + 50);
     expect(h.writes).toEqual([]);
+  });
+
+  it("fires the resume cue as an ATTENTION notify, NOT the loud error alarm", async () => {
+    // Per #44's strict chime policy: a session T-Hub ALREADY recovered is not a
+    // blocker (`error`) — it's an informational, attribution-carrying "was blocked,
+    // now moving again" cue. It must ride the softer `attention` chime.
+    h.paneText[ID] = MODAL;
+    seedExhausted(PAST_RESET);
+
+    scanPanes();
+    await vi.advanceTimersByTimeAsync(RECOVERY_ESC_SETTLE_MS);
+    await flush();
+
+    expect(h.notifies).toHaveLength(1);
+    const [kind, title, body] = h.notifies[0];
+    expect(kind).toBe("attention");
+    expect(kind).not.toBe("error");
+    // Attribution wording is preserved (captainSubjectForSession → null here, so
+    // the tile label carries it).
+    expect(title).toContain("auto-resumed");
+    expect(body).toContain("usage limit");
   });
 });
