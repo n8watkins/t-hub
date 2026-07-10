@@ -5,8 +5,8 @@
 //!      with an ingested statusline snapshot;
 //!   2. a real `t-hub` control listener ([`t_hub_lib::control::start`]) on a
 //!      loopback port, with the handshake written to a temp file;
-//!   3. a real tmux session (`th_*` on the isolated `t-hub` socket) so
-//!      `list_terminals` has something to report;
+//!   3. a real tmux session (`th_*` on a per-process ISOLATED socket, never the
+//!      live `t-hub`) so `list_terminals` has something to report;
 //!   4. the real compiled `t-hub-mcp` binary, spawned as a subprocess and
 //!      driven over its stdin/stdout with genuine MCP JSON-RPC.
 //!
@@ -137,6 +137,14 @@ fn tool_structured(resp: &Value) -> &Value {
 fn end_to_end_mcp_round_trip() {
     let bin = locate_mcp_binary();
 
+    // ISOLATED SOCKET: point this whole test (the in-process control listener that
+    // runs the tmux ops, the spawned t-hub-mcp which inherits the env, and the
+    // make/kill helpers below) at a per-process socket, NEVER the live `t-hub` a
+    // running app drives. Set BEFORE anything resolves `tmux::socket()` (the first
+    // list_terminals). Cleaned up at the end alongside T_HUB_CONTROL_FILE.
+    let tmux_socket = format!("t-hub-mcpe2e-{}", std::process::id());
+    std::env::set_var("T_HUB_TMUX_SOCKET", &tmux_socket);
+
     // --- 1. Seed real supervision + status state -------------------------
     let supervisor = Arc::new(Mutex::new(t_hub_lib::supervision_for_test()));
     {
@@ -180,7 +188,14 @@ fn end_to_end_mcp_round_trip() {
 
     // --- 3. A real tmux session so list_terminals reports something ------
     let tmux_session = format!("th_e2e{}", std::process::id() % 100000);
-    let tmux_ok = make_tmux_session(&tmux_session);
+    let tmux_ok = make_tmux_session(&tmux_socket, &tmux_session);
+    // Drop-guard: the session is killed even if an assertion below panics, so a
+    // failure can never leak an `th_e2e*` session (belt on top of the explicit
+    // cleanup at the end).
+    let _session_guard = TmuxSessionGuard {
+        socket: tmux_socket.clone(),
+        name: tmux_session.clone(),
+    };
 
     // --- 4. Spawn the real t-hub-mcp binary + drive it -----------------
     let mut mcp = McpProc::spawn(&bin, &handshake_file);
@@ -303,25 +318,39 @@ fn end_to_end_mcp_round_trip() {
 
     // --- cleanup ---------------------------------------------------------
     if tmux_ok {
-        kill_tmux_session(&tmux_session);
+        kill_tmux_session(&tmux_socket, &tmux_session);
     }
     drop(mcp);
     let _ = std::fs::remove_dir_all(&tmp);
     std::env::remove_var("T_HUB_CONTROL_FILE");
+    std::env::remove_var("T_HUB_TMUX_SOCKET");
 }
 
-/// Create a detached tmux session on the isolated `t-hub` socket. Returns
-/// false (and the test skips tmux-specific asserts) if tmux isn't usable here.
-fn make_tmux_session(name: &str) -> bool {
+/// Kills its session on drop - including on a panicking assertion - so this E2E
+/// can never leak an `th_e2e*` session.
+struct TmuxSessionGuard {
+    socket: String,
+    name: String,
+}
+impl Drop for TmuxSessionGuard {
+    fn drop(&mut self) {
+        kill_tmux_session(&self.socket, &self.name);
+    }
+}
+
+/// Create a detached tmux session on the ISOLATED test socket (never the live
+/// `t-hub`). Returns false (and the test skips tmux-specific asserts) if tmux
+/// isn't usable here.
+fn make_tmux_session(socket: &str, name: &str) -> bool {
     Command::new("tmux")
-        .args(["-L", "t-hub", "new-session", "-d", "-s", name, "sleep 300"])
+        .args(["-L", socket, "new-session", "-d", "-s", name, "sleep 300"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
 }
 
-fn kill_tmux_session(name: &str) {
+fn kill_tmux_session(socket: &str, name: &str) {
     let _ = Command::new("tmux")
-        .args(["-L", "t-hub", "kill-session", "-t", name])
+        .args(["-L", socket, "kill-session", "-t", name])
         .status();
 }

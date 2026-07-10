@@ -30,13 +30,21 @@ use crate::bounded_exec::output_with_timeout;
 /// killing — production's terminals. With NO env var set the value is exactly
 /// `"t-hub"`, so default behavior is byte-for-byte unchanged.
 ///
-/// TEST ISOLATION: in a `cargo test` build the default flips to `"t-hub-test"`
-/// so a unit test that spins up REAL tmux sessions (the attach-churn suite) can
-/// NEVER create or reap sessions on the live `-L t-hub` socket a running app is
-/// driving - the exact hazard behind the leaked `th_s27churn*` ghosts that broke
-/// the app's post-restart adopt path. An explicit `$T_HUB_TMUX_SOCKET` still wins
-/// (so a test can pin its own unique socket); only the *default* changes, and
+/// TEST ISOLATION: in a `cargo test` build of THIS crate the default flips to
+/// `"t-hub-test"` so a unit test that spins up REAL tmux sessions (the attach-churn
+/// suite) can NEVER create or reap sessions on the live `-L t-hub` socket a running
+/// app is driving - the exact hazard behind the leaked `th_s27churn*` ghosts that
+/// broke the app's post-restart adopt path. An explicit `$T_HUB_TMUX_SOCKET` still
+/// wins (so a test can pin its own unique socket); only the *default* changes, and
 /// only under `cfg(test)`, so the shipped binary is byte-for-byte unchanged.
+///
+/// SCOPE: this `cfg(test)` default covers only THIS crate's unit tests. Sibling
+/// isolation lives with each producer: the `t-hub-agent` crate mirrors this
+/// `cfg(test)` default in its own `registry::socket()`, and the `tests/mcp_e2e.rs`
+/// integration test (a separate binary that shells out to `tmux -L` directly, so
+/// this const never governs it) pins `$T_HUB_TMUX_SOCKET` to a per-process name.
+/// So no test across the workspace touches the live socket - but that guarantee is
+/// the sum of those three mechanisms, not this const alone.
 static SOCKET_NAME: LazyLock<String> = LazyLock::new(|| {
     std::env::var("T_HUB_TMUX_SOCKET").unwrap_or_else(|_| default_socket_name().into())
 });

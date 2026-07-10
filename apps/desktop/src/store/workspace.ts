@@ -1859,7 +1859,19 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       if (tabs.filter((t) => t.id !== CAPTAINS_TAB_ID).length <= 1) return;
       const target = tabs.find((t) => t.id === id);
       if (!target) return;
-      const ids = target.order.slice();
+
+      // PROTECT CAPTAINS (protective default): a registered-captain tile that
+      // happens to sit in this work tab must NEVER be SIGKILLed by a workspace
+      // close - a captain is a long-lived orchestrator, and this exact vector
+      // (closeWorkspace reaping a captain tile mis-placed in a work tab) killed a
+      // live captain during a re-org. Re-place it into the reserved Captains tab
+      // instead, and kill only the genuine work sessions. (The precise UX - silent
+      // re-place vs. a confirm prompt - is flagged for the general's ratification;
+      // the protective default ships now.)
+      const registeredCaptains = new Set(captainRegistryIds());
+      const captainsHere = target.order.filter((tid) => registeredCaptains.has(tid));
+      for (const tid of captainsHere) get().moveTileToCaptainsTab(tid);
+      const ids = target.order.filter((tid) => !registeredCaptains.has(tid));
 
       const refreshRecent = (): void => {
         if (typeof window !== "undefined") {
@@ -1881,9 +1893,11 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
           refreshRecent();
         });
 
-      // SIGKILL each session's process tree via the SAME backend path the per-tile
-      // × uses (killTerminal → kill_terminal → tmux::kill_session_tree). Fire-and-
-      // forget (mirrors deleteTerminal); a kill error is logged, not surfaced.
+      // SIGKILL each WORK session's process tree via the SAME backend path the
+      // per-tile × uses (killTerminal → kill_terminal → tmux::kill_session_tree).
+      // `ids` excludes any registered-captain tile (re-placed above), so a captain
+      // is never reaped here. Fire-and-forget (mirrors deleteTerminal); a kill error
+      // is logged, not surfaced.
       void import("../ipc/client").then((m) => {
         for (const tid of ids) {
           m.killTerminal(tid).catch((err) =>

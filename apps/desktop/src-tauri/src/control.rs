@@ -7119,8 +7119,10 @@ mod tests {
     /// 13 `th_s27churn*` ghosts in the incident: a failing run of the churn test
     /// left its sessions behind, and the app's post-restart adopt path then choked
     /// on the debris. Paired with the `cfg(test)` socket isolation in `tmux.rs`
-    /// (test sessions live on `t-hub-test`, never the live `t-hub` socket), this
-    /// makes a leak both impossible-to-hit-the-live-app AND self-cleaning.
+    /// (THIS crate's test sessions live on `t-hub-test`, never the live `t-hub`
+    /// socket), this makes a leak from the attach suite both unable-to-hit-the-live
+    /// -app AND self-cleaning. (Other producers isolate separately - see the SCOPE
+    /// note on `tmux::SOCKET_NAME`.)
     struct ChurnSession {
         id: String,
         target: String,

@@ -1,4 +1,5 @@
-//! tmux session registry on the isolated `t-hub` socket (agent side).
+//! tmux session registry on the isolated `t-hub` socket (agent side; a
+//! `cargo test` build uses `t-hub-test` so tests never touch the live socket).
 //!
 //! Mirrors the core's `src-tauri/src/tmux.rs` surface, but runs *inside WSL*
 //! where tmux actually lives. The agent is the future single owner of tmux
@@ -13,17 +14,42 @@
 use std::process::Command;
 
 use anyhow::{anyhow, Result};
+use std::sync::LazyLock;
 
-/// The isolated tmux socket name; always passed as `tmux -L t-hub`.
-pub const SOCKET: &str = "t-hub";
+/// The resolved tmux socket name, always passed as `tmux -L <socket>`.
+///
+/// Resolved ONCE from `$T_HUB_TMUX_SOCKET`, defaulting to `"t-hub"` - mirroring
+/// the app-side `t_hub_lib::tmux` so the agent and the app share one socket. In a
+/// `cargo test` build the default flips to `"t-hub-test"` so the lifecycle test
+/// (which creates + reaps REAL tmux sessions) can NEVER touch the live `t-hub`
+/// socket a running app drives. An explicit env still wins; the shipped binary is
+/// byte-for-byte unchanged (the `cfg(test)` branch only compiles under test).
+static SOCKET_NAME: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("T_HUB_TMUX_SOCKET").unwrap_or_else(|_| default_socket_name().into())
+});
+
+/// The compiled-in default socket name: `"t-hub"` normally, `"t-hub-test"` under
+/// `cfg(test)` (see [`SOCKET_NAME`]).
+const fn default_socket_name() -> &'static str {
+    if cfg!(test) {
+        "t-hub-test"
+    } else {
+        "t-hub"
+    }
+}
+
+/// The resolved tmux socket name (`$T_HUB_TMUX_SOCKET` or the default).
+pub fn socket() -> &'static str {
+    &SOCKET_NAME
+}
 
 /// Lines of scrollback to capture when seeding xterm.
 const SCROLLBACK_LINES: i64 = 2000;
 
-/// Build a `tmux -L t-hub` command with the given args.
+/// Build a `tmux -L <socket>` command with the given args.
 fn tmux(args: &[&str]) -> Command {
     let mut cmd = Command::new("tmux");
-    cmd.arg("-L").arg(SOCKET);
+    cmd.arg("-L").arg(socket());
     cmd.args(args);
     cmd
 }
@@ -127,10 +153,23 @@ mod tests {
         format!("th_agent_test_{ts}")
     }
 
-    // Requires a real tmux (present in this WSL2 dev shell).
+    /// Kills its session on drop - including on a panicking assertion - so the
+    /// lifecycle test can NEVER leak a session (paired with the `cfg(test)`
+    /// `t-hub-test` socket isolation, a leak can neither hit the live app nor
+    /// linger).
+    struct SessionGuard(String);
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            let _ = kill_session(&self.0);
+        }
+    }
+
+    // Requires a real tmux (present in this WSL2 dev shell). Runs on the isolated
+    // `t-hub-test` socket (the cfg(test) default), never the live `t-hub`.
     #[test]
     fn lifecycle() {
         let name = unique();
+        let _guard = SessionGuard(name.clone());
         let _ = kill_session(&name);
         new_session(&name, "/tmp", None).expect("new_session");
         assert!(has_session(&name));
