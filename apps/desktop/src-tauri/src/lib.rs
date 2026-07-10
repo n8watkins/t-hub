@@ -690,6 +690,9 @@ pub fn run() {
             voice::voice_settings_write,
             voice::voice_list_voices,
             voice::voice_tts,
+            // Bounded /health probe (2s) per engine - the Settings dual-engine
+            // health display + selected-engine-down error state read this.
+            voice::voice_health,
             // Scribe voice-gate: "is the general dictating?" (fails open).
             scribe::scribe_status,
         ])

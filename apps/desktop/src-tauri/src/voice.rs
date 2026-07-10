@@ -332,6 +332,77 @@ pub async fn voice_tts(
         .map_err(|e| format!("voice_tts task failed: {e}"))?
 }
 
+/// One engine's reachability snapshot for the Settings health display. Serialized
+/// camelCase over IPC. `reachable` is the ONLY thing the UI keys its error state
+/// on; `detail` carries the probe error (server down / timeout) for a tooltip,
+/// never a reason to hide the down state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineHealth {
+    pub engine: VoiceEngine,
+    pub reachable: bool,
+    pub detail: Option<String>,
+}
+
+/// GET /health on the engine's local server with a SHORT bounded timeout. A
+/// down/slow/unreachable server is a NORMAL outcome here (reachable=false with
+/// the error in `detail`), not a command error - the Settings panel renders it
+/// as the engine's error state, so the probe itself must always resolve Ok.
+///
+/// Bounded on purpose (this ship spent #45/#48/#50 killing unbounded calls): the
+/// 2s connect/read timeout caps a single probe, and the caller (Settings, on
+/// open + a slow periodic tick) fans out at most one probe per engine at a time.
+fn probe_health(engine: VoiceEngine) -> EngineHealth {
+    let base = base_url_for_engine(engine);
+    probe_health_at(engine, &base)
+}
+
+/// The URL-taking core of `probe_health`, split out so a test can point it at an
+/// arbitrary (e.g. deliberately-dead ephemeral) base URL WITHOUT mutating the
+/// process-global engine-URL env - hermetic under a parallel test harness.
+fn probe_health_at(engine: VoiceEngine, base_url: &str) -> EngineHealth {
+    let url = format!("{base_url}/health");
+    match agent()
+        .get(&url)
+        .timeout(Duration::from_secs(2))
+        .call()
+    {
+        // A 2xx: the server is up and healthy.
+        Ok(_) => EngineHealth {
+            engine,
+            reachable: true,
+            detail: None,
+        },
+        // ureq surfaces a 4xx/5xx as Error::Status - the server ANSWERED, so it
+        // is reachable (a live-but-sick server), just not a clean 200. We carry
+        // the code in `detail` but keep reachable=true: the incident we guard
+        // against is a fully-dead server (connection refused), which is a
+        // Transport error below, not a status.
+        Err(ureq::Error::Status(code, _)) => EngineHealth {
+            engine,
+            reachable: true,
+            detail: Some(format!("health returned HTTP {code}")),
+        },
+        // Transport error: connection refused / timeout / DNS - the server is
+        // not there. THIS is the silent-death case the Settings error surfaces.
+        Err(e) => EngineHealth {
+            engine,
+            reachable: false,
+            detail: Some(e.to_string()),
+        },
+    }
+}
+
+/// Probe one engine's /health for the Settings dual-engine status display.
+/// Always Ok (a down server is `reachable: false`); errors only if the blocking
+/// task itself panics.
+#[tauri::command]
+pub async fn voice_health(engine: VoiceEngine) -> Result<EngineHealth, String> {
+    tauri::async_runtime::spawn_blocking(move || probe_health(engine))
+        .await
+        .map_err(|e| format!("voice_health task failed: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +485,40 @@ mod tests {
     fn parse_settings_reads_kokoro_engine() {
         let parsed = parse_settings(&serde_json::json!({ "engine": "kokoro" }));
         assert_eq!(parsed.engine, VoiceEngine::Kokoro);
+    }
+
+    /// A dead server (nothing listening) probes as reachable=false with the
+    /// transport error in `detail` - the exact silent-death case the Settings
+    /// error state exists to surface. Hermetic: binds an ephemeral loopback port,
+    /// reads it, then DROPS the listener so the port is free-but-unlistened, and
+    /// points the probe straight at that URL - no process-global env mutation
+    /// (safe under the parallel test harness / Rust 2024). Connection-refused
+    /// returns fast, well inside the 2s bound.
+    #[test]
+    fn probe_health_reports_dead_server_unreachable() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // close it: the port is now reliably refusing connections
+        let base = format!("http://127.0.0.1:{port}");
+
+        let h = probe_health_at(VoiceEngine::Kokoro, &base);
+        assert_eq!(h.engine, VoiceEngine::Kokoro);
+        assert!(!h.reachable, "a dead server must probe as unreachable");
+        assert!(h.detail.is_some(), "the transport error is carried for the UI");
+    }
+
+    /// EngineHealth serializes camelCase so the webview reads `reachable`
+    /// directly (and the engine token stays the lowercase wire form).
+    #[test]
+    fn engine_health_serializes_camel_case() {
+        let out = serde_json::to_value(EngineHealth {
+            engine: VoiceEngine::Piper,
+            reachable: true,
+            detail: None,
+        })
+        .unwrap();
+        assert_eq!(out.get("reachable").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(out.get("engine").and_then(|v| v.as_str()), Some("piper"));
     }
 }

@@ -40,6 +40,23 @@ export function listVoices(engine: VoiceEngine): Promise<string[]> {
   return invoke("voice_list_voices", { engine });
 }
 
+/** One engine's reachability snapshot (mirrors the Rust EngineHealth). Drives
+ *  the Settings dual-engine health display + the selected-engine-down error
+ *  state. `reachable` is the sole flag the UI keys its error on; `detail` is the
+ *  probe error (server down / timeout / a non-200 status) for a tooltip. */
+export interface EngineHealth {
+  engine: VoiceEngine;
+  reachable: boolean;
+  detail: string | null;
+}
+
+/** Probe the given engine's /health (via the backend, bounded 2s). Resolves for
+ *  a down server too (`reachable: false`) - only rejects if the backend task
+ *  itself fails - so the Settings panel always gets a definite up/down. */
+export function voiceHealth(engine: VoiceEngine): Promise<EngineHealth> {
+  return invoke("voice_health", { engine });
+}
+
 /** Synthesize `text` with `voice` on `engine`; resolves to base64 WAV bytes
  *  for playback via an Audio data URI (the webview must not fetch the TTS
  *  server itself - it rejects browser-Origin requests; see
