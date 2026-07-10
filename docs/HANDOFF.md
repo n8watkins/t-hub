@@ -13,14 +13,20 @@ On resume: invoke `/shipmate`, claim via `claim_captain` (MCP) or `~/.t-hub/capt
 
 ## Current state (end of this wave)
 
-- **main is at 0.3.58** (commit `a3d1700`), installed and running (pid was 8556, binary FileVersion 0.3.58). Repo tree clean.
-- This wave shipped **0.3.54 → 0.3.58**. 0.3.58 merged PRs #47 (auto-continue full redesign, DEFAULT-ON) and #48 (control-socket flap fix: tmux+git subprocess bounding via a shared `bounded_exec` helper + M1 full re-probe-on-reap).
+- **main is at 0.3.59** (bump commit `648b7c1`), installed and running.
+0.3.59 merged PRs #49 (EventFanout snapshot-then-write-unlocked) and #50 (relay-wedge self-heal: `rebind_control` + client wedge-detector + stale-pin fallback).
 - **Two untracked files** (`.lavish/`, `docs/DECK-AGENTS-DESIGN.md`) are pre-existing, NOT this ship's work - leave them.
-- **All crew reaped, all worktrees removed** (except a doc-staleness crew active during wind-down - reaped as part of it). The only other tmux session, `9a32f554`, is the **monorepo-app captain** (another ship) - do NOT touch it.
+- All crew reaped, all worktrees removed.
+The only other captain-adjacent tmux sessions are Cortana (`e05764f5`) and the **monorepo-app captain** (`9a32f554`, another ship) - do NOT touch them.
 
-## ⚠ TOP PRIORITY on resume - the flap fix did NOT work
+## ✅ RESOLVED - the "control-socket wedge" saga (read before trusting old wedge reports)
 
-0.3.58's #48 bounded every tmux and git subprocess, but a **live control-socket wedge STILL reproduces on 0.3.58**: connect succeeds, but EVERY command hangs >11-18s - including non-tmux reads (`get_theme`, `list_tabs`, `wsl_health`), not just `list_terminals`. Meanwhile the tmux server itself is fast (`list-sessions` 0.006s) and only 3 sessions exist. So the wedge is in the **accept/serve/dispatch path** (upstream of handlers), NOT the tmux subprocess #48 bounded. The flap crew explicitly ruled the accept loop out; the evidence contradicts that. This is escalated as DECISION-NEEDED and is the #1 NEAR itinerary item: reopen the flap investigation with the corrected evidence (every command hangs incl. non-tmux ⇒ serve/dispatch seam - candidate: a global lock/worker-pool/`ACTIVE_CONNS` exhaustion in `serve`, or a stuck subscribed/attach connection holding a shared resource). Until fixed, the operational workaround stands: drive crew via **raw tmux** on the `-L t-hub` socket (invisible in the webview until an app restart re-adopts them); a restart transiently clears the wedged process.
+The long-running wedge decomposed into REAL app bugs (fixed in #45, #49) plus a **diagnostic artifact** that survived every fix:
+app-spawned sessions carry spawn-time `T_HUB_CONTROL_ADDR`+`T_HUB_CONTROL_TOKEN` env pins; `t1_lib.connect()` and the pre-#50 MCP client prefer the pin over `control.json`; every app restart rotates the port, so pinned tooling silently targets a DEAD port forever after.
+The WSL2 mirrored relay times out slowly on dead-port connects instead of refusing, so a dead pin presents exactly like a wedged live server.
+The full corrected evidence trail is on PR #50 (post-merge comment) and in memory `control-socket-transient-wedge`.
+Rules of thumb: never probe socket health through an env-pinned client; raw-connect to the CURRENT `control.json` addr; a slow WSL connect-timeout to a Windows loopback port usually means dead port, not wedged server.
+An intermediate "WSL relay per-port flow wedge" theory (2026-07-09) is FALSE - do not resurrect it from old reports.
 
 ## How to operate this ship (learned this wave)
 
@@ -37,8 +43,12 @@ On resume: invoke `/shipmate`, claim via `claim_captain` (MCP) or `~/.t-hub/capt
 
 ### NEAR (deferred or almost reached this session - pick up first)
 
-1. **[TOP] Reopen the control-socket flap investigation.** 0.3.58's #48 did NOT fix the live wedge (every command hangs incl. non-tmux ⇒ serve/dispatch path, not tmux; tmux server itself is healthy). Root-cause the accept/serve/dispatch seam (global lock / worker-pool / ACTIVE_CONNS exhaustion / stuck subscribed-or-attach connection). This is the general's headline pain (empty workspace, unusable MCP). Reproduce, fix, xhigh review.
-2. **F2 - EventFanout snapshot-under-lock.** `emit_event` holds the `subs` mutex across per-subscriber socket writes (bounded 5s each by SO_SNDTIMEO). The #48 flap crew flagged it as a latent seam (not the observed cause): N sequential stalled subscribers ⇒ ~N×5s emit stall, delaying event delivery/adoption forwards. Fix = snapshot subscribers under lock, write unlocked. May be related to item 1 - check first.
+1. **Post-0.3.59 wedge-saga carry-items.**
+(a) Live-verify PR #50's heal loop if a REAL wedge ever presents (none may - the residual symptom was the stale-pin artifact; the rebind is defense-in-depth).
+(b) Known limitation N2: a connect-level wedge presentation would not trigger the Timeout-only heal (documented in PR #50).
+(c) Fleet hygiene: after every install/restart, long-running app-spawned sessions' pinned MCP/tooling go dark on the dead port - fresh sessions in this repo get the F2-fixed client (debug `t-hub-mcp` rebuilt from post-#50 main, 2026-07-10); consider surfacing the same fallback in any other pin-preferring consumer.
+(d) PR #49 M2 design note from review: cross-client event ordering is now per-socket, not global - matters when M2 adds a second subscriber.
+2. **(done)** F2 EventFanout snapshot-under-lock - shipped as PR #49 in 0.3.59.
 3. **Bound the other-subsystem subprocesses.** The #48 F1 completeness sweep found unbounded `.output()`/`.status()` in files.rs, codex.rs, usage.rs, devserver.rs, recent.rs, claude/install.rs (and control.rs `tailscale_ip4` startup-only, benign). Route control-reachable ones through the shared `bounded_exec` helper for the same "no handler parks forever" invariant.
 4. **PR #45 M1 spawn_terminal re-probe honest-limit.** The re-probe closes the create_worktree reaped-duplicate but `spawn_terminal` returns `None` (server-minted id, nothing to probe by) and relies on the 600s reap window. If spawn duplicates recur, add a probe key (e.g. client-supplied spawn tag) so spawn is re-probable too.
 5. **PR #44 LOW watch-items** (all noted in the #44 PR body): header ctx% meter mid-turn flicker (default-OFF, small blast radius); tile-header button crowding at the narrowest widths (now 5 shrink-0 buttons); DRY the O(n) `sessionIdByTmux` reverse scan (a forward index retires it).
@@ -60,4 +70,6 @@ On resume: invoke `/shipmate`, claim via `claim_captain` (MCP) or `~/.t-hub/capt
 - **0.3.55**: captains-render-fix (#39) - externally-claimed captains render regardless of tile placement.
 - **0.3.56**: Cortana crown pane header (#40), Scribe v1 dictation-state migration (#41).
 - **0.3.57**: doc-staleness (#42), voice-gate dual-source dictation gate + announce.log (#43), UI batch - kill+restart button / ctx% setting / attribution / chime trim (#44), spawn-retry idempotency + de-wedge (#45), auto-continue small Esc+continue fix (#46).
-- **0.3.58**: auto-continue full redesign default-ON (#47), control-socket flap fix - tmux+git subprocess bound + M1 full fix (#48). **Caveat: the live serve-path wedge is NOT resolved (see TOP PRIORITY).**
+- **0.3.58**: auto-continue full redesign default-ON (#47), control-socket flap fix - tmux+git subprocess bound + M1 full fix (#48).
+- **0.3.59**: EventFanout snapshot-then-write-unlocked (#49), relay-wedge self-heal - rebind command + client wedge-detector + stale-pin fallback (#50).
+The wedge saga is RESOLVED (see the section above); the residual "wedge on 0.3.58" turned out to be the stale-env-pin artifact.
