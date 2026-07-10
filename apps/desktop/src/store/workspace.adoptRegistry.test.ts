@@ -239,6 +239,70 @@ describe("adoptRegistry keeps an externally-claimed captain (registry liveness)"
   });
 });
 
+describe("adoptRegistry adopts a socket-commissioned captain from the reserved tab", () => {
+  // THE DEFECT (agents-plane-captains): a captain commissioned over the control
+  // socket - spawn_terminal with tabId=captains-reserved - has its tile placed by
+  // the SERVER into the reserved Captains tab and its live terminal registered by
+  // the spawn_terminal apply (adoptTerminal), but the client never pinned it, so
+  // it is in NEITHER the local captains order NOR any work tab. The KEEP filter
+  // only prunes the existing local order, so before the fix the tile was dropped
+  // from every rebuilt tab: the agents plane rendered no tile and never attached a
+  // PTY client (tmux session_attached=0), and the cleanup pass GC'd the terminal.
+  afterEach(() => {
+    registerCaptainRegistry(() => []);
+  });
+
+  it("adopts an agent the server placed directly into captains-reserved that the local order lacks", () => {
+    seed(
+      [
+        { id: "t1", name: "Workspace 1", order: ["a"] },
+        { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, order: ["cap1"] },
+      ],
+      "t1",
+      "a",
+    );
+    // The live terminal is already registered (the spawn_terminal apply's
+    // adoptTerminal), but "sock" is not yet in any tab order.
+    useWorkspace.setState({
+      terminals: { ...useWorkspace.getState().terminals, sock: term("sock") },
+    });
+    useWorkspace.getState().adoptRegistry([
+      { id: "t1", name: "Workspace 1", tileIds: ["a"] },
+      { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, tileIds: ["cap1", "sock"] },
+    ]);
+    const s = useWorkspace.getState();
+    // The socket captain joins the agents plane at the tail, keeping the existing
+    // one (so the plane renders + attaches its terminal like any other captain).
+    expect(s.tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order).toEqual([
+      "cap1",
+      "sock",
+    ]);
+    expect(s.terminals["sock"]).toBeDefined(); // preserved, not cleaned up
+    // Exactly one reserved tab, still last; not duplicated into a work tab.
+    expect(s.tabs.filter((t) => t.id === CAPTAINS_TAB_ID)).toHaveLength(1);
+    expect(s.tabs[s.tabs.length - 1].id).toBe(CAPTAINS_TAB_ID);
+    expect(s.tabs.find((t) => t.id === "t1")?.order).toEqual(["a"]);
+  });
+
+  it("adopts the reserved-tab tile even before it is in the captains registry (spawn precedes claim)", () => {
+    // The tile is placed at spawn time, BEFORE claim_captain registers it - so the
+    // registry-liveness fallback does not yet cover it. The server's reserved-tab
+    // placement alone must suffice, else the tile is GC'd before the claim lands.
+    registerCaptainRegistry(() => []); // not a registered captain yet
+    seed([{ id: "t1", name: "Workspace 1", order: ["a"] }], "t1", "a");
+    useWorkspace.setState({
+      terminals: { ...useWorkspace.getState().terminals, sock: term("sock") },
+    });
+    useWorkspace.getState().adoptRegistry([
+      { id: "t1", name: "Workspace 1", tileIds: ["a"] },
+      { id: CAPTAINS_TAB_ID, name: CAPTAINS_TAB_NAME, tileIds: ["sock"] },
+    ]);
+    const s = useWorkspace.getState();
+    expect(s.tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order).toEqual(["sock"]);
+    expect(s.terminals["sock"]).toBeDefined();
+  });
+});
+
 describe("adoptRegistry never duplicates the reserved Captains tab (stray-placeholder bug)", () => {
   // ROOT CAUSE: the tab reporter up-syncs the client-only Captains tab to the
   // server, so the server echoes it back inside its snapshot. adoptRegistry used

@@ -1316,6 +1316,23 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       const captainsOrder = (localCaptains?.order ?? []).filter(
         (id) => serverTileIds.has(id) || registeredCaptains.has(id),
       );
+      // ADOPT an agent the SERVER placed DIRECTLY into the reserved Captains tab
+      // that the client never tracked locally - a captain commissioned over the
+      // control socket (spawn_terminal with tabId=captains-reserved), whose tile
+      // lands in the server's reserved-tab snapshot but is in NEITHER the local
+      // captains order (the client never pinned it) NOR any work tab. Without this
+      // it is filtered out of every rebuilt tab, so the agents plane renders no
+      // tile and never attaches a PTY client to it, and the cleanup pass below
+      // then garbage-collects its live entry. The KEEP filter above only prunes
+      // the existing local order - it can never ADD such a tile - so append it
+      // here at the tail (least-recently-summoned, like a fresh local pin),
+      // preserving the established order. Idempotent across the reporter round-
+      // trip: once adopted it is already in the local order on the next sync.
+      const serverCaptainsTiles =
+        regTabs.find((r) => r.id === CAPTAINS_TAB_ID)?.tileIds ?? [];
+      for (const id of serverCaptainsTiles) {
+        if (!captainsOrder.includes(id)) captainsOrder.push(id);
+      }
       const agentSet = new Set(captainsOrder);
 
       // The reserved Captains tab is CLIENT-ONLY, but the tab reporter up-syncs it
