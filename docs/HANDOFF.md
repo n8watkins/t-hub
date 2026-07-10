@@ -56,6 +56,10 @@ An intermediate "WSL relay per-port flow wedge" theory (2026-07-09) is FALSE - d
 T-Hub owns Kokoro as a managed child process: spawn on app start, health-watch, auto-restart, kill on exit, no orphan servers; keep the HTTP port (announce.sh/captain paths unchanged); no in-process model embed.
 Piper becomes a lazy standby (instantiate only on Kokoro failure); failure behavior flips from surface-and-prompt to AUTO-FALLBACK with toast + Settings error.
 The proposal must sequence clean removal/disable of the interim systemd unit so app and unit never fight over port 7478.
+3a. **REAP-SHIP feature bundle** (general via monorepo captain, routed by Cortana 2026-07-10; sequence after P1 + engine-supervisor; DESIGN PROPOSAL first - destructive ops, landed-gate semantics deserve review).
+A deterministic `reap_ship` control command keyed off the captains registry: close all crew terminals recorded under a captain, remove their worktrees, close captain-created tabs, clear the ship sentinel dir - with a HARD landed-gate per crew (refuse loudly if branch HEAD is not on origin).
+Bundled prereqs: (1) tabs need creator/owner metadata in the registry; (2) all spawns flow through the socket for spawnedBy tracking (the shipped relay self-heal largely covers the old wedge dependency); (3) registry self-heal for ghost tiles whose tmux sessions are dead - adjacent to PR #53's ghost/adopt work, fold or sequence there.
+Interim doctrine unchanged: RETIREMENT.md manual checklist.
 3b. **First-class ORCHESTRATOR representation in the agents workspace** (general product item, 2026-07-10; sequence AFTER the P1 adopt-harden fix).
 The orchestrator must render distinct from captains (the general objects to Cortana appearing as a captain).
 Interim state: a `claim_captain` slug `cortana` is in place and the general pinned it - remove/migrate that interim claim when the real representation ships.
