@@ -20,7 +20,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -41,13 +42,68 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CONTROL_EVENT: &str = "control://event";
 
 /// Where + how the client transport reaches the control listener: the bound
-/// loopback address and the per-launch auth token. Managed in Tauri state so the
-/// [`control_request`] command can find the socket. Local-only in M1; M2 swaps the
-/// addr for a remote/Tailscale one (and §8's auth-beyond-loopback gates that).
-#[derive(Clone)]
+/// loopback address and the per-launch auth token. Managed in Tauri state (as an
+/// `Arc`) so the [`control_request`] command, the event forwarder, and terminal
+/// attach all share ONE endpoint. Local-only in M1; M2 swaps the addr for a
+/// remote/Tailscale one (and §8's auth-beyond-loopback gates that).
+///
+/// RELAY-WEDGE SELF-HEAL (PR #50): the `addr` is interior-mutable because the
+/// server can rotate its listener port under us - `rebind_control` moves the
+/// listener to a fresh port to escape a wedged WSL loopback relay flow and rewrites
+/// `control.json`. The app's OWN client half lives on healthy Windows loopback (the
+/// wedge never touches it), so without a way to pick up the new port an automatic
+/// rebind would strand the local GUI's command channel + terminal attach on the
+/// retired port until a human restart - defeating the whole "no restart" goal.
+/// [`refresh_addr`](Self::refresh_addr) re-reads the fresh addr from the local
+/// handshake on a transport failure (mirroring PR #38's external-client behavior),
+/// keeping the cached FULL-power token (a rebind never rotates tokens).
 pub struct ControlEndpoint {
-    pub addr: String,
-    pub token: String,
+    addr: RwLock<String>,
+    token: String,
+    /// Local handshake file to re-read the rotated addr from. `None` in REMOTE
+    /// thin-client mode (there is no local rebind to track).
+    refresh_path: Option<PathBuf>,
+}
+
+impl ControlEndpoint {
+    /// The current control address (follows a rebind once [`refresh_addr`] adopts it).
+    pub fn addr(&self) -> String {
+        self.addr
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The auth token. Fixed for the launch: a rebind is transport recovery, not a
+    /// credential rotation, so the token the frontend already holds stays valid.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// After a transport failure, re-read the LOCAL handshake for a rotated addr (the
+    /// self-heal's `rebind_control` moves the listener + rewrites `control.json`).
+    /// Returns `Some(new_addr)` iff the addr CHANGED, updating the shared cache so
+    /// every consumer (command channel, forwarder, attach) follows to the new port.
+    /// `None` when there is no refresh source (remote mode), the file is unreadable,
+    /// or the addr is unchanged (a genuine failure that a re-resolve won't fix).
+    ///
+    /// The published token is deliberately IGNORED: under Phase 3 hardening
+    /// `control.json` publishes only the read token, so adopting it would drop the
+    /// frontend to read-only and break attach. The cached full token still authorizes
+    /// the fresh port because the rebind kept it.
+    pub fn refresh_addr(&self) -> Option<String> {
+        let path = self.refresh_path.as_ref()?;
+        let body = std::fs::read_to_string(path).ok()?;
+        let hs: Value = serde_json::from_str(&body).ok()?;
+        let fresh = hs.get("addr").and_then(|v| v.as_str())?.to_string();
+        let mut cur = self.addr.write().unwrap_or_else(|e| e.into_inner());
+        if *cur != fresh {
+            *cur = fresh.clone();
+            Some(fresh)
+        } else {
+            None
+        }
+    }
 }
 
 /// Open a one-shot connection to the control listener, send one request frame, and
@@ -107,7 +163,7 @@ fn request(addr: &str, token: &str, command: &str, args: &Value) -> Result<Value
 /// wrappers call it instead of a direct in-process `invoke`.
 #[tauri::command]
 pub async fn control_request(
-    endpoint: tauri::State<'_, ControlEndpoint>,
+    endpoint: tauri::State<'_, Arc<ControlEndpoint>>,
     command: String,
     args: Option<Value>,
 ) -> Result<Value, String> {
@@ -120,13 +176,24 @@ pub async fn control_request(
     // main-thread blocks with near-zero emits, ruling out emit volume). Running it
     // on the blocking pool keeps the main thread pumping. (Frontend unchanged —
     // `invoke` already returns a promise.)
-    let addr = endpoint.addr.clone();
-    let token = endpoint.token.clone();
+    let ep = endpoint.inner().clone();
     drop(endpoint); // release the State borrow BEFORE the await (keeps the future Send)
     let args = args.unwrap_or(Value::Null);
-    tauri::async_runtime::spawn_blocking(move || request(&addr, &token, &command, &args))
-        .await
-        .map_err(|e| format!("control_request: task join failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        match request(&ep.addr(), ep.token(), &command, &args) {
+            Ok(v) => Ok(v),
+            // A local rebind may have rotated the listener port (relay-wedge
+            // self-heal). Re-read the fresh addr from control.json and retry ONCE;
+            // `refresh_addr` returns Some only when the addr actually changed, so a
+            // normal app-level error is surfaced unchanged (no pointless retry).
+            Err(e) => match ep.refresh_addr() {
+                Some(fresh) => request(&fresh, ep.token(), &command, &args),
+                None => Err(e),
+            },
+        }
+    })
+    .await
+    .map_err(|e| format!("control_request: task join failed: {e}"))?
 }
 
 /// The production [`EventEmitter`]: writes every backend event to the control
@@ -157,7 +224,7 @@ impl EventEmitter for SocketEmitter {
 /// the webview as [`CONTROL_EVENT`]. This is the receive half of the event wire —
 /// in M1 it loops back to the same process; in M2 the same loop points at a remote
 /// server. Reconnects with a small backoff so a dropped/late listener self-heals.
-pub fn spawn_event_forwarder(app: AppHandle, addr: String, token: String) {
+pub fn spawn_event_forwarder(app: AppHandle, endpoint: Arc<ControlEndpoint>) {
     std::thread::Builder::new()
         .name("t-hub-control-forward".into())
         .spawn(move || {
@@ -177,7 +244,11 @@ pub fn spawn_event_forwarder(app: AppHandle, addr: String, token: String) {
             let healthy_after = Duration::from_secs(1);
             loop {
                 let started = std::time::Instant::now();
-                let result = forward_once(&app, &addr, &token);
+                // Read the (possibly rebound) addr each cycle so a reconnect follows a
+                // rotated listener port. Existing subscriptions survive a rebind (the
+                // fanout is shared across the server's listeners), so this only matters
+                // once the connection actually drops and must reconnect.
+                let result = forward_once(&app, &endpoint.addr(), endpoint.token());
                 let lived = started.elapsed();
                 match result {
                     Ok(()) if lived >= healthy_after => {
@@ -189,6 +260,10 @@ pub fn spawn_event_forwarder(app: AppHandle, addr: String, token: String) {
                         backoff = (backoff * 2).min(max_backoff);
                     }
                     Err(e) => {
+                        // A reconnect failure may be the retired old port after a
+                        // rebind: re-read control.json so the NEXT cycle targets the
+                        // fresh addr (relay-wedge self-heal).
+                        endpoint.refresh_addr();
                         eprintln!(
                             "t-hub-control: event forwarder reconnect failed: {e} (retry in {backoff:?})"
                         );
@@ -283,12 +358,22 @@ pub fn install(app: &AppHandle, handshake: &control::ControlHandshake) {
             );
         }
     }
+    let is_remote = matches!(remote, (Some(_), Some(_)));
     let (addr, token) = resolve_endpoint(handshake, remote);
-    app.manage(ControlEndpoint {
-        addr: addr.clone(),
-        token: token.clone(),
+    // LOCAL mode: track the local handshake so a rebind's rotated addr is picked up.
+    // REMOTE thin-client mode: no local rebind to follow, so no refresh source.
+    let refresh_path = if is_remote {
+        None
+    } else {
+        Some(control::handshake_path())
+    };
+    let endpoint = Arc::new(ControlEndpoint {
+        addr: RwLock::new(addr),
+        token,
+        refresh_path,
     });
-    spawn_event_forwarder(app.clone(), addr, token);
+    app.manage(endpoint.clone());
+    spawn_event_forwarder(app.clone(), endpoint);
 }
 
 /// Pick the (addr, token) the LOCAL webview authenticates the control socket with.
@@ -367,5 +452,63 @@ mod tests {
         assert_eq!(token, "full-control");
         let (_, token) = resolve_endpoint(&hs, (None, Some("remote-secret".into())));
         assert_eq!(token, "full-control");
+    }
+
+    /// F1 REGRESSION (PR #50 fix round): the app's OWN client must follow the server
+    /// to a rotated port after a `rebind_control`, or an automatic relay-wedge heal
+    /// would strand the local GUI's command channel + terminal attach on the retired
+    /// port until a human restart. This exercises the exact re-resolve seam the
+    /// reviewer flagged as untested: after the server rewrites control.json with a
+    /// fresh addr, `refresh_addr` adopts it (keeping the full token) and every
+    /// consumer's `addr()` follows.
+    #[test]
+    fn refresh_addr_adopts_a_rotated_port_from_the_local_handshake() {
+        let cj = std::env::temp_dir().join(format!(
+            "t-hub-f1-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(
+            &cj,
+            serde_json::to_vec(&json!({
+                "addr": "127.0.0.1:6001",
+                "token": "read-only",          // published token (ignored on refresh)
+                "read_token": "read-only",
+                "pid": 1,
+                "protocolVersion": control::PROTOCOL_VERSION,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Start on the OLD port with the FULL token; refresh source is the handshake.
+        let ep = ControlEndpoint {
+            addr: RwLock::new("127.0.0.1:6000".into()),
+            token: "full-control".into(),
+            refresh_path: Some(cj.clone()),
+        };
+        assert_eq!(ep.addr(), "127.0.0.1:6000");
+
+        // A rebind rotated the port: refresh adopts the fresh addr, keeps the token.
+        assert_eq!(ep.refresh_addr().as_deref(), Some("127.0.0.1:6001"));
+        assert_eq!(ep.addr(), "127.0.0.1:6001", "consumers must follow the new port");
+        assert_eq!(ep.token(), "full-control", "the full token must NOT be dropped");
+
+        // Idempotent: a second refresh with no further rotation reports no change.
+        assert_eq!(ep.refresh_addr(), None);
+
+        // Remote thin-client mode (no refresh source) never re-resolves.
+        let remote_ep = ControlEndpoint {
+            addr: RwLock::new("10.0.0.9:8787".into()),
+            token: "remote-secret".into(),
+            refresh_path: None,
+        };
+        assert_eq!(remote_ep.refresh_addr(), None);
+        assert_eq!(remote_ep.addr(), "10.0.0.9:8787");
+
+        let _ = std::fs::remove_file(&cj);
     }
 }

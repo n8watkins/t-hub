@@ -223,10 +223,17 @@ struct ControlResponse {
 /// Why a single control round-trip failed, so the retry layer can tell a moved
 /// endpoint apart from a command the app deliberately rejected.
 enum CallError {
-    /// Transport-level: connect refused/timed out, or the stream died (or spoke
-    /// garbage) mid round-trip. A restarted app on a new ephemeral port looks
-    /// exactly like this, so the caller re-reads control.json and retries.
+    /// Transport-level FAST failure: connect refused, the stream died, or spoke
+    /// garbage. A restarted/rebound app on a new ephemeral port looks exactly like
+    /// this (connect to the retired port refuses), so the caller re-reads
+    /// control.json and retries - but this is NOT the relay-wedge signature.
     Transport(String),
+    /// The round-trip CONNECTED but no response arrived before the deadline. This is
+    /// the relay-wedge signature: the WSL2 mirrored-loopback relay accepts the
+    /// connect locally then never carries the flow, so the app (healthy, reachable
+    /// Windows-side) never answers. Distinguished from [`Transport`] so the self-heal
+    /// fires ONLY on a wedge, never on an app-down (which refuses fast).
+    Timeout(String),
     /// The app answered and rejected the command (bad token, unknown command,
     /// governor refusal). A different endpoint won't change the verdict.
     App(String),
@@ -235,9 +242,74 @@ enum CallError {
 impl CallError {
     fn into_message(self) -> String {
         match self {
-            CallError::Transport(m) | CallError::App(m) => m,
+            CallError::Transport(m) | CallError::Timeout(m) | CallError::App(m) => m,
         }
     }
+
+    /// Whether this failure is the relay-wedge signature (connected-but-silent), the
+    /// only class the bridge self-heal should act on.
+    fn is_timeout(&self) -> bool {
+        matches!(self, CallError::Timeout(_))
+    }
+}
+
+/// Consecutive same-endpoint transport failures before the relay-wedge self-heal
+/// fires one bridge-triggered rebind. `1` = heal on the first confirmed failure: a
+/// wedged round-trip already burned ~[`READ_OVERALL_DEADLINE`] (45s) proving the
+/// endpoint is unreachable, so waiting for a second full timeout only doubles the
+/// outage. False positives (a genuinely-down app, or a rare >45s command) are cheap
+/// and self-correcting - the bridge attempt just fails/rate-limits and the episode
+/// guard blocks any repeat until a success resets it.
+const WEDGE_TRIGGER_AFTER: u32 = 1;
+
+/// Detection state machine for the relay-wedge self-heal (cause 2 of the
+/// control-socket wedge; see PR #49). Pure and unit-testable: `resolve_and_call`
+/// feeds it round-trip outcomes and it decides when to attempt ONE heal per episode.
+///
+/// An "episode" is a run of consecutive transport failures against an UNCHANGED
+/// endpoint (i.e. control.json still names the same addr, so it is NOT an
+/// app-restart-onto-a-new-port case that the file re-read already recovers). The
+/// heal is attempted at most once per episode; the next success clears the episode
+/// so a later wedge can heal again.
+#[derive(Debug, Default)]
+struct WedgeDetector {
+    consecutive_transport_failures: u32,
+    heal_attempted_this_episode: bool,
+}
+
+impl WedgeDetector {
+    /// A round-trip succeeded: the endpoint is healthy again, ending any episode.
+    fn on_success(&mut self) {
+        self.consecutive_transport_failures = 0;
+        self.heal_attempted_this_episode = false;
+    }
+
+    /// A transport failure whose fresh control.json re-read named the SAME endpoint.
+    /// Returns `true` at most ONCE per episode - when the consecutive count first
+    /// reaches `trigger_after` - to signal "attempt one bridge-triggered rebind now".
+    fn on_unchanged_transport_failure(&mut self, trigger_after: u32) -> bool {
+        self.consecutive_transport_failures =
+            self.consecutive_transport_failures.saturating_add(1);
+        if !self.heal_attempted_this_episode
+            && self.consecutive_transport_failures >= trigger_after
+        {
+            self.heal_attempted_this_episode = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// Process-global detector: the MCP server targets one app, so one shared episode
+/// state across all `tools/call`s is exactly right (and keeps the "one heal per
+/// episode" guarantee across separate calls during a persistent wedge).
+fn wedge_detector() -> std::sync::MutexGuard<'static, WedgeDetector> {
+    use std::sync::{Mutex, OnceLock};
+    static DETECTOR: OnceLock<Mutex<WedgeDetector>> = OnceLock::new();
+    DETECTOR
+        .get_or_init(|| Mutex::new(WedgeDetector::default()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
 }
 
 /// Resolve the control endpoint and run one command, transparently recovering
@@ -262,35 +334,116 @@ pub fn resolve_and_call(
     let (args, request_id) = ensure_request_id(command, args);
     let endpoint = discovery.resolve()?;
     match call_classified(&endpoint, command, &args) {
-        Ok(v) => Ok(v),
-        Err(CallError::App(msg)) => Err(msg),
-        Err(CallError::Transport(first)) => {
+        Ok(v) => {
+            wedge_detector().on_success();
+            Ok(v)
+        }
+        Err(CallError::App(msg)) => {
+            // The app answered (rejected the command) - the transport is healthy, so
+            // end any wedge episode.
+            wedge_detector().on_success();
+            Err(msg)
+        }
+        Err(first) => {
+            let first_is_timeout = first.is_timeout();
+            let first_msg = first.into_message();
+
             // The endpoint we tried is unreachable/unresponsive. If control.json now
-            // names a *different* endpoint (the app restarted onto a new port, so
-            // our env pin went stale), prefer the freshly-read addr+token.
+            // names a *different* endpoint (the app restarted or already rebound onto
+            // a new port, so our env pin went stale), prefer the freshly-read pair.
             let fresh = discovery
                 .resolve_from_file()
                 .ok()
                 .filter(|f| f.addr != endpoint.addr || f.token != endpoint.token);
 
-            // For a spawn-class command with a requestId the transport failure is
-            // AMBIGUOUS: the command may have applied server-side before the
-            // response leg died (Incident A/B/D). Resolve it authoritatively via
-            // get_request_status instead of blindly retrying (which historically
-            // made the duplicate) or failing (which lost the ghost).
+            // Spawn-class command: the transport failure is AMBIGUOUS (the command may
+            // have applied server-side before the response leg died - Incident A/B/D),
+            // so we resolve it authoritatively via get_request_status rather than
+            // blindly re-running (the historical duplicate-maker).
             if let Some(id) = &request_id {
-                let ep = fresh.unwrap_or(endpoint);
-                return resolve_ambiguous_request(&ep, command, &args, id, first);
+                let ep = match fresh {
+                    // control.json names a different live endpoint (restart/rebind):
+                    // resolve the ambiguity against it.
+                    Some(f) => f,
+                    // No different endpoint: the one we tried is live. If it TIMED OUT
+                    // (relay wedge) and the detector fires, heal to a fresh port FIRST -
+                    // otherwise get_request_status just hangs on the wedged endpoint for
+                    // the full ambiguous-resolve deadline and fails UNHEALED (the round-1
+                    // heal this spawn-class path must keep). The requestId dedup makes
+                    // resolving/re-running against the healed port safe.
+                    None => {
+                        if first_is_timeout
+                            && wedge_detector().on_unchanged_transport_failure(WEDGE_TRIGGER_AFTER)
+                        {
+                            try_bridge_rebind(discovery, &endpoint).unwrap_or(endpoint)
+                        } else {
+                            endpoint
+                        }
+                    }
+                };
+                let r = resolve_ambiguous_request(&ep, command, &args, id, first_msg);
+                if r.is_ok() {
+                    wedge_detector().on_success();
+                }
+                return r;
             }
 
-            // Non-idempotent command: keep the existing single restart-recovery
-            // retry against a genuinely-different endpoint, else surface the error.
-            match fresh {
-                Some(f) => call_classified(&f, command, &args).map_err(CallError::into_message),
-                None => Err(first),
+            // Non-idempotent command. If control.json named a DIFFERENT live endpoint,
+            // try it first (restart/rebind recovery). Whichever endpoint we end up
+            // having ACTUALLY TRIED and still-failing is the one the wedge decision is
+            // based on (F2: NOT the possibly-stale env pin we started from).
+            if let Some(f) = fresh {
+                match call_classified(&f, command, &args) {
+                    Ok(v) => {
+                        wedge_detector().on_success();
+                        Ok(v)
+                    }
+                    Err(CallError::App(msg)) => {
+                        wedge_detector().on_success();
+                        Err(msg)
+                    }
+                    Err(e2) => {
+                        let e2_is_timeout = e2.is_timeout();
+                        maybe_heal_and_retry(discovery, command, &args, f, e2.into_message(), e2_is_timeout)
+                    }
+                }
+            } else {
+                // control.json named no different endpoint: the one we tried IS live.
+                maybe_heal_and_retry(discovery, command, &args, endpoint, first_msg, first_is_timeout)
             }
         }
     }
+}
+
+/// RELAY-WEDGE SELF-HEAL (cause 2, F2-corrected): `tried` is the endpoint we
+/// ACTUALLY tried (the live one control.json names, not a stale env pin) and it is
+/// still failing. If that failure is the wedge signature (connected-but-silent
+/// TIMEOUT, not a fast app-down refusal) and the detector's per-episode trigger
+/// fires, send ONE `rebind_control` over the Windows powershell bridge - the path
+/// that works mid-wedge - then resume on the fresh port the app publishes. A
+/// successful retry resets the detector so a SECOND wedge on the rotated port can
+/// heal again (the bug this replaces: the old `fresh.is_none()` guard was never true
+/// under a stale env pin, so the detector was never re-consulted).
+fn maybe_heal_and_retry(
+    discovery: &Discovery,
+    command: &str,
+    args: &Value,
+    tried: ControlEndpoint,
+    err: String,
+    timeout_class: bool,
+) -> Result<Value, String> {
+    if timeout_class && wedge_detector().on_unchanged_transport_failure(WEDGE_TRIGGER_AFTER) {
+        if let Some(healed) = try_bridge_rebind(discovery, &tried) {
+            return match call_classified(&healed, command, args) {
+                Ok(v) => {
+                    wedge_detector().on_success();
+                    Ok(v)
+                }
+                other => other.map_err(CallError::into_message),
+            };
+        }
+    }
+    Err(err)
 }
 
 /// A socket read timeout / would-block surfaces as `WouldBlock` (unix SO_RCVTIMEO)
@@ -354,9 +507,10 @@ fn resolve_ambiguous_request(
             // older app that predates get_request_status (no server-side cache, so
             // no idempotency guarantee). Don't guess: surface the original error.
             Err(CallError::App(_)) => return Err(first_err),
-            // The channel is still unreachable: keep trying to reach the status
-            // endpoint until the deadline, else give up with the original error.
-            Err(CallError::Transport(_)) => {
+            // The channel is still unreachable (fast transport failure) or wedged
+            // (timeout): keep trying to reach the status endpoint until the deadline,
+            // else give up with the original error.
+            Err(CallError::Transport(_)) | Err(CallError::Timeout(_)) => {
                 if Instant::now() >= deadline {
                     return Err(first_err);
                 }
@@ -430,7 +584,9 @@ fn call_classified(
             // round-trip ambiguous - the command may already have been accepted.
             Err(e) if is_would_block(&e) => {
                 if Instant::now() >= deadline {
-                    return Err(CallError::Transport(format!(
+                    // Connected but silent past the deadline: the relay-wedge
+                    // signature (Timeout), NOT a fast transport failure.
+                    return Err(CallError::Timeout(format!(
                         "failed to read control response: {e} (no response within {}s)",
                         READ_OVERALL_DEADLINE.as_secs()
                     )));
@@ -457,6 +613,126 @@ fn call_classified(
         Err(CallError::App(resp.error.unwrap_or_else(|| {
             "control command failed (no error message)".to_string()
         })))
+    }
+}
+
+/// Whether the Windows-side powershell bridge is reachable (WSL interop present).
+/// Gating on this keeps the bridge OFF on native Linux (CI, a Linux-hosted app) so a
+/// heal attempt never spawns a missing `powershell.exe`; there the client degrades to
+/// the existing file-re-read recovery.
+fn wsl_powershell_available() -> bool {
+    std::env::var_os("WSL_INTEROP").is_some() || std::env::var_os("WSL_DISTRO_NAME").is_some()
+}
+
+/// Attempt ONE relay-wedge self-heal: trigger an app-side `rebind_control` over the
+/// Windows powershell bridge, then adopt the fresh endpoint the app just published.
+/// Returns the new endpoint on success, or `None` (app genuinely down, rate-limited,
+/// not under WSL, or the bridge failed) so the caller degrades gracefully. Even when
+/// this returns `None` after a rebind our output-parse missed, the NEXT call
+/// self-recovers: the stale env addr is now dead and control.json names the new port,
+/// which the existing file-re-read path already handles.
+fn try_bridge_rebind(discovery: &Discovery, stale: &ControlEndpoint) -> Option<ControlEndpoint> {
+    if !wsl_powershell_available() {
+        return None;
+    }
+    if !send_rebind_via_powershell(stale) {
+        return None;
+    }
+    let fresh = discovery.resolve_from_file().ok()?;
+    (fresh.addr != stale.addr).then_some(fresh)
+}
+
+/// Send a single `rebind_control` to the app via `powershell.exe` (a Windows-native
+/// TcpClient), which reaches the app even while the WSL loopback relay is wedged.
+///
+/// The token/host/port are passed as ENVIRONMENT variables (never interpolated into
+/// the `-Command` string) so there is no quoting/injection surface; the script builds
+/// the one-line JSON request from them. Bounded by powershell's own 8s socket
+/// timeouts so a hung bridge can't park the MCP server. Returns true iff the app
+/// answered with a rebind (`"rebound"`), i.e. the port actually moved.
+fn send_rebind_via_powershell(stale: &ControlEndpoint) -> bool {
+    // control.json addr is always loopback `host:port`; split from the right so a
+    // stray host colon (there is none for 127.0.0.1) can't misparse the port.
+    let (host, port) = match stale.addr.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.to_string()),
+        None => return false,
+    };
+    // Reject a non-numeric port up front (defensive; never spawn on garbage input).
+    if port.parse::<u16>().is_err() {
+        return false;
+    }
+    const SCRIPT: &str = r#"
+$ErrorActionPreference='Stop'
+try {
+  $req = '{"token":"' + $env:THUB_REBIND_TOKEN + '","command":"rebind_control","args":{},"v":1}' + "`n"
+  $c = New-Object System.Net.Sockets.TcpClient
+  $c.ReceiveTimeout = 8000; $c.SendTimeout = 8000
+  $c.Connect($env:THUB_REBIND_HOST, [int]$env:THUB_REBIND_PORT)
+  $s = $c.GetStream()
+  $b = [System.Text.Encoding]::UTF8.GetBytes($req)
+  $s.Write($b, 0, $b.Length); $s.Flush()
+  $buf = New-Object byte[] 65536
+  $n = $s.Read($buf, 0, $buf.Length)
+  [System.Text.Encoding]::UTF8.GetString($buf, 0, $n)
+  $c.Close()
+} catch { Write-Output ('ERR ' + $_.Exception.Message) }
+"#;
+    // F3: bound the subprocess with a RUST-side wall-clock timeout + kill.
+    // PowerShell's own 8s socket timeouts do NOT cover `TcpClient.Connect()` or
+    // process/JIT startup, so a hung bridge would otherwise park this tools/call
+    // thread indefinitely (the parked-thread class #45/#48 killed). This kills the
+    // child at the deadline instead of waiting on `.output()` forever.
+    let child = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("THUB_REBIND_TOKEN", &stale.token)
+        .env("THUB_REBIND_HOST", host)
+        .env("THUB_REBIND_PORT", port)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(_) => return false, // powershell.exe not found / spawn failed
+    };
+    match wait_with_timeout(&mut child, BRIDGE_TIMEOUT) {
+        Some(out) => out.contains("\"rebound\""),
+        None => false, // timed out (child killed) or read failed
+    }
+}
+
+/// Total wall-clock bound for the powershell bridge subprocess (F3). Comfortably
+/// above PowerShell's internal 8s socket timeout plus process/JIT startup, but finite
+/// so a hung bridge can never park the calling thread.
+const BRIDGE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Wait for `child` up to `budget`, returning its captured stdout on clean exit, or
+/// `None` if it timed out (after killing it) or its output could not be read. Polls
+/// `try_wait` rather than blocking on `wait`/`output`, so the timeout is enforced
+/// Rust-side regardless of what the child does. The bridge's output is tiny (one
+/// response line), so reading stdout after exit never risks a full-pipe deadlock.
+fn wait_with_timeout(child: &mut std::process::Child, budget: Duration) -> Option<String> {
+    use std::io::Read;
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                let mut out = String::new();
+                if let Some(mut so) = child.stdout.take() {
+                    let _ = so.read_to_string(&mut out);
+                }
+                return Some(out);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
     }
 }
 
@@ -496,6 +772,100 @@ mod tests {
             }
         });
         (addr, captured)
+    }
+
+    // ---- Relay-wedge self-heal: detection state machine (cause 2) --------------
+
+    #[test]
+    fn wedge_detector_triggers_at_threshold_and_only_once_per_episode() {
+        let mut d = WedgeDetector::default();
+        // trigger_after = 2: first unchanged failure arms but does not fire.
+        assert!(!d.on_unchanged_transport_failure(2), "1st failure must not fire");
+        // Second consecutive failure fires exactly once.
+        assert!(d.on_unchanged_transport_failure(2), "2nd failure must fire the heal");
+        // Further failures in the SAME episode never re-fire (one attempt per episode).
+        assert!(!d.on_unchanged_transport_failure(2), "3rd failure must not re-fire");
+        assert!(!d.on_unchanged_transport_failure(2), "4th failure must not re-fire");
+    }
+
+    #[test]
+    fn wedge_detector_trigger_after_one_fires_on_first_failure() {
+        let mut d = WedgeDetector::default();
+        assert!(d.on_unchanged_transport_failure(1), "N=1 fires on the first failure");
+        assert!(!d.on_unchanged_transport_failure(1), "but only once per episode");
+    }
+
+    #[test]
+    fn wedge_detector_success_resets_the_episode() {
+        let mut d = WedgeDetector::default();
+        assert!(d.on_unchanged_transport_failure(1), "first episode fires");
+        assert!(!d.on_unchanged_transport_failure(1), "same episode does not re-fire");
+        // A healthy round-trip ends the episode.
+        d.on_success();
+        // A later wedge is a NEW episode and may heal again.
+        assert!(d.on_unchanged_transport_failure(1), "a new episode fires again after success");
+    }
+
+    #[test]
+    fn wedge_detector_success_clears_partial_count_below_threshold() {
+        let mut d = WedgeDetector::default();
+        assert!(!d.on_unchanged_transport_failure(2), "1/2 - armed");
+        d.on_success(); // a success between failures must reset the run
+        assert!(!d.on_unchanged_transport_failure(2), "back to 1/2, not 2/2");
+        assert!(d.on_unchanged_transport_failure(2), "now 2/2 - fires");
+    }
+
+    #[test]
+    fn wedge_detector_second_wedge_after_recovery_heals_again() {
+        // F2 regression: the old `fresh.is_none()` guard meant a spawned crew's stale
+        // env pin made `fresh` always Some, so the detector was never re-consulted and
+        // a SECOND wedge on the rotated port could never heal. With the detection now
+        // keyed to the endpoint actually tried + reset on the recovery success, the
+        // sequence [wedge -> heal -> recover -> wedge again] heals BOTH times.
+        let mut d = WedgeDetector::default();
+        // First wedge episode: heals.
+        assert!(d.on_unchanged_transport_failure(1), "first wedge heals");
+        // Heal succeeded and the retry round-tripped -> episode ends.
+        d.on_success();
+        // Some healthy calls in between (each a success, no-op on an ended episode).
+        d.on_success();
+        // A SECOND wedge (on the now-rotated port) is a fresh episode and heals again.
+        assert!(d.on_unchanged_transport_failure(1), "second wedge heals again after recovery");
+    }
+
+    #[test]
+    fn closed_connection_classifies_as_transport_not_timeout() {
+        // The self-heal (on BOTH the read and the restored spawn-class path) fires
+        // ONLY on the Timeout class = connected-but-silent, the relay-wedge signature.
+        // A connection that CLOSES without responding (app down / old listener
+        // retired) must classify as Transport so it recovers via the file re-read and
+        // never triggers a spurious rebind. This guards that gate hermetically (a true
+        // connected-but-silent Timeout would need the full 45s deadline to reproduce).
+        let (addr, _captured) = scripted_server(vec![None]); // accept, read, drop, no reply
+        let ep = ControlEndpoint {
+            addr,
+            token: "t".into(),
+        };
+        let err = call_classified(&ep, "list_terminals", &serde_json::json!({}));
+        assert!(
+            matches!(err, Err(CallError::Transport(_))),
+            "a connection closed without responding must be Transport (app-down class), \
+             not Timeout - the wedge heal must not fire on it"
+        );
+    }
+
+    #[test]
+    fn send_rebind_via_powershell_rejects_malformed_addr_without_spawning() {
+        // No colon and a non-numeric port both fail the parse guards BEFORE any
+        // powershell spawn, so these are deterministic on any platform.
+        assert!(!send_rebind_via_powershell(&ControlEndpoint {
+            addr: "no-colon-here".to_string(),
+            token: "t".to_string(),
+        }));
+        assert!(!send_rebind_via_powershell(&ControlEndpoint {
+            addr: "127.0.0.1:not-a-port".to_string(),
+            token: "t".to_string(),
+        }));
     }
 
     fn discovery_for(addr: String) -> Discovery {
