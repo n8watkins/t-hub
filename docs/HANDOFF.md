@@ -1,33 +1,29 @@
-# T-Hub captain handoff (refreshed 2026-07-10, mid 0.3.62 ship)
+# T-Hub captain handoff (refreshed 2026-07-11, 0.3.63 increment complete on main)
 
-## ⏸ ACTIVE RESUME POINT (2026-07-11 ~00:0x - written for a PLANNED Cortana context reset; DESIGN PHASE COMPLETE, PR #57 awaiting merge word)
+## ⏸ ACTIVE RESUME POINT (2026-07-11 ~12:1x - BUILD PHASE: items 1-3 + wedge cap ALL MERGED; 0.3.63 increment complete, ONE deploy confirm pending)
 
-**THE PROGRAM (one line):** ALL FOUR structural items were drafted, adversarially gated, fixed, delta-verified, and GENERAL-RATIFIED on 2026-07-10 - the design phase is COMPLETE; what remains is builds and one batched deploy.
+**THE PROGRAM (one line):** all four items ratified 2026-07-10; items 1 (Phases 1+2), 2, and 3 are now BUILT and MERGED; the batched 0.3.63 increment is COMPLETE ON MAIN awaiting the general's single deploy confirm; next builds are item-1 Phase-3 ACLs -> item-4 -> typing-guard LAST.
 
-**Ratified artifacts (each with a RATIFIED header carrying the general's decision values, plus its full check record):** `~/.t-hub/captain/reviews/COMMS-PLANE-PROPOSAL-FINAL-2026-07-10.md`, `IDENTITY-REKEY-PROPOSAL-2026-07-10.md`, `SECURITY-DEFAULTS-PROPOSAL-2026-07-10.md`, `RULEBOOK-PROPOSAL-2026-07-10.md`; check records `comms-plane-design-check`, `item2-design-check`, `item3-design-check`, `item4-design-check` + PR reviews `pr55-review`, `pr56-review`, `pr57-review` (all `-2026-07-10.md`).
-Canon: `~/.t-hub/captain/ORCHESTRATION-PROGRAM.md` (Cortana keeps it reconciled - all rulings recorded).
+**MERGED (all with full gate: xhigh review -> fix round -> same-reviewer delta -> the general's DIRECT in-session word):** PR #55 `d599fa9` (Phase-1 backdoor close), PR #56 `0ba4360` (Phase-2 durable inbox + identity slice), PR #57 `753f738` (item-2 identity re-key), PR #59 `7b3afb4` (item-3 security defaults, all EIGHT ratified knobs), PR #58 `3daedc8` (spawn-wedge liveness de-conflation, option B - operational, outside the program queue).
+Review records durable in `~/.t-hub/captain/reviews/` (`pr55`-`pr59-review`, design checks, ratified proposals).
+Canon: `~/.t-hub/captain/ORCHESTRATION-PROGRAM.md`.
 
-**Built and MERGED:** item-1 Phase 1 (raw-tmux backdoor close, PR #55, `d599fa9`) + Phase 2 (durable inbox + identity slice, PR #56, `0ba4360`).
-**MERGE-READY awaiting the general's word:** PR #57 (item-2 identity re-key, head `a3a6191`, full gate passed, review record durable).
-**NOT YET BUILT:** item-3, item-1 Phase 3 (ACLs), item-4, item-1 Phase 4 (typing-guard).
+**DEPLOY (the next general decision):** ONE 0.3.63 confirm covers items 1-3 + the wedge cap.
+Deploy checklist before TRUSTING the flips in the field: (1) manual §3.1 gate check 3 - real webview attach + send_keys on the WSLg build (`T_HUB_CONTROL_HARDEN=0` = instant rollback); (2) DPAPI runtime-verify on the Windows build (dev/CI was Linux, path only cross-checked); (3) rotation note - pre-existing fleet sessions re-spawn + remote re-pair when rotation later fires (Windows first-restart adopts, does not rotate); (4) the PreToolUse blocking gate is OFF-by-default (distinct consent to enable).
 
-**BUILD QUEUE (dependency-honest, Cortana-acked):** PR-57 merge -> item-3 build -> item-1 Phase-3 ACLs -> item-4 build -> item-1 Phase-4 typing-guard LAST.
-Every build: dedicated worktree crew (Opus 4.8 high, permissionless), PR-only, no bump, xhigh review (Opus 4.8 xhigh), fix round, same-reviewer delta re-verify, then the merge word.
-**MERGE DOCTRINE (general-settled):** EVERY merge needs the general's word - no captain self-merge; the harness classifier additionally requires the general's DIRECT in-session confirm (AskUserQuestion) after Cortana relays approval - relay alone gets refused (live R-C1).
-**GO-LIVE IS BATCHED:** nothing builds/installs until the general's ONE 0.3.63 deploy confirm (ratified threshold: significant/user-facing only).
+**BUILD QUEUE (unchanged discipline - worktree crew Opus 4.8 high permissionless, PR-only, NO bump, xhigh review, fix round, same-reviewer delta, the general's word):** item-1 Phase-3 ACLs (NEXT; consumes item-3's session-token-on-ControlRequest + plane-confirm seams, documented in the PR #59 body) -> item-4 build -> item-1 Phase-4 typing-guard LAST.
+**IN FLIGHT:** option-A bounded-exec sweep (branch `bounded-sweep`, the wedge accumulation CAUSE; folds #58-review MED-1 force-escape + LOW-1 structured retryable flag) on the held diag crew; its review goes to the held reviewer-58.
+**MERGE DOCTRINE:** EVERY merge = the general's word, DIRECT in-session confirm (AskUserQuestion); relay alone gets refused (live R-C1).
 
-**HELD CREWS (reap after the PR-57 merge; verify landed first):**
-- item-2 build crew: tile `ec3fa9ef` (Claude session `867c00e7-d5a0-4611-a380-6fbb49ad490d`), worktree `.claude/worktrees/build-item2`, branch `build-item2` = PR #57. Migrated once already (the general's accidental restart; resumed seamlessly - the failure mode its own PR retires).
-- PR-57 reviewer: tile `3647011c` (Claude session likely `5a094b43-2416-49e5-a19f-0068e27e7dd2` - verify against the newest jsonl in the main-repo project dir before any resume).
-Everything else is reaped; worktrees/branches pruned.
+**⚠ WEDGE (root-caused, capped, cause-fix in flight):** ONE mechanism - `has_session` conflated probe TIMEOUT with absence (no adoption map exists); accumulation = unbounded on-handler `.output()` calls (#48 never swept; usage.rs `claude -p /usage` worst).
+PR #58 (merged, NOT LIVE until install) makes it honest/retryable + never transfer-grade; option A removes the cause.
+The RUNNING pre-#58 app still lies: false "no such session" on live sessions, and a timed-out `close_terminal` can EXECUTE LATE - verify kills against raw tmux, never trust the app's outcome under degradation.
+**Break-glass relay (works regardless):** Write message to file, `tmux -L t-hub load-buffer -b <buf> <file>`, `paste-buffer -b <buf> -t th_<id> -d`, `send-keys -t th_<id> Enter`, capture to verify submission.
 
-**⚠ ACTIVE ANOMALY - app-internal spawn wedge (Cortana-corrected diagnosis, 2026-07-11):** the app control plane progressively DROPS sessions from its adoption map (`send_text`/`close_terminal` -> "no such session") while tmux holds them fine, and MCP reads hit the 5s tmux-spawn timeout.
-Host-memory-pressure is REFUTED by data (11Gi available, no OOM, no swap thrash): this is runtime-STATE accumulation in the app's subprocess-spawn path (thread pool / async runtime / a lock serializing spawns) - the flap/wedge family.
-A diagnosis crew should target that spawn path; the batched-install restart may clear the symptom but a code bug recurs.
-**INTERIM: drive the fleet via RAW TMUX break-glass** - relay = Write the message to a file, `tmux -L t-hub load-buffer -b <buf> <file>`, `paste-buffer -b <buf> -t th_<id> -d`, `send-keys -t th_<id> Enter`, then capture to verify submission.
-
-**PERMS:** `.claude/settings.local.json` = `defaultMode bypassPermissions` + allow rules (send_text/spawn_terminal/send_keys); a fresh captain session boots in bypass - the classifier fights only merges and self-modification, by design.
-**Operating reminders:** typing-guard - a non-empty input line may be the DIM autosuggest placeholder (capture with `tmux -e`; ESC[2m dim = placeholder, plain = human typing, HOLD); VISIBLE-FIRST spawns + resize 220x50 BEFORE kickoff; KICKOFF-VERIFICATION (confirm PROCESSING); crew migration = `claude --resume <uuid>`; sentinel watcher = background loop over `/tmp/t-hub-crew-done/t-hub-scribe/` with a heartbeat exit; all briefs live in `/tmp/flap-probe/*-BRIEF.md`.
+**PERMS:** `.claude/settings.local.json` = `defaultMode bypassPermissions` + allow rules; classifier quirk: it may chain-flag raw-tmux capture-pane Bash calls in permissionless-crew contexts - use MCP `read_terminal` for pane reads (raw `-e` captures for typing-guard checks have passed).
+**Operating reminders:** GHOST TRAP - Claude Code renders generated prompt-suggestions DIM in idle input lines; plain-text reads make them look like typed human decisions; discriminate with `tmux -e` capture (ESC[2m = ghost = clear to send; plain = human = HOLD); Escape does NOT clear a ghost; NEVER attribute an input-line "decision" to the general without the -e check.
+MCP PARITY LANDED: `create_worktree`/`remove_worktree`/`wait_for_status` are native MCP tools (spawnedBy records crew) - raw-socket t1_lib.py is genuine break-glass only.
+VISIBLE-FIRST spawns + resize 220x50 BEFORE kickoff; KICKOFF-VERIFICATION (confirm PROCESSING); crew migration = `claude --resume <uuid>`; sentinel watcher = background loop over `/tmp/t-hub-crew-done/t-hub-scribe/` with a heartbeat exit; briefs in `/tmp/flap-probe/*-BRIEF.md`; copy review findings from /tmp to `reviews/` BEFORE reaping reviewers.
 
 ---
 
