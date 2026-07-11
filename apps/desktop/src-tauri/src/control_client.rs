@@ -60,6 +60,12 @@ pub const CONTROL_EVENT: &str = "control://event";
 pub struct ControlEndpoint {
     addr: RwLock<String>,
     token: String,
+    /// The READ capability token (item-3): the least-privilege credential the local
+    /// UI spawn path injects by DEFAULT into a new terminal, so a UI-spawned session
+    /// is read-only unless explicitly elevated. Empty in REMOTE thin-client mode
+    /// (there is no local read/control split there). Never authenticates the webview
+    /// itself - that always uses the full `token` above.
+    read_token: String,
     /// Local handshake file to re-read the rotated addr from. `None` in REMOTE
     /// thin-client mode (there is no local rebind to track).
     refresh_path: Option<PathBuf>,
@@ -78,6 +84,12 @@ impl ControlEndpoint {
     /// credential rotation, so the token the frontend already holds stays valid.
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// The READ capability token (item-3 least-privilege UI-spawn default). Empty in
+    /// remote thin-client mode. See the field doc.
+    pub fn read_token(&self) -> &str {
+        &self.read_token
     }
 
     /// After a transport failure, re-read the LOCAL handshake for a rotated addr (the
@@ -367,9 +379,17 @@ pub fn install(app: &AppHandle, handshake: &control::ControlHandshake) {
     } else {
         Some(control::handshake_path())
     };
+    // item-3: the least-privilege read token for the local UI spawn path. Only
+    // meaningful in local mode (remote has no read/control split); empty otherwise.
+    let read_token = if is_remote {
+        String::new()
+    } else {
+        handshake.read_token.clone()
+    };
     let endpoint = Arc::new(ControlEndpoint {
         addr: RwLock::new(addr),
         token,
+        read_token,
         refresh_path,
     });
     app.manage(endpoint.clone());
@@ -488,6 +508,7 @@ mod tests {
         let ep = ControlEndpoint {
             addr: RwLock::new("127.0.0.1:6000".into()),
             token: "full-control".into(),
+            read_token: "read-only".into(),
             refresh_path: Some(cj.clone()),
         };
         assert_eq!(ep.addr(), "127.0.0.1:6000");
@@ -504,6 +525,7 @@ mod tests {
         let remote_ep = ControlEndpoint {
             addr: RwLock::new("10.0.0.9:8787".into()),
             token: "remote-secret".into(),
+            read_token: String::new(),
             refresh_path: None,
         };
         assert_eq!(remote_ep.refresh_addr(), None);

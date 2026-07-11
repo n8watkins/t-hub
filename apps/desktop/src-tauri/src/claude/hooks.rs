@@ -99,7 +99,7 @@ pub fn statusline_is_t_hub(statusline: &serde_json::Value) -> bool {
     statusline
         .get("command")
         .and_then(|c| c.as_str())
-        .map(|s| command_is_t_hub(s))
+        .map(command_is_t_hub)
         .unwrap_or(false)
 }
 
@@ -265,6 +265,80 @@ pub fn t_hub_hooks_fragment_for(agent_bin: &str, events: &[&str]) -> serde_json:
     serde_json::json!({ "hooks": events_map })
 }
 
+/// item-3 Pillar C: the BLOCKING `PreToolUse` gate event. Unlike the observe-only
+/// [`HOOK_EVENTS`] (which fire `--hook <EVENT>` and never block), this installs a
+/// single blocking hook that runs `t-hub-agent --gate` on every `Bash` tool call and
+/// can DENY an outward-facing command a crew may not run. It is kept out of
+/// `HOOK_EVENTS` so the two classes never mix, but rides the SAME managed-marker,
+/// consent, and clean-uninstall discipline (the marker in its command string means
+/// [`remove_from_settings`] strips it exactly like every other T-Hub entry).
+pub const PRETOOLUSE_GATE_EVENT: &str = "PreToolUse";
+
+/// The `command` string for the blocking gate hook: `<agent_bin> --gate # <marker>`.
+pub fn t_hub_gate_command(agent_bin: &str) -> String {
+    format!("{agent_bin} --gate # {T_HUB_HOOK_MARKER}")
+}
+
+/// Install (idempotently) the blocking `PreToolUse` gate group into `existing`,
+/// matcher `Bash`. Any pre-existing T-Hub `PreToolUse` group is dropped first (so a
+/// reinstall does not duplicate it) and user-authored `PreToolUse` groups are
+/// preserved. Mirrors [`merge_statusline_into_settings`]'s additive, non-destructive
+/// shape; [`remove_from_settings`] already removes it by marker.
+pub fn merge_gate_into_settings(
+    existing: &serde_json::Value,
+    agent_bin: &str,
+) -> serde_json::Value {
+    let mut root: serde_json::Map<String, serde_json::Value> =
+        existing.as_object().cloned().unwrap_or_default();
+    let hooks_obj: &mut serde_json::Map<String, serde_json::Value> = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("hooks must be an object");
+    let arr: &mut Vec<serde_json::Value> = hooks_obj
+        .entry(PRETOOLUSE_GATE_EVENT.to_string())
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .expect("PreToolUse value must be an array");
+    arr.retain(|g| !group_is_t_hub(g));
+    arr.push(serde_json::json!({
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": t_hub_gate_command(agent_bin) }]
+    }));
+    serde_json::Value::Object(root)
+}
+
+/// Remove ONLY the T-Hub-managed blocking gate (the `PreToolUse` group), leaving the
+/// observe-only hooks, the statusLine, and any user-authored `PreToolUse` hook intact.
+/// The distinct gate opt-OUT (mirrors [`merge_gate_into_settings`]).
+pub fn remove_gate_from_settings(existing: &serde_json::Value) -> serde_json::Value {
+    let mut root: serde_json::Map<String, serde_json::Value> =
+        existing.as_object().cloned().unwrap_or_default();
+    if let Some(hooks_obj) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        if let Some(arr) = hooks_obj
+            .get_mut(PRETOOLUSE_GATE_EVENT)
+            .and_then(|v| v.as_array_mut())
+        {
+            arr.retain(|g| !group_is_t_hub(g));
+            if arr.is_empty() {
+                hooks_obj.remove(PRETOOLUSE_GATE_EVENT);
+            }
+        }
+    }
+    serde_json::Value::Object(root)
+}
+
+/// Whether the blocking `PreToolUse` gate is currently installed (a T-Hub-managed
+/// group under `PreToolUse`).
+pub fn gate_managed(settings: &serde_json::Value) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|h| h.get(PRETOOLUSE_GATE_EVENT))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().any(group_is_t_hub))
+        .unwrap_or(false)
+}
+
 /// The subset of [`HOOK_EVENTS`] currently managed by T-Hub in `settings`
 /// (each event whose group array contains a marker-tagged command). Lets the UI
 /// pre-check exactly the installed events.
@@ -356,7 +430,7 @@ pub fn group_is_t_hub(group: &serde_json::Value) -> bool {
             inner_hooks.iter().any(|h| {
                 h.get("command")
                     .and_then(|c| c.as_str())
-                    .map(|s| command_is_t_hub(s))
+                    .map(command_is_t_hub)
                     .unwrap_or(false)
             })
         })
@@ -491,6 +565,45 @@ mod tests {
                 "hook {name} must map to a journal event type"
             );
         }
+    }
+
+    #[test]
+    fn gate_installs_a_blocking_pretooluse_bash_hook_and_uninstalls_cleanly() {
+        // item-3 Pillar C: the gate installs one blocking PreToolUse/Bash hook running
+        // `--gate` with the managed marker; a user's own PreToolUse hook is preserved,
+        // and remove_from_settings strips exactly the gate. BYPASS-WOULD-FAIL: drop the
+        // merge_gate call and the "gate present" assert goes RED.
+        let bin = "/usr/local/bin/t-hub-agent";
+        // A settings.json that already has a user-authored PreToolUse hook.
+        let existing = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "Write", "hooks": [{ "type": "command", "command": "my-linter" }] }
+                ]
+            }
+        });
+        let installed = merge_gate_into_settings(&existing, bin);
+        assert!(gate_managed(&installed), "the gate must be installed");
+        let arr = installed["hooks"]["PreToolUse"].as_array().unwrap();
+        // Both the user hook and our gate are present.
+        assert_eq!(arr.len(), 2, "the user's PreToolUse hook must be preserved");
+        let gate = arr.iter().find(|g| group_is_t_hub(g)).expect("gate group present");
+        assert_eq!(gate["matcher"], "Bash");
+        assert!(gate["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("--gate"));
+
+        // Idempotent: re-installing does not duplicate the gate.
+        let reinstalled = merge_gate_into_settings(&installed, bin);
+        assert_eq!(reinstalled["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+
+        // Clean uninstall: the gate is stripped, the user hook stays.
+        let removed = remove_from_settings(&reinstalled);
+        assert!(!gate_managed(&removed), "the gate must be removed on uninstall");
+        let arr = removed["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["matcher"], "Write");
     }
 
     #[test]

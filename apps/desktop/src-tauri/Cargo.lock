@@ -4052,6 +4052,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2",
+ "t-hub-mcp",
  "t-hub-protocol",
  "tauri",
  "tauri-build",

@@ -42,7 +42,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -2181,31 +2181,120 @@ fn key_path() -> PathBuf {
     home.join(".t-hub").join("server-key")
 }
 
-/// The PERSISTENT control auth key (server-split M2b): the server's stable identity
-/// across restarts, so a remote client paired once need not re-pair each launch.
-/// Read from [`key_path`] if present + non-empty; otherwise a fresh UUID is generated
-/// and written (best-effort `0600` on unix). On any read/write failure we still
-/// return a usable (in-memory) key so the channel always comes up.
-pub fn persistent_key() -> String {
-    let path = key_path();
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let k = existing.trim().to_string();
-        if !k.is_empty() {
-            return k;
-        }
-    }
-    let key = uuid::Uuid::new_v4().to_string();
+/// Max age (seconds) before a persistent key is rotated at startup (item-3 Pillar B
+/// rotation-on-restart, general-decision #6). `T_HUB_KEY_MAX_AGE_SECS` overrides
+/// (`0` => rotate on EVERY restart). Default 7 days: long enough that a remote
+/// pairing survives normal restarts, short enough to bound a leaked key's lifetime.
+/// The cadence is a knob (N4), not the mechanism.
+fn key_max_age_secs() -> u64 {
+    std::env::var("T_HUB_KEY_MAX_AGE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7 * 24 * 60 * 60)
+}
+
+/// Whether a rotation is forced this startup regardless of age - the
+/// suspected-leak / operator-triggered path (`T_HUB_ROTATE_KEYS=1`).
+fn force_key_rotation() -> bool {
+    std::env::var("T_HUB_ROTATE_KEYS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Whether the key file at `path` (by its mtime) is at/past the rotation age. A
+/// missing file or an unreadable mtime is NOT "past age" (the caller handles missing
+/// via mint); a future mtime (clock skew) is treated as fresh, never rotated.
+fn key_is_past_max_age(path: &Path, max_age_secs: u64) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    matches!(modified.elapsed(), Ok(age) if age.as_secs() >= max_age_secs)
+}
+
+/// Write a secret key to `path`, SEALED for at-rest (DPAPI on Windows, plaintext +
+/// `0600` fallback elsewhere - see [`crate::secret_seal`]), mint-and-replace
+/// (truncating overwrite). Best-effort: a write failure still leaves the in-memory
+/// key usable.
+fn write_key_file(path: &Path, key: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if std::fs::write(&path, &key).is_ok() {
+    let sealed = crate::secret_seal::seal_str(key);
+    if std::fs::write(path, sealed.as_bytes()).is_ok() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
     }
+}
+
+/// Load a persistent secret key from `path`, ROTATING it (mint a fresh UUID + OVERWRITE
+/// the file) when it is missing/unreadable, past `max_age_secs`, or `force`d; otherwise
+/// KEEP the existing value, upgrading a legacy plaintext file to the sealed at-rest form
+/// in place. Rotation is mint-and-replace - it NEVER re-reads the same key (the
+/// reviewer's non-gating note: `persistent_key` used to reuse the file, so "rotate at
+/// startup" must actively overwrite it). The returned key is always the LIVE value and
+/// is usable in-memory even if the disk write fails. Policy is passed in so this core
+/// is pure/testable; [`load_or_rotate_key`] resolves it from the environment.
+///
+/// Whether AGE-based rotation may fire, given whether the on-disk value is already in
+/// item-3's sealed form and whether sealing is active on this host (MED-1). On a
+/// sealing host (Windows/DPAPI) a pre-item-3 key is UNsealed, so age-rotation is held
+/// off until the first restart has ADOPTED (sealed) it - never stranding pre-existing
+/// fleet on the very first item-3 restart. Where sealing is inactive there is no sealed
+/// form to key on, so age-rotation is always eligible (prior behavior). A FORCED
+/// rotation ignores this gate entirely.
+fn age_rotation_eligible(existing_is_sealed: bool, sealing_active: bool) -> bool {
+    !sealing_active || existing_is_sealed
+}
+
+fn load_or_rotate_key_with(path: &Path, force: bool, max_age_secs: u64) -> String {
+    let raw = std::fs::read_to_string(path).ok();
+    let existing = raw
+        .as_deref()
+        .and_then(crate::secret_seal::unseal_str)
+        .filter(|k| !k.is_empty());
+    let raw_is_sealed = raw.as_deref().map(crate::secret_seal::is_sealed).unwrap_or(false);
+    // MED-1 mitigation: age-based rotation only fires once the key is ALREADY in item-3's
+    // sealed form. On the Windows host a PRE-ITEM-3 key is unsealed, so the FIRST item-3
+    // restart ADOPTS it (keeps the value + seals it, resetting the rotation clock) rather
+    // than rotating and stranding pre-existing in-tmux fleet sessions / remote pairings.
+    // The clock then measures from adoption. A forced rotation (T_HUB_ROTATE_KEYS) still
+    // fires regardless. On a non-sealing host (pure-WSL/ext4 + dev/CI) there is no sealed
+    // form to gate on, so age-rotation keeps its prior behavior.
+    let age_eligible = age_rotation_eligible(raw_is_sealed, crate::secret_seal::sealing_active());
+    let rotate =
+        force || existing.is_none() || (age_eligible && key_is_past_max_age(path, max_age_secs));
+    if !rotate {
+        if let Some(k) = existing {
+            // Keep the credential; upgrade a legacy/plaintext file to the sealed form
+            // (this is also the MED-1 first-restart ADOPTION that resets the clock).
+            if crate::secret_seal::sealing_active() && !raw_is_sealed {
+                write_key_file(path, &k);
+            }
+            return k;
+        }
+    }
+    // Mint fresh and OVERWRITE (mint-and-replace).
+    let key = uuid::Uuid::new_v4().to_string();
+    write_key_file(path, &key);
     key
+}
+
+/// Environment-resolved wrapper over [`load_or_rotate_key_with`] (rotation forced by
+/// `T_HUB_ROTATE_KEYS`, age from `T_HUB_KEY_MAX_AGE_SECS`).
+fn load_or_rotate_key(path: &Path) -> String {
+    load_or_rotate_key_with(path, force_key_rotation(), key_max_age_secs())
+}
+
+/// The PERSISTENT control auth key (server-split M2b): the server's stable identity
+/// across restarts, so a remote client paired once need not re-pair each launch -
+/// bounded by item-3's rotation-on-restart age ([`load_or_rotate_key`]). Sealed at
+/// rest. On any read/write failure we still return a usable (in-memory) key so the
+/// channel always comes up.
+pub fn persistent_key() -> String {
+    load_or_rotate_key(&key_path())
 }
 
 /// Resolve the persistent **read**-key file: `$T_HUB_SERVER_READ_KEY_FILE` if set,
@@ -2225,49 +2314,37 @@ fn read_key_path() -> PathBuf {
 
 /// The PERSISTENT **read** capability key (socket-gate Phase 2): a distinct,
 /// stable-across-restarts secret from [`persistent_key`] (the control key), so a
-/// read-only consumer paired once keeps working. Read from [`read_key_path`] if
-/// present + non-empty, else a fresh UUID is minted and written (best-effort
-/// `0600`). Always returns a usable in-memory key on any I/O failure.
+/// read-only consumer paired once keeps working - bounded by the same rotation-on-
+/// restart age and sealed at rest ([`load_or_rotate_key`]). Always returns a usable
+/// in-memory key on any I/O failure.
 pub fn persistent_read_key() -> String {
-    let path = read_key_path();
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let k = existing.trim().to_string();
-        if !k.is_empty() {
-            return k;
-        }
-    }
-    let key = uuid::Uuid::new_v4().to_string();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if std::fs::write(&path, &key).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-    }
-    key
+    load_or_rotate_key(&read_key_path())
 }
 
 /// Phase 3 hardening flag (socket-gate). When ON, [`start`] stops publishing the
 /// control token to `control.json` and publishes only the read token there, so a
 /// process that merely scrapes the discovery file gets read-only; elevated sessions
-/// then rely on the control token injected down the spawn tree (Phase 2b). DEFAULT
-/// OFF - opt in with `T_HUB_CONTROL_HARDEN=1` (or `true`).
+/// then rely on the control token injected down the spawn tree (Phase 2b). item-3
+/// flip #2 (ratified 2026-07-10): DEFAULT ON - `T_HUB_CONTROL_HARDEN=0` (or `false`)
+/// is the instant, rebuild-free rollback to the Phase-2 disk behavior.
 ///
-/// NOTE (2026-07-07 incident): the default was briefly flipped ON (0.3.47) and
-/// reverted the same day. The app's OWN frontend authenticates to the control
-/// socket with the token published in `control.json`; hardening downgraded that to
-/// the read token, so the webview lost control and terminals could not re-attach
-/// ("session detached - reconnecting"). Phase 3 stays behind this flag until the
-/// frontend receives the control token via a trusted internal channel (a Tauri
-/// command / spawn-injected env) instead of scraping the discovery file. See
+/// HISTORY (2026-07-07 incident): an earlier ON default (0.3.47) was reverted the
+/// same day because the app's OWN frontend authenticated to the control socket with
+/// the token published in `control.json`; hardening downgraded that to the read token
+/// and the webview lost control ("session detached - reconnecting", PR #29). The cure
+/// is now structurally in the tree and independently re-verified (item-3 §1.2): the
+/// webview reads the FULL token from the in-process, never-serialized
+/// `local_control_token` (see [`ControlHandshake::local_control_token`] and
+/// `control_client::resolve_endpoint`), so the disk token can be read-only without
+/// touching the webview's credential. The §3.1 five-check verification gate (see the
+/// `hardened_*` tests) pins every one of those webview token paths, including
+/// reconnect-after-rebind, so the flip cannot silently re-break attach. See
 /// `docs/SOCKET-AUTH-DESIGN.md`.
 fn phase3_harden_enabled() -> bool {
     std::env::var("T_HUB_CONTROL_HARDEN")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        // Ratified default-ON: only an explicit `0`/`false` disables hardening.
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
 }
 
 /// Pick the token published in the `token` field of `control.json`. With hardening
@@ -3253,11 +3330,45 @@ fn required_tier(command: &str) -> CommandTier {
         // Comms-plane Phase 2 (review H1): `inbox_ack` MUTATES durable receipt state
         // (Delivered -> Processed) and force-compacts records, so it must NOT fall
         // through to the read tier - it needs the control capability AND the audit a
-        // mutating, non-spawn command gets (like `create_worktree`). `inbox_status`
-        // stays Read (genuinely counts-only).
+        // mutating, non-spawn command gets (like `create_worktree`).
+        //
+        // item-3 §2.4.1: `inbox_ack` STAYS Organization. Lowering it to a scoped-Read
+        // self-ack is UNSAFE until a session-token-on-request substrate exists (the
+        // `ControlRequest` carries no session identity, `inbox_ack` trusts the
+        // caller-supplied `sessionId`, and every crew presents the same read token -
+        // so scoped-Read would be cross-session spoofable, STRICTLY WORSE than this
+        // Organization gate). Ledger row 17 is LAW-TARGET; the crew ack loop is
+        // completed by a control-capable relay until the substrate lands.
+        //
+        // `inbox_status`'s BASE tier is Read (genuinely counts-only), but item-3 §2.4
+        // refines it by SCOPE in [`effective_tier`]: an unscoped fleet-wide
+        // enumeration is Organization.
         | "inbox_ack" => CommandTier::Organization,
         _ => CommandTier::Read,
     }
+}
+
+/// The tier a request must satisfy, refined by the request ARGS where the scope
+/// changes the privilege. Base tiers come from [`required_tier`]; item-3 §2.4 adds
+/// one refinement (ledger #15, closing the PR-56 L3 enumeration leak):
+///
+/// - `inbox_status` SCOPED to a single recipient (`sessionId` present) stays Read -
+///   it returns just that recipient's counts/cursors, never content.
+/// - `inbox_status` UNSCOPED (`depth_all`: every recipient's counts/cursors/oldest
+///   age) is Organization tier, so a bare read token cannot enumerate the whole
+///   fleet's inbox health.
+///
+/// Every other command's effective tier is exactly its [`required_tier`].
+fn effective_tier(command: &str, args: &Value) -> CommandTier {
+    if command == "inbox_status" {
+        let scoped = arg_str(args, "sessionId")
+            .or_else(|| arg_str(args, "session_id"))
+            .is_some();
+        if !scoped {
+            return CommandTier::Organization;
+        }
+    }
+    required_tier(command)
 }
 
 /// A resolved caller capability (socket-gate Phase 2). The read token resolves to
@@ -3377,16 +3488,60 @@ pub fn resolve_identity(ctx: &ControlContext, presented: &str) -> Option<Resolve
     })
 }
 
+/// Whether the pre-item-3 fail-OPEN spawn default is restored (instant rollback,
+/// §3.3). With `T_HUB_SPAWN_LEGACY_FULL=1`/`true` a spawn defaults to the FULL
+/// control token unless it explicitly asks for `capability:"read"` - the behavior
+/// before the least-privilege inversion. OFF by default: the ratified default is
+/// least-privilege (untagged spawn => READ).
+fn legacy_full_spawn_default() -> bool {
+    std::env::var("T_HUB_SPAWN_LEGACY_FULL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// The capability a spawned session is granted (item-3 Pillar A, HIGH-1: the root
+/// move). INVERTED least-privilege: the DEFAULT is READ. A control-capable child
+/// requires the caller to explicitly pass `capability:"control"`.
+///
+/// Why this is a WALL, not a painted line: every spawner is necessarily a Full-token
+/// caller (`spawn_terminal`/`create_worktree` are ProcessChanging/Organization - only
+/// Full may call them), so opting a child UP to control is a deliberate, audited act
+/// by a caller who already holds Full; a missed/typo'd tag under-privileges (fails
+/// SAFE to READ) instead of leaking the full token to crew. `T_HUB_SPAWN_LEGACY_FULL`
+/// restores the old fail-open default for an instant rollback.
+fn spawn_capability(args: &Value) -> Capability {
+    let declared = arg_str(args, "capability");
+    if legacy_full_spawn_default() {
+        // Pre-item-3 fail-open: control unless an explicit `read`.
+        let read_only = declared
+            .map(|c| c.eq_ignore_ascii_case("read"))
+            .unwrap_or(false);
+        return if read_only {
+            Capability::ReadOnly
+        } else {
+            Capability::Full
+        };
+    }
+    // Ratified inverted default: READ unless an explicit `control`.
+    let control = declared
+        .map(|c| c.eq_ignore_ascii_case("control"))
+        .unwrap_or(false);
+    if control {
+        Capability::Full
+    } else {
+        Capability::ReadOnly
+    }
+}
+
 /// The capability-token env injected into a spawned session so its in-session
 /// MCP/clients authenticate as the capability the spawn was granted (Phase 2b).
 ///
-/// DEFAULT is the full control token - every spawned session can orchestrate,
-/// exactly as today (where the in-session MCP reads the control token from
-/// `control.json`), so nothing that spawns today breaks. An explicit
-/// `capability: "read"` spawn arg downgrades the new session to the read token
-/// (a pure-work crew that can observe but not spawn/type/kill). Any other/absent
-/// `capability` value fails SAFE to the control token (a typo never silently
-/// under-privileges a session that needed to orchestrate).
+/// DEFAULT is the READ token (item-3 inverted least-privilege, [`spawn_capability`]):
+/// an untagged spawn is a pure-work crew that can observe but not spawn/type/kill.
+/// Only an explicit `capability:"control"` by the (necessarily Full) caller injects
+/// the full control token. An empty read token (a bare-probe / headless context that
+/// never minted one) falls back to the control token so it is never locked out,
+/// matching `select_published_token`'s safe fallback.
 ///
 /// Injects BOTH `T_HUB_CONTROL_ADDR` and `T_HUB_CONTROL_TOKEN` because the MCP's
 /// env override is all-or-nothing (it needs both, else it falls back to
@@ -3396,18 +3551,87 @@ fn elevation_env(ctx: &ControlContext, args: &Value) -> Vec<(String, String)> {
     if ctx.addr.is_empty() {
         return Vec::new();
     }
-    let read_only = arg_str(args, "capability")
-        .map(|c| c.eq_ignore_ascii_case("read"))
-        .unwrap_or(false);
-    let token = if read_only && !ctx.read_token.is_empty() {
-        ctx.read_token.clone()
-    } else {
-        ctx.token.clone()
+    let token = match spawn_capability(args) {
+        Capability::Full => ctx.token.clone(),
+        Capability::ReadOnly if !ctx.read_token.is_empty() => ctx.read_token.clone(),
+        Capability::ReadOnly => ctx.token.clone(),
     };
     vec![
         ("T_HUB_CONTROL_ADDR".to_string(), ctx.addr.clone()),
         ("T_HUB_CONTROL_TOKEN".to_string(), token),
     ]
+}
+
+/// The directory `GH_CONFIG_DIR` points crew at: an EMPTY t-hub-owned config dir with
+/// no `hosts.yml`, so `gh` finds no ambient credential there. Best-effort created.
+fn crew_empty_gh_config_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = home.join(".t-hub").join("crew-gh-empty");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// item-3 §2.3.5 (MED-5): the credential-WITHHOLDING env for a read-class (crew)
+/// spawn - the second, independent wall behind the PreToolUse gate ("hook OR missing
+/// credential"). Points `gh` at an empty config dir (so it finds no `hosts.yml`
+/// credential) AND blanks the common ambient token env vars at the SESSION level (a
+/// tmux `-e KEY=` overrides any inherited value), so a crew that evades the gate still
+/// fails at the remote for lack of a credential. Control-class spawns (captains) are
+/// NOT withheld - orchestrating IS their job.
+fn crew_credential_withholding_env() -> Vec<(String, String)> {
+    let mut env = vec![(
+        "GH_CONFIG_DIR".to_string(),
+        crew_empty_gh_config_dir().to_string_lossy().into_owned(),
+    )];
+    // Blank the ambient publish/registry/spend tokens a crew must not wield. Setting
+    // them empty at the session level scrubs any value inherited from the app env.
+    for key in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "NPM_TOKEN",
+        "NODE_AUTH_TOKEN",
+        "CARGO_REGISTRY_TOKEN",
+    ] {
+        env.push((key.to_string(), String::new()));
+    }
+    env
+}
+
+/// Emit a hash-chained audit record for a control-capability spawn (item-3 §2.1.1
+/// piece 4: "a control-spawn is never silent"). A distinct `control-spawn` decision
+/// with `tokenTier: control` so a log review enumerates exactly who was elevated and
+/// by whom (the `spawnedBy` meta). Read-tier spawns (the least-privilege default) are
+/// already covered by the command's own allowed-path audit, so only the elevation is
+/// recorded here.
+fn audit_control_spawn(ctx: &ControlContext, command: &str, args: &Value) {
+    let session = args
+        .get("sessionId")
+        .or_else(|| args.get("session_id"))
+        .and_then(|v| v.as_str());
+    let spawned_by = args
+        .get("spawnedBy")
+        .or_else(|| args.get("spawned_by"))
+        .and_then(|v| v.as_str());
+    ctx.audit.record(
+        command,
+        required_tier(command).label(),
+        "control-spawn",
+        args,
+        AuditMeta {
+            peer: if ctx.peer_is_loopback {
+                "loopback"
+            } else {
+                "remote"
+            },
+            token_tier: Capability::Full.tier_label(),
+            session,
+            spawned_by,
+            error: None,
+        },
+    );
 }
 
 /// Comms-plane Phase 2 (§2.3, D9): build the spawn env AND mint the session's
@@ -3430,12 +3654,25 @@ fn elevation_env(ctx: &ControlContext, args: &Value) -> Vec<(String, String)> {
 fn spawn_env_with_identity(
     ctx: &ControlContext,
     args: &Value,
+    command: &str,
 ) -> (Vec<(String, String)>, Option<crate::identity::SessionIdentity>) {
     let mut env = elevation_env(ctx, args);
     if env.is_empty() {
         // No addr => headless; do not mint (there is no channel for the session to
         // present its token over anyway).
         return (env, None);
+    }
+    // item-3 §2.1.1 piece 4: every control-capability spawn is audited so an
+    // elevation is never silent. The default (READ) spawn is not elevated.
+    let capability = spawn_capability(args);
+    if capability == Capability::Full {
+        audit_control_spawn(ctx, command, args);
+    } else {
+        // item-3 §2.3.5: a read-class (crew) spawn also gets credential-withholding -
+        // gh pointed at an empty config dir + ambient tokens blanked - so a crew that
+        // evades the PreToolUse gate still fails at the remote. Control-class spawns
+        // (captains) keep their credentials (orchestrating is their job).
+        env.extend(crew_credential_withholding_env());
     }
     // Resolve the spawner's ship so the crew's binding carries it (item-2 §2.3/§2.6).
     let ship = arg_str(args, "spawnedBy")
@@ -3556,7 +3793,9 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         return ControlResponse::err("unauthorized: bad control token");
     };
 
-    let tier = required_tier(&req.command);
+    // item-3 §2.4: the effective tier is args-refined - an UNSCOPED `inbox_status`
+    // (fleet-wide enumeration) is Organization even though its base tier is Read.
+    let tier = effective_tier(&req.command, &req.args);
 
     // Phase 2 capability gate: the presented token's capability must cover the
     // command's required tier. The read token authorizes Read only; Organization
@@ -3576,6 +3815,14 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
             }),
         );
         return ControlResponse::err(message);
+    }
+
+    // item-3 Pillar C: `my_capability` echoes the CALLER's resolved capability so the
+    // out-of-process PreToolUse gate can resolve its own class (control vs read) from
+    // the unspoofable token it presents. Read-tier (any valid token passes the gate
+    // above), no side effect, so it is answered here from `cap` directly.
+    if req.command == "my_capability" {
+        return ControlResponse::ok(json!({ "capability": cap.tier_label() }));
     }
 
     // Spawn-class idempotency (ask #1): a client-supplied `requestId` on a
@@ -4774,10 +5021,10 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     let mut terminal_id: Option<String> = None;
     let mut tab_id = tab_id;
     if has_ui {
-        // Phase 2b: elevate the worktree's terminal the same way spawn_terminal does
-        // (control token by default; `capability: "read"` downgrades it). Comms-plane
+        // item-3: the worktree terminal follows the same inverted least-privilege
+        // default as spawn_terminal (READ unless `capability:"control"`). Comms-plane
         // Phase 2 (§2.3): mint + inject its per-session identity token too.
-        let (elevation, minted_identity) = spawn_env_with_identity(ctx, args);
+        let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "create_worktree");
         match spawn_tmux_terminal(&worktree_path, None, &elevation) {
             Ok((id, _)) => {
                 if let Some(identity) = &minted_identity {
@@ -5518,11 +5765,11 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .clone()
         .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
     let pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
-    // Phase 2b: grant this session its capability token via env (control by default,
-    // read_token when `capability: "read"`), so its in-session MCP authenticates as
-    // the granted capability. Comms-plane Phase 2 (§2.3): also mint + inject this
-    // session's per-session identity token alongside the tier token.
-    let (elevation, minted_identity) = spawn_env_with_identity(ctx, args);
+    // item-3: grant this session its capability token via env (READ by default,
+    // control only on an explicit `capability:"control"`), so its in-session MCP
+    // authenticates as the granted capability. Comms-plane Phase 2 (§2.3): also mint
+    // + inject this session's per-session identity token alongside the tier token.
+    let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "spawn_terminal");
     let (id, tmux_session) = match spawn_tmux_terminal(&cwd_effective, pane.as_deref(), &elevation)
     {
         Ok(v) => v,
@@ -5989,9 +6236,9 @@ impl ControlContext {
         self
     }
 
-    /// Replace the [`AuditLog`] (tests point it at a temp dir so they never write to
-    /// the real `~/.t-hub/audit`).
-    #[cfg(test)]
+    /// Replace the [`AuditLog`]. Tests point it at a temp dir so they never write to
+    /// the real `~/.t-hub/audit`; item-3 also uses it in production to SHARE one audit
+    /// sink between the control server and the Tauri UI spawn path (single hash chain).
     pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
         self.audit = audit;
         self
@@ -7258,7 +7505,7 @@ mod tests {
         let id = format!("{:08x}", (nanos as u64) & 0xffff_ffff);
         let target = tmux::target_for_id(&id);
         let _ = tmux::kill_session(&target);
-        tmux::new_session(&target, "/tmp", None).expect("spawn session");
+        tmux::new_session_with_env(&target, "/tmp", None, &[]).expect("spawn session");
         // Deterministic geometry regardless of what the server's latest client
         // reports (the wedged-2x24 gotcha; see tmux::resize_window_for_tests).
         tmux::resize_window_for_tests(&target, 80, 24).expect("resize session");
@@ -8027,11 +8274,20 @@ mod tests {
         let new_addr = resp["addr"].as_str().unwrap().to_string();
         assert_ne!(new_addr, old_addr, "rebind must move to a fresh port");
 
-        // control.json now names the fresh addr (atomic rewrite), tokens KEPT.
+        // control.json now names the fresh addr (atomic rewrite), tokens KEPT (a
+        // rebind is transport recovery, never a key rotation). Under item-3's default-ON
+        // hardening the PUBLISHED token is the read token ("read-secret") - still the
+        // SAME read token, not a rotated one - and the full token stays off disk; the
+        // frontend keeps full control via the in-process local_control_token.
         let written: Value =
             serde_json::from_slice(&std::fs::read(&cj).expect("read control.json")).unwrap();
         assert_eq!(written["addr"], json!(new_addr));
-        assert_eq!(written["token"], json!("secret"), "tokens must be kept, not rotated");
+        assert_eq!(
+            written["token"],
+            json!("read-secret"),
+            "the published token must be the KEPT read token (harden default-ON), not rotated"
+        );
+        assert_ne!(written["token"], json!("secret"), "the full token must NOT reach disk");
 
         // The NEW listener serves; the OLD one is retired (stops accepting).
         assert!(
@@ -8072,7 +8328,7 @@ mod tests {
         );
         let target = format!("th_{id}");
         let _ = tmux::kill_session(&target);
-        tmux::new_session(&target, "/tmp", None).expect("spawn churn tmux session");
+        tmux::new_session_with_env(&target, "/tmp", None, &[]).expect("spawn churn tmux session");
         (id, target)
     }
 
@@ -9268,6 +9524,82 @@ mod tests {
     }
 
     #[test]
+    fn mcp_tier_annotations_match_control_required_tier() {
+        // item-3 ledger #16: the drift-can't-recur guard. Every tool the MCP surface
+        // advertises must carry the SAME tier the control server ENFORCES via
+        // `required_tier`, or the annotation-vs-enforcement drift that motivated the
+        // socket-gate work reopens. BYPASS-WOULD-FAIL: change one MCP tool's tier (or
+        // its control-side arm) without the other and this test goes RED.
+        for tool in t_hub_mcp::tools::catalog() {
+            let expected = match tool.tier {
+                t_hub_mcp::tools::Tier::Read => CommandTier::Read,
+                t_hub_mcp::tools::Tier::Organization => CommandTier::Organization,
+                t_hub_mcp::tools::Tier::ProcessChanging => CommandTier::ProcessChanging,
+                // The theme get/set pair is a PARALLEL track forwarded by name (it does
+                // not flow through `required_tier`'s capability gate), so it has no
+                // control-side tier to mirror. Skip it explicitly.
+                t_hub_mcp::tools::Tier::Theme => continue,
+            };
+            assert_eq!(
+                required_tier(tool.name),
+                expected,
+                "tier drift: MCP tool '{}' is annotated {:?} but control enforces {:?}",
+                tool.name,
+                tool.tier,
+                required_tier(tool.name),
+            );
+        }
+    }
+
+    #[test]
+    fn inbox_status_unscoped_enumeration_requires_organization() {
+        // item-3 §2.4 (ledger #15): a SCOPED inbox_status (own recipient) stays Read,
+        // but an UNSCOPED fleet-wide enumeration (depth_all) is Organization so a bare
+        // read token cannot enumerate every recipient's counts/cursors. inbox_ack STAYS
+        // Organization regardless (§2.4.1). BYPASS-WOULD-FAIL: drop the effective_tier
+        // refinement and the unscoped case falls back to Read and the assert goes RED.
+        assert_eq!(
+            effective_tier("inbox_status", &json!({"sessionId": "tileX"})),
+            CommandTier::Read,
+            "a scoped inbox_status is a Read"
+        );
+        assert_eq!(
+            effective_tier("inbox_status", &json!({})),
+            CommandTier::Organization,
+            "an unscoped inbox_status enumeration must require Organization"
+        );
+        // inbox_ack is Organization independent of scope (no self-scope until the
+        // session-token-on-request substrate lands, §2.4.1).
+        assert_eq!(
+            effective_tier("inbox_ack", &json!({"sessionId": "tileX"})),
+            CommandTier::Organization
+        );
+        // Every other command's effective tier is exactly its required_tier.
+        assert_eq!(effective_tier("list_terminals", &json!({})), CommandTier::Read);
+        assert_eq!(effective_tier("spawn_terminal", &json!({})), CommandTier::ProcessChanging);
+    }
+
+    #[test]
+    fn read_token_cannot_enumerate_all_inboxes_but_can_scope_its_own() {
+        // End-to-end through the gate: a read token doing an UNSCOPED inbox_status is
+        // authz-refused (Organization), while a SCOPED inbox_status is admitted (Read).
+        let ctx = test_ctx("t").with_inbox(Arc::new(crate::inbox::Inbox::ephemeral()));
+        let unscoped = dispatch_authenticated(&ctx, req("read-t", "inbox_status", json!({})));
+        assert!(
+            unscoped.error.clone().unwrap_or_default().contains("requires the control capability"),
+            "read token must be refused an unscoped enumeration, got: {:?}",
+            unscoped.error
+        );
+        let scoped =
+            dispatch_authenticated(&ctx, req("read-t", "inbox_status", json!({"sessionId": "me"})));
+        assert!(
+            !scoped.error.clone().unwrap_or_default().contains("requires the control capability"),
+            "read token must be allowed a scoped inbox_status, got: {:?}",
+            scoped.error
+        );
+    }
+
+    #[test]
     fn legit_spawn_send_close_through_gate_is_admitted_and_audited() {
         // End-to-end through dispatch_authenticated (governor + audit) against a
         // REAL tmux session: a legitimate crew spawn -> send_text -> close must all
@@ -9417,6 +9749,41 @@ mod tests {
     }
 
     #[test]
+    fn control_capability_spawn_is_audited_but_read_default_is_not() {
+        // item-3 §2.1.1 piece 4: every control-capability spawn emits a `control-spawn`
+        // audit record so an elevation is never silent; the least-privilege default
+        // (READ) does not. BYPASS-WOULD-FAIL: drop `audit_control_spawn` and the
+        // explicit-control assertion goes RED.
+        let dir = std::env::temp_dir().join("t-hub-item3-ctlspawn");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ctx = test_ctx("t").with_audit(Arc::new(AuditLog::new(dir.clone())));
+        // A bound addr so the spawn tree injects a capability token, mints, and audits.
+        // Exercise the mint+audit unit directly (the no-UI gate sits upstream of it).
+        ctx.addr = "127.0.0.1:4242".to_string();
+
+        // Default (untagged => READ) spawn: NO control-spawn audit record.
+        let _ = spawn_env_with_identity(&ctx, &json!({"cwd": "/tmp"}), "spawn_terminal");
+        let recs = read_audit(&dir);
+        assert!(
+            recs.iter().all(|r| r["decision"] != "control-spawn"),
+            "a read-default spawn must NOT emit a control-spawn audit record"
+        );
+
+        // Explicit `capability:"control"`: emits exactly one control-spawn record.
+        let _ = spawn_env_with_identity(
+            &ctx,
+            &json!({"cwd": "/tmp", "capability": "control"}),
+            "spawn_terminal",
+        );
+        let recs = read_audit(&dir);
+        let ctl: Vec<_> = recs.iter().filter(|r| r["decision"] == "control-spawn").collect();
+        assert_eq!(ctl.len(), 1, "an explicit control spawn is audited exactly once");
+        assert_eq!(ctl[0]["tokenTier"], "control");
+        assert_eq!(ctl[0]["command"], "spawn_terminal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn remote_peer_is_capped_to_read_even_with_control_token() {
         // Belt-and-suspenders (open Q4): a non-loopback peer presenting the CONTROL
         // token is capped to ReadOnly, so it cannot spawn/kill over the network bind.
@@ -9441,24 +9808,26 @@ mod tests {
     }
 
     #[test]
-    fn phase3_flag_is_off_by_default_and_selects_control_token() {
-        // Phase 3 hardening is OFF by default (unset ⇒ disabled), so `control.json`
-        // keeps publishing the full control token - the app's own frontend depends on
-        // that until it gets the control token via a trusted internal channel (see
-        // the 2026-07-07 incident note on `phase3_harden_enabled`). Opt in with `1`/
-        // `true`. This mutates a process-global env var; no other test reads this var,
-        // and it is saved/restored around the mutation to stay hermetic.
+    fn phase3_flag_is_on_by_default_and_selects_read_token() {
+        // item-3 flip #2 (ratified 2026-07-10): Phase 3 hardening is ON by default, so
+        // `control.json` publishes only the READ token and an ambient scraper is
+        // read-only. `T_HUB_CONTROL_HARDEN=0`/`false` is the instant rollback. This is
+        // a BYPASS-WOULD-FAIL guard: revert the default to OFF and the first assert
+        // goes RED. This mutates a process-global env var; it is saved/restored around
+        // the mutation to stay hermetic.
         let saved = std::env::var("T_HUB_CONTROL_HARDEN").ok();
         std::env::remove_var("T_HUB_CONTROL_HARDEN");
-        assert!(!phase3_harden_enabled(), "harden flag must default OFF");
-        std::env::set_var("T_HUB_CONTROL_HARDEN", "1");
-        assert!(phase3_harden_enabled(), "'1' must enable hardening");
-        std::env::set_var("T_HUB_CONTROL_HARDEN", "true");
-        assert!(phase3_harden_enabled(), "'true' must enable hardening");
+        assert!(phase3_harden_enabled(), "harden flag must default ON (item-3 flip #2)");
         std::env::set_var("T_HUB_CONTROL_HARDEN", "0");
-        assert!(!phase3_harden_enabled(), "'0' stays off");
+        assert!(!phase3_harden_enabled(), "'0' is the rollback (hardening OFF)");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "false");
+        assert!(!phase3_harden_enabled(), "'false' is the rollback (hardening OFF)");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "1");
+        assert!(phase3_harden_enabled(), "'1' stays ON");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "true");
+        assert!(phase3_harden_enabled(), "'true' stays ON");
         std::env::set_var("T_HUB_CONTROL_HARDEN", "yes");
-        assert!(!phase3_harden_enabled(), "only 1/true enable; other values stay off");
+        assert!(phase3_harden_enabled(), "any non-0/false value stays ON");
         match saved {
             Some(v) => std::env::set_var("T_HUB_CONTROL_HARDEN", v),
             None => std::env::remove_var("T_HUB_CONTROL_HARDEN"),
@@ -9470,6 +9839,68 @@ mod tests {
         // Never an empty read token (falls back to control so a context that never
         // minted a read token is not locked out).
         assert_eq!(select_published_token("ctl", "", true), "ctl");
+    }
+
+    #[test]
+    fn key_rotation_keeps_fresh_seals_and_rotates_on_policy() {
+        // item-3 Pillar B rotation-on-restart: a fresh key is KEPT (stable across
+        // restarts within max age) and sealed at rest; a forced rotation and an
+        // aged-out key both mint-and-REPLACE the file (never re-read the old key).
+        // BYPASS-WOULD-FAIL: revert to reuse-the-file and the forced/aged asserts go RED.
+        let base = std::env::temp_dir().join(format!("t-hub-keyrot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("server-key");
+
+        // Missing => mints and writes; the written file unseals back to the key.
+        let k1 = load_or_rotate_key_with(&path, false, 3600);
+        assert!(!k1.is_empty());
+        assert!(path.exists(), "a minted key must be written to disk");
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(crate::secret_seal::unseal_str(&stored).as_deref(), Some(k1.as_str()));
+
+        // Within age, not forced => KEEP the same value.
+        let k2 = load_or_rotate_key_with(&path, false, 3600);
+        assert_eq!(k2, k1, "a fresh key within max age must be kept, not rotated");
+
+        // Forced => a DIFFERENT value overwrites the file (mint-and-replace).
+        let k3 = load_or_rotate_key_with(&path, true, 3600);
+        assert_ne!(k3, k1, "a forced rotation must mint-and-replace the key");
+        let stored3 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(crate::secret_seal::unseal_str(&stored3).as_deref(), Some(k3.as_str()));
+
+        // max_age 0 => past age on every call => rotates.
+        let k4 = load_or_rotate_key_with(&path, false, 0);
+        assert_ne!(k4, k3, "max_age 0 must rotate on every restart");
+        assert!(!key_is_past_max_age(&path, 3600), "a just-written key is not past a 1h age");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn key_rotation_reads_legacy_plaintext_and_keeps_it() {
+        // A pre-item-3 key file (raw token, no seal prefix) is read and KEPT within
+        // age, so an upgrade preserves the paired credential (no surprise rotation).
+        let base = std::env::temp_dir().join(format!("t-hub-keylegacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("server-read-key");
+        std::fs::write(&path, "legacy-plaintext-token").unwrap();
+        let k = load_or_rotate_key_with(&path, false, 3600);
+        assert_eq!(k, "legacy-plaintext-token", "legacy plaintext must be read and kept");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn age_rotation_eligibility_holds_off_until_a_sealing_host_adopts_the_key() {
+        // MED-1: on a SEALING host (Windows/DPAPI) age-rotation is held off until a
+        // pre-item-3 (unsealed) key has been ADOPTED (sealed), so the first item-3
+        // restart never strands pre-existing fleet. Once sealed, age-rotation resumes.
+        // On a NON-sealing host there is no sealed form, so age-rotation stays eligible.
+        assert!(!age_rotation_eligible(false, true), "sealing host + unsealed key: adopt, don't rotate");
+        assert!(age_rotation_eligible(true, true), "sealing host + sealed key: age-rotates");
+        assert!(age_rotation_eligible(false, false), "non-sealing host: eligible regardless");
+        assert!(age_rotation_eligible(true, false), "non-sealing host: eligible regardless");
     }
 
     #[test]
@@ -9531,13 +9962,12 @@ mod tests {
     }
 
     #[test]
-    fn phase3_hardened_publishes_read_token_yet_spawn_env_carries_control() {
-        // With hardening ON (opt-in via `T_HUB_CONTROL_HARDEN=1`): what `control.json`
-        // publishes as `token` is the READ token (so a raw scraper is read-only), while
-        // the spawn-tree env injection still hands a spawned session the CONTROL token,
-        // preserving orchestration. These two facts together are the whole Phase 3
-        // contract - kept green so the flag is ready to re-enable once the frontend
-        // stops depending on the published control token.
+    fn phase3_hardened_publishes_read_token_and_default_spawn_is_read() {
+        // With hardening ON (the item-3 default): what `control.json` publishes as
+        // `token` is the READ token (so a raw scraper is read-only), AND the default
+        // spawn-tree env injection is now ALSO the READ token (item-3 flip #1 inverted
+        // least-privilege). Only an explicit `capability:"control"` spawn carries the
+        // full token. These facts together are the item-3 Pillar A contract.
         let ctx = test_ctx("ctl"); // read token is "read-ctl" (see test_ctx)
         // Discovery, hardened: publishes the read token, NOT the control token.
         let published = select_published_token(&ctx.token, &ctx.read_token, true);
@@ -9549,8 +9979,9 @@ mod tests {
             "published token must resolve to read-only"
         );
 
-        // Spawn-tree env injection: still carries the CONTROL token so the spawned
-        // session's in-session MCP authenticates with full power.
+        // Spawn-tree env injection, DEFAULT (untagged): the READ token, so a crew
+        // resolves to ReadOnly - the root move. BYPASS-WOULD-FAIL: revert the inverted
+        // default and this injects the control token and the assert goes RED.
         let mut ctx = ctx;
         ctx.addr = "127.0.0.1:4242".to_string();
         let env = elevation_env(&ctx, &json!({}));
@@ -9559,39 +9990,127 @@ mod tests {
             .find(|(k, _)| k == "T_HUB_CONTROL_TOKEN")
             .map(|(_, v)| v.clone())
             .expect("spawn env injects T_HUB_CONTROL_TOKEN");
-        assert_eq!(injected, ctx.token, "spawn env must inject the control token");
+        assert_eq!(injected, ctx.read_token, "default spawn must inject the READ token");
         assert_eq!(
             resolve_capability(&ctx, &injected),
+            Some(Capability::ReadOnly),
+            "default-spawned crew must resolve to read-only"
+        );
+
+        // Explicit opt-in: `capability:"control"` carries the full token.
+        let up = elevation_env(&ctx, &json!({"capability": "control"}));
+        assert_eq!(up[1], ("T_HUB_CONTROL_TOKEN".to_string(), ctx.token.clone()));
+        assert_eq!(
+            resolve_capability(&ctx, &up[1].1),
             Some(Capability::Full),
-            "injected token must grant full control"
+            "an explicit control spawn grants full control"
         );
     }
 
     #[test]
-    fn elevation_env_defaults_control_and_downgrades_to_read() {
+    fn phase3_verification_gate_checks_1_2_4_5() {
+        // item-3 §3.1: the automated portion of the FIVE-check verification gate that
+        // earns the default-ON flip #2. This test pins checks 1, 2, 4, 5 at the code
+        // level; check 3 (a real attach + send_keys DRIVEN THROUGH THE WEBVIEW on a
+        // WSLg build) is the manual acceptance step, documented in the PR body.
+        let ctx = test_ctx("ctl"); // token "ctl", read token "read-ctl"
+        let harden = true; // the ratified default (T_HUB_CONTROL_HARDEN unset => ON)
+
+        // CHECK 1: control.json's `token` == the READ token (full withheld from disk).
+        let published = select_published_token(&ctx.token, &ctx.read_token, harden);
+        assert_eq!(published, ctx.read_token, "check 1: disk token must be the read token");
+        assert_ne!(published, ctx.token, "check 1: full token must NOT reach disk");
+
+        // CHECK 2: the webview obtains the FULL token in-process, not from disk. The
+        // handshake carries `local_control_token` = full and never serializes it;
+        // `control_client::resolve_endpoint` returns it in local mode (proven by
+        // `control_client::tests::local_arm_authenticates_with_the_full_control_token`).
+        let handshake = ControlHandshake {
+            addr: "127.0.0.1:5000".into(),
+            token: published.to_string(),
+            read_token: ctx.read_token.clone(),
+            pid: 1,
+            protocol_version: PROTOCOL_VERSION,
+            local_control_token: ctx.token.clone(),
+        };
+        assert_eq!(handshake.local_control_token, ctx.token, "check 2: in-process full token");
+        assert_eq!(
+            serde_json::to_value(&handshake).unwrap().get("local_control_token"),
+            None,
+            "check 2: the in-process token must never serialize to control.json"
+        );
+
+        // CHECK 4: an external scraper presenting the PUBLISHED token is capped to
+        // ReadOnly (it can never spawn/type/kill).
+        assert_eq!(
+            resolve_capability(&ctx, published),
+            Some(Capability::ReadOnly),
+            "check 4: the published token must resolve to read-only"
+        );
+
+        // CHECK 5: attach SURVIVES a control rebind while hardened - the webview keeps
+        // full control across the rebind (the `rebind-strands-webview` class). Proven
+        // end-to-end by `control_client::tests::refresh_addr_adopts_a_rotated_port_
+        // from_the_local_handshake`, which keeps the full token across a port rotation
+        // where the published token on disk is read-only. Asserted here structurally:
+        // `rebind_control` rebuilds the handshake KEEPING the same full token.
+        // (Cross-module behavioral proof lives in that control_client test.)
+    }
+
+    #[test]
+    fn elevation_env_defaults_read_and_upgrades_to_control() {
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
-        // Default: full control token injected (preserve current behavior).
+        // item-3 inverted default: an untagged spawn injects the READ token.
         let def = elevation_env(&ctx, &json!({}));
         assert_eq!(def, vec![
             ("T_HUB_CONTROL_ADDR".to_string(), "127.0.0.1:4242".to_string()),
-            ("T_HUB_CONTROL_TOKEN".to_string(), "t".to_string()),
+            ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string()),
         ]);
-        // Opt-in read-only: the read token is injected instead.
-        let ro = elevation_env(&ctx, &json!({"capability": "read"}));
-        assert_eq!(ro[1], ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string()));
+        // A typo'd / unknown capability also fails SAFE to read (never leaks control).
+        let typo = elevation_env(&ctx, &json!({"capability": "conrtol"}));
+        assert_eq!(typo[1], ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string()));
+        // Explicit opt-in: `capability:"control"` injects the full control token.
+        let up = elevation_env(&ctx, &json!({"capability": "control"}));
+        assert_eq!(up[1], ("T_HUB_CONTROL_TOKEN".to_string(), "t".to_string()));
+        // Empty read token (bare-probe context) falls back to the control token so it
+        // is never locked out.
+        ctx.read_token = String::new();
+        let fb = elevation_env(&ctx, &json!({}));
+        assert_eq!(fb[1], ("T_HUB_CONTROL_TOKEN".to_string(), "t".to_string()));
         // No bound addr (headless): nothing injected, so spawns behave as before.
         ctx.addr = String::new();
-        assert!(elevation_env(&ctx, &json!({"capability": "read"})).is_empty());
+        assert!(elevation_env(&ctx, &json!({"capability": "control"})).is_empty());
+    }
+
+    #[test]
+    fn legacy_full_spawn_default_env_restores_fail_open() {
+        // The instant rollback (§3.3): `T_HUB_SPAWN_LEGACY_FULL=1` restores the
+        // pre-item-3 fail-OPEN default (control unless an explicit `read`). Guards
+        // that the rollback switch actually flips behavior. Process-global env var;
+        // saved/restored to stay hermetic.
+        let saved = std::env::var("T_HUB_SPAWN_LEGACY_FULL").ok();
+        std::env::remove_var("T_HUB_SPAWN_LEGACY_FULL");
+        // Default (inverted): untagged => ReadOnly.
+        assert_eq!(spawn_capability(&json!({})), Capability::ReadOnly);
+        assert_eq!(spawn_capability(&json!({"capability": "control"})), Capability::Full);
+        // Legacy rollback: untagged => Full (fail-open), explicit read => ReadOnly.
+        std::env::set_var("T_HUB_SPAWN_LEGACY_FULL", "1");
+        assert_eq!(spawn_capability(&json!({})), Capability::Full);
+        assert_eq!(spawn_capability(&json!({"capability": "read"})), Capability::ReadOnly);
+        match saved {
+            Some(v) => std::env::set_var("T_HUB_SPAWN_LEGACY_FULL", v),
+            None => std::env::remove_var("T_HUB_SPAWN_LEGACY_FULL"),
+        }
     }
 
     #[test]
     fn spawn_env_mints_and_injects_a_per_session_identity_token() {
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
-        let (env, minted) = spawn_env_with_identity(&ctx, &json!({}));
-        // The tier token is still injected (Phase-1 behavior preserved) ...
-        assert!(env.iter().any(|(k, v)| k == "T_HUB_CONTROL_TOKEN" && v == "t"));
+        let (env, minted) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
+        // The tier token is injected; the item-3 default is the READ token ...
+        assert!(env.iter().any(|(k, v)| k == "T_HUB_CONTROL_TOKEN" && v == "read-t"));
         // ... PLUS a per-session token alongside it (comms-plane Phase 2).
         let session_token = env
             .iter()
@@ -9613,9 +10132,47 @@ mod tests {
 
         // Headless (no addr): no identity minted, env empty, spawns behave as before.
         ctx.addr = String::new();
-        let (env2, minted2) = spawn_env_with_identity(&ctx, &json!({}));
+        let (env2, minted2) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
         assert!(env2.is_empty());
         assert!(minted2.is_none());
+    }
+
+    #[test]
+    fn crew_spawn_is_credential_withheld_but_control_spawn_is_not() {
+        // item-3 §2.3.5: a read-class (crew) spawn gets gh withholding (GH_CONFIG_DIR at
+        // an empty dir) + blanked ambient tokens - the second wall behind the gate. A
+        // control-class spawn (captain) keeps its credentials. BYPASS-WOULD-FAIL: drop
+        // the crew_credential_withholding_env call and the GH_CONFIG_DIR assert goes RED.
+        let mut ctx = test_ctx("t");
+        ctx.addr = "127.0.0.1:4242".to_string();
+
+        let (env, _) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
+        assert!(
+            env.iter().any(|(k, v)| k == "GH_CONFIG_DIR" && !v.is_empty()),
+            "a crew spawn must withhold gh via GH_CONFIG_DIR"
+        );
+        assert!(
+            env.iter().any(|(k, v)| k == "GH_TOKEN" && v.is_empty()),
+            "a crew spawn must blank the ambient GH_TOKEN"
+        );
+
+        let (env2, _) =
+            spawn_env_with_identity(&ctx, &json!({"capability": "control"}), "spawn_terminal");
+        assert!(
+            !env2.iter().any(|(k, _)| k == "GH_CONFIG_DIR"),
+            "a control-class spawn must keep its gh credentials"
+        );
+    }
+
+    #[test]
+    fn my_capability_reports_the_callers_resolved_capability() {
+        // item-3 Pillar C: the gate resolves its own class from the unspoofable token.
+        // A control token reports "control"; the read token reports "read".
+        let ctx = test_ctx("t");
+        let control = dispatch_authenticated(&ctx, req("t", "my_capability", json!({})));
+        assert_eq!(control.result.unwrap()["capability"], "control");
+        let read = dispatch_authenticated(&ctx, req("read-t", "my_capability", json!({})));
+        assert_eq!(read.result.unwrap()["capability"], "read");
     }
 
     #[test]

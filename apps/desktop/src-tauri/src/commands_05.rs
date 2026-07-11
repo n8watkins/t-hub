@@ -166,3 +166,31 @@ pub async fn claude_hooks_installed() -> Result<bool, String> {
 pub async fn claude_hooks_managed() -> Result<Vec<String>, String> {
     crate::claude::install::managed_event_names().map_err(|e| e.to_string())
 }
+
+// --- item-3 Pillar C: the BLOCKING PreToolUse gate - a DISTINCT opt-in (HIGH-1) ---
+//
+// The gate is a BLOCKING enforcement hook, separate from the observe-only hooks, so
+// it has its OWN consent + install/remove commands (never folded into the observe
+// install, never installed by the boot reconcile).
+
+/// Install the BLOCKING PreToolUse gate. `consent` MUST be true (collected via a
+/// DISTINCT UI opt-in that names the blocking behavior) or this refuses.
+#[tauri::command]
+pub async fn install_claude_gate(
+    agent_bin: String,
+    consent: bool,
+) -> Result<crate::claude::InstallReport, String> {
+    crate::claude::install::install_gate(&agent_bin, consent).map_err(|e| e.to_string())
+}
+
+/// Remove ONLY the blocking gate (its distinct opt-out), leaving observe hooks intact.
+#[tauri::command]
+pub async fn uninstall_claude_gate() -> Result<crate::claude::InstallReport, String> {
+    crate::claude::install::remove_gate().map_err(|e| e.to_string())
+}
+
+/// Whether the blocking gate is currently installed (for the UI opt-in toggle state).
+#[tauri::command]
+pub async fn claude_gate_installed() -> Result<bool, String> {
+    crate::claude::install::gate_installed().map_err(|e| e.to_string())
+}

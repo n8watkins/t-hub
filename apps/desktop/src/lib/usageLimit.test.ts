@@ -10,6 +10,8 @@ import {
   buildRecoveryInput,
   buildRecoverySteps,
   sanitizeContinueText,
+  allowlistContinueText,
+  SAFE_CONTINUE_FALLBACK,
   ESC,
   CR,
 } from "./usageLimit";
@@ -172,6 +174,34 @@ describe("buildRecoveryInput — the paid-option guardrail", () => {
     expect(out.split(CR)).toHaveLength(2); // one CR: the final submit only
     expect(out.indexOf(ESC)).toBe(0); // ESC only at the front
     expect(out.slice(1).includes(ESC)).toBe(false); // no interior ESC
+  });
+});
+
+describe("allowlistContinueText — the item-3 §2.3.6 keystroke allowlist", () => {
+  it("passes a plain alphabetic word (optionally space-separated) through", () => {
+    expect(allowlistContinueText("continue")).toBe("continue");
+    expect(allowlistContinueText("  keep going  ")).toBe("keep going");
+  });
+
+  it("keeps a blank text blank (dismiss-only, never a bare digit)", () => {
+    for (const blank of ["", "   ", "\n", null, undefined]) {
+      expect(allowlistContinueText(blank)).toBe("");
+    }
+  });
+
+  it("REJECTS a menu-selecting digit / paid-option input -> falls back to 'continue'", () => {
+    // The whole point: the auto-continue writer can never express "select a paid
+    // option". A bare digit, a "2. Switch to Team plan", a slash-command, or any
+    // punctuation collapses to the safe literal.
+    for (const bad of ["1", "2", "3", "2. Switch to Team plan", "/upgrade", "$$$", "1 continue"]) {
+      expect(allowlistContinueText(bad)).toBe(SAFE_CONTINUE_FALLBACK);
+    }
+    // And the built recovery therefore never submits the raw digit.
+    expect(buildRecoveryInput("2")).toBe(ESC + "continue" + CR);
+    expect(buildRecoverySteps("2. Switch to Team plan")).toEqual({
+      dismiss: ESC,
+      submit: "continue" + CR,
+    });
   });
 });
 

@@ -9,6 +9,13 @@ rust-version = "1.77"
 # deliberately dependency-light: no async runtime, no MCP SDK — the MCP protocol
 # subset we need (initialize / tools/list / tools/call) is small enough to
 # implement directly over line-delimited JSON-RPC on stdin/stdout.
+# A thin library target exposing the static tool catalog (see src/lib.rs) so the
+# app crate can assert MCP-vs-control tier parity in a dev-dependency test. The
+# stdio binary below is unchanged and does not depend on this lib.
+[lib]
+name = "t_hub_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "t-hub-mcp"
 path = "src/main.rs"
