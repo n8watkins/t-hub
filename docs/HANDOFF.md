@@ -1,8 +1,12 @@
-# T-Hub captain handoff (refreshed 2026-07-11, 0.3.63 increment complete on main)
+# T-Hub captain handoff (refreshed 2026-07-11, 0.3.63 DEPLOYED)
 
-## ⏸ ACTIVE RESUME POINT (2026-07-11 ~12:1x - BUILD PHASE: items 1-3 + wedge cap ALL MERGED; 0.3.63 increment complete, ONE deploy confirm pending)
+## ⏸ ACTIVE RESUME POINT (2026-07-11 ~13:0x - 0.3.63 DEPLOYED + VERIFIED + keys force-rotated; PR #60 in review; fleet at read tier pending capability-cycle)
 
-**THE PROGRAM (one line):** all four items ratified 2026-07-10; items 1 (Phases 1+2), 2, and 3 are now BUILT and MERGED; the batched 0.3.63 increment is COMPLETE ON MAIN awaiting the general's single deploy confirm; next builds are item-1 Phase-3 ACLs -> item-4 -> typing-guard LAST.
+**DEPLOY EXECUTED (2026-07-11, all general-confirmed direct):** 0.3.63 installed (pid rotates per restart; main `aea0255` = the deployed binary), all sessions re-adopted instantly (re-key live), wedge symptom cleared, **WSLg attach check PASSED (general's verdict - PR-29 gate cleared, harden flip trusted)**, DPAPI sealing runtime-verified (`thub-sealed:v1` + DPAPI blob header), blocking gate off-by-default, **forced key rotation executed** (`T_HUB_ROTATE_KEYS`; old disk-exposed control token VERIFIED REFUSED).
+**FLEET IS AT READ TIER BY DESIGN:** pre-regime sessions (Cortana + both captains) hold no control capability until re-spawned with `capability:control` + `claude --resume` migration (Cortana sequences this); interim = MCP reads + raw-tmux break-glass for relays; the captain's classifier correctly blocks stale-token reuse - do not fight it.
+**KNOWN STUTTER (not the wedge):** Windows memory pressure (~0.6GB free) makes wsl.exe spawns glacial - app tmux probes then time out HONESTLY (PR #58 semantics); PR #60 (bounded-exec sweep) bounds the offending load - in xhigh review now.
+
+**THE PROGRAM (one line):** all four items ratified 2026-07-10; items 1 (Phases 1+2), 2, and 3 are BUILT, MERGED, and DEPLOYED; next builds are item-1 Phase-3 ACLs -> item-4 -> typing-guard LAST.
 
 **MERGED (all with full gate: xhigh review -> fix round -> same-reviewer delta -> the general's DIRECT in-session word):** PR #55 `d599fa9` (Phase-1 backdoor close), PR #56 `0ba4360` (Phase-2 durable inbox + identity slice), PR #57 `753f738` (item-2 identity re-key), PR #59 `7b3afb4` (item-3 security defaults, all EIGHT ratified knobs), PR #58 `3daedc8` (spawn-wedge liveness de-conflation, option B - operational, outside the program queue).
 Review records durable in `~/.t-hub/captain/reviews/` (`pr55`-`pr59-review`, design checks, ratified proposals).
