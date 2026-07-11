@@ -1294,8 +1294,10 @@ impl CaptainsRegistry {
     /// releasing/rebinding; if the window changed, recompute. tmux is NEVER called
     /// while `inner` is held.
     ///
-    /// `is_terminal_dead(tile)` is `|t| !tmux::has_session(target(t))` in production
-    /// (the SOLE transfer-grade signal); tests inject a deterministic predicate.
+    /// `is_terminal_dead(tile)` is `|t| tmux::is_definitively_gone(session_liveness(target(t)))`
+    /// in production (the SOLE transfer-grade signal, R1): true ONLY for a completed
+    /// probe reporting the session absent, so a timed-out/ambiguous probe never
+    /// seizes a live ship. Tests inject a deterministic predicate.
     pub fn claim(
         &self,
         terminal_id: &str,
@@ -3036,14 +3038,32 @@ fn serve_pty_attach(
     // one call covers the sink the forwarder thread writes too.
     writer.set_write_timeout(Some(ctx.attach_write_timeout)).ok();
 
-    if !tmux::has_session(&tmux_session) {
-        return send_attach_error(
-            writer,
-            framing,
-            format!(
-                "attach_pty: tmux session {tmux_session} for terminal {session_id} no longer exists"
-            ),
-        );
+    // De-conflation (spawn-wedge): only a DEFINITIVE `Gone` is "no longer exists";
+    // an `Unknown` probe (timed out / failed to spawn) is the degraded-control-plane
+    // signal, and reporting it as "no longer exists" is exactly the false negative
+    // that made the webview drop live tiles. Surface a retryable timeout instead so
+    // the frontend's auto-reattach keeps trying rather than tearing the tile down.
+    match tmux::session_liveness(&tmux_session) {
+        tmux::SessionLiveness::Alive => {}
+        tmux::SessionLiveness::Gone => {
+            return send_attach_error(
+                writer,
+                framing,
+                format!(
+                    "attach_pty: tmux session {tmux_session} for terminal {session_id} no longer exists"
+                ),
+            );
+        }
+        tmux::SessionLiveness::Unknown => {
+            return send_attach_error(
+                writer,
+                framing,
+                format!(
+                    "attach_pty: liveness probe for tmux session {tmux_session} (terminal \
+                     {session_id}) timed out; NOT confirmed gone — retry"
+                ),
+            );
+        }
     }
 
     // Scrollback seed as the opening frame — sent BEFORE the stream starts so the
@@ -5442,11 +5462,24 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .ok_or("claim_captain requires a 'captainSessionId' argument")?;
     // Liveness: refuse a claim for a session with no live terminal, so a bogus
     // or raced id can never be persisted into captains.json to linger forever.
-    if !tmux::has_session(&tmux_target(&captain_session_id)) {
-        return Err(format!(
-            "claim_captain: no live terminal for session '{captain_session_id}' \
-             (spawn or attach it first - a claim for a dead session would linger)"
-        ));
+    // De-conflation (spawn-wedge): only a DEFINITIVE `Gone` rejects; an `Unknown`
+    // probe is retryable (refuse to persist a claim on an unverifiable session, but
+    // never assert it is dead) so a degraded control plane can't block a legitimate
+    // claim by mislabelling a live session as gone.
+    match tmux::session_liveness(&tmux_target(&captain_session_id)) {
+        tmux::SessionLiveness::Alive => {}
+        tmux::SessionLiveness::Gone => {
+            return Err(format!(
+                "claim_captain: no live terminal for session '{captain_session_id}' \
+                 (spawn or attach it first - a claim for a dead session would linger)"
+            ));
+        }
+        tmux::SessionLiveness::Unknown => {
+            return Err(format!(
+                "claim_captain: liveness probe for session '{captain_session_id}' timed out; \
+                 not confirmed live — retry (refusing to persist a claim on an unverified session)"
+            ));
+        }
     }
     let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
     // Item-2 D1/D2: resolve the first-class role. An explicit `role: "cortana"` wins;
@@ -5483,9 +5516,14 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         });
     let before_seq = ctx.captains.snapshot().seq;
     // The transfer-grade liveness predicate (R1): the SOLE signal that may auto-release
-    // an incumbent's slug to this claimant is its tmux session being gone. Evaluated
-    // lock-free inside `claim` (the CAS discipline, MED-3).
-    let is_terminal_dead = |tile: &str| !tmux::has_session(&tmux_target(tile));
+    // an incumbent's slug to this claimant is its tmux session being DEFINITIVELY gone.
+    // De-conflation (spawn-wedge): an `Unknown` probe (timed out / failed to spawn) is
+    // ambiguous and is NEVER transfer-grade - `is_definitively_gone` returns true only
+    // for a completed absent probe, so a degraded control plane can never seize a live
+    // ship (item-2 two-tier liveness: ambiguous is never seized). Evaluated lock-free
+    // inside `claim` (the CAS discipline, MED-3).
+    let is_terminal_dead =
+        |tile: &str| tmux::is_definitively_gone(tmux::session_liveness(&tmux_target(tile)));
     let outcome = ctx.captains.claim(
         &captain_session_id,
         ship_slug.as_deref(),
@@ -5579,11 +5617,22 @@ fn watch_fleet(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .or_else(|| arg_str(args, "sessionId"))
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("watch_fleet requires an 'orchestratorSessionId' argument (the orchestrator's own session id)")?;
-    if !tmux::has_session(&tmux_target(&orchestrator)) {
-        return Err(format!(
-            "watch_fleet: no live terminal for orchestrator '{orchestrator}' \
-             (a wake could never be delivered to a dead session)"
-        ));
+    // De-conflation (spawn-wedge): only a DEFINITIVE `Gone` rejects; an `Unknown`
+    // probe is a retryable control-plane timeout, not proof the orchestrator died.
+    match tmux::session_liveness(&tmux_target(&orchestrator)) {
+        tmux::SessionLiveness::Alive => {}
+        tmux::SessionLiveness::Gone => {
+            return Err(format!(
+                "watch_fleet: no live terminal for orchestrator '{orchestrator}' \
+                 (a wake could never be delivered to a dead session)"
+            ));
+        }
+        tmux::SessionLiveness::Unknown => {
+            return Err(format!(
+                "watch_fleet: liveness probe for orchestrator '{orchestrator}' timed out; \
+                 not confirmed live — retry (the control plane is degraded, not the session)"
+            ));
+        }
     }
     let scope = parse_watch_scope(args)?;
     // `states`: an array of camelCase status strings, or absent for the default
@@ -5868,9 +5917,16 @@ fn spawn_tmux_terminal(
     // has-session here means the id is live BEFORE it is placed/recorded, so a
     // spawn that didn't take fails loudly (and idempotently retryable) instead of
     // registering a phantom.
+    // `has_session` here is the ONE safe use of the boolean form under the
+    // de-conflation: both `Gone` (spawn genuinely didn't take) and `Unknown`
+    // (verify probe timed out) map to `false`, and the action for BOTH is identical
+    // and safe - best-effort reap + a loud, idempotently-retryable failure. We must
+    // NOT hand back an id we could not verify live (that is the Incident A/B ghost),
+    // so an ambiguous verify deliberately fails-retryable rather than registering.
     if !tmux::has_session(&tmux_session) {
-        // L1: a FALSE negative is possible (a has-session hiccup / TOCTOU) - the
-        // session may in fact have come up. Returning Err WITHOUT tearing it down
+        // L1: a FALSE negative is possible (a has-session hiccup / TOCTOU / probe
+        // timeout) - the session may in fact have come up. Returning Err WITHOUT
+        // tearing it down
         // would orphan it: a live pane with no tile, invisible to close_terminal,
         // and (under a requestId) the failure is cached so the retry won't adopt
         // it. Best-effort reap the maybe-live session before failing, so a spawn
@@ -5943,6 +5999,33 @@ fn mark_break_glass(ctx: &ControlContext, command: &str, args: &Value) {
 ///
 /// comms-plane Phase 1: DEMOTED to audited break-glass (see `mark_break_glass`).
 /// It is no longer the fleet path; the wake injects via `plane::deliver_tmux`.
+/// Liveness gate for the direct-writer break-glass commands (`send_text` /
+/// `send_keys`): map a three-state probe to proceed / a DEFINITIVE "no such
+/// session" / a RETRYABLE probe-timeout.
+///
+/// The `Unknown` arm is the spawn-wedge fix (de-conflation): a timed-out probe
+/// must NEVER be reported as "no such session". That false negative is exactly
+/// what made the app say sessions e05764f5/3647011c/68501753 were gone while tmux
+/// held them alive, sending the fleet to raw-tmux break-glass on 0.3.62. The
+/// caller is told the CONTROL PLANE is degraded (retry), not that its session died.
+fn writer_liveness_gate(
+    command: &str,
+    session_id: &str,
+    target: &str,
+    liveness: tmux::SessionLiveness,
+) -> Result<(), String> {
+    match liveness {
+        tmux::SessionLiveness::Alive => Ok(()),
+        tmux::SessionLiveness::Gone => {
+            Err(format!("{command}: no such session '{session_id}' (target {target})"))
+        }
+        tmux::SessionLiveness::Unknown => Err(format!(
+            "{command}: liveness probe for '{session_id}' (target {target}) timed out; \
+             session NOT confirmed gone — retry (the control plane is degraded, not the session)"
+        )),
+    }
+}
+
 fn send_text(args: &Value) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
@@ -5950,9 +6033,7 @@ fn send_text(args: &Value) -> Result<Value, String> {
     let text = arg_str(args, "text").ok_or("send_text requires a 'text' argument")?;
     let enter = args.get("enter").and_then(|v| v.as_bool()).unwrap_or(true);
     let target = tmux_target(&session_id);
-    if !tmux::has_session(&target) {
-        return Err(format!("send_text: no such session '{session_id}' (target {target})"));
-    }
+    writer_liveness_gate("send_text", &session_id, &target, tmux::session_liveness(&target))?;
     tmux::send_text(&target, &text, enter)
         .map_err(|e| format!("failed to send text to '{session_id}': {e}"))?;
     Ok(json!({
@@ -5985,9 +6066,7 @@ fn send_keys(args: &Value) -> Result<Value, String> {
         return Err("send_keys requires a non-empty 'keys' array of tmux key names".into());
     }
     let target = tmux_target(&session_id);
-    if !tmux::has_session(&target) {
-        return Err(format!("send_keys: no such session '{session_id}' (target {target})"));
-    }
+    writer_liveness_gate("send_keys", &session_id, &target, tmux::session_liveness(&target))?;
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     tmux::send_keys(&target, &key_refs)
         .map_err(|e| format!("failed to send keys to '{session_id}': {e}"))?;
@@ -6023,7 +6102,24 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // (not the kill's own status) because the tree sweep SIGKILLs the pane pids,
     // which can auto-destroy the session before `kill-session` runs, making a real
     // kill look already-gone. The kill stays idempotent; only the label is refined.
-    let existed = tmux::has_session(&target);
+    //
+    // De-conflation (spawn-wedge): an `Unknown` probe (timed out / failed to spawn)
+    // means the control plane is degraded, not that the session is gone. Do NOT run
+    // a destructive tree-kill we cannot verify and cannot honestly label - the kill
+    // itself would likely time out too. Surface a RETRYABLE error naming the
+    // timeout instead; `close_terminal` stays idempotent, so a retry after recovery
+    // is safe.
+    let existed = match tmux::session_liveness(&target) {
+        tmux::SessionLiveness::Alive => true,
+        tmux::SessionLiveness::Gone => false,
+        tmux::SessionLiveness::Unknown => {
+            return Err(format!(
+                "close_terminal: liveness probe for '{session_id}' (target {target}) timed out; \
+                 session NOT confirmed gone — retry once the control plane recovers \
+                 (refusing an unverifiable tree-kill)"
+            ));
+        }
+    };
     tmux::kill_session_tree(&target)
         .map_err(|e| format!("failed to close terminal '{session_id}': {e}"))?;
     let outcome = if existed { "killed" } else { "already_gone" };
@@ -6784,6 +6880,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("no such session"), "got: {err}");
+    }
+
+    /// De-conflation guard (spawn-wedge): the direct-writer gate must map a
+    /// three-state probe correctly - `Alive` proceeds, a DEFINITIVE `Gone` is "no
+    /// such session", and an INDETERMINATE `Unknown` (a timed-out / failed probe) is
+    /// a RETRYABLE control-plane timeout that must NEVER read as "no such session".
+    /// That false negative is exactly what sent the fleet to raw-tmux break-glass on
+    /// 0.3.62; reverting the `Unknown` arm to the old `!has_session` conflation (so a
+    /// timeout falls into the Gone message) trips this test.
+    #[test]
+    fn writer_gate_timeout_is_retryable_never_no_such_session() {
+        use tmux::SessionLiveness::*;
+        // Alive proceeds.
+        assert!(
+            writer_liveness_gate("send_text", "e05764f5", "th_e05764f5", Alive).is_ok(),
+            "a live session must proceed"
+        );
+        // Gone is a definitive "no such session".
+        let gone =
+            writer_liveness_gate("send_text", "e05764f5", "th_e05764f5", Gone).unwrap_err();
+        assert!(
+            gone.contains("no such session"),
+            "a completed-absent probe is 'no such session'; got: {gone}"
+        );
+        // Unknown (a timed-out probe) is retryable and must NOT read as gone.
+        let unknown =
+            writer_liveness_gate("send_keys", "e05764f5", "th_e05764f5", Unknown).unwrap_err();
+        assert!(
+            !unknown.contains("no such session"),
+            "a timed-out probe must NOT read as gone; got: {unknown}"
+        );
+        assert!(
+            unknown.contains("timed out") && unknown.contains("retry"),
+            "the Unknown arm must name the timeout and invite a retry; got: {unknown}"
+        );
     }
 
     #[test]
@@ -8775,6 +8906,39 @@ mod tests {
         assert_eq!(out.record.terminal_id.as_deref(), Some("cap-new"));
         assert_eq!(crew_tiles(&out.record), vec!["crew-1".to_string()], "crew followed the ship");
         assert_eq!(reg.snapshot().captains.len(), 1, "no duplicate - the slug transferred");
+    }
+
+    #[test]
+    fn timed_out_probe_never_seizes_an_incumbents_ship() {
+        // De-conflation guard (spawn-wedge): the transfer decision must be driven by
+        // the SAME production mapping the real claim uses -
+        // `is_definitively_gone(session_liveness(..))` - so that an INDETERMINATE probe
+        // (a 5s tmux timeout under a degraded spawn path) is NOT transfer-grade. Here
+        // the injected predicate is that production mapping applied to an `Unknown`
+        // probe result; the incumbent must be treated as a LIVE ship and the claim
+        // REJECTED, never auto-released. The old `!has_session` conflation returned
+        // `true` for a timeout and WOULD have seized the live ship - this trips it.
+        let reg = CaptainsRegistry::new();
+        reg.claim_test("cap-old", Some("t-hub-app"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-old", "crew-1"));
+        let before_seq = reg.snapshot().seq;
+        let probe_times_out =
+            |_: &str| tmux::is_definitively_gone(tmux::SessionLiveness::Unknown);
+        let err = reg
+            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &probe_times_out)
+            .unwrap_err();
+        assert!(
+            err.contains("already captained by a LIVE session 'cap-old'"),
+            "an ambiguous (timed-out) probe must reject like a live ship, not seize; got: {err}"
+        );
+        // The incumbent and its crew are untouched; the refusal did not bump the seq.
+        assert_eq!(only(&reg).terminal_id.as_deref(), Some("cap-old"));
+        assert_eq!(crew_tiles(&only(&reg)), vec!["crew-1".to_string()]);
+        assert_eq!(
+            reg.snapshot().seq,
+            before_seq,
+            "a refused seize must not bump the revision"
+        );
     }
 
     #[test]
