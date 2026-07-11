@@ -43,8 +43,24 @@ export function attachTerminal(
   return invoke(Commands.attachTerminal, { id, cols, rows });
 }
 
+/** Write HUMAN keystrokes/paste to a terminal (comms-plane Phase 1: the human
+ *  path). AUTOMATION input must go through {@link deliverAgentInput} instead. */
 export function writeTerminal(id: TerminalId, data: string): Promise<void> {
   return invoke(Commands.writeTerminal, { id, data });
+}
+
+/** comms-plane Phase 1: deliver AUTOMATION input through the plane's primary path.
+ *  `source` names the internal automation writer (the backend refuses an unknown
+ *  source). Auto-continue and the rules engine call this instead of
+ *  {@link writeTerminal}; the bytes are written immediately (no durability yet -
+ *  that is Phase 2), but now funnelled + attributed. */
+export type PlaneWriteSource = "fleet-wake" | "auto-continue" | "rules-engine";
+export function deliverAgentInput(
+  id: TerminalId,
+  data: string,
+  source: PlaneWriteSource,
+): Promise<void> {
+  return invoke(Commands.deliverAgentInput, { id, data, source });
 }
 
 export function resizeTerminal(

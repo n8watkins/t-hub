@@ -24,6 +24,10 @@ import {
 const h = vi.hoisted(() => ({
   paneText: {} as Record<string, string>,
   writes: [] as Array<[string, string]>,
+  // comms-plane Phase 1: auto-continue delivers via the plane, so we also record
+  // the attributed source so the test can assert it is the automation source (and
+  // never a human write).
+  sources: [] as string[],
   notifies: [] as Array<[string, string, string]>,
 }));
 
@@ -32,8 +36,12 @@ vi.mock("./terminalTail", () => ({
 }));
 vi.mock("../ipc/client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../ipc/client")>()),
-  writeTerminal: (id: string, data: string) => {
+  // comms-plane Phase 1: auto-continue moved OFF the human `writeTerminal` path
+  // onto the plane's `deliverAgentInput`. The split-write billing guardrail is
+  // unchanged - we assert the same two writes, now with the plane source stamped.
+  deliverAgentInput: (id: string, data: string, source: string) => {
     h.writes.push([id, data]);
+    h.sources.push(source);
     return Promise.resolve();
   },
 }));
@@ -109,6 +117,7 @@ beforeEach(() => {
   vi.setSystemTime(NOW_MS);
   h.paneText = {};
   h.writes = [];
+  h.sources = [];
   h.notifies = [];
   _resetAutoContinueForTest();
   useWorkspace.setState({ terminals: { [ID]: mkTerminal() } });
@@ -177,6 +186,9 @@ describe("scanPanes RECOVERY — a genuinely-blocked, past-reset tile DOES recov
     // The ESC never rides with the text, and the submit carries exactly one CR.
     expect(h.writes[1][1].startsWith(ESC)).toBe(false);
     expect(h.writes[1][1].split(CR)).toHaveLength(2);
+    // comms-plane Phase 1: both writes are delivered through the plane, attributed
+    // to the automation source - never the human write path.
+    expect(h.sources).toEqual(["auto-continue", "auto-continue"]);
   });
 
   it("recovers a reset window exactly ONCE across repeated scans (no re-fire loop)", async () => {

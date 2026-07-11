@@ -384,6 +384,16 @@ pub async fn attach_terminal(
     })
 }
 
+/// Write bytes to a terminal's PTY - the HUMAN keystroke path (path b).
+///
+/// comms-plane Phase 1: this command is scoped to HUMAN-origin input - the live
+/// keystrokes / paste / drop that come from `Terminal.tsx`'s `onData` seam and its
+/// siblings. That is the ONE permitted non-plane writer (the human typing in real
+/// time IS the deferral signal the plane defers around, design §0.1). AUTOMATION
+/// input (fleet wake, auto-continue, the rules engine) must NOT use this command;
+/// it funnels through the plane via `deliver_agent_input` so it is attributed and
+/// can later be durable/gated. Keeping the two on distinct IPC commands is the
+/// caller/origin distinction the design's D1b calls for - not "rely on convention".
 #[tauri::command]
 pub async fn write_terminal(
     remote: tauri::State<'_, RemotePtyManager>,
@@ -398,6 +408,34 @@ pub async fn write_terminal(
         .ok_or_else(|| format!("no live terminal {id}"))?;
     conn.write(data.as_bytes())
         .map_err(|e| format!("failed to write to terminal {id}: {e}"))
+}
+
+/// comms-plane Phase 1: the primary AUTOMATION-input path over the in-app write
+/// substrate (path b). Auto-continue (#47) and the rules engine call THIS instead
+/// of `write_terminal`, so their writes are funnelled through the plane seam and
+/// attributed to a `WriteSource` (fleet wake uses the tmux-substrate twin,
+/// `plane::deliver_tmux`). `source` must resolve to a known automation writer, or
+/// the write is refused - the automation door is not a generic bypass.
+///
+/// HONEST SCOPE (Phase 1): this is a FUNNEL, not yet a durable queue. The bytes are
+/// written to the PTY immediately, exactly as `write_terminal` did; there is no
+/// persistence, no ACL, and no typing-guard gate yet (Phases 2-4). The win is that
+/// automation input now has ONE attributed primary door.
+#[tauri::command]
+pub async fn deliver_agent_input(
+    remote: tauri::State<'_, RemotePtyManager>,
+    id: String,
+    data: String,
+    source: String,
+) -> Result<(), String> {
+    let source = crate::plane::WriteSource::parse(&source)?;
+    crate::plane::note_primary(source, &id, data.len());
+    let mut conns = remote.conns.lock();
+    let conn = conns
+        .get_mut(&id)
+        .ok_or_else(|| format!("no live terminal {id}"))?;
+    conn.write(data.as_bytes())
+        .map_err(|e| format!("failed to deliver agent input to terminal {id}: {e}"))
 }
 
 #[tauri::command]
