@@ -415,7 +415,9 @@ fn wsl_host_ip() -> Option<String> {
         // simpler and matches how the rest of T-Hub probes WSL.
         .arg("hostname -I");
     c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    let out = c.output().ok()?;
+    // Bounded (WSL_PROBE): a trivial `hostname -I`; a cold/wedged WSL must not park
+    // the `preview_host` handler this runs on.
+    let out = crate::bounded_exec::output_with_timeout(c, crate::bounded_exec::WSL_PROBE_TIMEOUT).ok()?;
     if !out.status.success() {
         return None;
     }

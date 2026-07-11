@@ -88,6 +88,37 @@ pub struct ControlResponse {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// True when `error` is a TRANSIENT, RETRYABLE control-plane condition rather
+    /// than a definitive failure - today: a liveness probe that timed out under a
+    /// degraded spawn path (the spawn-wedge de-conflation's `Unknown` arm). A fleet
+    /// client / MCP consumer can auto-retry a wedge WITHOUT substring-matching the
+    /// human `error` text (LOW-1 from the PR-58 review). Skipped (absent) on `ok`
+    /// and on non-retryable errors, so the wire is unchanged for every existing
+    /// consumer. Set structurally via the reserved [`RETRYABLE_ERROR_MARKER`], never
+    /// by matching prose.
+    #[serde(skip_serializing_if = "is_false")]
+    pub retryable: bool,
+}
+
+/// serde `skip_serializing_if` predicate: omit a `bool` field when it is `false`.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Reserved, unforgeable marker PREFIX that tags a dispatcher error string as
+/// RETRYABLE. A `\u{1}` (SOH control char) can never appear in a real message, so
+/// the wire layer detects the flag by an exact `strip_prefix` (NOT a fragile
+/// substring search of human prose) and moves it into
+/// [`ControlResponse::retryable`], leaving the human text clean. Callers never write
+/// this by hand - they build retryable errors through [`retryable_error`].
+const RETRYABLE_ERROR_MARKER: &str = "\u{1}retryable\u{1}";
+
+/// Build a dispatcher error tagged RETRYABLE: the human `message` prefixed with the
+/// machine [`RETRYABLE_ERROR_MARKER`]. Any `ControlResponse::err` built from this
+/// string (directly or via the dispatch `Result` mapping) surfaces `retryable:true`
+/// with the marker stripped from the wire text.
+fn retryable_error(message: impl std::fmt::Display) -> String {
+    format!("{RETRYABLE_ERROR_MARKER}{message}")
 }
 
 impl ControlResponse {
@@ -96,13 +127,27 @@ impl ControlResponse {
             ok: true,
             result: Some(result),
             error: None,
+            retryable: false,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            result: None,
-            error: Some(msg.into()),
+        // Structurally detect the retryable marker (never a prose match): a message
+        // built via `retryable_error` carries the reserved SOH prefix, which we strip
+        // and hoist into the structured `retryable` flag.
+        let raw = msg.into();
+        match raw.strip_prefix(RETRYABLE_ERROR_MARKER) {
+            Some(clean) => Self {
+                ok: false,
+                result: None,
+                error: Some(clean.to_string()),
+                retryable: true,
+            },
+            None => Self {
+                ok: false,
+                result: None,
+                error: Some(raw),
+                retryable: false,
+            },
         }
     }
 }
@@ -5475,10 +5520,10 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             ));
         }
         tmux::SessionLiveness::Unknown => {
-            return Err(format!(
+            return Err(retryable_error(format!(
                 "claim_captain: liveness probe for session '{captain_session_id}' timed out; \
                  not confirmed live — retry (refusing to persist a claim on an unverified session)"
-            ));
+            )));
         }
     }
     let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
@@ -5628,10 +5673,10 @@ fn watch_fleet(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             ));
         }
         tmux::SessionLiveness::Unknown => {
-            return Err(format!(
+            return Err(retryable_error(format!(
                 "watch_fleet: liveness probe for orchestrator '{orchestrator}' timed out; \
                  not confirmed live — retry (the control plane is degraded, not the session)"
-            ));
+            )));
         }
     }
     let scope = parse_watch_scope(args)?;
@@ -6019,10 +6064,10 @@ fn writer_liveness_gate(
         tmux::SessionLiveness::Gone => {
             Err(format!("{command}: no such session '{session_id}' (target {target})"))
         }
-        tmux::SessionLiveness::Unknown => Err(format!(
+        tmux::SessionLiveness::Unknown => Err(retryable_error(format!(
             "{command}: liveness probe for '{session_id}' (target {target}) timed out; \
              session NOT confirmed gone — retry (the control plane is degraded, not the session)"
-        )),
+        ))),
     }
 }
 
@@ -6079,6 +6124,69 @@ fn send_keys(args: &Value) -> Result<Value, String> {
     }))
 }
 
+/// The action [`close_terminal`] takes for a given liveness probe + `force` flag.
+enum ClosePlan {
+    /// Reap the session (bounded, idempotent tree-kill). `existed` labels the
+    /// outcome (`killed` vs `already_gone`); `forced` marks a force-escape reap of a
+    /// session whose liveness stayed indeterminate.
+    Kill { existed: bool, forced: bool },
+    /// The probe timed out and `force` was not set: refuse with a RETRYABLE error
+    /// (the de-conflation default - a wedge is not a death).
+    RetryableTimeout,
+    /// `force` was set but a fresh RE-PROBE showed the session ALIVE: refuse. We
+    /// never force-kill a session a second probe confirms live - the first `Unknown`
+    /// was merely slowness, not death (the conservative-design requirement).
+    RefuseForceOnLive,
+}
+
+/// Decide [`close_terminal`]'s action with NO side effects (unit-testable). MED-1
+/// (PR-58 review): `close_terminal` refusing every `Unknown` left a genuinely-dead-
+/// but-unprobeable session unreapable under a wedge. `force:true` adds an escape,
+/// designed conservatively so it NEVER kills a merely-slow-but-live session:
+///
+/// - `Alive`            → `Kill{existed:true}`   (normal close of a live tile)
+/// - `Gone`             → `Kill{existed:false}`  (idempotent already-gone)
+/// - `Unknown`, `!force`→ `RetryableTimeout`     (retry once the plane recovers)
+/// - `Unknown`, `force` → decided by a fresh `reprobe`:
+///     * `reprobe==Alive`   → `RefuseForceOnLive` (slow-but-live: NEVER force-kill)
+///     * `reprobe==Gone`    → `Kill{existed:false}` (confirmed dead: clean reap)
+///     * `reprobe==Unknown` → `Kill{forced:true}`   (still unreachable: forced reap)
+///
+/// `reprobe` is `Some` ONLY when `force && initial==Unknown`; otherwise `None`.
+fn plan_close(
+    force: bool,
+    initial: tmux::SessionLiveness,
+    reprobe: Option<tmux::SessionLiveness>,
+) -> ClosePlan {
+    use tmux::SessionLiveness::*;
+    match initial {
+        Alive => ClosePlan::Kill {
+            existed: true,
+            forced: false,
+        },
+        Gone => ClosePlan::Kill {
+            existed: false,
+            forced: false,
+        },
+        Unknown if !force => ClosePlan::RetryableTimeout,
+        Unknown => match reprobe {
+            Some(Alive) => ClosePlan::RefuseForceOnLive,
+            Some(Gone) => ClosePlan::Kill {
+                existed: false,
+                forced: false,
+            },
+            // Still indeterminate (or, defensively, no reprobe supplied): the
+            // operator asserted death and a fresh probe could not contradict it -
+            // perform the bounded forced reap. `kill_session_tree` is idempotent, so
+            // if the session was in fact already gone this is a clean no-op.
+            _ => ClosePlan::Kill {
+                existed: false,
+                forced: true,
+            },
+        },
+    }
+}
+
 /// `close_terminal`: kill an existing session and its process tree. Process-
 /// changing/destructive (confirmation-required). Backend-only via tmux
 /// `kill_session_tree` - the same guarantee the webview's `kill_terminal`
@@ -6089,11 +6197,25 @@ fn send_keys(args: &Value) -> Result<Value, String> {
 /// Headless-org: the dead tile is also dropped from the server tab registry and
 /// a `sync_tabs` snapshot is forwarded, so the tile leaves its tab cleanly even
 /// when that tab is hidden or the window is minimized (previously removal relied
-/// on the UI's ~5s live-terminal reconcile). Args: `sessionId` (required).
+/// on the UI's ~5s live-terminal reconcile). Args: `sessionId` (required),
+/// `force` (optional bool).
+///
+/// **`force` (MED-1 operator escape).** By default an `Unknown` liveness probe (a
+/// timed-out/failed probe under a degraded spawn path) is REFUSED as retryable -
+/// we never run a destructive tree-kill we cannot verify. But that leaves a
+/// genuinely-dead-but-unprobeable session unreapable during a wedge. `force:true`
+/// re-probes once and, if the session is STILL not confirmably alive, performs the
+/// bounded reap anyway (outcome `force_reaped`). It is designed conservatively: if
+/// the re-probe shows the session ALIVE, force is REFUSED (the probe was merely
+/// slow, not dead) - so `force` can never kill a live-but-slow session. Operator
+/// path: retry a normal `close_terminal` first; use `force:true` only for a tile you
+/// know is dead that a wedge won't let you reap; if even that is refused, the
+/// session is live - investigate instead of forcing.
 fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("close_terminal requires a 'sessionId' argument")?;
+    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let target = tmux_target(&session_id);
     // Registry-vs-reality (Incident C, ask #3): `kill_session_tree` is idempotent -
     // it returns Ok for an already-gone session too - so a caller could never tell
@@ -6103,26 +6225,43 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // which can auto-destroy the session before `kill-session` runs, making a real
     // kill look already-gone. The kill stays idempotent; only the label is refined.
     //
-    // De-conflation (spawn-wedge): an `Unknown` probe (timed out / failed to spawn)
-    // means the control plane is degraded, not that the session is gone. Do NOT run
-    // a destructive tree-kill we cannot verify and cannot honestly label - the kill
-    // itself would likely time out too. Surface a RETRYABLE error naming the
-    // timeout instead; `close_terminal` stays idempotent, so a retry after recovery
-    // is safe.
-    let existed = match tmux::session_liveness(&target) {
-        tmux::SessionLiveness::Alive => true,
-        tmux::SessionLiveness::Gone => false,
-        tmux::SessionLiveness::Unknown => {
-            return Err(format!(
+    // De-conflation (spawn-wedge) + MED-1 force escape: an `Unknown` probe means the
+    // control plane is degraded, not that the session is gone, so the DEFAULT refuses
+    // (retryable). `force:true` re-probes ONCE and reaps only if the session is still
+    // not confirmably alive - a fresh `Alive` re-probe refuses force (never kill a
+    // slow-but-live session). See `plan_close`.
+    let initial = tmux::session_liveness(&target);
+    let reprobe = if force && matches!(initial, tmux::SessionLiveness::Unknown) {
+        Some(tmux::session_liveness(&target))
+    } else {
+        None
+    };
+    let (existed, forced) = match plan_close(force, initial, reprobe) {
+        ClosePlan::Kill { existed, forced } => (existed, forced),
+        ClosePlan::RetryableTimeout => {
+            return Err(retryable_error(format!(
                 "close_terminal: liveness probe for '{session_id}' (target {target}) timed out; \
-                 session NOT confirmed gone — retry once the control plane recovers \
-                 (refusing an unverifiable tree-kill)"
+                 session NOT confirmed gone — retry once the control plane recovers, or pass \
+                 force:true to reap a session you know is dead (refusing an unverifiable tree-kill)"
+            )));
+        }
+        ClosePlan::RefuseForceOnLive => {
+            return Err(format!(
+                "close_terminal: force refused — a re-probe shows session '{session_id}' (target \
+                 {target}) is LIVE; the earlier probe was merely slow, not dead. Retry a normal \
+                 close_terminal (no force) to reap it."
             ));
         }
     };
     tmux::kill_session_tree(&target)
         .map_err(|e| format!("failed to close terminal '{session_id}': {e}"))?;
-    let outcome = if existed { "killed" } else { "already_gone" };
+    let outcome = if forced {
+        "force_reaped"
+    } else if existed {
+        "killed"
+    } else {
+        "already_gone"
+    };
     // The registry keys tiles by the bare terminal id; strip an already-prefixed
     // caller the same way tmux_target normalizes the other direction.
     let tile_id = session_id.strip_prefix("th_").unwrap_or(&session_id);
@@ -6143,7 +6282,9 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         "sessionId": session_id,
         "target": target,
         // killed = a live session was reaped; already_gone = nothing was there to
-        // kill (idempotent no-op). ok:true either way, so a retry stays safe.
+        // kill (idempotent no-op); force_reaped = an operator force:true reaped a
+        // session whose liveness stayed indeterminate. ok:true in every case, so a
+        // retry stays safe.
         "outcome": outcome,
         "audited": true,
     }))
@@ -6914,6 +7055,91 @@ mod tests {
         assert!(
             unknown.contains("timed out") && unknown.contains("retry"),
             "the Unknown arm must name the timeout and invite a retry; got: {unknown}"
+        );
+    }
+
+    /// MED-1 guard (PR-58 review): the `close_terminal` `force` escape keeps a
+    /// genuinely-dead-but-`Unknown` session reapable, but is designed conservatively
+    /// so it can NEVER force-kill a merely-slow-but-LIVE session. `plan_close` is the
+    /// pure decision; this pins every arm. Bypass: make `force + Unknown + reprobe
+    /// Alive` reap (drop the `RefuseForceOnLive` arm) and the live-refusal assert
+    /// trips - i.e. a slow-but-live session would be force-killed.
+    #[test]
+    fn med1_force_close_never_kills_a_slow_but_live_session() {
+        use tmux::SessionLiveness::*;
+        // Default (no force): Alive/Gone reap normally; Unknown is a retryable refusal.
+        assert!(matches!(
+            plan_close(false, Alive, None),
+            ClosePlan::Kill { existed: true, forced: false }
+        ));
+        assert!(matches!(
+            plan_close(false, Gone, None),
+            ClosePlan::Kill { existed: false, forced: false }
+        ));
+        assert!(matches!(
+            plan_close(false, Unknown, None),
+            ClosePlan::RetryableTimeout
+        ));
+        // force + Unknown, re-probe ALIVE => REFUSE (the load-bearing guarantee: a
+        // slow-but-live session is never force-killed).
+        assert!(matches!(
+            plan_close(true, Unknown, Some(Alive)),
+            ClosePlan::RefuseForceOnLive
+        ));
+        // force + Unknown, re-probe GONE => clean reap (now confirmed dead).
+        assert!(matches!(
+            plan_close(true, Unknown, Some(Gone)),
+            ClosePlan::Kill { existed: false, forced: false }
+        ));
+        // force + Unknown, re-probe STILL Unknown => forced reap (genuinely
+        // unreachable stays reapable - the whole point of the escape).
+        assert!(matches!(
+            plan_close(true, Unknown, Some(Unknown)),
+            ClosePlan::Kill { existed: false, forced: true }
+        ));
+    }
+
+    /// LOW-1 guard (PR-58 review): a retryable control error carries a STRUCTURED
+    /// `retryable:true` flag on the wire so fleet automation discriminates a wedge
+    /// from a genuine error WITHOUT substring-matching prose - and the machine marker
+    /// never leaks into the human text, and the flag is omitted (wire unchanged) for
+    /// non-retryable errors. Ties a real site (the writer gate) through
+    /// `retryable_error` → `ControlResponse::err` → serialization. Bypass: drop the
+    /// `retryable_error` wrapper on the Unknown arm and the `retryable==true` assert
+    /// trips.
+    #[test]
+    fn low1_retryable_errors_carry_a_structured_flag_not_prose() {
+        use tmux::SessionLiveness::*;
+        // A retryable site (writer gate on Unknown) → structured retryable + clean text.
+        let gate_err =
+            writer_liveness_gate("send_text", "e05764f5", "th_e05764f5", Unknown).unwrap_err();
+        let resp = ControlResponse::err(gate_err);
+        assert!(!resp.ok);
+        assert!(resp.retryable, "an Unknown-arm error must be structurally retryable");
+        let text = resp.error.as_deref().unwrap_or("");
+        assert!(
+            !text.contains(RETRYABLE_ERROR_MARKER),
+            "the machine marker must be stripped from the wire text; got: {text:?}"
+        );
+        assert!(
+            text.contains("timed out") && text.contains("retry"),
+            "human guidance is preserved: {text}"
+        );
+        // A definitive (Gone) error is NOT retryable.
+        let gone_err =
+            writer_liveness_gate("send_text", "e05764f5", "th_e05764f5", Gone).unwrap_err();
+        let resp_gone = ControlResponse::err(gone_err);
+        assert!(
+            !resp_gone.retryable,
+            "a definitive 'no such session' must not be flagged retryable"
+        );
+        // Serialization: `retryable` present only when true (wire unchanged otherwise).
+        let j = serde_json::to_value(&resp).unwrap();
+        assert_eq!(j.get("retryable").and_then(|v| v.as_bool()), Some(true));
+        let j_gone = serde_json::to_value(&resp_gone).unwrap();
+        assert!(
+            j_gone.get("retryable").is_none(),
+            "retryable is omitted when false, so existing consumers see an unchanged wire"
         );
     }
 

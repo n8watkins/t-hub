@@ -79,15 +79,17 @@ fn wsl_distro() -> String {
 #[cfg(windows)]
 fn wsl_home(distro: &str) -> Result<String> {
     use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("wsl.exe")
-        .arg("-d")
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.arg("-d")
         .arg(distro)
         .arg("--")
         .arg("bash")
         .arg("-lc")
         .arg("echo $HOME")
-        .creation_flags(0x0800_0000)
-        .output()
+        .creation_flags(0x0800_0000);
+    // Bounded (WSL_PROBE): install-time `echo $HOME`; a cold WSL must not hang the
+    // hook-install flow.
+    let out = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::WSL_PROBE_TIMEOUT)
         .with_context(|| format!("running `wsl.exe -d {distro} -- bash -lc 'echo $HOME'`"))?;
     if !out.status.success() {
         return Err(anyhow!(
@@ -297,10 +299,11 @@ pub fn managed_event_names() -> Result<Vec<String>> {
 fn resolve_agent_bin(passed: &str) -> String {
     use std::os::windows::process::CommandExt;
     let distro = wsl_distro();
-    if let Ok(out) = std::process::Command::new("wsl.exe")
-        .args(["-d", &distro, "--", "bash", "-lc", "command -v t-hub-agent"])
-        .creation_flags(0x0800_0000)
-        .output()
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.args(["-d", &distro, "--", "bash", "-lc", "command -v t-hub-agent"])
+        .creation_flags(0x0800_0000);
+    // Bounded (WSL_PROBE): install-time `command -v`; a cold WSL must not hang the flow.
+    if let Ok(out) = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::WSL_PROBE_TIMEOUT)
     {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -321,9 +324,10 @@ fn resolve_agent_bin(passed: &str) -> String {
     if passed.starts_with('/') && Path::new(passed).exists() {
         return passed.to_string();
     }
-    if let Ok(out) = std::process::Command::new("bash")
-        .args(["-lc", "command -v t-hub-agent"])
-        .output()
+    let mut cmd = std::process::Command::new("bash");
+    cmd.args(["-lc", "command -v t-hub-agent"]);
+    // Bounded (WSL_PROBE): install-time `command -v`; must not hang the flow.
+    if let Ok(out) = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::WSL_PROBE_TIMEOUT)
     {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();

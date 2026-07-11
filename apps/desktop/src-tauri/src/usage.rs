@@ -17,7 +17,28 @@
 //! login shell (`$SHELL -ilc`) so `claude` resolves on the PATH set in ~/.zshrc
 //! (same reason resolve_pane_command uses `-ilc`).
 
+use std::time::Duration;
+
 use serde::Serialize;
+
+use crate::bounded_exec::{output_with_timeout, NETWORK_TIMEOUT};
+
+/// Per-attempt timeout for `claude -p /usage`. This is a LIVE NETWORK round-trip
+/// (the headless SDK session talks to Claude), so the bound is generous - a healthy
+/// `/usage` returns in a few seconds, but a slow network / logged-out hang must not
+/// park the control-handler thread this runs on. Default 25s
+/// ([`NETWORK_TIMEOUT`]); `$T_HUB_USAGE_TIMEOUT_SECS` widens it for a slow host.
+/// Bounded on purpose: [`USAGE_ATTEMPTS`] already caps the retries, so the absolute
+/// worst case is 2×timeout only when BOTH attempts hang, and a wedged attempt now
+/// frees the handler instead of leaking a live `wsl.exe -> … -> claude` tree.
+fn usage_cmd_timeout() -> Duration {
+    std::env::var("T_HUB_USAGE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(NETWORK_TIMEOUT)
+}
 
 /// Parsed `/usage` output. Every field is optional so a missing/!changed line
 /// degrades gracefully. Percentages are the USED amount (0..=100); the UI shows
@@ -72,13 +93,18 @@ const USAGE_ATTEMPTS: usize = 2;
 fn run_usage() -> ClaudeUsage {
     let mut last = ClaudeUsage::default();
     for attempt in 1..=USAGE_ATTEMPTS {
-        let out = match usage_command().output() {
+        // Bounded: a hung `/usage` (slow network / logged-out SDK hang) is killed at
+        // `usage_cmd_timeout()` and surfaces as an Err here, freeing the handler
+        // thread instead of parking it and leaking a live child tree. A TimedOut is
+        // just a failed attempt - fall through to the next attempt / default.
+        let out = match output_with_timeout(usage_command(), usage_cmd_timeout()) {
             Ok(o) => o,
             Err(e) => {
                 crate::diag::diag_log(format!(
-                    "{{\"t\":\"usage\",\"m\":\"claude -p /usage spawn FAILED: {e}\"}}"
+                    "{{\"t\":\"usage\",\"m\":\"claude -p /usage spawn/timeout FAILED: {e}\"}}"
                 ));
-                return ClaudeUsage::default();
+                last = ClaudeUsage::default();
+                continue;
             }
         };
         let text = String::from_utf8_lossy(&out.stdout);

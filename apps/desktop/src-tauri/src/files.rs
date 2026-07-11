@@ -428,9 +428,11 @@ fi
     // "Show ignored": no filtering — list every child (ignored dirs included).
     const SCRIPT_ALL: &str = r#"find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null"#;
     let script = if show_ignored { SCRIPT_ALL } else { SCRIPT_FILTER };
-    let output = wsl_bash(&distro, script, dir)
-        .output()
-        .map_err(|e| format!("failed to spawn wsl.exe: {e}"))?;
+    // Bounded (LOCAL_IO): a `find` + per-entry `git check-ignore` over `dir`; a slow
+    // git / UNC / large dir must not park the file-index handler this runs on.
+    let output =
+        crate::bounded_exec::output_with_timeout(wsl_bash(&distro, script, dir), crate::bounded_exec::LOCAL_IO_TIMEOUT)
+            .map_err(|e| format!("failed to spawn/await wsl.exe: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("__TH_NODIR__") {
@@ -511,9 +513,11 @@ else
 fi
 "#
     );
-    let output = wsl_bash(&distro, &script, root)
-        .output()
-        .map_err(|e| format!("failed to spawn wsl.exe: {e}"))?;
+    // Bounded (LOCAL_IO): `rg`/`git ls-files`/`find` over the WHOLE project tree; a
+    // large repo or slow FS must not park the file-search handler this runs on.
+    let output =
+        crate::bounded_exec::output_with_timeout(wsl_bash(&distro, &script, root), crate::bounded_exec::LOCAL_IO_TIMEOUT)
+            .map_err(|e| format!("failed to spawn/await wsl.exe: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("__TH_NODIR__") {
@@ -1187,7 +1191,10 @@ fn resolve_real_posix(path: &str) -> Option<PathBuf> {
             .arg("--")
             .arg(&posix);
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        let out = c.output().ok()?;
+        // Bounded (WSL_PROBE): a single `realpath`; this is a scope-validation gate
+        // on file-read requests, so a wedged WSL must not park the handler.
+        let out =
+            crate::bounded_exec::output_with_timeout(c, crate::bounded_exec::WSL_PROBE_TIMEOUT).ok()?;
         if !out.status.success() {
             return None;
         }
