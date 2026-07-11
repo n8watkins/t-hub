@@ -258,7 +258,10 @@ const DEFAULT_AUDIT_TAIL: usize = 64;
 /// a coarse lock is simplest-correct; the only work done OUTSIDE the lock is the PTY
 /// write in `drain_one`, guarded by the persisted in-flight marker.
 pub struct Inbox {
-    dir: PathBuf,
+    /// The segment directory, or `None` for an ephemeral (in-memory-only) inbox - the
+    /// headless-test / no-addr default, mirroring `IdentityStore::ephemeral`. A `None`
+    /// inbox never touches disk (so unrelated tests do not write to `~/.t-hub/inbox`).
+    dir: Option<PathBuf>,
     queues: Mutex<HashMap<String, RecipientQueue>>,
     max_depth: usize,
     audit_tail: usize,
@@ -269,20 +272,12 @@ impl Inbox {
     /// Any in-flight marker found on disk is a crash mid-write: it is CLEARED so its
     /// still-`Enqueued` record redelivers on the next boundary (at-least-once).
     pub fn open(dir: PathBuf) -> Self {
-        let max_depth = std::env::var("T_HUB_INBOX_MAX_DEPTH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_MAX_DEPTH);
-        let audit_tail = std::env::var("T_HUB_INBOX_AUDIT_TAIL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_AUDIT_TAIL);
         let queues = load_segments(&dir);
         Inbox {
-            dir,
+            dir: Some(dir),
             queues: Mutex::new(queues),
-            max_depth,
-            audit_tail,
+            max_depth: env_max_depth(),
+            audit_tail: env_audit_tail(),
         }
     }
 
@@ -292,6 +287,16 @@ impl Inbox {
         Self::open(default_inbox_dir())
     }
 
+    /// An in-memory-only inbox that never persists (headless / no-addr default).
+    pub fn ephemeral() -> Self {
+        Inbox {
+            dir: None,
+            queues: Mutex::new(HashMap::new()),
+            max_depth: env_max_depth(),
+            audit_tail: env_audit_tail(),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, RecipientQueue>> {
         self.queues.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -299,9 +304,11 @@ impl Inbox {
     /// Persist one recipient's segment atomically (temp + rename + 0600), the exact
     /// discipline the captains registry / control.json use. The in-memory cache is
     /// the source of truth; a failed write logs and leaves the cache ahead of disk
-    /// (the next successful mutation re-persists the whole segment).
+    /// (the next successful mutation re-persists the whole segment). A no-op for an
+    /// ephemeral inbox.
     fn persist(&self, q: &RecipientQueue) {
-        if let Err(e) = write_segment(&self.dir, q) {
+        let Some(dir) = &self.dir else { return };
+        if let Err(e) = write_segment(dir, q) {
             eprintln!(
                 "t-hub-inbox: segment persist for '{}' failed: {e}",
                 q.recipient
@@ -523,6 +530,20 @@ fn compact(q: &mut RecipientQueue, audit_tail: usize) {
 }
 
 // ---- on-disk segment I/O -------------------------------------------------------
+
+fn env_max_depth() -> usize {
+    std::env::var("T_HUB_INBOX_MAX_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_DEPTH)
+}
+
+fn env_audit_tail() -> usize {
+    std::env::var("T_HUB_INBOX_AUDIT_TAIL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_AUDIT_TAIL)
+}
 
 /// Default inbox directory, mirroring `captains_path`'s HOME resolution. Override
 /// with `T_HUB_INBOX_DIR` (tests point this at a temp dir).
@@ -790,7 +811,7 @@ mod tests {
             TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let inbox = Inbox { dir, queues: Mutex::new(HashMap::new()), max_depth: 2, audit_tail: 8 };
+        let inbox = Inbox { dir: Some(dir), queues: Mutex::new(HashMap::new()), max_depth: 2, audit_tail: 8 };
         inbox.enqueue("t1", "s", Priority::Standard, "a", true).unwrap();
         inbox.enqueue("t1", "s", Priority::Standard, "b", true).unwrap();
         // Third standard enqueue overflows the depth-2 bound.
@@ -808,7 +829,7 @@ mod tests {
             TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let inbox = Inbox { dir, queues: Mutex::new(HashMap::new()), max_depth: 256, audit_tail: 2 };
+        let inbox = Inbox { dir: Some(dir), queues: Mutex::new(HashMap::new()), max_depth: 256, audit_tail: 2 };
         // Enqueue, deliver, and ack 5 records; only the newest 2 processed survive.
         for _ in 0..5 {
             inbox.enqueue("t1", "s", Priority::Standard, "x", true).unwrap();

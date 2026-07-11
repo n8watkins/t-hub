@@ -226,6 +226,14 @@ pub struct FleetNotifier {
     status_bridge: Arc<StatusBridge>,
     inject: Injector,
     event_sink: Option<EventSink>,
+    /// Comms-plane Phase 2: the durable inbox. When present, a wake is ENQUEUED
+    /// durably then DRAINED at the ready `Completed` edge (persist-before-write,
+    /// at-most-once, redelivery on the next edge if the write failed) - the wake
+    /// becomes the inbox's first client. When `None`, the legacy Phase-1 immediate
+    /// path runs unchanged: this is the Phase-2 rollback ("feature-flag off => fall
+    /// back to direct `Completed`-gated wake"), and the shape every existing fleet
+    /// test exercises.
+    inbox: Option<Arc<crate::inbox::Inbox>>,
     state: Mutex<NotifierState>,
 }
 
@@ -242,12 +250,21 @@ impl FleetNotifier {
             status_bridge,
             inject,
             event_sink: None,
+            inbox: None,
             state: Mutex::new(NotifierState::default()),
         }
     }
 
     pub fn with_event_sink(mut self, sink: EventSink) -> Self {
         self.event_sink = Some(sink);
+        self
+    }
+
+    /// Route wakes through the durable inbox (comms-plane Phase 2). Production wires
+    /// this; omit it (or pass the `T_HUB_INBOX_WAKE=0` rollback in `lib.rs`) to keep
+    /// the Phase-1 immediate path.
+    pub fn with_inbox(mut self, inbox: Arc<crate::inbox::Inbox>) -> Self {
+        self.inbox = Some(inbox);
         self
     }
 
@@ -308,9 +325,11 @@ impl FleetNotifier {
         }
     }
 
-    /// Inject the coalesced pending batch into `orch` if it is at its prompt and not
-    /// already suppressed. Clears the batch and suppresses further injects until the
-    /// orchestrator is next observed `Completed`.
+    /// Deliver the coalesced pending batch to `orch` if it is at its prompt and not
+    /// already suppressed. With the durable inbox (comms-plane Phase 2) the batch is
+    /// ENQUEUED durably then DRAINED at this ready edge; without it, the legacy
+    /// Phase-1 immediate inject runs. Either way a success suppresses further delivery
+    /// until the orchestrator is next observed `Completed`.
     fn try_flush(&self, st: &mut NotifierState, orch: &str) {
         let ready = st
             .last_status
@@ -321,17 +340,17 @@ impl FleetNotifier {
         if !ready || st.suppressed.contains(orch) {
             return;
         }
-        let Some(items_map) = st.pending.get(orch) else {
-            return;
-        };
-        if items_map.is_empty() {
+
+        if let Some(inbox) = self.inbox.clone() {
+            self.try_flush_durable(st, orch, &inbox);
             return;
         }
-        let mut items: Vec<WakeItem> = items_map.values().cloned().collect();
-        items.sort_by(|a, b| a.session_tile.cmp(&b.session_tile));
 
+        // Legacy Phase-1 immediate path (inbox disabled / tests) - unchanged.
+        let Some(items) = self.take_batch(st, orch) else {
+            return;
+        };
         let text = wake_message(&items);
-        // Emit the bonus UI/event payload regardless of injection outcome.
         if let Some(sink) = &self.event_sink {
             sink(&wake_event_payload(orch, &items));
         }
@@ -345,6 +364,61 @@ impl FleetNotifier {
                 // the batch pending so a later idle edge retries; do not suppress.
             }
         }
+    }
+
+    /// The comms-plane Phase-2 delivery: (1) enqueue any pending batch durably (the
+    /// ACK means "persisted"), clearing it from the in-memory coalesce buffer; (2)
+    /// drain ONE record at this ready `Completed` edge, writing at-most-once. A
+    /// delivered wake suppresses until the next edge; a failed write leaves the record
+    /// `Enqueued` to redeliver on the next edge (the only redelivery trigger). This is
+    /// strictly more durable than the legacy path: a wake survives a crash between
+    /// enqueue and write, and replays from disk on restart.
+    fn try_flush_durable(&self, st: &mut NotifierState, orch: &str, inbox: &crate::inbox::Inbox) {
+        // (1) Enqueue any coalesced batch, then hand ownership to the durable store.
+        if let Some(items) = self.take_batch(st, orch) {
+            let text = wake_message(&items);
+            if let Some(sink) = &self.event_sink {
+                sink(&wake_event_payload(orch, &items));
+            }
+            match inbox.enqueue(
+                orch,
+                crate::plane::WriteSource::FleetWake.label(),
+                crate::inbox::Priority::Standard,
+                &text,
+                true,
+            ) {
+                Ok(_) => {
+                    st.pending.remove(orch);
+                }
+                Err(e) => {
+                    // Overflow (a wedged, never-draining recipient): keep the batch
+                    // pending and surface loudly - never a silent drop (D5).
+                    eprintln!("t-hub-inbox: wake enqueue for '{orch}' refused: {e}");
+                }
+            }
+        }
+
+        // (2) Drain one record at this boundary. The write goes through the SAME
+        // injector (plane-attributed `FleetWake` tmux write) as the legacy path.
+        let outcome = inbox.drain_one(orch, |rec| (self.inject)(orch, &rec.body));
+        if let crate::inbox::DrainOutcome::Delivered { .. } = outcome {
+            st.suppressed.insert(orch.to_string());
+        }
+        // WriteFailed / Empty / Busy: do not suppress - the next `Completed` edge
+        // retries the still-`Enqueued` record (redelivery) or finds nothing to do.
+    }
+
+    /// Snapshot + sort the coalesced pending batch for `orch` (without clearing it -
+    /// the caller clears only once the batch is safely enqueued/injected). `None` when
+    /// there is nothing pending.
+    fn take_batch(&self, st: &NotifierState, orch: &str) -> Option<Vec<WakeItem>> {
+        let items_map = st.pending.get(orch)?;
+        if items_map.is_empty() {
+            return None;
+        }
+        let mut items: Vec<WakeItem> = items_map.values().cloned().collect();
+        items.sort_by(|a, b| a.session_tile.cmp(&b.session_tile));
+        Some(items)
     }
 }
 
@@ -661,6 +735,101 @@ mod tests {
         assert!(
             pane.contains("T-HUB FLEET WAKE") && pane.contains("e2ecap01"),
             "the orchestrator pane must show the injected wake naming the captain; got:\n{pane}"
+        );
+    }
+
+    // ---- comms-plane Phase 2: the wake as the durable inbox's first client -------
+
+    static DUR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// The `harness()` notifier, but with a durable inbox in a temp dir attached, so
+    /// wakes route through enqueue -> drain (comms-plane Phase 2). Returns the inbox
+    /// too so tests can assert receipt state.
+    fn harness_durable() -> (
+        FleetNotifier,
+        Arc<Recorder>,
+        Arc<FleetWatchRegistry>,
+        Arc<CaptainsRegistry>,
+        Arc<crate::inbox::Inbox>,
+    ) {
+        let (notifier, rec, watches, captains) = harness();
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-fleet-inbox-{}-{}",
+            std::process::id(),
+            DUR_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inbox = Arc::new(crate::inbox::Inbox::open(dir));
+        let notifier = notifier.with_inbox(inbox.clone());
+        (notifier, rec, watches, captains, inbox)
+    }
+
+    #[test]
+    fn durable_wake_enqueues_and_drains_through_the_inbox() {
+        let (n, rec, w, _c, inbox) = harness_durable();
+        w.arm("orcbbbbb", WatchScope::Captains, vec![]);
+        n.on_status("u-orc", SessionStatus::Completed);
+        n.on_status("u-cap", SessionStatus::Completed);
+        // The wake was written exactly once (the drain's at-most-once write) ...
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 1, "exactly one durable wake delivered");
+        assert_eq!(calls[0].0, "orcbbbbb");
+        // ... and the inbox records it delivered, not still-enqueued: durable receipt.
+        let d = inbox.depth("orcbbbbb");
+        assert_eq!((d.enqueued, d.delivered), (0, 1), "the record reached `delivered`");
+        // The recipient can confirm intake (the `delivered -> processed` ack channel).
+        assert_eq!(
+            inbox.ack("orcbbbbb", 0),
+            crate::inbox::AckOutcome::Processed { seq: 0 }
+        );
+    }
+
+    #[test]
+    fn durable_wake_survives_a_failed_write_and_redelivers_on_the_next_edge() {
+        let (n, rec, w, _c, inbox) = harness_durable();
+        w.arm("orcbbbbb", WatchScope::Captains, vec![]);
+        // The first delivery write FAILS (recorder fails its first call).
+        rec.fail.store(1, Ordering::SeqCst);
+        n.on_status("u-orc", SessionStatus::Completed);
+        n.on_status("u-cap", SessionStatus::Completed);
+        // Nothing was injected, and the wake is durably PARKED (still enqueued), not
+        // lost - the batch was persisted before the write was attempted.
+        assert!(rec.calls().is_empty(), "a failed write injects nothing");
+        assert_eq!(inbox.depth("orcbbbbb").enqueued, 1, "wake parked for redelivery");
+        // A new `Completed` edge (orchestrator cycles Working -> Completed) redelivers
+        // the SAME record - the only redelivery trigger is a prior failed write.
+        n.on_status("u-orc", SessionStatus::Working);
+        n.on_status("u-orc", SessionStatus::Completed);
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 1, "redelivered exactly once on the next edge");
+        assert_eq!(inbox.depth("orcbbbbb").delivered, 1);
+    }
+
+    #[test]
+    fn durable_wake_replays_from_disk_after_a_restart() {
+        // Enqueue a wake, fail its write so it stays durable, then drop everything and
+        // rebuild the inbox from disk - the wake must still be there to deliver.
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-fleet-inbox-restart-{}-{}",
+            std::process::id(),
+            DUR_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let (notifier, rec, w, _c) = harness();
+            let inbox = Arc::new(crate::inbox::Inbox::open(dir.clone()));
+            let n = notifier.with_inbox(inbox);
+            w.arm("orcbbbbb", WatchScope::Captains, vec![]);
+            rec.fail.store(1, Ordering::SeqCst); // write fails => stays enqueued
+            n.on_status("u-orc", SessionStatus::Completed);
+            n.on_status("u-cap", SessionStatus::Completed);
+        }
+        // Restart: a fresh inbox rebuilt from the same dir still holds the wake.
+        let reopened = crate::inbox::Inbox::open(dir);
+        assert_eq!(
+            reopened.depth("orcbbbbb").enqueued,
+            1,
+            "the durable wake replays from disk after a restart"
         );
     }
 }

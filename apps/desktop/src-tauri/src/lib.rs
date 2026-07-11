@@ -255,6 +255,8 @@ fn start_control_listener(
     tab_registry: std::sync::Arc<control::TabRegistry>,
     captains_registry: std::sync::Arc<control::CaptainsRegistry>,
     fleet_watches: std::sync::Arc<fleet::FleetWatchRegistry>,
+    identity_store: std::sync::Arc<identity::IdentityStore>,
+    inbox: std::sync::Arc<inbox::Inbox>,
 ) -> Option<control::ControlHandshake> {
     // The control auth token. Server-split M2b: a PERSISTENT key (stable across
     // restarts) so a remote client paired once doesn't have to re-pair every launch.
@@ -313,7 +315,13 @@ fn start_control_listener(
         .with_captains_registry(captains_registry)
         // Orchestrator wake: share the SAME watch registry the notifier reads, so
         // `watch_fleet` / `unwatch_fleet` arm the wakes the notifier delivers.
-        .with_fleet_watches(fleet_watches);
+        .with_fleet_watches(fleet_watches)
+        // Comms-plane Phase 2: share the per-session identity store (spawn mints +
+        // binds; `inbox_ack` resolves against it) and the durable inbox (the fleet
+        // notifier enqueues/drains; `inbox_ack` / `inbox_status` reach the same
+        // queues) - one Arc each across the notifier and every connection handler.
+        .with_identity_store(identity_store)
+        .with_inbox(inbox);
     match control::start(ctx) {
         Ok(h) => {
             eprintln!(
@@ -555,6 +563,14 @@ pub fn run() {
             // re-invoking its agent loop instead of only painting a UI badge. All
             // opt-in: no armed watch => no wakes => no behaviour change.
             let fleet_watches = std::sync::Arc::new(fleet::FleetWatchRegistry::new());
+            // Comms-plane Phase 2: the per-session identity store and the durable
+            // inbox, both loaded from their persistence files so bindings + queued
+            // messages survive restarts (identities.json; ~/.t-hub/inbox/). One Arc
+            // each is shared between the fleet notifier (the inbox's first client) and
+            // the control listener (identity resolve + inbox ack/status).
+            let identity_store =
+                std::sync::Arc::new(identity::IdentityStore::load_default());
+            let inbox = std::sync::Arc::new(inbox::Inbox::open_default());
             {
                 // The injector: type + submit a line into a tile's Claude session
                 // over tmux (the only thing that re-invokes an idle agent loop).
@@ -571,15 +587,24 @@ pub fn run() {
                 let event_sink: fleet::EventSink = std::sync::Arc::new(move |payload| {
                     sink_fanout.emit_event("fleet://wake", payload);
                 });
-                let notifier = std::sync::Arc::new(
-                    fleet::FleetNotifier::new(
-                        fleet_watches.clone(),
-                        captains_registry.clone(),
-                        state.status.clone(),
-                        inject,
-                    )
-                    .with_event_sink(event_sink),
-                );
+                let mut notifier = fleet::FleetNotifier::new(
+                    fleet_watches.clone(),
+                    captains_registry.clone(),
+                    state.status.clone(),
+                    inject,
+                )
+                .with_event_sink(event_sink);
+                // Comms-plane Phase 2: route wakes through the durable inbox (the
+                // wake becomes the inbox's first client) unless the rollback flag
+                // `T_HUB_INBOX_WAKE=0` is set, which falls back to the Phase-1
+                // immediate `Completed`-gated wake (the rollback the design names).
+                let wake_durable = std::env::var("T_HUB_INBOX_WAKE")
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true);
+                if wake_durable {
+                    notifier = notifier.with_inbox(inbox.clone());
+                }
+                let notifier = std::sync::Arc::new(notifier);
                 // Install as the AgentBridge status observer. The Arc is kept alive
                 // by the observer closure the bridge holds for the app's lifetime.
                 let observer: agent::StatusObserver =
@@ -593,6 +618,8 @@ pub fn run() {
                 tab_registry,
                 captains_registry,
                 fleet_watches,
+                identity_store,
+                inbox,
             ) {
                 control_client::install(app.handle(), &handshake);
             }

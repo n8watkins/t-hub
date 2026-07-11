@@ -1508,6 +1508,17 @@ pub struct ControlContext {
     /// Shared `Arc` so the `rebind_control` handler (on any connection thread) drives
     /// the same rate-limit + retires the same live listener. See [`RebindController`].
     rebind: Arc<RebindController>,
+    /// Comms-plane Phase 2: the per-session identity store (mint/bind/resolve). Shared
+    /// `Arc` so the spawn path mints+binds and the enqueue/ack path resolves against
+    /// one store. Persistent across restarts (`identities.json`); an ephemeral
+    /// in-memory one in headless tests.
+    identity: Arc<crate::identity::IdentityStore>,
+    /// Comms-plane Phase 2: the durable inbox (per-recipient segmented store + seq +
+    /// receipt state machine). Shared `Arc` so the fleet notifier (first client)
+    /// enqueues/drains and the `inbox_ack`/`inbox_status` handlers reach the same
+    /// queues. Persistent (`~/.t-hub/inbox/`); an ephemeral in-memory one in headless
+    /// tests.
+    inbox: Arc<crate::inbox::Inbox>,
 }
 
 impl ControlContext {
@@ -2726,6 +2737,38 @@ fn elevation_env(ctx: &ControlContext, args: &Value) -> Vec<(String, String)> {
         ("T_HUB_CONTROL_ADDR".to_string(), ctx.addr.clone()),
         ("T_HUB_CONTROL_TOKEN".to_string(), token),
     ]
+}
+
+/// Comms-plane Phase 2 (§2.3, D9): build the spawn env AND mint the session's
+/// per-session identity, injecting the per-session token (`T_HUB_SESSION_TOKEN`)
+/// ALONGSIDE the tier token that [`elevation_env`] already sets. Returns the env plus
+/// the minted identity so the caller binds it to the tile id once the spawn returns
+/// (the tile id is only known after `spawn_tmux_terminal`). When no capability env is
+/// injected (headless / addr unknown) no identity is minted and the session behaves
+/// exactly as before - the identity slice is additive.
+///
+/// Role at mint is best-effort `Crew`: `spawn_terminal` / `create_worktree` are the
+/// crew-spawn paths (a captain is created via `claim_captain`, not here). Durable
+/// role-PINNING / role-uniqueness need item 2's ship/role re-key (R-H2), flagged in
+/// the identity module; this records "which session, in what coarse role" - enough
+/// for the plane to stamp per-session attribution, and the substrate Phase 3's ACL
+/// builds on.
+fn spawn_env_with_identity(
+    ctx: &ControlContext,
+    args: &Value,
+) -> (Vec<(String, String)>, Option<crate::identity::SessionIdentity>) {
+    let mut env = elevation_env(ctx, args);
+    if env.is_empty() {
+        // No addr => headless; do not mint (there is no channel for the session to
+        // present its token over anyway).
+        return (env, None);
+    }
+    let identity = ctx.identity.mint(crate::identity::Role::Crew);
+    env.push((
+        crate::identity::SESSION_TOKEN_ENV.to_string(),
+        identity.secret.clone(),
+    ));
+    (env, Some(identity))
 }
 
 /// The authoritative count of live `th_*` tmux sessions, reconciled from the tmux
@@ -4001,10 +4044,14 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     let mut tab_id = tab_id;
     if has_ui {
         // Phase 2b: elevate the worktree's terminal the same way spawn_terminal does
-        // (control token by default; `capability: "read"` downgrades it).
-        let elevation = elevation_env(ctx, args);
+        // (control token by default; `capability: "read"` downgrades it). Comms-plane
+        // Phase 2 (§2.3): mint + inject its per-session identity token too.
+        let (elevation, minted_identity) = spawn_env_with_identity(ctx, args);
         match spawn_tmux_terminal(&worktree_path, None, &elevation) {
             Ok((id, _)) => {
+                if let Some(identity) = &minted_identity {
+                    ctx.identity.bind_tile(&identity.id, &id);
+                }
                 // Atomic placement with fallback: if the named tab was closed in
                 // the race window between resolution and placement, the tile
                 // lands in the active (else first) tab - never orphaned outside
@@ -4712,9 +4759,15 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
     // Phase 2b: grant this session its capability token via env (control by default,
     // read_token when `capability: "read"`), so its in-session MCP authenticates as
-    // the granted capability.
-    let elevation = elevation_env(ctx, args);
+    // the granted capability. Comms-plane Phase 2 (§2.3): also mint + inject this
+    // session's per-session identity token alongside the tier token.
+    let (elevation, minted_identity) = spawn_env_with_identity(ctx, args);
     let (id, tmux_session) = spawn_tmux_terminal(&cwd_effective, pane.as_deref(), &elevation)?;
+    // Bind the minted identity to the tile id now it is known (the tile is a mutable
+    // pointer; the durable key is the minted identity id - item-2 re-key flagged).
+    if let Some(identity) = &minted_identity {
+        ctx.identity.bind_tile(&identity.id, &id);
+    }
 
     // Atomic placement with fallback: if the resolved tab was closed in the race
     // window between spawn and placement, the tile lands in the active (else
@@ -5138,6 +5191,8 @@ impl ControlContext {
             audit: Arc::new(AuditLog::from_env()),
             requests: Arc::new(RequestCache::new()),
             rebind: Arc::new(RebindController::new(REBIND_MIN_INTERVAL)),
+            identity: Arc::new(crate::identity::IdentityStore::ephemeral()),
+            inbox: Arc::new(crate::inbox::Inbox::ephemeral()),
         }
     }
 
@@ -5195,6 +5250,24 @@ impl ControlContext {
     /// headless tests keep the in-memory one from [`new`](Self::new).
     pub fn with_fleet_watches(mut self, watches: Arc<crate::fleet::FleetWatchRegistry>) -> Self {
         self.fleet_watches = watches;
+        self
+    }
+
+    /// Attach the persistent per-session [`crate::identity::IdentityStore`]
+    /// (comms-plane Phase 2). `lib.rs` builds it with `IdentityStore::load` over
+    /// `identities.json` so bindings survive restarts and shares the same `Arc`;
+    /// headless tests keep the ephemeral one from [`new`](Self::new).
+    pub fn with_identity_store(mut self, identity: Arc<crate::identity::IdentityStore>) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// Attach the durable [`crate::inbox::Inbox`] (comms-plane Phase 2). `lib.rs`
+    /// builds it with `Inbox::open` over `~/.t-hub/inbox/` and shares the same `Arc`
+    /// with the fleet notifier (the inbox's first client); headless tests keep the
+    /// ephemeral one from [`new`](Self::new).
+    pub fn with_inbox(mut self, inbox: Arc<crate::inbox::Inbox>) -> Self {
+        self.inbox = inbox;
         self
     }
 
@@ -8491,6 +8564,39 @@ mod tests {
         // No bound addr (headless): nothing injected, so spawns behave as before.
         ctx.addr = String::new();
         assert!(elevation_env(&ctx, &json!({"capability": "read"})).is_empty());
+    }
+
+    #[test]
+    fn spawn_env_mints_and_injects_a_per_session_identity_token() {
+        let mut ctx = test_ctx("t");
+        ctx.addr = "127.0.0.1:4242".to_string();
+        let (env, minted) = spawn_env_with_identity(&ctx, &json!({}));
+        // The tier token is still injected (Phase-1 behavior preserved) ...
+        assert!(env.iter().any(|(k, v)| k == "T_HUB_CONTROL_TOKEN" && v == "t"));
+        // ... PLUS a per-session token alongside it (comms-plane Phase 2).
+        let session_token = env
+            .iter()
+            .find(|(k, _)| k == crate::identity::SESSION_TOKEN_ENV)
+            .map(|(_, v)| v.clone())
+            .expect("spawn env injects the per-session token");
+        let identity = minted.expect("an identity is minted when addr is set");
+        // The injected token resolves back to exactly this session's identity - the
+        // per-session attribution the plane stamps enqueues with.
+        let resolved = ctx
+            .identity
+            .resolve(&session_token)
+            .expect("the injected per-session token resolves");
+        assert_eq!(resolved.id, identity.id);
+        assert_eq!(resolved.role, crate::identity::Role::Crew);
+        // The per-session token is NOT the shared control token (that is the whole
+        // point - it is per-session, unforgeable across sessions).
+        assert_ne!(session_token, ctx.token);
+
+        // Headless (no addr): no identity minted, env empty, spawns behave as before.
+        ctx.addr = String::new();
+        let (env2, minted2) = spawn_env_with_identity(&ctx, &json!({}));
+        assert!(env2.is_empty());
+        assert!(minted2.is_none());
     }
 
     // -----------------------------------------------------------------------
