@@ -30,15 +30,24 @@ import {
   __resetCaptainsReconcileForTest,
   __setCaptainsBootstrappingForTest,
 } from "./controlBridge";
-import { useCaptain, type CaptainClaimRecord } from "../store/captain";
+import { useCaptain } from "../store/captain";
 import { useWorkspace } from "../store/workspace";
 
+// A raw wire captain (as `sync_captains` sends it). Typed loosely because the
+// adapter takes `unknown` and must tolerate BOTH schema versions; the helper emits
+// the modern shape (terminalId + CrewRef crew), and a dedicated test below feeds the
+// LEGACY shape to prove the mixed-window back-compat.
 function claim(
   id: string,
   workspaceTabIds: string[] = [],
   crew: string[] = [],
-): CaptainClaimRecord {
-  return { captainSessionId: id, shipSlug: `ship-${id}`, workspaceTabIds, crew };
+): Record<string, unknown> {
+  return {
+    terminalId: id,
+    shipSlug: `ship-${id}`,
+    workspaceTabIds,
+    crew: crew.map((c) => ({ terminalId: c })),
+  };
 }
 
 function seedCaptains(ids: string[]): void {
@@ -92,6 +101,24 @@ describe("adoptCaptainsSnapshot seq guard", () => {
     );
     expect(useCaptain.getState().captainIds).toEqual(before);
     expect(useCaptain.getState().claims["capA"].workspaceTabIds).toEqual(["t1"]);
+  });
+
+  it("adopts the LEGACY v0 wire shape (captainSessionId + string crew) - mixed window", () => {
+    // Item-2 re-key back-compat: a pre-item-2 server (or an on-disk v0 record read
+    // through) sends `captainSessionId` + `crew: [string]`. The adapter must still
+    // adopt it - keyed by terminal, crew upgraded to CrewRef - so a mixed
+    // client/server window never drops a live pin. A bypass (requiring the new
+    // field) would silently lose the captain here.
+    expect(
+      adoptCaptainsSnapshot({
+        seq: 9,
+        captains: [
+          { captainSessionId: "capLegacy", shipSlug: "old", workspaceTabIds: ["t1"], crew: ["c1"] },
+        ],
+      }),
+    ).toBe(true);
+    expect(useCaptain.getState().captainIds).toEqual(["capLegacy"]);
+    expect(useCaptain.getState().claims["capLegacy"].crew).toEqual([{ terminalId: "c1" }]);
   });
 
   it("ignores a malformed snapshot (missing seq / non-array captains)", () => {

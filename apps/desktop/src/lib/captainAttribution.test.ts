@@ -69,7 +69,7 @@ describe("captainAttribution", () => {
       claims: {
         cap00002: {
           shipSlug: "bravo-ship",
-          captainSessionId: "cap00002",
+          terminalId: "cap00002",
           workspaceTabIds: [],
           crew: [],
         },

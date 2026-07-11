@@ -24,7 +24,7 @@
 // reporting its scoped tab list would corrupt the main window's layout/registry.
 import { listen } from "@tauri-apps/api/event";
 import { isSatelliteWindow, useWorkspace } from "../store/workspace";
-import { useCaptain, type CaptainClaimRecord } from "../store/captain";
+import { useCaptain, type CaptainClaimRecord, type CrewRef } from "../store/captain";
 import { controlRequest } from "./controlClient";
 import type { TabReport, TabReportResult } from "./types";
 
@@ -100,17 +100,37 @@ export function adoptCaptainsSnapshot(sync: unknown): boolean {
   lastCaptainsSeq = seq;
   const records: CaptainClaimRecord[] = [];
   for (const c of captains) {
-    const r = c as Partial<CaptainClaimRecord> | null;
-    if (!r || typeof r.captainSessionId !== "string" || !r.captainSessionId) continue;
+    const r = c as (Partial<CaptainClaimRecord> & { captainSessionId?: unknown }) | null;
+    if (!r) continue;
+    // Item-2 re-key: the terminal pointer is `terminalId` (was `captainSessionId`);
+    // accept the legacy field too for a mixed on-disk/wire window. A claim with NO
+    // live terminal (orphaned/vacant) has no pin to render, so it is skipped here -
+    // the store keys by terminal, and the server retains the record for re-adoption.
+    const terminalId =
+      typeof r.terminalId === "string" && r.terminalId
+        ? r.terminalId
+        : typeof r.captainSessionId === "string" && r.captainSessionId
+          ? r.captainSessionId
+          : undefined;
+    if (terminalId === undefined) continue;
+    // Crew deserializes from BOTH the legacy `string[]` and the modern `CrewRef[]`.
+    const crew = Array.isArray(r.crew)
+      ? r.crew.flatMap((t): CrewRef[] => {
+          if (typeof t === "string") return [{ terminalId: t }];
+          if (t && typeof t === "object" && typeof (t as CrewRef).terminalId === "string") {
+            return [t as CrewRef];
+          }
+          return [];
+        })
+      : [];
     records.push({
-      captainSessionId: r.captainSessionId,
+      terminalId,
       shipSlug: typeof r.shipSlug === "string" ? r.shipSlug : "",
+      role: r.role === "cortana" ? "cortana" : "captain",
       workspaceTabIds: Array.isArray(r.workspaceTabIds)
         ? r.workspaceTabIds.filter((t): t is string => typeof t === "string")
         : [],
-      crew: Array.isArray(r.crew)
-        ? r.crew.filter((t): t is string => typeof t === "string")
-        : [],
+      crew,
     });
   }
   useCaptain.getState().adoptCaptainsRegistry(records);
@@ -362,7 +382,9 @@ export async function bootstrapCaptains(): Promise<void> {
       captains?: CaptainClaimRecord[];
     };
     const server = new Set(
-      (res.captains ?? []).map((c) => c.captainSessionId),
+      (res.captains ?? [])
+        .map((c) => c.terminalId ?? (c as { captainSessionId?: string }).captainSessionId)
+        .filter((id): id is string => typeof id === "string"),
     );
     const ws = useWorkspace.getState();
     const missing = useCaptain

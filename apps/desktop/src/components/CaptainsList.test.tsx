@@ -37,7 +37,12 @@ function claim(
   workspaceTabIds: string[],
   crew: string[],
 ): CaptainClaimRecord {
-  return { captainSessionId: id, shipSlug: `ship-${id}`, workspaceTabIds, crew };
+  return {
+    terminalId: id,
+    shipSlug: `ship-${id}`,
+    workspaceTabIds,
+    crew: crew.map((c) => ({ terminalId: c })),
+  };
 }
 
 /** Two pinned captains: cap00001 (MRU front / active, with a bound session and
