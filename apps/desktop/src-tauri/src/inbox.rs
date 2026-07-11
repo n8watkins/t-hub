@@ -24,13 +24,22 @@
 //! - It is NOT the voice/visual decision surface and adds no marked lane - Phase 4.
 //!
 //! Effectively-once, precisely (M2): a record is written to a PTY AT-MOST-ONCE
-//! relative to its durable `delivered` marker - once `state == Delivered` it is
-//! never re-picked. The only re-write is a record still `Enqueued` because the write
-//! FAILED or the app crashed after the write but before the `delivered` marker
-//! persisted (the narrow at-least-once seam the design chooses over silent loss:
-//! §2.2 "At-least-once-write + at-most-once-delivered is chosen over at-most-once
-//! because silent loss is the cardinal sin"). Dedup lives in this trusted app, not
-//! on the untrusted recipient.
+//! relative to its own durable `Delivered` state - once `state == Delivered` it is
+//! never re-picked (the re-pick guard is the per-record state itself, checked in
+//! `head_enqueued`; `last_drained_seq` is observability, not a correctness guard).
+//! The only re-write is a record still `Enqueued` because the write FAILED or the app
+//! crashed after the write but before the `Delivered` state persisted (the narrow
+//! at-least-once seam the design chooses over silent loss: §2.2 "At-least-once-write
+//! + at-most-once-delivered is chosen over at-most-once because silent loss is the
+//! cardinal sin"). Dedup lives in this trusted app, not on the untrusted recipient.
+//!
+//! DURABILITY IS PROCESS-CRASH-DURABLE, not power-loss-durable (review L1). Segments
+//! are published with temp-write + atomic `rename` but WITHOUT an `fsync` of the file
+//! or its directory - matching the established crate discipline (`write_handshake`,
+//! the captains registry persist, `voice.rs`). For the dominant crash model (app
+//! restart / process death) the page cache survives and an ACK'd message is never
+//! lost. A power-loss / kernel-panic in the write window is an undisclosed-elsewhere
+//! gap that closing would need fsync (a crate-wide change, deliberately not made here).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -576,6 +585,10 @@ fn depth_of(q: &RecipientQueue) -> QueueDepth {
 /// touches `Enqueued`/`Delivered` records. Keeps the newest `audit_tail` processed
 /// (by seq) for observability.
 fn compact(q: &mut RecipientQueue, audit_tail: usize) {
+    // Defense in depth vs review L4: even if a caller hands `audit_tail == 0`
+    // (env is already clamped in `env_audit_tail`), never index out of bounds -
+    // treat 0 as "retain 1" so the cutoff arithmetic below is always valid.
+    let audit_tail = audit_tail.max(1);
     let processed: Vec<u64> = q
         .records
         .iter()
@@ -603,10 +616,14 @@ fn env_max_depth() -> usize {
 }
 
 fn env_audit_tail() -> usize {
+    // Clamp to >= 1 (review L4): a `0` would make `compact()` index `keep[len]` out of
+    // bounds and panic under the queue lock. There must always be room for at least
+    // one retained processed record.
     std::env::var("T_HUB_INBOX_AUDIT_TAIL")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_AUDIT_TAIL)
+        .max(1)
 }
 
 /// Default inbox directory, mirroring `captains_path`'s HOME resolution. Override
@@ -906,6 +923,32 @@ mod tests {
             inbox.ack("t1", seq);
         }
         assert_eq!(inbox.depth("t1").processed, 2, "audit tail bounds processed retention");
+    }
+
+    #[test]
+    fn compact_with_zero_audit_tail_does_not_panic() {
+        // Review L4: a 0 audit tail must not panic `compact()` (out-of-bounds index)
+        // under the queue lock. The guard treats 0 as "retain >= 1".
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-inbox-l4-{}-{}",
+            std::process::id(),
+            TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inbox = Inbox { dir: Some(dir), queues: Mutex::new(HashMap::new()), max_depth: 256, audit_tail: 0, telemetry: None };
+        for _ in 0..3 {
+            inbox.enqueue("t1", "s", Priority::Standard, "x", true).unwrap();
+        }
+        let sink = std::sync::Mutex::new(Vec::new());
+        for _ in 0..3 {
+            inbox.drain_one("t1", ok_writer(&sink));
+        }
+        // Acking triggers compact with audit_tail 0 - must not panic; at least one
+        // processed record is retained.
+        for seq in 0..3 {
+            inbox.ack("t1", seq);
+        }
+        assert!(inbox.depth("t1").processed >= 1, "compact retains >= 1 despite a 0 tail");
     }
 
     #[test]

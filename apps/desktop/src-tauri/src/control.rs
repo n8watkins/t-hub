@@ -2636,7 +2636,13 @@ fn required_tier(command: &str) -> CommandTier {
         "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
         | "archive_recent_project" | "claim_captain" | "release_captain" | "watch_fleet"
-        | "unwatch_fleet" | "rebind_control" => CommandTier::Organization,
+        | "unwatch_fleet" | "rebind_control"
+        // Comms-plane Phase 2 (review H1): `inbox_ack` MUTATES durable receipt state
+        // (Delivered -> Processed) and force-compacts records, so it must NOT fall
+        // through to the read tier - it needs the control capability AND the audit a
+        // mutating, non-spawn command gets (like `create_worktree`). `inbox_status`
+        // stays Read (genuinely counts-only).
+        | "inbox_ack" => CommandTier::Organization,
         _ => CommandTier::Read,
     }
 }
@@ -4114,6 +4120,11 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
                 terminal_id = Some(id);
             }
             Err(e) => {
+                // Review L2: retire the just-minted identity so a failed worktree
+                // spawn does not leave an orphaned, secret-bearing entry.
+                if let Some(identity) = &minted_identity {
+                    ctx.identity.retire(&identity.id);
+                }
                 eprintln!("t-hub-control: create_worktree: worktree terminal spawn failed: {e}")
             }
         }
@@ -4814,7 +4825,19 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // the granted capability. Comms-plane Phase 2 (§2.3): also mint + inject this
     // session's per-session identity token alongside the tier token.
     let (elevation, minted_identity) = spawn_env_with_identity(ctx, args);
-    let (id, tmux_session) = spawn_tmux_terminal(&cwd_effective, pane.as_deref(), &elevation)?;
+    let (id, tmux_session) = match spawn_tmux_terminal(&cwd_effective, pane.as_deref(), &elevation)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // Review L2: the mint persisted before this point, so a failed spawn would
+            // leave an orphaned, secret-bearing identity for a session that never
+            // existed. Retire it on the error leg.
+            if let Some(identity) = &minted_identity {
+                ctx.identity.retire(&identity.id);
+            }
+            return Err(e);
+        }
+    };
     // Bind the minted identity to the tile id now it is known (the tile is a mutable
     // pointer; the durable key is the minted identity id - item-2 re-key flagged).
     if let Some(identity) = &minted_identity {
@@ -5070,6 +5093,10 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     if ctx.captains.remove_session(tile_id) {
         let _ = captains_sync_apply(ctx);
     }
+    // Comms-plane Phase 2 (review M3): a dead session's per-session identity is
+    // retired too, so its secret stops resolving and the identity store does not
+    // accrete dead sessions (it is bounded to live + not-yet-closed sessions).
+    ctx.identity.retire_tile(tile_id);
     Ok(json!({
         "accepted": "close_terminal",
         "sessionId": session_id,
@@ -8298,6 +8325,12 @@ mod tests {
         assert_eq!(required_tier("remove_worktree"), CommandTier::Organization);
         assert_eq!(required_tier("list_terminals"), CommandTier::Read);
         assert_eq!(required_tier("get_status"), CommandTier::Read);
+        // Comms-plane Phase 2 (review H1): `inbox_ack` mutates + compacts durable
+        // receipt state, so it must require the control token (Organization) and be
+        // audited - NOT fall through to the read tier. `inbox_status` is counts-only
+        // and stays Read.
+        assert_eq!(required_tier("inbox_ack"), CommandTier::Organization);
+        assert_eq!(required_tier("inbox_status"), CommandTier::Read);
     }
 
     #[test]

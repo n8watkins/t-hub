@@ -223,6 +223,39 @@ impl IdentityStore {
         self.persist(&snap);
     }
 
+    /// Retire (forget) an identity by its minted id, dropping its persisted secret.
+    /// Used to clean up an orphan from a FAILED spawn (the mint persisted before the
+    /// spawn's `?` returned - review L2) and, via [`retire_tile`](Self::retire_tile),
+    /// when a session closes (review M3 - bound the secret-bearing store to live +
+    /// not-yet-closed sessions rather than letting it grow forever). A no-op for an
+    /// unknown id. After this, the retired secret no longer `resolve`s.
+    pub fn retire(&self, id: &str) -> bool {
+        let mut snap = self.lock();
+        let removed = snap.identities.remove(id).is_some();
+        if removed {
+            self.persist(&snap);
+        }
+        removed
+    }
+
+    /// Retire the identity bound to a tile id (the session-close GC hook, M3). Removes
+    /// the identity whose `session_tile` matches, so a dead session's secret stops
+    /// resolving and the store does not accrete dead sessions. A no-op if no identity
+    /// is bound to that tile.
+    pub fn retire_tile(&self, tile: &str) -> bool {
+        let id = {
+            let snap = self.lock();
+            snap.identities
+                .values()
+                .find(|i| i.session_tile.as_deref() == Some(tile))
+                .map(|i| i.id.clone())
+        };
+        match id {
+            Some(id) => self.retire(&id),
+            None => false,
+        }
+    }
+
     /// Resolve a presented per-session token to its identity, constant-time. `None`
     /// for an empty or unknown token. This is IDENTIFICATION, never authorization.
     pub fn resolve(&self, presented: &str) -> Option<SessionIdentity> {
@@ -398,5 +431,34 @@ mod tests {
     fn missing_file_starts_empty() {
         let store = IdentityStore::load(temp_path());
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn retire_drops_the_identity_and_stops_resolving() {
+        // Review L2/M3: a retired identity is forgotten - its secret no longer
+        // resolves and the store shrinks (no unbounded secret-bearing growth).
+        let store = IdentityStore::ephemeral();
+        let a = store.mint(Role::Crew);
+        let b = store.mint(Role::Crew);
+        assert!(store.resolve(&a.secret).is_some());
+        assert!(store.retire(&a.id), "retire reports it removed something");
+        assert!(store.resolve(&a.secret).is_none(), "retired secret no longer resolves");
+        assert_eq!(store.len(), 1, "only the retired identity is gone");
+        assert!(store.resolve(&b.secret).is_some(), "the other identity is untouched");
+        // Retiring an unknown id is a no-op.
+        assert!(!store.retire("no-such-id"));
+    }
+
+    #[test]
+    fn retire_tile_removes_the_identity_bound_to_a_closed_session() {
+        // Review M3: the session-close GC hook retires by tile binding.
+        let store = IdentityStore::ephemeral();
+        let a = store.mint(Role::Crew);
+        store.bind_tile(&a.id, "deadtile");
+        assert!(store.retire_tile("deadtile"));
+        assert!(store.resolve(&a.secret).is_none());
+        assert!(store.is_empty());
+        // No binding for that tile => no-op.
+        assert!(!store.retire_tile("never-bound"));
     }
 }

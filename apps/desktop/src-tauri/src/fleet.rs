@@ -401,7 +401,17 @@ impl FleetNotifier {
         // (2) Drain one record at this boundary. The write goes through the SAME
         // injector (plane-attributed `FleetWake` tmux write) as the legacy path.
         let outcome = inbox.drain_one(orch, |rec| (self.inject)(orch, &rec.body));
-        if let crate::inbox::DrainOutcome::Delivered { .. } = outcome {
+        if let crate::inbox::DrainOutcome::Delivered { seq } = outcome {
+            // Auto-retire the wake on delivery (review M1). A fleet wake is
+            // fire-to-pane: delivery to the orchestrator's PTY IS terminal for it -
+            // there is no separate agent intake-confirmation producer for a wake. If
+            // it stayed `Delivered`-forever, wakes would accrete toward the overflow
+            // bound and eventually silently gate Standard wakes (a slow-burn wedge of
+            // the core wake path). Acking here keeps the 3-state receipt machine
+            // honest (a real `Delivered -> Processed` transition, telemetry'd + then
+            // compacted) - real session-to-session traffic later acks via `inbox_ack`;
+            // the wake acks its own.
+            inbox.ack(orch, seq);
             st.suppressed.insert(orch.to_string());
         }
         // WriteFailed / Empty / Busy: do not suppress - the next `Completed` edge
@@ -765,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_wake_enqueues_and_drains_through_the_inbox() {
+    fn durable_wake_enqueues_drains_and_auto_retires_through_the_inbox() {
         let (n, rec, w, _c, inbox) = harness_durable();
         w.arm("orcbbbbb", WatchScope::Captains, vec![]);
         n.on_status("u-orc", SessionStatus::Completed);
@@ -774,14 +784,39 @@ mod tests {
         let calls = rec.calls();
         assert_eq!(calls.len(), 1, "exactly one durable wake delivered");
         assert_eq!(calls[0].0, "orcbbbbb");
-        // ... and the inbox records it delivered, not still-enqueued: durable receipt.
+        // ... and the wake AUTO-RETIRES on delivery (M1): it does not linger as a
+        // `Delivered`-forever record - it is acked to `Processed` so it cannot accrete
+        // toward the overflow bound. Nothing is left enqueued or delivered.
         let d = inbox.depth("orcbbbbb");
-        assert_eq!((d.enqueued, d.delivered), (0, 1), "the record reached `delivered`");
-        // The recipient can confirm intake (the `delivered -> processed` ack channel).
+        assert_eq!((d.enqueued, d.delivered), (0, 0), "the wake is retired, not lingering");
+        assert_eq!(d.processed, 1, "delivery is terminal for a fire-to-pane wake");
+        // Re-acking is a benign no-op (already processed).
         assert_eq!(
             inbox.ack("orcbbbbb", 0),
-            crate::inbox::AckOutcome::Processed { seq: 0 }
+            crate::inbox::AckOutcome::AlreadyProcessed { seq: 0 }
         );
+    }
+
+    #[test]
+    fn durable_wakes_do_not_accrete_toward_the_overflow_bound() {
+        // M1 regression: many wake cycles must NOT accumulate open (Enqueued+Delivered)
+        // records - a wake that stayed Delivered-forever would eventually gate Standard
+        // wakes at the overflow bound. With auto-retire, open_records stays ~0.
+        let (n, rec, w, _c, inbox) = harness_durable();
+        w.arm("orcbbbbb", WatchScope::Captains, vec![]);
+        for _ in 0..300 {
+            // Each cycle: captain finishes, orchestrator idles -> one wake delivered.
+            n.on_status("u-cap", SessionStatus::Working);
+            n.on_status("u-cap", SessionStatus::Completed);
+            n.on_status("u-orc", SessionStatus::Working);
+            n.on_status("u-orc", SessionStatus::Completed);
+        }
+        // 300 cycles >> the 256 default overflow bound; if wakes accreted this would
+        // have started refusing Standard enqueues. Instead every wake landed.
+        assert_eq!(rec.calls().len(), 300, "every wake across 300 cycles landed");
+        let d = inbox.depth("orcbbbbb");
+        assert_eq!(d.enqueued, 0);
+        assert_eq!(d.delivered, 0, "no Delivered record lingers to accrete");
     }
 
     #[test]
@@ -802,7 +837,9 @@ mod tests {
         n.on_status("u-orc", SessionStatus::Completed);
         let calls = rec.calls();
         assert_eq!(calls.len(), 1, "redelivered exactly once on the next edge");
-        assert_eq!(inbox.depth("orcbbbbb").delivered, 1);
+        // The redelivered wake lands and auto-retires (M1) - nothing lingers.
+        let d = inbox.depth("orcbbbbb");
+        assert_eq!((d.enqueued, d.delivered), (0, 0), "delivered wake auto-retires");
     }
 
     #[test]
@@ -830,6 +867,59 @@ mod tests {
             reopened.depth("orcbbbbb").enqueued,
             1,
             "the durable wake replays from disk after a restart"
+        );
+    }
+
+    // Review M2: the invariants production actually relies on (coalescing,
+    // one-wake-per-idle-window, no-self-wake) are proven above only on the LEGACY
+    // fallback path. These durable-path TWINS pin the SAME invariants on the path that
+    // ships (default `wake_durable = true`), so a durable-path regression fails here.
+
+    #[test]
+    fn durable_coalesces_multiple_captains_into_one_wake() {
+        let (n, rec, w, c, _inbox) = harness_durable();
+        c.claim("capccccc", Some("ship-gamma"), vec![]).unwrap();
+        n.status_bridge_ingest("u-cap2", "th_capccccc");
+        w.arm("orcbbbbb", WatchScope::Captains, vec![]);
+        // Orchestrator BUSY while two captains transition -> nothing yet.
+        n.on_status("u-orc", SessionStatus::Working);
+        n.on_status("u-cap", SessionStatus::NeedsQuestion);
+        n.on_status("u-cap2", SessionStatus::Completed);
+        assert!(rec.calls().is_empty(), "no wake while the orchestrator is busy");
+        // Orchestrator idles -> ONE coalesced durable wake naming BOTH captains.
+        n.on_status("u-orc", SessionStatus::Completed);
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 1, "coalesced into a single durable wake");
+        assert!(calls[0].1.contains("capaaaaa"), "names captain 1");
+        assert!(calls[0].1.contains("capccccc"), "names captain 2");
+        assert!(calls[0].1.contains("2 supervised"), "coalesced header");
+    }
+
+    #[test]
+    fn durable_only_one_wake_per_idle_window() {
+        let (n, rec, w, _c, _inbox) = harness_durable();
+        w.arm("orcbbbbb", WatchScope::Captains, vec![]);
+        n.on_status("u-orc", SessionStatus::Completed);
+        // First captain transition -> one wake, orchestrator now suppressed.
+        n.on_status("u-cap", SessionStatus::NeedsQuestion);
+        // A second transition BEFORE the orchestrator idles again must NOT re-inject.
+        n.on_status("u-cap", SessionStatus::Completed);
+        assert_eq!(rec.calls().len(), 1, "no double-inject within one idle window");
+        // Next idle edge flushes the held state as one more wake.
+        n.on_status("u-orc", SessionStatus::Working);
+        n.on_status("u-orc", SessionStatus::Completed);
+        assert_eq!(rec.calls().len(), 2, "the next idle edge flushes the held state");
+    }
+
+    #[test]
+    fn durable_does_not_wake_on_the_orchestrators_own_transition() {
+        let (n, rec, w, _c, _inbox) = harness_durable();
+        // Scope All would otherwise match the orchestrator itself.
+        w.arm("orcbbbbb", WatchScope::All, vec![]);
+        n.on_status("u-orc", SessionStatus::Completed);
+        assert!(
+            rec.calls().is_empty(),
+            "an orchestrator must never wake itself (durable path)"
         );
     }
 }
