@@ -416,15 +416,67 @@ pub fn target_for_id(id: &str) -> String {
     }
 }
 
-/// Returns true if a session named `name` exists on the `t-hub` socket.
+/// The outcome of a session-liveness probe, distinguishing a DEFINITIVE answer
+/// (the `has-session` subprocess ran and reported) from an INDETERMINATE one (the
+/// probe timed out or the subprocess failed to spawn).
 ///
-/// `has-session` exits 0 when the session exists and non-zero otherwise
-/// (including when no server is running at all), so the exit status is the
-/// single source of truth — no stderr parsing required.
+/// Collapsing `Unknown` into `Gone` is the conflation behind the 0.3.62 spawn
+/// wedge: under a degraded subprocess-spawn path a bounded `has-session` probe
+/// TIMES OUT, and a LIVE session then read as absent — so `send_text`/`close`
+/// reported "no such session" and the captain-transfer/prune paths could seize or
+/// retire a live ship. Callers that must not act on an ambiguous probe match on
+/// `Unknown` explicitly (or go through [`is_definitively_gone`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLiveness {
+    /// `has-session` exited 0 — the session exists on the `t-hub` socket.
+    Alive,
+    /// `has-session` ran and exited non-zero — no such session (or no server
+    /// running). A DEFINITIVE negative: the probe completed and reported absence.
+    Gone,
+    /// The probe did NOT complete: it exceeded [`tmux_cmd_timeout`] or the
+    /// subprocess failed to spawn. Liveness is INDETERMINATE — never treat as
+    /// `Gone`. This is the residual-wedge signal a healthy control plane never
+    /// emits.
+    Unknown,
+}
+
+/// Probe whether `name` exists on the `t-hub` socket, DISTINGUISHING a definitive
+/// answer from an indeterminate one (see [`SessionLiveness`]).
+///
+/// `has-session` exits 0 when the session exists and non-zero otherwise (including
+/// when no server is running at all), so a COMPLETED run maps cleanly to
+/// `Alive`/`Gone` with no stderr parsing. A timeout or spawn failure is `Unknown`
+/// — the whole point of the three-state split: a stalled control plane must never
+/// make a live session read as gone.
+pub fn session_liveness(name: &str) -> SessionLiveness {
+    match output_with_timeout(tmux(&["has-session", "-t", name]), tmux_cmd_timeout()) {
+        Ok(o) if o.status.success() => SessionLiveness::Alive,
+        Ok(_) => SessionLiveness::Gone,
+        Err(_) => SessionLiveness::Unknown,
+    }
+}
+
+/// The transfer-grade / reap-grade death signal (R1): `true` ONLY when a probe
+/// DEFINITIVELY reported the session absent. `Alive` (obviously) and `Unknown` (a
+/// timed-out/failed probe) are BOTH not-gone, so a degraded control plane can
+/// never seize a live captain's ship, retire a live identity, or emit a spurious
+/// EXIT. This encodes the item-2 two-tier liveness invariant: ambiguous is never
+/// seized.
+pub fn is_definitively_gone(liveness: SessionLiveness) -> bool {
+    matches!(liveness, SessionLiveness::Gone)
+}
+
+/// Convenience boolean over [`session_liveness`]: `true` IFF the session is
+/// definitively `Alive`.
+///
+/// An `Unknown` (timed-out / failed) probe maps to `false`, so this is ONLY safe
+/// for callers whose "not alive" branch is itself the safe action for an
+/// indeterminate probe — a post-spawn verify that reaps + fails-retryable, or a
+/// test. Callers that must not conflate `Unknown` with `Gone` (the send/close/
+/// attach gates, the captain-transfer signal, the identity prune, the stream-end
+/// EXIT decision) call [`session_liveness`] / [`is_definitively_gone`] directly.
 pub fn has_session(name: &str) -> bool {
-    output_with_timeout(tmux(&["has-session", "-t", name]), tmux_cmd_timeout())
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    matches!(session_liveness(name), SessionLiveness::Alive)
 }
 
 /// Kill the tmux session named `name` via plain `kill-session` (SIGHUP).
@@ -985,5 +1037,60 @@ mod tests {
         }
         // Whether or not a server is running, this must not error.
         let _ = list_sessions().expect("list_sessions must tolerate no-server");
+    }
+
+    /// De-conflation guard (spawn-wedge): the transfer-/reap-grade death signal is
+    /// TRUE only for a DEFINITIVE `Gone`. `Alive` and `Unknown` (a timed-out /
+    /// failed probe) are BOTH not-gone, so a degraded control plane can never seize
+    /// a live captain's ship, retire a live identity, or emit a spurious EXIT. This
+    /// is pure (no tmux) so it runs everywhere, including Windows CI. Reverting the
+    /// `Unknown => false` arm to the old `unwrap_or(false)` conflation trips it.
+    #[test]
+    fn definitively_gone_is_only_the_completed_absent_probe() {
+        assert!(
+            is_definitively_gone(SessionLiveness::Gone),
+            "a completed absent probe is transfer/reap-grade (R1)"
+        );
+        assert!(
+            !is_definitively_gone(SessionLiveness::Alive),
+            "a live session is never gone"
+        );
+        assert!(
+            !is_definitively_gone(SessionLiveness::Unknown),
+            "an indeterminate (timed-out) probe must NOT read as gone — ambiguous is never seized"
+        );
+    }
+
+    /// A live tmux session probes `Alive`, and a never-created name probes `Gone`
+    /// (a COMPLETED negative, not `Unknown`) — the definitive arms of the split.
+    /// Needs a real tmux (WSL dev shell), skipped on the Windows CI target.
+    #[test]
+    fn session_liveness_reports_alive_and_definitive_gone() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::session_liveness_reports_alive_and_definitive_gone: \
+                 tmux not on PATH — skipping"
+            );
+            return;
+        }
+        let name = unique_name();
+        let _ = kill_session(&name);
+        assert_eq!(
+            session_liveness(&name),
+            SessionLiveness::Gone,
+            "a never-created session is a definitive Gone (probe completed, exited non-zero)"
+        );
+        new_session_with_env(&name, "/tmp", None, &[]).expect("new_session should succeed");
+        assert_eq!(
+            session_liveness(&name),
+            SessionLiveness::Alive,
+            "a created session is Alive"
+        );
+        kill_session(&name).expect("kill_session should succeed");
+        assert_eq!(
+            session_liveness(&name),
+            SessionLiveness::Gone,
+            "a killed session is a definitive Gone"
+        );
     }
 }

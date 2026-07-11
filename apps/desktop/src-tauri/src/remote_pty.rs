@@ -345,21 +345,28 @@ fn emit_batch(app: &AppHandle, id: &str, batch: &mut Vec<u8>) {
 ///
 /// So verify against tmux — the source of truth for liveness — before declaring
 /// death:
-///   - session gone  → the process really ended: emit `EXIT` + `STATE Exited`,
-///     exactly the old behavior;
-///   - session alive → this was only an ATTACH loss: emit `STATE Detached` (no
-///     `EXIT`), which the frontend's auto-reattach picks up. A clean local
-///     `detach()`/`close_terminal` also lands here — `Detached` is the truthful
-///     state for that too (the tile is gone, the event is a harmless no-op).
+///   - session DEFINITIVELY gone → the process really ended: emit `EXIT` + `STATE
+///     Exited`, exactly the old behavior;
+///   - session alive, OR liveness INDETERMINATE → treat as an ATTACH loss: emit
+///     `STATE Detached` (no `EXIT`), which the frontend's auto-reattach picks up. A
+///     clean local `detach()`/`close_terminal` also lands here — `Detached` is the
+///     truthful state for that too (the tile is gone, the event is a harmless no-op).
 ///
-/// The `has_session` probe shells out to tmux; this runs on the (terminating)
-/// reader thread, so the cost is off every hot path. NOTE: the check runs on the
-/// CLIENT host — correct while the control endpoint is loopback (M2a); when M2
-/// points this at a remote host, liveness must be asked of the remote server
-/// instead.
+/// De-conflation (spawn-wedge): a probe that TIMES OUT (`Unknown`) must NOT be read
+/// as death - emitting a spurious `EXIT` would tear a live tile out of the UI on a
+/// transient control-plane stall. Only a DEFINITIVE `Gone` emits `EXIT`; `Unknown`
+/// falls through to `Detached`, which auto-reattach retries (and a real exit is
+/// confirmed by the next probe).
+///
+/// The liveness probe shells out to tmux; this runs on the (terminating) reader
+/// thread, so the cost is off every hot path. NOTE: the check runs on the CLIENT
+/// host — correct while the control endpoint is loopback (M2a); when M2 points this
+/// at a remote host, liveness must be asked of the remote server instead.
 fn emit_stream_end(app: &AppHandle, id: &str, code: Option<i32>) {
-    let alive = crate::tmux::has_session(&crate::tmux::target_for_id(id));
-    if alive {
+    let gone = crate::tmux::is_definitively_gone(crate::tmux::session_liveness(
+        &crate::tmux::target_for_id(id),
+    ));
+    if !gone {
         let _ = app.emit(
             events::STATE,
             &StateEvent {

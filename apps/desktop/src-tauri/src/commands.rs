@@ -414,10 +414,25 @@ pub async fn attach_terminal(
     // has been killed or exited and there is nothing to attach to. (The server-side
     // `serve_pty_attach` re-checks this too, but verifying here lets us return the
     // same clear error before opening a socket.)
-    if !tmux::has_session(&tmux_session) {
-        return Err(format!(
-            "tmux session {tmux_session} for terminal {id} no longer exists"
-        ));
+    //
+    // De-conflation (spawn-wedge): only a DEFINITIVE `Gone` is "no longer exists".
+    // An `Unknown` probe (timed out / failed to spawn) is a degraded control plane,
+    // not a dead session - reporting it as gone is the false negative that made the
+    // webview drop live tiles, so surface a retryable timeout and let the frontend's
+    // auto-reattach keep trying.
+    match tmux::session_liveness(&tmux_session) {
+        tmux::SessionLiveness::Alive => {}
+        tmux::SessionLiveness::Gone => {
+            return Err(format!(
+                "tmux session {tmux_session} for terminal {id} no longer exists"
+            ));
+        }
+        tmux::SessionLiveness::Unknown => {
+            return Err(format!(
+                "tmux session {tmux_session} for terminal {id}: liveness probe timed out; \
+                 NOT confirmed gone — retry"
+            ));
+        }
     }
 
     // If a RemotePty already streams this id (the tile is visible), keep it and
