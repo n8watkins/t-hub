@@ -6133,26 +6133,32 @@ enum ClosePlan {
     /// The probe timed out and `force` was not set: refuse with a RETRYABLE error
     /// (the de-conflation default - a wedge is not a death).
     RetryableTimeout,
-    /// `force` was set but a fresh RE-PROBE showed the session ALIVE: refuse. We
-    /// never force-kill a session a second probe confirms live - the first `Unknown`
-    /// was merely slowness, not death (the conservative-design requirement).
+    /// `force` was set but a fresh RE-PROBE CONFIRMED the session ALIVE: refuse.
+    /// `force` never kills a session a re-probe reports `Alive` - that first
+    /// `Unknown` was merely slowness. (This is the ONLY liveness state that refuses
+    /// force; a re-probe that ALSO times out is `Unknown`, not `Alive`, and is
+    /// force-reaped - see `plan_close`.)
     RefuseForceOnLive,
 }
 
 /// Decide [`close_terminal`]'s action with NO side effects (unit-testable). MED-1
 /// (PR-58 review): `close_terminal` refusing every `Unknown` left a genuinely-dead-
-/// but-unprobeable session unreapable under a wedge. `force:true` adds an escape,
-/// designed conservatively so it NEVER kills a merely-slow-but-live session:
+/// but-unprobeable session unreapable under a wedge. `force:true` adds an escape:
 ///
 /// - `Alive`            → `Kill{existed:true}`   (normal close of a live tile)
 /// - `Gone`             → `Kill{existed:false}`  (idempotent already-gone)
 /// - `Unknown`, `!force`→ `RetryableTimeout`     (retry once the plane recovers)
 /// - `Unknown`, `force` → decided by a fresh `reprobe`:
-///     * `reprobe==Alive`   → `RefuseForceOnLive` (slow-but-live: NEVER force-kill)
+///     * `reprobe==Alive`   → `RefuseForceOnLive` (re-probe CONFIRMS live: refuse)
 ///     * `reprobe==Gone`    → `Kill{existed:false}` (confirmed dead: clean reap)
 ///     * `reprobe==Unknown` → `Kill{forced:true}`   (still unreachable: forced reap)
 ///
-/// `reprobe` is `Some` ONLY when `force && initial==Unknown`; otherwise `None`.
+/// The honest guarantee (NOT "never kills a live session"): force never kills a
+/// session a fresh re-probe CONFIRMS `Alive`. Under a SUSTAINED wedge a live-but-
+/// slow session's re-probe also returns `Unknown` - indistinguishable from dead -
+/// and force WILL reap it. That is what `force:true` means: reap-during-wedge, at
+/// the caller's risk. `reprobe` is `Some` ONLY when `force && initial==Unknown`;
+/// otherwise `None`.
 fn plan_close(
     force: bool,
     initial: tmux::SessionLiveness,
@@ -6205,12 +6211,20 @@ fn plan_close(
 /// we never run a destructive tree-kill we cannot verify. But that leaves a
 /// genuinely-dead-but-unprobeable session unreapable during a wedge. `force:true`
 /// re-probes once and, if the session is STILL not confirmably alive, performs the
-/// bounded reap anyway (outcome `force_reaped`). It is designed conservatively: if
-/// the re-probe shows the session ALIVE, force is REFUSED (the probe was merely
-/// slow, not dead) - so `force` can never kill a live-but-slow session. Operator
-/// path: retry a normal `close_terminal` first; use `force:true` only for a tile you
-/// know is dead that a wedge won't let you reap; if even that is refused, the
-/// session is live - investigate instead of forcing.
+/// bounded reap anyway (outcome `force_reaped`).
+///
+/// The guarantee is NARROW and honest: force never kills a session a fresh re-probe
+/// reports `Alive`. It is NOT "never kills a live session" - under a SUSTAINED wedge
+/// a live-but-slow session's re-probe also times out (`Unknown`), which is
+/// probe-indistinguishable from dead, and force WILL reap it. `force:true` therefore
+/// means "reap this tile even if it turns out to be live-but-unreachable - I accept
+/// that risk," so use it ONLY when you have independent reason to believe the session
+/// is DEAD (its work finished, its process is gone) and a wedge is merely blocking
+/// the reap. **⚠ Do NOT reach for `force` to work around slowness on a session you
+/// think may still be live** - retry a normal `close_terminal` (no force) first; a
+/// normal close reaps a confirmed-`Alive` session cleanly and refuses on `Unknown`.
+/// If a forced close is refused, the re-probe confirmed the tile LIVE - investigate,
+/// do not re-force.
 fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
@@ -6227,9 +6241,11 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     //
     // De-conflation (spawn-wedge) + MED-1 force escape: an `Unknown` probe means the
     // control plane is degraded, not that the session is gone, so the DEFAULT refuses
-    // (retryable). `force:true` re-probes ONCE and reaps only if the session is still
-    // not confirmably alive - a fresh `Alive` re-probe refuses force (never kill a
-    // slow-but-live session). See `plan_close`.
+    // (retryable). `force:true` re-probes ONCE and reaps unless that re-probe CONFIRMS
+    // `Alive` (only a definitive Alive refuses force). Under a sustained wedge a live-
+    // but-slow session's re-probe is also `Unknown` - indistinguishable from dead - so
+    // force reaps it too; force is a deliberate reap-during-wedge override, not a
+    // never-touch-a-live-session guarantee. See `plan_close`.
     let initial = tmux::session_liveness(&target);
     let reprobe = if force && matches!(initial, tmux::SessionLiveness::Unknown) {
         Some(tmux::session_liveness(&target))
@@ -7059,13 +7075,15 @@ mod tests {
     }
 
     /// MED-1 guard (PR-58 review): the `close_terminal` `force` escape keeps a
-    /// genuinely-dead-but-`Unknown` session reapable, but is designed conservatively
-    /// so it can NEVER force-kill a merely-slow-but-LIVE session. `plan_close` is the
-    /// pure decision; this pins every arm. Bypass: make `force + Unknown + reprobe
-    /// Alive` reap (drop the `RefuseForceOnLive` arm) and the live-refusal assert
-    /// trips - i.e. a slow-but-live session would be force-killed.
+    /// genuinely-dead-but-`Unknown` session reapable, and never kills a session a
+    /// fresh re-probe CONFIRMS `Alive`. The name states exactly what is pinned - NOT
+    /// "never kills a live session" (a live-but-slow session whose re-probe also
+    /// times out is `Unknown`, indistinguishable from dead, and IS force-reaped; see
+    /// `plan_close`). `plan_close` is the pure decision; this pins every arm. Bypass:
+    /// make `force + Unknown + reprobe Alive` reap (drop the `RefuseForceOnLive` arm)
+    /// and the reprobe-Alive refusal assert trips.
     #[test]
-    fn med1_force_close_never_kills_a_slow_but_live_session() {
+    fn force_close_never_kills_a_session_that_probes_alive() {
         use tmux::SessionLiveness::*;
         // Default (no force): Alive/Gone reap normally; Unknown is a retryable refusal.
         assert!(matches!(
@@ -7081,7 +7099,7 @@ mod tests {
             ClosePlan::RetryableTimeout
         ));
         // force + Unknown, re-probe ALIVE => REFUSE (the load-bearing guarantee: a
-        // slow-but-live session is never force-killed).
+        // session a fresh probe CONFIRMS Alive is never force-killed).
         assert!(matches!(
             plan_close(true, Unknown, Some(Alive)),
             ClosePlan::RefuseForceOnLive
@@ -7091,8 +7109,10 @@ mod tests {
             plan_close(true, Unknown, Some(Gone)),
             ClosePlan::Kill { existed: false, forced: false }
         ));
-        // force + Unknown, re-probe STILL Unknown => forced reap (genuinely
-        // unreachable stays reapable - the whole point of the escape).
+        // force + Unknown, re-probe STILL Unknown => forced reap: a still-unreachable
+        // session stays reapable (the whole point of the escape). Under a sustained
+        // wedge this reaps a dead OR a live-but-unreachable tile - by design; force is
+        // an explicit reap-during-wedge override.
         assert!(matches!(
             plan_close(true, Unknown, Some(Unknown)),
             ClosePlan::Kill { existed: false, forced: true }
