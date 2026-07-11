@@ -70,7 +70,10 @@ impl Role {
 /// One minted per-session identity. `secret` is the bearer token injected into the
 /// session's env; `id` is the stable, non-secret handle used to STAMP attribution
 /// (an enqueue records the id/role, never the secret).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is HAND-WRITTEN to REDACT `secret` (LOW-3): item-3 seals this secret at
+/// rest, so a stray `{:?}` in a log must not undo that by printing it in cleartext.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionIdentity {
     /// Stable, non-secret identity handle (the attribution stamp).
@@ -93,6 +96,21 @@ pub struct SessionIdentity {
     pub ship_slug: Option<String>,
     /// Epoch-ms minted.
     pub minted_at: u64,
+}
+
+impl std::fmt::Debug for SessionIdentity {
+    /// Redacts `secret` (LOW-3) so no `{:?}` ever leaks the bearer token in cleartext,
+    /// undermining the at-rest sealing. All non-secret fields print normally.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionIdentity")
+            .field("id", &self.id)
+            .field("secret", &"<redacted>")
+            .field("role", &self.role)
+            .field("session_tile", &self.session_tile)
+            .field("ship_slug", &self.ship_slug)
+            .field("minted_at", &self.minted_at)
+            .finish()
+    }
 }
 
 /// A non-secret view of an identity - what an attribution stamp / observability may
@@ -471,6 +489,18 @@ mod tests {
         assert_ne!(a.secret, b.secret, "secrets are distinct");
         assert!(!a.secret.is_empty());
         assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn debug_redacts_the_secret() {
+        // LOW-3: a stray {:?} must never print the bearer secret in cleartext (it would
+        // undo the at-rest sealing). Non-secret fields still print.
+        let store = IdentityStore::ephemeral();
+        let a = store.mint(Role::Crew);
+        let dbg = format!("{a:?}");
+        assert!(!dbg.contains(&a.secret), "Debug must NOT contain the secret: {dbg}");
+        assert!(dbg.contains("<redacted>"), "Debug must show the redaction marker");
+        assert!(dbg.contains(&a.id), "Debug still shows the non-secret id");
     }
 
     #[test]

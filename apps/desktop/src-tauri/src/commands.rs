@@ -127,12 +127,24 @@ fn ui_spawn_capability_env(
     app: &tauri::AppHandle,
     opts: &SpawnOptions,
 ) -> (Vec<(String, String)>, bool) {
+    // LOW-1: the scrub is UNCONDITIONAL - env-inheritance must never decide a
+    // session's capability. When the control endpoint is unresolvable / unbound (a
+    // pre-bind race, no live control server), we still explicitly BLANK
+    // T_HUB_CONTROL_TOKEN/_ADDR at the session level so the child can never inherit a
+    // (possibly polluted) full token; a blank token resolves to nothing, so the child
+    // has no capability rather than an inherited one.
+    let scrub = || {
+        vec![
+            ("T_HUB_CONTROL_TOKEN".to_string(), String::new()),
+            ("T_HUB_CONTROL_ADDR".to_string(), String::new()),
+        ]
+    };
     let Ok(endpoint) = control_endpoint(app) else {
-        return (Vec::new(), false);
+        return (scrub(), false);
     };
     let addr = endpoint.addr();
     if addr.is_empty() {
-        return (Vec::new(), false);
+        return (scrub(), false);
     }
     let is_control = opts
         .capability

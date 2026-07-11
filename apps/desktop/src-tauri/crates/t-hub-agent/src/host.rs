@@ -245,11 +245,15 @@ mod tests {
         let repo = env!("CARGO_MANIFEST_DIR");
         let branch = git_branch(repo)
             .expect("git_branch should not error in a valid git worktree");
-        let branch = branch.expect("branch should be Some inside a git checkout");
-        assert!(
-            !branch.is_empty(),
-            "branch string should be non-empty, got: {branch}"
-        );
+        // NIT-2b: tolerate a DETACHED HEAD (git worktree add --detach, some CI checkout
+        // modes) where `git branch --show-current` is empty -> None. When Some, it must
+        // be non-empty.
+        if let Some(branch) = branch {
+            assert!(
+                !branch.is_empty(),
+                "branch string should be non-empty when on a branch, got: {branch}"
+            );
+        }
     }
 
     #[test]

@@ -2237,19 +2237,40 @@ fn write_key_file(path: &Path, key: &str) {
 /// startup" must actively overwrite it). The returned key is always the LIVE value and
 /// is usable in-memory even if the disk write fails. Policy is passed in so this core
 /// is pure/testable; [`load_or_rotate_key`] resolves it from the environment.
+///
+/// Whether AGE-based rotation may fire, given whether the on-disk value is already in
+/// item-3's sealed form and whether sealing is active on this host (MED-1). On a
+/// sealing host (Windows/DPAPI) a pre-item-3 key is UNsealed, so age-rotation is held
+/// off until the first restart has ADOPTED (sealed) it - never stranding pre-existing
+/// fleet on the very first item-3 restart. Where sealing is inactive there is no sealed
+/// form to key on, so age-rotation is always eligible (prior behavior). A FORCED
+/// rotation ignores this gate entirely.
+fn age_rotation_eligible(existing_is_sealed: bool, sealing_active: bool) -> bool {
+    !sealing_active || existing_is_sealed
+}
+
 fn load_or_rotate_key_with(path: &Path, force: bool, max_age_secs: u64) -> String {
     let raw = std::fs::read_to_string(path).ok();
     let existing = raw
         .as_deref()
         .and_then(crate::secret_seal::unseal_str)
         .filter(|k| !k.is_empty());
-    let rotate = force || existing.is_none() || key_is_past_max_age(path, max_age_secs);
+    let raw_is_sealed = raw.as_deref().map(crate::secret_seal::is_sealed).unwrap_or(false);
+    // MED-1 mitigation: age-based rotation only fires once the key is ALREADY in item-3's
+    // sealed form. On the Windows host a PRE-ITEM-3 key is unsealed, so the FIRST item-3
+    // restart ADOPTS it (keeps the value + seals it, resetting the rotation clock) rather
+    // than rotating and stranding pre-existing in-tmux fleet sessions / remote pairings.
+    // The clock then measures from adoption. A forced rotation (T_HUB_ROTATE_KEYS) still
+    // fires regardless. On a non-sealing host (pure-WSL/ext4 + dev/CI) there is no sealed
+    // form to gate on, so age-rotation keeps its prior behavior.
+    let age_eligible = age_rotation_eligible(raw_is_sealed, crate::secret_seal::sealing_active());
+    let rotate =
+        force || existing.is_none() || (age_eligible && key_is_past_max_age(path, max_age_secs));
     if !rotate {
         if let Some(k) = existing {
-            // Keep the credential; upgrade a legacy/plaintext file to the sealed form.
-            if crate::secret_seal::sealing_active()
-                && !raw.as_deref().map(crate::secret_seal::is_sealed).unwrap_or(false)
-            {
+            // Keep the credential; upgrade a legacy/plaintext file to the sealed form
+            // (this is also the MED-1 first-restart ADOPTION that resets the clock).
+            if crate::secret_seal::sealing_active() && !raw_is_sealed {
                 write_key_file(path, &k);
             }
             return k;
@@ -9868,6 +9889,18 @@ mod tests {
         let k = load_or_rotate_key_with(&path, false, 3600);
         assert_eq!(k, "legacy-plaintext-token", "legacy plaintext must be read and kept");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn age_rotation_eligibility_holds_off_until_a_sealing_host_adopts_the_key() {
+        // MED-1: on a SEALING host (Windows/DPAPI) age-rotation is held off until a
+        // pre-item-3 (unsealed) key has been ADOPTED (sealed), so the first item-3
+        // restart never strands pre-existing fleet. Once sealed, age-rotation resumes.
+        // On a NON-sealing host there is no sealed form, so age-rotation stays eligible.
+        assert!(!age_rotation_eligible(false, true), "sealing host + unsealed key: adopt, don't rotate");
+        assert!(age_rotation_eligible(true, true), "sealing host + sealed key: age-rotates");
+        assert!(age_rotation_eligible(false, false), "non-sealing host: eligible regardless");
+        assert!(age_rotation_eligible(true, false), "non-sealing host: eligible regardless");
     }
 
     #[test]

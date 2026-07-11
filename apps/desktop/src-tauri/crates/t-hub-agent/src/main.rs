@@ -51,9 +51,9 @@ use std::sync::Arc;
 /// - `--statusline`    Statusline ingest: read Claude's statusline JSON from
 ///                     stdin, append a `StatusSnapshot` journal entry, echo a
 ///                     short readout to stdout, exit 0. Never blocks Claude.
-/// - `--gate`          item-3 Pillar C: the BLOCKING `PreToolUse` gate. Reads the
-///                     hook JSON on stdin, classifies the Bash command, and DENIES an
-///                     outward-facing action a crew may not take (fail-closed).
+/// - `--gate` item-3 Pillar C: the BLOCKING `PreToolUse` gate - reads the hook JSON
+///   on stdin, classifies the Bash command, and DENIES an outward-facing action a
+///   crew may not take (fail-closed).
 ///
 /// ## Shared flags
 /// - `--journal-dir <PATH>`  Override the journal directory (default:
