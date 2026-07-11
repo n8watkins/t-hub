@@ -241,7 +241,8 @@ fn schema_close_terminal() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "sessionId": { "type": "string", "description": "Session/terminal id to close (kills the tmux session th_<id> and its process tree)." }
+            "sessionId": { "type": "string", "description": "Session/terminal id to close (kills the tmux session th_<id> and its process tree)." },
+            "force": { "type": "boolean", "description": "Operator escape (default false). When the liveness probe times out under a degraded control plane, close normally REFUSES (retryable). Set force:true to reap a session you KNOW is dead: it re-probes once and reaps unless the re-probe CONFIRMS the session Alive. WARNING: under a sustained wedge a live-but-slow session's re-probe also times out (indistinguishable from dead) and force WILL reap it - use force ONLY when you believe the session is dead. Try a normal close first." }
         },
         "required": ["sessionId"],
         "additionalProperties": false

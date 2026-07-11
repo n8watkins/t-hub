@@ -256,15 +256,18 @@ if dbs:
     except sqlite3.Error:
         pass
 PY"#;
-    let out = std::process::Command::new("wsl.exe")
-        .arg("-d")
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.arg("-d")
         .arg(&distro)
         .arg("-e")
         .arg("bash")
         .arg("-lc")
         .arg(READER)
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output()
+        .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    // Bounded (LOCAL_IO): a recursive glob over ~/.codex/sessions + an immutable
+    // SQLite open. Fast normally, but a slow/large tree must not park the
+    // control-handler thread this runs on (the M3 `codex_usage` read path).
+    let out = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::LOCAL_IO_TIMEOUT)
         .ok()?;
     if !out.status.success() {
         return None;
@@ -454,15 +457,17 @@ fn codex_dir() -> Option<std::path::PathBuf> {
 #[cfg(windows)]
 fn wsl_home(distro: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("wsl.exe")
-        .arg("-d")
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.arg("-d")
         .arg(distro)
         .arg("--")
         .arg("bash")
         .arg("-lc")
         .arg("echo $HOME")
-        .creation_flags(0x0800_0000)
-        .output()
+        .creation_flags(0x0800_0000);
+    // Bounded (WSL_PROBE): a trivial `echo $HOME` WSL round-trip; sub-second on a
+    // healthy host, but a cold/wedged WSL must not park the handler.
+    let out = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::WSL_PROBE_TIMEOUT)
         .ok()?;
     if !out.status.success() {
         return None;

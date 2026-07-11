@@ -26,6 +26,39 @@ use std::time::{Duration, Instant};
 /// busy-spin.
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(15);
 
+/// Grace window for draining the reader threads AFTER a timed-out child is killed
+/// (see [`output_with_timeout`]'s timeout branch). Killing the DIRECT child closes
+/// the pipe ends it owns, so on the common path the readers hit EOF and finish
+/// within a poll or two. But a GRANDCHILD that inherited the pipe fds (a shell that
+/// `exec`d / backgrounded a long-lived `claude`/python) keeps the write end open,
+/// so `read_to_end` would block until THAT process exits. We must never re-park the
+/// control-handler thread we just freed, so after this grace we DETACH the reader
+/// instead of joining it forever. Small: the goal is to reclaim a clean output when
+/// it's already there, not to wait on an orphan.
+const REAP_JOIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Timeout classes for the on-handler subprocess sweep (the residual of PR #48,
+/// which bounded only tmux + git). Each WSL-shelling caller that runs on a request
+/// path picks the class matching its work, so a stall surfaces as a fast,
+/// recoverable error instead of parking a control-handler thread and leaking a live
+/// `wsl.exe -> …` child tree (the accumulation behind the spawn wedge). tmux and git
+/// keep their own module-level, env-tunable timeouts; these cover the rest.
+///
+/// A trivial WSL round-trip (`echo $HOME`, `hostname -I`, `realpath`, `command -v`):
+/// answers in well under a second on a healthy host.
+pub const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A local filesystem / SQLite walk (`find`, `rg`, `git ls-files`, the Codex log
+/// reader, an archive `mv`): seconds on a healthy host, but a slow/UNC/large tree
+/// must not park a handler indefinitely.
+pub const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A live network round-trip (`claude -p /usage`): the DEFAULT when the caller's
+/// env override is unset. Generous on purpose - the SDK session does a real network
+/// call - but bounded so a hung/logged-out probe can't park a handler forever. See
+/// `usage::usage_cmd_timeout` for the operator override.
+pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(25);
+
 /// Run `cmd` to completion, but KILL it (and return an [`std::io::ErrorKind::TimedOut`]
 /// error) if it has not finished within `timeout`. This is the single choke point that
 /// guarantees NO subprocess can park a control handler thread indefinitely.
@@ -70,13 +103,20 @@ pub fn output_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Resu
             }
             None => {
                 if Instant::now() >= deadline {
-                    // Stalled past the bound: kill + reap (no zombie), then surface a
-                    // TimedOut error. Killing closes the pipes, so the reader threads
-                    // hit EOF and join cleanly rather than leaking.
+                    // Stalled past the bound: kill + reap the DIRECT child (no zombie),
+                    // which frees the handler thread and its connection slot, then
+                    // surface a TimedOut error. Draining the reader threads is BOUNDED
+                    // (join-or-detach): killing the direct child closes the pipe ends
+                    // it owns, so the readers normally hit EOF at once - but a
+                    // grandchild that inherited the fds could hold the write end open,
+                    // and we must NOT let that re-park the handler we just freed. The
+                    // old code joined unconditionally here and could hang forever on
+                    // exactly such an orphan (the pipe-inheritance hazard).
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = out_handle.join();
-                    let _ = err_handle.join();
+                    let grace = Instant::now() + REAP_JOIN_GRACE;
+                    join_or_detach(out_handle, grace);
+                    join_or_detach(err_handle, grace);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!("command exceeded {}s timeout", timeout.as_secs()),
@@ -85,6 +125,31 @@ pub fn output_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Resu
                 std::thread::sleep(OUTPUT_POLL_INTERVAL);
             }
         }
+    }
+}
+
+/// Drain one reader thread on the TIMEOUT path, but never for longer than the
+/// caller's `deadline` ([`REAP_JOIN_GRACE`] from the kill). If the thread finishes
+/// (the common case: the killed child's pipe ends closed, so `read_to_end` hit EOF)
+/// we join it and drop its buffer. If it is still blocked at the deadline - a
+/// grandchild inherited the pipe fds and outlived the direct child - we DETACH it:
+/// the handler thread has already been freed, and the reader will drain and exit on
+/// its own once the orphan closes the pipe (bounded, transient). This is the fix for
+/// the old unconditional join, which could park the handler here forever.
+///
+/// Only ever called from the timeout branch: the success path still joins fully, so
+/// a slow-but-valid large drain is never truncated.
+fn join_or_detach(handle: std::thread::JoinHandle<Vec<u8>>, deadline: Instant) {
+    loop {
+        if handle.is_finished() {
+            let _ = handle.join();
+            return;
+        }
+        if Instant::now() >= deadline {
+            // Detach: do not join. The thread lives until the orphan closes the pipe.
+            return;
+        }
+        std::thread::sleep(OUTPUT_POLL_INTERVAL);
     }
 }
 
@@ -221,6 +286,44 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(10),
             "dual-pipe drain should finish on throughput, took {elapsed:?}"
+        );
+    }
+
+    /// PIPE-INHERITANCE guard (the reason bounded_exec's timeout branch was audited
+    /// before the Option-A sweep): a shell that OUTLIVES the timeout AND leaves a
+    /// backgrounded GRANDCHILD holding the inherited stdout pipe. On timeout we kill
+    /// only the DIRECT child (the shell); the grandchild keeps the write end open, so
+    /// `read_to_end` never hits EOF. The old code joined the reader threads
+    /// unconditionally here and would block until the 30s grandchild exited — the
+    /// exact "handler parks forever" hazard, just relocated onto the newly wrapped
+    /// on-handler callers (usage/codex/find shell into long-lived grandchildren). The
+    /// bounded join+detach must return within the timeout + grace regardless.
+    ///
+    /// Bypass check: restore the old `out_handle.join()`/`err_handle.join()` and the
+    /// `recv_timeout` below trips (the worker never reports back in time).
+    #[cfg(unix)]
+    #[test]
+    fn timeout_does_not_hang_on_a_grandchild_holding_the_pipe() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // `sleep 30 &` backgrounds a grandchild that inherits stdout; the
+            // foreground `sleep 30` keeps the shell alive past the bound. Killing the
+            // shell leaves BOTH sleeps holding the pipe.
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg("sleep 30 & sleep 30");
+            let r = output_with_timeout(cmd, Duration::from_millis(300));
+            let _ = tx.send(r.map(|_| ()).map_err(|e| e.kind()));
+        });
+        // With the fix the call returns in ~ (300ms bound + 500ms grace); 5s is a
+        // generous non-flaky ceiling. Without it, the reader-join blocks ~30s and
+        // this recv_timeout expires -> clean FAIL.
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("output_with_timeout hung on a grandchild-held pipe (join+detach regressed)");
+        assert_eq!(
+            got,
+            Err(std::io::ErrorKind::TimedOut),
+            "the killed shell should surface TimedOut, got {got:?}"
         );
     }
 }

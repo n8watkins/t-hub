@@ -224,16 +224,19 @@ pub fn invalidate_recent_cache() {
 fn run_archive(encoded: &str) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     let distro = crate::files::host_distro();
-    let status = std::process::Command::new("wsl.exe")
-        .arg("-d")
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.arg("-d")
         .arg(&distro)
         .arg("-e")
         .arg("bash")
         .arg("-lc")
         .arg(archive_shell_cmd(encoded))
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .status()
-        .map_err(|e| format!("archive spawn failed: {e}"))?;
+        .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    // Bounded (LOCAL_IO): an archive `mv` under ~/.claude; a stalled WSL FS must
+    // not park the handler this runs on.
+    let status = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::LOCAL_IO_TIMEOUT)
+        .map_err(|e| format!("archive spawn/timeout failed: {e}"))?
+        .status;
     if status.success() {
         Ok(())
     } else {
@@ -244,11 +247,13 @@ fn run_archive(encoded: &str) -> Result<(), String> {
 /// Run the archive move directly (unix / dev build).
 #[cfg(not(windows))]
 fn run_archive(encoded: &str) -> Result<(), String> {
-    let status = std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(archive_shell_cmd(encoded))
-        .status()
-        .map_err(|e| format!("archive spawn failed: {e}"))?;
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-lc").arg(archive_shell_cmd(encoded));
+    // Bounded (LOCAL_IO): an archive `mv` under ~/.claude; a stalled FS must not
+    // park the handler this runs on.
+    let status = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::LOCAL_IO_TIMEOUT)
+        .map_err(|e| format!("archive spawn/timeout failed: {e}"))?
+        .status;
     if status.success() {
         Ok(())
     } else {
@@ -735,15 +740,17 @@ fn resumable_entries_from_dir(
 #[cfg(windows)]
 fn wsl_home(distro: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("wsl.exe")
-        .arg("-d")
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.arg("-d")
         .arg(distro)
         .arg("-e")
         .arg("bash")
         .arg("-lc")
         .arg("echo $HOME")
-        .creation_flags(0x0800_0000)
-        .output()
+        .creation_flags(0x0800_0000);
+    // Bounded (WSL_PROBE): trivial `echo $HOME`; a cold/wedged WSL must not park
+    // the `recent_sessions` handler.
+    let out = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::WSL_PROBE_TIMEOUT)
         .ok()?;
     if !out.status.success() {
         return None;
@@ -780,15 +787,18 @@ fn projects_unc(distro: &str, wsl_home: &str) -> std::path::PathBuf {
 #[cfg(windows)]
 fn wsl_find_rows(distro: &str) -> Option<Vec<(i64, String)>> {
     use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("wsl.exe")
-        .arg("-d")
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.arg("-d")
         .arg(distro)
         .arg("-e")
         .arg("bash")
         .arg("-lc")
         .arg("find ~/.claude/projects -mindepth 2 -maxdepth 2 -name '*.jsonl' -not -path '*/-tmp-t-hub-usage/*' -printf '%T@\\t%P\\n'")
-        .creation_flags(0x0800_0000)
-        .output()
+        .creation_flags(0x0800_0000);
+    // Bounded (LOCAL_IO): a `find` over the whole transcript catalog (~10k files);
+    // fast on ext4 but a large/slow tree must not park the `recent_sessions`
+    // handler. On timeout the caller degrades to the UNC stat-walk (returns None).
+    let out = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::LOCAL_IO_TIMEOUT)
         .ok()?;
     if !out.status.success() {
         return None;
