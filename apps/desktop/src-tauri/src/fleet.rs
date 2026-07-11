@@ -281,6 +281,13 @@ impl FleetNotifier {
             return;
         };
 
+        // Item-2 §2.3/MED-7: this is a live uuid<->tile resolution, so opportunistically
+        // BACKFILL the registry's continuity anchor for that tile (a captain record or
+        // a CrewRef minted with `claude_uuid: None` at record time). A no-op once
+        // filled / when the tile is not a member; the anchor is a fast-path hint, never
+        // load-bearing, so gating it on an armed watch is fine.
+        self.captains.backfill_uuid(&tile, session_uuid);
+
         let mut st = self.state.lock().expect("fleet notifier mutex poisoned");
 
         // Edge detection: the observer fires on every emit for a session, not just
@@ -537,7 +544,7 @@ mod tests {
         );
         let captains = Arc::new(CaptainsRegistry::new());
         captains
-            .claim("capaaaaa", Some("ship-alpha"), vec![])
+            .claim_test("capaaaaa", Some("ship-alpha"), vec![])
             .unwrap();
         let watches = Arc::new(FleetWatchRegistry::new());
         let rec = Arc::new(Recorder::default());
@@ -579,7 +586,7 @@ mod tests {
     fn wake_holds_until_orchestrator_is_idle_then_coalesces() {
         let (n, rec, w, c) = harness();
         // A second captain, also watched.
-        c.claim("capccccc", Some("ship-gamma"), vec![]).unwrap();
+        c.claim_test("capccccc", Some("ship-gamma"), vec![]).unwrap();
         n.status_bridge_ingest("u-cap2", "th_capccccc");
         w.arm("orcbbbbb", WatchScope::Captains, vec![]);
 
@@ -721,7 +728,7 @@ mod tests {
             2,
         );
         let captains = Arc::new(CaptainsRegistry::new());
-        captains.claim(cap_tile, Some("ship-e2e"), vec![]).unwrap();
+        captains.claim_test(cap_tile, Some("ship-e2e"), vec![]).unwrap();
         let watches = Arc::new(FleetWatchRegistry::new());
         watches.arm(orc_tile, WatchScope::Captains, vec![]);
 
@@ -878,7 +885,7 @@ mod tests {
     #[test]
     fn durable_coalesces_multiple_captains_into_one_wake() {
         let (n, rec, w, c, _inbox) = harness_durable();
-        c.claim("capccccc", Some("ship-gamma"), vec![]).unwrap();
+        c.claim_test("capccccc", Some("ship-gamma"), vec![]).unwrap();
         n.status_bridge_ingest("u-cap2", "th_capccccc");
         w.arm("orcbbbbb", WatchScope::Captains, vec![]);
         // Orchestrator BUSY while two captains transition -> nothing yet.

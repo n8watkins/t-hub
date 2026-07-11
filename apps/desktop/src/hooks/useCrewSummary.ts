@@ -4,7 +4,7 @@
 // needs-input flag. Used by BOTH the sidebar captain rows (CaptainsList) and the
 // captains deck tiles so the two surfaces read one source of truth.
 import { useMemo } from "react";
-import { useCaptain } from "../store/captain";
+import { useCaptain, type CrewRef } from "../store/captain";
 import { useSupervision } from "../store/supervision";
 import type { SessionStatus } from "../ipc/model";
 import { sessionNameForTerminal } from "../store/sessionContext";
@@ -21,7 +21,7 @@ const CREW_RUNNING: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
 
 /** Stable empty crew list so the memo's dep identity does not churn for a
  *  captain with no claim/crew yet. */
-const NO_CREW: readonly string[] = [];
+const NO_CREW: readonly CrewRef[] = [];
 
 /** One crewmate's rolled-up state. */
 export interface CrewMember {
@@ -53,24 +53,29 @@ export interface CrewSummary {
  */
 export function useCrewSummary(terminalId: string): CrewSummary {
   const claim = useCaptain((s) => s.claims[terminalId]);
-  const crewIds = claim?.crew ?? NO_CREW;
+  const crew = claim?.crew ?? NO_CREW;
   const statuses = useSupervision((s) => s.statuses);
   const sessionIdByTmux = useSupervision((s) => s.sessionIdByTmux);
 
   return useMemo(() => {
-    const members: CrewMember[] = crewIds.map((id) => {
-      const sid = sessionIdByTmux[sessionNameForTerminal(id)];
-      const st = sid !== undefined ? statuses[sid] : undefined;
-      return {
-        id,
-        known: st !== undefined,
-        running: st !== undefined && CREW_RUNNING.has(st),
-        needsInput: st === "needsQuestion" || st === "needsPermission",
-      };
-    });
+    // A crew whose OWN tile died is marked `removed` (item-2 §2.4); it is gone, so
+    // it drops out of the live crew summary rather than lingering as a dead row.
+    const members: CrewMember[] = crew
+      .filter((c) => c.state?.kind !== "removed")
+      .map((c) => {
+        const id = c.terminalId;
+        const sid = sessionIdByTmux[sessionNameForTerminal(id)];
+        const st = sid !== undefined ? statuses[sid] : undefined;
+        return {
+          id,
+          known: st !== undefined,
+          running: st !== undefined && CREW_RUNNING.has(st),
+          needsInput: st === "needsQuestion" || st === "needsPermission",
+        };
+      });
     const running = members.filter((c) => c.running).length;
     const done = members.filter((c) => c.known && !c.running).length;
     const needsInput = members.some((c) => c.needsInput);
     return { members, running, done, needsInput };
-  }, [crewIds, statuses, sessionIdByTmux]);
+  }, [crew, statuses, sessionIdByTmux]);
 }

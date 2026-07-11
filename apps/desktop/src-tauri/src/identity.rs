@@ -84,6 +84,13 @@ pub struct SessionIdentity {
     /// minted `id`, not the tile.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_tile: Option<String>,
+    /// The durable SHIP this session belongs to, resolved at mint from the spawner's
+    /// identity (item-2 §2.6 widened binding, D5). A crew inherits its spawner
+    /// captain's ship; `None` when the ship is not yet resolvable at mint (the
+    /// spawner had no claim yet) - the durable ship key lives in the captains
+    /// registry regardless, this is the fast-path attribution copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ship_slug: Option<String>,
     /// Epoch-ms minted.
     pub minted_at: u64,
 }
@@ -97,15 +104,19 @@ pub struct IdentityStamp {
     pub role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_tile: Option<String>,
+    /// The durable ship this session belongs to, when resolved (item-2 §2.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ship_slug: Option<String>,
 }
 
 impl SessionIdentity {
-    /// The attribution stamp (id + role + tile), never the secret.
+    /// The attribution stamp (id + role + tile + ship), never the secret.
     pub fn stamp(&self) -> IdentityStamp {
         IdentityStamp {
             id: self.id.clone(),
             role: self.role,
             session_tile: self.session_tile.clone(),
+            ship_slug: self.ship_slug.clone(),
         }
     }
 
@@ -195,6 +206,14 @@ impl IdentityStore {
     /// store. The secret is what gets env-injected; the returned identity carries it
     /// so the caller can inject it, but the STAMP (id/role) is what attribution uses.
     pub fn mint(&self, role: Role) -> SessionIdentity {
+        self.mint_for(role, None)
+    }
+
+    /// Mint a fresh per-session identity carrying its durable SHIP (item-2 §2.6,
+    /// D5: the widened binding). `ship` is the spawner captain's ship_slug when it
+    /// could be resolved at spawn (a crew inherits its spawner's ship), else `None`.
+    /// Everything else matches [`mint`](Self::mint) - one seam, wider payload.
+    pub fn mint_for(&self, role: Role, ship: Option<String>) -> SessionIdentity {
         let identity = SessionIdentity {
             id: uuid::Uuid::new_v4().simple().to_string(),
             // Two v4 uuids => ~244 bits of entropy; a bearer secret, not a display id.
@@ -205,6 +224,7 @@ impl IdentityStore {
             ),
             role,
             session_tile: None,
+            ship_slug: ship,
             minted_at: now_ms(),
         };
         let mut snap = self.lock();
@@ -254,6 +274,38 @@ impl IdentityStore {
             Some(id) => self.retire(&id),
             None => false,
         }
+    }
+
+    /// Load-time prune / reconciliation (PR-56 review LOW residual, closed by item-2
+    /// which now owns the identity store). Session-close GC ([`retire_tile`]) is
+    /// close-path-driven ONLY: an identity whose session died WITHOUT a clean
+    /// `close_terminal` (SIGKILL, crash, a process that exited before its close
+    /// reached us) is never retired, so its secret lingers in the store forever and
+    /// the store accretes across restarts. This reconciles at load, retiring an
+    /// identity when its session is UNAMBIGUOUSLY gone:
+    ///
+    /// - `session_tile: None`: minted by a PRIOR process that died before it bound the
+    ///   tile (a failed spawn whose L2 retire never ran); a fresh process has no live
+    ///   in-flight mints, so an unbound identity at load is a leak.
+    /// - `session_tile: Some(tile)` where `is_live(tile)` is false: the tile's tmux
+    ///   session is gone (the SOLE unambiguous-death signal, mirroring the registry's
+    ///   transfer-grade liveness; `is_live` is `tmux::has_session` in production).
+    ///
+    /// A still-live tile is KEPT. Returns the number retired. Call ONCE at load, from
+    /// the construction site that can supply the liveness predicate (`lib.rs`); the
+    /// store itself stays tmux-free and unit-testable via an injected predicate.
+    pub fn prune_dead(&self, is_live: impl Fn(&str) -> bool) -> usize {
+        let mut snap = self.lock();
+        let before = snap.identities.len();
+        snap.identities.retain(|_, ident| match ident.session_tile.as_deref() {
+            Some(tile) => is_live(tile),
+            None => false,
+        });
+        let removed = before - snap.identities.len();
+        if removed > 0 {
+            self.persist(&snap);
+        }
+        removed
     }
 
     /// Resolve a presented per-session token to its identity, constant-time. `None`
@@ -447,6 +499,48 @@ mod tests {
         assert!(store.resolve(&b.secret).is_some(), "the other identity is untouched");
         // Retiring an unknown id is a no-op.
         assert!(!store.retire("no-such-id"));
+    }
+
+    #[test]
+    fn mint_for_carries_the_durable_ship() {
+        // Item-2 §2.6 D5: the widened binding carries the spawner's ship, resolved at
+        // mint. A plain mint leaves it None (ship not resolvable / a captain claim).
+        let store = IdentityStore::ephemeral();
+        let crew = store.mint_for(Role::Crew, Some("t-hub-app".to_string()));
+        assert_eq!(crew.ship_slug.as_deref(), Some("t-hub-app"));
+        assert_eq!(crew.stamp().ship_slug.as_deref(), Some("t-hub-app"));
+        let plain = store.mint(Role::Crew);
+        assert!(plain.ship_slug.is_none());
+    }
+
+    #[test]
+    fn prune_dead_retires_gone_and_unbound_but_keeps_live() {
+        // PR-56 residual: load-time reconciliation retires identities whose session is
+        // unambiguously gone (dead tile OR never-bound prior-run leak) and KEEPS live
+        // ones. A BYPASS - keeping a dead session's secret resolvable - fails here.
+        let store = IdentityStore::ephemeral();
+        let live = store.mint(Role::Crew);
+        store.bind_tile(&live.id, "live-tile");
+        let dead = store.mint(Role::Crew);
+        store.bind_tile(&dead.id, "dead-tile");
+        let unbound = store.mint(Role::Crew); // never bound (prior-run failed spawn)
+        assert_eq!(store.len(), 3);
+
+        let removed = store.prune_dead(|tile| tile == "live-tile");
+        assert_eq!(removed, 2, "the dead tile AND the unbound identity are pruned");
+        assert!(store.resolve(&live.secret).is_some(), "the live session survives");
+        assert!(store.resolve(&dead.secret).is_none(), "the dead session's secret is gone");
+        assert!(store.resolve(&unbound.secret).is_none(), "the unbound leak is gone");
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn prune_dead_is_a_noop_when_all_live() {
+        let store = IdentityStore::ephemeral();
+        let a = store.mint(Role::Crew);
+        store.bind_tile(&a.id, "t");
+        assert_eq!(store.prune_dead(|_| true), 0);
+        assert_eq!(store.len(), 1);
     }
 
     #[test]

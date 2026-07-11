@@ -570,6 +570,25 @@ pub fn run() {
             // the control listener (identity resolve + inbox ack/status).
             let identity_store =
                 std::sync::Arc::new(identity::IdentityStore::load_default());
+            // Item-2 (PR-56 review LOW residual, now owned here): the identity store's
+            // GC is close-path-driven only, so a session that died without a clean
+            // `close_terminal` leaves its secret in the store forever, accreting across
+            // restarts. Reconcile ONCE at load: retire any identity whose tile is
+            // unambiguously gone (`tmux::has_session` false - the SAME transfer-grade
+            // liveness the registry uses) or was never bound (a prior-run failed-spawn
+            // leak). This is the only site that both owns the store and can supply the
+            // tmux predicate; the store stays tmux-free + unit-testable.
+            {
+                let pruned = identity_store
+                    .prune_dead(|tile| tmux::has_session(&tmux::target_for_id(tile)));
+                if pruned > 0 {
+                    eprintln!(
+                        "t-hub-identity: load-time prune retired {pruned} dead/unbound \
+                         identit{} (session gone without a clean close)",
+                        if pruned == 1 { "y" } else { "ies" }
+                    );
+                }
+            }
             // Comms-plane Phase 2 observability (§2.8): fan out each message's
             // lifecycle transition on `control://inbox` (counts/ids/lengths only,
             // never content) so the Settings health panel + delivery tests can watch

@@ -437,10 +437,10 @@ describe("phase 2: pinning is claiming (server captains registry)", () => {
     tabs: string[] = [],
     crew: string[] = [],
   ): CaptainClaimRecord => ({
-    captainSessionId: id,
+    terminalId: id,
     shipSlug: `ship-${id}`,
     workspaceTabIds: tabs,
-    crew,
+    crew: crew.map((c) => ({ terminalId: c })),
   });
 
   it("pin fires claim_captain and unpin fires release_captain (best-effort)", async () => {
@@ -474,7 +474,7 @@ describe("phase 2: pinning is claiming (server captains registry)", () => {
     // Survivors keep the LOCAL MRU order (ddd before cap despite server order).
     expect(s.captainIds).toEqual(["ddd00001", "cap00001", "bbb00001"]);
     expect(s.activeCaptainId).toBe("ddd00001");
-    expect(s.claims["bbb00001"].crew).toEqual(["crew0001"]);
+    expect(s.claims["bbb00001"].crew).toEqual([{ terminalId: "crew0001" }]);
     expect(s.claims["cap00001"].workspaceTabIds).toEqual(["t1"]);
   });
 
@@ -669,7 +669,7 @@ describe("orchestrator reconcile on adopt", () => {
     // terminals, but not that one.
     useWorkspace.setState({ terminals: { bbb00001: term("bbb00001") } });
     useCaptain.getState().adoptCaptainsRegistry([
-      { captainSessionId: "bbb00001", shipSlug: "s", workspaceTabIds: [], crew: [] },
+      { terminalId: "bbb00001", shipSlug: "s", workspaceTabIds: [], crew: [] },
     ]);
     expect(useCaptain.getState().orchestratorId).toBeNull();
   });
@@ -678,7 +678,7 @@ describe("orchestrator reconcile on adopt", () => {
     useCaptain.getState().setOrchestratorId("cap00001");
     useWorkspace.setState({ terminals: { cap00001: term("cap00001") } });
     useCaptain.getState().adoptCaptainsRegistry([
-      { captainSessionId: "cap00001", shipSlug: "s", workspaceTabIds: [], crew: [] },
+      { terminalId: "cap00001", shipSlug: "s", workspaceTabIds: [], crew: [] },
     ]);
     expect(useCaptain.getState().orchestratorId).toBe("cap00001");
   });
@@ -687,7 +687,7 @@ describe("orchestrator reconcile on adopt", () => {
     useCaptain.getState().setOrchestratorId("cap00001");
     useWorkspace.setState({ terminals: {} }); // not loaded yet
     useCaptain.getState().adoptCaptainsRegistry([
-      { captainSessionId: "cap00001", shipSlug: "s", workspaceTabIds: [], crew: [] },
+      { terminalId: "cap00001", shipSlug: "s", workspaceTabIds: [], crew: [] },
     ]);
     expect(useCaptain.getState().orchestratorId).toBe("cap00001");
   });

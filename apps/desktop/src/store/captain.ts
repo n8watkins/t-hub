@@ -140,14 +140,28 @@ export function loadCaptainPersisted(): PersistedCaptain {
 
 const initial = loadCaptainPersisted();
 
-/** One claim from the SERVER captains registry (captain-chat phase 2): the ship,
- *  the captain's terminal/session id, the workspace tabs it controls, and the
- *  crew sessions it spawned (`spawnedBy` recorded at the spawn paths). */
+/** A crew member of a ship (item-2 §2.3). Crew now carry their own tile pointer +
+ *  lifecycle state (was a bare tile-id string). */
+export interface CrewRef {
+  terminalId: string;
+  claudeUuid?: string;
+  state?: { kind: "active" | "orphaned" | "removed"; since?: number };
+}
+
+/** One claim from the SERVER captains registry (item-2 identity re-key): the ship
+ *  (the DURABLE primary key), the first-class role, the mutable terminal pointer
+ *  (was `captainSessionId`; absent while the claim is orphaned/vacant), the workspace
+ *  tabs it controls, and the crew it spawned. */
 export interface CaptainClaimRecord {
   shipSlug: string;
-  captainSessionId: string;
+  role?: "cortana" | "captain";
+  claudeUuid?: string;
+  /** The mutable terminal pointer. Absent for an orphaned/vacant claim (no live
+   *  tile to pin); the wire adapter only surfaces claims that HAVE one. */
+  terminalId?: string;
   workspaceTabIds: string[];
-  crew: string[];
+  crew: CrewRef[];
+  state?: { kind: "active" | "orphaned" | "vacant"; since?: number };
 }
 
 /** Count of in-flight `release_captain` calls this window initiated. An empty
@@ -342,11 +356,10 @@ export const useCaptain = create<CaptainState>((set, get) => {
         return;
       }
       const claims: Record<TerminalId, CaptainClaimRecord> = {};
-      for (const r of records) claims[r.captainSessionId] = r;
+      for (const r of records) if (r.terminalId) claims[r.terminalId] = r;
+      const activeIds = Object.keys(claims);
       const kept = s.captainIds.filter((id) => claims[id] !== undefined);
-      const added = records
-        .map((r) => r.captainSessionId)
-        .filter((id) => !kept.includes(id));
+      const added = activeIds.filter((id) => !kept.includes(id));
       const next = [...kept, ...added];
       // Mirror unpinCaptain's ordering: close BEFORE the summoned captain's
       // designation drops, so the focus restore still resolves.
