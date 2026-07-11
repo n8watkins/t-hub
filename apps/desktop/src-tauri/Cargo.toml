@@ -131,6 +131,15 @@ windows = { version = "0.61", features = [
     # (scribe.rs): T-Hub-on-Windows confirms Scribe's pid is alive so a long
     # continuous dictation holds regardless of the status file's mtime.
     "Win32_System_Threading",
+    # CreateJobObjectW/AssignProcessToJobObject/SetInformationJobObject +
+    # JOBOBJECT_EXTENDED_LIMIT_INFORMATION for engine_supervisor's
+    # KILL_ON_JOB_CLOSE job that ties the managed Kokoro child's lifetime to the
+    # app process (assign_kill_on_close_job, PR #54). cfg(windows)-gated, so the
+    # Linux dev build cannot surface the missing feature - the Windows build does.
+    # Win32_Security is required too: CreateJobObjectW's signature takes a
+    # *SECURITY_ATTRIBUTES, so the fn is gated behind that feature as well.
+    "Win32_System_JobObjects",
+    "Win32_Security",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_HiDpi",
