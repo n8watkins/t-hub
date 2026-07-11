@@ -14,8 +14,12 @@ NOTE: this terminal id itself migrated once (84ce1cae died to a closeWorkspace S
 
 ## Current state (2026-07-10, evening)
 
-- **PRs #53 and #54 are MERGED** (main @ `a129e29` pre-bump); the **0.3.62 joint build is in flight** and installs on completion (general-authorized).
-Post-install, 0.3.62 carries: #53 adopt/attach per-tile isolation + authoritative placement + closeWorkspace captain-guard (silent re-place, general-ratified) + test-socket isolation; #54 managed Kokoro lifecycle engine supervisor behind the **default-OFF** `T_HUB_MANAGED_KOKORO` flag (merge is runtime-inert).
+- **0.3.62 is INSTALLED + VERIFIED** (main @ `d358044`, pid 17752, endpoint rotates per control.json).
+Carries: #53 adopt/attach per-tile isolation + authoritative placement + closeWorkspace captain-guard (silent re-place, general-ratified) + test-socket isolation; #54 managed Kokoro lifecycle engine supervisor behind the **default-OFF** `T_HUB_MANAGED_KOKORO` flag (runtime-inert until a deliberate flag-on wave).
+The joint build caught a real PR #54 `cfg(windows)` regression (missing Win32_System_JobObjects/Win32_Security feature flags) - landed as its own commit `d358044`; the Windows build-verify is why it surfaced.
+Post-install verify: socket round-trip 1.2s, 6 terminals adopted, NO ghost/blank-UI (P1 class clear); flag-off inertness confirmed (kokoro unit still `active` + health 200, `T_HUB_MANAGED_KOKORO` unset).
+STILL NEEDS the general's visual confirm: per-tile error-isolation containing a throw and the captain-guard sparing a captain on tab-close are compiled-in but only exercisable by a live UI action (not safely restart-triggerable). Open #54 nit: `forgetting_copy_types` at engine_supervisor.rs:630 (redundant `mem::forget`).
+- **The ORCHESTRATION PROGRAM CLOCK has started**: the comms-plane design crew (item 1/4) is running; proposal drafts then gets an independent xhigh design-check before it escalates to Cortana for the general's ratification.
 - **The kokoro interim systemd user unit still owns port 7478** and keeps serving after the install; the unit -> managed-child cutover is a SEPARATE deliberate step gated on the wave-1 flag-on validation (general-confirmed).
 - **Two untracked files** (`.lavish/`, `docs/DECK-AGENTS-DESIGN.md`) are pre-existing, NOT this ship's work - leave them.
 - Other ships share the tmux server (Cortana `e05764f5`, monorepo `9a32f554`, behavior-tracker `3e3b6479` + crew, appturnity crews) - touch ONLY your own roster.
