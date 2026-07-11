@@ -754,10 +754,11 @@ impl FleetRole {
 /// The lifecycle state of a claim (item-2 §2.4). Death MARKS, it does not scrub - a
 /// dead supervisor's record and crew are RETAINED for re-adoption instead of the
 /// silent `retain`-away leak (the old `remove_session` C4 single-point-of-failure).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ClaimState {
     /// Live and pointed at a terminal.
+    #[default]
     Active,
     /// The supervisor's terminal is UNAMBIGUOUSLY gone (`tmux::has_session` false)
     /// but the durable identity + its crew are retained for re-adoption by a resumed
@@ -769,19 +770,14 @@ pub enum ClaimState {
     Vacant,
 }
 
-impl Default for ClaimState {
-    fn default() -> Self {
-        ClaimState::Active
-    }
-}
-
 /// A crew member's lifecycle under its ship (item-2 §2.4). Like [`ClaimState`],
 /// crew are marked rather than scrubbed so an orphaned worker is re-adoptable and
 /// a dead one is visible to telemetry/reap-ship instead of vanishing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum CrewState {
     /// Live under a live captain.
+    #[default]
     Active,
     /// The CAPTAIN died: the crew is orphaned-but-retained, re-adopted (→ `Active`)
     /// when a same-ship captain resumes. `since` epoch-ms.
@@ -790,12 +786,6 @@ pub enum CrewState {
     /// gone), retained (not scrubbed) so telemetry/reap-ship still see it. `since`
     /// epoch-ms.
     Removed { since: u64 },
-}
-
-impl Default for CrewState {
-    fn default() -> Self {
-        CrewState::Active
-    }
 }
 
 /// One crew member of a ship (item-2 §2.3). Crew membership is a property of the
@@ -1350,7 +1340,7 @@ impl CaptainsRegistry {
             };
 
             // Phase 2 (NO lock held): probe incumbent liveness (Incident-D / MED-3).
-            let incumbent_dead = probe.as_deref().map(|other| is_terminal_dead(other));
+            let incumbent_dead = probe.as_deref().map(is_terminal_dead);
 
             // Phase 3 (re-acquire `inner`): re-validate then mutate.
             let mut g = self.lock();

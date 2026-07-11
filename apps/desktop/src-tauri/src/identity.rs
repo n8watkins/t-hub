@@ -281,14 +281,16 @@ impl IdentityStore {
     /// close-path-driven ONLY: an identity whose session died WITHOUT a clean
     /// `close_terminal` (SIGKILL, crash, a process that exited before its close
     /// reached us) is never retired, so its secret lingers in the store forever and
-    /// the store accretes across restarts. This reconciles at load: an identity is
-    /// retired when its session is UNAMBIGUOUSLY gone -
-    ///   - `session_tile: None` -> minted by a PRIOR process that died before it bound
-    ///     the tile (a failed spawn whose L2 retire never ran); a fresh process has no
-    ///     live in-flight mints, so an unbound identity at load is a leak, and
-    ///   - `session_tile: Some(tile)` where `is_live(tile)` is false -> the tile's tmux
-    ///     session is gone (the SOLE unambiguous-death signal, mirroring the registry's
-    ///     transfer-grade liveness; `is_live` is `tmux::has_session` in production).
+    /// the store accretes across restarts. This reconciles at load, retiring an
+    /// identity when its session is UNAMBIGUOUSLY gone:
+    ///
+    /// - `session_tile: None`: minted by a PRIOR process that died before it bound the
+    ///   tile (a failed spawn whose L2 retire never ran); a fresh process has no live
+    ///   in-flight mints, so an unbound identity at load is a leak.
+    /// - `session_tile: Some(tile)` where `is_live(tile)` is false: the tile's tmux
+    ///   session is gone (the SOLE unambiguous-death signal, mirroring the registry's
+    ///   transfer-grade liveness; `is_live` is `tmux::has_session` in production).
+    ///
     /// A still-live tile is KEPT. Returns the number retired. Call ONCE at load, from
     /// the construction site that can supply the liveness predicate (`lib.rs`); the
     /// store itself stays tmux-free and unit-testable via an injected predicate.
