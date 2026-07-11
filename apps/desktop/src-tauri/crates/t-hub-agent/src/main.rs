@@ -32,6 +32,7 @@
 //! (filled in by a subagent); `main` wires the pieces together.
 
 mod dispatch;
+mod gate;
 mod hook;
 mod host;
 mod journal;
@@ -50,6 +51,9 @@ use std::sync::Arc;
 /// - `--statusline`    Statusline ingest: read Claude's statusline JSON from
 ///                     stdin, append a `StatusSnapshot` journal entry, echo a
 ///                     short readout to stdout, exit 0. Never blocks Claude.
+/// - `--gate`          item-3 Pillar C: the BLOCKING `PreToolUse` gate. Reads the
+///                     hook JSON on stdin, classifies the Bash command, and DENIES an
+///                     outward-facing action a crew may not take (fail-closed).
 ///
 /// ## Shared flags
 /// - `--journal-dir <PATH>`  Override the journal directory (default:
@@ -68,6 +72,11 @@ enum Mode {
     /// Statusline ingest: read Claude's statusline JSON from stdin, journal a
     /// `StatusSnapshot`, echo a readout, exit 0.
     Statusline,
+    /// item-3 Pillar C: the BLOCKING `PreToolUse` gate. Reads the hook JSON on stdin,
+    /// classifies the Bash command, resolves the caller's capability class from the
+    /// app, and DENIES an outward-facing action a crew may not take (or a significant
+    /// deploy/spend lacking a verified general authorization). Fail-closed.
+    Gate,
     None,
 }
 
@@ -88,6 +97,7 @@ fn parse_args() -> Args {
                 }
             }
             "--statusline" => mode = Mode::Statusline,
+            "--gate" => mode = Mode::Gate,
             "--journal-dir" => journal_dir = it.next(),
             "--version" | "-V" => {
                 println!("t-hub-agent {}", env!("CARGO_PKG_VERSION"));
@@ -130,6 +140,17 @@ fn main() {
                 eprintln!("t-hub-agent --statusline: unexpected error: {e:#}");
             }
             // Always exit 0 — never fail Claude's statusline render.
+            std::process::exit(0);
+        }
+
+        // ------------------------------------------------------------------
+        // --gate: the BLOCKING PreToolUse gate (item-3 Pillar C). Emits a deny
+        // decision for a blocked outward-facing command, else stays silent so the
+        // normal permission flow proceeds. Always exits 0 (the decision is carried
+        // in the JSON output, not the exit code).
+        // ------------------------------------------------------------------
+        Mode::Gate => {
+            gate::run();
             std::process::exit(0);
         }
 

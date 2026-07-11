@@ -109,6 +109,28 @@ export function sanitizeContinueText(text: string | null | undefined): string {
   return (text ?? "").trim().replace(/[\x00-\x1f\x7f]/g, "");
 }
 
+/** The safe literal the allowlist falls back to for any non-conforming input. */
+export const SAFE_CONTINUE_FALLBACK = "continue";
+
+/**
+ * item-3 §2.3.6 (M10, ledger #14): the explicit keystroke ALLOWLIST. The auto-continue
+ * watcher is the ONLY automated writer into the usage-limit dialog and it holds the
+ * local full token (the frontend TCB), so it is constrained here so it can Esc+continue
+ * but can NEVER express "select a paid/upgrade option". After sanitizing, the submit
+ * text must be a plain alphabetic word (optionally space-separated) - e.g. "continue",
+ * "keep going". A bare menu digit ("1"/"2"), a "/"-command, or any punctuation that
+ * could navigate or submit a paid option is REJECTED and collapses to the safe literal
+ * "continue"; a blank text stays blank (dismiss-only). Graded SOFTER than the server-
+ * enforced crew-`ReadOnly` half (LOW-10): a single-writer frontend constraint, not a
+ * server wall - a second automated writer or a bypassing path would not be covered.
+ */
+export function allowlistContinueText(text: string | null | undefined): string {
+  const clean = sanitizeContinueText(text);
+  if (!clean) return ""; // blank => dismiss-only (never a bare digit / stray Enter)
+  if (/^[A-Za-z][A-Za-z ]*$/.test(clean)) return clean;
+  return SAFE_CONTINUE_FALLBACK;
+}
+
 /**
  * The keystrokes that recover a session stuck on the usage-limit modal: ESC to
  * DISMISS the numbered menu (never selecting a paid option), then the continue
@@ -131,7 +153,9 @@ export function sanitizeContinueText(text: string | null | undefined): string {
  * shape; the split write removes any ESC-then-CR atomicity assumption.
  */
 export function buildRecoveryInput(text: string | null | undefined): string {
-  const clean = sanitizeContinueText(text);
+  // item-3 §2.3.6: the ALLOWLIST (not just the sanitizer) decides the submit text, so
+  // a menu-selecting digit / "/"-command collapses to the safe literal "continue".
+  const clean = allowlistContinueText(text);
   // Dismiss-only when there's nothing meaningful to type: never a bare digit.
   if (!clean) return ESC;
   return ESC + clean + CR;
@@ -152,6 +176,7 @@ export function buildRecoverySteps(text: string | null | undefined): {
   dismiss: string;
   submit: string;
 } {
-  const clean = sanitizeContinueText(text);
+  // Same ALLOWLIST as buildRecoveryInput (item-3 §2.3.6), so the two stay byte-identical.
+  const clean = allowlistContinueText(text);
   return { dismiss: ESC, submit: clean ? clean + CR : "" };
 }

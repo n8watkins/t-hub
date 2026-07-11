@@ -385,6 +385,10 @@ pub fn install_hooks_at_events(
     // the sidebar USAGE strip shows only dashes. Respects a user-authored
     // statusLine (merge_statusline_into_settings leaves a non-managed one alone).
     let merged = hooks::merge_statusline_into_settings(&merged, agent_bin);
+    // item-3 Pillar C: install the BLOCKING PreToolUse gate (matcher Bash) alongside
+    // the observe-only hooks, under the same consent + clean-uninstall discipline. It
+    // denies an outward-facing command (push/merge/deploy/spend) a crew may not run.
+    let merged = hooks::merge_gate_into_settings(&merged, agent_bin);
     write_settings_atomic(path, &merged)?;
     let managed = count_managed(&merged);
     let statusline_on = hooks::statusline_managed(&merged);

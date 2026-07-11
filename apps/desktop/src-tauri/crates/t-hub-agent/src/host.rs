@@ -239,16 +239,16 @@ mod tests {
 
     #[test]
     fn git_branch_in_t_hub_worktree() {
-        let branch = git_branch("/home/natkins/n8builds/t-hub-05")
+        // Use THIS crate's own directory (a real git checkout on any machine) rather
+        // than a hardcoded absolute path to one dev's clone, which does not exist in
+        // CI / other checkouts and made this test spuriously fail.
+        let repo = env!("CARGO_MANIFEST_DIR");
+        let branch = git_branch(repo)
             .expect("git_branch should not error in a valid git worktree");
-        let branch = branch.expect("branch should be Some in feat/0.5-personal-alpha worktree");
+        let branch = branch.expect("branch should be Some inside a git checkout");
         assert!(
             !branch.is_empty(),
             "branch string should be non-empty, got: {branch}"
-        );
-        assert_eq!(
-            branch, "feat/0.5-personal-alpha",
-            "expected branch feat/0.5-personal-alpha"
         );
     }
 
@@ -264,17 +264,15 @@ mod tests {
 
     #[test]
     fn git_worktrees_in_t_hub_repo() {
-        let worktrees = git_worktrees("/home/natkins/n8builds/t-hub-05")
+        // Portable: query THIS crate's own git repo (see git_branch_in_t_hub_worktree),
+        // not a machine-specific absolute path.
+        let repo = env!("CARGO_MANIFEST_DIR");
+        let worktrees = git_worktrees(repo)
             .expect("git_worktrees should not error in a valid git repo");
         assert!(
             !worktrees.is_empty(),
             "should find at least one worktree entry"
         );
-        // The worktree-05 entry should appear somewhere in the list with the expected branch.
-        let found = worktrees.iter().any(|wt| {
-            wt.branch.as_deref() == Some("feat/0.5-personal-alpha")
-        });
-        assert!(found, "expected to find the feat/0.5-personal-alpha worktree in list");
         // Every entry must have a non-empty path.
         for wt in &worktrees {
             assert!(!wt.path.is_empty(), "worktree path should not be empty");

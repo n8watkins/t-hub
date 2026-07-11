@@ -3541,6 +3541,44 @@ fn elevation_env(ctx: &ControlContext, args: &Value) -> Vec<(String, String)> {
     ]
 }
 
+/// The directory `GH_CONFIG_DIR` points crew at: an EMPTY t-hub-owned config dir with
+/// no `hosts.yml`, so `gh` finds no ambient credential there. Best-effort created.
+fn crew_empty_gh_config_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = home.join(".t-hub").join("crew-gh-empty");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// item-3 §2.3.5 (MED-5): the credential-WITHHOLDING env for a read-class (crew)
+/// spawn - the second, independent wall behind the PreToolUse gate ("hook OR missing
+/// credential"). Points `gh` at an empty config dir (so it finds no `hosts.yml`
+/// credential) AND blanks the common ambient token env vars at the SESSION level (a
+/// tmux `-e KEY=` overrides any inherited value), so a crew that evades the gate still
+/// fails at the remote for lack of a credential. Control-class spawns (captains) are
+/// NOT withheld - orchestrating IS their job.
+fn crew_credential_withholding_env() -> Vec<(String, String)> {
+    let mut env = vec![(
+        "GH_CONFIG_DIR".to_string(),
+        crew_empty_gh_config_dir().to_string_lossy().into_owned(),
+    )];
+    // Blank the ambient publish/registry/spend tokens a crew must not wield. Setting
+    // them empty at the session level scrubs any value inherited from the app env.
+    for key in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "NPM_TOKEN",
+        "NODE_AUTH_TOKEN",
+        "CARGO_REGISTRY_TOKEN",
+    ] {
+        env.push((key.to_string(), String::new()));
+    }
+    env
+}
+
 /// Emit a hash-chained audit record for a control-capability spawn (item-3 §2.1.1
 /// piece 4: "a control-spawn is never silent"). A distinct `control-spawn` decision
 /// with `tokenTier: control` so a log review enumerates exactly who was elevated and
@@ -3605,8 +3643,15 @@ fn spawn_env_with_identity(
     }
     // item-3 §2.1.1 piece 4: every control-capability spawn is audited so an
     // elevation is never silent. The default (READ) spawn is not elevated.
-    if spawn_capability(args) == Capability::Full {
+    let capability = spawn_capability(args);
+    if capability == Capability::Full {
         audit_control_spawn(ctx, command, args);
+    } else {
+        // item-3 §2.3.5: a read-class (crew) spawn also gets credential-withholding -
+        // gh pointed at an empty config dir + ambient tokens blanked - so a crew that
+        // evades the PreToolUse gate still fails at the remote. Control-class spawns
+        // (captains) keep their credentials (orchestrating is their job).
+        env.extend(crew_credential_withholding_env());
     }
     // Resolve the spawner's ship so the crew's binding carries it (item-2 §2.3/§2.6).
     let ship = arg_str(args, "spawnedBy")
@@ -3749,6 +3794,14 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
             }),
         );
         return ControlResponse::err(message);
+    }
+
+    // item-3 Pillar C: `my_capability` echoes the CALLER's resolved capability so the
+    // out-of-process PreToolUse gate can resolve its own class (control vs read) from
+    // the unspoofable token it presents. Read-tier (any valid token passes the gate
+    // above), no side effect, so it is answered here from `cap` directly.
+    if req.command == "my_capability" {
+        return ControlResponse::ok(json!({ "capability": cap.tier_label() }));
     }
 
     // Spawn-class idempotency (ask #1): a client-supplied `requestId` on a
@@ -10049,6 +10102,44 @@ mod tests {
         let (env2, minted2) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
         assert!(env2.is_empty());
         assert!(minted2.is_none());
+    }
+
+    #[test]
+    fn crew_spawn_is_credential_withheld_but_control_spawn_is_not() {
+        // item-3 §2.3.5: a read-class (crew) spawn gets gh withholding (GH_CONFIG_DIR at
+        // an empty dir) + blanked ambient tokens - the second wall behind the gate. A
+        // control-class spawn (captain) keeps its credentials. BYPASS-WOULD-FAIL: drop
+        // the crew_credential_withholding_env call and the GH_CONFIG_DIR assert goes RED.
+        let mut ctx = test_ctx("t");
+        ctx.addr = "127.0.0.1:4242".to_string();
+
+        let (env, _) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
+        assert!(
+            env.iter().any(|(k, v)| k == "GH_CONFIG_DIR" && !v.is_empty()),
+            "a crew spawn must withhold gh via GH_CONFIG_DIR"
+        );
+        assert!(
+            env.iter().any(|(k, v)| k == "GH_TOKEN" && v.is_empty()),
+            "a crew spawn must blank the ambient GH_TOKEN"
+        );
+
+        let (env2, _) =
+            spawn_env_with_identity(&ctx, &json!({"capability": "control"}), "spawn_terminal");
+        assert!(
+            !env2.iter().any(|(k, _)| k == "GH_CONFIG_DIR"),
+            "a control-class spawn must keep its gh credentials"
+        );
+    }
+
+    #[test]
+    fn my_capability_reports_the_callers_resolved_capability() {
+        // item-3 Pillar C: the gate resolves its own class from the unspoofable token.
+        // A control token reports "control"; the read token reports "read".
+        let ctx = test_ctx("t");
+        let control = dispatch_authenticated(&ctx, req("t", "my_capability", json!({})));
+        assert_eq!(control.result.unwrap()["capability"], "control");
+        let read = dispatch_authenticated(&ctx, req("read-t", "my_capability", json!({})));
+        assert_eq!(read.result.unwrap()["capability"], "read");
     }
 
     #[test]
