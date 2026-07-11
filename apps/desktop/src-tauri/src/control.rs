@@ -693,23 +693,271 @@ impl TabRegistry {
 // Captains registry (captain-chat phase 2: ship-registry unification)
 // ---------------------------------------------------------------------------
 
-/// One claimed captaincy as the control channel sees it (captain-chat phase 2):
-/// the ship, the captain's terminal/session id (the same id every other control
-/// command uses - the tmux session is `th_<id>`), the workspace tabs the captain
-/// controls, and the crew sessions it spawned (recorded at the
-/// `spawn_terminal`/`create_worktree` paths via `spawnedBy`).
+/// Epoch-ms now (registry lifecycle timestamps: `Orphaned{since}` etc.). 0 on the
+/// impossible pre-1970 clock, matching the other epoch-ms sites in this file.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The reserved ship slug the apex singleton occupies. A legacy `ship_slug ==
+/// "cortana"` captain claim (the pre-item-2 slug hack, R-H2) migrates to a
+/// first-class `role: Cortana` on this slug (item-2 §2.4/D2, MED-6).
+pub const CORTANA_SLUG: &str = "cortana";
+
+/// Bounded retry budget for the claim compare-and-swap (item-2 §2.2/MED-3). The
+/// window between the lock-free liveness probe and the re-validated mutate is tiny;
+/// a few retries absorb a concurrent mutation. Exhausting it (pathological churn)
+/// surfaces as a contended error rather than looping forever.
+const CLAIM_CAS_ATTEMPTS: usize = 8;
+
+/// The current on-disk schema version for `captains.json` (item-2 §3.2/D2). v0 (the
+/// absent/legacy shape: `captainSessionId` + `crew: [string]`, no `role`/`state`)
+/// is accepted on read and upgraded in place; every write stamps this version.
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 1;
+
+/// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
+/// apex SINGLETON - at most one `Active` across the whole registry - and a Captain
+/// maps to exactly one ship. This is the first-class role that RETIRES the
+/// `ship: cortana` slug-collision hack: uniqueness is enforced on the role, not on a
+/// reserved slug. It is a strict subset of the coarse [`crate::identity::Role`]
+/// (which also carries mint-time General/Crew/Unknown) because only a supervisor
+/// ever holds a registry claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FleetRole {
+    Cortana,
+    Captain,
+}
+
+impl Default for FleetRole {
+    /// Legacy records (no `role` field) default to `Captain`; the load-time
+    /// reconciliation then re-seeds the single `ship_slug == "cortana"` incumbent to
+    /// `Cortana` (D2/MED-6), so the singleton is seeded from the live incumbent, not
+    /// defaulted empty.
+    fn default() -> Self {
+        FleetRole::Captain
+    }
+}
+
+impl FleetRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            FleetRole::Cortana => "cortana",
+            FleetRole::Captain => "captain",
+        }
+    }
+}
+
+/// The lifecycle state of a claim (item-2 §2.4). Death MARKS, it does not scrub - a
+/// dead supervisor's record and crew are RETAINED for re-adoption instead of the
+/// silent `retain`-away leak (the old `remove_session` C4 single-point-of-failure).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ClaimState {
+    /// Live and pointed at a terminal.
+    Active,
+    /// The supervisor's terminal is UNAMBIGUOUSLY gone (`tmux::has_session` false)
+    /// but the durable identity + its crew are retained for re-adoption by a resumed
+    /// same-key supervisor. `since` is epoch-ms. Retained INDEFINITELY (D6); reap
+    /// timing + the landed-gate stay reap-ship's, not item-2's.
+    Orphaned { since: u64 },
+    /// Explicitly released while crew remained: re-claimable by a new captain of the
+    /// same ship, crew preserved. (A release with NO crew hard-removes instead.)
+    Vacant,
+}
+
+impl Default for ClaimState {
+    fn default() -> Self {
+        ClaimState::Active
+    }
+}
+
+/// A crew member's lifecycle under its ship (item-2 §2.4). Like [`ClaimState`],
+/// crew are marked rather than scrubbed so an orphaned worker is re-adoptable and
+/// a dead one is visible to telemetry/reap-ship instead of vanishing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum CrewState {
+    /// Live under a live captain.
+    Active,
+    /// The CAPTAIN died: the crew is orphaned-but-retained, re-adopted (→ `Active`)
+    /// when a same-ship captain resumes. `since` epoch-ms.
+    Orphaned { since: u64 },
+    /// The crew's OWN tile died: a terminal marker (NOT re-adoptable - the worker is
+    /// gone), retained (not scrubbed) so telemetry/reap-ship still see it. `since`
+    /// epoch-ms.
+    Removed { since: u64 },
+}
+
+impl Default for CrewState {
+    fn default() -> Self {
+        CrewState::Active
+    }
+}
+
+/// One crew member of a ship (item-2 §2.3). Crew membership is a property of the
+/// SHIP (this ref lives inside the ship's [`FleetIdentity`]), so it follows the ship
+/// across a captain migration by construction - no pointer-chasing migration routine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrewRef {
+    /// The crew's tile id (a MUTABLE pointer). Membership is keyed on the ship, not
+    /// on this pointer.
+    pub terminal_id: String,
+    /// The crew's Claude continuity anchor. `None` at record time (the crew's own
+    /// `SessionStart` has not fired yet - `control.rs` async-backfill window, MED-7)
+    /// and BACKFILLED on the first StatusBridge resolution. Never load-bearing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_uuid: Option<String>,
+    #[serde(default)]
+    pub state: CrewState,
+}
+
+impl CrewRef {
+    fn new(terminal_id: &str) -> Self {
+        CrewRef {
+            terminal_id: terminal_id.to_string(),
+            claude_uuid: None,
+            state: CrewState::Active,
+        }
+    }
+}
+
+/// Deserialize `crew` from BOTH schema versions (item-2 §3.2/D2): the legacy
+/// `Vec<String>` of bare tile ids AND the modern `Vec<CrewRef>`. A bare string
+/// upgrades to `CrewRef { terminal_id, claude_uuid: None, state: Active }` so an
+/// on-disk v0 file loads without a manual `Value`-walk.
+fn deserialize_crew<'de, D>(d: D) -> Result<Vec<CrewRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CrewWire {
+        Legacy(String),
+        Modern(CrewRef),
+    }
+    let raw = Vec::<CrewWire>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|c| match c {
+            CrewWire::Legacy(tile) => CrewRef::new(&tile),
+            CrewWire::Modern(r) => r,
+        })
+        .collect())
+}
+
+/// A fleet identity as the control channel sees it (item-2 §2.1: the ship/role
+/// re-key). The record is keyed on the DURABLE `ship_slug` (was a mere label); the
+/// terminal id is demoted to a rebindable `Option` pointer, `role` is first-class,
+/// and the Claude UUID is a continuity anchor (a fast-path hint, resolved async, NOT
+/// the load-bearing key). Crew carry their own anchor + state.
 ///
 /// Serialized camelCase in BOTH directions: the persistence file, `list_captains`,
-/// and every `sync_captains` forward all carry this exact shape.
+/// and every `sync_captains` forward all carry this exact shape. On READ it also
+/// accepts the legacy v0 shape (`captainSessionId`, `crew: [string]`, no
+/// role/state) via the field aliases + [`deserialize_crew`] (D2 migration).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CaptainRecord {
+pub struct FleetIdentity {
+    /// The DURABLE primary key (item-2 §2.1): every registry lookup for a captain
+    /// keys on this. For a Cortana claim it is the reserved [`CORTANA_SLUG`].
     pub ship_slug: String,
-    pub captain_session_id: String,
+    /// The first-class role (D1). Cortana is the registry-wide singleton.
+    #[serde(default)]
+    pub role: FleetRole,
+    /// The Claude continuity anchor (`provider_session_id`). A fast-path idempotency
+    /// hint that fires WHEN resolved and is otherwise absent (backfilled async,
+    /// HIGH-1); correctness never rests on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_uuid: Option<String>,
+    /// The MUTABLE terminal pointer (was `captain_session_id`, the old primary key).
+    /// `None` while orphaned/vacant - un-pointed but not lost (the exact window that
+    /// deadlocked R-H2). Accepts the legacy `captainSessionId` field on load.
+    #[serde(default, alias = "captainSessionId")]
+    pub terminal_id: Option<String>,
     #[serde(default)]
     pub workspace_tab_ids: Vec<String>,
+    /// The ship's crew (item-2 §2.3). Deserializes from BOTH the legacy `Vec<String>`
+    /// of tile ids and the modern `Vec<CrewRef>` (D2 migration).
+    #[serde(default, deserialize_with = "deserialize_crew")]
+    pub crew: Vec<CrewRef>,
     #[serde(default)]
-    pub crew: Vec<String>,
+    pub state: ClaimState,
+}
+
+/// Back-compat alias: item-2 renamed `CaptainRecord` → [`FleetIdentity`] (a captain
+/// is a ship/role, not a terminal). The old name stays as an alias so existing
+/// references and call sites read unchanged.
+pub type CaptainRecord = FleetIdentity;
+
+/// What a [`CaptainsRegistry::claim`] resolved to - for the audit/telemetry trail
+/// (D6: orphan/rebind lifecycle is surfaced, never silent). Distinguishes a fresh
+/// claim from an idempotent refresh, a verified same-UUID rebind, an orphan/vacant
+/// re-adoption, and a dead-incumbent auto-release (the R-H2 deadlock clearer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimDisposition {
+    /// A brand-new claim (durable key was free).
+    Created,
+    /// A re-claim by the SAME terminal (idempotent designation refresh).
+    Refreshed,
+    /// The same session migrated to a new terminal, recognized by a RESOLVED
+    /// `claude_uuid` matching the record's anchor (the verified fast-path, §2.2 fix 2).
+    ReboundSameUuid,
+    /// An `Orphaned`/`Vacant` record re-claimed by its own durable key (D4: the
+    /// ship-slug re-claim IS the always-available auto-rebind trigger). Crew re-adopted.
+    ReadoptedOrphan,
+    /// The durable key was held by a DIFFERENT terminal that is UNAMBIGUOUSLY dead
+    /// (`tmux::has_session` false - the SOLE transfer-grade signal, R1): the corpse's
+    /// claim is auto-released and the new claim takes the slug. This is the R-H2
+    /// deadlock clearer (§2.2 fix 1).
+    AutoReleasedDead,
+}
+
+impl ClaimDisposition {
+    pub fn label(self) -> &'static str {
+        match self {
+            ClaimDisposition::Created => "created",
+            ClaimDisposition::Refreshed => "refreshed",
+            ClaimDisposition::ReboundSameUuid => "rebound_same_uuid",
+            ClaimDisposition::ReadoptedOrphan => "readopted_orphan",
+            ClaimDisposition::AutoReleasedDead => "auto_released_dead",
+        }
+    }
+}
+
+/// The result of a [`CaptainsRegistry::claim`]: the resulting record + how it was
+/// resolved (for the audit/telemetry stamp). Whether the registry `seq` advanced
+/// (⇒ a `sync_captains` forward) is still derived by the caller from the seq delta,
+/// exactly as before.
+#[derive(Debug, Clone)]
+pub struct ClaimOutcome {
+    pub record: FleetIdentity,
+    pub disposition: ClaimDisposition,
+}
+
+/// Which ship (and role) a terminal belongs to (item-2 §2.5/§2.6: the `ship_of`
+/// resolution the cross-ship ownership ACL and per-session attribution key on). The
+/// item-2 KEY; the ACL WIRING that consumes it stays item-1 Phase 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShipMembership {
+    /// The tile is a supervisor's OWN terminal (a captain of its ship, or Cortana).
+    Supervisor { ship_slug: String, role: FleetRole },
+    /// The tile is a crew member of a ship.
+    Crew { ship_slug: String },
+}
+
+impl ShipMembership {
+    /// The durable ship slug, whichever membership kind (the H3 ACL comparison key).
+    pub fn ship_slug(&self) -> &str {
+        match self {
+            ShipMembership::Supervisor { ship_slug, .. } => ship_slug,
+            ShipMembership::Crew { ship_slug } => ship_slug,
+        }
+    }
 }
 
 /// A full, versioned copy of the captains registry: what `list_captains` returns,
@@ -719,6 +967,10 @@ pub struct CaptainRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptainsSnapshot {
+    /// On-disk schema version (item-2 §3.2/D2). Absent/0 = legacy; every write
+    /// stamps [`CAPTAINS_SCHEMA_VERSION`]. A mixed-window reader accepts BOTH.
+    #[serde(default)]
+    pub schema_version: u32,
     #[serde(default)]
     pub seq: u64,
     #[serde(default)]
@@ -810,7 +1062,14 @@ impl CaptainsRegistry {
         let inner = std::fs::read_to_string(&path)
             .ok()
             .and_then(|body| serde_json::from_str::<CaptainsSnapshot>(&body).ok())
-            .map(|snap| CaptainsInner { captains: snap.captains, seq: snap.seq })
+            .map(|snap| {
+                // D2/MED-6: the versioned reader accepts BOTH schema versions (the
+                // field aliases + `deserialize_crew` upgrade a v0 record's shape) and
+                // then reconciles the Cortana singleton from the live incumbent.
+                let mut captains = snap.captains;
+                Self::reconcile_on_load(&mut captains);
+                CaptainsInner { captains, seq: snap.seq }
+            })
             .unwrap_or_default();
         // N3: seed the persist guard from the LOADED seq, not 0, so a stale
         // in-memory snapshot (seq <= what's already on disk) can't rewrite the file
@@ -836,7 +1095,34 @@ impl CaptainsRegistry {
     /// caller's already-held `inner` lock. The (potentially slow) disk write then
     /// happens in [`persist`](Self::persist) AFTER the lock is dropped.
     fn snapshot_for_persist(g: &CaptainsInner) -> CaptainsSnapshot {
-        CaptainsSnapshot { seq: g.seq, captains: g.captains.clone() }
+        CaptainsSnapshot {
+            schema_version: CAPTAINS_SCHEMA_VERSION,
+            seq: g.seq,
+            captains: g.captains.clone(),
+        }
+    }
+
+    /// Load-time reconciliation of the Cortana singleton (item-2 D2/MED-6). A legacy
+    /// `ship_slug == "cortana"` captain claim (the pre-item-2 slug hack) is the LIVE
+    /// apex incumbent, so seed the first-class `role: Cortana` FROM it rather than
+    /// defaulting it to `Captain` (which would leave the singleton with zero holders).
+    /// Idempotent: a v1 record that is already `Cortana` stays so. Defensive against a
+    /// corrupt file with two exact-`cortana` slugs (prior uniqueness prevented it):
+    /// keep the first as the Active singleton and orphan the rest, so the "one Active
+    /// Cortana" invariant holds and an operator resolves the duplicate.
+    fn reconcile_on_load(caps: &mut [FleetIdentity]) {
+        let mut seen_cortana = false;
+        for c in caps.iter_mut() {
+            if c.ship_slug == CORTANA_SLUG {
+                c.role = FleetRole::Cortana;
+                if seen_cortana {
+                    c.state = ClaimState::Orphaned { since: now_ms() };
+                    c.terminal_id = None;
+                } else {
+                    seen_cortana = true;
+                }
+            }
+        }
     }
 
     /// Best-effort write-through of a snapshot to disk, WITHOUT the `inner` lock
@@ -896,6 +1182,17 @@ impl CaptainsRegistry {
             );
             return;
         }
+        // MED-4: item-2's BIND writes a per-session SECRET (the widened identity
+        // binding) into this store, so 0600 it - the captains `persist` inherited the
+        // process umask before (the 0600 discipline lived only in `write_handshake`
+        // for control.json). Set it on the temp file BEFORE the atomic rename so the
+        // target is never briefly world-readable. Best-effort (unix only), mirroring
+        // `identity::write_atomic`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
         if let Err(e) = std::fs::rename(&tmp, path) {
             eprintln!(
                 "t-hub-control: captains registry rename to {} failed: {e}",
@@ -916,141 +1213,353 @@ impl CaptainsRegistry {
     /// The full versioned snapshot (`list_captains` + every `sync_captains` forward).
     pub fn snapshot(&self) -> CaptainsSnapshot {
         let g = self.lock();
-        CaptainsSnapshot { seq: g.seq, captains: g.captains.clone() }
+        CaptainsSnapshot {
+            schema_version: CAPTAINS_SCHEMA_VERSION,
+            seq: g.seq,
+            captains: g.captains.clone(),
+        }
     }
 
-    /// The captain record for a given captain session id (a tile id), if that
-    /// session currently holds a captaincy. Used by the fleet notifier to label a
-    /// transition as belonging to a captain (and name its ship).
+    /// The fleet identity a terminal id currently POINTS (item-2 §2.1: keyed on the
+    /// mutable `terminal_id`, was `captain_session_id`). Used by the fleet notifier
+    /// to label a transition as belonging to a captain (and name its ship). A record
+    /// whose terminal is orphaned (`terminal_id: None`) is intentionally NOT returned
+    /// here - it has no live pointer to attribute a status edge to.
     pub fn captain_for_session(&self, session_id: &str) -> Option<CaptainRecord> {
         self.lock()
             .captains
             .iter()
-            .find(|c| c.captain_session_id == session_id)
+            .find(|c| c.terminal_id.as_deref() == Some(session_id))
             .cloned()
     }
 
-    /// Claim captaincy (UPSERT by captain session id):
-    ///   - a NEW captain gets a record `{shipSlug, captainSessionId, workspaceTabIds}`
-    ///     (crew starts empty);
-    ///   - RE-claiming by the same captain updates its ship slug / workspace tabs
-    ///     and keeps its crew (idempotent designation refresh);
-    ///   - a ship slug already held by a DIFFERENT captain is refused (fleet
-    ///     doctrine: one captain per ship - release first, explicitly).
-    ///
-    /// `ship_slug` is slugified; empty/absent falls back to `ship-<sessionId>` so
-    /// a UI pin (which has no ship name) always claims something addressable.
-    ///
-    /// Idempotent: a re-claim that would change NOTHING (same slug, and no new
-    /// workspace tabs) does not bump the revision or persist - the caller sees an
-    /// unchanged `seq` and skips the redundant `sync_captains` forward.
-    pub fn claim(
+    /// Does record `c` hold the durable key for `(role, slug)`? For a Captain the key
+    /// is `ship_slug`; for the Cortana singleton it is the ROLE (D1 - uniqueness on
+    /// the role, not a reserved slug).
+    fn key_matches(c: &FleetIdentity, role: FleetRole, slug: &str) -> bool {
+        match role {
+            FleetRole::Cortana => c.role == FleetRole::Cortana,
+            FleetRole::Captain => c.role == FleetRole::Captain && c.ship_slug == slug,
+        }
+    }
+
+    /// Does record `c`'s RESOLVED continuity anchor equal the presented one? Only a
+    /// non-empty, both-present, equal pair matches - an absent anchor (the async
+    /// window, HIGH-1) never matches, so this is a fast-path hint only.
+    fn uuid_matches(c: &FleetIdentity, presented: Option<&str>) -> bool {
+        match (c.claude_uuid.as_deref(), presented) {
+            (Some(a), Some(b)) => !a.is_empty() && a == b,
+            _ => false,
+        }
+    }
+
+    /// Bump seq + persist iff `changed`, then package the [`ClaimOutcome`]. The guard
+    /// is consumed here so the (potentially slow) disk write runs AFTER `inner` is
+    /// dropped (Incident-D discipline).
+    fn commit_claim(
         &self,
-        captain_session_id: &str,
-        ship_slug: Option<&str>,
-        workspace_tab_ids: Vec<String>,
-    ) -> Result<CaptainRecord, String> {
-        if captain_session_id.trim().is_empty() {
-            return Err("claim_captain requires a non-empty 'captainSessionId'".into());
-        }
-        let slug = ship_slug
-            .map(slugify_ship)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| slugify_ship(&format!("ship-{captain_session_id}")));
-        let mut g = self.lock();
-        if let Some(other) = g
-            .captains
-            .iter()
-            .find(|c| c.ship_slug == slug && c.captain_session_id != captain_session_id)
-        {
-            return Err(format!(
-                "claim_captain: ship '{slug}' is already captained by session '{}' \
-                 (release_captain it first - one captain per ship)",
-                other.captain_session_id
-            ));
-        }
-        let mut changed = true;
-        let record = match g
-            .captains
-            .iter_mut()
-            .find(|c| c.captain_session_id == captain_session_id)
-        {
-            Some(c) => {
-                // Would this re-claim actually change anything? An empty
-                // workspace_tab_ids means "leave the tabs as they are".
-                let tabs_change =
-                    !workspace_tab_ids.is_empty() && c.workspace_tab_ids != workspace_tab_ids;
-                if c.ship_slug == slug && !tabs_change {
-                    changed = false;
-                } else {
-                    c.ship_slug = slug;
-                    if !workspace_tab_ids.is_empty() {
-                        c.workspace_tab_ids = workspace_tab_ids;
-                    }
-                }
-                c.clone()
-            }
-            None => {
-                let record = CaptainRecord {
-                    ship_slug: slug,
-                    captain_session_id: captain_session_id.to_string(),
-                    workspace_tab_ids,
-                    crew: Vec::new(),
-                };
-                g.captains.push(record.clone());
-                record
-            }
-        };
+        mut g: std::sync::MutexGuard<'_, CaptainsInner>,
+        record: FleetIdentity,
+        disposition: ClaimDisposition,
+        changed: bool,
+    ) -> ClaimOutcome {
         if changed {
             g.seq += 1;
             let snap = Self::snapshot_for_persist(&g);
             drop(g);
             self.persist(snap);
         }
-        Ok(record)
+        ClaimOutcome { record, disposition }
     }
 
-    /// Release a captaincy, addressed by captain session id OR ship slug.
-    /// Unknown target is an error (strict, like the tab mutations - a silent
-    /// no-op is how state drifts). Returns the released record.
+    /// Claim (or re-key / rebind) an identity on the DURABLE ship/role key (item-2
+    /// §2.1/§2.2). This replaces the terminal-id-primary upsert. The collision matrix
+    /// (§2.2, "defined once"):
+    ///   - key FREE                          -> `Created` (or a same-terminal
+    ///     re-designation moves this session's record to the new key);
+    ///   - key held by the SAME terminal     -> `Refreshed` (idempotent);
+    ///   - key held, resolved `claude_uuid`
+    ///     matches the presented one         -> `ReboundSameUuid` (verified fast-path);
+    ///   - key held by an `Orphaned`/`Vacant`
+    ///     record (or an un-pointed one)      -> `ReadoptedOrphan` (D4: the ship-slug
+    ///     re-claim IS the always-available auto-rebind trigger; crew re-adopted);
+    ///   - key held by a DIFFERENT terminal
+    ///     that is UNAMBIGUOUSLY dead         -> `AutoReleasedDead` (the R-H2 deadlock
+    ///     clearer - transfer ONLY on `tmux::has_session == false`, R1);
+    ///   - key held by a DIFFERENT terminal
+    ///     that is ALIVE                      -> rejected ("already captained by a
+    ///     LIVE session - release first"). No soft signal ever seizes a live ship.
+    ///
+    /// LOCK DISCIPLINE (MED-3 / Incident-D): the incumbent liveness probe
+    /// (`is_terminal_dead`, a tmux subprocess) is a COMPARE-AND-SWAP - snapshot the
+    /// colliding record under `inner`, RELEASE `inner`, probe with NO lock held,
+    /// re-acquire `inner` and RE-VALIDATE the incumbent is unchanged before
+    /// releasing/rebinding; if the window changed, recompute. tmux is NEVER called
+    /// while `inner` is held.
+    ///
+    /// `is_terminal_dead(tile)` is `|t| !tmux::has_session(target(t))` in production
+    /// (the SOLE transfer-grade signal); tests inject a deterministic predicate.
+    pub fn claim(
+        &self,
+        terminal_id: &str,
+        ship_slug: Option<&str>,
+        role: FleetRole,
+        claude_uuid: Option<&str>,
+        workspace_tab_ids: Vec<String>,
+        is_terminal_dead: &dyn Fn(&str) -> bool,
+    ) -> Result<ClaimOutcome, String> {
+        if terminal_id.trim().is_empty() {
+            return Err("claim_captain requires a non-empty 'captainSessionId'".into());
+        }
+        // The Cortana singleton always occupies the reserved slug; a Captain slugifies
+        // its ship name, falling back to `ship-<terminal>` so a UI pin always claims
+        // something addressable.
+        let slug = match role {
+            FleetRole::Cortana => CORTANA_SLUG.to_string(),
+            FleetRole::Captain => ship_slug
+                .map(slugify_ship)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| slugify_ship(&format!("ship-{terminal_id}"))),
+        };
+
+        for _attempt in 0..CLAIM_CAS_ATTEMPTS {
+            // Phase 1 (under `inner`): decide whether an incumbent liveness probe is
+            // required, and snapshot WHICH terminal to probe. Release the lock before
+            // any tmux I/O.
+            let probe: Option<String> = {
+                let g = self.lock();
+                match g.captains.iter().find(|c| Self::key_matches(c, role, &slug)) {
+                    Some(h) => {
+                        let same_terminal = h.terminal_id.as_deref() == Some(terminal_id);
+                        if same_terminal || Self::uuid_matches(h, claude_uuid) {
+                            None
+                        } else {
+                            match (&h.terminal_id, &h.state) {
+                                // An ACTIVE incumbent on a different terminal is the
+                                // only case that needs a liveness probe to decide
+                                // transfer-vs-reject.
+                                (Some(other), ClaimState::Active) => Some(other.clone()),
+                                // Un-pointed or non-Active (Orphaned/Vacant) => a
+                                // ship-slug re-adoption; no probe.
+                                _ => None,
+                            }
+                        }
+                    }
+                    None => None,
+                }
+            };
+
+            // Phase 2 (NO lock held): probe incumbent liveness (Incident-D / MED-3).
+            let incumbent_dead = probe.as_deref().map(|other| is_terminal_dead(other));
+
+            // Phase 3 (re-acquire `inner`): re-validate then mutate.
+            let mut g = self.lock();
+            let holder_pos = g
+                .captains
+                .iter()
+                .position(|c| Self::key_matches(c, role, &slug));
+
+            // Re-validate the probe assumption still holds; if the incumbent moved
+            // under the window, recompute from scratch.
+            if let Some(probed) = &probe {
+                let still = holder_pos.is_some_and(|i| {
+                    let h = &g.captains[i];
+                    h.terminal_id.as_deref() == Some(probed.as_str())
+                        && h.state == ClaimState::Active
+                });
+                if !still {
+                    drop(g);
+                    continue;
+                }
+            }
+
+            match holder_pos {
+                None => {
+                    // Durable key FREE. If THIS terminal already captains a different
+                    // ship, this is a re-designation: move its record to the new key
+                    // (preserving crew). Otherwise a fresh claim.
+                    if let Some(mi) = g
+                        .captains
+                        .iter()
+                        .position(|c| c.terminal_id.as_deref() == Some(terminal_id))
+                    {
+                        let c = &mut g.captains[mi];
+                        c.ship_slug = slug.clone();
+                        c.role = role;
+                        if let Some(u) = claude_uuid {
+                            c.claude_uuid = Some(u.to_string());
+                        }
+                        if !workspace_tab_ids.is_empty() {
+                            c.workspace_tab_ids = workspace_tab_ids;
+                        }
+                        c.state = ClaimState::Active;
+                        let rec = c.clone();
+                        return Ok(self.commit_claim(g, rec, ClaimDisposition::Refreshed, true));
+                    }
+                    let rec = FleetIdentity {
+                        ship_slug: slug.clone(),
+                        role,
+                        claude_uuid: claude_uuid.map(str::to_string),
+                        terminal_id: Some(terminal_id.to_string()),
+                        workspace_tab_ids,
+                        crew: Vec::new(),
+                        state: ClaimState::Active,
+                    };
+                    g.captains.push(rec.clone());
+                    return Ok(self.commit_claim(g, rec, ClaimDisposition::Created, true));
+                }
+                Some(i) => {
+                    // Idempotent refresh by the SAME terminal.
+                    if g.captains[i].terminal_id.as_deref() == Some(terminal_id) {
+                        let c = &mut g.captains[i];
+                        let tabs_change = !workspace_tab_ids.is_empty()
+                            && c.workspace_tab_ids != workspace_tab_ids;
+                        let uuid_change =
+                            claude_uuid.is_some() && c.claude_uuid.as_deref() != claude_uuid;
+                        let reactivate = c.state != ClaimState::Active;
+                        if tabs_change {
+                            c.workspace_tab_ids = workspace_tab_ids;
+                        }
+                        if uuid_change {
+                            c.claude_uuid = claude_uuid.map(str::to_string);
+                        }
+                        if reactivate {
+                            c.state = ClaimState::Active;
+                            Self::readopt_orphaned_crew(c);
+                        }
+                        let changed = tabs_change || uuid_change || reactivate;
+                        let rec = c.clone();
+                        return Ok(self.commit_claim(g, rec, ClaimDisposition::Refreshed, changed));
+                    }
+
+                    // A DIFFERENT terminal holds the key. Classify per the matrix.
+                    let uuid_hit = Self::uuid_matches(&g.captains[i], claude_uuid);
+                    let orphan_or_vacant = g.captains[i].terminal_id.is_none()
+                        || matches!(
+                            g.captains[i].state,
+                            ClaimState::Orphaned { .. } | ClaimState::Vacant
+                        );
+                    let disposition = if uuid_hit {
+                        ClaimDisposition::ReboundSameUuid
+                    } else if orphan_or_vacant {
+                        ClaimDisposition::ReadoptedOrphan
+                    } else {
+                        // Active incumbent on a different terminal, no UUID match:
+                        // transfer ONLY on the unambiguous-death signal (R1).
+                        match incumbent_dead {
+                            Some(true) => ClaimDisposition::AutoReleasedDead,
+                            Some(false) => {
+                                let other =
+                                    g.captains[i].terminal_id.clone().unwrap_or_default();
+                                return Err(format!(
+                                    "claim_captain: ship '{slug}' is already captained by a \
+                                     LIVE session '{other}' (release_captain it first - one \
+                                     captain per ship)"
+                                ));
+                            }
+                            // Probe missing/stale for this now-Active incumbent (a
+                            // race made it Active under the window): recompute.
+                            None => {
+                                drop(g);
+                                continue;
+                            }
+                        }
+                    };
+
+                    // Rebind the pointer, re-activate, re-adopt orphaned crew.
+                    let c = &mut g.captains[i];
+                    c.terminal_id = Some(terminal_id.to_string());
+                    if let Some(u) = claude_uuid {
+                        c.claude_uuid = Some(u.to_string());
+                    }
+                    if !workspace_tab_ids.is_empty() {
+                        c.workspace_tab_ids = workspace_tab_ids;
+                    }
+                    c.state = ClaimState::Active;
+                    Self::readopt_orphaned_crew(c);
+                    let rec = c.clone();
+                    return Ok(self.commit_claim(g, rec, disposition, true));
+                }
+            }
+        }
+        Err(format!(
+            "claim_captain: ship '{slug}' claim was contended across {CLAIM_CAS_ATTEMPTS} \
+             attempts - retry"
+        ))
+    }
+
+    /// Re-adopt a resuming supervisor's Orphaned crew (Orphaned -> Active). A crew
+    /// whose OWN tile died (`Removed`) is NOT resurrected - the worker is gone.
+    fn readopt_orphaned_crew(c: &mut FleetIdentity) {
+        for cr in c.crew.iter_mut() {
+            if matches!(cr.state, CrewState::Orphaned { .. }) {
+                cr.state = CrewState::Active;
+            }
+        }
+    }
+
+    /// Release a captaincy, addressed by terminal id OR ship slug (or the Cortana
+    /// reserved slug). Unknown target is an error (strict - a silent no-op is how
+    /// state drifts). If crew REMAIN, the claim transitions to `Vacant` (re-claimable
+    /// by a new captain of the same ship, crew preserved) rather than hard-removing;
+    /// a childless claim is removed outright (§3.1 release row). Returns the record
+    /// as it stands after release.
     pub fn release(&self, target: &str) -> Result<CaptainRecord, String> {
         let mut g = self.lock();
         let Some(idx) = g
             .captains
             .iter()
-            .position(|c| c.captain_session_id == target || c.ship_slug == target)
+            .position(|c| c.terminal_id.as_deref() == Some(target) || c.ship_slug == target)
         else {
             return Err(format!(
                 "release_captain: no claim matches '{target}' (list_captains shows \
-                 captainSessionId + shipSlug of every claim)"
+                 terminalId + shipSlug of every claim)"
             ));
         };
-        let removed = g.captains.remove(idx);
+        let has_live_crew = g.captains[idx]
+            .crew
+            .iter()
+            .any(|cr| !matches!(cr.state, CrewState::Removed { .. }));
+        let released = if has_live_crew {
+            let c = &mut g.captains[idx];
+            c.state = ClaimState::Vacant;
+            c.terminal_id = None;
+            c.clone()
+        } else {
+            g.captains.remove(idx)
+        };
         g.seq += 1;
         let snap = Self::snapshot_for_persist(&g);
         drop(g);
         self.persist(snap);
-        Ok(removed)
+        Ok(released)
     }
 
-    /// Record a spawned crew session under its captain (`spawnedBy` at the
-    /// `spawn_terminal`/`create_worktree` paths). Returns true (revision bumped)
-    /// when the captain is claimed and the crew id was newly added; false when
-    /// the captain has no claim (the spawn still proceeds - crew linkage simply
-    /// requires the captain to have claimed first) or the id is already crew.
+    /// Record a spawned crew session under its spawner's SHIP (item-2 §2.3: crew
+    /// membership is a property of the ship, keyed via the spawner's terminal
+    /// pointer). Returns true (revision bumped) when the spawner holds a claim and
+    /// the crew was newly added or REACTIVATED (a reused tile id whose prior ref was
+    /// Removed/Orphaned); false when the spawner has no claim (the spawn still
+    /// proceeds) or the crew is already an Active member. The `CrewRef`'s
+    /// `claude_uuid` is `None` here (the crew's own SessionStart has not fired yet,
+    /// MED-7) and is backfilled later via [`backfill_uuid`](Self::backfill_uuid).
     pub fn record_crew(&self, spawned_by: &str, crew_session_id: &str) -> bool {
         let mut g = self.lock();
         let Some(c) = g
             .captains
             .iter_mut()
-            .find(|c| c.captain_session_id == spawned_by)
+            .find(|c| c.terminal_id.as_deref() == Some(spawned_by))
         else {
             return false;
         };
-        if c.crew.iter().any(|id| id == crew_session_id) {
-            return false;
+        if let Some(existing) = c.crew.iter_mut().find(|cr| cr.terminal_id == crew_session_id) {
+            if matches!(existing.state, CrewState::Active) {
+                return false;
+            }
+            existing.state = CrewState::Active;
+        } else {
+            c.crew.push(CrewRef::new(crew_session_id));
         }
-        c.crew.push(crew_session_id.to_string());
         g.seq += 1;
         let snap = Self::snapshot_for_persist(&g);
         drop(g);
@@ -1058,18 +1567,100 @@ impl CaptainsRegistry {
         true
     }
 
-    /// Lifecycle cleanup for a closed/killed session: drop its captaincy (a dead
-    /// captain must not hold a ship) and remove it from every crew list. Returns
+    /// Backfill the Claude continuity anchor for a tile once the StatusBridge
+    /// resolves it (item-2 §2.3/MED-7 + §2.1: the async-resolved anchor). Sets
+    /// `claude_uuid` on a captain record whose `terminal_id` matches, or on a
+    /// `CrewRef` whose `terminal_id` matches, but ONLY when currently `None` (never
+    /// overwrites a resolved anchor). Returns true (revision bumped) if it filled
+    /// one. A pure enrichment - it changes no ownership.
+    pub fn backfill_uuid(&self, tile: &str, uuid: &str) -> bool {
+        if tile.is_empty() || uuid.is_empty() {
+            return false;
+        }
+        let mut g = self.lock();
+        let mut changed = false;
+        for c in g.captains.iter_mut() {
+            if c.terminal_id.as_deref() == Some(tile) && c.claude_uuid.is_none() {
+                c.claude_uuid = Some(uuid.to_string());
+                changed = true;
+            }
+            for cr in c.crew.iter_mut() {
+                if cr.terminal_id == tile && cr.claude_uuid.is_none() {
+                    cr.claude_uuid = Some(uuid.to_string());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            g.seq += 1;
+            let snap = Self::snapshot_for_persist(&g);
+            drop(g);
+            self.persist(snap);
+        }
+        changed
+    }
+
+    /// Resolve which SHIP (and, for a supervisor, which role) a terminal id belongs
+    /// to (item-2 §2.5/§2.6: the `ship_of` resolver the cross-ship ownership ACL and
+    /// per-session attribution key on). A supervisor terminal resolves to its own
+    /// ship+role; a crew tile resolves to its ship (skipping a `Removed` ref - that
+    /// worker is gone). `None` if the tile belongs to no ship.
+    pub fn ship_of(&self, tile: &str) -> Option<ShipMembership> {
+        let g = self.lock();
+        if let Some(c) = g.captains.iter().find(|c| c.terminal_id.as_deref() == Some(tile)) {
+            return Some(ShipMembership::Supervisor {
+                ship_slug: c.ship_slug.clone(),
+                role: c.role,
+            });
+        }
+        for c in g.captains.iter() {
+            if c.crew.iter().any(|cr| {
+                cr.terminal_id == tile && !matches!(cr.state, CrewState::Removed { .. })
+            }) {
+                return Some(ShipMembership::Crew {
+                    ship_slug: c.ship_slug.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Lifecycle transition for a closed/killed session (item-2 §2.4: death MARKS,
+    /// it does not scrub - retiring the old `remove_session` C4 silent-leak). Two
+    /// cases, both idempotent:
+    ///   - the id is a SUPERVISOR terminal -> its record goes `Orphaned{since}`, its
+    ///     `terminal_id` clears to `None`, and its Active crew go `Orphaned` under the
+    ///     STILL-PRESENT ship record (dead captain -> orphaned crew; dead Cortana ->
+    ///     orphaned captains-as-crew). Re-adoptable by a resumed same-key supervisor.
+    ///   - the id is a CREW tile -> that `CrewRef` flips to `Removed{since}` (its own
+    ///     worker died; not re-adoptable), retained not scrubbed.
+    /// Records are retained INDEFINITELY (D6); reap timing stays reap-ship's. Returns
     /// true (revision bumped) if anything changed.
     pub fn remove_session(&self, session_id: &str) -> bool {
         let mut g = self.lock();
-        let before_caps = g.captains.len();
-        g.captains.retain(|c| c.captain_session_id != session_id);
-        let mut changed = g.captains.len() != before_caps;
+        let now = now_ms();
+        let mut changed = false;
+        // Case 1: a supervisor's terminal died -> Orphaned, un-pointed, crew orphaned.
         for c in g.captains.iter_mut() {
-            let before = c.crew.len();
-            c.crew.retain(|id| id != session_id);
-            changed |= c.crew.len() != before;
+            if c.terminal_id.as_deref() == Some(session_id) {
+                c.state = ClaimState::Orphaned { since: now };
+                c.terminal_id = None;
+                for cr in c.crew.iter_mut() {
+                    if matches!(cr.state, CrewState::Active) {
+                        cr.state = CrewState::Orphaned { since: now };
+                    }
+                }
+                changed = true;
+            }
+        }
+        // Case 2: a crew tile's OWN session died -> mark that ref Removed (not scrubbed).
+        for c in g.captains.iter_mut() {
+            for cr in c.crew.iter_mut() {
+                if cr.terminal_id == session_id && !matches!(cr.state, CrewState::Removed { .. }) {
+                    cr.state = CrewState::Removed { since: now };
+                    changed = true;
+                }
+            }
         }
         if changed {
             g.seq += 1;
@@ -1099,6 +1690,29 @@ impl CaptainsRegistry {
             self.persist(snap);
         }
         changed
+    }
+}
+
+#[cfg(test)]
+impl CaptainsRegistry {
+    /// Test convenience preserving the legacy 3-arg `claim` ergonomics: a `Captain`
+    /// claim, no UUID hint, and a "nothing is dead" liveness predicate (so a live
+    /// incumbent is never auto-released). Tests that exercise the dead-claim /
+    /// rebind / Cortana paths call the full 6-arg [`claim`](Self::claim) directly.
+    pub(crate) fn claim_test(
+        &self,
+        terminal_id: &str,
+        ship_slug: Option<&str>,
+        workspace_tab_ids: Vec<String>,
+    ) -> Result<ClaimOutcome, String> {
+        self.claim(
+            terminal_id,
+            ship_slug,
+            FleetRole::Captain,
+            None,
+            workspace_tab_ids,
+            &|_| false,
+        )
     }
 }
 
@@ -2712,6 +3326,58 @@ fn token_is_valid(ctx: &ControlContext, presented: &str) -> bool {
     resolve_capability(ctx, presented).is_some()
 }
 
+/// A per-session identity resolved to its DURABLE ship/role (item-2 §2.6 RESOLVE, the
+/// widened resolver). This is the KEY the comms-plane enqueue-ACL, delegation-gate,
+/// and cross-ship ownership ACL (item-1 2.6/H3) consume - item 2 provides the key +
+/// resolver; the ACL WIRING stays item-1 Phase 3 (§2.8, Phase D).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIdentity {
+    /// The minted per-session id (the non-secret attribution handle).
+    pub session_id: String,
+    /// The coarse mint-time role (`Captain`/`Crew`/...).
+    pub mint_role: crate::identity::Role,
+    /// The tile this session is bound to (a mutable pointer), if bound yet.
+    pub tile: Option<String>,
+    /// `ship_of(session)` - the DURABLE ship, registry-authoritative when the tile
+    /// resolves in the captains registry, else the mint-time ship copy.
+    pub ship_slug: Option<String>,
+    /// `role_of(session)` at the registry's granularity: the first-class fleet role
+    /// when the tile is a SUPERVISOR terminal, else `None` (a crew is not a fleet role).
+    pub fleet_role: Option<FleetRole>,
+    /// `uuid_of(session)` - the Claude continuity anchor, when the StatusBridge has
+    /// resolved it (async, HIGH-1).
+    pub claude_uuid: Option<String>,
+}
+
+/// RESOLVE (item-2 §2.6): map a presented per-session token to its widened
+/// [`ResolvedIdentity`] - `ship_of` / `role_of` / `uuid_of` in one lookup. Kept
+/// BESIDE the unchanged [`resolve_capability`] (LOW-9: identity resolution is a
+/// bounded add, not a return-type widening of the tier resolver, so tier-check
+/// callers keep their signature). Returns `None` for an empty/unknown token. This is
+/// IDENTIFICATION, never authorization (the ACL is item-1 Phase 3).
+pub fn resolve_identity(ctx: &ControlContext, presented: &str) -> Option<ResolvedIdentity> {
+    let ident = ctx.identity.resolve(presented)?;
+    let tile = ident.session_tile.clone();
+    // Registry-authoritative ship/role, falling back to the mint-time ship copy when
+    // the tile is not (yet) a registry member.
+    let (ship_slug, fleet_role) = match tile.as_deref().and_then(|t| ctx.captains.ship_of(t)) {
+        Some(ShipMembership::Supervisor { ship_slug, role }) => (Some(ship_slug), Some(role)),
+        Some(ShipMembership::Crew { ship_slug }) => (Some(ship_slug), None),
+        None => (ident.ship_slug.clone(), None),
+    };
+    let claude_uuid = tile
+        .as_deref()
+        .and_then(|t| ctx.status.session_for_terminal(t));
+    Some(ResolvedIdentity {
+        session_id: ident.id,
+        mint_role: ident.role,
+        tile,
+        ship_slug,
+        fleet_role,
+        claude_uuid,
+    })
+}
+
 /// The capability-token env injected into a spawned session so its in-session
 /// MCP/clients authenticate as the capability the spawn was granted (Phase 2b).
 ///
@@ -2754,11 +3420,14 @@ fn elevation_env(ctx: &ControlContext, args: &Value) -> Vec<(String, String)> {
 /// exactly as before - the identity slice is additive.
 ///
 /// Role at mint is best-effort `Crew`: `spawn_terminal` / `create_worktree` are the
-/// crew-spawn paths (a captain is created via `claim_captain`, not here). Durable
-/// role-PINNING / role-uniqueness need item 2's ship/role re-key (R-H2), flagged in
-/// the identity module; this records "which session, in what coarse role" - enough
-/// for the plane to stamp per-session attribution, and the substrate Phase 3's ACL
-/// builds on.
+/// crew-spawn paths (a captain is created via `claim_captain`, not here).
+///
+/// Item-2 §2.6/D5 (the widened binding): the mint now ALSO carries the crew's durable
+/// SHIP, resolved from the SPAWNER's identity - a crew inherits its spawner captain's
+/// ship (`ship_of(spawnedBy)`). This is the same seam item 1 stood up, widened from
+/// `{claude_uuid}` to `{claude_uuid, ship_slug, role}`; the durable ship key still
+/// lives authoritatively in the captains registry, this is the fast-path attribution
+/// copy. `None` when the spawner has no claim yet (the ship is unresolved).
 fn spawn_env_with_identity(
     ctx: &ControlContext,
     args: &Value,
@@ -2769,7 +3438,12 @@ fn spawn_env_with_identity(
         // present its token over anyway).
         return (env, None);
     }
-    let identity = ctx.identity.mint(crate::identity::Role::Crew);
+    // Resolve the spawner's ship so the crew's binding carries it (item-2 §2.3/§2.6).
+    let ship = arg_str(args, "spawnedBy")
+        .or_else(|| arg_str(args, "spawned_by"))
+        .and_then(|spawner| ctx.captains.ship_of(&spawner))
+        .map(|m| m.ship_slug().to_string());
+    let identity = ctx.identity.mint_for(crate::identity::Role::Crew, ship);
     env.push((
         crate::identity::SESSION_TOKEN_ENV.to_string(),
         identity.secret.clone(),
@@ -4529,6 +5203,21 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         ));
     }
     let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
+    // Item-2 D1/D2: resolve the first-class role. An explicit `role: "cortana"` wins;
+    // otherwise a `ship_slug` that slugifies to the reserved `cortana` maps to the
+    // Cortana singleton (so the existing "claim ship cortana" callers keep working
+    // while the slug hack is retired), and everything else is a Captain.
+    let role = match arg_str(args, "role").map(|r| r.to_ascii_lowercase()) {
+        Some(r) if r == "cortana" => FleetRole::Cortana,
+        _ if ship_slug.as_deref().map(slugify_ship).as_deref() == Some(CORTANA_SLUG) => {
+            FleetRole::Cortana
+        }
+        _ => FleetRole::Captain,
+    };
+    // The Claude continuity anchor, best-effort (async-resolved, HIGH-1): a fast-path
+    // idempotency hint only. `None` in the startup window is fine - the ship-slug
+    // re-claim is the load-bearing rebind trigger.
+    let claude_uuid = ctx.status.session_for_terminal(&captain_session_id);
     let workspace_tab_ids: Vec<String> = args
         .get("workspaceTabIds")
         .or_else(|| args.get("workspace_tab_ids"))
@@ -4547,9 +5236,18 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
                 .collect()
         });
     let before_seq = ctx.captains.snapshot().seq;
-    let record = ctx
-        .captains
-        .claim(&captain_session_id, ship_slug.as_deref(), workspace_tab_ids)?;
+    // The transfer-grade liveness predicate (R1): the SOLE signal that may auto-release
+    // an incumbent's slug to this claimant is its tmux session being gone. Evaluated
+    // lock-free inside `claim` (the CAS discipline, MED-3).
+    let is_terminal_dead = |tile: &str| !tmux::has_session(&tmux_target(tile));
+    let outcome = ctx.captains.claim(
+        &captain_session_id,
+        ship_slug.as_deref(),
+        role,
+        claude_uuid.as_deref(),
+        workspace_tab_ids,
+        &is_terminal_dead,
+    )?;
     let snap = ctx.captains.snapshot();
     // Idempotent re-claim (unchanged): the registry left `seq` alone, so skip the
     // redundant forward. A real change bumps `seq` and forwards the snapshot.
@@ -4558,7 +5256,8 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         "accepted": "claim_captain",
         "audited": true,
         "applied": applied,
-        "captain": record,
+        "captain": outcome.record,
+        "disposition": outcome.disposition.label(),
         "seq": snap.seq,
         "captains": snap.captains,
         "note": "captaincy claimed in the server captains registry (authoritative, \
@@ -7739,75 +8438,159 @@ mod tests {
         ))
     }
 
+    /// A crew ref's tile ids, for concise assertions.
+    fn crew_tiles(rec: &FleetIdentity) -> Vec<String> {
+        rec.crew.iter().map(|c| c.terminal_id.clone()).collect()
+    }
+    /// The one captain record (tests keep a single ship).
+    fn only(reg: &CaptainsRegistry) -> FleetIdentity {
+        reg.snapshot().captains.into_iter().next().unwrap()
+    }
+    /// "Everything alive" liveness predicate (never auto-releases).
+    fn all_alive(_: &str) -> bool {
+        false
+    }
+
     #[test]
     fn claim_registers_updates_and_bumps_seq() {
         let reg = CaptainsRegistry::new();
-        let rec = reg.claim("cap-1", Some("Ship Alpha!"), vec!["tab-1".into()]).unwrap();
+        let out = reg
+            .claim("cap-1", Some("Ship Alpha!"), FleetRole::Captain, None, vec!["tab-1".into()], &all_alive)
+            .unwrap();
+        assert_eq!(out.disposition, ClaimDisposition::Created);
+        let rec = out.record;
         assert_eq!(rec.ship_slug, "ship-alpha");
-        assert_eq!(rec.captain_session_id, "cap-1");
+        assert_eq!(rec.terminal_id.as_deref(), Some("cap-1"));
+        assert_eq!(rec.role, FleetRole::Captain);
+        assert_eq!(rec.state, ClaimState::Active);
         assert_eq!(rec.workspace_tab_ids, vec!["tab-1".to_string()]);
         assert!(rec.crew.is_empty());
-        let snap = reg.snapshot();
-        assert_eq!(snap.seq, 1);
-        assert_eq!(snap.captains.len(), 1);
+        assert_eq!(reg.snapshot().seq, 1);
 
-        // Re-claim by the SAME captain is an upsert: slug/tabs refresh, crew kept.
+        // Re-claim by the SAME terminal to a new ship is a re-designation: slug/tabs
+        // refresh, crew kept, no duplicate record.
         assert!(reg.record_crew("cap-1", "crew-1"));
-        let rec = reg.claim("cap-1", Some("ship-beta"), vec!["tab-2".into()]).unwrap();
+        let out = reg
+            .claim("cap-1", Some("ship-beta"), FleetRole::Captain, None, vec!["tab-2".into()], &all_alive)
+            .unwrap();
+        let rec = out.record;
         assert_eq!(rec.ship_slug, "ship-beta");
         assert_eq!(rec.workspace_tab_ids, vec!["tab-2".to_string()]);
-        assert_eq!(rec.crew, vec!["crew-1".to_string()]);
+        assert_eq!(crew_tiles(&rec), vec!["crew-1".to_string()]);
         let snap = reg.snapshot();
-        assert_eq!(snap.captains.len(), 1, "upsert must not duplicate the claim");
+        assert_eq!(snap.captains.len(), 1, "re-designation must not duplicate the claim");
         assert_eq!(snap.seq, 3);
     }
 
     #[test]
-    fn claim_defaults_slug_and_refuses_a_taken_ship() {
+    fn claim_defaults_slug_and_a_live_ship_is_never_seized() {
+        // The double-claim RACE / wedged-not-dead guard: a DIFFERENT terminal claiming
+        // a slug held by a LIVE incumbent is REJECTED (a bypass - seizing a live ship
+        // on a soft signal - would split-brain; HIGH-2/R1). A live tmux session is the
+        // "wedged" case too: has_session true => not transfer-grade => reject.
         let reg = CaptainsRegistry::new();
-        // No ship name (a UI pin): slug falls back to ship-<sessionId>.
-        let rec = reg.claim("cap-1", None, vec![]).unwrap();
-        assert_eq!(rec.ship_slug, "ship-cap-1");
-        // One captain per ship: a DIFFERENT captain claiming the slug is refused.
-        let err = reg.claim("cap-2", Some("ship-cap-1"), vec![]).unwrap_err();
-        assert!(err.contains("already captained by session 'cap-1'"), "got: {err}");
-        // Empty session id is refused before touching the registry.
-        assert!(reg.claim("  ", None, vec![]).is_err());
+        let out = reg.claim_test("cap-1", None, vec![]).unwrap();
+        assert_eq!(out.record.ship_slug, "ship-cap-1");
+        let err = reg
+            .claim("cap-2", Some("ship-cap-1"), FleetRole::Captain, None, vec![], &all_alive)
+            .unwrap_err();
+        assert!(err.contains("already captained by a LIVE session 'cap-1'"), "got: {err}");
+        // The incumbent is untouched; the refusal did not bump the revision.
+        assert_eq!(only(&reg).terminal_id.as_deref(), Some("cap-1"));
         assert_eq!(reg.snapshot().seq, 1, "refusals must not bump the revision");
+        // Empty session id is refused before touching the registry.
+        assert!(reg.claim_test("  ", None, vec![]).is_err());
     }
 
     #[test]
-    fn release_is_strict_and_addresses_by_id_or_slug() {
+    fn corpse_holds_slug_auto_releases_on_unambiguous_death() {
+        // R-H2 core: a captain's terminal is killed and the session migrates to a new
+        // terminal. The corpse's claim would DEADLOCK the migrated re-claim today.
+        // Re-keyed: `tmux::has_session == false` (the SOLE transfer-grade signal) auto-
+        // releases the corpse and the new terminal takes the slug. Crew are preserved.
         let reg = CaptainsRegistry::new();
-        reg.claim("cap-1", Some("alpha"), vec![]).unwrap();
-        reg.claim("cap-2", Some("beta"), vec![]).unwrap();
-        // By ship slug.
-        assert_eq!(reg.release("alpha").unwrap().captain_session_id, "cap-1");
-        // By captain session id.
-        assert_eq!(reg.release("cap-2").unwrap().ship_slug, "beta");
-        // Unknown target is an error, not a silent no-op.
-        let err = reg.release("cap-2").unwrap_err();
-        assert!(err.contains("no claim matches"), "got: {err}");
-        assert!(reg.snapshot().captains.is_empty());
+        reg.claim_test("cap-old", Some("t-hub-app"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-old", "crew-1"));
+        // cap-old's pane is gone; cap-new re-claims the same ship (no UUID resolved).
+        let dead_is_old = |tile: &str| tile == "cap-old";
+        let out = reg
+            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &dead_is_old)
+            .unwrap();
+        assert_eq!(out.disposition, ClaimDisposition::AutoReleasedDead);
+        assert_eq!(out.record.terminal_id.as_deref(), Some("cap-new"));
+        assert_eq!(crew_tiles(&out.record), vec!["crew-1".to_string()], "crew followed the ship");
+        assert_eq!(reg.snapshot().captains.len(), 1, "no duplicate - the slug transferred");
     }
 
     #[test]
-    fn crew_lifecycle_record_dedupe_and_session_removal() {
+    fn same_uuid_rebind_is_a_fast_path_even_when_incumbent_looks_alive() {
+        // The verified fast-path (§2.2 fix 2): a re-claim presenting a RESOLVED
+        // claude_uuid equal to the record's anchor is the SAME migrated session, so it
+        // rebinds the terminal pointer WITHOUT the liveness path - even if the probe
+        // would say "alive" (the old tile lingering). It must never be a competitor seize.
         let reg = CaptainsRegistry::new();
-        reg.claim("cap-1", Some("alpha"), vec![]).unwrap();
-        // Recording under an UNclaimed captain is a no-op (spawn still proceeds).
-        assert!(!reg.record_crew("cap-ghost", "crew-1"));
+        reg.claim("cap-old", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive)
+            .unwrap();
+        let out = reg
+            .claim("cap-new", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive)
+            .unwrap();
+        assert_eq!(out.disposition, ClaimDisposition::ReboundSameUuid);
+        assert_eq!(out.record.terminal_id.as_deref(), Some("cap-new"));
+        assert_eq!(reg.snapshot().captains.len(), 1);
+    }
+
+    #[test]
+    fn orphaned_record_is_readopted_by_ship_slug_reclaim() {
+        // D4 auto-rebind on resume: after the captain dies (Orphaned), a resumed
+        // captain re-claiming the ship SLUG (the always-available trigger, no UUID
+        // needed) re-adopts the record → Active and resurrects its Orphaned crew.
+        let reg = CaptainsRegistry::new();
+        reg.claim_test("cap-old", Some("shipx"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-old", "crew-1"));
+        assert!(reg.remove_session("cap-old"), "captain death marks orphaned");
+        assert!(matches!(only(&reg).state, ClaimState::Orphaned { .. }));
+
+        let out = reg.claim_test("cap-new", Some("shipx"), vec![]).unwrap();
+        assert_eq!(out.disposition, ClaimDisposition::ReadoptedOrphan);
+        let rec = only(&reg);
+        assert_eq!(rec.state, ClaimState::Active);
+        assert_eq!(rec.terminal_id.as_deref(), Some("cap-new"));
+        assert_eq!(rec.crew[0].state, CrewState::Active, "orphaned crew re-adopted");
+    }
+
+    #[test]
+    fn dead_captain_orphans_crew_and_is_not_scrubbed() {
+        // Phase B: death MARKS, it does not scrub (retiring the C4 silent leak). A dead
+        // captain's record is retained Orphaned, un-pointed, with its crew Orphaned.
+        let reg = CaptainsRegistry::new();
+        reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
         assert!(reg.record_crew("cap-1", "crew-1"));
-        assert!(!reg.record_crew("cap-1", "crew-1"), "duplicate crew must not re-add");
         assert!(reg.record_crew("cap-1", "crew-2"));
-        assert_eq!(reg.snapshot().captains[0].crew.len(), 2);
-
-        // A killed crew session leaves every crew list.
-        assert!(reg.remove_session("crew-1"));
-        assert_eq!(reg.snapshot().captains[0].crew, vec!["crew-2".to_string()]);
-        // A killed CAPTAIN loses its claim.
         assert!(reg.remove_session("cap-1"));
-        assert!(reg.snapshot().captains.is_empty());
+        let rec = only(&reg);
+        assert!(matches!(rec.state, ClaimState::Orphaned { .. }), "retained, not scrubbed");
+        assert!(rec.terminal_id.is_none(), "un-pointed");
+        assert!(
+            rec.crew.iter().all(|c| matches!(c.state, CrewState::Orphaned { .. })),
+            "crew orphaned under the surviving ship, never dropped"
+        );
+    }
+
+    #[test]
+    fn dead_crew_tile_is_marked_removed_not_scrubbed() {
+        // A crew's OWN tile dying flips that ref to Removed (retained for telemetry),
+        // leaving the live captain + sibling crew untouched.
+        let reg = CaptainsRegistry::new();
+        reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-1", "crew-1"));
+        assert!(reg.record_crew("cap-1", "crew-2"));
+        assert!(reg.remove_session("crew-1"));
+        let rec = only(&reg);
+        assert_eq!(rec.state, ClaimState::Active, "captain still alive");
+        let c1 = rec.crew.iter().find(|c| c.terminal_id == "crew-1").unwrap();
+        let c2 = rec.crew.iter().find(|c| c.terminal_id == "crew-2").unwrap();
+        assert!(matches!(c1.state, CrewState::Removed { .. }), "dead crew retained as Removed");
+        assert_eq!(c2.state, CrewState::Active);
         // Removing an unknown session changes nothing (no revision bump).
         let seq = reg.snapshot().seq;
         assert!(!reg.remove_session("nobody"));
@@ -7815,9 +8598,141 @@ mod tests {
     }
 
     #[test]
+    fn record_crew_dedupes_and_reactivates_a_removed_ref() {
+        let reg = CaptainsRegistry::new();
+        reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
+        assert!(!reg.record_crew("cap-ghost", "crew-1"), "unclaimed spawner is a no-op");
+        assert!(reg.record_crew("cap-1", "crew-1"));
+        assert!(!reg.record_crew("cap-1", "crew-1"), "duplicate Active crew must not re-add");
+        // A reused tile id after its ref was Removed re-activates (does not duplicate).
+        assert!(reg.remove_session("crew-1"));
+        assert!(reg.record_crew("cap-1", "crew-1"), "reused tile reactivates");
+        let rec = only(&reg);
+        assert_eq!(rec.crew.len(), 1);
+        assert_eq!(rec.crew[0].state, CrewState::Active);
+    }
+
+    #[test]
+    fn cortana_is_a_first_class_singleton_role() {
+        // D1: Cortana is a first-class role, unique registry-wide, NOT a slug hack. A
+        // second Cortana claim by a LIVE competitor is rejected; only unambiguous death
+        // (or the same session) yields the apex.
+        let reg = CaptainsRegistry::new();
+        let out = reg
+            .claim("cor-1", None, FleetRole::Cortana, None, vec![], &all_alive)
+            .unwrap();
+        assert_eq!(out.record.role, FleetRole::Cortana);
+        assert_eq!(out.record.ship_slug, CORTANA_SLUG);
+        // A different LIVE terminal cannot seize the singleton.
+        let err = reg
+            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &all_alive)
+            .unwrap_err();
+        assert!(err.contains("LIVE"), "got: {err}");
+        // The incumbent dying hands the apex to the resumed Cortana.
+        let dead_is_1 = |t: &str| t == "cor-1";
+        let out = reg
+            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &dead_is_1)
+            .unwrap();
+        assert_eq!(out.disposition, ClaimDisposition::AutoReleasedDead);
+        assert_eq!(out.record.terminal_id.as_deref(), Some("cor-2"));
+        assert_eq!(reg.snapshot().captains.iter().filter(|c| c.role == FleetRole::Cortana).count(), 1);
+    }
+
+    #[test]
+    fn release_with_crew_becomes_vacant_childless_removes() {
+        let reg = CaptainsRegistry::new();
+        reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-1", "crew-1"));
+        // Release with crew: transition to Vacant (re-claimable), crew preserved.
+        let released = reg.release("alpha").unwrap();
+        assert_eq!(released.state, ClaimState::Vacant);
+        assert!(released.terminal_id.is_none());
+        assert_eq!(only(&reg).crew.len(), 1, "crew preserved for re-adoption");
+        // Re-claiming the vacant ship re-adopts it.
+        let out = reg.claim_test("cap-2", Some("alpha"), vec![]).unwrap();
+        assert_eq!(out.disposition, ClaimDisposition::ReadoptedOrphan);
+
+        // A childless claim hard-removes on release.
+        reg.claim_test("cap-9", Some("beta"), vec![]).unwrap();
+        assert_eq!(reg.release("beta").unwrap().ship_slug, "beta");
+        assert!(reg.snapshot().captains.iter().all(|c| c.ship_slug != "beta"));
+        // Unknown target is an error, not a silent no-op.
+        assert!(reg.release("no-such").unwrap_err().contains("no claim matches"));
+    }
+
+    #[test]
+    fn ship_of_resolves_supervisor_and_crew_across_the_namespace() {
+        // Phase D: the cross-ship ownership KEY resolves for both a supervisor terminal
+        // and a crew tile (item-1 Phase 3 wires the ACL on top of this).
+        let reg = CaptainsRegistry::new();
+        reg.claim("cap-1", Some("shipx"), FleetRole::Captain, None, vec![], &all_alive)
+            .unwrap();
+        assert!(reg.record_crew("cap-1", "crew-1"));
+        assert_eq!(
+            reg.ship_of("cap-1"),
+            Some(ShipMembership::Supervisor { ship_slug: "shipx".into(), role: FleetRole::Captain })
+        );
+        assert_eq!(
+            reg.ship_of("crew-1"),
+            Some(ShipMembership::Crew { ship_slug: "shipx".into() })
+        );
+        assert_eq!(reg.ship_of("nobody"), None);
+        // A Removed crew tile no longer resolves.
+        assert!(reg.remove_session("crew-1"));
+        assert_eq!(reg.ship_of("crew-1"), None);
+    }
+
+    #[test]
+    fn backfill_uuid_fills_only_a_none_anchor() {
+        // MED-7: the async-resolved anchor is backfilled once, never overwritten.
+        let reg = CaptainsRegistry::new();
+        reg.claim_test("cap-1", Some("shipx"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-1", "crew-1"));
+        assert!(reg.backfill_uuid("cap-1", "uuid-cap"));
+        assert!(reg.backfill_uuid("crew-1", "uuid-crew"));
+        let rec = only(&reg);
+        assert_eq!(rec.claude_uuid.as_deref(), Some("uuid-cap"));
+        assert_eq!(rec.crew[0].claude_uuid.as_deref(), Some("uuid-crew"));
+        // A second backfill of an already-resolved anchor is a no-op (no seq bump).
+        let seq = reg.snapshot().seq;
+        assert!(!reg.backfill_uuid("cap-1", "uuid-other"));
+        assert_eq!(reg.snapshot().seq, seq);
+        assert_eq!(only(&reg).claude_uuid.as_deref(), Some("uuid-cap"));
+    }
+
+    #[test]
+    fn legacy_v0_captains_json_migrates_in_place() {
+        // D2/MED-6: the versioned reader accepts the legacy shape (captainSessionId +
+        // crew: [string], no role/state) AND special-cases the cortana slug -> the
+        // first-class Cortana singleton, seeded from the live incumbent.
+        let path = captains_tmp("legacy-v0");
+        let legacy = serde_json::json!({
+            "seq": 5,
+            "captains": [
+                { "shipSlug": "cortana", "captainSessionId": "cor-x", "crew": ["c1", "c2"] },
+                { "shipSlug": "t-hub-app", "captainSessionId": "cap-y", "workspaceTabIds": ["t1"], "crew": [] }
+            ]
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let reg = CaptainsRegistry::load(path.clone());
+        let snap = reg.snapshot();
+        assert_eq!(snap.seq, 5, "seq preserved across the migration");
+        let cor = snap.captains.iter().find(|c| c.ship_slug == "cortana").unwrap();
+        assert_eq!(cor.role, FleetRole::Cortana, "legacy cortana slug seeds the singleton role");
+        assert_eq!(cor.terminal_id.as_deref(), Some("cor-x"), "captainSessionId -> terminal_id");
+        assert_eq!(cor.state, ClaimState::Active);
+        assert_eq!(crew_tiles(cor), vec!["c1".to_string(), "c2".to_string()], "crew strings -> CrewRef");
+        assert!(cor.crew.iter().all(|c| c.state == CrewState::Active));
+        let cap = snap.captains.iter().find(|c| c.ship_slug == "t-hub-app").unwrap();
+        assert_eq!(cap.role, FleetRole::Captain, "a normal ship stays a Captain");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn prune_tab_drops_the_tab_but_keeps_the_claim() {
         let reg = CaptainsRegistry::new();
-        reg.claim("cap-1", Some("alpha"), vec!["tab-1".into(), "tab-2".into()]).unwrap();
+        reg.claim_test("cap-1", Some("alpha"), vec!["tab-1".into(), "tab-2".into()]).unwrap();
         assert!(reg.prune_tab("tab-1"));
         let snap = reg.snapshot();
         assert_eq!(snap.captains[0].workspace_tab_ids, vec!["tab-2".to_string()]);
@@ -7832,7 +8747,7 @@ mod tests {
         let path = captains_tmp("roundtrip");
         {
             let reg = CaptainsRegistry::load(path.clone());
-            reg.claim("cap-1", Some("alpha"), vec!["tab-1".into()]).unwrap();
+            reg.claim_test("cap-1", Some("alpha"), vec!["tab-1".into()]).unwrap();
             reg.record_crew("cap-1", "crew-1");
         }
         // A fresh load (an app restart) resumes the same claims AND revision.
@@ -7841,9 +8756,9 @@ mod tests {
         assert_eq!(snap.seq, 2);
         assert_eq!(snap.captains.len(), 1);
         assert_eq!(snap.captains[0].ship_slug, "alpha");
-        assert_eq!(snap.captains[0].crew, vec!["crew-1".to_string()]);
+        assert_eq!(crew_tiles(&snap.captains[0]), vec!["crew-1".to_string()]);
         // And keeps counting monotonically from there.
-        reg.claim("cap-2", Some("beta"), vec![]).unwrap();
+        reg.claim_test("cap-2", Some("beta"), vec![]).unwrap();
         assert_eq!(CaptainsRegistry::load(path.clone()).snapshot().seq, 3);
 
         // Atomic write discipline: the temp file is renamed over the target, so
@@ -7871,7 +8786,7 @@ mod tests {
         let reg = CaptainsRegistry::load(path.clone());
         assert!(reg.snapshot().captains.is_empty());
         // The first mutation heals the file.
-        reg.claim("cap-1", None, vec![]).unwrap();
+        reg.claim_test("cap-1", None, vec![]).unwrap();
         let healed = CaptainsRegistry::load(path.clone());
         assert_eq!(healed.snapshot().captains.len(), 1);
         let _ = std::fs::remove_file(&path);
@@ -7880,12 +8795,12 @@ mod tests {
     #[test]
     fn list_captains_returns_the_versioned_snapshot() {
         let ctx = test_ctx("secret");
-        ctx.captains.claim("cap-1", Some("alpha"), vec!["tab-1".into()]).unwrap();
+        ctx.captains.claim_test("cap-1", Some("alpha"), vec!["tab-1".into()]).unwrap();
         let v = dispatch(&ctx, "list_captains", &json!({})).unwrap();
         assert_eq!(v["count"], 1);
         assert_eq!(v["seq"], 1);
         assert_eq!(v["captains"][0]["shipSlug"], "alpha");
-        assert_eq!(v["captains"][0]["captainSessionId"], "cap-1");
+        assert_eq!(v["captains"][0]["terminalId"], "cap-1");
         assert_eq!(v["captains"][0]["workspaceTabIds"][0], "tab-1");
         assert_eq!(v["captains"][0]["crew"], json!([]));
     }
@@ -7929,11 +8844,11 @@ mod tests {
         assert_eq!(v["applied"], true);
         assert_eq!(v["captain"]["shipSlug"], format!("ship-{cap_id}"));
         assert_eq!(v["captain"]["workspaceTabIds"], json!(["tab-1"]));
-        assert_eq!(v["captain"]["captainSessionId"], cap_id);
+        assert_eq!(v["captain"]["terminalId"], cap_id);
 
         let v = dispatch(&ctx, "release_captain", &json!({"captainSessionId": cap_id})).unwrap();
         assert_eq!(v["accepted"], "release_captain");
-        assert_eq!(v["released"]["captainSessionId"], cap_id);
+        assert_eq!(v["released"]["terminalId"], cap_id);
         assert_eq!(v["captains"], json!([]));
 
         // The claim + release each forwarded a sync_captains snapshot (filtering
@@ -7947,7 +8862,7 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(sync_calls.len(), 2);
-        assert_eq!(sync_calls[0].1["sync"]["captains"][0]["captainSessionId"], cap_id);
+        assert_eq!(sync_calls[0].1["sync"]["captains"][0]["terminalId"], cap_id);
         assert_eq!(sync_calls[1].1["sync"]["captains"], json!([]));
 
         dispatch(&ctx, "close_terminal", &json!({"sessionId": cap_id})).unwrap();
@@ -8045,7 +8960,7 @@ mod tests {
             name: "Main".into(),
             tile_ids: vec![],
         }]);
-        ctx.captains.claim("cap-1", Some("alpha"), vec![]).unwrap();
+        ctx.captains.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
 
         // A claimed captain spawns crew: the link is recorded + synced.
         let v = dispatch(
@@ -8058,11 +8973,19 @@ mod tests {
         assert_eq!(v["spawnedBy"], "cap-1");
         let crew_id = v["id"].as_str().unwrap().to_string();
         let snap = ctx.captains.snapshot();
-        assert_eq!(snap.captains[0].crew, vec![crew_id.clone()]);
+        assert_eq!(crew_tiles(&snap.captains[0]), vec![crew_id.clone()]);
 
-        // The dead crew session leaves the registry (and forwards a sync).
+        // Item-2 Phase B: a dead crew session is MARKED Removed (retained for
+        // telemetry / reap-ship), not scrubbed (retiring the old silent-leak), and a
+        // sync still forwards so every surface drops the crewmate live.
         dispatch(&ctx, "close_terminal", &json!({"sessionId": crew_id.clone()})).unwrap();
-        assert!(ctx.captains.snapshot().captains[0].crew.is_empty());
+        let after = ctx.captains.snapshot();
+        let cr = after.captains[0]
+            .crew
+            .iter()
+            .find(|c| c.terminal_id == crew_id)
+            .expect("crew ref retained, not scrubbed");
+        assert!(matches!(cr.state, CrewState::Removed { .. }));
 
         // Forwards: sync_captains (crew add), spawn_terminal (with spawnedBy),
         // sync_tabs (tile drop), sync_captains (crew removal).
@@ -8072,9 +8995,15 @@ mod tests {
             names,
             ["sync_captains", "spawn_terminal", "sync_tabs", "sync_captains"]
         );
-        assert_eq!(calls[0].1["sync"]["captains"][0]["crew"], json!([crew_id]));
+        // The crew-add forward carries the crew as a CrewRef (terminalId + state).
+        assert_eq!(calls[0].1["sync"]["captains"][0]["crew"][0]["terminalId"], crew_id);
         assert_eq!(calls[1].1["spawnedBy"], "cap-1");
-        assert_eq!(calls[3].1["sync"]["captains"][0]["crew"], json!([]));
+        // The crew-removal forward retains the ref, now marked Removed (not scrubbed).
+        assert_eq!(calls[3].1["sync"]["captains"][0]["crew"][0]["terminalId"], crew_id);
+        assert_eq!(
+            calls[3].1["sync"]["captains"][0]["crew"][0]["state"]["kind"],
+            "removed"
+        );
     }
 
     #[test]
@@ -8102,13 +9031,19 @@ mod tests {
     }
 
     #[test]
-    fn close_terminal_of_a_captain_releases_its_claim() {
+    fn close_terminal_of_a_captain_orphans_its_claim() {
         let ctx = test_ctx("t");
-        ctx.captains.claim("cap-1", Some("alpha"), vec![]).unwrap();
-        // The captain's own session dies (already-gone tmux session: the kill
-        // is idempotent, so dispatch succeeds and the registry cleanup runs).
+        ctx.captains.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
+        // Item-2 Phase B: the captain's own session dies (already-gone tmux session:
+        // the kill is idempotent, so dispatch succeeds and the registry cleanup runs).
+        // The claim is MARKED Orphaned + un-pointed (retained for re-adoption by a
+        // resumed captain of the same ship), NOT scrubbed - the old whole-record
+        // `retain`-away was the C4 silent leak.
         dispatch(&ctx, "close_terminal", &json!({"sessionId": "cap-1"})).unwrap();
-        assert!(ctx.captains.snapshot().captains.is_empty());
+        let snap = ctx.captains.snapshot();
+        assert_eq!(snap.captains.len(), 1, "record retained, not scrubbed");
+        assert!(matches!(snap.captains[0].state, ClaimState::Orphaned { .. }));
+        assert!(snap.captains[0].terminal_id.is_none(), "un-pointed");
     }
 
     #[test]
@@ -8126,7 +9061,7 @@ mod tests {
             TabRecord { id: "t2".into(), name: "Side".into(), tile_ids: vec![] },
         ]);
         ctx.captains
-            .claim("cap-1", Some("alpha"), vec!["t1".into(), "t2".into()])
+            .claim_test("cap-1", Some("alpha"), vec!["t1".into(), "t2".into()])
             .unwrap();
 
         // Report a tab set WITHOUT t2 (the user closed it): t2 is pruned from the
@@ -8160,7 +9095,7 @@ mod tests {
             TabRecord { id: "tab-2".into(), name: "Side".into(), tile_ids: vec![] },
         ]);
         ctx.captains
-            .claim("cap-1", Some("alpha"), vec!["tab-2".into()])
+            .claim_test("cap-1", Some("alpha"), vec!["tab-2".into()])
             .unwrap();
 
         dispatch(&ctx, "close_tab", &json!({"tabId": "tab-2"})).unwrap();
@@ -9039,7 +9974,7 @@ mod tests {
         let path = dir.join("captains.json");
         let _ = std::fs::remove_file(&path);
         let reg = CaptainsRegistry::load(path.clone());
-        reg.claim("cap-1", Some("alpha"), vec![]).unwrap();
+        reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
         let body = std::fs::read_to_string(&path).expect("captains.json written through");
         assert!(body.contains("alpha"), "persisted body must carry the claim: {body}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -9054,10 +9989,10 @@ mod tests {
         let path = dir.join("captains.json");
         let _ = std::fs::remove_file(&path);
         let reg = CaptainsRegistry::load(path.clone());
-        reg.claim("cap-1", Some("alpha"), vec![]).unwrap(); // seq -> 1 on disk
+        reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap(); // seq -> 1 on disk
         let newer = reg.snapshot(); // seq 1
         // Hand-persist a STALE snapshot (seq 0): it must be dropped, not clobber.
-        reg.persist(CaptainsSnapshot { seq: 0, captains: vec![] });
+        reg.persist(CaptainsSnapshot { schema_version: CAPTAINS_SCHEMA_VERSION, seq: 0, captains: vec![] });
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("alpha"), "stale seq-0 snapshot must not clobber the claim: {body}");
         // A NEWER snapshot (seq 1, already on disk) is allowed to (re)write.
@@ -9096,7 +10031,7 @@ mod tests {
         // persist runs, so `inner` is free while this stalls.
         let writer_reg = reg.clone();
         let writer = std::thread::spawn(move || {
-            writer_reg.claim("cap-1", Some("alpha"), vec![]).unwrap();
+            writer_reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
         });
         started_rx
             .recv_timeout(std::time::Duration::from_secs(5))
