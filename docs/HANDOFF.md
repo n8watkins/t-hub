@@ -1,4 +1,4 @@
-# T-Hub captain handoff (fresh, 2026-07-09 wind-down)
+# T-Hub captain handoff (refreshed 2026-07-10, mid 0.3.62 ship)
 
 Zero-context resume doc for the next t-hub-app captain.
 Ship file (authoritative roster + full history): `~/.t-hub/captain/ships/t-hub-scribe.md`.
@@ -10,17 +10,15 @@ You are the captain of ship **t-hub-app** (registry slug `t-hub-app`), terminal 
 The general (user) commands via the orchestrator **Cortana** (terminal `e05764f5`).
 You DELEGATE all project work to crew; you stay at orchestration altitude.
 On resume: invoke `/shipmate`, claim via `claim_captain` (MCP) or `~/.t-hub/captain/claim-captain.sh ab440bfa t-hub-app` (raw-socket fallback), rebuild the roster from the ship file + `list_terminals`.
+NOTE: this terminal id itself migrated once (84ce1cae died to a closeWorkspace SIGKILL 2026-07-10; PR #53 removed the mis-placement vector and added the captain-guard) - if it migrates again, re-claim under the new id and update this doc.
 
-## Current state (end of this wave)
+## Current state (2026-07-10, evening)
 
-- **main is at 0.3.61** (bump commit `8ab809f`), installed and running.
-0.3.61 shipped solo with PR #52 (TTS engine health in Settings + never-silent fallback chime); the interim kokoro systemd user unit is live (cutover verified: health 200, journald logs, spoken line).
-0.3.59 merged PRs #49 (EventFanout snapshot-then-write-unlocked) and #50 (relay-wedge self-heal: `rebind_control` + client wedge-detector + stale-pin fallback).
-0.3.60 shipped solo with PR #51 (agents plane renders socket-commissioned captains: adoptRegistry now ADOPTS server-placed reserved-tab tiles missing from the local order, gated on not-locally-placed to avoid the unpin re-adopt race).
-E2E acceptance verified post-install: the general-reported invisible captain attached and rendered (`session_attached` 0 -> 1).
+- **PRs #53 and #54 are MERGED** (main @ `a129e29` pre-bump); the **0.3.62 joint build is in flight** and installs on completion (general-authorized).
+Post-install, 0.3.62 carries: #53 adopt/attach per-tile isolation + authoritative placement + closeWorkspace captain-guard (silent re-place, general-ratified) + test-socket isolation; #54 managed Kokoro lifecycle engine supervisor behind the **default-OFF** `T_HUB_MANAGED_KOKORO` flag (merge is runtime-inert).
+- **The kokoro interim systemd user unit still owns port 7478** and keeps serving after the install; the unit -> managed-child cutover is a SEPARATE deliberate step gated on the wave-1 flag-on validation (general-confirmed).
 - **Two untracked files** (`.lavish/`, `docs/DECK-AGENTS-DESIGN.md`) are pre-existing, NOT this ship's work - leave them.
-- All crew reaped, all worktrees removed.
-The only other captain-adjacent tmux sessions are Cortana (`e05764f5`) and the **monorepo-app captain** (`9a32f554`, another ship) - do NOT touch them.
+- Other ships share the tmux server (Cortana `e05764f5`, monorepo `9a32f554`, behavior-tracker `3e3b6479` + crew, appturnity crews) - touch ONLY your own roster.
 
 ## ✅ RESOLVED - the "control-socket wedge" saga (read before trusting old wedge reports)
 
@@ -31,16 +29,20 @@ The full corrected evidence trail is on PR #50 (post-merge comment) and in memor
 Rules of thumb: never probe socket health through an env-pinned client; raw-connect to the CURRENT `control.json` addr; a slow WSL connect-timeout to a Windows loopback port usually means dead port, not wedged server.
 An intermediate "WSL relay per-port flow wedge" theory (2026-07-09) is FALSE - do not resurrect it from old reports.
 
-## How to operate this ship (learned this wave)
+## How to operate this ship
 
-- **Control socket flaps/wedges** - never diagnose "app up/down" from a bare TCP connect; round-trip a real command (`list_terminals`) with a timeout. See memory `control-socket-transient-wedge`.
-- **Spawn crew via raw tmux** while the socket is wedged: `tmux -L t-hub new-session -d -s th_<id> -c <worktree> -x 220 -y 50; tmux -L t-hub set-option -t th_<id> window-size manual`, then `send-keys` the harness (`claude --model claude-opus-4-8 --effort high --dangerously-skip-permissions`) and the brief. Raw-tmux crew are native-client-adopted but NOT webview-visible until a restart.
-- **`send-keys` backtick trap**: backticks/`$()`/quotes in a message get shell-interpreted locally and mangle the send - build the message in a single-quoted heredoc and send with `-l` (literal), or write plain prose. Memory `send-keys-backtick-trap`.
-- **Completion signaling**: every crew brief ends with `touch /tmp/t-hub-crew-done/t-hub-scribe/<name>.done`; run ONE background watcher (`run_in_background` Bash loop over that dir) that exits on the first sentinel and wakes you.
-- **Model policy** (`MODEL-POLICY.md`): captain = Fable 5 high; crew = Opus 4.8 high (review crew = Opus 4.8 xhigh). Pin `--model claude-opus-4-8 --effort high|xhigh` on every spawn (session default can leak xhigh - restart with `--effort high` if so).
-- **Escalation doctrine** (`ESCALATION.md`, v2 2026-07-10): decisions at the lowest capable level; captain decides all technical/ship matters and reports STATUS, escalates only above-ship items (merge/push/install/outward, product, spend, cross-ship, security, unclear standing-order intent) to Cortana as DECISION-NEEDED (options + recommendation). Report classes: STATUS / DECISION-NEEDED / EMERGENCY. Fold `BRIEF-ESCALATION-BLOCK.md` into EVERY crew brief. Helm feature CANCELLED - courtesy no-inject-over-the-general-while-typing only.
-- **announce.sh deploy step**: the NSIS installer ships the binary, NOT the captain-dir fleet scripts. After any `apps/desktop/scripts/announce.sh` change lands, deploy it: `cp <repo>/apps/desktop/scripts/announce.sh ~/.t-hub/captain/announce.sh && chmod +x`; verify with `announce.sh --gate` + an announce.log line. Memory `captain-voice-announcements`.
-- **Version bump** on every code commit via `bump-version.sh` (docs exempt); sync Cargo.lock via `cargo check`, never hand-sed.
+- **Socket health**: never diagnose "app up/down" from a bare TCP connect; round-trip a real command with a timeout, against the CURRENT control.json addr (memory `control-socket-transient-wedge`). The wedge-discriminator runbook: `~/.t-hub/captain/WEDGE-RUNBOOK.md`.
+- **VISIBLE-FIRST spawning (standing procedure)**: spawn ALL crew via the socket (`create_worktree` or `spawn_terminal` with tabName/tabId) so terminals render in the workspace from birth - reviews and builds included. Raw tmux ONLY when a live round-trip proves the socket degraded, and migrate such crew to a visible tile once it recovers. Force `window-size manual` + 220x50 on every new pane (the unsized-client 2-char trap), resize BEFORE sending the kickoff.
+- **KICKOFF VERIFICATION**: after every send-keys kickoff, capture the pane and confirm the crew is PROCESSING (spinner/cost ticking) - a collapsed pane can eat the Enter and the kickoff sits unsubmitted (this cost a 40-minute silent stall once).
+- **Crew migration = `claude --resume <session-uuid>`** (general's directive): record every crew's Claude session UUID in the roster at spawn (newest small+fresh `.jsonl` under `~/.claude/projects/<munged-worktree>/`); to move a crew, spawn the destination, STOP the old claude, `--resume <uuid>` in the new terminal, kill the old tmux session. Never a fresh re-kick; never `--continue` guessing. Memory `crew-migration-resume-by-id`.
+- **RELAY TYPING-GUARD (interim, until the comms plane ships)**: before any send-keys relay to a human-facing terminal, capture the destination pane and check the LAST prompt line for typed content (the prompt char is followed by a non-breaking space - match content, not whitespace); if non-empty, HOLD and retry - never interleave with a human mid-keystroke.
+- **`send-keys` backtick trap**: backticks/`$()`/quotes get shell-interpreted and mangle the send - single-quoted heredoc + `-l` (literal), or plain prose; long messages can render as a paste placeholder ("paste again to expand") - verify submission. Memory `send-keys-backtick-trap`.
+- **Completion signaling**: every crew brief ends with `touch /tmp/t-hub-crew-done/t-hub-scribe/<name>.done`; run ONE background watcher over that dir; clear collected sentinels promptly (any lingering `.done` re-fires the next watcher).
+- **Model policy** (`MODEL-POLICY.md`): captain = Fable 5 high; crew = Opus 4.8 high (review crew = Opus 4.8 xhigh); pin `--model claude-opus-4-8 --effort high|xhigh` on every spawn.
+- **Escalation doctrine** (`ESCALATION.md`): decisions at the lowest capable level; STATUS / DECISION-NEEDED / EMERGENCY report classes; fold `BRIEF-ESCALATION-BLOCK.md` into EVERY crew brief; merge/push-main/install/outward/product/spend escalate via Cortana.
+- **Review discipline**: xhigh review on every control-path or destructive-adjacent PR; reviewer verdicts go at the END of reports (pane-capture survival); reviewers write findings to a file when a fix crew needs them; hold the same reviewer for delta re-verifies.
+- **announce.sh deploy step**: the NSIS installer ships the binary, NOT the captain-dir fleet scripts; after any `apps/desktop/scripts/announce.sh` change lands, copy to `~/.t-hub/captain/announce.sh` and verify. Memory `captain-voice-announcements`.
+- **Version bump** on every code commit via `bump-version.sh` (docs exempt); sync Cargo.lock via `cargo check`, never hand-sed. Ship practice: PRs carry NO bump; one bump per batch at build time.
 
 ## FUTURE ITINERARY
 
@@ -48,78 +50,51 @@ An intermediate "WSL relay per-port flow wedge" theory (2026-07-09) is FALSE - d
 
 Source: `~/.t-hub/captain/reviews/orchestration-adversarial-review-2026-07-10.md` + addendum (both passes; approved as roadmap).
 Captain's distillation: `~/.t-hub/captain/reviews/CAPTAIN-CRIB-SHEET-2026-07-10.md`.
-Sequenced AFTER PR 53/54 ship (joint build+install). Proposals go up ONE AT A TIME via Cortana for the general's ratification; each covers problem / design / blast-radius+migration / effort / specific general-decisions.
+Clock starts at the 0.3.62 install. Proposals go up ONE AT A TIME via Cortana for the general's ratification; drafting of item N+1 pipelines while item N awaits ratification; each proposal is adversarially design-checked by an independent xhigh crew before escalation; format = problem / design / blast-radius+migration / effort / specific general-decisions.
 Priority order:
-1. **UNIFIED COMMS PLANE** (keystone, FIRST - ahead of the orchestrator-representation build): one authenticated, attributed, receipted, ordered per-recipient channel; retires raw send-keys to break-glass; hosts the typing-guard as its drain predicate (turn-boundary EXISTS at fleet.rs is_ready_for_wake; not-being-typed-into MUST BE BUILT input-side); one-way-input policy as queue ACLs with an EMERGENCY fast-lane; receipt-on-DRAIN; applied at EVERY hop; inbox + typing-guard are ONE queue with two predicates, never two.
+1. **UNIFIED COMMS PLANE** (keystone, FIRST): one authenticated, attributed, receipted, ordered per-recipient channel; retires raw send-keys to break-glass; hosts the typing-guard as its drain predicate (turn-boundary EXISTS at fleet.rs `is_ready_for_wake`; not-being-typed-into MUST BE BUILT input-side - PTY-output parsing is a verified dead end); one-way-input policy as queue ACLs with an EMERGENCY fast-lane; receipt-on-DRAIN; applied at EVERY hop; inbox + typing-guard are ONE queue with two predicates, never two.
+This item ABSORBS the P2 fleet-wide typing-guard (general's four-part sketch + Cortana's premise correction live in the review addendum + crib sheet - single source there, not restated here).
+Design-crew brief is staged at `/tmp/flap-probe/COMMS-PLANE-DESIGN-BRIEF.md`.
 2. **IDENTITY RE-KEY** to ship/role; terminal id demoted to mutable pointer; crew ownership follows the ship; auto-rebind on migration; Claude session UUID as continuity anchor.
-3. **SECURITY DEFAULTS**: read/control token split default-on (fix the webview scrape via the in-process local_control_token seam); full token off shared-readable disk; mechanical gates on push-main/spend/outward via the existing tier machinery.
+3. **SECURITY DEFAULTS**: read/control token split default-on (fix the webview scrape via the in-process `local_control_token` seam); full token off shared-readable disk; mechanical gates on push-main/spend/outward via the existing tier machinery.
 4. **RULEBOOK ENFORCEMENT**: capability matrix with LAW/GATE/NORM per cell; single-writer memory rules (registry = sole roster truth, ship files = rendered views, durable pending-decisions store); instruction-layer precedence + provenance + versioning.
-Parallel: the reap-ship design proposal (3a below) drafts alongside; orchestrator-representation (3b) builds once ITS design is ratified.
-Mandated build order within item 1 when it builds: close the raw-tmux backdoor FIRST, then inbox, then ACLs, then typing-guard LAST.
+Parallel track: the REAP-SHIP design proposal drafts alongside; ORCHESTRATOR-REPRESENTATION builds once its own design is ratified.
+Mandated build order within item 1: close the raw-tmux backdoor FIRST, then inbox, then ACLs, then typing-guard LAST.
 
-### NEAR (deferred or almost reached this session - pick up first)
+### NEAR
 
-1. **Post-0.3.59 wedge-saga carry-items.**
-(a) Live-verify PR #50's heal loop if a REAL wedge ever presents (none may - the residual symptom was the stale-pin artifact; the rebind is defense-in-depth).
-(b) Known limitation N2: a connect-level wedge presentation would not trigger the Timeout-only heal (documented in PR #50).
-(c) Fleet hygiene: after every install/restart, long-running app-spawned sessions' pinned MCP/tooling go dark on the dead port - fresh sessions in this repo get the F2-fixed client (debug `t-hub-mcp` rebuilt from post-#50 main, 2026-07-10); consider surfacing the same fallback in any other pin-preferring consumer.
-(d) PR #49 M2 design note from review: cross-client event ordering is now per-socket, not global - matters when M2 adds a second subscriber.
-2. **(done)** F2 EventFanout snapshot-under-lock - shipped as PR #49 in 0.3.59.
-3. **Managed Kokoro lifecycle (general's design directive, PROPOSE before building).**
-T-Hub owns Kokoro as a managed child process: spawn on app start, health-watch, auto-restart, kill on exit, no orphan servers; keep the HTTP port (announce.sh/captain paths unchanged); no in-process model embed.
-Piper becomes a lazy standby (instantiate only on Kokoro failure); failure behavior flips from surface-and-prompt to AUTO-FALLBACK with toast + Settings error.
-The proposal must sequence clean removal/disable of the interim systemd unit so app and unit never fight over port 7478.
-3a. **REAP-SHIP feature bundle** (general via monorepo captain, routed by Cortana 2026-07-10; sequence after P1 + engine-supervisor; DESIGN PROPOSAL first - destructive ops, landed-gate semantics deserve review).
-A deterministic `reap_ship` control command keyed off the captains registry: close all crew terminals recorded under a captain, remove their worktrees, close captain-created tabs, clear the ship sentinel dir - with a HARD landed-gate per crew (refuse loudly if branch HEAD is not on origin).
-Bundled prereqs: (1) tabs need creator/owner metadata in the registry; (2) all spawns flow through the socket for spawnedBy tracking (the shipped relay self-heal largely covers the old wedge dependency); (3) registry self-heal for ghost tiles whose tmux sessions are dead - adjacent to PR #53's ghost/adopt work, fold or sequence there.
-Interim doctrine unchanged: RETIREMENT.md manual checklist.
-3b-2. **Fleet-wide typing-guard for agent injection** (P2, general-reported + design-sketched 2026-07-10, BROADENED from orchestrator-only; sequence WITH the orchestrator-representation wave - both are general-facing comms correctness).
-The general may be typing directly into ANY captain terminal when agent traffic interrupts - interleaving corrupts both streams.
-General's endorsed design sketch (four parts):
-(1) server-side per-terminal HUMAN-TYPING detection - t-hub owns the PTYs, so it can distinguish UI keystrokes from socket-originated send_text; track recent-keystroke/non-empty-input state per terminal;
-(2) send_text/send_keys GUARDED BY DEFAULT - active human typing at the destination defers and queues the injection until idle (defer-then-flush, same shape as the scribe voice gate), never interleave;
-(3) ATTRIBUTION SEPARATION - agent-injected text renders visibly distinct from human keystrokes (marked lane), which also closes report-spoofing ambiguity;
-(4) queryable typing-state check (MCP/socket) for senders polite beyond the enforced guard.
-PREMISE CORRECTION (Cortana architecture-review addendum, source-verified @ a93ca9f): t-hub does NOT currently track any human-typing signal - part (1) must be BUILT as input-side keystroke instrumentation, not exposed from existing state.
-What exists: a reliable turn-boundary signal (SessionStatus::Completed edge, fleet.rs is_ready_for_wake).
-What does not: keystroke-source tracking (none), backend focus state (frontend Zustand only).
-PTY-OUTPUT parsing is a DEAD END - echoed human bytes and injected agent bytes are indistinguishable on the output side.
-DESIGN STEER (binding for the proposal): the typing-guard and the durable message-inbox are ONE comms plane, not two features - a single per-terminal durable queue, drained only when the destination is BOTH at a turn boundary (exists) AND not being typed into (to be built), reusing the scribe voice-gate fail-open-safe defer pattern.
-Do NOT build them as separate queues or the two predicates will disagree.
-Live validation datum from the day it was filed: the captain's interim pane-check guard caught the general mid-keystroke TWICE while holding one relay - the race is frequent, not theoretical.
-INTERIM captain discipline until it ships: capture the destination pane before any send-keys relay; if the LAST prompt line has typed content, hold and retry (note: the prompt char is followed by a non-breaking space - match content, not whitespace shape).
-3b. **First-class ORCHESTRATOR representation in the agents workspace** (general product item, 2026-07-10; sequence AFTER the P1 adopt-harden fix).
-The orchestrator must render distinct from captains (the general objects to Cortana appearing as a captain).
-Interim state: a `claim_captain` slug `cortana` is in place and the general pinned it - remove/migrate that interim claim when the real representation ships.
-Consider extending the existing Cortana-crown concept (sidebar OrchestratorRow + pane-header crown from 0.3.55/0.3.56).
-4. **Amber degraded state** for a non-2xx (reachable-but-sick) TTS engine - lands as part of the engine-supervisor fallback UX (build in flight).
-5. **Flaky test on this host**: `control::tests::attach_path_survives_abrupt_client_churn` - idle-reaper race (500ms) makes it effectively broken on this WSL host (pre-existing; 8/8 isolated failures). Fix = make the race deterministic (inject/raise idle timeout or gate reaping on churn phase); do NOT weaken the s27 regression guard.
-6. **Host load levers** (data first): dual-side load recorder running (`~/.t-hub/captain/load-recorder.sh` -> load.log; nohup, dies on WSL restart). WSL saturates CPU at compile peaks; Windows is memory-starved (WSL VM 19G of 31G + Chrome). Levers: .wslconfig memory cap, Chrome trim, more RAM; optional product item = in-app resource surfacing.
-6b. **closeWorkspace captain-guard confirm prompt** (optional follow-up; general chose SILENT re-place at the PR #53 ratification - do NOT build the prompt unless he asks).
-7. **Raw-session adoption gap**: the webview cannot adopt a live raw-tmux session (`move_tile` no-ops - no tile object); workaround = socket spawn + `claude --resume <uuid>` migration; proper fix = an adopt-session path (next onion layer past #51).
-3. **Bound the other-subsystem subprocesses.** The #48 F1 completeness sweep found unbounded `.output()`/`.status()` in files.rs, codex.rs, usage.rs, devserver.rs, recent.rs, claude/install.rs (and control.rs `tailscale_ip4` startup-only, benign). Route control-reachable ones through the shared `bounded_exec` helper for the same "no handler parks forever" invariant.
-4. **PR #45 M1 spawn_terminal re-probe honest-limit.** The re-probe closes the create_worktree reaped-duplicate but `spawn_terminal` returns `None` (server-minted id, nothing to probe by) and relies on the 600s reap window. If spawn duplicates recur, add a probe key (e.g. client-supplied spawn tag) so spawn is re-probable too.
-5. **PR #44 LOW watch-items** (all noted in the #44 PR body): header ctx% meter mid-turn flicker (default-OFF, small blast radius); tile-header button crowding at the narrowest widths (now 5 shrink-0 buttons); DRY the O(n) `sessionIdByTmux` reverse scan (a forward index retires it).
-6. **Auto-continue redesign follow-ups** (from the two xhigh reviews, all LOW, shipped as-is): default-ON flip surprises v1 curated opt-in users (needs a **release note** - flag to the general); re-verify the modal detection anchors against a real limited pane when one safely presents (anchors were verified against strings grepped from the Claude Code binary, not a live render); the account-wide Codex reset fans out to all watched Codex tiles at reset.
+1. **Wave-1 flag-on validation for the engine supervisor** (gates the kokoro unit -> managed-child cutover): Windows build with `T_HUB_MANAGED_KOKORO` on in a controlled window; validate real spawn/kill, the adopt-and-disable-unit sequence, measure the true Piper cold start, live-verify the fallback toast/amber/remap; then the deliberate cutover with Cortana sequencing. Deferred-documented findings F5/F8 ride this wave.
+2. **REAP-SHIP feature bundle** (design proposal first - destructive ops): deterministic `reap_ship` keyed off the captains registry with a HARD landed-gate per crew; prereqs: tab creator/owner metadata; all spawns socket-flowed for spawnedBy; registry self-heal for dead-session ghost tiles (PR #53 lineage - the design takes the fold-or-sequence question explicitly). Interim doctrine: RETIREMENT.md manual checklist.
+3. **First-class ORCHESTRATOR representation** in the agents workspace (distinct from captains; interim `cortana` claim-slug removal is part of its definition of done; consider extending the Cortana-crown concept).
+4. **closeWorkspace captain-guard confirm prompt** (optional; general chose SILENT re-place at PR #53 ratification - do NOT build unless he asks).
+5. **Raw-session adoption gap**: the webview cannot adopt a live raw-tmux session (`move_tile` no-ops - no tile object); workaround = socket spawn + `--resume <uuid>` migration; proper fix = an adopt-session path (next onion layer past #51).
+6. **Host load levers** (data first): dual-side load recorder at `~/.t-hub/captain/load-recorder.sh` -> load.log (nohup - dies on WSL restart, re-run or unit-ize).
+Findings so far: WSL saturates CPU at compile peaks; Windows is memory-starved (WSL VM 19G of 31G + Chrome; 0.4-0.5G free), which makes `wsl.exe` spawns glacial - the exact seam behind the app's bounded-subprocess timeouts under load.
+Levers: `.wslconfig` memory cap, Chrome trim, more RAM; optional product item = in-app resource surfacing.
+7. **Post-0.3.59 wedge-saga carry-items**: (a) live-verify PR #50's heal loop if a real wedge ever presents; (b) N2 known limitation - a connect-level wedge presentation would not trigger the Timeout-only heal; (c) fleet hygiene - long-running app-spawned sessions' env-pinned tooling goes dark after every restart until the F2-fixed client is everywhere; (d) PR #49 M2 note - cross-client event ordering is per-socket, not global.
+8. **Bound the other-subsystem subprocesses** (from the #48 sweep): unbounded `.output()`/`.status()` in files.rs, codex.rs, usage.rs, devserver.rs, recent.rs, claude/install.rs - route control-reachable ones through `bounded_exec`.
+9. **PR #45 M1 spawn_terminal re-probe honest-limit**: add a probe key (client-supplied spawn tag) if spawn duplicates recur.
+10. **PR #44 LOW watch-items**: ctx% meter mid-turn flicker; tile-header button crowding; DRY the `sessionIdByTmux` reverse scan.
+11. **Auto-continue follow-ups** (all LOW): default-ON release note for v1 opt-in users; re-verify modal anchors against a real limited pane; account-wide Codex reset fan-out.
 
-### FURTHER (on our list, never got to this wave)
+### FURTHER
 
 1. **PR #34 orchestrator-wake fast-follows** (3 MEDIUM, on hold since 0.3.54): stale-UUID handling, no-suppression-timeout, live-validate the wake path.
-2. **no-mistakes CI-step cwd bug** - the shared no-mistakes daemon runs `gh pr checks` from its non-repo cwd (`~/.no-mistakes`) so the CI step hangs forever though checks actually pass. Fix = give the CI step repo context (chdir/--repo). This is the no-mistakes TOOL repo, a different ship - route via Cortana. Memory `no-mistakes-ci-step-cwd-bug`. (Why every crew this wave ran plain commit+push+PR, never /no-mistakes.)
-3. **Registry slug-rename persistence inconsistency** - a pre-restart slug rename rolled back across a restart for this ship while monorepo-app's survived; registry persistence is inconsistent across restarts.
-4. **ensure-thub-mcp debug-binary repoint** - the per-repo `.mcp.json` provisioning points at the local DEBUG t-hub-mcp build; override via `T_HUB_MCP_BIN` once t-hub ships a packaged sidecar. Memory `captain-self-register-provisioning`.
-5. **WorkspacesList Cortana rename** - small UI follow-up (the orchestrator folder-name row), general-queued for a future batch.
-6. **Server-split M2-M4** (remote), webview supervision cues, MCP parity for `create_worktree`/`remove_worktree`/`wait_for_status` (currently raw-socket-only) - the standing longer-horizon goals from the native-pivot survivors.
-7. **Doc debt** (flagged by the 0.3.58 wind-down doc sweep, deferred as MEDIUM+ rewrites): re-baseline `docs/ROADMAP-PLAN.md` + `docs/SERVER-SPLIT-AND-ROADMAP.md` onto the 0.3.58 wave (they still cite `v0.2.0`-era figures + a pre-#42 "next build"); expand `docs/MCP.md` §2 to document #45's control-channel idempotency/retry contract (`requestId`/`RequestCache`/`get_request_status`, `close_terminal` killed|already_gone) - the tool catalog is accurate but the robustness layer is undocumented; optional one-word nit in `docs/FEATURE-PLAN.md:3` ("current 0.1.67" reads wrong at 0.3.58, but it is a historical banner - leave unless re-baselining).
+2. **no-mistakes CI-step cwd bug** (different ship - route via Cortana). Memory `no-mistakes-ci-step-cwd-bug`.
+3. **Registry slug-rename persistence inconsistency** across restarts.
+4. **ensure-thub-mcp debug-binary repoint** via `T_HUB_MCP_BIN` once a packaged sidecar ships. Memory `captain-self-register-provisioning`.
+5. **WorkspacesList Cortana rename** (small UI, general-queued).
+6. **Server-split M2-M4** (remote), webview supervision cues, MCP parity for `create_worktree`/`remove_worktree`/`wait_for_status` (raw-socket-only today).
+7. **Doc debt** (MEDIUM+ rewrites, still open): re-baseline `docs/ROADMAP-PLAN.md` + `docs/SERVER-SPLIT-AND-ROADMAP.md` (still cite v0.2.0-era figures); expand `docs/MCP.md` §2 with the #45 idempotency/retry contract; `docs/FEATURE-PLAN.md:3` historical banner nit.
 
-## What shipped this wave (for context)
+## What shipped (for context)
 
 - **0.3.54**: orchestrator-wake (#34), scribe gate (#35), pty forwarder leak (#36), per-session header glitch (#37), endpoint reconnect (#38).
-- **0.3.55**: captains-render-fix (#39) - externally-claimed captains render regardless of tile placement.
+- **0.3.55**: captains-render-fix (#39).
 - **0.3.56**: Cortana crown pane header (#40), Scribe v1 dictation-state migration (#41).
-- **0.3.57**: doc-staleness (#42), voice-gate dual-source dictation gate + announce.log (#43), UI batch - kill+restart button / ctx% setting / attribution / chime trim (#44), spawn-retry idempotency + de-wedge (#45), auto-continue small Esc+continue fix (#46).
-- **0.3.58**: auto-continue full redesign default-ON (#47), control-socket flap fix - tmux+git subprocess bound + M1 full fix (#48).
-- **0.3.59**: EventFanout snapshot-then-write-unlocked (#49), relay-wedge self-heal - rebind command + client wedge-detector + stale-pin fallback (#50).
-The wedge saga is RESOLVED (see the section above); the residual "wedge on 0.3.58" turned out to be the stale-env-pin artifact.
-- **0.3.60**: agents plane renders socket-commissioned captains (#51, solo ship for a general-reported defect; E2E-verified post-install).
-- **0.3.61**: TTS engine health in Settings + never-silent fallback chime (#52, solo ship); interim kokoro systemd supervision cutover landed alongside (kokoro-tts repo, local master).
+- **0.3.57**: doc-staleness (#42), voice-gate dual-source + announce.log (#43), UI batch (#44), spawn-retry idempotency + de-wedge (#45), auto-continue small fix (#46).
+- **0.3.58**: auto-continue full redesign default-ON (#47), control-socket flap fix (#48).
+- **0.3.59**: EventFanout snapshot-then-write-unlocked (#49), relay-wedge self-heal (#50). The wedge saga resolved (stale-env-pin artifact - see above).
+- **0.3.60**: agents plane renders socket-commissioned captains (#51; E2E-verified post-install).
+- **0.3.61**: TTS engine health + never-silent fallback chime (#52); interim kokoro systemd supervision cutover alongside (kokoro-tts repo, local master).
+- **0.3.62** (in flight): adopt/attach per-tile isolation + captain-guard + test-socket isolation (#53); managed Kokoro lifecycle engine supervisor, default-OFF flag (#54; amber degraded state + voice remap included; flaky churn test fixed + isolated by #53).
