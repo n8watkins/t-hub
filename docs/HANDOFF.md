@@ -1,27 +1,33 @@
 # T-Hub captain handoff (refreshed 2026-07-10, mid 0.3.62 ship)
 
-## ⏸ ACTIVE RESUME POINT (2026-07-10 late evening - comms-plane ESCALATED, awaiting the general's ratification)
+## ⏸ ACTIVE RESUME POINT (2026-07-11 ~00:0x - written for a PLANNED Cortana context reset; DESIGN PHASE COMPLETE, PR #57 awaiting merge word)
 
-**Canon entry point:** `~/.t-hub/captain/ORCHESTRATION-PROGRAM.md` (Cortana fixed its line-50 Cortana-own-crew staleness upstream 2026-07-10 eve).
-Supporting docs unchanged: `reviews/capability-matrix-draft.md`, `reviews/ruleset-adversarial-2026-07-10.md`, `reviews/orchestration-adversarial-review-2026-07-10.md` + addendum, `reviews/CAPTAIN-CRIB-SHEET-2026-07-10.md`.
+**THE PROGRAM (one line):** ALL FOUR structural items were drafted, adversarially gated, fixed, delta-verified, and GENERAL-RATIFIED on 2026-07-10 - the design phase is COMPLETE; what remains is builds and one batched deploy.
 
-**Where the program is:** Item 1 of 4 (UNIFIED COMMS PLANE) is COMPLETE on this ship's side and **ESCALATED to Cortana (DECISION-NEEDED, general's ratification pending)**.
-Durable artifacts: the proposal at `~/.t-hub/captain/reviews/COMMS-PLANE-PROPOSAL-FINAL-2026-07-10.md` (80KB) and the full independent design-check + delta re-verify record at `reviews/comms-plane-design-check-2026-07-10.md` (38KB).
-Gate trail, complete: DRAFT-3 reconciled with the general's three rulings (R-C1 one-mechanism/one-policy-bit accept_relayed_authorization; R-H1 parameterizable deploy_confirm_threshold; R-C3 subagent-for-bounded NORM) -> independent Opus 4.8 xhigh adversarial design-check PASS-WITH-FIXES (gating H1-H4, M1-M10, L1-L4; code anchors ~95% verified) -> full fix round folded EVERYTHING -> same-reviewer delta re-verify **CLEAN - ESCALATE** (no ruling or baked invariant regressed) -> 3 non-gating nits folded in a cleanup pass -> escalated.
+**Ratified artifacts (each with a RATIFIED header carrying the general's decision values, plus its full check record):** `~/.t-hub/captain/reviews/COMMS-PLANE-PROPOSAL-FINAL-2026-07-10.md`, `IDENTITY-REKEY-PROPOSAL-2026-07-10.md`, `SECURITY-DEFAULTS-PROPOSAL-2026-07-10.md`, `RULEBOOK-PROPOSAL-2026-07-10.md`; check records `comms-plane-design-check`, `item2-design-check`, `item3-design-check`, `item4-design-check` + PR reviews `pr55-review`, `pr56-review`, `pr57-review` (all `-2026-07-10.md`).
+Canon: `~/.t-hub/captain/ORCHESTRATION-PROGRAM.md` (Cortana keeps it reconciled - all rulings recorded).
 
-**Ship state:** design crew `b46bc46c` (Claude UUID `96e689e7-b320-4f5a-a2d7-70bfdd149b2e`, worktree `.claude/worktrees/comms-plane-design`) HELD idle for ratification feedback.
-The independent reviewer (was `f286bc9f`) is REAPED - work landed durable, report collected.
+**Built and MERGED:** item-1 Phase 1 (raw-tmux backdoor close, PR #55, `d599fa9`) + Phase 2 (durable inbox + identity slice, PR #56, `0ba4360`).
+**MERGE-READY awaiting the general's word:** PR #57 (item-2 identity re-key, head `a3a6191`, full gate passed, review record durable).
+**NOT YET BUILT:** item-3, item-1 Phase 3 (ACLs), item-4, item-1 Phase 4 (typing-guard).
 
-**Open general items:** the `deploy_confirm_threshold` parameter VALUE (every-deploy vs significant/user-facing); the EMERGENCY soft-flag row (pending-ratification); 0.3.62 visual confirms (per-tile error isolation + captain-guard, live-UI-only).
+**BUILD QUEUE (dependency-honest, Cortana-acked):** PR-57 merge -> item-3 build -> item-1 Phase-3 ACLs -> item-4 build -> item-1 Phase-4 typing-guard LAST.
+Every build: dedicated worktree crew (Opus 4.8 high, permissionless), PR-only, no bump, xhigh review (Opus 4.8 xhigh), fix round, same-reviewer delta re-verify, then the merge word.
+**MERGE DOCTRINE (general-settled):** EVERY merge needs the general's word - no captain self-merge; the harness classifier additionally requires the general's DIRECT in-session confirm (AskUserQuestion) after Cortana relays approval - relay alone gets refused (live R-C1).
+**GO-LIVE IS BATCHED:** nothing builds/installs until the general's ONE 0.3.63 deploy confirm (ratified threshold: significant/user-facing only).
 
-**On RATIFICATION:** mandated build order within item 1 = close the raw-tmux backdoor FIRST, then inbox, then ACLs, typing-guard LAST; item 2 (identity re-key) drafting pipelines alongside per the program process.
+**HELD CREWS (reap after the PR-57 merge; verify landed first):**
+- item-2 build crew: tile `ec3fa9ef` (Claude session `867c00e7-d5a0-4611-a380-6fbb49ad490d`), worktree `.claude/worktrees/build-item2`, branch `build-item2` = PR #57. Migrated once already (the general's accidental restart; resumed seamlessly - the failure mode its own PR retires).
+- PR-57 reviewer: tile `3647011c` (Claude session likely `5a094b43-2416-49e5-a19f-0068e27e7dd2` - verify against the newest jsonl in the main-repo project dir before any resume).
+Everything else is reaped; worktrees/branches pruned.
 
-**PERMS (general-ordered, Cortana-provisioned fleet-wide 2026-07-10 eve):** `.claude/settings.local.json` carries `permissions.defaultMode=bypassPermissions` + allow rules for `mcp__t-hub__send_text`/`spawn_terminal`/`send_keys`, folded into `ensure-thub-mcp.sh` (backfills existing ships).
-Allow rules apply live per-call; the bypass defaultMode boots at NEXT session launch.
-The 2026-07-10 captain session ate classifier denials mid-errand and stayed partially chain-constrained on non-allow-listed calls touching permissionless spawns - a FRESH session boots clean in bypass.
-Full story: memory `harness-classifier-blocks-permissionless-spawns`.
+**⚠ ACTIVE ANOMALY - app-internal spawn wedge (Cortana-corrected diagnosis, 2026-07-11):** the app control plane progressively DROPS sessions from its adoption map (`send_text`/`close_terminal` -> "no such session") while tmux holds them fine, and MCP reads hit the 5s tmux-spawn timeout.
+Host-memory-pressure is REFUTED by data (11Gi available, no OOM, no swap thrash): this is runtime-STATE accumulation in the app's subprocess-spawn path (thread pool / async runtime / a lock serializing spawns) - the flap/wedge family.
+A diagnosis crew should target that spawn path; the batched-install restart may clear the symptom but a code bug recurs.
+**INTERIM: drive the fleet via RAW TMUX break-glass** - relay = Write the message to a file, `tmux -L t-hub load-buffer -b <buf> <file>`, `paste-buffer -b <buf> -t th_<id> -d`, `send-keys -t th_<id> Enter`, then capture to verify submission.
 
-**Operating reminders (full versions below):** VISIBLE-FIRST socket spawns + resize 220x50 BEFORE kickoff; KICKOFF-VERIFICATION (confirm the crew is PROCESSING, a collapsed pane eats the Enter); crew migration = `claude --resume <uuid>` never a fresh re-kick; RELAY TYPING-GUARD before any send to Cortana/general - NEW nuance: a non-empty input line may be the DIM AUTOSUGGEST placeholder, not typed text; capture with `tmux -e` and check the SGR code (ESC[2m dim = placeholder, plain = human typing, HOLD); env-pin trap (`env -u T_HUB_CONTROL_ADDR -u T_HUB_CONTROL_TOKEN` for socket probes; raw-connect to the current control.json).
+**PERMS:** `.claude/settings.local.json` = `defaultMode bypassPermissions` + allow rules (send_text/spawn_terminal/send_keys); a fresh captain session boots in bypass - the classifier fights only merges and self-modification, by design.
+**Operating reminders:** typing-guard - a non-empty input line may be the DIM autosuggest placeholder (capture with `tmux -e`; ESC[2m dim = placeholder, plain = human typing, HOLD); VISIBLE-FIRST spawns + resize 220x50 BEFORE kickoff; KICKOFF-VERIFICATION (confirm PROCESSING); crew migration = `claude --resume <uuid>`; sentinel watcher = background loop over `/tmp/t-hub-crew-done/t-hub-scribe/` with a heartbeat exit; all briefs live in `/tmp/flap-probe/*-BRIEF.md`.
 
 ---
 
@@ -44,7 +50,7 @@ Carries: #53 adopt/attach per-tile isolation + authoritative placement + closeWo
 The joint build caught a real PR #54 `cfg(windows)` regression (missing Win32_System_JobObjects/Win32_Security feature flags) - landed as its own commit `d358044`; the Windows build-verify is why it surfaced.
 Post-install verify: socket round-trip 1.2s, 6 terminals adopted, NO ghost/blank-UI (P1 class clear); flag-off inertness confirmed (kokoro unit still `active` + health 200, `T_HUB_MANAGED_KOKORO` unset).
 STILL NEEDS the general's visual confirm: per-tile error-isolation containing a throw and the captain-guard sparing a captain on tab-close are compiled-in but only exercisable by a live UI action (not safely restart-triggerable). Open #54 nit: `forgetting_copy_types` at engine_supervisor.rs:630 (redundant `mem::forget`).
-- **The ORCHESTRATION PROGRAM item 1/4 is ESCALATED** (2026-07-10 late eve): the comms-plane proposal passed its full gate (design-check PASS-WITH-FIXES -> fix round -> delta re-verify CLEAN - ESCALATE) and sits with Cortana for the general's ratification. See the ACTIVE RESUME POINT above.
+- **The ORCHESTRATION PROGRAM design phase is COMPLETE** (2026-07-10): all four items ratified same-day through the full adversarial gate; item-1 Phases 1+2 and item-2 built (PRs #55/#56 merged, #57 merge-ready). See the ACTIVE RESUME POINT above for the build queue and the active app-spawn-wedge anomaly.
 - **The kokoro interim systemd user unit still owns port 7478** and keeps serving after the install; the unit -> managed-child cutover is a SEPARATE deliberate step gated on the wave-1 flag-on validation (general-confirmed).
 - **Two untracked files** (`.lavish/`, `docs/DECK-AGENTS-DESIGN.md`) are pre-existing, NOT this ship's work - leave them.
 - Other ships share the tmux server (Cortana `e05764f5`, monorepo `9a32f554`, behavior-tracker `3e3b6479` + crew, appturnity crews) - touch ONLY your own roster.
