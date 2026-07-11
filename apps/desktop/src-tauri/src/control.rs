@@ -4831,7 +4831,23 @@ fn mark_break_glass(ctx: &ControlContext, command: &str, args: &Value) {
         .or_else(|| arg_str(args, "session_id"))
         .unwrap_or_default();
     let target = tmux_target(&session_id);
-    let bytes = arg_str(args, "text").map(|t| t.len()).unwrap_or(0);
+    // Payload size (length only, never content). `send_text` carries `text`;
+    // `send_keys` carries its payload in the `keys` array, so fall back to the
+    // joined key names - otherwise every `send_keys` marker would report bytes=0.
+    let bytes = if let Some(text) = arg_str(args, "text") {
+        text.len()
+    } else {
+        args.get("keys")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .len()
+            })
+            .unwrap_or(0)
+    };
     plane::note_break_glass(command, &target, bytes);
     ctx.fanout.emit_event(
         "control://break-glass",
@@ -5852,13 +5868,16 @@ mod tests {
         let _ = dispatch(
             &ctx,
             "send_keys",
-            &json!({ "sessionId": "no-such-session", "keys": ["Escape"] }),
+            &json!({ "sessionId": "no-such-session", "keys": ["C-c", "Escape"] }),
         );
 
         let frame = read_event_frame(&mut reader);
         assert_eq!(frame["event"], "control://break-glass");
         assert_eq!(frame["payload"]["command"], "send_keys");
         assert_eq!(frame["payload"]["breakGlass"], true);
+        // send_keys carries its payload in `keys`, not `text`: the marker must
+        // report the joined key-name length ("C-c Escape" = 10), not bytes=0.
+        assert_eq!(frame["payload"]["bytes"], 10);
     }
 
     #[test]

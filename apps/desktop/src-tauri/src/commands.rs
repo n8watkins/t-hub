@@ -384,16 +384,25 @@ pub async fn attach_terminal(
     })
 }
 
-/// Write bytes to a terminal's PTY - the HUMAN keystroke path (path b).
+/// Write bytes to a terminal's PTY - the HUMAN-origin + local terminal-management
+/// path (path b), i.e. NON-automation-message input.
 ///
-/// comms-plane Phase 1: this command is scoped to HUMAN-origin input - the live
-/// keystrokes / paste / drop that come from `Terminal.tsx`'s `onData` seam and its
-/// siblings. That is the ONE permitted non-plane writer (the human typing in real
-/// time IS the deferral signal the plane defers around, design §0.1). AUTOMATION
-/// input (fleet wake, auto-continue, the rules engine) must NOT use this command;
-/// it funnels through the plane via `deliver_agent_input` so it is attributed and
-/// can later be durable/gated. Keeping the two on distinct IPC commands is the
-/// caller/origin distinction the design's D1b calls for - not "rely on convention".
+/// comms-plane Phase 1: this command carries human-origin input (the live
+/// keystrokes / paste / drop from `Terminal.tsx`'s `onData` seam and its siblings)
+/// AND the app's own local terminal-management writes that are NOT an instruction to
+/// the agent loop (e.g. the `\x0c` form-feed repaint-nudge on reattach, the file-
+/// path insert on paste). Neither is an automation MESSAGE, so neither belongs on
+/// the plane. What must NOT use this command is automation-message input (fleet
+/// wake, auto-continue, the rules engine); that funnels through the plane via
+/// `deliver_agent_input` so it is attributed and can later be durable/gated.
+/// Keeping the two on distinct IPC commands is the caller/origin distinction the
+/// design's D1b calls for - not "rely on convention".
+///
+/// PHASE-4 NOTE (design L3): when the typing-guard lands, every `write_terminal`
+/// caller must emit the human-typing beat OR be explicitly classified. The human
+/// keystroke/paste/drop callers emit it; the local terminal-management writes
+/// (repaint form-feed, path insert) must be classified so a repaint does NOT trip
+/// `human_busy`. Flagged here, not built in Phase 1.
 #[tauri::command]
 pub async fn write_terminal(
     remote: tauri::State<'_, RemotePtyManager>,

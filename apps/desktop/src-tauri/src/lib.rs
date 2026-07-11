@@ -557,19 +557,13 @@ pub fn run() {
                 // The injector: type + submit a line into a tile's Claude session
                 // over tmux (the only thing that re-invokes an idle agent loop).
                 // comms-plane Phase 1: the wake is the plane's FIRST primary writer -
-                // it routes through `plane::deliver_tmux` (funnel + attribution)
-                // instead of calling `tmux::send_text` directly. Behaviour is
-                // unchanged (still an immediate, `Completed`-gated tmux write - no
-                // durability yet, that is Phase 2); the write is now the primary
-                // path, not a direct one.
-                let inject: fleet::Injector = std::sync::Arc::new(|tile: &str, text: &str| {
-                    plane::deliver_tmux(
-                        &tmux::target_for_id(tile),
-                        text,
-                        true,
-                        plane::WriteSource::FleetWake,
-                    )
-                });
+                // it routes through the plane (funnel + attribution) instead of
+                // calling `tmux::send_text` directly. Behaviour is unchanged (still an
+                // immediate, `Completed`-gated tmux write - no durability yet, that is
+                // Phase 2). The construction lives in `fleet::production_wake_injector`
+                // so the funnel is pinned by a test (a revert to a direct tmux write
+                // there fails `production_wake_injector_routes_through_plane`).
+                let inject: fleet::Injector = fleet::production_wake_injector();
                 // Bonus UI/voice cue: fan out `fleet://wake` alongside the injection.
                 let sink_fanout = control_fanout.clone();
                 let event_sink: fleet::EventSink = std::sync::Arc::new(move |payload| {

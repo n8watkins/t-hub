@@ -83,6 +83,38 @@ pub fn note_primary(source: WriteSource, target: &str, bytes: usize) {
         target,
         bytes
     );
+    #[cfg(test)]
+    test_hook::record(source, target, bytes);
+}
+
+/// Test-only recorder for primary writes, so a wiring test can assert that a
+/// production writer (e.g. the fleet-wake injector) actually attributes through the
+/// plane - and a revert to a direct substrate write would fail that test.
+#[cfg(test)]
+pub(crate) mod test_hook {
+    use super::WriteSource;
+    use std::sync::Mutex;
+
+    static RECORDS: Mutex<Vec<(WriteSource, String, usize)>> = Mutex::new(Vec::new());
+
+    pub fn record(source: WriteSource, target: &str, bytes: usize) {
+        RECORDS
+            .lock()
+            .unwrap()
+            .push((source, target.to_string(), bytes));
+    }
+
+    /// Every primary write recorded whose target matches `target` (filtered so
+    /// parallel tests do not see each other's records).
+    pub fn recorded_for(target: &str) -> Vec<(WriteSource, usize)> {
+        RECORDS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, t, _)| t == target)
+            .map(|(s, _, b)| (*s, *b))
+            .collect()
+    }
 }
 
 /// Record a BREAK-GLASS deviation - a write that went around the primary path (the
@@ -140,5 +172,29 @@ mod tests {
         let err = WriteSource::parse("send_text").unwrap_err();
         assert!(err.contains("unknown plane write source"), "got: {err}");
         assert!(WriteSource::parse("").is_err());
+    }
+
+    #[test]
+    fn production_wake_injector_routes_through_plane() {
+        // LOW-1 pin: the PRODUCTION fleet-wake injector (the one `lib.rs` wires in)
+        // must attribute its write through the plane as `FleetWake`. If someone
+        // reverts `production_wake_injector` to a direct `tmux::send_text`, no
+        // primary record is emitted and this test fails - re-opening path (a)'s
+        // funnel for the wake would no longer pass silently.
+        //
+        // A tile id that cannot map to a live pane, so the underlying tmux write
+        // errors fast; we only care that the plane attribution fired FIRST (it does,
+        // before the substrate write), which is exactly the funnel guarantee.
+        let tile = "planewaketest";
+        let target = crate::tmux::target_for_id(tile);
+        let inject = crate::fleet::production_wake_injector();
+        let _ = inject(tile, "wake payload");
+
+        let records = test_hook::recorded_for(&target);
+        assert_eq!(
+            records,
+            vec![(WriteSource::FleetWake, "wake payload".len())],
+            "wake must attribute exactly one FleetWake primary write through the plane"
+        );
     }
 }

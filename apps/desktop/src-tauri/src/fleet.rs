@@ -178,8 +178,27 @@ struct WakeItem {
 }
 
 /// A closure that injects `text` into the terminal with tile id `tile`, submitting
-/// it (Enter). Production wires this to `tmux::send_text`; tests record calls.
+/// it (Enter). Production wires this to the comms-plane primary path
+/// ([`production_wake_injector`]); tests record calls.
 pub type Injector = Arc<dyn Fn(&str, &str) -> Result<(), String> + Send + Sync>;
+
+/// The PRODUCTION wake injector, extracted from `setup()` so its funnel guarantee
+/// is testable. comms-plane Phase 1: the wake is the plane's first primary writer,
+/// so it routes through [`crate::plane::deliver_tmux`] (attributed
+/// [`WriteSource::FleetWake`](crate::plane::WriteSource::FleetWake)) rather than
+/// calling `tmux::send_text` directly. Behaviour is unchanged (still an immediate,
+/// `Completed`-gated tmux write); the write is now the plane primary path. A revert
+/// to a direct tmux write here fails `production_wake_injector_routes_through_plane`.
+pub fn production_wake_injector() -> Injector {
+    Arc::new(|tile: &str, text: &str| {
+        crate::plane::deliver_tmux(
+            &crate::tmux::target_for_id(tile),
+            text,
+            true,
+            crate::plane::WriteSource::FleetWake,
+        )
+    })
+}
 
 /// An optional sink for the bonus `fleet://wake` UI/event payload.
 pub type EventSink = Arc<dyn Fn(&Value) + Send + Sync>;

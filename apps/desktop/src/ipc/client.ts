@@ -43,8 +43,10 @@ export function attachTerminal(
   return invoke(Commands.attachTerminal, { id, cols, rows });
 }
 
-/** Write HUMAN keystrokes/paste to a terminal (comms-plane Phase 1: the human
- *  path). AUTOMATION input must go through {@link deliverAgentInput} instead. */
+/** Write human-origin + local terminal-management (non-automation-message) input
+ *  to a terminal (comms-plane Phase 1). Human keystrokes/paste/drop plus the app's
+ *  own repaint/path-insert writes. AUTOMATION-message input (fleet wake, auto-
+ *  continue, rules engine) must go through {@link deliverAgentInput} instead. */
 export function writeTerminal(id: TerminalId, data: string): Promise<void> {
   return invoke(Commands.writeTerminal, { id, data });
 }

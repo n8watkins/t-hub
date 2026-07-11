@@ -54,8 +54,9 @@ export const Commands = {
   spawnTerminal: "spawn_terminal",
   /** (Re)attach a PTY client to a tmux session; returns base64 scrollback to seed xterm. */
   attachTerminal: "attach_terminal",
-  /** HUMAN keystroke path only (comms-plane Phase 1). Automation must use
-   *  `deliverAgentInput` so its writes funnel through the plane. */
+  /** Human-origin + local terminal-management (non-automation-message) input
+   *  (comms-plane Phase 1). Automation-message input must use `deliverAgentInput`
+   *  so its writes funnel through the plane. */
   writeTerminal: "write_terminal",
   /** comms-plane Phase 1: the AUTOMATION-input path (auto-continue, rules engine).
    *  Routes through the plane seam with an attributed `WriteSource`; kept distinct
