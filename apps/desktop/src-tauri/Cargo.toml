@@ -152,6 +152,12 @@ windows = { version = "0.61", features = [
     "Win32_UI_Controls",
 ] }
 
+# Test-only: the MCP tool catalog, so control.rs's tier-parity test can assert that
+# every MCP tool's declared Tier matches the server-side `required_tier` enforcement
+# (item-3 ledger #16). The shipped app binary does not link this.
+[dev-dependencies]
+t-hub-mcp = { path = "crates/t-hub-mcp" }
+
 [profile.release]
 codegen-units = 1
 lto = true

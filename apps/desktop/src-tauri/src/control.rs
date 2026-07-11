@@ -3259,11 +3259,45 @@ fn required_tier(command: &str) -> CommandTier {
         // Comms-plane Phase 2 (review H1): `inbox_ack` MUTATES durable receipt state
         // (Delivered -> Processed) and force-compacts records, so it must NOT fall
         // through to the read tier - it needs the control capability AND the audit a
-        // mutating, non-spawn command gets (like `create_worktree`). `inbox_status`
-        // stays Read (genuinely counts-only).
+        // mutating, non-spawn command gets (like `create_worktree`).
+        //
+        // item-3 §2.4.1: `inbox_ack` STAYS Organization. Lowering it to a scoped-Read
+        // self-ack is UNSAFE until a session-token-on-request substrate exists (the
+        // `ControlRequest` carries no session identity, `inbox_ack` trusts the
+        // caller-supplied `sessionId`, and every crew presents the same read token -
+        // so scoped-Read would be cross-session spoofable, STRICTLY WORSE than this
+        // Organization gate). Ledger row 17 is LAW-TARGET; the crew ack loop is
+        // completed by a control-capable relay until the substrate lands.
+        //
+        // `inbox_status`'s BASE tier is Read (genuinely counts-only), but item-3 §2.4
+        // refines it by SCOPE in [`effective_tier`]: an unscoped fleet-wide
+        // enumeration is Organization.
         | "inbox_ack" => CommandTier::Organization,
         _ => CommandTier::Read,
     }
+}
+
+/// The tier a request must satisfy, refined by the request ARGS where the scope
+/// changes the privilege. Base tiers come from [`required_tier`]; item-3 §2.4 adds
+/// one refinement (ledger #15, closing the PR-56 L3 enumeration leak):
+///
+/// - `inbox_status` SCOPED to a single recipient (`sessionId` present) stays Read -
+///   it returns just that recipient's counts/cursors, never content.
+/// - `inbox_status` UNSCOPED (`depth_all`: every recipient's counts/cursors/oldest
+///   age) is Organization tier, so a bare read token cannot enumerate the whole
+///   fleet's inbox health.
+///
+/// Every other command's effective tier is exactly its [`required_tier`].
+fn effective_tier(command: &str, args: &Value) -> CommandTier {
+    if command == "inbox_status" {
+        let scoped = arg_str(args, "sessionId")
+            .or_else(|| arg_str(args, "session_id"))
+            .is_some();
+        if !scoped {
+            return CommandTier::Organization;
+        }
+    }
+    required_tier(command)
 }
 
 /// A resolved caller capability (socket-gate Phase 2). The read token resolves to
@@ -3643,7 +3677,9 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         return ControlResponse::err("unauthorized: bad control token");
     };
 
-    let tier = required_tier(&req.command);
+    // item-3 §2.4: the effective tier is args-refined - an UNSCOPED `inbox_status`
+    // (fleet-wide enumeration) is Organization even though its base tier is Read.
+    let tier = effective_tier(&req.command, &req.args);
 
     // Phase 2 capability gate: the presented token's capability must cover the
     // command's required tier. The read token authorizes Read only; Organization
@@ -9361,6 +9397,82 @@ mod tests {
         // and stays Read.
         assert_eq!(required_tier("inbox_ack"), CommandTier::Organization);
         assert_eq!(required_tier("inbox_status"), CommandTier::Read);
+    }
+
+    #[test]
+    fn mcp_tier_annotations_match_control_required_tier() {
+        // item-3 ledger #16: the drift-can't-recur guard. Every tool the MCP surface
+        // advertises must carry the SAME tier the control server ENFORCES via
+        // `required_tier`, or the annotation-vs-enforcement drift that motivated the
+        // socket-gate work reopens. BYPASS-WOULD-FAIL: change one MCP tool's tier (or
+        // its control-side arm) without the other and this test goes RED.
+        for tool in t_hub_mcp::tools::catalog() {
+            let expected = match tool.tier {
+                t_hub_mcp::tools::Tier::Read => CommandTier::Read,
+                t_hub_mcp::tools::Tier::Organization => CommandTier::Organization,
+                t_hub_mcp::tools::Tier::ProcessChanging => CommandTier::ProcessChanging,
+                // The theme get/set pair is a PARALLEL track forwarded by name (it does
+                // not flow through `required_tier`'s capability gate), so it has no
+                // control-side tier to mirror. Skip it explicitly.
+                t_hub_mcp::tools::Tier::Theme => continue,
+            };
+            assert_eq!(
+                required_tier(tool.name),
+                expected,
+                "tier drift: MCP tool '{}' is annotated {:?} but control enforces {:?}",
+                tool.name,
+                tool.tier,
+                required_tier(tool.name),
+            );
+        }
+    }
+
+    #[test]
+    fn inbox_status_unscoped_enumeration_requires_organization() {
+        // item-3 §2.4 (ledger #15): a SCOPED inbox_status (own recipient) stays Read,
+        // but an UNSCOPED fleet-wide enumeration (depth_all) is Organization so a bare
+        // read token cannot enumerate every recipient's counts/cursors. inbox_ack STAYS
+        // Organization regardless (§2.4.1). BYPASS-WOULD-FAIL: drop the effective_tier
+        // refinement and the unscoped case falls back to Read and the assert goes RED.
+        assert_eq!(
+            effective_tier("inbox_status", &json!({"sessionId": "tileX"})),
+            CommandTier::Read,
+            "a scoped inbox_status is a Read"
+        );
+        assert_eq!(
+            effective_tier("inbox_status", &json!({})),
+            CommandTier::Organization,
+            "an unscoped inbox_status enumeration must require Organization"
+        );
+        // inbox_ack is Organization independent of scope (no self-scope until the
+        // session-token-on-request substrate lands, §2.4.1).
+        assert_eq!(
+            effective_tier("inbox_ack", &json!({"sessionId": "tileX"})),
+            CommandTier::Organization
+        );
+        // Every other command's effective tier is exactly its required_tier.
+        assert_eq!(effective_tier("list_terminals", &json!({})), CommandTier::Read);
+        assert_eq!(effective_tier("spawn_terminal", &json!({})), CommandTier::ProcessChanging);
+    }
+
+    #[test]
+    fn read_token_cannot_enumerate_all_inboxes_but_can_scope_its_own() {
+        // End-to-end through the gate: a read token doing an UNSCOPED inbox_status is
+        // authz-refused (Organization), while a SCOPED inbox_status is admitted (Read).
+        let ctx = test_ctx("t").with_inbox(Arc::new(crate::inbox::Inbox::ephemeral()));
+        let unscoped = dispatch_authenticated(&ctx, req("read-t", "inbox_status", json!({})));
+        assert!(
+            unscoped.error.clone().unwrap_or_default().contains("requires the control capability"),
+            "read token must be refused an unscoped enumeration, got: {:?}",
+            unscoped.error
+        );
+        let scoped =
+            dispatch_authenticated(&ctx, req("read-t", "inbox_status", json!({"sessionId": "me"})));
+        assert!(
+            !scoped.error.clone().unwrap_or_default().contains("requires the control capability"),
+            "read token must be allowed a scoped inbox_status, got: {:?}",
+            scoped.error
+        );
     }
 
     #[test]
