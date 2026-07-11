@@ -570,7 +570,21 @@ pub fn run() {
             // the control listener (identity resolve + inbox ack/status).
             let identity_store =
                 std::sync::Arc::new(identity::IdentityStore::load_default());
-            let inbox = std::sync::Arc::new(inbox::Inbox::open_default());
+            // Comms-plane Phase 2 observability (§2.8): fan out each message's
+            // lifecycle transition on `control://inbox` (counts/ids/lengths only,
+            // never content) so the Settings health panel + delivery tests can watch
+            // the queue.
+            let inbox_telemetry_fanout = control_fanout.clone();
+            let inbox_telemetry: inbox::TelemetrySink =
+                std::sync::Arc::new(move |ev: &inbox::InboxEvent| {
+                    inbox_telemetry_fanout.emit_event(
+                        "control://inbox",
+                        &serde_json::to_value(ev).unwrap_or_default(),
+                    );
+                });
+            let inbox = std::sync::Arc::new(
+                inbox::Inbox::open_default().with_telemetry(inbox_telemetry),
+            );
             {
                 // The injector: type + submit a line into a tile's Claude session
                 // over tmux (the only thing that re-invokes an idle agent loop).

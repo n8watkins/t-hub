@@ -257,6 +257,29 @@ const DEFAULT_AUDIT_TAIL: usize = 64;
 /// of the parsed queues behind a single mutex. Low-volume (fleet wakes coalesce), so
 /// a coarse lock is simplest-correct; the only work done OUTSIDE the lock is the PTY
 /// write in `drain_one`, guarded by the persisted in-flight marker.
+/// A per-message lifecycle telemetry event (§2.8 delivery telemetry). Carries the
+/// routing metadata + state transition, NEVER the body (content can carry secrets,
+/// mirroring the audit log's redaction). `lib.rs` fans these out on `control://inbox`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxEvent {
+    pub recipient: String,
+    pub seq: u64,
+    pub sender: String,
+    pub priority: Priority,
+    /// The lifecycle transition this event marks: `enqueued` | `delivered` |
+    /// `processed` | `writeFailed`. Distinct from the enqueue ACK's `accepted`
+    /// (which means "persisted") - D6's "add a distinct processed receipt event".
+    pub event: &'static str,
+    /// Payload length only (never the content).
+    pub bytes: usize,
+    pub at_ms: u64,
+}
+
+/// A telemetry sink the inbox calls on each lifecycle transition. Wired to the
+/// control event fanout in production; a recording closure in tests.
+pub type TelemetrySink = std::sync::Arc<dyn Fn(&InboxEvent) + Send + Sync>;
+
 pub struct Inbox {
     /// The segment directory, or `None` for an ephemeral (in-memory-only) inbox - the
     /// headless-test / no-addr default, mirroring `IdentityStore::ephemeral`. A `None`
@@ -265,6 +288,9 @@ pub struct Inbox {
     queues: Mutex<HashMap<String, RecipientQueue>>,
     max_depth: usize,
     audit_tail: usize,
+    /// Optional per-message lifecycle telemetry sink (§2.8). Emitted OUTSIDE the queue
+    /// lock so the sink can never deadlock the inbox.
+    telemetry: Option<TelemetrySink>,
 }
 
 impl Inbox {
@@ -278,6 +304,7 @@ impl Inbox {
             queues: Mutex::new(queues),
             max_depth: env_max_depth(),
             audit_tail: env_audit_tail(),
+            telemetry: None,
         }
     }
 
@@ -294,11 +321,35 @@ impl Inbox {
             queues: Mutex::new(HashMap::new()),
             max_depth: env_max_depth(),
             audit_tail: env_audit_tail(),
+            telemetry: None,
         }
+    }
+
+    /// Attach a per-message lifecycle telemetry sink (§2.8). `lib.rs` wires it to the
+    /// `control://inbox` fanout; tests pass a recording closure.
+    pub fn with_telemetry(mut self, sink: TelemetrySink) -> Self {
+        self.telemetry = Some(sink);
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, RecipientQueue>> {
         self.queues.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Emit a lifecycle telemetry event, if a sink is attached. Called only OUTSIDE
+    /// the queue lock.
+    fn emit(&self, recipient: &str, rec: &InboxRecord, event: &'static str) {
+        if let Some(sink) = &self.telemetry {
+            sink(&InboxEvent {
+                recipient: recipient.to_string(),
+                seq: rec.seq,
+                sender: rec.sender.clone(),
+                priority: rec.priority,
+                event,
+                bytes: rec.body.len(),
+                at_ms: now_ms(),
+            });
+        }
     }
 
     /// Persist one recipient's segment atomically (temp + rename + 0600), the exact
@@ -343,7 +394,7 @@ impl Inbox {
         }
         let seq = q.next_seq;
         q.next_seq += 1;
-        q.records.push(InboxRecord {
+        let record = InboxRecord {
             seq,
             sender: sender.to_string(),
             priority,
@@ -354,8 +405,11 @@ impl Inbox {
             delivered_at: None,
             processed_at: None,
             write_attempts: 0,
-        });
+        };
+        q.records.push(record.clone());
         self.persist(q);
+        drop(queues);
+        self.emit(recipient, &record, "enqueued");
         Ok(EnqueueOutcome { seq })
     }
 
@@ -413,6 +467,8 @@ impl Inbox {
                     q.last_drained_seq = record.seq;
                 }
                 self.persist(q);
+                drop(queues);
+                self.emit(recipient, &record, "delivered");
                 DrainOutcome::Delivered { seq: record.seq }
             }
             Err(error) => {
@@ -420,6 +476,8 @@ impl Inbox {
                     rec.write_attempts = rec.write_attempts.saturating_add(1);
                 }
                 self.persist(q);
+                drop(queues);
+                self.emit(recipient, &record, "writeFailed");
                 DrainOutcome::WriteFailed {
                     seq: record.seq,
                     error,
@@ -449,9 +507,15 @@ impl Inbox {
                 AckOutcome::Processed { seq }
             }
         };
+        let mut processed_record = None;
         if matches!(outcome, AckOutcome::Processed { .. }) {
+            processed_record = q.find_mut(seq).map(|r| r.clone());
             compact(q, self.audit_tail);
             self.persist(q);
+        }
+        drop(queues);
+        if let Some(rec) = &processed_record {
+            self.emit(recipient, rec, "processed");
         }
         outcome
     }
@@ -811,7 +875,7 @@ mod tests {
             TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let inbox = Inbox { dir: Some(dir), queues: Mutex::new(HashMap::new()), max_depth: 2, audit_tail: 8 };
+        let inbox = Inbox { dir: Some(dir), queues: Mutex::new(HashMap::new()), max_depth: 2, audit_tail: 8, telemetry: None };
         inbox.enqueue("t1", "s", Priority::Standard, "a", true).unwrap();
         inbox.enqueue("t1", "s", Priority::Standard, "b", true).unwrap();
         // Third standard enqueue overflows the depth-2 bound.
@@ -829,7 +893,7 @@ mod tests {
             TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let inbox = Inbox { dir: Some(dir), queues: Mutex::new(HashMap::new()), max_depth: 256, audit_tail: 2 };
+        let inbox = Inbox { dir: Some(dir), queues: Mutex::new(HashMap::new()), max_depth: 256, audit_tail: 2, telemetry: None };
         // Enqueue, deliver, and ack 5 records; only the newest 2 processed survive.
         for _ in 0..5 {
             inbox.enqueue("t1", "s", Priority::Standard, "x", true).unwrap();
@@ -859,6 +923,51 @@ mod tests {
         // A separator cannot traverse the directory.
         assert!(!segment_name("../etc/passwd").contains('/'));
         assert!(segment_name("../etc").contains('%'));
+    }
+
+    #[test]
+    fn telemetry_reports_the_full_lifecycle_without_the_body() {
+        let (inbox, _dir) = temp_inbox();
+        let events: std::sync::Arc<std::sync::Mutex<Vec<(String, u64, usize)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = events.clone();
+        let inbox = inbox.with_telemetry(std::sync::Arc::new(move |ev: &InboxEvent| {
+            sink_events
+                .lock()
+                .unwrap()
+                .push((ev.event.to_string(), ev.seq, ev.bytes));
+        }));
+        inbox.enqueue("t1", "crew:abc", Priority::Standard, "secret-body", true).unwrap();
+        let sink = std::sync::Mutex::new(Vec::new());
+        inbox.drain_one("t1", ok_writer(&sink));
+        inbox.ack("t1", 0);
+        let got = events.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                ("enqueued".to_string(), 0, "secret-body".len()),
+                ("delivered".to_string(), 0, "secret-body".len()),
+                ("processed".to_string(), 0, "secret-body".len()),
+            ],
+            "the full lifecycle is reported as distinct events (D6), by length not content"
+        );
+    }
+
+    #[test]
+    fn telemetry_reports_a_failed_write() {
+        let (inbox, _dir) = temp_inbox();
+        let events: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = events.clone();
+        let inbox = inbox.with_telemetry(std::sync::Arc::new(move |ev: &InboxEvent| {
+            sink_events.lock().unwrap().push(ev.event.to_string());
+        }));
+        inbox.enqueue("t1", "s", Priority::Standard, "x", true).unwrap();
+        inbox.drain_one("t1", |_rec| Err("boom".to_string()));
+        assert_eq!(
+            events.lock().unwrap().clone(),
+            vec!["enqueued".to_string(), "writeFailed".to_string()]
+        );
     }
 
     #[test]

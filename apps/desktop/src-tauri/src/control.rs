@@ -3250,6 +3250,15 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // whichever client is attached.
         "report_workspace_tabs" => report_workspace_tabs(ctx, args),
         "read_terminal" | "capture_pane" => read_terminal(args),
+        // Comms-plane Phase 2: the durable inbox's read-tier surface. `inbox_ack` is
+        // the recipient's `delivered -> processed` intake confirmation (the receipt
+        // state machine's ack channel, §2.4 M2); `inbox_status` is the per-recipient
+        // observability snapshot (§2.8). Read-tier: an ack only retires the
+        // recipient's own already-delivered message (idempotent, never a re-write),
+        // and status is counts-only. Phase 3 adds the ownership ACL that gates a
+        // cross-session ack; Phase 2 does not authorize (no ACLs yet).
+        "inbox_ack" => inbox_ack(ctx, args),
+        "inbox_status" => inbox_status(ctx, args),
 
         // ---- Organization tier (PRD §11.2: allowed, audited) ---------------
         // These are surfaced by the MCP server and accepted here, but the
@@ -3929,6 +3938,49 @@ fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, St
 /// directly (`tmux -L t-hub capture-pane -p [-S -N] -t th_<id>`), no UI round
 /// trip. Args: `sessionId` (required), `historyLines` (optional, default 0 =
 /// visible screen only; clamped to keep responses bounded).
+/// Comms-plane Phase 2: `inbox_ack` - the recipient confirms intake of a delivered
+/// inbox message (`delivered -> processed`, §2.4 M2). `sessionId` is the recipient's
+/// own tile id (the inbox key the wake enqueued under); `seq` the message. The ACK is
+/// idempotent + safe: a lost or duplicate ack never triggers a re-write, and acking
+/// before delivery / an unknown seq is reported honestly rather than silently
+/// advancing state. Phase 2 does NOT authorize the caller (no ACLs) - Phase 3's
+/// ownership ACL gates a cross-session ack.
+fn inbox_ack(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let recipient = arg_str(args, "sessionId")
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("inbox_ack requires a 'sessionId' argument")?;
+    let seq = args
+        .get("seq")
+        .and_then(|v| v.as_u64())
+        .ok_or("inbox_ack requires a numeric 'seq' argument")?;
+    let outcome = ctx.inbox.ack(&recipient, seq);
+    let state = match outcome {
+        crate::inbox::AckOutcome::Processed { .. } => "processed",
+        crate::inbox::AckOutcome::AlreadyProcessed { .. } => "alreadyProcessed",
+        crate::inbox::AckOutcome::NotDelivered { .. } => "notDelivered",
+        crate::inbox::AckOutcome::Unknown { .. } => "unknown",
+    };
+    Ok(json!({
+        "accepted": "inbox_ack",
+        "sessionId": recipient,
+        "seq": seq,
+        "state": state,
+    }))
+}
+
+/// Comms-plane Phase 2: `inbox_status` - per-recipient observability (§2.8). With a
+/// `sessionId` it returns that recipient's depth snapshot; without one, every
+/// recipient's. Counts + cursors + oldest-un-drained age only, never message content.
+fn inbox_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    if let Some(recipient) =
+        arg_str(args, "sessionId").or_else(|| arg_str(args, "session_id"))
+    {
+        Ok(json!({ "recipient": ctx.inbox.depth(&recipient) }))
+    } else {
+        Ok(json!({ "recipients": ctx.inbox.depth_all() }))
+    }
+}
+
 fn read_terminal(args: &Value) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
@@ -8597,6 +8649,42 @@ mod tests {
         let (env2, minted2) = spawn_env_with_identity(&ctx, &json!({}));
         assert!(env2.is_empty());
         assert!(minted2.is_none());
+    }
+
+    #[test]
+    fn inbox_ack_and_status_handlers_round_trip() {
+        let inbox = Arc::new(crate::inbox::Inbox::ephemeral());
+        inbox
+            .enqueue("tileX", "crew:a", crate::inbox::Priority::Standard, "hi", true)
+            .unwrap();
+        // Deliver it so it is ackable (the drain's at-most-once write).
+        inbox.drain_one("tileX", |_r| Ok(()));
+        let ctx = test_ctx("t").with_inbox(inbox.clone());
+
+        // Status reflects the delivered-not-yet-processed record.
+        let status = inbox_status(&ctx, &json!({"sessionId": "tileX"})).unwrap();
+        assert_eq!(status["recipient"]["delivered"].as_u64(), Some(1));
+        assert_eq!(status["recipient"]["enqueued"].as_u64(), Some(0));
+
+        // Ack retires it (`delivered -> processed`).
+        let ack = inbox_ack(&ctx, &json!({"sessionId": "tileX", "seq": 0})).unwrap();
+        assert_eq!(ack["accepted"], "inbox_ack");
+        assert_eq!(ack["state"], "processed");
+        // A duplicate ack is a benign no-op (a lost-then-retried ack never re-writes).
+        let reack = inbox_ack(&ctx, &json!({"sessionId": "tileX", "seq": 0})).unwrap();
+        assert_eq!(reack["state"], "alreadyProcessed");
+
+        // No sessionId => the all-recipients snapshot.
+        let all = inbox_status(&ctx, &json!({})).unwrap();
+        assert!(all["recipients"].is_array());
+
+        // A malformed ack (missing seq) is rejected, not silently accepted.
+        assert!(inbox_ack(&ctx, &json!({"sessionId": "tileX"})).is_err());
+        // Acking an unknown recipient/seq is honest, not a crash.
+        assert_eq!(
+            inbox_ack(&ctx, &json!({"sessionId": "nope", "seq": 7})).unwrap()["state"],
+            "unknown"
+        );
     }
 
     // -----------------------------------------------------------------------
