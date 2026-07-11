@@ -7,9 +7,9 @@
 //! independent of Tauri.
 //!
 //! Surface:
-//!   - `new_session(name, cwd, command)` — detached session, one window/pane,
-//!     with `window-size latest` so a stale hidden client can't shrink the pane
-//!     (REVIEW.md risk #4).
+//!   - `new_session_with_env(name, cwd, command, env)` — detached session, one
+//!     window/pane, with `window-size latest` so a stale hidden client can't shrink
+//!     the pane (REVIEW.md risk #4), and optional per-session `-e KEY=VALUE` env.
 //!   - `has_session(name) -> bool`
 //!   - `kill_session(name)`
 //!   - `list_sessions() -> Vec<String>`  (tolerates "no server running")
@@ -217,7 +217,8 @@ fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxErro
     }
 }
 
-/// Create a new detached tmux session named `name`, rooted at `cwd`.
+/// Create a new detached tmux session named `name`, rooted at `cwd`, with optional
+/// per-session environment variables via tmux `-e` (socket-gate Phase 2b).
 ///
 /// `new-session -d` starts the session detached with a single window/pane. When
 /// `command` is `None` tmux runs the user's login shell (the default for the
@@ -225,16 +226,14 @@ fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxErro
 /// (a freshly attached visible tile and a stale hidden one) this makes the pane
 /// track the most recently active client instead of shrinking to the smallest,
 /// which would otherwise corrupt the visible layout (REVIEW.md risk #4).
-pub fn new_session(name: &str, cwd: &str, command: Option<&str>) -> Result<(), TmuxError> {
-    new_session_with_env(name, cwd, command, &[])
-}
-
-/// Like [`new_session`], but sets per-session environment variables via tmux `-e`
-/// (socket-gate Phase 2b). tmux applies `-e KEY=VALUE` to the session BEFORE the
-/// first pane execs, so an in-session process (e.g. the MCP server the pane later
-/// launches) inherits them - and, unlike prefixing the pane command, the values
-/// never appear in `ps`/`pane_start_command`. `env` empty ⇒ identical to
-/// [`new_session`].
+///
+/// tmux applies `-e KEY=VALUE` to the session BEFORE the first pane execs, so an
+/// in-session process (e.g. the MCP server the pane later launches) inherits them -
+/// and, unlike prefixing the pane command, the values never appear in
+/// `ps`/`pane_start_command`. Because the session env OVERRIDES the tmux server's
+/// inherited global env, this is also how item-3's UI spawn path SCRUBS an inherited
+/// `T_HUB_CONTROL_TOKEN` (it sets its own value at the session level). `env` empty ⇒
+/// a plain login-shell session with no injected capability env.
 pub fn new_session_with_env(
     name: &str,
     cwd: &str,
@@ -874,7 +873,7 @@ mod tests {
         // Clean slate in case a previous run leaked this name (it shouldn't).
         let _ = kill_session(&name);
 
-        new_session(&name, "/tmp", None).expect("new_session should succeed");
+        new_session_with_env(&name, "/tmp", None, &[]).expect("new_session should succeed");
 
         assert!(has_session(&name), "session should exist after creation");
 
@@ -914,7 +913,7 @@ mod tests {
         }
         let name = unique_name();
         let _ = kill_session(&name);
-        new_session(&name, "/tmp", None).expect("new_session should succeed");
+        new_session_with_env(&name, "/tmp", None, &[]).expect("new_session should succeed");
         // Deterministic geometry regardless of what the server's latest client
         // reports (see `resize_window_for_tests` — the wedged-2x24 gotcha).
         resize_window_for_tests(&name, 80, 24).expect("resize should succeed");
@@ -951,7 +950,7 @@ mod tests {
         }
         let name = unique_name();
         let _ = kill_session(&name);
-        new_session(&name, "/tmp", None).expect("new_session should succeed");
+        new_session_with_env(&name, "/tmp", None, &[]).expect("new_session should succeed");
 
         send_keys(&name, &["C-c"]).expect("send_keys C-c should succeed");
         send_keys(&name, &["Enter"]).expect("send_keys Enter should succeed");

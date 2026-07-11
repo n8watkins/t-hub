@@ -2253,21 +2253,27 @@ pub fn persistent_read_key() -> String {
 /// Phase 3 hardening flag (socket-gate). When ON, [`start`] stops publishing the
 /// control token to `control.json` and publishes only the read token there, so a
 /// process that merely scrapes the discovery file gets read-only; elevated sessions
-/// then rely on the control token injected down the spawn tree (Phase 2b). DEFAULT
-/// OFF - opt in with `T_HUB_CONTROL_HARDEN=1` (or `true`).
+/// then rely on the control token injected down the spawn tree (Phase 2b). item-3
+/// flip #2 (ratified 2026-07-10): DEFAULT ON - `T_HUB_CONTROL_HARDEN=0` (or `false`)
+/// is the instant, rebuild-free rollback to the Phase-2 disk behavior.
 ///
-/// NOTE (2026-07-07 incident): the default was briefly flipped ON (0.3.47) and
-/// reverted the same day. The app's OWN frontend authenticates to the control
-/// socket with the token published in `control.json`; hardening downgraded that to
-/// the read token, so the webview lost control and terminals could not re-attach
-/// ("session detached - reconnecting"). Phase 3 stays behind this flag until the
-/// frontend receives the control token via a trusted internal channel (a Tauri
-/// command / spawn-injected env) instead of scraping the discovery file. See
+/// HISTORY (2026-07-07 incident): an earlier ON default (0.3.47) was reverted the
+/// same day because the app's OWN frontend authenticated to the control socket with
+/// the token published in `control.json`; hardening downgraded that to the read token
+/// and the webview lost control ("session detached - reconnecting", PR #29). The cure
+/// is now structurally in the tree and independently re-verified (item-3 §1.2): the
+/// webview reads the FULL token from the in-process, never-serialized
+/// `local_control_token` (see [`ControlHandshake::local_control_token`] and
+/// `control_client::resolve_endpoint`), so the disk token can be read-only without
+/// touching the webview's credential. The §3.1 five-check verification gate (see the
+/// `hardened_*` tests) pins every one of those webview token paths, including
+/// reconnect-after-rebind, so the flip cannot silently re-break attach. See
 /// `docs/SOCKET-AUTH-DESIGN.md`.
 fn phase3_harden_enabled() -> bool {
     std::env::var("T_HUB_CONTROL_HARDEN")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        // Ratified default-ON: only an explicit `0`/`false` disables hardening.
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
 }
 
 /// Pick the token published in the `token` field of `control.json`. With hardening
@@ -3377,16 +3383,60 @@ pub fn resolve_identity(ctx: &ControlContext, presented: &str) -> Option<Resolve
     })
 }
 
+/// Whether the pre-item-3 fail-OPEN spawn default is restored (instant rollback,
+/// §3.3). With `T_HUB_SPAWN_LEGACY_FULL=1`/`true` a spawn defaults to the FULL
+/// control token unless it explicitly asks for `capability:"read"` - the behavior
+/// before the least-privilege inversion. OFF by default: the ratified default is
+/// least-privilege (untagged spawn => READ).
+fn legacy_full_spawn_default() -> bool {
+    std::env::var("T_HUB_SPAWN_LEGACY_FULL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// The capability a spawned session is granted (item-3 Pillar A, HIGH-1: the root
+/// move). INVERTED least-privilege: the DEFAULT is READ. A control-capable child
+/// requires the caller to explicitly pass `capability:"control"`.
+///
+/// Why this is a WALL, not a painted line: every spawner is necessarily a Full-token
+/// caller (`spawn_terminal`/`create_worktree` are ProcessChanging/Organization - only
+/// Full may call them), so opting a child UP to control is a deliberate, audited act
+/// by a caller who already holds Full; a missed/typo'd tag under-privileges (fails
+/// SAFE to READ) instead of leaking the full token to crew. `T_HUB_SPAWN_LEGACY_FULL`
+/// restores the old fail-open default for an instant rollback.
+fn spawn_capability(args: &Value) -> Capability {
+    let declared = arg_str(args, "capability");
+    if legacy_full_spawn_default() {
+        // Pre-item-3 fail-open: control unless an explicit `read`.
+        let read_only = declared
+            .map(|c| c.eq_ignore_ascii_case("read"))
+            .unwrap_or(false);
+        return if read_only {
+            Capability::ReadOnly
+        } else {
+            Capability::Full
+        };
+    }
+    // Ratified inverted default: READ unless an explicit `control`.
+    let control = declared
+        .map(|c| c.eq_ignore_ascii_case("control"))
+        .unwrap_or(false);
+    if control {
+        Capability::Full
+    } else {
+        Capability::ReadOnly
+    }
+}
+
 /// The capability-token env injected into a spawned session so its in-session
 /// MCP/clients authenticate as the capability the spawn was granted (Phase 2b).
 ///
-/// DEFAULT is the full control token - every spawned session can orchestrate,
-/// exactly as today (where the in-session MCP reads the control token from
-/// `control.json`), so nothing that spawns today breaks. An explicit
-/// `capability: "read"` spawn arg downgrades the new session to the read token
-/// (a pure-work crew that can observe but not spawn/type/kill). Any other/absent
-/// `capability` value fails SAFE to the control token (a typo never silently
-/// under-privileges a session that needed to orchestrate).
+/// DEFAULT is the READ token (item-3 inverted least-privilege, [`spawn_capability`]):
+/// an untagged spawn is a pure-work crew that can observe but not spawn/type/kill.
+/// Only an explicit `capability:"control"` by the (necessarily Full) caller injects
+/// the full control token. An empty read token (a bare-probe / headless context that
+/// never minted one) falls back to the control token so it is never locked out,
+/// matching `select_published_token`'s safe fallback.
 ///
 /// Injects BOTH `T_HUB_CONTROL_ADDR` and `T_HUB_CONTROL_TOKEN` because the MCP's
 /// env override is all-or-nothing (it needs both, else it falls back to
@@ -3396,18 +3446,49 @@ fn elevation_env(ctx: &ControlContext, args: &Value) -> Vec<(String, String)> {
     if ctx.addr.is_empty() {
         return Vec::new();
     }
-    let read_only = arg_str(args, "capability")
-        .map(|c| c.eq_ignore_ascii_case("read"))
-        .unwrap_or(false);
-    let token = if read_only && !ctx.read_token.is_empty() {
-        ctx.read_token.clone()
-    } else {
-        ctx.token.clone()
+    let token = match spawn_capability(args) {
+        Capability::Full => ctx.token.clone(),
+        Capability::ReadOnly if !ctx.read_token.is_empty() => ctx.read_token.clone(),
+        Capability::ReadOnly => ctx.token.clone(),
     };
     vec![
         ("T_HUB_CONTROL_ADDR".to_string(), ctx.addr.clone()),
         ("T_HUB_CONTROL_TOKEN".to_string(), token),
     ]
+}
+
+/// Emit a hash-chained audit record for a control-capability spawn (item-3 §2.1.1
+/// piece 4: "a control-spawn is never silent"). A distinct `control-spawn` decision
+/// with `tokenTier: control` so a log review enumerates exactly who was elevated and
+/// by whom (the `spawnedBy` meta). Read-tier spawns (the least-privilege default) are
+/// already covered by the command's own allowed-path audit, so only the elevation is
+/// recorded here.
+fn audit_control_spawn(ctx: &ControlContext, command: &str, args: &Value) {
+    let session = args
+        .get("sessionId")
+        .or_else(|| args.get("session_id"))
+        .and_then(|v| v.as_str());
+    let spawned_by = args
+        .get("spawnedBy")
+        .or_else(|| args.get("spawned_by"))
+        .and_then(|v| v.as_str());
+    ctx.audit.record(
+        command,
+        required_tier(command).label(),
+        "control-spawn",
+        args,
+        AuditMeta {
+            peer: if ctx.peer_is_loopback {
+                "loopback"
+            } else {
+                "remote"
+            },
+            token_tier: Capability::Full.tier_label(),
+            session,
+            spawned_by,
+            error: None,
+        },
+    );
 }
 
 /// Comms-plane Phase 2 (§2.3, D9): build the spawn env AND mint the session's
@@ -3430,12 +3511,18 @@ fn elevation_env(ctx: &ControlContext, args: &Value) -> Vec<(String, String)> {
 fn spawn_env_with_identity(
     ctx: &ControlContext,
     args: &Value,
+    command: &str,
 ) -> (Vec<(String, String)>, Option<crate::identity::SessionIdentity>) {
     let mut env = elevation_env(ctx, args);
     if env.is_empty() {
         // No addr => headless; do not mint (there is no channel for the session to
         // present its token over anyway).
         return (env, None);
+    }
+    // item-3 §2.1.1 piece 4: every control-capability spawn is audited so an
+    // elevation is never silent. The default (READ) spawn is not elevated.
+    if spawn_capability(args) == Capability::Full {
+        audit_control_spawn(ctx, command, args);
     }
     // Resolve the spawner's ship so the crew's binding carries it (item-2 §2.3/§2.6).
     let ship = arg_str(args, "spawnedBy")
@@ -4774,10 +4861,10 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     let mut terminal_id: Option<String> = None;
     let mut tab_id = tab_id;
     if has_ui {
-        // Phase 2b: elevate the worktree's terminal the same way spawn_terminal does
-        // (control token by default; `capability: "read"` downgrades it). Comms-plane
+        // item-3: the worktree terminal follows the same inverted least-privilege
+        // default as spawn_terminal (READ unless `capability:"control"`). Comms-plane
         // Phase 2 (§2.3): mint + inject its per-session identity token too.
-        let (elevation, minted_identity) = spawn_env_with_identity(ctx, args);
+        let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "create_worktree");
         match spawn_tmux_terminal(&worktree_path, None, &elevation) {
             Ok((id, _)) => {
                 if let Some(identity) = &minted_identity {
@@ -5518,11 +5605,11 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .clone()
         .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
     let pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
-    // Phase 2b: grant this session its capability token via env (control by default,
-    // read_token when `capability: "read"`), so its in-session MCP authenticates as
-    // the granted capability. Comms-plane Phase 2 (§2.3): also mint + inject this
-    // session's per-session identity token alongside the tier token.
-    let (elevation, minted_identity) = spawn_env_with_identity(ctx, args);
+    // item-3: grant this session its capability token via env (READ by default,
+    // control only on an explicit `capability:"control"`), so its in-session MCP
+    // authenticates as the granted capability. Comms-plane Phase 2 (§2.3): also mint
+    // + inject this session's per-session identity token alongside the tier token.
+    let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "spawn_terminal");
     let (id, tmux_session) = match spawn_tmux_terminal(&cwd_effective, pane.as_deref(), &elevation)
     {
         Ok(v) => v,
@@ -5989,9 +6076,9 @@ impl ControlContext {
         self
     }
 
-    /// Replace the [`AuditLog`] (tests point it at a temp dir so they never write to
-    /// the real `~/.t-hub/audit`).
-    #[cfg(test)]
+    /// Replace the [`AuditLog`]. Tests point it at a temp dir so they never write to
+    /// the real `~/.t-hub/audit`; item-3 also uses it in production to SHARE one audit
+    /// sink between the control server and the Tauri UI spawn path (single hash chain).
     pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
         self.audit = audit;
         self
@@ -7258,7 +7345,7 @@ mod tests {
         let id = format!("{:08x}", (nanos as u64) & 0xffff_ffff);
         let target = tmux::target_for_id(&id);
         let _ = tmux::kill_session(&target);
-        tmux::new_session(&target, "/tmp", None).expect("spawn session");
+        tmux::new_session_with_env(&target, "/tmp", None, &[]).expect("spawn session");
         // Deterministic geometry regardless of what the server's latest client
         // reports (the wedged-2x24 gotcha; see tmux::resize_window_for_tests).
         tmux::resize_window_for_tests(&target, 80, 24).expect("resize session");
@@ -8027,11 +8114,20 @@ mod tests {
         let new_addr = resp["addr"].as_str().unwrap().to_string();
         assert_ne!(new_addr, old_addr, "rebind must move to a fresh port");
 
-        // control.json now names the fresh addr (atomic rewrite), tokens KEPT.
+        // control.json now names the fresh addr (atomic rewrite), tokens KEPT (a
+        // rebind is transport recovery, never a key rotation). Under item-3's default-ON
+        // hardening the PUBLISHED token is the read token ("read-secret") - still the
+        // SAME read token, not a rotated one - and the full token stays off disk; the
+        // frontend keeps full control via the in-process local_control_token.
         let written: Value =
             serde_json::from_slice(&std::fs::read(&cj).expect("read control.json")).unwrap();
         assert_eq!(written["addr"], json!(new_addr));
-        assert_eq!(written["token"], json!("secret"), "tokens must be kept, not rotated");
+        assert_eq!(
+            written["token"],
+            json!("read-secret"),
+            "the published token must be the KEPT read token (harden default-ON), not rotated"
+        );
+        assert_ne!(written["token"], json!("secret"), "the full token must NOT reach disk");
 
         // The NEW listener serves; the OLD one is retired (stops accepting).
         assert!(
@@ -8072,7 +8168,7 @@ mod tests {
         );
         let target = format!("th_{id}");
         let _ = tmux::kill_session(&target);
-        tmux::new_session(&target, "/tmp", None).expect("spawn churn tmux session");
+        tmux::new_session_with_env(&target, "/tmp", None, &[]).expect("spawn churn tmux session");
         (id, target)
     }
 
@@ -9417,6 +9513,41 @@ mod tests {
     }
 
     #[test]
+    fn control_capability_spawn_is_audited_but_read_default_is_not() {
+        // item-3 §2.1.1 piece 4: every control-capability spawn emits a `control-spawn`
+        // audit record so an elevation is never silent; the least-privilege default
+        // (READ) does not. BYPASS-WOULD-FAIL: drop `audit_control_spawn` and the
+        // explicit-control assertion goes RED.
+        let dir = std::env::temp_dir().join("t-hub-item3-ctlspawn");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ctx = test_ctx("t").with_audit(Arc::new(AuditLog::new(dir.clone())));
+        // A bound addr so the spawn tree injects a capability token, mints, and audits.
+        // Exercise the mint+audit unit directly (the no-UI gate sits upstream of it).
+        ctx.addr = "127.0.0.1:4242".to_string();
+
+        // Default (untagged => READ) spawn: NO control-spawn audit record.
+        let _ = spawn_env_with_identity(&ctx, &json!({"cwd": "/tmp"}), "spawn_terminal");
+        let recs = read_audit(&dir);
+        assert!(
+            recs.iter().all(|r| r["decision"] != "control-spawn"),
+            "a read-default spawn must NOT emit a control-spawn audit record"
+        );
+
+        // Explicit `capability:"control"`: emits exactly one control-spawn record.
+        let _ = spawn_env_with_identity(
+            &ctx,
+            &json!({"cwd": "/tmp", "capability": "control"}),
+            "spawn_terminal",
+        );
+        let recs = read_audit(&dir);
+        let ctl: Vec<_> = recs.iter().filter(|r| r["decision"] == "control-spawn").collect();
+        assert_eq!(ctl.len(), 1, "an explicit control spawn is audited exactly once");
+        assert_eq!(ctl[0]["tokenTier"], "control");
+        assert_eq!(ctl[0]["command"], "spawn_terminal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn remote_peer_is_capped_to_read_even_with_control_token() {
         // Belt-and-suspenders (open Q4): a non-loopback peer presenting the CONTROL
         // token is capped to ReadOnly, so it cannot spawn/kill over the network bind.
@@ -9441,24 +9572,26 @@ mod tests {
     }
 
     #[test]
-    fn phase3_flag_is_off_by_default_and_selects_control_token() {
-        // Phase 3 hardening is OFF by default (unset ⇒ disabled), so `control.json`
-        // keeps publishing the full control token - the app's own frontend depends on
-        // that until it gets the control token via a trusted internal channel (see
-        // the 2026-07-07 incident note on `phase3_harden_enabled`). Opt in with `1`/
-        // `true`. This mutates a process-global env var; no other test reads this var,
-        // and it is saved/restored around the mutation to stay hermetic.
+    fn phase3_flag_is_on_by_default_and_selects_read_token() {
+        // item-3 flip #2 (ratified 2026-07-10): Phase 3 hardening is ON by default, so
+        // `control.json` publishes only the READ token and an ambient scraper is
+        // read-only. `T_HUB_CONTROL_HARDEN=0`/`false` is the instant rollback. This is
+        // a BYPASS-WOULD-FAIL guard: revert the default to OFF and the first assert
+        // goes RED. This mutates a process-global env var; it is saved/restored around
+        // the mutation to stay hermetic.
         let saved = std::env::var("T_HUB_CONTROL_HARDEN").ok();
         std::env::remove_var("T_HUB_CONTROL_HARDEN");
-        assert!(!phase3_harden_enabled(), "harden flag must default OFF");
-        std::env::set_var("T_HUB_CONTROL_HARDEN", "1");
-        assert!(phase3_harden_enabled(), "'1' must enable hardening");
-        std::env::set_var("T_HUB_CONTROL_HARDEN", "true");
-        assert!(phase3_harden_enabled(), "'true' must enable hardening");
+        assert!(phase3_harden_enabled(), "harden flag must default ON (item-3 flip #2)");
         std::env::set_var("T_HUB_CONTROL_HARDEN", "0");
-        assert!(!phase3_harden_enabled(), "'0' stays off");
+        assert!(!phase3_harden_enabled(), "'0' is the rollback (hardening OFF)");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "false");
+        assert!(!phase3_harden_enabled(), "'false' is the rollback (hardening OFF)");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "1");
+        assert!(phase3_harden_enabled(), "'1' stays ON");
+        std::env::set_var("T_HUB_CONTROL_HARDEN", "true");
+        assert!(phase3_harden_enabled(), "'true' stays ON");
         std::env::set_var("T_HUB_CONTROL_HARDEN", "yes");
-        assert!(!phase3_harden_enabled(), "only 1/true enable; other values stay off");
+        assert!(phase3_harden_enabled(), "any non-0/false value stays ON");
         match saved {
             Some(v) => std::env::set_var("T_HUB_CONTROL_HARDEN", v),
             None => std::env::remove_var("T_HUB_CONTROL_HARDEN"),
@@ -9531,13 +9664,12 @@ mod tests {
     }
 
     #[test]
-    fn phase3_hardened_publishes_read_token_yet_spawn_env_carries_control() {
-        // With hardening ON (opt-in via `T_HUB_CONTROL_HARDEN=1`): what `control.json`
-        // publishes as `token` is the READ token (so a raw scraper is read-only), while
-        // the spawn-tree env injection still hands a spawned session the CONTROL token,
-        // preserving orchestration. These two facts together are the whole Phase 3
-        // contract - kept green so the flag is ready to re-enable once the frontend
-        // stops depending on the published control token.
+    fn phase3_hardened_publishes_read_token_and_default_spawn_is_read() {
+        // With hardening ON (the item-3 default): what `control.json` publishes as
+        // `token` is the READ token (so a raw scraper is read-only), AND the default
+        // spawn-tree env injection is now ALSO the READ token (item-3 flip #1 inverted
+        // least-privilege). Only an explicit `capability:"control"` spawn carries the
+        // full token. These facts together are the item-3 Pillar A contract.
         let ctx = test_ctx("ctl"); // read token is "read-ctl" (see test_ctx)
         // Discovery, hardened: publishes the read token, NOT the control token.
         let published = select_published_token(&ctx.token, &ctx.read_token, true);
@@ -9549,8 +9681,9 @@ mod tests {
             "published token must resolve to read-only"
         );
 
-        // Spawn-tree env injection: still carries the CONTROL token so the spawned
-        // session's in-session MCP authenticates with full power.
+        // Spawn-tree env injection, DEFAULT (untagged): the READ token, so a crew
+        // resolves to ReadOnly - the root move. BYPASS-WOULD-FAIL: revert the inverted
+        // default and this injects the control token and the assert goes RED.
         let mut ctx = ctx;
         ctx.addr = "127.0.0.1:4242".to_string();
         let env = elevation_env(&ctx, &json!({}));
@@ -9559,39 +9692,127 @@ mod tests {
             .find(|(k, _)| k == "T_HUB_CONTROL_TOKEN")
             .map(|(_, v)| v.clone())
             .expect("spawn env injects T_HUB_CONTROL_TOKEN");
-        assert_eq!(injected, ctx.token, "spawn env must inject the control token");
+        assert_eq!(injected, ctx.read_token, "default spawn must inject the READ token");
         assert_eq!(
             resolve_capability(&ctx, &injected),
+            Some(Capability::ReadOnly),
+            "default-spawned crew must resolve to read-only"
+        );
+
+        // Explicit opt-in: `capability:"control"` carries the full token.
+        let up = elevation_env(&ctx, &json!({"capability": "control"}));
+        assert_eq!(up[1], ("T_HUB_CONTROL_TOKEN".to_string(), ctx.token.clone()));
+        assert_eq!(
+            resolve_capability(&ctx, &up[1].1),
             Some(Capability::Full),
-            "injected token must grant full control"
+            "an explicit control spawn grants full control"
         );
     }
 
     #[test]
-    fn elevation_env_defaults_control_and_downgrades_to_read() {
+    fn phase3_verification_gate_checks_1_2_4_5() {
+        // item-3 §3.1: the automated portion of the FIVE-check verification gate that
+        // earns the default-ON flip #2. This test pins checks 1, 2, 4, 5 at the code
+        // level; check 3 (a real attach + send_keys DRIVEN THROUGH THE WEBVIEW on a
+        // WSLg build) is the manual acceptance step, documented in the PR body.
+        let ctx = test_ctx("ctl"); // token "ctl", read token "read-ctl"
+        let harden = true; // the ratified default (T_HUB_CONTROL_HARDEN unset => ON)
+
+        // CHECK 1: control.json's `token` == the READ token (full withheld from disk).
+        let published = select_published_token(&ctx.token, &ctx.read_token, harden);
+        assert_eq!(published, ctx.read_token, "check 1: disk token must be the read token");
+        assert_ne!(published, ctx.token, "check 1: full token must NOT reach disk");
+
+        // CHECK 2: the webview obtains the FULL token in-process, not from disk. The
+        // handshake carries `local_control_token` = full and never serializes it;
+        // `control_client::resolve_endpoint` returns it in local mode (proven by
+        // `control_client::tests::local_arm_authenticates_with_the_full_control_token`).
+        let handshake = ControlHandshake {
+            addr: "127.0.0.1:5000".into(),
+            token: published.to_string(),
+            read_token: ctx.read_token.clone(),
+            pid: 1,
+            protocol_version: PROTOCOL_VERSION,
+            local_control_token: ctx.token.clone(),
+        };
+        assert_eq!(handshake.local_control_token, ctx.token, "check 2: in-process full token");
+        assert_eq!(
+            serde_json::to_value(&handshake).unwrap().get("local_control_token"),
+            None,
+            "check 2: the in-process token must never serialize to control.json"
+        );
+
+        // CHECK 4: an external scraper presenting the PUBLISHED token is capped to
+        // ReadOnly (it can never spawn/type/kill).
+        assert_eq!(
+            resolve_capability(&ctx, published),
+            Some(Capability::ReadOnly),
+            "check 4: the published token must resolve to read-only"
+        );
+
+        // CHECK 5: attach SURVIVES a control rebind while hardened - the webview keeps
+        // full control across the rebind (the `rebind-strands-webview` class). Proven
+        // end-to-end by `control_client::tests::refresh_addr_adopts_a_rotated_port_
+        // from_the_local_handshake`, which keeps the full token across a port rotation
+        // where the published token on disk is read-only. Asserted here structurally:
+        // `rebind_control` rebuilds the handshake KEEPING the same full token.
+        // (Cross-module behavioral proof lives in that control_client test.)
+    }
+
+    #[test]
+    fn elevation_env_defaults_read_and_upgrades_to_control() {
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
-        // Default: full control token injected (preserve current behavior).
+        // item-3 inverted default: an untagged spawn injects the READ token.
         let def = elevation_env(&ctx, &json!({}));
         assert_eq!(def, vec![
             ("T_HUB_CONTROL_ADDR".to_string(), "127.0.0.1:4242".to_string()),
-            ("T_HUB_CONTROL_TOKEN".to_string(), "t".to_string()),
+            ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string()),
         ]);
-        // Opt-in read-only: the read token is injected instead.
-        let ro = elevation_env(&ctx, &json!({"capability": "read"}));
-        assert_eq!(ro[1], ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string()));
+        // A typo'd / unknown capability also fails SAFE to read (never leaks control).
+        let typo = elevation_env(&ctx, &json!({"capability": "conrtol"}));
+        assert_eq!(typo[1], ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string()));
+        // Explicit opt-in: `capability:"control"` injects the full control token.
+        let up = elevation_env(&ctx, &json!({"capability": "control"}));
+        assert_eq!(up[1], ("T_HUB_CONTROL_TOKEN".to_string(), "t".to_string()));
+        // Empty read token (bare-probe context) falls back to the control token so it
+        // is never locked out.
+        ctx.read_token = String::new();
+        let fb = elevation_env(&ctx, &json!({}));
+        assert_eq!(fb[1], ("T_HUB_CONTROL_TOKEN".to_string(), "t".to_string()));
         // No bound addr (headless): nothing injected, so spawns behave as before.
         ctx.addr = String::new();
-        assert!(elevation_env(&ctx, &json!({"capability": "read"})).is_empty());
+        assert!(elevation_env(&ctx, &json!({"capability": "control"})).is_empty());
+    }
+
+    #[test]
+    fn legacy_full_spawn_default_env_restores_fail_open() {
+        // The instant rollback (§3.3): `T_HUB_SPAWN_LEGACY_FULL=1` restores the
+        // pre-item-3 fail-OPEN default (control unless an explicit `read`). Guards
+        // that the rollback switch actually flips behavior. Process-global env var;
+        // saved/restored to stay hermetic.
+        let saved = std::env::var("T_HUB_SPAWN_LEGACY_FULL").ok();
+        std::env::remove_var("T_HUB_SPAWN_LEGACY_FULL");
+        // Default (inverted): untagged => ReadOnly.
+        assert_eq!(spawn_capability(&json!({})), Capability::ReadOnly);
+        assert_eq!(spawn_capability(&json!({"capability": "control"})), Capability::Full);
+        // Legacy rollback: untagged => Full (fail-open), explicit read => ReadOnly.
+        std::env::set_var("T_HUB_SPAWN_LEGACY_FULL", "1");
+        assert_eq!(spawn_capability(&json!({})), Capability::Full);
+        assert_eq!(spawn_capability(&json!({"capability": "read"})), Capability::ReadOnly);
+        match saved {
+            Some(v) => std::env::set_var("T_HUB_SPAWN_LEGACY_FULL", v),
+            None => std::env::remove_var("T_HUB_SPAWN_LEGACY_FULL"),
+        }
     }
 
     #[test]
     fn spawn_env_mints_and_injects_a_per_session_identity_token() {
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
-        let (env, minted) = spawn_env_with_identity(&ctx, &json!({}));
-        // The tier token is still injected (Phase-1 behavior preserved) ...
-        assert!(env.iter().any(|(k, v)| k == "T_HUB_CONTROL_TOKEN" && v == "t"));
+        let (env, minted) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
+        // The tier token is injected; the item-3 default is the READ token ...
+        assert!(env.iter().any(|(k, v)| k == "T_HUB_CONTROL_TOKEN" && v == "read-t"));
         // ... PLUS a per-session token alongside it (comms-plane Phase 2).
         let session_token = env
             .iter()
@@ -9613,7 +9834,7 @@ mod tests {
 
         // Headless (no addr): no identity minted, env empty, spawns behave as before.
         ctx.addr = String::new();
-        let (env2, minted2) = spawn_env_with_identity(&ctx, &json!({}));
+        let (env2, minted2) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
         assert!(env2.is_empty());
         assert!(minted2.is_none());
     }

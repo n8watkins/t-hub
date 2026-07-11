@@ -710,11 +710,11 @@ mod tests {
         let _ = tmux::kill_session(&orc_sess);
         // `cat` keeps the pane alive and echoes typed lines with no shell prompt
         // offset / command execution to mangle the captured text.
-        if tmux::new_session(&orc_sess, "/tmp", Some("cat")).is_err() {
+        if tmux::new_session_with_env(&orc_sess, "/tmp", Some("cat"), &[]).is_err() {
             eprintln!("fleet e2e: tmux new-session failed (tmux missing?) - skipping");
             return;
         }
-        tmux::new_session(&cap_sess, "/tmp", Some("cat")).expect("captain session");
+        tmux::new_session_with_env(&cap_sess, "/tmp", Some("cat"), &[]).expect("captain session");
 
         let status = Arc::new(StatusBridge::new());
         status.ingest(

@@ -300,10 +300,21 @@ fn start_control_listener(
         dyn Fn() -> Result<t_hub_protocol::HostMetrics, String> + Send + Sync,
     > = std::sync::Arc::new(move || metrics_bridge.metrics());
 
+    // item-3 §2.1.1 piece 3+4: ONE shared audit sink for BOTH the control server and
+    // the Tauri UI spawn path (`commands::spawn_terminal`), so a UI control-spawn
+    // appends to the SAME hash-chained log rather than a second writer that would
+    // fork the chain. Managed on the app so `commands` can record against it.
+    let audit = std::sync::Arc::new(crate::audit::AuditLog::from_env());
+    {
+        use tauri::Manager;
+        app.manage(audit.clone());
+    }
+
     // Share the event fanout (server-split M1) so a subscribed control connection
     // receives the same stream the backend emits through the SocketEmitter.
     let ctx = control::ControlContext::new(state.status.clone(), supervisor, token)
         .with_read_token(read_token)
+        .with_audit(audit)
         .with_apply_sink(apply_sink)
         .with_event_fanout(fanout)
         .with_metrics(metrics)

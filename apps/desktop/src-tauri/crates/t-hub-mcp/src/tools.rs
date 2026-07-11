@@ -282,7 +282,8 @@ fn schema_spawn_terminal() -> Value {
             "startupCommand": { "type": "string", "description": "Optional command run inside an interactive login shell the pane execs back into (e.g. claude --resume <id>)." },
             "tabName": { "type": "string", "description": "Optional target workspace tab, by name: reused if it exists, created (hidden - the user's active tab is NOT switched) if not." },
             "tabId":   { "type": "string", "description": "Optional target workspace tab, by id (must exist; see list_tabs). Defaults to the user's active tab." },
-            "spawnedBy": { "type": "string", "description": "Optional captain session id: records the spawned session as that captain's CREW in the captains registry (requires the captain to have claim_captain'd; an unclaimed id records nothing - crewRecorded: false)." }
+            "spawnedBy": { "type": "string", "description": "Optional captain session id: records the spawned session as that captain's CREW in the captains registry (requires the captain to have claim_captain'd; an unclaimed id records nothing - crewRecorded: false)." },
+            "capability": { "type": "string", "enum": ["read", "control"], "description": "Capability the new session is granted (item-3 least-privilege, default \"read\"): \"read\" spawns a pure-work crew that can observe but not spawn/type/kill; \"control\" is a deliberate, audited elevation for a session that must orchestrate (e.g. a captain/orchestrator). Omitted defaults to \"read\"." }
         },
         "additionalProperties": false
     })
@@ -311,7 +312,8 @@ fn schema_create_worktree() -> Value {
             "worktreePath": { "type": "string", "description": "Absolute POSIX path for the new worktree's working-tree dir." },
             "branch":       { "type": "string", "description": "Optional branch to check out at the worktree (must not be checked out elsewhere). Omitted => git creates a new branch named after the path's final component." },
             "tabName":      { "type": "string", "description": "Optional name for the new workspace tab (defaults to the branch / final path component)." },
-            "spawnedBy":    { "type": "string", "description": "Optional captain session id: records the worktree terminal as that captain's CREW in the captains registry (same contract as spawn_terminal's spawnedBy)." }
+            "spawnedBy":    { "type": "string", "description": "Optional captain session id: records the worktree terminal as that captain's CREW in the captains registry (same contract as spawn_terminal's spawnedBy)." },
+            "capability":   { "type": "string", "enum": ["read", "control"], "description": "Capability the worktree terminal is granted (item-3 least-privilege, default \"read\"): same contract as spawn_terminal's capability - \"control\" is a deliberate, audited elevation." }
         },
         "required": ["repoRoot", "worktreePath"],
         "additionalProperties": false
