@@ -28,6 +28,8 @@ mod model; // data-model structs (PRD §8)
 mod plane; // comms-plane Phase 1: Single Write Authority primary-writer seam (funnel + attribution for agent/automation input; NOT yet durable/ACL'd/typing-gated)
 mod inbox; // comms-plane Phase 2: durable inbox (per-recipient segmented store + seq + at-least-once + receipt state machine); the fleet wake is its first client
 mod identity; // comms-plane Phase 2: per-session identity slice (mint/bind/resolve a per-session token for unforgeable-across-sessions attribution)
+mod acl; // comms-plane Phase 3: the ACL policy (settled capability matrix as pure predicates; wired at control.rs enforcement points)
+mod authz; // comms-plane Phase 3: the delegation-gate carrier (durable general-authorization artifacts + resolve-and-verify, §2.6 M1)
 mod remote_pty; // server-split M2a: client-side remote-PTY transport (terminal tiles over the control socket)
 // --- feat/projects-sidebar (Agent A) ---------------------------------------
 mod recent; // recent recallable Claude sessions for the sidebar "Recent" list
