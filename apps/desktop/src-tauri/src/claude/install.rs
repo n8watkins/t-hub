@@ -373,6 +373,14 @@ pub fn install_hooks_at_events(
     };
     let existing = read_settings(path)?;
     let backed_up = backup_once(path).is_ok();
+    // item-3 HIGH-1 (ratified-knob #8 consent discipline): the BLOCKING PreToolUse gate
+    // must NEVER be installed as a side effect of the observe-hook install OR the boot
+    // reconcile - it lands ONLY via the distinct [`install_gate_at`] opt-in. But a user
+    // who ALREADY opted into the gate must keep it across this reconcile (and have its
+    // agent_bin migrated), so we PRESERVE + migrate an existing gate here, and add one
+    // only when it was already present. `remove_from_settings` strips it below, so we
+    // must re-add it iff it existed.
+    let had_gate = hooks::gate_managed(&existing);
     // Strip every T-Hub hook, then merge exactly the selection — the managed
     // set ends up equal to `events` (deselecting an event uninstalls it).
     let cleaned = hooks::remove_from_settings(&existing);
@@ -385,10 +393,12 @@ pub fn install_hooks_at_events(
     // the sidebar USAGE strip shows only dashes. Respects a user-authored
     // statusLine (merge_statusline_into_settings leaves a non-managed one alone).
     let merged = hooks::merge_statusline_into_settings(&merged, agent_bin);
-    // item-3 Pillar C: install the BLOCKING PreToolUse gate (matcher Bash) alongside
-    // the observe-only hooks, under the same consent + clean-uninstall discipline. It
-    // denies an outward-facing command (push/merge/deploy/spend) a crew may not run.
-    let merged = hooks::merge_gate_into_settings(&merged, agent_bin);
+    // Preserve + migrate an existing gate; NEVER add one here (see above).
+    let merged = if had_gate {
+        hooks::merge_gate_into_settings(&merged, agent_bin)
+    } else {
+        merged
+    };
     write_settings_atomic(path, &merged)?;
     let managed = count_managed(&merged);
     let statusline_on = hooks::statusline_managed(&merged);
@@ -430,6 +440,84 @@ pub fn uninstall_hooks_at(path: &Path) -> Result<InstallReport> {
         managed_events: count_managed(&cleaned),
         message: "Removed T-Hub hook handlers + usage statusline.".to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// item-3 Pillar C: the BLOCKING PreToolUse gate - a DISTINCT opt-in (HIGH-1)
+// ---------------------------------------------------------------------------
+//
+// The gate is a BLOCKING enforcement hook, categorically different from the
+// observe-only hooks above. Per ratified general-decision #8 (consented) and the
+// staged rollout (§3.2 step 5: the gate is a LATER, separately-consented step AFTER
+// flips #1/#2 stabilize), it has its OWN consent gate and is NEVER installed as a
+// side effect of the observe-hook install or the boot reconcile. These functions are
+// the only path that ADDS the gate.
+
+/// Install the blocking PreToolUse gate. Requires its OWN explicit `consent`
+/// (distinct from the observe-hook consent). Env-resolving wrapper over
+/// [`install_gate_at`].
+#[allow(dead_code)] // the distinct opt-in surface (UI command / operator action)
+pub fn install_gate(agent_bin: &str, consent: bool) -> Result<InstallReport> {
+    let resolved = resolve_agent_bin(agent_bin);
+    install_gate_at(&settings_path()?, &resolved, consent)
+}
+
+/// Path-injected core of [`install_gate`]. Adds the single blocking PreToolUse/Bash
+/// gate group under the managed marker; refuses without explicit `consent`.
+pub fn install_gate_at(path: &Path, agent_bin: &str, consent: bool) -> Result<InstallReport> {
+    if !consent {
+        return Err(anyhow!(
+            "refusing to install the BLOCKING PreToolUse gate into {} without explicit \
+             consent (the gate is a distinct, separately-consented enforcement step)",
+            path.display()
+        ));
+    }
+    let existing = read_settings(path)?;
+    let backed_up = backup_once(path).is_ok();
+    let merged = hooks::merge_gate_into_settings(&existing, agent_bin);
+    write_settings_atomic(path, &merged)?;
+    crate::diag::diag_log(format!(
+        "claude/install: installed blocking PreToolUse gate into {} (agent_bin={agent_bin})",
+        path.display()
+    ));
+    Ok(InstallReport {
+        settings_path: path.display().to_string(),
+        backed_up,
+        managed_events: count_managed(&merged),
+        message: "Installed the T-Hub blocking PreToolUse gate.".to_string(),
+    })
+}
+
+/// Remove ONLY the blocking gate (its distinct opt-out), leaving the observe-only
+/// hooks + statusLine intact. Env-resolving wrapper over [`remove_gate_at`].
+#[allow(dead_code)]
+pub fn remove_gate() -> Result<InstallReport> {
+    remove_gate_at(&settings_path()?)
+}
+
+/// Path-injected core of [`remove_gate`].
+pub fn remove_gate_at(path: &Path) -> Result<InstallReport> {
+    let existing = read_settings(path)?;
+    let cleaned = hooks::remove_gate_from_settings(&existing);
+    write_settings_atomic(path, &cleaned)?;
+    Ok(InstallReport {
+        settings_path: path.display().to_string(),
+        backed_up: false,
+        managed_events: count_managed(&cleaned),
+        message: "Removed the T-Hub blocking PreToolUse gate.".to_string(),
+    })
+}
+
+/// Whether the blocking PreToolUse gate is currently installed (for the UI opt-in
+/// toggle to show its state) — without modifying anything.
+pub fn gate_installed_at(path: &Path) -> Result<bool> {
+    let existing = read_settings(path)?;
+    Ok(hooks::gate_managed(&existing))
+}
+
+/// Env-resolving wrapper over [`gate_installed_at`].
+pub fn gate_installed() -> Result<bool> {
+    gate_installed_at(&settings_path()?)
 }
 
 /// Report whether T-Hub hooks are currently installed (any marker present)
@@ -586,6 +674,63 @@ mod tests {
         assert!(pre
             .iter()
             .any(|g| serde_json::to_string(g).unwrap().contains("keepme")));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn observe_hook_install_never_adds_the_blocking_gate() {
+        // item-3 HIGH-1: consenting to the observe-only hooks must NOT silently install
+        // the blocking gate. BYPASS-WOULD-FAIL: restore the unconditional
+        // merge_gate_into_settings and gate_managed goes true here.
+        let path = temp_settings("no-gate-observe");
+        install_hooks_at(&path, "/usr/bin/t-hub-agent", true).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(hooks_installed_at(&path).unwrap(), "observe hooks installed");
+        assert!(
+            !hooks::gate_managed(&written),
+            "the observe-hook install must NOT add the blocking gate"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn gate_is_a_distinct_consented_opt_in_and_survives_an_observe_reinstall() {
+        // The gate installs ONLY via its distinct opt-in (its own consent), and once
+        // installed it is PRESERVED + migrated (agent_bin rewritten) across a later
+        // observe-hook reinstall / boot reconcile - never silently added, never lost.
+        let path = temp_settings("gate-optin");
+
+        // Distinct consent is required.
+        let err = install_gate_at(&path, "/usr/bin/t-hub-agent", false).unwrap_err();
+        assert!(err.to_string().contains("consent"), "gate needs its own consent");
+        assert!(!gate_installed_at(&path).unwrap());
+
+        // Explicit opt-in installs it.
+        install_gate_at(&path, "/old/t-hub-agent", true).unwrap();
+        assert!(gate_installed_at(&path).unwrap(), "explicit opt-in installs the gate");
+
+        // A later observe-hook (re)install PRESERVES the gate and MIGRATES its agent_bin.
+        install_hooks_at(&path, "/new/t-hub-agent", true).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(hooks::gate_managed(&written), "an existing gate survives the reinstall");
+        let gate_cmd = written["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| hooks::group_is_t_hub(g))
+            .unwrap()["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(gate_cmd.contains("/new/t-hub-agent"), "gate agent_bin migrated: {gate_cmd}");
+        assert!(gate_cmd.contains("--gate"));
+
+        // The distinct opt-OUT removes only the gate, leaving observe hooks intact.
+        remove_gate_at(&path).unwrap();
+        assert!(!gate_installed_at(&path).unwrap(), "opt-out removes the gate");
+        assert!(hooks_installed_at(&path).unwrap(), "observe hooks remain after gate opt-out");
         cleanup(&path);
     }
 

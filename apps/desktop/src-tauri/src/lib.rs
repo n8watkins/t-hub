@@ -740,6 +740,10 @@ pub fn run() {
             commands_05::uninstall_claude_hooks,
             commands_05::claude_hooks_installed,
             commands_05::claude_hooks_managed,
+            // item-3 Pillar C: the blocking PreToolUse gate - a DISTINCT opt-in.
+            commands_05::install_claude_gate,
+            commands_05::uninstall_claude_gate,
+            commands_05::claude_gate_installed,
             // Files: index + search + tree + reader (PRD §6.8/§9.7)
             files::index_project,
             files::search_files,

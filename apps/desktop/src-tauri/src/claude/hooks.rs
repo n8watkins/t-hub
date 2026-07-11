@@ -308,6 +308,26 @@ pub fn merge_gate_into_settings(
     serde_json::Value::Object(root)
 }
 
+/// Remove ONLY the T-Hub-managed blocking gate (the `PreToolUse` group), leaving the
+/// observe-only hooks, the statusLine, and any user-authored `PreToolUse` hook intact.
+/// The distinct gate opt-OUT (mirrors [`merge_gate_into_settings`]).
+pub fn remove_gate_from_settings(existing: &serde_json::Value) -> serde_json::Value {
+    let mut root: serde_json::Map<String, serde_json::Value> =
+        existing.as_object().cloned().unwrap_or_default();
+    if let Some(hooks_obj) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        if let Some(arr) = hooks_obj
+            .get_mut(PRETOOLUSE_GATE_EVENT)
+            .and_then(|v| v.as_array_mut())
+        {
+            arr.retain(|g| !group_is_t_hub(g));
+            if arr.is_empty() {
+                hooks_obj.remove(PRETOOLUSE_GATE_EVENT);
+            }
+        }
+    }
+    serde_json::Value::Object(root)
+}
+
 /// Whether the blocking `PreToolUse` gate is currently installed (a T-Hub-managed
 /// group under `PreToolUse`).
 pub fn gate_managed(settings: &serde_json::Value) -> bool {
