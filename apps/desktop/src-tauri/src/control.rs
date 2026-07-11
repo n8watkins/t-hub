@@ -958,7 +958,14 @@ impl ShipMembership {
 #[serde(rename_all = "camelCase")]
 pub struct CaptainsSnapshot {
     /// On-disk schema version (item-2 §3.2/D2). Absent/0 = legacy; every write
-    /// stamps [`CAPTAINS_SCHEMA_VERSION`]. A mixed-window reader accepts BOTH.
+    /// stamps [`CAPTAINS_SCHEMA_VERSION`].
+    ///
+    /// FORWARD-COMPATIBLE ONLY: the item-2 reader accepts BOTH v0 and v1, so an
+    /// upgrade is seamless. It is NOT interop between binaries - a v1 file (which
+    /// writes `terminalId` + object crew) is UNREADABLE by a pre-item-2 binary
+    /// (`captainSessionId` required, `crew: [string]`), so a DOWNGRADE parses to
+    /// empty and RESETS the captains registry. That loss is recoverable, not
+    /// catastrophic: claims re-derive as captains re-claim on their next startup.
     #[serde(default)]
     pub schema_version: u32,
     #[serde(default)]
@@ -1618,12 +1625,14 @@ impl CaptainsRegistry {
     /// Lifecycle transition for a closed/killed session (item-2 §2.4: death MARKS,
     /// it does not scrub - retiring the old `remove_session` C4 silent-leak). Two
     /// cases, both idempotent:
-    ///   - the id is a SUPERVISOR terminal -> its record goes `Orphaned{since}`, its
-    ///     `terminal_id` clears to `None`, and its Active crew go `Orphaned` under the
-    ///     STILL-PRESENT ship record (dead captain -> orphaned crew; dead Cortana ->
-    ///     orphaned captains-as-crew). Re-adoptable by a resumed same-key supervisor.
-    ///   - the id is a CREW tile -> that `CrewRef` flips to `Removed{since}` (its own
-    ///     worker died; not re-adoptable), retained not scrubbed.
+    ///
+    /// - the id is a SUPERVISOR terminal: its record goes `Orphaned{since}`, its
+    ///   `terminal_id` clears to `None`, and its Active crew go `Orphaned` under the
+    ///   STILL-PRESENT ship record (dead captain -> orphaned crew; dead Cortana ->
+    ///   orphaned captains-as-crew). Re-adoptable by a resumed same-key supervisor.
+    /// - the id is a CREW tile: that `CrewRef` flips to `Removed{since}` (its own
+    ///   worker died; not re-adoptable), retained not scrubbed.
+    ///
     /// Records are retained INDEFINITELY (D6); reap timing stays reap-ship's. Returns
     /// true (revision bumped) if anything changed.
     pub fn remove_session(&self, session_id: &str) -> bool {
