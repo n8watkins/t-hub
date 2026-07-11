@@ -56,6 +56,11 @@ export function handleOverlayEscape(shiftKey: boolean): boolean {
   const cap = useCaptain.getState();
   if (cap.open && shiftKey) {
     // Passthrough: interrupt the ACTIVE captain, don't dismiss the overlay.
+    // comms-plane Phase 1 (PR #55 LOW-5): the design §3.1 lists this in the
+    // break-glass bucket ("user-initiated modal dismiss"), but it fires ONLY on a
+    // human pressing Shift+Esc, so it is genuine HUMAN-origin input - it stays on
+    // `writeTerminal` (the human path), NOT the audited break-glass writers. Noted
+    // so the spec/impl classification is reconciled on the record.
     if (cap.activeCaptainId) {
       void writeTerminal(cap.activeCaptainId, ESC_BYTE).catch(() => {});
     }

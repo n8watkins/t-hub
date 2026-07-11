@@ -24,6 +24,7 @@ mod fleet; // orchestrator wake: FleetWatchRegistry + FleetNotifier (server-side
 mod git; // git awareness for the Files panel: branch/worktree info + commit
 // ----------------------
 mod model; // data-model structs (PRD §8)
+mod plane; // comms-plane Phase 1: Single Write Authority primary-writer seam (funnel + attribution for agent/automation input; NOT yet durable/ACL'd/typing-gated)
 mod remote_pty; // server-split M2a: client-side remote-PTY transport (terminal tiles over the control socket)
 // --- feat/projects-sidebar (Agent A) ---------------------------------------
 mod recent; // recent recallable Claude sessions for the sidebar "Recent" list
@@ -555,10 +556,14 @@ pub fn run() {
             {
                 // The injector: type + submit a line into a tile's Claude session
                 // over tmux (the only thing that re-invokes an idle agent loop).
-                let inject: fleet::Injector = std::sync::Arc::new(|tile: &str, text: &str| {
-                    tmux::send_text(&tmux::target_for_id(tile), text, true)
-                        .map_err(|e| e.to_string())
-                });
+                // comms-plane Phase 1: the wake is the plane's FIRST primary writer -
+                // it routes through the plane (funnel + attribution) instead of
+                // calling `tmux::send_text` directly. Behaviour is unchanged (still an
+                // immediate, `Completed`-gated tmux write - no durability yet, that is
+                // Phase 2). The construction lives in `fleet::production_wake_injector`
+                // so the funnel is pinned by a test (a revert to a direct tmux write
+                // there fails `production_wake_injector_routes_through_plane`).
+                let inject: fleet::Injector = fleet::production_wake_injector();
                 // Bonus UI/voice cue: fan out `fleet://wake` alongside the injection.
                 let sink_fanout = control_fanout.clone();
                 let event_sink: fleet::EventSink = std::sync::Arc::new(move |payload| {
@@ -641,6 +646,7 @@ pub fn run() {
             commands::spawn_terminal,
             commands::attach_terminal,
             commands::write_terminal,
+            commands::deliver_agent_input,
             commands::resize_terminal,
             commands::close_terminal,
             commands::kill_terminal,

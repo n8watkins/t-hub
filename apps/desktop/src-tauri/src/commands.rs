@@ -384,6 +384,25 @@ pub async fn attach_terminal(
     })
 }
 
+/// Write bytes to a terminal's PTY - the HUMAN-origin + local terminal-management
+/// path (path b), i.e. NON-automation-message input.
+///
+/// comms-plane Phase 1: this command carries human-origin input (the live
+/// keystrokes / paste / drop from `Terminal.tsx`'s `onData` seam and its siblings)
+/// AND the app's own local terminal-management writes that are NOT an instruction to
+/// the agent loop (e.g. the `\x0c` form-feed repaint-nudge on reattach, the file-
+/// path insert on paste). Neither is an automation MESSAGE, so neither belongs on
+/// the plane. What must NOT use this command is automation-message input (fleet
+/// wake, auto-continue, the rules engine); that funnels through the plane via
+/// `deliver_agent_input` so it is attributed and can later be durable/gated.
+/// Keeping the two on distinct IPC commands is the caller/origin distinction the
+/// design's D1b calls for - not "rely on convention".
+///
+/// PHASE-4 NOTE (design L3): when the typing-guard lands, every `write_terminal`
+/// caller must emit the human-typing beat OR be explicitly classified. The human
+/// keystroke/paste/drop callers emit it; the local terminal-management writes
+/// (repaint form-feed, path insert) must be classified so a repaint does NOT trip
+/// `human_busy`. Flagged here, not built in Phase 1.
 #[tauri::command]
 pub async fn write_terminal(
     remote: tauri::State<'_, RemotePtyManager>,
@@ -398,6 +417,34 @@ pub async fn write_terminal(
         .ok_or_else(|| format!("no live terminal {id}"))?;
     conn.write(data.as_bytes())
         .map_err(|e| format!("failed to write to terminal {id}: {e}"))
+}
+
+/// comms-plane Phase 1: the primary AUTOMATION-input path over the in-app write
+/// substrate (path b). Auto-continue (#47) and the rules engine call THIS instead
+/// of `write_terminal`, so their writes are funnelled through the plane seam and
+/// attributed to a `WriteSource` (fleet wake uses the tmux-substrate twin,
+/// `plane::deliver_tmux`). `source` must resolve to a known automation writer, or
+/// the write is refused - the automation door is not a generic bypass.
+///
+/// HONEST SCOPE (Phase 1): this is a FUNNEL, not yet a durable queue. The bytes are
+/// written to the PTY immediately, exactly as `write_terminal` did; there is no
+/// persistence, no ACL, and no typing-guard gate yet (Phases 2-4). The win is that
+/// automation input now has ONE attributed primary door.
+#[tauri::command]
+pub async fn deliver_agent_input(
+    remote: tauri::State<'_, RemotePtyManager>,
+    id: String,
+    data: String,
+    source: String,
+) -> Result<(), String> {
+    let source = crate::plane::WriteSource::parse(&source)?;
+    crate::plane::note_primary(source, &id, data.len());
+    let mut conns = remote.conns.lock();
+    let conn = conns
+        .get_mut(&id)
+        .ok_or_else(|| format!("no live terminal {id}"))?;
+    conn.write(data.as_bytes())
+        .map_err(|e| format!("failed to deliver agent input to terminal {id}: {e}"))
 }
 
 #[tauri::command]

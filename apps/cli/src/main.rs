@@ -268,6 +268,12 @@ fn cmd_status(args: &[String]) -> Result<(), CliError> {
 }
 
 fn cmd_send(args: &[String]) -> Result<(), CliError> {
+    // comms-plane Phase 1: `th send` is a HUMAN direct-control BREAK-GLASS path. It
+    // calls the demoted `send_text` control command, so every use is marked loudly
+    // (control://break-glass) backend-side. It is intentionally NOT the fleet/
+    // automation path - that funnels through the plane - but stays available for
+    // humans and external scripts (demote, not deny).
+    //
     // Everything after the session id is literal text; `--no-enter` suppresses
     // the trailing Enter, `--json` picks the machine envelope. The rest is kept
     // verbatim (so quoted text passes through unchanged).

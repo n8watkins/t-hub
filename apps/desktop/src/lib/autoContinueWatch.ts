@@ -34,7 +34,7 @@ import { useSettings } from "../store/settings";
 import { useWorkspace, deriveLabel } from "../store/workspace";
 import { sessionNameForTerminal } from "../store/sessionContext";
 import { clientForTerminal } from "../store/clientType";
-import { writeTerminal } from "../ipc/client";
+import { deliverAgentInput } from "../ipc/client";
 import { codexUsage, type CodexUsage } from "../ipc/codex";
 import type { StatusSnapshot } from "../ipc/model";
 import type { TerminalId } from "../ipc/types";
@@ -203,15 +203,21 @@ async function recover(id: TerminalId, reason: string): Promise<void> {
     `recovering ${id} (${reason}): ESC (settle ${RECOVERY_ESC_SETTLE_MS}ms) + "${text}"`,
   );
   try {
+    // comms-plane Phase 1: auto-continue is AUTOMATION input, so it funnels through
+    // the plane (`deliverAgentInput`), not the human `writeTerminal` path. The
+    // billing guardrail is UNCHANGED: the ESC dismiss and the continue-text submit
+    // stay two separate writes with the settle gap between them (buildRecoverySteps
+    // still strips interior control chars), so we Esc+continue and NEVER select a
+    // paid option (design M10: the auto-continue migration may Esc+continue only).
     // 1) ESC ALONE — an unambiguous standalone dismiss.
-    await writeTerminal(id, dismiss);
+    await deliverAgentInput(id, dismiss, "auto-continue");
     // 2) Let the terminal settle so ESC is not folded into what follows.
     await delay(RECOVERY_ESC_SETTLE_MS);
     // 3) The continue text + Enter at the now-freed prompt (empty -> dismiss-only,
     //    so we never send a stray Enter that could re-select a menu option).
     if (submit) {
       if (!useAutoContinue.getState().isWatched(id)) return; // opted out mid-delay
-      await writeTerminal(id, submit);
+      await deliverAgentInput(id, submit, "auto-continue");
     }
   } catch {
     /* terminal gone — ignore, and skip the resume notification below */

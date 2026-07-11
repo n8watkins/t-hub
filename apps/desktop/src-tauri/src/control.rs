@@ -55,7 +55,7 @@ use crate::audit::{AuditLog, AuditMeta};
 use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
 use crate::supervision::Supervisor;
-use crate::{files, git, pty, tmux};
+use crate::{files, git, plane, pty, tmux};
 
 /// A single control request: a command name + free-form JSON args, authenticated
 /// by the per-launch `token`.
@@ -3266,8 +3266,20 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // session — execute directly against tmux (they only act on a `th_*`
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args),
-        "send_text" => send_text(args),
-        "send_keys" => send_keys(args),
+        // comms-plane Phase 1: `send_text`/`send_keys` are DEMOTED to audited
+        // break-glass. They still execute (H2: demote, not deny) but every use is
+        // marked loudly, because the primary automation path is now the plane
+        // (`plane::deliver_tmux` for the wake, `deliver_agent_input` for in-app
+        // automation), not these direct writers. `th send` reaches `send_text`, so
+        // it inherits the same marker.
+        "send_text" => {
+            mark_break_glass(ctx, "send_text", args);
+            send_text(args)
+        }
+        "send_keys" => {
+            mark_break_glass(ctx, "send_keys", args);
+            send_keys(args)
+        }
         "close_terminal" => close_terminal(ctx, args),
 
         // ---- Theme (forwarded by name; parallel track owns the handlers) ----
@@ -4801,11 +4813,63 @@ fn spawn_tmux_terminal(
     Ok((id, tmux_session))
 }
 
+/// comms-plane Phase 1: mark a BREAK-GLASS use of the demoted direct writers
+/// (`send_text`/`send_keys`) LOUDLY. These are no longer the primary path - the
+/// fleet wake and the in-app automation writers funnel through `plane` (path a/b) -
+/// but they are DEMOTED, not DENIED (design H2): they still execute, so a human or
+/// external script keeps its escape hatch. Every use emits a `t-hub-plane:`
+/// break-glass log line AND a live `control://break-glass` fanout event so the
+/// deviation is visible and cannot quietly become the primary path again (D11a).
+///
+/// HONEST LIMIT (Phase 1): break-glass rides the SHARED control token, so it is
+/// attributed only as "some Full caller" (the command that deviated), not the
+/// per-session identity - and it stays callable by every crew session until item 3
+/// tiers the token away. This marker makes the deviation observable; it does not
+/// yet make it impossible.
+fn mark_break_glass(ctx: &ControlContext, command: &str, args: &Value) {
+    let session_id = arg_str(args, "sessionId")
+        .or_else(|| arg_str(args, "session_id"))
+        .unwrap_or_default();
+    let target = tmux_target(&session_id);
+    // Payload size (length only, never content). `send_text` carries `text`;
+    // `send_keys` carries its payload in the `keys` array, so fall back to the
+    // joined key names - otherwise every `send_keys` marker would report bytes=0.
+    let bytes = if let Some(text) = arg_str(args, "text") {
+        text.len()
+    } else {
+        args.get("keys")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .len()
+            })
+            .unwrap_or(0)
+    };
+    plane::note_break_glass(command, &target, bytes);
+    ctx.fanout.emit_event(
+        "control://break-glass",
+        &json!({
+            "command": command,
+            "sessionId": session_id,
+            "target": target,
+            "bytes": bytes,
+            "breakGlass": true,
+            "note": "demoted direct writer used; NOT the plane primary path (Phase 1)",
+        }),
+    );
+}
+
 /// `send_text`: type literal `text` into an existing session, optionally pressing
 /// Enter to submit it. Process-changing (PRD §11.2): the MCP tool description
 /// marks it CONFIRMATION REQUIRED. Backend-only — drives tmux directly
 /// (`send-keys -l`), no UI round trip. Args: `sessionId` + `text` (required),
 /// `enter` (optional, default true). Requires the session to exist.
+///
+/// comms-plane Phase 1: DEMOTED to audited break-glass (see `mark_break_glass`).
+/// It is no longer the fleet path; the wake injects via `plane::deliver_tmux`.
 fn send_text(args: &Value) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
@@ -5765,6 +5829,55 @@ mod tests {
 
         assert!(!wt.exists(), "the worktree dir must be gone");
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn send_text_break_glass_emits_loud_marker() {
+        // comms-plane Phase 1: `send_text` is DEMOTED to break-glass. Using it must
+        // emit a live `control://break-glass` marker (D11a) so the deviation from
+        // the plane primary path is visible. The marker fires even though this
+        // send_text ultimately errors (no such tmux session) - a break-glass USE is
+        // logged on attempt, not only on success.
+        let fanout = Arc::new(EventFanout::new());
+        let ctx = test_ctx("t").with_event_fanout(fanout.clone());
+        let mut reader = subscribe_test_reader(&fanout);
+
+        let _ = dispatch(
+            &ctx,
+            "send_text",
+            &json!({ "sessionId": "no-such-session", "text": "hello" }),
+        );
+
+        let frame = read_event_frame(&mut reader);
+        assert_eq!(frame["event"], "control://break-glass");
+        assert_eq!(frame["payload"]["command"], "send_text");
+        assert_eq!(frame["payload"]["breakGlass"], true);
+        assert_eq!(frame["payload"]["sessionId"], "no-such-session");
+        // Byte length only - the marker must NOT leak the payload content.
+        assert_eq!(frame["payload"]["bytes"], 5);
+        assert!(frame["payload"].get("text").is_none(), "must not leak text: {frame}");
+    }
+
+    #[test]
+    fn send_keys_break_glass_emits_loud_marker() {
+        // The demoted twin: `send_keys` also emits the break-glass marker.
+        let fanout = Arc::new(EventFanout::new());
+        let ctx = test_ctx("t").with_event_fanout(fanout.clone());
+        let mut reader = subscribe_test_reader(&fanout);
+
+        let _ = dispatch(
+            &ctx,
+            "send_keys",
+            &json!({ "sessionId": "no-such-session", "keys": ["C-c", "Escape"] }),
+        );
+
+        let frame = read_event_frame(&mut reader);
+        assert_eq!(frame["event"], "control://break-glass");
+        assert_eq!(frame["payload"]["command"], "send_keys");
+        assert_eq!(frame["payload"]["breakGlass"], true);
+        // send_keys carries its payload in `keys`, not `text`: the marker must
+        // report the joined key-name length ("C-c Escape" = 10), not bytes=0.
+        assert_eq!(frame["payload"]["bytes"], 10);
     }
 
     #[test]
