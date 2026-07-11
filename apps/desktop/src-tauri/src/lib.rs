@@ -8,6 +8,7 @@ mod tmux;
 // --- 0.5 additions ---
 mod agent; // core-side agent bridge (Workstream A, core half)
 mod audit; // control-socket audit log with teeth (socket-gate Phase 1, hash-chained JSONL)
+mod secret_seal; // item-3 Pillar B: at-rest sealing of secret material (DPAPI on Windows, 0600 fallback elsewhere)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
 mod governor; // fleet spawn budget + rate limits for process-changing control commands (socket-gate Phase 1)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)

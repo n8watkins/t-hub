@@ -42,7 +42,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -2181,31 +2181,99 @@ fn key_path() -> PathBuf {
     home.join(".t-hub").join("server-key")
 }
 
-/// The PERSISTENT control auth key (server-split M2b): the server's stable identity
-/// across restarts, so a remote client paired once need not re-pair each launch.
-/// Read from [`key_path`] if present + non-empty; otherwise a fresh UUID is generated
-/// and written (best-effort `0600` on unix). On any read/write failure we still
-/// return a usable (in-memory) key so the channel always comes up.
-pub fn persistent_key() -> String {
-    let path = key_path();
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let k = existing.trim().to_string();
-        if !k.is_empty() {
-            return k;
-        }
-    }
-    let key = uuid::Uuid::new_v4().to_string();
+/// Max age (seconds) before a persistent key is rotated at startup (item-3 Pillar B
+/// rotation-on-restart, general-decision #6). `T_HUB_KEY_MAX_AGE_SECS` overrides
+/// (`0` => rotate on EVERY restart). Default 7 days: long enough that a remote
+/// pairing survives normal restarts, short enough to bound a leaked key's lifetime.
+/// The cadence is a knob (N4), not the mechanism.
+fn key_max_age_secs() -> u64 {
+    std::env::var("T_HUB_KEY_MAX_AGE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7 * 24 * 60 * 60)
+}
+
+/// Whether a rotation is forced this startup regardless of age - the
+/// suspected-leak / operator-triggered path (`T_HUB_ROTATE_KEYS=1`).
+fn force_key_rotation() -> bool {
+    std::env::var("T_HUB_ROTATE_KEYS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Whether the key file at `path` (by its mtime) is at/past the rotation age. A
+/// missing file or an unreadable mtime is NOT "past age" (the caller handles missing
+/// via mint); a future mtime (clock skew) is treated as fresh, never rotated.
+fn key_is_past_max_age(path: &Path, max_age_secs: u64) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    matches!(modified.elapsed(), Ok(age) if age.as_secs() >= max_age_secs)
+}
+
+/// Write a secret key to `path`, SEALED for at-rest (DPAPI on Windows, plaintext +
+/// `0600` fallback elsewhere - see [`crate::secret_seal`]), mint-and-replace
+/// (truncating overwrite). Best-effort: a write failure still leaves the in-memory
+/// key usable.
+fn write_key_file(path: &Path, key: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if std::fs::write(&path, &key).is_ok() {
+    let sealed = crate::secret_seal::seal_str(key);
+    if std::fs::write(path, sealed.as_bytes()).is_ok() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
     }
+}
+
+/// Load a persistent secret key from `path`, ROTATING it (mint a fresh UUID + OVERWRITE
+/// the file) when it is missing/unreadable, past `max_age_secs`, or `force`d; otherwise
+/// KEEP the existing value, upgrading a legacy plaintext file to the sealed at-rest form
+/// in place. Rotation is mint-and-replace - it NEVER re-reads the same key (the
+/// reviewer's non-gating note: `persistent_key` used to reuse the file, so "rotate at
+/// startup" must actively overwrite it). The returned key is always the LIVE value and
+/// is usable in-memory even if the disk write fails. Policy is passed in so this core
+/// is pure/testable; [`load_or_rotate_key`] resolves it from the environment.
+fn load_or_rotate_key_with(path: &Path, force: bool, max_age_secs: u64) -> String {
+    let raw = std::fs::read_to_string(path).ok();
+    let existing = raw
+        .as_deref()
+        .and_then(crate::secret_seal::unseal_str)
+        .filter(|k| !k.is_empty());
+    let rotate = force || existing.is_none() || key_is_past_max_age(path, max_age_secs);
+    if !rotate {
+        if let Some(k) = existing {
+            // Keep the credential; upgrade a legacy/plaintext file to the sealed form.
+            if crate::secret_seal::sealing_active()
+                && !raw.as_deref().map(crate::secret_seal::is_sealed).unwrap_or(false)
+            {
+                write_key_file(path, &k);
+            }
+            return k;
+        }
+    }
+    // Mint fresh and OVERWRITE (mint-and-replace).
+    let key = uuid::Uuid::new_v4().to_string();
+    write_key_file(path, &key);
     key
+}
+
+/// Environment-resolved wrapper over [`load_or_rotate_key_with`] (rotation forced by
+/// `T_HUB_ROTATE_KEYS`, age from `T_HUB_KEY_MAX_AGE_SECS`).
+fn load_or_rotate_key(path: &Path) -> String {
+    load_or_rotate_key_with(path, force_key_rotation(), key_max_age_secs())
+}
+
+/// The PERSISTENT control auth key (server-split M2b): the server's stable identity
+/// across restarts, so a remote client paired once need not re-pair each launch -
+/// bounded by item-3's rotation-on-restart age ([`load_or_rotate_key`]). Sealed at
+/// rest. On any read/write failure we still return a usable (in-memory) key so the
+/// channel always comes up.
+pub fn persistent_key() -> String {
+    load_or_rotate_key(&key_path())
 }
 
 /// Resolve the persistent **read**-key file: `$T_HUB_SERVER_READ_KEY_FILE` if set,
@@ -2225,29 +2293,11 @@ fn read_key_path() -> PathBuf {
 
 /// The PERSISTENT **read** capability key (socket-gate Phase 2): a distinct,
 /// stable-across-restarts secret from [`persistent_key`] (the control key), so a
-/// read-only consumer paired once keeps working. Read from [`read_key_path`] if
-/// present + non-empty, else a fresh UUID is minted and written (best-effort
-/// `0600`). Always returns a usable in-memory key on any I/O failure.
+/// read-only consumer paired once keeps working - bounded by the same rotation-on-
+/// restart age and sealed at rest ([`load_or_rotate_key`]). Always returns a usable
+/// in-memory key on any I/O failure.
 pub fn persistent_read_key() -> String {
-    let path = read_key_path();
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let k = existing.trim().to_string();
-        if !k.is_empty() {
-            return k;
-        }
-    }
-    let key = uuid::Uuid::new_v4().to_string();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if std::fs::write(&path, &key).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-    }
-    key
+    load_or_rotate_key(&read_key_path())
 }
 
 /// Phase 3 hardening flag (socket-gate). When ON, [`start`] stops publishing the
@@ -9715,6 +9765,56 @@ mod tests {
         // Never an empty read token (falls back to control so a context that never
         // minted a read token is not locked out).
         assert_eq!(select_published_token("ctl", "", true), "ctl");
+    }
+
+    #[test]
+    fn key_rotation_keeps_fresh_seals_and_rotates_on_policy() {
+        // item-3 Pillar B rotation-on-restart: a fresh key is KEPT (stable across
+        // restarts within max age) and sealed at rest; a forced rotation and an
+        // aged-out key both mint-and-REPLACE the file (never re-read the old key).
+        // BYPASS-WOULD-FAIL: revert to reuse-the-file and the forced/aged asserts go RED.
+        let base = std::env::temp_dir().join(format!("t-hub-keyrot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("server-key");
+
+        // Missing => mints and writes; the written file unseals back to the key.
+        let k1 = load_or_rotate_key_with(&path, false, 3600);
+        assert!(!k1.is_empty());
+        assert!(path.exists(), "a minted key must be written to disk");
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(crate::secret_seal::unseal_str(&stored).as_deref(), Some(k1.as_str()));
+
+        // Within age, not forced => KEEP the same value.
+        let k2 = load_or_rotate_key_with(&path, false, 3600);
+        assert_eq!(k2, k1, "a fresh key within max age must be kept, not rotated");
+
+        // Forced => a DIFFERENT value overwrites the file (mint-and-replace).
+        let k3 = load_or_rotate_key_with(&path, true, 3600);
+        assert_ne!(k3, k1, "a forced rotation must mint-and-replace the key");
+        let stored3 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(crate::secret_seal::unseal_str(&stored3).as_deref(), Some(k3.as_str()));
+
+        // max_age 0 => past age on every call => rotates.
+        let k4 = load_or_rotate_key_with(&path, false, 0);
+        assert_ne!(k4, k3, "max_age 0 must rotate on every restart");
+        assert!(!key_is_past_max_age(&path, 3600), "a just-written key is not past a 1h age");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn key_rotation_reads_legacy_plaintext_and_keeps_it() {
+        // A pre-item-3 key file (raw token, no seal prefix) is read and KEPT within
+        // age, so an upgrade preserves the paired credential (no surprise rotation).
+        let base = std::env::temp_dir().join(format!("t-hub-keylegacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("server-read-key");
+        std::fs::write(&path, "legacy-plaintext-token").unwrap();
+        let k = load_or_rotate_key_with(&path, false, 3600);
+        assert_eq!(k, "legacy-plaintext-token", "legacy plaintext must be read and kept");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

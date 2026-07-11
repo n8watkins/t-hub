@@ -140,6 +140,10 @@ windows = { version = "0.61", features = [
     # *SECURITY_ATTRIBUTES, so the fn is gated behind that feature as well.
     "Win32_System_JobObjects",
     "Win32_Security",
+    # DPAPI (CryptProtectData/CryptUnprotectData) for item-3 Pillar B: at-rest
+    # sealing of the server-key / server-read-key / per-session identity secrets
+    # under the Windows user's data-protection key (src/secret_seal.rs).
+    "Win32_Security_Cryptography",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_HiDpi",

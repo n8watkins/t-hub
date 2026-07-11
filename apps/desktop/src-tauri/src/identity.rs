@@ -26,7 +26,7 @@
 //!   "which session, in what role" - never "may it do X".
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -153,6 +153,25 @@ fn ct_eq(a: &str, b: &str) -> bool {
 struct IdentitiesSnapshot {
     /// Keyed by the minted identity id.
     identities: HashMap<String, SessionIdentity>,
+    /// item-3 Pillar B: the explicit REVOCATION set (minted ids). An id here never
+    /// resolves again even if its record somehow survives, so a compromised secret is
+    /// killed the instant it is revoked. Persisted (a durable tombstone), `#[serde(
+    /// default)]` so pre-item-3 stores load. Distinct from retire/close-GC (which is
+    /// lifecycle cleanup); this is a deliberate "this credential is burned" act.
+    #[serde(default)]
+    revoked: HashSet<String>,
+}
+
+/// Identity-secret TTL in ms, from `T_HUB_IDENTITY_TTL_SECS` (seconds). `0` (the
+/// default) DISABLES expiry - the mechanism ships and is enforced when configured, but
+/// off by default so a long-lived session (a captain running for days) is never cut
+/// off mid-life; the cadence is an operator knob (N4-class). Revocation is always-on.
+fn identity_ttl_ms() -> u64 {
+    std::env::var("T_HUB_IDENTITY_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|secs| secs.saturating_mul(1000))
+        .unwrap_or(0)
 }
 
 /// The per-session identity store: an in-memory map behind a mutex, persisted
@@ -165,12 +184,21 @@ pub struct IdentityStore {
 
 impl IdentityStore {
     /// Load (or start empty) from `path`. A missing/corrupt file starts empty - never
-    /// a startup failure, matching `CaptainsRegistry::load`.
+    /// a startup failure, matching `CaptainsRegistry::load`. item-3 Pillar B: each
+    /// secret is UNSEALED on load (DPAPI on Windows; a legacy/plaintext secret reads
+    /// verbatim), so the in-memory secret is always the plaintext `resolve` compares.
     pub fn load(path: PathBuf) -> Self {
-        let inner = std::fs::read_to_string(&path)
+        let mut inner = std::fs::read_to_string(&path)
             .ok()
             .and_then(|body| serde_json::from_str::<IdentitiesSnapshot>(&body).ok())
             .unwrap_or_default();
+        for ident in inner.identities.values_mut() {
+            if let Some(plain) = crate::secret_seal::unseal_str(&ident.secret) {
+                ident.secret = plain;
+            }
+            // If a sealed secret cannot be unsealed here (wrong host), it is left as-is
+            // and simply never resolves - the store belongs to the Windows-hosted app.
+        }
         IdentityStore {
             path: Some(path),
             inner: Mutex::new(inner),
@@ -308,9 +336,37 @@ impl IdentityStore {
         removed
     }
 
+    /// Explicitly REVOKE an identity by its minted id (item-3 Pillar B): record it in
+    /// the durable revocation set AND drop its secret from the store, so a compromised
+    /// or burned credential stops resolving immediately and forever. Distinct from
+    /// [`retire`](Self::retire) (lifecycle GC): revocation is a deliberate "this
+    /// credential is burned" act and leaves a persistent tombstone so the id can never
+    /// resolve again. Returns true if anything changed (newly revoked or removed).
+    pub fn revoke(&self, id: &str) -> bool {
+        let mut snap = self.lock();
+        let newly_revoked = snap.revoked.insert(id.to_string());
+        let removed = snap.identities.remove(id).is_some();
+        if newly_revoked || removed {
+            self.persist(&snap);
+        }
+        newly_revoked || removed
+    }
+
+    /// Whether an identity id has been revoked.
+    pub fn is_revoked(&self, id: &str) -> bool {
+        self.lock().revoked.contains(id)
+    }
+
     /// Resolve a presented per-session token to its identity, constant-time. `None`
-    /// for an empty or unknown token. This is IDENTIFICATION, never authorization.
+    /// for an empty/unknown token, a REVOKED identity, or one past its TTL (item-3
+    /// Pillar B). This is IDENTIFICATION, never authorization.
     pub fn resolve(&self, presented: &str) -> Option<SessionIdentity> {
+        self.resolve_with(presented, now_ms(), identity_ttl_ms())
+    }
+
+    /// [`resolve`](Self::resolve) with the clock + TTL passed in, so the expiry/
+    /// revocation logic is pure and race-free to test (no env / no wall clock).
+    fn resolve_with(&self, presented: &str, now: u64, ttl_ms: u64) -> Option<SessionIdentity> {
         if presented.is_empty() {
             return None;
         }
@@ -318,6 +374,10 @@ impl IdentityStore {
         snap.identities
             .values()
             .find(|ident| ct_eq(&ident.secret, presented))
+            // Revoked ids never resolve, even if the record somehow lingers.
+            .filter(|ident| !snap.revoked.contains(&ident.id))
+            // TTL expiry (0 => disabled): a leaked dead-session secret stops resolving.
+            .filter(|ident| ttl_ms == 0 || now.saturating_sub(ident.minted_at) <= ttl_ms)
             .cloned()
     }
 
@@ -359,11 +419,20 @@ fn default_identities_path() -> PathBuf {
 
 /// Atomic write (temp + 0600 + rename), the registry discipline. The store holds
 /// secrets, so 0600 matters - it is the same sensitivity class as the server-key file.
+/// item-3 Pillar B: each secret is SEALED at rest (DPAPI on Windows; plaintext behind
+/// 0600 on the pure-WSL/ext4 and dev/CI hosts) so the shared-readable state file does
+/// not expose the bearer tokens in cleartext on the real Windows deployment.
 fn write_atomic(path: &PathBuf, snap: &IdentitiesSnapshot) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let body = serde_json::to_vec_pretty(snap)?;
+    // Seal secrets only at the disk boundary; the in-memory secret stays plaintext so
+    // `resolve` compares directly.
+    let mut sealed = snap.clone();
+    for ident in sealed.identities.values_mut() {
+        ident.secret = crate::secret_seal::seal_str(&ident.secret);
+    }
+    let body = serde_json::to_vec_pretty(&sealed)?;
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     std::fs::write(&tmp, &body)?;
     #[cfg(unix)]
@@ -402,6 +471,79 @@ mod tests {
         assert_ne!(a.secret, b.secret, "secrets are distinct");
         assert!(!a.secret.is_empty());
         assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn revoke_kills_resolve_and_persists_a_tombstone() {
+        // item-3 Pillar B: an explicit revoke stops the secret resolving immediately,
+        // AND survives a reload as a durable tombstone. BYPASS-WOULD-FAIL: drop the
+        // revoked-set check in resolve and the post-revoke resolve returns the identity.
+        let path = temp_path();
+        let a = {
+            let store = IdentityStore::load(path.clone());
+            let a = store.mint(Role::Crew);
+            assert!(store.resolve(&a.secret).is_some(), "mints resolve before revoke");
+            assert!(store.revoke(&a.id), "revoke reports a change");
+            assert!(store.resolve(&a.secret).is_none(), "a revoked secret must not resolve");
+            assert!(store.is_revoked(&a.id));
+            a
+        };
+        // Reload: the tombstone persisted, so even a resurrected record would not resolve.
+        let reloaded = IdentityStore::load(path.clone());
+        assert!(reloaded.is_revoked(&a.id), "the revocation tombstone must persist");
+        assert!(reloaded.resolve(&a.secret).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ttl_expires_a_secret_but_zero_disables_expiry() {
+        // item-3 Pillar B TTL mechanism (pure, race-free via resolve_with). ttl=0
+        // disables expiry (the default); a positive ttl rejects a secret older than it.
+        let store = IdentityStore::ephemeral();
+        let a = store.mint(Role::Crew);
+        let minted = a.minted_at;
+        // ttl disabled: resolves at any clock.
+        assert!(store.resolve_with(&a.secret, minted + 10_000_000, 0).is_some());
+        // Within ttl: resolves.
+        assert!(store.resolve_with(&a.secret, minted + 500, 1000).is_some());
+        // Past ttl: expired, no resolve.
+        assert!(
+            store.resolve_with(&a.secret, minted + 2000, 1000).is_none(),
+            "a secret older than the TTL must not resolve"
+        );
+    }
+
+    #[test]
+    fn identity_secrets_are_sealed_at_rest_and_unsealed_on_load() {
+        // item-3 Pillar B at-rest sealing: the on-disk secret is the sealed form
+        // (unseal_str recovers it), and load() restores the plaintext so resolve works.
+        // On the Linux dev/CI host the seal is the 0600-fallback identity, so the disk
+        // form is plaintext; the round-trip and the unseal_str invariant hold regardless.
+        let path = temp_path();
+        let secret = {
+            let store = IdentityStore::load(path.clone());
+            store.mint(Role::Crew).secret
+        };
+        // The raw file's stored secret unseals back to the plaintext secret.
+        let body = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let on_disk = parsed["identities"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()["secret"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            crate::secret_seal::unseal_str(on_disk).as_deref(),
+            Some(secret.as_str()),
+            "the on-disk secret must unseal back to the plaintext"
+        );
+        // And a fresh load restores the plaintext so resolve still works.
+        let reloaded = IdentityStore::load(path.clone());
+        assert!(reloaded.resolve(&secret).is_some(), "reload must restore a resolvable secret");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
