@@ -1,5 +1,34 @@
 # T-Hub captain handoff (refreshed 2026-07-10, mid 0.3.62 ship)
 
+## ⏸ ACTIVE RESUME POINT (2026-07-10 evening - written for a Cortana-triggered /clear; read this FIRST)
+
+You are being resumed with fresh context mid-way through the ORCHESTRATION PROGRAM. Your context reset is YOURS ONLY - the comms-plane crew session and all DRAFT files persist on disk.
+
+**Canon entry point (read after this block):** `~/.t-hub/captain/ORCHESTRATION-PROGRAM.md` - the single source of truth for the program (settled rules, capability matrix, comms-plane invariants, the REOPENED-then-decided policy items, detail-doc pointers). Supporting: `~/.t-hub/captain/reviews/capability-matrix-draft.md` (settled matrix + clarifications), `reviews/ruleset-adversarial-2026-07-10.md` (the adversarial findings), `reviews/orchestration-adversarial-review-2026-07-10.md` + addendum (the approved roadmap), `reviews/CAPTAIN-CRIB-SHEET-2026-07-10.md` (my distillation).
+
+**Where the program is:** Item 1 of 4, the UNIFIED COMMS PLANE design proposal, is at **DRAFT-3 (design-complete, PARKED)**. Items 2-4 (identity re-key, security defaults, rulebook enforcement) queued behind it; reap-ship design + orchestrator-representation build are the parallel track.
+
+**The comms-plane crew:** session `b46bc46c` (Claude session UUID `96e689e7-b320-4f5a-a2d7-70bfdd149b2e`), worktree `.claude/worktrees/comms-plane-design`, branch `comms-plane-design`, VISIBLE in the t-hub-app tab. It is IDLE/parked, holding for the general's policy rulings. To resume it: `claude --resume 96e689e7-b320-4f5a-a2d7-70bfdd149b2e` is the continuity anchor if the tmux session ever needs re-hosting (it should still be live).
+- Deliverable: `/tmp/flap-probe/COMMS-PLANE-PROPOSAL.md` (DRAFT-3, ~55KB, design-complete).
+- Briefs it was built against: `/tmp/flap-probe/COMMS-PLANE-DESIGN-BRIEF.md` -> `-REVISION-BRIEF.md` -> `-FINAL-DESIGN-BRIEF.md` (all in `/tmp/flap-probe/`).
+
+**DRAFT-3 baked-in invariants (do not relitigate):** SINGLE WRITE AUTHORITY (every byte to a PTY input originates from the queue drain, BOTH substrates - control/tmux AND in-app write_terminal->PTY - break-glass only; D1 closes both); one-queue-two-predicates (turn-boundary Completed edge + not-being-typed-into); receipt-on-drain; fail-open (scribe-gate shape); EMERGENCY lane (never interleaves over a typing human, D4); voice+visual = ONE decision-queue; per-session identity is the enforcement seam that turns LAW-TARGET cells into LAW-NOW; the 5 missing ACL cells folded (cross-ship read/msg ISOLATION [HIGH, wide-open today], abort/interrupt-subordinate primitive, sibling no-daisy-chain, EMERGENCY-flag authority, operate-fleet-infra owner); role-pinning HARD-depends on Item 2 identity re-key (flagged, not solved).
+
+**THE THREE POLICY RULINGS (general, now DECIDED - this is what unblocks the final pass):**
+- **R-C1 (delegation-gate)**: NOW = captain VERIFIES with the general before spend/publish. POST-PLANE = elastic delegation-via-Cortana is safe because the plane makes "the general authorized this" unforgeable (the plane is the precondition). Build so the interim captain-verify UPGRADES cleanly. Crew stub is at proposal §2.6.
+- **R-H1 (deploy)**: captain CONFIRMS with the general DIRECT before deploying; make the confirm-before-deploy threshold PARAMETERIZABLE (every-deploy vs significant/user-facing), exact scope pending a further general call. Crew stub at §2.6.
+- **R-C3 (research)**: bounded one-shot research = background SUBAGENT (cheaper); crew only for ongoing. Do NOT push always-spawn-crew. Crew stub at §2.8 (a NORM).
+
+**NEW Item-4 principle (role-scoped rules from the ONE canonical matrix):** Cortana = full canon; Captain = own capabilities + adjacent-layer awareness + operating doctrine (NOT orchestration internals); Crew = a minimal can/can't card (its matrix COLUMN + task only). Fold into Item 4.
+
+**NEW capability (now in the matrix):** Cortana MAY reset a captain's context (/clear) - that is what produced this handoff.
+
+**YOUR NEXT ACTION on resume:** hand the comms-plane crew (`b46bc46c`) the three policy rulings above for its FINAL RECONCILIATION pass (resolve the three PENDING-GENERAL-RULING stubs into concrete design per the rulings; keep everything else). THEN the holding sequence completes: crew final reconciliation -> independent xhigh design-check (spawn a fresh Opus 4.8 xhigh reviewer, adversarial, on the reconciled proposal) -> escalate the design-checked proposal to Cortana for the general. Nothing escalates before the design-check. Report per cadence.
+
+**Operating reminders that bit me today (full versions below):** VISIBLE-FIRST socket spawns + resize 220x50 BEFORE kickoff; KICKOFF-VERIFICATION (confirm the crew is PROCESSING, a collapsed pane eats the Enter); crew migration = `claude --resume <uuid>` never a fresh re-kick; RELAY TYPING-GUARD before any send-keys to Cortana/general (check the last prompt line has no typed content - the prompt char is followed by a non-breaking space); env-pin trap (`env -u T_HUB_CONTROL_ADDR -u T_HUB_CONTROL_TOKEN` for socket probes; raw-connect to the current control.json).
+
+---
+
 Zero-context resume doc for the next t-hub-app captain.
 Ship file (authoritative roster + full history): `~/.t-hub/captain/ships/t-hub-scribe.md`.
 Fleet doctrine: `~/.t-hub/captain/{ESCALATION,MODEL-POLICY,RETIREMENT}.md`; crew-brief escalation block: `~/.t-hub/captain/BRIEF-ESCALATION-BLOCK.md`.
