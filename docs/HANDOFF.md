@@ -1,6 +1,16 @@
 # T-Hub captain handoff (refreshed 2026-07-11, 0.3.63 DEPLOYED)
 
-## ⏸ ACTIVE RESUME POINT (2026-07-11 ~13:0x - 0.3.63 DEPLOYED + VERIFIED + keys force-rotated; PR #60 in review; fleet at read tier pending capability-cycle)
+## ⏸ ACTIVE RESUME POINT (2026-07-11 ~15:0x - CAPABILITY BOOTSTRAP: fresh captain boots CONTROL-CAPABLE in a general-spawned terminal; read THIS + the CAPTAIN'S LOG first)
+
+**YOU (fresh captain) just booted via the capability bootstrap** (flag-on window -> general-spawned terminal with control token env -> you; the flag comes OFF at the clean restart - verify `T_HUB_SPAWN_LEGACY_FULL` is unset in the APP env afterward, your own token stays valid via adopt-first).
+**FIRST ACTIONS:** claim `t-hub-app` (claim_captain now works - you have control), verify a socket spawn works (visible-first restored), read `~/.t-hub/captain/logs/t-hub-app.md` (the CAPTAIN'S LOG - general-adopted doctrine 2026-07-11: STATUS is PULL via this log, you WRITE it at every trigger point, NO status relays to Cortana; DECISION-NEEDED/EMERGENCY still push).
+**IMMEDIATE QUEUE (general-directed):**
+1. **Codex Phase-1**: the plan+review agent's deliverable is at `~/.t-hub/captain/reviews/codex-phase1-plan-2026-07-11.md` (may still have been writing at handoff - verify it's complete with a verdict). If PLAN-READY: present verdict to the general, then IMPLEMENT via a build crew (full gate: PR-only, no bump, xhigh review, fix round, delta, general's merge word). Background: `codex-harness-audit-2026-07-11.md` (headline: Codex ships Claude-compatible hooks - shim is ~one milestone).
+2. **Spurious voice cue investigation (general-reported)**: "captain needs your attention" announcements fire when nothing is needed (crew-finished moments). NOT announce.sh (its log is clean) - it's the APP's supervision voice cue; hypothesis: idle-at-prompt conflated with needs-attention, aggravated by crew churn. Find the trigger, propose a gate (crew for it).
+3. **Program queue** (after the above per the general's pacing): item-1 Phase-3 ACLs -> tile-attach fix + UI control-spawn toggle + adopt-session path (bundle: same tile/spawn family; restores visible-first durably) -> item-4 -> typing-guard LAST.
+**Cortana capability**: she still needs HER control re-spawn (sequence with her); the monorepo captain too.
+
+## (prior resume point 2026-07-11 ~13:0x - 0.3.63 DEPLOYED + VERIFIED + keys force-rotated; PR #60 was in review then MERGED f0f7a4e; fleet was at read tier pending capability-cycle)
 
 **DEPLOY EXECUTED (2026-07-11, all general-confirmed direct):** 0.3.63 installed (pid rotates per restart; main `aea0255` = the deployed binary), all sessions re-adopted instantly (re-key live), wedge symptom cleared, **WSLg attach check PASSED (general's verdict - PR-29 gate cleared, harden flip trusted)**, DPAPI sealing runtime-verified (`thub-sealed:v1` + DPAPI blob header), blocking gate off-by-default, **forced key rotation executed** (`T_HUB_ROTATE_KEYS`; old disk-exposed control token VERIFIED REFUSED).
 **FLEET IS AT READ TIER BY DESIGN:** pre-regime sessions (Cortana + both captains) hold no control capability until re-spawned with `capability:control` + `claude --resume` migration (Cortana sequences this); interim = MCP reads + raw-tmux break-glass for relays; the captain's classifier correctly blocks stale-token reuse - do not fight it.
