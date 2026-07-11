@@ -99,7 +99,7 @@ pub fn statusline_is_t_hub(statusline: &serde_json::Value) -> bool {
     statusline
         .get("command")
         .and_then(|c| c.as_str())
-        .map(|s| command_is_t_hub(s))
+        .map(command_is_t_hub)
         .unwrap_or(false)
 }
 
@@ -410,7 +410,7 @@ pub fn group_is_t_hub(group: &serde_json::Value) -> bool {
             inner_hooks.iter().any(|h| {
                 h.get("command")
                     .and_then(|c| c.as_str())
-                    .map(|s| command_is_t_hub(s))
+                    .map(command_is_t_hub)
                     .unwrap_or(false)
             })
         })
