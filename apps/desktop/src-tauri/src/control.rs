@@ -3627,16 +3627,44 @@ fn elevation_env(ctx: &ControlContext, args: &Value) -> Vec<(String, String)> {
     ]
 }
 
-/// The directory `GH_CONFIG_DIR` points crew at: an EMPTY t-hub-owned config dir with
-/// no `hosts.yml`, so `gh` finds no ambient credential there. Best-effort created.
-fn crew_empty_gh_config_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = home.join(".t-hub").join("crew-gh-empty");
+/// The directory `GH_CONFIG_DIR` points crew at: an EMPTY t-hub-owned config dir
+/// with no `hosts.yml`, so `gh` finds no ambient credential there.
+///
+/// The value is injected into the crew's WSL shell via `tmux -e`, so it MUST be a
+/// POSIX path. The old form built it with `PathBuf::join` and a `USERPROFILE`
+/// fallback: on a Windows binary that yields BACKSLASH separators and/or a `C:`
+/// drive path (`C:\Users\...\.t-hub\crew-gh-empty`) that is meaningless in WSL -
+/// so `gh` got a mangled dir and the credential-withholding wall silently broke
+/// (audit HIGH, hit 3 crews). Fix: resolve ONLY from a POSIX-absolute `$HOME` and
+/// build the string with explicit forward slashes; when `$HOME` is absent or a
+/// Windows-style value (a native-Windows launch), fall back to a fixed POSIX path.
+/// Either way the crew gets a valid POSIX dir with no `hosts.yml` - never a
+/// backslash/drive path.
+fn crew_empty_gh_config_dir() -> String {
+    let dir = crew_gh_config_dir_from_home(std::env::var("HOME").ok().as_deref());
+    // The security property is the ABSENCE of a `hosts.yml` at this path, not that
+    // the app created it, so a best-effort create is enough even if the app's FS
+    // view differs from the crew's WSL view.
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// Pure core of [`crew_empty_gh_config_dir`] (env-free, so it is unit-testable
+/// without racy env mutation). Given the raw `$HOME` value, produce the POSIX
+/// `GH_CONFIG_DIR` string for the crew's WSL shell.
+///
+/// A POSIX-absolute `$HOME` (the WSL-launched app, the common case) is used
+/// directly; anything else - `None` or a Windows `USERPROFILE`-style value
+/// (`C:\Users\...`, no leading `/`) - falls back to a fixed `/tmp` path. The
+/// string is built with explicit forward slashes (NOT `PathBuf::join`, which
+/// emits `\` on a Windows binary), so the result is ALWAYS a backslash-free POSIX
+/// path.
+fn crew_gh_config_dir_from_home(home: Option<&str>) -> String {
+    let base = home
+        .filter(|h| h.starts_with('/'))
+        .unwrap_or("/tmp")
+        .trim_end_matches('/');
+    format!("{base}/.t-hub/crew-gh-empty")
 }
 
 /// item-3 §2.3.5 (MED-5): the credential-WITHHOLDING env for a read-class (crew)
@@ -3647,10 +3675,7 @@ fn crew_empty_gh_config_dir() -> PathBuf {
 /// fails at the remote for lack of a credential. Control-class spawns (captains) are
 /// NOT withheld - orchestrating IS their job.
 fn crew_credential_withholding_env() -> Vec<(String, String)> {
-    let mut env = vec![(
-        "GH_CONFIG_DIR".to_string(),
-        crew_empty_gh_config_dir().to_string_lossy().into_owned(),
-    )];
+    let mut env = vec![("GH_CONFIG_DIR".to_string(), crew_empty_gh_config_dir())];
     // Blank the ambient publish/registry/spend tokens a crew must not wield. Setting
     // them empty at the session level scrubs any value inherited from the app env.
     for key in [
@@ -10557,9 +10582,24 @@ mod tests {
         ctx.addr = "127.0.0.1:4242".to_string();
 
         let (env, _) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
+        let gh_dir = env
+            .iter()
+            .find(|(k, _)| k == "GH_CONFIG_DIR")
+            .map(|(_, v)| v.as_str());
         assert!(
-            env.iter().any(|(k, v)| k == "GH_CONFIG_DIR" && !v.is_empty()),
+            gh_dir.is_some_and(|v| !v.is_empty()),
             "a crew spawn must withhold gh via GH_CONFIG_DIR"
+        );
+        // The value rides a `tmux -e` into a WSL shell, so it must be a POSIX path:
+        // no backslash, no `C:`-style drive, forward-slash absolute. A Windows path
+        // (the old USERPROFILE/PathBuf::join form) silently defeated withholding.
+        assert!(
+            !env.iter().any(|(_, v)| v.contains('\\')),
+            "no emitted env value may contain a backslash (Windows) path: {env:?}"
+        );
+        assert!(
+            gh_dir.is_some_and(|v| v.starts_with('/') && !v.contains(":\\")),
+            "GH_CONFIG_DIR must be a POSIX-absolute path, got {gh_dir:?}"
         );
         assert!(
             env.iter().any(|(k, v)| k == "GH_TOKEN" && v.is_empty()),
@@ -10571,6 +10611,37 @@ mod tests {
         assert!(
             !env2.iter().any(|(k, _)| k == "GH_CONFIG_DIR"),
             "a control-class spawn must keep its gh credentials"
+        );
+    }
+
+    #[test]
+    fn crew_gh_config_dir_is_always_a_backslash_free_posix_path() {
+        // audit HIGH: the value rides a `tmux -e` into WSL, so it must ALWAYS be a
+        // POSIX path. BYPASS-WOULD-FAIL: restore the USERPROFILE/PathBuf::join form
+        // and the Windows-path cases below emit `C:\...\.t-hub\...` → RED.
+
+        // A POSIX-absolute HOME (WSL-launched app) is used verbatim.
+        assert_eq!(
+            crew_gh_config_dir_from_home(Some("/home/natkins")),
+            "/home/natkins/.t-hub/crew-gh-empty"
+        );
+        // A trailing slash is normalized (no doubled `//`).
+        assert_eq!(
+            crew_gh_config_dir_from_home(Some("/home/natkins/")),
+            "/home/natkins/.t-hub/crew-gh-empty"
+        );
+        // A Windows USERPROFILE-style value is REJECTED (the crux of the bug): it
+        // falls back to a fixed POSIX path, never a backslash/drive path.
+        for windows_home in [r"C:\Users\natha", r"C:\Users\natha\", r"D:\home"] {
+            let dir = crew_gh_config_dir_from_home(Some(windows_home));
+            assert_eq!(dir, "/tmp/.t-hub/crew-gh-empty");
+            assert!(!dir.contains('\\'), "no backslash: {dir}");
+            assert!(!dir.contains(":\\"), "no drive path: {dir}");
+        }
+        // An absent HOME also falls back to the POSIX path (native-Windows launch).
+        assert_eq!(
+            crew_gh_config_dir_from_home(None),
+            "/tmp/.t-hub/crew-gh-empty"
         );
     }
 
