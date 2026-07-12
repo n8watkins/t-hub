@@ -2590,6 +2590,28 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     };
     write_handshake(&handshake)?;
 
+    // H2 production verifier: recompute the KEYED audit chain + head anchor on
+    // startup and report any breaks LOUDLY - stderr (in `startup_integrity_check`)
+    // plus a fanout event so the UI/operators see a tampered/truncated trail rather
+    // than the old `cfg(test)`-only recompute that never ran in prod.
+    let integrity = ctx.audit.startup_integrity_check();
+    if !integrity.ok() {
+        ctx.fanout.emit_event(
+            "control://audit",
+            &json!({
+                "event": "integrity-check-failed",
+                "breaks": integrity.breaks.len(),
+                "records": integrity.records,
+                "files": integrity.files,
+                "detail": integrity
+                    .breaks
+                    .iter()
+                    .map(|b| format!("{} line {}: {:?} - {}", b.file, b.line, b.kind, b.detail))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
     // Opt-in ADDITIONAL bind for REMOTE access (server-split M2b). GATED — default
     // OFF, so the §8 loopback-only boundary holds unless explicitly enabled. When
     // set, a second listener serves the same dispatch; `handle_conn` restricts peers
@@ -3992,8 +4014,11 @@ fn governor_gate(ctx: &ControlContext, command: &str, args: &Value) -> Result<()
 }
 
 /// Write one audit record for an Organization/ProcessChanging command (or a
-/// governor refusal). `decision` is the gate outcome (`allowed` / `refused-*`);
-/// `error` carries a downstream dispatch failure for an allowed command.
+/// governor refusal), **best-effort** (a sink failure is logged to stderr and never
+/// breaks dispatch). Used on the paths that are not process-affecting - Organization
+/// records, governor/authz refusals - where availability is the right posture.
+/// ProcessChanging commands use [`try_audit_command`] so a sink failure fails the
+/// command CLOSED (H3).
 fn audit_command(
     ctx: &ControlContext,
     req: &ControlRequest,
@@ -4002,6 +4027,25 @@ fn audit_command(
     decision: &str,
     error: Option<&str>,
 ) {
+    if let Err(e) = try_audit_command(ctx, req, tier, cap, decision, error) {
+        eprintln!(
+            "t-hub-control: audit write failed for '{}' ({}): {e}",
+            req.command, decision
+        );
+    }
+}
+
+/// The checked audit write behind [`audit_command`]: returns the sink result so the
+/// dispatch path can REFUSE a ProcessChanging command whose durable trace could not
+/// be written (H3 fail-closed).
+fn try_audit_command(
+    ctx: &ControlContext,
+    req: &ControlRequest,
+    tier: CommandTier,
+    cap: Capability,
+    decision: &str,
+    error: Option<&str>,
+) -> std::io::Result<()> {
     let session = req
         .args
         .get("sessionId")
@@ -4012,7 +4056,7 @@ fn audit_command(
         .get("spawnedBy")
         .or_else(|| req.args.get("spawned_by"))
         .and_then(|v| v.as_str());
-    ctx.audit.record(
+    ctx.audit.try_record(
         &req.command,
         tier.label(),
         decision,
@@ -4025,7 +4069,7 @@ fn audit_command(
             spawned_by,
             error,
         },
-    );
+    )
 }
 
 /// Resolve capability, gate + audit, then dispatch. A bad token is rejected before
@@ -4164,6 +4208,39 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         }
     }
 
+    // H3 fail-CLOSED audit sink: a ProcessChanging command's durable authorization
+    // record MUST land BEFORE its side effect. If the audit write fails (ENOSPC,
+    // perms, a locked/hostile sink) we REFUSE the command rather than let an
+    // unlogged spawn/kill/type execute - the audit trail is load-bearing for the
+    // "a control mutation is never silent" guarantee, and disk-pressure/tamper is
+    // exactly when it must not be defeated. The record carries the authorization
+    // (decision `allowed`); a downstream dispatch error is still returned to the
+    // caller and mirrored on the fanout, so no information is lost. Organization-tier
+    // commands are not process-affecting and stay best-effort post-dispatch.
+    if tier == CommandTier::ProcessChanging {
+        if let Err(e) = try_audit_command(ctx, &req, tier, cap, "allowed", None) {
+            // Not an applied outcome: release any idempotency reservation so a retry
+            // after the sink recovers can still succeed.
+            if let Some(id) = &request_id {
+                ctx.requests.cancel(id);
+            }
+            let message = format!(
+                "refused: audit sink unavailable - '{}' is process-changing and must be \
+                 recorded before it runs ({e})",
+                req.command
+            );
+            ctx.fanout.emit_event(
+                "control://governor",
+                &json!({
+                    "command": req.command.as_str(),
+                    "decision": "refused-audit",
+                    "error": message.as_str(),
+                }),
+            );
+            return ControlResponse::err(message);
+        }
+    }
+
     // Dispatch, then record the outcome under the requestId (if any) so a later
     // retry replays exactly this result. `finish` returns the outcome back. The caller
     // identity resolved above is threaded in so the per-command ACL wiring can enforce
@@ -4178,9 +4255,11 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         Err(e) => ControlResponse::err(e),
     };
 
-    // Audit every Organization + ProcessChanging command on the allowed path,
-    // capturing the dispatch outcome. Read-tier commands are not audited.
-    if tier != CommandTier::Read {
+    // Audit Organization-tier commands post-dispatch (best-effort), capturing the
+    // dispatch outcome. ProcessChanging commands were already recorded fail-closed
+    // BEFORE dispatch (above), so re-recording here would duplicate the line; Read-tier
+    // commands are never audited.
+    if tier == CommandTier::Organization {
         let err = if response.ok {
             None
         } else {
@@ -10653,6 +10732,30 @@ mod tests {
         assert!(!blob.contains("SUPERSECRET"), "literal text leaked into audit: {blob}");
         assert_eq!(recs[0]["args"]["textLen"], 11);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_changing_command_is_refused_when_the_audit_sink_fails() {
+        // H3 fail-CLOSED, proven end-to-end through the dispatch path: when the audit
+        // sink cannot be written, a ProcessChanging command is REFUSED before its side
+        // effect (not silently allowed). BYPASS-WOULD-FAIL: drop the pre-dispatch
+        // try_audit_command gate and this goes RED (the spawn would proceed unlogged).
+        let base = std::env::temp_dir().join("t-hub-gate-sinkfail");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&base);
+        // A FILE where the audit dir's parent should be, so create_dir_all(dir) fails.
+        std::fs::write(&base, b"not a dir").unwrap();
+        let unwritable = base.join("audit");
+        let ctx = test_ctx("sink").with_audit(Arc::new(AuditLog::new(unwritable)));
+
+        let resp = dispatch_authenticated(&ctx, req("sink", "spawn_terminal", json!({"cwd": "/tmp"})));
+        assert!(!resp.ok, "spawn must be refused when the audit sink is down");
+        assert!(
+            resp.error.clone().unwrap().contains("audit sink unavailable"),
+            "expected the fail-closed refusal, got: {:?}",
+            resp.error
+        );
+        let _ = std::fs::remove_file(&base);
     }
 
     #[test]
