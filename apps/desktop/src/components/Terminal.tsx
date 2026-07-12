@@ -38,7 +38,7 @@ import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { CanvasAddon } from "@xterm/addon-canvas";
-import { saneFitProposal } from "./terminalFit";
+import { saneFitProposal, MIN_SANE_COLS, MIN_READABLE_COLS } from "./terminalFit";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -672,6 +672,14 @@ export function TerminalView({
     // garbled reflowed scrollback needs clearing (see settleResize).
     let lastCols = 0;
 
+    // The column acceptance floor for THIS tile right now. A watched/foreground
+    // tile fits its real box down to MIN_SANE_COLS (a narrow split is legitimate);
+    // an unwatched/background tile uses the ratified readable floor so it is never
+    // shrunk below 80 cols (its output would wrap to garbage before anyone views it
+    // / a captain capture-pane-reads it). See terminalFit.ts::MIN_READABLE_COLS.
+    const fitFloor = () =>
+      foregroundRef.current ? MIN_SANE_COLS : MIN_READABLE_COLS;
+
     const pushResize = () => {
       if (disposed) return;
       // NEVER push a degenerate resize. A parked/hidden/not-yet-laid-out tile
@@ -679,7 +687,9 @@ export function TerminalView({
       // the PTY wedges the whole tmux window to 2 columns (the 2x24-client bug).
       // Skip until the tile has a real box — the ResizeObserver / pool-move
       // re-runs this once it does, and term keeps its current sane geometry.
-      if (!saneFitProposal(term, fit)) return;
+      // A BACKGROUND tile additionally refuses a sub-readable-floor (< 80) fit, so
+      // an unwatched tile never shrinks below a readable width (client-tracked).
+      if (!saneFitProposal(term, fit, fitFloor())) return;
       try {
         fit.fit();
         void resizeTerminal(terminalId, term.cols, term.rows);
@@ -764,8 +774,10 @@ export function TerminalView({
           // would create the PTY at 2 cols — the wedged 2x24 client. Skipping
           // leaves xterm at its 80x24 construction default, a sane geometry to
           // attach at; the pool-move / ResizeObserver re-fits to the tile's real
-          // width the moment it gets a box.
-          if (saneFitProposal(term, fit)) fit.fit();
+          // width the moment it gets a box. A background tile additionally holds
+          // the 80x24 seed for any measured-but-narrow box (fitFloor = readable),
+          // so a freshly created captain/crew tile attaches readable before view.
+          if (saneFitProposal(term, fit, fitFloor())) fit.fit();
         } catch {
           /* container detached; ignore */
         }
@@ -1546,7 +1558,10 @@ export function TerminalView({
       // Same degenerate-measurement guard as pushResize: a zoom change on a
       // parked/hidden tile must not fit-and-push ~2 cols to the PTY. When it
       // un-parks, the pool-move / ResizeObserver re-fits at the new font size.
-      if (!saneFitProposal(term, fit)) return;
+      // Background tiles keep the readable floor here too (a zoom-out must not
+      // shrink an unwatched tile below 80 cols).
+      const floor = foregroundRef.current ? MIN_SANE_COLS : MIN_READABLE_COLS;
+      if (!saneFitProposal(term, fit, floor)) return;
       fit.fit();
       void resizeTerminal(terminalId, term.cols, term.rows);
     } catch {
