@@ -622,9 +622,24 @@ impl AgentBridge {
             .or_else(|| entry.payload.get("session_id").and_then(|v| v.as_str()));
         let agent_id = entry.payload.get("agent_id").and_then(|v| v.as_str());
         let agent_type = entry.payload.get("agent_type").and_then(|v| v.as_str());
+        // Claude Code's `Notification` hook carries a `notification_type`
+        // discriminator (`idle_prompt`, `permission_prompt`, …). The reducer needs
+        // it to tell the 60s idle ping from a real needs-input event; absent for
+        // every other hook.
+        let notification_type = entry
+            .payload
+            .get("notification_type")
+            .and_then(|v| v.as_str());
 
         let affected = self.with_supervisor(|s| {
-            s.ingest(session_id, agent_id, agent_type, entry.event_type, entry.timestamp_ms)
+            s.ingest(
+                session_id,
+                agent_id,
+                agent_type,
+                notification_type,
+                entry.event_type,
+                entry.timestamp_ms,
+            )
         });
 
         // 5. Emit the fresh tree + status for the affected session so the sidebar

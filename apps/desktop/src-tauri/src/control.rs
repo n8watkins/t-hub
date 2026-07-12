@@ -6668,6 +6668,7 @@ mod tests {
             Some("uuid-abc"),
             None,
             None,
+            None,
             JournalEventType::SessionStart,
             1,
         );
