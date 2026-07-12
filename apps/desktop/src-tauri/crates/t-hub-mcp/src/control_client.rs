@@ -191,6 +191,44 @@ impl Discovery {
         })
     }
 
+    /// Whether an explicit env pin (`$T_HUB_CONTROL_ADDR` + `$T_HUB_CONTROL_TOKEN`)
+    /// is in force - i.e. [`resolve`](Self::resolve) returned that pair rather than the
+    /// file. The env token is the credential the app injected at spawn (a control-tier
+    /// session gets the FULL token), so it must be PRESERVED across a port rotation,
+    /// never swapped for control.json's (read-only, under item-3 harden) token.
+    pub fn has_env_pin(&self) -> bool {
+        matches!(
+            (&self.addr, &self.token),
+            (Some(a), Some(t)) if !a.is_empty() && !t.is_empty()
+        )
+    }
+
+    /// The endpoint to retry after the pinned one failed: the fresh ADDRESS the
+    /// running app just published in control.json, but KEEPING the env token when an
+    /// env pin is in force.
+    ///
+    /// This is the core stale-pin fix. A restart/install rotates the control PORT but
+    /// not the token (adopt-first), while control.json under item-3 hardening carries
+    /// only the READ token. The old recovery re-read BOTH fields wholesale
+    /// ([`resolve_from_file`](Self::resolve_from_file)), so a fully-authorized control
+    /// session silently degraded to read-only after any restart. Keeping the env token
+    /// lets the control session reach the fresh port with its real capability; if that
+    /// token is genuinely refused (a real rotation), the caller surfaces a loud error
+    /// rather than a silent downgrade.
+    ///
+    /// With NO env pin (the app's own / a probe path that never had one), there is no
+    /// token to preserve, so the file's token is adopted as before.
+    pub fn refreshed_endpoint(&self) -> Result<ControlEndpoint, String> {
+        let file = self.resolve_from_file()?;
+        if self.has_env_pin() {
+            return Ok(ControlEndpoint {
+                addr: file.addr,
+                token: self.token.clone().unwrap_or_default(),
+            });
+        }
+        Ok(file)
+    }
+
     /// The handshake file path (mirrors `crate::control::handshake_path` on the
     /// app side): the `file` override, else `<home>/.t-hub/control.json`.
     fn handshake_path(&self) -> PathBuf {
@@ -318,10 +356,19 @@ fn wedge_detector() -> std::sync::MutexGuard<'static, WedgeDetector> {
 /// The app rebinds to a fresh ephemeral port on every launch and rewrites
 /// control.json, but a session's MCP captured the old addr+token in its env at
 /// spawn time (see `elevation_env` on the app side). So when the resolved
-/// endpoint is dead (a transport failure), we re-read control.json - dropping
-/// the stale env pair entirely - and retry once against the addr+token the
-/// running app just wrote, instead of wrongly concluding "T-Hub is down".
-/// App-level rejections are returned verbatim (a new endpoint won't change them).
+/// endpoint is dead (a transport failure), we re-resolve the fresh ADDR from
+/// control.json and retry once against it, instead of wrongly concluding "T-Hub
+/// is down".
+///
+/// STALE-PIN FIX: the retry KEEPS the pinned env token (see
+/// [`Discovery::refreshed_endpoint`]). A restart rotates the port but not the
+/// token (adopt-first), while control.json - under item-3 hardening - publishes
+/// only the READ token. The old recovery re-read BOTH fields wholesale, so a
+/// fully-authorized control session silently degraded to read-only after any
+/// restart. If the kept env token is genuinely REFUSED at the fresh addr (a real
+/// token rotation), we surface a loud, cause-naming error rather than a silent
+/// read-only downgrade. App-level rejections are otherwise returned verbatim (a
+/// new endpoint won't change them).
 pub fn resolve_and_call(
     discovery: &Discovery,
     command: &str,
@@ -349,10 +396,12 @@ pub fn resolve_and_call(
             let first_msg = first.into_message();
 
             // The endpoint we tried is unreachable/unresponsive. If control.json now
-            // names a *different* endpoint (the app restarted or already rebound onto
-            // a new port, so our env pin went stale), prefer the freshly-read pair.
+            // names a *different* addr (the app restarted or already rebound onto a new
+            // port, so our env pin went stale), prefer the freshly-resolved endpoint -
+            // which KEEPS the pinned env token (never adopts control.json's read-only
+            // token under a control session; the stale-pin downgrade this fixes).
             let fresh = discovery
-                .resolve_from_file()
+                .refreshed_endpoint()
                 .ok()
                 .filter(|f| f.addr != endpoint.addr || f.token != endpoint.token);
 
@@ -381,7 +430,8 @@ pub fn resolve_and_call(
                         }
                     }
                 };
-                let r = resolve_ambiguous_request(&ep, command, &args, id, first_msg);
+                let r =
+                    resolve_ambiguous_request(&ep, command, &args, id, first_msg, discovery.has_env_pin());
                 if r.is_ok() {
                     wedge_detector().on_success();
                 }
@@ -400,7 +450,16 @@ pub fn resolve_and_call(
                     }
                     Err(CallError::App(msg)) => {
                         wedge_detector().on_success();
-                        Err(msg)
+                        // We reached the fresh addr but the app rejected the call. When
+                        // we kept an env token across the rotation and the rejection is
+                        // an AUTH refusal, that means a REAL token rotation - surface the
+                        // stale-pin cause loudly instead of the terse "unauthorized"
+                        // (never a silent read-only slide onto control.json's token).
+                        if discovery.has_env_pin() && is_auth_rejection(&msg) {
+                            Err(stale_env_token_error(&msg))
+                        } else {
+                            Err(msg)
+                        }
                     }
                     Err(e2) => {
                         let e2_is_timeout = e2.is_timeout();
@@ -446,6 +505,32 @@ fn maybe_heal_and_retry(
     Err(err)
 }
 
+/// Whether an app rejection is an authentication/authorization failure - the token
+/// itself was refused. Matches the control dispatcher's auth error strings
+/// ("unauthorized: bad control token", "unauthorized: '<cmd>' requires the control
+/// capability (this token is read-only)"). Both are prefixed `unauthorized`.
+fn is_auth_rejection(msg: &str) -> bool {
+    msg.starts_with("unauthorized")
+}
+
+/// Loud, cause-naming error for when the pinned env token is REFUSED at the
+/// freshly-resolved addr: the app's control token actually rotated (a fresh install
+/// or a token reset) since this session was spawned. We refuse to silently adopt
+/// control.json's token - under item-3 hardening that is the READ-ONLY token, and
+/// adopting it would silently drop this control session to read-only, the exact bug
+/// this fix removes - and instead tell the operator to re-spawn/restart the session.
+fn stale_env_token_error(app_msg: &str) -> String {
+    format!(
+        "T-Hub refused this session's pinned control token at the current control \
+         address ({app_msg}). The app's control token was rotated (a fresh install or a \
+         token reset) after this session was spawned, so the T_HUB_CONTROL_TOKEN in its \
+         environment is stale. Re-spawn this session from the app (or restart it) to pick \
+         up the live token. Refusing to fall back to control.json's token: under control \
+         hardening that is the READ-ONLY token, and adopting it would silently drop this \
+         control session to read-only."
+    )
+}
+
 /// A socket read timeout / would-block surfaces as `WouldBlock` (unix SO_RCVTIMEO)
 /// or `TimedOut` (windows). Both mean "no data yet", not a dead transport.
 fn is_would_block(e: &std::io::Error) -> bool {
@@ -458,12 +543,14 @@ fn is_would_block(e: &std::io::Error) -> bool {
 /// Resolve an ambiguous spawn-class transport failure (ask #1/#2): the command was
 /// possibly accepted but its response leg failed. Query `get_request_status` for
 /// the SAME `request_id` and act on the authoritative answer:
-///   - completed(ok)   -> return the original result (the apply happened once)
-///   - completed(err)   -> return that error (it ran and failed; no ghost)
-///   - inFlight         -> poll until it resolves or the deadline, then hand the
-///                         caller the requestId to poll themselves
-///   - unknown          -> it never landed under this id: safe to re-run ONCE (the
-///                         same requestId keeps that retry idempotent)
+///
+/// - completed(ok)  -> return the original result (the apply happened once)
+/// - completed(err) -> return that error (it ran and failed; no ghost)
+/// - inFlight       -> poll until it resolves or the deadline, then hand the caller
+///   the requestId to poll themselves
+/// - unknown        -> it never landed under this id: safe to re-run ONCE (the same
+///   requestId keeps that retry idempotent)
+///
 /// If the status channel itself stays unreachable, we surface the original error.
 fn resolve_ambiguous_request(
     endpoint: &ControlEndpoint,
@@ -471,6 +558,7 @@ fn resolve_ambiguous_request(
     args: &Value,
     request_id: &str,
     first_err: String,
+    has_env_pin: bool,
 ) -> Result<Value, String> {
     let deadline = Instant::now() + AMBIGUOUS_RESOLVE_DEADLINE;
     let status_args = serde_json::json!({ "requestId": request_id });
@@ -489,9 +577,18 @@ fn resolve_ambiguous_request(
                 }
                 Some("inFlight") => {
                     if Instant::now() >= deadline {
+                        // PENDING, not failed (ask #2): the app ACCEPTED the spawn and
+                        // is still materializing it (e.g. a Windows memory trough slowed
+                        // it past our deadline). Hand back the resolvable requestId with
+                        // an unambiguous "accepted/pending" framing so the caller polls
+                        // get_request_status rather than reading this as a spawn failure
+                        // and guessing/retrying.
                         return Err(format!(
-                            "{first_err}; the request was accepted (requestId '{request_id}') \
-                             but is still in flight - poll get_request_status for its outcome"
+                            "PENDING: the request was accepted (requestId '{request_id}') and is \
+                             still materializing after {}s - poll get_request_status with that \
+                             requestId for its final outcome (do NOT re-issue the command). \
+                             (Original client-deadline note: {first_err})",
+                            AMBIGUOUS_RESOLVE_DEADLINE.as_secs()
                         ));
                     }
                     std::thread::sleep(Duration::from_millis(500));
@@ -503,10 +600,18 @@ fn resolve_ambiguous_request(
                         .map_err(CallError::into_message);
                 }
             },
-            // The app answered but rejected the STATUS query itself - most likely an
-            // older app that predates get_request_status (no server-side cache, so
-            // no idempotency guarantee). Don't guess: surface the original error.
-            Err(CallError::App(_)) => return Err(first_err),
+            // The app answered but rejected the STATUS query itself. Under a kept env
+            // pin an AUTH refusal means a real token rotation (the env token no longer
+            // authenticates) - name that cause loudly rather than the terse transport
+            // error. Otherwise it is most likely an older app that predates
+            // get_request_status (no server-side cache, so no idempotency guarantee):
+            // don't guess, surface the original error.
+            Err(CallError::App(msg)) => {
+                if has_env_pin && is_auth_rejection(&msg) {
+                    return Err(stale_env_token_error(&msg));
+                }
+                return Err(first_err);
+            }
             // The channel is still unreachable (fast transport failure) or wedged
             // (timeout): keep trying to reach the status endpoint until the deadline,
             // else give up with the original error.
@@ -1061,32 +1166,42 @@ mod tests {
     }
 
     #[test]
-    fn resolve_and_call_recovers_after_app_restart() {
-        // Reproduce the real failure: a session's MCP was spawned BEFORE an app
-        // restart, so its env pins the now-dead addr+token, while control.json
-        // carries the addr+token the restarted app just wrote. (Both change here - // proving the recovery drops the stale env PAIR, not just the addr.)
-        let dir = std::env::temp_dir().join(format!("th-mcp-restart-{}", std::process::id()));
+    fn resolve_and_call_keeps_the_env_token_after_a_port_rotation() {
+        // The stale-pin bug (the primary fix): a control session was spawned with a
+        // FULL control token pinned in its env; the app then restarted onto a fresh
+        // port (adopt-first: the token is UNCHANGED, only the port rotates) and, under
+        // item-3 hardening, control.json now publishes only the READ token. The
+        // recovery must re-resolve the fresh ADDR from control.json but KEEP the pinned
+        // env token - never adopt the file's read-only token (the silent read-only
+        // downgrade this fixes).
+        //
+        // BYPASS-WOULD-FAIL: revert `refreshed_endpoint` to the old wholesale
+        // `resolve_from_file` and the app receives "READ-tok" instead of the env
+        // "FULL-tok" - the captured-token assertion below goes RED.
+        let dir = std::env::temp_dir().join(format!("th-mcp-rotate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("control.json");
 
-        // The "restarted" app: a fresh listener on a new port with a new token,
-        // and control.json pointing at it (what the live app wrote on relaunch).
-        let live_addr = fake_server("filetok", r#"{"ok":true,"result":{"hello":"world"}}"#);
+        // The restarted app on a fresh port; control.json points at it but publishes
+        // only the READ token (hardening). scripted_server captures the request so we
+        // can assert WHICH token the app actually saw.
+        let (live_addr, captured) =
+            scripted_server(vec![Some(r#"{"ok":true,"result":{"hello":"world"}}"#)]);
         std::fs::write(
             &file,
-            format!(r#"{{"addr":"{live_addr}","token":"filetok","pid":1}}"#),
+            format!(r#"{{"addr":"{live_addr}","token":"READ-tok","pid":1}}"#),
         )
         .unwrap();
 
-        // The dead pre-restart endpoint: bind to grab a port, then drop it so
-        // connects are refused (the old ephemeral port the app abandoned).
+        // The dead pre-restart endpoint the session's env still pins: bind to grab a
+        // port, then drop it so connects are refused (the old ephemeral port).
         let dead = TcpListener::bind("127.0.0.1:0").unwrap();
         let dead_addr = dead.local_addr().unwrap().to_string();
         drop(dead);
 
         let discovery = Discovery {
             addr: Some(dead_addr.clone()),
-            token: Some("envtok".into()),
+            token: Some("FULL-tok".into()),
             file: Some(file.clone()),
             ..Default::default()
         };
@@ -1100,10 +1215,90 @@ mod tests {
             "the dead endpoint must fail to connect"
         );
 
-        // Green path: resolve_and_call drops the stale env pair, re-reads
-        // control.json, and reconnects to the live post-restart endpoint+token.
+        // Green path: resolve_and_call re-resolves the fresh addr from control.json but
+        // keeps the FULL env token, and reaches the live post-restart endpoint.
         let v = resolve_and_call(&discovery, "list_tabs", &Value::Null).unwrap();
         assert_eq!(v["hello"], "world");
+        let reqs = captured.lock().unwrap();
+        assert_eq!(
+            reqs[0]["token"], "FULL-tok",
+            "recovery must present the pinned env token, NOT control.json's read-only token"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_and_call_reports_a_real_token_rotation_loudly() {
+        // A REAL rotation (a fresh install / token reset), distinct from a mere port
+        // rotation: the pinned env token no longer authenticates at the fresh addr. The
+        // recovery must NOT silently adopt control.json's read-only token; it surfaces a
+        // clear error naming the stale env pin so the operator restarts/re-spawns.
+        let dir = std::env::temp_dir().join(format!("th-mcp-rot2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+
+        // The live app on a fresh port refuses the (now rotated-away) env token.
+        let (live_addr, _cap) = scripted_server(vec![Some(
+            r#"{"ok":false,"error":"unauthorized: bad control token"}"#,
+        )]);
+        std::fs::write(
+            &file,
+            format!(r#"{{"addr":"{live_addr}","token":"READ-tok","pid":1}}"#),
+        )
+        .unwrap();
+
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap().to_string();
+        drop(dead);
+
+        let discovery = Discovery {
+            addr: Some(dead_addr),
+            token: Some("STALE-tok".into()),
+            file: Some(file.clone()),
+            ..Default::default()
+        };
+
+        let err = resolve_and_call(&discovery, "list_tabs", &Value::Null).unwrap_err();
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("stale") && lower.contains("read-only"),
+            "must name the stale env pin + refuse the read-only fallback: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refreshed_endpoint_keeps_env_token_but_takes_fresh_addr() {
+        // Unit-level guard on the core fix: with an env pin, refreshed_endpoint adopts
+        // the file's addr yet keeps the env token; with NO env pin it takes both.
+        let dir = std::env::temp_dir().join(format!("th-mcp-refe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+        std::fs::write(
+            &file,
+            r#"{"addr":"127.0.0.1:5555","token":"READ-tok","pid":1}"#,
+        )
+        .unwrap();
+
+        let pinned = Discovery {
+            addr: Some("127.0.0.1:1".into()),
+            token: Some("FULL-tok".into()),
+            file: Some(file.clone()),
+            ..Default::default()
+        };
+        let ep = pinned.refreshed_endpoint().unwrap();
+        assert_eq!(ep.addr, "127.0.0.1:5555", "takes the fresh addr from control.json");
+        assert_eq!(ep.token, "FULL-tok", "keeps the pinned env token");
+
+        let file_only = Discovery {
+            file: Some(file.clone()),
+            ..Default::default()
+        };
+        let ep2 = file_only.refreshed_endpoint().unwrap();
+        assert_eq!(ep2.addr, "127.0.0.1:5555");
+        assert_eq!(ep2.token, "READ-tok", "no env pin: adopt the file token as before");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
