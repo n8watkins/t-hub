@@ -123,6 +123,17 @@ fn control_endpoint(app: &tauri::AppHandle) -> Result<std::sync::Arc<ControlEndp
 /// the full token so it is never locked out, mirroring `control::elevation_env`. When
 /// no control endpoint is bound yet, nothing is injected (there is no addr to
 /// orchestrate against, so it fails SAFE).
+/// Whether a spawn's requested `capability` is the elevated CONTROL tier. Inverted
+/// least-privilege: `None` (absent) and any non-`"control"` value (`"read"`, junk)
+/// resolve to READ; ONLY a case-insensitive `"control"` elevates. Pure + tested so
+/// the "control is always the deliberate opt-in, never the default" invariant can't
+/// silently regress (e.g. a future refactor defaulting an absent tier to control).
+fn capability_is_control(capability: Option<&str>) -> bool {
+    capability
+        .map(|c| c.eq_ignore_ascii_case("control"))
+        .unwrap_or(false)
+}
+
 fn ui_spawn_capability_env(
     app: &tauri::AppHandle,
     opts: &SpawnOptions,
@@ -146,11 +157,7 @@ fn ui_spawn_capability_env(
     if addr.is_empty() {
         return (scrub(), false);
     }
-    let is_control = opts
-        .capability
-        .as_deref()
-        .map(|c| c.eq_ignore_ascii_case("control"))
-        .unwrap_or(false);
+    let is_control = capability_is_control(opts.capability.as_deref());
     let token = if is_control {
         endpoint.token().to_string()
     } else if !endpoint.read_token().is_empty() {
@@ -994,5 +1001,29 @@ mod tests {
     fn pane_command_quotes_embedded_quotes() {
         let cmd = pane_command(None, Some("echo 'hi there'")).unwrap();
         assert!(cmd.contains("echo '\\''hi there'\\''"), "got: {cmd}");
+    }
+
+    /// item-3 §2.1.1: the capability gate. Inverted least-privilege means an ABSENT
+    /// tier and any non-`control` value default to READ; only an explicit, case-
+    /// insensitive `control` elevates. This is the exact predicate that decides
+    /// whether the UI spawn injects the full control token and fires the audit — pin
+    /// it so control can never become the accidental default (bypass-would-fail:
+    /// flip the default and `spawns_without_capability_default_read` fails).
+    #[test]
+    fn spawns_without_capability_default_read() {
+        // The ordinary spawn path passes NO capability -> read (never elevated).
+        assert!(!capability_is_control(None));
+        assert!(!capability_is_control(Some("read")));
+        assert!(!capability_is_control(Some("")));
+        assert!(!capability_is_control(Some("controll"))); // typo != control
+        assert!(!capability_is_control(Some("write")));
+    }
+
+    #[test]
+    fn control_capability_elevates_case_insensitively() {
+        // The toggled spawn passes `capability:"control"` -> the audited elevation.
+        assert!(capability_is_control(Some("control")));
+        assert!(capability_is_control(Some("Control")));
+        assert!(capability_is_control(Some("CONTROL")));
     }
 }
