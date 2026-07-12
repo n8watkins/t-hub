@@ -14,9 +14,10 @@
 //!   - `Elicitation` → `NeedsQuestion`; `PermissionRequest` → `NeedsPermission`;
 //!     `Notification` → discriminated on `notification_type`: informational pings
 //!     (`idle_prompt`, `auth_success`, `elicitation_complete`/`_response`,
-//!     `push_notification`) leave status unchanged, `permission_prompt` →
-//!     `NeedsPermission`, everything else (incl. legacy no-type) → `NeedsQuestion`
-//!     (fallback); `StopFailure` / abnormal `SessionEnd` → `Failed`.
+//!     `push_notification`, `computer_use_enter`/`_exit`) leave status unchanged,
+//!     `permission_prompt`/`worker_permission_prompt` → `NeedsPermission`,
+//!     everything else (incl. legacy no-type) → `NeedsQuestion` (fallback);
+//!     `StopFailure` / abnormal `SessionEnd` → `Failed`.
 //!
 //! ## Design
 //! [`Supervisor`] is a pure in-memory reducer: feed it
@@ -376,9 +377,16 @@ impl Supervisor {
                 | Some("auth_success")
                 | Some("elicitation_complete")
                 | Some("elicitation_response")
-                | Some("push_notification") => {}
+                | Some("push_notification")
+                // computer_use_enter/exit bracket a computer-use action - lifecycle
+                // pings, not a needs-input event.
+                | Some("computer_use_enter")
+                | Some("computer_use_exit") => {}
                 // A permission notification is a permission need, not a question.
-                Some("permission_prompt") => entry.status = SessionStatus::NeedsPermission,
+                // worker_permission_prompt is the subagent-side variant of the same.
+                Some("permission_prompt") | Some("worker_permission_prompt") => {
+                    entry.status = SessionStatus::NeedsPermission
+                }
                 // `elicitation_dialog`, any unknown/future type, and legacy payloads
                 // with no `notification_type` keep the conservative "needs input"
                 // fallback - an unknown notification must never be silently dropped.
@@ -794,18 +802,63 @@ mod tests {
     }
 
     #[test]
+    fn informational_notifications_never_flip_completed_to_needs_question() {
+        // Every denylisted informational type must leave a completed session
+        // Completed with no transition edge (RED if any is dropped from the arm).
+        for ntype in [
+            "idle_prompt",
+            "auth_success",
+            "elicitation_complete",
+            "elicitation_response",
+            "push_notification",
+            "computer_use_enter",
+            "computer_use_exit",
+        ] {
+            let mut s = sup();
+            s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+            s.ingest(Some("o1"), None, None, None, JournalEventType::Stop, 2);
+            assert_eq!(s.status("o1"), SessionStatus::Completed);
+            let before = s.current_seq();
+            s.ingest(
+                Some("o1"),
+                None,
+                None,
+                Some(ntype),
+                JournalEventType::Notification,
+                3,
+            );
+            assert_eq!(
+                s.status("o1"),
+                SessionStatus::Completed,
+                "{ntype} must leave a completed session Completed"
+            );
+            assert!(
+                s.transitions_since(before).is_empty(),
+                "{ntype} must not log a transition edge"
+            );
+        }
+    }
+
+    #[test]
     fn permission_prompt_notification_maps_to_needs_permission() {
-        let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(
-            Some("o1"),
-            None,
-            None,
-            Some("permission_prompt"),
-            JournalEventType::Notification,
-            2,
-        );
-        assert_eq!(s.status("o1"), SessionStatus::NeedsPermission);
+        // Both the top-level and the subagent-side (worker_) permission pings.
+        for ntype in ["permission_prompt", "worker_permission_prompt"] {
+            let mut s = sup();
+            s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+            s.ingest(
+                Some("o1"),
+                None,
+                None,
+                Some(ntype),
+                JournalEventType::Notification,
+                2,
+            );
+            assert_eq!(
+                s.status("o1"),
+                SessionStatus::NeedsPermission,
+                "{ntype} must map to NeedsPermission"
+            );
+        }
     }
 
     #[test]
