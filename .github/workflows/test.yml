@@ -1,0 +1,100 @@
+name: Test
+
+# The server-side TEST GATE (audit CRITICAL "no CI test gate"): runs on every
+# pull_request to main and mirrors the exact suites the crews / no-mistakes run
+# locally, so a red suite blocks the merge instead of relying on a human to have
+# run tests. This is ADDITIVE to release.yml — release.yml still ONLY builds +
+# signs the Windows installer on a tag; nothing here changes that.
+#
+# Runs on ubuntu-latest, NOT windows: every suite here is platform-agnostic
+# (the Rust tests shell out to `tmux -L t-hub` on an isolated socket and the
+# frontend suites are jsdom), they run green on Linux, and ubuntu runners are
+# ~faster/cheaper. The Windows-only bits (the Tauri installer) stay in
+# release.yml where they belong.
+
+on:
+  pull_request:
+    branches: [main]
+  # Allow a manual run from the Actions tab for debugging the gate itself.
+  workflow_dispatch:
+
+# Cancel an in-flight run when a new commit is pushed to the same PR.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (cargo test + clippy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Rust tests (and the mcp_e2e integration test) shell out to the real
+      # `tmux` binary on the isolated `-L t-hub` socket. ubuntu-latest ships tmux,
+      # but install it explicitly so the gate never depends on the image default.
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+        working-directory: .
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      # The mcp_e2e integration test spawns the REAL t-hub-mcp binary and locates
+      # it at target/debug/t-hub-mcp. `cargo test --workspace` compiles the crate's
+      # test targets but does NOT place that binary there, so build it explicitly
+      # FIRST (mirrors apps/desktop/scripts/mcp_proof.sh). Without this the e2e
+      # test fails with "t-hub-mcp binary not found".
+      - name: Build t-hub-mcp binary (mcp_e2e dependency)
+        run: cargo build -p t-hub-mcp
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # Clippy runs as a gate but is NOT `-D warnings`: the workspace carries a
+      # large set of pre-existing, tolerated style/doc/MSRV lints (the same bar the
+      # local crews hold), so deny-all would be red from day one. This still fails
+      # the check on genuine clippy ERRORS (the deny-by-default correctness lints)
+      # and on any compile error. Flipping to `-D warnings` belongs in a dedicated
+      # lint-cleanup PR, not this additive gate.
+      - name: cargo clippy --workspace
+        run: cargo clippy --workspace --all-targets
+
+  frontend:
+    name: Frontend (vitest + tsc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm must be set up BEFORE setup-node's pnpm cache can resolve.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `tsc --noEmit` — the same command `pnpm typecheck` runs.
+      - name: tsc --noEmit
+        run: pnpm --filter t-hub-desktop typecheck
+
+      # `vitest run` — the same command `pnpm --filter t-hub-desktop test` runs.
+      - name: vitest run
+        run: pnpm --filter t-hub-desktop test
