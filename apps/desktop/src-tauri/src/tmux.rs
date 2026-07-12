@@ -479,6 +479,30 @@ pub fn has_session(name: &str) -> bool {
     matches!(session_liveness(name), SessionLiveness::Alive)
 }
 
+/// Reassert `window-size latest` on `name` (best-effort; never fails a caller).
+///
+/// The spawn path pins `window-size latest` ONCE at session creation
+/// ([`new_session_with_env`]), after which nothing reasserts it — so a session
+/// flipped to `window-size manual` out of band (historically, a captain forcing
+/// `manual 220x50` to work around the width-2 background-client bug) stays manual
+/// for the LIFE of the tmux session, across every attach/detach and app restart.
+/// A stale manual override overshoots the real tile: content clips off the right
+/// edge and tmux paints its `fill-character` dot field in the unused area.
+///
+/// Reasserting `latest` on every ATTACH is the belt-and-braces half of the
+/// tile-attach fix (the frontend measurement guard in `Terminal.tsx` is the
+/// primary cause): once the front end can no longer push a degenerate ~2-col
+/// size, `window-size latest` alone keeps each window tracking its focused
+/// client's real width, so a stale manual/degenerate size can never outlive its
+/// purpose. Best-effort — the session already exists and is streaming, so we
+/// never fail an attach over this.
+pub fn reassert_window_size_latest(name: &str) {
+    let _ = output_with_timeout(
+        tmux(&["set-option", "-t", name, "window-size", "latest"]),
+        tmux_cmd_timeout(),
+    );
+}
+
 /// Kill the tmux session named `name` via plain `kill-session` (SIGHUP).
 ///
 /// Treated as success if the session (or the whole server) is already gone, so
@@ -1006,6 +1030,68 @@ mod tests {
 
         send_keys(&name, &["C-c"]).expect("send_keys C-c should succeed");
         send_keys(&name, &["Enter"]).expect("send_keys Enter should succeed");
+
+        kill_session(&name).expect("kill_session should succeed");
+    }
+
+    /// The attach belt-and-braces: [`reassert_window_size_latest`] restores
+    /// `window-size latest` on a session that was flipped to `manual` (the retired
+    /// captain 220x50 workaround). Proves a stale manual override can't outlive its
+    /// purpose once the attach path reasserts on every attach.
+    ///
+    /// Needs a real `tmux` on PATH (the WSL2 dev shell, not the Windows CI target).
+    #[test]
+    fn reassert_window_size_latest_restores_from_manual() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::reassert_window_size_latest_restores_from_manual: \
+                 tmux not on PATH — skipping"
+            );
+            return;
+        }
+        // Reads the window-size option's current mode ("latest" / "manual") off a
+        // live session. `show-options -w -t <name> window-size` prints
+        // `window-size <mode>`; we return just the mode token.
+        fn window_size_mode(name: &str) -> String {
+            let out = output_with_timeout(
+                tmux(&["show-options", "-w", "-t", name, "window-size"]),
+                tmux_cmd_timeout(),
+            )
+            .expect("show-options should run");
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        }
+
+        let name = unique_name();
+        let _ = kill_session(&name);
+        new_session_with_env(&name, "/tmp", None, &[]).expect("new_session should succeed");
+        // Fresh sessions are pinned `latest` at creation.
+        assert_eq!(
+            window_size_mode(&name),
+            "latest",
+            "a freshly created session pins window-size latest"
+        );
+
+        // `resize-window` flips the window to `manual` — exactly the degenerate
+        // state the retired captain 220x50 workaround left behind.
+        resize_window_for_tests(&name, 220, 50).expect("resize should succeed");
+        assert_eq!(
+            window_size_mode(&name),
+            "manual",
+            "resize-window must flip the window to manual sizing"
+        );
+
+        // The attach reassert restores `latest`, so the window tracks its client
+        // again instead of clipping at a stale manual size.
+        reassert_window_size_latest(&name);
+        assert_eq!(
+            window_size_mode(&name),
+            "latest",
+            "reassert_window_size_latest must restore window-size latest"
+        );
 
         kill_session(&name).expect("kill_session should succeed");
     }

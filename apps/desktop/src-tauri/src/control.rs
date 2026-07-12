@@ -3111,6 +3111,15 @@ fn serve_pty_attach(
         }
     }
 
+    // Belt-and-braces (tile-attach fix): reassert `window-size latest` on every
+    // attach, not just at session creation. If this session was ever flipped to
+    // `window-size manual` out of band (the retired captain 220x50 workaround),
+    // that override otherwise persists for the life of the tmux session and
+    // clips content off the right edge. Reasserting here guarantees the window
+    // tracks the newly-attached client's real width. Best-effort: the session is
+    // Alive and about to stream, so never fail the attach over this.
+    tmux::reassert_window_size_latest(&tmux_session);
+
     // Scrollback seed as the opening frame — sent BEFORE the stream starts so the
     // reader thread's output frames never race it. v1: `{"scrollback":"<b64>"}`;
     // v2: a binary SCROLLBACK frame carrying the raw capture bytes.
