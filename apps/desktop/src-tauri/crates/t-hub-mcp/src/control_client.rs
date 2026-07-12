@@ -498,6 +498,13 @@ fn maybe_heal_and_retry(
                     wedge_detector().on_success();
                     Ok(v)
                 }
+                // The healed endpoint keeps the env token (see `try_bridge_rebind`),
+                // so an AUTH refusal here means a REAL token rotation - name it loudly
+                // rather than returning the terse "unauthorized" (mirrors the primary
+                // stale-pin path; never a silent read-only slide).
+                Err(CallError::App(msg)) if discovery.has_env_pin() && is_auth_rejection(&msg) => {
+                    Err(stale_env_token_error(&msg))
+                }
                 other => other.map_err(CallError::into_message),
             };
         }
@@ -744,6 +751,13 @@ fn wsl_powershell_available() -> bool {
 /// this returns `None` after a rebind our output-parse missed, the NEXT call
 /// self-recovers: the stale env addr is now dead and control.json names the new port,
 /// which the existing file-re-read path already handles.
+///
+/// The rebind_control request itself is authenticated with `stale.token` (the env
+/// token, control-tier under an env pin - correct, the app requires control for a
+/// rebind). The endpoint to RESUME on then KEEPS that env token via
+/// [`healed_endpoint_after_rebind`] rather than adopting control.json's (read-only,
+/// under item-3 harden) token - closing the same silent read-only downgrade the
+/// primary path fixes (P71-1).
 fn try_bridge_rebind(discovery: &Discovery, stale: &ControlEndpoint) -> Option<ControlEndpoint> {
     if !wsl_powershell_available() {
         return None;
@@ -751,7 +765,20 @@ fn try_bridge_rebind(discovery: &Discovery, stale: &ControlEndpoint) -> Option<C
     if !send_rebind_via_powershell(stale) {
         return None;
     }
-    let fresh = discovery.resolve_from_file().ok()?;
+    healed_endpoint_after_rebind(discovery, stale)
+}
+
+/// Given a successful rebind, the endpoint to resume on: the fresh ADDR the app just
+/// published, KEEPING the env token when an env pin is in force (a rebind rotates the
+/// port, not the token - the same invariant [`Discovery::refreshed_endpoint`] holds on
+/// the primary stale-pin path). Returns `Some` only when the addr actually moved (the
+/// rebind took effect). Split out of the powershell-spawning [`try_bridge_rebind`] so
+/// this token-preservation is unit-testable without a live bridge.
+fn healed_endpoint_after_rebind(
+    discovery: &Discovery,
+    stale: &ControlEndpoint,
+) -> Option<ControlEndpoint> {
+    let fresh = discovery.refreshed_endpoint().ok()?;
     (fresh.addr != stale.addr).then_some(fresh)
 }
 
@@ -1299,6 +1326,60 @@ mod tests {
         let ep2 = file_only.refreshed_endpoint().unwrap();
         assert_eq!(ep2.addr, "127.0.0.1:5555");
         assert_eq!(ep2.token, "READ-tok", "no env pin: adopt the file token as before");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn healed_endpoint_after_rebind_keeps_env_token_not_control_json_token() {
+        // P71-1: the relay-wedge self-heal must resume on the fresh addr the rebind
+        // published but KEEP the env token - never adopt control.json's (read-only,
+        // under item-3 harden) token. Guards the exact silent read-only downgrade the
+        // bridge-heal path used to have.
+        //
+        // BYPASS-WOULD-FAIL: revert `healed_endpoint_after_rebind` to
+        // `discovery.resolve_from_file()` and it returns "READ-tok" - the token
+        // assertion below goes RED.
+        let dir = std::env::temp_dir().join(format!("th-mcp-heal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+        // control.json after the rebind: fresh port, only the READ token published.
+        std::fs::write(
+            &file,
+            r#"{"addr":"127.0.0.1:7777","token":"READ-tok","pid":1}"#,
+        )
+        .unwrap();
+
+        // The control-tier session's env pin (FULL token) at the now-wedged old port.
+        let discovery = Discovery {
+            addr: Some("127.0.0.1:1".into()),
+            token: Some("FULL-tok".into()),
+            file: Some(file.clone()),
+            ..Default::default()
+        };
+        let stale = ControlEndpoint {
+            addr: "127.0.0.1:1".into(),
+            token: "FULL-tok".into(),
+        };
+
+        let healed = healed_endpoint_after_rebind(&discovery, &stale).expect("addr moved -> Some");
+        assert_eq!(healed.addr, "127.0.0.1:7777", "resumes on the rebound port");
+        assert_eq!(
+            healed.token, "FULL-tok",
+            "the healed endpoint must keep the env token, not control.json's read-only token"
+        );
+
+        // No addr movement (control.json still names the stale addr) -> None (nothing
+        // to heal to), regardless of the token.
+        std::fs::write(
+            &file,
+            r#"{"addr":"127.0.0.1:1","token":"READ-tok","pid":1}"#,
+        )
+        .unwrap();
+        assert!(
+            healed_endpoint_after_rebind(&discovery, &stale).is_none(),
+            "an unchanged addr yields no healed endpoint"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
