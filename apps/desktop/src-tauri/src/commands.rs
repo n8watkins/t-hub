@@ -319,10 +319,22 @@ pub(crate) fn pane_command(shell: Option<&str>, startup_command: Option<&str>) -
     // straight to the fallback shell (the "Resume opens a plain terminal, not
     // Claude" bug). `-i` forces ~/.zshrc to load, so the command resolves exactly
     // as when typed by hand. Verified in a clean env (no inherited PATH).
+    //
+    // NO DOUBLE QUOTES in this string. On Windows every tmux call is spawned via
+    // `wsl.exe -e tmux <argv>` (tmux.rs `tmux()`), and Rust's Windows `Command`
+    // arg-serializer backslash-escapes any embedded `"` into `\"`; wsl.exe's
+    // command-line parsing then mangles those `\"` sequences and DROPS this trailing
+    // command entirely, so tmux launches a bare login shell and the `startupCommand`
+    // (e.g. `claude --resume <uuid>`) never runs -- the "spawn booted to bare zsh"
+    // bug (captain log 0024/0025). Every other tmux script in this codebase that
+    // survives the wsl.exe round-trip uses SINGLE quotes only (see tmux.rs
+    // `list_sessions`/`kill_session_tree` notes); we match that here. `$SHELL` is a
+    // bare path with no spaces, so leaving `${SHELL:-/bin/sh}` unquoted is safe, and
+    // the interactive-login `-i` argument stays single-quoted via `sh_single_quote`.
     Some(format!(
-        "exec \"${{SHELL:-/bin/sh}}\" -ilc {}",
+        "exec ${{SHELL:-/bin/sh}} -ilc {}",
         sh_single_quote(&format!(
-            "{startup}; exec \"${{SHELL:-/bin/sh}}\" -l"
+            "{startup}; exec ${{SHELL:-/bin/sh}} -l"
         ))
     ))
 }
@@ -943,9 +955,37 @@ mod tests {
 
         // A startup command rides inside the interactive login shell wrap.
         let cmd = pane_command(None, Some("claude --resume 'abc-123'")).unwrap();
-        assert!(cmd.starts_with("exec \"${SHELL:-/bin/sh}\" -ilc "), "got: {cmd}");
+        assert!(cmd.starts_with("exec ${SHELL:-/bin/sh} -ilc "), "got: {cmd}");
         assert!(cmd.contains("claude --resume '\\''abc-123'\\''"), "got: {cmd}");
-        assert!(cmd.contains("exec \"${SHELL:-/bin/sh}\" -l"), "got: {cmd}");
+        assert!(cmd.contains("exec ${SHELL:-/bin/sh} -l"), "got: {cmd}");
+    }
+
+    /// REGRESSION (startupCommand no-op bug): the wrapped pane command must contain
+    /// ZERO double-quote characters. On Windows tmux is spawned via `wsl.exe -e tmux
+    /// <argv>`; Rust's Windows `Command` arg-serializer escapes any embedded `"` into
+    /// `\"`, which wsl.exe's command-line parsing mangles -- dropping the trailing
+    /// command so the pane boots to a bare login shell and `claude --resume` never
+    /// runs. Every tmux script here that survives the wsl.exe round-trip uses single
+    /// quotes only; pin that invariant so a future edit can't silently reintroduce a
+    /// `"` and re-break one-click resume / Create Orchestrator.
+    #[test]
+    fn pane_command_has_no_double_quotes() {
+        // Realistic startup commands (the "+" presets + `claude --resume <uuid>`);
+        // none contain a `"` of their own, so the wrap must not introduce one. A
+        // user "Custom…" command that itself contains `"` is a separate, pre-existing
+        // concern and out of scope for this invariant.
+        for startup in [
+            "claude",
+            "claude --resume 138adaa9-35a7-4fa6-909d-3e0d8adeef29",
+            "claude --resume 'abc-123'",
+            "echo 'hi there'",
+        ] {
+            let cmd = pane_command(None, Some(startup)).unwrap();
+            assert!(
+                !cmd.contains('"'),
+                "pane command must be double-quote-free (wsl.exe mangles \\\"); got: {cmd}"
+            );
+        }
     }
 
     /// The wrap single-quotes the startup command, so embedded quotes survive

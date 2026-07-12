@@ -503,6 +503,32 @@ pub fn reassert_window_size_latest(name: &str) {
     );
 }
 
+/// Read one session-scoped environment variable (`tmux show-environment -t
+/// <name> <key>`), as baked in at `new-session -e KEY=VALUE` time. Returns the
+/// value, or `None` when the session/variable is absent, the variable is unset
+/// (`-KEY`), or the probe fails/times out.
+///
+/// Used by the orchestrator commission to detect a STALE control token: a session
+/// spawned in a PRIOR app launch carries that launch's `T_HUB_CONTROL_ADDR`, which
+/// the current launch has rotated away from (`control-endpoint-rotates-on-restart`),
+/// so its baked control capability is dead. `show-environment KEY` prints `KEY=VALUE`
+/// when set and `-KEY` when explicitly unset; either way the answer is one line.
+pub fn session_env(name: &str, key: &str) -> Option<String> {
+    let out = output_with_timeout(
+        tmux(&["show-environment", "-t", name, key]),
+        tmux_cmd_timeout(),
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.trim();
+    // `KEY=VALUE` => Some(VALUE); `-KEY` (unset) or anything else => None.
+    line.strip_prefix(&format!("{key}="))
+        .map(|v| v.to_string())
+}
+
 /// Kill the tmux session named `name` via plain `kill-session` (SIGHUP).
 ///
 /// Treated as success if the session (or the whole server) is already gone, so
@@ -971,6 +997,38 @@ mod tests {
             !has_session(&name),
             "session should be gone after kill_session"
         );
+    }
+
+    /// `session_env` reads a variable baked in at `new-session -e KEY=VALUE`, and
+    /// returns `None` for an absent key. This is the DP1=B stale-token detector's
+    /// primitive: the orchestrator commission compares the surviving session's baked
+    /// `T_HUB_CONTROL_ADDR` to the current launch addr.
+    #[test]
+    fn session_env_reads_a_baked_variable() {
+        if !tmux_available() {
+            eprintln!("tmux::tests::session_env_reads_a_baked_variable: tmux not on PATH — skipping");
+            return;
+        }
+        let name = unique_name();
+        let _ = kill_session(&name);
+        let env = vec![("T_HUB_TEST_KEY".to_string(), "127.0.0.1:4242".to_string())];
+        new_session_with_env(&name, "/tmp", None, &env).expect("new_session should succeed");
+        assert_eq!(
+            session_env(&name, "T_HUB_TEST_KEY").as_deref(),
+            Some("127.0.0.1:4242"),
+            "a baked -e variable is read back verbatim"
+        );
+        assert_eq!(
+            session_env(&name, "T_HUB_ABSENT_KEY"),
+            None,
+            "an absent variable is None"
+        );
+        assert_eq!(
+            session_env("th_no_such_session_xyz", "T_HUB_TEST_KEY"),
+            None,
+            "a missing session is None, not an error"
+        );
+        let _ = kill_session_tree(&name);
     }
 
     /// The MCP read/write helpers round-trip through a real session: send a

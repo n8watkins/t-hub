@@ -184,6 +184,12 @@ const HANDLERS: Record<CommandId, () => void> = {
     const id = useWorkspace.getState().focusedId;
     if (id) useCaptain.getState().toggleCaptain(id);
   },
+  // One-click Create Orchestrator (keyboard twin of the sidebar affordance): the
+  // backend commission adopts a live orchestrator / re-spawn-resumes a dead one /
+  // cold-starts a fresh one in the canonical home, then it is designated + focused.
+  createOrchestrator: () => {
+    void import("./ensureOrchestrator").then((m) => m.commissionOrchestrator());
+  },
 };
 
 /** Run a command by id. Safe to call from any trigger (Canvas keydown, the

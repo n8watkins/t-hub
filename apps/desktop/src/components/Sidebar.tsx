@@ -42,9 +42,11 @@ import {
   useCodexUsage,
 } from "./UsageStrip";
 import { useMemo, useState } from "react";
-import { LayoutGrid } from "lucide-react";
+import { LayoutGrid, Plus } from "lucide-react";
 import { useCaptain } from "../store/captain";
 import { CaptainsList, OrchestratorRow } from "./CaptainsList";
+import { OrchestratorCrownIcon } from "./OrchestratorCrownIcon";
+import { commissionOrchestrator } from "../lib/ensureOrchestrator";
 import { WorkspacesList } from "./WorkspacesList";
 import { RecentList } from "./RecentList";
 import { ClaudeIcon } from "./ClaudeIcon";
@@ -147,6 +149,40 @@ export function Sidebar({
   );
 }
 
+/**
+ * The one-click "Create Orchestrator" affordance in the Agents section. Shown ONLY
+ * when no orchestrator exists yet - once one does, the crowned `OrchestratorRow`
+ * above it IS the "Focus Cortana" affordance (click focuses it), so a second button
+ * would be redundant. Fires the backend `commission_orchestrator` command, which
+ * provisions + spawns a control-tier orchestrator in the canonical home and never
+ * duplicates. The palette command "Create Orchestrator" is the keyboard twin.
+ */
+function CreateOrchestratorRow({ hasOrchestrator }: { hasOrchestrator: boolean }) {
+  if (hasOrchestrator) return null;
+  return (
+    <div className="px-2 pt-1" data-create-orchestrator-row>
+      <button
+        type="button"
+        onClick={() => void commissionOrchestrator()}
+        title="Create a control-capable orchestrator (Cortana) in its canonical home"
+        aria-label="Create Orchestrator"
+        className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
+      >
+        <span className="relative shrink-0" style={{ color: "var(--th-accent)" }}>
+          <OrchestratorCrownIcon size={14} />
+          <Plus
+            size={9}
+            aria-hidden
+            className="absolute -bottom-1 -right-1"
+            strokeWidth={3}
+          />
+        </span>
+        <span className="truncate">Create Orchestrator</span>
+      </button>
+    </div>
+  );
+}
+
 interface FullProps {
   width: number;
   onRecall?: (sessionId: string, cwd: string) => void;
@@ -176,6 +212,9 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
     (s) => s.orchestratorId != null && !s.captainIds.includes(s.orchestratorId),
   );
   const agentCount = captainCount + (hasOrchestrator ? 1 : 0);
+  // The Agents section is always shown so the "Create Orchestrator" affordance is
+  // reachable even before any agent exists (the whole point of the one-click flow).
+  const showAgents = agentCount > 0 || !hasOrchestrator;
 
   return (
     <aside
@@ -201,7 +240,7 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
             captains, above Workspaces (command view over terrain view). Clicking
             an agent navigates to the reserved Captains workspace tab and focuses
             its live terminal tile. Hidden entirely while no agent exists. */}
-        {agentCount > 0 && (
+        {showAgents && (
           <Section
             title="Agents"
             count={agentCount}
@@ -211,20 +250,44 @@ function SidebarFull({ width, onRecall, onToggleSidebar }: FullProps) {
             bodyClassName="th-scroll overflow-y-auto"
             bodyStyle={{ maxHeight: "30vh" }}
             action={
-              <button
-                type="button"
-                onClick={() => {
-                  const ws = useWorkspace.getState();
-                  ws.setActiveTab(ws.ensureCaptainsTab());
-                }}
-                aria-label="Open Captains workspace"
-                title="Open Captains workspace"
-                className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
-              >
-                <LayoutGrid size={13} aria-hidden />
-              </button>
+              <div className="flex items-center gap-1">
+                {/* Restore / re-commission the orchestrator. Self-healing: after an app
+                    restart the surviving orchestrator session is re-adopted but its
+                    baked control token is stale (the endpoint rotates every launch), so
+                    this re-spawn-resumes it to RESTORE control capability (DP1=B). When
+                    it is already live+fresh it is a no-op adopt+focus, never a duplicate. */}
+                {hasOrchestrator && (
+                  <button
+                    type="button"
+                    onClick={() => void commissionOrchestrator()}
+                    aria-label="Restore orchestrator"
+                    title="Restore the orchestrator's control capability (re-commission; needed once after an app restart)"
+                    className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
+                    style={{ color: "var(--th-accent)" }}
+                  >
+                    <OrchestratorCrownIcon size={13} />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    const ws = useWorkspace.getState();
+                    ws.setActiveTab(ws.ensureCaptainsTab());
+                  }}
+                  aria-label="Open Captains workspace"
+                  title="Open Captains workspace"
+                  className="flex h-6 w-6 items-center justify-center rounded text-neutral-300 transition-colors hover:bg-neutral-700/60 hover:text-white"
+                >
+                  <LayoutGrid size={13} aria-hidden />
+                </button>
+              </div>
             }
           >
+            {/* One-click "Create Orchestrator" (or "Focus Cortana" when one already
+                exists): the persistent, canonical singleton flow. The backend command
+                adopts a live one / re-spawn-resumes a dead one / cold-starts a fresh
+                one - never a duplicate. */}
+            <CreateOrchestratorRow hasOrchestrator={hasOrchestrator} />
             <OrchestratorRow />
             <CaptainsList />
           </Section>

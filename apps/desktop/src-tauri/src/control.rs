@@ -3442,7 +3442,11 @@ fn required_tier(command: &str) -> CommandTier {
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
         // process/state-changing and control-gated + audited.
-        | "abort_session" | "plane_admin" => {
+        | "abort_session" | "plane_admin"
+        // Create Orchestrator: spawns a control-tier session (Case B/C), so it is
+        // process-changing - gated behind the confirmation tier + spawn governor,
+        // and it needs the control token (the elevated spawn injects `ctx.token`).
+        | "commission_orchestrator" => {
             CommandTier::ProcessChanging
         }
         "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
@@ -3984,7 +3988,13 @@ fn is_kill_key(k: &str) -> bool {
 fn governor_gate(ctx: &ControlContext, command: &str, args: &Value) -> Result<(), crate::governor::Refusal> {
     let now = std::time::Instant::now();
     match command {
-        "spawn_terminal" => ctx.governor.check_spawn(live_session_count(), now),
+        // A commission spawns exactly one control-tier session (Case B/C), so it is
+        // bounded by the same concurrent-cap + spawn-rate as a plain spawn (Case A
+        // adopts and never reaches the internal spawn, but the singleton guard makes
+        // a repeat commission a no-op spawn-wise anyway).
+        "spawn_terminal" | "commission_orchestrator" => {
+            ctx.governor.check_spawn(live_session_count(), now)
+        }
         "close_terminal" => ctx.governor.check_destructive(now),
         "send_keys" if keys_are_kill_style(args) => ctx.governor.check_destructive(now),
         _ => Ok(()),
@@ -4546,6 +4556,12 @@ fn dispatch_with_caller(
         // session — execute directly against tmux (they only act on a `th_*`
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args),
+        // Create Orchestrator (Option B): the atomic one-click commission. Resolves
+        // the cortana singleton and adopts (Case A) / re-spawn-resumes (Case B) /
+        // cold-starts (Case C) a control-tier orchestrator in the canonical home,
+        // never duplicating. ProcessChanging: it spawns (Case B/C), so it inherits the
+        // spawn governor + confirmation tier; Case A is a pure adopt (no spawn).
+        "commission_orchestrator" => commission_orchestrator(ctx, args),
         // comms-plane Phase 1: `send_text`/`send_keys` are DEMOTED to audited
         // break-glass. They still execute (H2: demote, not deny) but every use is
         // marked loudly, because the primary automation path is now the plane
@@ -6231,6 +6247,338 @@ fn release_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         "seq": snap.seq,
         "captains": snap.captains,
     }))
+}
+
+// ---- Create Orchestrator (persistent canonical singleton) -------------------
+//
+// One backend command (`commission_orchestrator`) that resolves the reserved
+// `cortana` registry record and branches idempotently so the general gets a
+// fully-working, control-capable orchestrator from ONE UI action, never a
+// duplicate. See reviews/orchestrator-provisioning-design-2026-07-11.md (Option
+// B). The four layers a working orchestrator needs are all birth properties of
+// the session, satisfied here in the canonical home:
+//   L1 ROLE       = `claim_captain role:cortana`
+//   L2 MCP TOOLS  = `provision_orchestrator_home` (.mcp.json + settings.local.json)
+//   L3 CONTROL    = the control-tier spawn (`capability:"control"`)
+//   L4 MEMORY     = `startupCommand = claude --resume <uuid>` (cwd-keyed transcript)
+
+/// The canonical orchestrator home: `~/.t-hub/orchestrator` (override with
+/// `T_HUB_ORCHESTRATOR_HOME` for tests / dev-isolation). Mirrors [`captains_path`]'s
+/// home resolution so the Windows-home-under-WSL case is handled identically. The
+/// orchestrator is the apex SINGLETON with exactly ONE home, which also sidesteps
+/// the raw-session adoption gap by construction (always an app-spawned `th_*` in a
+/// known dir).
+pub fn orchestrator_home() -> PathBuf {
+    if let Ok(p) = std::env::var("T_HUB_ORCHESTRATOR_HOME") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".t-hub").join("orchestrator")
+}
+
+/// Resolve the `t-hub-mcp` binary the provisioned `.mcp.json` points `claude` at.
+/// `T_HUB_MCP_BIN` wins (the shell script's override, and how a packaged sidecar
+/// repoints it - `captain-self-register-provisioning`); otherwise the bare name
+/// `t-hub-mcp` (resolved on the launched shell's PATH). NOTE: a fresh cold-start on a
+/// machine where the binary is not on PATH needs `T_HUB_MCP_BIN` set - a disclosed
+/// packaged-deploy follow-up (design assumption #6.2). Provisioning is NON-CLOBBERING
+/// (below), so an existing working `.mcp.json` command path is always preserved.
+fn orchestrator_mcp_bin() -> String {
+    std::env::var("T_HUB_MCP_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "t-hub-mcp".to_string())
+}
+
+/// Fold the `ensure-thub-mcp.sh` provisioning into the backend so Layer 2 (the MCP
+/// tools) is guaranteed before the orchestrator session is born. Idempotent: an
+/// existing `.mcp.json` that already registers `t-hub` keeps its command path
+/// untouched (never overwrite the general's live, working home), and
+/// `settings.local.json` is MERGED append-only (existing entries kept) EXCEPT
+/// `permissions.defaultMode`, which is force-set to `bypassPermissions` - this
+/// dedicated singleton home must run unblocked to drive the fleet (matching the shell
+/// script). Writes:
+///   - `<home>/.mcp.json`               : registers the t-hub MCP server (absolute/PATH bin)
+///   - `<home>/.claude/settings.local.json`: enables it + grants fleet permissions
+fn provision_orchestrator_home(home: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(home)
+        .map_err(|e| format!("commission_orchestrator: failed to create {home:?}: {e}"))?;
+
+    // --- .mcp.json (register the t-hub server; preserve an existing t-hub entry) ---
+    let mcp_path = home.join(".mcp.json");
+    let mut mcp: serde_json::Map<String, Value> = std::fs::read_to_string(&mcp_path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Map<String, Value>>(&body).ok())
+        .unwrap_or_default();
+    let servers = mcp
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let has_thub = servers
+        .as_object()
+        .and_then(|o| o.get("t-hub"))
+        .and_then(|t| t.get("command"))
+        .and_then(|c| c.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !has_thub {
+        if let Some(obj) = servers.as_object_mut() {
+            obj.insert(
+                "t-hub".to_string(),
+                json!({ "command": orchestrator_mcp_bin(), "args": [], "env": {} }),
+            );
+        }
+        let body = serde_json::to_string_pretty(&Value::Object(mcp)).unwrap_or_default();
+        std::fs::write(&mcp_path, format!("{body}\n"))
+            .map_err(|e| format!("commission_orchestrator: failed to write {mcp_path:?}: {e}"))?;
+    }
+
+    // --- .claude/settings.local.json (enable the server + fleet permissions) ---
+    let claude_dir = home.join(".claude");
+    std::fs::create_dir_all(&claude_dir)
+        .map_err(|e| format!("commission_orchestrator: failed to create {claude_dir:?}: {e}"))?;
+    let settings_path = claude_dir.join("settings.local.json");
+    let mut settings: serde_json::Map<String, Value> = std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Map<String, Value>>(&body).ok())
+        .unwrap_or_default();
+    // enabledMcpjsonServers: ensure "t-hub" present.
+    let enabled = settings
+        .entry("enabledMcpjsonServers".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(arr) = enabled.as_array_mut() {
+        if !arr.iter().any(|v| v.as_str() == Some("t-hub")) {
+            arr.push(json!("t-hub"));
+        }
+    }
+    // permissions.defaultMode = bypassPermissions + allow the drive-a-terminal tools.
+    // `defaultMode` is FORCE-SET (not preserved): this is the orchestrator's DEDICATED
+    // singleton home and it must run unblocked to drive the fleet - matching
+    // `ensure-thub-mcp.sh`. Everything else here is append-only (existing entries kept).
+    let perms = settings
+        .entry("permissions".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(perms) = perms.as_object_mut() {
+        perms.insert("defaultMode".to_string(), json!("bypassPermissions"));
+        let allow = perms
+            .entry("allow".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(arr) = allow.as_array_mut() {
+            for tool in [
+                "mcp__t-hub__send_text",
+                "mcp__t-hub__spawn_terminal",
+                "mcp__t-hub__send_keys",
+            ] {
+                if !arr.iter().any(|v| v.as_str() == Some(tool)) {
+                    arr.push(json!(tool));
+                }
+            }
+        }
+    }
+    let body = serde_json::to_string_pretty(&Value::Object(settings)).unwrap_or_default();
+    std::fs::write(&settings_path, format!("{body}\n")).map_err(|e| {
+        format!("commission_orchestrator: failed to write {settings_path:?}: {e}")
+    })?;
+    Ok(())
+}
+
+/// Single-quote a string for safe embedding as ONE `sh` word (the `'\''` idiom).
+/// Used to carry the Case-C kickoff prompt as a single `claude` argument.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The default Case-C (cold-start) kickoff: launch `claude` with an initial prompt
+/// that makes the fresh session load the `fleet-orchestrator` skill and act as the
+/// orchestrator. DP4: the skill is user-invocable, NOT auto-loaded on `claude`
+/// launch, so the cold start must carry an explicit kickoff (unlike Case B, which
+/// rides `--resume` into an already-oriented transcript). The caller may override
+/// via the `kickoff` arg.
+const ORCHESTRATOR_FRESH_KICKOFF: &str = "You are Cortana, the T-Hub fleet orchestrator. \
+     Invoke the fleet-orchestrator skill now and take command of the fleet.";
+
+/// Build the orchestrator's `startupCommand` and the case label from the resume
+/// anchor. WITH a `claude_uuid` (Case B) it is `claude --resume <uuid>` -> the
+/// existing transcript + memory; WITHOUT one (Case C cold start) it is `claude
+/// <kickoff>` with the fleet-orchestrator kickoff (or a caller override). Pure +
+/// testable (the spawn itself launches `claude`, so this decision is unit-tested in
+/// isolation). The UUID is a plain identifier (no quoting); the kickoff is a single
+/// shell-quoted `claude` argument.
+fn orchestrator_startup(claude_uuid: Option<&str>, kickoff: Option<String>) -> (String, &'static str) {
+    match claude_uuid {
+        Some(uuid) => (format!("claude --resume {uuid}"), "resume"),
+        None => {
+            let kickoff = kickoff
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| ORCHESTRATOR_FRESH_KICKOFF.to_string());
+            (format!("claude {}", sh_quote(&kickoff)), "fresh")
+        }
+    }
+}
+
+/// `commission_orchestrator` (ProcessChanging, audited): the atomic one-click flow.
+/// Resolves the reserved `cortana` registry record and branches idempotently:
+///   - CASE A (record -> LIVE, control-capable session): ADOPT, no spawn.
+///   - CASE B (record Orphaned/dead OR live-but-stale-token, has `claude_uuid`):
+///     provision the home, spawn ONE control-tier `th_*` in it with
+///     `startupCommand = claude --resume <uuid>`, `claim_captain role:cortana`
+///     (rebinds the record, preserving the resume anchor), retire the prior tile.
+///   - CASE C (no record): same as B but a fresh fleet-orchestrator kickoff; the
+///     claim CREATES the record.
+///
+/// SINGLETON GUARD: a live control-capable orchestrator always resolves to Case A
+/// (focus, never duplicate). `forceRespawn:true` forces the B/C path (the restart
+/// stale-token repair / power-user re-key). The frontend applies the returned
+/// `terminalId` via `setOrchestratorId` + focuses it; a spawned tile is placed by
+/// the shared `spawn_terminal` apply path exactly like any spawn.
+fn commission_orchestrator(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let force_respawn = args
+        .get("forceRespawn")
+        .or_else(|| args.get("force_respawn"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Resolve the Cortana singleton (role-keyed, not slug-keyed - the apex invariant).
+    let record = ctx
+        .captains
+        .snapshot()
+        .captains
+        .into_iter()
+        .find(|c| c.role == FleetRole::Cortana);
+
+    // CASE A: the record points at a LIVE session whose baked control token is still
+    // valid (its `T_HUB_CONTROL_ADDR` matches this launch's addr). A stale token
+    // (session survived an app restart that rotated the endpoint) is NOT Case A - it
+    // falls through to a control-tier re-spawn (DP1=B) so the crown is never over a
+    // BLIND orchestrator.
+    if !force_respawn {
+        if let Some(rec) = &record {
+            if let Some(tid) = &rec.terminal_id {
+                let target = tmux_target(tid);
+                if matches!(tmux::session_liveness(&target), tmux::SessionLiveness::Alive)
+                    && orchestrator_token_is_fresh(ctx, &target)
+                {
+                    return Ok(json!({
+                        "accepted": "commission_orchestrator",
+                        "audited": true,
+                        "case": "adopt",
+                        "terminalId": tid,
+                        "claudeUuid": rec.claude_uuid,
+                        "spawned": false,
+                        "note": "a live, control-capable orchestrator already exists; \
+                                 adopting it (no duplicate spawned).",
+                    }));
+                }
+            }
+        }
+    }
+
+    // CASE B / C: provision the canonical home, then spawn a control-tier session.
+    let home = orchestrator_home();
+    provision_orchestrator_home(&home)?;
+    let home_str = home.to_string_lossy().into_owned();
+
+    // The prior embodiment to retire (a dead ghost in Case B, or a live-but-stale
+    // session in the restart-repair / forceRespawn path).
+    let prior_terminal = record.as_ref().and_then(|r| r.terminal_id.clone());
+    // Layer 4: resume the existing transcript when we have an anchor (Case B), else a
+    // fresh cold-start kickoff (Case C, DP4).
+    let claude_uuid = record.as_ref().and_then(|r| r.claude_uuid.clone());
+    let kickoff = arg_str(args, "kickoff")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let (startup, case) = orchestrator_startup(claude_uuid.as_deref(), kickoff);
+
+    // RETIRE-PRIOR *BEFORE* the claim (H1). The DP1=B restart case survives the app
+    // (tmux is independent), so the `cortana` record is still `Active` pointing at a
+    // LIVE session - just one whose baked control token went stale. If we claimed the
+    // new tile while that live incumbent still held the role, `claim_captain` would hit
+    // the "already captained by a LIVE session - release_captain it first" refusal
+    // (registry.claim's Active-incumbent + `Some(false)` death-probe arm) and error
+    // out, leaving the freshly-spawned tile unclaimed + unretired: a duplicate + an
+    // error, the exact 3-tile mess this design eliminates. So we close the prior FIRST:
+    // `close_terminal` marks the record `Orphaned` (terminal_id=None) via
+    // `remove_session`, which turns the subsequent claim into a clean `ReadoptedOrphan`
+    // rebind that PRESERVES the resume anchor (claim overwrites `claude_uuid` only when
+    // the presented value is Some, and a fresh session has none yet). Closing BEFORE the
+    // spawn also means a genuine close failure aborts here - we never leak a new tile.
+    // force:true reaps a dead ghost (`already_gone`) or a live-but-stale session (MED-1
+    // force escape) alike; the registry-record scrub of truly-dead ghosts backfills when
+    // reap-ship lands (DP5 TODO seam).
+    let mut retired_prior: Option<String> = None;
+    if let Some(prior) = &prior_terminal {
+        close_terminal(ctx, &json!({ "sessionId": prior, "force": true })).map_err(|e| {
+            format!(
+                "commission_orchestrator: failed to retire the prior orchestrator tile \
+                 '{prior}' before re-commission (refusing to spawn a duplicate): {e}"
+            )
+        })?;
+        retired_prior = Some(prior.clone());
+    }
+
+    // Layer 3 (control-tier) + Layer 2 (cwd == provisioned home) + Layer 4 (resume/
+    // kickoff) all satisfied by this one spawn. Reuse the shared `spawn_terminal` so
+    // the tile is minted, verified live, and placed by the same ApplySink adoption
+    // path every spawn uses.
+    let spawn_args = json!({
+        "cwd": home_str,
+        "name": "Cortana",
+        "capability": "control",
+        "startupCommand": startup,
+    });
+    let spawn_res = spawn_terminal(ctx, &spawn_args)?;
+    let new_id = spawn_res
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("commission_orchestrator: spawn_terminal returned no id")?
+        .to_string();
+
+    // Layer 1: claim the Cortana role for the new tile. With the prior now retired the
+    // record is `Orphaned`/absent, so this is a `ReadoptedOrphan` (or `Created` on cold
+    // start) that PRESERVES the resume anchor - never the live-incumbent refusal (H1).
+    let claim_res = claim_captain(
+        ctx,
+        &json!({ "captainSessionId": new_id, "role": "cortana", "shipSlug": CORTANA_SLUG }),
+    )?;
+    let disposition = claim_res
+        .get("disposition")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Ok(json!({
+        "accepted": "commission_orchestrator",
+        "audited": true,
+        "case": case,
+        "terminalId": new_id,
+        "claudeUuid": claude_uuid,
+        "spawned": true,
+        "cwd": home_str,
+        "disposition": disposition,
+        "retiredPriorId": retired_prior,
+        "provisioned": true,
+        "note": "commissioned a control-tier orchestrator in the canonical home \
+                 (provisioned MCP + resume/kickoff + cortana claim); prior tile retired.",
+    }))
+}
+
+/// Whether a live orchestrator session's baked control token is still valid for THIS
+/// launch: its `T_HUB_CONTROL_ADDR` (set at spawn via tmux `-e`) must equal the
+/// currently-bound control addr. A mismatch means the session survived an app restart
+/// that rotated the endpoint (`control-endpoint-rotates-on-restart`), so its capability
+/// is stale (DP1=B). Fails SAFE toward adopt: when the addr is unreadable/absent (can't
+/// prove staleness) or headless (`ctx.addr` empty), we do NOT force a re-spawn that
+/// would needlessly reload the transcript and kill a possibly-working session.
+fn orchestrator_token_is_fresh(ctx: &ControlContext, target: &str) -> bool {
+    if ctx.addr.is_empty() {
+        return true;
+    }
+    match tmux::session_env(target, "T_HUB_CONTROL_ADDR") {
+        Some(addr) => addr == ctx.addr,
+        None => true,
+    }
 }
 
 /// Parse the `scope` argument of `watch_fleet` into a [`crate::fleet::WatchScope`].
@@ -12170,5 +12518,223 @@ mod tests {
         let _ = release_tx.send(());
         writer.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Create Orchestrator (commission_orchestrator)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn orchestrator_home_defaults_under_dot_thub() {
+        // The canonical home is `<home>/.t-hub/orchestrator` (the reserved singleton
+        // dir). We assert the suffix rather than the absolute prefix so the test is
+        // host-agnostic.
+        let home = orchestrator_home();
+        assert!(
+            home.ends_with(".t-hub/orchestrator") || home.ends_with(".t-hub\\orchestrator"),
+            "unexpected orchestrator home: {home:?}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_startup_resume_vs_fresh_kickoff() {
+        // Case B (has anchor): resume the transcript verbatim, no quoting on the uuid.
+        let (cmd, case) = orchestrator_startup(Some("138adaa9-uuid"), None);
+        assert_eq!(case, "resume");
+        assert_eq!(cmd, "claude --resume 138adaa9-uuid");
+        // Case C (no anchor): fresh kickoff, shell-quoted as ONE claude argument, and
+        // it invokes the fleet-orchestrator skill (DP4: not auto-loaded on launch).
+        let (cmd, case) = orchestrator_startup(None, None);
+        assert_eq!(case, "fresh");
+        assert!(cmd.starts_with("claude '"), "got: {cmd}");
+        assert!(cmd.contains("fleet-orchestrator skill"), "got: {cmd}");
+        // A caller-supplied kickoff overrides the default.
+        let (cmd, _) = orchestrator_startup(None, Some("do the thing".to_string()));
+        assert_eq!(cmd, "claude 'do the thing'");
+        // No double quotes anywhere (same wsl.exe round-trip hazard as pane_command).
+        assert!(!cmd.contains('"'), "startup must be double-quote-free: {cmd}");
+    }
+
+    #[test]
+    fn provision_orchestrator_home_writes_idempotent_and_non_clobbering() {
+        let dir = std::env::temp_dir().join(format!("t-hub-orch-prov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // First provision: writes .mcp.json (t-hub server) + settings.local.json.
+        provision_orchestrator_home(&dir).unwrap();
+        let mcp: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+        assert!(
+            mcp["mcpServers"]["t-hub"]["command"].is_string(),
+            "mcp registers t-hub: {mcp}"
+        );
+        let settings: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".claude/settings.local.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
+        assert!(settings["enabledMcpjsonServers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "t-hub"));
+        assert!(settings["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "mcp__t-hub__spawn_terminal"));
+
+        // NON-CLOBBERING: hand-write a custom t-hub command, re-provision, assert it
+        // is PRESERVED (never overwrite the general's live, working home).
+        std::fs::write(
+            dir.join(".mcp.json"),
+            r#"{"mcpServers":{"t-hub":{"command":"/custom/t-hub-mcp","args":[],"env":{}}}}"#,
+        )
+        .unwrap();
+        provision_orchestrator_home(&dir).unwrap();
+        let mcp2: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(
+            mcp2["mcpServers"]["t-hub"]["command"], "/custom/t-hub-mcp",
+            "an existing t-hub command path must be preserved (idempotent, non-clobbering)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commission_orchestrator_case_a_adopts_a_live_one_without_duplicating() {
+        // The core singleton guarantee: with a live, control-capable orchestrator
+        // already claimed, a commission ADOPTS it (case "adopt", no new spawn) instead
+        // of minting a duplicate tile (the 3-tile mess this design eliminates). We seed
+        // it with a plain-shell session (no `claude`) so the test never launches claude;
+        // ctx.addr is empty (headless), so the stale-token check passes (adopt).
+        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let ctx = test_ctx("t").with_apply_sink(sink);
+        let spawn = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap();
+        let id = spawn["id"].as_str().unwrap().to_string();
+        dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({"captainSessionId": id, "role": "cortana"}),
+        )
+        .unwrap();
+
+        let v = dispatch(&ctx, "commission_orchestrator", &json!({})).unwrap();
+        assert_eq!(v["accepted"], "commission_orchestrator");
+        assert_eq!(v["case"], "adopt", "a live orchestrator is adopted, not duplicated");
+        assert_eq!(v["terminalId"], id);
+        assert_eq!(v["spawned"], false);
+
+        // Reap the seeded session.
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+    }
+
+    #[test]
+    fn commission_orchestrator_is_process_changing_tier() {
+        // It spawns (Case B/C), so it must sit in the ProcessChanging tier (control
+        // token + spawn governor), never fall through to the read tier.
+        assert_eq!(
+            required_tier("commission_orchestrator"),
+            CommandTier::ProcessChanging
+        );
+    }
+
+    #[test]
+    fn orchestrator_token_is_fresh_detects_a_rotated_endpoint() {
+        // The DP1=B stale-token detector: a session's baked T_HUB_CONTROL_ADDR is
+        // compared to the CURRENT launch addr. Equal => fresh (adopt); different => the
+        // endpoint rotated on an app restart, so the baked control capability is stale
+        // (fall through to a control-tier re-spawn). Empty ctx.addr => fail-safe adopt.
+        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let mut ctx = test_ctx("t").with_apply_sink(sink);
+        ctx.addr = "127.0.0.1:4242".to_string();
+        // The spawn bakes T_HUB_CONTROL_ADDR == the current ctx.addr into the session.
+        let spawn = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap();
+        let id = spawn["id"].as_str().unwrap().to_string();
+        let target = tmux_target(&id);
+        assert!(
+            orchestrator_token_is_fresh(&ctx, &target),
+            "a session whose baked addr matches the current launch is fresh (adopt)"
+        );
+        // Rotate the endpoint (simulate an app restart): the baked addr no longer
+        // matches, so the surviving session's control token is stale.
+        ctx.addr = "127.0.0.1:9999".to_string();
+        assert!(
+            !orchestrator_token_is_fresh(&ctx, &target),
+            "a rotated endpoint makes the surviving session's baked token stale"
+        );
+        // Fail-safe: an empty ctx.addr (headless) never forces a needless respawn.
+        ctx.addr = String::new();
+        assert!(
+            orchestrator_token_is_fresh(&ctx, &target),
+            "an empty ctx.addr fails safe toward adopt"
+        );
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+    }
+
+    #[test]
+    fn commission_close_prior_before_claim_avoids_the_live_incumbent_refusal_and_keeps_uuid() {
+        // H1: the DP1=B restart case survives the app with the `cortana` record still
+        // ACTIVE pointing at a LIVE (but stale-token) session. This proves the fix -
+        // close-the-prior-BEFORE-claim - at the exact registry seam the commission uses,
+        // without launching claude (the full commission's spawn would).
+        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let ctx = test_ctx("t").with_apply_sink(sink);
+
+        // A live prior orchestrator session, claimed cortana WITH a resume anchor.
+        let old = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap();
+        let id_old = old["id"].as_str().unwrap().to_string();
+        ctx.captains
+            .claim(
+                &id_old,
+                Some("cortana"),
+                FleetRole::Cortana,
+                Some("uuid-keep"),
+                vec![],
+                &|_| false,
+            )
+            .unwrap();
+
+        // The replacement session (as the commission spawns it).
+        let new = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap();
+        let id_new = new["id"].as_str().unwrap().to_string();
+
+        // THE BUG (claim BEFORE retiring the live incumbent): the server refuses to
+        // seize the role off a live session - the exact error that leaked a duplicate.
+        let err = claim_captain(
+            &ctx,
+            &json!({"captainSessionId": id_new, "role": "cortana", "shipSlug": CORTANA_SLUG}),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("already captained by a LIVE session"),
+            "claiming over a live incumbent must refuse (why close-first is needed): {err}"
+        );
+
+        // THE FIX (close prior FIRST): the record drops to Orphaned, so the claim is a
+        // clean ReadoptedOrphan that PRESERVES the resume anchor.
+        close_terminal(&ctx, &json!({"sessionId": id_old, "force": true})).unwrap();
+        let claim = claim_captain(
+            &ctx,
+            &json!({"captainSessionId": id_new, "role": "cortana", "shipSlug": CORTANA_SLUG}),
+        )
+        .unwrap();
+        assert_eq!(claim["disposition"], "readopted_orphan");
+        let rec = ctx
+            .captains
+            .snapshot()
+            .captains
+            .into_iter()
+            .find(|c| c.role == FleetRole::Cortana)
+            .unwrap();
+        assert_eq!(rec.terminal_id.as_deref(), Some(id_new.as_str()));
+        assert_eq!(
+            rec.claude_uuid.as_deref(),
+            Some("uuid-keep"),
+            "the resume anchor must survive the close-first re-commission"
+        );
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id_new})).unwrap();
     }
 }
