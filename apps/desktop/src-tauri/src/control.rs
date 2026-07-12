@@ -69,6 +69,16 @@ pub struct ControlRequest {
     /// Command arguments. Shape is per-command; absent ⇒ `null`.
     #[serde(default)]
     pub args: Value,
+    /// Comms-plane Phase 3: the caller's PER-SESSION token (`T_HUB_SESSION_TOKEN`),
+    /// carried ALONGSIDE the tier `token` so the app can resolve WHICH session (in what
+    /// role, on what ship) is calling and enforce the enqueue/access ACLs against an
+    /// unforgeable-across-sessions identity (`identity.rs` mint/bind/resolve). Absent for
+    /// the trusted control-token HOST (the app's own webview / MCP / fleet wake), which
+    /// never minted a session token; those callers resolve to no identity and the
+    /// cross-ship ACL FAILS OPEN for them (the NORM-now / LAW-target staging, §2.6).
+    /// `#[serde(default)]` so every pre-Phase-3 client keeps working unchanged.
+    #[serde(default)]
+    pub session: String,
     /// Wire protocol version the client speaks (server-split M2b). Absent for the
     /// MCP / any legacy client (then unchecked, for backward compatibility); when
     /// present it must be `<=` [`PROTOCOL_VERSION`] or the server rejects the request.
@@ -2179,6 +2189,11 @@ pub struct ControlContext {
     /// queues. Persistent (`~/.t-hub/inbox/`); an ephemeral in-memory one in headless
     /// tests.
     inbox: Arc<crate::inbox::Inbox>,
+    /// Comms-plane Phase 3: the delegation-gate carrier store (durable general-
+    /// authorization artifacts). Shared `Arc` so the `authorize` record path and the
+    /// `check_authorization` resolve-and-verify gate (a captain's money/publish consult)
+    /// reach one store. Persistent (`authorizations.json`); ephemeral in headless tests.
+    authz: Arc<crate::authz::AuthzStore>,
 }
 
 impl ControlContext {
@@ -3385,7 +3400,11 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "send_text" | "send_keys" | "close_terminal" => {
+        "spawn_terminal" | "send_text" | "send_keys" | "close_terminal"
+        // comms-plane Phase 3: `abort_session` interrupts a running process (like
+        // send_keys/close) and `plane_admin` purges durable queues - both are
+        // process/state-changing and control-gated + audited.
+        | "abort_session" | "plane_admin" => {
             CommandTier::ProcessChanging
         }
         "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
@@ -3397,18 +3416,28 @@ fn required_tier(command: &str) -> CommandTier {
         // through to the read tier - it needs the control capability AND the audit a
         // mutating, non-spawn command gets (like `create_worktree`).
         //
-        // item-3 §2.4.1: `inbox_ack` STAYS Organization. Lowering it to a scoped-Read
-        // self-ack is UNSAFE until a session-token-on-request substrate exists (the
-        // `ControlRequest` carries no session identity, `inbox_ack` trusts the
-        // caller-supplied `sessionId`, and every crew presents the same read token -
-        // so scoped-Read would be cross-session spoofable, STRICTLY WORSE than this
-        // Organization gate). Ledger row 17 is LAW-TARGET; the crew ack loop is
-        // completed by a control-capable relay until the substrate lands.
+        // item-3 §2.4.1: `inbox_ack`'s BASE tier STAYS Organization - the host/relay
+        // ack-on-behalf path needs the control capability, and a non-self-ack still does.
+        // comms-plane Phase 3 (§2.4.1) then RETIRES the interim price: the session-token-
+        // on-request substrate now lands the caller's identity on the wire, so a SELF-ack
+        // (the caller's own session token resolves to the recipient tile) is admitted at
+        // READ via a proven-self-ack bypass in `dispatch_authenticated`, and `can_ack`
+        // re-checks ownership in the handler. The cross-session spoof the old
+        // Organization gate feared is closed by per-session identity, not re-opened - the
+        // crew ack loop no longer needs a control-capable relay. Ledger row 17: LAW-now.
         //
         // `inbox_status`'s BASE tier is Read (genuinely counts-only), but item-3 §2.4
         // refines it by SCOPE in [`effective_tier`]: an unscoped fleet-wide
         // enumeration is Organization.
-        | "inbox_ack" => CommandTier::Organization,
+        | "inbox_ack"
+        // comms-plane Phase 3: `authorize` records a durable governance artifact
+        // (mutating, audited); only the general originates (enforced by the handler ACL).
+        | "authorize" => CommandTier::Organization,
+        // comms-plane Phase 3: `plane_send` is Read base tier so an identified CREW
+        // (least-privilege read token) can send up to its captain; the handler REQUIRES a
+        // resolved session identity (or a Full host) and the `can_message` ACL is the real
+        // wall. `check_authorization` is a read-only resolve-and-verify consult.
+        // (Every other command's tier is its default Read.)
         _ => CommandTier::Read,
     }
 }
@@ -3550,6 +3579,98 @@ pub fn resolve_identity(ctx: &ControlContext, presented: &str) -> Option<Resolve
         ship_slug,
         fleet_role,
         claude_uuid,
+    })
+}
+
+/// Map a [`ResolvedIdentity`] into the [`crate::acl::AclActor`] the Phase-3 ACL keys on.
+/// The effective role prefers the registry-authoritative FLEET role (a supervisor
+/// terminal is a Captain/Cortana) and falls back to the mint-time role (Crew/General).
+fn acl_actor(id: &ResolvedIdentity) -> crate::acl::AclActor {
+    use crate::acl::AclRole;
+    let role = match id.fleet_role {
+        Some(FleetRole::Cortana) => AclRole::Cortana,
+        Some(FleetRole::Captain) => AclRole::Captain,
+        None => match id.mint_role {
+            crate::identity::Role::General => AclRole::General,
+            crate::identity::Role::Cortana => AclRole::Cortana,
+            crate::identity::Role::Captain => AclRole::Captain,
+            crate::identity::Role::Crew => AclRole::Crew,
+            crate::identity::Role::Unknown => AclRole::Unknown,
+        },
+    };
+    crate::acl::AclActor {
+        role,
+        ship: id.ship_slug.clone(),
+        tile: id.tile.clone(),
+        session_id: id.session_id.clone(),
+    }
+}
+
+/// Resolve a TARGET tile's [`crate::acl::ShipRef`] from the captains registry (the
+/// access/abort target's ship membership). An unregistered tile is `Unowned` - nothing
+/// to isolate.
+fn target_ship_ref(ctx: &ControlContext, tile: &str) -> crate::acl::ShipRef {
+    match ctx.captains.ship_of(tile) {
+        Some(ShipMembership::Supervisor { ship_slug, .. }) => {
+            crate::acl::ShipRef::Supervisor { ship: ship_slug }
+        }
+        Some(ShipMembership::Crew { ship_slug }) => crate::acl::ShipRef::Crew { ship: ship_slug },
+        None => crate::acl::ShipRef::Unowned,
+    }
+}
+
+/// The recipient's [`crate::acl::MessageTarget`] (role + ship) for the send ACL, from
+/// the captains registry. An unregistered recipient tile is `Unknown`/no-ship.
+fn message_target(ctx: &ControlContext, tile: &str) -> crate::acl::MessageTarget {
+    use crate::acl::AclRole;
+    match ctx.captains.ship_of(tile) {
+        Some(ShipMembership::Supervisor { ship_slug, role }) => crate::acl::MessageTarget {
+            role: match role {
+                FleetRole::Cortana => AclRole::Cortana,
+                FleetRole::Captain => AclRole::Captain,
+            },
+            ship: Some(ship_slug),
+        },
+        Some(ShipMembership::Crew { ship_slug }) => crate::acl::MessageTarget {
+            role: AclRole::Crew,
+            ship: Some(ship_slug),
+        },
+        None => crate::acl::MessageTarget {
+            role: AclRole::Unknown,
+            ship: None,
+        },
+    }
+}
+
+/// The cross-ship isolation gate on a READ/WRITE session handler (§2.6 H3, the one
+/// mechanization add). FAIL-OPEN for the trusted control-token host (`caller == None` -
+/// the app's own webview / MCP / fleet wake presented no per-session token): those
+/// callers are unconstrained (NORM-now). For an IDENTIFIED session, enforce
+/// [`crate::acl::can_access_session`] against the target tile's ship, refusing +
+/// attributing a cross-ship reach.
+fn enforce_session_access(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    target_tile: &str,
+) -> Result<(), String> {
+    let Some(id) = caller else { return Ok(()) };
+    let actor = acl_actor(id);
+    let target = target_ship_ref(ctx, target_tile);
+    crate::acl::can_access_session(&actor, &target).map_err(|d| {
+        // Attribute the denial in the audit/governor stream so a refused cross-ship
+        // reach is never a silent drop.
+        ctx.fanout.emit_event(
+            "control://acl",
+            &json!({
+                "cell": "cross-ship-isolation",
+                "decision": "refused",
+                "session": actor.session_id.as_str(),
+                "role": actor.role.label(),
+                "target": target_tile,
+                "reason": d.reason.as_str(),
+            }),
+        );
+        format!("acl: {}", d.reason)
     })
 }
 
@@ -3858,14 +3979,36 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         return ControlResponse::err("unauthorized: bad control token");
     };
 
+    // Comms-plane Phase 3: resolve the caller's PER-SESSION identity from the session
+    // token carried on the request (`req.session`), if any. IDENTIFICATION only
+    // (`resolve_identity` is not authorization); the per-command ACL wiring consumes it.
+    // A control-token HOST (no session token) resolves to `None`.
+    let caller = resolve_identity(ctx, &req.session);
+
     // item-3 §2.4: the effective tier is args-refined - an UNSCOPED `inbox_status`
     // (fleet-wide enumeration) is Organization even though its base tier is Read.
     let tier = effective_tier(&req.command, &req.args);
 
+    // Comms-plane Phase 3 (§2.4.1): the inbox-ack SELF-SCOPE upgrade retires the interim
+    // "ack stays Organization; a control-capable relay carries it" price (PR-56/#59) now
+    // that the per-session token lands the caller's identity on the wire. A session that
+    // presents a valid token resolving to the recipient's OWN tile may self-ack even with
+    // a bare READ token (the crew ack loop, no relay needed). The tier refusal below is
+    // bypassed ONLY for this proven self-ack; a cross-session ack still needs the control
+    // capability (the host/relay path) and is re-checked by `can_ack` in the handler.
+    let inbox_self_ack = req.command == "inbox_ack"
+        && caller
+            .as_ref()
+            .zip(
+                arg_str(&req.args, "sessionId").or_else(|| arg_str(&req.args, "session_id")),
+            )
+            .map(|(id, recipient)| id.tile.as_deref() == Some(recipient.as_str()))
+            .unwrap_or(false);
+
     // Phase 2 capability gate: the presented token's capability must cover the
     // command's required tier. The read token authorizes Read only; Organization
     // and ProcessChanging require the control token.
-    if !cap.allows(tier) {
+    if !cap.allows(tier) && !inbox_self_ack {
         let message = format!(
             "unauthorized: '{}' requires the control capability (this token is read-only)",
             req.command
@@ -3959,8 +4102,10 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     }
 
     // Dispatch, then record the outcome under the requestId (if any) so a later
-    // retry replays exactly this result. `finish` returns the outcome back.
-    let outcome = dispatch(ctx, &req.command, &req.args);
+    // retry replays exactly this result. `finish` returns the outcome back. The caller
+    // identity resolved above is threaded in so the per-command ACL wiring can enforce
+    // the enqueue/access/ack cells against an unforgeable-across-sessions identity.
+    let outcome = dispatch_with_caller(ctx, &req.command, &req.args, caller.as_ref(), cap);
     let outcome = match &request_id {
         Some(id) => ctx.requests.finish(id, outcome),
         None => outcome,
@@ -4206,7 +4351,26 @@ fn rebind_control(ctx: &ControlContext) -> Result<Value, String> {
     }))
 }
 
+/// The 3-arg dispatcher used by the in-file unit tests (a control-token HOST with no
+/// per-session caller: `None` identity + `Full` capability - the fail-open path the ACL
+/// treats as the trusted host). The authenticated production path calls
+/// [`dispatch_with_caller`] directly with the resolved caller. Kept so the ~90 existing
+/// dispatch tests read unchanged; the Phase-3 ACL tests call `dispatch_with_caller`.
+#[cfg(test)]
 fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, String> {
+    dispatch_with_caller(ctx, command, args, None, Capability::Full)
+}
+
+fn dispatch_with_caller(
+    ctx: &ControlContext,
+    command: &str,
+    args: &Value,
+    // Comms-plane Phase 3: the resolved per-session caller (`None` = a control-token
+    // host that presented no session token), and its resolved tier capability. The ACL
+    // wiring for the enqueue/access/ack cells consumes both.
+    caller: Option<&ResolvedIdentity>,
+    cap: Capability,
+) -> Result<Value, String> {
     match command {
         // ---- Read tier (PRD §11.2: allowed) --------------------------------
         "list_terminals" => list_terminals(),
@@ -4240,7 +4404,7 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // registry the webview reports into, so `list_tabs` stays truthful
         // whichever client is attached.
         "report_workspace_tabs" => report_workspace_tabs(ctx, args),
-        "read_terminal" | "capture_pane" => read_terminal(args),
+        "read_terminal" | "capture_pane" => read_terminal(ctx, args, caller),
         // Comms-plane Phase 2: the durable inbox's read-tier surface. `inbox_ack` is
         // the recipient's `delivered -> processed` intake confirmation (the receipt
         // state machine's ack channel, §2.4 M2); `inbox_status` is the per-recipient
@@ -4248,8 +4412,18 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // recipient's own already-delivered message (idempotent, never a re-write),
         // and status is counts-only. Phase 3 adds the ownership ACL that gates a
         // cross-session ack; Phase 2 does not authorize (no ACLs yet).
-        "inbox_ack" => inbox_ack(ctx, args),
+        "inbox_ack" => inbox_ack(ctx, args, caller, cap),
         "inbox_status" => inbox_status(ctx, args),
+        // Comms-plane Phase 3: the agent-to-agent plane SEND, gated by the settled
+        // matrix message rows (`can_message`) + the EMERGENCY-flag authority
+        // (`can_flag_emergency`). Read base tier so an identified CREW (least-privilege
+        // read token) can send up to its captain; the handler REQUIRES a resolved
+        // session identity (or a Full host) - a bare read token with no session cannot
+        // enqueue.
+        "plane_send" => plane_send(ctx, args, caller, cap),
+        // The resolve-and-verify GATE a captain's money/publish gate consults
+        // (`general_authorization_present`): read-only, Read tier.
+        "check_authorization" => check_authorization(ctx, args),
 
         // ---- Organization tier (PRD §11.2: allowed, audited) ---------------
         // These are surfaced by the MCP server and accepted here, but the
@@ -4316,14 +4490,36 @@ fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, 
         // automation), not these direct writers. `th send` reaches `send_text`, so
         // it inherits the same marker.
         "send_text" => {
+            // Phase 3 (§2.6 H3): break-glass STILL rides the cross-ship isolation ACL -
+            // an identified session may only write a pane on its OWN ship. The host
+            // (webview/MCP, no session token) fails open.
+            if let Some(tile) = arg_str(args, "sessionId").or_else(|| arg_str(args, "session_id")) {
+                enforce_session_access(ctx, caller, &tile)?;
+            }
             mark_break_glass(ctx, "send_text", args);
             send_text(args)
         }
         "send_keys" => {
+            if let Some(tile) = arg_str(args, "sessionId").or_else(|| arg_str(args, "session_id")) {
+                enforce_session_access(ctx, caller, &tile)?;
+            }
             mark_break_glass(ctx, "send_keys", args);
             send_keys(args)
         }
         "close_terminal" => close_terminal(ctx, args),
+        // Comms-plane Phase 3: the ABORT/interrupt-subordinate primitive (§2.7 R-H3). A
+        // preempt CONTROL signal (an Escape interrupt), NOT a queued input message, so it
+        // cannot be typed over or corrupt a draft. Gated by `can_abort` (Cortana->captain,
+        // captain->own crew, general->anyone; cross-ship/sibling DENIED; crew never).
+        "abort_session" => abort_session(ctx, args, caller),
+        // Comms-plane Phase 3: record a durable general-authorization artifact (the
+        // delegation-gate carrier, M1). Gated by `can_originate_authorization` (only the
+        // general ORIGINATES; Cortana may relay by reference, never originate).
+        "authorize" => authorize(ctx, args, caller),
+        // Comms-plane Phase 3: operate-fleet-infra (§2.7 R-L2) - the plane's own
+        // administrative ops (queue purge/flush), gated to the apex fleet-infra owner
+        // (`can_operate_fleet_infra`).
+        "plane_admin" => plane_admin(ctx, args, caller),
 
         // ---- Theme (forwarded by name; parallel track owns the handlers) ----
         "get_theme" | "set_theme" => Err(format!(
@@ -4936,7 +5132,12 @@ fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, St
 /// before delivery / an unknown seq is reported honestly rather than silently
 /// advancing state. Phase 2 does NOT authorize the caller (no ACLs) - Phase 3's
 /// ownership ACL gates a cross-session ack.
-fn inbox_ack(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn inbox_ack(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    cap: Capability,
+) -> Result<Value, String> {
     let recipient = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("inbox_ack requires a 'sessionId' argument")?;
@@ -4944,6 +5145,33 @@ fn inbox_ack(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .get("seq")
         .and_then(|v| v.as_u64())
         .ok_or("inbox_ack requires a numeric 'seq' argument")?;
+    // Phase 3 (§2.4.1): the ownership ACL. A session self-acks ONLY its OWN inbox (its
+    // tile == the recipient key); a control-capable HOST/RELAY (Full) may ack on behalf
+    // (the interim relay path, still supported). A read-token session acking a DIFFERENT
+    // recipient is refused - the cross-session spoof the interim Organization gate feared
+    // is closed by the per-session identity, not re-opened.
+    // A session identity that is NOT the recipient itself may only ack with the control
+    // capability (the host/relay ack-on-behalf path); a Read caller acking someone else's
+    // inbox is refused. No session identity (`None`) only reaches this handler with the
+    // control capability (the tier gate required Organization for a non-self-ack), i.e.
+    // the trusted host/relay - allowed.
+    if let Some(id) = caller {
+        if let Err(d) = crate::acl::can_ack(&acl_actor(id), &recipient) {
+            if cap != Capability::Full {
+                ctx.fanout.emit_event(
+                    "control://acl",
+                    &json!({
+                        "cell": "inbox-ack-self-scope",
+                        "decision": "refused",
+                        "session": id.session_id.as_str(),
+                        "recipient": recipient.as_str(),
+                        "reason": d.reason.as_str(),
+                    }),
+                );
+                return Err(format!("acl: {}", d.reason));
+            }
+        }
+    }
     let outcome = ctx.inbox.ack(&recipient, seq);
     let state = match outcome {
         crate::inbox::AckOutcome::Processed { .. } => "processed",
@@ -4972,10 +5200,288 @@ fn inbox_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     }
 }
 
-fn read_terminal(args: &Value) -> Result<Value, String> {
+/// The attributed `sender` label for a plane message from a resolved identity: the same
+/// `role:id` shape `identity::SessionIdentity::sender_label` produces, so the inbox's
+/// attribution stamp is per-session (not the coarse tier). A host (no session) stamps
+/// the coarse source label.
+fn caller_sender_label(caller: Option<&ResolvedIdentity>) -> String {
+    match caller {
+        Some(id) => format!("{}:{}", acl_actor(id).role.label(), id.session_id),
+        None => "control-host".to_string(),
+    }
+}
+
+/// Parse the requested plane priority. Absent / `"standard"` => Standard; `"emergency"`
+/// => Emergency (the authority to actually SET it is checked separately by
+/// [`crate::acl::can_flag_emergency`] - the field is a REQUEST, the role is the grant).
+fn parse_priority(args: &Value) -> Result<crate::inbox::Priority, String> {
+    match arg_str(args, "priority").as_deref() {
+        None | Some("standard") | Some("Standard") => Ok(crate::inbox::Priority::Standard),
+        Some("emergency") | Some("Emergency") => Ok(crate::inbox::Priority::Emergency),
+        Some(other) => Err(format!(
+            "plane_send: unknown priority '{other}' (expected 'standard' or 'emergency')"
+        )),
+    }
+}
+
+/// Comms-plane Phase 3: the agent-to-agent plane SEND. Enforces the settled matrix
+/// message rows (`can_message`) at enqueue time and the EMERGENCY-flag authority
+/// (`can_flag_emergency`), then enqueues a durable, attributed message. A denied send is
+/// REFUSED + attributed on `control://acl`, never a silent drop. An identified session is
+/// REQUIRED (or a Full-capability host/relay) - a bare read token with no session cannot
+/// enqueue as anyone.
+fn plane_send(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    cap: Capability,
+) -> Result<Value, String> {
+    let recipient = arg_str(args, "recipient")
+        .or_else(|| arg_str(args, "sessionId"))
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("plane_send requires a 'recipient' (recipient tile id) argument")?;
+    let body = arg_str(args, "text")
+        .or_else(|| arg_str(args, "body"))
+        .ok_or("plane_send requires a 'text' argument")?;
+    let enter = args.get("enter").and_then(|v| v.as_bool()).unwrap_or(true);
+    let priority = parse_priority(args)?;
+
+    let refuse = |ctx: &ControlContext, cell: &str, who: &str, reason: &str| -> String {
+        ctx.fanout.emit_event(
+            "control://acl",
+            &json!({
+                "cell": cell,
+                "decision": "refused",
+                "session": who,
+                "recipient": recipient.as_str(),
+                "reason": reason,
+            }),
+        );
+        format!("acl: {reason}")
+    };
+
+    match caller {
+        Some(id) => {
+            let actor = acl_actor(id);
+            let target = message_target(ctx, &recipient);
+            if let Err(d) = crate::acl::can_message(&actor, &target) {
+                return Err(refuse(ctx, "message-send", &actor.session_id, &d.reason));
+            }
+            if priority == crate::inbox::Priority::Emergency {
+                if let Err(d) = crate::acl::can_flag_emergency(&actor) {
+                    return Err(refuse(ctx, "emergency-flag", &actor.session_id, &d.reason));
+                }
+            }
+        }
+        // No session identity: only a Full-capability host/relay (the app / fleet) may
+        // enqueue tokenless; a bare read token with no session is refused (the send
+        // cannot be attributed to any session, so it is not a fail-open case like a read).
+        None => {
+            if cap != Capability::Full {
+                return Err(refuse(
+                    ctx,
+                    "message-send",
+                    "<no-session>",
+                    "plane_send requires a per-session identity (present T_HUB_SESSION_TOKEN)",
+                ));
+            }
+        }
+    }
+
+    let sender = caller_sender_label(caller);
+    match ctx.inbox.enqueue(&recipient, &sender, priority, &body, enter) {
+        Ok(outcome) => Ok(json!({
+            "accepted": "plane_send",
+            "recipient": recipient,
+            "seq": outcome.seq,
+            "priority": priority,
+            "sender": sender,
+        })),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Comms-plane Phase 3: the ABORT/interrupt-subordinate primitive. Delivers an Escape
+/// interrupt (the claude turn-interrupt; the Escape/C-c equivalent) to the target's
+/// runtime - a preempt signal, NOT a queued input message, so it cannot be typed over or
+/// corrupt a human draft. Gated by `can_abort`; an identified caller must own the target
+/// (Cortana->captain, captain->own crew, general->anyone), cross-ship/sibling is DENIED,
+/// and crew have no subordinate to abort. A Full-capability host (no session) acts as the
+/// trusted apex.
+fn abort_session(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+) -> Result<Value, String> {
+    let session_id = arg_str(args, "sessionId")
+        .or_else(|| arg_str(args, "session_id"))
+        .or_else(|| arg_str(args, "target"))
+        .ok_or("abort_session requires a 'sessionId' (target tile id) argument")?;
+
+    if let Some(id) = caller {
+        let actor = acl_actor(id);
+        let target = target_ship_ref(ctx, &session_id);
+        if let Err(d) = crate::acl::can_abort(&actor, &target) {
+            ctx.fanout.emit_event(
+                "control://acl",
+                &json!({
+                    "cell": "abort",
+                    "decision": "refused",
+                    "session": actor.session_id.as_str(),
+                    "role": actor.role.label(),
+                    "target": session_id.as_str(),
+                    "reason": d.reason.as_str(),
+                }),
+            );
+            return Err(format!("acl: {}", d.reason));
+        }
+    }
+    // A Full-capability host with no session identity is the trusted apex (the general
+    // driving the app); allowed. (The coarse ProcessChanging tier already required Full.)
+
+    let target = tmux_target(&session_id);
+    writer_liveness_gate("abort_session", &session_id, &target, tmux::session_liveness(&target))?;
+    // Escape interrupts the current turn (claude's in-turn interrupt) WITHOUT killing the
+    // session or its in-flight state - the C4-safe abort the design calls for.
+    tmux::send_keys(&target, &["Escape"])
+        .map_err(|e| format!("failed to deliver abort interrupt to '{session_id}': {e}"))?;
+    Ok(json!({
+        "accepted": "abort_session",
+        "sessionId": session_id,
+        "target": target,
+        "signal": "Escape",
+        "audited": true,
+    }))
+}
+
+/// Comms-plane Phase 3: record a durable general-authorization artifact (the delegation-
+/// gate carrier, M1). Only the GENERAL may ORIGINATE (`can_originate_authorization`);
+/// Cortana may relay by reference but never originate. The origin is APP-STAMPED from the
+/// resolved identity's role (never sender-supplied), so a captain/crew with a Full token
+/// but a non-general session cannot forge a general authorization.
+fn authorize(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+) -> Result<Value, String> {
+    let Some(id) = caller else {
+        return Err(
+            "authorize requires a per-session identity resolving to the GENERAL role \
+             (only the general originates an authorization)"
+                .to_string(),
+        );
+    };
+    let actor = acl_actor(id);
+    if let Err(d) = crate::acl::can_originate_authorization(&actor) {
+        ctx.fanout.emit_event(
+            "control://acl",
+            &json!({
+                "cell": "authorization-originate",
+                "decision": "refused",
+                "session": actor.session_id.as_str(),
+                "role": actor.role.label(),
+                "reason": d.reason.as_str(),
+            }),
+        );
+        return Err(format!("acl: {}", d.reason));
+    }
+    let action = arg_str(args, "action")
+        .ok_or("authorize requires an 'action' (the authorized scope, e.g. 'spend'/'publish')")?;
+    let target_ship = arg_str(args, "targetShip").or_else(|| arg_str(args, "target_ship"));
+    // Origin role is app-stamped GENERAL (the ACL above proved it); origin_session is the
+    // unforgeable attribution root. Direct authorization => no relay reference.
+    let auth = ctx.authz.record(
+        crate::authz::ORIGIN_GENERAL,
+        &actor.session_id,
+        &action,
+        target_ship,
+        None,
+    );
+    Ok(json!({
+        "accepted": "authorize",
+        "id": auth.id,
+        "action": auth.action,
+        "targetShip": auth.target_ship,
+    }))
+}
+
+/// Comms-plane Phase 3: the resolve-and-verify GATE a captain's money/publish gate
+/// consults (`general_authorization_present`). Resolves the referenced artifact by id and
+/// verifies its app-stamped origin == general, it is not revoked, and (under STATE 2) it
+/// is not a relayed reference. Read-only.
+fn check_authorization(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let id = arg_str(args, "id")
+        .or_else(|| arg_str(args, "authorizationId"))
+        .ok_or("check_authorization requires an 'id' (the authorization reference)")?;
+    let verdict = ctx
+        .authz
+        .present(&id, crate::authz::accept_relayed_authorization());
+    Ok(json!({
+        "id": id,
+        "present": verdict.is_present(),
+        "verdict": verdict.label(),
+    }))
+}
+
+/// Comms-plane Phase 3: operate-fleet-infra (§2.7 R-L2). The plane's own administrative
+/// operations (queue purge/flush) gated to the apex fleet-infra owner
+/// (`can_operate_fleet_infra`): a captain/crew may NOT administer the shared plane. The
+/// only op today is `purge` (reset a wedged recipient's queue) - the "flushing/
+/// administering queues" surface the design names; WHO holds it is a matrix policy call.
+fn plane_admin(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+) -> Result<Value, String> {
+    if let Some(id) = caller {
+        let actor = acl_actor(id);
+        if let Err(d) = crate::acl::can_operate_fleet_infra(&actor) {
+            ctx.fanout.emit_event(
+                "control://acl",
+                &json!({
+                    "cell": "operate-fleet-infra",
+                    "decision": "refused",
+                    "session": actor.session_id.as_str(),
+                    "role": actor.role.label(),
+                    "reason": d.reason.as_str(),
+                }),
+            );
+            return Err(format!("acl: {}", d.reason));
+        }
+    }
+    // A Full-capability host with no session identity is the trusted apex; allowed.
+    let op = arg_str(args, "op").unwrap_or_default();
+    match op.as_str() {
+        "purge" => {
+            let recipient = arg_str(args, "recipient")
+                .or_else(|| arg_str(args, "sessionId"))
+                .ok_or("plane_admin op=purge requires a 'recipient' tile id")?;
+            let removed = ctx.inbox.purge_recipient(&recipient);
+            Ok(json!({
+                "accepted": "plane_admin",
+                "op": "purge",
+                "recipient": recipient,
+                "removed": removed,
+            }))
+        }
+        other => Err(format!(
+            "plane_admin: unknown op '{other}' (supported: 'purge')"
+        )),
+    }
+}
+
+fn read_terminal(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("read_terminal requires a 'sessionId' argument")?;
+    // Phase 3 (§2.6 H3): the cross-ship READ hole - `read_terminal` captures another
+    // session's scrollback directly via tmux, bypassing the plane entirely. An
+    // identified session may read a pane ONLY on its own ship; the host fails open.
+    enforce_session_access(ctx, caller, &session_id)?;
     let target = tmux_target(&session_id);
     let history = args
         .get("historyLines")
@@ -6470,6 +6976,7 @@ impl ControlContext {
             rebind: Arc::new(RebindController::new(REBIND_MIN_INTERVAL)),
             identity: Arc::new(crate::identity::IdentityStore::ephemeral()),
             inbox: Arc::new(crate::inbox::Inbox::ephemeral()),
+            authz: Arc::new(crate::authz::AuthzStore::ephemeral()),
         }
     }
 
@@ -6545,6 +7052,15 @@ impl ControlContext {
     /// ephemeral one from [`new`](Self::new).
     pub fn with_inbox(mut self, inbox: Arc<crate::inbox::Inbox>) -> Self {
         self.inbox = inbox;
+        self
+    }
+
+    /// Attach the durable [`crate::authz::AuthzStore`] (comms-plane Phase 3 delegation-
+    /// gate carrier). `lib.rs` builds it with `AuthzStore::load` over
+    /// `authorizations.json` and shares the same `Arc`; headless tests keep the
+    /// ephemeral one from [`new`](Self::new).
+    pub fn with_authz(mut self, authz: Arc<crate::authz::AuthzStore>) -> Self {
+        self.authz = authz;
         self
     }
 
@@ -6628,6 +7144,7 @@ mod tests {
             token: "wrong".into(),
             command: "list_tabs".into(),
             args: Value::Null,
+            session: String::new(),
             v: None,
         };
         let resp = dispatch_authenticated(&ctx, req);
@@ -6642,6 +7159,7 @@ mod tests {
             token: "secret".into(),
             command: "list_tabs".into(),
             args: Value::Null,
+            session: String::new(),
             v: None,
         };
         let resp = dispatch_authenticated(&ctx, req);
@@ -9800,6 +10318,20 @@ mod tests {
             token: token.to_string(),
             command: command.to_string(),
             args,
+            session: String::new(),
+            v: None,
+        }
+    }
+
+    /// A request carrying a per-session token (Phase 3): drives `dispatch_authenticated`
+    /// end-to-end with a resolved caller identity, so the ACL wiring is exercised through
+    /// the real authenticated path (not just the pure predicate).
+    fn req_session(token: &str, session: &str, command: &str, args: Value) -> ControlRequest {
+        ControlRequest {
+            token: token.to_string(),
+            command: command.to_string(),
+            args,
+            session: session.to_string(),
             v: None,
         }
     }
@@ -10602,11 +11134,11 @@ mod tests {
         assert_eq!(status["recipient"]["enqueued"].as_u64(), Some(0));
 
         // Ack retires it (`delivered -> processed`).
-        let ack = inbox_ack(&ctx, &json!({"sessionId": "tileX", "seq": 0})).unwrap();
+        let ack = inbox_ack(&ctx, &json!({"sessionId": "tileX", "seq": 0}), None, Capability::Full).unwrap();
         assert_eq!(ack["accepted"], "inbox_ack");
         assert_eq!(ack["state"], "processed");
         // A duplicate ack is a benign no-op (a lost-then-retried ack never re-writes).
-        let reack = inbox_ack(&ctx, &json!({"sessionId": "tileX", "seq": 0})).unwrap();
+        let reack = inbox_ack(&ctx, &json!({"sessionId": "tileX", "seq": 0}), None, Capability::Full).unwrap();
         assert_eq!(reack["state"], "alreadyProcessed");
 
         // No sessionId => the all-recipients snapshot.
@@ -10614,12 +11146,287 @@ mod tests {
         assert!(all["recipients"].is_array());
 
         // A malformed ack (missing seq) is rejected, not silently accepted.
-        assert!(inbox_ack(&ctx, &json!({"sessionId": "tileX"})).is_err());
+        assert!(inbox_ack(&ctx, &json!({"sessionId": "tileX"}), None, Capability::Full).is_err());
         // Acking an unknown recipient/seq is honest, not a crash.
         assert_eq!(
-            inbox_ack(&ctx, &json!({"sessionId": "nope", "seq": 7})).unwrap()["state"],
+            inbox_ack(&ctx, &json!({"sessionId": "nope", "seq": 7}), None, Capability::Full).unwrap()["state"],
             "unknown"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Comms-plane Phase 3: ACL enforcement END-TO-END through the authenticated
+    // gate (`dispatch_authenticated` with a per-session token on the request).
+    // These exercise the WIRING (session-token resolve -> acl predicate -> refuse
+    // + attribute), complementing the pure predicate tests in `acl.rs`.
+    // -----------------------------------------------------------------------
+
+    /// Mint a per-session identity for `role` on `ship`, bind it to `tile`, and return
+    /// its secret - the `T_HUB_SESSION_TOKEN` a request presents. Registered in `store`.
+    fn mint_session(
+        store: &crate::identity::IdentityStore,
+        role: crate::identity::Role,
+        ship: &str,
+        tile: &str,
+    ) -> String {
+        let id = store.mint_for(role, Some(ship.to_string()));
+        store.bind_tile(&id.id, tile);
+        id.secret
+    }
+
+    #[test]
+    fn cross_ship_isolation_refuses_a_foreign_read_through_the_gate() {
+        // MANDATED cross-ship-isolation guard: a crew on ship-a may NOT read another
+        // ship's pane. BYPASS-WOULD-FAIL: remove `enforce_session_access` from
+        // `read_terminal` and the foreign read proceeds to tmux (a different, non-acl
+        // error) - this assert (the isolation reason) goes RED.
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let reg = Arc::new(CaptainsRegistry::new());
+        reg.claim_test("cap-b", Some("ship-b"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-b", "crew-b"));
+        let crew_a = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
+        let ctx = test_ctx("ctrl")
+            .with_read_token("read-t".to_string())
+            .with_identity_store(store)
+            .with_captains_registry(reg);
+
+        let foreign = dispatch_authenticated(
+            &ctx,
+            req_session("read-t", &crew_a, "read_terminal", json!({"sessionId": "crew-b"})),
+        );
+        assert!(!foreign.ok, "a foreign read must be refused");
+        assert!(
+            foreign.error.unwrap().contains("cross-ship isolation"),
+            "the refusal must be the isolation ACL, not a downstream tmux error"
+        );
+
+        // A tokenless control-token HOST (webview/MCP) fails OPEN - it is not refused by
+        // the ACL (it errors later at the tmux capture, which is a different message).
+        let host = dispatch_authenticated(
+            &ctx,
+            req("ctrl", "read_terminal", json!({"sessionId": "crew-b"})),
+        );
+        assert!(
+            !host.error.unwrap_or_default().contains("cross-ship isolation"),
+            "the trusted host must fail open (NORM-now), not be ACL-refused"
+        );
+    }
+
+    #[test]
+    fn cross_ship_isolation_refuses_a_foreign_break_glass_write() {
+        // The write side of H3: even break-glass `send_text` rides the isolation ACL. A
+        // captain on ship-a (holding the Full control token) may not write ship-b's crew.
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let reg = Arc::new(CaptainsRegistry::new());
+        reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
+        reg.claim_test("cap-b", Some("ship-b"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-b", "crew-b"));
+        let cap_a = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
+        let ctx = test_ctx("ctrl")
+            .with_identity_store(store)
+            .with_captains_registry(reg);
+        let resp = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &cap_a, "send_text", json!({"sessionId": "crew-b", "text": "hi"})),
+        );
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap().contains("cross-ship isolation"));
+    }
+
+    #[test]
+    fn inbox_ack_self_scope_admits_own_ack_at_read_refuses_cross_session() {
+        // The retired interim price: a crew self-acks its OWN inbox with only a READ
+        // token (no control-capable relay needed). A cross-session ack is refused.
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let inbox = Arc::new(crate::inbox::Inbox::ephemeral());
+        for tile in ["crew-a", "crew-b"] {
+            inbox.enqueue(tile, "cap:x", crate::inbox::Priority::Standard, "m", true).unwrap();
+            inbox.drain_one(tile, |_r| Ok(())); // deliver so it is ackable
+        }
+        let crew_a = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
+        let ctx = test_ctx("ctrl")
+            .with_read_token("read-t".to_string())
+            .with_identity_store(store)
+            .with_inbox(inbox.clone());
+
+        // Self-ack with a bare READ token: ADMITTED (the §2.4.1 upgrade).
+        let ok = dispatch_authenticated(
+            &ctx,
+            req_session("read-t", &crew_a, "inbox_ack", json!({"sessionId": "crew-a", "seq": 0})),
+        );
+        assert!(ok.ok, "self-ack must be admitted at read tier: {:?}", ok.error);
+        assert_eq!(ok.result.unwrap()["state"], "processed");
+
+        // Cross-session ack (crew-a acking crew-b) with the read token: REFUSED, and
+        // crew-b's message is untouched.
+        let bad = dispatch_authenticated(
+            &ctx,
+            req_session("read-t", &crew_a, "inbox_ack", json!({"sessionId": "crew-b", "seq": 0})),
+        );
+        assert!(!bad.ok, "a cross-session ack with a read token must be refused");
+        assert_eq!(
+            inbox.depth("crew-b").delivered,
+            1,
+            "a refused cross-session ack must not process crew-b's message"
+        );
+    }
+
+    #[test]
+    fn plane_send_enforces_message_rows_and_never_crew_emergency() {
+        // MANDATED never-crew-emergency guard + the message rows through the gate.
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let reg = Arc::new(CaptainsRegistry::new());
+        reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-a", "crew-a"));
+        assert!(reg.record_crew("cap-a", "crew-a2"));
+        let inbox = Arc::new(crate::inbox::Inbox::ephemeral());
+        let crew_a = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
+        let cap_a = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
+        let ctx = test_ctx("ctrl")
+            .with_read_token("read-t".to_string())
+            .with_identity_store(store)
+            .with_captains_registry(reg)
+            .with_inbox(inbox.clone());
+
+        // Crew -> its OWN captain (up): ALLOWED at read tier.
+        let up = dispatch_authenticated(
+            &ctx,
+            req_session("read-t", &crew_a, "plane_send", json!({"recipient": "cap-a", "text": "status"})),
+        );
+        assert!(up.ok, "crew->own captain must be allowed: {:?}", up.error);
+
+        // Crew -> a SIBLING crew: REFUSED (no daisy-chain).
+        let sib = dispatch_authenticated(
+            &ctx,
+            req_session("read-t", &crew_a, "plane_send", json!({"recipient": "crew-a2", "text": "psst"})),
+        );
+        assert!(!sib.ok);
+        assert!(sib.error.unwrap().contains("daisy-chain"));
+
+        // Crew raising EMERGENCY: REFUSED (never-crew-emergency). BYPASS-WOULD-FAIL:
+        // admit crew emergency and this goes RED.
+        let emg = dispatch_authenticated(
+            &ctx,
+            req_session("read-t", &crew_a, "plane_send", json!({"recipient": "cap-a", "text": "!!", "priority": "emergency"})),
+        );
+        assert!(!emg.ok);
+        assert!(emg.error.unwrap().contains("EMERGENCY"));
+
+        // A CAPTAIN may raise EMERGENCY to its own crew.
+        let cap_emg = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &cap_a, "plane_send", json!({"recipient": "crew-a", "text": "!!", "priority": "emergency"})),
+        );
+        assert!(cap_emg.ok, "a captain's emergency to own crew must be allowed: {:?}", cap_emg.error);
+        assert_eq!(cap_emg.result.unwrap()["priority"], "emergency");
+    }
+
+    #[test]
+    fn abort_session_denies_cross_ship_and_crew_through_the_gate() {
+        // The never-seized guard through the gate: a captain may not abort another
+        // ship's crew, and a crew (read token) cannot reach the ProcessChanging abort at
+        // all. No tmux is touched - the ACL refuses first.
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let reg = Arc::new(CaptainsRegistry::new());
+        reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
+        reg.claim_test("cap-b", Some("ship-b"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-b", "crew-b"));
+        assert!(reg.record_crew("cap-a", "crew-a"));
+        let cap_a = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
+        let crew_a = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
+        let ctx = test_ctx("ctrl")
+            .with_read_token("read-t".to_string())
+            .with_identity_store(store)
+            .with_captains_registry(reg);
+
+        // Captain of ship-a aborting ship-b's crew: cross-ship, REFUSED.
+        let cross = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &cap_a, "abort_session", json!({"sessionId": "crew-b"})),
+        );
+        assert!(!cross.ok);
+        assert!(cross.error.unwrap().contains("abort denied"));
+
+        // A crew presenting a read token cannot even reach the ProcessChanging abort.
+        let crew_try = dispatch_authenticated(
+            &ctx,
+            req_session("read-t", &crew_a, "abort_session", json!({"sessionId": "cap-a"})),
+        );
+        assert!(!crew_try.ok, "a read-token crew must not be able to abort");
+    }
+
+    #[test]
+    fn only_a_general_session_authorizes_and_the_gate_resolves_it() {
+        // The delegation-gate carrier through the gate: only a general-roled session may
+        // ORIGINATE; the resolve-and-verify gate then reports Present. A captain cannot.
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let general = mint_session(&store, crate::identity::Role::General, "cortana", "gen");
+        let captain = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
+        let ctx = test_ctx("ctrl").with_identity_store(store);
+
+        // A captain session may NOT originate an authorization.
+        let capauth = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &captain, "authorize", json!({"action": "spend"})),
+        );
+        assert!(!capauth.ok);
+        assert!(capauth.error.unwrap().contains("only the general"));
+
+        // The general originates one; the captain's gate consult resolves it Present.
+        let ga = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &general, "authorize", json!({"action": "spend", "targetShip": "ship-a"})),
+        );
+        assert!(ga.ok, "general authorize failed: {:?}", ga.error);
+        let id = ga.result.unwrap()["id"].as_str().unwrap().to_string();
+        let chk = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &captain, "check_authorization", json!({"id": id})),
+        );
+        let r = chk.result.unwrap();
+        assert_eq!(r["present"], json!(true));
+        assert_eq!(r["verdict"], "present");
+
+        // An unknown reference is Absent (the captain's gate FIRES = escalate).
+        let miss = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &captain, "check_authorization", json!({"id": "no-such"})),
+        );
+        assert_eq!(miss.result.unwrap()["verdict"], "absent");
+    }
+
+    #[test]
+    fn plane_admin_purge_is_apex_only() {
+        // operate-fleet-infra through the gate: a captain may not administer the shared
+        // plane; the apex (Cortana) may.
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let reg = Arc::new(CaptainsRegistry::new());
+        reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
+        let inbox = Arc::new(crate::inbox::Inbox::ephemeral());
+        inbox.enqueue("crew-a", "x", crate::inbox::Priority::Standard, "m", true).unwrap();
+        let captain = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
+        let cortana = mint_session(&store, crate::identity::Role::Cortana, "cortana", "cor");
+        let ctx = test_ctx("ctrl")
+            .with_identity_store(store)
+            .with_captains_registry(reg)
+            .with_inbox(inbox.clone());
+
+        // A captain may NOT purge.
+        let capadm = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &captain, "plane_admin", json!({"op": "purge", "recipient": "crew-a"})),
+        );
+        assert!(!capadm.ok);
+        assert!(capadm.error.unwrap().contains("apex-owned"));
+        assert_eq!(inbox.depth("crew-a").enqueued, 1, "a refused purge leaves the queue intact");
+
+        // Cortana (apex) may.
+        let coradm = dispatch_authenticated(
+            &ctx,
+            req_session("ctrl", &cortana, "plane_admin", json!({"op": "purge", "recipient": "crew-a"})),
+        );
+        assert!(coradm.ok, "cortana purge failed: {:?}", coradm.error);
+        assert_eq!(inbox.depth("crew-a").enqueued, 0, "an apex purge flushed the queue");
     }
 
     // -----------------------------------------------------------------------
@@ -10845,6 +11652,7 @@ mod tests {
             token: "t".into(),
             command: "spawn_terminal".into(),
             args: args.clone(),
+            session: String::new(),
             v: None,
         });
         assert!(first.ok, "first spawn failed: {:?}", first.error);
@@ -10855,6 +11663,7 @@ mod tests {
             token: "t".into(),
             command: "spawn_terminal".into(),
             args,
+            session: String::new(),
             v: None,
         });
         assert!(retry.ok, "retry failed: {:?}", retry.error);
@@ -10886,6 +11695,7 @@ mod tests {
             token: "t".into(),
             command: "spawn_terminal".into(),
             args: json!({"cwd": "/tmp", "requestId": "spawn-status-1"}),
+            session: String::new(),
             v: None,
         });
         assert!(spawn.ok);

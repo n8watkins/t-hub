@@ -541,6 +541,23 @@ impl Inbox {
         depth_of(q)
     }
 
+    /// Comms-plane Phase 3 (operate-fleet-infra, §2.7 R-L2): PURGE a recipient's queue -
+    /// drop ALL its records (a wedged-queue reset / drain-flush admin op). Returns the
+    /// number of records removed. This is a DESTRUCTIVE administrative operation (durable
+    /// messages are lost), which is why `control.rs` gates it to the apex fleet-infra
+    /// owner via `acl::can_operate_fleet_infra`. A no-op for an unknown recipient.
+    pub fn purge_recipient(&self, recipient: &str) -> usize {
+        let mut queues = self.lock();
+        let Some(q) = queues.get_mut(recipient) else {
+            return 0;
+        };
+        let removed = q.records.len();
+        q.records.clear();
+        q.inflight = None;
+        self.persist(q);
+        removed
+    }
+
     /// Observability across all recipients (§2.8 health panel feed).
     pub fn depth_all(&self) -> Vec<QueueDepth> {
         let queues = self.lock();
@@ -949,6 +966,19 @@ mod tests {
             inbox.ack("t1", seq);
         }
         assert!(inbox.depth("t1").processed >= 1, "compact retains >= 1 despite a 0 tail");
+    }
+
+    #[test]
+    fn purge_recipient_flushes_the_queue() {
+        // operate-fleet-infra (Phase 3): purge drops ALL of a recipient's records (a
+        // wedged-queue reset) and reports the count; an unknown recipient is a no-op.
+        let (inbox, _dir) = temp_inbox();
+        inbox.enqueue("t1", "s", Priority::Standard, "a", true).unwrap();
+        inbox.enqueue("t1", "s", Priority::Emergency, "b", true).unwrap();
+        assert_eq!(inbox.purge_recipient("t1"), 2, "both records removed");
+        assert_eq!(inbox.depth("t1").enqueued, 0);
+        assert!(inbox.depth("t1").inflight.is_none());
+        assert_eq!(inbox.purge_recipient("no-such"), 0, "unknown recipient is a no-op");
     }
 
     #[test]

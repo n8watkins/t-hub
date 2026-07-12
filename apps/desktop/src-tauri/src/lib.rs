@@ -28,6 +28,8 @@ mod model; // data-model structs (PRD §8)
 mod plane; // comms-plane Phase 1: Single Write Authority primary-writer seam (funnel + attribution for agent/automation input; NOT yet durable/ACL'd/typing-gated)
 mod inbox; // comms-plane Phase 2: durable inbox (per-recipient segmented store + seq + at-least-once + receipt state machine); the fleet wake is its first client
 mod identity; // comms-plane Phase 2: per-session identity slice (mint/bind/resolve a per-session token for unforgeable-across-sessions attribution)
+mod acl; // comms-plane Phase 3: the ACL policy (settled capability matrix as pure predicates; wired at control.rs enforcement points)
+mod authz; // comms-plane Phase 3: the delegation-gate carrier (durable general-authorization artifacts + resolve-and-verify, §2.6 M1)
 mod remote_pty; // server-split M2a: client-side remote-PTY transport (terminal tiles over the control socket)
 // --- feat/projects-sidebar (Agent A) ---------------------------------------
 mod recent; // recent recallable Claude sessions for the sidebar "Recent" list
@@ -258,6 +260,7 @@ fn start_control_listener(
     fleet_watches: std::sync::Arc<fleet::FleetWatchRegistry>,
     identity_store: std::sync::Arc<identity::IdentityStore>,
     inbox: std::sync::Arc<inbox::Inbox>,
+    authz: std::sync::Arc<authz::AuthzStore>,
 ) -> Option<control::ControlHandshake> {
     // The control auth token. Server-split M2b: a PERSISTENT key (stable across
     // restarts) so a remote client paired once doesn't have to re-pair every launch.
@@ -333,7 +336,11 @@ fn start_control_listener(
         // notifier enqueues/drains; `inbox_ack` / `inbox_status` reach the same
         // queues) - one Arc each across the notifier and every connection handler.
         .with_identity_store(identity_store)
-        .with_inbox(inbox);
+        .with_inbox(inbox)
+        // Comms-plane Phase 3: the delegation-gate carrier store (durable general-
+        // authorization artifacts) - one Arc shared with the control listener so
+        // `authorize` records and `check_authorization` resolves against the same store.
+        .with_authz(authz);
     match control::start(ctx) {
         Ok(h) => {
             eprintln!(
@@ -622,6 +629,10 @@ pub fn run() {
             let inbox = std::sync::Arc::new(
                 inbox::Inbox::open_default().with_telemetry(inbox_telemetry),
             );
+            // Comms-plane Phase 3: the delegation-gate carrier store (durable general-
+            // authorization artifacts), loaded from `authorizations.json` so recorded
+            // authorizations survive restarts. One Arc shared with the control listener.
+            let authz_store = std::sync::Arc::new(authz::AuthzStore::load_default());
             {
                 // The injector: type + submit a line into a tile's Claude session
                 // over tmux (the only thing that re-invokes an idle agent loop).
@@ -671,6 +682,7 @@ pub fn run() {
                 fleet_watches,
                 identity_store,
                 inbox,
+                authz_store,
             ) {
                 control_client::install(app.handle(), &handshake);
             }
