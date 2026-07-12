@@ -25,9 +25,24 @@ vi.mock("./TilePanel", () => ({
 vi.mock("../ipc/git", () => ({
   gitInfo: vi.fn(() => new Promise(() => {})),
 }));
+// Capture the header menu's click-to-copy without a Tauri clipboard host.
+const clipboardWrites: string[] = [];
+vi.mock("../lib/clipboard", () => ({
+  clipboardWrite: (text: string) => {
+    clipboardWrites.push(text);
+    return Promise.resolve();
+  },
+  clipboardRead: () => Promise.resolve(""),
+}));
+// The Cortana mark is a fire-and-forget control mutation; swallow it in tests.
+vi.mock("../ipc/controlClient", () => ({
+  controlRequest: () => Promise.resolve({}),
+  onControlEvent: () => () => {},
+}));
 
 import { Tile } from "./Tile";
 import { useCaptain } from "../store/captain";
+import { useSupervision } from "../store/supervision";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import type { TerminalInfo } from "../ipc/types";
 
@@ -55,6 +70,8 @@ beforeEach(() => {
     labels: {},
   });
   useCaptain.setState({ orchestratorId: null, captainIds: [] });
+  useSupervision.setState({ sessionIdByTmux: {} });
+  clipboardWrites.length = 0;
 });
 
 function renderTile(terminalId: string): HTMLElement {
@@ -104,6 +121,77 @@ describe("Tile header orchestrator identity", () => {
     expect(header.textContent).toContain("Cortana");
     expect(header.textContent).not.toContain("orchestrator");
     expect(within(header).getByLabelText("Orchestrator")).toBeTruthy();
+  });
+});
+
+describe("Tile header context menu: IDs + Mark as Cortana", () => {
+  /** Right-click the header to open the context menu, then return the menu's
+   *  root (it renders fixed to the document, not inside the header). */
+  function openMenu(terminalId: string): HTMLElement {
+    const header = renderTile(terminalId);
+    act(() => {
+      fireEvent.contextMenu(header);
+    });
+    // The menu is the fixed panel that holds the "Terminal ID" row.
+    const item = within(document.body).getByText("Terminal ID");
+    const menu = item.closest<HTMLElement>(".fixed.z-50");
+    expect(menu).toBeTruthy();
+    return menu!;
+  }
+
+  it("shows the Terminal ID (copyable) and copies it on click", () => {
+    const menu = openMenu("cap00001");
+    // The 8-char tmux-derived id is shown verbatim under the label.
+    expect(menu.textContent).toContain("cap00001");
+    const idRow = within(menu).getByTitle("Copy Terminal ID");
+    act(() => {
+      fireEvent.click(idRow);
+    });
+    expect(clipboardWrites).toEqual(["cap00001"]);
+    // A one-line ack toast confirms the copy.
+    expect(document.body.textContent).toContain("Copied Terminal ID");
+  });
+
+  it("hides the Claude Session ID row until a session is bound, then shows + copies it", () => {
+    // Unbound: no session id in the supervision reverse index.
+    let menu = openMenu("cap00001");
+    expect(within(menu).queryByTitle("Copy Claude Session ID")).toBeNull();
+    // Bind a Claude UUID to this tile's tmux session (`th_<id>`), as a
+    // statusline snapshot would, then re-open the menu.
+    act(() => {
+      useSupervision.setState({
+        sessionIdByTmux: { th_cap00001: "uuid-abc-123" },
+      });
+    });
+    menu = openMenu("cap00001");
+    const sessionRow = within(menu).getByTitle("Copy Claude Session ID");
+    expect(sessionRow.textContent).toContain("uuid-abc-123");
+    act(() => {
+      fireEvent.click(sessionRow);
+    });
+    expect(clipboardWrites).toEqual(["uuid-abc-123"]);
+  });
+
+  it("labels the mark affordance 'Mark as Cortana' and 'Unmark Cortana' when set", () => {
+    let menu = openMenu("cap00001");
+    expect(within(menu).getByText("Mark as Cortana")).toBeTruthy();
+    // Mark it, then re-open: the affordance flips to the unmark label.
+    act(() => {
+      useCaptain.setState({ orchestratorId: "cap00001" });
+    });
+    menu = openMenu("cap00001");
+    expect(within(menu).getByText("Unmark Cortana")).toBeTruthy();
+  });
+
+  it("marking Cortana from the menu sets the designation and flashes the next-steps hint", () => {
+    const menu = openMenu("cap00001");
+    act(() => {
+      fireEvent.click(within(menu).getByText("Mark as Cortana"));
+    });
+    expect(useCaptain.getState().orchestratorId).toBe("cap00001");
+    // The honest hint points at the still-unbuilt follow-on flow.
+    expect(document.body.textContent).toContain("Marked as Cortana");
+    expect(document.body.textContent).toContain("capability elevation");
   });
 });
 

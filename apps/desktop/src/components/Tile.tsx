@@ -61,7 +61,8 @@ import { ORCHESTRATOR_DISPLAY_NAME } from "../lib/ensureOrchestrator";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { gitInfo, type GitInfo } from "../ipc/git";
 import { runWhenIdle } from "../lib/windowInteraction";
-import { Anchor, GitBranch, RotateCcw } from "lucide-react";
+import { clipboardWrite } from "../lib/clipboard";
+import { Anchor, Copy, GitBranch, RotateCcw } from "lucide-react";
 
 /** Poll git facts (branch / worktree / dirty count) for a tile's cwd. Refreshes
  *  on mount and whenever the window regains focus (cheap; the backend best-efforts
@@ -258,6 +259,13 @@ export function Tile({
   // designated agent, no bottom input exists.)
   const isOrchestrator = useCaptain((s) => s.orchestratorId === terminalId);
   const setOrchestratorId = useCaptain((s) => s.setOrchestratorId);
+  // The Claude session UUID bound to this tile, for the header menu's copyable
+  // ID row. Resolved through the supervision store's tmux->session reverse index
+  // (the agent stamps each statusline with its owning `th_<id>` session); absent
+  // until a bound Claude session has reported, so the menu hides the row then.
+  const claudeSessionId = useSupervision(
+    (s) => s.sessionIdByTmux[sessionNameForTerminal(terminalId)],
+  );
   // Per-terminal color override (the ⋯ menu): the effective color comes from
   // this terminal's override first, then the global theme, then a fallback.
   const termPalette = useTheme((s) => s.active.terminal);
@@ -408,6 +416,29 @@ export function Tile({
     right: number;
     top: number;
   } | null>(null);
+  // Transient one-line confirmation toast (null = hidden): a copied-id ack, or the
+  // "what a Cortana mark does / doesn't do yet" hint. Auto-clears after a few
+  // seconds; positioned `fixed` so it's readable regardless of the tile's size.
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimer = useRef<number | null>(null);
+  const flash = (msg: string) => {
+    setToast(msg);
+    if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 5000);
+  };
+  useEffect(
+    () => () => {
+      if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
+    },
+    [],
+  );
+  // Copy `value` to the clipboard and flash a one-line ack. Used by the header
+  // menu's Terminal ID / Claude Session ID rows.
+  const copyId = (label: string, value: string) => {
+    setCtxMenu(null);
+    void clipboardWrite(value);
+    flash(`Copied ${label}`);
+  };
   // Inline work-name editor (Feature 1): null = display mode; a string = the live
   // draft while editing. Enter commits, Esc cancels. Seeded from the saved name.
   const [nameDraft, setNameDraft] = useState<string | null>(null);
@@ -1084,6 +1115,26 @@ export function Tile({
             }}
             onPointerDown={(e) => e.stopPropagation()}
           >
+            {/* Identity first: the tile's Terminal ID (the 8-char tmux-derived
+                id) and the bound Claude Session ID (only once a Claude session
+                has reported). Click either to copy - handy for telling tiles
+                apart when coordinating with captains. */}
+            <CtxCopyItem
+              label="Terminal ID"
+              value={terminalId}
+              onClick={() => copyId("Terminal ID", terminalId)}
+            />
+            {claudeSessionId && (
+              <CtxCopyItem
+                label="Claude Session ID"
+                value={claudeSessionId}
+                onClick={() => copyId("Claude Session ID", claudeSessionId)}
+              />
+            )}
+            <div
+              className="my-1 border-t"
+              style={{ borderColor: "var(--th-border)" }}
+            />
             <CtxItem
               label="Refresh terminal"
               hint="Re-fit to the current size + repaint — fixes a tile that didn't reflow after growing"
@@ -1105,15 +1156,25 @@ export function Tile({
               }}
             />
             <CtxItem
-              label={isOrchestrator ? "Unmark orchestrator" : "Mark as orchestrator"}
+              label={
+                isOrchestrator
+                  ? `Unmark ${ORCHESTRATOR_DISPLAY_NAME}`
+                  : `Mark as ${ORCHESTRATOR_DISPLAY_NAME}`
+              }
               hint={
                 isOrchestrator
-                  ? "This session is the designated orchestrator - unmark to clear it"
-                  : "Designate this session as the orchestrator"
+                  ? `This session is ${ORCHESTRATOR_DISPLAY_NAME} - unmark to release the role`
+                  : `Make this session ${ORCHESTRATOR_DISPLAY_NAME}, the fleet orchestrator (claims the role in the captains registry)`
               }
               onClick={() => {
                 setCtxMenu(null);
-                setOrchestratorId(isOrchestrator ? null : terminalId);
+                const next = isOrchestrator ? null : terminalId;
+                setOrchestratorId(next);
+                if (next) {
+                  flash(
+                    `Marked as ${ORCHESTRATOR_DISPLAY_NAME} - the captains registry now points here. Context resume + capability elevation are a separate, upcoming step.`,
+                  );
+                }
               }}
             />
             <CtxItem
@@ -1127,6 +1188,24 @@ export function Tile({
             />
           </div>
         </>
+      )}
+
+      {/* Transient one-line toast (copied-id ack / Cortana-mark hint). Fixed to
+          the viewport so it reads regardless of this tile's size; auto-clears. */}
+      {toast && (
+        <div
+          className="fixed bottom-6 left-1/2 z-[60] -translate-x-1/2 rounded-md border px-3 py-2 text-xs shadow-2xl"
+          style={{
+            backgroundColor: "var(--th-tile-bg)",
+            borderColor: "var(--th-border)",
+            color: "var(--th-fg)",
+            fontFamily: "var(--th-font)",
+            maxWidth: "min(90vw, 520px)",
+          }}
+          role="status"
+        >
+          {toast}
+        </div>
       )}
 
       {/* Per-terminal color popover (⋯). Mirrors the context-menu pattern: a
@@ -1444,6 +1523,40 @@ function CtxItem({
       <span className="text-xs" style={{ color: "var(--th-fg-muted)" }}>
         {hint}
       </span>
+    </button>
+  );
+}
+
+/** A context-menu row that copies an identifier on click: the label on top, the
+ *  value beneath in monospace (truncated), with a copy glyph on the right. */
+function CtxCopyItem({
+  label,
+  value,
+  onClick,
+}: {
+  label: string;
+  value: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={`Copy ${label}`}
+      className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left transition-colors hover:bg-neutral-700/30"
+    >
+      <span className="flex min-w-0 flex-col items-start gap-0.5">
+        <span className="text-sm" style={{ color: "var(--th-fg)" }}>
+          {label}
+        </span>
+        <span
+          className="max-w-[220px] truncate font-mono text-xs"
+          style={{ color: "var(--th-fg-muted)" }}
+        >
+          {value}
+        </span>
+      </span>
+      <Copy size={13} className="shrink-0" style={{ color: "var(--th-fg-muted)" }} />
     </button>
   );
 }
