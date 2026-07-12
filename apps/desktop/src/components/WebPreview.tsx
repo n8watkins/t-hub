@@ -78,11 +78,17 @@ export interface WebPreviewProps {
   /** localhost URLs scraped from the tile's terminal output (newest-first).
    *  Rendered as one-click chips under the URL bar; clicking one navigates. */
   detectedUrls?: string[];
+  /** Called with the normalized URL each time the user commits a navigation (URL
+   *  bar submit or a detected-URL chip). Lets a host tile persist the last-viewed
+   *  address so it survives a tab switch (e.g. usePanels.setPreviewUrl /
+   *  setBoardUrl). Optional — the standalone preview doesn't need it. */
+  onNavigate?: (url: string) => void;
 }
 
 export function WebPreview({
   initialUrl = "",
   detectedUrls = [],
+  onNavigate,
 }: WebPreviewProps): ReactElement {
   // `url` is the committed (submitted) address driving the iframe; `draft` is
   // the editable input value. Splitting them means typing doesn't reload on
@@ -119,8 +125,10 @@ export function WebPreview({
       setDraft(next);
       setLoad({ status: "loading" });
       setNav((n) => n + 1);
+      // Let a host tile persist the committed address (survives tab switches).
+      onNavigate?.(next);
     },
-    [normalize],
+    [normalize, onNavigate],
   );
 
   // Follow a LIVE `initialUrl`. The per-tile Preview tab passes the project's

@@ -73,6 +73,12 @@ const DEFAULTS = {
    *  hits its usage limit and the window resets (see lib/autoContinueMount). The
    *  text is typed + Enter; default "continue". */
   autoContinueText: "continue",
+  /** Base URL a tile's Board tab loads by default — the powder board (a
+   *  self-hostable agent work-ledger). Dev points at the local server
+   *  (http://localhost:4000); in production this is set to the board's tailnet
+   *  URL. Per-tile navigation in the Board tab's URL bar overrides this without
+   *  changing the default. Read by TilePanel (the "board" branch). */
+  powderBoardUrl: "http://localhost:4000",
 } as const;
 
 interface PersistedSettings {
@@ -90,6 +96,7 @@ interface PersistedSettings {
   fileIconTheme: string;
   hideDotfiles: boolean;
   autoContinueText: string;
+  powderBoardUrl: string;
 }
 
 /** Clamp a persisted/incoming number into a range, falling back to a default
@@ -166,6 +173,10 @@ function coerceSettings(raw: unknown): PersistedSettings {
       typeof p.autoContinueText === "string"
         ? p.autoContinueText
         : DEFAULTS.autoContinueText,
+    powderBoardUrl:
+      typeof p.powderBoardUrl === "string"
+        ? p.powderBoardUrl
+        : DEFAULTS.powderBoardUrl,
   };
 }
 
@@ -252,6 +263,12 @@ interface SettingsState {
    *  "continue"). See store/autoContinue + lib/autoContinueMount. */
   autoContinueText: string;
   setAutoContinueText: (v: string) => void;
+
+  /** Base URL a tile's Board tab loads by default (the powder board). Configurable
+   *  so dev (localhost:4000) and production (a tailnet URL) both work without a
+   *  code change. Read by components/TilePanel.tsx. */
+  powderBoardUrl: string;
+  setPowderBoardUrl: (v: string) => void;
 }
 
 const initial = loadPersisted();
@@ -277,6 +294,7 @@ export const useSettings = create<SettingsState>((set, get) => {
       fileIconTheme: s.fileIconTheme,
       hideDotfiles: s.hideDotfiles,
       autoContinueText: s.autoContinueText,
+      powderBoardUrl: s.powderBoardUrl,
     });
   };
 
@@ -383,6 +401,12 @@ export const useSettings = create<SettingsState>((set, get) => {
     autoContinueText: initial.autoContinueText,
     setAutoContinueText: (v) => {
       set({ autoContinueText: v });
+      persistAll();
+    },
+
+    powderBoardUrl: initial.powderBoardUrl,
+    setPowderBoardUrl: (v) => {
+      set({ powderBoardUrl: v });
       persistAll();
     },
   };

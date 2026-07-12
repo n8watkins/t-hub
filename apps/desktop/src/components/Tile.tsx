@@ -111,6 +111,7 @@ const PANEL_TABS: { id: PanelTab; label: string }[] = [
   { id: "files", label: "Files" },
   { id: "preview", label: "Preview" },
   { id: "dev", label: "Dev" },
+  { id: "board", label: "Board" },
 ];
 
 /** Terminal-palette keys editable from the per-tile ⋯ color menu. */
@@ -243,7 +244,10 @@ export function Tile({
   // value (e.g. a tab dropped in a past build) falls back to "terminal".
   const rawTab = usePanels((s) => s.tab[terminalId]);
   const activeTab: PanelTab =
-    rawTab === "files" || rawTab === "preview" || rawTab === "dev"
+    rawTab === "files" ||
+    rawTab === "preview" ||
+    rawTab === "dev" ||
+    rawTab === "board"
       ? rawTab
       : "terminal";
   const setTab = usePanels((s) => s.setTab);
