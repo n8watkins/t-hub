@@ -235,7 +235,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
   // presets: Claude / Resume Claude / Custom…). An undefined startupCommand is
   // the plain "Shell" preset = today's bare login shell (no regression).
   const spawn = useCallback(
-    async (startupCommand?: string) => {
+    async (startupCommand?: string, capability?: "control") => {
       // Busy gate (#7): ignore a second trigger while a spawn is in flight, so a
       // double-click can't stack duplicate tmux+claude spawns. The ref is the
       // synchronous source of truth (state only drives the disabled styling).
@@ -243,14 +243,19 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
       spawningRef.current = true;
       setSpawning(true);
       try {
-        const info = await spawnTerminal(
-          startupCommand ? { startupCommand } : {},
-        );
+        // Thread the requested capability tier straight to the backend spawn arg.
+        // `undefined` (the common case) defaults to the read tier; `"control"` is
+        // the audited elevation the SpawnMenu control toggle opts into. Only add
+        // the keys we actually set so a plain shell spawn stays byte-for-byte today's.
+        const info = await spawnTerminal({
+          ...(startupCommand ? { startupCommand } : {}),
+          ...(capability ? { capability } : {}),
+        });
         // DIAG (#blank): record the spawn so a fresh repro correlates "grid went
         // blank" with the new-terminal id + which preset drove it.
         tlog(
           "spawn",
-          `spawned ${info.id} cmd=${startupCommand ?? "(shell)"} ` +
+          `spawned ${info.id} cmd=${startupCommand ?? "(shell)"} cap=${capability ?? "read"} ` +
             `tiles-before=${useWorkspace.getState().tabs.reduce((n, t) => n + t.order.length, 0)}`,
         );
         addAfterFocused(info);
@@ -501,7 +506,9 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
         <SpawnMenu
           busy={spawning}
           onClose={() => setSpawnMenuOpen(false)}
-          onSpawn={(startupCommand) => void spawn(startupCommand)}
+          onSpawn={(startupCommand, capability) =>
+            void spawn(startupCommand, capability)
+          }
         />
       )}
     </div>

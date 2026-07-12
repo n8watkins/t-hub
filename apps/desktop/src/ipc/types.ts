@@ -29,6 +29,17 @@ export interface SpawnOptions {
    * shell (the "Shell" preset = today's behavior, no regression).
    */
   startupCommand?: string;
+  /**
+   * item-3 §2.1.1: the capability tier the UI-spawned session is granted. INVERTED
+   * least-privilege — `undefined`/`"read"` (the default) makes the tile a pure-work
+   * session that can observe but not spawn/type/kill; `"control"` is a deliberate,
+   * AUDITED elevation for an orchestration terminal (e.g. a hand-spawned captain).
+   * The backend (`ui_spawn_capability_env` in commands.rs) injects the matching
+   * control token at the tmux session level and records a control spawn in the
+   * hash-chained audit log. Never default this to `"control"` — control is always
+   * the explicit, opt-in choice.
+   */
+  capability?: "read" | "control";
 }
 
 export interface TerminalInfo {

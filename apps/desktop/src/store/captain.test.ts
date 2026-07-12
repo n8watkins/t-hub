@@ -691,6 +691,47 @@ describe("orchestrator reconcile on adopt", () => {
     ]);
     expect(useCaptain.getState().orchestratorId).toBe("cap00001");
   });
+
+  // The mission's core case: a claim_captain role:cortana that landed on ANOTHER
+  // client (or was restored from the registry on this window's reload) arrives as a
+  // sync_captains record carrying role:"cortana". This client, which never set the
+  // crown locally, must ADOPT it so the sidebar + deck reflect the registry truth
+  // live. Bypass-would-fail: drop the applyOrchestrator(serverCortanaId) branch and
+  // this fails (the crown never appears on the second client / after reload).
+  it("ADOPTS a server-declared cortana this client never set locally (claim from another client / reload)", () => {
+    expect(useCaptain.getState().orchestratorId).toBeNull(); // beforeEach: no local crown
+    useCaptain.getState().adoptCaptainsRegistry([
+      { terminalId: "cap00001", shipSlug: "cortana", role: "cortana", workspaceTabIds: [], crew: [] },
+    ]);
+    expect(useCaptain.getState().orchestratorId).toBe("cap00001");
+  });
+
+  // The FleetRole split: a cortana record is tracked ONLY via orchestratorId, never
+  // silently pinned as a summonable captain (mirrors the server's Cortana vs Captain
+  // split). So adopting it must not add it to captainIds/claims.
+  it("tracks an adopted cortana via orchestratorId only, never as a pinned captain", () => {
+    seedCaptains([]); // start with no pins
+    useCaptain.setState({ claims: {}, orchestratorId: null });
+    useCaptain.getState().adoptCaptainsRegistry([
+      { terminalId: "cap00001", shipSlug: "cortana", role: "cortana", workspaceTabIds: [], crew: [] },
+      { terminalId: "bbb00001", shipSlug: "ship-b", workspaceTabIds: [], crew: [] },
+    ]);
+    const s = useCaptain.getState();
+    expect(s.orchestratorId).toBe("cap00001");
+    expect(s.captainIds).toEqual(["bbb00001"]); // only the non-cortana record pins
+    expect(s.claims["cap00001"]).toBeUndefined(); // cortana is NOT a claim row
+  });
+
+  // A cortana transfer driven from another client (release-then-claim moves the role
+  // to a different live tile): this client converges the crown onto the new holder.
+  it("converges the crown when the server moves cortana to a different live tile", () => {
+    useCaptain.getState().setOrchestratorId("cap00001");
+    expect(useCaptain.getState().orchestratorId).toBe("cap00001");
+    useCaptain.getState().adoptCaptainsRegistry([
+      { terminalId: "bbb00001", shipSlug: "cortana", role: "cortana", workspaceTabIds: [], crew: [] },
+    ]);
+    expect(useCaptain.getState().orchestratorId).toBe("bbb00001");
+  });
 });
 
 describe("Mark as Cortana (server captains-registry singleton)", () => {

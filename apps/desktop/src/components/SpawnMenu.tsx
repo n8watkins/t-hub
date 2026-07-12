@@ -15,7 +15,8 @@
 // Chrome matches the rest of T-Hub: it reads the `--th-*` theme tokens
 // (surface/border/fg/accent/radius) so it tracks the active theme like the FAB
 // and the ThemeEditor panels do.
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { ShieldCheck } from "lucide-react";
 
 /** `claude --resume` lets Claude show its interactive session picker. (`--continue`
  *  / `-c` would silently resume the MOST RECENT session instead; the picker is the
@@ -36,9 +37,11 @@ export interface SpawnMenuProps {
   /**
    * Spawn a terminal with the chosen preset. `startupCommand` is the command to
    * run in the new pane, or `undefined` for the plain "Shell" preset (today's
-   * behavior). Canvas owns the actual spawnTerminal() IPC call + tile insertion.
+   * behavior). `capability` is the requested tier — `"control"` ONLY when the
+   * user explicitly flipped the (default-off) control toggle, `undefined` (read)
+   * otherwise. Canvas owns the actual spawnTerminal() IPC call + tile insertion.
    */
-  onSpawn: (startupCommand?: string) => void;
+  onSpawn: (startupCommand?: string, capability?: "control") => void;
   /** A spawn is already in flight (#7) — disable the presets so a double-click
    *  can't stack duplicate spawns. */
   busy?: boolean;
@@ -79,6 +82,13 @@ export const PRESETS: Preset[] = [
 ];
 
 export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
+  // The audited control-capability opt-in. DEFAULT OFF (inverted least-privilege
+  // is ratified — control is the deliberate, explicit choice, never the default).
+  // When on, EVERY preset picked from this menu spawns with `capability:"control"`,
+  // which the backend injects the full control token for and records in the audit
+  // log. Local to the menu's lifetime: it resets to read every time the menu opens.
+  const [control, setControl] = useState(false);
+
   // Escape closes the menu.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -95,7 +105,9 @@ export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
     // Busy gate (#7): a spawn is already in flight — ignore the pick so a
     // double-click can't stack a duplicate spawn.
     if (busy) return;
-    onSpawn(command);
+    // Control is opt-in: pass `"control"` ONLY when the toggle is on, so an
+    // ordinary pick always defaults to the read tier (never elevates by accident).
+    onSpawn(command, control ? "control" : undefined);
     onClose();
   };
 
@@ -153,6 +165,52 @@ export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
             </span>
           </button>
         ))}
+
+        {/* Audited control-capability opt-in. Visually SET APART from the presets
+            (its own bordered footer + accent chrome when armed) because it grants
+            the full control token — a privilege elevation, not a preset. Default
+            off; the next preset picked while it is armed spawns a control terminal
+            (e.g. a hand-spawned captain). The one-click "Create Orchestrator" is
+            the fully-provisioned path; this is the general control-spawn primitive. */}
+        <button
+          type="button"
+          role="menuitemcheckbox"
+          aria-checked={control}
+          aria-label="Spawn as control terminal"
+          onClick={() => setControl((v) => !v)}
+          title="Grant this terminal the full control token (spawn / type / kill the fleet). Audited. Default is a read-only work terminal."
+          className="flex items-center gap-2 border-t px-3 py-2 text-left transition-colors hover:bg-neutral-700/30"
+          style={{
+            borderColor: "var(--th-border)",
+            // Tint the whole row on the accent when armed so the elevation is
+            // impossible to miss before a preset is picked.
+            backgroundColor: control ? "var(--th-accent-soft, rgba(250,204,21,0.12))" : undefined,
+          }}
+        >
+          <span
+            className="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border"
+            style={{
+              borderColor: control ? "var(--th-accent)" : "var(--th-border)",
+              backgroundColor: control ? "var(--th-accent)" : "transparent",
+              color: control ? "var(--th-tile-bg)" : "var(--th-fg-muted)",
+            }}
+          >
+            {control && <ShieldCheck size={12} aria-hidden />}
+          </span>
+          <span className="flex flex-col">
+            <span
+              className="text-sm"
+              style={{ color: control ? "var(--th-accent)" : "var(--th-fg)" }}
+            >
+              Control terminal
+            </span>
+            <span className="text-xs" style={{ color: "var(--th-fg-muted)" }}>
+              {control
+                ? "Armed — the next preset spawns a control terminal (audited)"
+                : "Elevate: grants the full control token (audited)"}
+            </span>
+          </span>
+        </button>
       </div>
     </div>
   );

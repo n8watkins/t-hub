@@ -141,6 +141,33 @@ describe("adoptCaptainsSnapshot A1 empty guard", () => {
   });
 });
 
+describe("cortana role survives the wire -> record conversion (crown sync)", () => {
+  // The captains-view crown must reflect the registry's Cortana holder live. A
+  // claim_captain role:cortana on ANOTHER client (or restored at this window's
+  // reload) rides a sync_captains record carrying role:"cortana"; adoptCaptains-
+  // Snapshot must PRESERVE that role so the store's reconcile can adopt the crown.
+  // Bypass-would-fail: drop `role: ...` from the record it pushes and this fails
+  // (the crown never syncs cross-client / on reload).
+  it("adopts a wire cortana record into orchestratorId", () => {
+    useWorkspace.setState({
+      tabs: [{ id: "t1", name: "W1", order: ["capA"] }],
+      activeTabId: "t1",
+      focusedId: "capA",
+      terminals: { capA: { id: "capA", tmuxSession: "th_capA", cwd: "/tmp", title: "capA", state: "live" } },
+      poppedOutTabs: [],
+    });
+    useCaptain.setState({ orchestratorId: null });
+    const ok = adoptCaptainsSnapshot({
+      seq: 1,
+      captains: [{ terminalId: "capA", shipSlug: "cortana", role: "cortana", workspaceTabIds: [], crew: [] }],
+    });
+    expect(ok).toBe(true);
+    expect(useCaptain.getState().orchestratorId).toBe("capA");
+    // Role split: a cortana record is the crown, never a summonable captain pin.
+    expect(useCaptain.getState().captainIds).toEqual([]);
+  });
+});
+
 describe("sync_captains forward suppression during bootstrap", () => {
   it("suppresses a mid-loop sync_captains forward, then resumes after bootstrap", () => {
     seedCaptains(["capA"]);
