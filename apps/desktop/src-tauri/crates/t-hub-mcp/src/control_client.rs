@@ -535,8 +535,16 @@ fn call_classified(
     command: &str,
     args: &Value,
 ) -> Result<Value, CallError> {
+    // Comms-plane Phase 3: present the caller session's PER-SESSION token
+    // (`T_HUB_SESSION_TOKEN`, injected into this session's env at spawn) ALONGSIDE the
+    // tier `token`, so the app can resolve WHICH session (role/ship) is calling and
+    // enforce the plane ACLs against an unforgeable-across-sessions identity. Absent for
+    // a session that never minted one (a legacy/host context) - the server then treats
+    // the caller as the trusted control-token host and the cross-ship ACL fails open.
+    let session = std::env::var("T_HUB_SESSION_TOKEN").unwrap_or_default();
     let request = serde_json::json!({
         "token": endpoint.token,
+        "session": session,
         "command": command,
         "args": args,
     });

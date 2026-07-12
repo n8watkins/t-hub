@@ -118,8 +118,15 @@ fn handshake_path() -> PathBuf {
 /// error. The app's own error string is preserved verbatim (so gating /
 /// confirmation messages surface unchanged).
 pub fn call(ep: &Endpoint, command: &str, args: Value) -> Result<Value, ControlError> {
+    // Comms-plane Phase 3: present the caller session's PER-SESSION token
+    // (`T_HUB_SESSION_TOKEN`) alongside the tier `token` so `th` run inside a spawned
+    // session is bound to that session's identity by the plane ACLs (a crew's `th send`
+    // is ship-gated like its MCP writes). Absent for a host/human context - the server
+    // then treats it as the trusted control-token host (cross-ship ACL fails open).
+    let session = std::env::var("T_HUB_SESSION_TOKEN").unwrap_or_default();
     let request = serde_json::json!({
         "token": ep.token,
+        "session": session,
         "command": command,
         "args": args,
         "v": PROTOCOL_VERSION,
