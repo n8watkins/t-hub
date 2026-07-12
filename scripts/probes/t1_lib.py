@@ -31,18 +31,38 @@ def control_token(hs):
         return env_tok
     return hs["token"]
 
+def _connect_addr(addr, timeout):
+    host, port = addr.rsplit(":", 1)
+    return socket.create_connection((host, int(port)), timeout=timeout)
+
 def connect(timeout=15.0):
     hs = handshake()
     # Discovery of the address still comes from control.json; the endpoint address
-    # is not a secret. An explicit T_HUB_CONTROL_ADDR (paired with the env token)
-    # overrides it - the same all-or-nothing pairing the Rust MCP client uses.
+    # is not a secret. An explicit T_HUB_CONTROL_ADDR (paired with the env token) is
+    # tried FIRST, but a session's env pin points at a DEAD port after any app
+    # restart/rebind (the app rotates its ephemeral port every launch). So on a
+    # connection failure we re-resolve the LIVE addr from control.json and retry,
+    # KEEPING the env token - a restart rotates the port, not the token (adopt-first);
+    # adopting control.json's token (READ-only once hardening is on) would silently
+    # drop a control caller to read-only. Mirrors the Rust MCP client's stale-pin
+    # recovery (`Discovery::refreshed_endpoint`).
     env_addr = os.environ.get("T_HUB_CONTROL_ADDR")
-    addr = env_addr if (env_addr and os.environ.get("T_HUB_CONTROL_TOKEN")) else hs["addr"]
-    host, port = addr.rsplit(":", 1)
-    s = socket.create_connection((host, int(port)), timeout=timeout)
+    env_pinned = bool(env_addr and os.environ.get("T_HUB_CONTROL_TOKEN"))
+    addr = env_addr if env_pinned else hs["addr"]
+    try:
+        s = _connect_addr(addr, timeout)
+    except OSError:
+        # The pinned addr is dead. Re-read control.json for the addr the live app
+        # just published; retry there only if it actually moved, else re-raise.
+        fresh = handshake().get("addr")
+        if not fresh or fresh == addr:
+            raise
+        s = _connect_addr(fresh, timeout)
     # Expose the Phase 3-aware control token on the handshake dict so callers that
     # do `tok = hs["token"]` keep working after the flip by reading hs["token"]
-    # (now the effective control token when the env injects one).
+    # (now the effective control token when the env injects one). control_token
+    # prefers the env token, so the fallback above keeps the caller's real
+    # capability even after re-resolving the addr.
     hs = dict(hs)
     hs["token"] = control_token(hs)
     return s, hs
