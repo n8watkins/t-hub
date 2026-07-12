@@ -1,7 +1,7 @@
 // Per-project panel state — the per-tile "workbench".
 //
 // Each project tile shows ONE of several views — Terminal / Files / Preview /
-// Dev — plus a fullscreen toggle. This store holds that purely-presentational,
+// Dev / Board — plus a fullscreen toggle. This store holds that purely-presentational,
 // per-terminal UI state. It is deliberately kept OUT of the workspace store so
 // the parallel panel work doesn't contend on workspace.ts.
 // In-memory only for v1 (not persisted): a fresh launch starts every tile on its
@@ -17,8 +17,10 @@
 import { create } from "zustand";
 import type { TerminalId } from "../ipc/types";
 
-/** The selectable views inside a project tile. */
-export type PanelTab = "terminal" | "files" | "preview" | "dev";
+/** The selectable views inside a project tile. "board" embeds an external URL
+ *  (the powder board by default — see settings.powderBoardUrl) in the shared
+ *  WebPreview surface. */
+export type PanelTab = "terminal" | "files" | "preview" | "dev" | "board";
 
 /** The view a tile shows until the user switches it. */
 export const DEFAULT_PANEL_TAB: PanelTab = "terminal";
@@ -89,6 +91,10 @@ interface PanelState {
   /** Last URL the user committed in a terminal's Preview tab, so it survives a
    *  tab switch. The Preview tab prefers a live `devUrl` over this. */
   previewUrl: Record<TerminalId, string | null>;
+  /** Last URL committed in a terminal's Board tab, so navigating away from the
+   *  powder-board default survives a tab switch. Absent => fall back to the
+   *  configured settings.powderBoardUrl. */
+  boardUrl: Record<TerminalId, string | null>;
   /** localhost-ish URLs scraped from a terminal's LIVE output (newest-first,
    *  deduped, capped). Written by Terminal.tsx as Claude/dev servers print their
    *  URLs; surfaced as one-click chips in that tile's Preview tab. Absent => []. */
@@ -127,6 +133,8 @@ interface PanelState {
   addDetectedUrl: (id: TerminalId, url: string) => void;
   /** Remember the user-typed Preview URL for a terminal. */
   setPreviewUrl: (id: TerminalId, url: string | null) => void;
+  /** Remember the URL committed in a terminal's Board tab. */
+  setBoardUrl: (id: TerminalId, url: string | null) => void;
   /** Drop all panel state for a terminal (call when its tile is deleted). */
   forget: (id: TerminalId) => void;
 }
@@ -136,6 +144,7 @@ export const usePanels = create<PanelState>((set, get) => ({
   fullscreenId: null,
   devUrl: {},
   previewUrl: {},
+  boardUrl: {},
   detectedUrls: {},
   panelExpanded: {},
   splitRatio: loadSplitRatios(),
@@ -184,17 +193,21 @@ export const usePanels = create<PanelState>((set, get) => ({
     }),
   setPreviewUrl: (id, url) =>
     set((s) => ({ previewUrl: { ...s.previewUrl, [id]: url } })),
+  setBoardUrl: (id, url) =>
+    set((s) => ({ boardUrl: { ...s.boardUrl, [id]: url } })),
   forget: (id) =>
     set((s) => {
       const tab = { ...s.tab };
       const devUrl = { ...s.devUrl };
       const previewUrl = { ...s.previewUrl };
+      const boardUrl = { ...s.boardUrl };
       const detectedUrls = { ...s.detectedUrls };
       const panelExpanded = { ...s.panelExpanded };
       const splitRatio = { ...s.splitRatio };
       delete tab[id];
       delete devUrl[id];
       delete previewUrl[id];
+      delete boardUrl[id];
       delete detectedUrls[id];
       delete panelExpanded[id];
       const hadRatio = id in splitRatio;
@@ -205,6 +218,7 @@ export const usePanels = create<PanelState>((set, get) => ({
         tab,
         devUrl,
         previewUrl,
+        boardUrl,
         detectedUrls,
         panelExpanded,
         splitRatio,
