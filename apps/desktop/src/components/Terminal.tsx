@@ -63,40 +63,8 @@ import { tlog } from "../lib/diag";
 import { REPAINT_ALL_EVENT, REFRESH_TERMINAL_EVENT } from "../lib/repaint";
 import { registerTerminalTail, unregisterTerminalTail } from "../lib/terminalTail";
 import type { ITheme, ILink } from "@xterm/xterm";
-import {
-  readText as tauriReadText,
-  writeText as tauriWriteText,
-} from "@tauri-apps/plugin-clipboard-manager";
+import { clipboardRead, clipboardWrite } from "../lib/clipboard";
 import "./Terminal.css";
-
-// Clipboard helpers. WebView2 silently blocks `navigator.clipboard` (copy/paste
-// "did nothing"), so prefer the Tauri clipboard plugin and fall back to the web
-// API only if the plugin isn't available (e.g. plain `pnpm dev` in a browser).
-async function clipboardWrite(text: string): Promise<void> {
-  try {
-    await tauriWriteText(text);
-    return;
-  } catch {
-    /* fall through to the web API */
-  }
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    /* nothing more we can do */
-  }
-}
-async function clipboardRead(): Promise<string> {
-  try {
-    return (await tauriReadText()) ?? "";
-  } catch {
-    /* fall through */
-  }
-  try {
-    return await navigator.clipboard.readText();
-  } catch {
-    return "";
-  }
-}
 
 // Paste into a terminal, preferring an IMAGE on the clipboard over text. When the
 // clipboard holds an image (a screenshot, a copied picture), the Rust side saves
