@@ -38,6 +38,7 @@ import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { CanvasAddon } from "@xterm/addon-canvas";
+import { saneFitProposal } from "./terminalFit";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -705,6 +706,12 @@ export function TerminalView({
 
     const pushResize = () => {
       if (disposed) return;
+      // NEVER push a degenerate resize. A parked/hidden/not-yet-laid-out tile
+      // measures ~0px wide and FitAddon would propose ~2 cols; pushing that to
+      // the PTY wedges the whole tmux window to 2 columns (the 2x24-client bug).
+      // Skip until the tile has a real box — the ResizeObserver / pool-move
+      // re-runs this once it does, and term keeps its current sane geometry.
+      if (!saneFitProposal(term, fit)) return;
       try {
         fit.fit();
         void resizeTerminal(terminalId, term.cols, term.rows);
@@ -783,7 +790,14 @@ export function TerminalView({
       rafId = requestAnimationFrame(() => {
         if (disposed) return;
         try {
-          fit.fit();
+          // Only fit if the tile is really laid out at a sane size. A tile that
+          // spawns in the BACKGROUND (another tab active) has no measured box
+          // yet, so a fit here would size xterm to ~2 cols and the attach below
+          // would create the PTY at 2 cols — the wedged 2x24 client. Skipping
+          // leaves xterm at its 80x24 construction default, a sane geometry to
+          // attach at; the pool-move / ResizeObserver re-fits to the tile's real
+          // width the moment it gets a box.
+          if (saneFitProposal(term, fit)) fit.fit();
         } catch {
           /* container detached; ignore */
         }
@@ -1558,8 +1572,14 @@ export function TerminalView({
     const term = termRef.current;
     if (!term) return;
     term.options.fontSize = fontSize;
+    const fit = fitRef.current;
+    if (!fit) return;
     try {
-      fitRef.current?.fit();
+      // Same degenerate-measurement guard as pushResize: a zoom change on a
+      // parked/hidden tile must not fit-and-push ~2 cols to the PTY. When it
+      // un-parks, the pool-move / ResizeObserver re-fits at the new font size.
+      if (!saneFitProposal(term, fit)) return;
+      fit.fit();
       void resizeTerminal(terminalId, term.cols, term.rows);
     } catch {
       /* container detached mid-zoom; ignore */
