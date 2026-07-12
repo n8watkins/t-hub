@@ -1361,6 +1361,7 @@ impl CaptainsRegistry {
         claude_uuid: Option<&str>,
         workspace_tab_ids: Vec<String>,
         is_terminal_dead: &dyn Fn(&str) -> bool,
+        crew_liveness: &dyn Fn(&str) -> tmux::SessionLiveness,
     ) -> Result<ClaimOutcome, String> {
         if terminal_id.trim().is_empty() {
             return Err("claim_captain requires a non-empty 'captainSessionId'".into());
@@ -1479,7 +1480,7 @@ impl CaptainsRegistry {
                         }
                         if reactivate {
                             c.state = ClaimState::Active;
-                            Self::readopt_orphaned_crew(c);
+                            Self::readopt_orphaned_crew(c, crew_liveness);
                         }
                         let changed = tabs_change || uuid_change || reactivate;
                         let rec = c.clone();
@@ -1530,7 +1531,7 @@ impl CaptainsRegistry {
                         c.workspace_tab_ids = workspace_tab_ids;
                     }
                     c.state = ClaimState::Active;
-                    Self::readopt_orphaned_crew(c);
+                    Self::readopt_orphaned_crew(c, crew_liveness);
                     let rec = c.clone();
                     return Ok(self.commit_claim(g, rec, disposition, true));
                 }
@@ -1542,12 +1543,36 @@ impl CaptainsRegistry {
         ))
     }
 
-    /// Re-adopt a resuming supervisor's Orphaned crew (Orphaned -> Active). A crew
-    /// whose OWN tile died (`Removed`) is NOT resurrected - the worker is gone.
-    fn readopt_orphaned_crew(c: &mut FleetIdentity) {
+    /// Re-adopt a resuming supervisor's Orphaned crew, GATED on a liveness probe
+    /// (audit BUG-1: the old form blind-flipped EVERY Orphaned crew to `Active`
+    /// with no probe, so a captain resuming after its crew had died resurrected
+    /// dead tiles). Per-crew, keyed on the same de-conflated two-tier liveness the
+    /// incumbent transfer uses (PR#58):
+    ///   - `Alive`   -> `Active`  (the worker is really there, re-adopt it);
+    ///   - `Gone`    -> `Removed` (a DEFINITIVE absent probe: the worker died while
+    ///     orphaned; mark it, don't resurrect it);
+    ///   - `Unknown` -> left `Orphaned` (an ambiguous/timed-out probe is NEVER
+    ///     seized - it stays re-adoptable on the next resume once liveness is
+    ///     definite; item-2 two-tier invariant: ambiguous is never acted on).
+    /// A crew whose OWN tile already went `Removed` is untouched (the worker is
+    /// gone for good).
+    ///
+    /// `crew_liveness` MUST be a PURE lookup (this runs while the registry `inner`
+    /// lock is held; MED-3/Incident-D forbids tmux I/O under the lock). The real
+    /// caller precomputes a liveness map lock-free and passes a map-reading
+    /// closure; tests inject a deterministic one.
+    fn readopt_orphaned_crew(
+        c: &mut FleetIdentity,
+        crew_liveness: &dyn Fn(&str) -> tmux::SessionLiveness,
+    ) {
+        let now = now_ms();
         for cr in c.crew.iter_mut() {
             if matches!(cr.state, CrewState::Orphaned { .. }) {
-                cr.state = CrewState::Active;
+                match crew_liveness(&cr.terminal_id) {
+                    tmux::SessionLiveness::Alive => cr.state = CrewState::Active,
+                    tmux::SessionLiveness::Gone => cr.state = CrewState::Removed { since: now },
+                    tmux::SessionLiveness::Unknown => {}
+                }
             }
         }
     }
@@ -1768,6 +1793,10 @@ impl CaptainsRegistry {
             None,
             workspace_tab_ids,
             &|_| false,
+            // Legacy resurrect-all: existing readopt tests predate the liveness
+            // gate and assert orphaned crew come back Active. Tests that exercise
+            // the Gone/Unknown legs pass an explicit `crew_liveness` to `claim`.
+            &|_| tmux::SessionLiveness::Alive,
         )
     }
 }
@@ -3757,16 +3786,44 @@ fn elevation_env(ctx: &ControlContext, args: &Value) -> Vec<(String, String)> {
     ]
 }
 
-/// The directory `GH_CONFIG_DIR` points crew at: an EMPTY t-hub-owned config dir with
-/// no `hosts.yml`, so `gh` finds no ambient credential there. Best-effort created.
-fn crew_empty_gh_config_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = home.join(".t-hub").join("crew-gh-empty");
+/// The directory `GH_CONFIG_DIR` points crew at: an EMPTY t-hub-owned config dir
+/// with no `hosts.yml`, so `gh` finds no ambient credential there.
+///
+/// The value is injected into the crew's WSL shell via `tmux -e`, so it MUST be a
+/// POSIX path. The old form built it with `PathBuf::join` and a `USERPROFILE`
+/// fallback: on a Windows binary that yields BACKSLASH separators and/or a `C:`
+/// drive path (`C:\Users\...\.t-hub\crew-gh-empty`) that is meaningless in WSL -
+/// so `gh` got a mangled dir and the credential-withholding wall silently broke
+/// (audit HIGH, hit 3 crews). Fix: resolve ONLY from a POSIX-absolute `$HOME` and
+/// build the string with explicit forward slashes; when `$HOME` is absent or a
+/// Windows-style value (a native-Windows launch), fall back to a fixed POSIX path.
+/// Either way the crew gets a valid POSIX dir with no `hosts.yml` - never a
+/// backslash/drive path.
+fn crew_empty_gh_config_dir() -> String {
+    let dir = crew_gh_config_dir_from_home(std::env::var("HOME").ok().as_deref());
+    // The security property is the ABSENCE of a `hosts.yml` at this path, not that
+    // the app created it, so a best-effort create is enough even if the app's FS
+    // view differs from the crew's WSL view.
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// Pure core of [`crew_empty_gh_config_dir`] (env-free, so it is unit-testable
+/// without racy env mutation). Given the raw `$HOME` value, produce the POSIX
+/// `GH_CONFIG_DIR` string for the crew's WSL shell.
+///
+/// A POSIX-absolute `$HOME` (the WSL-launched app, the common case) is used
+/// directly; anything else - `None` or a Windows `USERPROFILE`-style value
+/// (`C:\Users\...`, no leading `/`) - falls back to a fixed `/tmp` path. The
+/// string is built with explicit forward slashes (NOT `PathBuf::join`, which
+/// emits `\` on a Windows binary), so the result is ALWAYS a backslash-free POSIX
+/// path.
+fn crew_gh_config_dir_from_home(home: Option<&str>) -> String {
+    let base = home
+        .filter(|h| h.starts_with('/'))
+        .unwrap_or("/tmp")
+        .trim_end_matches('/');
+    format!("{base}/.t-hub/crew-gh-empty")
 }
 
 /// item-3 §2.3.5 (MED-5): the credential-WITHHOLDING env for a read-class (crew)
@@ -3777,10 +3834,7 @@ fn crew_empty_gh_config_dir() -> PathBuf {
 /// fails at the remote for lack of a credential. Control-class spawns (captains) are
 /// NOT withheld - orchestrating IS their job.
 fn crew_credential_withholding_env() -> Vec<(String, String)> {
-    let mut env = vec![(
-        "GH_CONFIG_DIR".to_string(),
-        crew_empty_gh_config_dir().to_string_lossy().into_owned(),
-    )];
+    let mut env = vec![("GH_CONFIG_DIR".to_string(), crew_empty_gh_config_dir())];
     // Blank the ambient publish/registry/spend tokens a crew must not wield. Setting
     // them empty at the session level scrubs any value inherited from the app env.
     for key in [
@@ -5535,7 +5589,13 @@ fn open_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// (`addWorktreeWorkspace`), which is the same path the FilePanel UI uses. The git
 /// worktree already exists by then, so the store SKIPS its own `gitWorktreeAdd` —
 /// the forward carries `alreadyCreated: true`. Args: `repoRoot`, `worktreePath`
-/// (required); `branch`, `tabName` (optional).
+/// (required); `branch`, `tabName`, `startupCommand` (optional).
+///
+/// `startupCommand` mirrors `spawn_terminal`'s: the command the worktree
+/// terminal execs back into inside an interactive login shell (e.g.
+/// `claude --resume <id>`), plumbed through the SAME `pane_command` / `-ilc` exec
+/// path `spawn_terminal` uses. Without it a worktree crew booted to a bare shell
+/// (the provisioning gap powder/Cortana hit).
 fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let repo_root = arg_str(args, "repoRoot")
         .or_else(|| arg_str(args, "repo_root"))
@@ -5545,6 +5605,10 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         .ok_or("create_worktree requires a 'worktreePath' argument")?;
     let branch = arg_str(args, "branch");
     let tab_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
+    // The command the worktree terminal execs into, same contract + exec path as
+    // spawn_terminal's startupCommand (snake alias for parity with the other args).
+    let startup_command =
+        arg_str(args, "startupCommand").or_else(|| arg_str(args, "startup_command"));
     // Captain-chat phase 2: a captain staging a crew worktree identifies itself
     // so the worktree terminal is recorded as crew (same contract as
     // spawn_terminal's spawnedBy).
@@ -5605,7 +5669,12 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         // default as spawn_terminal (READ unless `capability:"control"`). Comms-plane
         // Phase 2 (§2.3): mint + inject its per-session identity token too.
         let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "create_worktree");
-        match spawn_tmux_terminal(&worktree_path, None, &elevation) {
+        // Wrap the startupCommand into the pane exec the SAME way spawn_terminal
+        // does (pane_command → an interactive login shell that execs the command);
+        // None keeps the prior bare-shell behavior. No `shell` preset for a
+        // worktree spawn - the crew boots into the worktree dir running this.
+        let pane = crate::commands::pane_command(None, startup_command.as_deref());
+        match spawn_tmux_terminal(&worktree_path, pane.as_deref(), &elevation) {
             Ok((id, _)) => {
                 if let Some(identity) = &minted_identity {
                     ctx.identity.bind_tile(&identity.id, &id);
@@ -5653,6 +5722,7 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
             "tabId": tab_id,
             "tabName": effective_tab_name,
             "terminalId": terminal_id,
+            "startupCommand": startup_command,
             "alreadyCreated": true,
         }),
     );
@@ -5664,6 +5734,7 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         "tabId": tab_id,
         "tabName": effective_tab_name,
         "terminalId": terminal_id,
+        "startupCommand": startup_command,
         "gitOutput": git_output,
         "spawnedBy": spawned_by,
         "crewRecorded": crew_recorded,
@@ -6084,6 +6155,33 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // inside `claim` (the CAS discipline, MED-3).
     let is_terminal_dead =
         |tile: &str| tmux::is_definitively_gone(tmux::session_liveness(&tmux_target(tile)));
+    // BUG-1: readopt of a resuming captain's Orphaned crew is now GATED on a per-
+    // crew liveness probe (Alive->active, Gone->retired, Unknown->stays orphaned)
+    // instead of blind-activating every orphan. The probes are tmux subprocesses,
+    // so they run HERE, lock-free, into a precomputed map (MED-3: tmux is never
+    // called while the registry lock is held). Probe every orphaned crew tile in
+    // the current snapshot; `claim` reads the map purely under the lock and any
+    // tile not in it (a race adding an orphan after this snapshot) defaults to
+    // Unknown -> left orphaned, re-adoptable on the next resume.
+    let orphan_liveness: std::collections::HashMap<String, tmux::SessionLiveness> = ctx
+        .captains
+        .snapshot()
+        .captains
+        .iter()
+        .flat_map(|c| c.crew.iter())
+        .filter(|cr| matches!(cr.state, CrewState::Orphaned { .. }))
+        .map(|cr| {
+            let tile = cr.terminal_id.clone();
+            let liveness = tmux::session_liveness(&tmux_target(&tile));
+            (tile, liveness)
+        })
+        .collect();
+    let crew_liveness = |tile: &str| {
+        orphan_liveness
+            .get(tile)
+            .copied()
+            .unwrap_or(tmux::SessionLiveness::Unknown)
+    };
     let outcome = ctx.captains.claim(
         &captain_session_id,
         ship_slug.as_deref(),
@@ -6091,6 +6189,7 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         claude_uuid.as_deref(),
         workspace_tab_ids,
         &is_terminal_dead,
+        &crew_liveness,
     )?;
     let snap = ctx.captains.snapshot();
     // Idempotent re-claim (unchanged): the registry left `seq` alone, so skip the
@@ -7831,6 +7930,64 @@ mod tests {
 
         assert!(!wt.exists(), "the worktree dir must be gone");
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn create_worktree_runs_the_startup_command_in_the_worktree_terminal() {
+        // audit MED (provisioning gap): create_worktree now carries a
+        // `startupCommand` plumbed through the SAME pane_command / -ilc exec path
+        // spawn_terminal uses, so a worktree crew boots into its command instead of
+        // a bare shell. This proves it EXECUTES end-to-end: the startupCommand
+        // touches a sentinel file, and we poll for it. BYPASS-WOULD-FAIL: pass
+        // `None` for the pane again (the old bare-shell spawn) and the sentinel is
+        // never created -> the poll times out RED.
+        let (base, repo, _wt) = scratch_repo_with_worktree();
+        let new_wt = base.join("wt-startup");
+        let sentinel = base.join("startup-ran.marker");
+        let startup = format!("touch {}", sentinel.to_str().unwrap());
+
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let v = dispatch(
+            &ctx,
+            "create_worktree",
+            &json!({
+                "repoRoot": repo.to_str().unwrap(),
+                "worktreePath": new_wt.to_str().unwrap(),
+                "startupCommand": startup,
+            }),
+        )
+        .unwrap();
+        assert_eq!(v["accepted"], "create_worktree");
+        // The response + the UI forward both carry the command verbatim.
+        assert_eq!(v["startupCommand"], json!(startup));
+        let terminal_id = v["terminalId"].as_str().expect("a terminal was spawned");
+        {
+            let calls = sink.calls.lock().unwrap();
+            let fwd = calls
+                .iter()
+                .find(|(cmd, _)| cmd == "add_worktree_workspace")
+                .expect("the worktree forward was delivered");
+            assert_eq!(fwd.1["startupCommand"], json!(startup));
+        }
+
+        // Poll for the sentinel: proof the -ilc pane wrap actually ran the command
+        // (the interactive login shell can take a moment to source rc + exec).
+        let mut ran = false;
+        for _ in 0..100 {
+            if sentinel.exists() {
+                ran = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // Reap the real session before asserting, so a failure never leaks a tmux
+        // session or the scratch dir.
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": terminal_id})).ok();
+        std::fs::remove_dir_all(&base).ok();
+        assert!(ran, "the worktree terminal must have run the startupCommand");
     }
 
     #[test]
@@ -9610,12 +9767,17 @@ mod tests {
     fn all_alive(_: &str) -> bool {
         false
     }
+    /// Crew liveness seam that reports every crew Alive - the legacy resurrect-all
+    /// readopt behavior. Tests that exercise the Gone/Unknown legs pass their own.
+    fn crew_all_alive(_: &str) -> tmux::SessionLiveness {
+        tmux::SessionLiveness::Alive
+    }
 
     #[test]
     fn claim_registers_updates_and_bumps_seq() {
         let reg = CaptainsRegistry::new();
         let out = reg
-            .claim("cap-1", Some("Ship Alpha!"), FleetRole::Captain, None, vec!["tab-1".into()], &all_alive)
+            .claim("cap-1", Some("Ship Alpha!"), FleetRole::Captain, None, vec!["tab-1".into()], &all_alive, &crew_all_alive)
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::Created);
         let rec = out.record;
@@ -9631,7 +9793,7 @@ mod tests {
         // refresh, crew kept, no duplicate record.
         assert!(reg.record_crew("cap-1", "crew-1"));
         let out = reg
-            .claim("cap-1", Some("ship-beta"), FleetRole::Captain, None, vec!["tab-2".into()], &all_alive)
+            .claim("cap-1", Some("ship-beta"), FleetRole::Captain, None, vec!["tab-2".into()], &all_alive, &crew_all_alive)
             .unwrap();
         let rec = out.record;
         assert_eq!(rec.ship_slug, "ship-beta");
@@ -9652,7 +9814,7 @@ mod tests {
         let out = reg.claim_test("cap-1", None, vec![]).unwrap();
         assert_eq!(out.record.ship_slug, "ship-cap-1");
         let err = reg
-            .claim("cap-2", Some("ship-cap-1"), FleetRole::Captain, None, vec![], &all_alive)
+            .claim("cap-2", Some("ship-cap-1"), FleetRole::Captain, None, vec![], &all_alive, &crew_all_alive)
             .unwrap_err();
         assert!(err.contains("already captained by a LIVE session 'cap-1'"), "got: {err}");
         // The incumbent is untouched; the refusal did not bump the revision.
@@ -9674,7 +9836,7 @@ mod tests {
         // cap-old's pane is gone; cap-new re-claims the same ship (no UUID resolved).
         let dead_is_old = |tile: &str| tile == "cap-old";
         let out = reg
-            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &dead_is_old)
+            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &dead_is_old, &crew_all_alive)
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::AutoReleasedDead);
         assert_eq!(out.record.terminal_id.as_deref(), Some("cap-new"));
@@ -9699,7 +9861,7 @@ mod tests {
         let probe_times_out =
             |_: &str| tmux::is_definitively_gone(tmux::SessionLiveness::Unknown);
         let err = reg
-            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &probe_times_out)
+            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &probe_times_out, &crew_all_alive)
             .unwrap_err();
         assert!(
             err.contains("already captained by a LIVE session 'cap-old'"),
@@ -9722,10 +9884,10 @@ mod tests {
         // rebinds the terminal pointer WITHOUT the liveness path - even if the probe
         // would say "alive" (the old tile lingering). It must never be a competitor seize.
         let reg = CaptainsRegistry::new();
-        reg.claim("cap-old", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive)
+        reg.claim("cap-old", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive, &crew_all_alive)
             .unwrap();
         let out = reg
-            .claim("cap-new", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive)
+            .claim("cap-new", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive, &crew_all_alive)
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::ReboundSameUuid);
         assert_eq!(out.record.terminal_id.as_deref(), Some("cap-new"));
@@ -9749,6 +9911,65 @@ mod tests {
         assert_eq!(rec.state, ClaimState::Active);
         assert_eq!(rec.terminal_id.as_deref(), Some("cap-new"));
         assert_eq!(rec.crew[0].state, CrewState::Active, "orphaned crew re-adopted");
+    }
+
+    #[test]
+    fn readopt_is_gated_on_per_crew_liveness_never_blind_activates() {
+        // audit BUG-1: a resumed captain must NOT blind-flip every Orphaned crew to
+        // Active - it re-probes each and only re-adopts the ones actually Alive.
+        // Alive -> Active, Gone (definitively absent) -> Removed, Unknown (ambiguous
+        // probe) -> stays Orphaned (re-adoptable next resume). BYPASS-WOULD-FAIL:
+        // restore the blind `cr.state = Active` and the Gone/Unknown crew come back
+        // Active -> RED.
+        let reg = CaptainsRegistry::new();
+        reg.claim_test("cap-old", Some("shipx"), vec![]).unwrap();
+        for c in ["crew-alive", "crew-gone", "crew-unknown"] {
+            assert!(reg.record_crew("cap-old", c));
+        }
+        assert!(reg.remove_session("cap-old"), "captain death orphans the crew");
+        assert!(
+            only(&reg).crew.iter().all(|c| matches!(c.state, CrewState::Orphaned { .. })),
+            "all crew start Orphaned"
+        );
+
+        // The liveness seam the real handler precomputes lock-free: one verdict per
+        // crew tile.
+        let crew_liveness = |tile: &str| match tile {
+            "crew-alive" => tmux::SessionLiveness::Alive,
+            "crew-gone" => tmux::SessionLiveness::Gone,
+            _ => tmux::SessionLiveness::Unknown,
+        };
+        let out = reg
+            .claim(
+                "cap-new",
+                Some("shipx"),
+                FleetRole::Captain,
+                None,
+                vec![],
+                &all_alive,
+                &crew_liveness,
+            )
+            .unwrap();
+        assert_eq!(out.disposition, ClaimDisposition::ReadoptedOrphan);
+
+        let rec = only(&reg);
+        assert_eq!(rec.state, ClaimState::Active, "the captain itself re-activates");
+        let state_of = |tile: &str| {
+            rec.crew
+                .iter()
+                .find(|c| c.terminal_id == tile)
+                .map(|c| c.state.clone())
+                .unwrap()
+        };
+        assert_eq!(state_of("crew-alive"), CrewState::Active, "Alive -> re-adopted");
+        assert!(
+            matches!(state_of("crew-gone"), CrewState::Removed { .. }),
+            "Gone -> retired, never resurrected"
+        );
+        assert!(
+            matches!(state_of("crew-unknown"), CrewState::Orphaned { .. }),
+            "Unknown -> left Orphaned (ambiguous is never seized)"
+        );
     }
 
     #[test]
@@ -9812,19 +10033,19 @@ mod tests {
         // (or the same session) yields the apex.
         let reg = CaptainsRegistry::new();
         let out = reg
-            .claim("cor-1", None, FleetRole::Cortana, None, vec![], &all_alive)
+            .claim("cor-1", None, FleetRole::Cortana, None, vec![], &all_alive, &crew_all_alive)
             .unwrap();
         assert_eq!(out.record.role, FleetRole::Cortana);
         assert_eq!(out.record.ship_slug, CORTANA_SLUG);
         // A different LIVE terminal cannot seize the singleton.
         let err = reg
-            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &all_alive)
+            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &all_alive, &crew_all_alive)
             .unwrap_err();
         assert!(err.contains("LIVE"), "got: {err}");
         // The incumbent dying hands the apex to the resumed Cortana.
         let dead_is_1 = |t: &str| t == "cor-1";
         let out = reg
-            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &dead_is_1)
+            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &dead_is_1, &crew_all_alive)
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::AutoReleasedDead);
         assert_eq!(out.record.terminal_id.as_deref(), Some("cor-2"));
@@ -9858,7 +10079,7 @@ mod tests {
         // Phase D: the cross-ship ownership KEY resolves for both a supervisor terminal
         // and a crew tile (item-1 Phase 3 wires the ACL on top of this).
         let reg = CaptainsRegistry::new();
-        reg.claim("cap-1", Some("shipx"), FleetRole::Captain, None, vec![], &all_alive)
+        reg.claim("cap-1", Some("shipx"), FleetRole::Captain, None, vec![], &all_alive, &crew_all_alive)
             .unwrap();
         assert!(reg.record_crew("cap-1", "crew-1"));
         assert_eq!(
@@ -11099,9 +11320,24 @@ mod tests {
         ctx.addr = "127.0.0.1:4242".to_string();
 
         let (env, _) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
+        let gh_dir = env
+            .iter()
+            .find(|(k, _)| k == "GH_CONFIG_DIR")
+            .map(|(_, v)| v.as_str());
         assert!(
-            env.iter().any(|(k, v)| k == "GH_CONFIG_DIR" && !v.is_empty()),
+            gh_dir.is_some_and(|v| !v.is_empty()),
             "a crew spawn must withhold gh via GH_CONFIG_DIR"
+        );
+        // The value rides a `tmux -e` into a WSL shell, so it must be a POSIX path:
+        // no backslash, no `C:`-style drive, forward-slash absolute. A Windows path
+        // (the old USERPROFILE/PathBuf::join form) silently defeated withholding.
+        assert!(
+            !env.iter().any(|(_, v)| v.contains('\\')),
+            "no emitted env value may contain a backslash (Windows) path: {env:?}"
+        );
+        assert!(
+            gh_dir.is_some_and(|v| v.starts_with('/') && !v.contains(":\\")),
+            "GH_CONFIG_DIR must be a POSIX-absolute path, got {gh_dir:?}"
         );
         assert!(
             env.iter().any(|(k, v)| k == "GH_TOKEN" && v.is_empty()),
@@ -11113,6 +11349,37 @@ mod tests {
         assert!(
             !env2.iter().any(|(k, _)| k == "GH_CONFIG_DIR"),
             "a control-class spawn must keep its gh credentials"
+        );
+    }
+
+    #[test]
+    fn crew_gh_config_dir_is_always_a_backslash_free_posix_path() {
+        // audit HIGH: the value rides a `tmux -e` into WSL, so it must ALWAYS be a
+        // POSIX path. BYPASS-WOULD-FAIL: restore the USERPROFILE/PathBuf::join form
+        // and the Windows-path cases below emit `C:\...\.t-hub\...` → RED.
+
+        // A POSIX-absolute HOME (WSL-launched app) is used verbatim.
+        assert_eq!(
+            crew_gh_config_dir_from_home(Some("/home/natkins")),
+            "/home/natkins/.t-hub/crew-gh-empty"
+        );
+        // A trailing slash is normalized (no doubled `//`).
+        assert_eq!(
+            crew_gh_config_dir_from_home(Some("/home/natkins/")),
+            "/home/natkins/.t-hub/crew-gh-empty"
+        );
+        // A Windows USERPROFILE-style value is REJECTED (the crux of the bug): it
+        // falls back to a fixed POSIX path, never a backslash/drive path.
+        for windows_home in [r"C:\Users\natha", r"C:\Users\natha\", r"D:\home"] {
+            let dir = crew_gh_config_dir_from_home(Some(windows_home));
+            assert_eq!(dir, "/tmp/.t-hub/crew-gh-empty");
+            assert!(!dir.contains('\\'), "no backslash: {dir}");
+            assert!(!dir.contains(":\\"), "no drive path: {dir}");
+        }
+        // An absent HOME also falls back to the POSIX path (native-Windows launch).
+        assert_eq!(
+            crew_gh_config_dir_from_home(None),
+            "/tmp/.t-hub/crew-gh-empty"
         );
     }
 

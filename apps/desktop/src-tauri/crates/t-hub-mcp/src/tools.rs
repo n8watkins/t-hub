@@ -313,6 +313,7 @@ fn schema_create_worktree() -> Value {
             "worktreePath": { "type": "string", "description": "Absolute POSIX path for the new worktree's working-tree dir." },
             "branch":       { "type": "string", "description": "Optional branch to check out at the worktree (must not be checked out elsewhere). Omitted => git creates a new branch named after the path's final component." },
             "tabName":      { "type": "string", "description": "Optional name for the new workspace tab (defaults to the branch / final path component)." },
+            "startupCommand": { "type": "string", "description": "Optional command the worktree terminal runs inside an interactive login shell it execs back into (e.g. claude --resume <id>) - same contract and exec path as spawn_terminal's startupCommand. Omitted boots a bare shell in the worktree dir." },
             "spawnedBy":    { "type": "string", "description": "Optional captain session id: records the worktree terminal as that captain's CREW in the captains registry (same contract as spawn_terminal's spawnedBy)." },
             "capability":   { "type": "string", "enum": ["read", "control"], "description": "Capability the worktree terminal is granted (item-3 least-privilege, default \"read\"): same contract as spawn_terminal's capability - \"control\" is a deliberate, audited elevation." }
         },
@@ -746,6 +747,20 @@ mod tests {
             assert!(
                 schema["properties"]["spawnedBy"].is_object(),
                 "{name} must accept spawnedBy"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_paths_expose_startup_command() {
+        // audit MED: create_worktree must accept startupCommand just like
+        // spawn_terminal, so a worktree crew can boot into its command (e.g.
+        // `claude --resume <id>`) instead of a bare shell.
+        for name in ["spawn_terminal", "create_worktree"] {
+            let schema = (find(name).unwrap().input_schema)();
+            assert!(
+                schema["properties"]["startupCommand"].is_object(),
+                "{name} must accept startupCommand"
             );
         }
     }
