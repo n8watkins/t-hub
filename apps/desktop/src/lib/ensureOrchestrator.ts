@@ -111,10 +111,14 @@ export async function commissionOrchestrator(opts?: {
     const id =
       res && typeof res.terminalId === "string" ? res.terminalId : null;
     if (!id) return null;
-    // Designate immediately so whenever the (possibly just-spawned) tile lands it
-    // renders crowned + moves into the Captains tab; then focus it.
+    // Designate LOCALLY (M1): the backend `commission_orchestrator` already claimed
+    // the cortana role for this tile, carefully preserving the resume anchor. Driving
+    // the PUBLIC `setOrchestratorId` here would re-release + re-claim server-side and
+    // WIPE that anchor (a childless release drops `claude_uuid`; the fresh re-claim has
+    // no UUID yet), so an app restart in the heal window would lose transcript
+    // continuity. `designateOrchestratorLocal` just mirrors the state + places the tile.
     const { useCaptain } = await import("../store/captain");
-    useCaptain.getState().setOrchestratorId(id);
+    useCaptain.getState().designateOrchestratorLocal(id);
     await focusTile(id);
     return id;
   } catch (err) {

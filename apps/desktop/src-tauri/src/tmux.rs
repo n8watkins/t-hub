@@ -999,6 +999,38 @@ mod tests {
         );
     }
 
+    /// `session_env` reads a variable baked in at `new-session -e KEY=VALUE`, and
+    /// returns `None` for an absent key. This is the DP1=B stale-token detector's
+    /// primitive: the orchestrator commission compares the surviving session's baked
+    /// `T_HUB_CONTROL_ADDR` to the current launch addr.
+    #[test]
+    fn session_env_reads_a_baked_variable() {
+        if !tmux_available() {
+            eprintln!("tmux::tests::session_env_reads_a_baked_variable: tmux not on PATH — skipping");
+            return;
+        }
+        let name = unique_name();
+        let _ = kill_session(&name);
+        let env = vec![("T_HUB_TEST_KEY".to_string(), "127.0.0.1:4242".to_string())];
+        new_session_with_env(&name, "/tmp", None, &env).expect("new_session should succeed");
+        assert_eq!(
+            session_env(&name, "T_HUB_TEST_KEY").as_deref(),
+            Some("127.0.0.1:4242"),
+            "a baked -e variable is read back verbatim"
+        );
+        assert_eq!(
+            session_env(&name, "T_HUB_ABSENT_KEY"),
+            None,
+            "an absent variable is None"
+        );
+        assert_eq!(
+            session_env("th_no_such_session_xyz", "T_HUB_TEST_KEY"),
+            None,
+            "a missing session is None, not an error"
+        );
+        let _ = kill_session_tree(&name);
+    }
+
     /// The MCP read/write helpers round-trip through a real session: send a
     /// literal line, then read it back as plain text from the captured pane.
     ///

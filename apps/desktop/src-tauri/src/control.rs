@@ -6195,10 +6195,13 @@ fn orchestrator_mcp_bin() -> String {
 }
 
 /// Fold the `ensure-thub-mcp.sh` provisioning into the backend so Layer 2 (the MCP
-/// tools) is guaranteed before the orchestrator session is born. Idempotent and
-/// NON-CLOBBERING: an existing `.mcp.json` that already registers `t-hub` keeps its
-/// command path untouched (never overwrite the general's live, working home), and
-/// `settings.local.json` is MERGED (existing keys preserved). Writes:
+/// tools) is guaranteed before the orchestrator session is born. Idempotent: an
+/// existing `.mcp.json` that already registers `t-hub` keeps its command path
+/// untouched (never overwrite the general's live, working home), and
+/// `settings.local.json` is MERGED append-only (existing entries kept) EXCEPT
+/// `permissions.defaultMode`, which is force-set to `bypassPermissions` - this
+/// dedicated singleton home must run unblocked to drive the fleet (matching the shell
+/// script). Writes:
 ///   - `<home>/.mcp.json`               : registers the t-hub MCP server (absolute/PATH bin)
 ///   - `<home>/.claude/settings.local.json`: enables it + grants fleet permissions
 fn provision_orchestrator_home(home: &std::path::Path) -> Result<(), String> {
@@ -6252,6 +6255,9 @@ fn provision_orchestrator_home(home: &std::path::Path) -> Result<(), String> {
         }
     }
     // permissions.defaultMode = bypassPermissions + allow the drive-a-terminal tools.
+    // `defaultMode` is FORCE-SET (not preserved): this is the orchestrator's DEDICATED
+    // singleton home and it must run unblocked to drive the fleet - matching
+    // `ensure-thub-mcp.sh`. Everything else here is append-only (existing entries kept).
     let perms = settings
         .entry("permissions".to_string())
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
@@ -6375,8 +6381,8 @@ fn commission_orchestrator(ctx: &ControlContext, args: &Value) -> Result<Value, 
     provision_orchestrator_home(&home)?;
     let home_str = home.to_string_lossy().into_owned();
 
-    // The prior embodiment to retire once the replacement is claimed (may be a dead
-    // ghost in Case B, or a live-but-stale session in the restart-repair path).
+    // The prior embodiment to retire (a dead ghost in Case B, or a live-but-stale
+    // session in the restart-repair / forceRespawn path).
     let prior_terminal = record.as_ref().and_then(|r| r.terminal_id.clone());
     // Layer 4: resume the existing transcript when we have an anchor (Case B), else a
     // fresh cold-start kickoff (Case C, DP4).
@@ -6385,6 +6391,33 @@ fn commission_orchestrator(ctx: &ControlContext, args: &Value) -> Result<Value, 
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let (startup, case) = orchestrator_startup(claude_uuid.as_deref(), kickoff);
+
+    // RETIRE-PRIOR *BEFORE* the claim (H1). The DP1=B restart case survives the app
+    // (tmux is independent), so the `cortana` record is still `Active` pointing at a
+    // LIVE session - just one whose baked control token went stale. If we claimed the
+    // new tile while that live incumbent still held the role, `claim_captain` would hit
+    // the "already captained by a LIVE session - release_captain it first" refusal
+    // (registry.claim's Active-incumbent + `Some(false)` death-probe arm) and error
+    // out, leaving the freshly-spawned tile unclaimed + unretired: a duplicate + an
+    // error, the exact 3-tile mess this design eliminates. So we close the prior FIRST:
+    // `close_terminal` marks the record `Orphaned` (terminal_id=None) via
+    // `remove_session`, which turns the subsequent claim into a clean `ReadoptedOrphan`
+    // rebind that PRESERVES the resume anchor (claim overwrites `claude_uuid` only when
+    // the presented value is Some, and a fresh session has none yet). Closing BEFORE the
+    // spawn also means a genuine close failure aborts here - we never leak a new tile.
+    // force:true reaps a dead ghost (`already_gone`) or a live-but-stale session (MED-1
+    // force escape) alike; the registry-record scrub of truly-dead ghosts backfills when
+    // reap-ship lands (DP5 TODO seam).
+    let mut retired_prior: Option<String> = None;
+    if let Some(prior) = &prior_terminal {
+        close_terminal(ctx, &json!({ "sessionId": prior, "force": true })).map_err(|e| {
+            format!(
+                "commission_orchestrator: failed to retire the prior orchestrator tile \
+                 '{prior}' before re-commission (refusing to spawn a duplicate): {e}"
+            )
+        })?;
+        retired_prior = Some(prior.clone());
+    }
 
     // Layer 3 (control-tier) + Layer 2 (cwd == provisioned home) + Layer 4 (resume/
     // kickoff) all satisfied by this one spawn. Reuse the shared `spawn_terminal` so
@@ -6403,10 +6436,9 @@ fn commission_orchestrator(ctx: &ControlContext, args: &Value) -> Result<Value, 
         .ok_or("commission_orchestrator: spawn_terminal returned no id")?
         .to_string();
 
-    // Layer 1: claim the Cortana role for the new tile. On an existing record this is
-    // a ReadoptedOrphan/AutoReleasedDead rebind that PRESERVES the resume anchor
-    // (claim only overwrites `claude_uuid` when the new value is Some, and a freshly
-    // spawned session has no resolved UUID yet); on a cold start it CREATES the record.
+    // Layer 1: claim the Cortana role for the new tile. With the prior now retired the
+    // record is `Orphaned`/absent, so this is a `ReadoptedOrphan` (or `Created` on cold
+    // start) that PRESERVES the resume anchor - never the live-incumbent refusal (H1).
     let claim_res = claim_captain(
         ctx,
         &json!({ "captainSessionId": new_id, "role": "cortana", "shipSlug": CORTANA_SLUG }),
@@ -6416,25 +6448,6 @@ fn commission_orchestrator(ctx: &ControlContext, args: &Value) -> Result<Value, 
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-
-    // RETIRE-PRIOR (DP5, tile level now): close the stale tile so the 3-tile mess
-    // cannot recur. Best-effort + force (a dead ghost is `already_gone`; a live stale
-    // session is force-reaped). The claim above already repointed the record to the
-    // new tile; the registry-record scrub of truly-dead ghosts backfills when
-    // reap-ship lands (TODO seam). Never fail the commission on a retire hiccup - the
-    // new orchestrator is already live and claimed.
-    let mut retired_prior: Option<String> = None;
-    if let Some(prior) = prior_terminal {
-        if prior != new_id {
-            match close_terminal(ctx, &json!({ "sessionId": prior, "force": true })) {
-                Ok(_) => retired_prior = Some(prior),
-                Err(e) => eprintln!(
-                    "commission_orchestrator: best-effort retire of prior tile '{prior}' \
-                     failed (non-fatal, the new orchestrator is live): {e}"
-                ),
-            }
-        }
-    }
 
     Ok(json!({
         "accepted": "commission_orchestrator",
@@ -12296,5 +12309,103 @@ mod tests {
             required_tier("commission_orchestrator"),
             CommandTier::ProcessChanging
         );
+    }
+
+    #[test]
+    fn orchestrator_token_is_fresh_detects_a_rotated_endpoint() {
+        // The DP1=B stale-token detector: a session's baked T_HUB_CONTROL_ADDR is
+        // compared to the CURRENT launch addr. Equal => fresh (adopt); different => the
+        // endpoint rotated on an app restart, so the baked control capability is stale
+        // (fall through to a control-tier re-spawn). Empty ctx.addr => fail-safe adopt.
+        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let mut ctx = test_ctx("t").with_apply_sink(sink);
+        ctx.addr = "127.0.0.1:4242".to_string();
+        // The spawn bakes T_HUB_CONTROL_ADDR == the current ctx.addr into the session.
+        let spawn = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap();
+        let id = spawn["id"].as_str().unwrap().to_string();
+        let target = tmux_target(&id);
+        assert!(
+            orchestrator_token_is_fresh(&ctx, &target),
+            "a session whose baked addr matches the current launch is fresh (adopt)"
+        );
+        // Rotate the endpoint (simulate an app restart): the baked addr no longer
+        // matches, so the surviving session's control token is stale.
+        ctx.addr = "127.0.0.1:9999".to_string();
+        assert!(
+            !orchestrator_token_is_fresh(&ctx, &target),
+            "a rotated endpoint makes the surviving session's baked token stale"
+        );
+        // Fail-safe: an empty ctx.addr (headless) never forces a needless respawn.
+        ctx.addr = String::new();
+        assert!(
+            orchestrator_token_is_fresh(&ctx, &target),
+            "an empty ctx.addr fails safe toward adopt"
+        );
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+    }
+
+    #[test]
+    fn commission_close_prior_before_claim_avoids_the_live_incumbent_refusal_and_keeps_uuid() {
+        // H1: the DP1=B restart case survives the app with the `cortana` record still
+        // ACTIVE pointing at a LIVE (but stale-token) session. This proves the fix -
+        // close-the-prior-BEFORE-claim - at the exact registry seam the commission uses,
+        // without launching claude (the full commission's spawn would).
+        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let ctx = test_ctx("t").with_apply_sink(sink);
+
+        // A live prior orchestrator session, claimed cortana WITH a resume anchor.
+        let old = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap();
+        let id_old = old["id"].as_str().unwrap().to_string();
+        ctx.captains
+            .claim(
+                &id_old,
+                Some("cortana"),
+                FleetRole::Cortana,
+                Some("uuid-keep"),
+                vec![],
+                &|_| false,
+            )
+            .unwrap();
+
+        // The replacement session (as the commission spawns it).
+        let new = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap();
+        let id_new = new["id"].as_str().unwrap().to_string();
+
+        // THE BUG (claim BEFORE retiring the live incumbent): the server refuses to
+        // seize the role off a live session - the exact error that leaked a duplicate.
+        let err = claim_captain(
+            &ctx,
+            &json!({"captainSessionId": id_new, "role": "cortana", "shipSlug": CORTANA_SLUG}),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("already captained by a LIVE session"),
+            "claiming over a live incumbent must refuse (why close-first is needed): {err}"
+        );
+
+        // THE FIX (close prior FIRST): the record drops to Orphaned, so the claim is a
+        // clean ReadoptedOrphan that PRESERVES the resume anchor.
+        close_terminal(&ctx, &json!({"sessionId": id_old, "force": true})).unwrap();
+        let claim = claim_captain(
+            &ctx,
+            &json!({"captainSessionId": id_new, "role": "cortana", "shipSlug": CORTANA_SLUG}),
+        )
+        .unwrap();
+        assert_eq!(claim["disposition"], "readopted_orphan");
+        let rec = ctx
+            .captains
+            .snapshot()
+            .captains
+            .into_iter()
+            .find(|c| c.role == FleetRole::Cortana)
+            .unwrap();
+        assert_eq!(rec.terminal_id.as_deref(), Some(id_new.as_str()));
+        assert_eq!(
+            rec.claude_uuid.as_deref(),
+            Some("uuid-keep"),
+            "the resume anchor must survive the close-first re-commission"
+        );
+
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id_new})).unwrap();
     }
 }

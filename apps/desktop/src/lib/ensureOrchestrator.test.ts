@@ -10,7 +10,7 @@ import {
 // control.rs; here we verify the FRONTEND wiring: fire the command, then designate +
 // focus the returned tile, with a double-click in-flight guard).
 const controlRequest = vi.fn();
-const setOrchestratorId = vi.fn();
+const designateOrchestratorLocal = vi.fn();
 const setActiveTab = vi.fn();
 const ensureCaptainsTab = vi.fn(() => "captains-tab");
 const setFocus = vi.fn();
@@ -19,7 +19,7 @@ vi.mock("../ipc/controlClient", () => ({
 }));
 vi.mock("../store/captain", () => ({
   useCaptain: {
-    getState: () => ({ orchestratorId: "orch-live", setOrchestratorId }),
+    getState: () => ({ orchestratorId: "orch-live", designateOrchestratorLocal }),
   },
 }));
 vi.mock("../store/workspace", () => ({
@@ -80,7 +80,7 @@ describe("resolveOrchestrator (adopt-only, never spawns)", () => {
 describe("commissionOrchestrator (one-click create/adopt/focus)", () => {
   beforeEach(() => {
     controlRequest.mockReset();
-    setOrchestratorId.mockReset();
+    designateOrchestratorLocal.mockReset();
     setActiveTab.mockReset();
     setFocus.mockReset();
   });
@@ -91,7 +91,7 @@ describe("commissionOrchestrator (one-click create/adopt/focus)", () => {
     const id = await commissionOrchestrator();
     expect(id).toBe("new-orch");
     expect(controlRequest).toHaveBeenCalledWith("commission_orchestrator", {});
-    expect(setOrchestratorId).toHaveBeenCalledWith("new-orch");
+    expect(designateOrchestratorLocal).toHaveBeenCalledWith("new-orch");
     expect(setActiveTab).toHaveBeenCalledWith("captains-tab");
     expect(setFocus).toHaveBeenCalledWith("new-orch");
   });
@@ -127,6 +127,6 @@ describe("commissionOrchestrator (one-click create/adopt/focus)", () => {
     controlRequest.mockResolvedValue({});
     const { commissionOrchestrator } = await import("./ensureOrchestrator");
     expect(await commissionOrchestrator()).toBeNull();
-    expect(setOrchestratorId).not.toHaveBeenCalled();
+    expect(designateOrchestratorLocal).not.toHaveBeenCalled();
   });
 });

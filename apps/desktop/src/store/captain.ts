@@ -325,8 +325,16 @@ export interface CaptainState {
   toggleOverlay: () => void;
   /** Show/hide the titlebar anchor dropdown. */
   setAnchorMenu: (open: boolean) => void;
-  /** Designate (or clear, with null) the orchestrator terminal. Persisted. */
+  /** Designate (or clear, with null) the orchestrator terminal. Persisted.
+   *  Drives the server captains registry (claim/release the Cortana role). */
   setOrchestratorId: (id: TerminalId | null) => void;
+  /** Designate the orchestrator LOCALLY only (state + persist + placement), WITHOUT
+   *  re-driving the server claim. For a caller where the BACKEND is already the
+   *  authoritative claimer (the `commission_orchestrator` command claims cortana
+   *  server-side, carefully preserving the resume anchor): re-driving
+   *  `setOrchestratorId` here would release+reclaim and WIPE that anchor (a childless
+   *  release drops `claude_uuid`, and the fresh re-claim has no UUID yet). */
+  designateOrchestratorLocal: (id: TerminalId) => void;
   /** Commit dragged/resized geometry (persisted). */
   setGeometry: (g: { x: number; y: number; width: number; height: number }) => void;
 }
@@ -609,6 +617,14 @@ export const useCaptain = create<CaptainState>((set, get) => {
       // renders from the adopted server snapshot (adoptCaptainsRegistry).
       if (id) serverClaimCortana(id);
       else serverReleaseCortana();
+    },
+
+    designateOrchestratorLocal: (id) => {
+      // Local-only: the backend `commission_orchestrator` already claimed cortana for
+      // this tile (preserving the resume anchor). Do NOT re-drive the server claim
+      // (that would release+reclaim and wipe the anchor - M1). The crown still renders
+      // from the adopted server snapshot; this just designates + places locally.
+      applyOrchestrator(id);
     },
 
     setGeometry: (g) => {
