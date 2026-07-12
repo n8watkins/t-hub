@@ -10,6 +10,7 @@ mod agent; // core-side agent bridge (Workstream A, core half)
 mod audit; // control-socket audit log with teeth (socket-gate Phase 1, hash-chained JSONL)
 mod secret_seal; // item-3 Pillar B: at-rest sealing of secret material (DPAPI on Windows, 0600 fallback elsewhere)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
+mod harness; // harness adapter seam (Codex Phase-1 D1): launch/turn argv + permission map, keyed off the provider string
 mod governor; // fleet spawn budget + rate limits for process-changing control commands (socket-gate Phase 1)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.

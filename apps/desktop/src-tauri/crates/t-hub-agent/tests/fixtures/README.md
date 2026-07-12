@@ -1,0 +1,33 @@
+# Codex `exec --json` fixtures
+
+Real ThreadEvent JSONL captured from the installed Codex binary, used by the
+Phase-1 `--codex-tap` lifecycle producer tests (PR-B / D3).
+Tests parse these fixtures - they never hand-invent event shapes - so the
+producer stays locked to what the pinned Codex version actually emits.
+
+## Provenance
+
+- **Codex version:** `codex-cli 0.142.5` (the fleet-pinned version; filenames
+  carry it so a version bump forces a re-record instead of silent drift).
+- **Recorded:** 2026-07-11, task-0 of the Codex Phase-1 build (ratified plan
+  `~/.t-hub/captain/reviews/codex-phase1-plan-2026-07-11.md`, §1.4 test bar).
+- **Host:** the same machine the fleet runs on (`/home/natkins/.bun/bin/codex`).
+
+## Files
+
+| File | How recorded | Exercises |
+|---|---|---|
+| `codex-0.142.5-clean-turn.jsonl` | `codex exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check '<prompt>'` | `thread.started` -> `turn.started` -> `item.completed` -> `turn.completed` (the happy path; EOF-after-completed must emit NO `SessionEnd`). |
+| `codex-0.142.5-resumed-turn.jsonl` | `codex exec resume '<thread-id>' --json ... '<prompt>'` | resume keeps the SAME `thread_id` (identity lock) and re-emits the full turn shape. |
+| `codex-0.142.5-turn-failed.jsonl` | `codex exec --json ... -m '<invalid-model>' 'hi'` | a REAL failure: an inline `item.completed`/`type:error`, a standalone top-level `error` event, and a `turn.failed` with `error.message`. Process exit code 1. |
+| `codex-0.142.5-turn-failed-minimal.jsonl` | hand-written | the minimal `turn.failed` boundary (`thread.started` -> `turn.started` -> `turn.failed`) for a tight mapping unit test. |
+
+## Event shapes observed on 0.142.5
+
+- `{"type":"thread.started","thread_id":"<uuidv7>"}`
+- `{"type":"turn.started"}`
+- `{"type":"item.completed","item":{"id":"item_N","type":"agent_message","text":"..."}}` - `item.*` is deliberately unmapped in Phase 1.
+- `{"type":"item.completed","item":{"id":"item_N","type":"error","message":"..."}}`
+- `{"type":"turn.completed","usage":{"input_tokens":N,"cached_input_tokens":N,"output_tokens":N,"reasoning_output_tokens":N}}`
+- `{"type":"error","message":"..."}`
+- `{"type":"turn.failed","error":{"message":"..."}}`
