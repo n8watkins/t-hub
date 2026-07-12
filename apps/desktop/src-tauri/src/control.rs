@@ -5045,7 +5045,13 @@ fn open_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// (`addWorktreeWorkspace`), which is the same path the FilePanel UI uses. The git
 /// worktree already exists by then, so the store SKIPS its own `gitWorktreeAdd` —
 /// the forward carries `alreadyCreated: true`. Args: `repoRoot`, `worktreePath`
-/// (required); `branch`, `tabName` (optional).
+/// (required); `branch`, `tabName`, `startupCommand` (optional).
+///
+/// `startupCommand` mirrors `spawn_terminal`'s: the command the worktree
+/// terminal execs back into inside an interactive login shell (e.g.
+/// `claude --resume <id>`), plumbed through the SAME `pane_command` / `-ilc` exec
+/// path `spawn_terminal` uses. Without it a worktree crew booted to a bare shell
+/// (the provisioning gap powder/Cortana hit).
 fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let repo_root = arg_str(args, "repoRoot")
         .or_else(|| arg_str(args, "repo_root"))
@@ -5055,6 +5061,10 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         .ok_or("create_worktree requires a 'worktreePath' argument")?;
     let branch = arg_str(args, "branch");
     let tab_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
+    // The command the worktree terminal execs into, same contract + exec path as
+    // spawn_terminal's startupCommand (snake alias for parity with the other args).
+    let startup_command =
+        arg_str(args, "startupCommand").or_else(|| arg_str(args, "startup_command"));
     // Captain-chat phase 2: a captain staging a crew worktree identifies itself
     // so the worktree terminal is recorded as crew (same contract as
     // spawn_terminal's spawnedBy).
@@ -5115,7 +5125,12 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         // default as spawn_terminal (READ unless `capability:"control"`). Comms-plane
         // Phase 2 (§2.3): mint + inject its per-session identity token too.
         let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "create_worktree");
-        match spawn_tmux_terminal(&worktree_path, None, &elevation) {
+        // Wrap the startupCommand into the pane exec the SAME way spawn_terminal
+        // does (pane_command → an interactive login shell that execs the command);
+        // None keeps the prior bare-shell behavior. No `shell` preset for a
+        // worktree spawn - the crew boots into the worktree dir running this.
+        let pane = crate::commands::pane_command(None, startup_command.as_deref());
+        match spawn_tmux_terminal(&worktree_path, pane.as_deref(), &elevation) {
             Ok((id, _)) => {
                 if let Some(identity) = &minted_identity {
                     ctx.identity.bind_tile(&identity.id, &id);
@@ -5163,6 +5178,7 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
             "tabId": tab_id,
             "tabName": effective_tab_name,
             "terminalId": terminal_id,
+            "startupCommand": startup_command,
             "alreadyCreated": true,
         }),
     );
@@ -5174,6 +5190,7 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         "tabId": tab_id,
         "tabName": effective_tab_name,
         "terminalId": terminal_id,
+        "startupCommand": startup_command,
         "gitOutput": git_output,
         "spawnedBy": spawned_by,
         "crewRecorded": crew_recorded,
@@ -7328,6 +7345,64 @@ mod tests {
 
         assert!(!wt.exists(), "the worktree dir must be gone");
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn create_worktree_runs_the_startup_command_in_the_worktree_terminal() {
+        // audit MED (provisioning gap): create_worktree now carries a
+        // `startupCommand` plumbed through the SAME pane_command / -ilc exec path
+        // spawn_terminal uses, so a worktree crew boots into its command instead of
+        // a bare shell. This proves it EXECUTES end-to-end: the startupCommand
+        // touches a sentinel file, and we poll for it. BYPASS-WOULD-FAIL: pass
+        // `None` for the pane again (the old bare-shell spawn) and the sentinel is
+        // never created -> the poll times out RED.
+        let (base, repo, _wt) = scratch_repo_with_worktree();
+        let new_wt = base.join("wt-startup");
+        let sentinel = base.join("startup-ran.marker");
+        let startup = format!("touch {}", sentinel.to_str().unwrap());
+
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let v = dispatch(
+            &ctx,
+            "create_worktree",
+            &json!({
+                "repoRoot": repo.to_str().unwrap(),
+                "worktreePath": new_wt.to_str().unwrap(),
+                "startupCommand": startup,
+            }),
+        )
+        .unwrap();
+        assert_eq!(v["accepted"], "create_worktree");
+        // The response + the UI forward both carry the command verbatim.
+        assert_eq!(v["startupCommand"], json!(startup));
+        let terminal_id = v["terminalId"].as_str().expect("a terminal was spawned");
+        {
+            let calls = sink.calls.lock().unwrap();
+            let fwd = calls
+                .iter()
+                .find(|(cmd, _)| cmd == "add_worktree_workspace")
+                .expect("the worktree forward was delivered");
+            assert_eq!(fwd.1["startupCommand"], json!(startup));
+        }
+
+        // Poll for the sentinel: proof the -ilc pane wrap actually ran the command
+        // (the interactive login shell can take a moment to source rc + exec).
+        let mut ran = false;
+        for _ in 0..100 {
+            if sentinel.exists() {
+                ran = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // Reap the real session before asserting, so a failure never leaks a tmux
+        // session or the scratch dir.
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": terminal_id})).ok();
+        std::fs::remove_dir_all(&base).ok();
+        assert!(ran, "the worktree terminal must have run the startupCommand");
     }
 
     #[test]
