@@ -503,6 +503,32 @@ pub fn reassert_window_size_latest(name: &str) {
     );
 }
 
+/// Read one session-scoped environment variable (`tmux show-environment -t
+/// <name> <key>`), as baked in at `new-session -e KEY=VALUE` time. Returns the
+/// value, or `None` when the session/variable is absent, the variable is unset
+/// (`-KEY`), or the probe fails/times out.
+///
+/// Used by the orchestrator commission to detect a STALE control token: a session
+/// spawned in a PRIOR app launch carries that launch's `T_HUB_CONTROL_ADDR`, which
+/// the current launch has rotated away from (`control-endpoint-rotates-on-restart`),
+/// so its baked control capability is dead. `show-environment KEY` prints `KEY=VALUE`
+/// when set and `-KEY` when explicitly unset; either way the answer is one line.
+pub fn session_env(name: &str, key: &str) -> Option<String> {
+    let out = output_with_timeout(
+        tmux(&["show-environment", "-t", name, key]),
+        tmux_cmd_timeout(),
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.trim();
+    // `KEY=VALUE` => Some(VALUE); `-KEY` (unset) or anything else => None.
+    line.strip_prefix(&format!("{key}="))
+        .map(|v| v.to_string())
+}
+
 /// Kill the tmux session named `name` via plain `kill-session` (SIGHUP).
 ///
 /// Treated as success if the session (or the whole server) is already gone, so

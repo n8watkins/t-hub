@@ -172,9 +172,14 @@ describe("Tile header context menu: IDs + Mark as Cortana", () => {
     expect(clipboardWrites).toEqual(["uuid-abc-123"]);
   });
 
-  it("labels the mark affordance 'Mark as Cortana' and 'Unmark Cortana' when set", () => {
+  it("labels the mark affordance as the DEMOTED advanced adopt / 'Unmark Cortana' when set", () => {
+    // DP3: the right-click is demoted to the advanced escape hatch (the primary
+    // path is the one-click "Create Orchestrator"); it now reads "Adopt this
+    // terminal as Cortana (advanced)". When already set it flips to "Unmark Cortana".
     let menu = openMenu("cap00001");
-    expect(within(menu).getByText("Mark as Cortana")).toBeTruthy();
+    expect(
+      within(menu).getByText("Adopt this terminal as Cortana (advanced)"),
+    ).toBeTruthy();
     // Mark it, then re-open: the affordance flips to the unmark label.
     act(() => {
       useCaptain.setState({ orchestratorId: "cap00001" });
@@ -183,15 +188,17 @@ describe("Tile header context menu: IDs + Mark as Cortana", () => {
     expect(within(menu).getByText("Unmark Cortana")).toBeTruthy();
   });
 
-  it("marking Cortana from the menu sets the designation and flashes the next-steps hint", () => {
+  it("adopting Cortana from the menu sets the designation and flashes the role-only hint", () => {
     const menu = openMenu("cap00001");
     act(() => {
-      fireEvent.click(within(menu).getByText("Mark as Cortana"));
+      fireEvent.click(
+        within(menu).getByText("Adopt this terminal as Cortana (advanced)"),
+      );
     });
     expect(useCaptain.getState().orchestratorId).toBe("cap00001");
-    // The honest hint points at the still-unbuilt follow-on flow.
+    // The honest hint says this is role-only and points at the fully-working flow.
     expect(document.body.textContent).toContain("Marked as Cortana");
-    expect(document.body.textContent).toContain("capability elevation");
+    expect(document.body.textContent).toContain("Create Orchestrator");
   });
 });
 

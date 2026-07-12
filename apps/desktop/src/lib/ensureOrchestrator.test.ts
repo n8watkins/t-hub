@@ -1,10 +1,32 @@
 // The ADOPT-ONLY default-orchestrator resolution (no spawn, per the audit).
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   isOrchestratorCwd,
   resolveOrchestrator,
   ORCHESTRATOR_CWD_SUFFIX,
 } from "./ensureOrchestrator";
+
+// Mocks for the one-click commission glue (the backend command is unit-tested in
+// control.rs; here we verify the FRONTEND wiring: fire the command, then designate +
+// focus the returned tile, with a double-click in-flight guard).
+const controlRequest = vi.fn();
+const setOrchestratorId = vi.fn();
+const setActiveTab = vi.fn();
+const ensureCaptainsTab = vi.fn(() => "captains-tab");
+const setFocus = vi.fn();
+vi.mock("../ipc/controlClient", () => ({
+  controlRequest: (...a: unknown[]) => controlRequest(...a),
+}));
+vi.mock("../store/captain", () => ({
+  useCaptain: {
+    getState: () => ({ orchestratorId: "orch-live", setOrchestratorId }),
+  },
+}));
+vi.mock("../store/workspace", () => ({
+  useWorkspace: {
+    getState: () => ({ setActiveTab, ensureCaptainsTab, setFocus }),
+  },
+}));
 
 describe("isOrchestratorCwd", () => {
   it("matches the orchestrator home under any HOME (WSL / Windows separators)", () => {
@@ -52,5 +74,59 @@ describe("resolveOrchestrator (adopt-only, never spawns)", () => {
     const terminals = { b: { cwd: home } };
     const first = resolveOrchestrator(null, terminals);
     expect(resolveOrchestrator(first, terminals)).toBe(first);
+  });
+});
+
+describe("commissionOrchestrator (one-click create/adopt/focus)", () => {
+  beforeEach(() => {
+    controlRequest.mockReset();
+    setOrchestratorId.mockReset();
+    setActiveTab.mockReset();
+    setFocus.mockReset();
+  });
+
+  it("fires the backend command, then designates + focuses the returned tile", async () => {
+    controlRequest.mockResolvedValue({ terminalId: "new-orch" });
+    const { commissionOrchestrator } = await import("./ensureOrchestrator");
+    const id = await commissionOrchestrator();
+    expect(id).toBe("new-orch");
+    expect(controlRequest).toHaveBeenCalledWith("commission_orchestrator", {});
+    expect(setOrchestratorId).toHaveBeenCalledWith("new-orch");
+    expect(setActiveTab).toHaveBeenCalledWith("captains-tab");
+    expect(setFocus).toHaveBeenCalledWith("new-orch");
+  });
+
+  it("passes forceRespawn through for the restart stale-token repair", async () => {
+    controlRequest.mockResolvedValue({ terminalId: "restored" });
+    const { commissionOrchestrator } = await import("./ensureOrchestrator");
+    await commissionOrchestrator({ forceRespawn: true });
+    expect(controlRequest).toHaveBeenCalledWith("commission_orchestrator", {
+      forceRespawn: true,
+    });
+  });
+
+  it("dedups a concurrent double-click (second in-flight call is a no-op)", async () => {
+    let resolveFirst: (v: { terminalId: string }) => void = () => {};
+    controlRequest.mockReturnValueOnce(
+      new Promise((r) => {
+        resolveFirst = r;
+      }),
+    );
+    const { commissionOrchestrator } = await import("./ensureOrchestrator");
+    const p1 = commissionOrchestrator();
+    const p2 = commissionOrchestrator(); // in-flight -> immediate null, no 2nd call
+    expect(await p2).toBeNull();
+    // p1's controlRequest fires only after its dynamic import() resolves; flush the
+    // microtask/timer queue so the assertion sees exactly the one in-flight call.
+    await vi.waitFor(() => expect(controlRequest).toHaveBeenCalledTimes(1));
+    resolveFirst({ terminalId: "new-orch" });
+    expect(await p1).toBe("new-orch");
+  });
+
+  it("returns null and does not designate when the backend yields no tile", async () => {
+    controlRequest.mockResolvedValue({});
+    const { commissionOrchestrator } = await import("./ensureOrchestrator");
+    expect(await commissionOrchestrator()).toBeNull();
+    expect(setOrchestratorId).not.toHaveBeenCalled();
   });
 });

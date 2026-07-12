@@ -41,6 +41,7 @@ export const COMMAND_IDS = [
   "openWorktreesList",
   "toggleCaptainOverlay",
   "pinCaptainFocused",
+  "createOrchestrator",
 ] as const;
 
 export type CommandId = (typeof COMMAND_IDS)[number];
@@ -157,6 +158,13 @@ export const COMMANDS: CommandMeta[] = [
     label: "Pin as captain",
     description:
       "Pin (or unpin) the focused tile as a captain the overlay can summon - pinning is additive",
+    category: "App",
+  },
+  {
+    id: "createOrchestrator",
+    label: "Create Orchestrator",
+    description:
+      "Create (or focus) the persistent, control-capable orchestrator (Cortana) in its canonical home - provisions, spawns, resumes, and claims in one action; never duplicates",
     category: "App",
   },
 ];

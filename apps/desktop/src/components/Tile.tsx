@@ -1155,16 +1155,23 @@ export function Tile({
                 toggleCaptain(terminalId);
               }}
             />
+            {/* ADVANCED escape hatch (DP3): the PRIMARY way to get an orchestrator is
+                the one-click "Create Orchestrator" (sidebar + palette), which spawns a
+                fully-provisioned, control-capable Cortana in the canonical home. This
+                right-click only ADOPTS whatever terminal you clicked as the orchestrator
+                designation (role only - it does NOT provision MCP, grant control
+                capability, or resume memory), so it is for the power user who
+                hand-spawned a canonical session and wants to bless it. Kept, demoted. */}
             <CtxItem
               label={
                 isOrchestrator
                   ? `Unmark ${ORCHESTRATOR_DISPLAY_NAME}`
-                  : `Mark as ${ORCHESTRATOR_DISPLAY_NAME}`
+                  : `Adopt this terminal as ${ORCHESTRATOR_DISPLAY_NAME} (advanced)`
               }
               hint={
                 isOrchestrator
                   ? `This session is ${ORCHESTRATOR_DISPLAY_NAME} - unmark to release the role`
-                  : `Make this session ${ORCHESTRATOR_DISPLAY_NAME}, the fleet orchestrator (claims the role in the captains registry)`
+                  : `Advanced: claim the ${ORCHESTRATOR_DISPLAY_NAME} role for THIS terminal (role only - it does NOT provision MCP, grant control capability, or resume memory). Prefer "Create Orchestrator" for a fully-working one.`
               }
               onClick={() => {
                 setCtxMenu(null);
@@ -1172,7 +1179,7 @@ export function Tile({
                 setOrchestratorId(next);
                 if (next) {
                   flash(
-                    `Marked as ${ORCHESTRATOR_DISPLAY_NAME} - the captains registry now points here. Context resume + capability elevation are a separate, upcoming step.`,
+                    `Marked as ${ORCHESTRATOR_DISPLAY_NAME} - the captains registry now points here (role only). For a fully-working orchestrator (provisioned MCP + control + resume), use "Create Orchestrator".`,
                   );
                 }
               }}
