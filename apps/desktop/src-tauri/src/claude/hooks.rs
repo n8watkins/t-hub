@@ -177,6 +177,14 @@ pub fn event_type_for_hook(hook_name: &str) -> Option<JournalEventType> {
 /// The intended UI status hint a given hook most directly implies (used to
 /// pre-classify before the supervision reducer runs; the reducer remains
 /// authoritative for `WaitingOnSubagents`). Pure mapping, no I/O.
+///
+/// DEAD CODE (no callers; module is `#![allow(dead_code)]`). It must NOT be wired
+/// as-is: `Notification` here maps unconditionally to `NeedsQuestion`, but Claude
+/// Code fires that hook for informational pings too (the 60s `idle_prompt`), which
+/// is exactly the spurious-cue bug the supervision reducer now guards against by
+/// discriminating on `notification_type`. Any real wiring must thread the
+/// `notification_type` discriminator through here the same way `Supervisor::ingest`
+/// does, or defer the Notification classification entirely to the reducer.
 pub fn status_hint_for_hook(hook_name: &str) -> Option<SessionStatus> {
     Some(match hook_name {
         "UserPromptSubmit" => SessionStatus::Working,
