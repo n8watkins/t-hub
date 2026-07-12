@@ -1351,6 +1351,7 @@ impl CaptainsRegistry {
         claude_uuid: Option<&str>,
         workspace_tab_ids: Vec<String>,
         is_terminal_dead: &dyn Fn(&str) -> bool,
+        crew_liveness: &dyn Fn(&str) -> tmux::SessionLiveness,
     ) -> Result<ClaimOutcome, String> {
         if terminal_id.trim().is_empty() {
             return Err("claim_captain requires a non-empty 'captainSessionId'".into());
@@ -1469,7 +1470,7 @@ impl CaptainsRegistry {
                         }
                         if reactivate {
                             c.state = ClaimState::Active;
-                            Self::readopt_orphaned_crew(c);
+                            Self::readopt_orphaned_crew(c, crew_liveness);
                         }
                         let changed = tabs_change || uuid_change || reactivate;
                         let rec = c.clone();
@@ -1520,7 +1521,7 @@ impl CaptainsRegistry {
                         c.workspace_tab_ids = workspace_tab_ids;
                     }
                     c.state = ClaimState::Active;
-                    Self::readopt_orphaned_crew(c);
+                    Self::readopt_orphaned_crew(c, crew_liveness);
                     let rec = c.clone();
                     return Ok(self.commit_claim(g, rec, disposition, true));
                 }
@@ -1532,12 +1533,36 @@ impl CaptainsRegistry {
         ))
     }
 
-    /// Re-adopt a resuming supervisor's Orphaned crew (Orphaned -> Active). A crew
-    /// whose OWN tile died (`Removed`) is NOT resurrected - the worker is gone.
-    fn readopt_orphaned_crew(c: &mut FleetIdentity) {
+    /// Re-adopt a resuming supervisor's Orphaned crew, GATED on a liveness probe
+    /// (audit BUG-1: the old form blind-flipped EVERY Orphaned crew to `Active`
+    /// with no probe, so a captain resuming after its crew had died resurrected
+    /// dead tiles). Per-crew, keyed on the same de-conflated two-tier liveness the
+    /// incumbent transfer uses (PR#58):
+    ///   - `Alive`   -> `Active`  (the worker is really there, re-adopt it);
+    ///   - `Gone`    -> `Removed` (a DEFINITIVE absent probe: the worker died while
+    ///     orphaned; mark it, don't resurrect it);
+    ///   - `Unknown` -> left `Orphaned` (an ambiguous/timed-out probe is NEVER
+    ///     seized - it stays re-adoptable on the next resume once liveness is
+    ///     definite; item-2 two-tier invariant: ambiguous is never acted on).
+    /// A crew whose OWN tile already went `Removed` is untouched (the worker is
+    /// gone for good).
+    ///
+    /// `crew_liveness` MUST be a PURE lookup (this runs while the registry `inner`
+    /// lock is held; MED-3/Incident-D forbids tmux I/O under the lock). The real
+    /// caller precomputes a liveness map lock-free and passes a map-reading
+    /// closure; tests inject a deterministic one.
+    fn readopt_orphaned_crew(
+        c: &mut FleetIdentity,
+        crew_liveness: &dyn Fn(&str) -> tmux::SessionLiveness,
+    ) {
+        let now = now_ms();
         for cr in c.crew.iter_mut() {
             if matches!(cr.state, CrewState::Orphaned { .. }) {
-                cr.state = CrewState::Active;
+                match crew_liveness(&cr.terminal_id) {
+                    tmux::SessionLiveness::Alive => cr.state = CrewState::Active,
+                    tmux::SessionLiveness::Gone => cr.state = CrewState::Removed { since: now },
+                    tmux::SessionLiveness::Unknown => {}
+                }
             }
         }
     }
@@ -1758,6 +1783,10 @@ impl CaptainsRegistry {
             None,
             workspace_tab_ids,
             &|_| false,
+            // Legacy resurrect-all: existing readopt tests predate the liveness
+            // gate and assert orphaned crew come back Active. Tests that exercise
+            // the Gone/Unknown legs pass an explicit `crew_liveness` to `claim`.
+            &|_| tmux::SessionLiveness::Alive,
         )
     }
 }
@@ -5611,6 +5640,33 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // inside `claim` (the CAS discipline, MED-3).
     let is_terminal_dead =
         |tile: &str| tmux::is_definitively_gone(tmux::session_liveness(&tmux_target(tile)));
+    // BUG-1: readopt of a resuming captain's Orphaned crew is now GATED on a per-
+    // crew liveness probe (Alive->active, Gone->retired, Unknown->stays orphaned)
+    // instead of blind-activating every orphan. The probes are tmux subprocesses,
+    // so they run HERE, lock-free, into a precomputed map (MED-3: tmux is never
+    // called while the registry lock is held). Probe every orphaned crew tile in
+    // the current snapshot; `claim` reads the map purely under the lock and any
+    // tile not in it (a race adding an orphan after this snapshot) defaults to
+    // Unknown -> left orphaned, re-adoptable on the next resume.
+    let orphan_liveness: std::collections::HashMap<String, tmux::SessionLiveness> = ctx
+        .captains
+        .snapshot()
+        .captains
+        .iter()
+        .flat_map(|c| c.crew.iter())
+        .filter(|cr| matches!(cr.state, CrewState::Orphaned { .. }))
+        .map(|cr| {
+            let tile = cr.terminal_id.clone();
+            let liveness = tmux::session_liveness(&tmux_target(&tile));
+            (tile, liveness)
+        })
+        .collect();
+    let crew_liveness = |tile: &str| {
+        orphan_liveness
+            .get(tile)
+            .copied()
+            .unwrap_or(tmux::SessionLiveness::Unknown)
+    };
     let outcome = ctx.captains.claim(
         &captain_session_id,
         ship_slug.as_deref(),
@@ -5618,6 +5674,7 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         claude_uuid.as_deref(),
         workspace_tab_ids,
         &is_terminal_dead,
+        &crew_liveness,
     )?;
     let snap = ctx.captains.snapshot();
     // Idempotent re-claim (unchanged): the registry left `seq` alone, so skip the
@@ -9182,12 +9239,17 @@ mod tests {
     fn all_alive(_: &str) -> bool {
         false
     }
+    /// Crew liveness seam that reports every crew Alive - the legacy resurrect-all
+    /// readopt behavior. Tests that exercise the Gone/Unknown legs pass their own.
+    fn crew_all_alive(_: &str) -> tmux::SessionLiveness {
+        tmux::SessionLiveness::Alive
+    }
 
     #[test]
     fn claim_registers_updates_and_bumps_seq() {
         let reg = CaptainsRegistry::new();
         let out = reg
-            .claim("cap-1", Some("Ship Alpha!"), FleetRole::Captain, None, vec!["tab-1".into()], &all_alive)
+            .claim("cap-1", Some("Ship Alpha!"), FleetRole::Captain, None, vec!["tab-1".into()], &all_alive, &crew_all_alive)
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::Created);
         let rec = out.record;
@@ -9203,7 +9265,7 @@ mod tests {
         // refresh, crew kept, no duplicate record.
         assert!(reg.record_crew("cap-1", "crew-1"));
         let out = reg
-            .claim("cap-1", Some("ship-beta"), FleetRole::Captain, None, vec!["tab-2".into()], &all_alive)
+            .claim("cap-1", Some("ship-beta"), FleetRole::Captain, None, vec!["tab-2".into()], &all_alive, &crew_all_alive)
             .unwrap();
         let rec = out.record;
         assert_eq!(rec.ship_slug, "ship-beta");
@@ -9224,7 +9286,7 @@ mod tests {
         let out = reg.claim_test("cap-1", None, vec![]).unwrap();
         assert_eq!(out.record.ship_slug, "ship-cap-1");
         let err = reg
-            .claim("cap-2", Some("ship-cap-1"), FleetRole::Captain, None, vec![], &all_alive)
+            .claim("cap-2", Some("ship-cap-1"), FleetRole::Captain, None, vec![], &all_alive, &crew_all_alive)
             .unwrap_err();
         assert!(err.contains("already captained by a LIVE session 'cap-1'"), "got: {err}");
         // The incumbent is untouched; the refusal did not bump the revision.
@@ -9246,7 +9308,7 @@ mod tests {
         // cap-old's pane is gone; cap-new re-claims the same ship (no UUID resolved).
         let dead_is_old = |tile: &str| tile == "cap-old";
         let out = reg
-            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &dead_is_old)
+            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &dead_is_old, &crew_all_alive)
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::AutoReleasedDead);
         assert_eq!(out.record.terminal_id.as_deref(), Some("cap-new"));
@@ -9271,7 +9333,7 @@ mod tests {
         let probe_times_out =
             |_: &str| tmux::is_definitively_gone(tmux::SessionLiveness::Unknown);
         let err = reg
-            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &probe_times_out)
+            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &probe_times_out, &crew_all_alive)
             .unwrap_err();
         assert!(
             err.contains("already captained by a LIVE session 'cap-old'"),
@@ -9294,10 +9356,10 @@ mod tests {
         // rebinds the terminal pointer WITHOUT the liveness path - even if the probe
         // would say "alive" (the old tile lingering). It must never be a competitor seize.
         let reg = CaptainsRegistry::new();
-        reg.claim("cap-old", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive)
+        reg.claim("cap-old", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive, &crew_all_alive)
             .unwrap();
         let out = reg
-            .claim("cap-new", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive)
+            .claim("cap-new", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive, &crew_all_alive)
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::ReboundSameUuid);
         assert_eq!(out.record.terminal_id.as_deref(), Some("cap-new"));
@@ -9321,6 +9383,65 @@ mod tests {
         assert_eq!(rec.state, ClaimState::Active);
         assert_eq!(rec.terminal_id.as_deref(), Some("cap-new"));
         assert_eq!(rec.crew[0].state, CrewState::Active, "orphaned crew re-adopted");
+    }
+
+    #[test]
+    fn readopt_is_gated_on_per_crew_liveness_never_blind_activates() {
+        // audit BUG-1: a resumed captain must NOT blind-flip every Orphaned crew to
+        // Active - it re-probes each and only re-adopts the ones actually Alive.
+        // Alive -> Active, Gone (definitively absent) -> Removed, Unknown (ambiguous
+        // probe) -> stays Orphaned (re-adoptable next resume). BYPASS-WOULD-FAIL:
+        // restore the blind `cr.state = Active` and the Gone/Unknown crew come back
+        // Active -> RED.
+        let reg = CaptainsRegistry::new();
+        reg.claim_test("cap-old", Some("shipx"), vec![]).unwrap();
+        for c in ["crew-alive", "crew-gone", "crew-unknown"] {
+            assert!(reg.record_crew("cap-old", c));
+        }
+        assert!(reg.remove_session("cap-old"), "captain death orphans the crew");
+        assert!(
+            only(&reg).crew.iter().all(|c| matches!(c.state, CrewState::Orphaned { .. })),
+            "all crew start Orphaned"
+        );
+
+        // The liveness seam the real handler precomputes lock-free: one verdict per
+        // crew tile.
+        let crew_liveness = |tile: &str| match tile {
+            "crew-alive" => tmux::SessionLiveness::Alive,
+            "crew-gone" => tmux::SessionLiveness::Gone,
+            _ => tmux::SessionLiveness::Unknown,
+        };
+        let out = reg
+            .claim(
+                "cap-new",
+                Some("shipx"),
+                FleetRole::Captain,
+                None,
+                vec![],
+                &all_alive,
+                &crew_liveness,
+            )
+            .unwrap();
+        assert_eq!(out.disposition, ClaimDisposition::ReadoptedOrphan);
+
+        let rec = only(&reg);
+        assert_eq!(rec.state, ClaimState::Active, "the captain itself re-activates");
+        let state_of = |tile: &str| {
+            rec.crew
+                .iter()
+                .find(|c| c.terminal_id == tile)
+                .map(|c| c.state.clone())
+                .unwrap()
+        };
+        assert_eq!(state_of("crew-alive"), CrewState::Active, "Alive -> re-adopted");
+        assert!(
+            matches!(state_of("crew-gone"), CrewState::Removed { .. }),
+            "Gone -> retired, never resurrected"
+        );
+        assert!(
+            matches!(state_of("crew-unknown"), CrewState::Orphaned { .. }),
+            "Unknown -> left Orphaned (ambiguous is never seized)"
+        );
     }
 
     #[test]
@@ -9384,19 +9505,19 @@ mod tests {
         // (or the same session) yields the apex.
         let reg = CaptainsRegistry::new();
         let out = reg
-            .claim("cor-1", None, FleetRole::Cortana, None, vec![], &all_alive)
+            .claim("cor-1", None, FleetRole::Cortana, None, vec![], &all_alive, &crew_all_alive)
             .unwrap();
         assert_eq!(out.record.role, FleetRole::Cortana);
         assert_eq!(out.record.ship_slug, CORTANA_SLUG);
         // A different LIVE terminal cannot seize the singleton.
         let err = reg
-            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &all_alive)
+            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &all_alive, &crew_all_alive)
             .unwrap_err();
         assert!(err.contains("LIVE"), "got: {err}");
         // The incumbent dying hands the apex to the resumed Cortana.
         let dead_is_1 = |t: &str| t == "cor-1";
         let out = reg
-            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &dead_is_1)
+            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &dead_is_1, &crew_all_alive)
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::AutoReleasedDead);
         assert_eq!(out.record.terminal_id.as_deref(), Some("cor-2"));
@@ -9430,7 +9551,7 @@ mod tests {
         // Phase D: the cross-ship ownership KEY resolves for both a supervisor terminal
         // and a crew tile (item-1 Phase 3 wires the ACL on top of this).
         let reg = CaptainsRegistry::new();
-        reg.claim("cap-1", Some("shipx"), FleetRole::Captain, None, vec![], &all_alive)
+        reg.claim("cap-1", Some("shipx"), FleetRole::Captain, None, vec![], &all_alive, &crew_all_alive)
             .unwrap();
         assert!(reg.record_crew("cap-1", "crew-1"));
         assert_eq!(
