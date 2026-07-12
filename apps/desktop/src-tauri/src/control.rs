@@ -11489,6 +11489,68 @@ mod tests {
     }
 
     #[test]
+    fn read_terminal_ownership_matrix_through_the_gate() {
+        // The full DoD ownership matrix for `read_terminal`, exercised END-TO-END through
+        // `dispatch_authenticated` (session-token resolve -> `enforce_session_access` ->
+        // `can_access_session`). The sibling `cross_ship_isolation_refuses_a_foreign_read_
+        // through_the_gate` test is the bypass-would-fail sentinel (drop the guard and the
+        // foreign-crew cell flips to a non-ACL error); THIS test proves the ALLOW cells go
+        // through and the orchestrator cells resolve correctly.
+        //
+        // An ALLOWED read cannot fully succeed in the headless test env (there is no live
+        // `th_*` tmux session), so it fails at the tmux capture with a DIFFERENT message.
+        // The invariant for an allow cell is therefore: NOT refused with the isolation ACL
+        // reason. A DENIED cell must carry "cross-ship isolation".
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let reg = Arc::new(CaptainsRegistry::new());
+        reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-a", "crew-a"));
+        reg.claim_test("cap-b", Some("ship-b"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-b", "crew-b"));
+        let crew_a = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
+        let cap_a = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
+        let cortana = mint_session(&store, crate::identity::Role::Cortana, "cortana", "cor");
+        let ctx = test_ctx("ctrl")
+            .with_read_token("read-t".to_string())
+            .with_identity_store(store)
+            .with_captains_registry(reg);
+
+        // An allow cell: refused ONLY if the isolation ACL fired (else it fell through to
+        // the tmux layer, which is the intended "permitted" outcome).
+        let is_isolation_denied = |session: &str, target: &str| -> bool {
+            let resp = dispatch_authenticated(
+                &ctx,
+                req_session("read-t", session, "read_terminal", json!({"sessionId": target})),
+            );
+            resp.error.unwrap_or_default().contains("cross-ship isolation")
+        };
+
+        // SELF: a crew reading its OWN pane -> permitted (falls through to tmux).
+        assert!(!is_isolation_denied(&crew_a, "crew-a"), "self-read must be permitted");
+        // OWN-CREW: a captain reading its own ship's crew -> permitted.
+        assert!(!is_isolation_denied(&cap_a, "crew-a"), "captain reading own crew must be permitted");
+        // OWN-SHIP SUPERVISOR: a crew reading its own captain's pane -> permitted (same ship).
+        assert!(!is_isolation_denied(&crew_a, "cap-a"), "same-ship supervisor read must be permitted");
+        // ORCHESTRATOR: cortana reading a SUPERVISOR on any ship (her subordinate) -> permitted.
+        assert!(!is_isolation_denied(&cortana, "cap-b"), "cortana reading a captain must be permitted");
+        // FOREIGN-CREW: a crew reading another ship's crew -> DENIED.
+        assert!(is_isolation_denied(&crew_a, "crew-b"), "cross-ship crew read must be refused");
+        // ORCHESTRATOR SKIP-LEVEL: cortana reading a FOREIGN ship's crew directly -> DENIED.
+        assert!(is_isolation_denied(&cortana, "crew-b"), "cortana skip-level into foreign crew must be refused");
+
+        // FULL-TOKEN HOST: the tokenless control-token host (the app webview/MCP) presents
+        // no per-session identity -> fails OPEN (never ACL-refused).
+        let host = dispatch_authenticated(
+            &ctx,
+            req("ctrl", "read_terminal", json!({"sessionId": "crew-b"})),
+        );
+        assert!(
+            !host.error.unwrap_or_default().contains("cross-ship isolation"),
+            "the full-token host must fail open, not be ACL-refused"
+        );
+    }
+
+    #[test]
     fn cross_ship_isolation_refuses_a_foreign_break_glass_write() {
         // The write side of H3: even break-glass `send_text` rides the isolation ACL. A
         // captain on ship-a (holding the Full control token) may not write ship-b's crew.
