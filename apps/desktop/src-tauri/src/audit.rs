@@ -105,6 +105,13 @@ fn head_path_for(dir: &Path) -> PathBuf {
     dir.with_extension("head.json")
 }
 
+/// Test-only accessor for the head-anchor path, so `control.rs` tests can clean up the
+/// sibling head file they create through the dispatch path.
+#[cfg(test)]
+pub(crate) fn head_path_for_test(dir: &Path) -> PathBuf {
+    head_path_for(dir)
+}
+
 /// 32 bytes of key material from two v4 UUIDs (each drawn from the OS CSPRNG via
 /// `getrandom`); ~244 bits of entropy after the fixed version/variant bits — ample
 /// for an HMAC-SHA256 key, and avoids taking a direct `rand`/`getrandom` dependency.
@@ -363,6 +370,14 @@ impl AuditLog {
             for b in &report.breaks {
                 eprintln!("  {} line {}: {:?} — {}", b.file, b.line, b.kind, b.detail);
             }
+        } else if report.legacy > 0 {
+            // Benign: an upgraded install carries pre-v2 history the new key cannot
+            // verify. NOT a break - report quietly so it is never confused with tamper.
+            eprintln!(
+                "t-hub-audit: integrity OK. {} legacy pre-v2 record(s) present (from before \
+                 the keyed chain; unverifiable by design, not counted as breaks).",
+                report.legacy
+            );
         }
         report
     }
@@ -393,13 +408,35 @@ pub struct AuditMeta<'a> {
 pub struct VerifyReport {
     pub files: usize,
     pub records: usize,
+    /// Records written by the OLD unkeyed (pre-v2) scheme. These are NOT breaks - on
+    /// an upgraded install the audit dir legitimately holds legacy history that the
+    /// new key cannot MAC-verify. Counted + reported so the signal is honest, but they
+    /// never trip the "tampered/truncated" alarm (P72-1: no upgrade cry-wolf).
+    pub legacy: usize,
     pub breaks: Vec<ChainBreak>,
 }
 
 impl VerifyReport {
-    /// True iff the chain verified with zero breaks.
+    /// True iff the keyed (v2) chain verified with zero breaks. Legacy pre-v2 records
+    /// do not affect this - they are unverifiable-by-design, not tampering.
     pub fn ok(&self) -> bool {
         self.breaks.is_empty()
+    }
+
+    /// Render the report as JSON for a control-command response (`audit_verify`).
+    pub fn to_json(&self) -> Value {
+        json!({
+            "ok": self.ok(),
+            "files": self.files,
+            "records": self.records,
+            "legacy": self.legacy,
+            "breaks": self.breaks.iter().map(|b| json!({
+                "file": b.file,
+                "line": b.line,
+                "kind": format!("{:?}", b.kind),
+                "detail": b.detail,
+            })).collect::<Vec<_>>(),
+        })
     }
 }
 
@@ -511,13 +548,14 @@ pub fn verify_with_head(dir: &Path, head_path: &Path, key: &[u8]) -> VerifyRepor
             let stored = stored.to_string();
 
             if rec.get("v").and_then(|v| v.as_u64()) != Some(AUDIT_FORMAT_VERSION) {
-                report.breaks.push(ChainBreak {
-                    file: name.clone(),
-                    line: line_no,
-                    kind: BreakKind::Malformed,
-                    detail: "record predates the keyed (v2) format; cannot MAC-verify".into(),
-                });
-                // Still advance the linkage so we don't cascade a PrevMismatch.
+                // A record from the OLD unkeyed (pre-v2) scheme. On an upgraded install
+                // the audit dir legitimately holds such history, and the freshly-minted
+                // key cannot MAC-verify it. This is NOT tampering, so it must NOT count
+                // as an integrity break (P72-1: reporting every legacy line as a break on
+                // the first post-deploy startup is cry-wolf that erodes trust in the real
+                // alarm). Count it as legacy, advance the linkage so the first genuine v2
+                // record still chains cleanly onto it, and move on.
+                report.legacy += 1;
                 prev = stored.clone();
                 last_hash = stored;
                 continue;
@@ -1044,6 +1082,64 @@ mod tests {
         );
         assert!(res.is_err(), "a sink write failure must surface as Err");
         let _ = std::fs::remove_file(&base);
+    }
+
+    #[test]
+    fn legacy_pre_v2_records_are_not_counted_as_breaks() {
+        // P72-1: on an upgraded install the audit dir holds OLD unkeyed (pre-v2)
+        // history the new key cannot MAC-verify. That must NOT be reported as tampering
+        // (cry-wolf), yet a genuine v2 tamper AFTER the legacy tail must still be caught.
+        // BYPASS-WOULD-FAIL: restore the `Malformed`-break-on-`v!=2` path and the first
+        // assert flips RED.
+        let dir = temp_dir("legacy");
+        clean(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two legacy v1 lines (no `v` field, unkeyed SHA-256 chain), then a genuine v2
+        // line appended by the new build (which re-seeds `prev` from the last line). The
+        // legacy lines must live in TODAY's file so the live `record` (which keys off
+        // `chrono::Local::now()`) appends v2 to the SAME file - the real mid-day upgrade.
+        let today = chrono::Local::now().format("%Y%m%d").to_string();
+        let path = dir.join(format!("control-{today}.jsonl"));
+        let mut prev = String::new();
+        let mut legacy_lines = Vec::new();
+        for i in 0..2 {
+            let mut rec = json!({
+                "ts": "2026-01-01T00:00:00Z",
+                "command": "close_terminal",
+                "decision": "allowed",
+                "prev": prev,
+                "args": {"sessionId": format!("legacy{i}")},
+            });
+            let body = serde_json::to_string(&rec).unwrap();
+            let h = hex(&Sha256::digest(body.as_bytes())); // OLD unkeyed scheme
+            rec["hash"] = json!(h);
+            legacy_lines.push(serde_json::to_string(&rec).unwrap());
+            prev = h;
+        }
+        std::fs::write(&path, format!("{}\n", legacy_lines.join("\n"))).unwrap();
+
+        // Now the live log appends a v2 record over the same file (re-seeds from the
+        // last legacy hash) - the normal upgrade path.
+        let log = AuditLog::with_key(dir.clone(), TEST_KEY.to_vec());
+        log.record("close_terminal", "process-changing", "allowed", &json!({"sessionId": "fresh"}), meta());
+
+        let report = verify(&dir, TEST_KEY);
+        assert!(report.ok(), "legacy history must not be a break: {:?}", report.breaks);
+        assert_eq!(report.legacy, 2, "both pre-v2 lines should be counted as legacy");
+        assert_eq!(report.records, 3);
+
+        // A tamper of the v2 tail is STILL detected (the alarm is not defeated).
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        let mut v2: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        v2["decision"] = json!("refused-cap");
+        *lines.last_mut().unwrap() = serde_json::to_string(&v2).unwrap();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        let report = verify(&dir, TEST_KEY);
+        assert!(!report.ok(), "a v2 tamper after legacy history must still be caught");
+        assert!(report.breaks.iter().any(|b| b.kind == BreakKind::BadMac));
+        clean(&dir);
     }
 
     #[test]

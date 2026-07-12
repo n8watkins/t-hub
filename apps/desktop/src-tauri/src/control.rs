@@ -2591,9 +2591,12 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     write_handshake(&handshake)?;
 
     // H2 production verifier: recompute the KEYED audit chain + head anchor on
-    // startup and report any breaks LOUDLY - stderr (in `startup_integrity_check`)
-    // plus a fanout event so the UI/operators see a tampered/truncated trail rather
-    // than the old `cfg(test)`-only recompute that never ran in prod.
+    // startup and report any breaks LOUDLY on stderr (in `startup_integrity_check`),
+    // replacing the old `cfg(test)`-only recompute that never ran in prod. The fanout
+    // event below is a best-effort live mirror only - it runs before `serve` accepts,
+    // so a subscriber connected at THIS instant is rare; the DURABLE queryable surface
+    // is the `audit_verify` control command (P72-2), which any late-subscribing UI or
+    // health poll can call to get an authoritative, non-stale integrity report.
     let integrity = ctx.audit.startup_integrity_check();
     if !integrity.ok() {
         ctx.fanout.emit_event(
@@ -4138,6 +4141,18 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     // above), no side effect, so it is answered here from `cap` directly.
     if req.command == "my_capability" {
         return ControlResponse::ok(json!({ "capability": cap.tier_label() }));
+    }
+
+    // P72-2: the queryable integrity surface. The startup integrity check only reaches
+    // stderr (and a fanout event that predates any subscriber), so a late-connecting UI
+    // or an operator had no in-product way to learn the audit chain is broken. This
+    // Read-tier command re-runs the verifier LIVE and returns the report, so a health
+    // poll or a manual query gets an authoritative, non-stale answer. Read-tier (any
+    // valid token passes the gate above), no side effect - answered inline like
+    // `my_capability`, so `required_tier`/the dispatch match/the MCP catalog are
+    // untouched (keeping the contested `control.rs` surface tight).
+    if req.command == "audit_verify" {
+        return ControlResponse::ok(ctx.audit.verify_self().to_json());
     }
 
     // Spawn-class idempotency (ask #1): a client-supplied `requestId` on a
@@ -11495,6 +11510,30 @@ mod tests {
         assert_eq!(control.result.unwrap()["capability"], "control");
         let read = dispatch_authenticated(&ctx, req("read-t", "my_capability", json!({})));
         assert_eq!(read.result.unwrap()["capability"], "read");
+    }
+
+    #[test]
+    fn audit_verify_reports_integrity_live_to_a_read_token() {
+        // P72-2: the queryable integrity surface. After writing a real chain through
+        // the gate, `audit_verify` returns `ok:true` with the record count; it is
+        // Read-tier so a least-privilege health poll (the read token) can call it.
+        let dir = std::env::temp_dir().join("t-hub-gate-auditverify");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(crate::audit::head_path_for_test(&dir));
+        let ctx = test_ctx("av").with_audit(Arc::new(AuditLog::new(dir.clone())));
+        // A process-changing command lays down a keyed record (fail-closed pre-dispatch).
+        let _ = dispatch_authenticated(
+            &ctx,
+            req("av", "send_text", json!({"sessionId": "x", "text": "hi", "enter": true})),
+        );
+        let resp = dispatch_authenticated(&ctx, req("read-av", "audit_verify", json!({})));
+        assert!(resp.ok, "audit_verify should succeed for a read token");
+        let v = resp.result.unwrap();
+        assert_eq!(v["ok"], true, "an untampered chain verifies");
+        assert!(v["records"].as_u64().unwrap() >= 1, "the written record is counted");
+        assert_eq!(v["breaks"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(crate::audit::head_path_for_test(&dir));
     }
 
     #[test]
