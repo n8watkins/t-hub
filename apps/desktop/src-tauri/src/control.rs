@@ -773,10 +773,11 @@ pub const CORTANA_SLUG: &str = "cortana";
 /// surfaces as a contended error rather than looping forever.
 const CLAIM_CAS_ATTEMPTS: usize = 8;
 
-/// The current on-disk schema version for `captains.json` (item-2 §3.2/D2). v0 (the
-/// absent/legacy shape: `captainSessionId` + `crew: [string]`, no `role`/`state`)
-/// is accepted on read and upgraded in place; every write stamps this version.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 1;
+/// The current on-disk schema version for `captains.json`.
+/// v0 used terminal-keyed captains and string crew; v1 introduced durable ship
+/// identities; v2 adds registered projects plus reset-safe Captain, Crew, and
+/// Powder bindings. All prior shapes remain readable and upgrade on write.
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 2;
 
 /// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
 /// apex SINGLETON - at most one `Active` across the whole registry - and a Captain
@@ -862,6 +863,24 @@ pub struct CrewRef {
     /// and BACKFILLED on the first StatusBridge resolution. Never load-bearing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_uuid: Option<String>,
+    /// Harness-neutral conversation identifier used to resume or reconcile a
+    /// replaced Crew conversation. Provider continuity is useful, but never the
+    /// durable crew identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// Human-readable task boundary delegated to this Crew member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Powder work claimed by this Crew member. T-Hub owns the terminal binding;
+    /// Powder remains authoritative for the claim and run lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub powder_work: Option<PowderWorkBinding>,
     #[serde(default)]
     pub state: CrewState,
 }
@@ -871,15 +890,63 @@ impl CrewRef {
         CrewRef {
             terminal_id: terminal_id.to_string(),
             claude_uuid: None,
+            conversation_id: None,
+            task: None,
+            harness: None,
+            worktree_path: None,
+            branch: None,
+            powder_work: None,
             state: CrewState::Active,
         }
     }
 }
 
+/// A Crew member's durable pointer into Powder's work ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PowderWorkBinding {
+    pub card_id: String,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_expires_at: Option<i64>,
+}
+
+/// Project-level Powder mapping. Credentials never belong in this registry;
+/// `connection_profile` names separately protected endpoint configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PowderProjectBinding {
+    #[serde(default = "default_powder_profile")]
+    pub connection_profile: String,
+    pub repository: String,
+}
+
+fn default_powder_profile() -> String {
+    "default".to_string()
+}
+
+/// A repository registered with T-Hub. Projects outlive terminals, Captain
+/// conversations, and individual ships.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRecord {
+    pub project_id: String,
+    pub name: String,
+    pub repo_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub powder: Option<PowderProjectBinding>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 /// Deserialize `crew` from BOTH schema versions (item-2 §3.2/D2): the legacy
 /// `Vec<String>` of bare tile ids AND the modern `Vec<CrewRef>`. A bare string
-/// upgrades to `CrewRef { terminal_id, claude_uuid: None, state: Active }` so an
-/// on-disk v0 file loads without a manual `Value`-walk.
+/// upgrades through [`CrewRef::new`] so an on-disk v0 file loads without a manual
+/// `Value` walk and every v2 field receives its safe default.
 fn deserialize_crew<'de, D>(d: D) -> Result<Vec<CrewRef>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -929,6 +996,21 @@ pub struct FleetIdentity {
     /// deadlocked R-H2). Accepts the legacy `captainSessionId` field on load.
     #[serde(default, alias = "captainSessionId")]
     pub terminal_id: Option<String>,
+    /// The registered project this ship supervises. A missing value identifies a
+    /// legacy or deliberately unscoped Captain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// The Captain's durable assignment, restored independently of model memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Harness-neutral conversation identifier for reset and provider migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// Deterministic one-screen recovery state, refreshed by the Captain protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_point: Option<String>,
     #[serde(default)]
     pub workspace_tab_ids: Vec<String>,
     /// The ship's crew (item-2 §2.3). Deserializes from BOTH the legacy `Vec<String>`
@@ -1020,23 +1102,26 @@ pub struct CaptainsSnapshot {
     /// On-disk schema version (item-2 §3.2/D2). Absent/0 = legacy; every write
     /// stamps [`CAPTAINS_SCHEMA_VERSION`].
     ///
-    /// FORWARD-COMPATIBLE ONLY: the item-2 reader accepts BOTH v0 and v1, so an
-    /// upgrade is seamless. It is NOT interop between binaries - a v1 file (which
-    /// writes `terminalId` + object crew) is UNREADABLE by a pre-item-2 binary
-    /// (`captainSessionId` required, `crew: [string]`), so a DOWNGRADE parses to
-    /// empty and RESETS the captains registry. That loss is recoverable, not
-    /// catastrophic: claims re-derive as captains re-claim on their next startup.
+    /// Upgrades are seamless because the reader accepts every prior shape.
+    /// Downgrading from v2 is not safe for project metadata: a v1 binary ignores
+    /// the new fields and drops them on its next write even though captain claims
+    /// remain readable.
     #[serde(default)]
     pub schema_version: u32,
     #[serde(default)]
     pub seq: u64,
     #[serde(default)]
     pub captains: Vec<CaptainRecord>,
+    /// Durable registered repositories. Added in schema v2; older snapshots
+    /// deserialize to an empty registry.
+    #[serde(default)]
+    pub projects: Vec<ProjectRecord>,
 }
 
 #[derive(Default)]
 struct CaptainsInner {
     captains: Vec<CaptainRecord>,
+    projects: Vec<ProjectRecord>,
     /// Monotonic revision, bumped on every accepted mutation - the same
     /// convergence contract as [`RegistryInner::seq`]. Persisted, so it stays
     /// monotonic across app restarts.
@@ -1127,6 +1212,7 @@ impl CaptainsRegistry {
                 Self::reconcile_on_load(&mut captains);
                 CaptainsInner {
                     captains,
+                    projects: snap.projects,
                     seq: snap.seq,
                 }
             })
@@ -1159,6 +1245,7 @@ impl CaptainsRegistry {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: g.seq,
             captains: g.captains.clone(),
+            projects: g.projects.clone(),
         }
     }
 
@@ -1277,7 +1364,125 @@ impl CaptainsRegistry {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: g.seq,
             captains: g.captains.clone(),
+            projects: g.projects.clone(),
         }
+    }
+
+    /// Return the durable project registry without exposing the registry lock.
+    pub fn projects(&self) -> Vec<ProjectRecord> {
+        self.lock().projects.clone()
+    }
+
+    /// Register or update one canonical repository. Repository roots and project
+    /// ids are both unique so a rename cannot silently create two identities for
+    /// the same checkout and an id cannot be repointed to another repository.
+    pub fn upsert_project(&self, mut project: ProjectRecord) -> Result<ProjectRecord, String> {
+        project.project_id = project.project_id.trim().to_string();
+        project.name = project.name.trim().to_string();
+        project.repo_root = project.repo_root.trim_end_matches(['/', '\\']).to_string();
+        if project.project_id.is_empty() {
+            return Err("projectId must not be empty".into());
+        }
+        if project.name.is_empty() {
+            return Err("project name must not be empty".into());
+        }
+        if project.repo_root.is_empty() || !std::path::Path::new(&project.repo_root).is_absolute() {
+            return Err("repoRoot must be an absolute path".into());
+        }
+        if let Some(powder) = project.powder.as_mut() {
+            powder.connection_profile = powder.connection_profile.trim().to_string();
+            powder.repository = powder.repository.trim().to_string();
+            if powder.connection_profile.is_empty() || powder.repository.is_empty() {
+                return Err("Powder connectionProfile and repository must not be empty".into());
+            }
+        }
+
+        let mut g = self.lock();
+        let by_id = g
+            .projects
+            .iter()
+            .position(|p| p.project_id == project.project_id);
+        let by_root = g
+            .projects
+            .iter()
+            .position(|p| p.repo_root == project.repo_root);
+        if let (Some(id_index), Some(root_index)) = (by_id, by_root) {
+            if id_index != root_index {
+                return Err(
+                    "projectId and repoRoot belong to different registered projects".into(),
+                );
+            }
+        }
+        if let Some(index) = by_id {
+            if g.projects[index].repo_root != project.repo_root {
+                return Err(format!(
+                    "projectId '{}' is already bound to '{}'",
+                    project.project_id, g.projects[index].repo_root
+                ));
+            }
+        }
+
+        let index = by_id.or(by_root);
+        if let Some(index) = index {
+            project.project_id = g.projects[index].project_id.clone();
+            project.created_at = g.projects[index].created_at;
+            project.updated_at = g.projects[index].updated_at;
+            if g.projects[index] == project {
+                return Ok(project);
+            }
+            project.updated_at = now_ms();
+            g.projects[index] = project.clone();
+        } else {
+            let now = now_ms();
+            if project.created_at == 0 {
+                project.created_at = now;
+            }
+            project.updated_at = now;
+            g.projects.push(project.clone());
+        }
+        g.seq = g.seq.saturating_add(1);
+        let snap = Self::snapshot_for_persist(&g);
+        drop(g);
+        self.persist(snap);
+        Ok(project)
+    }
+
+    /// Bind an existing ship to its durable project and reset-safe assignment.
+    /// The project and ship must already exist; commissioning creates both before
+    /// this binding step and can therefore retry without inventing partial state.
+    pub fn bind_ship_context(
+        &self,
+        ship_slug: &str,
+        project_id: &str,
+        assignment: &str,
+        harness: &str,
+    ) -> Result<CaptainRecord, String> {
+        let assignment = assignment.trim();
+        let harness = harness.trim();
+        if assignment.is_empty() {
+            return Err("assignment must not be empty".into());
+        }
+        if harness.is_empty() {
+            return Err("harness must not be empty".into());
+        }
+        let mut g = self.lock();
+        if !g.projects.iter().any(|p| p.project_id == project_id) {
+            return Err(format!("unknown projectId '{project_id}'"));
+        }
+        let captain = g
+            .captains
+            .iter_mut()
+            .find(|c| c.ship_slug == ship_slug)
+            .ok_or_else(|| format!("unknown shipSlug '{ship_slug}'"))?;
+        captain.project_id = Some(project_id.to_string());
+        captain.assignment = Some(assignment.to_string());
+        captain.harness = Some(harness.to_string());
+        let result = captain.clone();
+        g.seq = g.seq.saturating_add(1);
+        let snap = Self::snapshot_for_persist(&g);
+        drop(g);
+        self.persist(snap);
+        Ok(result)
     }
 
     /// The fleet identity a terminal id currently POINTS (item-2 §2.1: keyed on the
@@ -1471,6 +1676,11 @@ impl CaptainsRegistry {
                         role,
                         claude_uuid: claude_uuid.map(str::to_string),
                         terminal_id: Some(terminal_id.to_string()),
+                        project_id: None,
+                        assignment: None,
+                        harness: None,
+                        conversation_id: None,
+                        resume_point: None,
                         workspace_tab_ids,
                         crew: Vec::new(),
                         state: ClaimState::Active,
@@ -13048,6 +13258,7 @@ mod tests {
             schema_version: CAPTAINS_SCHEMA_VERSION,
             seq: 0,
             captains: vec![],
+            projects: vec![],
         });
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -13057,6 +13268,83 @@ mod tests {
         // A NEWER snapshot (seq 1, already on disk) is allowed to (re)write.
         reg.persist(newer);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_powder_and_ship_context_survive_registry_reload() {
+        let path = captains_tmp("project-context");
+        let _ = std::fs::remove_file(&path);
+        let reg = CaptainsRegistry::load(path.clone());
+        let project = reg
+            .upsert_project(ProjectRecord {
+                project_id: "project-thub".into(),
+                name: "T-Hub".into(),
+                repo_root: "/home/test/t-hub".into(),
+                remote_url: Some("https://example.test/t-hub.git".into()),
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "production".into(),
+                    repository: "t-hub".into(),
+                }),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        reg.claim_test("cap-1", Some("t-hub"), vec![]).unwrap();
+        reg.bind_ship_context("t-hub", &project.project_id, "Own T-Hub stability", "codex")
+            .unwrap();
+
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(restored.schema_version, CAPTAINS_SCHEMA_VERSION);
+        assert_eq!(restored.projects, vec![project]);
+        let captain = restored
+            .captains
+            .iter()
+            .find(|c| c.ship_slug == "t-hub")
+            .unwrap();
+        assert_eq!(captain.project_id.as_deref(), Some("project-thub"));
+        assert_eq!(captain.assignment.as_deref(), Some("Own T-Hub stability"));
+        assert_eq!(captain.harness.as_deref(), Some("codex"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn project_registry_rejects_split_identity_and_invalid_powder_binding() {
+        let reg = CaptainsRegistry::new();
+        let base = ProjectRecord {
+            project_id: "project-one".into(),
+            name: "One".into(),
+            repo_root: "/repo/one".into(),
+            remote_url: None,
+            default_branch: None,
+            powder: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        reg.upsert_project(base.clone()).unwrap();
+
+        let mut repointed = base.clone();
+        repointed.repo_root = "/repo/two".into();
+        assert!(reg
+            .upsert_project(repointed)
+            .unwrap_err()
+            .contains("already bound"));
+
+        let mut duplicate_root = base.clone();
+        duplicate_root.project_id = "project-two".into();
+        let updated = reg.upsert_project(duplicate_root).unwrap();
+        assert_eq!(updated.project_id, "project-one");
+        assert_eq!(reg.projects().len(), 1);
+
+        let mut invalid_powder = base;
+        invalid_powder.powder = Some(PowderProjectBinding {
+            connection_profile: "default".into(),
+            repository: " ".into(),
+        });
+        assert!(reg
+            .upsert_project(invalid_powder)
+            .unwrap_err()
+            .contains("Powder"));
     }
 
     #[test]
