@@ -779,7 +779,7 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// identities; v2 adds registered projects plus reset-safe Captain, Crew, and
 /// Powder bindings; v3 adds durable per-project Powder event cursors. All prior
 /// shapes remain readable and upgrade on write.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 3;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 4;
 
 /// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
 /// apex SINGLETON - at most one `Active` across the whole registry - and a Captain
@@ -870,6 +870,9 @@ pub struct CrewRef {
     /// durable crew identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
+    /// Latest durable handoff boundary for this Crew conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_point: Option<String>,
     /// Human-readable task boundary delegated to this Crew member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
@@ -893,6 +896,7 @@ impl CrewRef {
             terminal_id: terminal_id.to_string(),
             claude_uuid: None,
             conversation_id: None,
+            resume_point: None,
             task: None,
             harness: None,
             worktree_path: None,
@@ -1619,6 +1623,72 @@ impl CaptainsRegistry {
         }
         binding.claim_expires_at = Some(expires_at);
         let result = crew.clone();
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok(result)
+    }
+
+    pub fn checkpoint(
+        &self,
+        captain_session_id: Option<&str>,
+        ship_slug: Option<&str>,
+        crew_session_id: Option<&str>,
+        conversation_id: Option<&str>,
+        resume_point: Option<&str>,
+    ) -> Result<CaptainRecord, String> {
+        if captain_session_id.is_none() && ship_slug.is_none() {
+            return Err("captain_checkpoint requires 'captainSessionId' or 'shipSlug'".into());
+        }
+        if conversation_id.is_none() && resume_point.is_none() {
+            return Err("captain_checkpoint requires 'conversationId' or 'resumePoint'".into());
+        }
+        let conversation_id = conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let resume_point = resume_point
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if conversation_id.is_none() && resume_point.is_none() {
+            return Err("captain_checkpoint values must not be empty".into());
+        }
+
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let captain = g
+            .captains
+            .iter_mut()
+            .find(|captain| {
+                captain_session_id.is_some_and(|id| captain.terminal_id.as_deref() == Some(id))
+                    || ship_slug.is_some_and(|slug| captain.ship_slug == slug)
+            })
+            .ok_or("captain_checkpoint: no matching Captain is registered")?;
+        if let Some(crew_session_id) = crew_session_id {
+            let crew = captain
+                .crew
+                .iter_mut()
+                .find(|crew| crew.terminal_id == crew_session_id)
+                .ok_or_else(|| {
+                    format!(
+                        "captain_checkpoint: Crew session '{crew_session_id}' is not on ship '{}'",
+                        captain.ship_slug
+                    )
+                })?;
+            if let Some(value) = conversation_id {
+                crew.conversation_id = Some(value.to_string());
+            }
+            if let Some(value) = resume_point {
+                crew.resume_point = Some(value.to_string());
+            }
+        } else {
+            if let Some(value) = conversation_id {
+                captain.conversation_id = Some(value.to_string());
+            }
+            if let Some(value) = resume_point {
+                captain.resume_point = Some(value.to_string());
+            }
+        }
+        let result = captain.clone();
         g.seq = g.seq.saturating_add(1);
         self.commit_mutation(g, previous)?;
         Ok(result)
@@ -3890,7 +3960,8 @@ fn required_tier(command: &str) -> CommandTier {
         "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
         | "archive_recent_project" | "register_project" | "bind_project_powder"
-        | "claim_captain" | "release_captain" | "watch_fleet" | "unwatch_fleet"
+        | "claim_captain" | "release_captain" | "captain_checkpoint" | "watch_fleet"
+        | "unwatch_fleet"
         | "rebind_control"
         // Comms-plane Phase 2 (review H1): `inbox_ack` MUTATES durable receipt state
         // (Delivered -> Processed) and force-compacts records, so it must NOT fall
@@ -4997,6 +5068,7 @@ fn dispatch_with_caller(
         // and every mutation forwards the authoritative captains snapshot.
         "claim_captain" => claim_captain(ctx, args),
         "release_captain" => release_captain(ctx, args),
+        "captain_checkpoint" => captain_checkpoint(ctx, args, caller),
         // Orchestrator wake: arm/disarm a server-side push that re-invokes the
         // orchestrator's loop when a watched session goes idle / needs-input /
         // completes. Organization tier (audited); the wake itself injects via the
@@ -7713,6 +7785,54 @@ fn captains_sync_apply(ctx: &ControlContext) -> bool {
     let snap = ctx.captains.snapshot();
     let args = json!({ "sync": serde_json::to_value(&snap).unwrap_or(Value::Null) });
     forward_apply(ctx, "sync_captains", &args)
+}
+
+fn captain_checkpoint(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+) -> Result<Value, String> {
+    let captain_session_id =
+        arg_str(args, "captainSessionId").or_else(|| arg_str(args, "captain_session_id"));
+    let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
+    let crew_session_id =
+        arg_str(args, "crewSessionId").or_else(|| arg_str(args, "crew_session_id"));
+    let conversation_id =
+        arg_str(args, "conversationId").or_else(|| arg_str(args, "conversation_id"));
+    let resume_point = arg_str(args, "resumePoint").or_else(|| arg_str(args, "resume_point"));
+    let snapshot = ctx.captains.snapshot();
+    let captain = snapshot
+        .captains
+        .iter()
+        .find(|captain| {
+            captain_session_id
+                .as_deref()
+                .is_some_and(|id| captain.terminal_id.as_deref() == Some(id))
+                || ship_slug
+                    .as_deref()
+                    .is_some_and(|slug| captain.ship_slug == slug)
+        })
+        .ok_or("captain_checkpoint: no matching Captain is registered")?;
+    let target = crew_session_id
+        .as_deref()
+        .or(captain.terminal_id.as_deref())
+        .ok_or("captain_checkpoint: Captain has no active terminal")?;
+    enforce_session_access(ctx, caller, target)?;
+
+    let captain = ctx.captains.checkpoint(
+        captain_session_id.as_deref(),
+        ship_slug.as_deref(),
+        crew_session_id.as_deref(),
+        conversation_id.as_deref(),
+        resume_point.as_deref(),
+    )?;
+    let _ = captains_sync_apply(ctx);
+    Ok(json!({
+        "accepted": "captain_checkpoint",
+        "audited": true,
+        "captain": captain,
+        "target": if crew_session_id.is_some() { "crew" } else { "captain" },
+    }))
 }
 
 /// `claim_captain` (Organization, audited; captain-chat phase 2): claim captaincy
@@ -12277,6 +12397,76 @@ mod tests {
         assert_eq!(reg.snapshot().seq, 0);
         assert!(reg.snapshot().captains.is_empty());
         std::fs::remove_file(blocker).unwrap();
+    }
+
+    #[test]
+    fn captain_and_crew_checkpoints_survive_registry_reload() {
+        let path = captains_tmp("checkpoint-roundtrip");
+        let _ = std::fs::remove_file(&path);
+        let reg = CaptainsRegistry::load(path.clone());
+        reg.claim_test("captain-1", Some("checkpoint-ship"), vec![])
+            .unwrap();
+        reg.record_crew("captain-1", "crew-1").unwrap();
+        reg.checkpoint(
+            None,
+            Some("checkpoint-ship"),
+            None,
+            Some("thread-captain"),
+            Some("Review Crew result, then update Powder."),
+        )
+        .unwrap();
+        reg.checkpoint(
+            Some("captain-1"),
+            None,
+            Some("crew-1"),
+            Some("thread-crew"),
+            Some("Implementing persistence tests."),
+        )
+        .unwrap();
+
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        let captain = &restored.captains[0];
+        assert_eq!(captain.conversation_id.as_deref(), Some("thread-captain"));
+        assert_eq!(
+            captain.resume_point.as_deref(),
+            Some("Review Crew result, then update Powder.")
+        );
+        assert_eq!(
+            captain.crew[0].conversation_id.as_deref(),
+            Some("thread-crew")
+        );
+        assert_eq!(
+            captain.crew[0].resume_point.as_deref(),
+            Some("Implementing persistence tests.")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn captain_checkpoint_command_updates_the_manifest() {
+        let ctx = test_ctx("secret");
+        ctx.captains
+            .claim_test("captain-checkpoint", Some("checkpoint-command"), vec![])
+            .unwrap();
+
+        let response = dispatch(
+            &ctx,
+            "captain_checkpoint",
+            &json!({
+                "shipSlug": "checkpoint-command",
+                "conversationId": "thread-123",
+                "resumePoint": "Resume by reconciling Powder events."
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(response["accepted"], "captain_checkpoint");
+        assert_eq!(response["target"], "captain");
+        assert_eq!(response["captain"]["conversationId"], "thread-123");
+        assert_eq!(
+            response["captain"]["resumePoint"],
+            "Resume by reconciling Powder events."
+        );
     }
 
     #[test]

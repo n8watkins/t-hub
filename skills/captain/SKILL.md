@@ -175,6 +175,7 @@ Never reap based only on a completed status or sentinel.
 ## Recover Captain Context
 
 Keep the structured manifest and Powder work state current after every staffing, reassignment, landing, and reaping action.
+Call `captain_checkpoint` whenever the Captain or a Crew conversation identifier becomes known and whenever its concise resume point changes materially.
 Keep the legacy ship file current while compatibility mode remains active.
 Before a context reset, persist a one-screen resume point containing active crew, Powder cards and runs, pending decisions, current branches or PRs, blockers, and the next ordered action.
 After restart, run the full durable-context recovery sequence before taking action.

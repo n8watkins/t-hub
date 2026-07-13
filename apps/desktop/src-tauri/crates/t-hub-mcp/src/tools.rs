@@ -373,6 +373,10 @@ fn schema_captain_bootstrap() -> Value {
             "shipSlug": { "type": "string", "description": "Durable ship slug to recover." },
             "captainSessionId": { "type": "string", "description": "Alternative current Captain terminal id." }
         },
+        "anyOf": [
+            { "required": ["captainSessionId"] },
+            { "required": ["shipSlug"] }
+        ],
         "additionalProperties": false
     })
 }
@@ -419,6 +423,38 @@ fn schema_dispatch_crew() -> Value {
             "tabName": { "type": "string", "description": "Optional workspace tab name, reused or created without switching focus." }
         },
         "required": ["cardId", "task"],
+        "anyOf": [
+            { "required": ["captainSessionId"] },
+            { "required": ["shipSlug"] }
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn schema_captain_checkpoint() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "captainSessionId": { "type": "string", "description": "Current Captain terminal id." },
+            "shipSlug": { "type": "string", "description": "Alternative durable Captain ship slug." },
+            "crewSessionId": { "type": "string", "description": "Optional Crew terminal to checkpoint instead of the Captain." },
+            "conversationId": { "type": "string", "description": "Harness conversation or thread identifier used for provider resume." },
+            "resumePoint": { "type": "string", "description": "Concise durable handoff with current state and next ordered action." }
+        },
+        "allOf": [
+            {
+                "anyOf": [
+                    { "required": ["captainSessionId"] },
+                    { "required": ["shipSlug"] }
+                ]
+            },
+            {
+                "anyOf": [
+                    { "required": ["conversationId"] },
+                    { "required": ["resumePoint"] }
+                ]
+            }
+        ],
         "additionalProperties": false
     })
 }
@@ -442,6 +478,10 @@ fn schema_release_captain() -> Value {
             "captainSessionId": { "type": "string", "description": "The claiming session id to release." },
             "shipSlug":         { "type": "string", "description": "Alternative to captainSessionId: release by ship slug." }
         },
+        "anyOf": [
+            { "required": ["captainSessionId"] },
+            { "required": ["shipSlug"] }
+        ],
         "additionalProperties": false
     })
 }
@@ -652,6 +692,12 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Organization,
             summary: "Release a claimed captaincy (by captainSessionId or shipSlug; unknown claims are refused).",
             input_schema: schema_release_captain,
+        },
+        ToolDef {
+            name: "captain_checkpoint",
+            tier: Tier::Organization,
+            summary: "Persist a Captain or Crew conversation identifier and reset-safe resume point in the ship manifest.",
+            input_schema: schema_captain_checkpoint,
         },
         ToolDef {
             name: "register_project",
@@ -883,7 +929,7 @@ mod tests {
         let list = find("list_captains").unwrap().to_mcp();
         assert_eq!(list["annotations"]["t-hubTier"], "read");
         assert_eq!(list["annotations"]["confirmationRequired"], false);
-        for name in ["claim_captain", "release_captain"] {
+        for name in ["claim_captain", "release_captain", "captain_checkpoint"] {
             let mcp = find(name).unwrap().to_mcp();
             assert_eq!(mcp["annotations"]["t-hubTier"], "organization", "{name}");
             assert_eq!(mcp["annotations"]["confirmationRequired"], false, "{name}");
@@ -922,6 +968,13 @@ mod tests {
             bootstrap.to_mcp()["annotations"]["confirmationRequired"],
             false
         );
+        assert_eq!(
+            (bootstrap.input_schema)()["anyOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
 
         let commission = find("commission_captain").unwrap();
         assert_eq!(commission.tier, Tier::ProcessChanging);
@@ -943,6 +996,20 @@ mod tests {
         assert_eq!(
             (dispatch.input_schema)()["required"],
             json!(["cardId", "task"])
+        );
+        assert_eq!(
+            (dispatch.input_schema)()["anyOf"].as_array().unwrap().len(),
+            2
+        );
+
+        let checkpoint = find("captain_checkpoint").unwrap();
+        assert_eq!(checkpoint.tier, Tier::Organization);
+        assert_eq!(
+            (checkpoint.input_schema)()["allOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
         );
 
         let heartbeat = find("heartbeat_crew_powder").unwrap();
