@@ -42,7 +42,7 @@ const AMBIGUOUS_RESOLVE_DEADLINE: Duration = Duration::from_secs(30);
 fn is_idempotent_command(command: &str) -> bool {
     matches!(
         command,
-        "spawn_terminal" | "create_worktree" | "commission_captain"
+        "spawn_terminal" | "create_worktree" | "commission_captain" | "dispatch_crew"
     )
 }
 

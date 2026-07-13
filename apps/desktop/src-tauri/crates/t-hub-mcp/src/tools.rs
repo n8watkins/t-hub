@@ -392,6 +392,48 @@ fn schema_commission_captain() -> Value {
     })
 }
 
+fn schema_powder_status() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "projectId": { "type": "string", "description": "Registered Powder-bound project id." }
+        },
+        "required": ["projectId"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_dispatch_crew() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "captainSessionId": { "type": "string", "description": "Current Captain terminal id." },
+            "shipSlug": { "type": "string", "description": "Alternative durable Captain ship slug." },
+            "cardId": { "type": "string", "description": "Ready Powder card to claim before starting work." },
+            "task": { "type": "string", "description": "Bounded Crew assignment for this card." },
+            "harness": { "type": "string", "enum": ["codex", "claude"], "description": "Crew harness. Defaults to the Captain harness." },
+            "worktreePath": { "type": "string", "description": "Existing Git worktree of the Captain project. Defaults to the main worktree." },
+            "branch": { "type": "string", "description": "Branch recorded in the durable Crew manifest." },
+            "ttlSeconds": { "type": "integer", "minimum": 300, "maximum": 86400, "description": "Initial Powder claim TTL. Defaults to 3600." },
+            "tabId": { "type": "string", "description": "Optional existing workspace tab for the Crew tile." },
+            "tabName": { "type": "string", "description": "Optional workspace tab name, reused or created without switching focus." }
+        },
+        "required": ["cardId", "task"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_heartbeat_crew_powder() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "crewSessionId": { "type": "string", "description": "Live Crew terminal whose Powder claim should be heartbeated." }
+        },
+        "required": ["crewSessionId"],
+        "additionalProperties": false
+    })
+}
+
 /// `release_captain` schema (captain-chat phase 2): release a claimed captaincy.
 fn schema_release_captain() -> Value {
     json!({
@@ -539,6 +581,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_captain_bootstrap,
         },
         ToolDef {
+            name: "powder_status",
+            tier: Tier::Read,
+            summary: "Verify the protected Powder connection for a registered project without exposing credentials.",
+            input_schema: schema_powder_status,
+        },
+        ToolDef {
             name: "list_fleet_watches",
             tier: Tier::Read,
             summary: "List the armed orchestrator wakes (who gets woken, for which sessions + states).",
@@ -642,6 +690,18 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::ProcessChanging,
             summary: "Commission one project-aware Captain in Codex or Claude and bind it transactionally to its durable Powder-backed ship.",
             input_schema: schema_commission_captain,
+        },
+        ToolDef {
+            name: "dispatch_crew",
+            tier: Tier::ProcessChanging,
+            summary: "Claim a project Powder card, spawn one least-privilege Crew harness, and persist the card/run-to-terminal binding transactionally.",
+            input_schema: schema_dispatch_crew,
+        },
+        ToolDef {
+            name: "heartbeat_crew_powder",
+            tier: Tier::ProcessChanging,
+            summary: "Heartbeat a Crew Powder claim only after verifying its terminal is live.",
+            input_schema: schema_heartbeat_crew_powder,
         },
         ToolDef {
             name: "send_text",
@@ -872,6 +932,24 @@ mod tests {
         assert_eq!(
             (commission.input_schema)()["required"],
             json!(["projectId", "assignment"])
+        );
+
+        let status = find("powder_status").unwrap();
+        assert_eq!(status.tier, Tier::Read);
+        assert_eq!((status.input_schema)()["required"], json!(["projectId"]));
+
+        let dispatch = find("dispatch_crew").unwrap();
+        assert_eq!(dispatch.tier, Tier::ProcessChanging);
+        assert_eq!(
+            (dispatch.input_schema)()["required"],
+            json!(["cardId", "task"])
+        );
+
+        let heartbeat = find("heartbeat_crew_powder").unwrap();
+        assert_eq!(heartbeat.tier, Tier::ProcessChanging);
+        assert_eq!(
+            (heartbeat.input_schema)()["required"],
+            json!(["crewSessionId"])
         );
     }
 

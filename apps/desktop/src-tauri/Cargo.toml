@@ -94,7 +94,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # no default features (no TLS): the server is 127.0.0.1-only, and going through
 # the backend (which sends no Origin header) is the whole point - the TTS
 # server rejects browser-origin requests.
-ureq = { version = "2", default-features = false }
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 uuid = { version = "1", features = ["v4"] }
 # OS cache-dir resolution for the Scribe voice-gate status file (scribe.rs):
 # LOCALAPPDATA on Windows, ~/.cache on Linux, ~/Library/Caches on macOS - so the

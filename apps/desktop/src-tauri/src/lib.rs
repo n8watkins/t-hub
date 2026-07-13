@@ -31,6 +31,7 @@ mod identity; // comms-plane Phase 2: per-session identity slice (mint/bind/reso
 mod inbox; // comms-plane Phase 2: durable inbox (per-recipient segmented store + seq + at-least-once + receipt state machine); the fleet wake is its first client
 mod model; // data-model structs (PRD §8)
 mod plane; // comms-plane Phase 1: Single Write Authority primary-writer seam (funnel + attribution for agent/automation input; NOT yet durable/ACL'd/typing-gated)
+mod powder; // Powder API profiles and claim lifecycle client; credentials stay outside the Captain registry
 mod remote_pty; // server-split M2a: client-side remote-PTY transport (terminal tiles over the control socket)
                 // --- feat/projects-sidebar (Agent A) ---------------------------------------
 mod recent; // recent recallable Claude sessions for the sidebar "Recent" list
@@ -342,6 +343,7 @@ fn start_control_listener(
         // authorization artifacts) - one Arc shared with the control listener so
         // `authorize` records and `check_authorization` resolves against the same store.
         .with_authz(authz);
+    control::start_powder_reconciler(ctx.clone());
     match control::start(ctx) {
         Ok(h) => {
             eprintln!(

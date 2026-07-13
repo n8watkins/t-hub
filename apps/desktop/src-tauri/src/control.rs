@@ -56,7 +56,7 @@ use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
 use crate::harness::Harness;
 use crate::supervision::Supervisor;
-use crate::{files, git, plane, pty, tmux};
+use crate::{files, git, plane, powder, pty, tmux};
 
 /// A single control request: a command name + free-form JSON args, authenticated
 /// by the per-launch `token`.
@@ -1486,6 +1486,73 @@ impl CaptainsRegistry {
         Ok(result)
     }
 
+    /// Enrich a spawned Crew reference with its durable task, harness, checkout,
+    /// and authoritative Powder card/run binding.
+    pub fn bind_crew_context(
+        &self,
+        captain_session_id: &str,
+        crew_session_id: &str,
+        task: &str,
+        harness: &str,
+        worktree_path: Option<&str>,
+        branch: Option<&str>,
+        powder_work: PowderWorkBinding,
+    ) -> Result<CrewRef, String> {
+        if task.trim().is_empty() {
+            return Err("crew task must not be empty".into());
+        }
+        let mut g = self.lock();
+        let captain = g
+            .captains
+            .iter_mut()
+            .find(|captain| captain.terminal_id.as_deref() == Some(captain_session_id))
+            .ok_or_else(|| format!("unknown Captain session '{captain_session_id}'"))?;
+        let crew = captain
+            .crew
+            .iter_mut()
+            .find(|crew| crew.terminal_id == crew_session_id)
+            .ok_or_else(|| format!("unknown Crew session '{crew_session_id}'"))?;
+        crew.task = Some(task.trim().to_string());
+        crew.harness = Some(harness.to_string());
+        crew.worktree_path = worktree_path.map(str::to_string);
+        crew.branch = branch.map(str::to_string);
+        crew.powder_work = Some(powder_work);
+        let result = crew.clone();
+        g.seq = g.seq.saturating_add(1);
+        let snap = Self::snapshot_for_persist(&g);
+        drop(g);
+        self.persist(snap);
+        Ok(result)
+    }
+
+    pub fn update_crew_claim_expiry(
+        &self,
+        crew_session_id: &str,
+        expires_at: i64,
+    ) -> Result<CrewRef, String> {
+        let mut g = self.lock();
+        let crew = g
+            .captains
+            .iter_mut()
+            .flat_map(|captain| captain.crew.iter_mut())
+            .find(|crew| crew.terminal_id == crew_session_id)
+            .ok_or_else(|| format!("unknown Crew session '{crew_session_id}'"))?;
+        let binding = crew
+            .powder_work
+            .as_mut()
+            .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
+        if binding.claim_expires_at == Some(expires_at) {
+            return Ok(crew.clone());
+        }
+        binding.claim_expires_at = Some(expires_at);
+        let result = crew.clone();
+        g.seq = g.seq.saturating_add(1);
+        let snap = Self::snapshot_for_persist(&g);
+        drop(g);
+        self.persist(snap);
+        Ok(result)
+    }
+
     /// The fleet identity a terminal id currently POINTS (item-2 §2.1: keyed on the
     /// mutable `terminal_id`, was `captain_session_id`). Used by the fleet notifier
     /// to label a transition as belonging to a captain (and name its ship). A record
@@ -1873,6 +1940,28 @@ impl CaptainsRegistry {
         drop(g);
         self.persist(snap);
         true
+    }
+
+    /// Remove a Crew reference created by a dispatch transaction that failed
+    /// before work started. Normal terminal death remains a retained Removed
+    /// record; this method is only rollback for an uncommitted dispatch.
+    pub fn rollback_crew(&self, crew_session_id: &str) -> bool {
+        let mut g = self.lock();
+        let mut changed = false;
+        for captain in &mut g.captains {
+            let before = captain.crew.len();
+            captain
+                .crew
+                .retain(|crew| crew.terminal_id != crew_session_id);
+            changed |= captain.crew.len() != before;
+        }
+        if changed {
+            g.seq = g.seq.saturating_add(1);
+            let snap = Self::snapshot_for_persist(&g);
+            drop(g);
+            self.persist(snap);
+        }
+        changed
     }
 
     /// Backfill the Claude continuity anchor for a tile once the StatusBridge
@@ -3700,7 +3789,8 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "commission_captain" | "send_text" | "send_keys" | "close_terminal"
+        "spawn_terminal" | "commission_captain" | "dispatch_crew" | "heartbeat_crew_powder"
+        | "send_text" | "send_keys" | "close_terminal"
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
         // process/state-changing and control-gated + audited.
@@ -4254,7 +4344,7 @@ fn governor_gate(
 ) -> Result<(), crate::governor::Refusal> {
     let now = std::time::Instant::now();
     match command {
-        "spawn_terminal" | "commission_captain" => {
+        "spawn_terminal" | "commission_captain" | "dispatch_crew" => {
             ctx.governor.check_spawn(live_session_count(), now)
         }
         "close_terminal" => ctx.governor.check_destructive(now),
@@ -4474,7 +4564,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
 fn is_idempotent_command(command: &str) -> bool {
     matches!(
         command,
-        "spawn_terminal" | "create_worktree" | "commission_captain"
+        "spawn_terminal" | "create_worktree" | "commission_captain" | "dispatch_crew"
     )
 }
 
@@ -4753,6 +4843,7 @@ fn dispatch_with_caller(
         "list_captains" => list_captains(ctx),
         "list_projects" => list_projects(ctx),
         "captain_bootstrap" => captain_bootstrap(ctx, args),
+        "powder_status" => powder_status(ctx, args),
         "list_fleet_watches" => list_fleet_watches(ctx),
         // T12: the socket twin of the `report_workspace_tabs` Tauri command - a
         // socket UI (the native cockpit) reports its tab layout into the same
@@ -4841,6 +4932,8 @@ fn dispatch_with_caller(
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args),
         "commission_captain" => commission_captain(ctx, args),
+        "dispatch_crew" => dispatch_crew(ctx, args),
+        "heartbeat_crew_powder" => heartbeat_crew_powder(ctx, args),
         // comms-plane Phase 1: `send_text`/`send_keys` are DEMOTED to audited
         // break-glass. They still execute (H2: demote, not deny) but every use is
         // marked loudly, because the primary automation path is now the plane
@@ -5766,6 +5859,512 @@ fn commission_captain(ctx: &ControlContext, args: &Value) -> Result<Value, Strin
     };
     let _ = captains_sync_apply(ctx);
     Ok(commissioned_response(captain, project, false))
+}
+
+fn powder_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let project_id = arg_str(args, "projectId")
+        .or_else(|| arg_str(args, "project_id"))
+        .ok_or("powder_status requires a 'projectId' argument")?;
+    let project = ctx
+        .captains
+        .projects()
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("powder_status: unknown projectId '{project_id}'"))?;
+    let binding = project.powder.as_ref().ok_or_else(|| {
+        format!(
+            "powder_status: project '{}' is not Powder-bound",
+            project.name
+        )
+    })?;
+    let client = powder::Client::from_profile(&binding.connection_profile)?;
+    let health = client.health()?;
+    Ok(json!({
+        "projectId": project.project_id,
+        "repository": binding.repository,
+        "connectionProfile": binding.connection_profile,
+        "health": health,
+    }))
+}
+
+fn captain_and_project_for_dispatch(
+    ctx: &ControlContext,
+    args: &Value,
+) -> Result<(CaptainRecord, ProjectRecord), String> {
+    let session_id =
+        arg_str(args, "captainSessionId").or_else(|| arg_str(args, "captain_session_id"));
+    let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
+    if session_id.is_none() && ship_slug.is_none() {
+        return Err("dispatch_crew requires 'captainSessionId' or 'shipSlug'".into());
+    }
+    let snapshot = ctx.captains.snapshot();
+    let captain = snapshot
+        .captains
+        .into_iter()
+        .find(|captain| {
+            session_id
+                .as_deref()
+                .is_some_and(|id| captain.terminal_id.as_deref() == Some(id))
+                || ship_slug
+                    .as_deref()
+                    .is_some_and(|slug| captain.ship_slug == slugify_ship(slug))
+        })
+        .ok_or("dispatch_crew: no matching Captain is registered")?;
+    let captain_session_id = captain
+        .terminal_id
+        .as_deref()
+        .ok_or("dispatch_crew: Captain is not attached to a live terminal")?;
+    match tmux::session_liveness(&tmux_target(captain_session_id)) {
+        tmux::SessionLiveness::Alive => {}
+        tmux::SessionLiveness::Gone => {
+            return Err("dispatch_crew: Captain terminal is gone".into());
+        }
+        tmux::SessionLiveness::Unknown => {
+            return Err(retryable_error(
+                "dispatch_crew: Captain liveness is unavailable; refusing to dispatch",
+            ));
+        }
+    }
+    let project_id = captain
+        .project_id
+        .as_deref()
+        .ok_or("dispatch_crew: Captain is not bound to a project")?;
+    let project = snapshot
+        .projects
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("dispatch_crew: unknown projectId '{project_id}'"))?;
+    Ok((captain, project))
+}
+
+fn validate_crew_checkout(
+    project: &ProjectRecord,
+    requested: Option<String>,
+) -> Result<String, String> {
+    let requested = requested.unwrap_or_else(|| project.repo_root.clone());
+    let canonical = std::fs::canonicalize(&requested).map_err(|error| {
+        format!(
+            "dispatch_crew: checkout '{}' is unavailable: {error}",
+            requested
+        )
+    })?;
+    let worktrees = git::worktree_list(&project.repo_root)
+        .map_err(|error| format!("dispatch_crew: could not validate project worktrees: {error}"))?;
+    let valid = worktrees.iter().any(|worktree| {
+        std::fs::canonicalize(&worktree.path)
+            .map(|path| path == canonical)
+            .unwrap_or(false)
+    });
+    if !valid {
+        return Err(format!(
+            "dispatch_crew: checkout '{}' is not a worktree of project '{}'",
+            canonical.display(),
+            project.name
+        ));
+    }
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+fn rollback_crew_dispatch(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    client: Option<&powder::Client>,
+    claim: Option<&powder::Claim>,
+) {
+    let registry_owns_claim = ctx.captains.snapshot().captains.iter().any(|captain| {
+        captain
+            .crew
+            .iter()
+            .any(|crew| crew.terminal_id == crew_session_id && crew.powder_work.is_some())
+    });
+    let _ = close_terminal(ctx, &json!({ "sessionId": crew_session_id }));
+    if !registry_owns_claim {
+        if let (Some(client), Some(claim)) = (client, claim) {
+            if let Err(error) = client.release(claim) {
+                eprintln!(
+                "t-hub-control: Powder release during Crew rollback failed for card '{}': {error}",
+                claim.card_id
+            );
+            }
+        }
+    }
+    ctx.captains.rollback_crew(crew_session_id);
+    let _ = captains_sync_apply(ctx);
+}
+
+fn dispatch_crew(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let (captain, project) = captain_and_project_for_dispatch(ctx, args)?;
+    let captain_session_id = captain.terminal_id.as_deref().unwrap().to_string();
+    let binding = project.powder.as_ref().ok_or_else(|| {
+        format!(
+            "dispatch_crew: project '{}' is not Powder-bound",
+            project.name
+        )
+    })?;
+    let card_id = arg_str(args, "cardId")
+        .or_else(|| arg_str(args, "card_id"))
+        .ok_or("dispatch_crew requires a 'cardId' argument")?;
+    let task = arg_str(args, "task")
+        .filter(|task| !task.trim().is_empty())
+        .ok_or("dispatch_crew requires a non-empty 'task' argument")?;
+    let harness_name = arg_str(args, "harness").unwrap_or_else(|| {
+        captain
+            .harness
+            .clone()
+            .unwrap_or_else(|| "codex".to_string())
+    });
+    let harness = match harness_name.trim().to_ascii_lowercase().as_str() {
+        "codex" => Harness::Codex,
+        "claude" => Harness::Claude,
+        other => return Err(format!("dispatch_crew: unsupported harness '{other}'")),
+    };
+    let checkout = validate_crew_checkout(
+        &project,
+        arg_str(args, "worktreePath").or_else(|| arg_str(args, "worktree_path")),
+    )?;
+    let branch = arg_str(args, "branch");
+    let ttl_seconds = args
+        .get("ttlSeconds")
+        .or_else(|| args.get("ttl_seconds"))
+        .and_then(Value::as_u64)
+        .unwrap_or(3600)
+        .clamp(300, 86_400);
+    let client = powder::Client::from_profile(&binding.connection_profile)?;
+    let card = client.get_card(&card_id)?;
+    let card_repo = card["repo"].as_str().ok_or_else(|| {
+        format!("dispatch_crew: Powder card '{card_id}' has no repository mapping")
+    })?;
+    if card_repo != binding.repository {
+        return Err(format!(
+            "dispatch_crew: Powder card '{card_id}' belongs to repository '{card_repo}', not '{}'",
+            binding.repository
+        ));
+    }
+
+    let mut spawn_args = json!({
+        "cwd": checkout,
+        "name": format!("Crew - {}", card_id),
+        "spawnedBy": captain_session_id,
+        "capability": "read",
+    });
+    if let Some(tab_id) = arg_str(args, "tabId").or_else(|| arg_str(args, "tab_id")) {
+        spawn_args["tabId"] = json!(tab_id);
+    } else if let Some(tab_name) = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name")) {
+        spawn_args["tabName"] = json!(tab_name);
+    }
+    let spawned = spawn_terminal(ctx, &spawn_args)?;
+    let crew_session_id = spawned["id"]
+        .as_str()
+        .ok_or("dispatch_crew: spawn returned no terminal id")?
+        .to_string();
+    let claim = match client.claim(&card_id, ttl_seconds) {
+        Ok(claim) => claim,
+        Err(error) => {
+            rollback_crew_dispatch(ctx, &crew_session_id, None, None);
+            return Err(format!(
+                "dispatch_crew: Powder claim failed before the harness started and the terminal was rolled back: {error}"
+            ));
+        }
+    };
+    let crew = match ctx.captains.bind_crew_context(
+        &captain_session_id,
+        &crew_session_id,
+        &task,
+        harness.as_provider(),
+        Some(&checkout),
+        branch.as_deref(),
+        PowderWorkBinding {
+            card_id: claim.card_id.clone(),
+            run_id: claim.run_id.clone(),
+            claim_expires_at: Some(claim.expires_at),
+        },
+    ) {
+        Ok(crew) => crew,
+        Err(error) => {
+            rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
+            return Err(format!(
+                "dispatch_crew: durable Crew binding failed and all side effects were rolled back: {error}"
+            ));
+        }
+    };
+    let prompt = format!(
+        "You are Crew on ship '{}'. Work only Powder card '{}' in run '{}'. Task: {} Use checkout '{}'. Report progress, blockers, and completion to Captain session '{}'. Do not claim other work or spawn additional agents.",
+        captain.ship_slug, claim.card_id, claim.run_id, task, checkout, captain_session_id
+    );
+    let launch = harness.adapter().fresh_argv(&prompt);
+    #[cfg(test)]
+    let launch = arg_str(args, "testHarnessCommand").unwrap_or_else(|| launch.clone());
+    if let Err(error) =
+        send_text(&json!({ "sessionId": crew_session_id, "text": launch, "enter": true }))
+    {
+        rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
+        return Err(format!(
+            "dispatch_crew: harness launch failed and all side effects were rolled back: {error}"
+        ));
+    }
+    let _ = captains_sync_apply(ctx);
+    Ok(json!({
+        "accepted": "dispatch_crew",
+        "audited": true,
+        "captain": captain,
+        "crew": crew,
+        "project": project,
+        "powderCard": card,
+        "claim": {
+            "cardId": claim.card_id,
+            "runId": claim.run_id,
+            "agent": claim.agent,
+            "expiresAt": claim.expires_at,
+        },
+    }))
+}
+
+fn crew_powder_context(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+) -> Result<(powder::Client, powder::Claim), String> {
+    let snapshot = ctx.captains.snapshot();
+    let (captain, crew) = snapshot
+        .captains
+        .iter()
+        .find_map(|captain| {
+            captain
+                .crew
+                .iter()
+                .find(|crew| crew.terminal_id == crew_session_id)
+                .map(|crew| (captain, crew))
+        })
+        .ok_or_else(|| format!("unknown Crew session '{crew_session_id}'"))?;
+    let work = crew
+        .powder_work
+        .as_ref()
+        .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
+    let project_id = captain
+        .project_id
+        .as_deref()
+        .ok_or("Crew ship has no project binding")?;
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("unknown projectId '{project_id}'"))?;
+    let binding = project
+        .powder
+        .as_ref()
+        .ok_or("Crew project has no Powder binding")?;
+    let client = powder::Client::from_profile(&binding.connection_profile)?;
+    let card = client.get_card(&work.card_id)?;
+    let claim = card["claim"]
+        .as_object()
+        .ok_or_else(|| format!("Powder card '{}' has no active claim", work.card_id))?;
+    let authoritative = powder::Claim {
+        card_id: work.card_id.clone(),
+        run_id: claim
+            .get("run_id")
+            .and_then(Value::as_str)
+            .ok_or("Powder card claim has no run_id")?
+            .to_string(),
+        agent: claim
+            .get("agent")
+            .and_then(Value::as_str)
+            .ok_or("Powder card claim has no agent")?
+            .to_string(),
+        expires_at: claim
+            .get("expires_at")
+            .and_then(Value::as_i64)
+            .ok_or("Powder card claim has no expires_at")?,
+    };
+    if authoritative.run_id != work.run_id {
+        return Err(format!(
+            "Powder card '{}' is now held by run '{}', not Crew run '{}'",
+            work.card_id, authoritative.run_id, work.run_id
+        ));
+    }
+    Ok((client, authoritative))
+}
+
+fn heartbeat_crew_powder(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let crew_session_id = arg_str(args, "crewSessionId")
+        .or_else(|| arg_str(args, "crew_session_id"))
+        .or_else(|| arg_str(args, "sessionId"))
+        .ok_or("heartbeat_crew_powder requires a 'crewSessionId' argument")?;
+    match tmux::session_liveness(&tmux_target(&crew_session_id)) {
+        tmux::SessionLiveness::Alive => {}
+        tmux::SessionLiveness::Gone => {
+            return Err(format!(
+                "heartbeat_crew_powder: Crew session '{crew_session_id}' is gone; refusing to extend its claim"
+            ));
+        }
+        tmux::SessionLiveness::Unknown => {
+            return Err(retryable_error(format!(
+                "heartbeat_crew_powder: Crew session '{crew_session_id}' liveness is unavailable"
+            )));
+        }
+    }
+    let (client, claim) = crew_powder_context(ctx, &crew_session_id)?;
+    let renewed = client.heartbeat(&claim)?;
+    let crew = ctx
+        .captains
+        .update_crew_claim_expiry(&crew_session_id, renewed.expires_at)?;
+    let _ = captains_sync_apply(ctx);
+    Ok(json!({
+        "accepted": "heartbeat_crew_powder",
+        "audited": true,
+        "crew": crew,
+        "claim": {
+            "cardId": renewed.card_id,
+            "runId": renewed.run_id,
+            "agent": renewed.agent,
+            "expiresAt": renewed.expires_at,
+        },
+    }))
+}
+
+fn release_crew_powder_binding(ctx: &ControlContext, crew_session_id: &str) -> Option<Value> {
+    let snapshot = ctx.captains.snapshot();
+    let (captain, work) = snapshot.captains.iter().find_map(|captain| {
+        captain
+            .crew
+            .iter()
+            .find(|crew| crew.terminal_id == crew_session_id)
+            .and_then(|crew| crew.powder_work.as_ref().map(|work| (captain, work)))
+    })?;
+    let project_id = captain.project_id.as_deref()?;
+    let binding = snapshot
+        .projects
+        .iter()
+        .find(|project| project.project_id == project_id)?
+        .powder
+        .as_ref()?;
+    let client = match powder::Client::from_profile(&binding.connection_profile) {
+        Ok(client) => client,
+        Err(error) => return Some(json!({ "released": false, "error": error })),
+    };
+    let claim = powder::Claim {
+        card_id: work.card_id.clone(),
+        run_id: work.run_id.clone(),
+        agent: String::new(),
+        expires_at: work.claim_expires_at.unwrap_or_default(),
+    };
+    Some(match client.release(&claim) {
+        Ok(released) => json!({
+            "released": true,
+            "cardId": released.card_id,
+            "runId": released.run_id,
+        }),
+        Err(error) => json!({
+            "released": false,
+            "cardId": work.card_id,
+            "runId": work.run_id,
+            "error": error,
+        }),
+    })
+}
+
+/// Start the deterministic Powder lease reconciler. Model memory is not part of
+/// this loop: tmux liveness controls renew/release and the registry supplies all
+/// card, run, project, and profile context after a restart.
+pub fn start_powder_reconciler(ctx: ControlContext) {
+    std::thread::Builder::new()
+        .name("t-hub-powder-reconciler".into())
+        .spawn(move || loop {
+            reconcile_powder_leases(&ctx);
+            std::thread::sleep(Duration::from_secs(300));
+        })
+        .ok();
+}
+
+fn reconcile_powder_leases(ctx: &ControlContext) {
+    let snapshot = ctx.captains.snapshot();
+    let mut work = Vec::new();
+    for captain in &snapshot.captains {
+        let Some(project_id) = captain.project_id.as_deref() else {
+            continue;
+        };
+        let Some(binding) = snapshot
+            .projects
+            .iter()
+            .find(|project| project.project_id == project_id)
+            .and_then(|project| project.powder.as_ref())
+        else {
+            continue;
+        };
+        for crew in &captain.crew {
+            if !matches!(crew.state, CrewState::Active) {
+                continue;
+            }
+            if let Some(powder_work) = crew.powder_work.clone() {
+                work.push((
+                    crew.terminal_id.clone(),
+                    binding.connection_profile.clone(),
+                    powder_work,
+                ));
+            }
+        }
+    }
+    for (crew_session_id, profile, work) in work {
+        let claim = powder::Claim {
+            card_id: work.card_id,
+            run_id: work.run_id,
+            agent: String::new(),
+            expires_at: work.claim_expires_at.unwrap_or_default(),
+        };
+        match tmux::session_liveness(&tmux_target(&crew_session_id)) {
+            tmux::SessionLiveness::Alive => {
+                let result = powder::Client::from_profile(&profile)
+                    .and_then(|client| client.renew(&claim, 3600));
+                match result {
+                    Ok(renewed) => {
+                        let _ = ctx
+                            .captains
+                            .update_crew_claim_expiry(&crew_session_id, renewed.expires_at);
+                        ctx.fanout.emit_event(
+                            "control://powder",
+                            &json!({
+                                "event": "claim-renewed",
+                                "crewSessionId": crew_session_id,
+                                "cardId": renewed.card_id,
+                                "runId": renewed.run_id,
+                                "expiresAt": renewed.expires_at,
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        ctx.fanout.emit_event(
+                            "control://powder",
+                            &json!({
+                                "event": "claim-renew-failed",
+                                "crewSessionId": crew_session_id,
+                                "cardId": claim.card_id,
+                                "runId": claim.run_id,
+                                "error": error,
+                            }),
+                        );
+                    }
+                }
+            }
+            tmux::SessionLiveness::Gone => {
+                let result = powder::Client::from_profile(&profile)
+                    .and_then(|client| client.release(&claim));
+                let released = result.is_ok();
+                let error = result.err();
+                ctx.captains.remove_session(&crew_session_id);
+                let _ = captains_sync_apply(ctx);
+                ctx.fanout.emit_event(
+                    "control://powder",
+                    &json!({
+                        "event": "dead-crew-reconciled",
+                        "crewSessionId": crew_session_id,
+                        "cardId": claim.card_id,
+                        "runId": claim.run_id,
+                        "released": released,
+                        "error": error,
+                    }),
+                );
+            }
+            tmux::SessionLiveness::Unknown => {}
+        }
+    }
 }
 
 /// `report_workspace_tabs` (T12 / headless-org): a UI client up-syncs its live tab
@@ -7540,6 +8139,12 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     };
     tmux::kill_session_tree(&target)
         .map_err(|e| format!("failed to close terminal '{session_id}': {e}"))?;
+    // The terminal is now definitely stopped. Release any Crew claim after the
+    // kill so a failed kill can never leave a live worker without its lease.
+    // Powder failure does not resurrect a dead process; the claim expires by TTL
+    // and the response makes the failed best-effort release visible.
+    let powder_release =
+        release_crew_powder_binding(ctx, session_id.strip_prefix("th_").unwrap_or(&session_id));
     let outcome = if forced {
         "force_reaped"
     } else if existed {
@@ -7571,6 +8176,7 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         // session whose liveness stayed indeterminate. ok:true in every case, so a
         // retry stays safe.
         "outcome": outcome,
+        "powderRelease": powder_release,
         "audited": true,
     }))
 }
@@ -13820,6 +14426,59 @@ mod tests {
         assert_eq!(captain.project_id.as_deref(), Some("project-thub"));
         assert_eq!(captain.assignment.as_deref(), Some("Own T-Hub stability"));
         assert_eq!(captain.harness.as_deref(), Some("codex"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn crew_powder_context_and_heartbeat_expiry_survive_registry_reload() {
+        let path = captains_tmp("crew-powder-context");
+        let _ = std::fs::remove_file(&path);
+        let reg = CaptainsRegistry::load(path.clone());
+        reg.upsert_project(ProjectRecord {
+            project_id: "project-crew".into(),
+            name: "Crew Project".into(),
+            repo_root: "/tmp/crew-project".into(),
+            remote_url: None,
+            default_branch: Some("main".into()),
+            powder: Some(PowderProjectBinding {
+                connection_profile: "production".into(),
+                repository: "crew-project".into(),
+            }),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+        reg.claim_test("captain-1", Some("crew-project"), vec![])
+            .unwrap();
+        reg.bind_ship_context("crew-project", "project-crew", "Own delivery", "codex")
+            .unwrap();
+        assert!(reg.record_crew("captain-1", "crew-1"));
+        reg.bind_crew_context(
+            "captain-1",
+            "crew-1",
+            "Implement card",
+            "claude",
+            Some("/tmp/crew-project-worktree"),
+            Some("card-1"),
+            PowderWorkBinding {
+                card_id: "card-1".into(),
+                run_id: "run-1".into(),
+                claim_expires_at: Some(100),
+            },
+        )
+        .unwrap();
+        reg.update_crew_claim_expiry("crew-1", 200).unwrap();
+
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        let crew = &restored.captains[0].crew[0];
+        assert_eq!(crew.task.as_deref(), Some("Implement card"));
+        assert_eq!(crew.harness.as_deref(), Some("claude"));
+        assert_eq!(crew.branch.as_deref(), Some("card-1"));
+        assert_eq!(crew.powder_work.as_ref().unwrap().run_id, "run-1");
+        assert_eq!(
+            crew.powder_work.as_ref().unwrap().claim_expires_at,
+            Some(200)
+        );
         let _ = std::fs::remove_file(path);
     }
 
