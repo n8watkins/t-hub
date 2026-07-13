@@ -3,6 +3,7 @@ import { controlRequest } from "./controlClient";
 export interface PowderProjectBinding {
   connectionProfile: string;
   repository: string;
+  eventCursor?: number;
 }
 
 export interface RegisteredProject {

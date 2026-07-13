@@ -242,6 +242,21 @@ impl Client {
         parse_event_stream(&body, after)
     }
 
+    pub fn event_head(&self) -> Result<i64, String> {
+        let mut cursor = 0;
+        for _ in 0..10_000 {
+            let events = self.tail_events(cursor, 1000)?;
+            let count = events.len();
+            if let Some(last) = events.last() {
+                cursor = last.sequence;
+            }
+            if count < 1000 {
+                return Ok(cursor);
+            }
+        }
+        Err("Powder event stream is too large to establish an initial cursor".into())
+    }
+
     fn request_text(&self, path: &str) -> Result<String, String> {
         let url = format!("{}{path}", self.base_url);
         let mut request = self.agent.get(&url);

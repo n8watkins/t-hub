@@ -777,8 +777,9 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// The current on-disk schema version for `captains.json`.
 /// v0 used terminal-keyed captains and string crew; v1 introduced durable ship
 /// identities; v2 adds registered projects plus reset-safe Captain, Crew, and
-/// Powder bindings. All prior shapes remain readable and upgrade on write.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 2;
+/// Powder bindings; v3 adds durable per-project Powder event cursors. All prior
+/// shapes remain readable and upgrade on write.
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 3;
 
 /// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
 /// apex SINGLETON - at most one `Active` across the whole registry - and a Captain
@@ -920,10 +921,16 @@ pub struct PowderProjectBinding {
     #[serde(default = "default_powder_profile")]
     pub connection_profile: String,
     pub repository: String,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub event_cursor: i64,
 }
 
 fn default_powder_profile() -> String {
     "default".to_string()
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
 }
 
 /// A repository registered with T-Hub. Projects outlive terminals, Captain
@@ -1446,6 +1453,43 @@ impl CaptainsRegistry {
         drop(g);
         self.persist(snap);
         Ok(project)
+    }
+
+    /// Advance a project's Powder cursor monotonically without allowing an event
+    /// poll that raced a rebind to write into the replacement stream.
+    pub fn advance_project_powder_cursor(
+        &self,
+        project_id: &str,
+        connection_profile: &str,
+        repository: &str,
+        cursor: i64,
+    ) -> Result<ProjectRecord, String> {
+        let mut g = self.lock();
+        let project = g
+            .projects
+            .iter_mut()
+            .find(|project| project.project_id == project_id)
+            .ok_or_else(|| format!("unknown projectId '{project_id}'"))?;
+        let powder = project
+            .powder
+            .as_mut()
+            .ok_or_else(|| format!("project '{project_id}' is not Powder-bound"))?;
+        if powder.connection_profile != connection_profile || powder.repository != repository {
+            return Err(format!(
+                "project '{project_id}' Powder binding changed while events were being read"
+            ));
+        }
+        if cursor <= powder.event_cursor {
+            return Ok(project.clone());
+        }
+        powder.event_cursor = cursor;
+        project.updated_at = now_ms();
+        let updated = project.clone();
+        g.seq = g.seq.saturating_add(1);
+        let snap = Self::snapshot_for_persist(&g);
+        drop(g);
+        self.persist(snap);
+        Ok(updated)
     }
 
     /// Bind an existing ship to its durable project and reset-safe assignment.
@@ -5558,19 +5602,35 @@ fn register_project(ctx: &ControlContext, args: &Value) -> Result<Value, String>
                 .map(|value| value.to_string_lossy().into_owned())
         })
         .ok_or("register_project: could not derive a project name")?;
-    let powder_repository =
-        arg_str(args, "powderRepository").or_else(|| arg_str(args, "powder_repository"));
-    let powder = powder_repository.map(|repository| PowderProjectBinding {
-        connection_profile: arg_str(args, "powderConnectionProfile")
-            .or_else(|| arg_str(args, "powder_connection_profile"))
-            .unwrap_or_else(default_powder_profile),
-        repository,
-    });
     let existing = ctx
         .captains
         .projects()
         .into_iter()
         .find(|project| project.repo_root == repo_root);
+    let powder_repository =
+        arg_str(args, "powderRepository").or_else(|| arg_str(args, "powder_repository"));
+    let powder = if let Some(repository) = powder_repository {
+        let connection_profile = arg_str(args, "powderConnectionProfile")
+            .or_else(|| arg_str(args, "powder_connection_profile"))
+            .unwrap_or_else(default_powder_profile);
+        let matching_binding = existing
+            .as_ref()
+            .and_then(|project| project.powder.as_ref())
+            .filter(|binding| {
+                binding.connection_profile == connection_profile && binding.repository == repository
+            });
+        let event_cursor = match matching_binding {
+            Some(binding) => binding.event_cursor,
+            None => initial_powder_event_cursor(&connection_profile, args)?,
+        };
+        Some(PowderProjectBinding {
+            connection_profile,
+            repository,
+            event_cursor,
+        })
+    } else {
+        None
+    };
     let project = ctx.captains.upsert_project(ProjectRecord {
         project_id: existing
             .as_ref()
@@ -5602,13 +5662,30 @@ fn bind_project_powder(ctx: &ControlContext, args: &Value) -> Result<Value, Stri
         .into_iter()
         .find(|project| project.project_id == project_id)
         .ok_or_else(|| format!("bind_project_powder: unknown projectId '{project_id}'"))?;
+    let connection_profile = arg_str(args, "connectionProfile")
+        .or_else(|| arg_str(args, "connection_profile"))
+        .unwrap_or_else(default_powder_profile);
+    let matching_binding = project.powder.as_ref().filter(|binding| {
+        binding.connection_profile == connection_profile && binding.repository == repository
+    });
+    let event_cursor = match matching_binding {
+        Some(binding) => binding.event_cursor,
+        None => initial_powder_event_cursor(&connection_profile, args)?,
+    };
     project.powder = Some(PowderProjectBinding {
-        connection_profile: arg_str(args, "connectionProfile")
-            .or_else(|| arg_str(args, "connection_profile"))
-            .unwrap_or_else(default_powder_profile),
+        connection_profile,
         repository,
+        event_cursor,
     });
     serde_json::to_value(ctx.captains.upsert_project(project)?).map_err(|e| e.to_string())
+}
+
+fn initial_powder_event_cursor(connection_profile: &str, _args: &Value) -> Result<i64, String> {
+    #[cfg(test)]
+    if let Some(cursor) = _args.get("testInitialEventCursor").and_then(Value::as_i64) {
+        return Ok(cursor.max(0));
+    }
+    powder::Client::from_profile(connection_profile)?.event_head()
 }
 
 fn resolve_bootstrap_context(
@@ -6289,6 +6366,7 @@ fn release_crew_powder_binding(ctx: &ControlContext, crew_session_id: &str) -> O
 /// this loop: tmux liveness controls renew/release and the registry supplies all
 /// card, run, project, and profile context after a restart.
 pub fn start_powder_reconciler(ctx: ControlContext) {
+    let event_ctx = ctx.clone();
     std::thread::Builder::new()
         .name("t-hub-powder-reconciler".into())
         .spawn(move || loop {
@@ -6296,6 +6374,22 @@ pub fn start_powder_reconciler(ctx: ControlContext) {
             std::thread::sleep(Duration::from_secs(300));
         })
         .ok();
+    std::thread::Builder::new()
+        .name("t-hub-powder-events".into())
+        .spawn(move || loop {
+            reconcile_powder_events(&event_ctx);
+            std::thread::sleep(powder_event_poll_interval());
+        })
+        .ok();
+}
+
+fn powder_event_poll_interval() -> Duration {
+    let seconds = std::env::var("T_HUB_POWDER_EVENT_POLL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15)
+        .max(5);
+    Duration::from_secs(seconds)
 }
 
 fn reconcile_powder_leases(ctx: &ControlContext) {
@@ -6389,6 +6483,123 @@ fn reconcile_powder_leases(ctx: &ControlContext) {
             tmux::SessionLiveness::Unknown => {}
         }
     }
+}
+
+fn reconcile_powder_events(ctx: &ControlContext) {
+    let snapshot = ctx.captains.snapshot();
+    for project in &snapshot.projects {
+        let Some(binding) = project.powder.as_ref() else {
+            continue;
+        };
+        let captain_session_id = snapshot
+            .captains
+            .iter()
+            .find(|captain| {
+                captain.project_id.as_deref() == Some(&project.project_id)
+                    && matches!(captain.state, ClaimState::Active)
+            })
+            .and_then(|captain| captain.terminal_id.as_deref());
+        let client = match powder::Client::from_profile(&binding.connection_profile) {
+            Ok(client) => client,
+            Err(error) => {
+                emit_powder_event_sync_error(ctx, project, error);
+                continue;
+            }
+        };
+        let events = match client.tail_events(binding.event_cursor, 1000) {
+            Ok(events) => events,
+            Err(error) => {
+                emit_powder_event_sync_error(ctx, project, error);
+                continue;
+            }
+        };
+        let cursor = apply_powder_events(ctx, project, binding, captain_session_id, &events);
+        if cursor > binding.event_cursor {
+            if let Err(error) = ctx.captains.advance_project_powder_cursor(
+                &project.project_id,
+                &binding.connection_profile,
+                &binding.repository,
+                cursor,
+            ) {
+                emit_powder_event_sync_error(ctx, project, error);
+            }
+        }
+    }
+}
+
+fn apply_powder_events(
+    ctx: &ControlContext,
+    project: &ProjectRecord,
+    binding: &PowderProjectBinding,
+    captain_session_id: Option<&str>,
+    events: &[powder::CardEvent],
+) -> i64 {
+    let mut cursor = binding.event_cursor;
+    for event in events {
+        if event.repository.as_deref() != Some(binding.repository.as_str()) {
+            cursor = event.sequence;
+            continue;
+        }
+        if let Some(recipient) = captain_session_id {
+            let body = format!(
+                "Powder event '{}' ({}) for card '{}' - {}. Status: '{}'. Re-read the authoritative card and update the durable Captain resume point before acting.",
+                event.event_type,
+                event.event_id,
+                event.card_id,
+                event.card_title,
+                event.card_status,
+            );
+            if let Err(error) = ctx.inbox.enqueue(
+                recipient,
+                &format!("powder:{}", binding.repository),
+                crate::inbox::Priority::Standard,
+                &body,
+                true,
+            ) {
+                ctx.fanout.emit_event(
+                    "control://powder",
+                    &json!({
+                        "event": "event-delivery-failed",
+                        "projectId": project.project_id,
+                        "captainSessionId": recipient,
+                        "powderEventId": event.event_id,
+                        "error": error.to_string(),
+                    }),
+                );
+                break;
+            }
+        }
+        ctx.fanout.emit_event(
+            "control://powder",
+            &json!({
+                "event": "card-event",
+                "projectId": project.project_id,
+                "repository": binding.repository,
+                "captainSessionId": captain_session_id,
+                "sequence": event.sequence,
+                "powderEventId": event.event_id,
+                "eventType": event.event_type,
+                "occurredAt": event.occurred_at,
+                "cardId": event.card_id,
+                "cardTitle": event.card_title,
+                "cardStatus": event.card_status,
+                "change": event.change,
+            }),
+        );
+        cursor = event.sequence;
+    }
+    cursor
+}
+
+fn emit_powder_event_sync_error(ctx: &ControlContext, project: &ProjectRecord, error: String) {
+    ctx.fanout.emit_event(
+        "control://powder",
+        &json!({
+            "event": "event-sync-failed",
+            "projectId": project.project_id,
+            "error": error,
+        }),
+    );
 }
 
 /// `report_workspace_tabs` (T12 / headless-org): a UI client up-syncs its live tab
@@ -11916,12 +12127,27 @@ mod tests {
             &json!({
                 "projectId": project_id,
                 "repository": "t-hub-app",
-                "connectionProfile": "production"
+                "connectionProfile": "production",
+                "testInitialEventCursor": 0
             }),
         )
         .unwrap();
         assert_eq!(bound["powder"]["repository"], "t-hub-app");
         assert_eq!(bound["powder"]["connectionProfile"], "production");
+        ctx.captains
+            .advance_project_powder_cursor(project_id, "production", "t-hub-app", 9)
+            .unwrap();
+        let rebound = dispatch(
+            &ctx,
+            "bind_project_powder",
+            &json!({
+                "projectId": project_id,
+                "repository": "t-hub-app",
+                "connectionProfile": "production"
+            }),
+        )
+        .unwrap();
+        assert_eq!(rebound["powder"]["eventCursor"], 9);
 
         let catalog = dispatch(&ctx, "list_projects", &json!({})).unwrap();
         assert_eq!(catalog["count"], 1);
@@ -11949,6 +12175,7 @@ mod tests {
                 powder: Some(PowderProjectBinding {
                     connection_profile: "production".into(),
                     repository: "commission-e2e".into(),
+                    event_cursor: 0,
                 }),
                 created_at: 0,
                 updated_at: 0,
@@ -14431,10 +14658,14 @@ mod tests {
                 powder: Some(PowderProjectBinding {
                     connection_profile: "production".into(),
                     repository: "t-hub".into(),
+                    event_cursor: 0,
                 }),
                 created_at: 0,
                 updated_at: 0,
             })
+            .unwrap();
+        let project = reg
+            .advance_project_powder_cursor(&project.project_id, "production", "t-hub", 17)
             .unwrap();
         reg.claim_test("cap-1", Some("t-hub"), vec![]).unwrap();
         reg.bind_ship_context("t-hub", &project.project_id, "Own T-Hub stability", "codex")
@@ -14455,6 +14686,62 @@ mod tests {
     }
 
     #[test]
+    fn powder_events_filter_by_repository_and_wake_the_project_captain() {
+        let ctx = test_ctx("secret");
+        let project = ctx
+            .captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-events".into(),
+                name: "Events".into(),
+                repo_root: "/tmp/events".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "production".into(),
+                    repository: "events".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-events", Some("events"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context("events", &project.project_id, "Own events", "codex")
+            .unwrap();
+        let binding = project.powder.as_ref().unwrap();
+        let event = |sequence, repository: &str, event_id: &str| powder::CardEvent {
+            sequence,
+            event_id: event_id.into(),
+            event_type: "completed".into(),
+            occurred_at: 100 + sequence,
+            card_id: format!("card-{sequence}"),
+            card_title: "Verified delivery".into(),
+            card_status: "done".into(),
+            repository: Some(repository.into()),
+            change: json!({"proof": "tests"}),
+        };
+        let cursor = apply_powder_events(
+            &ctx,
+            &project,
+            binding,
+            Some("captain-events"),
+            &[event(1, "other", "evt-1"), event(2, "events", "evt-2")],
+        );
+
+        assert_eq!(cursor, 2);
+        let depth = ctx.inbox.depth("captain-events");
+        assert_eq!(depth.enqueued, 1);
+        let updated = ctx
+            .captains
+            .advance_project_powder_cursor("project-events", "production", "events", cursor)
+            .unwrap();
+        assert_eq!(updated.powder.unwrap().event_cursor, 2);
+    }
+
+    #[test]
     fn crew_powder_context_and_heartbeat_expiry_survive_registry_reload() {
         let path = captains_tmp("crew-powder-context");
         let _ = std::fs::remove_file(&path);
@@ -14468,6 +14755,7 @@ mod tests {
             powder: Some(PowderProjectBinding {
                 connection_profile: "production".into(),
                 repository: "crew-project".into(),
+                event_cursor: 0,
             }),
             created_at: 0,
             updated_at: 0,
@@ -14539,6 +14827,7 @@ mod tests {
         invalid_powder.powder = Some(PowderProjectBinding {
             connection_profile: "default".into(),
             repository: " ".into(),
+            event_cursor: 0,
         });
         assert!(reg
             .upsert_project(invalid_powder)
