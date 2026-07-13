@@ -91,21 +91,16 @@ impl Channel {
 /// Per-request urgency hint. Distinct from [`Channel`] (which classifies the
 /// *kind* of traffic): two `Control` requests can still carry different
 /// priorities. Lower numeric rank = served first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     /// User-blocking control (spawn/kill/attach intent, resume guards).
     High,
     /// Default for routine RPCs.
+    #[default]
     Normal,
     /// Background/best-effort (bulk dumps, opportunistic refreshes).
     Low,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Priority::Normal
-    }
 }
 
 impl Priority {
