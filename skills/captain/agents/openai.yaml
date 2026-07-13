@@ -1,0 +1,4 @@
+interface:
+  display_name: "Captain"
+  short_description: "Orchestrate visible T-Hub agent crews"
+  default_prompt: "Use $captain to captain this project with a visible T-Hub crew."

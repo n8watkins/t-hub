@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Print non-secret readiness facts for the Codex Shipmate bootstrap.
+# Print non-secret readiness facts for the Codex Captain bootstrap.
 set -u
 
 codex_version="unavailable"
