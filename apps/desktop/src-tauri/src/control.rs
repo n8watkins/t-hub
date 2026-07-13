@@ -8678,6 +8678,14 @@ fn close_terminal_with_policy(
         .ok_or("close_terminal requires a 'sessionId' argument")?;
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let target = tmux_target(&session_id);
+    let tile_id = session_id.strip_prefix("th_").unwrap_or(&session_id);
+    let cleanup_was_pending = ctx.captains.snapshot().captains.iter().any(|captain| {
+        captain.crew.iter().any(|crew| {
+            crew.terminal_id == tile_id
+                && matches!(crew.state, CrewState::CleanupPending { .. })
+                && crew.powder_work.is_some()
+        })
+    });
     // Registry-vs-reality (Incident C, ask #3): `kill_session_tree` is idempotent -
     // it returns Ok for an already-gone session too - so a caller could never tell
     // a real kill from a phantom close (ghost ids f0f3207b / 709c7252). Probe
@@ -8722,9 +8730,8 @@ fn close_terminal_with_policy(
     // kill so a failed kill can never leave a live worker without its lease.
     // Powder failure does not resurrect a dead process; the claim expires by TTL
     // and the response makes the failed best-effort release visible.
-    let powder_release =
-        release_crew_powder_binding(ctx, session_id.strip_prefix("th_").unwrap_or(&session_id));
-    let crew_binding_retained = preserve_crew_on_powder_failure
+    let powder_release = release_crew_powder_binding(ctx, tile_id);
+    let crew_binding_retained = (preserve_crew_on_powder_failure || cleanup_was_pending)
         && powder_release
             .as_ref()
             .is_some_and(|release| release.get("released").and_then(Value::as_bool) != Some(true));
@@ -8737,7 +8744,6 @@ fn close_terminal_with_policy(
     };
     // The registry keys tiles by the bare terminal id; strip an already-prefixed
     // caller the same way tmux_target normalizes the other direction.
-    let tile_id = session_id.strip_prefix("th_").unwrap_or(&session_id);
     if ctx.tabs.remove_tile(tile_id) {
         let _ = forward_apply(ctx, "sync_tabs", &with_sync(ctx, json!({})));
     }
@@ -12795,6 +12801,18 @@ mod tests {
         assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
         assert!(crew.powder_work.is_some());
         assert_eq!(tmux::session_liveness(&target), tmux::SessionLiveness::Gone);
+
+        let retried = close_terminal(&ctx, &json!({ "sessionId": crew_id })).unwrap();
+        assert_eq!(retried["outcome"], "already_gone");
+        assert_eq!(retried["powderRelease"]["released"], false);
+        assert_eq!(retried["crewBindingRetained"], true);
+        let retried_snapshot = registry.snapshot();
+        let retried_crew = &retried_snapshot.captains[0].crew[0];
+        assert!(matches!(
+            retried_crew.state,
+            CrewState::CleanupPending { .. }
+        ));
+        assert!(retried_crew.powder_work.is_some());
     }
 
     #[test]
