@@ -1,6 +1,7 @@
 name: Release
 
-# Builds + signs the Windows installer on a v* tag (or manual dispatch),
+# Runs the reusable quality gate, then builds + signs the Windows installer on a
+# v* tag (or manual dispatch),
 # generates the updater manifest (latest.json) from the signed NSIS artifact,
 # and uploads everything to the GitHub Release. The in-app auto-updater fetches
 # latest.json from this release's assets (see plugins.updater in
@@ -28,7 +29,12 @@ permissions:
   contents: write
 
 jobs:
+  quality:
+    name: Quality gate
+    uses: ./.github/workflows/test.yml
+
   build-windows:
+    needs: quality
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

@@ -1,10 +1,9 @@
 name: Test
 
 # The server-side TEST GATE (audit CRITICAL "no CI test gate"): runs on every
-# pull_request to main and mirrors the exact suites the crews / no-mistakes run
-# locally, so a red suite blocks the merge instead of relying on a human to have
-# run tests. This is ADDITIVE to release.yml — release.yml still ONLY builds +
-# signs the Windows installer on a tag; nothing here changes that.
+# pull_request to main, every push to main, and as the release workflow's reusable
+# quality gate. It mirrors the exact suites the crews / no-mistakes run locally,
+# so a red suite blocks merge and release instead of relying on a local test run.
 #
 # Runs on ubuntu-latest, NOT windows: every suite here is platform-agnostic
 # (the Rust tests shell out to `tmux -L t-hub` on an isolated socket and the
@@ -13,7 +12,10 @@ name: Test
 # release.yml where they belong.
 
 on:
+  workflow_call:
   pull_request:
+    branches: [main]
+  push:
     branches: [main]
   # Allow a manual run from the Actions tab for debugging the gate itself.
   workflow_dispatch:
@@ -62,7 +64,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -75,6 +77,9 @@ jobs:
       # test fails with "t-hub-mcp binary not found".
       - name: Build t-hub-mcp binary (mcp_e2e dependency)
         run: cargo build -p t-hub-mcp
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: cargo test --workspace
         run: cargo test --workspace
@@ -115,3 +120,8 @@ jobs:
       # `vitest run` — the same command `pnpm --filter t-hub-desktop test` runs.
       - name: vitest run
         run: pnpm --filter t-hub-desktop test
+
+      # Compile the actual production bundle as well as checking TypeScript.
+      # This catches Vite import, asset, and bundling failures that jsdom does not.
+      - name: Production frontend build
+        run: pnpm build

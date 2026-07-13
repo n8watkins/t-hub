@@ -35,10 +35,10 @@ Conversation recovery may survive a host restart when the provider transcript re
 
 - TypeScript compilation passes.
 - The desktop production frontend build completes.
-- All 395 frontend tests pass across 39 files.
-- The Rust workspace has 636 passing tests and one ignored test.
+- All 400 frontend tests pass across 40 files.
+- The Rust workspace has 653 passing tests and one ignored test.
 - The standalone CLI has 28 passing tests.
-- The current PR gate runs Rust tests, Clippy, TypeScript, and Vitest.
+- The reusable quality gate runs Rust formatting, tests, Clippy, TypeScript, Vitest, and the production frontend build for pull requests, pushes to `main`, and releases.
 - `main` blocks force pushes and deletion.
 - Tauri updater artifacts are cryptographically signed with the updater key.
 - Runtime state includes SQLite WAL persistence, recovery records, diagnostic logging, capability-scoped control tokens, and a control audit trail.
@@ -48,7 +48,6 @@ Conversation recovery may survive a host restart when the provider transcript re
 | Area | Current evidence | Why it blocks stable |
 | --- | --- | --- |
 | Production-platform testing | CI runs product tests on Ubuntu only. | Windows, WebView2, `wsl.exe`, DPAPI, NSIS, Win32 window behavior, and WSL boundaries are the actual product. |
-| Release gating | The tag workflow builds and publishes without depending on the PR test suite. | A release can be built from a commit that never passed the complete gate. |
 | Windows trust | The workflow signs Tauri updater artifacts but has no Authenticode certificate configuration. | Windows may treat the executable and installer as an unknown publisher. |
 | Browser and packaged-app E2E | There is no Playwright, WebDriver, or packaged Windows automation. | Unit tests do not prove core user workflows or visual integrity. |
 | Security automation | Dependabot, secret scanning, push protection, and repository security analysis are disabled. | Known vulnerable dependencies and committed secrets can reach `main` undetected. |
@@ -66,7 +65,7 @@ Conversation recovery may survive a host restart when the provider transcript re
 - Several frontend modules exceed 1,500 lines and mix rendering, persistence, orchestration, and IPC responsibilities.
 - Frontend tests emit React `act(...)` warnings and attempt unmocked Tauri IPC calls.
 - The production frontend contains a roughly 3.72 MB icon chunk and a 1.20 MB application chunk before compression.
-- The CI workflow does not test the CLI, marketing site, shell gates, probe scripts, formatting, coverage, or dependency policy.
+- The CI workflow does not test the CLI, marketing site, shell gates, probe scripts, coverage, or dependency policy.
 - GitHub Actions use movable version tags instead of full commit SHA pins.
 - The manual smoke checklist is extensive, mostly unchecked, and not recorded per release.
 
@@ -172,14 +171,14 @@ Exit gate: the baseline is installed, its version is unambiguous, and all curren
 ### PR-1: Make CI Honest
 
 1. Fix all Clippy warnings and switch CI to `-D warnings`.
-2. Add `cargo fmt --check` and a committed Rust toolchain policy.
+2. Keep the completed `cargo fmt --check` gate and add a committed Rust toolchain policy.
 3. Raise the MSRV to the real minimum or replace APIs that exceed Rust 1.77.
 4. Add ESLint and formatting checks for the desktop frontend.
 5. Fix all frontend test warnings and fail tests on unexpected stderr or console output.
 6. Add CLI and site jobs.
 7. Add dependency and license policy checks.
 8. Add Windows compilation and Windows-specific tests.
-9. Run CI on pushes to `main` as a branch-health backstop.
+9. Keep the completed CI-on-`main` branch-health backstop required and healthy.
 
 Exit gate: every required check is clean, warning-free, reproducible from lockfiles, and required by branch protection.
 
