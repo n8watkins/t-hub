@@ -48,7 +48,9 @@ describe("SpawnMenu presets", () => {
     expect(byKey("captain-codex")?.options).toEqual({
       startupCommand: "codex",
       capability: "control",
+      name: "Captain Codex",
     });
+    expect(byKey("captain-codex")?.pinAsCaptain).toBe(true);
   });
 
   it("has unique preset keys", () => {
@@ -65,7 +67,9 @@ describe("SpawnMenu control confirmation", () => {
 
     fireEvent.click(screen.getByRole("menuitem", { name: /Codex New terminal/i }));
 
-    expect(onSpawn).toHaveBeenCalledWith({ startupCommand: "codex" });
+    expect(onSpawn).toHaveBeenCalledWith(
+      expect.objectContaining({ options: { startupCommand: "codex" } }),
+    );
     expect(onClose).toHaveBeenCalledOnce();
   });
 
@@ -80,8 +84,12 @@ describe("SpawnMenu control confirmation", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Start Captain Codex" }));
     expect(onSpawn).toHaveBeenCalledWith({
-      startupCommand: "codex",
-      capability: "control",
+      options: {
+        startupCommand: "codex",
+        capability: "control",
+        name: "Captain Codex",
+      },
+      pinAsCaptain: true,
     });
     expect(onClose).toHaveBeenCalledOnce();
   });

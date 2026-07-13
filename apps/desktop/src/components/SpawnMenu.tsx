@@ -38,18 +38,22 @@ export interface SpawnMenuProps {
    * Spawn a terminal with the chosen typed options. The plain Shell preset sends
    * an empty object; only Captain Codex requests control capability.
    */
-  onSpawn: (options: SpawnOptions) => void;
+  onSpawn: (selection: SpawnSelection) => void;
   /** A spawn is already in flight (#7) — disable the presets so a double-click
    *  can't stack duplicate spawns. */
   busy?: boolean;
 }
 
-interface Preset {
+export interface SpawnSelection {
+  options: SpawnOptions;
+  pinAsCaptain?: boolean;
+}
+
+interface Preset extends SpawnSelection {
   key: string;
   label: string;
   /** One-line hint shown under the label. */
   hint: string;
-  options: SpawnOptions;
 }
 
 export const PRESETS: Preset[] = [
@@ -72,7 +76,12 @@ export const PRESETS: Preset[] = [
     key: "captain-codex",
     label: "Captain Codex",
     hint: "New Codex captain with audited T-Hub control",
-    options: { startupCommand: CODEX_CMD, capability: "control" },
+    options: {
+      startupCommand: CODEX_CMD,
+      capability: "control",
+      name: "Captain Codex",
+    },
+    pinAsCaptain: true,
   },
   {
     key: "resume-codex",
@@ -105,7 +114,7 @@ export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
       setPendingControlPreset(preset);
       return;
     }
-    onSpawn(preset.options);
+    onSpawn({ options: preset.options, pinAsCaptain: preset.pinAsCaptain });
     onClose();
   };
 
@@ -176,7 +185,10 @@ export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
         danger={false}
         onConfirm={() => {
           if (!pendingControlPreset) return;
-          onSpawn(pendingControlPreset.options);
+          onSpawn({
+            options: pendingControlPreset.options,
+            pinAsCaptain: pendingControlPreset.pinAsCaptain,
+          });
           setPendingControlPreset(null);
           onClose();
         }}
