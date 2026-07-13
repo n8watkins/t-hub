@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-13.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
-**Local branch:** `main` at `85eb54d`.
+**Implementation head:** `85eb54d`, followed by this handoff documentation commit.
 **Status:** The implementation, first review fixes, second review fixes, and local verification are complete.
 The Windows T-Hub application has not been rebuilt or installed and the commits have not been pushed.
 
