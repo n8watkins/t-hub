@@ -6,6 +6,7 @@
 // src-tauri/src/commands.rs (Rust structs there use `rename_all = "camelCase"`).
 
 export type TerminalId = string;
+export type TerminalCapability = "read" | "control";
 
 export type TerminalState =
   | "starting"
@@ -29,6 +30,11 @@ export interface SpawnOptions {
    * shell (the "Shell" preset = today's behavior, no regression).
    */
   startupCommand?: string;
+  /**
+   * T-Hub control-plane authority inherited by the spawned terminal.
+   * Omitted/read is least privilege; control is an explicit audited elevation.
+   */
+  capability?: TerminalCapability;
 }
 
 export interface TerminalInfo {

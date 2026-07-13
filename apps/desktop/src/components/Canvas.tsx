@@ -34,7 +34,7 @@ import { TerminalPoolProvider } from "./TerminalPool";
 import { SpawnMenu } from "./SpawnMenu";
 import { repaintAllTerminals } from "../lib/repaint";
 import { tlog } from "../lib/diag";
-import type { TerminalId } from "../ipc/types";
+import type { SpawnOptions, TerminalId } from "../ipc/types";
 import { useKeybindings, directCommandForChord } from "../store/keybindings";
 import { runCommand, registerSidebarFocus } from "../lib/keymapExecutor";
 import { chordFromEvent } from "../lib/chord";
@@ -231,11 +231,11 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
     repaintAllTerminals();
   }, [spawnMenuOpen]);
 
-  // Spawn a terminal, optionally running a startup command in it (the "+"
-  // presets: Claude / Resume Claude / Custom…). An undefined startupCommand is
-  // the plain "Shell" preset = today's bare login shell (no regression).
+  // Spawn a terminal using the selected preset options. An empty object is the
+  // plain Shell preset. Capability stays omitted for normal presets so the
+  // backend's least-privilege read default remains authoritative.
   const spawn = useCallback(
-    async (startupCommand?: string) => {
+    async (opts: SpawnOptions = {}) => {
       // Busy gate (#7): ignore a second trigger while a spawn is in flight, so a
       // double-click can't stack duplicate tmux+claude spawns. The ref is the
       // synchronous source of truth (state only drives the disabled styling).
@@ -243,14 +243,13 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
       spawningRef.current = true;
       setSpawning(true);
       try {
-        const info = await spawnTerminal(
-          startupCommand ? { startupCommand } : {},
-        );
+        const info = await spawnTerminal(opts);
         // DIAG (#blank): record the spawn so a fresh repro correlates "grid went
         // blank" with the new-terminal id + which preset drove it.
         tlog(
           "spawn",
-          `spawned ${info.id} cmd=${startupCommand ?? "(shell)"} ` +
+          `spawned ${info.id} cmd=${opts.startupCommand ?? "(shell)"} ` +
+            `capability=${opts.capability ?? "read"} ` +
             `tiles-before=${useWorkspace.getState().tabs.reduce((n, t) => n + t.order.length, 0)}`,
         );
         addAfterFocused(info);
@@ -501,7 +500,7 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
         <SpawnMenu
           busy={spawning}
           onClose={() => setSpawnMenuOpen(false)}
-          onSpawn={(startupCommand) => void spawn(startupCommand)}
+          onSpawn={(opts) => void spawn(opts)}
         />
       )}
     </div>

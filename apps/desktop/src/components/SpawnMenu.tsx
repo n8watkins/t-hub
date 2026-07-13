@@ -7,15 +7,16 @@
 //                      user chooses which past session to resume. It does NOT
 //                      resume every session, and it always opens a fresh tile.
 //
-// Selecting a preset calls back with an optional `startupCommand` string (None
-// for Shell), which Canvas threads into spawnTerminal({ startupCommand }) → the
-// backend runs it inside a login shell the pane execs back into (so quitting the
-// command drops to a live shell instead of closing the tile).
+// Selecting a preset calls back with typed spawn options, which Canvas threads
+// into spawnTerminal(). Normal presets omit capability and inherit the read-only
+// default. Captain Codex requires confirmation before requesting audited control.
 //
 // Chrome matches the rest of T-Hub: it reads the `--th-*` theme tokens
 // (surface/border/fg/accent/radius) so it tracks the active theme like the FAB
 // and the ThemeEditor panels do.
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import type { SpawnOptions } from "../ipc/types";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 /** `claude --resume` lets Claude show its interactive session picker. (`--continue`
  *  / `-c` would silently resume the MOST RECENT session instead; the picker is the
@@ -34,11 +35,10 @@ export interface SpawnMenuProps {
   /** Close the menu without spawning (Escape / backdrop click / after a pick). */
   onClose: () => void;
   /**
-   * Spawn a terminal with the chosen preset. `startupCommand` is the command to
-   * run in the new pane, or `undefined` for the plain "Shell" preset (today's
-   * behavior). Canvas owns the actual spawnTerminal() IPC call + tile insertion.
+   * Spawn a terminal with the chosen typed options. The plain Shell preset sends
+   * an empty object; only Captain Codex requests control capability.
    */
-  onSpawn: (startupCommand?: string) => void;
+  onSpawn: (options: SpawnOptions) => void;
   /** A spawn is already in flight (#7) — disable the presets so a double-click
    *  can't stack duplicate spawns. */
   busy?: boolean;
@@ -49,36 +49,42 @@ interface Preset {
   label: string;
   /** One-line hint shown under the label. */
   hint: string;
-  /** The startup command, or undefined for a plain shell. */
-  command?: string;
+  options: SpawnOptions;
 }
 
 export const PRESETS: Preset[] = [
-  { key: "shell", label: "Shell", hint: "New login shell in ~", command: undefined },
+  { key: "shell", label: "Shell", hint: "New login shell in ~", options: {} },
   {
     key: "resume",
     label: "Resume Claude…",
     // Make it unambiguous: a NEW terminal opens, showing Claude's session picker
     // there so the user chooses which session to resume (it doesn't resume all).
     hint: "New terminal → pick a session to resume",
-    command: CLAUDE_RESUME_CMD,
+    options: { startupCommand: CLAUDE_RESUME_CMD },
   },
   {
     key: "codex",
     label: "Codex",
     hint: "New terminal → fresh Codex session",
-    command: CODEX_CMD,
+    options: { startupCommand: CODEX_CMD },
+  },
+  {
+    key: "captain-codex",
+    label: "Captain Codex",
+    hint: "New Codex captain with audited T-Hub control",
+    options: { startupCommand: CODEX_CMD, capability: "control" },
   },
   {
     key: "resume-codex",
     label: "Resume Codex…",
     // Symmetric with Resume Claude: opens Codex's own session picker in a new tile.
     hint: "New terminal → pick a Codex session to resume",
-    command: CODEX_RESUME_CMD,
+    options: { startupCommand: CODEX_RESUME_CMD },
   },
 ];
 
 export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
+  const [pendingControlPreset, setPendingControlPreset] = useState<Preset | null>(null);
   // Escape closes the menu.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -91,69 +97,91 @@ export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const pick = (command?: string) => {
+  const pick = (preset: Preset) => {
     // Busy gate (#7): a spawn is already in flight — ignore the pick so a
     // double-click can't stack a duplicate spawn.
     if (busy) return;
-    onSpawn(command);
+    if (preset.options.capability === "control") {
+      setPendingControlPreset(preset);
+      return;
+    }
+    onSpawn(preset.options);
     onClose();
   };
 
   return (
-    // Full-viewport backdrop: a click anywhere outside the popover dismisses it.
-    // Transparent (not dimmed) so it reads as a lightweight menu, not a modal.
-    <div
-      className="fixed inset-0 z-40"
-      onPointerDown={onClose}
-      aria-hidden={false}
-    >
+    <>
+      {/* Full-viewport backdrop: clicking outside the popover dismisses it. */}
       <div
-        role="menu"
-        aria-label="New terminal preset"
-        // Anchored just above the "+" FAB (which sits at bottom-3 right-3, h-9).
-        // Stop pointer/click propagation so interacting with the menu doesn't hit
-        // the backdrop dismiss above.
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={(e) => e.stopPropagation()}
-        className="absolute bottom-14 right-3 flex w-60 flex-col overflow-hidden rounded-lg border shadow-2xl"
-        style={{
-          // Solid surface so the menu never bleeds the terminal through
-          // (--th-header-bg carries alpha in some themes).
-          backgroundColor: "var(--th-tile-bg)",
-          borderColor: "var(--th-border)",
-          color: "var(--th-fg)",
-          fontFamily: "var(--th-font)",
-          borderRadius: "var(--th-radius)",
-        }}
+        className="fixed inset-0 z-40"
+        onPointerDown={onClose}
+        aria-hidden={false}
       >
         <div
-          className="border-b px-3 py-2 text-xs font-medium uppercase tracking-wide"
+          role="menu"
+          aria-label="New terminal preset"
+          // Anchored above the "+" FAB. Stop events inside the menu from reaching
+          // the full-viewport dismiss backdrop.
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          className="absolute bottom-14 right-3 flex w-60 flex-col overflow-hidden rounded-lg border shadow-2xl"
           style={{
+            backgroundColor: "var(--th-tile-bg)",
             borderColor: "var(--th-border)",
-            color: "var(--th-fg-muted)",
+            color: "var(--th-fg)",
+            fontFamily: "var(--th-font)",
+            borderRadius: "var(--th-radius)",
           }}
         >
-          New terminal
-        </div>
-
-        {PRESETS.map((p) => (
-          <button
-            key={p.key}
-            type="button"
-            role="menuitem"
-            onClick={() => pick(p.command)}
-            disabled={busy}
-            className="flex flex-col items-start gap-0.5 px-3 py-2 text-left transition-colors hover:bg-neutral-700/30 disabled:cursor-not-allowed disabled:opacity-50"
+          <div
+            className="border-b px-3 py-2 text-xs font-medium uppercase tracking-wide"
+            style={{
+              borderColor: "var(--th-border)",
+              color: "var(--th-fg-muted)",
+            }}
           >
-            <span className="text-sm" style={{ color: "var(--th-fg)" }}>
-              {p.label}
-            </span>
-            <span className="text-xs" style={{ color: "var(--th-fg-muted)" }}>
-              {p.hint}
-            </span>
-          </button>
-        ))}
+            New terminal
+          </div>
+
+          {PRESETS.map((p) => (
+            <button
+              key={p.key}
+              type="button"
+              role="menuitem"
+              onClick={() => pick(p)}
+              disabled={busy}
+              className="flex flex-col items-start gap-0.5 px-3 py-2 text-left transition-colors hover:bg-neutral-700/30 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <span className="text-sm" style={{ color: "var(--th-fg)" }}>
+                {p.label}
+              </span>
+              <span className="text-xs" style={{ color: "var(--th-fg-muted)" }}>
+                {p.hint}
+              </span>
+            </button>
+          ))}
+        </div>
       </div>
-    </div>
+      <ConfirmDialog
+        open={pendingControlPreset != null}
+        title="Start Captain Codex?"
+        body={
+          <>
+            This session can organize T-Hub and control other terminals, including
+            spawning, typing into, and stopping them. Control elevation is audited,
+            and destructive actions still require confirmation.
+          </>
+        }
+        confirmLabel="Start Captain Codex"
+        danger={false}
+        onConfirm={() => {
+          if (!pendingControlPreset) return;
+          onSpawn(pendingControlPreset.options);
+          setPendingControlPreset(null);
+          onClose();
+        }}
+        onCancel={() => setPendingControlPreset(null)}
+      />
+    </>
   );
 }
