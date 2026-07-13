@@ -1,0 +1,7 @@
+interface:
+  display_name: "Shipmate"
+  short_description: "Orchestrate visible T-Hub agent crews"
+  default_prompt: "Use $shipmate to captain this project with a visible T-Hub crew."
+
+policy:
+  allow_implicit_invocation: true
