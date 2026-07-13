@@ -6646,14 +6646,11 @@ fn reconcile_powder_events(ctx: &ControlContext) {
         let Some(binding) = project.powder.as_ref() else {
             continue;
         };
-        let captain_session_id = snapshot
-            .captains
-            .iter()
-            .find(|captain| {
-                captain.project_id.as_deref() == Some(&project.project_id)
-                    && matches!(captain.state, ClaimState::Active)
-            })
-            .and_then(|captain| captain.terminal_id.as_deref());
+        let captain = snapshot.captains.iter().find(|captain| {
+            captain.project_id.as_deref() == Some(&project.project_id)
+                && matches!(captain.state, ClaimState::Active)
+                && captain.terminal_id.is_some()
+        });
         let client = match powder::Client::from_profile(&binding.connection_profile) {
             Ok(client) => client,
             Err(error) => {
@@ -6668,7 +6665,7 @@ fn reconcile_powder_events(ctx: &ControlContext) {
                 continue;
             }
         };
-        let cursor = apply_powder_events(ctx, project, binding, captain_session_id, &events);
+        let cursor = apply_powder_events(ctx, project, binding, captain, &events);
         if cursor > binding.event_cursor {
             if let Err(error) = ctx.captains.advance_project_powder_cursor(
                 &project.project_id,
@@ -6686,7 +6683,7 @@ fn apply_powder_events(
     ctx: &ControlContext,
     project: &ProjectRecord,
     binding: &PowderProjectBinding,
-    captain_session_id: Option<&str>,
+    captain: Option<&CaptainRecord>,
     events: &[powder::CardEvent],
 ) -> i64 {
     let mut cursor = binding.event_cursor;
@@ -6695,34 +6692,40 @@ fn apply_powder_events(
             cursor = event.sequence;
             continue;
         }
-        if let Some(recipient) = captain_session_id {
-            let body = format!(
-                "Powder event '{}' ({}) for card '{}' - {}. Status: '{}'. Re-read the authoritative card and update the durable Captain resume point before acting.",
-                event.event_type,
-                event.event_id,
-                event.card_id,
-                event.card_title,
-                event.card_status,
+        let Some(captain) = captain else {
+            break;
+        };
+        let Some(captain_session_id) = captain.terminal_id.as_deref() else {
+            break;
+        };
+        let recipient = format!("ship:{}", captain.ship_slug);
+        let body = format!(
+            "Powder event '{}' ({}) for card '{}' - {}. Status: '{}'. Re-read the authoritative card and update the durable Captain resume point before acting.",
+            event.event_type,
+            event.event_id,
+            event.card_id,
+            event.card_title,
+            event.card_status,
+        );
+        if let Err(error) = ctx.inbox.enqueue(
+            &recipient,
+            &format!("powder:{}", binding.repository),
+            crate::inbox::Priority::Standard,
+            &body,
+            true,
+        ) {
+            ctx.fanout.emit_event(
+                "control://powder",
+                &json!({
+                    "event": "event-delivery-failed",
+                    "projectId": project.project_id,
+                    "captainSessionId": captain_session_id,
+                    "shipSlug": captain.ship_slug,
+                    "powderEventId": event.event_id,
+                    "error": error.to_string(),
+                }),
             );
-            if let Err(error) = ctx.inbox.enqueue(
-                recipient,
-                &format!("powder:{}", binding.repository),
-                crate::inbox::Priority::Standard,
-                &body,
-                true,
-            ) {
-                ctx.fanout.emit_event(
-                    "control://powder",
-                    &json!({
-                        "event": "event-delivery-failed",
-                        "projectId": project.project_id,
-                        "captainSessionId": recipient,
-                        "powderEventId": event.event_id,
-                        "error": error.to_string(),
-                    }),
-                );
-                break;
-            }
+            break;
         }
         ctx.fanout.emit_event(
             "control://powder",
@@ -6731,6 +6734,7 @@ fn apply_powder_events(
                 "projectId": project.project_id,
                 "repository": binding.repository,
                 "captainSessionId": captain_session_id,
+                "shipSlug": captain.ship_slug,
                 "sequence": event.sequence,
                 "powderEventId": event.event_id,
                 "eventType": event.event_type,
@@ -14947,22 +14951,78 @@ mod tests {
             repository: Some(repository.into()),
             change: json!({"proof": "tests"}),
         };
+        let snapshot = ctx.captains.snapshot();
+        let captain = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "events")
+            .unwrap();
         let cursor = apply_powder_events(
             &ctx,
             &project,
             binding,
-            Some("captain-events"),
+            Some(captain),
             &[event(1, "other", "evt-1"), event(2, "events", "evt-2")],
         );
 
         assert_eq!(cursor, 2);
-        let depth = ctx.inbox.depth("captain-events");
+        let depth = ctx.inbox.depth("ship:events");
         assert_eq!(depth.enqueued, 1);
+        assert_eq!(ctx.inbox.depth("captain-events").enqueued, 0);
         let updated = ctx
             .captains
             .advance_project_powder_cursor("project-events", "production", "events", cursor)
             .unwrap();
         assert_eq!(updated.powder.unwrap().event_cursor, 2);
+    }
+
+    #[test]
+    fn powder_event_cursor_waits_for_a_project_captain() {
+        let ctx = test_ctx("secret");
+        let project = ProjectRecord {
+            project_id: "project-waiting-events".into(),
+            name: "Waiting Events".into(),
+            repo_root: "/tmp/waiting-events".into(),
+            remote_url: None,
+            default_branch: Some("main".into()),
+            powder: Some(PowderProjectBinding {
+                connection_profile: "production".into(),
+                repository: "waiting-events".into(),
+                event_cursor: 4,
+            }),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let binding = project.powder.as_ref().unwrap();
+        let events = [
+            powder::CardEvent {
+                sequence: 5,
+                event_id: "evt-foreign".into(),
+                event_type: "updated".into(),
+                occurred_at: 105,
+                card_id: "card-foreign".into(),
+                card_title: "Foreign".into(),
+                card_status: "open".into(),
+                repository: Some("another-repository".into()),
+                change: json!({}),
+            },
+            powder::CardEvent {
+                sequence: 6,
+                event_id: "evt-relevant".into(),
+                event_type: "completed".into(),
+                occurred_at: 106,
+                card_id: "card-relevant".into(),
+                card_title: "Must survive".into(),
+                card_status: "done".into(),
+                repository: Some("waiting-events".into()),
+                change: json!({}),
+            },
+        ];
+
+        let cursor = apply_powder_events(&ctx, &project, binding, None, &events);
+
+        assert_eq!(cursor, 5, "the relevant event must remain unread");
+        assert_eq!(ctx.inbox.depth("ship:waiting-events").enqueued, 0);
     }
 
     #[test]

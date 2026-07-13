@@ -411,7 +411,14 @@ impl FleetNotifier {
 
         // (2) Drain one record at this boundary. The write goes through the SAME
         // injector (plane-attributed `FleetWake` tmux write) as the legacy path.
-        let outcome = inbox.drain_one(orch, |rec| (self.inject)(orch, &rec.body));
+        let mut recipient = orch.to_string();
+        let mut outcome = inbox.drain_one(orch, |rec| (self.inject)(orch, &rec.body));
+        if matches!(outcome, crate::inbox::DrainOutcome::Empty) {
+            if let Some(captain) = self.captains.captain_for_session(orch) {
+                recipient = format!("ship:{}", captain.ship_slug);
+                outcome = inbox.drain_one(&recipient, |rec| (self.inject)(orch, &rec.body));
+            }
+        }
         if let crate::inbox::DrainOutcome::Delivered { seq } = outcome {
             // Auto-retire the wake on delivery (review M1). A fleet wake is
             // fire-to-pane: delivery to the orchestrator's PTY IS terminal for it -
@@ -422,7 +429,7 @@ impl FleetNotifier {
             // honest (a real `Delivered -> Processed` transition, telemetry'd + then
             // compacted) - real session-to-session traffic later acks via `inbox_ack`;
             // the wake acks its own.
-            inbox.ack(orch, seq);
+            inbox.ack(&recipient, seq);
             st.suppressed.insert(orch.to_string());
         }
         // WriteFailed / Empty / Busy: do not suppress - the next `Completed` edge
@@ -836,6 +843,33 @@ mod tests {
         assert_eq!(
             inbox.ack("orcbbbbb", 0),
             crate::inbox::AckOutcome::AlreadyProcessed { seq: 0 }
+        );
+    }
+
+    #[test]
+    fn durable_ship_queue_drains_into_the_current_captain_terminal() {
+        let (n, rec, watches, _captains, inbox) = harness_durable();
+        watches.arm("capaaaaa", WatchScope::Captains, vec![]);
+        inbox
+            .enqueue(
+                "ship:ship-alpha",
+                "powder:test",
+                crate::inbox::Priority::Standard,
+                "Powder event ready",
+                true,
+            )
+            .unwrap();
+
+        n.on_status("u-cap", SessionStatus::Completed);
+
+        assert_eq!(
+            rec.calls(),
+            vec![("capaaaaa".into(), "Powder event ready".into())]
+        );
+        let depth = inbox.depth("ship:ship-alpha");
+        assert_eq!(
+            (depth.enqueued, depth.delivered, depth.processed),
+            (0, 0, 1)
         );
     }
 
