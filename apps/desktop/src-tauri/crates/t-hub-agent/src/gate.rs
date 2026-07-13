@@ -173,7 +173,8 @@ pub fn classify(command: &str) -> CommandClass {
     }
 
     // Merges.
-    if joined.contains("gh pr merge") || (has("git") && has("merge") && mentions_protected_branch(&toks))
+    if joined.contains("gh pr merge")
+        || (has("git") && has("merge") && mentions_protected_branch(&toks))
     {
         return CommandClass::Merge;
     }
@@ -323,8 +324,12 @@ fn emit_deny(reason: &str) {
 /// error (missing env, unreachable app, malformed reply) => the caller fail-closes to
 /// Read.
 fn resolve_caller_class() -> Option<CallerClass> {
-    let addr = std::env::var("T_HUB_CONTROL_ADDR").ok().filter(|a| !a.is_empty())?;
-    let token = std::env::var("T_HUB_CONTROL_TOKEN").ok().filter(|t| !t.is_empty())?;
+    let addr = std::env::var("T_HUB_CONTROL_ADDR")
+        .ok()
+        .filter(|a| !a.is_empty())?;
+    let token = std::env::var("T_HUB_CONTROL_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())?;
     let cap = control_my_capability(&addr, &token)?;
     match cap.as_str() {
         "control" => Some(CallerClass::Control),
@@ -379,15 +384,27 @@ mod tests {
 
     #[test]
     fn benign_commands_are_not_outward_facing() {
-        for cmd in ["ls -la", "cargo test", "git status", "git commit -m x", "git pull"] {
+        for cmd in [
+            "ls -la",
+            "cargo test",
+            "git status",
+            "git commit -m x",
+            "git pull",
+        ] {
             assert_eq!(classify(cmd), CommandClass::Benign, "misclassified: {cmd}");
         }
     }
 
     #[test]
     fn pushes_merges_deploys_spends_are_classified() {
-        assert_eq!(classify("git push --force origin feature"), CommandClass::ProtectedPush);
-        assert_eq!(classify("git push origin main"), CommandClass::ProtectedPush);
+        assert_eq!(
+            classify("git push --force origin feature"),
+            CommandClass::ProtectedPush
+        );
+        assert_eq!(
+            classify("git push origin main"),
+            CommandClass::ProtectedPush
+        );
         // A bare push has an ambiguous target => fail-closed to protected.
         assert_eq!(classify("git push"), CommandClass::ProtectedPush);
         // An explicit non-protected branch push is benign.
@@ -395,11 +412,16 @@ mod tests {
         assert_eq!(classify("gh pr merge 57 --squash"), CommandClass::Merge);
         assert_eq!(
             classify("gh workflow run release.yml -f variant=prod"),
-            CommandClass::Deploy { target: "release.yml".to_string() }
+            CommandClass::Deploy {
+                target: "release.yml".to_string()
+            }
         );
         assert_eq!(classify("npm publish"), CommandClass::SpendOrPublish);
         assert_eq!(classify("cargo publish"), CommandClass::SpendOrPublish);
-        assert_eq!(classify("gh release create v1.2.3"), CommandClass::SpendOrPublish);
+        assert_eq!(
+            classify("gh release create v1.2.3"),
+            CommandClass::SpendOrPublish
+        );
     }
 
     #[test]
@@ -407,7 +429,10 @@ mod tests {
         let reg = SignificanceRegistry::builtin();
         // Unknown / release targets are significant.
         assert_eq!(reg.significance("release.yml"), Significance::Significant);
-        assert_eq!(reg.significance("anything-unlisted"), Significance::Significant);
+        assert_eq!(
+            reg.significance("anything-unlisted"),
+            Significance::Significant
+        );
         // Only an explicitly-listed target is routine.
         let mut reg2 = SignificanceRegistry::builtin();
         reg2.routine.insert("preview.yml".to_string());
@@ -438,23 +463,52 @@ mod tests {
             &routine,
             false,
         );
-        assert!(matches!(d, Decision::Deny(_)), "crew never deploy, even routine");
+        assert!(
+            matches!(d, Decision::Deny(_)),
+            "crew never deploy, even routine"
+        );
     }
 
     #[test]
     fn control_may_push_merge_but_significant_deploy_and_spend_need_authorization() {
         let reg = SignificanceRegistry::builtin();
         // Push / merge: a captain's job, allowed.
-        assert_eq!(decide(&classify("git push origin main"), CallerClass::Control, &reg, false), Decision::Allow);
-        assert_eq!(decide(&classify("gh pr merge 57"), CallerClass::Control, &reg, false), Decision::Allow);
+        assert_eq!(
+            decide(
+                &classify("git push origin main"),
+                CallerClass::Control,
+                &reg,
+                false
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(
+                &classify("gh pr merge 57"),
+                CallerClass::Control,
+                &reg,
+                false
+            ),
+            Decision::Allow
+        );
         // Significant deploy without authorization: denied (fail-closed).
         assert!(matches!(
-            decide(&classify("gh workflow run release.yml"), CallerClass::Control, &reg, false),
+            decide(
+                &classify("gh workflow run release.yml"),
+                CallerClass::Control,
+                &reg,
+                false
+            ),
             Decision::Deny(_)
         ));
         // ... and allowed WITH a verified authorization.
         assert_eq!(
-            decide(&classify("gh workflow run release.yml"), CallerClass::Control, &reg, true),
+            decide(
+                &classify("gh workflow run release.yml"),
+                CallerClass::Control,
+                &reg,
+                true
+            ),
             Decision::Allow
         );
         // Spend / publish without authorization: denied.
@@ -471,7 +525,12 @@ mod tests {
         let mut reg = SignificanceRegistry::builtin();
         reg.routine.insert("preview.yml".to_string());
         assert_eq!(
-            decide(&classify("gh workflow run preview.yml"), CallerClass::Control, &reg, false),
+            decide(
+                &classify("gh workflow run preview.yml"),
+                CallerClass::Control,
+                &reg,
+                false
+            ),
             Decision::Allow
         );
     }

@@ -69,8 +69,7 @@ impl Journal {
     /// crash mid-append) is tolerated — it is simply not counted, and the next
     /// append starts a clean line after it.
     pub fn open(dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating journal dir {dir:?}"))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating journal dir {dir:?}"))?;
         let path = dir.join(JOURNAL_FILE);
 
         // Count existing complete lines to recover head_seq. A "complete" line is
@@ -169,7 +168,10 @@ impl Journal {
             .file
             .write_all(line.as_bytes())
             .context("writing journal line")?;
-        guard.file.write_all(b"\n").context("writing journal newline")?;
+        guard
+            .file
+            .write_all(b"\n")
+            .context("writing journal newline")?;
         guard.file.flush().context("flushing journal")?;
         guard.file.sync_data().context("fsync journal")?;
 
@@ -260,7 +262,11 @@ impl Journal {
         let len = file.metadata().map(|m| m.len()).unwrap_or(0);
         // Compaction/rotation/truncation: the file is smaller than where we were,
         // so our byte offset is stale — restart from the top with a fresh seq.
-        let (mut pos, mut seq) = if len < offset { (0, 0) } else { (offset, last_seq) };
+        let (mut pos, mut seq) = if len < offset {
+            (0, 0)
+        } else {
+            (offset, last_seq)
+        };
 
         let mut reader = BufReader::new(file);
         reader
@@ -410,7 +416,9 @@ mod tests {
         let j = Journal::open(&dir).unwrap();
         assert_eq!(j.head_seq(), 0);
 
-        let a = j.append(entry(JournalEventType::SessionStart, "s1")).unwrap();
+        let a = j
+            .append(entry(JournalEventType::SessionStart, "s1"))
+            .unwrap();
         let b = j.append(entry(JournalEventType::Stop, "s1")).unwrap();
         assert_eq!(a.seq, 1);
         assert_eq!(b.seq, 2);
@@ -424,13 +432,17 @@ mod tests {
         let dir = temp_dir("reopen");
         {
             let j = Journal::open(&dir).unwrap();
-            j.append(entry(JournalEventType::SessionStart, "s1")).unwrap();
-            j.append(entry(JournalEventType::UserPromptSubmit, "s1")).unwrap();
+            j.append(entry(JournalEventType::SessionStart, "s1"))
+                .unwrap();
+            j.append(entry(JournalEventType::UserPromptSubmit, "s1"))
+                .unwrap();
             j.append(entry(JournalEventType::Stop, "s1")).unwrap();
         }
         let j2 = Journal::open(&dir).unwrap();
         assert_eq!(j2.head_seq(), 3, "head_seq must survive reopen");
-        let next = j2.append(entry(JournalEventType::SessionEnd, "s1")).unwrap();
+        let next = j2
+            .append(entry(JournalEventType::SessionEnd, "s1"))
+            .unwrap();
         assert_eq!(next.seq, 4);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -441,7 +453,8 @@ mod tests {
         let dir = temp_dir("replay");
         let j = Journal::open(&dir).unwrap();
         for _ in 0..5 {
-            j.append(entry(JournalEventType::Notification, "s1")).unwrap();
+            j.append(entry(JournalEventType::Notification, "s1"))
+                .unwrap();
         }
         let all = j.replay(0).unwrap();
         assert_eq!(all.len(), 5);
@@ -469,14 +482,24 @@ mod tests {
 
         {
             let writer = Journal::open(&dir).unwrap();
-            writer.append(entry(JournalEventType::SessionStart, "s1")).unwrap();
+            writer
+                .append(entry(JournalEventType::SessionStart, "s1"))
+                .unwrap();
             writer.append(entry(JournalEventType::Stop, "s1")).unwrap();
         }
 
         // In-memory head is stale (this handle never appended).
-        assert_eq!(tailer.head_seq(), 0, "in-memory head must not see other-process appends");
+        assert_eq!(
+            tailer.head_seq(),
+            0,
+            "in-memory head must not see other-process appends"
+        );
         // On-disk head observes the file growth...
-        assert_eq!(tailer.head_seq_on_disk(), 2, "disk head must see the 2 appended entries");
+        assert_eq!(
+            tailer.head_seq_on_disk(),
+            2,
+            "disk head must see the 2 appended entries"
+        );
         // ...and advances the in-memory head so a follow-up replay is consistent.
         assert_eq!(tailer.head_seq(), 2);
         let streamed = tailer.replay(0).unwrap();
@@ -492,7 +515,8 @@ mod tests {
         let j = Journal::open(&dir).unwrap();
 
         // Seed two entries; tailing from the start sees both and reaches EOF.
-        j.append(entry(JournalEventType::SessionStart, "s1")).unwrap();
+        j.append(entry(JournalEventType::SessionStart, "s1"))
+            .unwrap();
         j.append(entry(JournalEventType::Stop, "s1")).unwrap();
         let (batch1, off1, seq1) = j.tail_from(0, 0).unwrap();
         assert_eq!(batch1.len(), 2);
@@ -516,7 +540,9 @@ mod tests {
         // from the top rather than skipping the renumbered contents.
         std::fs::write(dir.join(JOURNAL_FILE), b"").unwrap();
         let fresh = Journal::open(&dir).unwrap();
-        fresh.append(entry(JournalEventType::Notification, "s2")).unwrap();
+        fresh
+            .append(entry(JournalEventType::Notification, "s2"))
+            .unwrap();
         let (batch3, _off3, seq3) = j.tail_from(off2, seq2).unwrap();
         assert_eq!(batch3.len(), 1, "shrink must restart the read from the top");
         assert_eq!(seq3, 1);
@@ -539,7 +565,8 @@ mod tests {
         let dir = temp_dir("compact");
         let j = Journal::open(&dir).unwrap();
         // Interleave durable (Hook) and ephemeral (Status) entries.
-        j.append(entry(JournalEventType::SessionStart, "s1")).unwrap();
+        j.append(entry(JournalEventType::SessionStart, "s1"))
+            .unwrap();
         j.append(status("s1")).unwrap();
         j.append(entry(JournalEventType::Stop, "s1")).unwrap();
         j.append(status("s1")).unwrap();
@@ -566,13 +593,15 @@ mod tests {
         let dir = temp_dir("torn");
         {
             let j = Journal::open(&dir).unwrap();
-            j.append(entry(JournalEventType::SessionStart, "s1")).unwrap();
+            j.append(entry(JournalEventType::SessionStart, "s1"))
+                .unwrap();
         }
         // Simulate a crash mid-append: a partial, unterminated garbage line.
         let path = dir.join(JOURNAL_FILE);
         {
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-            f.write_all(b"{\"seq\":2,\"timestamp_ms\":2,\"sour").unwrap();
+            f.write_all(b"{\"seq\":2,\"timestamp_ms\":2,\"sour")
+                .unwrap();
         }
         // Reopen: the torn tail must not be counted, and the next append is seq 2.
         let j2 = Journal::open(&dir).unwrap();

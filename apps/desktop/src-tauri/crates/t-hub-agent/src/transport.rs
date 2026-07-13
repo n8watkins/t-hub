@@ -114,7 +114,10 @@ pub fn serve_stdio(journal: Arc<Journal>) -> Result<()> {
                         for entry in entries {
                             let frame = AgentFrame {
                                 channel: Channel::Events,
-                                msg: AgentToCore::Journal { seq: entry.seq, entry },
+                                msg: AgentToCore::Journal {
+                                    seq: entry.seq,
+                                    entry,
+                                },
                             };
                             if tail_tx.send(frame).is_err() {
                                 // Writer thread has exited (main loop shut down). Quit.
@@ -191,7 +194,10 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
         };
 
         match frame.msg {
-            CoreToAgent::Hello(Hello { protocol_version, core_version }) => {
+            CoreToAgent::Hello(Hello {
+                protocol_version,
+                core_version,
+            }) => {
                 if protocol_version != PROTOCOL_VERSION {
                     eprintln!(
                         "t-hub-agent: protocol mismatch \
@@ -215,7 +221,11 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
                 }
             }
 
-            CoreToAgent::Request { id, priority: _, body } => {
+            CoreToAgent::Request {
+                id,
+                priority: _,
+                body,
+            } => {
                 // SUBAGENT(transport): `priority` is currently ignored (strict
                 // arrival order). The scheduler enhancement uses it.
                 if !handshaken {
@@ -227,7 +237,10 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
                     // nature. We keep it simple: control by default. The
                     // scheduler subagent may classify per-op.
                     channel: Channel::Control,
-                    msg: AgentToCore::Response { id, body: resp_body },
+                    msg: AgentToCore::Response {
+                        id,
+                        body: resp_body,
+                    },
                 };
                 if tx.send(resp).is_err() {
                     break;
@@ -257,7 +270,10 @@ fn reader_loop(journal: &Arc<Journal>, tx: &mpsc::Sender<AgentFrame>) -> Result<
                     last_seq = entry.seq;
                     let f = AgentFrame {
                         channel: Channel::Events,
-                        msg: AgentToCore::Journal { seq: entry.seq, entry },
+                        msg: AgentToCore::Journal {
+                            seq: entry.seq,
+                            entry,
+                        },
                     };
                     if tx.send(f).is_err() {
                         return Ok(());
@@ -314,9 +330,7 @@ fn detect_distro() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use t_hub_protocol::{
-        AgentToCore, Channel, CoreFrame, CoreToAgent, Hello, PROTOCOL_VERSION,
-    };
+    use t_hub_protocol::{AgentToCore, Channel, CoreFrame, CoreToAgent, Hello, PROTOCOL_VERSION};
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let ts = std::time::SystemTime::now()
@@ -337,7 +351,11 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         // Must end with exactly one newline.
         assert!(s.ends_with('\n'), "frame must end with newline");
-        assert_eq!(s.matches('\n').count(), 1, "frame must be single-line NDJSON");
+        assert_eq!(
+            s.matches('\n').count(),
+            1,
+            "frame must be single-line NDJSON"
+        );
         // Must roundtrip.
         let back = t_hub_protocol::decode_agent(s.trim_end_matches('\n')).unwrap();
         match back.msg {
@@ -411,7 +429,10 @@ mod tests {
                             for entry in entries {
                                 let frame = AgentFrame {
                                     channel: Channel::Events,
-                                    msg: AgentToCore::Journal { seq: entry.seq, entry },
+                                    msg: AgentToCore::Journal {
+                                        seq: entry.seq,
+                                        entry,
+                                    },
                                 };
                                 if tx.send(frame).is_err() {
                                     return;
@@ -438,7 +459,11 @@ mod tests {
         drop(tail_tx);
 
         let received: Vec<AgentFrame> = tail_rx.try_iter().collect();
-        assert_eq!(received.len(), 2, "tail should stream exactly the 2 new entries");
+        assert_eq!(
+            received.len(),
+            2,
+            "tail should stream exactly the 2 new entries"
+        );
 
         match &received[0].msg {
             AgentToCore::Journal { entry, .. } => {
@@ -448,7 +473,10 @@ mod tests {
         }
         match &received[1].msg {
             AgentToCore::Journal { entry, .. } => {
-                assert_eq!(entry.event_type, t_hub_protocol::JournalEventType::SessionEnd);
+                assert_eq!(
+                    entry.event_type,
+                    t_hub_protocol::JournalEventType::SessionEnd
+                );
             }
             other => panic!("expected Journal, got {other:?}"),
         }

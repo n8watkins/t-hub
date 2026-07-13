@@ -8,41 +8,41 @@ mod tmux;
 // --- 0.5 additions ---
 mod agent; // core-side agent bridge (Workstream A, core half)
 mod audit; // control-socket audit log with teeth (socket-gate Phase 1, hash-chained JSONL)
-mod secret_seal; // item-3 Pillar B: at-rest sealing of secret material (DPAPI on Windows, 0600 fallback elsewhere)
 mod claude; // Claude adapter: hooks + status bridge (Workstream B)
-mod harness; // harness adapter seam (Codex Phase-1 D1): launch/turn argv + permission map, keyed off the provider string
-mod governor; // fleet spawn budget + rate limits for process-changing control commands (socket-gate Phase 1)
 mod commands_05; // the 0.5 Tauri command surface (agent/supervision/status)
 pub mod control; // MCP control listener: dispatches `{command,args}` over loopback (PRD §9.6). `pub` so the end-to-end integration test can stand up a real listener.
 mod control_client; // server-split M1: client-side socket transport (control_request command + event forwarder)
 mod db; // durable SQLite copy of the workspace layout (#sqlite phase 1)
 mod devserver; // feat/dev-runner: managed `npm run dev` per-project runner (Dev tab)
 mod diag; // runtime diagnostics sink: diag_log/diag_clear -> fixed file (feat/diag)
-mod hangwatch; // host main-thread hang watchdog (sporadic Not-Responding/ghost hunt)
 mod dropin; // feat/terminal-input (Lane C): clipboard-image -> temp PNG for image paste
 mod files; // file index + fuzzy search + shallow tree + capped reader (PRD §6.8/§9.7)
-mod fleet; // orchestrator wake: FleetWatchRegistry + FleetNotifier (server-side push on supervised transitions)
-// --- feat/git-panel ---
+mod fleet;
+mod governor; // fleet spawn budget + rate limits for process-changing control commands (socket-gate Phase 1)
+mod hangwatch; // host main-thread hang watchdog (sporadic Not-Responding/ghost hunt)
+mod harness; // harness adapter seam (Codex Phase-1 D1): launch/turn argv + permission map, keyed off the provider string
+mod secret_seal; // item-3 Pillar B: at-rest sealing of secret material (DPAPI on Windows, 0600 fallback elsewhere) // orchestrator wake: FleetWatchRegistry + FleetNotifier (server-side push on supervised transitions)
+                 // --- feat/git-panel ---
 mod git; // git awareness for the Files panel: branch/worktree info + commit
-// ----------------------
-mod model; // data-model structs (PRD §8)
-mod plane; // comms-plane Phase 1: Single Write Authority primary-writer seam (funnel + attribution for agent/automation input; NOT yet durable/ACL'd/typing-gated)
-mod inbox; // comms-plane Phase 2: durable inbox (per-recipient segmented store + seq + at-least-once + receipt state machine); the fleet wake is its first client
-mod identity; // comms-plane Phase 2: per-session identity slice (mint/bind/resolve a per-session token for unforgeable-across-sessions attribution)
+         // ----------------------
 mod acl; // comms-plane Phase 3: the ACL policy (settled capability matrix as pure predicates; wired at control.rs enforcement points)
 mod authz; // comms-plane Phase 3: the delegation-gate carrier (durable general-authorization artifacts + resolve-and-verify, §2.6 M1)
+mod identity; // comms-plane Phase 2: per-session identity slice (mint/bind/resolve a per-session token for unforgeable-across-sessions attribution)
+mod inbox; // comms-plane Phase 2: durable inbox (per-recipient segmented store + seq + at-least-once + receipt state machine); the fleet wake is its first client
+mod model; // data-model structs (PRD §8)
+mod plane; // comms-plane Phase 1: Single Write Authority primary-writer seam (funnel + attribution for agent/automation input; NOT yet durable/ACL'd/typing-gated)
 mod remote_pty; // server-split M2a: client-side remote-PTY transport (terminal tiles over the control socket)
-// --- feat/projects-sidebar (Agent A) ---------------------------------------
+                // --- feat/projects-sidebar (Agent A) ---------------------------------------
 mod recent; // recent recallable Claude sessions for the sidebar "Recent" list
-// ---------------------------------------------------------------------------
+            // ---------------------------------------------------------------------------
+mod codex; // Codex plan usage, read from ~/.codex/sessions rollout files (sidebar)
+mod engine_supervisor; // managed Kokoro lifecycle: spawn/health-watch/auto-restart + auto-fallback to Piper (default-off flag; proposal /tmp/flap-probe/LIFECYCLE-PROPOSAL.md)
+mod scribe; // Scribe voice-gate: v1 status endpoint via ~/.scribe/control.json, status.json fallback ("is the general dictating?")
 mod supervision; // orchestrator->subagent tree + status (Workstream C)
 mod theme; // live theming contract: get_theme/set_theme + theme://changed (MCP-facing)
 mod tray; // system-tray icon + close-to-tray (hide instead of quit) (#17)
 mod usage; // Claude plan usage via `claude -p /usage` (sidebar Usage strip)
-mod codex; // Codex plan usage, read from ~/.codex/sessions rollout files (sidebar)
 mod voice; // Settings > Voice: voice.json persistence + loopback Piper TTS proxy (no browser Origin)
-mod engine_supervisor; // managed Kokoro lifecycle: spawn/health-watch/auto-restart + auto-fallback to Piper (default-off flag; proposal /tmp/flap-probe/LIFECYCLE-PROPOSAL.md)
-mod scribe; // Scribe voice-gate: v1 status endpoint via ~/.scribe/control.json, status.json fallback ("is the general dictating?")
 mod win_snap; // Windows 11 Snap Layouts + native edge-resize on the frameless window (no-op on unix)
 
 use agent::AgentBridge;
@@ -113,9 +113,7 @@ fn spawn_agent_connect(state: &AppState) {
             // the default login shell (zsh); see agent::launch_argv. (Or the
             // verbatim T_HUB_AGENT_BIN override.) On unix it's the direct spawn.
             let argv = agent::launch_argv(&distro);
-            eprintln!(
-                "t-hub: connecting agent bridge (distro={distro:?}) via {argv:?}"
-            );
+            eprintln!("t-hub: connecting agent bridge (distro={distro:?}) via {argv:?}");
             if let Err(e) = bridge.connect(&distro) {
                 // A failure here never aborts startup: the bridge degrades to a
                 // Failed/Disconnected state the sidebar renders. The most common
@@ -228,7 +226,10 @@ fn report_workspace_tabs(
     fanout: tauri::State<'_, std::sync::Arc<control::EventFanout>>,
 ) -> serde_json::Value {
     match registry.report(tabs, active_tab_id, base_seq) {
-        control::ReportOutcome::Accepted { seq, removed_tab_ids } => {
+        control::ReportOutcome::Accepted {
+            seq,
+            removed_tab_ids,
+        } => {
             // Captain-chat phase 2: the webview's normal tab-close lands here (not
             // the socket close_tab), so a closed tab must be pruned from every
             // captain's workspaceTabIds here too - else it lingers as a phantom
@@ -285,11 +286,10 @@ fn start_control_listener(
     // A visitor closure that locks the bridge's Supervisor and runs `f`. Capturing
     // a clone of the bridge keeps `control` decoupled from `agent` internals.
     let bridge = state.agent.clone();
-    let supervisor: std::sync::Arc<
-        dyn Fn(&mut dyn FnMut(&supervision::Supervisor)) + Send + Sync,
-    > = std::sync::Arc::new(move |f: &mut dyn FnMut(&supervision::Supervisor)| {
-        bridge.with_supervisor(|s| f(s));
-    });
+    let supervisor: std::sync::Arc<dyn Fn(&mut dyn FnMut(&supervision::Supervisor)) + Send + Sync> =
+        std::sync::Arc::new(move |f: &mut dyn FnMut(&supervision::Supervisor)| {
+            bridge.with_supervisor(|s| f(s));
+        });
 
     // Forward Organization-tier UI mutations to the frontend via control://apply.
     let apply_sink: std::sync::Arc<dyn control::ApplySink> =
@@ -476,9 +476,8 @@ pub fn run() {
             // pinned the UI. So we install the SocketEmitter ALONE. (The dual-leg
             // TeeEmitter + in-process TauriEmitter have been removed entirely.)
             let control_fanout = std::sync::Arc::new(control::EventFanout::new());
-            let emitter: std::sync::Arc<dyn agent::EventEmitter> = std::sync::Arc::new(
-                control_client::SocketEmitter::new(control_fanout.clone()),
-            );
+            let emitter: std::sync::Arc<dyn agent::EventEmitter> =
+                std::sync::Arc::new(control_client::SocketEmitter::new(control_fanout.clone()));
             // Manage the SAME fanout Arc so UI-driven Tauri commands that mutate
             // the captains registry (kill_terminal, the tab-close report) can
             // broadcast a captains snapshot to socket clients (the native cockpit)
@@ -528,9 +527,7 @@ pub fn run() {
                          engine is not Kokoro - not starting (wave-1 manages Kokoro only)"
                             .to_string(),
                     );
-                } else if let Some(opts) =
-                    engine_supervisor::runtime::opts_from_env(selected)
-                {
+                } else if let Some(opts) = engine_supervisor::runtime::opts_from_env(selected) {
                     engine_supervisor::runtime::start(
                         control_fanout.clone(),
                         engine_snapshot_handle,
@@ -588,8 +585,7 @@ pub fn run() {
             // messages survive restarts (identities.json; ~/.t-hub/inbox/). One Arc
             // each is shared between the fleet notifier (the inbox's first client) and
             // the control listener (identity resolve + inbox ack/status).
-            let identity_store =
-                std::sync::Arc::new(identity::IdentityStore::load_default());
+            let identity_store = std::sync::Arc::new(identity::IdentityStore::load_default());
             // Item-2 (PR-56 review LOW residual, now owned here): the identity store's
             // GC is close-path-driven only, so a session that died without a clean
             // `close_terminal` leaves its secret in the store forever, accreting across
@@ -627,9 +623,8 @@ pub fn run() {
                         &serde_json::to_value(ev).unwrap_or_default(),
                     );
                 });
-            let inbox = std::sync::Arc::new(
-                inbox::Inbox::open_default().with_telemetry(inbox_telemetry),
-            );
+            let inbox =
+                std::sync::Arc::new(inbox::Inbox::open_default().with_telemetry(inbox_telemetry));
             // Comms-plane Phase 3: the delegation-gate carrier store (durable general-
             // authorization artifacts), loaded from `authorizations.json` so recorded
             // authorizations survive restarts. One Arc shared with the control listener.

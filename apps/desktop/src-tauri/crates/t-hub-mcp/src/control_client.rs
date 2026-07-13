@@ -326,10 +326,8 @@ impl WedgeDetector {
     /// Returns `true` at most ONCE per episode - when the consecutive count first
     /// reaches `trigger_after` - to signal "attempt one bridge-triggered rebind now".
     fn on_unchanged_transport_failure(&mut self, trigger_after: u32) -> bool {
-        self.consecutive_transport_failures =
-            self.consecutive_transport_failures.saturating_add(1);
-        if !self.heal_attempted_this_episode
-            && self.consecutive_transport_failures >= trigger_after
+        self.consecutive_transport_failures = self.consecutive_transport_failures.saturating_add(1);
+        if !self.heal_attempted_this_episode && self.consecutive_transport_failures >= trigger_after
         {
             self.heal_attempted_this_episode = true;
             return true;
@@ -430,8 +428,14 @@ pub fn resolve_and_call(
                         }
                     }
                 };
-                let r =
-                    resolve_ambiguous_request(&ep, command, &args, id, first_msg, discovery.has_env_pin());
+                let r = resolve_ambiguous_request(
+                    &ep,
+                    command,
+                    &args,
+                    id,
+                    first_msg,
+                    discovery.has_env_pin(),
+                );
                 if r.is_ok() {
                     wedge_detector().on_success();
                 }
@@ -463,12 +467,26 @@ pub fn resolve_and_call(
                     }
                     Err(e2) => {
                         let e2_is_timeout = e2.is_timeout();
-                        maybe_heal_and_retry(discovery, command, &args, f, e2.into_message(), e2_is_timeout)
+                        maybe_heal_and_retry(
+                            discovery,
+                            command,
+                            &args,
+                            f,
+                            e2.into_message(),
+                            e2_is_timeout,
+                        )
                     }
                 }
             } else {
                 // control.json named no different endpoint: the one we tried IS live.
-                maybe_heal_and_retry(discovery, command, &args, endpoint, first_msg, first_is_timeout)
+                maybe_heal_and_retry(
+                    discovery,
+                    command,
+                    &args,
+                    endpoint,
+                    first_msg,
+                    first_is_timeout,
+                )
             }
         }
     }
@@ -894,7 +912,9 @@ mod tests {
         let cap = captured.clone();
         std::thread::spawn(move || {
             for reply in replies {
-                let Ok((stream, _)) = listener.accept() else { break };
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
                 let mut writer = stream.try_clone().unwrap();
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
@@ -920,30 +940,54 @@ mod tests {
     fn wedge_detector_triggers_at_threshold_and_only_once_per_episode() {
         let mut d = WedgeDetector::default();
         // trigger_after = 2: first unchanged failure arms but does not fire.
-        assert!(!d.on_unchanged_transport_failure(2), "1st failure must not fire");
+        assert!(
+            !d.on_unchanged_transport_failure(2),
+            "1st failure must not fire"
+        );
         // Second consecutive failure fires exactly once.
-        assert!(d.on_unchanged_transport_failure(2), "2nd failure must fire the heal");
+        assert!(
+            d.on_unchanged_transport_failure(2),
+            "2nd failure must fire the heal"
+        );
         // Further failures in the SAME episode never re-fire (one attempt per episode).
-        assert!(!d.on_unchanged_transport_failure(2), "3rd failure must not re-fire");
-        assert!(!d.on_unchanged_transport_failure(2), "4th failure must not re-fire");
+        assert!(
+            !d.on_unchanged_transport_failure(2),
+            "3rd failure must not re-fire"
+        );
+        assert!(
+            !d.on_unchanged_transport_failure(2),
+            "4th failure must not re-fire"
+        );
     }
 
     #[test]
     fn wedge_detector_trigger_after_one_fires_on_first_failure() {
         let mut d = WedgeDetector::default();
-        assert!(d.on_unchanged_transport_failure(1), "N=1 fires on the first failure");
-        assert!(!d.on_unchanged_transport_failure(1), "but only once per episode");
+        assert!(
+            d.on_unchanged_transport_failure(1),
+            "N=1 fires on the first failure"
+        );
+        assert!(
+            !d.on_unchanged_transport_failure(1),
+            "but only once per episode"
+        );
     }
 
     #[test]
     fn wedge_detector_success_resets_the_episode() {
         let mut d = WedgeDetector::default();
         assert!(d.on_unchanged_transport_failure(1), "first episode fires");
-        assert!(!d.on_unchanged_transport_failure(1), "same episode does not re-fire");
+        assert!(
+            !d.on_unchanged_transport_failure(1),
+            "same episode does not re-fire"
+        );
         // A healthy round-trip ends the episode.
         d.on_success();
         // A later wedge is a NEW episode and may heal again.
-        assert!(d.on_unchanged_transport_failure(1), "a new episode fires again after success");
+        assert!(
+            d.on_unchanged_transport_failure(1),
+            "a new episode fires again after success"
+        );
     }
 
     #[test]
@@ -970,7 +1014,10 @@ mod tests {
         // Some healthy calls in between (each a success, no-op on an ended episode).
         d.on_success();
         // A SECOND wedge (on the now-rotated port) is a fresh episode and heals again.
-        assert!(d.on_unchanged_transport_failure(1), "second wedge heals again after recovery");
+        assert!(
+            d.on_unchanged_transport_failure(1),
+            "second wedge heals again after recovery"
+        );
     }
 
     #[test]
@@ -1022,8 +1069,12 @@ mod tests {
     #[test]
     fn spawn_class_call_injects_a_request_id() {
         let (addr, captured) = scripted_server(vec![Some(r#"{"ok":true,"result":{"id":"s"}}"#)]);
-        resolve_and_call(&discovery_for(addr), "spawn_terminal", &serde_json::json!({"cwd": "/tmp"}))
-            .unwrap();
+        resolve_and_call(
+            &discovery_for(addr),
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp"}),
+        )
+        .unwrap();
         let reqs = captured.lock().unwrap();
         assert!(
             reqs[0]["args"]["requestId"].as_str().is_some(),
@@ -1050,10 +1101,16 @@ mod tests {
         // using the SAME requestId, and returns the original result - no duplicate.
         let (addr, captured) = scripted_server(vec![
             None, // spawn_terminal: accepted, response leg dies
-            Some(r#"{"ok":true,"result":{"status":"completed","ok":true,"result":{"id":"sess-1"}}}"#),
+            Some(
+                r#"{"ok":true,"result":{"status":"completed","ok":true,"result":{"id":"sess-1"}}}"#,
+            ),
         ]);
-        let v = resolve_and_call(&discovery_for(addr), "spawn_terminal", &serde_json::json!({"cwd": "/tmp"}))
-            .unwrap();
+        let v = resolve_and_call(
+            &discovery_for(addr),
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp"}),
+        )
+        .unwrap();
         assert_eq!(v["id"], "sess-1", "returns the completed spawn's result");
         let reqs = captured.lock().unwrap();
         let rid = reqs[0]["args"]["requestId"].as_str().unwrap();
@@ -1071,12 +1128,16 @@ mod tests {
         // unknown: it did not land). The client safely re-runs it ONCE with the
         // same requestId, which now succeeds.
         let (addr, captured) = scripted_server(vec![
-            None,                                             // spawn 1: response leg dies
+            None,                                                 // spawn 1: response leg dies
             Some(r#"{"ok":true,"result":{"status":"unknown"}}"#), // status: never landed
             Some(r#"{"ok":true,"result":{"id":"sess-2","accepted":"spawn_terminal"}}"#), // retry ok
         ]);
-        let v = resolve_and_call(&discovery_for(addr), "spawn_terminal", &serde_json::json!({"cwd": "/tmp"}))
-            .unwrap();
+        let v = resolve_and_call(
+            &discovery_for(addr),
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp"}),
+        )
+        .unwrap();
         assert_eq!(v["id"], "sess-2");
         let reqs = captured.lock().unwrap();
         assert_eq!(reqs.len(), 3);
@@ -1316,7 +1377,10 @@ mod tests {
             ..Default::default()
         };
         let ep = pinned.refreshed_endpoint().unwrap();
-        assert_eq!(ep.addr, "127.0.0.1:5555", "takes the fresh addr from control.json");
+        assert_eq!(
+            ep.addr, "127.0.0.1:5555",
+            "takes the fresh addr from control.json"
+        );
         assert_eq!(ep.token, "FULL-tok", "keeps the pinned env token");
 
         let file_only = Discovery {
@@ -1325,7 +1389,10 @@ mod tests {
         };
         let ep2 = file_only.refreshed_endpoint().unwrap();
         assert_eq!(ep2.addr, "127.0.0.1:5555");
-        assert_eq!(ep2.token, "READ-tok", "no env pin: adopt the file token as before");
+        assert_eq!(
+            ep2.token, "READ-tok",
+            "no env pin: adopt the file token as before"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -274,7 +274,8 @@ impl IdentityStore {
             minted_at: now_ms(),
         };
         let mut snap = self.lock();
-        snap.identities.insert(identity.id.clone(), identity.clone());
+        snap.identities
+            .insert(identity.id.clone(), identity.clone());
         self.persist(&snap);
         identity
     }
@@ -343,10 +344,11 @@ impl IdentityStore {
     pub fn prune_dead(&self, is_live: impl Fn(&str) -> bool) -> usize {
         let mut snap = self.lock();
         let before = snap.identities.len();
-        snap.identities.retain(|_, ident| match ident.session_tile.as_deref() {
-            Some(tile) => is_live(tile),
-            None => false,
-        });
+        snap.identities
+            .retain(|_, ident| match ident.session_tile.as_deref() {
+                Some(tile) => is_live(tile),
+                None => false,
+            });
         let removed = before - snap.identities.len();
         if removed > 0 {
             self.persist(&snap);
@@ -498,8 +500,14 @@ mod tests {
         let store = IdentityStore::ephemeral();
         let a = store.mint(Role::Crew);
         let dbg = format!("{a:?}");
-        assert!(!dbg.contains(&a.secret), "Debug must NOT contain the secret: {dbg}");
-        assert!(dbg.contains("<redacted>"), "Debug must show the redaction marker");
+        assert!(
+            !dbg.contains(&a.secret),
+            "Debug must NOT contain the secret: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug must show the redaction marker"
+        );
         assert!(dbg.contains(&a.id), "Debug still shows the non-secret id");
     }
 
@@ -512,15 +520,24 @@ mod tests {
         let a = {
             let store = IdentityStore::load(path.clone());
             let a = store.mint(Role::Crew);
-            assert!(store.resolve(&a.secret).is_some(), "mints resolve before revoke");
+            assert!(
+                store.resolve(&a.secret).is_some(),
+                "mints resolve before revoke"
+            );
             assert!(store.revoke(&a.id), "revoke reports a change");
-            assert!(store.resolve(&a.secret).is_none(), "a revoked secret must not resolve");
+            assert!(
+                store.resolve(&a.secret).is_none(),
+                "a revoked secret must not resolve"
+            );
             assert!(store.is_revoked(&a.id));
             a
         };
         // Reload: the tombstone persisted, so even a resurrected record would not resolve.
         let reloaded = IdentityStore::load(path.clone());
-        assert!(reloaded.is_revoked(&a.id), "the revocation tombstone must persist");
+        assert!(
+            reloaded.is_revoked(&a.id),
+            "the revocation tombstone must persist"
+        );
         assert!(reloaded.resolve(&a.secret).is_none());
         let _ = std::fs::remove_file(&path);
     }
@@ -533,7 +550,9 @@ mod tests {
         let a = store.mint(Role::Crew);
         let minted = a.minted_at;
         // ttl disabled: resolves at any clock.
-        assert!(store.resolve_with(&a.secret, minted + 10_000_000, 0).is_some());
+        assert!(store
+            .resolve_with(&a.secret, minted + 10_000_000, 0)
+            .is_some());
         // Within ttl: resolves.
         assert!(store.resolve_with(&a.secret, minted + 500, 1000).is_some());
         // Past ttl: expired, no resolve.
@@ -572,7 +591,10 @@ mod tests {
         );
         // And a fresh load restores the plaintext so resolve still works.
         let reloaded = IdentityStore::load(path.clone());
-        assert!(reloaded.resolve(&secret).is_some(), "reload must restore a resolvable secret");
+        assert!(
+            reloaded.resolve(&secret).is_some(),
+            "reload must restore a resolvable secret"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -609,7 +631,10 @@ mod tests {
         let a = store.mint(Role::Crew);
         assert!(a.session_tile.is_none());
         store.bind_tile(&a.id, "abc12345");
-        assert_eq!(store.get(&a.id).unwrap().session_tile.as_deref(), Some("abc12345"));
+        assert_eq!(
+            store.get(&a.id).unwrap().session_tile.as_deref(),
+            Some("abc12345")
+        );
         assert_eq!(store.for_tile("abc12345").unwrap().id, a.id);
     }
 
@@ -643,7 +668,10 @@ mod tests {
         let a = store.mint(Role::Crew);
         let label = a.sender_label();
         assert!(label.starts_with("crew:"));
-        assert!(!label.contains(&a.secret), "the sender label never leaks the secret");
+        assert!(
+            !label.contains(&a.secret),
+            "the sender label never leaks the secret"
+        );
         let stamp = a.stamp();
         assert_eq!(stamp.id, a.id);
         // The stamp serializes without the secret field.
@@ -666,9 +694,15 @@ mod tests {
         let b = store.mint(Role::Crew);
         assert!(store.resolve(&a.secret).is_some());
         assert!(store.retire(&a.id), "retire reports it removed something");
-        assert!(store.resolve(&a.secret).is_none(), "retired secret no longer resolves");
+        assert!(
+            store.resolve(&a.secret).is_none(),
+            "retired secret no longer resolves"
+        );
         assert_eq!(store.len(), 1, "only the retired identity is gone");
-        assert!(store.resolve(&b.secret).is_some(), "the other identity is untouched");
+        assert!(
+            store.resolve(&b.secret).is_some(),
+            "the other identity is untouched"
+        );
         // Retiring an unknown id is a no-op.
         assert!(!store.retire("no-such-id"));
     }
@@ -699,10 +733,22 @@ mod tests {
         assert_eq!(store.len(), 3);
 
         let removed = store.prune_dead(|tile| tile == "live-tile");
-        assert_eq!(removed, 2, "the dead tile AND the unbound identity are pruned");
-        assert!(store.resolve(&live.secret).is_some(), "the live session survives");
-        assert!(store.resolve(&dead.secret).is_none(), "the dead session's secret is gone");
-        assert!(store.resolve(&unbound.secret).is_none(), "the unbound leak is gone");
+        assert_eq!(
+            removed, 2,
+            "the dead tile AND the unbound identity are pruned"
+        );
+        assert!(
+            store.resolve(&live.secret).is_some(),
+            "the live session survives"
+        );
+        assert!(
+            store.resolve(&dead.secret).is_none(),
+            "the dead session's secret is gone"
+        );
+        assert!(
+            store.resolve(&unbound.secret).is_none(),
+            "the unbound leak is gone"
+        );
         assert_eq!(store.len(), 1);
     }
 

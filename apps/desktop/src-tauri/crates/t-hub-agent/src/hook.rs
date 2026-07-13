@@ -25,22 +25,22 @@ use t_hub_protocol::{EventJournalEntry, JournalEventType, JournalSource};
 pub fn event_type_for_hook(hook_name: &str) -> JournalEventType {
     use JournalEventType::*;
     match hook_name {
-        "SessionStart"      => SessionStart,
-        "SessionEnd"        => SessionEnd,
-        "UserPromptSubmit"  => UserPromptSubmit,
-        "Stop"              => Stop,
-        "StopFailure"       => StopFailure,
+        "SessionStart" => SessionStart,
+        "SessionEnd" => SessionEnd,
+        "UserPromptSubmit" => UserPromptSubmit,
+        "Stop" => Stop,
+        "StopFailure" => StopFailure,
         "PermissionRequest" => PermissionRequest,
-        "Notification"      => Notification,
-        "Elicitation"       => Elicitation,
-        "SubagentStart"     => SubagentStart,
-        "SubagentStop"      => SubagentStop,
-        "TaskCreated"       => TaskCreated,
-        "TaskCompleted"     => TaskCompleted,
-        "CwdChanged"        => CwdChanged,
-        "WorktreeCreate"    => WorktreeCreate,
-        "WorktreeRemove"    => WorktreeRemove,
-        _                   => Unknown,
+        "Notification" => Notification,
+        "Elicitation" => Elicitation,
+        "SubagentStart" => SubagentStart,
+        "SubagentStop" => SubagentStop,
+        "TaskCreated" => TaskCreated,
+        "TaskCompleted" => TaskCompleted,
+        "CwdChanged" => CwdChanged,
+        "WorktreeCreate" => WorktreeCreate,
+        "WorktreeRemove" => WorktreeRemove,
+        _ => Unknown,
     }
 }
 
@@ -122,9 +122,7 @@ pub fn run(hook_name: &str, journal_dir: Option<&str>) -> anyhow::Result<()> {
     let journal = match crate::journal::Journal::open(&dir) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!(
-                "t-hub-agent --hook {hook_name}: failed to open journal at {dir:?}: {e:#}"
-            );
+            eprintln!("t-hub-agent --hook {hook_name}: failed to open journal at {dir:?}: {e:#}");
             // Return Ok so main exits 0.
             return Ok(());
         }
@@ -340,21 +338,21 @@ mod tests {
     #[test]
     fn all_15_hook_names_map_correctly() {
         let cases = [
-            ("SessionStart",      JournalEventType::SessionStart),
-            ("SessionEnd",        JournalEventType::SessionEnd),
-            ("UserPromptSubmit",  JournalEventType::UserPromptSubmit),
-            ("Stop",              JournalEventType::Stop),
-            ("StopFailure",       JournalEventType::StopFailure),
+            ("SessionStart", JournalEventType::SessionStart),
+            ("SessionEnd", JournalEventType::SessionEnd),
+            ("UserPromptSubmit", JournalEventType::UserPromptSubmit),
+            ("Stop", JournalEventType::Stop),
+            ("StopFailure", JournalEventType::StopFailure),
             ("PermissionRequest", JournalEventType::PermissionRequest),
-            ("Notification",      JournalEventType::Notification),
-            ("Elicitation",       JournalEventType::Elicitation),
-            ("SubagentStart",     JournalEventType::SubagentStart),
-            ("SubagentStop",      JournalEventType::SubagentStop),
-            ("TaskCreated",       JournalEventType::TaskCreated),
-            ("TaskCompleted",     JournalEventType::TaskCompleted),
-            ("CwdChanged",        JournalEventType::CwdChanged),
-            ("WorktreeCreate",    JournalEventType::WorktreeCreate),
-            ("WorktreeRemove",    JournalEventType::WorktreeRemove),
+            ("Notification", JournalEventType::Notification),
+            ("Elicitation", JournalEventType::Elicitation),
+            ("SubagentStart", JournalEventType::SubagentStart),
+            ("SubagentStop", JournalEventType::SubagentStop),
+            ("TaskCreated", JournalEventType::TaskCreated),
+            ("TaskCompleted", JournalEventType::TaskCompleted),
+            ("CwdChanged", JournalEventType::CwdChanged),
+            ("WorktreeCreate", JournalEventType::WorktreeCreate),
+            ("WorktreeRemove", JournalEventType::WorktreeRemove),
         ];
         for (name, expected) in &cases {
             assert_eq!(
@@ -367,9 +365,15 @@ mod tests {
 
     #[test]
     fn unknown_hook_name_maps_to_unknown() {
-        assert_eq!(event_type_for_hook("FutureThing"), JournalEventType::Unknown);
+        assert_eq!(
+            event_type_for_hook("FutureThing"),
+            JournalEventType::Unknown
+        );
         assert_eq!(event_type_for_hook(""), JournalEventType::Unknown);
-        assert_eq!(event_type_for_hook("sessionstart"), JournalEventType::Unknown); // case-sensitive
+        assert_eq!(
+            event_type_for_hook("sessionstart"),
+            JournalEventType::Unknown
+        ); // case-sensitive
     }
 
     // -----------------------------------------------------------------------
@@ -391,7 +395,10 @@ mod tests {
         assert_eq!(entry.payload["cwd"], "/x");
         assert_eq!(entry.payload["session_id"], "s1");
         assert!(entry.result.is_none());
-        assert_eq!(entry.seq, 0, "seq is assigned by Journal::append, not build_entry");
+        assert_eq!(
+            entry.seq, 0,
+            "seq is assigned by Journal::append, not build_entry"
+        );
         assert!(entry.timestamp_ms > 0);
     }
 
@@ -442,7 +449,10 @@ mod tests {
         // session_id lifted to the top of the payload.
         assert_eq!(entry.payload["session_id"], "sess-9");
         // Raw statusline preserved under payload.status (what the core parses).
-        assert_eq!(entry.payload["status"]["context_window"]["used_percentage"], 42);
+        assert_eq!(
+            entry.payload["status"]["context_window"]["used_percentage"],
+            42
+        );
         assert_eq!(entry.payload["status"]["cost"]["total_cost_usd"], 1.23);
         assert!(entry.timestamp_ms > 0);
         assert_eq!(entry.seq, 0, "seq is assigned by Journal::append");

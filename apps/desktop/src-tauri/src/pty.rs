@@ -26,9 +26,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use portable_pty::{
-    native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize,
-};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
 
@@ -300,7 +298,13 @@ fn reader_loop(
         .ok()
         .and_then(|status| i32::try_from(status.exit_code()).ok());
 
-    let _ = app.emit(events::EXIT, &ExitEvent { id: id.clone(), code });
+    let _ = app.emit(
+        events::EXIT,
+        &ExitEvent {
+            id: id.clone(),
+            code,
+        },
+    );
     let _ = app.emit(
         events::STATE,
         &StateEvent {
@@ -606,7 +610,11 @@ fn stream_reader_loop(
                 // stream so a gone/stalled client surfaces as a write error / a
                 // full-buffer write timeout instead of leaking this forwarder. A
                 // healthy client drains and ignores it.
-                if sink.write_all(&keepalive_bytes).and_then(|()| sink.flush()).is_err() {
+                if sink
+                    .write_all(&keepalive_bytes)
+                    .and_then(|()| sink.flush())
+                    .is_err()
+                {
                     sink_dead = true;
                     break;
                 }
@@ -676,9 +684,8 @@ fn feed_pty(mut reader: Box<dyn Read + Send>, tx: SyncSender<Vec<u8>>) {
 fn keepalive_frame(framing: PtyFraming) -> Vec<u8> {
     match framing {
         PtyFraming::V1Json => {
-            let mut line =
-                serde_json::to_vec(&json!({ "keepalive": ".".repeat(KEEPALIVE_PAD) }))
-                    .unwrap_or_default();
+            let mut line = serde_json::to_vec(&json!({ "keepalive": ".".repeat(KEEPALIVE_PAD) }))
+                .unwrap_or_default();
             line.push(b'\n');
             line
         }
@@ -710,10 +717,7 @@ mod tests {
         // isolated `t-hub-test` default, not the live `t-hub`. Assert against the
         // resolved socket so the shape check holds under both builds.
         let sock = tmux::socket();
-        assert_eq!(
-            argv,
-            vec!["tmux", "-L", sock, "attach", "-t", "th_abc123"]
-        );
+        assert_eq!(argv, vec!["tmux", "-L", sock, "attach", "-t", "th_abc123"]);
     }
 
     #[cfg(windows)]
@@ -724,7 +728,14 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                "wsl.exe", "-e", "tmux", "-L", sock, "attach", "-t", "th_abc123"
+                "wsl.exe",
+                "-e",
+                "tmux",
+                "-L",
+                sock,
+                "attach",
+                "-t",
+                "th_abc123"
             ]
         );
     }

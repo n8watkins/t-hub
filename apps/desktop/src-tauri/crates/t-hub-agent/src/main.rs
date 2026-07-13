@@ -68,7 +68,9 @@ struct Args {
 
 enum Mode {
     Stdio,
-    Hook { event: String },
+    Hook {
+        event: String,
+    },
     /// Statusline ingest: read Claude's statusline JSON from stdin, journal a
     /// `StatusSnapshot`, echo a readout, exit 0.
     Statusline,
@@ -87,15 +89,13 @@ fn parse_args() -> Args {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--stdio" => mode = Mode::Stdio,
-            "--hook" => {
-                match it.next() {
-                    Some(event) => mode = Mode::Hook { event },
-                    None => {
-                        eprintln!("t-hub-agent: --hook requires an EVENT name argument");
-                        std::process::exit(1);
-                    }
+            "--hook" => match it.next() {
+                Some(event) => mode = Mode::Hook { event },
+                None => {
+                    eprintln!("t-hub-agent: --hook requires an EVENT name argument");
+                    std::process::exit(1);
                 }
-            }
+            },
             "--statusline" => mode = Mode::Statusline,
             "--gate" => mode = Mode::Gate,
             "--journal-dir" => journal_dir = it.next(),
@@ -162,9 +162,7 @@ fn main() {
             let journal = match journal::Journal::open(&journal_dir) {
                 Ok(j) => j,
                 Err(e) => {
-                    eprintln!(
-                        "t-hub-agent: failed to open journal at {journal_dir:?}: {e:#}"
-                    );
+                    eprintln!("t-hub-agent: failed to open journal at {journal_dir:?}: {e:#}");
                     std::process::exit(1);
                 }
             };

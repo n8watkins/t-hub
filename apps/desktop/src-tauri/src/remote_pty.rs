@@ -178,7 +178,10 @@ impl RemotePty {
             .get("scrollback")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                format!("remote_pty: expected a scrollback frame, got: {}", line.trim())
+                format!(
+                    "remote_pty: expected a scrollback frame, got: {}",
+                    line.trim()
+                )
             })?
             .to_string();
 
@@ -441,11 +444,7 @@ fn reader_loop(app: AppHandle, id: String, reader: BufReader<TcpStream>) {
         // promptly. A raw `read` into our own buffer means a timeout consumes
         // nothing (no partial-line corruption) — unlike a timed `read_line`.
         let pending = !batch.is_empty();
-        let _ = stream.set_read_timeout(if pending {
-            Some(COALESCE_WINDOW)
-        } else {
-            None
-        });
+        let _ = stream.set_read_timeout(if pending { Some(COALESCE_WINDOW) } else { None });
         match (&stream).read(&mut buf) {
             Ok(0) => break, // EOF: server detached / connection dropped.
             Ok(n) => acc.extend_from_slice(&buf[..n]),
@@ -507,7 +506,10 @@ mod tests {
     #[test]
     fn parses_exit_frame_with_and_without_code() {
         assert_eq!(parse_pty_frame(br#"{"exit":0}"#), PtyFrame::Exit(Some(0)));
-        assert_eq!(parse_pty_frame(br#"{"exit":137}"#), PtyFrame::Exit(Some(137)));
+        assert_eq!(
+            parse_pty_frame(br#"{"exit":137}"#),
+            PtyFrame::Exit(Some(137))
+        );
         // A null/absent exit code → Exit(None) (signalled / unknown).
         assert_eq!(parse_pty_frame(br#"{"exit":null}"#), PtyFrame::Exit(None));
     }
@@ -518,12 +520,18 @@ mod tests {
         assert_eq!(parse_pty_frame(b"   \t"), PtyFrame::Ignore);
         assert_eq!(parse_pty_frame(b"not json"), PtyFrame::Ignore);
         // Well-formed JSON but `out` isn't valid base64 → skipped, not a panic.
-        assert_eq!(parse_pty_frame(br#"{"out":"!!!not base64!!!"}"#), PtyFrame::Ignore);
+        assert_eq!(
+            parse_pty_frame(br#"{"out":"!!!not base64!!!"}"#),
+            PtyFrame::Ignore
+        );
         // A late/unknown frame shape (e.g. scrollback) is ignored.
         assert_eq!(parse_pty_frame(br#"{"scrollback":"x"}"#), PtyFrame::Ignore);
         // The server's idle keepalive is a no-op here: it carries no `out`/`exit`,
         // so it must drop silently (the s27 idle-leak fix relies on this contract).
-        assert_eq!(parse_pty_frame(br#"{"keepalive":"...."}"#), PtyFrame::Ignore);
+        assert_eq!(
+            parse_pty_frame(br#"{"keepalive":"...."}"#),
+            PtyFrame::Ignore
+        );
     }
 
     #[test]

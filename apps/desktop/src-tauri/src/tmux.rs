@@ -359,13 +359,33 @@ pub(crate) fn resize_window_for_tests(name: &str, cols: u16, rows: u16) -> Resul
 /// The whole set is one `;`-separated tmux command sequence so it costs a single
 /// process launch (one `wsl.exe` spawn on Windows) instead of seven.
 const GLOBAL_KEYBIND_ARGS: &[&str] = &[
-    "set-option", "-g", "prefix", "None", ";",
-    "unbind", "-n", "C-b", ";",
-    "unbind", "C-b", ";",
-    "unbind", "-n", "MouseDown3Pane", ";",
-    "unbind", "-n", "MouseDown3Status", ";",
-    "unbind", "-n", "MouseDown3StatusLeft", ";",
-    "unbind", "-n", "MouseDown3StatusRight",
+    "set-option",
+    "-g",
+    "prefix",
+    "None",
+    ";",
+    "unbind",
+    "-n",
+    "C-b",
+    ";",
+    "unbind",
+    "C-b",
+    ";",
+    "unbind",
+    "-n",
+    "MouseDown3Pane",
+    ";",
+    "unbind",
+    "-n",
+    "MouseDown3Status",
+    ";",
+    "unbind",
+    "-n",
+    "MouseDown3StatusLeft",
+    ";",
+    "unbind",
+    "-n",
+    "MouseDown3StatusRight",
 ];
 
 fn apply_global_keybinds() {
@@ -389,7 +409,10 @@ pub fn ensure_mouse_on() {
     let _ = run("set-option", &["set-option", "-g", "mouse", "on"]);
     if let Ok(sessions) = list_sessions() {
         for s in &sessions {
-            let _ = run("set-option", &["set-option", "-t", s.as_str(), "mouse", "on"]);
+            let _ = run(
+                "set-option",
+                &["set-option", "-t", s.as_str(), "mouse", "on"],
+            );
         }
     }
     // Disable the C-b prefix and tmux's built-in mouse context menus,
@@ -610,11 +633,13 @@ pub fn list_sessions() -> Result<Vec<String>, TmuxError> {
     // `<name>: <window/size info>`; tmux forbids `:` in session names, so the
     // name is everything before the first colon. This needs no format argument
     // and survives the wsl.exe round-trip intact.
-    let output = output_with_timeout(tmux(&["list-sessions"]), tmux_cmd_timeout())
-        .map_err(|e| TmuxError {
-            op: "list-sessions",
-            code: None,
-            message: format!("failed to spawn tmux: {e}"),
+    let output =
+        output_with_timeout(tmux(&["list-sessions"]), tmux_cmd_timeout()).map_err(|e| {
+            TmuxError {
+                op: "list-sessions",
+                code: None,
+                message: format!("failed to spawn tmux: {e}"),
+            }
         })?;
 
     if output.status.success() {
@@ -748,7 +773,12 @@ done;; esac; printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done",
 fn pane_info_command(script: &str) -> Command {
     use std::os::windows::process::CommandExt;
     let mut c = Command::new("wsl.exe");
-    c.arg("--cd").arg("~").arg("-e").arg("bash").arg("-lc").arg(script);
+    c.arg("--cd")
+        .arg("~")
+        .arg("-e")
+        .arg("bash")
+        .arg("-lc")
+        .arg(script);
     c.creation_flags(0x0800_0000);
     c
 }
@@ -842,7 +872,11 @@ pub fn send_keys(name: &str, keys: &[&str]) -> Result<(), TmuxError> {
 /// Read a pane format (e.g. `#{pane_in_mode}`, `#{scroll_position}`) for session
 /// `name`'s active pane. Returns the trimmed value, or None on any failure.
 fn pane_format(name: &str, fmt: &str) -> Option<String> {
-    let out = run("display-message", &["display-message", "-p", "-t", name, fmt]).ok()?;
+    let out = run(
+        "display-message",
+        &["display-message", "-p", "-t", name, fmt],
+    )
+    .ok()?;
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -1101,9 +1135,7 @@ mod tests {
     #[test]
     fn kill_missing_is_idempotent() {
         if !tmux_available() {
-            eprintln!(
-                "tmux::tests::kill_missing_is_idempotent: tmux not on PATH — skipping"
-            );
+            eprintln!("tmux::tests::kill_missing_is_idempotent: tmux not on PATH — skipping");
             return;
         }
         let name = format!("{}_never", unique_name());
@@ -1116,9 +1148,7 @@ mod tests {
     #[test]
     fn list_sessions_tolerates_empty() {
         if !tmux_available() {
-            eprintln!(
-                "tmux::tests::list_sessions_tolerates_empty: tmux not on PATH — skipping"
-            );
+            eprintln!("tmux::tests::list_sessions_tolerates_empty: tmux not on PATH — skipping");
             return;
         }
         // Whether or not a server is running, this must not error.

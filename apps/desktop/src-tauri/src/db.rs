@@ -231,8 +231,7 @@ impl Db {
         let Some(conn) = guard.as_ref() else {
             return Ok(Vec::new());
         };
-        let mut stmt =
-            conn.prepare("SELECT id, ts, json FROM snapshots ORDER BY id DESC")?;
+        let mut stmt = conn.prepare("SELECT id, ts, json FROM snapshots ORDER BY id DESC")?;
         let rows = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
             let ts: i64 = row.get(1)?;
@@ -456,10 +455,7 @@ pub fn init(app: &tauri::AppHandle) -> Db {
 /// Best-effort from the caller's view: a DB error is returned but the frontend
 /// keeps its localStorage mirror, so a failure here never loses the live state.
 #[tauri::command]
-pub async fn save_workspace_snapshot(
-    app: tauri::AppHandle,
-    json: String,
-) -> Result<(), String> {
+pub async fn save_workspace_snapshot(app: tauri::AppHandle, json: String) -> Result<(), String> {
     let db = app.state::<std::sync::Arc<Db>>();
     // The live save: upsert the latest layout (boot hydration reads this). This
     // result is authoritative — a failure here is the command's failure.
@@ -488,10 +484,7 @@ pub async fn list_snapshots(app: tauri::AppHandle) -> Result<Vec<SnapshotMeta>, 
 /// `None` if it has aged out of the ring or the DB is unavailable. The frontend
 /// parses + applies this through the same load/apply path as boot hydration.
 #[tauri::command]
-pub async fn get_snapshot(
-    app: tauri::AppHandle,
-    id: i64,
-) -> Result<Option<String>, String> {
+pub async fn get_snapshot(app: tauri::AppHandle, id: i64) -> Result<Option<String>, String> {
     app.state::<std::sync::Arc<Db>>()
         .get_snapshot(id)
         .map_err(|e| format!("get_snapshot: {e}"))
@@ -501,9 +494,7 @@ pub async fn get_snapshot(
 /// yet (fresh install, or the DB couldn't be opened). The frontend prefers this
 /// over localStorage when present, and seeds it from localStorage once if empty.
 #[tauri::command]
-pub async fn load_workspace_snapshot(
-    app: tauri::AppHandle,
-) -> Result<Option<String>, String> {
+pub async fn load_workspace_snapshot(app: tauri::AppHandle) -> Result<Option<String>, String> {
     app.state::<std::sync::Arc<Db>>()
         .get(WORKSPACE_KEY)
         .map_err(|e| format!("load_workspace_snapshot: {e}"))
@@ -522,9 +513,7 @@ pub async fn load_workspace_snapshot(
 /// brought back. Newest-first. Best-effort: any failure degrades to an empty list
 /// (nothing offered) rather than erroring the UI.
 #[tauri::command]
-pub async fn list_orphaned_sessions(
-    app: tauri::AppHandle,
-) -> Result<Vec<OrphanedSession>, String> {
+pub async fn list_orphaned_sessions(app: tauri::AppHandle) -> Result<Vec<OrphanedSession>, String> {
     let rows = app
         .state::<std::sync::Arc<Db>>()
         .all_tile_sessions()
@@ -691,9 +680,11 @@ mod tests {
         let guard = db.conn.lock().unwrap();
         let conn = guard.as_ref().unwrap();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM kv WHERE key = ?1", [WORKSPACE_KEY], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key = ?1",
+                [WORKSPACE_KEY],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 1);
         drop(guard);
@@ -727,7 +718,8 @@ mod tests {
     fn append_then_list_newest_first() {
         let (db, dir) = temp_db();
         db.append_snapshot(r#"{"tabs":[{"order":["a"]}]}"#).unwrap();
-        db.append_snapshot(r#"{"tabs":[{"order":["a","b"]}]}"#).unwrap();
+        db.append_snapshot(r#"{"tabs":[{"order":["a","b"]}]}"#)
+            .unwrap();
         let metas = db.list_snapshots().unwrap();
         assert_eq!(metas.len(), 2);
         // Newest first: the second append has the larger id and leads the list.
@@ -777,7 +769,10 @@ mod tests {
         let (db, dir) = temp_db();
         db.append_snapshot(r#"{"tabs":[]}"#).unwrap();
         let id = db.list_snapshots().unwrap()[0].id;
-        assert_eq!(db.get_snapshot(id).unwrap().as_deref(), Some(r#"{"tabs":[]}"#));
+        assert_eq!(
+            db.get_snapshot(id).unwrap().as_deref(),
+            Some(r#"{"tabs":[]}"#)
+        );
         // An unknown id is a clean None, not an error.
         assert_eq!(db.get_snapshot(id + 999).unwrap(), None);
         let _ = std::fs::remove_dir_all(dir);
@@ -810,13 +805,20 @@ mod tests {
     fn record_tile_session_upserts_by_terminal_id() {
         let (db, dir) = temp_db();
         // First binding for a tile.
-        db.record_tile_session("t1", "sess-a", "/home/u/p", "th_t1").unwrap();
+        db.record_tile_session("t1", "sess-a", "/home/u/p", "th_t1")
+            .unwrap();
         // A later statusline for the SAME tile (new session) overwrites in place.
-        db.record_tile_session("t1", "sess-b", "/home/u/p2", "th_t1").unwrap();
+        db.record_tile_session("t1", "sess-b", "/home/u/p2", "th_t1")
+            .unwrap();
         // A different tile is a separate row.
-        db.record_tile_session("t2", "sess-c", "/home/u/q", "th_t2").unwrap();
+        db.record_tile_session("t2", "sess-c", "/home/u/q", "th_t2")
+            .unwrap();
         let rows = db.all_tile_sessions().unwrap();
-        assert_eq!(rows.len(), 2, "one row per terminal_id (upsert, not insert)");
+        assert_eq!(
+            rows.len(),
+            2,
+            "one row per terminal_id (upsert, not insert)"
+        );
         let t1 = rows.iter().find(|r| r.terminal_id == "t1").unwrap();
         assert_eq!(t1.session_id, "sess-b", "latest session wins for the tile");
         assert_eq!(t1.cwd, "/home/u/p2");
@@ -827,7 +829,8 @@ mod tests {
     #[test]
     fn tile_sessions_survive_reopen() {
         let (db, dir) = temp_db();
-        db.record_tile_session("t1", "sess-a", "/work", "th_t1").unwrap();
+        db.record_tile_session("t1", "sess-a", "/work", "th_t1")
+            .unwrap();
         drop(db);
         let db2 = Db::open_in(dir.clone());
         let rows = db2.all_tile_sessions().unwrap();
@@ -850,11 +853,15 @@ mod tests {
     #[test]
     fn delete_tile_sessions_prunes_only_named_rows() {
         let (db, dir) = temp_db();
-        db.record_tile_session("t1", "sess-a", "/a", "th_t1").unwrap();
-        db.record_tile_session("t2", "sess-b", "/b", "th_t2").unwrap();
-        db.record_tile_session("t3", "sess-c", "/c", "th_t3").unwrap();
+        db.record_tile_session("t1", "sess-a", "/a", "th_t1")
+            .unwrap();
+        db.record_tile_session("t2", "sess-b", "/b", "th_t2")
+            .unwrap();
+        db.record_tile_session("t3", "sess-c", "/c", "th_t3")
+            .unwrap();
         // Prune two; the third survives.
-        db.delete_tile_sessions(&["t1".into(), "t3".into()]).unwrap();
+        db.delete_tile_sessions(&["t1".into(), "t3".into()])
+            .unwrap();
         let rows = db.all_tile_sessions().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].terminal_id, "t2");
@@ -916,10 +923,16 @@ mod tests {
         assert_eq!(scan.orphans.len(), 1);
         let o = &scan.orphans[0];
         assert_eq!(o.session_id, "sess-a");
-        assert_eq!(o.cwd, "/home/u/proj", "recorded cwd is preferred over catalog");
+        assert_eq!(
+            o.cwd, "/home/u/proj",
+            "recorded cwd is preferred over catalog"
+        );
         assert_eq!(o.label, "Fix the parser");
         assert_eq!(o.last_seen, 100);
-        assert!(scan.dead_terminal_ids.is_empty(), "a resumable row is not pruned");
+        assert!(
+            scan.dead_terminal_ids.is_empty(),
+            "a resumable row is not pruned"
+        );
     }
 
     #[test]
@@ -931,7 +944,10 @@ mod tests {
         let cat = catalog(&[("sess-a", "Still running", "/catalog/cwd")]);
         let scan = classify_orphans(rows, &live_set(&["t1"]), &cat);
 
-        assert!(scan.orphans.is_empty(), "a live session is never offered for restore");
+        assert!(
+            scan.orphans.is_empty(),
+            "a live session is never offered for restore"
+        );
         assert!(
             scan.dead_terminal_ids.is_empty(),
             "a live session is never pruned (we can't prove it dead)",
@@ -988,9 +1004,20 @@ mod tests {
         ]);
         let scan = classify_orphans(rows, &live_set(&[]), &cat);
 
-        let blank = scan.orphans.iter().find(|o| o.session_id == "sess-blank").unwrap();
-        let set = scan.orphans.iter().find(|o| o.session_id == "sess-set").unwrap();
-        assert_eq!(blank.cwd, "/from-catalog", "blank recorded cwd falls back to catalog");
+        let blank = scan
+            .orphans
+            .iter()
+            .find(|o| o.session_id == "sess-blank")
+            .unwrap();
+        let set = scan
+            .orphans
+            .iter()
+            .find(|o| o.session_id == "sess-set")
+            .unwrap();
+        assert_eq!(
+            blank.cwd, "/from-catalog",
+            "blank recorded cwd falls back to catalog"
+        );
         assert_eq!(set.cwd, "/recorded", "non-blank recorded cwd is preferred");
     }
 
@@ -1000,12 +1027,12 @@ mod tests {
         // gone-without-transcript (prune). Confirms the three buckets are disjoint
         // and complete in a single pass.
         let rows = vec![
-            row("live1", "sess-live", "/x", 100),  // still live ⇒ skip
-            row("orph1", "sess-orph", "/y", 200),  // gone + transcript ⇒ offer
-            row("dead1", "sess-dead", "/z", 300),  // gone + no transcript ⇒ prune
+            row("live1", "sess-live", "/x", 100), // still live ⇒ skip
+            row("orph1", "sess-orph", "/y", 200), // gone + transcript ⇒ offer
+            row("dead1", "sess-dead", "/z", 300), // gone + no transcript ⇒ prune
         ];
         let cat = catalog(&[
-            ("sess-live", "live", "/x"),  // present but its row is live ⇒ unused
+            ("sess-live", "live", "/x"), // present but its row is live ⇒ unused
             ("sess-orph", "orphan", "/y"),
         ]);
         let scan = classify_orphans(rows, &live_set(&["live1"]), &cat);

@@ -366,9 +366,7 @@ impl EventFanout {
             let Ok(subs) = self.subs.lock() else {
                 return 0;
             };
-            subs.iter()
-                .map(|s| (s.id, Arc::clone(&s.writer)))
-                .collect()
+            subs.iter().map(|s| (s.id, Arc::clone(&s.writer))).collect()
         };
         // Write each frame with the registry lock released. The per-subscriber
         // mutex serializes concurrent emits to the SAME socket (no interleaving)
@@ -541,7 +539,10 @@ impl TabRegistry {
             g.active_tab_id = g.tabs.first().map(|t| t.id.clone());
         }
         g.seq += 1;
-        ReportOutcome::Accepted { seq: g.seq, removed_tab_ids }
+        ReportOutcome::Accepted {
+            seq: g.seq,
+            removed_tab_ids,
+        }
     }
 
     /// A clone of the current tab list (for tests / callers that only need tabs).
@@ -734,7 +735,11 @@ impl TabRegistry {
             .lock()
             .tabs
             .iter()
-            .filter_map(|t| t.name.strip_prefix("Workspace ").and_then(|n| n.trim().parse().ok()))
+            .filter_map(|t| {
+                t.name
+                    .strip_prefix("Workspace ")
+                    .and_then(|n| n.trim().parse().ok())
+            })
             .collect();
         let mut n = 1u32;
         while used.contains(&n) {
@@ -1120,7 +1125,10 @@ impl CaptainsRegistry {
                 // then reconciles the Cortana singleton from the live incumbent.
                 let mut captains = snap.captains;
                 Self::reconcile_on_load(&mut captains);
-                CaptainsInner { captains, seq: snap.seq }
+                CaptainsInner {
+                    captains,
+                    seq: snap.seq,
+                }
             })
             .unwrap_or_default();
         // N3: seed the persist guard from the LOADED seq, not 0, so a stale
@@ -1321,7 +1329,10 @@ impl CaptainsRegistry {
             drop(g);
             self.persist(snap);
         }
-        ClaimOutcome { record, disposition }
+        ClaimOutcome {
+            record,
+            disposition,
+        }
     }
 
     /// Claim (or re-key / rebind) an identity on the DURABLE ship/role key (item-2
@@ -1383,7 +1394,11 @@ impl CaptainsRegistry {
             // any tmux I/O.
             let probe: Option<String> = {
                 let g = self.lock();
-                match g.captains.iter().find(|c| Self::key_matches(c, role, &slug)) {
+                match g
+                    .captains
+                    .iter()
+                    .find(|c| Self::key_matches(c, role, &slug))
+                {
                     Some(h) => {
                         let same_terminal = h.terminal_id.as_deref() == Some(terminal_id);
                         if same_terminal || Self::uuid_matches(h, claude_uuid) {
@@ -1504,8 +1519,7 @@ impl CaptainsRegistry {
                         match incumbent_dead {
                             Some(true) => ClaimDisposition::AutoReleasedDead,
                             Some(false) => {
-                                let other =
-                                    g.captains[i].terminal_id.clone().unwrap_or_default();
+                                let other = g.captains[i].terminal_id.clone().unwrap_or_default();
                                 return Err(format!(
                                     "claim_captain: ship '{slug}' is already captained by a \
                                      LIVE session '{other}' (release_captain it first - one \
@@ -1631,7 +1645,11 @@ impl CaptainsRegistry {
         else {
             return false;
         };
-        if let Some(existing) = c.crew.iter_mut().find(|cr| cr.terminal_id == crew_session_id) {
+        if let Some(existing) = c
+            .crew
+            .iter_mut()
+            .find(|cr| cr.terminal_id == crew_session_id)
+        {
             if matches!(existing.state, CrewState::Active) {
                 return false;
             }
@@ -1686,16 +1704,21 @@ impl CaptainsRegistry {
     /// worker is gone). `None` if the tile belongs to no ship.
     pub fn ship_of(&self, tile: &str) -> Option<ShipMembership> {
         let g = self.lock();
-        if let Some(c) = g.captains.iter().find(|c| c.terminal_id.as_deref() == Some(tile)) {
+        if let Some(c) = g
+            .captains
+            .iter()
+            .find(|c| c.terminal_id.as_deref() == Some(tile))
+        {
             return Some(ShipMembership::Supervisor {
                 ship_slug: c.ship_slug.clone(),
                 role: c.role,
             });
         }
         for c in g.captains.iter() {
-            if c.crew.iter().any(|cr| {
-                cr.terminal_id == tile && !matches!(cr.state, CrewState::Removed { .. })
-            }) {
+            if c.crew
+                .iter()
+                .any(|cr| cr.terminal_id == tile && !matches!(cr.state, CrewState::Removed { .. }))
+            {
                 return Some(ShipMembership::Crew {
                     ship_slug: c.ship_slug.clone(),
                 });
@@ -2002,7 +2025,9 @@ impl RequestCache {
                 // Capacity bound: evict the oldest COMPLETED entries (never an
                 // in-flight reservation) until back under the cap.
                 while inner.order.len() > self.capacity {
-                    let Some(oldest) = inner.order.front().cloned() else { break };
+                    let Some(oldest) = inner.order.front().cloned() else {
+                        break;
+                    };
                     match inner.slots.get(&oldest) {
                         Some(RequestSlot::Done { .. }) | None => {
                             inner.order.pop_front();
@@ -2346,7 +2371,10 @@ fn load_or_rotate_key_with(path: &Path, force: bool, max_age_secs: u64) -> Strin
         .as_deref()
         .and_then(crate::secret_seal::unseal_str)
         .filter(|k| !k.is_empty());
-    let raw_is_sealed = raw.as_deref().map(crate::secret_seal::is_sealed).unwrap_or(false);
+    let raw_is_sealed = raw
+        .as_deref()
+        .map(crate::secret_seal::is_sealed)
+        .unwrap_or(false);
     // MED-1 mitigation: age-based rotation only fires once the key is ALREADY in item-3's
     // sealed form. On the Windows host a PRE-ITEM-3 key is unsealed, so the FIRST item-3
     // restart ADOPTS it (keeps the value + seals it, resetting the rotation clock) rather
@@ -2445,7 +2473,11 @@ fn phase3_harden_enabled() -> bool {
 /// back to the control token even when hardening is ON, so a context that never
 /// minted a read token (e.g. a bare probe server) is never locked out. Pure so it
 /// is directly unit-testable.
-fn select_published_token<'a>(control_token: &'a str, read_token: &'a str, harden: bool) -> &'a str {
+fn select_published_token<'a>(
+    control_token: &'a str,
+    read_token: &'a str,
+    harden: bool,
+) -> &'a str {
     if harden && !read_token.is_empty() {
         read_token
     } else {
@@ -2954,7 +2986,10 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
     // that connects but never sends — or stalls mid-line — closes itself rather
     // than parking this thread forever. CLEARED below when the connection becomes
     // a long-lived event/PTY stream (those block on reads for minutes by design).
-    reader.get_ref().set_read_timeout(Some(ctx.idle_timeout)).ok();
+    reader
+        .get_ref()
+        .set_read_timeout(Some(ctx.idle_timeout))
+        .ok();
     // Set once this connection joins the event-subscription registry; used to
     // prune it from the fanout on clean disconnect (loop EOF below).
     let mut subscriber_id: Option<u64> = None;
@@ -3089,7 +3124,11 @@ fn serve_pty_attach(
     reader: &mut BufReader<TcpStream>,
     args: &Value,
 ) -> std::io::Result<()> {
-    let framing = if args.get("binary").and_then(|v| v.as_bool()).unwrap_or(false) {
+    let framing = if args
+        .get("binary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         pty::PtyFraming::V2Binary
     } else {
         pty::PtyFraming::V1Json
@@ -3098,7 +3137,11 @@ fn serve_pty_attach(
     let session_id = match arg_str(args, "sessionId").or_else(|| arg_str(args, "session_id")) {
         Some(s) => s,
         None => {
-            return send_attach_error(writer, framing, "attach_pty requires a 'sessionId' argument");
+            return send_attach_error(
+                writer,
+                framing,
+                "attach_pty requires a 'sessionId' argument",
+            );
         }
     };
     let tmux_session = tmux_target(&session_id);
@@ -3125,7 +3168,9 @@ fn serve_pty_attach(
     // Bound every write on this connection (seed, output firehose, exit frame):
     // SO_SNDTIMEO lives on the underlying socket, shared by every clone, so this
     // one call covers the sink the forwarder thread writes too.
-    writer.set_write_timeout(Some(ctx.attach_write_timeout)).ok();
+    writer
+        .set_write_timeout(Some(ctx.attach_write_timeout))
+        .ok();
 
     // De-conflation (spawn-wedge): only a DEFINITIVE `Gone` is "no longer exists";
     // an `Unknown` probe (timed out / failed to spawn) is the degraded-control-plane
@@ -3169,9 +3214,10 @@ fn serve_pty_attach(
     // v2: a binary SCROLLBACK frame carrying the raw capture bytes.
     let scrollback = tmux::capture_pane(&tmux_session).unwrap_or_default();
     match framing {
-        pty::PtyFraming::V1Json => {
-            write_json_line(writer, &json!({ "scrollback": STANDARD.encode(&scrollback) }))?
-        }
+        pty::PtyFraming::V1Json => write_json_line(
+            writer,
+            &json!({ "scrollback": STANDARD.encode(&scrollback) }),
+        )?,
         pty::PtyFraming::V2Binary => {
             pty::write_bin_frame(writer, pty::binframe::SCROLLBACK, &scrollback)?
         }
@@ -3261,8 +3307,14 @@ fn read_pty_input_v1(
                 let _ = handle.write(&bytes);
             }
         } else if let Some(rz) = frame.get("resize") {
-            let c = rz.get("cols").and_then(|v| v.as_u64()).unwrap_or(cols as u64) as u16;
-            let r = rz.get("rows").and_then(|v| v.as_u64()).unwrap_or(rows as u64) as u16;
+            let c = rz
+                .get("cols")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(cols as u64) as u16;
+            let r = rz
+                .get("rows")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(rows as u64) as u16;
             let _ = handle.resize(c, r);
         }
     }
@@ -3336,9 +3388,8 @@ fn write_json_line(writer: &mut TcpStream, frame: &Value) -> std::io::Result<()>
 /// peer that stays unwritable for the whole deadline is abandoned (its handler
 /// thread then exits and frees its ACTIVE_CONNS slot rather than parking forever).
 fn write_response(writer: &mut TcpStream, resp: &ControlResponse) -> std::io::Result<()> {
-    let mut body = serde_json::to_vec(resp).unwrap_or_else(|_| {
-        br#"{"ok":false,"error":"failed to serialize response"}"#.to_vec()
-    });
+    let mut body = serde_json::to_vec(resp)
+        .unwrap_or_else(|_| br#"{"ok":false,"error":"failed to serialize response"}"#.to_vec());
     body.push(b'\n');
     write_all_eagain_robust(writer, &body)?;
     // A flush can itself hit WouldBlock on a backpressured socket; treat that as
@@ -3904,7 +3955,10 @@ fn spawn_env_with_identity(
     ctx: &ControlContext,
     args: &Value,
     command: &str,
-) -> (Vec<(String, String)>, Option<crate::identity::SessionIdentity>) {
+) -> (
+    Vec<(String, String)>,
+    Option<crate::identity::SessionIdentity>,
+) {
     let mut env = elevation_env(ctx, args);
     if env.is_empty() {
         // No addr => headless; do not mint (there is no channel for the session to
@@ -3981,7 +4035,11 @@ fn is_kill_key(k: &str) -> bool {
 /// concurrent-session cap + spawn rate; `close_terminal` and kill-style `send_keys`
 /// by the destructive throttle; `send_text` and benign `send_keys` are not
 /// throttled (only audited).
-fn governor_gate(ctx: &ControlContext, command: &str, args: &Value) -> Result<(), crate::governor::Refusal> {
+fn governor_gate(
+    ctx: &ControlContext,
+    command: &str,
+    args: &Value,
+) -> Result<(), crate::governor::Refusal> {
     let now = std::time::Instant::now();
     match command {
         "spawn_terminal" => ctx.governor.check_spawn(live_session_count(), now),
@@ -4018,7 +4076,11 @@ fn audit_command(
         decision,
         &req.args,
         AuditMeta {
-            peer: if ctx.peer_is_loopback { "loopback" } else { "remote" },
+            peer: if ctx.peer_is_loopback {
+                "loopback"
+            } else {
+                "remote"
+            },
             // Phase 2: the capability the presented token resolved to.
             token_tier: cap.tier_label(),
             session,
@@ -4062,9 +4124,7 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     let inbox_self_ack = req.command == "inbox_ack"
         && caller
             .as_ref()
-            .zip(
-                arg_str(&req.args, "sessionId").or_else(|| arg_str(&req.args, "session_id")),
-            )
+            .zip(arg_str(&req.args, "sessionId").or_else(|| arg_str(&req.args, "session_id")))
             .map(|(id, recipient)| id.tile.as_deref() == Some(recipient.as_str()))
             .unwrap_or(false);
 
@@ -4607,7 +4667,8 @@ fn dispatch_with_caller(
 /// the in-memory Live/Detached refinement (the control channel does not own the
 /// UI's PTY map; everything tmux reports is a live tmux session).
 fn list_terminals() -> Result<Value, String> {
-    let sessions = tmux::list_sessions().map_err(|e| format!("failed to list tmux sessions: {e}"))?;
+    let sessions =
+        tmux::list_sessions().map_err(|e| format!("failed to list tmux sessions: {e}"))?;
     // Correlate each session with its pane's live cwd (the same `pane_info`
     // source `commands::list_terminals` uses) so socket clients can map
     // sessions to filesystem paths - `th worktree ls/prune` lease detection
@@ -5158,7 +5219,10 @@ fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, St
         .or_else(|| args.get("base_seq"))
         .and_then(|v| v.as_u64());
     match ctx.tabs.report(tabs, active, base_seq) {
-        ReportOutcome::Accepted { seq, removed_tab_ids } => {
+        ReportOutcome::Accepted {
+            seq,
+            removed_tab_ids,
+        } => {
             // Captain-chat phase 2: a normally-closed tab (the primary UI path)
             // must leave every captain's workspaceTabIds too - prune, and forward
             // a captains snapshot when anything changed so the UI/native cockpit
@@ -5254,9 +5318,7 @@ fn inbox_ack(
 /// `sessionId` it returns that recipient's depth snapshot; without one, every
 /// recipient's. Counts + cursors + oldest-un-drained age only, never message content.
 fn inbox_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    if let Some(recipient) =
-        arg_str(args, "sessionId").or_else(|| arg_str(args, "session_id"))
-    {
+    if let Some(recipient) = arg_str(args, "sessionId").or_else(|| arg_str(args, "session_id")) {
         Ok(json!({ "recipient": ctx.inbox.depth(&recipient) }))
     } else {
         Ok(json!({ "recipients": ctx.inbox.depth_all() }))
@@ -5352,7 +5414,10 @@ fn plane_send(
     }
 
     let sender = caller_sender_label(caller);
-    match ctx.inbox.enqueue(&recipient, &sender, priority, &body, enter) {
+    match ctx
+        .inbox
+        .enqueue(&recipient, &sender, priority, &body, enter)
+    {
         Ok(outcome) => Ok(json!({
             "accepted": "plane_send",
             "recipient": recipient,
@@ -5403,7 +5468,12 @@ fn abort_session(
     // driving the app); allowed. (The coarse ProcessChanging tier already required Full.)
 
     let target = tmux_target(&session_id);
-    writer_liveness_gate("abort_session", &session_id, &target, tmux::session_liveness(&target))?;
+    writer_liveness_gate(
+        "abort_session",
+        &session_id,
+        &target,
+        tmux::session_liveness(&target),
+    )?;
     // Escape interrupts the current turn (claude's in-turn interrupt) WITHOUT killing the
     // session or its in-flight state - the C4-safe abort the design calls for.
     tmux::send_keys(&target, &["Escape"])
@@ -5812,9 +5882,10 @@ fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     });
     match &ctx.apply_sink {
         Some(sink) => {
-            sink.apply("remove_worktree_workspace", &forward).map_err(|e| {
-                format!("remove_worktree: failed to forward removal to the UI: {e}")
-            })?;
+            sink.apply("remove_worktree_workspace", &forward)
+                .map_err(|e| {
+                    format!("remove_worktree: failed to forward removal to the UI: {e}")
+                })?;
             // T12: a native cockpit attached to this same server detaches its
             // own tiles rooted in the worktree in parallel; the detach->git
             // ordering and the git removal itself stay webview-owned. (With no
@@ -5911,8 +5982,10 @@ fn list_worktrees(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
 /// many subscribers received it. Zero subscribers is a cheap no-op, so this runs
 /// unconditionally next to every [`ApplySink`] forward.
 fn broadcast_apply(ctx: &ControlContext, command: &str, args: &Value) -> usize {
-    ctx.fanout
-        .emit_event(APPLY_EVENT_CHANNEL, &json!({ "command": command, "args": args }))
+    ctx.fanout.emit_event(
+        APPLY_EVENT_CHANNEL,
+        &json!({ "command": command, "args": args }),
+    )
 }
 
 /// Forward one command + args to the frontend through the [`ApplySink`], returning
@@ -6003,8 +6076,7 @@ fn new_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         .unwrap_or_else(|| ctx.tabs.auto_name());
     let id = uuid::Uuid::new_v4().to_string();
     ctx.tabs.insert_tab(&id, &name);
-    let mut res =
-        organization_sync_apply(ctx, "new_tab", json!({ "id": id, "name": name }))?;
+    let mut res = organization_sync_apply(ctx, "new_tab", json!({ "id": id, "name": name }))?;
     res["tabId"] = json!(id);
     res["name"] = json!(name);
     Ok(res)
@@ -6035,11 +6107,8 @@ fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     if ctx.captains.prune_tab(&tab_id) {
         let _ = captains_sync_apply(ctx);
     }
-    let mut res = organization_sync_apply(
-        ctx,
-        "close_tab",
-        json!({ "tabId": tab_id, "force": force }),
-    )?;
+    let mut res =
+        organization_sync_apply(ctx, "close_tab", json!({ "tabId": tab_id, "force": force }))?;
     res["tabId"] = json!(tab_id);
     res["orphanedTileIds"] = json!(orphaned);
     Ok(res)
@@ -6444,7 +6513,10 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // existing tab or mints one (created hidden; the user's active tab is NOT
     // switched), and neither means the UI's active tab per the registry mirror.
     let tab_name = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name"));
-    let tab_id = match (arg_str(args, "tabId").or_else(|| arg_str(args, "tab_id")), &tab_name) {
+    let tab_id = match (
+        arg_str(args, "tabId").or_else(|| arg_str(args, "tab_id")),
+        &tab_name,
+    ) {
         (Some(id), _) => {
             if !ctx.tabs.has_tab(&id) {
                 return Err(format!("spawn_terminal: unknown tabId '{id}'"));
@@ -6675,9 +6747,9 @@ fn writer_liveness_gate(
 ) -> Result<(), String> {
     match liveness {
         tmux::SessionLiveness::Alive => Ok(()),
-        tmux::SessionLiveness::Gone => {
-            Err(format!("{command}: no such session '{session_id}' (target {target})"))
-        }
+        tmux::SessionLiveness::Gone => Err(format!(
+            "{command}: no such session '{session_id}' (target {target})"
+        )),
         tmux::SessionLiveness::Unknown => Err(retryable_error(format!(
             "{command}: liveness probe for '{session_id}' (target {target}) timed out; \
              session NOT confirmed gone — retry (the control plane is degraded, not the session)"
@@ -6692,7 +6764,12 @@ fn send_text(args: &Value) -> Result<Value, String> {
     let text = arg_str(args, "text").ok_or("send_text requires a 'text' argument")?;
     let enter = args.get("enter").and_then(|v| v.as_bool()).unwrap_or(true);
     let target = tmux_target(&session_id);
-    writer_liveness_gate("send_text", &session_id, &target, tmux::session_liveness(&target))?;
+    writer_liveness_gate(
+        "send_text",
+        &session_id,
+        &target,
+        tmux::session_liveness(&target),
+    )?;
     tmux::send_text(&target, &text, enter)
         .map_err(|e| format!("failed to send text to '{session_id}': {e}"))?;
     Ok(json!({
@@ -6725,7 +6802,12 @@ fn send_keys(args: &Value) -> Result<Value, String> {
         return Err("send_keys requires a non-empty 'keys' array of tmux key names".into());
     }
     let target = tmux_target(&session_id);
-    writer_liveness_gate("send_keys", &session_id, &target, tmux::session_liveness(&target))?;
+    writer_liveness_gate(
+        "send_keys",
+        &session_id,
+        &target,
+        tmux::session_liveness(&target),
+    )?;
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     tmux::send_keys(&target, &key_refs)
         .map_err(|e| format!("failed to send keys to '{session_id}': {e}"))?;
@@ -6936,7 +7018,9 @@ fn tmux_target(session_id: &str) -> String {
 
 /// Pull a string field out of a JSON args object.
 fn arg_str(args: &Value, key: &str) -> Option<String> {
-    args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Collect a `HostMetrics`-shaped snapshot from the local system. On Linux/WSL
@@ -7341,11 +7425,12 @@ mod tests {
         let ctx = test_ctx("t");
         // No live tmux for this id -> the arm is refused so a bogus id can't arm a
         // watch that could never deliver.
-        let err = watch_fleet(&ctx, &json!({ "orchestratorSessionId": "nolivetile" }))
-            .unwrap_err();
+        let err = watch_fleet(&ctx, &json!({ "orchestratorSessionId": "nolivetile" })).unwrap_err();
         assert!(err.contains("no live terminal"), "got: {err}");
         // And it requires the id at all.
-        assert!(watch_fleet(&ctx, &json!({})).unwrap_err().contains("orchestratorSessionId"));
+        assert!(watch_fleet(&ctx, &json!({}))
+            .unwrap_err()
+            .contains("orchestratorSessionId"));
     }
 
     #[test]
@@ -7370,7 +7455,10 @@ mod tests {
         let removed = unwatch_fleet(&ctx, &json!({ "orchestratorSessionId": "orc12345" })).unwrap();
         assert_eq!(removed.get("removed").and_then(|x| x.as_bool()), Some(true));
         assert_eq!(
-            list_fleet_watches(&ctx).unwrap().get("count").and_then(|x| x.as_u64()),
+            list_fleet_watches(&ctx)
+                .unwrap()
+                .get("count")
+                .and_then(|x| x.as_u64()),
             Some(0)
         );
     }
@@ -7416,7 +7504,10 @@ mod tests {
         );
         assert_eq!(v.get("cpu_count").and_then(|x| x.as_u64()), Some(12));
         assert_eq!(v.get("process_count").and_then(|x| x.as_u64()), Some(432));
-        assert_eq!(v.get("distro").and_then(|x| x.as_str()), Some("Ubuntu 24.04"));
+        assert_eq!(
+            v.get("distro").and_then(|x| x.as_str()),
+            Some("Ubuntu 24.04")
+        );
         assert!(
             v.get("memTotalKib").is_none(),
             "must be snake_case, not the camelCase wsl_health shape"
@@ -7478,15 +7569,25 @@ mod tests {
         .unwrap();
         assert_eq!(v["accepted"], "spawn_terminal");
         assert_eq!(v["audited"], true);
-        let id = v["id"].as_str().expect("real id returned synchronously").to_string();
+        let id = v["id"]
+            .as_str()
+            .expect("real id returned synchronously")
+            .to_string();
         assert_eq!(v["placed"], true);
         let tab_id = v["tabId"].as_str().unwrap().to_string();
-        assert_ne!(tab_id, "tab-1", "a NEW hidden tab is minted for the new name");
+        assert_ne!(
+            tab_id, "tab-1",
+            "a NEW hidden tab is minted for the new name"
+        );
 
         // The registry (authoritative) holds the placement, and the active tab
         // was NOT touched (no focus steal).
         let snap = ctx.tab_registry().snapshot_full();
-        let tab = snap.tabs.iter().find(|t| t.id == tab_id).expect("tab minted");
+        let tab = snap
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .expect("tab minted");
         assert_eq!(tab.name, "hidden-ops");
         assert_eq!(tab.tile_ids, vec![id.clone()]);
         assert_eq!(snap.active_tab_id, None);
@@ -7593,8 +7694,12 @@ mod tests {
     #[test]
     fn wait_for_status_requires_session_and_target() {
         let ctx = test_ctx("t");
-        let err = dispatch(&ctx, "wait_for_status", &json!({"targetStatus": "completed"}))
-            .unwrap_err();
+        let err = dispatch(
+            &ctx,
+            "wait_for_status",
+            &json!({"targetStatus": "completed"}),
+        )
+        .unwrap_err();
         assert!(err.contains("sessionId"), "got: {err}");
         let err = dispatch(&ctx, "wait_for_status", &json!({"sessionId": "x"})).unwrap_err();
         assert!(err.contains("targetStatus"), "got: {err}");
@@ -7682,8 +7787,7 @@ mod tests {
             "a live session must proceed"
         );
         // Gone is a definitive "no such session".
-        let gone =
-            writer_liveness_gate("send_text", "e05764f5", "th_e05764f5", Gone).unwrap_err();
+        let gone = writer_liveness_gate("send_text", "e05764f5", "th_e05764f5", Gone).unwrap_err();
         assert!(
             gone.contains("no such session"),
             "a completed-absent probe is 'no such session'; got: {gone}"
@@ -7715,11 +7819,17 @@ mod tests {
         // Default (no force): Alive/Gone reap normally; Unknown is a retryable refusal.
         assert!(matches!(
             plan_close(false, Alive, None),
-            ClosePlan::Kill { existed: true, forced: false }
+            ClosePlan::Kill {
+                existed: true,
+                forced: false
+            }
         ));
         assert!(matches!(
             plan_close(false, Gone, None),
-            ClosePlan::Kill { existed: false, forced: false }
+            ClosePlan::Kill {
+                existed: false,
+                forced: false
+            }
         ));
         assert!(matches!(
             plan_close(false, Unknown, None),
@@ -7734,7 +7844,10 @@ mod tests {
         // force + Unknown, re-probe GONE => clean reap (now confirmed dead).
         assert!(matches!(
             plan_close(true, Unknown, Some(Gone)),
-            ClosePlan::Kill { existed: false, forced: false }
+            ClosePlan::Kill {
+                existed: false,
+                forced: false
+            }
         ));
         // force + Unknown, re-probe STILL Unknown => forced reap: a still-unreachable
         // session stays reapable (the whole point of the escape). Under a sustained
@@ -7742,7 +7855,10 @@ mod tests {
         // an explicit reap-during-wedge override.
         assert!(matches!(
             plan_close(true, Unknown, Some(Unknown)),
-            ClosePlan::Kill { existed: false, forced: true }
+            ClosePlan::Kill {
+                existed: false,
+                forced: true
+            }
         ));
     }
 
@@ -7762,7 +7878,10 @@ mod tests {
             writer_liveness_gate("send_text", "e05764f5", "th_e05764f5", Unknown).unwrap_err();
         let resp = ControlResponse::err(gate_err);
         assert!(!resp.ok);
-        assert!(resp.retryable, "an Unknown-arm error must be structurally retryable");
+        assert!(
+            resp.retryable,
+            "an Unknown-arm error must be structurally retryable"
+        );
         let text = resp.error.as_deref().unwrap_or("");
         assert!(
             !text.contains(RETRYABLE_ERROR_MARKER),
@@ -7844,7 +7963,10 @@ mod tests {
         );
         // The note must not falsely imply confirmed completion.
         let note = v["note"].as_str().unwrap();
-        assert!(note.contains("not confirmed") || note.contains("NOT confirmed"), "got: {note}");
+        assert!(
+            note.contains("not confirmed") || note.contains("NOT confirmed"),
+            "got: {note}"
+        );
 
         // The removal was actually forwarded to the UI with the args.
         let calls = sink.calls.lock().unwrap();
@@ -7880,10 +8002,7 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        let base = std::env::temp_dir().join(format!(
-            "t-hub-tb-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let base = std::env::temp_dir().join(format!("t-hub-tb-{}", uuid::Uuid::new_v4().simple()));
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
         sh_git(&repo, &["init", "-q"]);
@@ -7891,7 +8010,15 @@ mod tests {
         sh_git(&repo, &["add", "."]);
         sh_git(
             &repo,
-            &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
         );
         let wt = base.join("wt");
         sh_git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
@@ -7987,7 +8114,10 @@ mod tests {
         // session or the scratch dir.
         dispatch(&ctx, "close_terminal", &json!({"sessionId": terminal_id})).ok();
         std::fs::remove_dir_all(&base).ok();
-        assert!(ran, "the worktree terminal must have run the startupCommand");
+        assert!(
+            ran,
+            "the worktree terminal must have run the startupCommand"
+        );
     }
 
     #[test]
@@ -8014,7 +8144,10 @@ mod tests {
         assert_eq!(frame["payload"]["sessionId"], "no-such-session");
         // Byte length only - the marker must NOT leak the payload content.
         assert_eq!(frame["payload"]["bytes"], 5);
-        assert!(frame["payload"].get("text").is_none(), "must not leak text: {frame}");
+        assert!(
+            frame["payload"].get("text").is_none(),
+            "must not leak text: {frame}"
+        );
     }
 
     #[test]
@@ -8043,15 +8176,24 @@ mod tests {
     fn list_worktrees_lists_main_then_linked() {
         let (base, repo, wt) = scratch_repo_with_worktree();
         let ctx = test_ctx("t");
-        let v = dispatch(&ctx, "list_worktrees", &json!({"cwd": repo.to_str().unwrap()})).unwrap();
+        let v = dispatch(
+            &ctx,
+            "list_worktrees",
+            &json!({"cwd": repo.to_str().unwrap()}),
+        )
+        .unwrap();
         let list = v["worktrees"].as_array().expect("worktrees array");
         assert_eq!(list.len(), 2, "main + linked: {list:?}");
         assert_eq!(list[0]["isLinked"], false);
         assert_eq!(list[1]["isLinked"], true);
         assert_eq!(list[1]["path"], json!(wt.to_str().unwrap()));
         // The IPC-twin alias resolves to the same handler.
-        let v2 =
-            dispatch(&ctx, "git_worktree_list", &json!({"cwd": repo.to_str().unwrap()})).unwrap();
+        let v2 = dispatch(
+            &ctx,
+            "git_worktree_list",
+            &json!({"cwd": repo.to_str().unwrap()}),
+        )
+        .unwrap();
         assert_eq!(v2["worktrees"], v["worktrees"]);
         std::fs::remove_dir_all(&base).ok();
     }
@@ -8130,7 +8272,10 @@ mod tests {
         }
         // git_info probes git at a peer-controlled cwd — same allowlist gate.
         let err = dispatch(&ctx, "git_info", &json!({"path": "/home/x/whatever"})).unwrap_err();
-        assert!(err.contains("disabled"), "git_info should be gated; got: {err}");
+        assert!(
+            err.contains("disabled"),
+            "git_info should be gated; got: {err}"
+        );
     }
 
     #[test]
@@ -8235,7 +8380,12 @@ mod tests {
         let seq = v["seq"].as_u64().unwrap();
 
         // A headless move into the hidden tab bumps the revision.
-        dispatch(&ctx, "move_tile", &json!({"terminalId": "aa", "tabId": "t2"})).unwrap();
+        dispatch(
+            &ctx,
+            "move_tile",
+            &json!({"terminalId": "aa", "tabId": "t2"}),
+        )
+        .unwrap();
 
         // The UI (which never applied the move - hidden tab, suspended webview…)
         // reports its stale layout: REJECTED, answered with the snapshot.
@@ -8251,11 +8401,20 @@ mod tests {
         assert_eq!(v["stale"], true);
         let tabs = v["tabs"].as_array().unwrap();
         let t2 = tabs.iter().find(|t| t["id"] == "t2").unwrap();
-        assert_eq!(t2["tileIds"], json!(["aa"]), "the move survives the stale report");
+        assert_eq!(
+            t2["tileIds"],
+            json!(["aa"]),
+            "the move survives the stale report"
+        );
 
         // list_tabs stays truthful: the tile is in the hidden tab.
         let tabs = dispatch(&ctx, "list_tabs", &Value::Null).unwrap();
-        let t2 = tabs["tabs"].as_array().unwrap().iter().find(|t| t["id"] == "t2").unwrap();
+        let t2 = tabs["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == "t2")
+            .unwrap();
         assert_eq!(t2["tileIds"], json!(["aa"]));
 
         // A report based on the CURRENT revision is accepted (normal UI flow).
@@ -8357,7 +8516,8 @@ mod tests {
         // Empty registry -> unplaced (None), the only case a tile stays out.
         ctx.tab_registry().replace(vec![]);
         assert_eq!(
-            ctx.tab_registry().place_tile_with_fallback("tile-c", Some("x")),
+            ctx.tab_registry()
+                .place_tile_with_fallback("tile-c", Some("x")),
             None
         );
     }
@@ -8394,8 +8554,12 @@ mod tests {
                 let _ = dispatch(&ctx, "close_tab", &json!({"tabId": "doomed"}));
             })
         };
-        let v = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "doomed"}))
-            .unwrap();
+        let v = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "tabId": "doomed"}),
+        )
+        .unwrap();
         closer.join().unwrap();
 
         let id = v["id"].as_str().unwrap().to_string();
@@ -8421,9 +8585,21 @@ mod tests {
         // is a single atomic operation.
         let ctx = test_ctx("t");
         ctx.tab_registry().replace(vec![
-            TabRecord { id: "a".into(), name: "A".into(), tile_ids: vec![] },
-            TabRecord { id: "b".into(), name: "B".into(), tile_ids: vec![] },
-            TabRecord { id: "c".into(), name: "C".into(), tile_ids: vec![] },
+            TabRecord {
+                id: "a".into(),
+                name: "A".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: "b".into(),
+                name: "B".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: "c".into(),
+                name: "C".into(),
+                tile_ids: vec![],
+            },
         ]);
         assert!(ctx.tab_registry().set_active_tab("c"));
 
@@ -8453,9 +8629,21 @@ mod tests {
         // Concurrent closes from a 3-tab registry: whichever interleaving wins,
         // the surviving pointer references a live tab.
         ctx.tab_registry().replace(vec![
-            TabRecord { id: "a".into(), name: "A".into(), tile_ids: vec![] },
-            TabRecord { id: "b".into(), name: "B".into(), tile_ids: vec![] },
-            TabRecord { id: "c".into(), name: "C".into(), tile_ids: vec![] },
+            TabRecord {
+                id: "a".into(),
+                name: "A".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: "b".into(),
+                name: "B".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: "c".into(),
+                name: "C".into(),
+                tile_ids: vec![],
+            },
         ]);
         assert!(ctx.tab_registry().set_active_tab("b"));
         let t1 = {
@@ -8589,7 +8777,10 @@ mod tests {
 
         let c = dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
         assert_eq!(c["accepted"], "close_terminal");
-        assert!(!tmux::has_session(&target), "session should be gone after close");
+        assert!(
+            !tmux::has_session(&target),
+            "session should be gone after close"
+        );
     }
 
     #[test]
@@ -8714,7 +8905,10 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(resp["ok"], true, "loopback list_dir should bypass scope: {resp}");
+        assert_eq!(
+            resp["ok"], true,
+            "loopback list_dir should bypass scope: {resp}"
+        );
         // Close the client so the server's next read hits EOF and handle_conn
         // returns immediately — otherwise it would park until the idle timeout.
         drop(reader);
@@ -8840,7 +9034,10 @@ mod tests {
 
         for (cmd, args) in [
             ("focus_session", json!({"sessionId": "term-1"})),
-            ("move_tile", json!({"terminalId": "term-1", "tabId": "tab-2"})),
+            (
+                "move_tile",
+                json!({"terminalId": "term-1", "tabId": "tab-2"}),
+            ),
             ("rename_tab", json!({"tabId": "tab-2", "name": "Ops"})),
         ] {
             let v = dispatch(&ctx, cmd, &args).unwrap();
@@ -9023,10 +9220,21 @@ mod tests {
         assert_eq!(frame["payload"]["args"]["worktreePath"], "/r/wt");
 
         // The sink saw every forward, unchanged by the broadcast riding along.
-        let names: Vec<String> = sink.calls.lock().unwrap().iter().map(|(c, _)| c.clone()).collect();
+        let names: Vec<String> = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect();
         assert_eq!(
             names,
-            ["focus_tab", "new_tab", "spawn_terminal", "remove_worktree_workspace"]
+            [
+                "focus_tab",
+                "new_tab",
+                "spawn_terminal",
+                "remove_worktree_workspace"
+            ]
         );
 
         // Reap the real session the spawn created.
@@ -9047,7 +9255,10 @@ mod tests {
         let mut reader = subscribe_test_reader(&fanout);
 
         let v = dispatch(&ctx, "rename_tab", &json!({"tabId": "x", "name": "ops"})).unwrap();
-        assert_eq!(v["applied"], true, "subscriber delivery counts without a sink");
+        assert_eq!(
+            v["applied"], true,
+            "subscriber delivery counts without a sink"
+        );
         let frame = read_event_frame(&mut reader);
         assert_eq!(frame["payload"]["command"], "rename_tab");
         // (Sink-less AND subscriber-less stays applied:false - covered by
@@ -9083,8 +9294,12 @@ mod tests {
         // Malformed shapes are a clear error, not a partial replace.
         let err = dispatch(&ctx, "report_workspace_tabs", &json!({})).unwrap_err();
         assert!(err.contains("requires a 'tabs'"), "got: {err}");
-        let err =
-            dispatch(&ctx, "report_workspace_tabs", &json!({"tabs": [{"name": 7}]})).unwrap_err();
+        let err = dispatch(
+            &ctx,
+            "report_workspace_tabs",
+            &json!({"tabs": [{"name": 7}]}),
+        )
+        .unwrap_err();
         assert!(err.contains("bad 'tabs' shape"), "got: {err}");
     }
 
@@ -9122,7 +9337,12 @@ mod tests {
         std::fs::write(&file, "# Title\n\nbody").unwrap();
 
         let ctx = test_ctx("t");
-        let v = dispatch(&ctx, "open_file", &json!({ "path": file.to_string_lossy() })).unwrap();
+        let v = dispatch(
+            &ctx,
+            "open_file",
+            &json!({ "path": file.to_string_lossy() }),
+        )
+        .unwrap();
         assert_eq!(v["ext"], "md");
         assert!(v["text"].as_str().unwrap().contains("# Title"));
 
@@ -9169,7 +9389,9 @@ mod tests {
         assert!(is_allowed_peer(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         // Tailscale CGNAT 100.64.0.0/10 (IPv4).
         assert!(is_allowed_peer(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
-        assert!(is_allowed_peer(IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254))));
+        assert!(is_allowed_peer(IpAddr::V4(Ipv4Addr::new(
+            100, 127, 255, 254
+        ))));
         // Tailscale ULA fd7a:115c::/32 (IPv6).
         assert!(is_allowed_peer(IpAddr::V6(Ipv6Addr::new(
             0xfd7a, 0x115c, 0, 0, 0, 0, 0, 1
@@ -9207,8 +9429,14 @@ mod tests {
         assert_eq!(back.protocol_version, PROTOCOL_VERSION);
         // `local_control_token` is in-process-only: it is NEVER serialized, so it
         // does not survive the JSON round-trip and comes back empty (its default).
-        assert!(!s.contains("local_control_token"), "field must not serialize");
-        assert!(!s.contains("full"), "in-process token must not appear in JSON");
+        assert!(
+            !s.contains("local_control_token"),
+            "field must not serialize"
+        );
+        assert!(
+            !s.contains("full"),
+            "in-process token must not appear in JSON"
+        );
         assert_eq!(back.local_control_token, "");
     }
 
@@ -9265,14 +9493,13 @@ mod tests {
             Ok(s) => s,
             Err(_) => return false,
         };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .ok();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
         let mut writer = match stream.try_clone() {
             Ok(w) => w,
             Err(_) => return false,
         };
-        let req = json!({"token": "secret", "command": "get_theme", "args": {}, "v": 1}).to_string();
+        let req =
+            json!({"token": "secret", "command": "get_theme", "args": {}, "v": 1}).to_string();
         if writeln!(writer, "{req}").is_err() {
             return false;
         }
@@ -9349,7 +9576,11 @@ mod tests {
             json!("read-secret"),
             "the published token must be the KEPT read token (harden default-ON), not rotated"
         );
-        assert_ne!(written["token"], json!("secret"), "the full token must NOT reach disk");
+        assert_ne!(
+            written["token"],
+            json!("secret"),
+            "the full token must NOT reach disk"
+        );
 
         // The NEW listener serves; the OLD one is retired (stops accepting).
         assert!(
@@ -9470,9 +9701,11 @@ mod tests {
     #[test]
     fn attach_path_survives_abrupt_client_churn() {
         let _serial = attach_serial_guard();
-        eventually("forwarder table to drain before the test", Duration::from_secs(10), || {
-            attach_forwarder_count() == 0
-        });
+        eventually(
+            "forwarder table to drain before the test",
+            Duration::from_secs(10),
+            || attach_forwarder_count() == 0,
+        );
 
         let mut ctx = test_ctx("churn-secret");
         ctx.idle_timeout = Duration::from_millis(500);
@@ -9513,7 +9746,10 @@ mod tests {
             send_attach_request(&mut w, "churn-secret", &id);
             let mut reader = BufReader::new(s);
             let seed = read_json_frame(&mut reader);
-            assert!(seed.get("scrollback").is_some(), "expected a seed, got {seed}");
+            assert!(
+                seed.get("scrollback").is_some(),
+                "expected a seed, got {seed}"
+            );
             socket2::SockRef::from(reader.get_ref())
                 .set_linger(Some(Duration::from_secs(0)))
                 .unwrap();
@@ -9532,12 +9768,17 @@ mod tests {
             sock.connect(&addr.into()).expect("connect wedge client");
             TcpStream::from(sock)
         };
-        wedge.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        wedge
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut wedge_writer = wedge.try_clone().unwrap();
         send_attach_request(&mut wedge_writer, "churn-secret", &id);
         let mut wedge_reader = BufReader::new(wedge);
         let seed = read_json_frame(&mut wedge_reader);
-        assert!(seed.get("scrollback").is_some(), "expected a seed, got {seed}");
+        assert!(
+            seed.get("scrollback").is_some(),
+            "expected a seed, got {seed}"
+        );
         send_write_frame(&mut wedge_writer, "yes S27-FIREHOSE | head -n 1000000\n");
         // Do NOT read, do NOT close. The server must reap the forwarder on its
         // own; every earlier case drains here too (EOF/RST paths are fast).
@@ -9550,7 +9791,9 @@ mod tests {
         // A FRESH attach must now succeed end to end - the exact operation that
         // failed for every client in the incident.
         let fresh = TcpStream::connect(addr).expect("connect fresh client");
-        fresh.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        fresh
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut fresh_writer = fresh.try_clone().unwrap();
         send_attach_request(&mut fresh_writer, "churn-secret", &id);
         let mut fresh_reader = BufReader::new(fresh);
@@ -9588,12 +9831,16 @@ mod tests {
         drop(wedge_reader);
         drop(wedge_writer);
         let _ = tmux::kill_session(&target);
-        eventually("forwarder table back to baseline", Duration::from_secs(10), || {
-            attach_forwarder_count() == 0
-        });
-        eventually("connection handlers to drain", Duration::from_secs(10), || {
-            ACTIVE_CONNS.load(Ordering::Relaxed) <= conns_baseline
-        });
+        eventually(
+            "forwarder table back to baseline",
+            Duration::from_secs(10),
+            || attach_forwarder_count() == 0,
+        );
+        eventually(
+            "connection handlers to drain",
+            Duration::from_secs(10),
+            || ACTIVE_CONNS.load(Ordering::Relaxed) <= conns_baseline,
+        );
     }
 
     /// The defensive forwarder-table bound: at the cap a new attach is refused
@@ -9602,9 +9849,11 @@ mod tests {
     #[test]
     fn attach_forwarder_cap_refuses_then_recovers() {
         let _serial = attach_serial_guard();
-        eventually("forwarder table to drain before the test", Duration::from_secs(10), || {
-            attach_forwarder_count() == 0
-        });
+        eventually(
+            "forwarder table to drain before the test",
+            Duration::from_secs(10),
+            || attach_forwarder_count() == 0,
+        );
 
         let mut ctx = test_ctx("cap-secret");
         ctx.idle_timeout = Duration::from_millis(500);
@@ -9619,16 +9868,22 @@ mod tests {
         // First attach fills the size-1 table; reading the seed proves the slot
         // is held (the guard is acquired before the seed is written).
         let first = TcpStream::connect(addr).expect("connect");
-        first.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut first_writer = first.try_clone().unwrap();
         send_attach_request(&mut first_writer, "cap-secret", &id);
         let mut first_reader = BufReader::new(first);
-        assert!(read_json_frame(&mut first_reader).get("scrollback").is_some());
+        assert!(read_json_frame(&mut first_reader)
+            .get("scrollback")
+            .is_some());
         assert_eq!(attach_forwarder_count(), 1);
 
         // Second attach: refused with an actionable error, then closed.
         let second = TcpStream::connect(addr).expect("connect");
-        second.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut second_writer = second.try_clone().unwrap();
         send_attach_request(&mut second_writer, "cap-secret", &id);
         let mut second_reader = BufReader::new(second);
@@ -9643,7 +9898,9 @@ mod tests {
         );
         let mut rest = String::new();
         assert_eq!(
-            second_reader.read_line(&mut rest).expect("read after refusal"),
+            second_reader
+                .read_line(&mut rest)
+                .expect("read after refusal"),
             0,
             "the refused connection must be closed, not parked"
         );
@@ -9651,27 +9908,35 @@ mod tests {
         // Release the slot; the table must drain without any explicit detach call.
         drop(first_reader);
         drop(first_writer);
-        eventually("slot release after client disconnect", Duration::from_secs(10), || {
-            attach_forwarder_count() == 0
-        });
+        eventually(
+            "slot release after client disconnect",
+            Duration::from_secs(10),
+            || attach_forwarder_count() == 0,
+        );
 
         // And the attach path is serviceable again.
         let third = TcpStream::connect(addr).expect("connect");
-        third.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        third
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut third_writer = third.try_clone().unwrap();
         send_attach_request(&mut third_writer, "cap-secret", &id);
         let mut third_reader = BufReader::new(third);
         assert!(
-            read_json_frame(&mut third_reader).get("scrollback").is_some(),
+            read_json_frame(&mut third_reader)
+                .get("scrollback")
+                .is_some(),
             "attach must succeed once the table drained"
         );
 
         drop(third_reader);
         drop(third_writer);
         let _ = tmux::kill_session(&target);
-        eventually("forwarder table drained at test end", Duration::from_secs(10), || {
-            attach_forwarder_count() == 0
-        });
+        eventually(
+            "forwarder table drained at test end",
+            Duration::from_secs(10),
+            || attach_forwarder_count() == 0,
+        );
     }
 
     /// THE s27 idle-leak regression: a client attached to an IDLE terminal that
@@ -9689,9 +9954,11 @@ mod tests {
     #[test]
     fn attach_reaps_idle_terminal_with_stalled_client() {
         let _serial = attach_serial_guard();
-        eventually("forwarder table to drain before the test", Duration::from_secs(10), || {
-            attach_forwarder_count() == 0
-        });
+        eventually(
+            "forwarder table to drain before the test",
+            Duration::from_secs(10),
+            || attach_forwarder_count() == 0,
+        );
 
         let mut ctx = test_ctx("idle-secret");
         ctx.idle_timeout = Duration::from_millis(500);
@@ -9719,12 +9986,17 @@ mod tests {
             sock.connect(&addr.into()).expect("connect stalled client");
             TcpStream::from(sock)
         };
-        stalled.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut stalled_writer = stalled.try_clone().unwrap();
         send_attach_request(&mut stalled_writer, "idle-secret", &id);
         let mut stalled_reader = BufReader::new(stalled);
         let seed = read_json_frame(&mut stalled_reader);
-        assert!(seed.get("scrollback").is_some(), "expected a seed, got {seed}");
+        assert!(
+            seed.get("scrollback").is_some(),
+            "expected a seed, got {seed}"
+        );
         assert_eq!(attach_forwarder_count(), 1, "forwarder up after attach");
 
         // Do NOT read, do NOT close: the client is gone but its socket lingers. The
@@ -9740,9 +10012,11 @@ mod tests {
         drop(stalled_reader);
         drop(stalled_writer);
         let _ = tmux::kill_session(&target);
-        eventually("connection handlers to drain", Duration::from_secs(10), || {
-            ACTIVE_CONNS.load(Ordering::Relaxed) <= conns_baseline
-        });
+        eventually(
+            "connection handlers to drain",
+            Duration::from_secs(10),
+            || ACTIVE_CONNS.load(Ordering::Relaxed) <= conns_baseline,
+        );
     }
 
     // ---- Captains registry (captain-chat phase 2) -------------------------
@@ -9777,7 +10051,15 @@ mod tests {
     fn claim_registers_updates_and_bumps_seq() {
         let reg = CaptainsRegistry::new();
         let out = reg
-            .claim("cap-1", Some("Ship Alpha!"), FleetRole::Captain, None, vec!["tab-1".into()], &all_alive, &crew_all_alive)
+            .claim(
+                "cap-1",
+                Some("Ship Alpha!"),
+                FleetRole::Captain,
+                None,
+                vec!["tab-1".into()],
+                &all_alive,
+                &crew_all_alive,
+            )
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::Created);
         let rec = out.record;
@@ -9793,14 +10075,26 @@ mod tests {
         // refresh, crew kept, no duplicate record.
         assert!(reg.record_crew("cap-1", "crew-1"));
         let out = reg
-            .claim("cap-1", Some("ship-beta"), FleetRole::Captain, None, vec!["tab-2".into()], &all_alive, &crew_all_alive)
+            .claim(
+                "cap-1",
+                Some("ship-beta"),
+                FleetRole::Captain,
+                None,
+                vec!["tab-2".into()],
+                &all_alive,
+                &crew_all_alive,
+            )
             .unwrap();
         let rec = out.record;
         assert_eq!(rec.ship_slug, "ship-beta");
         assert_eq!(rec.workspace_tab_ids, vec!["tab-2".to_string()]);
         assert_eq!(crew_tiles(&rec), vec!["crew-1".to_string()]);
         let snap = reg.snapshot();
-        assert_eq!(snap.captains.len(), 1, "re-designation must not duplicate the claim");
+        assert_eq!(
+            snap.captains.len(),
+            1,
+            "re-designation must not duplicate the claim"
+        );
         assert_eq!(snap.seq, 3);
     }
 
@@ -9814,9 +10108,20 @@ mod tests {
         let out = reg.claim_test("cap-1", None, vec![]).unwrap();
         assert_eq!(out.record.ship_slug, "ship-cap-1");
         let err = reg
-            .claim("cap-2", Some("ship-cap-1"), FleetRole::Captain, None, vec![], &all_alive, &crew_all_alive)
+            .claim(
+                "cap-2",
+                Some("ship-cap-1"),
+                FleetRole::Captain,
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
             .unwrap_err();
-        assert!(err.contains("already captained by a LIVE session 'cap-1'"), "got: {err}");
+        assert!(
+            err.contains("already captained by a LIVE session 'cap-1'"),
+            "got: {err}"
+        );
         // The incumbent is untouched; the refusal did not bump the revision.
         assert_eq!(only(&reg).terminal_id.as_deref(), Some("cap-1"));
         assert_eq!(reg.snapshot().seq, 1, "refusals must not bump the revision");
@@ -9831,17 +10136,34 @@ mod tests {
         // Re-keyed: `tmux::has_session == false` (the SOLE transfer-grade signal) auto-
         // releases the corpse and the new terminal takes the slug. Crew are preserved.
         let reg = CaptainsRegistry::new();
-        reg.claim_test("cap-old", Some("t-hub-app"), vec![]).unwrap();
+        reg.claim_test("cap-old", Some("t-hub-app"), vec![])
+            .unwrap();
         assert!(reg.record_crew("cap-old", "crew-1"));
         // cap-old's pane is gone; cap-new re-claims the same ship (no UUID resolved).
         let dead_is_old = |tile: &str| tile == "cap-old";
         let out = reg
-            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &dead_is_old, &crew_all_alive)
+            .claim(
+                "cap-new",
+                Some("t-hub-app"),
+                FleetRole::Captain,
+                None,
+                vec![],
+                &dead_is_old,
+                &crew_all_alive,
+            )
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::AutoReleasedDead);
         assert_eq!(out.record.terminal_id.as_deref(), Some("cap-new"));
-        assert_eq!(crew_tiles(&out.record), vec!["crew-1".to_string()], "crew followed the ship");
-        assert_eq!(reg.snapshot().captains.len(), 1, "no duplicate - the slug transferred");
+        assert_eq!(
+            crew_tiles(&out.record),
+            vec!["crew-1".to_string()],
+            "crew followed the ship"
+        );
+        assert_eq!(
+            reg.snapshot().captains.len(),
+            1,
+            "no duplicate - the slug transferred"
+        );
     }
 
     #[test]
@@ -9855,13 +10177,21 @@ mod tests {
         // REJECTED, never auto-released. The old `!has_session` conflation returned
         // `true` for a timeout and WOULD have seized the live ship - this trips it.
         let reg = CaptainsRegistry::new();
-        reg.claim_test("cap-old", Some("t-hub-app"), vec![]).unwrap();
+        reg.claim_test("cap-old", Some("t-hub-app"), vec![])
+            .unwrap();
         assert!(reg.record_crew("cap-old", "crew-1"));
         let before_seq = reg.snapshot().seq;
-        let probe_times_out =
-            |_: &str| tmux::is_definitively_gone(tmux::SessionLiveness::Unknown);
+        let probe_times_out = |_: &str| tmux::is_definitively_gone(tmux::SessionLiveness::Unknown);
         let err = reg
-            .claim("cap-new", Some("t-hub-app"), FleetRole::Captain, None, vec![], &probe_times_out, &crew_all_alive)
+            .claim(
+                "cap-new",
+                Some("t-hub-app"),
+                FleetRole::Captain,
+                None,
+                vec![],
+                &probe_times_out,
+                &crew_all_alive,
+            )
             .unwrap_err();
         assert!(
             err.contains("already captained by a LIVE session 'cap-old'"),
@@ -9884,10 +10214,26 @@ mod tests {
         // rebinds the terminal pointer WITHOUT the liveness path - even if the probe
         // would say "alive" (the old tile lingering). It must never be a competitor seize.
         let reg = CaptainsRegistry::new();
-        reg.claim("cap-old", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive, &crew_all_alive)
-            .unwrap();
+        reg.claim(
+            "cap-old",
+            Some("shipx"),
+            FleetRole::Captain,
+            Some("uuid-1"),
+            vec![],
+            &all_alive,
+            &crew_all_alive,
+        )
+        .unwrap();
         let out = reg
-            .claim("cap-new", Some("shipx"), FleetRole::Captain, Some("uuid-1"), vec![], &all_alive, &crew_all_alive)
+            .claim(
+                "cap-new",
+                Some("shipx"),
+                FleetRole::Captain,
+                Some("uuid-1"),
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::ReboundSameUuid);
         assert_eq!(out.record.terminal_id.as_deref(), Some("cap-new"));
@@ -9902,7 +10248,10 @@ mod tests {
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-old", Some("shipx"), vec![]).unwrap();
         assert!(reg.record_crew("cap-old", "crew-1"));
-        assert!(reg.remove_session("cap-old"), "captain death marks orphaned");
+        assert!(
+            reg.remove_session("cap-old"),
+            "captain death marks orphaned"
+        );
         assert!(matches!(only(&reg).state, ClaimState::Orphaned { .. }));
 
         let out = reg.claim_test("cap-new", Some("shipx"), vec![]).unwrap();
@@ -9910,7 +10259,11 @@ mod tests {
         let rec = only(&reg);
         assert_eq!(rec.state, ClaimState::Active);
         assert_eq!(rec.terminal_id.as_deref(), Some("cap-new"));
-        assert_eq!(rec.crew[0].state, CrewState::Active, "orphaned crew re-adopted");
+        assert_eq!(
+            rec.crew[0].state,
+            CrewState::Active,
+            "orphaned crew re-adopted"
+        );
     }
 
     #[test]
@@ -9926,9 +10279,15 @@ mod tests {
         for c in ["crew-alive", "crew-gone", "crew-unknown"] {
             assert!(reg.record_crew("cap-old", c));
         }
-        assert!(reg.remove_session("cap-old"), "captain death orphans the crew");
         assert!(
-            only(&reg).crew.iter().all(|c| matches!(c.state, CrewState::Orphaned { .. })),
+            reg.remove_session("cap-old"),
+            "captain death orphans the crew"
+        );
+        assert!(
+            only(&reg)
+                .crew
+                .iter()
+                .all(|c| matches!(c.state, CrewState::Orphaned { .. })),
             "all crew start Orphaned"
         );
 
@@ -9953,7 +10312,11 @@ mod tests {
         assert_eq!(out.disposition, ClaimDisposition::ReadoptedOrphan);
 
         let rec = only(&reg);
-        assert_eq!(rec.state, ClaimState::Active, "the captain itself re-activates");
+        assert_eq!(
+            rec.state,
+            ClaimState::Active,
+            "the captain itself re-activates"
+        );
         let state_of = |tile: &str| {
             rec.crew
                 .iter()
@@ -9961,7 +10324,11 @@ mod tests {
                 .map(|c| c.state.clone())
                 .unwrap()
         };
-        assert_eq!(state_of("crew-alive"), CrewState::Active, "Alive -> re-adopted");
+        assert_eq!(
+            state_of("crew-alive"),
+            CrewState::Active,
+            "Alive -> re-adopted"
+        );
         assert!(
             matches!(state_of("crew-gone"), CrewState::Removed { .. }),
             "Gone -> retired, never resurrected"
@@ -9982,10 +10349,15 @@ mod tests {
         assert!(reg.record_crew("cap-1", "crew-2"));
         assert!(reg.remove_session("cap-1"));
         let rec = only(&reg);
-        assert!(matches!(rec.state, ClaimState::Orphaned { .. }), "retained, not scrubbed");
+        assert!(
+            matches!(rec.state, ClaimState::Orphaned { .. }),
+            "retained, not scrubbed"
+        );
         assert!(rec.terminal_id.is_none(), "un-pointed");
         assert!(
-            rec.crew.iter().all(|c| matches!(c.state, CrewState::Orphaned { .. })),
+            rec.crew
+                .iter()
+                .all(|c| matches!(c.state, CrewState::Orphaned { .. })),
             "crew orphaned under the surviving ship, never dropped"
         );
     }
@@ -10003,7 +10375,10 @@ mod tests {
         assert_eq!(rec.state, ClaimState::Active, "captain still alive");
         let c1 = rec.crew.iter().find(|c| c.terminal_id == "crew-1").unwrap();
         let c2 = rec.crew.iter().find(|c| c.terminal_id == "crew-2").unwrap();
-        assert!(matches!(c1.state, CrewState::Removed { .. }), "dead crew retained as Removed");
+        assert!(
+            matches!(c1.state, CrewState::Removed { .. }),
+            "dead crew retained as Removed"
+        );
         assert_eq!(c2.state, CrewState::Active);
         // Removing an unknown session changes nothing (no revision bump).
         let seq = reg.snapshot().seq;
@@ -10015,12 +10390,21 @@ mod tests {
     fn record_crew_dedupes_and_reactivates_a_removed_ref() {
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
-        assert!(!reg.record_crew("cap-ghost", "crew-1"), "unclaimed spawner is a no-op");
+        assert!(
+            !reg.record_crew("cap-ghost", "crew-1"),
+            "unclaimed spawner is a no-op"
+        );
         assert!(reg.record_crew("cap-1", "crew-1"));
-        assert!(!reg.record_crew("cap-1", "crew-1"), "duplicate Active crew must not re-add");
+        assert!(
+            !reg.record_crew("cap-1", "crew-1"),
+            "duplicate Active crew must not re-add"
+        );
         // A reused tile id after its ref was Removed re-activates (does not duplicate).
         assert!(reg.remove_session("crew-1"));
-        assert!(reg.record_crew("cap-1", "crew-1"), "reused tile reactivates");
+        assert!(
+            reg.record_crew("cap-1", "crew-1"),
+            "reused tile reactivates"
+        );
         let rec = only(&reg);
         assert_eq!(rec.crew.len(), 1);
         assert_eq!(rec.crew[0].state, CrewState::Active);
@@ -10033,23 +10417,54 @@ mod tests {
         // (or the same session) yields the apex.
         let reg = CaptainsRegistry::new();
         let out = reg
-            .claim("cor-1", None, FleetRole::Cortana, None, vec![], &all_alive, &crew_all_alive)
+            .claim(
+                "cor-1",
+                None,
+                FleetRole::Cortana,
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
             .unwrap();
         assert_eq!(out.record.role, FleetRole::Cortana);
         assert_eq!(out.record.ship_slug, CORTANA_SLUG);
         // A different LIVE terminal cannot seize the singleton.
         let err = reg
-            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &all_alive, &crew_all_alive)
+            .claim(
+                "cor-2",
+                None,
+                FleetRole::Cortana,
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
             .unwrap_err();
         assert!(err.contains("LIVE"), "got: {err}");
         // The incumbent dying hands the apex to the resumed Cortana.
         let dead_is_1 = |t: &str| t == "cor-1";
         let out = reg
-            .claim("cor-2", None, FleetRole::Cortana, None, vec![], &dead_is_1, &crew_all_alive)
+            .claim(
+                "cor-2",
+                None,
+                FleetRole::Cortana,
+                None,
+                vec![],
+                &dead_is_1,
+                &crew_all_alive,
+            )
             .unwrap();
         assert_eq!(out.disposition, ClaimDisposition::AutoReleasedDead);
         assert_eq!(out.record.terminal_id.as_deref(), Some("cor-2"));
-        assert_eq!(reg.snapshot().captains.iter().filter(|c| c.role == FleetRole::Cortana).count(), 1);
+        assert_eq!(
+            reg.snapshot()
+                .captains
+                .iter()
+                .filter(|c| c.role == FleetRole::Cortana)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -10069,9 +10484,16 @@ mod tests {
         // A childless claim hard-removes on release.
         reg.claim_test("cap-9", Some("beta"), vec![]).unwrap();
         assert_eq!(reg.release("beta").unwrap().ship_slug, "beta");
-        assert!(reg.snapshot().captains.iter().all(|c| c.ship_slug != "beta"));
+        assert!(reg
+            .snapshot()
+            .captains
+            .iter()
+            .all(|c| c.ship_slug != "beta"));
         // Unknown target is an error, not a silent no-op.
-        assert!(reg.release("no-such").unwrap_err().contains("no claim matches"));
+        assert!(reg
+            .release("no-such")
+            .unwrap_err()
+            .contains("no claim matches"));
     }
 
     #[test]
@@ -10079,16 +10501,29 @@ mod tests {
         // Phase D: the cross-ship ownership KEY resolves for both a supervisor terminal
         // and a crew tile (item-1 Phase 3 wires the ACL on top of this).
         let reg = CaptainsRegistry::new();
-        reg.claim("cap-1", Some("shipx"), FleetRole::Captain, None, vec![], &all_alive, &crew_all_alive)
-            .unwrap();
+        reg.claim(
+            "cap-1",
+            Some("shipx"),
+            FleetRole::Captain,
+            None,
+            vec![],
+            &all_alive,
+            &crew_all_alive,
+        )
+        .unwrap();
         assert!(reg.record_crew("cap-1", "crew-1"));
         assert_eq!(
             reg.ship_of("cap-1"),
-            Some(ShipMembership::Supervisor { ship_slug: "shipx".into(), role: FleetRole::Captain })
+            Some(ShipMembership::Supervisor {
+                ship_slug: "shipx".into(),
+                role: FleetRole::Captain
+            })
         );
         assert_eq!(
             reg.ship_of("crew-1"),
-            Some(ShipMembership::Crew { ship_slug: "shipx".into() })
+            Some(ShipMembership::Crew {
+                ship_slug: "shipx".into()
+            })
         );
         assert_eq!(reg.ship_of("nobody"), None);
         // A Removed crew tile no longer resolves.
@@ -10132,25 +10567,56 @@ mod tests {
         let reg = CaptainsRegistry::load(path.clone());
         let snap = reg.snapshot();
         assert_eq!(snap.seq, 5, "seq preserved across the migration");
-        let cor = snap.captains.iter().find(|c| c.ship_slug == "cortana").unwrap();
-        assert_eq!(cor.role, FleetRole::Cortana, "legacy cortana slug seeds the singleton role");
-        assert_eq!(cor.terminal_id.as_deref(), Some("cor-x"), "captainSessionId -> terminal_id");
+        let cor = snap
+            .captains
+            .iter()
+            .find(|c| c.ship_slug == "cortana")
+            .unwrap();
+        assert_eq!(
+            cor.role,
+            FleetRole::Cortana,
+            "legacy cortana slug seeds the singleton role"
+        );
+        assert_eq!(
+            cor.terminal_id.as_deref(),
+            Some("cor-x"),
+            "captainSessionId -> terminal_id"
+        );
         assert_eq!(cor.state, ClaimState::Active);
-        assert_eq!(crew_tiles(cor), vec!["c1".to_string(), "c2".to_string()], "crew strings -> CrewRef");
+        assert_eq!(
+            crew_tiles(cor),
+            vec!["c1".to_string(), "c2".to_string()],
+            "crew strings -> CrewRef"
+        );
         assert!(cor.crew.iter().all(|c| c.state == CrewState::Active));
-        let cap = snap.captains.iter().find(|c| c.ship_slug == "t-hub-app").unwrap();
-        assert_eq!(cap.role, FleetRole::Captain, "a normal ship stays a Captain");
+        let cap = snap
+            .captains
+            .iter()
+            .find(|c| c.ship_slug == "t-hub-app")
+            .unwrap();
+        assert_eq!(
+            cap.role,
+            FleetRole::Captain,
+            "a normal ship stays a Captain"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn prune_tab_drops_the_tab_but_keeps_the_claim() {
         let reg = CaptainsRegistry::new();
-        reg.claim_test("cap-1", Some("alpha"), vec!["tab-1".into(), "tab-2".into()]).unwrap();
+        reg.claim_test("cap-1", Some("alpha"), vec!["tab-1".into(), "tab-2".into()])
+            .unwrap();
         assert!(reg.prune_tab("tab-1"));
         let snap = reg.snapshot();
-        assert_eq!(snap.captains[0].workspace_tab_ids, vec!["tab-2".to_string()]);
-        assert!(!reg.prune_tab("tab-1"), "already-pruned tab must not bump the revision");
+        assert_eq!(
+            snap.captains[0].workspace_tab_ids,
+            vec!["tab-2".to_string()]
+        );
+        assert!(
+            !reg.prune_tab("tab-1"),
+            "already-pruned tab must not bump the revision"
+        );
         assert!(reg.prune_tab("tab-2"));
         // Zero controlled tabs is a valid claim state.
         assert_eq!(reg.snapshot().captains.len(), 1);
@@ -10161,7 +10627,8 @@ mod tests {
         let path = captains_tmp("roundtrip");
         {
             let reg = CaptainsRegistry::load(path.clone());
-            reg.claim_test("cap-1", Some("alpha"), vec!["tab-1".into()]).unwrap();
+            reg.claim_test("cap-1", Some("alpha"), vec!["tab-1".into()])
+                .unwrap();
             reg.record_crew("cap-1", "crew-1");
         }
         // A fresh load (an app restart) resumes the same claims AND revision.
@@ -10209,7 +10676,9 @@ mod tests {
     #[test]
     fn list_captains_returns_the_versioned_snapshot() {
         let ctx = test_ctx("secret");
-        ctx.captains.claim_test("cap-1", Some("alpha"), vec!["tab-1".into()]).unwrap();
+        ctx.captains
+            .claim_test("cap-1", Some("alpha"), vec!["tab-1".into()])
+            .unwrap();
         let v = dispatch(&ctx, "list_captains", &json!({})).unwrap();
         assert_eq!(v["count"], 1);
         assert_eq!(v["seq"], 1);
@@ -10244,8 +10713,12 @@ mod tests {
             tile_ids: vec![],
         }]);
         // A LIVE terminal to claim (the liveness gate): spawn it into tab-1.
-        let cap_id = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
-            .unwrap()["id"]
+        let cap_id = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "tabId": "tab-1"}),
+        )
+        .unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -10260,7 +10733,12 @@ mod tests {
         assert_eq!(v["captain"]["workspaceTabIds"], json!(["tab-1"]));
         assert_eq!(v["captain"]["terminalId"], cap_id);
 
-        let v = dispatch(&ctx, "release_captain", &json!({"captainSessionId": cap_id})).unwrap();
+        let v = dispatch(
+            &ctx,
+            "release_captain",
+            &json!({"captainSessionId": cap_id}),
+        )
+        .unwrap();
         assert_eq!(v["accepted"], "release_captain");
         assert_eq!(v["released"]["terminalId"], cap_id);
         assert_eq!(v["captains"], json!([]));
@@ -10292,19 +10770,31 @@ mod tests {
             name: "Main".into(),
             tile_ids: vec![],
         }]);
-        let id1 = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
-            .unwrap()["id"]
+        let id1 = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "tabId": "tab-1"}),
+        )
+        .unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
-        let id2 = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
-            .unwrap()["id"]
+        let id2 = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "tabId": "tab-1"}),
+        )
+        .unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
 
-        dispatch(&ctx, "claim_captain", &json!({"captainSessionId": id1, "shipSlug": "alpha"}))
-            .unwrap();
+        dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({"captainSessionId": id1, "shipSlug": "alpha"}),
+        )
+        .unwrap();
         // A DIFFERENT live captain claiming the same ship is refused.
         let err = dispatch(
             &ctx,
@@ -10315,8 +10805,12 @@ mod tests {
         assert!(err.contains("already captained"), "got: {err}");
         // A claim for a DEAD/unknown session is refused by the liveness gate
         // (else it would persist and linger forever).
-        let err =
-            dispatch(&ctx, "claim_captain", &json!({"captainSessionId": "nonexistent"})).unwrap_err();
+        let err = dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({"captainSessionId": "nonexistent"}),
+        )
+        .unwrap_err();
         assert!(err.contains("no live terminal"), "got: {err}");
         let err = dispatch(&ctx, "release_captain", &json!({"shipSlug": "nope"})).unwrap_err();
         assert!(err.contains("no claim matches"), "got: {err}");
@@ -10338,8 +10832,12 @@ mod tests {
             name: "Main".into(),
             tile_ids: vec![],
         }]);
-        let id = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp", "tabId": "tab-1"}))
-            .unwrap()["id"]
+        let id = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": "/tmp", "tabId": "tab-1"}),
+        )
+        .unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -10349,7 +10847,11 @@ mod tests {
         let seq1 = v1["seq"].as_u64().unwrap();
         // An identical re-claim changes nothing: seq stays put, no second forward.
         let v2 = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": id})).unwrap();
-        assert_eq!(v2["seq"].as_u64().unwrap(), seq1, "unchanged re-claim must not bump seq");
+        assert_eq!(
+            v2["seq"].as_u64().unwrap(),
+            seq1,
+            "unchanged re-claim must not bump seq"
+        );
         assert_eq!(v2["applied"], false, "unchanged re-claim must not forward");
         let sync_count = sink
             .calls
@@ -10374,7 +10876,9 @@ mod tests {
             name: "Main".into(),
             tile_ids: vec![],
         }]);
-        ctx.captains.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
+        ctx.captains
+            .claim_test("cap-1", Some("alpha"), vec![])
+            .unwrap();
 
         // A claimed captain spawns crew: the link is recorded + synced.
         let v = dispatch(
@@ -10392,7 +10896,12 @@ mod tests {
         // Item-2 Phase B: a dead crew session is MARKED Removed (retained for
         // telemetry / reap-ship), not scrubbed (retiring the old silent-leak), and a
         // sync still forwards so every surface drops the crewmate live.
-        dispatch(&ctx, "close_terminal", &json!({"sessionId": crew_id.clone()})).unwrap();
+        dispatch(
+            &ctx,
+            "close_terminal",
+            &json!({"sessionId": crew_id.clone()}),
+        )
+        .unwrap();
         let after = ctx.captains.snapshot();
         let cr = after.captains[0]
             .crew
@@ -10407,13 +10916,24 @@ mod tests {
         let names: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
         assert_eq!(
             names,
-            ["sync_captains", "spawn_terminal", "sync_tabs", "sync_captains"]
+            [
+                "sync_captains",
+                "spawn_terminal",
+                "sync_tabs",
+                "sync_captains"
+            ]
         );
         // The crew-add forward carries the crew as a CrewRef (terminalId + state).
-        assert_eq!(calls[0].1["sync"]["captains"][0]["crew"][0]["terminalId"], crew_id);
+        assert_eq!(
+            calls[0].1["sync"]["captains"][0]["crew"][0]["terminalId"],
+            crew_id
+        );
         assert_eq!(calls[1].1["spawnedBy"], "cap-1");
         // The crew-removal forward retains the ref, now marked Removed (not scrubbed).
-        assert_eq!(calls[3].1["sync"]["captains"][0]["crew"][0]["terminalId"], crew_id);
+        assert_eq!(
+            calls[3].1["sync"]["captains"][0]["crew"][0]["terminalId"],
+            crew_id
+        );
         assert_eq!(
             calls[3].1["sync"]["captains"][0]["crew"][0]["state"]["kind"],
             "removed"
@@ -10433,7 +10953,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v["accepted"], "spawn_terminal");
-        assert_eq!(v["crewRecorded"], false, "no claim = no crew link, spawn unaffected");
+        assert_eq!(
+            v["crewRecorded"], false,
+            "no claim = no crew link, spawn unaffected"
+        );
         assert!(ctx.captains.snapshot().captains.is_empty());
         let id = v["id"].as_str().unwrap().to_string();
         dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
@@ -10447,7 +10970,9 @@ mod tests {
     #[test]
     fn close_terminal_of_a_captain_orphans_its_claim() {
         let ctx = test_ctx("t");
-        ctx.captains.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
+        ctx.captains
+            .claim_test("cap-1", Some("alpha"), vec![])
+            .unwrap();
         // Item-2 Phase B: the captain's own session dies (already-gone tmux session:
         // the kill is idempotent, so dispatch succeeds and the registry cleanup runs).
         // The claim is MARKED Orphaned + un-pointed (retained for re-adoption by a
@@ -10456,7 +10981,10 @@ mod tests {
         dispatch(&ctx, "close_terminal", &json!({"sessionId": "cap-1"})).unwrap();
         let snap = ctx.captains.snapshot();
         assert_eq!(snap.captains.len(), 1, "record retained, not scrubbed");
-        assert!(matches!(snap.captains[0].state, ClaimState::Orphaned { .. }));
+        assert!(matches!(
+            snap.captains[0].state,
+            ClaimState::Orphaned { .. }
+        ));
         assert!(snap.captains[0].terminal_id.is_none(), "un-pointed");
     }
 
@@ -10471,8 +10999,16 @@ mod tests {
         });
         let ctx = test_ctx("t").with_apply_sink(sink.clone());
         ctx.tab_registry().replace(vec![
-            TabRecord { id: "t1".into(), name: "Main".into(), tile_ids: vec![] },
-            TabRecord { id: "t2".into(), name: "Side".into(), tile_ids: vec![] },
+            TabRecord {
+                id: "t1".into(),
+                name: "Main".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: "t2".into(),
+                name: "Side".into(),
+                tile_ids: vec![],
+            },
         ]);
         ctx.captains
             .claim_test("cap-1", Some("alpha"), vec!["t1".into(), "t2".into()])
@@ -10505,8 +11041,16 @@ mod tests {
         });
         let ctx = test_ctx("t").with_apply_sink(sink.clone());
         ctx.tab_registry().replace(vec![
-            TabRecord { id: "tab-1".into(), name: "Main".into(), tile_ids: vec![] },
-            TabRecord { id: "tab-2".into(), name: "Side".into(), tile_ids: vec![] },
+            TabRecord {
+                id: "tab-1".into(),
+                name: "Main".into(),
+                tile_ids: vec![],
+            },
+            TabRecord {
+                id: "tab-2".into(),
+                name: "Side".into(),
+                tile_ids: vec![],
+            },
         ]);
         ctx.captains
             .claim_test("cap-1", Some("alpha"), vec!["tab-2".into()])
@@ -10580,10 +11124,17 @@ mod tests {
         for i in 0..6 {
             let resp = dispatch_authenticated(
                 &ctx,
-                req("burst", "spawn_terminal", json!({"cwd": "/tmp", "name": format!("crew-{i}")})),
+                req(
+                    "burst",
+                    "spawn_terminal",
+                    json!({"cwd": "/tmp", "name": format!("crew-{i}")}),
+                ),
             );
             let err = resp.error.clone().unwrap_or_default();
-            assert!(!err.contains("rate limit"), "spawn {i} was rate-limited: {err}");
+            assert!(
+                !err.contains("rate limit"),
+                "spawn {i} was rate-limited: {err}"
+            );
             assert!(
                 !err.contains("concurrent-session cap"),
                 "spawn {i} hit the concurrent cap: {err}"
@@ -10601,12 +11152,21 @@ mod tests {
         let ctx = test_ctx("rate")
             .with_governor(Arc::new(SpawnGovernor::new(64, 20.0, 1.0)))
             .with_audit(Arc::new(AuditLog::new(dir.clone())));
-        let r1 = dispatch_authenticated(&ctx, req("rate", "spawn_terminal", json!({"cwd": "/tmp"})));
+        let r1 =
+            dispatch_authenticated(&ctx, req("rate", "spawn_terminal", json!({"cwd": "/tmp"})));
         // Governor admitted r1; it fails downstream on the missing UI sink.
-        assert!(r1.error.clone().unwrap_or_default().contains("no UI"), "got: {:?}", r1.error);
-        let r2 = dispatch_authenticated(&ctx, req("rate", "spawn_terminal", json!({"cwd": "/tmp"})));
         assert!(
-            r2.error.clone().unwrap().contains("spawn rate limit (20/min); retry shortly"),
+            r1.error.clone().unwrap_or_default().contains("no UI"),
+            "got: {:?}",
+            r1.error
+        );
+        let r2 =
+            dispatch_authenticated(&ctx, req("rate", "spawn_terminal", json!({"cwd": "/tmp"})));
+        assert!(
+            r2.error
+                .clone()
+                .unwrap()
+                .contains("spawn rate limit (20/min); retry shortly"),
             "got: {:?}",
             r2.error
         );
@@ -10629,7 +11189,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let ctx = test_ctx("read").with_audit(Arc::new(AuditLog::new(dir.clone())));
         let _ = dispatch_authenticated(&ctx, req("read", "list_terminals", json!({})));
-        assert!(read_audit(&dir).is_empty(), "a read-tier command was audited");
+        assert!(
+            read_audit(&dir).is_empty(),
+            "a read-tier command was audited"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10642,7 +11205,11 @@ mod tests {
         let ctx = test_ctx("st").with_audit(Arc::new(AuditLog::new(dir.clone())));
         let resp = dispatch_authenticated(
             &ctx,
-            req("st", "send_text", json!({"sessionId": "ghost", "text": "SUPERSECRET", "enter": true})),
+            req(
+                "st",
+                "send_text",
+                json!({"sessionId": "ghost", "text": "SUPERSECRET", "enter": true}),
+            ),
         );
         assert!(!resp.ok); // no such session, but the audit still lands
         let recs = read_audit(&dir);
@@ -10650,7 +11217,10 @@ mod tests {
         assert_eq!(recs[0]["command"], "send_text");
         assert_eq!(recs[0]["decision"], "allowed");
         let blob = serde_json::to_string(&recs[0]).unwrap();
-        assert!(!blob.contains("SUPERSECRET"), "literal text leaked into audit: {blob}");
+        assert!(
+            !blob.contains("SUPERSECRET"),
+            "literal text leaked into audit: {blob}"
+        );
         assert_eq!(recs[0]["args"]["textLen"], 11);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10680,8 +11250,14 @@ mod tests {
 
     #[test]
     fn command_tiers_are_classified() {
-        assert_eq!(required_tier("spawn_terminal"), CommandTier::ProcessChanging);
-        assert_eq!(required_tier("close_terminal"), CommandTier::ProcessChanging);
+        assert_eq!(
+            required_tier("spawn_terminal"),
+            CommandTier::ProcessChanging
+        );
+        assert_eq!(
+            required_tier("close_terminal"),
+            CommandTier::ProcessChanging
+        );
         assert_eq!(required_tier("send_text"), CommandTier::ProcessChanging);
         assert_eq!(required_tier("new_tab"), CommandTier::Organization);
         assert_eq!(required_tier("create_worktree"), CommandTier::Organization);
@@ -10748,8 +11324,14 @@ mod tests {
             CommandTier::Organization
         );
         // Every other command's effective tier is exactly its required_tier.
-        assert_eq!(effective_tier("list_terminals", &json!({})), CommandTier::Read);
-        assert_eq!(effective_tier("spawn_terminal", &json!({})), CommandTier::ProcessChanging);
+        assert_eq!(
+            effective_tier("list_terminals", &json!({})),
+            CommandTier::Read
+        );
+        assert_eq!(
+            effective_tier("spawn_terminal", &json!({})),
+            CommandTier::ProcessChanging
+        );
     }
 
     #[test]
@@ -10759,14 +11341,24 @@ mod tests {
         let ctx = test_ctx("t").with_inbox(Arc::new(crate::inbox::Inbox::ephemeral()));
         let unscoped = dispatch_authenticated(&ctx, req("read-t", "inbox_status", json!({})));
         assert!(
-            unscoped.error.clone().unwrap_or_default().contains("requires the control capability"),
+            unscoped
+                .error
+                .clone()
+                .unwrap_or_default()
+                .contains("requires the control capability"),
             "read token must be refused an unscoped enumeration, got: {:?}",
             unscoped.error
         );
-        let scoped =
-            dispatch_authenticated(&ctx, req("read-t", "inbox_status", json!({"sessionId": "me"})));
+        let scoped = dispatch_authenticated(
+            &ctx,
+            req("read-t", "inbox_status", json!({"sessionId": "me"})),
+        );
         assert!(
-            !scoped.error.clone().unwrap_or_default().contains("requires the control capability"),
+            !scoped
+                .error
+                .clone()
+                .unwrap_or_default()
+                .contains("requires the control capability"),
             "read token must be allowed a scoped inbox_status, got: {:?}",
             scoped.error
         );
@@ -10795,39 +11387,74 @@ mod tests {
         // Spawn a real session through the authenticated gate.
         let sresp = dispatch_authenticated(
             &ctx,
-            req("e2e", "spawn_terminal", json!({"cwd": "/tmp", "name": "crew", "tabId": "tab-1"})),
+            req(
+                "e2e",
+                "spawn_terminal",
+                json!({"cwd": "/tmp", "name": "crew", "tabId": "tab-1"}),
+            ),
         );
-        assert!(sresp.ok, "legit spawn was refused by the gate: {:?}", sresp.error);
-        let id = sresp.result.as_ref().unwrap()["id"].as_str().unwrap().to_string();
+        assert!(
+            sresp.ok,
+            "legit spawn was refused by the gate: {:?}",
+            sresp.error
+        );
+        let id = sresp.result.as_ref().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let target = tmux::target_for_id(&id);
-        assert!(tmux::has_session(&target), "the real tmux session should exist");
+        assert!(
+            tmux::has_session(&target),
+            "the real tmux session should exist"
+        );
         let _ = tmux::resize_window_for_tests(&target, 80, 24);
 
         // Type into it through the gate (send_text is not throttled).
         let tresp = dispatch_authenticated(
             &ctx,
-            req("e2e", "send_text", json!({"sessionId": id, "text": "echo GATE_E2E_OK", "enter": true})),
+            req(
+                "e2e",
+                "send_text",
+                json!({"sessionId": id, "text": "echo GATE_E2E_OK", "enter": true}),
+            ),
         );
         assert!(tresp.ok, "legit send_text was refused: {:?}", tresp.error);
 
         // Close it through the gate (destructive, but the first teardown is under
         // the burst of 10 so it is admitted).
-        let cresp = dispatch_authenticated(&ctx, req("e2e", "close_terminal", json!({"sessionId": id})));
-        assert!(cresp.ok, "legit close_terminal was refused: {:?}", cresp.error);
-        assert!(!tmux::has_session(&target), "session should be gone after close");
+        let cresp =
+            dispatch_authenticated(&ctx, req("e2e", "close_terminal", json!({"sessionId": id})));
+        assert!(
+            cresp.ok,
+            "legit close_terminal was refused: {:?}",
+            cresp.error
+        );
+        assert!(
+            !tmux::has_session(&target),
+            "session should be gone after close"
+        );
 
         // All three land in the audit log, allowed and hash-chained. send_text's
         // literal payload is NOT present (redacted).
         let recs = read_audit(&dir);
         assert_eq!(recs.len(), 3, "expected spawn+send+close audited: {recs:?}");
-        let cmds: Vec<&str> = recs.iter().map(|r| r["command"].as_str().unwrap()).collect();
+        let cmds: Vec<&str> = recs
+            .iter()
+            .map(|r| r["command"].as_str().unwrap())
+            .collect();
         assert_eq!(cmds, ["spawn_terminal", "send_text", "close_terminal"]);
-        assert!(recs.iter().all(|r| r["decision"] == "allowed"), "a legit command was not allowed: {recs:?}");
+        assert!(
+            recs.iter().all(|r| r["decision"] == "allowed"),
+            "a legit command was not allowed: {recs:?}"
+        );
         for w in recs.windows(2) {
             assert_eq!(w[1]["prev"], w[0]["hash"], "hash chain broken");
         }
         let blob = serde_json::to_string(&recs).unwrap();
-        assert!(!blob.contains("GATE_E2E_OK"), "send_text literal leaked into audit");
+        assert!(
+            !blob.contains("GATE_E2E_OK"),
+            "send_text literal leaked into audit"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10840,7 +11467,10 @@ mod tests {
         // control token -> Full; read token -> ReadOnly; anything else -> None.
         let ctx = test_ctx("t"); // control="t", read="read-t"
         assert_eq!(resolve_capability(&ctx, "t"), Some(Capability::Full));
-        assert_eq!(resolve_capability(&ctx, "read-t"), Some(Capability::ReadOnly));
+        assert_eq!(
+            resolve_capability(&ctx, "read-t"),
+            Some(Capability::ReadOnly)
+        );
         assert_eq!(resolve_capability(&ctx, "nope"), None);
         assert_eq!(resolve_capability(&ctx, ""), None);
     }
@@ -10872,8 +11502,14 @@ mod tests {
         // UI sink - proving authz passed).
         let resp = dispatch_authenticated(&ctx, req("t", "spawn_terminal", json!({"cwd": "/tmp"})));
         let err = resp.error.unwrap_or_default();
-        assert!(!err.contains("requires the control capability"), "control token was authz-refused: {err}");
-        assert!(err.contains("no UI"), "expected the downstream no-UI failure, got: {err}");
+        assert!(
+            !err.contains("requires the control capability"),
+            "control token was authz-refused: {err}"
+        );
+        assert!(
+            err.contains("no UI"),
+            "expected the downstream no-UI failure, got: {err}"
+        );
     }
 
     #[test]
@@ -10885,13 +11521,29 @@ mod tests {
         // Read tier: allowed (not authz-refused). May fail on tmux, but never authz.
         let r = dispatch_authenticated(&ctx, req("read-t", "list_terminals", json!({})));
         assert!(
-            !r.error.clone().unwrap_or_default().contains("requires the control capability"),
+            !r.error
+                .clone()
+                .unwrap_or_default()
+                .contains("requires the control capability"),
             "read token was refused a Read command"
         );
 
         // ProcessChanging + Organization-destructive: authz-refused with the exact msg.
-        for cmd in ["spawn_terminal", "send_text", "send_keys", "close_terminal", "create_worktree"] {
-            let resp = dispatch_authenticated(&ctx, req("read-t", cmd, json!({"cwd": "/tmp", "sessionId": "x", "text": "y", "keys": ["C-c"]})));
+        for cmd in [
+            "spawn_terminal",
+            "send_text",
+            "send_keys",
+            "close_terminal",
+            "create_worktree",
+        ] {
+            let resp = dispatch_authenticated(
+                &ctx,
+                req(
+                    "read-t",
+                    cmd,
+                    json!({"cwd": "/tmp", "sessionId": "x", "text": "y", "keys": ["C-c"]}),
+                ),
+            );
             let err = resp.error.unwrap_or_default();
             assert!(
                 err == format!("unauthorized: '{cmd}' requires the control capability (this token is read-only)"),
@@ -10949,8 +11601,15 @@ mod tests {
             "spawn_terminal",
         );
         let recs = read_audit(&dir);
-        let ctl: Vec<_> = recs.iter().filter(|r| r["decision"] == "control-spawn").collect();
-        assert_eq!(ctl.len(), 1, "an explicit control spawn is audited exactly once");
+        let ctl: Vec<_> = recs
+            .iter()
+            .filter(|r| r["decision"] == "control-spawn")
+            .collect();
+        assert_eq!(
+            ctl.len(),
+            1,
+            "an explicit control spawn is audited exactly once"
+        );
         assert_eq!(ctl[0]["tokenTier"], "control");
         assert_eq!(ctl[0]["command"], "spawn_terminal");
         let _ = std::fs::remove_dir_all(&dir);
@@ -10964,10 +11623,18 @@ mod tests {
         ctx.peer_is_loopback = false;
         assert_eq!(resolve_capability(&ctx, "t"), Some(Capability::ReadOnly));
         // Read still works remotely; ProcessChanging is authz-refused.
-        let spawn = dispatch_authenticated(&ctx, req("t", "spawn_terminal", json!({"cwd": "/tmp"})));
-        assert!(spawn.error.unwrap().contains("requires the control capability"));
+        let spawn =
+            dispatch_authenticated(&ctx, req("t", "spawn_terminal", json!({"cwd": "/tmp"})));
+        assert!(spawn
+            .error
+            .unwrap()
+            .contains("requires the control capability"));
         let read = dispatch_authenticated(&ctx, req("t", "list_terminals", json!({})));
-        assert!(!read.error.clone().unwrap_or_default().contains("requires the control capability"));
+        assert!(!read
+            .error
+            .clone()
+            .unwrap_or_default()
+            .contains("requires the control capability"));
     }
 
     #[test]
@@ -10990,11 +11657,20 @@ mod tests {
         // the mutation to stay hermetic.
         let saved = std::env::var("T_HUB_CONTROL_HARDEN").ok();
         std::env::remove_var("T_HUB_CONTROL_HARDEN");
-        assert!(phase3_harden_enabled(), "harden flag must default ON (item-3 flip #2)");
+        assert!(
+            phase3_harden_enabled(),
+            "harden flag must default ON (item-3 flip #2)"
+        );
         std::env::set_var("T_HUB_CONTROL_HARDEN", "0");
-        assert!(!phase3_harden_enabled(), "'0' is the rollback (hardening OFF)");
+        assert!(
+            !phase3_harden_enabled(),
+            "'0' is the rollback (hardening OFF)"
+        );
         std::env::set_var("T_HUB_CONTROL_HARDEN", "false");
-        assert!(!phase3_harden_enabled(), "'false' is the rollback (hardening OFF)");
+        assert!(
+            !phase3_harden_enabled(),
+            "'false' is the rollback (hardening OFF)"
+        );
         std::env::set_var("T_HUB_CONTROL_HARDEN", "1");
         assert!(phase3_harden_enabled(), "'1' stays ON");
         std::env::set_var("T_HUB_CONTROL_HARDEN", "true");
@@ -11030,22 +11706,34 @@ mod tests {
         assert!(!k1.is_empty());
         assert!(path.exists(), "a minted key must be written to disk");
         let stored = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(crate::secret_seal::unseal_str(&stored).as_deref(), Some(k1.as_str()));
+        assert_eq!(
+            crate::secret_seal::unseal_str(&stored).as_deref(),
+            Some(k1.as_str())
+        );
 
         // Within age, not forced => KEEP the same value.
         let k2 = load_or_rotate_key_with(&path, false, 3600);
-        assert_eq!(k2, k1, "a fresh key within max age must be kept, not rotated");
+        assert_eq!(
+            k2, k1,
+            "a fresh key within max age must be kept, not rotated"
+        );
 
         // Forced => a DIFFERENT value overwrites the file (mint-and-replace).
         let k3 = load_or_rotate_key_with(&path, true, 3600);
         assert_ne!(k3, k1, "a forced rotation must mint-and-replace the key");
         let stored3 = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(crate::secret_seal::unseal_str(&stored3).as_deref(), Some(k3.as_str()));
+        assert_eq!(
+            crate::secret_seal::unseal_str(&stored3).as_deref(),
+            Some(k3.as_str())
+        );
 
         // max_age 0 => past age on every call => rotates.
         let k4 = load_or_rotate_key_with(&path, false, 0);
         assert_ne!(k4, k3, "max_age 0 must rotate on every restart");
-        assert!(!key_is_past_max_age(&path, 3600), "a just-written key is not past a 1h age");
+        assert!(
+            !key_is_past_max_age(&path, 3600),
+            "a just-written key is not past a 1h age"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -11060,7 +11748,10 @@ mod tests {
         let path = base.join("server-read-key");
         std::fs::write(&path, "legacy-plaintext-token").unwrap();
         let k = load_or_rotate_key_with(&path, false, 3600);
-        assert_eq!(k, "legacy-plaintext-token", "legacy plaintext must be read and kept");
+        assert_eq!(
+            k, "legacy-plaintext-token",
+            "legacy plaintext must be read and kept"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -11070,10 +11761,22 @@ mod tests {
         // pre-item-3 (unsealed) key has been ADOPTED (sealed), so the first item-3
         // restart never strands pre-existing fleet. Once sealed, age-rotation resumes.
         // On a NON-sealing host there is no sealed form, so age-rotation stays eligible.
-        assert!(!age_rotation_eligible(false, true), "sealing host + unsealed key: adopt, don't rotate");
-        assert!(age_rotation_eligible(true, true), "sealing host + sealed key: age-rotates");
-        assert!(age_rotation_eligible(false, false), "non-sealing host: eligible regardless");
-        assert!(age_rotation_eligible(true, false), "non-sealing host: eligible regardless");
+        assert!(
+            !age_rotation_eligible(false, true),
+            "sealing host + unsealed key: adopt, don't rotate"
+        );
+        assert!(
+            age_rotation_eligible(true, true),
+            "sealing host + sealed key: age-rotates"
+        );
+        assert!(
+            age_rotation_eligible(false, false),
+            "non-sealing host: eligible regardless"
+        );
+        assert!(
+            age_rotation_eligible(true, false),
+            "non-sealing host: eligible regardless"
+        );
     }
 
     #[test]
@@ -11098,9 +11801,12 @@ mod tests {
         };
 
         // (a) Published discovery is read-only and never leaks the full token.
-        assert_eq!(handshake.token, read, "published token must be the read token");
-        let file = std::env::temp_dir()
-            .join(format!("t-hub-ctl-harden-{}.json", std::process::id()));
+        assert_eq!(
+            handshake.token, read,
+            "published token must be the read token"
+        );
+        let file =
+            std::env::temp_dir().join(format!("t-hub-ctl-harden-{}.json", std::process::id()));
         let prev = std::env::var("T_HUB_CONTROL_FILE").ok();
         std::env::set_var("T_HUB_CONTROL_FILE", &file);
         write_handshake(&handshake).expect("write handshake");
@@ -11119,8 +11825,7 @@ mod tests {
             !on_disk.contains("local_control_token"),
             "the in-process field must not be serialized; got: {on_disk}"
         );
-        let parsed: ControlHandshake =
-            serde_json::from_str(&on_disk).expect("control.json parses");
+        let parsed: ControlHandshake = serde_json::from_str(&on_disk).expect("control.json parses");
         assert_eq!(parsed.token, read, "on-disk token must be the read token");
         assert_eq!(
             parsed.local_control_token, "",
@@ -11142,10 +11847,16 @@ mod tests {
         // least-privilege). Only an explicit `capability:"control"` spawn carries the
         // full token. These facts together are the item-3 Pillar A contract.
         let ctx = test_ctx("ctl"); // read token is "read-ctl" (see test_ctx)
-        // Discovery, hardened: publishes the read token, NOT the control token.
+                                   // Discovery, hardened: publishes the read token, NOT the control token.
         let published = select_published_token(&ctx.token, &ctx.read_token, true);
-        assert_eq!(published, ctx.read_token, "hardened discovery must publish read token");
-        assert_ne!(published, ctx.token, "hardened discovery must NOT publish control token");
+        assert_eq!(
+            published, ctx.read_token,
+            "hardened discovery must publish read token"
+        );
+        assert_ne!(
+            published, ctx.token,
+            "hardened discovery must NOT publish control token"
+        );
         assert_eq!(
             resolve_capability(&ctx, published),
             Some(Capability::ReadOnly),
@@ -11163,7 +11874,10 @@ mod tests {
             .find(|(k, _)| k == "T_HUB_CONTROL_TOKEN")
             .map(|(_, v)| v.clone())
             .expect("spawn env injects T_HUB_CONTROL_TOKEN");
-        assert_eq!(injected, ctx.read_token, "default spawn must inject the READ token");
+        assert_eq!(
+            injected, ctx.read_token,
+            "default spawn must inject the READ token"
+        );
         assert_eq!(
             resolve_capability(&ctx, &injected),
             Some(Capability::ReadOnly),
@@ -11172,7 +11886,10 @@ mod tests {
 
         // Explicit opt-in: `capability:"control"` carries the full token.
         let up = elevation_env(&ctx, &json!({"capability": "control"}));
-        assert_eq!(up[1], ("T_HUB_CONTROL_TOKEN".to_string(), ctx.token.clone()));
+        assert_eq!(
+            up[1],
+            ("T_HUB_CONTROL_TOKEN".to_string(), ctx.token.clone())
+        );
         assert_eq!(
             resolve_capability(&ctx, &up[1].1),
             Some(Capability::Full),
@@ -11191,8 +11908,14 @@ mod tests {
 
         // CHECK 1: control.json's `token` == the READ token (full withheld from disk).
         let published = select_published_token(&ctx.token, &ctx.read_token, harden);
-        assert_eq!(published, ctx.read_token, "check 1: disk token must be the read token");
-        assert_ne!(published, ctx.token, "check 1: full token must NOT reach disk");
+        assert_eq!(
+            published, ctx.read_token,
+            "check 1: disk token must be the read token"
+        );
+        assert_ne!(
+            published, ctx.token,
+            "check 1: full token must NOT reach disk"
+        );
 
         // CHECK 2: the webview obtains the FULL token in-process, not from disk. The
         // handshake carries `local_control_token` = full and never serializes it;
@@ -11206,9 +11929,14 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             local_control_token: ctx.token.clone(),
         };
-        assert_eq!(handshake.local_control_token, ctx.token, "check 2: in-process full token");
         assert_eq!(
-            serde_json::to_value(&handshake).unwrap().get("local_control_token"),
+            handshake.local_control_token, ctx.token,
+            "check 2: in-process full token"
+        );
+        assert_eq!(
+            serde_json::to_value(&handshake)
+                .unwrap()
+                .get("local_control_token"),
             None,
             "check 2: the in-process token must never serialize to control.json"
         );
@@ -11236,13 +11964,22 @@ mod tests {
         ctx.addr = "127.0.0.1:4242".to_string();
         // item-3 inverted default: an untagged spawn injects the READ token.
         let def = elevation_env(&ctx, &json!({}));
-        assert_eq!(def, vec![
-            ("T_HUB_CONTROL_ADDR".to_string(), "127.0.0.1:4242".to_string()),
-            ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string()),
-        ]);
+        assert_eq!(
+            def,
+            vec![
+                (
+                    "T_HUB_CONTROL_ADDR".to_string(),
+                    "127.0.0.1:4242".to_string()
+                ),
+                ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string()),
+            ]
+        );
         // A typo'd / unknown capability also fails SAFE to read (never leaks control).
         let typo = elevation_env(&ctx, &json!({"capability": "conrtol"}));
-        assert_eq!(typo[1], ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string()));
+        assert_eq!(
+            typo[1],
+            ("T_HUB_CONTROL_TOKEN".to_string(), "read-t".to_string())
+        );
         // Explicit opt-in: `capability:"control"` injects the full control token.
         let up = elevation_env(&ctx, &json!({"capability": "control"}));
         assert_eq!(up[1], ("T_HUB_CONTROL_TOKEN".to_string(), "t".to_string()));
@@ -11266,11 +12003,17 @@ mod tests {
         std::env::remove_var("T_HUB_SPAWN_LEGACY_FULL");
         // Default (inverted): untagged => ReadOnly.
         assert_eq!(spawn_capability(&json!({})), Capability::ReadOnly);
-        assert_eq!(spawn_capability(&json!({"capability": "control"})), Capability::Full);
+        assert_eq!(
+            spawn_capability(&json!({"capability": "control"})),
+            Capability::Full
+        );
         // Legacy rollback: untagged => Full (fail-open), explicit read => ReadOnly.
         std::env::set_var("T_HUB_SPAWN_LEGACY_FULL", "1");
         assert_eq!(spawn_capability(&json!({})), Capability::Full);
-        assert_eq!(spawn_capability(&json!({"capability": "read"})), Capability::ReadOnly);
+        assert_eq!(
+            spawn_capability(&json!({"capability": "read"})),
+            Capability::ReadOnly
+        );
         match saved {
             Some(v) => std::env::set_var("T_HUB_SPAWN_LEGACY_FULL", v),
             None => std::env::remove_var("T_HUB_SPAWN_LEGACY_FULL"),
@@ -11283,7 +12026,9 @@ mod tests {
         ctx.addr = "127.0.0.1:4242".to_string();
         let (env, minted) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
         // The tier token is injected; the item-3 default is the READ token ...
-        assert!(env.iter().any(|(k, v)| k == "T_HUB_CONTROL_TOKEN" && v == "read-t"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "T_HUB_CONTROL_TOKEN" && v == "read-t"));
         // ... PLUS a per-session token alongside it (comms-plane Phase 2).
         let session_token = env
             .iter()
@@ -11398,7 +12143,13 @@ mod tests {
     fn inbox_ack_and_status_handlers_round_trip() {
         let inbox = Arc::new(crate::inbox::Inbox::ephemeral());
         inbox
-            .enqueue("tileX", "crew:a", crate::inbox::Priority::Standard, "hi", true)
+            .enqueue(
+                "tileX",
+                "crew:a",
+                crate::inbox::Priority::Standard,
+                "hi",
+                true,
+            )
             .unwrap();
         // Deliver it so it is ackable (the drain's at-most-once write).
         inbox.drain_one("tileX", |_r| Ok(()));
@@ -11410,11 +12161,23 @@ mod tests {
         assert_eq!(status["recipient"]["enqueued"].as_u64(), Some(0));
 
         // Ack retires it (`delivered -> processed`).
-        let ack = inbox_ack(&ctx, &json!({"sessionId": "tileX", "seq": 0}), None, Capability::Full).unwrap();
+        let ack = inbox_ack(
+            &ctx,
+            &json!({"sessionId": "tileX", "seq": 0}),
+            None,
+            Capability::Full,
+        )
+        .unwrap();
         assert_eq!(ack["accepted"], "inbox_ack");
         assert_eq!(ack["state"], "processed");
         // A duplicate ack is a benign no-op (a lost-then-retried ack never re-writes).
-        let reack = inbox_ack(&ctx, &json!({"sessionId": "tileX", "seq": 0}), None, Capability::Full).unwrap();
+        let reack = inbox_ack(
+            &ctx,
+            &json!({"sessionId": "tileX", "seq": 0}),
+            None,
+            Capability::Full,
+        )
+        .unwrap();
         assert_eq!(reack["state"], "alreadyProcessed");
 
         // No sessionId => the all-recipients snapshot.
@@ -11425,7 +12188,13 @@ mod tests {
         assert!(inbox_ack(&ctx, &json!({"sessionId": "tileX"}), None, Capability::Full).is_err());
         // Acking an unknown recipient/seq is honest, not a crash.
         assert_eq!(
-            inbox_ack(&ctx, &json!({"sessionId": "nope", "seq": 7}), None, Capability::Full).unwrap()["state"],
+            inbox_ack(
+                &ctx,
+                &json!({"sessionId": "nope", "seq": 7}),
+                None,
+                Capability::Full
+            )
+            .unwrap()["state"],
             "unknown"
         );
     }
@@ -11468,7 +12237,12 @@ mod tests {
 
         let foreign = dispatch_authenticated(
             &ctx,
-            req_session("read-t", &crew_a, "read_terminal", json!({"sessionId": "crew-b"})),
+            req_session(
+                "read-t",
+                &crew_a,
+                "read_terminal",
+                json!({"sessionId": "crew-b"}),
+            ),
         );
         assert!(!foreign.ok, "a foreign read must be refused");
         assert!(
@@ -11483,7 +12257,10 @@ mod tests {
             req("ctrl", "read_terminal", json!({"sessionId": "crew-b"})),
         );
         assert!(
-            !host.error.unwrap_or_default().contains("cross-ship isolation"),
+            !host
+                .error
+                .unwrap_or_default()
+                .contains("cross-ship isolation"),
             "the trusted host must fail open (NORM-now), not be ACL-refused"
         );
     }
@@ -11520,23 +12297,48 @@ mod tests {
         let is_isolation_denied = |session: &str, target: &str| -> bool {
             let resp = dispatch_authenticated(
                 &ctx,
-                req_session("read-t", session, "read_terminal", json!({"sessionId": target})),
+                req_session(
+                    "read-t",
+                    session,
+                    "read_terminal",
+                    json!({"sessionId": target}),
+                ),
             );
-            resp.error.unwrap_or_default().contains("cross-ship isolation")
+            resp.error
+                .unwrap_or_default()
+                .contains("cross-ship isolation")
         };
 
         // SELF: a crew reading its OWN pane -> permitted (falls through to tmux).
-        assert!(!is_isolation_denied(&crew_a, "crew-a"), "self-read must be permitted");
+        assert!(
+            !is_isolation_denied(&crew_a, "crew-a"),
+            "self-read must be permitted"
+        );
         // OWN-CREW: a captain reading its own ship's crew -> permitted.
-        assert!(!is_isolation_denied(&cap_a, "crew-a"), "captain reading own crew must be permitted");
+        assert!(
+            !is_isolation_denied(&cap_a, "crew-a"),
+            "captain reading own crew must be permitted"
+        );
         // OWN-SHIP SUPERVISOR: a crew reading its own captain's pane -> permitted (same ship).
-        assert!(!is_isolation_denied(&crew_a, "cap-a"), "same-ship supervisor read must be permitted");
+        assert!(
+            !is_isolation_denied(&crew_a, "cap-a"),
+            "same-ship supervisor read must be permitted"
+        );
         // ORCHESTRATOR: cortana reading a SUPERVISOR on any ship (her subordinate) -> permitted.
-        assert!(!is_isolation_denied(&cortana, "cap-b"), "cortana reading a captain must be permitted");
+        assert!(
+            !is_isolation_denied(&cortana, "cap-b"),
+            "cortana reading a captain must be permitted"
+        );
         // FOREIGN-CREW: a crew reading another ship's crew -> DENIED.
-        assert!(is_isolation_denied(&crew_a, "crew-b"), "cross-ship crew read must be refused");
+        assert!(
+            is_isolation_denied(&crew_a, "crew-b"),
+            "cross-ship crew read must be refused"
+        );
         // ORCHESTRATOR SKIP-LEVEL: cortana reading a FOREIGN ship's crew directly -> DENIED.
-        assert!(is_isolation_denied(&cortana, "crew-b"), "cortana skip-level into foreign crew must be refused");
+        assert!(
+            is_isolation_denied(&cortana, "crew-b"),
+            "cortana skip-level into foreign crew must be refused"
+        );
 
         // FULL-TOKEN HOST: the tokenless control-token host (the app webview/MCP) presents
         // no per-session identity -> fails OPEN (never ACL-refused).
@@ -11545,7 +12347,10 @@ mod tests {
             req("ctrl", "read_terminal", json!({"sessionId": "crew-b"})),
         );
         assert!(
-            !host.error.unwrap_or_default().contains("cross-ship isolation"),
+            !host
+                .error
+                .unwrap_or_default()
+                .contains("cross-ship isolation"),
             "the full-token host must fail open, not be ACL-refused"
         );
     }
@@ -11565,7 +12370,12 @@ mod tests {
             .with_captains_registry(reg);
         let resp = dispatch_authenticated(
             &ctx,
-            req_session("ctrl", &cap_a, "send_text", json!({"sessionId": "crew-b", "text": "hi"})),
+            req_session(
+                "ctrl",
+                &cap_a,
+                "send_text",
+                json!({"sessionId": "crew-b", "text": "hi"}),
+            ),
         );
         assert!(!resp.ok);
         assert!(resp.error.unwrap().contains("cross-ship isolation"));
@@ -11578,7 +12388,9 @@ mod tests {
         let store = Arc::new(crate::identity::IdentityStore::ephemeral());
         let inbox = Arc::new(crate::inbox::Inbox::ephemeral());
         for tile in ["crew-a", "crew-b"] {
-            inbox.enqueue(tile, "cap:x", crate::inbox::Priority::Standard, "m", true).unwrap();
+            inbox
+                .enqueue(tile, "cap:x", crate::inbox::Priority::Standard, "m", true)
+                .unwrap();
             inbox.drain_one(tile, |_r| Ok(())); // deliver so it is ackable
         }
         let crew_a = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
@@ -11590,18 +12402,35 @@ mod tests {
         // Self-ack with a bare READ token: ADMITTED (the §2.4.1 upgrade).
         let ok = dispatch_authenticated(
             &ctx,
-            req_session("read-t", &crew_a, "inbox_ack", json!({"sessionId": "crew-a", "seq": 0})),
+            req_session(
+                "read-t",
+                &crew_a,
+                "inbox_ack",
+                json!({"sessionId": "crew-a", "seq": 0}),
+            ),
         );
-        assert!(ok.ok, "self-ack must be admitted at read tier: {:?}", ok.error);
+        assert!(
+            ok.ok,
+            "self-ack must be admitted at read tier: {:?}",
+            ok.error
+        );
         assert_eq!(ok.result.unwrap()["state"], "processed");
 
         // Cross-session ack (crew-a acking crew-b) with the read token: REFUSED, and
         // crew-b's message is untouched.
         let bad = dispatch_authenticated(
             &ctx,
-            req_session("read-t", &crew_a, "inbox_ack", json!({"sessionId": "crew-b", "seq": 0})),
+            req_session(
+                "read-t",
+                &crew_a,
+                "inbox_ack",
+                json!({"sessionId": "crew-b", "seq": 0}),
+            ),
         );
-        assert!(!bad.ok, "a cross-session ack with a read token must be refused");
+        assert!(
+            !bad.ok,
+            "a cross-session ack with a read token must be refused"
+        );
         assert_eq!(
             inbox.depth("crew-b").delivered,
             1,
@@ -11629,14 +12458,24 @@ mod tests {
         // Crew -> its OWN captain (up): ALLOWED at read tier.
         let up = dispatch_authenticated(
             &ctx,
-            req_session("read-t", &crew_a, "plane_send", json!({"recipient": "cap-a", "text": "status"})),
+            req_session(
+                "read-t",
+                &crew_a,
+                "plane_send",
+                json!({"recipient": "cap-a", "text": "status"}),
+            ),
         );
         assert!(up.ok, "crew->own captain must be allowed: {:?}", up.error);
 
         // Crew -> a SIBLING crew: REFUSED (no daisy-chain).
         let sib = dispatch_authenticated(
             &ctx,
-            req_session("read-t", &crew_a, "plane_send", json!({"recipient": "crew-a2", "text": "psst"})),
+            req_session(
+                "read-t",
+                &crew_a,
+                "plane_send",
+                json!({"recipient": "crew-a2", "text": "psst"}),
+            ),
         );
         assert!(!sib.ok);
         assert!(sib.error.unwrap().contains("daisy-chain"));
@@ -11645,7 +12484,12 @@ mod tests {
         // admit crew emergency and this goes RED.
         let emg = dispatch_authenticated(
             &ctx,
-            req_session("read-t", &crew_a, "plane_send", json!({"recipient": "cap-a", "text": "!!", "priority": "emergency"})),
+            req_session(
+                "read-t",
+                &crew_a,
+                "plane_send",
+                json!({"recipient": "cap-a", "text": "!!", "priority": "emergency"}),
+            ),
         );
         assert!(!emg.ok);
         assert!(emg.error.unwrap().contains("EMERGENCY"));
@@ -11653,9 +12497,18 @@ mod tests {
         // A CAPTAIN may raise EMERGENCY to its own crew.
         let cap_emg = dispatch_authenticated(
             &ctx,
-            req_session("ctrl", &cap_a, "plane_send", json!({"recipient": "crew-a", "text": "!!", "priority": "emergency"})),
+            req_session(
+                "ctrl",
+                &cap_a,
+                "plane_send",
+                json!({"recipient": "crew-a", "text": "!!", "priority": "emergency"}),
+            ),
         );
-        assert!(cap_emg.ok, "a captain's emergency to own crew must be allowed: {:?}", cap_emg.error);
+        assert!(
+            cap_emg.ok,
+            "a captain's emergency to own crew must be allowed: {:?}",
+            cap_emg.error
+        );
         assert_eq!(cap_emg.result.unwrap()["priority"], "emergency");
     }
 
@@ -11680,7 +12533,12 @@ mod tests {
         // Captain of ship-a aborting ship-b's crew: cross-ship, REFUSED.
         let cross = dispatch_authenticated(
             &ctx,
-            req_session("ctrl", &cap_a, "abort_session", json!({"sessionId": "crew-b"})),
+            req_session(
+                "ctrl",
+                &cap_a,
+                "abort_session",
+                json!({"sessionId": "crew-b"}),
+            ),
         );
         assert!(!cross.ok);
         assert!(cross.error.unwrap().contains("abort denied"));
@@ -11688,7 +12546,12 @@ mod tests {
         // A crew presenting a read token cannot even reach the ProcessChanging abort.
         let crew_try = dispatch_authenticated(
             &ctx,
-            req_session("read-t", &crew_a, "abort_session", json!({"sessionId": "cap-a"})),
+            req_session(
+                "read-t",
+                &crew_a,
+                "abort_session",
+                json!({"sessionId": "cap-a"}),
+            ),
         );
         assert!(!crew_try.ok, "a read-token crew must not be able to abort");
     }
@@ -11713,7 +12576,12 @@ mod tests {
         // The general originates one; the captain's gate consult resolves it Present.
         let ga = dispatch_authenticated(
             &ctx,
-            req_session("ctrl", &general, "authorize", json!({"action": "spend", "targetShip": "ship-a"})),
+            req_session(
+                "ctrl",
+                &general,
+                "authorize",
+                json!({"action": "spend", "targetShip": "ship-a"}),
+            ),
         );
         assert!(ga.ok, "general authorize failed: {:?}", ga.error);
         let id = ga.result.unwrap()["id"].as_str().unwrap().to_string();
@@ -11728,7 +12596,12 @@ mod tests {
         // An unknown reference is Absent (the captain's gate FIRES = escalate).
         let miss = dispatch_authenticated(
             &ctx,
-            req_session("ctrl", &captain, "check_authorization", json!({"id": "no-such"})),
+            req_session(
+                "ctrl",
+                &captain,
+                "check_authorization",
+                json!({"id": "no-such"}),
+            ),
         );
         assert_eq!(miss.result.unwrap()["verdict"], "absent");
     }
@@ -11741,7 +12614,9 @@ mod tests {
         let reg = Arc::new(CaptainsRegistry::new());
         reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
         let inbox = Arc::new(crate::inbox::Inbox::ephemeral());
-        inbox.enqueue("crew-a", "x", crate::inbox::Priority::Standard, "m", true).unwrap();
+        inbox
+            .enqueue("crew-a", "x", crate::inbox::Priority::Standard, "m", true)
+            .unwrap();
         let captain = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
         let cortana = mint_session(&store, crate::identity::Role::Cortana, "cortana", "cor");
         let ctx = test_ctx("ctrl")
@@ -11752,19 +12627,37 @@ mod tests {
         // A captain may NOT purge.
         let capadm = dispatch_authenticated(
             &ctx,
-            req_session("ctrl", &captain, "plane_admin", json!({"op": "purge", "recipient": "crew-a"})),
+            req_session(
+                "ctrl",
+                &captain,
+                "plane_admin",
+                json!({"op": "purge", "recipient": "crew-a"}),
+            ),
         );
         assert!(!capadm.ok);
         assert!(capadm.error.unwrap().contains("apex-owned"));
-        assert_eq!(inbox.depth("crew-a").enqueued, 1, "a refused purge leaves the queue intact");
+        assert_eq!(
+            inbox.depth("crew-a").enqueued,
+            1,
+            "a refused purge leaves the queue intact"
+        );
 
         // Cortana (apex) may.
         let coradm = dispatch_authenticated(
             &ctx,
-            req_session("ctrl", &cortana, "plane_admin", json!({"op": "purge", "recipient": "crew-a"})),
+            req_session(
+                "ctrl",
+                &cortana,
+                "plane_admin",
+                json!({"op": "purge", "recipient": "crew-a"}),
+            ),
         );
         assert!(coradm.ok, "cortana purge failed: {:?}", coradm.error);
-        assert_eq!(inbox.depth("crew-a").enqueued, 0, "an apex purge flushed the queue");
+        assert_eq!(
+            inbox.depth("crew-a").enqueued,
+            0,
+            "an apex purge flushed the queue"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -11877,10 +12770,7 @@ mod tests {
         // reserved), not a permanent InFlight. The `AfterReap` flavor tells dispatch
         // to RE-PROBE reality before re-applying (M1 full fix) - a genuinely-new id
         // would be plain Fresh.
-        assert!(matches!(
-            cache.begin("stuck"),
-            BeginOutcome::FreshAfterReap
-        ));
+        assert!(matches!(cache.begin("stuck"), BeginOutcome::FreshAfterReap));
     }
 
     #[test]
@@ -11966,7 +12856,10 @@ mod tests {
         assert!(matches!(cache.status("x"), RequestStatus::Unknown));
         // The handler finally finishes, AFTER its reservation was reaped.
         let _ = cache.finish("x", Ok(json!({"id": "x"})));
-        assert!(matches!(cache.status("x"), RequestStatus::Completed(_)), "outcome preserved");
+        assert!(
+            matches!(cache.status("x"), RequestStatus::Completed(_)),
+            "outcome preserved"
+        );
         // Crucially, "x" is back in `order`: capacity pressure now evicts it. With
         // the leak unfixed, "x" would linger in `slots` forever (never in `order`).
         cache.begin("y");
@@ -11983,31 +12876,50 @@ mod tests {
         // the same requestId (the client's recovery from an ambiguous response leg)
         // must apply exactly once - one tmux session, one tile, one UI forward - and
         // the retry must replay the original outcome, never spawn a second session.
-        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
         let ctx = test_ctx("t").with_apply_sink(sink.clone());
         let args = json!({"cwd": "/tmp", "requestId": "spawn-retry-1"});
-        let first = dispatch_authenticated(&ctx, ControlRequest {
-            token: "t".into(),
-            command: "spawn_terminal".into(),
-            args: args.clone(),
-            session: String::new(),
-            v: None,
-        });
+        let first = dispatch_authenticated(
+            &ctx,
+            ControlRequest {
+                token: "t".into(),
+                command: "spawn_terminal".into(),
+                args: args.clone(),
+                session: String::new(),
+                v: None,
+            },
+        );
         assert!(first.ok, "first spawn failed: {:?}", first.error);
-        let id = first.result.as_ref().unwrap()["id"].as_str().unwrap().to_string();
+        let id = first.result.as_ref().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // The retry: identical requestId. It must NOT spawn again.
-        let retry = dispatch_authenticated(&ctx, ControlRequest {
-            token: "t".into(),
-            command: "spawn_terminal".into(),
-            args,
-            session: String::new(),
-            v: None,
-        });
+        let retry = dispatch_authenticated(
+            &ctx,
+            ControlRequest {
+                token: "t".into(),
+                command: "spawn_terminal".into(),
+                args,
+                session: String::new(),
+                v: None,
+            },
+        );
         assert!(retry.ok, "retry failed: {:?}", retry.error);
         let retry_result = retry.result.unwrap();
-        assert_eq!(retry_result["id"].as_str().unwrap(), id, "retry replays the same id");
-        assert_eq!(retry_result["idempotentReplay"], json!(true), "retry is tagged a replay");
+        assert_eq!(
+            retry_result["id"].as_str().unwrap(),
+            id,
+            "retry replays the same id"
+        );
+        assert_eq!(
+            retry_result["idempotentReplay"],
+            json!(true),
+            "retry is tagged a replay"
+        );
 
         // Exactly ONE real session materialized, and ONE UI forward was emitted.
         let live: Vec<String> = tmux::list_sessions()
@@ -12016,7 +12928,11 @@ mod tests {
             .filter(|s| s == &format!("th_{id}"))
             .collect();
         assert_eq!(live.len(), 1, "exactly one tmux session for the id");
-        assert_eq!(sink.calls.lock().unwrap().len(), 1, "the retry did NOT re-forward a spawn");
+        assert_eq!(
+            sink.calls.lock().unwrap().len(),
+            1,
+            "the retry did NOT re-forward a spawn"
+        );
 
         // Reap the real session.
         dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
@@ -12027,24 +12943,39 @@ mod tests {
         // The queryable half of ask #1: after a spawn with a requestId, a caller
         // whose response leg failed can learn the outcome (and the real id) without
         // guessing. An unknown id reports unknown (safe to retry).
-        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
-        let ctx = test_ctx("t").with_apply_sink(sink);
-        let spawn = dispatch_authenticated(&ctx, ControlRequest {
-            token: "t".into(),
-            command: "spawn_terminal".into(),
-            args: json!({"cwd": "/tmp", "requestId": "spawn-status-1"}),
-            session: String::new(),
-            v: None,
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
         });
+        let ctx = test_ctx("t").with_apply_sink(sink);
+        let spawn = dispatch_authenticated(
+            &ctx,
+            ControlRequest {
+                token: "t".into(),
+                command: "spawn_terminal".into(),
+                args: json!({"cwd": "/tmp", "requestId": "spawn-status-1"}),
+                session: String::new(),
+                v: None,
+            },
+        );
         assert!(spawn.ok);
         let id = spawn.result.unwrap()["id"].as_str().unwrap().to_string();
 
-        let status = dispatch(&ctx, "get_request_status", &json!({"requestId": "spawn-status-1"})).unwrap();
+        let status = dispatch(
+            &ctx,
+            "get_request_status",
+            &json!({"requestId": "spawn-status-1"}),
+        )
+        .unwrap();
         assert_eq!(status["status"], "completed");
         assert_eq!(status["ok"], true);
         assert_eq!(status["result"]["id"].as_str().unwrap(), id);
 
-        let unknown = dispatch(&ctx, "get_request_status", &json!({"requestId": "never-seen"})).unwrap();
+        let unknown = dispatch(
+            &ctx,
+            "get_request_status",
+            &json!({"requestId": "never-seen"}),
+        )
+        .unwrap();
         assert_eq!(unknown["status"], "unknown");
 
         dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
@@ -12068,7 +12999,9 @@ mod tests {
     fn close_terminal_reports_killed_for_a_live_session() {
         // A real session reports outcome=killed, so a caller can tell a genuine kill
         // from a phantom close.
-        let sink = Arc::new(RecordingSink { calls: StdMutex::new(Vec::new()) });
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
         let ctx = test_ctx("t").with_apply_sink(sink);
         let spawn = dispatch(&ctx, "spawn_terminal", &json!({"cwd": "/tmp"})).unwrap();
         let id = spawn["id"].as_str().unwrap().to_string();
@@ -12084,14 +13017,18 @@ mod tests {
     fn captains_persist_writes_through_off_the_lock() {
         // The write-through still happens (durability preserved), now via the
         // off-lock `persist` path.
-        let dir = std::env::temp_dir().join(format!("t-hub-captains-persist-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("t-hub-captains-persist-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("captains.json");
         let _ = std::fs::remove_file(&path);
         let reg = CaptainsRegistry::load(path.clone());
         reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
         let body = std::fs::read_to_string(&path).expect("captains.json written through");
-        assert!(body.contains("alpha"), "persisted body must carry the claim: {body}");
+        assert!(
+            body.contains("alpha"),
+            "persisted body must carry the claim: {body}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12106,10 +13043,17 @@ mod tests {
         let reg = CaptainsRegistry::load(path.clone());
         reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap(); // seq -> 1 on disk
         let newer = reg.snapshot(); // seq 1
-        // Hand-persist a STALE snapshot (seq 0): it must be dropped, not clobber.
-        reg.persist(CaptainsSnapshot { schema_version: CAPTAINS_SCHEMA_VERSION, seq: 0, captains: vec![] });
+                                    // Hand-persist a STALE snapshot (seq 0): it must be dropped, not clobber.
+        reg.persist(CaptainsSnapshot {
+            schema_version: CAPTAINS_SCHEMA_VERSION,
+            seq: 0,
+            captains: vec![],
+        });
         let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("alpha"), "stale seq-0 snapshot must not clobber the claim: {body}");
+        assert!(
+            body.contains("alpha"),
+            "stale seq-0 snapshot must not clobber the claim: {body}"
+        );
         // A NEWER snapshot (seq 1, already on disk) is allowed to (re)write.
         reg.persist(newer);
         let _ = std::fs::remove_dir_all(&dir);
@@ -12146,7 +13090,9 @@ mod tests {
         // persist runs, so `inner` is free while this stalls.
         let writer_reg = reg.clone();
         let writer = std::thread::spawn(move || {
-            writer_reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
+            writer_reg
+                .claim_test("cap-1", Some("alpha"), vec![])
+                .unwrap();
         });
         started_rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -12163,7 +13109,9 @@ mod tests {
         });
         let n = read_rx
             .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("a reader was BLOCKED by a stalled persist (regression: persist holds `inner`)");
+            .expect(
+                "a reader was BLOCKED by a stalled persist (regression: persist holds `inner`)",
+            );
         assert_eq!(n, 1, "the reader sees the already-committed claim");
 
         // Release the stalled write; the mutator finishes cleanly.

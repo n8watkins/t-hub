@@ -287,14 +287,8 @@ impl AgentBridge {
 
         // Take ownership of the stdio handles before the child handle moves
         // into TransportHandles.
-        let child_stdin = child
-            .stdin
-            .take()
-            .ok_or("child has no stdin pipe")?;
-        let child_stdout = child
-            .stdout
-            .take()
-            .ok_or("child has no stdout pipe")?;
+        let child_stdin = child.stdin.take().ok_or("child has no stdin pipe")?;
+        let child_stdout = child.stdout.take().ok_or("child has no stdout pipe")?;
 
         // Build the shared correlation map and next-id counter.
         let pending = Arc::new(connection::CorrelationMap::new(
@@ -467,13 +461,16 @@ impl AgentBridge {
         // Grab the transport handles (returns an error if not connected).
         let handles = {
             let guard = self.inner.transport.lock();
-            guard.as_ref()
+            guard
+                .as_ref()
                 .cloned()
                 .ok_or_else(|| "agent bridge not connected".to_string())?
         };
 
         // Allocate a unique request id.
-        let id = handles.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = handles
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Register the one-shot channel before writing so the reader thread
         // can never race ahead of us.
@@ -525,7 +522,9 @@ impl AgentBridge {
 
     /// Convenience: derive the current git branch for `cwd` (statusline lacks it).
     pub fn git_branch(&self, cwd: &str) -> Result<Option<String>, String> {
-        match self.request(AgentRequest::GitBranch { cwd: cwd.to_string() })? {
+        match self.request(AgentRequest::GitBranch {
+            cwd: cwd.to_string(),
+        })? {
             AgentResponse::GitBranch { branch } => Ok(branch),
             other => Err(format!("unexpected response to git_branch: {other:?}")),
         }
@@ -533,7 +532,9 @@ impl AgentBridge {
 
     /// Convenience: list worktrees for the repo containing `cwd`.
     pub fn git_worktrees(&self, cwd: &str) -> Result<Vec<WorktreeInfo>, String> {
-        match self.request(AgentRequest::GitWorktrees { cwd: cwd.to_string() })? {
+        match self.request(AgentRequest::GitWorktrees {
+            cwd: cwd.to_string(),
+        })? {
             AgentResponse::GitWorktrees { worktrees } => Ok(worktrees),
             other => Err(format!("unexpected response to git_worktrees: {other:?}")),
         }
@@ -575,26 +576,20 @@ impl AgentBridge {
             self.ingest_status_from_journal(entry);
             // Return the entry's own session id for callers/tests; no tree/status
             // emit (the reducer status is unchanged by a status snapshot).
-            return entry
-                .entity_id
-                .clone()
-                .or_else(|| {
-                    entry
-                        .payload
-                        .get("session_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                });
+            return entry.entity_id.clone().or_else(|| {
+                entry
+                    .payload
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
         }
 
         let cursor_advanced = self.advance_cursor(entry.seq);
 
         // 1. Forward the raw journal entry to the UI (snake_case, verbatim — it's
         //    the protocol type). Serialize once and reuse the value.
-        self.inner.emit(
-            EVT_JOURNAL,
-            &JournalEventPayload { entry },
-        );
+        self.inner.emit(EVT_JOURNAL, &JournalEventPayload { entry });
 
         // 2. If the replay cursor moved, the health area's journalCursor changed.
         if cursor_advanced {
@@ -717,10 +712,7 @@ impl AgentBridge {
         let Some(sid) = session_id else { return };
         // The raw statusline lives under `payload.status` when the agent wraps it;
         // fall back to the whole payload for forward-compat.
-        let raw = entry
-            .payload
-            .get("status")
-            .unwrap_or(&entry.payload);
+        let raw = entry.payload.get("status").unwrap_or(&entry.payload);
         // Capture the PREVIOUS snapshot, then ingest, then only emit when something
         // MEANINGFUL changed. The statusline re-ingests an IDENTICAL snapshot many
         // times/sec (only `ingested_at_ms` ticks); emitting each was ~25 events/sec
@@ -881,12 +873,7 @@ mod tests {
         assert_eq!(bridge.journal_cursor(), 0);
 
         bridge.consume_journal_entry(&entry(1, "o1", None, JournalEventType::SessionStart));
-        bridge.consume_journal_entry(&entry(
-            2,
-            "o1",
-            Some("a1"),
-            JournalEventType::SubagentStart,
-        ));
+        bridge.consume_journal_entry(&entry(2, "o1", Some("a1"), JournalEventType::SubagentStart));
         let affected = bridge.consume_journal_entry(&entry(3, "o1", None, JournalEventType::Stop));
         assert_eq!(affected.as_deref(), Some("o1"));
         assert_eq!(bridge.journal_cursor(), 3);
@@ -939,9 +926,18 @@ mod tests {
         // supervision://tree + session://status.
         bridge.consume_journal_entry(&entry(1, "o1", None, JournalEventType::SessionStart));
         let channels: Vec<String> = rec.events.lock().iter().map(|(c, _)| c.clone()).collect();
-        assert!(channels.contains(&super::EVT_JOURNAL.to_string()), "journal: {channels:?}");
-        assert!(channels.contains(&super::EVT_AGENT_STATE.to_string()), "state: {channels:?}");
-        assert!(channels.contains(&super::EVT_SUPERVISION.to_string()), "tree: {channels:?}");
+        assert!(
+            channels.contains(&super::EVT_JOURNAL.to_string()),
+            "journal: {channels:?}"
+        );
+        assert!(
+            channels.contains(&super::EVT_AGENT_STATE.to_string()),
+            "state: {channels:?}"
+        );
+        assert!(
+            channels.contains(&super::EVT_SUPERVISION.to_string()),
+            "tree: {channels:?}"
+        );
         assert!(
             channels.contains(&super::EVT_SESSION_STATUS.to_string()),
             "status: {channels:?}"
@@ -990,7 +986,10 @@ mod tests {
 
         let got = seen.lock().clone();
         assert!(!got.is_empty(), "observer must fire on the emit path");
-        assert!(got.iter().all(|(u, _)| u == "o1"), "always the affected session");
+        assert!(
+            got.iter().all(|(u, _)| u == "o1"),
+            "always the affected session"
+        );
         assert_eq!(
             got.last().map(|(_, s)| *s),
             Some(SessionStatus::Completed),
@@ -1091,7 +1090,7 @@ mod tests {
 
     #[test]
     fn status_snapshot_journal_entry_routes_to_status_bridge_and_emits() {
-        use t_hub_protocol::{JournalSource, EventJournalEntry};
+        use t_hub_protocol::{EventJournalEntry, JournalSource};
         let bridge = AgentBridge::new();
         let rec = RecordingEmitter::default();
         let status = Arc::new(crate::claude::StatusBridge::new());
@@ -1159,8 +1158,7 @@ mod tests {
         // First snapshot: exactly ONE emit, on status://snapshot. No journal /
         // agent://state / supervision://tree / session://status.
         bridge.consume_journal_entry(&snap(1, 100));
-        let channels: Vec<String> =
-            rec.events.lock().iter().map(|(c, _)| c.clone()).collect();
+        let channels: Vec<String> = rec.events.lock().iter().map(|(c, _)| c.clone()).collect();
         assert_eq!(
             channels,
             vec![super::EVT_STATUS_SNAPSHOT.to_string()],
@@ -1198,7 +1196,11 @@ mod tests {
         let long = "a ".repeat(80);
         let p = serde_json::json!({ "session_id": "s1", "prompt": long });
         let t = super::derive_session_title(JournalEventType::UserPromptSubmit, &p).unwrap();
-        assert!(t.chars().count() <= super::TITLE_MAX_CHARS, "got {} chars", t.chars().count());
+        assert!(
+            t.chars().count() <= super::TITLE_MAX_CHARS,
+            "got {} chars",
+            t.chars().count()
+        );
         assert!(t.ends_with('…'));
     }
 

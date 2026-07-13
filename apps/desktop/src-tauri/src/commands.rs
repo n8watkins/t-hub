@@ -321,9 +321,7 @@ pub(crate) fn pane_command(shell: Option<&str>, startup_command: Option<&str>) -
     // as when typed by hand. Verified in a clean env (no inherited PATH).
     Some(format!(
         "exec \"${{SHELL:-/bin/sh}}\" -ilc {}",
-        sh_single_quote(&format!(
-            "{startup}; exec \"${{SHELL:-/bin/sh}}\" -l"
-        ))
+        sh_single_quote(&format!("{startup}; exec \"${{SHELL:-/bin/sh}}\" -l"))
     ))
 }
 
@@ -470,9 +468,7 @@ pub async fn attach_terminal(
             // self-heal). Re-read the fresh addr from control.json and retry the
             // attach ONCE against it, keeping the (unchanged) token.
             Err(e) => match endpoint.refresh_addr() {
-                Some(fresh) => {
-                    RemotePty::connect(&app, &fresh, endpoint.token(), &id, cols, rows)?
-                }
+                Some(fresh) => RemotePty::connect(&app, &fresh, endpoint.token(), &id, cols, rows)?,
                 None => return Err(e),
             },
         };
@@ -620,8 +616,7 @@ pub(crate) fn forward_captains_sync(
             return;
         }
     };
-    let payload =
-        serde_json::json!({ "command": "sync_captains", "args": { "sync": snap } });
+    let payload = serde_json::json!({ "command": "sync_captains", "args": { "sync": snap } });
     // Webview (the raw control://apply Tauri event controlBridge listens to).
     let _ = app.emit(crate::control::APPLY_EVENT_CHANNEL, &payload);
     // Socket clients (the native cockpit's apply module).
@@ -719,70 +714,69 @@ pub async fn list_terminals(
     // the `'static` closure needing to borrow `&State`.
     let (infos, live_sessions): (Vec<TerminalInfo>, std::collections::HashSet<String>) =
         tauri::async_runtime::spawn_blocking(move || {
-        // Source of truth for liveness is the tmux server on the `t-hub` socket;
-        // the in-memory map only tells us which terminals this UI currently has a
-        // PTY client for (Live) vs. ones running detached (Detached).
-        let live_sessions = tmux::list_sessions()
-            .map_err(|e| format!("failed to list tmux sessions: {e}"))?;
+            // Source of truth for liveness is the tmux server on the `t-hub` socket;
+            // the in-memory map only tells us which terminals this UI currently has a
+            // PTY client for (Live) vs. ones running detached (Detached).
+            let live_sessions =
+                tmux::list_sessions().map_err(|e| format!("failed to list tmux sessions: {e}"))?;
 
-        // Per-session foreground command + live cwd (best-effort), so each tile is
-        // labeled by what's actually running (`claude`, `zsh`, ...) and where, rather
-        // than a raw id. A failure here just leaves the old id-based label.
-        let pane_map: std::collections::HashMap<String, (String, String)> = tmux::pane_info()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| (p.session, (p.command, p.cwd)))
-            .collect();
+            // Per-session foreground command + live cwd (best-effort), so each tile is
+            // labeled by what's actually running (`claude`, `zsh`, ...) and where, rather
+            // than a raw id. A failure here just leaves the old id-based label.
+            let pane_map: std::collections::HashMap<String, (String, String)> = tmux::pane_info()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| (p.session, (p.command, p.cwd)))
+                .collect();
 
-        // Reconcile: every tmux session named `th_*` is a T-Hub terminal. Reverse
-        // any leftover in-memory entries whose tmux session vanished by NOT
-        // reporting them (their reader thread will have emitted `exit`).
-        let mut infos: Vec<TerminalInfo> = Vec::with_capacity(live_sessions.len());
-        for tmux_session in &live_sessions {
-            // Only surface sessions that belong to T-Hub (the `th_` prefix), not
-            // anything a user might have created on this socket out-of-band.
-            if !tmux_session.starts_with("th_") {
-                continue;
+            // Reconcile: every tmux session named `th_*` is a T-Hub terminal. Reverse
+            // any leftover in-memory entries whose tmux session vanished by NOT
+            // reporting them (their reader thread will have emitted `exit`).
+            let mut infos: Vec<TerminalInfo> = Vec::with_capacity(live_sessions.len());
+            for tmux_session in &live_sessions {
+                // Only surface sessions that belong to T-Hub (the `th_` prefix), not
+                // anything a user might have created on this socket out-of-band.
+                if !tmux_session.starts_with("th_") {
+                    continue;
+                }
+
+                // Match back to an in-memory PtySession (if this UI has a client for
+                // it) to recover the canonical id; otherwise the id is the session's
+                // own suffix and the terminal is running detached from this UI.
+                let (id, state_val) = match live_clients.get(tmux_session) {
+                    Some(id) => (id.clone(), TerminalState::Live),
+                    None => (
+                        tmux_session
+                            .strip_prefix("th_")
+                            .unwrap_or(tmux_session)
+                            .to_string(),
+                        TerminalState::Detached,
+                    ),
+                };
+
+                // Foreground command + live cwd from tmux (pane_info), so the UI labels
+                // this tile by what's running and where instead of the raw id.
+                let (cmd, cwd) = pane_map.get(tmux_session).cloned().unwrap_or_default();
+                infos.push(TerminalInfo {
+                    id,
+                    tmux_session: tmux_session.clone(),
+                    cwd,
+                    title: if cmd.is_empty() {
+                        tmux_session.clone()
+                    } else {
+                        cmd
+                    },
+                    state: state_val,
+                });
             }
 
-            // Match back to an in-memory PtySession (if this UI has a client for
-            // it) to recover the canonical id; otherwise the id is the session's
-            // own suffix and the terminal is running detached from this UI.
-            let (id, state_val) = match live_clients.get(tmux_session) {
-                Some(id) => (id.clone(), TerminalState::Live),
-                None => (
-                    tmux_session
-                        .strip_prefix("th_")
-                        .unwrap_or(tmux_session)
-                        .to_string(),
-                    TerminalState::Detached,
-                ),
-            };
-
-            // Foreground command + live cwd from tmux (pane_info), so the UI labels
-            // this tile by what's running and where instead of the raw id.
-            let (cmd, cwd) = pane_map.get(tmux_session).cloned().unwrap_or_default();
-            infos.push(TerminalInfo {
-                id,
-                tmux_session: tmux_session.clone(),
-                cwd,
-                title: if cmd.is_empty() {
-                    tmux_session.clone()
-                } else {
-                    cmd
-                },
-                state: state_val,
-            });
-        }
-
-        // Hand back the live tmux session set too, so the caller can self-reap
-        // genuinely-EXITED entries from the in-memory map (see below).
-        let live_set: std::collections::HashSet<String> =
-            live_sessions.into_iter().collect();
-        Ok::<_, String>((infos, live_set))
-    })
-    .await
-    .map_err(|e| format!("list_terminals task failed: {e}"))??;
+            // Hand back the live tmux session set too, so the caller can self-reap
+            // genuinely-EXITED entries from the in-memory map (see below).
+            let live_set: std::collections::HashSet<String> = live_sessions.into_iter().collect();
+            Ok::<_, String>((infos, live_set))
+        })
+        .await
+        .map_err(|e| format!("list_terminals task failed: {e}"))??;
 
     // Self-reap genuinely-EXITED terminals: any in-memory conn whose tmux session
     // is no longer in the live set has had its process tree end (tmux tore the
@@ -943,8 +937,14 @@ mod tests {
 
         // A startup command rides inside the interactive login shell wrap.
         let cmd = pane_command(None, Some("claude --resume 'abc-123'")).unwrap();
-        assert!(cmd.starts_with("exec \"${SHELL:-/bin/sh}\" -ilc "), "got: {cmd}");
-        assert!(cmd.contains("claude --resume '\\''abc-123'\\''"), "got: {cmd}");
+        assert!(
+            cmd.starts_with("exec \"${SHELL:-/bin/sh}\" -ilc "),
+            "got: {cmd}"
+        );
+        assert!(
+            cmd.contains("claude --resume '\\''abc-123'\\''"),
+            "got: {cmd}"
+        );
         assert!(cmd.contains("exec \"${SHELL:-/bin/sh}\" -l"), "got: {cmd}");
     }
 

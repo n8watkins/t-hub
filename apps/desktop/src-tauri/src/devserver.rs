@@ -309,7 +309,10 @@ pub async fn start_dev_server(
     }
 
     // Announce the start so the Dev tab flips to "running" immediately.
-    let _ = app.emit(&channel(&terminal_id), DevServerEvent::started(&terminal_id));
+    let _ = app.emit(
+        &channel(&terminal_id),
+        DevServerEvent::started(&terminal_id),
+    );
 
     // Register the child + the stdout reader handle (joined on stop). We keep only
     // the stdout handle to join; the stderr thread exits on its own EOF and is
@@ -340,7 +343,7 @@ pub async fn start_dev_server(
                 let still_ours = match reg.get_mut(&id_wait) {
                     Some(proc) => match proc.child.try_wait() {
                         Ok(Some(status)) => Some(status.code()),
-                        Ok(None) => None,    // still running
+                        Ok(None) => None,     // still running
                         Err(_) => Some(None), // wait failed: treat as gone
                     },
                     None => {
@@ -357,8 +360,10 @@ pub async fn start_dev_server(
                         Some(c) => format!("dev server exited (code {c})"),
                         None => "dev server exited".to_string(),
                     };
-                    let _ =
-                        app_wait.emit(&channel(&id_wait), DevServerEvent::exited(&id_wait, summary));
+                    let _ = app_wait.emit(
+                        &channel(&id_wait),
+                        DevServerEvent::exited(&id_wait, summary),
+                    );
                     return;
                 }
             }
@@ -415,9 +420,10 @@ fn wsl_host_ip() -> Option<String> {
         // simpler and matches how the rest of T-Hub probes WSL.
         .arg("hostname -I");
     c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    // Bounded (WSL_PROBE): a trivial `hostname -I`; a cold/wedged WSL must not park
-    // the `preview_host` handler this runs on.
-    let out = crate::bounded_exec::output_with_timeout(c, crate::bounded_exec::WSL_PROBE_TIMEOUT).ok()?;
+                                   // Bounded (WSL_PROBE): a trivial `hostname -I`; a cold/wedged WSL must not park
+                                   // the `preview_host` handler this runs on.
+    let out =
+        crate::bounded_exec::output_with_timeout(c, crate::bounded_exec::WSL_PROBE_TIMEOUT).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -542,7 +548,11 @@ mod tests {
         let mut cmd = build_command("/tmp", "printf '%s' \"$HOST\"");
         let out = cmd.output().expect("sh -lc should run");
         let text = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(text.trim(), "0.0.0.0", "HOST should be forced to all-ifaces");
+        assert_eq!(
+            text.trim(),
+            "0.0.0.0",
+            "HOST should be forced to all-ifaces"
+        );
     }
 
     /// The TCP probe should connect to a port we open and report it refused once
@@ -564,12 +574,7 @@ mod tests {
         // Poll `tcp_reachable` until it returns `want`, or fail after `deadline`.
         // Each probe carries a tight connect budget so the loop is responsive; the
         // overall deadline (not any single probe) bounds the wait.
-        fn poll_until_reachable(
-            host: &str,
-            port: u16,
-            want: bool,
-            deadline: Duration,
-        ) -> bool {
+        fn poll_until_reachable(host: &str, port: u16, want: bool, deadline: Duration) -> bool {
             let start = Instant::now();
             loop {
                 if tcp_reachable(host, port, 50).unwrap() == want {

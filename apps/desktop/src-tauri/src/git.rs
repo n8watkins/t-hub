@@ -428,19 +428,20 @@ fn parse_worktree_list(stdout: &str) -> Vec<WorktreeInfo> {
 
     // Flush the in-progress record (if it has a path) into `out`, marking it
     // linked iff it isn't the first record we've seen.
-    let flush = |path: &mut Option<String>, branch: &mut Option<String>, out: &mut Vec<WorktreeInfo>| {
-        if let Some(p) = path.take() {
-            let is_linked = !out.is_empty();
-            out.push(WorktreeInfo {
-                path: p,
-                branch: branch.take(),
-                is_linked,
-            });
-        } else {
-            // No path => nothing to flush, but still clear any stray branch.
-            *branch = None;
-        }
-    };
+    let flush =
+        |path: &mut Option<String>, branch: &mut Option<String>, out: &mut Vec<WorktreeInfo>| {
+            if let Some(p) = path.take() {
+                let is_linked = !out.is_empty();
+                out.push(WorktreeInfo {
+                    path: p,
+                    branch: branch.take(),
+                    is_linked,
+                });
+            } else {
+                // No path => nothing to flush, but still clear any stray branch.
+                *branch = None;
+            }
+        };
 
     for line in stdout.lines() {
         let line = line.trim_end();
@@ -507,7 +508,11 @@ fn already_checked_out_branch(stderr: &str) -> Option<String> {
 /// Each element is its own argv entry (no shell interpolation), so paths/branches
 /// with metacharacters — and branch names containing `/` (e.g. `feature/login`) —
 /// are passed verbatim to git.
-fn worktree_add_args<'a>(path: &'a str, branch: Option<&'a str>, branch_exists: bool) -> Vec<&'a str> {
+fn worktree_add_args<'a>(
+    path: &'a str,
+    branch: Option<&'a str>,
+    branch_exists: bool,
+) -> Vec<&'a str> {
     let mut args: Vec<&str> = vec!["worktree", "add", path];
     if let Some(b) = branch {
         if branch_exists {
@@ -910,7 +915,10 @@ mod tests {
         let info = parse_git_info_output("inside\t\n");
         assert_eq!(info, GitInfo::not_repo());
         // A literal `false` (some git builds) is likewise "not a repo".
-        assert_eq!(parse_git_info_output("inside\tfalse\n"), GitInfo::not_repo());
+        assert_eq!(
+            parse_git_info_output("inside\tfalse\n"),
+            GitInfo::not_repo()
+        );
         // Completely empty stdout (total spawn weirdness) -> not a repo.
         assert_eq!(parse_git_info_output(""), GitInfo::not_repo());
     }
@@ -1162,7 +1170,10 @@ detached
     fn worktree_add_args_new_branch_uses_dash_b() {
         // branch given + does NOT exist -> create it with `-b`.
         let args = worktree_add_args("/home/u/repo-feat", Some("feat/login"), false);
-        assert_eq!(args, vec!["worktree", "add", "/home/u/repo-feat", "-b", "feat/login"]);
+        assert_eq!(
+            args,
+            vec!["worktree", "add", "/home/u/repo-feat", "-b", "feat/login"]
+        );
         // `-b` must come immediately before the branch name (git's create form).
         let b_idx = args.iter().position(|a| *a == "-b").expect("contains -b");
         assert_eq!(args[b_idx + 1], "feat/login");
@@ -1172,7 +1183,10 @@ detached
     fn worktree_add_args_existing_branch_checks_out_without_dash_b() {
         // branch given + already exists -> bare checkout (`<path> <branch>`, no `-b`).
         let args = worktree_add_args("/home/u/repo-feat", Some("feat/login"), true);
-        assert_eq!(args, vec!["worktree", "add", "/home/u/repo-feat", "feat/login"]);
+        assert_eq!(
+            args,
+            vec!["worktree", "add", "/home/u/repo-feat", "feat/login"]
+        );
         assert!(!args.contains(&"-b"), "existing branch must not pass -b");
     }
 
@@ -1181,7 +1195,10 @@ detached
         // No branch -> `["worktree","add",path]`; git derives the branch from the
         // path's final component. The `branch_exists` flag is irrelevant here.
         let expected = vec!["worktree", "add", "/home/u/repo-feat"];
-        assert_eq!(worktree_add_args("/home/u/repo-feat", None, false), expected);
+        assert_eq!(
+            worktree_add_args("/home/u/repo-feat", None, false),
+            expected
+        );
         assert_eq!(worktree_add_args("/home/u/repo-feat", None, true), expected);
     }
 }

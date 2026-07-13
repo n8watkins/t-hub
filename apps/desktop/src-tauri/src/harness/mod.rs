@@ -195,7 +195,15 @@ mod tests {
         // No-regression lock: anything unknown/legacy/empty is Claude (today's
         // only behavior). This is the guard that fails if the fallback is ever
         // flipped to Codex.
-        for p in ["", "   ", "gpt", "anthropic", "openai", "codexx", "claude-2"] {
+        for p in [
+            "",
+            "   ",
+            "gpt",
+            "anthropic",
+            "openai",
+            "codexx",
+            "claude-2",
+        ] {
             assert_eq!(
                 Harness::from_provider(p),
                 Harness::Claude,

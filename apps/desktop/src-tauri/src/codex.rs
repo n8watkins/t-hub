@@ -264,9 +264,9 @@ PY"#;
         .arg("-lc")
         .arg(READER)
         .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    // Bounded (LOCAL_IO): a recursive glob over ~/.codex/sessions + an immutable
-    // SQLite open. Fast normally, but a slow/large tree must not park the
-    // control-handler thread this runs on (the M3 `codex_usage` read path).
+                                      // Bounded (LOCAL_IO): a recursive glob over ~/.codex/sessions + an immutable
+                                      // SQLite open. Fast normally, but a slow/large tree must not park the
+                                      // control-handler thread this runs on (the M3 `codex_usage` read path).
     let out = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::LOCAL_IO_TIMEOUT)
         .ok()?;
     if !out.status.success() {

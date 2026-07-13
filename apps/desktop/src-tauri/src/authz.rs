@@ -302,7 +302,13 @@ mod tests {
         // relay disabled. This is the artifact + resolve-and-verify gate the captain's
         // money/publish gate consults.
         let store = AuthzStore::ephemeral();
-        let a = store.record(ORIGIN_GENERAL, "sess-general", "spend", Some("ship-a".into()), None);
+        let a = store.record(
+            ORIGIN_GENERAL,
+            "sess-general",
+            "spend",
+            Some("ship-a".into()),
+            None,
+        );
         assert_eq!(store.present(&a.id, false), GateVerdict::Present);
         // An unknown reference is Absent (the gate FIRES = escalate).
         assert_eq!(store.present("no-such-id", false), GateVerdict::Absent);
@@ -352,7 +358,13 @@ mod tests {
         let path = temp_path();
         let id = {
             let store = AuthzStore::load(path.clone());
-            let a = store.record(ORIGIN_GENERAL, "sess-general", "spend", Some("ship-a".into()), None);
+            let a = store.record(
+                ORIGIN_GENERAL,
+                "sess-general",
+                "spend",
+                Some("ship-a".into()),
+                None,
+            );
             a.id
         };
         let reloaded = AuthzStore::load(path.clone());

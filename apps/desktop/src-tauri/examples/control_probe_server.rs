@@ -17,7 +17,9 @@ use parking_lot::Mutex;
 use t_hub_lib::{control, status_bridge_for_test, supervision_for_test};
 
 fn main() {
-    let token = std::env::args().nth(1).unwrap_or_else(|| "t13-probe-token".to_string());
+    let token = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "t13-probe-token".to_string());
 
     // Empty-but-real supervision + status bridges. The PTY attach path this probe
     // exercises needs neither; they're required only to construct the context.

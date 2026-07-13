@@ -95,12 +95,10 @@ fn read_persisted() -> Option<String> {
 /// here does NOT prevent the in-memory update or the change event — a theme that
 /// can't be written to disk still applies for the session.
 fn write_persisted(json: &str) -> Result<(), String> {
-    let path = theme_file().ok_or_else(|| {
-        "could not resolve a config dir (no XDG_CONFIG_HOME / HOME)".to_string()
-    })?;
+    let path = theme_file()
+        .ok_or_else(|| "could not resolve a config dir (no XDG_CONFIG_HOME / HOME)".to_string())?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))
 }
@@ -166,12 +164,10 @@ pub async fn load_shared_layout() -> Result<Option<String>, String> {
 /// Write the shared workspace layout JSON (best-effort, creating the dir as needed).
 #[tauri::command]
 pub async fn save_shared_layout(layout: String) -> Result<(), String> {
-    let path = shared_layout_file().ok_or_else(|| {
-        "could not resolve a config dir (no XDG_CONFIG_HOME / HOME)".to_string()
-    })?;
+    let path = shared_layout_file()
+        .ok_or_else(|| "could not resolve a config dir (no XDG_CONFIG_HOME / HOME)".to_string())?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     std::fs::write(&path, layout).map_err(|e| format!("write {}: {e}", path.display()))
 }
@@ -194,10 +190,7 @@ mod tests {
     fn with_temp_config<T>(f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "t-hub-theme-test-{}-{n}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("t-hub-theme-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let prev = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", &dir);

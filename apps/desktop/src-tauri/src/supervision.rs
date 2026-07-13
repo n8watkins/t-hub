@@ -276,14 +276,17 @@ impl Supervisor {
 
             JournalEventType::SubagentStart => {
                 if let Some(aid) = agent_id {
-                    entry.children.entry(aid.to_string()).or_insert(SubagentNode {
-                        parent_session_id: session_id.to_string(),
-                        agent_id: aid.to_string(),
-                        agent_type: agent_type.map(str::to_string),
-                        state: SubagentState::Running,
-                        started_at: timestamp_ms,
-                        ended_at: None,
-                    });
+                    entry
+                        .children
+                        .entry(aid.to_string())
+                        .or_insert(SubagentNode {
+                            parent_session_id: session_id.to_string(),
+                            agent_id: aid.to_string(),
+                            agent_type: agent_type.map(str::to_string),
+                            state: SubagentState::Running,
+                            started_at: timestamp_ms,
+                            ended_at: None,
+                        });
                 }
                 // Starting a subagent implies the orchestrator is actively working.
                 if !entry.main_stopped {
@@ -547,10 +550,7 @@ impl Supervisor {
     /// After a child/task finishes, if the main agent had already stopped and
     /// everything is now idle, transition WaitingOnSubagents → Completed.
     fn recompute_after_completion(entry: &mut SessionEntry) {
-        if entry.main_stopped
-            && entry.idle()
-            && entry.status == SessionStatus::WaitingOnSubagents
-        {
+        if entry.main_stopped && entry.idle() && entry.status == SessionStatus::WaitingOnSubagents {
             entry.status = SessionStatus::Completed;
         }
     }
@@ -605,8 +605,22 @@ mod tests {
     #[test]
     fn stop_with_running_subagent_is_waiting_not_completed() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 2);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            2,
+        );
         // Orchestrator spawns a subagent.
         s.ingest(
             Some("o1"),
@@ -625,25 +639,60 @@ mod tests {
         );
 
         // The child finishes → orchestrator transitions to Completed.
-        s.ingest(Some("o1"), Some("a1"), None, None, JournalEventType::SubagentStop, 5);
+        s.ingest(
+            Some("o1"),
+            Some("a1"),
+            None,
+            None,
+            JournalEventType::SubagentStop,
+            5,
+        );
         assert_eq!(s.status("o1"), SessionStatus::Completed);
     }
 
     #[test]
     fn stop_with_outstanding_task_is_waiting() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::TaskCreated, 2);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::TaskCreated,
+            2,
+        );
         s.ingest(Some("o1"), None, None, None, JournalEventType::Stop, 3);
         assert_eq!(s.status("o1"), SessionStatus::WaitingOnSubagents);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::TaskCompleted, 4);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::TaskCompleted,
+            4,
+        );
         assert_eq!(s.status("o1"), SessionStatus::Completed);
     }
 
     #[test]
     fn stop_with_nothing_outstanding_is_completed() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
         s.ingest(Some("o1"), None, None, None, JournalEventType::Stop, 2);
         assert_eq!(s.status("o1"), SessionStatus::Completed);
     }
@@ -651,8 +700,22 @@ mod tests {
     #[test]
     fn escape_interrupt_phantom_reaped_at_turn_boundary() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 2);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            2,
+        );
         s.ingest(
             Some("o1"),
             Some("a1"),
@@ -667,7 +730,14 @@ mod tests {
         assert_eq!(s.status("o1"), SessionStatus::WaitingOnSubagents);
         // The next prompt is the turn boundary: phantom cleared, tree empty,
         // session Working - no permanent "1 running" pin.
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 5);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            5,
+        );
         assert_eq!(s.status("o1"), SessionStatus::Working);
         assert!(s.tree("o1").unwrap().children.is_empty());
     }
@@ -675,15 +745,57 @@ mod tests {
     #[test]
     fn counts_are_turn_scoped() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 2);
-        s.ingest(Some("o1"), Some("a1"), None, None, JournalEventType::SubagentStart, 3);
-        s.ingest(Some("o1"), Some("a1"), None, None, JournalEventType::SubagentStop, 4);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            2,
+        );
+        s.ingest(
+            Some("o1"),
+            Some("a1"),
+            None,
+            None,
+            JournalEventType::SubagentStart,
+            3,
+        );
+        s.ingest(
+            Some("o1"),
+            Some("a1"),
+            None,
+            None,
+            JournalEventType::SubagentStop,
+            4,
+        );
         assert_eq!(s.tree("o1").unwrap().children.len(), 1);
         // A new turn resets the display: last turn's completed child no longer
         // counts - the tree reads "N running · M done" for THIS turn.
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 5);
-        s.ingest(Some("o1"), Some("a2"), None, None, JournalEventType::SubagentStart, 6);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            5,
+        );
+        s.ingest(
+            Some("o1"),
+            Some("a2"),
+            None,
+            None,
+            JournalEventType::SubagentStart,
+            6,
+        );
         let tree = s.tree("o1").unwrap();
         assert_eq!(tree.children.len(), 1);
         assert_eq!(tree.children[0].agent_id, "a2");
@@ -693,16 +805,40 @@ mod tests {
     #[test]
     fn orphan_stop_synthesizes_completed_child() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 2);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            2,
+        );
         // The real-journal shape: an implicit internal agent fires SubagentStop
         // with an EMPTY agent_type and never fired SubagentStart (995/1005
         // orphan stops in the 2026-07 journal).
-        s.ingest(Some("o1"), Some("ghost"), Some(""), None, JournalEventType::SubagentStop, 3);
+        s.ingest(
+            Some("o1"),
+            Some("ghost"),
+            Some(""),
+            None,
+            JournalEventType::SubagentStop,
+            3,
+        );
         let tree = s.tree("o1").unwrap();
         assert_eq!(tree.children.len(), 1, "orphan stop must synthesize a node");
         assert_eq!(tree.children[0].state, SubagentState::Completed);
-        assert_eq!(tree.children[0].agent_type, None, "empty type normalized to absent");
+        assert_eq!(
+            tree.children[0].agent_type, None,
+            "empty type normalized to absent"
+        );
         assert_eq!(tree.children[0].started_at, 3);
         assert_eq!(tree.children[0].ended_at, Some(3));
         // The synthesized completion never blocks a clean Completed.
@@ -713,16 +849,44 @@ mod tests {
     #[test]
     fn timed_out_running_child_is_reaped_and_unpins_waiting() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 2);
-        s.ingest(Some("o1"), Some("a1"), None, None, JournalEventType::SubagentStart, 3);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            2,
+        );
+        s.ingest(
+            Some("o1"),
+            Some("a1"),
+            None,
+            None,
+            JournalEventType::SubagentStart,
+            3,
+        );
         s.ingest(Some("o1"), None, None, None, JournalEventType::Stop, 4);
         assert_eq!(s.status("o1"), SessionStatus::WaitingOnSubagents);
         // No turn boundary ever arrives; ANY later event past the orphan
         // deadline (here a reducer-passthrough status snapshot) reaps the
         // phantom and unpins the stuck WaitingOnSubagents.
         let late = 3 + ORPHAN_RUNNING_TIMEOUT_MS;
-        s.ingest(Some("o1"), None, None, None, JournalEventType::StatusSnapshot, late);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::StatusSnapshot,
+            late,
+        );
         assert_eq!(s.status("o1"), SessionStatus::Completed);
         let tree = s.tree("o1").unwrap();
         assert_eq!(tree.children[0].state, SubagentState::Completed);
@@ -732,9 +896,30 @@ mod tests {
     #[test]
     fn terminal_status_reaps_running_children() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), Some("a1"), None, None, JournalEventType::SubagentStart, 2);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionEnd, 3);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            Some("a1"),
+            None,
+            None,
+            JournalEventType::SubagentStart,
+            2,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionEnd,
+            3,
+        );
         let tree = s.tree("o1").unwrap();
         assert_eq!(tree.children[0].state, SubagentState::Completed);
         assert_eq!(tree.children[0].ended_at, Some(3));
@@ -743,9 +928,30 @@ mod tests {
     #[test]
     fn stop_failure_reaps_running_children() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), Some("a1"), None, None, JournalEventType::SubagentStart, 2);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::StopFailure, 3);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            Some("a1"),
+            None,
+            None,
+            JournalEventType::SubagentStart,
+            2,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::StopFailure,
+            3,
+        );
         assert_eq!(s.status("o1"), SessionStatus::Failed);
         let tree = s.tree("o1").unwrap();
         assert_eq!(tree.children[0].state, SubagentState::Completed);
@@ -755,10 +961,31 @@ mod tests {
     #[test]
     fn elicitation_and_permission_map_to_states() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::Elicitation, 2);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::Elicitation,
+            2,
+        );
         assert_eq!(s.status("o1"), SessionStatus::NeedsQuestion);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::PermissionRequest, 3);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::PermissionRequest,
+            3,
+        );
         assert_eq!(s.status("o1"), SessionStatus::NeedsPermission);
     }
 
@@ -771,7 +998,14 @@ mod tests {
     #[test]
     fn idle_prompt_notification_does_not_flip_completed_to_needs_question() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
         s.ingest(Some("o1"), None, None, None, JournalEventType::Stop, 2);
         assert_eq!(s.status("o1"), SessionStatus::Completed);
 
@@ -815,7 +1049,14 @@ mod tests {
             "computer_use_exit",
         ] {
             let mut s = sup();
-            s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+            s.ingest(
+                Some("o1"),
+                None,
+                None,
+                None,
+                JournalEventType::SessionStart,
+                1,
+            );
             s.ingest(Some("o1"), None, None, None, JournalEventType::Stop, 2);
             assert_eq!(s.status("o1"), SessionStatus::Completed);
             let before = s.current_seq();
@@ -844,7 +1085,14 @@ mod tests {
         // Both the top-level and the subagent-side (worker_) permission pings.
         for ntype in ["permission_prompt", "worker_permission_prompt"] {
             let mut s = sup();
-            s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+            s.ingest(
+                Some("o1"),
+                None,
+                None,
+                None,
+                JournalEventType::SessionStart,
+                1,
+            );
             s.ingest(
                 Some("o1"),
                 None,
@@ -864,7 +1112,14 @@ mod tests {
     #[test]
     fn unknown_notification_type_keeps_needs_question_fallback() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
         // An unknown/future type must NEVER be silently dropped - it still alerts.
         s.ingest(
             Some("o1"),
@@ -880,16 +1135,37 @@ mod tests {
     #[test]
     fn legacy_notification_without_type_keeps_needs_question_fallback() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
         // Legacy Claude payloads carry no `notification_type` at all.
-        s.ingest(Some("o1"), None, None, None, JournalEventType::Notification, 2);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::Notification,
+            2,
+        );
         assert_eq!(s.status("o1"), SessionStatus::NeedsQuestion);
     }
 
     #[test]
     fn elicitation_dialog_notification_maps_to_needs_question() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
         s.ingest(
             Some("o1"),
             None,
@@ -904,8 +1180,22 @@ mod tests {
     #[test]
     fn idle_prompt_notification_does_not_downgrade_a_real_pending_need() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::PermissionRequest, 2);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::PermissionRequest,
+            2,
+        );
         assert_eq!(s.status("o1"), SessionStatus::NeedsPermission);
         // An informational ping arriving on top of a genuine pending need leaves
         // status unchanged - it neither escalates nor clears the real state.
@@ -923,11 +1213,46 @@ mod tests {
     #[test]
     fn tree_reports_children_and_task_count() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), Some("a1"), Some("explore"), None, JournalEventType::SubagentStart, 2);
-        s.ingest(Some("o1"), Some("a2"), Some("plan"), None, JournalEventType::SubagentStart, 3);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::TaskCreated, 4);
-        s.ingest(Some("o1"), Some("a1"), None, None, JournalEventType::SubagentStop, 5);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            Some("a1"),
+            Some("explore"),
+            None,
+            JournalEventType::SubagentStart,
+            2,
+        );
+        s.ingest(
+            Some("o1"),
+            Some("a2"),
+            Some("plan"),
+            None,
+            JournalEventType::SubagentStart,
+            3,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::TaskCreated,
+            4,
+        );
+        s.ingest(
+            Some("o1"),
+            Some("a1"),
+            None,
+            None,
+            JournalEventType::SubagentStop,
+            5,
+        );
 
         let tree = s.tree("o1").unwrap();
         assert_eq!(tree.children.len(), 2);
@@ -942,18 +1267,46 @@ mod tests {
     #[test]
     fn new_turn_after_completion_returns_to_working() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
         s.ingest(Some("o1"), None, None, None, JournalEventType::Stop, 2);
         assert_eq!(s.status("o1"), SessionStatus::Completed);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 3);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            3,
+        );
         assert_eq!(s.status("o1"), SessionStatus::Working);
     }
 
     #[test]
     fn stop_failure_is_failed() {
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::StopFailure, 2);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::StopFailure,
+            2,
+        );
         assert_eq!(s.status("o1"), SessionStatus::Failed);
     }
 
@@ -964,11 +1317,25 @@ mod tests {
         // that captured `start` before the run can still observe it after the fact.
         let mut s = sup();
         let start = s.current_seq();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 1);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            1,
+        );
         assert_eq!(s.status("o1"), SessionStatus::Working);
         s.ingest(Some("o1"), None, None, None, JournalEventType::Stop, 2);
         assert_eq!(s.status("o1"), SessionStatus::Completed);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 3);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            3,
+        );
         // Current status is back to Working — Completed was only transient.
         assert_eq!(s.status("o1"), SessionStatus::Working);
 
@@ -993,15 +1360,32 @@ mod tests {
         // Re-ingesting the same-status signal must not push a duplicate edge.
         let mut s = sup();
         let start = s.current_seq();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 1);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            1,
+        );
         // A second UserPromptSubmit while already Working is a same-status re-ingest.
-        s.ingest(Some("o1"), None, None, None, JournalEventType::UserPromptSubmit, 2);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            2,
+        );
         let working_edges = s
             .transitions_since(start)
             .into_iter()
             .filter(|(sid, st)| sid == "o1" && *st == SessionStatus::Working)
             .count();
-        assert_eq!(working_edges, 1, "same-status re-ingest must not log an edge");
+        assert_eq!(
+            working_edges, 1,
+            "same-status re-ingest must not log an edge"
+        );
     }
 
     // --- Memory-leak fixes: eviction + bounded growth --------------------------
@@ -1013,14 +1397,38 @@ mod tests {
         // Unknown. Bounded growth is the LRU cap's job (the entry stops being touched
         // → ages out oldest-first), not an immediate evict here.
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), Some("a1"), Some("explore"), None, JournalEventType::SubagentStart, 2);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            Some("a1"),
+            Some("explore"),
+            None,
+            JournalEventType::SubagentStart,
+            2,
+        );
         s.ingest(Some("o1"), None, None, None, JournalEventType::Stop, 3);
         assert!(s.tree("o1").is_some());
 
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionEnd, 4);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionEnd,
+            4,
+        );
         // Entry survives with the terminal status (Failed — it wasn't Completed).
-        assert!(s.tree("o1").is_some(), "tree must survive SessionEnd for the UI");
+        assert!(
+            s.tree("o1").is_some(),
+            "tree must survive SessionEnd for the UI"
+        );
         assert_eq!(s.session_ids().len(), 1);
         assert_eq!(
             s.status("o1"),
@@ -1035,10 +1443,24 @@ mod tests {
         // `wait_for_status(completed)` poller that polls right after the end still
         // sees Completed instead of a spurious timeout. (Regression guard.)
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
         s.ingest(Some("o1"), None, None, None, JournalEventType::Stop, 2); // no children → Completed
         assert_eq!(s.status("o1"), SessionStatus::Completed);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionEnd, 3);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionEnd,
+            3,
+        );
         assert_eq!(
             s.status("o1"),
             SessionStatus::Completed,
@@ -1052,8 +1474,22 @@ mod tests {
         // so a poller that captured `start` before the run observes it via the log.
         let mut s = sup();
         let start = s.current_seq();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionEnd, 2);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionEnd,
+            2,
+        );
         let matched = s.matched_since("o1", &[SessionStatus::Failed], start);
         assert!(
             matches!(matched, Some((_, SessionStatus::Failed))),
@@ -1067,18 +1503,46 @@ mod tests {
         // Completed children beyond the cap are pruned oldest-first; a still-running
         // child is always retained (it's outstanding and drives WaitingOnSubagents).
         let mut s = sup();
-        s.ingest(Some("o1"), None, None, None, JournalEventType::SessionStart, 1);
+        s.ingest(
+            Some("o1"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
         // One long-running child that never stops.
-        s.ingest(Some("o1"), Some("run"), Some("worker"), None, JournalEventType::SubagentStart, 2);
+        s.ingest(
+            Some("o1"),
+            Some("run"),
+            Some("worker"),
+            None,
+            JournalEventType::SubagentStart,
+            2,
+        );
 
         // Finish far more than the cap's worth of children.
         let n = COMPLETED_CHILDREN_CAP + 50;
         for i in 0..n {
             let aid = format!("c{i:04}");
             let start_ts = 100 + i as u64;
-            s.ingest(Some("o1"), Some(&aid), Some("worker"), None, JournalEventType::SubagentStart, start_ts);
+            s.ingest(
+                Some("o1"),
+                Some(&aid),
+                Some("worker"),
+                None,
+                JournalEventType::SubagentStart,
+                start_ts,
+            );
             // End them in order so `ended_at` reflects finish order.
-            s.ingest(Some("o1"), Some(&aid), None, None, JournalEventType::SubagentStop, start_ts + 1);
+            s.ingest(
+                Some("o1"),
+                Some(&aid),
+                None,
+                None,
+                JournalEventType::SubagentStop,
+                start_ts + 1,
+            );
         }
 
         let tree = s.tree("o1").unwrap();
@@ -1092,7 +1556,10 @@ mod tests {
             .iter()
             .filter(|c| c.state == SubagentState::Running)
             .count();
-        assert_eq!(completed, COMPLETED_CHILDREN_CAP, "completed children are capped");
+        assert_eq!(
+            completed, COMPLETED_CHILDREN_CAP,
+            "completed children are capped"
+        );
         assert_eq!(running, 1, "the still-running child is never pruned");
 
         // The oldest-finished children were the victims: c0000 is gone, the most
@@ -1117,28 +1584,57 @@ mod tests {
         // `update_stamp`s ascend s0 < s1 < ... .
         for i in 0..SESSION_MAP_CAP {
             let sid = format!("s{i:05}");
-            s.ingest(Some(&sid), None, None, None, JournalEventType::SessionStart, i as u64);
+            s.ingest(
+                Some(&sid),
+                None,
+                None,
+                None,
+                JournalEventType::SessionStart,
+                i as u64,
+            );
         }
         assert_eq!(s.session_ids().len(), SESSION_MAP_CAP, "filled to the cap");
 
         // Re-touch the oldest session so it is NO LONGER the LRU victim — proving
         // eviction is recency-based, not insertion-based.
-        s.ingest(Some("s00000"), None, None, None, JournalEventType::UserPromptSubmit, 9_000);
+        s.ingest(
+            Some("s00000"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            9_000,
+        );
 
         // One more brand-new session pushes us over the cap → exactly one eviction.
-        s.ingest(Some("s99999"), None, None, None, JournalEventType::SessionStart, 9_001);
+        s.ingest(
+            Some("s99999"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            9_001,
+        );
         assert_eq!(
             s.session_ids().len(),
             SESSION_MAP_CAP,
             "map stays hard-bounded at the cap"
         );
         // The re-touched oldest survives; the now-least-recent (s00001) is gone.
-        assert_eq!(s.status("s00000"), SessionStatus::Working, "re-touched session survives");
+        assert_eq!(
+            s.status("s00000"),
+            SessionStatus::Working,
+            "re-touched session survives"
+        );
         assert_eq!(
             s.status("s00001"),
             SessionStatus::Unknown,
             "least-recently-updated session was evicted"
         );
-        assert_eq!(s.status("s99999"), SessionStatus::Working, "the new session is present");
+        assert_eq!(
+            s.status("s99999"),
+            SessionStatus::Working,
+            "the new session is present"
+        );
     }
 }

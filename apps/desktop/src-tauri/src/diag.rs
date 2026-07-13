@@ -170,7 +170,10 @@ fn writer() -> &'static SyncSender<Msg> {
 fn writer_loop(path: PathBuf, rx: mpsc::Receiver<Msg>) {
     let mut file = open_log(&path);
     // Track the size ourselves so we don't `stat` per line.
-    let mut size = file.as_ref().and_then(|f| f.metadata().ok()).map_or(0, |m| m.len());
+    let mut size = file
+        .as_ref()
+        .and_then(|f| f.metadata().ok())
+        .map_or(0, |m| m.len());
 
     for msg in rx {
         match msg {
@@ -178,7 +181,10 @@ fn writer_loop(path: PathBuf, rx: mpsc::Receiver<Msg>) {
                 // Re-open lazily if a previous error left us without a handle.
                 if file.is_none() {
                     file = open_log(&path);
-                    size = file.as_ref().and_then(|f| f.metadata().ok()).map_or(0, |m| m.len());
+                    size = file
+                        .as_ref()
+                        .and_then(|f| f.metadata().ok())
+                        .map_or(0, |m| m.len());
                 }
                 if let Some(f) = file.as_mut() {
                     if f.write_all(entry.as_bytes()).is_ok() {

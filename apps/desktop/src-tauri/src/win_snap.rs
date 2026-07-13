@@ -475,7 +475,12 @@ mod imp {
         } else {
             SC_MAXIMIZE
         };
-        let _ = SendMessageW(hwnd, WM_SYSCOMMAND, Some(WPARAM(cmd as usize)), Some(LPARAM(0)));
+        let _ = SendMessageW(
+            hwnd,
+            WM_SYSCOMMAND,
+            Some(WPARAM(cmd as usize)),
+            Some(LPARAM(0)),
+        );
     }
 
     // Re-import RemoveWindowSubclass here (used only in the proc) to keep the

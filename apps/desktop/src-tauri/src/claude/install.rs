@@ -141,7 +141,8 @@ fn write_settings_atomic(path: &Path, value: &serde_json::Value) -> Result<()> {
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp).with_context(|| format!("creating {tmp:?}"))?;
-        f.write_all(text.as_bytes()).context("writing temp settings")?;
+        f.write_all(text.as_bytes())
+            .context("writing temp settings")?;
         f.write_all(b"\n").ok();
         f.flush().ok();
         f.sync_data().ok();
@@ -303,7 +304,8 @@ fn resolve_agent_bin(passed: &str) -> String {
     cmd.args(["-d", &distro, "--", "bash", "-lc", "command -v t-hub-agent"])
         .creation_flags(0x0800_0000);
     // Bounded (WSL_PROBE): install-time `command -v`; a cold WSL must not hang the flow.
-    if let Ok(out) = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::WSL_PROBE_TIMEOUT)
+    if let Ok(out) =
+        crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::WSL_PROBE_TIMEOUT)
     {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -327,7 +329,8 @@ fn resolve_agent_bin(passed: &str) -> String {
     let mut cmd = std::process::Command::new("bash");
     cmd.args(["-lc", "command -v t-hub-agent"]);
     // Bounded (WSL_PROBE): install-time `command -v`; must not hang the flow.
-    if let Ok(out) = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::WSL_PROBE_TIMEOUT)
+    if let Ok(out) =
+        crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::WSL_PROBE_TIMEOUT)
     {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -595,7 +598,10 @@ mod tests {
         write_settings_atomic(&path, &seed).unwrap();
 
         let report = install_hooks_at(&path, "/usr/bin/t-hub-agent", true).unwrap();
-        assert!(report.backed_up, "a backup must be made over an existing file");
+        assert!(
+            report.backed_up,
+            "a backup must be made over an existing file"
+        );
         assert!(path.with_extension("json.t-hub-bak").exists());
 
         let written: serde_json::Value =
@@ -618,7 +624,10 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         // statusLine installed and points at --statusline.
-        assert!(hooks::statusline_managed(&written), "statusLine must be installed");
+        assert!(
+            hooks::statusline_managed(&written),
+            "statusLine must be installed"
+        );
         assert!(written["statusLine"]["command"]
             .as_str()
             .unwrap()
@@ -627,7 +636,10 @@ mod tests {
         uninstall_hooks_at(&path).unwrap();
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(after.get("statusLine").is_none(), "statusLine must be removed on uninstall");
+        assert!(
+            after.get("statusLine").is_none(),
+            "statusLine must be removed on uninstall"
+        );
         cleanup(&path);
     }
 
@@ -690,7 +702,10 @@ mod tests {
         install_hooks_at(&path, "/usr/bin/t-hub-agent", true).unwrap();
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(hooks_installed_at(&path).unwrap(), "observe hooks installed");
+        assert!(
+            hooks_installed_at(&path).unwrap(),
+            "observe hooks installed"
+        );
         assert!(
             !hooks::gate_managed(&written),
             "the observe-hook install must NOT add the blocking gate"
@@ -707,18 +722,27 @@ mod tests {
 
         // Distinct consent is required.
         let err = install_gate_at(&path, "/usr/bin/t-hub-agent", false).unwrap_err();
-        assert!(err.to_string().contains("consent"), "gate needs its own consent");
+        assert!(
+            err.to_string().contains("consent"),
+            "gate needs its own consent"
+        );
         assert!(!gate_installed_at(&path).unwrap());
 
         // Explicit opt-in installs it.
         install_gate_at(&path, "/old/t-hub-agent", true).unwrap();
-        assert!(gate_installed_at(&path).unwrap(), "explicit opt-in installs the gate");
+        assert!(
+            gate_installed_at(&path).unwrap(),
+            "explicit opt-in installs the gate"
+        );
 
         // A later observe-hook (re)install PRESERVES the gate and MIGRATES its agent_bin.
         install_hooks_at(&path, "/new/t-hub-agent", true).unwrap();
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(hooks::gate_managed(&written), "an existing gate survives the reinstall");
+        assert!(
+            hooks::gate_managed(&written),
+            "an existing gate survives the reinstall"
+        );
         let gate_cmd = written["hooks"]["PreToolUse"]
             .as_array()
             .unwrap()
@@ -728,13 +752,22 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert!(gate_cmd.contains("/new/t-hub-agent"), "gate agent_bin migrated: {gate_cmd}");
+        assert!(
+            gate_cmd.contains("/new/t-hub-agent"),
+            "gate agent_bin migrated: {gate_cmd}"
+        );
         assert!(gate_cmd.contains("--gate"));
 
         // The distinct opt-OUT removes only the gate, leaving observe hooks intact.
         remove_gate_at(&path).unwrap();
-        assert!(!gate_installed_at(&path).unwrap(), "opt-out removes the gate");
-        assert!(hooks_installed_at(&path).unwrap(), "observe hooks remain after gate opt-out");
+        assert!(
+            !gate_installed_at(&path).unwrap(),
+            "opt-out removes the gate"
+        );
+        assert!(
+            hooks_installed_at(&path).unwrap(),
+            "observe hooks remain after gate opt-out"
+        );
         cleanup(&path);
     }
 

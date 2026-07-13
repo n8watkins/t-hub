@@ -189,6 +189,9 @@ mod tests {
     fn whitespace_is_tolerated() {
         // Key files are written without a trailing newline, but a hand-edit might add
         // one; unseal must tolerate surrounding whitespace like the old trim() read.
-        assert_eq!(unseal_str("  plain-token \n").as_deref(), Some("plain-token"));
+        assert_eq!(
+            unseal_str("  plain-token \n").as_deref(),
+            Some("plain-token")
+        );
     }
 }

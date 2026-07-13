@@ -168,7 +168,10 @@ impl Default for VoiceSettings {
 fn parse_settings(v: &serde_json::Value) -> VoiceSettings {
     let d = VoiceSettings::default();
     VoiceSettings {
-        enabled: v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(d.enabled),
+        enabled: v
+            .get("enabled")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(d.enabled),
         engine: v
             .get("engine")
             .and_then(|x| x.as_str())
@@ -184,7 +187,10 @@ fn parse_settings(v: &serde_json::Value) -> VoiceSettings {
             .and_then(|x| x.as_f64())
             .map(|x| x.clamp(0.0, 1.0))
             .unwrap_or(d.volume),
-        sapi_rate: v.get("sapiRate").and_then(|x| x.as_i64()).unwrap_or(d.sapi_rate),
+        sapi_rate: v
+            .get("sapiRate")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(d.sapi_rate),
         announce_on_attention: v
             .get("announceOnAttention")
             .and_then(|x| x.as_bool())
@@ -237,7 +243,8 @@ fn write_settings(settings: &VoiceSettings) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    let body = serde_json::to_vec_pretty(&root).map_err(|e| format!("serialize voice.json: {e}"))?;
+    let body =
+        serde_json::to_vec_pretty(&root).map_err(|e| format!("serialize voice.json: {e}"))?;
     // Atomic replace (temp + rename): external tooling polls this file, and a
     // plain in-place write could hand it a truncated read mid-write. std's
     // rename replaces the destination on Windows too (MOVEFILE_REPLACE_EXISTING).
@@ -346,11 +353,7 @@ fn synthesize(text: &str, voice: &str, engine: VoiceEngine) -> Result<String, St
 }
 
 #[tauri::command]
-pub async fn voice_tts(
-    text: String,
-    voice: String,
-    engine: VoiceEngine,
-) -> Result<String, String> {
+pub async fn voice_tts(text: String, voice: String, engine: VoiceEngine) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || synthesize(&text, &voice, engine))
         .await
         .map_err(|e| format!("voice_tts task failed: {e}"))?
@@ -388,11 +391,7 @@ fn probe_health(engine: VoiceEngine) -> EngineHealth {
 /// bounded probe the Settings health display uses.
 pub(crate) fn probe_health_at(engine: VoiceEngine, base_url: &str) -> EngineHealth {
     let url = format!("{base_url}/health");
-    match agent()
-        .get(&url)
-        .timeout(Duration::from_secs(2))
-        .call()
-    {
+    match agent().get(&url).timeout(Duration::from_secs(2)).call() {
         // A 2xx: the server is up and healthy.
         Ok(_) => EngineHealth {
             engine,
@@ -536,8 +535,14 @@ mod tests {
     /// coerces to a real engine and never triggers a reclaim/adopt.
     #[test]
     fn from_token_strict_only_matches_known_engines() {
-        assert_eq!(VoiceEngine::from_token_strict("kokoro"), Some(VoiceEngine::Kokoro));
-        assert_eq!(VoiceEngine::from_token_strict("piper"), Some(VoiceEngine::Piper));
+        assert_eq!(
+            VoiceEngine::from_token_strict("kokoro"),
+            Some(VoiceEngine::Kokoro)
+        );
+        assert_eq!(
+            VoiceEngine::from_token_strict("piper"),
+            Some(VoiceEngine::Piper)
+        );
         assert_eq!(VoiceEngine::from_token_strict("festival"), None);
         assert_eq!(VoiceEngine::from_token_strict(""), None);
         assert_eq!(VoiceEngine::from_token_strict("Kokoro"), None); // case-sensitive
@@ -568,7 +573,10 @@ mod tests {
         let h = probe_health_at(VoiceEngine::Kokoro, &base);
         assert_eq!(h.engine, VoiceEngine::Kokoro);
         assert!(!h.reachable, "a dead server must probe as unreachable");
-        assert!(h.detail.is_some(), "the transport error is carried for the UI");
+        assert!(
+            h.detail.is_some(),
+            "the transport error is carried for the UI"
+        );
     }
 
     /// EngineHealth serializes camelCase so the webview reads `reachable`

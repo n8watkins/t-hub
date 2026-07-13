@@ -232,11 +232,12 @@ fn run_archive(encoded: &str) -> Result<(), String> {
         .arg("-lc")
         .arg(archive_shell_cmd(encoded))
         .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    // Bounded (LOCAL_IO): an archive `mv` under ~/.claude; a stalled WSL FS must
-    // not park the handler this runs on.
-    let status = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::LOCAL_IO_TIMEOUT)
-        .map_err(|e| format!("archive spawn/timeout failed: {e}"))?
-        .status;
+                                      // Bounded (LOCAL_IO): an archive `mv` under ~/.claude; a stalled WSL FS must
+                                      // not park the handler this runs on.
+    let status =
+        crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::LOCAL_IO_TIMEOUT)
+            .map_err(|e| format!("archive spawn/timeout failed: {e}"))?
+            .status;
     if status.success() {
         Ok(())
     } else {
@@ -251,9 +252,10 @@ fn run_archive(encoded: &str) -> Result<(), String> {
     cmd.arg("-lc").arg(archive_shell_cmd(encoded));
     // Bounded (LOCAL_IO): an archive `mv` under ~/.claude; a stalled FS must not
     // park the handler this runs on.
-    let status = crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::LOCAL_IO_TIMEOUT)
-        .map_err(|e| format!("archive spawn/timeout failed: {e}"))?
-        .status;
+    let status =
+        crate::bounded_exec::output_with_timeout(cmd, crate::bounded_exec::LOCAL_IO_TIMEOUT)
+            .map_err(|e| format!("archive spawn/timeout failed: {e}"))?
+            .status;
     if status.success() {
         Ok(())
     } else {
@@ -542,7 +544,11 @@ fn read_sessions_from_dir(
     let mut total = 0usize;
     for project in project_dirs.flatten() {
         // Skip machine-generated throwaway project dirs (e.g. the /usage probe).
-        if project.file_name().to_str().is_some_and(is_ignored_project_dir) {
+        if project
+            .file_name()
+            .to_str()
+            .is_some_and(is_ignored_project_dir)
+        {
             continue;
         }
         let Ok(files) = std::fs::read_dir(project.path()) else {
@@ -554,7 +560,11 @@ fn read_sessions_from_dir(
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+            let Some(id) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
                 continue;
             };
             let last_seen = entry
@@ -582,8 +592,10 @@ fn read_sessions_from_dir(
     buckets.sort_by(|a, b| b.0.cmp(&a.0));
     buckets.truncate(project_limit);
     let kept_projects = buckets.len();
-    let metas: Vec<(String, std::path::PathBuf, i64)> =
-        buckets.into_iter().flat_map(|(_, sessions)| sessions).collect();
+    let metas: Vec<(String, std::path::PathBuf, i64)> = buckets
+        .into_iter()
+        .flat_map(|(_, sessions)| sessions)
+        .collect();
 
     // Phase 2: read the 32KB PREFIX (cwd/summary live near the top) AND the 32KB
     // SUFFIX (the last message text) of just the survivors.
@@ -889,8 +901,10 @@ fn read_sessions_windows_fast(
     buckets.sort_by(|a, b| b.0.cmp(&a.0));
     buckets.truncate(project_limit);
     let kept_projects = buckets.len();
-    let metas: Vec<(String, std::path::PathBuf, i64)> =
-        buckets.into_iter().flat_map(|(_, sessions)| sessions).collect();
+    let metas: Vec<(String, std::path::PathBuf, i64)> = buckets
+        .into_iter()
+        .flat_map(|(_, sessions)| sessions)
+        .collect();
 
     // Phase 2: read the 32KB PREFIX (cwd/summary) AND 32KB SUFFIX (last message
     // text) of just the survivors — EXACTLY like read_sessions_from_dir.
@@ -931,12 +945,7 @@ fn read_sessions_windows() -> Vec<RecentSession> {
             crate::diag::diag_log(
                 "{\"t\":\"recent\",\"m\":\"windows reader: FAST wsl-find path\"}".to_string(),
             );
-            return read_sessions_windows_fast(
-                &projects,
-                rows,
-                PROJECT_LIMIT,
-                PER_PROJECT_LIMIT,
-            );
+            return read_sessions_windows_fast(&projects, rows, PROJECT_LIMIT, PER_PROJECT_LIMIT);
         }
     }
     crate::diag::diag_log(
@@ -989,13 +998,17 @@ mod tests {
         // The /usage probe dir encodes to the folder Recent ignores.
         assert_eq!(encode_project_dir("/tmp/t-hub-usage"), "-tmp-t-hub-usage");
         // A path with no alphanumerics is what archive_project's guard rejects.
-        assert!(!encode_project_dir("///").chars().any(|c| c.is_ascii_alphanumeric()));
+        assert!(!encode_project_dir("///")
+            .chars()
+            .any(|c| c.is_ascii_alphanumeric()));
     }
 
     #[test]
     fn is_ignored_project_dir_filters_the_usage_probe() {
         assert!(is_ignored_project_dir("-tmp-t-hub-usage"));
-        assert!(!is_ignored_project_dir("-home-natkins-projects-tools-t-hub-t-hub-app"));
+        assert!(!is_ignored_project_dir(
+            "-home-natkins-projects-tools-t-hub-t-hub-app"
+        ));
     }
 
     #[test]
@@ -1037,17 +1050,57 @@ mod tests {
     #[test]
     fn make_session_label_prefers_summary_then_prompt_then_basename() {
         // No cwd -> unrecallable -> dropped.
-        assert!(make_session("id".into(), 1, Parsed { cwd: None, summary: None, first_prompt: None }, None).is_none());
+        assert!(make_session(
+            "id".into(),
+            1,
+            Parsed {
+                cwd: None,
+                summary: None,
+                first_prompt: None
+            },
+            None
+        )
+        .is_none());
         // No summary, no prompt -> label falls back to the cwd basename.
-        let s = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: None, first_prompt: None }, None).unwrap();
+        let s = make_session(
+            "id".into(),
+            5,
+            Parsed {
+                cwd: Some("/home/u/proj".into()),
+                summary: None,
+                first_prompt: None,
+            },
+            None,
+        )
+        .unwrap();
         assert_eq!(s.label, "proj");
         assert_eq!(s.last_seen, 5);
         assert_eq!(s.last_text, ""); // no tail text supplied -> empty
-        // First prompt beats the basename when there's no summary.
-        let s2 = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: None, first_prompt: Some("add auth".into()) }, None).unwrap();
+                                     // First prompt beats the basename when there's no summary.
+        let s2 = make_session(
+            "id".into(),
+            5,
+            Parsed {
+                cwd: Some("/home/u/proj".into()),
+                summary: None,
+                first_prompt: Some("add auth".into()),
+            },
+            None,
+        )
+        .unwrap();
         assert_eq!(s2.label, "add auth");
         // Summary wins for the label; the tail text becomes last_text (tidied).
-        let s3 = make_session("id".into(), 5, Parsed { cwd: Some("/home/u/proj".into()), summary: Some("Do a thing".into()), first_prompt: Some("add auth".into()) }, Some("  the   last line  ".into())).unwrap();
+        let s3 = make_session(
+            "id".into(),
+            5,
+            Parsed {
+                cwd: Some("/home/u/proj".into()),
+                summary: Some("Do a thing".into()),
+                first_prompt: Some("add auth".into()),
+            },
+            Some("  the   last line  ".into()),
+        )
+        .unwrap();
         assert_eq!(s3.label, "Do a thing");
         assert_eq!(s3.last_text, "the last line");
     }
@@ -1169,7 +1222,9 @@ mod tests {
         writeln!(g, "{{\"type\":\"user\",\"cwd\":\"/home/u/other\"}}").unwrap();
 
         let wanted: std::collections::HashSet<String> =
-            ["sess-keep".to_string(), "sess-gone".to_string()].into_iter().collect();
+            ["sess-keep".to_string(), "sess-gone".to_string()]
+                .into_iter()
+                .collect();
         let got = resumable_entries_from_dir(&tmp, &wanted);
         std::fs::remove_dir_all(&tmp).ok();
 
@@ -1199,7 +1254,10 @@ mod tests {
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"middle reply"}]}}
 {"type":"user","message":{"role":"user","content":"<command-name>noise</command-name>"}}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"the last thing said"}]}}"#;
-        assert_eq!(parse_last_text(text).as_deref(), Some("the last thing said"));
+        assert_eq!(
+            parse_last_text(text).as_deref(),
+            Some("the last thing said")
+        );
         assert_eq!(parse_last_text("only garbage\nmore garbage"), None);
     }
 }

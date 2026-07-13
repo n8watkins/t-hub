@@ -74,10 +74,7 @@ pub struct ControlEndpoint {
 impl ControlEndpoint {
     /// The current control address (follows a rebind once [`refresh_addr`] adopts it).
     pub fn addr(&self) -> String {
-        self.addr
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.addr.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The auth token. Fixed for the launch: a rebind is transport recovery, not a
@@ -340,7 +337,10 @@ fn forward_once(app: &AppHandle, addr: &str, token: &str) -> Result<(), String> 
         };
         let payload = frame.get("payload").cloned().unwrap_or(Value::Null);
         crate::hangwatch::note_emit(); // count toward the main-thread emit-rate watchdog
-        if let Err(e) = app.emit(CONTROL_EVENT, json!({ "channel": channel, "payload": payload })) {
+        if let Err(e) = app.emit(
+            CONTROL_EVENT,
+            json!({ "channel": channel, "payload": payload }),
+        ) {
             eprintln!("t-hub-control: re-emit of {channel} failed: {e}");
         }
     }
@@ -358,8 +358,12 @@ pub fn install(app: &AppHandle, handshake: &control::ControlHandshake) {
     // ControlEndpoint) target the remote control socket instead of this machine's
     // loopback. Unset (the default) ⇒ the local loopback server, exactly as today.
     let remote = (
-        std::env::var("T_HUB_REMOTE_ADDR").ok().filter(|a| !a.is_empty()),
-        std::env::var("T_HUB_REMOTE_TOKEN").ok().filter(|t| !t.is_empty()),
+        std::env::var("T_HUB_REMOTE_ADDR")
+            .ok()
+            .filter(|a| !a.is_empty()),
+        std::env::var("T_HUB_REMOTE_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty()),
     );
     if matches!(remote, (Some(_), Some(_))) {
         // Log only in the remote branch; `resolve_endpoint` stays pure/testable.
@@ -415,7 +419,10 @@ fn resolve_endpoint(
 ) -> (String, String) {
     match remote {
         (Some(addr), Some(token)) => (addr, token),
-        _ => (handshake.addr.clone(), handshake.local_control_token.clone()),
+        _ => (
+            handshake.addr.clone(),
+            handshake.local_control_token.clone(),
+        ),
     }
 }
 
@@ -447,8 +454,14 @@ mod tests {
         let hs = hardened_handshake();
         let (addr, token) = resolve_endpoint(&hs, (None, None));
         assert_eq!(addr, "127.0.0.1:5000");
-        assert_eq!(token, "full-control", "local frontend must get the FULL token");
-        assert_ne!(token, hs.token, "must NOT use the published (read-only) token");
+        assert_eq!(
+            token, "full-control",
+            "local frontend must get the FULL token"
+        );
+        assert_ne!(
+            token, hs.token,
+            "must NOT use the published (read-only) token"
+        );
     }
 
     #[test]
@@ -515,8 +528,16 @@ mod tests {
 
         // A rebind rotated the port: refresh adopts the fresh addr, keeps the token.
         assert_eq!(ep.refresh_addr().as_deref(), Some("127.0.0.1:6001"));
-        assert_eq!(ep.addr(), "127.0.0.1:6001", "consumers must follow the new port");
-        assert_eq!(ep.token(), "full-control", "the full token must NOT be dropped");
+        assert_eq!(
+            ep.addr(),
+            "127.0.0.1:6001",
+            "consumers must follow the new port"
+        );
+        assert_eq!(
+            ep.token(),
+            "full-control",
+            "the full token must NOT be dropped"
+        );
 
         // Idempotent: a second refresh with no further rotation reports no change.
         assert_eq!(ep.refresh_addr(), None);

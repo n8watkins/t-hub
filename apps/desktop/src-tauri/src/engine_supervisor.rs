@@ -531,7 +531,11 @@ fn parse_managed_flag(v: Option<&str>) -> bool {
 pub fn engine_runtime_status(
     state: tauri::State<'_, runtime::SharedSnapshot>,
 ) -> SupervisorSnapshot {
-    state.0.lock().map(|s| s.clone()).unwrap_or_else(|p| p.into_inner().clone())
+    state
+        .0
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_else(|p| p.into_inner().clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -609,8 +613,8 @@ pub mod platform {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-            JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
         unsafe {
@@ -643,7 +647,10 @@ pub mod platform {
     /// keeps the relay windowless (matches tmux.rs/git.rs/files.rs).
     pub fn kokoro_command(repo_dir: &str) -> std::process::Command {
         let mut cmd = std::process::Command::new("wsl.exe");
-        cmd.arg("-e").arg("bash").arg("-c").arg(lifeline_script(repo_dir));
+        cmd.arg("-e")
+            .arg("bash")
+            .arg("-c")
+            .arg(lifeline_script(repo_dir));
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -749,8 +756,12 @@ pub mod runtime {
     /// server). Returning None keeps the flag-on path FAIL-SAFE: with no config
     /// we don't spawn anything blindly.
     pub fn opts_from_env(selected: VoiceEngine) -> Option<StartOpts> {
-        let kokoro_repo_dir = std::env::var("T_HUB_KOKORO_DIR").ok().filter(|s| !s.trim().is_empty())?;
-        let piper_exe = std::env::var("T_HUB_PIPER_EXE").ok().filter(|s| !s.trim().is_empty())?;
+        let kokoro_repo_dir = std::env::var("T_HUB_KOKORO_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        let piper_exe = std::env::var("T_HUB_PIPER_EXE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
         Some(StartOpts {
             selected,
             kokoro_repo_dir,
@@ -939,12 +950,16 @@ pub mod runtime {
                 // stdin piped = the lifeline; stdout/stderr discarded (journald
                 // is gone once app-managed, but a crashy engine surfaces via the
                 // health probe, not logs we'd have to babysit).
-                c.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+                c.stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
                 c
             }
             VoiceEngine::Piper => {
                 let mut c = platform::piper_command(&opts.piper_exe, engine.default_port());
-                c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                c.stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
                 c
             }
         };
@@ -953,7 +968,10 @@ pub mod runtime {
         // Best-effort job-object hardening (no-op off Windows; the lifeline is the
         // portable guarantee).
         let _ = platform::assign_kill_on_close_job(&child);
-        Some(EngineChild { child, _stdin: stdin })
+        Some(EngineChild {
+            child,
+            _stdin: stdin,
+        })
     }
 
     /// Probe the primary's port at startup and build the squatter-policy input
@@ -967,7 +985,12 @@ pub mod runtime {
     fn startup_probe(engine: VoiceEngine) -> StartupProbe {
         let base_url = crate::voice::base_url_for_engine(engine);
         if !crate::voice::probe_health_at(engine, &base_url).reachable {
-            return StartupProbe { served: false, engine: None, is_our_unit: false, marker_matches: false };
+            return StartupProbe {
+                served: false,
+                engine: None,
+                is_our_unit: false,
+                marker_matches: false,
+            };
         }
         StartupProbe {
             served: true,
@@ -995,7 +1018,10 @@ pub mod runtime {
     pub(crate) fn parse_ss_pid(ss_stdout: &str) -> Option<u32> {
         let marker = "pid=";
         let idx = ss_stdout.find(marker)? + marker.len();
-        let digits: String = ss_stdout[idx..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        let digits: String = ss_stdout[idx..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
         digits.parse().ok()
     }
 
@@ -1003,9 +1029,17 @@ pub mod runtime {
     /// the primary port - i.e. a genuine leaked child of a prior app run, not a
     /// stale marker whose pid was reused (F2: the marker alone is never trusted).
     fn marker_pid_owns_port(engine: VoiceEngine) -> bool {
-        let marker_pid = run_bounded_bash(&format!("cat '{}' 2>/dev/null", platform::KOKORO_PID_MARKER))
-            .ok()
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok());
+        let marker_pid = run_bounded_bash(&format!(
+            "cat '{}' 2>/dev/null",
+            platform::KOKORO_PID_MARKER
+        ))
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        });
         match (marker_pid, port_owner_pid(engine.default_port())) {
             (Some(m), Some(owner)) => m == owner,
             _ => false,
@@ -1027,7 +1061,8 @@ pub mod runtime {
                     crate::diag::diag_log(
                         "engine_supervisor: `systemctl --user disable --now kokoro-tts.service` \
                          did NOT deactivate the unit - refusing to spawn a managed child while \
-                         the unit still owns the port (would fight Restart=always)".to_string(),
+                         the unit still owns the port (would fight Restart=always)"
+                            .to_string(),
                     );
                 }
             }
@@ -1054,11 +1089,14 @@ pub mod runtime {
             // kill. The loop treats the port as unavailable and falls back.
             crate::diag::diag_log(
                 "engine_supervisor: reclaim aborted - port occupant is no longer \
-                 the identified engine at kill time".to_string(),
+                 the identified engine at kill time"
+                    .to_string(),
             );
             return;
         }
-        let Some(pid) = port_owner_pid(engine.default_port()) else { return };
+        let Some(pid) = port_owner_pid(engine.default_port()) else {
+            return;
+        };
         // Group-kill the CURRENT owner (its pgid), falling back to the bare pid.
         let script = format!(
             "pgid=$(ps -o pgid= -p {pid} 2>/dev/null | tr -d ' '); \
@@ -1112,9 +1150,9 @@ mod tests {
     }
 
     fn has_toast<'a>(actions: &'a [Action], kind: &str) -> Option<&'a Action> {
-        actions.iter().find(
-            |a| matches!(a, Action::Toast { kind: k, .. } if *k == kind),
-        )
+        actions
+            .iter()
+            .find(|a| matches!(a, Action::Toast { kind: k, .. } if *k == kind))
     }
 
     // --- down detection -----------------------------------------------------
@@ -1218,7 +1256,11 @@ mod tests {
         s.on_probe(VoiceEngine::Kokoro, true, 50);
         s.on_probe(VoiceEngine::Kokoro, false, 60);
         let a = s.on_probe(VoiceEngine::Kokoro, false, 61);
-        assert_eq!(count_restarts(&a), 1, "budget should reset after a recovery");
+        assert_eq!(
+            count_restarts(&a),
+            1,
+            "budget should reset after a recovery"
+        );
     }
 
     // --- switch-back hysteresis (D1) ---------------------------------------
@@ -1251,14 +1293,14 @@ mod tests {
         s.on_probe(VoiceEngine::Kokoro, true, 0);
         s.on_probe(VoiceEngine::Kokoro, false, 1);
         s.on_probe(VoiceEngine::Kokoro, false, 2); // degraded
-        // Recovers at 50...
+                                                   // Recovers at 50...
         s.on_probe(VoiceEngine::Kokoro, true, 50);
         // ...but a transient fail at 90 nulls the green clock (still above the
         // down-threshold so health stays Up, but the stability window restarts).
         s.on_probe(VoiceEngine::Kokoro, false, 90);
         s.on_probe(VoiceEngine::Kokoro, true, 95); // green clock restarts at 95
-        // t=180 is 130ms after the FIRST recovery but only 85ms after the last -
-        // must NOT have switched back.
+                                                   // t=180 is 130ms after the FIRST recovery but only 85ms after the last -
+                                                   // must NOT have switched back.
         s.on_tick(180);
         assert_eq!(s.active(), VoiceEngine::Piper, "flap must not switch back");
         // t=196 (>=100ms of uninterrupted green since 95): now it switches.
@@ -1280,12 +1322,16 @@ mod tests {
         // Now the STANDBY (Piper) also dies while we depend on it.
         s.on_probe(VoiceEngine::Piper, false, 3);
         let down = s.on_probe(VoiceEngine::Piper, false, 4); // Piper now Down
-        // It gets an EnsureRunning(standby) (immediately eligible: backoff_until 0).
+                                                             // It gets an EnsureRunning(standby) (immediately eligible: backoff_until 0).
         assert!(down.contains(&Action::EnsureRunning(VoiceEngine::Piper)));
         // Not a tight loop: a tick before the backoff elapses re-issues nothing.
-        assert!(!s.on_tick(5).contains(&Action::EnsureRunning(VoiceEngine::Piper)));
+        assert!(!s
+            .on_tick(5)
+            .contains(&Action::EnsureRunning(VoiceEngine::Piper)));
         // After the backoff, it retries again (no give-up budget for the standby).
-        assert!(s.on_tick(100).contains(&Action::EnsureRunning(VoiceEngine::Piper)));
+        assert!(s
+            .on_tick(100)
+            .contains(&Action::EnsureRunning(VoiceEngine::Piper)));
     }
 
     // --- level ladder -------------------------------------------------------
@@ -1296,7 +1342,7 @@ mod tests {
         assert_eq!(s.level(), RuntimeLevel::Unknown); // nothing probed
         s.on_probe(VoiceEngine::Kokoro, true, 0);
         assert_eq!(s.level(), RuntimeLevel::Green); // primary up, active
-        // Fall back with Piper up -> amber.
+                                                    // Fall back with Piper up -> amber.
         s.on_probe(VoiceEngine::Piper, true, 0);
         s.on_probe(VoiceEngine::Kokoro, false, 1);
         s.on_probe(VoiceEngine::Kokoro, false, 2);
@@ -1314,8 +1360,16 @@ mod tests {
 
     #[test]
     fn startup_free_port_just_spawns() {
-        let p = StartupProbe { served: false, engine: None, is_our_unit: false, marker_matches: false };
-        assert_eq!(classify_startup(p, VoiceEngine::Kokoro), StartupAction::Spawn);
+        let p = StartupProbe {
+            served: false,
+            engine: None,
+            is_our_unit: false,
+            marker_matches: false,
+        };
+        assert_eq!(
+            classify_startup(p, VoiceEngine::Kokoro),
+            StartupAction::Spawn
+        );
     }
 
     #[test]
@@ -1335,22 +1389,54 @@ mod tests {
     #[test]
     fn startup_reclaims_a_leaked_marked_child_or_bare_same_engine() {
         // Our lifeline marker matches a leaked child.
-        let leaked = StartupProbe { served: true, engine: Some(VoiceEngine::Kokoro), is_our_unit: false, marker_matches: true };
-        assert_eq!(classify_startup(leaked, VoiceEngine::Kokoro), StartupAction::ReclaimThenSpawn);
+        let leaked = StartupProbe {
+            served: true,
+            engine: Some(VoiceEngine::Kokoro),
+            is_our_unit: false,
+            marker_matches: true,
+        };
+        assert_eq!(
+            classify_startup(leaked, VoiceEngine::Kokoro),
+            StartupAction::ReclaimThenSpawn
+        );
         // A bare same-engine server (e.g. a manual nohup) is provably the engine
         // we manage -> safe to reclaim.
-        let bare = StartupProbe { served: true, engine: Some(VoiceEngine::Kokoro), is_our_unit: false, marker_matches: false };
-        assert_eq!(classify_startup(bare, VoiceEngine::Kokoro), StartupAction::ReclaimThenSpawn);
+        let bare = StartupProbe {
+            served: true,
+            engine: Some(VoiceEngine::Kokoro),
+            is_our_unit: false,
+            marker_matches: false,
+        };
+        assert_eq!(
+            classify_startup(bare, VoiceEngine::Kokoro),
+            StartupAction::ReclaimThenSpawn
+        );
     }
 
     #[test]
     fn startup_refuses_to_kill_a_stranger() {
         // A different engine on our port, or an unidentifiable occupant: never
         // kill it - run degraded on the standby and tell the general.
-        let other_engine = StartupProbe { served: true, engine: Some(VoiceEngine::Piper), is_our_unit: false, marker_matches: false };
-        assert_eq!(classify_startup(other_engine, VoiceEngine::Kokoro), StartupAction::RefuseAndFallback);
-        let unknown = StartupProbe { served: true, engine: None, is_our_unit: false, marker_matches: false };
-        assert_eq!(classify_startup(unknown, VoiceEngine::Kokoro), StartupAction::RefuseAndFallback);
+        let other_engine = StartupProbe {
+            served: true,
+            engine: Some(VoiceEngine::Piper),
+            is_our_unit: false,
+            marker_matches: false,
+        };
+        assert_eq!(
+            classify_startup(other_engine, VoiceEngine::Kokoro),
+            StartupAction::RefuseAndFallback
+        );
+        let unknown = StartupProbe {
+            served: true,
+            engine: None,
+            is_our_unit: false,
+            marker_matches: false,
+        };
+        assert_eq!(
+            classify_startup(unknown, VoiceEngine::Kokoro),
+            StartupAction::RefuseAndFallback
+        );
     }
 
     /// F1 regression: a REACHABLE-but-unidentified occupant (a foreign HTTP
@@ -1382,12 +1468,20 @@ mod tests {
     fn f10_usable_from_signals_refuses_a_stranger_on_the_primary_port() {
         use super::runtime::usable_from_signals;
         // Real Kokoro self-identifies -> usable (adopted).
-        assert!(usable_from_signals(VoiceEngine::Kokoro, true, Some(VoiceEngine::Kokoro)));
+        assert!(usable_from_signals(
+            VoiceEngine::Kokoro,
+            true,
+            Some(VoiceEngine::Kokoro)
+        ));
         // Reachable but NOT provably Kokoro (foreign/4xx with no engine field) ->
         // stranger -> UNUSABLE. This is the F10 landmine, now defused.
         assert!(!usable_from_signals(VoiceEngine::Kokoro, true, None));
         // A different engine squatting the Kokoro port -> unusable.
-        assert!(!usable_from_signals(VoiceEngine::Kokoro, true, Some(VoiceEngine::Piper)));
+        assert!(!usable_from_signals(
+            VoiceEngine::Kokoro,
+            true,
+            Some(VoiceEngine::Piper)
+        ));
         // Unreachable -> unusable regardless.
         assert!(!usable_from_signals(VoiceEngine::Kokoro, false, None));
         // Piper doesn't self-identify (no engine field), so reachability is the
@@ -1420,8 +1514,15 @@ mod tests {
             s.on_probe(VoiceEngine::Kokoro, stranger_usable, t);
             s.on_tick(t);
         }
-        assert_eq!(s.active(), VoiceEngine::Piper, "must NOT adopt/switch back to the stranger");
-        assert!(s.degraded, "stays degraded - the primary is a stranger, not our Kokoro");
+        assert_eq!(
+            s.active(),
+            VoiceEngine::Piper,
+            "must NOT adopt/switch back to the stranger"
+        );
+        assert!(
+            s.degraded,
+            "stays degraded - the primary is a stranger, not our Kokoro"
+        );
         assert_eq!(s.track(VoiceEngine::Kokoro).health, Health::Down);
     }
 
@@ -1430,7 +1531,10 @@ mod tests {
     fn parse_ss_pid_extracts_the_owning_pid() {
         let ss = "LISTEN 0 5 127.0.0.1:7478 0.0.0.0:* users:((\"python\",pid=3564749,fd=4))";
         assert_eq!(super::runtime::parse_ss_pid(ss), Some(3564749));
-        assert_eq!(super::runtime::parse_ss_pid("LISTEN 0 5 127.0.0.1:7478"), None);
+        assert_eq!(
+            super::runtime::parse_ss_pid("LISTEN 0 5 127.0.0.1:7478"),
+            None
+        );
         assert_eq!(super::runtime::parse_ss_pid(""), None);
     }
 
@@ -1456,8 +1560,14 @@ mod tests {
         s.on_probe(VoiceEngine::Kokoro, true, 0);
         let v = serde_json::to_value(s.snapshot()).unwrap();
         assert_eq!(v.get("managed").and_then(|x| x.as_bool()), Some(true));
-        assert_eq!(v.get("selectedEngine").and_then(|x| x.as_str()), Some("kokoro"));
-        assert_eq!(v.get("activeEngine").and_then(|x| x.as_str()), Some("kokoro"));
+        assert_eq!(
+            v.get("selectedEngine").and_then(|x| x.as_str()),
+            Some("kokoro")
+        );
+        assert_eq!(
+            v.get("activeEngine").and_then(|x| x.as_str()),
+            Some("kokoro")
+        );
         assert_eq!(v.get("level").and_then(|x| x.as_str()), Some("green"));
         assert_eq!(v.get("kokoro").and_then(|x| x.as_str()), Some("up"));
     }
@@ -1475,11 +1585,26 @@ mod tests {
     fn lifeline_script_has_the_no_orphan_essentials() {
         let script = platform::lifeline_script("/home/x/kokoro-tts");
         assert!(script.contains("/home/x/kokoro-tts"), "cd's into the repo");
-        assert!(script.contains("setsid ./start.sh"), "own process group for a clean group-kill");
-        assert!(script.contains("cat"), "blocks on stdin to detect parent death via EOF");
-        assert!(script.contains("kill -TERM -\"$SRV\""), "group-kills on death");
-        assert!(script.contains("trap"), "also kills on a delivered TERM/HUP");
-        assert!(script.contains(platform::KOKORO_PID_MARKER), "writes the reaper pid marker");
+        assert!(
+            script.contains("setsid ./start.sh"),
+            "own process group for a clean group-kill"
+        );
+        assert!(
+            script.contains("cat"),
+            "blocks on stdin to detect parent death via EOF"
+        );
+        assert!(
+            script.contains("kill -TERM -\"$SRV\""),
+            "group-kills on death"
+        );
+        assert!(
+            script.contains("trap"),
+            "also kills on a delivered TERM/HUP"
+        );
+        assert!(
+            script.contains(platform::KOKORO_PID_MARKER),
+            "writes the reaper pid marker"
+        );
         // F2: the marker is UNLINKED on clean exit so a stale marker can't later
         // drive a kill / a false marker_matches.
         assert!(script.contains("rm -f"), "cleans up the pid marker on exit");

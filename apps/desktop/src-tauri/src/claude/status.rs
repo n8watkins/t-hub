@@ -253,12 +253,7 @@ impl StatusBridge {
 
     /// Ingest a raw statusline payload for `session_id`, storing the normalized
     /// snapshot and returning it.
-    pub fn ingest(
-        &self,
-        session_id: &str,
-        raw: &serde_json::Value,
-        now_ms: u64,
-    ) -> StatusSnapshot {
+    pub fn ingest(&self, session_id: &str, raw: &serde_json::Value, now_ms: u64) -> StatusSnapshot {
         let snap = StatusSnapshot::from_statusline(session_id, raw, now_ms);
         // Bump the monotonic touch counter so this entry is the most-recently-used
         // and the cap evicts true LRU victims (never the session we just ingested).
@@ -336,7 +331,10 @@ impl StatusBridge {
         // the cache only AFTER recording so a transient DB error is retried next
         // ingest rather than masked by a premature cache write.
         {
-            let cache = self.last_recorded.lock().expect("status dedup mutex poisoned");
+            let cache = self
+                .last_recorded
+                .lock()
+                .expect("status dedup mutex poisoned");
             if cache
                 .get(terminal_id)
                 .is_some_and(|(s, c)| s == &snap.session_id && c == cwd)
@@ -351,18 +349,28 @@ impl StatusBridge {
             self.last_recorded
                 .lock()
                 .expect("status dedup mutex poisoned")
-                .insert(terminal_id.to_string(), (snap.session_id.clone(), cwd.to_string()));
+                .insert(
+                    terminal_id.to_string(),
+                    (snap.session_id.clone(), cwd.to_string()),
+                );
         }
     }
 
     /// The latest snapshot for a session, if any.
     pub fn get(&self, session_id: &str) -> Option<StatusSnapshot> {
-        self.latest.read().get(session_id).map(|(_, snap)| snap.clone())
+        self.latest
+            .read()
+            .get(session_id)
+            .map(|(_, snap)| snap.clone())
     }
 
     /// All known snapshots (for the utility-area usage display).
     pub fn all(&self) -> Vec<StatusSnapshot> {
-        self.latest.read().values().map(|(_, snap)| snap.clone()).collect()
+        self.latest
+            .read()
+            .values()
+            .map(|(_, snap)| snap.clone())
+            .collect()
     }
 
     /// Reverse-lookup: the T-Hub **tile id** (`th_<id>` ⇒ `<id>`) currently bound to
@@ -419,7 +427,10 @@ mod tests {
         assert_eq!(snap.context_used_pct, Some(42.5));
         assert_eq!(snap.cost_usd, Some(1.23));
         assert!(snap.rate_limits_present);
-        assert_eq!(snap.five_hour.as_ref().unwrap().resets_at, Some(1_700_000_000));
+        assert_eq!(
+            snap.five_hour.as_ref().unwrap().resets_at,
+            Some(1_700_000_000)
+        );
         assert!(snap.near_limit(75.0));
         assert!(!snap.near_limit(90.0));
     }
@@ -435,7 +446,10 @@ mod tests {
         assert!(!snap.rate_limits_present);
         assert!(snap.five_hour.is_none());
         assert!(snap.seven_day.is_none());
-        assert!(!snap.near_limit(50.0), "absent block must not read as near-limit");
+        assert!(
+            !snap.near_limit(50.0),
+            "absent block must not read as near-limit"
+        );
         // context derived from used/total.
         assert_eq!(snap.context_used_pct, Some(25.0));
     }
@@ -461,9 +475,21 @@ mod tests {
     #[test]
     fn bridge_stores_latest_per_session() {
         let bridge = StatusBridge::new();
-        bridge.ingest("s1", &serde_json::json!({"context_window":{"used_percentage":10.0}}), 1);
-        bridge.ingest("s1", &serde_json::json!({"context_window":{"used_percentage":20.0}}), 2);
-        bridge.ingest("s2", &serde_json::json!({"context_window":{"used_percentage":5.0}}), 3);
+        bridge.ingest(
+            "s1",
+            &serde_json::json!({"context_window":{"used_percentage":10.0}}),
+            1,
+        );
+        bridge.ingest(
+            "s1",
+            &serde_json::json!({"context_window":{"used_percentage":20.0}}),
+            2,
+        );
+        bridge.ingest(
+            "s2",
+            &serde_json::json!({"context_window":{"used_percentage":5.0}}),
+            3,
+        );
         assert_eq!(bridge.get("s1").unwrap().context_used_pct, Some(20.0));
         assert_eq!(bridge.get("s2").unwrap().context_used_pct, Some(5.0));
         assert_eq!(bridge.all().len(), 2);
@@ -611,7 +637,10 @@ mod tests {
         );
         let rows = db.all_tile_sessions().unwrap();
         assert_eq!(rows.len(), 1, "still one row per terminal_id (upsert)");
-        assert_eq!(rows[0].session_id, "sess-b", "the changed session was written");
+        assert_eq!(
+            rows[0].session_id, "sess-b",
+            "the changed session was written"
+        );
         assert_eq!(rows[0].cwd, "/home/u/proj2");
         {
             let cache = bridge.last_recorded.lock().unwrap();
@@ -656,7 +685,11 @@ mod tests {
         let bridge = StatusBridge::new();
         // Fill exactly to the cap, one ingest each in ascending order.
         for i in 0..STATUS_MAP_CAP {
-            bridge.ingest(&format!("s{i:05}"), &ctx_payload(i as f64 % 100.0), i as u64);
+            bridge.ingest(
+                &format!("s{i:05}"),
+                &ctx_payload(i as f64 % 100.0),
+                i as u64,
+            );
         }
         assert_eq!(bridge.all().len(), STATUS_MAP_CAP, "filled to the cap");
 
@@ -665,11 +698,21 @@ mod tests {
 
         // One brand-new session pushes over the cap → exactly one eviction.
         bridge.ingest("s99999", &ctx_payload(1.0), 9_001);
-        assert_eq!(bridge.all().len(), STATUS_MAP_CAP, "map stays bounded at the cap");
+        assert_eq!(
+            bridge.all().len(),
+            STATUS_MAP_CAP,
+            "map stays bounded at the cap"
+        );
 
         // The re-ingested oldest survives; the now-least-recent (s00001) is evicted.
-        assert!(bridge.get("s00000").is_some(), "re-ingested session survives");
-        assert!(bridge.get("s00001").is_none(), "least-recently-ingested evicted");
+        assert!(
+            bridge.get("s00000").is_some(),
+            "re-ingested session survives"
+        );
+        assert!(
+            bridge.get("s00001").is_none(),
+            "least-recently-ingested evicted"
+        );
         assert!(bridge.get("s99999").is_some(), "the new session is present");
     }
 

@@ -32,14 +32,16 @@ pub fn metrics() -> HostMetrics {
             let key = parts.next().unwrap_or("").trim();
             let val_str = parts.next().unwrap_or("").trim();
             // Values look like "12345678 kB" — take the first token.
-            let val: u64 = val_str.split_whitespace().next()
+            let val: u64 = val_str
+                .split_whitespace()
+                .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             match key {
-                "MemTotal"    => mem_total_kib     = val,
-                "MemAvailable"=> mem_available_kib  = val,
-                "SwapTotal"   => swap_total_kib     = val,
-                "SwapFree"    => swap_free_kib      = val,
+                "MemTotal" => mem_total_kib = val,
+                "MemAvailable" => mem_available_kib = val,
+                "SwapTotal" => swap_total_kib = val,
+                "SwapFree" => swap_free_kib = val,
                 _ => {}
             }
         }
@@ -47,7 +49,8 @@ pub fn metrics() -> HostMetrics {
 
     // --- /proc/cpuinfo — count "processor" lines ---
     let cpu_count: u32 = if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
-        content.lines()
+        content
+            .lines()
             .filter(|l| l.starts_with("processor"))
             .count() as u32
     } else {
@@ -83,14 +86,14 @@ pub fn metrics() -> HostMetrics {
         .unwrap_or(0);
 
     // --- /etc/os-release — PRETTY_NAME, strip surrounding double-quotes ---
-    let distro: Option<String> = std::fs::read_to_string("/etc/os-release").ok().and_then(|s| {
-        s.lines()
-            .find(|l| l.starts_with("PRETTY_NAME="))
-            .map(|l| {
+    let distro: Option<String> = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|s| {
+            s.lines().find(|l| l.starts_with("PRETTY_NAME=")).map(|l| {
                 let val = l["PRETTY_NAME=".len()..].trim();
                 val.trim_matches('"').to_string()
             })
-    });
+        });
 
     HostMetrics {
         mem_total_kib,
@@ -184,9 +187,7 @@ pub fn git_worktrees(cwd: &str) -> Result<Vec<WorktreeInfo>> {
                 wt.head = Some(sha.to_string());
             } else if let Some(branch_ref) = line.strip_prefix("branch ") {
                 // Strip "refs/heads/" prefix.
-                let branch = branch_ref
-                    .strip_prefix("refs/heads/")
-                    .unwrap_or(branch_ref);
+                let branch = branch_ref.strip_prefix("refs/heads/").unwrap_or(branch_ref);
                 wt.branch = Some(branch.to_string());
             } else if line == "bare" {
                 wt.bare = true;
@@ -218,7 +219,10 @@ mod tests {
     #[test]
     fn metrics_mem_total_is_positive() {
         let m = metrics();
-        assert!(m.mem_total_kib > 0, "mem_total_kib should be > 0 on this Linux host");
+        assert!(
+            m.mem_total_kib > 0,
+            "mem_total_kib should be > 0 on this Linux host"
+        );
     }
 
     #[test]
@@ -243,8 +247,7 @@ mod tests {
         // than a hardcoded absolute path to one dev's clone, which does not exist in
         // CI / other checkouts and made this test spuriously fail.
         let repo = env!("CARGO_MANIFEST_DIR");
-        let branch = git_branch(repo)
-            .expect("git_branch should not error in a valid git worktree");
+        let branch = git_branch(repo).expect("git_branch should not error in a valid git worktree");
         // NIT-2b: tolerate a DETACHED HEAD (git worktree add --detach, some CI checkout
         // modes) where `git branch --show-current` is empty -> None. When Some, it must
         // be non-empty.
@@ -258,8 +261,7 @@ mod tests {
 
     #[test]
     fn git_branch_not_a_repo_returns_none() {
-        let result = git_branch("/tmp")
-            .expect("git_branch on /tmp should return Ok, not Err");
+        let result = git_branch("/tmp").expect("git_branch on /tmp should return Ok, not Err");
         assert!(
             result.is_none(),
             "git_branch on /tmp should return None (not a git repo)"
@@ -271,8 +273,8 @@ mod tests {
         // Portable: query THIS crate's own git repo (see git_branch_in_t_hub_worktree),
         // not a machine-specific absolute path.
         let repo = env!("CARGO_MANIFEST_DIR");
-        let worktrees = git_worktrees(repo)
-            .expect("git_worktrees should not error in a valid git repo");
+        let worktrees =
+            git_worktrees(repo).expect("git_worktrees should not error in a valid git repo");
         assert!(
             !worktrees.is_empty(),
             "should find at least one worktree entry"
@@ -285,8 +287,8 @@ mod tests {
 
     #[test]
     fn git_worktrees_not_a_repo_returns_empty() {
-        let worktrees = git_worktrees("/tmp")
-            .expect("git_worktrees on /tmp should return Ok, not Err");
+        let worktrees =
+            git_worktrees("/tmp").expect("git_worktrees on /tmp should return Ok, not Err");
         assert!(
             worktrees.is_empty(),
             "git_worktrees on /tmp should return empty Vec"

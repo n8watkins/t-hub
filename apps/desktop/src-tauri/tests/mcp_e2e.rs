@@ -150,8 +150,22 @@ fn end_to_end_mcp_round_trip() {
     {
         let mut s = supervisor.lock();
         // An orchestrator with a running subagent, then Stop → WaitingOnSubagents.
-        s.ingest(Some("sess-e2e"), None, None, None, JournalEventType::SessionStart, 1);
-        s.ingest(Some("sess-e2e"), None, None, None, JournalEventType::UserPromptSubmit, 2);
+        s.ingest(
+            Some("sess-e2e"),
+            None,
+            None,
+            None,
+            JournalEventType::SessionStart,
+            1,
+        );
+        s.ingest(
+            Some("sess-e2e"),
+            None,
+            None,
+            None,
+            JournalEventType::UserPromptSubmit,
+            2,
+        );
         s.ingest(
             Some("sess-e2e"),
             Some("agent-1"),
@@ -160,7 +174,14 @@ fn end_to_end_mcp_round_trip() {
             JournalEventType::SubagentStart,
             3,
         );
-        s.ingest(Some("sess-e2e"), None, None, None, JournalEventType::Stop, 4);
+        s.ingest(
+            Some("sess-e2e"),
+            None,
+            None,
+            None,
+            JournalEventType::Stop,
+            4,
+        );
     }
 
     let status = Arc::new(t_hub_lib::status_bridge_for_test());

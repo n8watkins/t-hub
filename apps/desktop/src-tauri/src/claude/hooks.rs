@@ -408,7 +408,9 @@ pub fn managed_stale(settings: &serde_json::Value, agent_bin: &str) -> bool {
         return false;
     };
     for groups in hooks.values() {
-        let Some(arr) = groups.as_array() else { continue };
+        let Some(arr) = groups.as_array() else {
+            continue;
+        };
         for g in arr {
             let Some(inner) = g.get("hooks").and_then(|h| h.as_array()) else {
                 continue;
@@ -465,10 +467,7 @@ pub fn group_is_t_hub(group: &serde_json::Value) -> bool {
 /// ## Preservation
 /// Every non-hook top-level key in `existing` (e.g. `model`, `permissions`,
 /// `cleanupPeriodDays`) is carried through unchanged.
-pub fn merge_into_settings(
-    existing: &serde_json::Value,
-    agent_bin: &str,
-) -> serde_json::Value {
+pub fn merge_into_settings(existing: &serde_json::Value, agent_bin: &str) -> serde_json::Value {
     merge_into_settings_for(existing, agent_bin, HOOK_EVENTS)
 }
 
@@ -482,10 +481,8 @@ pub fn merge_into_settings_for(
     events: &[&str],
 ) -> serde_json::Value {
     // Start from existing (clone) or an empty object if existing is not an object.
-    let mut root: serde_json::Map<String, serde_json::Value> = existing
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+    let mut root: serde_json::Map<String, serde_json::Value> =
+        existing.as_object().cloned().unwrap_or_default();
 
     // Ensure the top-level "hooks" key is an object.
     let hooks_obj: &mut serde_json::Map<String, serde_json::Value> = root
@@ -526,10 +523,8 @@ pub fn merge_into_settings_for(
 /// array becomes empty the event key is removed entirely. All user (non-marker)
 /// groups are preserved, as are all top-level keys outside `hooks`.
 pub fn remove_from_settings(existing: &serde_json::Value) -> serde_json::Value {
-    let mut root: serde_json::Map<String, serde_json::Value> = existing
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+    let mut root: serde_json::Map<String, serde_json::Value> =
+        existing.as_object().cloned().unwrap_or_default();
 
     if let Some(hooks_val) = root.get_mut("hooks") {
         if let Some(hooks_obj) = hooks_val.as_object_mut() {
@@ -595,7 +590,10 @@ mod tests {
         let arr = installed["hooks"]["PreToolUse"].as_array().unwrap();
         // Both the user hook and our gate are present.
         assert_eq!(arr.len(), 2, "the user's PreToolUse hook must be preserved");
-        let gate = arr.iter().find(|g| group_is_t_hub(g)).expect("gate group present");
+        let gate = arr
+            .iter()
+            .find(|g| group_is_t_hub(g))
+            .expect("gate group present");
         assert_eq!(gate["matcher"], "Bash");
         assert!(gate["hooks"][0]["command"]
             .as_str()
@@ -604,11 +602,17 @@ mod tests {
 
         // Idempotent: re-installing does not duplicate the gate.
         let reinstalled = merge_gate_into_settings(&installed, bin);
-        assert_eq!(reinstalled["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            reinstalled["hooks"]["PreToolUse"].as_array().unwrap().len(),
+            2
+        );
 
         // Clean uninstall: the gate is stripped, the user hook stays.
         let removed = remove_from_settings(&reinstalled);
-        assert!(!gate_managed(&removed), "the gate must be removed on uninstall");
+        assert!(
+            !gate_managed(&removed),
+            "the gate must be removed on uninstall"
+        );
         let arr = removed["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["matcher"], "Write");
@@ -661,7 +665,10 @@ mod tests {
         });
         let out = merge_statusline_into_settings(&existing, bin);
         // User's statusLine must be left intact (not stolen).
-        assert_eq!(out["statusLine"]["command"].as_str(), Some("my-own-status.sh"));
+        assert_eq!(
+            out["statusLine"]["command"].as_str(),
+            Some("my-own-status.sh")
+        );
         assert!(!statusline_managed(&out));
     }
 
@@ -686,7 +693,10 @@ mod tests {
             "statusLine": { "type": "command", "command": "my-own-status.sh" }
         });
         let kept = remove_statusline_from_settings(&user);
-        assert_eq!(kept["statusLine"]["command"].as_str(), Some("my-own-status.sh"));
+        assert_eq!(
+            kept["statusLine"]["command"].as_str(),
+            Some("my-own-status.sh")
+        );
     }
 
     #[test]
@@ -790,7 +800,11 @@ mod tests {
         // User PreToolUse group must survive (PreToolUse is not in HOOK_EVENTS,
         // so it should be left completely untouched).
         let pretooluse = hooks["PreToolUse"].as_array().expect("array");
-        assert_eq!(pretooluse.len(), 1, "user PreToolUse group must be preserved");
+        assert_eq!(
+            pretooluse.len(),
+            1,
+            "user PreToolUse group must be preserved"
+        );
         assert_eq!(
             pretooluse[0]["hooks"][0]["command"].as_str(),
             Some("echo user_pretooluse")
@@ -798,20 +812,24 @@ mod tests {
 
         // User Stop group (no marker) must survive alongside the T-Hub Stop group.
         let stop_groups = hooks["Stop"].as_array().expect("array");
-        let user_stop_groups: Vec<_> = stop_groups
-            .iter()
-            .filter(|g| !group_is_t_hub(g))
-            .collect();
-        assert_eq!(user_stop_groups.len(), 1, "user Stop group must be preserved");
+        let user_stop_groups: Vec<_> = stop_groups.iter().filter(|g| !group_is_t_hub(g)).collect();
+        assert_eq!(
+            user_stop_groups.len(),
+            1,
+            "user Stop group must be preserved"
+        );
         assert_eq!(
             user_stop_groups[0]["hooks"][0]["command"].as_str(),
             Some("echo user_stop_handler")
         );
 
         // T-Hub Stop group must also be present.
-        let t_hub_stop_groups: Vec<_> =
-            stop_groups.iter().filter(|g| group_is_t_hub(g)).collect();
-        assert_eq!(t_hub_stop_groups.len(), 1, "T-Hub Stop group must be present");
+        let t_hub_stop_groups: Vec<_> = stop_groups.iter().filter(|g| group_is_t_hub(g)).collect();
+        assert_eq!(
+            t_hub_stop_groups.len(),
+            1,
+            "T-Hub Stop group must be present"
+        );
     }
 
     // ---------------------------------------------------------------------------

@@ -79,12 +79,7 @@ fn err(kind: ResponseErrorKind, message: String) -> AgentResponse {
 
 /// Record an agent-initiated command in the journal (best-effort; a journal
 /// write failure must not fail the RPC, so we swallow its error after logging).
-fn record_command(
-    journal: &Journal,
-    entity: &str,
-    op: &str,
-    err: Option<&anyhow::Error>,
-) {
+fn record_command(journal: &Journal, entity: &str, op: &str, err: Option<&anyhow::Error>) {
     let result = match err {
         Some(e) => format!("error: {e}"),
         None => "ok".to_string(),

@@ -145,9 +145,7 @@ fn snapshot_is_fresh(updated_at: Option<&str>, now: i64) -> bool {
 #[cfg(target_os = "windows")]
 fn windows_pid_alive(pid: u32) -> bool {
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     // OpenProcess's `binherithandle` is a plain Rust `bool` in windows 0.61.
     unsafe {
         match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
@@ -195,10 +193,17 @@ struct Discovery {
 /// schemaVersion, or a missing/empty baseUrl or readToken (a bad token would
 /// only earn a 401 anyway - fail toward the fallback immediately).
 fn parse_control(v: &serde_json::Value) -> Option<Discovery> {
-    if v.get("schemaVersion").and_then(|x| x.as_u64()).is_some_and(|n| n > 1) {
+    if v.get("schemaVersion")
+        .and_then(|x| x.as_u64())
+        .is_some_and(|n| n > 1)
+    {
         return None;
     }
-    let base_url = v.get("baseUrl")?.as_str()?.trim_end_matches('/').to_string();
+    let base_url = v
+        .get("baseUrl")?
+        .as_str()?
+        .trim_end_matches('/')
+        .to_string();
     let read_token = v.get("readToken")?.as_str()?.to_string();
     if base_url.is_empty() || read_token.is_empty() {
         return None;
@@ -258,7 +263,10 @@ fn fetch_v1_snapshot(d: &Discovery) -> Option<serde_json::Value> {
 /// non-Scribe local server squatting a reused port), so the caller falls
 /// through to the file fallback.
 fn eval_v1_snapshot(v: &serde_json::Value, now: i64) -> Option<CandidateEval> {
-    if v.get("schemaVersion").and_then(|x| x.as_u64()).is_some_and(|n| n > 1) {
+    if v.get("schemaVersion")
+        .and_then(|x| x.as_u64())
+        .is_some_and(|n| n > 1)
+    {
         return None;
     }
     // F2: require `app == "scribe"` present AND equal, not merely "not wrong".
@@ -542,7 +550,10 @@ mod tests {
             t0_ms() + 1_000,
         )
         .expect("valid snapshot");
-        assert!(c.status.listening, "busy=true must hold even when dictating=false");
+        assert!(
+            c.status.listening,
+            "busy=true must hold even when dictating=false"
+        );
         assert_eq!(c.status.source, Some("v1"));
         assert_eq!(c.status.status.as_deref(), Some("Transcribing"));
     }
@@ -576,11 +587,23 @@ mod tests {
     fn v1_snapshot_rejects_unusable_payloads() {
         let now = t0_ms();
         // A future major contract version (fresh, so the TTL is not the reason).
-        assert!(eval_v1_snapshot(&json!({ "schemaVersion": 2, "app": "scribe", "busy": true, "updatedAt": T0 }), now).is_none());
+        assert!(eval_v1_snapshot(
+            &json!({ "schemaVersion": 2, "app": "scribe", "busy": true, "updatedAt": T0 }),
+            now
+        )
+        .is_none());
         // A non-Scribe local server squatting a reused port.
-        assert!(eval_v1_snapshot(&json!({ "schemaVersion": 1, "app": "other", "busy": true, "updatedAt": T0 }), now).is_none());
+        assert!(eval_v1_snapshot(
+            &json!({ "schemaVersion": 1, "app": "other", "busy": true, "updatedAt": T0 }),
+            now
+        )
+        .is_none());
         // Neither boolean present: not a snapshot at all.
-        assert!(eval_v1_snapshot(&json!({ "schemaVersion": 1, "app": "scribe", "updatedAt": T0 }), now).is_none());
+        assert!(eval_v1_snapshot(
+            &json!({ "schemaVersion": 1, "app": "scribe", "updatedAt": T0 }),
+            now
+        )
+        .is_none());
     }
 
     #[test]
@@ -597,7 +620,8 @@ mod tests {
             "stale v1 snapshot -> fall through to the fallback",
         );
         // At exactly the TTL boundary it still holds.
-        let c = eval_v1_snapshot(&v, t0_ms() + SCRIBE_SNAPSHOT_TTL_MS).expect("fresh at the boundary");
+        let c =
+            eval_v1_snapshot(&v, t0_ms() + SCRIBE_SNAPSHOT_TTL_MS).expect("fresh at the boundary");
         assert!(c.status.listening);
     }
 
@@ -662,8 +686,14 @@ mod tests {
             "readToken": "tok",
         }))
         .expect("valid discovery");
-        assert_eq!(d.base_url, "http://127.0.0.1:52431", "trailing slash trimmed");
-        assert_eq!(d.status_path, "/v1/status-custom", "published path used, not hard-coded");
+        assert_eq!(
+            d.base_url, "http://127.0.0.1:52431",
+            "trailing slash trimmed"
+        );
+        assert_eq!(
+            d.status_path, "/v1/status-custom",
+            "published path used, not hard-coded"
+        );
         assert_eq!(d.read_token, "tok");
         assert_eq!(d.pid, Some(4242));
 
@@ -675,10 +705,19 @@ mod tests {
 
     #[test]
     fn control_parse_rejects_unusable_files() {
-        assert!(parse_control(&json!({ "readToken": "tok" })).is_none(), "no baseUrl");
-        assert!(parse_control(&json!({ "baseUrl": "http://127.0.0.1:1" })).is_none(), "no token");
         assert!(
-            parse_control(&json!({ "schemaVersion": 2, "baseUrl": "http://127.0.0.1:1", "readToken": "t" })).is_none(),
+            parse_control(&json!({ "readToken": "tok" })).is_none(),
+            "no baseUrl"
+        );
+        assert!(
+            parse_control(&json!({ "baseUrl": "http://127.0.0.1:1" })).is_none(),
+            "no token"
+        );
+        assert!(
+            parse_control(
+                &json!({ "schemaVersion": 2, "baseUrl": "http://127.0.0.1:1", "readToken": "t" })
+            )
+            .is_none(),
             "future major schemaVersion",
         );
     }
@@ -747,7 +786,10 @@ mod tests {
         let port = serve_v1_once(body, "sekret");
         let ctl = write_control(port, "sekret", std::process::id() as u64);
         let c = eval_flavor(Some(&ctl), None).expect("v1 answered");
-        assert!(c.status.listening, "busy=true gates end-to-end over the wire");
+        assert!(
+            c.status.listening,
+            "busy=true gates end-to-end over the wire"
+        );
         assert_eq!(c.status.source, Some("v1"));
         assert_eq!(c.status.status.as_deref(), Some("Transcribing"));
         let _ = std::fs::remove_file(&ctl);
@@ -764,7 +806,10 @@ mod tests {
         let ctl = write_control(dead_port, "sekret", std::process::id() as u64);
 
         // No fallback file either: nothing to trust -> fail open.
-        assert!(eval_flavor(Some(&ctl), None).is_none(), "unreachable + no file -> fail open");
+        assert!(
+            eval_flavor(Some(&ctl), None).is_none(),
+            "unreachable + no file -> fail open"
+        );
 
         // A live fresh fallback file: the s7.2 path answers instead.
         let file = temp_path("fallback");
@@ -846,7 +891,10 @@ mod tests {
     #[test]
     fn fallback_dead_pid_fails_open_even_when_fresh() {
         let v = json!({ "dictating": true, "busy": true, "updatedAt": T0, "pid": 42 });
-        assert!(!evaluate_fallback(&v, t0_ms(), DEAD).listening, "s7.2 step 2: dead pid overrides everything");
+        assert!(
+            !evaluate_fallback(&v, t0_ms(), DEAD).listening,
+            "s7.2 step 2: dead pid overrides everything"
+        );
     }
 
     #[test]
@@ -862,10 +910,16 @@ mod tests {
 
     #[test]
     fn fallback_missing_or_bad_updated_at_fails_open() {
-        assert!(!evaluate_fallback(&json!({ "dictating": true, "pid": 42 }), t0_ms(), ALIVE).listening);
         assert!(
-            !evaluate_fallback(&json!({ "dictating": true, "updatedAt": "not-a-time", "pid": 42 }), t0_ms(), ALIVE)
-                .listening
+            !evaluate_fallback(&json!({ "dictating": true, "pid": 42 }), t0_ms(), ALIVE).listening
+        );
+        assert!(
+            !evaluate_fallback(
+                &json!({ "dictating": true, "updatedAt": "not-a-time", "pid": 42 }),
+                t0_ms(),
+                ALIVE
+            )
+            .listening
         );
     }
 
@@ -873,7 +927,9 @@ mod tests {
     fn fallback_uncheckable_pid_relies_on_the_ttl_alone() {
         let v = json!({ "dictating": true, "busy": true, "updatedAt": T0, "pid": 42 });
         assert!(evaluate_fallback(&v, t0_ms() + 1_000, UNCHECKABLE).listening);
-        assert!(!evaluate_fallback(&v, t0_ms() + SCRIBE_SNAPSHOT_TTL_MS + 1, UNCHECKABLE).listening);
+        assert!(
+            !evaluate_fallback(&v, t0_ms() + SCRIBE_SNAPSHOT_TTL_MS + 1, UNCHECKABLE).listening
+        );
     }
 
     #[test]
@@ -928,7 +984,10 @@ mod tests {
         )
         .unwrap();
         let s = read_fallback_at(&p);
-        assert!(s.listening, "fresh heartbeat + own live pid should be listening");
+        assert!(
+            s.listening,
+            "fresh heartbeat + own live pid should be listening"
+        );
         assert_eq!(s.status.as_deref(), Some("Recording"));
         let _ = std::fs::remove_file(&p);
     }
@@ -972,27 +1031,55 @@ mod tests {
         // prod not busy (older), dev busy (newer) -> overall listening, and
         // status/since reported from dev (the freshest updatedAt).
         let prod = CandidateEval {
-            status: ScribeStatus { listening: false, status: Some("Ready".into()), since: None, source: Some("v1") },
+            status: ScribeStatus {
+                listening: false,
+                status: Some("Ready".into()),
+                since: None,
+                source: Some("v1"),
+            },
             updated_at: Some("2026-07-07T01:00:00Z".into()),
         };
         let dev = CandidateEval {
-            status: ScribeStatus { listening: true, status: Some("Recording".into()), since: None, source: Some("file") },
+            status: ScribeStatus {
+                listening: true,
+                status: Some("Recording".into()),
+                since: None,
+                source: Some("file"),
+            },
             updated_at: Some("2026-07-07T02:00:00Z".into()),
         };
         let combined = combine_candidates(&[prod, dev]);
         assert!(combined.listening, "OR of both -> listening");
-        assert_eq!(combined.status.as_deref(), Some("Recording"), "freshest reported");
-        assert_eq!(combined.source, Some("file"), "source follows the chosen candidate");
+        assert_eq!(
+            combined.status.as_deref(),
+            Some("Recording"),
+            "freshest reported"
+        );
+        assert_eq!(
+            combined.source,
+            Some("file"),
+            "source follows the chosen candidate"
+        );
     }
 
     #[test]
     fn combine_prefers_prod_on_a_tie() {
         let prod = CandidateEval {
-            status: ScribeStatus { listening: false, status: Some("prod".into()), since: None, source: Some("v1") },
+            status: ScribeStatus {
+                listening: false,
+                status: Some("prod".into()),
+                since: None,
+                source: Some("v1"),
+            },
             updated_at: Some("2026-07-07T02:00:00Z".into()),
         };
         let dev = CandidateEval {
-            status: ScribeStatus { listening: false, status: Some("dev".into()), since: None, source: Some("v1") },
+            status: ScribeStatus {
+                listening: false,
+                status: Some("dev".into()),
+                since: None,
+                source: Some("v1"),
+            },
             updated_at: Some("2026-07-07T02:00:00Z".into()),
         };
         assert_eq!(
@@ -1014,13 +1101,13 @@ mod tests {
     #[test]
     fn gate_matches_golden_fixtures_cross_impl() {
         use chrono::TimeZone;
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../scripts/gate-fixtures.json");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/gate-fixtures.json");
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let manifest: serde_json::Value = serde_json::from_str(&raw).expect("fixtures parse");
-        let base = parse_rfc3339_ms(manifest["base"].as_str().expect("base string"))
-            .expect("base parses");
+        let base =
+            parse_rfc3339_ms(manifest["base"].as_str().expect("base string")).expect("base parses");
         // The fixtures pin the shared TTL; if scribe.rs's TTL ever changes, the
         // manifest (and the shell) must change with it - assert they still match.
         assert_eq!(
@@ -1065,14 +1152,18 @@ mod tests {
     /// Skipped on hosts / CI where the file is absent (never flakes).
     #[test]
     fn reads_the_real_scribe_file_on_this_host_when_present() {
-        let real = PathBuf::from(
-            "/mnt/c/Users/natha/AppData/Local/com.natkins.scribe/status.json",
-        );
+        let real = PathBuf::from("/mnt/c/Users/natha/AppData/Local/com.natkins.scribe/status.json");
         if !real.exists() {
             return;
         }
         let s = read_fallback_at(&real);
-        assert!(!s.listening, "the general is not dictating -> not listening");
-        assert!(s.status.is_some(), "the real file's status field was parsed");
+        assert!(
+            !s.listening,
+            "the general is not dictating -> not listening"
+        );
+        assert!(
+            s.status.is_some(),
+            "the real file's status field was parsed"
+        );
     }
 }

@@ -114,7 +114,10 @@ impl SpawnGovernor {
         Self {
             max_sessions: max_sessions.min(HARD_SESSION_CEILING),
             spawn: Mutex::new(TokenBucket::new(spawn_burst, spawn_rate_per_min)),
-            destructive: Mutex::new(TokenBucket::new(DESTRUCTIVE_BURST, DESTRUCTIVE_RATE_PER_MIN)),
+            destructive: Mutex::new(TokenBucket::new(
+                DESTRUCTIVE_BURST,
+                DESTRUCTIVE_RATE_PER_MIN,
+            )),
             spawn_rate_per_min,
             destructive_rate_per_min: DESTRUCTIVE_RATE_PER_MIN,
         }
@@ -247,7 +250,10 @@ mod tests {
         let gov = SpawnGovernor::default();
         let t0 = Instant::now();
         for i in 0..8 {
-            assert!(gov.check_spawn(i, t0).is_ok(), "spawn {i} refused within burst");
+            assert!(
+                gov.check_spawn(i, t0).is_ok(),
+                "spawn {i} refused within burst"
+            );
         }
         // The 9th instantaneous spawn (beyond burst, no time to refill) is refused
         // as a rate limit — the runaway-loop signal.
@@ -309,7 +315,9 @@ mod tests {
         }
         let refusal = gov.check_destructive(t0).unwrap_err();
         assert_eq!(refusal.code, "refused-rate");
-        assert!(refusal.message.contains("destructive-command rate limit (15/min)"));
+        assert!(refusal
+            .message
+            .contains("destructive-command rate limit (15/min)"));
         // 15/min = one every 4s; after 4s one more teardown is admitted.
         let t1 = t0 + Duration::from_secs(4);
         assert!(gov.check_destructive(t1).is_ok());

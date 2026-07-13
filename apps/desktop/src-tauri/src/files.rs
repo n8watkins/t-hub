@@ -103,11 +103,7 @@ pub struct FileEntry {
 
 impl FileEntry {
     fn from_rel(rel_path: String) -> Self {
-        let basename = rel_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&rel_path)
-            .to_string();
+        let basename = rel_path.rsplit('/').next().unwrap_or(&rel_path).to_string();
         let ext = Path::new(&basename)
             .extension()
             .and_then(|e| e.to_str())
@@ -217,7 +213,6 @@ impl FileIndexState {
         self.indexes.lock().insert(arc.root.clone(), arc.clone());
         arc
     }
-
 }
 
 /// Normalize a user-supplied path to an absolute, lexically-clean form. We
@@ -275,12 +270,8 @@ fn to_host_path(path: &str) -> PathBuf {
     {
         // Already a Windows/UNC path (drive-letter, `\\server\...`, or a
         // `\\wsl.localhost\...` / `\\wsl$\...` share) — leave it alone.
-        let is_windows_shaped = path.starts_with("\\\\")
-            || path
-                .as_bytes()
-                .get(1)
-                .map(|&b| b == b':')
-                .unwrap_or(false);
+        let is_windows_shaped =
+            path.starts_with("\\\\") || path.as_bytes().get(1).map(|&b| b == b':').unwrap_or(false);
         // A POSIX-absolute path ("/home/...") that is NOT already a forward-slash
         // UNC ("//wsl.localhost/...") is a WSL path we must map onto the share.
         let is_posix_abs = path.starts_with('/') && !path.starts_with("//");
@@ -427,12 +418,18 @@ fi
 "#;
     // "Show ignored": no filtering — list every child (ignored dirs included).
     const SCRIPT_ALL: &str = r#"find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null"#;
-    let script = if show_ignored { SCRIPT_ALL } else { SCRIPT_FILTER };
+    let script = if show_ignored {
+        SCRIPT_ALL
+    } else {
+        SCRIPT_FILTER
+    };
     // Bounded (LOCAL_IO): a `find` + per-entry `git check-ignore` over `dir`; a slow
     // git / UNC / large dir must not park the file-index handler this runs on.
-    let output =
-        crate::bounded_exec::output_with_timeout(wsl_bash(&distro, script, dir), crate::bounded_exec::LOCAL_IO_TIMEOUT)
-            .map_err(|e| format!("failed to spawn/await wsl.exe: {e}"))?;
+    let output = crate::bounded_exec::output_with_timeout(
+        wsl_bash(&distro, script, dir),
+        crate::bounded_exec::LOCAL_IO_TIMEOUT,
+    )
+    .map_err(|e| format!("failed to spawn/await wsl.exe: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("__TH_NODIR__") {
@@ -470,9 +467,11 @@ fi
         });
     }
     out.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+        b.is_dir.cmp(&a.is_dir).then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        })
     });
     Ok(out)
 }
@@ -515,9 +514,11 @@ fi
     );
     // Bounded (LOCAL_IO): `rg`/`git ls-files`/`find` over the WHOLE project tree; a
     // large repo or slow FS must not park the file-search handler this runs on.
-    let output =
-        crate::bounded_exec::output_with_timeout(wsl_bash(&distro, &script, root), crate::bounded_exec::LOCAL_IO_TIMEOUT)
-            .map_err(|e| format!("failed to spawn/await wsl.exe: {e}"))?;
+    let output = crate::bounded_exec::output_with_timeout(
+        wsl_bash(&distro, &script, root),
+        crate::bounded_exec::LOCAL_IO_TIMEOUT,
+    )
+    .map_err(|e| format!("failed to spawn/await wsl.exe: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("__TH_NODIR__") {
@@ -729,7 +730,7 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
             hi += 1;
         }
         let idx = found?; // not a subsequence
-        // Base reward for a matched char.
+                          // Base reward for a matched char.
         score += 10;
         // Consecutive-run bonus.
         if let Some(prev) = prev_match {
@@ -987,7 +988,11 @@ fn read_dir_shallow_fs(dir: &Path, show_ignored: bool) -> Result<Vec<DirEntry>, 
     out.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir) // dirs (true) before files (false)
-            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+            .then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
     });
     Ok(out)
 }
@@ -997,10 +1002,7 @@ fn read_dir_shallow_fs(dir: &Path, show_ignored: bool) -> Result<Vec<DirEntry>, 
 /// plumbing). Used both for the "Show ignored" listing and to add gitignored
 /// files back onto the directory-only-filtered listing. Not sorted here — the
 /// caller merges + sorts.
-fn read_dir_raw(
-    dir: &Path,
-    keep: impl Fn(&str, bool) -> bool,
-) -> Result<Vec<DirEntry>, String> {
+fn read_dir_raw(dir: &Path, keep: impl Fn(&str, bool) -> bool) -> Result<Vec<DirEntry>, String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir failed: {e}"))?;
     let mut out = Vec::new();
     for ent in rd.flatten() {
@@ -1191,10 +1193,11 @@ fn resolve_real_posix(path: &str) -> Option<PathBuf> {
             .arg("--")
             .arg(&posix);
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        // Bounded (WSL_PROBE): a single `realpath`; this is a scope-validation gate
-        // on file-read requests, so a wedged WSL must not park the handler.
+                                       // Bounded (WSL_PROBE): a single `realpath`; this is a scope-validation gate
+                                       // on file-read requests, so a wedged WSL must not park the handler.
         let out =
-            crate::bounded_exec::output_with_timeout(c, crate::bounded_exec::WSL_PROBE_TIMEOUT).ok()?;
+            crate::bounded_exec::output_with_timeout(c, crate::bounded_exec::WSL_PROBE_TIMEOUT)
+                .ok()?;
         if !out.status.success() {
             return None;
         }
@@ -1241,7 +1244,8 @@ fn scoped_path(path: &str, enforce: bool, allowed_roots: &[PathBuf]) -> Result<P
         return Ok(normalize(path));
     }
     remote_precheck(path, allowed_roots)?;
-    let real = resolve_real_posix(path).ok_or_else(|| format!("cannot resolve {path} on the host"))?;
+    let real =
+        resolve_real_posix(path).ok_or_else(|| format!("cannot resolve {path} on the host"))?;
     if !under_allowed_root(&real, allowed_roots) {
         return Err(format!(
             "path is outside the allowed remote roots ({}): {}",
@@ -1490,7 +1494,11 @@ mod tests {
         // A gitignore that hides `secret.txt`, the `ignored/` dir, `*.log`, and
         // `.env` (the conventional secret-config case the directory-only rule must
         // still SHOW in the tree).
-        fs::write(root.join(".gitignore"), "secret.txt\nignored/\n*.log\n.env\n").unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            "secret.txt\nignored/\n*.log\n.env\n",
+        )
+        .unwrap();
 
         fs::write(root.join("README.md"), "# Title\n\nhello").unwrap();
         fs::write(root.join("package.json"), "{}").unwrap();
@@ -1549,9 +1557,15 @@ mod tests {
         // only the TREE relaxes it to a directory-only rule; see
         // `list_dir_is_shallow_dirs_first_and_prunes`. So a gitignored `.env`
         // is correctly absent here while still showing in the tree.)
-        assert!(!rels.contains(&"secret.txt".to_string()), "gitignored file leaked");
+        assert!(
+            !rels.contains(&"secret.txt".to_string()),
+            "gitignored file leaked"
+        );
         assert!(!rels.contains(&"debug.log".to_string()), "*.log leaked");
-        assert!(!rels.contains(&".env".to_string()), "gitignored .env leaked into index");
+        assert!(
+            !rels.contains(&".env".to_string()),
+            "gitignored .env leaked into index"
+        );
         assert!(
             !rels.iter().any(|r| r.starts_with("ignored/")),
             "gitignored dir leaked"
@@ -1565,7 +1579,10 @@ mod tests {
         assert!(!rels.iter().any(|r| r.starts_with(".git/")), ".git leaked");
 
         // Binary blob skipped.
-        assert!(!rels.contains(&"blob.bin".to_string()), "binary blob leaked");
+        assert!(
+            !rels.contains(&"blob.bin".to_string()),
+            "binary blob leaked"
+        );
 
         cleanup(&root);
     }
@@ -1618,7 +1635,10 @@ mod tests {
         // normalize can't canonicalize the `..` away — mirrors the WSL-UNC fast path).
         let traversal = format!("{root_str}/../../no_such_dir_scopetest_xyz");
         let terr = control_list_dir(&traversal, false, true, &allow).unwrap_err();
-        assert!(terr.contains("'..'"), "expected a '..' rejection, got: {terr}");
+        assert!(
+            terr.contains("'..'"),
+            "expected a '..' rejection, got: {terr}"
+        );
 
         // A symlink INSIDE the allowed root that points OUT is refused — canonicalize
         // resolves it to the parent, which isn't under the allowed root. (unix: where
@@ -1784,7 +1804,10 @@ mod tests {
         assert!(!names.contains(&"node_modules"));
 
         // DIRECTORY-only gitignore rule: ignored *directories* stay hidden …
-        assert!(!names.contains(&"ignored"), "gitignored dir leaked into tree");
+        assert!(
+            !names.contains(&"ignored"),
+            "gitignored dir leaked into tree"
+        );
         // … but ignored *files* are SHOWN. The headline case: a gitignored `.env`
         // (and other gitignored files like secret.txt / *.log) must appear while
         // browsing, even though the search index legitimately omits them.
@@ -1804,7 +1827,10 @@ mod tests {
         assert!(names.contains(&"README.md"));
         assert!(names.contains(&"package.json"));
         // .git is never browsable — pruned regardless.
-        assert!(!names.contains(&".git"), ".git must never appear in the tree");
+        assert!(
+            !names.contains(&".git"),
+            ".git must never appear in the tree"
+        );
 
         // Dirs come before files: the first non-pruned entry should be a dir.
         let first_dir_idx = entries.iter().position(|e| e.is_dir);
@@ -1835,16 +1861,25 @@ mod tests {
         let entries = read_dir_shallow(&root, true).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
 
-        assert!(names.contains(&"ignored"), "show_ignored should reveal ignored dirs");
+        assert!(
+            names.contains(&"ignored"),
+            "show_ignored should reveal ignored dirs"
+        );
         assert!(
             names.contains(&"node_modules"),
             "show_ignored should reveal node_modules"
         );
-        assert!(names.contains(&".env"), "show_ignored still shows ignored files");
+        assert!(
+            names.contains(&".env"),
+            "show_ignored still shows ignored files"
+        );
         assert!(names.contains(&"src"));
         assert!(names.contains(&"README.md"));
         // .git is never browsable, even with show_ignored on.
-        assert!(!names.contains(&".git"), ".git stays hidden even with show_ignored");
+        assert!(
+            !names.contains(&".git"),
+            ".git stays hidden even with show_ignored"
+        );
 
         cleanup(&root);
     }
@@ -1884,7 +1919,10 @@ mod tests {
         drop(f);
 
         let contents = read_text_capped(&big).unwrap();
-        assert!(contents.truncated, "oversize file should be marked truncated");
+        assert!(
+            contents.truncated,
+            "oversize file should be marked truncated"
+        );
         assert!(
             contents.text.len() as u64 <= MAX_READ_BYTES,
             "returned text exceeds cap"
@@ -1933,7 +1971,10 @@ mod tests {
     #[test]
     fn to_host_path_is_identity_on_unix() {
         // On unix a native POSIX path is already the Linux path: no rewrite.
-        assert_eq!(to_host_path("/home/natkins/proj"), PathBuf::from("/home/natkins/proj"));
+        assert_eq!(
+            to_host_path("/home/natkins/proj"),
+            PathBuf::from("/home/natkins/proj")
+        );
         assert_eq!(to_host_path("relative/dir"), PathBuf::from("relative/dir"));
     }
 
@@ -1947,7 +1988,10 @@ mod tests {
             PathBuf::from("\\\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\proj"),
         );
         // Already-Windows paths pass through untouched.
-        assert_eq!(to_host_path("C:\\Users\\natha"), PathBuf::from("C:\\Users\\natha"));
+        assert_eq!(
+            to_host_path("C:\\Users\\natha"),
+            PathBuf::from("C:\\Users\\natha")
+        );
         assert_eq!(
             to_host_path("\\\\wsl.localhost\\Ubuntu-24.04\\home\\x"),
             PathBuf::from("\\\\wsl.localhost\\Ubuntu-24.04\\home\\x"),

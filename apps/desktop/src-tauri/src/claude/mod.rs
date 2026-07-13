@@ -29,6 +29,6 @@ pub mod status;
 // re-exported for consumers/tests even though nothing in this crate names it
 // directly yet, so the adapter's status types are reachable as `claude::*`.
 #[allow(unused_imports)]
-pub use status::{RateLimitWindow, StatusBridge, StatusSnapshot};
-#[allow(unused_imports)]
 pub use install::InstallReport;
+#[allow(unused_imports)]
+pub use status::{RateLimitWindow, StatusBridge, StatusSnapshot};

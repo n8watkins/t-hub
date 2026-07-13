@@ -50,19 +50,12 @@ use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{
-        mpsc::Sender,
-        atomic::AtomicU64,
-        Arc,
-    },
+    sync::{atomic::AtomicU64, mpsc::Sender, Arc},
 };
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use t_hub_protocol::{
-    AgentResponse, AgentToCore, CoreFrame,
-    encode_core, decode_agent,
-};
+use t_hub_protocol::{decode_agent, encode_core, AgentResponse, AgentToCore, CoreFrame};
 
 // Re-export AgentBridge so the reader thread can call consume_journal_entry
 // without a circular import (the thread captures a clone of AgentBridge).
@@ -135,9 +128,8 @@ pub(crate) struct TransportHandles {
 /// priority scheduler can reorder outbound frames before they reach this
 /// function; the wire format already carries all the metadata it needs.
 pub(crate) fn write_frame(w: &mut impl Write, frame: &CoreFrame) -> std::io::Result<()> {
-    let line = encode_core(frame).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let line =
+        encode_core(frame).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     w.write_all(line.as_bytes())?;
     w.write_all(b"\n")?;
     w.flush()
@@ -368,7 +360,8 @@ mod transport_tests {
         // wait on the observable state instead of a fixed "give the reader a moment"
         // nap, so the test never races a slow handshake and never sleeps blindly.
         assert!(
-            wait_until(Duration::from_secs(5), || bridge.state() == ConnectionState::Live),
+            wait_until(Duration::from_secs(5), || bridge.state()
+                == ConnectionState::Live),
             "bridge should reach Live after connect(); got {:?}",
             bridge.state()
         );
@@ -465,16 +458,24 @@ mod transport_tests {
                 .write_all(stdin_json.as_bytes())
                 .unwrap();
             let status = child.wait().expect("hook wait");
-            assert!(status.success(), "hook {event} must exit 0 (never fail Claude)");
+            assert!(
+                status.success(),
+                "hook {event} must exit 0 (never fail Claude)"
+            );
         };
 
         // --- Phase 1: fire a hook sequence BEFORE connect (replay path) ---
         let sid = "demo-session-1";
-        fire_hook("SessionStart", &format!(r#"{{"session_id":"{sid}","cwd":"/w"}}"#));
+        fire_hook(
+            "SessionStart",
+            &format!(r#"{{"session_id":"{sid}","cwd":"/w"}}"#),
+        );
         fire_hook("UserPromptSubmit", &format!(r#"{{"session_id":"{sid}"}}"#));
         fire_hook(
             "SubagentStart",
-            &format!(r#"{{"session_id":"{sid}","agent_id":"sub-a","agent_type":"general-purpose"}}"#),
+            &format!(
+                r#"{{"session_id":"{sid}","agent_id":"sub-a","agent_type":"general-purpose"}}"#
+            ),
         );
         // Main agent Stop while the subagent is still running → WaitingOnSubagents.
         fire_hook("Stop", &format!(r#"{{"session_id":"{sid}"}}"#));
@@ -490,7 +491,9 @@ mod transport_tests {
         }
         impl crate::agent::EventEmitter for Rec {
             fn emit_json(&self, channel: &str, payload: &serde_json::Value) {
-                self.events.lock().push((channel.to_string(), payload.clone()));
+                self.events
+                    .lock()
+                    .push((channel.to_string(), payload.clone()));
             }
         }
         let rec = Rec::default();
@@ -524,7 +527,10 @@ mod transport_tests {
             .iter()
             .filter(|(ch, _)| ch == super::super::emit::EVT_JOURNAL)
             .count();
-        assert!(journal_emits >= 4, "expected >=4 journal emits, got {journal_emits}");
+        assert!(
+            journal_emits >= 4,
+            "expected >=4 journal emits, got {journal_emits}"
+        );
 
         eprintln!("live_emit_demo: replay path emitted waitingOnSubagents ✓");
 

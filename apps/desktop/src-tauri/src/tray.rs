@@ -98,8 +98,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         None::<&str>,
     )?;
     // --- Recovery (light tier): unwedge without a full restart. ---
-    let reload_item =
-        MenuItem::with_id(app, "reload_window", "Reload window", true, None::<&str>)?;
+    let reload_item = MenuItem::with_id(app, "reload_window", "Reload window", true, None::<&str>)?;
     let reconnect_item = MenuItem::with_id(
         app,
         "reconnect_agent",

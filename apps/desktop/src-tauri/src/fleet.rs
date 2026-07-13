@@ -453,7 +453,11 @@ fn wake_message(items: &[WakeItem]) -> String {
         }
     };
     if items.len() == 1 {
-        let noun = if items[0].is_captain { "it" } else { "that session" };
+        let noun = if items[0].is_captain {
+            "it"
+        } else {
+            "that session"
+        };
         format!(
             "[T-HUB FLEET WAKE] {}. Supervise {noun} (get_status / read_terminal, then act).",
             describe(&items[0])
@@ -574,7 +578,10 @@ mod tests {
         n.on_status("u-cap", SessionStatus::Completed);
         let calls = rec.calls();
         assert_eq!(calls.len(), 1, "exactly one wake");
-        assert_eq!(calls[0].0, "orcbbbbb", "injected into the orchestrator tile");
+        assert_eq!(
+            calls[0].0, "orcbbbbb",
+            "injected into the orchestrator tile"
+        );
         assert!(
             calls[0].1.contains("capaaaaa") && calls[0].1.contains("completed"),
             "payload names the captain + state: {}",
@@ -586,7 +593,8 @@ mod tests {
     fn wake_holds_until_orchestrator_is_idle_then_coalesces() {
         let (n, rec, w, c) = harness();
         // A second captain, also watched.
-        c.claim_test("capccccc", Some("ship-gamma"), vec![]).unwrap();
+        c.claim_test("capccccc", Some("ship-gamma"), vec![])
+            .unwrap();
         n.status_bridge_ingest("u-cap2", "th_capccccc");
         w.arm("orcbbbbb", WatchScope::Captains, vec![]);
 
@@ -630,11 +638,19 @@ mod tests {
         // Another transition of the same captain BEFORE the orchestrator idles again
         // must NOT inject a second time.
         n.on_status("u-cap", SessionStatus::Completed);
-        assert_eq!(rec.calls().len(), 1, "no double-inject within one idle window");
+        assert_eq!(
+            rec.calls().len(),
+            1,
+            "no double-inject within one idle window"
+        );
         // Orchestrator goes busy then idle -> the held transition flushes.
         n.on_status("u-orc", SessionStatus::Working);
         n.on_status("u-orc", SessionStatus::Completed);
-        assert_eq!(rec.calls().len(), 2, "the next idle edge flushes the held state");
+        assert_eq!(
+            rec.calls().len(),
+            2,
+            "the next idle edge flushes the held state"
+        );
     }
 
     #[test]
@@ -661,7 +677,10 @@ mod tests {
         w.arm("orcbbbbb", WatchScope::Captains, vec![]);
         n.on_status("u-orc", SessionStatus::Completed);
         n.on_status("u-cap", SessionStatus::Completed);
-        assert!(rec.calls().is_empty(), "first inject failed, batch retained");
+        assert!(
+            rec.calls().is_empty(),
+            "first inject failed, batch retained"
+        );
         // A fresh idle edge retries; this time it succeeds.
         n.on_status("u-orc", SessionStatus::Working);
         n.on_status("u-orc", SessionStatus::Completed);
@@ -672,8 +691,11 @@ mod tests {
     // shared status bridge after construction.
     impl FleetNotifier {
         fn status_bridge_ingest(&self, uuid: &str, tmux_session: &str) {
-            self.status_bridge
-                .ingest(uuid, &json!({ "cwd": "/x", "tmux_session": tmux_session }), 9);
+            self.status_bridge.ingest(
+                uuid,
+                &json!({ "cwd": "/x", "tmux_session": tmux_session }),
+                9,
+            );
         }
     }
 
@@ -728,7 +750,9 @@ mod tests {
             2,
         );
         let captains = Arc::new(CaptainsRegistry::new());
-        captains.claim_test(cap_tile, Some("ship-e2e"), vec![]).unwrap();
+        captains
+            .claim_test(cap_tile, Some("ship-e2e"), vec![])
+            .unwrap();
         let watches = Arc::new(FleetWatchRegistry::new());
         watches.arm(orc_tile, WatchScope::Captains, vec![]);
 
@@ -795,8 +819,15 @@ mod tests {
         // `Delivered`-forever record - it is acked to `Processed` so it cannot accrete
         // toward the overflow bound. Nothing is left enqueued or delivered.
         let d = inbox.depth("orcbbbbb");
-        assert_eq!((d.enqueued, d.delivered), (0, 0), "the wake is retired, not lingering");
-        assert_eq!(d.processed, 1, "delivery is terminal for a fire-to-pane wake");
+        assert_eq!(
+            (d.enqueued, d.delivered),
+            (0, 0),
+            "the wake is retired, not lingering"
+        );
+        assert_eq!(
+            d.processed, 1,
+            "delivery is terminal for a fire-to-pane wake"
+        );
         // Re-acking is a benign no-op (already processed).
         assert_eq!(
             inbox.ack("orcbbbbb", 0),
@@ -820,7 +851,11 @@ mod tests {
         }
         // 300 cycles >> the 256 default overflow bound; if wakes accreted this would
         // have started refusing Standard enqueues. Instead every wake landed.
-        assert_eq!(rec.calls().len(), 300, "every wake across 300 cycles landed");
+        assert_eq!(
+            rec.calls().len(),
+            300,
+            "every wake across 300 cycles landed"
+        );
         let d = inbox.depth("orcbbbbb");
         assert_eq!(d.enqueued, 0);
         assert_eq!(d.delivered, 0, "no Delivered record lingers to accrete");
@@ -837,7 +872,11 @@ mod tests {
         // Nothing was injected, and the wake is durably PARKED (still enqueued), not
         // lost - the batch was persisted before the write was attempted.
         assert!(rec.calls().is_empty(), "a failed write injects nothing");
-        assert_eq!(inbox.depth("orcbbbbb").enqueued, 1, "wake parked for redelivery");
+        assert_eq!(
+            inbox.depth("orcbbbbb").enqueued,
+            1,
+            "wake parked for redelivery"
+        );
         // A new `Completed` edge (orchestrator cycles Working -> Completed) redelivers
         // the SAME record - the only redelivery trigger is a prior failed write.
         n.on_status("u-orc", SessionStatus::Working);
@@ -846,7 +885,11 @@ mod tests {
         assert_eq!(calls.len(), 1, "redelivered exactly once on the next edge");
         // The redelivered wake lands and auto-retires (M1) - nothing lingers.
         let d = inbox.depth("orcbbbbb");
-        assert_eq!((d.enqueued, d.delivered), (0, 0), "delivered wake auto-retires");
+        assert_eq!(
+            (d.enqueued, d.delivered),
+            (0, 0),
+            "delivered wake auto-retires"
+        );
     }
 
     #[test]
@@ -885,14 +928,18 @@ mod tests {
     #[test]
     fn durable_coalesces_multiple_captains_into_one_wake() {
         let (n, rec, w, c, _inbox) = harness_durable();
-        c.claim_test("capccccc", Some("ship-gamma"), vec![]).unwrap();
+        c.claim_test("capccccc", Some("ship-gamma"), vec![])
+            .unwrap();
         n.status_bridge_ingest("u-cap2", "th_capccccc");
         w.arm("orcbbbbb", WatchScope::Captains, vec![]);
         // Orchestrator BUSY while two captains transition -> nothing yet.
         n.on_status("u-orc", SessionStatus::Working);
         n.on_status("u-cap", SessionStatus::NeedsQuestion);
         n.on_status("u-cap2", SessionStatus::Completed);
-        assert!(rec.calls().is_empty(), "no wake while the orchestrator is busy");
+        assert!(
+            rec.calls().is_empty(),
+            "no wake while the orchestrator is busy"
+        );
         // Orchestrator idles -> ONE coalesced durable wake naming BOTH captains.
         n.on_status("u-orc", SessionStatus::Completed);
         let calls = rec.calls();
@@ -911,11 +958,19 @@ mod tests {
         n.on_status("u-cap", SessionStatus::NeedsQuestion);
         // A second transition BEFORE the orchestrator idles again must NOT re-inject.
         n.on_status("u-cap", SessionStatus::Completed);
-        assert_eq!(rec.calls().len(), 1, "no double-inject within one idle window");
+        assert_eq!(
+            rec.calls().len(),
+            1,
+            "no double-inject within one idle window"
+        );
         // Next idle edge flushes the held state as one more wake.
         n.on_status("u-orc", SessionStatus::Working);
         n.on_status("u-orc", SessionStatus::Completed);
-        assert_eq!(rec.calls().len(), 2, "the next idle edge flushes the held state");
+        assert_eq!(
+            rec.calls().len(),
+            2,
+            "the next idle edge flushes the held state"
+        );
     }
 
     #[test]

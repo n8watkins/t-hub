@@ -86,10 +86,7 @@ mod tests {
     fn resume_argv_exact_string() {
         // No-regression lock: the recall path emits exactly this for a Claude row.
         let a = ClaudeHarness;
-        assert_eq!(
-            a.resume_argv("abc-123"),
-            "claude --resume 'abc-123'"
-        );
+        assert_eq!(a.resume_argv("abc-123"), "claude --resume 'abc-123'");
     }
 
     #[test]

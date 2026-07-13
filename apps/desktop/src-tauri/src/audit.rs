@@ -243,10 +243,7 @@ mod tests {
     fn temp_dir(tag: &str) -> PathBuf {
         // Unique per test (thread id + tag) to avoid cross-test collisions without
         // touching the process-global env.
-        let uniq = format!(
-            "t-hub-audit-test-{tag}-{:?}",
-            std::thread::current().id()
-        );
+        let uniq = format!("t-hub-audit-test-{tag}-{:?}", std::thread::current().id());
         std::env::temp_dir().join(uniq)
     }
 

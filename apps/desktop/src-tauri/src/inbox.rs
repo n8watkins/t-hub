@@ -166,9 +166,7 @@ impl RecipientQueue {
             .enumerate()
             .filter(|(_, r)| matches!(r.state, ReceiptState::Enqueued))
             // Higher priority first (Emergency > Standard), then lower seq (FIFO).
-            .min_by(|(_, a), (_, b)| {
-                b.priority.cmp(&a.priority).then(a.seq.cmp(&b.seq))
-            })
+            .min_by(|(_, a), (_, b)| b.priority.cmp(&a.priority).then(a.seq.cmp(&b.seq)))
             .map(|(i, _)| i)
     }
 
@@ -191,13 +189,21 @@ pub enum EnqueueError {
     /// The recipient's queue is at its bounded depth. Surfaced as an attributed
     /// backpressure error, never a silent drop (D5 option a). Emergency traffic is
     /// exempt from the bound so a decision is never lost to backpressure.
-    Overflow { recipient: String, depth: usize, max: usize },
+    Overflow {
+        recipient: String,
+        depth: usize,
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for EnqueueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EnqueueError::Overflow { recipient, depth, max } => write!(
+            EnqueueError::Overflow {
+                recipient,
+                depth,
+                max,
+            } => write!(
                 f,
                 "inbox overflow for recipient '{recipient}': {depth} open messages at bound {max}"
             ),
@@ -750,9 +756,13 @@ mod tests {
     }
 
     /// A writer that always succeeds and records what it was asked to write.
-    fn ok_writer(sink: &std::sync::Mutex<Vec<(u64, String, bool)>>) -> impl Fn(&InboxRecord) -> Result<(), String> + '_ {
+    fn ok_writer(
+        sink: &std::sync::Mutex<Vec<(u64, String, bool)>>,
+    ) -> impl Fn(&InboxRecord) -> Result<(), String> + '_ {
         move |rec: &InboxRecord| {
-            sink.lock().unwrap().push((rec.seq, rec.body.clone(), rec.enter));
+            sink.lock()
+                .unwrap()
+                .push((rec.seq, rec.body.clone(), rec.enter));
             Ok(())
         }
     }
@@ -760,10 +770,28 @@ mod tests {
     #[test]
     fn enqueue_assigns_monotonic_per_recipient_seq_and_persists() {
         let (inbox, _dir) = temp_inbox();
-        assert_eq!(inbox.enqueue("t1", "s", Priority::Standard, "a", true).unwrap().seq, 0);
-        assert_eq!(inbox.enqueue("t1", "s", Priority::Standard, "b", true).unwrap().seq, 1);
+        assert_eq!(
+            inbox
+                .enqueue("t1", "s", Priority::Standard, "a", true)
+                .unwrap()
+                .seq,
+            0
+        );
+        assert_eq!(
+            inbox
+                .enqueue("t1", "s", Priority::Standard, "b", true)
+                .unwrap()
+                .seq,
+            1
+        );
         // A different recipient has its OWN seq space starting at 0.
-        assert_eq!(inbox.enqueue("t2", "s", Priority::Standard, "c", true).unwrap().seq, 0);
+        assert_eq!(
+            inbox
+                .enqueue("t2", "s", Priority::Standard, "c", true)
+                .unwrap()
+                .seq,
+            0
+        );
         let d = inbox.depth("t1");
         assert_eq!(d.enqueued, 2);
         assert_eq!(d.next_seq, 2);
@@ -772,35 +800,64 @@ mod tests {
     #[test]
     fn drain_writes_head_then_marks_delivered_at_most_once() {
         let (inbox, _dir) = temp_inbox();
-        inbox.enqueue("t1", "s", Priority::Standard, "hello", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "hello", true)
+            .unwrap();
         let sink = std::sync::Mutex::new(Vec::new());
         // First drain writes + delivers seq 0.
-        assert_eq!(inbox.drain_one("t1", ok_writer(&sink)), DrainOutcome::Delivered { seq: 0 });
+        assert_eq!(
+            inbox.drain_one("t1", ok_writer(&sink)),
+            DrainOutcome::Delivered { seq: 0 }
+        );
         // Second drain finds nothing enqueued - a DELIVERED record is never re-picked
         // (at-most-once), so the writer is NOT called again.
         assert_eq!(inbox.drain_one("t1", ok_writer(&sink)), DrainOutcome::Empty);
         let writes = sink.lock().unwrap();
-        assert_eq!(&*writes, &[(0, "hello".to_string(), true)], "exactly one write for seq 0");
+        assert_eq!(
+            &*writes,
+            &[(0, "hello".to_string(), true)],
+            "exactly one write for seq 0"
+        );
     }
 
     #[test]
     fn drains_one_per_boundary_in_fifo_order() {
         let (inbox, _dir) = temp_inbox();
-        inbox.enqueue("t1", "s", Priority::Standard, "first", true).unwrap();
-        inbox.enqueue("t1", "s", Priority::Standard, "second", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "first", true)
+            .unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "second", true)
+            .unwrap();
         let sink = std::sync::Mutex::new(Vec::new());
-        assert_eq!(inbox.drain_one("t1", ok_writer(&sink)), DrainOutcome::Delivered { seq: 0 });
-        assert_eq!(inbox.drain_one("t1", ok_writer(&sink)), DrainOutcome::Delivered { seq: 1 });
+        assert_eq!(
+            inbox.drain_one("t1", ok_writer(&sink)),
+            DrainOutcome::Delivered { seq: 0 }
+        );
+        assert_eq!(
+            inbox.drain_one("t1", ok_writer(&sink)),
+            DrainOutcome::Delivered { seq: 1 }
+        );
         let writes = sink.lock().unwrap();
-        assert_eq!(writes.iter().map(|w| w.0).collect::<Vec<_>>(), vec![0, 1], "FIFO by seq");
+        assert_eq!(
+            writes.iter().map(|w| w.0).collect::<Vec<_>>(),
+            vec![0, 1],
+            "FIFO by seq"
+        );
     }
 
     #[test]
     fn emergency_drains_ahead_of_standard_but_is_still_seqd() {
         let (inbox, _dir) = temp_inbox();
-        inbox.enqueue("t1", "s", Priority::Standard, "std-0", true).unwrap();
-        inbox.enqueue("t1", "s", Priority::Emergency, "emg-1", true).unwrap();
-        inbox.enqueue("t1", "s", Priority::Emergency, "emg-2", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "std-0", true)
+            .unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Emergency, "emg-1", true)
+            .unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Emergency, "emg-2", true)
+            .unwrap();
         let sink = std::sync::Mutex::new(Vec::new());
         // Emergency records (seq 1,2) drain before the earlier Standard (seq 0), but
         // FIFO within the Emergency class (1 before 2).
@@ -814,23 +871,45 @@ mod tests {
     #[test]
     fn failed_write_leaves_record_enqueued_and_redelivers() {
         let (inbox, _dir) = temp_inbox();
-        inbox.enqueue("t1", "s", Priority::Standard, "retry-me", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "retry-me", true)
+            .unwrap();
         // A write that fails: the record must NOT advance to delivered.
         let out = inbox.drain_one("t1", |_rec| Err("pty gone".to_string()));
-        assert_eq!(out, DrainOutcome::WriteFailed { seq: 0, error: "pty gone".to_string() });
-        assert_eq!(inbox.depth("t1").enqueued, 1, "still enqueued after a failed write");
-        assert!(inbox.depth("t1").inflight.is_none(), "in-flight cleared after commit");
+        assert_eq!(
+            out,
+            DrainOutcome::WriteFailed {
+                seq: 0,
+                error: "pty gone".to_string()
+            }
+        );
+        assert_eq!(
+            inbox.depth("t1").enqueued,
+            1,
+            "still enqueued after a failed write"
+        );
+        assert!(
+            inbox.depth("t1").inflight.is_none(),
+            "in-flight cleared after commit"
+        );
         // Next boundary redelivers the same seq; this time it lands.
         let sink = std::sync::Mutex::new(Vec::new());
-        assert_eq!(inbox.drain_one("t1", ok_writer(&sink)), DrainOutcome::Delivered { seq: 0 });
+        assert_eq!(
+            inbox.drain_one("t1", ok_writer(&sink)),
+            DrainOutcome::Delivered { seq: 0 }
+        );
         assert_eq!(inbox.depth("t1").delivered, 1);
     }
 
     #[test]
     fn survives_restart_and_resumes_from_disk() {
         let (inbox, dir) = temp_inbox();
-        inbox.enqueue("t1", "s", Priority::Standard, "durable-0", true).unwrap();
-        inbox.enqueue("t1", "s", Priority::Standard, "durable-1", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "durable-0", true)
+            .unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "durable-1", true)
+            .unwrap();
         // Deliver seq 0 only.
         let sink = std::sync::Mutex::new(Vec::new());
         inbox.drain_one("t1", ok_writer(&sink));
@@ -843,14 +922,27 @@ mod tests {
         assert_eq!(d.enqueued, 1);
         assert_eq!(d.next_seq, 2, "seq mint survives restart - no reuse");
         let sink2 = std::sync::Mutex::new(Vec::new());
-        assert_eq!(inbox2.drain_one("t1", ok_writer(&sink2)), DrainOutcome::Delivered { seq: 1 });
-        assert_eq!(sink2.lock().unwrap().iter().map(|w| w.0).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            inbox2.drain_one("t1", ok_writer(&sink2)),
+            DrainOutcome::Delivered { seq: 1 }
+        );
+        assert_eq!(
+            sink2
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|w| w.0)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     #[test]
     fn crash_mid_write_inflight_marker_redelivers_on_reopen() {
         let (inbox, dir) = temp_inbox();
-        inbox.enqueue("t1", "s", Priority::Standard, "crashy", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "crashy", true)
+            .unwrap();
         // Simulate a crash DURING the write: the writer panics-equivalent is a hard
         // process death, which we model by persisting the in-flight marker and NOT
         // committing. We reach into a drain that "hangs" by writing the marker then
@@ -869,15 +961,23 @@ mod tests {
         // Reopen: the in-flight marker is a detected crash; it is cleared and the
         // still-enqueued record redelivers (at-least-once).
         let inbox2 = Inbox::open(dir);
-        assert!(inbox2.depth("t1").inflight.is_none(), "crash in-flight marker cleared on load");
+        assert!(
+            inbox2.depth("t1").inflight.is_none(),
+            "crash in-flight marker cleared on load"
+        );
         let sink = std::sync::Mutex::new(Vec::new());
-        assert_eq!(inbox2.drain_one("t1", ok_writer(&sink)), DrainOutcome::Delivered { seq: 0 });
+        assert_eq!(
+            inbox2.drain_one("t1", ok_writer(&sink)),
+            DrainOutcome::Delivered { seq: 0 }
+        );
     }
 
     #[test]
     fn ack_moves_delivered_to_processed_and_is_idempotent() {
         let (inbox, _dir) = temp_inbox();
-        inbox.enqueue("t1", "s", Priority::Standard, "x", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "x", true)
+            .unwrap();
         // Ack before delivery is rejected.
         assert_eq!(inbox.ack("t1", 0), AckOutcome::NotDelivered { seq: 0 });
         let sink = std::sync::Mutex::new(Vec::new());
@@ -892,7 +992,9 @@ mod tests {
     #[test]
     fn only_processed_retires_a_record_delivered_is_not_enough() {
         let (inbox, _dir) = temp_inbox();
-        inbox.enqueue("t1", "s", Priority::Standard, "x", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "x", true)
+            .unwrap();
         let sink = std::sync::Mutex::new(Vec::new());
         inbox.drain_one("t1", ok_writer(&sink));
         // Delivered-but-not-acked stays on the books (redelivery is off - it was
@@ -909,14 +1011,28 @@ mod tests {
             TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let inbox = Inbox { dir: Some(dir), queues: Mutex::new(HashMap::new()), max_depth: 2, audit_tail: 8, telemetry: None };
-        inbox.enqueue("t1", "s", Priority::Standard, "a", true).unwrap();
-        inbox.enqueue("t1", "s", Priority::Standard, "b", true).unwrap();
+        let inbox = Inbox {
+            dir: Some(dir),
+            queues: Mutex::new(HashMap::new()),
+            max_depth: 2,
+            audit_tail: 8,
+            telemetry: None,
+        };
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "a", true)
+            .unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "b", true)
+            .unwrap();
         // Third standard enqueue overflows the depth-2 bound.
-        let err = inbox.enqueue("t1", "s", Priority::Standard, "c", true).unwrap_err();
+        let err = inbox
+            .enqueue("t1", "s", Priority::Standard, "c", true)
+            .unwrap_err();
         assert!(matches!(err, EnqueueError::Overflow { max: 2, .. }));
         // Emergency is exempt - a decision is never lost to backpressure.
-        assert!(inbox.enqueue("t1", "s", Priority::Emergency, "urgent", true).is_ok());
+        assert!(inbox
+            .enqueue("t1", "s", Priority::Emergency, "urgent", true)
+            .is_ok());
     }
 
     #[test]
@@ -927,10 +1043,18 @@ mod tests {
             TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let inbox = Inbox { dir: Some(dir), queues: Mutex::new(HashMap::new()), max_depth: 256, audit_tail: 2, telemetry: None };
+        let inbox = Inbox {
+            dir: Some(dir),
+            queues: Mutex::new(HashMap::new()),
+            max_depth: 256,
+            audit_tail: 2,
+            telemetry: None,
+        };
         // Enqueue, deliver, and ack 5 records; only the newest 2 processed survive.
         for _ in 0..5 {
-            inbox.enqueue("t1", "s", Priority::Standard, "x", true).unwrap();
+            inbox
+                .enqueue("t1", "s", Priority::Standard, "x", true)
+                .unwrap();
         }
         let sink = std::sync::Mutex::new(Vec::new());
         for _ in 0..5 {
@@ -939,7 +1063,11 @@ mod tests {
         for seq in 0..5 {
             inbox.ack("t1", seq);
         }
-        assert_eq!(inbox.depth("t1").processed, 2, "audit tail bounds processed retention");
+        assert_eq!(
+            inbox.depth("t1").processed,
+            2,
+            "audit tail bounds processed retention"
+        );
     }
 
     #[test]
@@ -952,9 +1080,17 @@ mod tests {
             TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let inbox = Inbox { dir: Some(dir), queues: Mutex::new(HashMap::new()), max_depth: 256, audit_tail: 0, telemetry: None };
+        let inbox = Inbox {
+            dir: Some(dir),
+            queues: Mutex::new(HashMap::new()),
+            max_depth: 256,
+            audit_tail: 0,
+            telemetry: None,
+        };
         for _ in 0..3 {
-            inbox.enqueue("t1", "s", Priority::Standard, "x", true).unwrap();
+            inbox
+                .enqueue("t1", "s", Priority::Standard, "x", true)
+                .unwrap();
         }
         let sink = std::sync::Mutex::new(Vec::new());
         for _ in 0..3 {
@@ -965,7 +1101,10 @@ mod tests {
         for seq in 0..3 {
             inbox.ack("t1", seq);
         }
-        assert!(inbox.depth("t1").processed >= 1, "compact retains >= 1 despite a 0 tail");
+        assert!(
+            inbox.depth("t1").processed >= 1,
+            "compact retains >= 1 despite a 0 tail"
+        );
     }
 
     #[test]
@@ -973,21 +1112,35 @@ mod tests {
         // operate-fleet-infra (Phase 3): purge drops ALL of a recipient's records (a
         // wedged-queue reset) and reports the count; an unknown recipient is a no-op.
         let (inbox, _dir) = temp_inbox();
-        inbox.enqueue("t1", "s", Priority::Standard, "a", true).unwrap();
-        inbox.enqueue("t1", "s", Priority::Emergency, "b", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "a", true)
+            .unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Emergency, "b", true)
+            .unwrap();
         assert_eq!(inbox.purge_recipient("t1"), 2, "both records removed");
         assert_eq!(inbox.depth("t1").enqueued, 0);
         assert!(inbox.depth("t1").inflight.is_none());
-        assert_eq!(inbox.purge_recipient("no-such"), 0, "unknown recipient is a no-op");
+        assert_eq!(
+            inbox.purge_recipient("no-such"),
+            0,
+            "unknown recipient is a no-op"
+        );
     }
 
     #[test]
     fn depth_reports_oldest_enqueued_age() {
         let (inbox, _dir) = temp_inbox();
-        inbox.enqueue("t1", "s", Priority::Standard, "x", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "x", true)
+            .unwrap();
         let d = inbox.depth("t1");
         assert!(d.oldest_enqueued_age_ms.is_some());
-        assert_eq!(inbox.depth("no-such").enqueued, 0, "unknown recipient => empty snapshot");
+        assert_eq!(
+            inbox.depth("no-such").enqueued,
+            0,
+            "unknown recipient => empty snapshot"
+        );
     }
 
     #[test]
@@ -1010,7 +1163,9 @@ mod tests {
                 .unwrap()
                 .push((ev.event.to_string(), ev.seq, ev.bytes));
         }));
-        inbox.enqueue("t1", "crew:abc", Priority::Standard, "secret-body", true).unwrap();
+        inbox
+            .enqueue("t1", "crew:abc", Priority::Standard, "secret-body", true)
+            .unwrap();
         let sink = std::sync::Mutex::new(Vec::new());
         inbox.drain_one("t1", ok_writer(&sink));
         inbox.ack("t1", 0);
@@ -1035,7 +1190,9 @@ mod tests {
         let inbox = inbox.with_telemetry(std::sync::Arc::new(move |ev: &InboxEvent| {
             sink_events.lock().unwrap().push(ev.event.to_string());
         }));
-        inbox.enqueue("t1", "s", Priority::Standard, "x", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "x", true)
+            .unwrap();
         inbox.drain_one("t1", |_rec| Err("boom".to_string()));
         assert_eq!(
             events.lock().unwrap().clone(),
@@ -1046,8 +1203,12 @@ mod tests {
     #[test]
     fn concurrent_drain_sees_busy_while_a_write_is_in_flight() {
         let (inbox, _dir) = temp_inbox();
-        inbox.enqueue("t1", "s", Priority::Standard, "a", true).unwrap();
-        inbox.enqueue("t1", "s", Priority::Standard, "b", true).unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "a", true)
+            .unwrap();
+        inbox
+            .enqueue("t1", "s", Priority::Standard, "b", true)
+            .unwrap();
         // Thread A holds a record in-flight (its writer blocks on a channel); while it
         // is mid-write, thread B's drain must see Busy, never start a second write.
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
@@ -1064,13 +1225,16 @@ mod tests {
                 })
             });
             started_rx.recv().unwrap(); // A is now mid-write with seq 0 in-flight
-            // B tries to drain concurrently and must be told Busy (at-most-once + FIFO).
+                                        // B tries to drain concurrently and must be told Busy (at-most-once + FIFO).
             assert_eq!(inbox.drain_one("t1", |_rec| Ok(())), DrainOutcome::Busy);
             release_tx.send(()).unwrap();
             assert_eq!(a.join().unwrap(), DrainOutcome::Delivered { seq: 0 });
         });
         // After A commits, B can drain seq 1.
         let sink = std::sync::Mutex::new(Vec::new());
-        assert_eq!(inbox.drain_one("t1", ok_writer(&sink)), DrainOutcome::Delivered { seq: 1 });
+        assert_eq!(
+            inbox.drain_one("t1", ok_writer(&sink)),
+            DrainOutcome::Delivered { seq: 1 }
+        );
     }
 }

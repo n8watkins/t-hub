@@ -396,26 +396,78 @@ mod tests {
         // to Ok and this test goes RED.
         let crew_a = actor(AclRole::Crew, Some("ship-a"), Some("crew-a"));
         // Same ship: allowed.
-        assert!(can_access_session(&crew_a, &ShipRef::Crew { ship: "ship-a".into() }).is_ok());
-        assert!(can_access_session(&crew_a, &ShipRef::Supervisor { ship: "ship-a".into() }).is_ok());
+        assert!(can_access_session(
+            &crew_a,
+            &ShipRef::Crew {
+                ship: "ship-a".into()
+            }
+        )
+        .is_ok());
+        assert!(can_access_session(
+            &crew_a,
+            &ShipRef::Supervisor {
+                ship: "ship-a".into()
+            }
+        )
+        .is_ok());
         // Cross ship: REFUSED, attributed.
-        let denied = can_access_session(&crew_a, &ShipRef::Crew { ship: "ship-b".into() }).unwrap_err();
-        assert!(denied.reason.contains("cross-ship isolation"), "got: {}", denied.reason);
+        let denied = can_access_session(
+            &crew_a,
+            &ShipRef::Crew {
+                ship: "ship-b".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            denied.reason.contains("cross-ship isolation"),
+            "got: {}",
+            denied.reason
+        );
         // A captain is isolated the same way.
         let cap_a = actor(AclRole::Captain, Some("ship-a"), Some("cap-a"));
-        assert!(can_access_session(&cap_a, &ShipRef::Crew { ship: "ship-b".into() }).is_err());
-        assert!(can_access_session(&cap_a, &ShipRef::Crew { ship: "ship-a".into() }).is_ok());
+        assert!(can_access_session(
+            &cap_a,
+            &ShipRef::Crew {
+                ship: "ship-b".into()
+            }
+        )
+        .is_err());
+        assert!(can_access_session(
+            &cap_a,
+            &ShipRef::Crew {
+                ship: "ship-a".into()
+            }
+        )
+        .is_ok());
     }
 
     #[test]
     fn general_reads_anyone_cortana_reaches_captains_not_foreign_crew() {
         let general = actor(AclRole::General, None, None);
-        assert!(can_access_session(&general, &ShipRef::Crew { ship: "ship-x".into() }).is_ok());
+        assert!(can_access_session(
+            &general,
+            &ShipRef::Crew {
+                ship: "ship-x".into()
+            }
+        )
+        .is_ok());
         let cortana = actor(AclRole::Cortana, Some("cortana"), Some("cor"));
         // A captain (supervisor) on any ship: her subordinate, allowed.
-        assert!(can_access_session(&cortana, &ShipRef::Supervisor { ship: "ship-x".into() }).is_ok());
+        assert!(can_access_session(
+            &cortana,
+            &ShipRef::Supervisor {
+                ship: "ship-x".into()
+            }
+        )
+        .is_ok());
         // Another ship's CREW directly: no skip-level, REFUSED.
-        assert!(can_access_session(&cortana, &ShipRef::Crew { ship: "ship-x".into() }).is_err());
+        assert!(can_access_session(
+            &cortana,
+            &ShipRef::Crew {
+                ship: "ship-x".into()
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -433,27 +485,81 @@ mod tests {
         // The mandated never-seized guard. Crew has no subordinate: abort is REFUSED.
         // BYPASS-WOULD-FAIL: make `can_abort` return Ok for crew and this goes RED.
         let crew = actor(AclRole::Crew, Some("ship-a"), Some("crew-a"));
-        assert!(can_abort(&crew, &ShipRef::Crew { ship: "ship-a".into() }).is_err());
-        assert!(can_abort(&crew, &ShipRef::Supervisor { ship: "ship-a".into() }).is_err());
+        assert!(can_abort(
+            &crew,
+            &ShipRef::Crew {
+                ship: "ship-a".into()
+            }
+        )
+        .is_err());
+        assert!(can_abort(
+            &crew,
+            &ShipRef::Supervisor {
+                ship: "ship-a".into()
+            }
+        )
+        .is_err());
 
         let cap_a = actor(AclRole::Captain, Some("ship-a"), Some("cap-a"));
         // Own crew: allowed.
-        assert!(can_abort(&cap_a, &ShipRef::Crew { ship: "ship-a".into() }).is_ok());
+        assert!(can_abort(
+            &cap_a,
+            &ShipRef::Crew {
+                ship: "ship-a".into()
+            }
+        )
+        .is_ok());
         // Sibling captain: never (no sibling seize).
-        assert!(can_abort(&cap_a, &ShipRef::Supervisor { ship: "ship-b".into() }).is_err());
+        assert!(can_abort(
+            &cap_a,
+            &ShipRef::Supervisor {
+                ship: "ship-b".into()
+            }
+        )
+        .is_err());
         // Another ship's crew: cross-ship, refused.
-        assert!(can_abort(&cap_a, &ShipRef::Crew { ship: "ship-b".into() }).is_err());
+        assert!(can_abort(
+            &cap_a,
+            &ShipRef::Crew {
+                ship: "ship-b".into()
+            }
+        )
+        .is_err());
     }
 
     #[test]
     fn cortana_aborts_a_captain_general_aborts_anyone() {
         let cortana = actor(AclRole::Cortana, Some("cortana"), Some("cor"));
-        assert!(can_abort(&cortana, &ShipRef::Supervisor { ship: "ship-x".into() }).is_ok());
+        assert!(can_abort(
+            &cortana,
+            &ShipRef::Supervisor {
+                ship: "ship-x".into()
+            }
+        )
+        .is_ok());
         // Not a ship's crew directly (no skip-level).
-        assert!(can_abort(&cortana, &ShipRef::Crew { ship: "ship-x".into() }).is_err());
+        assert!(can_abort(
+            &cortana,
+            &ShipRef::Crew {
+                ship: "ship-x".into()
+            }
+        )
+        .is_err());
         let general = actor(AclRole::General, None, None);
-        assert!(can_abort(&general, &ShipRef::Crew { ship: "ship-x".into() }).is_ok());
-        assert!(can_abort(&general, &ShipRef::Supervisor { ship: "ship-x".into() }).is_ok());
+        assert!(can_abort(
+            &general,
+            &ShipRef::Crew {
+                ship: "ship-x".into()
+            }
+        )
+        .is_ok());
+        assert!(can_abort(
+            &general,
+            &ShipRef::Supervisor {
+                ship: "ship-x".into()
+            }
+        )
+        .is_ok());
     }
 
     // ---- emergency authority / never-crew-emergency --------------------------
@@ -467,14 +573,19 @@ mod tests {
         // Crew EXCLUDED.
         assert!(can_flag_emergency(&actor(AclRole::Crew, Some("s"), Some("c"))).is_err());
         // Cortana is NOT in the ratified GENERAL + CAPTAINS ONLY set.
-        assert!(can_flag_emergency(&actor(AclRole::Cortana, Some("cortana"), Some("cor"))).is_err());
+        assert!(
+            can_flag_emergency(&actor(AclRole::Cortana, Some("cortana"), Some("cor"))).is_err()
+        );
         assert!(can_flag_emergency(&actor(AclRole::Unknown, None, None)).is_err());
     }
 
     // ---- message rows + no-daisy-chain ---------------------------------------
 
     fn mt(role: AclRole, ship: Option<&str>) -> MessageTarget {
-        MessageTarget { role, ship: ship.map(String::from) }
+        MessageTarget {
+            role,
+            ship: ship.map(String::from),
+        }
     }
 
     #[test]
@@ -541,7 +652,9 @@ mod tests {
     #[test]
     fn fleet_infra_is_apex_only() {
         assert!(can_operate_fleet_infra(&actor(AclRole::General, None, None)).is_ok());
-        assert!(can_operate_fleet_infra(&actor(AclRole::Cortana, Some("cortana"), Some("c"))).is_ok());
+        assert!(
+            can_operate_fleet_infra(&actor(AclRole::Cortana, Some("cortana"), Some("c"))).is_ok()
+        );
         assert!(can_operate_fleet_infra(&actor(AclRole::Captain, Some("s"), Some("c"))).is_err());
         assert!(can_operate_fleet_infra(&actor(AclRole::Crew, Some("s"), Some("c"))).is_err());
     }
@@ -550,9 +663,12 @@ mod tests {
     fn only_general_originates_authorization() {
         assert!(can_originate_authorization(&actor(AclRole::General, None, None)).is_ok());
         // Cortana may relay-by-reference but never originate.
-        let d = can_originate_authorization(&actor(AclRole::Cortana, Some("cortana"), Some("c"))).unwrap_err();
+        let d = can_originate_authorization(&actor(AclRole::Cortana, Some("cortana"), Some("c")))
+            .unwrap_err();
         assert!(d.reason.contains("relay"), "got: {}", d.reason);
-        assert!(can_originate_authorization(&actor(AclRole::Captain, Some("s"), Some("c"))).is_err());
+        assert!(
+            can_originate_authorization(&actor(AclRole::Captain, Some("s"), Some("c"))).is_err()
+        );
         assert!(can_originate_authorization(&actor(AclRole::Crew, Some("s"), Some("c"))).is_err());
     }
 }
