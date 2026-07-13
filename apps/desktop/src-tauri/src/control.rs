@@ -6159,26 +6159,63 @@ fn rollback_crew_dispatch(
     crew_session_id: &str,
     client: Option<&powder::Client>,
     claim: Option<&powder::Claim>,
-) {
+) -> Result<(), String> {
     let registry_owns_claim = ctx.captains.snapshot().captains.iter().any(|captain| {
         captain
             .crew
             .iter()
             .any(|crew| crew.terminal_id == crew_session_id && crew.powder_work.is_some())
     });
-    let _ = close_terminal(ctx, &json!({ "sessionId": crew_session_id }));
+    let closed = close_terminal(ctx, &json!({ "sessionId": crew_session_id })).map_err(|error| {
+        format!(
+            "Crew terminal '{crew_session_id}' could not be stopped; its durable binding was retained: {error}"
+        )
+    })?;
+    if registry_owns_claim {
+        require_confirmed_powder_release(crew_session_id, &closed)?;
+    }
     if !registry_owns_claim {
         if let (Some(client), Some(claim)) = (client, claim) {
-            if let Err(error) = client.release(claim) {
-                eprintln!(
-                "t-hub-control: Powder release during Crew rollback failed for card '{}': {error}",
-                claim.card_id
-            );
-            }
+            client.release(claim).map_err(|error| {
+                format!(
+                    "Crew terminal '{crew_session_id}' stopped, but Powder card '{}' run '{}' could not be released: {error}",
+                    claim.card_id, claim.run_id
+                )
+            })?;
         }
     }
-    let _ = ctx.captains.rollback_crew(crew_session_id);
+    ctx.captains.rollback_crew(crew_session_id).map_err(|error| {
+        format!(
+            "Crew terminal '{crew_session_id}' and its Powder claim were cleaned up, but the durable Crew record could not be removed: {error}"
+        )
+    })?;
     let _ = captains_sync_apply(ctx);
+    Ok(())
+}
+
+fn require_confirmed_powder_release(crew_session_id: &str, closed: &Value) -> Result<(), String> {
+    let release = closed.get("powderRelease").ok_or_else(|| {
+        format!(
+            "Crew terminal '{crew_session_id}' stopped, but Powder release was not attempted; its durable binding was retained"
+        )
+    })?;
+    if release.get("released").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let error = release
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("Powder did not confirm release");
+    Err(format!(
+        "Crew terminal '{crew_session_id}' stopped, but its Powder claim was not released; its durable binding was retained: {error}"
+    ))
+}
+
+fn dispatch_rollback_error(primary: String, rollback: Result<(), String>) -> String {
+    match rollback {
+        Ok(()) => format!("{primary} and all side effects were rolled back"),
+        Err(error) => format!("{primary}; rollback is incomplete: {error}"),
+    }
 }
 
 fn dispatch_crew(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
@@ -6249,9 +6286,10 @@ fn dispatch_crew(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let claim = match client.claim(&card_id, ttl_seconds) {
         Ok(claim) => claim,
         Err(error) => {
-            rollback_crew_dispatch(ctx, &crew_session_id, None, None);
-            return Err(format!(
-                "dispatch_crew: Powder claim failed before the harness started and the terminal was rolled back: {error}"
+            let rollback = rollback_crew_dispatch(ctx, &crew_session_id, None, None);
+            return Err(dispatch_rollback_error(
+                format!("dispatch_crew: Powder claim failed before the harness started: {error}"),
+                rollback,
             ));
         }
     };
@@ -6270,9 +6308,11 @@ fn dispatch_crew(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     ) {
         Ok(crew) => crew,
         Err(error) => {
-            rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
-            return Err(format!(
-                "dispatch_crew: durable Crew binding failed and all side effects were rolled back: {error}"
+            let rollback =
+                rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
+            return Err(dispatch_rollback_error(
+                format!("dispatch_crew: durable Crew binding failed: {error}"),
+                rollback,
             ));
         }
     };
@@ -6286,15 +6326,17 @@ fn dispatch_crew(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     if let Err(error) =
         send_text(&json!({ "sessionId": crew_session_id, "text": launch, "enter": true }))
     {
-        rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
-        return Err(format!(
-            "dispatch_crew: harness launch failed and all side effects were rolled back: {error}"
+        let rollback = rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
+        return Err(dispatch_rollback_error(
+            format!("dispatch_crew: harness launch failed: {error}"),
+            rollback,
         ));
     }
     if let Err(error) = wait_for_harness_started(&crew_session_id, harness.as_provider()) {
-        rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
-        return Err(format!(
-            "dispatch_crew: harness startup failed and all side effects were rolled back: {error}"
+        let rollback = rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
+        return Err(dispatch_rollback_error(
+            format!("dispatch_crew: harness startup failed: {error}"),
+            rollback,
         ));
     }
     let _ = captains_sync_apply(ctx);
@@ -12415,6 +12457,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("bound to Powder"), "got: {error}");
+    }
+
+    #[test]
+    fn crew_rollback_requires_a_confirmed_powder_release() {
+        let failed = json!({
+            "powderRelease": {
+                "released": false,
+                "error": "Powder unavailable"
+            }
+        });
+        let error = require_confirmed_powder_release("crew-1", &failed).unwrap_err();
+        assert!(error.contains("durable binding was retained"));
+        assert!(error.contains("Powder unavailable"));
+
+        let released = json!({ "powderRelease": { "released": true } });
+        require_confirmed_powder_release("crew-1", &released).unwrap();
     }
 
     #[test]
