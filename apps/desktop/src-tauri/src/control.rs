@@ -5984,22 +5984,28 @@ fn commission_captain(ctx: &ControlContext, args: &Value) -> Result<Value, Strin
         )
     })?;
     #[cfg(not(test))]
-    powder::Client::from_profile(&powder_binding.connection_profile)?
-        .health()
-        .map_err(|error| {
-            format!(
-                "commission_captain: Powder preflight failed for repository '{}': {error}",
-                powder_binding.repository
-            )
-        })?;
+    {
+        let client = powder::Client::from_profile(&powder_binding.connection_profile)?;
+        client
+            .health()
+            .and_then(|_| client.authorization_probe())
+            .map_err(|error| {
+                format!(
+                    "commission_captain: Powder preflight failed for repository '{}': {error}",
+                    powder_binding.repository
+                )
+            })?;
+    }
     #[cfg(test)]
     if !args
         .get("testSkipPowderHealth")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        powder::Client::from_profile(&powder_binding.connection_profile)?
+        let client = powder::Client::from_profile(&powder_binding.connection_profile)?;
+        client
             .health()
+            .and_then(|_| client.authorization_probe())
             .map_err(|error| {
                 format!(
                     "commission_captain: Powder preflight failed for repository '{}': {error}",
@@ -6136,6 +6142,7 @@ fn powder_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     })?;
     let client = powder::Client::from_profile(&binding.connection_profile)?;
     let health = client.health()?;
+    client.authorization_probe()?;
     Ok(json!({
         "projectId": project.project_id,
         "repository": binding.repository,

@@ -153,9 +153,7 @@ impl Client {
 
     fn new(config: ProfileConfig) -> Result<Self, String> {
         let base_url = config.base_url.trim().trim_end_matches('/').to_string();
-        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
-            return Err("Powder baseUrl must start with http:// or https://".into());
-        }
+        validate_base_url(&base_url)?;
         let agent_name = config.agent_name.trim().to_string();
         if agent_name.is_empty() {
             return Err("Powder agentName must not be empty".into());
@@ -184,6 +182,12 @@ impl Client {
 
     pub fn health(&self) -> Result<Value, String> {
         self.request("GET", "/healthz", None)
+    }
+
+    /// Prove that the configured credential can reach an agent-protected API.
+    /// Health endpoints are commonly public and are not an authorization check.
+    pub fn authorization_probe(&self) -> Result<(), String> {
+        self.tail_events(0, 1).map(|_| ())
     }
 
     pub fn get_card(&self, card_id: &str) -> Result<Value, String> {
@@ -292,6 +296,41 @@ impl Client {
             Err(error) => Err(response_error(error)),
         }
     }
+}
+
+fn validate_base_url(base_url: &str) -> Result<(), String> {
+    if let Some(authority) = base_url.strip_prefix("https://") {
+        if authority.is_empty() {
+            return Err("Powder baseUrl must include a host".into());
+        }
+        return Ok(());
+    }
+    let Some(rest) = base_url.strip_prefix("http://") else {
+        return Err("Powder baseUrl must use https://, or http:// for loopback development".into());
+    };
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or("Powder baseUrl must include a host")?;
+    if authority.contains('@') {
+        return Err("Powder baseUrl must not contain embedded credentials".into());
+    }
+    let loopback = if authority.starts_with('[') {
+        authority
+            .strip_prefix("[::1]")
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(':'))
+    } else {
+        let host = authority.split(':').next().unwrap_or_default();
+        matches!(host, "localhost" | "127.0.0.1")
+    };
+    if !loopback {
+        return Err(
+            "Powder baseUrl must use HTTPS; plain HTTP is allowed only for localhost, 127.0.0.1, or [::1] development endpoints"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn response_error(error: ureq::Error) -> String {
@@ -479,6 +518,42 @@ mod tests {
     #[test]
     fn path_segments_are_percent_encoded() {
         assert_eq!(encode_path("repo/card 1"), "repo%2Fcard%201");
+    }
+
+    #[test]
+    fn plain_http_is_limited_to_explicit_loopback_hosts() {
+        for base_url in [
+            "http://powder.example.test",
+            "http://10.0.0.2:8080",
+            "http://localhost.example.test",
+        ] {
+            let error = Client::new(ProfileConfig {
+                base_url: base_url.into(),
+                agent_name: "t-hub".into(),
+                api_key: Some("secret".into()),
+                api_key_env: None,
+                api_key_command: None,
+            })
+            .err()
+            .unwrap();
+            assert!(error.contains("must use HTTPS"), "{base_url}: {error}");
+        }
+
+        for base_url in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "https://powder.example.test",
+        ] {
+            Client::new(ProfileConfig {
+                base_url: base_url.into(),
+                agent_name: "t-hub".into(),
+                api_key: Some("secret".into()),
+                api_key_env: None,
+                api_key_command: None,
+            })
+            .unwrap();
+        }
     }
 
     #[test]
