@@ -40,7 +40,10 @@ const AMBIGUOUS_RESOLVE_DEADLINE: Duration = Duration::from_secs(30);
 /// Spawn-class commands whose retries must dedup via a client `requestId`
 /// (mirrors the app-side `is_idempotent_command`).
 fn is_idempotent_command(command: &str) -> bool {
-    matches!(command, "spawn_terminal" | "create_worktree")
+    matches!(
+        command,
+        "spawn_terminal" | "create_worktree" | "commission_captain"
+    )
 }
 
 /// Mint a process-unique idempotency key without pulling in a uuid/rng dependency

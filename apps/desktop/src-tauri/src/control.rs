@@ -54,6 +54,7 @@ use serde_json::{json, Value};
 use crate::audit::{AuditLog, AuditMeta};
 use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
+use crate::harness::Harness;
 use crate::supervision::Supervisor;
 use crate::{files, git, plane, pty, tmux};
 
@@ -3699,7 +3700,7 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "send_text" | "send_keys" | "close_terminal"
+        "spawn_terminal" | "commission_captain" | "send_text" | "send_keys" | "close_terminal"
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
         // process/state-changing and control-gated + audited.
@@ -4253,7 +4254,9 @@ fn governor_gate(
 ) -> Result<(), crate::governor::Refusal> {
     let now = std::time::Instant::now();
     match command {
-        "spawn_terminal" => ctx.governor.check_spawn(live_session_count(), now),
+        "spawn_terminal" | "commission_captain" => {
+            ctx.governor.check_spawn(live_session_count(), now)
+        }
         "close_terminal" => ctx.governor.check_destructive(now),
         "send_keys" if keys_are_kill_style(args) => ctx.governor.check_destructive(now),
         _ => Ok(()),
@@ -4469,7 +4472,10 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
 /// ghost, or a spawn that can duplicate on retry). Read/organization commands are
 /// naturally re-runnable and need no dedup.
 fn is_idempotent_command(command: &str) -> bool {
-    matches!(command, "spawn_terminal" | "create_worktree")
+    matches!(
+        command,
+        "spawn_terminal" | "create_worktree" | "commission_captain"
+    )
 }
 
 /// M1 full fix: when an InFlight reservation was REAPED (presumed dead after the
@@ -4551,6 +4557,19 @@ fn reprobe_reaped_request(
                 })))
             } else {
                 None
+            }
+        }
+        "commission_captain" => {
+            let project_id = arg_str(args, "projectId").or_else(|| arg_str(args, "project_id"))?;
+            let project = ctx
+                .captains
+                .projects()
+                .into_iter()
+                .find(|project| project.project_id == project_id)?;
+            match existing_project_captain(ctx, &project_id) {
+                Ok(Some(captain)) => Some(Ok(commissioned_response(captain, project, true))),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
             }
         }
         // Server-minted artifact id (see doc comment): nothing in args to probe by.
@@ -4733,6 +4752,7 @@ fn dispatch_with_caller(
         "list_tabs" => list_tabs(ctx),
         "list_captains" => list_captains(ctx),
         "list_projects" => list_projects(ctx),
+        "captain_bootstrap" => captain_bootstrap(ctx, args),
         "list_fleet_watches" => list_fleet_watches(ctx),
         // T12: the socket twin of the `report_workspace_tabs` Tauri command - a
         // socket UI (the native cockpit) reports its tab layout into the same
@@ -4820,6 +4840,7 @@ fn dispatch_with_caller(
         // session — execute directly against tmux (they only act on a `th_*`
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args),
+        "commission_captain" => commission_captain(ctx, args),
         // comms-plane Phase 1: `send_text`/`send_keys` are DEMOTED to audited
         // break-glass. They still execute (H2: demote, not deny) but every use is
         // marked loudly, because the primary automation path is now the plane
@@ -5495,6 +5516,256 @@ fn bind_project_powder(ctx: &ControlContext, args: &Value) -> Result<Value, Stri
         repository,
     });
     serde_json::to_value(ctx.captains.upsert_project(project)?).map_err(|e| e.to_string())
+}
+
+fn resolve_bootstrap_context(
+    ctx: &ControlContext,
+    args: &Value,
+) -> Result<(CaptainRecord, ProjectRecord), String> {
+    let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
+    let session_id = arg_str(args, "captainSessionId")
+        .or_else(|| arg_str(args, "captain_session_id"))
+        .or_else(|| arg_str(args, "sessionId"))
+        .or_else(|| arg_str(args, "session_id"));
+    if ship_slug.is_none() && session_id.is_none() {
+        return Err(
+            "captain_bootstrap requires a 'shipSlug' or 'captainSessionId' argument".into(),
+        );
+    }
+    let snapshot = ctx.captains.snapshot();
+    let captain = snapshot
+        .captains
+        .into_iter()
+        .find(|captain| {
+            ship_slug
+                .as_deref()
+                .is_some_and(|slug| captain.ship_slug == slugify_ship(slug))
+                || session_id
+                    .as_deref()
+                    .is_some_and(|id| captain.terminal_id.as_deref() == Some(id))
+        })
+        .ok_or("captain_bootstrap: no matching Captain is registered")?;
+    let project_id = captain
+        .project_id
+        .as_deref()
+        .ok_or("captain_bootstrap: Captain is not bound to a registered project")?;
+    let project = snapshot
+        .projects
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| {
+            format!("captain_bootstrap: Captain references unknown projectId '{project_id}'")
+        })?;
+    Ok((captain, project))
+}
+
+fn bootstrap_instructions(captain: &CaptainRecord, project: &ProjectRecord) -> String {
+    let assignment = captain.assignment.as_deref().unwrap_or("Unassigned");
+    let powder = project
+        .powder
+        .as_ref()
+        .map(|binding| {
+            format!(
+                "Powder profile '{}' and repository '{}' are authoritative for work and claims.",
+                binding.connection_profile, binding.repository
+            )
+        })
+        .unwrap_or_else(|| "This project has no Powder binding.".to_string());
+    format!(
+        "Use $captain. Recover ship '{}' for project '{}' at '{}'. Assignment: {} {} Read the durable Captain and Crew records before acting, reconcile Powder state before dispatching work, and keep the registry resume point current.",
+        captain.ship_slug, project.name, project.repo_root, assignment, powder
+    )
+}
+
+/// Return the complete durable recovery packet for a Captain conversation.
+/// This command is deliberately independent of cwd and harness recall state.
+fn captain_bootstrap(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let (captain, project) = resolve_bootstrap_context(ctx, args)?;
+    let instructions = bootstrap_instructions(&captain, &project);
+    Ok(json!({
+        "captain": captain,
+        "project": project,
+        "instructions": instructions,
+        "recoverySource": "captains-registry",
+    }))
+}
+
+fn existing_project_captain(
+    ctx: &ControlContext,
+    project_id: &str,
+) -> Result<Option<CaptainRecord>, String> {
+    let existing = ctx
+        .captains
+        .snapshot()
+        .captains
+        .into_iter()
+        .find(|captain| captain.project_id.as_deref() == Some(project_id));
+    let Some(captain) = existing else {
+        return Ok(None);
+    };
+    let Some(terminal_id) = captain.terminal_id.as_deref() else {
+        return Ok(None);
+    };
+    match tmux::session_liveness(&tmux_target(terminal_id)) {
+        tmux::SessionLiveness::Alive => Ok(Some(captain)),
+        tmux::SessionLiveness::Gone => Ok(None),
+        tmux::SessionLiveness::Unknown => Err(retryable_error(format!(
+            "commission_captain: existing Captain '{}' could not be verified alive or gone; retry when terminal liveness recovers",
+            captain.ship_slug
+        ))),
+    }
+}
+
+fn commissioned_response(
+    captain: CaptainRecord,
+    project: ProjectRecord,
+    already_commissioned: bool,
+) -> Value {
+    let instructions = bootstrap_instructions(&captain, &project);
+    json!({
+        "accepted": "commission_captain",
+        "audited": true,
+        "alreadyCommissioned": already_commissioned,
+        "captain": captain,
+        "project": project,
+        "instructions": instructions,
+    })
+}
+
+/// Start and durably bind one project Captain as a single process-changing
+/// operation. Any failure after spawning reaps the new terminal best-effort.
+fn commission_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let project_id = arg_str(args, "projectId")
+        .or_else(|| arg_str(args, "project_id"))
+        .ok_or("commission_captain requires a 'projectId' argument")?;
+    let assignment = arg_str(args, "assignment")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("commission_captain requires a non-empty 'assignment' argument")?;
+    let harness_name = arg_str(args, "harness").unwrap_or_else(|| "codex".to_string());
+    let harness = match harness_name.trim().to_ascii_lowercase().as_str() {
+        "codex" => Harness::Codex,
+        "claude" => Harness::Claude,
+        other => {
+            return Err(format!(
+                "commission_captain: unsupported harness '{other}' (expected 'codex' or 'claude')"
+            ));
+        }
+    };
+    let project = ctx
+        .captains
+        .projects()
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("commission_captain: unknown projectId '{project_id}'"))?;
+    if project.powder.is_none() {
+        return Err(format!(
+            "commission_captain: project '{}' must be bound to Powder before commissioning",
+            project.name
+        ));
+    }
+    if let Some(captain) = existing_project_captain(ctx, &project.project_id)? {
+        let requested_slug = arg_str(args, "shipSlug")
+            .or_else(|| arg_str(args, "ship_slug"))
+            .map(|value| slugify_ship(&value));
+        let same_contract = captain.assignment.as_deref() == Some(assignment.as_str())
+            && captain.harness.as_deref() == Some(harness.as_provider())
+            && requested_slug
+                .as_deref()
+                .map_or(true, |slug| slug == captain.ship_slug);
+        if !same_contract {
+            return Err(format!(
+                "commission_captain: project '{}' already has live Captain '{}' with a different assignment, harness, or shipSlug; release or update that Captain explicitly",
+                project.name, captain.ship_slug
+            ));
+        }
+        return Ok(commissioned_response(captain, project, true));
+    }
+
+    let ship_slug = arg_str(args, "shipSlug")
+        .or_else(|| arg_str(args, "ship_slug"))
+        .map(|value| slugify_ship(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| slugify_ship(&project.name));
+    if ship_slug.is_empty() {
+        return Err("commission_captain: could not derive a non-empty shipSlug".into());
+    }
+    let provisional = CaptainRecord {
+        ship_slug: ship_slug.clone(),
+        role: FleetRole::Captain,
+        claude_uuid: None,
+        terminal_id: None,
+        project_id: Some(project.project_id.clone()),
+        assignment: Some(assignment.clone()),
+        harness: Some(harness.as_provider().to_string()),
+        conversation_id: None,
+        resume_point: None,
+        workspace_tab_ids: Vec::new(),
+        crew: Vec::new(),
+        state: ClaimState::Active,
+    };
+    let prompt = bootstrap_instructions(&provisional, &project);
+    let startup_command = harness.adapter().fresh_argv(&prompt);
+    #[cfg(test)]
+    let startup_command =
+        arg_str(args, "testStartupCommand").unwrap_or_else(|| startup_command.clone());
+    let workspace_tab_ids: Vec<String> = args
+        .get("workspaceTabIds")
+        .or_else(|| args.get("workspace_tab_ids"))
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut spawn_args = json!({
+        "cwd": project.repo_root,
+        "name": format!("Captain - {}", project.name),
+        "startupCommand": startup_command,
+        "capability": "control",
+    });
+    if ctx.tabs.has_tab("captains-reserved") {
+        spawn_args["tabId"] = json!("captains-reserved");
+    } else {
+        spawn_args["tabName"] = json!("Captains");
+    }
+    let spawned = spawn_terminal(ctx, &spawn_args)?;
+    let terminal_id = spawned["id"]
+        .as_str()
+        .ok_or("commission_captain: spawn returned no terminal id")?
+        .to_string();
+    let claim = claim_captain(
+        ctx,
+        &json!({
+            "captainSessionId": terminal_id,
+            "shipSlug": ship_slug,
+            "workspaceTabIds": workspace_tab_ids,
+        }),
+    );
+    if let Err(error) = claim {
+        let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
+        return Err(format!(
+            "commission_captain: terminal was spawned but its Captain claim failed and was rolled back: {error}"
+        ));
+    }
+    let captain = match ctx.captains.bind_ship_context(
+        &ship_slug,
+        &project.project_id,
+        &assignment,
+        harness.as_provider(),
+    ) {
+        Ok(captain) => captain,
+        Err(error) => {
+            let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
+            let _ = release_captain(ctx, &json!({ "shipSlug": ship_slug }));
+            return Err(format!(
+                "commission_captain: durable project binding failed and the terminal was rolled back: {error}"
+            ));
+        }
+    };
+    let _ = captains_sync_apply(ctx);
+    Ok(commissioned_response(captain, project, false))
 }
 
 /// `report_workspace_tabs` (T12 / headless-org): a UI client up-syncs its live tab
@@ -11025,6 +11296,102 @@ mod tests {
         let catalog = dispatch(&ctx, "list_projects", &json!({})).unwrap();
         assert_eq!(catalog["count"], 1);
         assert_eq!(catalog["projects"][0]["projectId"], first["projectId"]);
+    }
+
+    #[test]
+    fn commission_captain_spawns_binds_bootstraps_and_deduplicates() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("secret").with_apply_sink(sink);
+        ctx.tab_registry().replace(vec![TabRecord {
+            id: "captains-reserved".into(),
+            name: "Captains".into(),
+            tile_ids: vec![],
+        }]);
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-e2e".into(),
+                name: "Commission E2E".into(),
+                repo_root: "/tmp".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "production".into(),
+                    repository: "commission-e2e".into(),
+                }),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+
+        let args = json!({
+            "projectId": "project-e2e",
+            "assignment": "Keep this project stable",
+            "harness": "codex",
+            "shipSlug": "commission-e2e",
+            "workspaceTabIds": ["project-tab"],
+            "testStartupCommand": "sleep 60",
+        });
+        let first = dispatch(&ctx, "commission_captain", &args).unwrap();
+        assert_eq!(first["alreadyCommissioned"], false);
+        assert_eq!(first["captain"]["projectId"], "project-e2e");
+        assert_eq!(first["captain"]["assignment"], "Keep this project stable");
+        assert_eq!(first["captain"]["harness"], "codex");
+        assert_eq!(first["captain"]["workspaceTabIds"][0], "project-tab");
+        assert_eq!(first["project"]["powder"]["repository"], "commission-e2e");
+        let terminal_id = first["captain"]["terminalId"].as_str().unwrap().to_string();
+        assert!(tmux::has_session(&tmux_target(&terminal_id)));
+
+        let bootstrap = dispatch(
+            &ctx,
+            "captain_bootstrap",
+            &json!({ "captainSessionId": terminal_id }),
+        )
+        .unwrap();
+        assert_eq!(bootstrap["recoverySource"], "captains-registry");
+        assert!(bootstrap["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Use $captain"));
+        assert!(bootstrap["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("commission-e2e"));
+
+        let retry = dispatch(&ctx, "commission_captain", &args).unwrap();
+        assert_eq!(retry["alreadyCommissioned"], true);
+        assert_eq!(retry["captain"]["terminalId"], terminal_id);
+        assert_eq!(ctx.captains.snapshot().captains.len(), 1);
+
+        dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
+    }
+
+    #[test]
+    fn commission_captain_requires_a_powder_binding() {
+        let ctx = test_ctx("secret");
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-unbound".into(),
+                name: "Unbound".into(),
+                repo_root: "/tmp".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: None,
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        let error = dispatch(
+            &ctx,
+            "commission_captain",
+            &json!({
+                "projectId": "project-unbound",
+                "assignment": "Should not start"
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("bound to Powder"), "got: {error}");
     }
 
     #[test]

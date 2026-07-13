@@ -366,6 +366,32 @@ fn schema_bind_project_powder() -> Value {
     })
 }
 
+fn schema_captain_bootstrap() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "shipSlug": { "type": "string", "description": "Durable ship slug to recover." },
+            "captainSessionId": { "type": "string", "description": "Alternative current Captain terminal id." }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn schema_commission_captain() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "projectId": { "type": "string", "description": "Powder-bound registered project to supervise." },
+            "assignment": { "type": "string", "description": "Durable Captain assignment restored after resets." },
+            "harness": { "type": "string", "enum": ["codex", "claude"], "description": "Agent harness. Defaults to codex." },
+            "shipSlug": { "type": "string", "description": "Optional durable ship slug. Defaults to the project name." },
+            "workspaceTabIds": { "type": "array", "items": { "type": "string" }, "description": "Project workspace tabs this Captain owns." }
+        },
+        "required": ["projectId", "assignment"],
+        "additionalProperties": false
+    })
+}
+
 /// `release_captain` schema (captain-chat phase 2): release a claimed captaincy.
 fn schema_release_captain() -> Value {
     json!({
@@ -507,6 +533,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_empty,
         },
         ToolDef {
+            name: "captain_bootstrap",
+            tier: Tier::Read,
+            summary: "Recover a Captain's durable project, assignment, Crew roster, and Powder binding after a reset or new conversation.",
+            input_schema: schema_captain_bootstrap,
+        },
+        ToolDef {
             name: "list_fleet_watches",
             tier: Tier::Read,
             summary: "List the armed orchestrator wakes (who gets woken, for which sessions + states).",
@@ -604,6 +636,12 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::ProcessChanging,
             summary: "Spawn a new terminal in a directory (optionally into a named workspace tab, without switching the user's view).",
             input_schema: schema_spawn_terminal,
+        },
+        ToolDef {
+            name: "commission_captain",
+            tier: Tier::ProcessChanging,
+            summary: "Commission one project-aware Captain in Codex or Claude and bind it transactionally to its durable Powder-backed ship.",
+            input_schema: schema_commission_captain,
         },
         ToolDef {
             name: "send_text",
@@ -816,6 +854,24 @@ mod tests {
         assert_eq!(
             (find("bind_project_powder").unwrap().input_schema)()["required"],
             json!(["projectId", "repository"])
+        );
+
+        let bootstrap = find("captain_bootstrap").unwrap();
+        assert_eq!(bootstrap.tier, Tier::Read);
+        assert_eq!(
+            bootstrap.to_mcp()["annotations"]["confirmationRequired"],
+            false
+        );
+
+        let commission = find("commission_captain").unwrap();
+        assert_eq!(commission.tier, Tier::ProcessChanging);
+        assert_eq!(
+            commission.to_mcp()["annotations"]["confirmationRequired"],
+            true
+        );
+        assert_eq!(
+            (commission.input_schema)()["required"],
+            json!(["projectId", "assignment"])
         );
     }
 
