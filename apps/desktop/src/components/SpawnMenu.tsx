@@ -7,16 +7,16 @@
 //                      user chooses which past session to resume. It does NOT
 //                      resume every session, and it always opens a fresh tile.
 //
-// Selecting a preset calls back with typed spawn options, which Canvas threads
-// into spawnTerminal(). Normal presets omit capability and inherit the read-only
-// default. Captain Codex requires confirmation before requesting audited control.
+// Selecting a terminal preset calls back with typed spawn options, which Canvas
+// threads into spawnTerminal(). Captain opens the project-aware commissioning
+// workflow instead of creating and pinning a generic elevated terminal.
 //
 // Chrome matches the rest of T-Hub: it reads the `--th-*` theme tokens
 // (surface/border/fg/accent/radius) so it tracks the active theme like the FAB
 // and the ThemeEditor panels do.
 import { useEffect, useState } from "react";
 import type { SpawnOptions } from "../ipc/types";
-import { ConfirmDialog } from "./ConfirmDialog";
+import { CaptainCommissionDialog } from "./CaptainCommissionDialog";
 
 /** `claude --resume` lets Claude show its interactive session picker. (`--continue`
  *  / `-c` would silently resume the MOST RECENT session instead; the picker is the
@@ -54,6 +54,7 @@ interface Preset extends SpawnSelection {
   label: string;
   /** One-line hint shown under the label. */
   hint: string;
+  commission?: boolean;
 }
 
 export const PRESETS: Preset[] = [
@@ -74,14 +75,10 @@ export const PRESETS: Preset[] = [
   },
   {
     key: "captain-codex",
-    label: "Captain Codex",
-    hint: "New Codex captain with audited T-Hub control",
-    options: {
-      startupCommand: CODEX_CMD,
-      capability: "control",
-      name: "Captain Codex",
-    },
-    pinAsCaptain: true,
+    label: "Captain",
+    hint: "Project-aware Codex or Claude captain",
+    options: {},
+    commission: true,
   },
   {
     key: "resume-codex",
@@ -93,7 +90,7 @@ export const PRESETS: Preset[] = [
 ];
 
 export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
-  const [pendingControlPreset, setPendingControlPreset] = useState<Preset | null>(null);
+  const [commissionOpen, setCommissionOpen] = useState(false);
   // Escape closes the menu.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -110,8 +107,11 @@ export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
     // Busy gate (#7): a spawn is already in flight — ignore the pick so a
     // double-click can't stack a duplicate spawn.
     if (busy) return;
+    if (preset.commission) {
+      setCommissionOpen(true);
+      return;
+    }
     if (preset.options.capability === "control") {
-      setPendingControlPreset(preset);
       return;
     }
     onSpawn({ options: preset.options, pinAsCaptain: preset.pinAsCaptain });
@@ -171,28 +171,13 @@ export function SpawnMenu({ onClose, onSpawn, busy }: SpawnMenuProps) {
           ))}
         </div>
       </div>
-      <ConfirmDialog
-        open={pendingControlPreset != null}
-        title="Start Captain Codex?"
-        body={
-          <>
-            This session can organize T-Hub and control other terminals, including
-            spawning, typing into, and stopping them. Control elevation is audited,
-            and destructive actions still require confirmation.
-          </>
-        }
-        confirmLabel="Start Captain Codex"
-        danger={false}
-        onConfirm={() => {
-          if (!pendingControlPreset) return;
-          onSpawn({
-            options: pendingControlPreset.options,
-            pinAsCaptain: pendingControlPreset.pinAsCaptain,
-          });
-          setPendingControlPreset(null);
+      <CaptainCommissionDialog
+        open={commissionOpen}
+        onCommissioned={() => {}}
+        onClose={() => {
+          setCommissionOpen(false);
           onClose();
         }}
-        onCancel={() => setPendingControlPreset(null)}
       />
     </>
   );

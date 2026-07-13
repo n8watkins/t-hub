@@ -2,6 +2,12 @@
 // the confirmation boundary around a control-capable Captain Codex spawn.
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+vi.mock("../ipc/projects", () => ({
+  listProjects: vi.fn().mockResolvedValue({ projects: [], count: 0, seq: 0 }),
+  registerProject: vi.fn(),
+  bindProjectPowder: vi.fn(),
+  commissionCaptain: vi.fn(),
+}));
 import {
   SpawnMenu,
   PRESETS,
@@ -43,14 +49,10 @@ describe("SpawnMenu presets", () => {
     expect(resumeCodex?.options).toEqual({ startupCommand: "codex resume" });
   });
 
-  it("keeps ordinary Codex read-only and makes Captain Codex explicitly control-capable", () => {
+  it("keeps ordinary Codex read-only and routes Captain through commissioning", () => {
     expect(byKey("codex")?.options.capability).toBeUndefined();
-    expect(byKey("captain-codex")?.options).toEqual({
-      startupCommand: "codex",
-      capability: "control",
-      name: "Captain Codex",
-    });
-    expect(byKey("captain-codex")?.pinAsCaptain).toBe(true);
+    expect(byKey("captain-codex")?.options).toEqual({});
+    expect(byKey("captain-codex")?.commission).toBe(true);
   });
 
   it("has unique preset keys", () => {
@@ -59,7 +61,7 @@ describe("SpawnMenu presets", () => {
   });
 });
 
-describe("SpawnMenu control confirmation", () => {
+describe("SpawnMenu Captain commissioning", () => {
   it("spawns ordinary Codex immediately without elevation", () => {
     const onSpawn = vi.fn();
     const onClose = vi.fn();
@@ -73,24 +75,14 @@ describe("SpawnMenu control confirmation", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it("requires confirmation before emitting a control-capable spawn", () => {
+  it("opens project-aware commissioning instead of emitting a generic spawn", async () => {
     const onSpawn = vi.fn();
     const onClose = vi.fn();
     render(<SpawnMenu onSpawn={onSpawn} onClose={onClose} />);
 
-    fireEvent.click(screen.getByRole("menuitem", { name: /Captain Codex/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Captain Project-aware/i }));
     expect(onSpawn).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog", { name: "Start Captain Codex?" })).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: "Start Captain Codex" }));
-    expect(onSpawn).toHaveBeenCalledWith({
-      options: {
-        startupCommand: "codex",
-        capability: "control",
-        name: "Captain Codex",
-      },
-      pinAsCaptain: true,
-    });
-    expect(onClose).toHaveBeenCalledOnce();
+    expect(await screen.findByRole("dialog", { name: "Commission Captain" })).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
   });
 });

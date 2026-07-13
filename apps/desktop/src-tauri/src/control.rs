@@ -5750,11 +5750,35 @@ fn commission_captain(ctx: &ControlContext, args: &Value) -> Result<Value, Strin
         .into_iter()
         .find(|project| project.project_id == project_id)
         .ok_or_else(|| format!("commission_captain: unknown projectId '{project_id}'"))?;
-    if project.powder.is_none() {
-        return Err(format!(
+    let powder_binding = project.powder.as_ref().ok_or_else(|| {
+        format!(
             "commission_captain: project '{}' must be bound to Powder before commissioning",
             project.name
-        ));
+        )
+    })?;
+    #[cfg(not(test))]
+    powder::Client::from_profile(&powder_binding.connection_profile)?
+        .health()
+        .map_err(|error| {
+            format!(
+                "commission_captain: Powder preflight failed for repository '{}': {error}",
+                powder_binding.repository
+            )
+        })?;
+    #[cfg(test)]
+    if !args
+        .get("testSkipPowderHealth")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        powder::Client::from_profile(&powder_binding.connection_profile)?
+            .health()
+            .map_err(|error| {
+                format!(
+                    "commission_captain: Powder preflight failed for repository '{}': {error}",
+                    powder_binding.repository
+                )
+            })?;
     }
     if let Some(captain) = existing_project_captain(ctx, &project.project_id)? {
         let requested_slug = arg_str(args, "shipSlug")
@@ -11938,6 +11962,7 @@ mod tests {
             "shipSlug": "commission-e2e",
             "workspaceTabIds": ["project-tab"],
             "testStartupCommand": "sleep 60",
+            "testSkipPowderHealth": true,
         });
         let first = dispatch(&ctx, "commission_captain", &args).unwrap();
         assert_eq!(first["alreadyCommissioned"], false);
