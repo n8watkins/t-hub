@@ -845,6 +845,9 @@ pub enum CrewState {
     /// The CAPTAIN died: the crew is orphaned-but-retained, re-adopted (→ `Active`)
     /// when a same-ship captain resumes. `since` epoch-ms.
     Orphaned { since: u64 },
+    /// The Crew terminal is stopped, but its Powder claim could not be released.
+    /// Keep the binding addressable until a later cleanup confirms the release.
+    CleanupPending { since: u64 },
     /// The crew's OWN tile died: a terminal marker (NOT re-adoptable - the worker is
     /// gone), retained (not scrubbed) so telemetry/reap-ship still see it. `since`
     /// epoch-ms.
@@ -2122,6 +2125,27 @@ impl CaptainsRegistry {
             self.commit_mutation(g, previous)?;
         }
         Ok(changed)
+    }
+
+    pub fn mark_crew_cleanup_pending(&self, crew_session_id: &str) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let Some(crew) = g
+            .captains
+            .iter_mut()
+            .flat_map(|captain| captain.crew.iter_mut())
+            .find(|crew| crew.terminal_id == crew_session_id)
+        else {
+            return Ok(false);
+        };
+        if matches!(crew.state, CrewState::CleanupPending { .. }) {
+            return Ok(false);
+        }
+        crew.state = CrewState::CleanupPending { since: now_ms() };
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok(true)
     }
 
     /// Backfill the Claude continuity anchor for a tile once the StatusBridge
@@ -6245,7 +6269,12 @@ fn rollback_crew_dispatch(
             .iter()
             .any(|crew| crew.terminal_id == crew_session_id && crew.powder_work.is_some())
     });
-    let closed = close_terminal(ctx, &json!({ "sessionId": crew_session_id })).map_err(|error| {
+    let closed = close_terminal_with_policy(
+        ctx,
+        &json!({ "sessionId": crew_session_id }),
+        true,
+    )
+    .map_err(|error| {
         format!(
             "Crew terminal '{crew_session_id}' could not be stopped; its durable binding was retained: {error}"
         )
@@ -8636,6 +8665,14 @@ fn plan_close(
 /// If a forced close is refused, the re-probe confirmed the tile LIVE - investigate,
 /// do not re-force.
 fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    close_terminal_with_policy(ctx, args, false)
+}
+
+fn close_terminal_with_policy(
+    ctx: &ControlContext,
+    args: &Value,
+    preserve_crew_on_powder_failure: bool,
+) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("close_terminal requires a 'sessionId' argument")?;
@@ -8687,6 +8724,10 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // and the response makes the failed best-effort release visible.
     let powder_release =
         release_crew_powder_binding(ctx, session_id.strip_prefix("th_").unwrap_or(&session_id));
+    let crew_binding_retained = preserve_crew_on_powder_failure
+        && powder_release
+            .as_ref()
+            .is_some_and(|release| release.get("released").and_then(Value::as_bool) != Some(true));
     let outcome = if forced {
         "force_reaped"
     } else if existed {
@@ -8702,7 +8743,12 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     }
     // Captain-chat phase 2: a dead session leaves the captains registry too -
     // its captaincy is released and it drops out of every crew list.
-    if ctx.captains.remove_session(tile_id)? {
+    let captain_state_changed = if crew_binding_retained {
+        ctx.captains.mark_crew_cleanup_pending(tile_id)?
+    } else {
+        ctx.captains.remove_session(tile_id)?
+    };
+    if captain_state_changed {
         let _ = captains_sync_apply(ctx);
     }
     // Comms-plane Phase 2 (review M3): a dead session's per-session identity is
@@ -8719,6 +8765,7 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
         // retry stays safe.
         "outcome": outcome,
         "powderRelease": powder_release,
+        "crewBindingRetained": crew_binding_retained,
         "audited": true,
     }))
 }
@@ -12674,6 +12721,80 @@ mod tests {
 
         let released = json!({ "powderRelease": { "released": true } });
         require_confirmed_powder_release("crew-1", &released).unwrap();
+    }
+
+    #[test]
+    fn rollback_close_retains_cleanup_pending_crew_when_powder_release_fails() {
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!(
+                "rollback_close_retains_cleanup_pending_crew_when_powder_release_fails: tmux not on PATH - skipping"
+            );
+            return;
+        }
+        let crew_id = format!("rollback-{}", uuid::Uuid::new_v4().simple());
+        let target = tmux_target(&crew_id);
+        tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
+
+        let registry = Arc::new(CaptainsRegistry::new());
+        registry
+            .upsert_project(ProjectRecord {
+                project_id: "rollback-project".into(),
+                name: "Rollback Project".into(),
+                repo_root: "/tmp".into(),
+                remote_url: None,
+                default_branch: None,
+                powder: Some(PowderProjectBinding {
+                    connection_profile: format!("missing-{}", uuid::Uuid::new_v4().simple()),
+                    repository: "rollback-project".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        registry
+            .claim_test("rollback-captain", Some("rollback-ship"), vec![])
+            .unwrap();
+        registry
+            .bind_ship_context(
+                "rollback-ship",
+                "rollback-project",
+                "Test rollback",
+                "codex",
+            )
+            .unwrap();
+        registry.record_crew("rollback-captain", &crew_id).unwrap();
+        registry
+            .bind_crew_context(
+                "rollback-captain",
+                &crew_id,
+                "Test failed release",
+                "codex",
+                Some("/tmp"),
+                Some("card-1"),
+                PowderWorkBinding {
+                    card_id: "card-1".into(),
+                    run_id: "run-1".into(),
+                    claim_expires_at: Some(1),
+                },
+            )
+            .unwrap();
+        let ctx = test_ctx("secret").with_captains_registry(registry.clone());
+
+        let closed =
+            close_terminal_with_policy(&ctx, &json!({ "sessionId": crew_id }), true).unwrap();
+
+        assert_eq!(closed["powderRelease"]["released"], false);
+        assert_eq!(closed["crewBindingRetained"], true);
+        let snapshot = registry.snapshot();
+        let crew = &snapshot.captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
+        assert!(crew.powder_work.is_some());
+        assert_eq!(tmux::session_liveness(&target), tmux::SessionLiveness::Gone);
     }
 
     #[test]
