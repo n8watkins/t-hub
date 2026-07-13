@@ -10,13 +10,22 @@
 //      re-appended by adoptRegistry, so a server sync must not resurrect it here);
 //   3. an ordinary user workspace still closes normally.
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, within } from "@testing-library/react";
+import { fireEvent, render, waitFor, within } from "@testing-library/react";
+
+const killTerminal = vi.fn((_id: string) => Promise.resolve());
+const invalidateRecentCache = vi.fn(() => Promise.resolve());
 
 // WorkspacesList -> TerminalRow reads the supervision/activity/theme/clientType
 // stores but never mounts a terminal; nothing here needs xterm, but popOutTab
 // (lib/windows) pulls Tauri window APIs, so stub it to keep the render web-safe.
 vi.mock("../lib/windows", () => ({
   popOutTab: () => {},
+}));
+vi.mock("../ipc/client", () => ({
+  killTerminal: (id: string) => killTerminal(id),
+}));
+vi.mock("../ipc/recent", () => ({
+  invalidateRecentCache: () => invalidateRecentCache(),
 }));
 
 import { WorkspacesList } from "./WorkspacesList";
@@ -57,6 +66,8 @@ function seed(): void {
 }
 
 beforeEach(() => {
+  killTerminal.mockClear();
+  invalidateRecentCache.mockClear();
   localStorage.clear();
   seed();
 });
@@ -114,7 +125,7 @@ describe("WorkspacesList excludes the reserved Captains tab", () => {
     expect(container.textContent).not.toContain(CAPTAINS_TAB_NAME);
   });
 
-  it("an ordinary work workspace still closes normally", () => {
+  it("an ordinary work workspace still closes normally", async () => {
     // Two work tabs so the last-tab guard does not block the close.
     useWorkspace.setState({
       tabs: [
@@ -134,11 +145,15 @@ describe("WorkspacesList excludes the reserved Captains tab", () => {
     const { container } = render(<WorkspacesList />);
     const row = container.querySelector<HTMLElement>('[data-th-ws-row="t2"]')!;
     const closeBtn = within(row).getByLabelText("Close workspace Workspace 2");
-    closeBtn.click();
+    fireEvent.click(closeBtn);
     const ids = useWorkspace.getState().tabs.map((t) => t.id);
     expect(ids).not.toContain("t2");
     // The reserved Captains tab and the other work tab survive.
     expect(ids).toContain("t1");
     expect(ids).toContain(CAPTAINS_TAB_ID);
+    await waitFor(() => {
+      expect(killTerminal).toHaveBeenCalledWith("work0002");
+      expect(invalidateRecentCache).toHaveBeenCalledOnce();
+    });
   });
 });

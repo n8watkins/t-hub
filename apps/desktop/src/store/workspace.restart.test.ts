@@ -2,11 +2,12 @@
 // the same cwd, swapping it into the OLD tile's exact tab + slot, then killing
 // the old session. This guards the placement contract (same tab, same index) and
 // that the old session is killed and its live map entry dropped.
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const spawnTerminal = vi.fn();
 const killTerminal = vi.fn((_id?: string) => Promise.resolve());
 const notify = vi.fn();
+let consoleError: ReturnType<typeof vi.spyOn>;
 
 vi.mock("../ipc/client", () => ({
   spawnTerminal: (opts: unknown) => spawnTerminal(opts),
@@ -26,6 +27,7 @@ function term(id: string, cwd = "/repo"): TerminalInfo {
 }
 
 beforeEach(() => {
+  consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
   spawnTerminal.mockReset();
   killTerminal.mockReset();
   notify.mockReset();
@@ -47,6 +49,10 @@ beforeEach(() => {
     userLabels: {},
     labels: {},
   });
+});
+
+afterEach(() => {
+  consoleError.mockRestore();
 });
 
 describe("restartTerminal", () => {
@@ -83,6 +89,10 @@ describe("restartTerminal", () => {
     expect(t1?.order).toEqual(["a", "old1", "b"]);
     expect(useWorkspace.getState().terminals.old1).toBeTruthy();
     expect(killTerminal).not.toHaveBeenCalled();
+    expect(consoleError).toHaveBeenCalledWith(
+      "restartTerminal failed",
+      expect.any(Error),
+    );
   });
 
   it("no-ops for an unknown terminal id", async () => {
@@ -108,6 +118,10 @@ describe("restartTerminal", () => {
     await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
     expect(notify.mock.calls[0][0]).toBe("error");
     expect(notify.mock.calls[0][2]).toContain("old1");
+    expect(consoleError).toHaveBeenCalledWith(
+      "restartTerminal: kill old session failed after retry",
+      expect.any(Error),
+    );
   });
 
   it("recovers on the retry: no notice when the second kill succeeds", async () => {
