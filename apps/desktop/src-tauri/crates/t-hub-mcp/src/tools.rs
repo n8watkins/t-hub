@@ -9,11 +9,13 @@
 //! Tiers (PRD §11.2):
 //!   - **Read** (allowed): `list_terminals`, `get_status`, `wait_for_status`,
 //!     `supervision_tree`, `wsl_health`, `search_files`, `list_tabs`,
-//!     `list_captains`, `list_fleet_watches`, `read_terminal`, `my_capability`.
+//!     `list_captains`, `list_projects`, `list_fleet_watches`, `read_terminal`,
+//!     `my_capability`.
 //!   - **Organization** (allowed, audited): `focus_session`, `move_tile`,
 //!     `rename_tab`, `new_tab`, `focus_tab`, `close_tab`, `claim_captain`,
 //!     `release_captain`, `watch_fleet`, `unwatch_fleet`, `open_file`,
-//!     `create_worktree`, `remove_worktree`.
+//!     `create_worktree`, `remove_worktree`, `register_project`,
+//!     `bind_project_powder`.
 //!   - **Process-changing** (confirmation required): `spawn_terminal`,
 //!     `send_text`, `send_keys`, `close_terminal`.
 //!   - **Theme**: `get_theme`, `set_theme` — forwarded by name verbatim.
@@ -336,6 +338,34 @@ fn schema_claim_captain() -> Value {
     })
 }
 
+fn schema_register_project() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "repoRoot": { "type": "string", "description": "Path inside an existing Git repository; T-Hub resolves its canonical main worktree." },
+            "name": { "type": "string", "description": "Optional display name; defaults to the repository directory name." },
+            "remoteUrl": { "type": "string", "description": "Optional canonical Git remote URL." },
+            "powderRepository": { "type": "string", "description": "Optional canonical Powder repository name to bind during registration." },
+            "powderConnectionProfile": { "type": "string", "description": "Protected Powder endpoint profile name; defaults to 'default'." }
+        },
+        "required": ["repoRoot"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_bind_project_powder() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "projectId": { "type": "string", "description": "Durable T-Hub project id from list_projects." },
+            "repository": { "type": "string", "description": "Canonical Powder repository name." },
+            "connectionProfile": { "type": "string", "description": "Protected Powder endpoint profile name; defaults to 'default'." }
+        },
+        "required": ["projectId", "repository"],
+        "additionalProperties": false
+    })
+}
+
 /// `release_captain` schema (captain-chat phase 2): release a claimed captaincy.
 fn schema_release_captain() -> Value {
     json!({
@@ -471,6 +501,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_empty,
         },
         ToolDef {
+            name: "list_projects",
+            tier: Tier::Read,
+            summary: "List durable registered projects and their Powder repository bindings.",
+            input_schema: schema_empty,
+        },
+        ToolDef {
             name: "list_fleet_watches",
             tier: Tier::Read,
             summary: "List the armed orchestrator wakes (who gets woken, for which sessions + states).",
@@ -536,6 +572,18 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Organization,
             summary: "Release a claimed captaincy (by captainSessionId or shipSlug; unknown claims are refused).",
             input_schema: schema_release_captain,
+        },
+        ToolDef {
+            name: "register_project",
+            tier: Tier::Organization,
+            summary: "Register an existing Git repository as a durable T-Hub project, optionally with its Powder mapping.",
+            input_schema: schema_register_project,
+        },
+        ToolDef {
+            name: "bind_project_powder",
+            tier: Tier::Organization,
+            summary: "Bind a registered T-Hub project to a canonical Powder repository and protected connection profile.",
+            input_schema: schema_bind_project_powder,
         },
         ToolDef {
             name: "watch_fleet",
@@ -748,6 +796,27 @@ mod tests {
         }
         let claim_schema = (find("claim_captain").unwrap().input_schema)();
         assert_eq!(claim_schema["required"], json!(["captainSessionId"]));
+    }
+
+    #[test]
+    fn project_tools_expose_read_and_audited_mutation_tiers() {
+        let list = find("list_projects").unwrap();
+        assert_eq!(list.tier, Tier::Read);
+        assert_eq!((list.input_schema)(), schema_empty());
+
+        for name in ["register_project", "bind_project_powder"] {
+            let tool = find(name).unwrap();
+            assert_eq!(tool.tier, Tier::Organization);
+            assert_eq!(tool.to_mcp()["annotations"]["confirmationRequired"], false);
+        }
+        assert_eq!(
+            (find("register_project").unwrap().input_schema)()["required"],
+            json!(["repoRoot"])
+        );
+        assert_eq!(
+            (find("bind_project_powder").unwrap().input_schema)()["required"],
+            json!(["projectId", "repository"])
+        );
     }
 
     #[test]

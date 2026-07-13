@@ -3708,8 +3708,9 @@ fn required_tier(command: &str) -> CommandTier {
         }
         "focus_session" | "move_tile" | "rename_tab" | "new_tab" | "close_tab" | "remove_tab"
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
-        | "archive_recent_project" | "claim_captain" | "release_captain" | "watch_fleet"
-        | "unwatch_fleet" | "rebind_control"
+        | "archive_recent_project" | "register_project" | "bind_project_powder"
+        | "claim_captain" | "release_captain" | "watch_fleet" | "unwatch_fleet"
+        | "rebind_control"
         // Comms-plane Phase 2 (review H1): `inbox_ack` MUTATES durable receipt state
         // (Delivered -> Processed) and force-compacts records, so it must NOT fall
         // through to the read tier - it needs the control capability AND the audit a
@@ -4731,6 +4732,7 @@ fn dispatch_with_caller(
         "read_text_file" => read_text_file(ctx, args),
         "list_tabs" => list_tabs(ctx),
         "list_captains" => list_captains(ctx),
+        "list_projects" => list_projects(ctx),
         "list_fleet_watches" => list_fleet_watches(ctx),
         // T12: the socket twin of the `report_workspace_tabs` Tauri command - a
         // socket UI (the native cockpit) reports its tab layout into the same
@@ -4787,6 +4789,8 @@ fn dispatch_with_caller(
         // scanned catalog into projects-archive (reversible). App-initiated from
         // the sidebar; filesystem-mutating like the worktree ops above.
         "archive_recent_project" => archive_recent_project(args),
+        "register_project" => register_project(ctx, args),
+        "bind_project_powder" => bind_project_powder(ctx, args),
         // Captain-chat phase 2: captaincy is a SERVER mutation (audited) - the
         // UI's pin action and an MCP captain's self-registration both land here,
         // and every mutation forwards the authoritative captains snapshot.
@@ -5403,6 +5407,94 @@ fn list_captains(ctx: &ControlContext) -> Result<Value, String> {
         "count": snap.captains.len(),
         "seq": snap.seq,
     }))
+}
+
+/// Return the durable registered-project catalog. This is separate from Recent,
+/// which is activity-derived and may include unregistered scratch directories.
+fn list_projects(ctx: &ControlContext) -> Result<Value, String> {
+    let snap = ctx.captains.snapshot();
+    Ok(json!({
+        "projects": snap.projects,
+        "count": snap.projects.len(),
+        "seq": snap.seq,
+    }))
+}
+
+/// Register an existing Git repository using its canonical main-worktree root.
+/// Re-registering the same root updates metadata while preserving its project id.
+fn register_project(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let requested_root = arg_str(args, "repoRoot")
+        .or_else(|| arg_str(args, "repo_root"))
+        .ok_or("register_project requires a 'repoRoot' argument")?;
+    let worktrees = git::worktree_list(&requested_root)
+        .map_err(|e| format!("register_project: repository validation failed: {e}"))?;
+    let main = worktrees
+        .iter()
+        .find(|worktree| !worktree.is_linked)
+        .ok_or("register_project: path is not inside a Git repository with a main worktree")?;
+    let repo_root = std::fs::canonicalize(&main.path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&main.path))
+        .to_string_lossy()
+        .into_owned();
+    let name = arg_str(args, "name")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::path::Path::new(&repo_root)
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+        })
+        .ok_or("register_project: could not derive a project name")?;
+    let powder_repository =
+        arg_str(args, "powderRepository").or_else(|| arg_str(args, "powder_repository"));
+    let powder = powder_repository.map(|repository| PowderProjectBinding {
+        connection_profile: arg_str(args, "powderConnectionProfile")
+            .or_else(|| arg_str(args, "powder_connection_profile"))
+            .unwrap_or_else(default_powder_profile),
+        repository,
+    });
+    let existing = ctx
+        .captains
+        .projects()
+        .into_iter()
+        .find(|project| project.repo_root == repo_root);
+    let project = ctx.captains.upsert_project(ProjectRecord {
+        project_id: existing
+            .as_ref()
+            .map(|project| project.project_id.clone())
+            .unwrap_or_else(|| format!("project-{}", uuid::Uuid::new_v4())),
+        name,
+        repo_root,
+        remote_url: arg_str(args, "remoteUrl").or_else(|| arg_str(args, "remote_url")),
+        default_branch: main.branch.clone(),
+        powder: powder.or_else(|| existing.as_ref().and_then(|project| project.powder.clone())),
+        created_at: existing.as_ref().map_or(0, |project| project.created_at),
+        updated_at: 0,
+    })?;
+    serde_json::to_value(project).map_err(|e| e.to_string())
+}
+
+/// Attach a registered project to its canonical Powder repository. Endpoint
+/// credentials remain outside this registry; only the protected profile name is
+/// persisted with the mapping.
+fn bind_project_powder(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let project_id = arg_str(args, "projectId")
+        .or_else(|| arg_str(args, "project_id"))
+        .ok_or("bind_project_powder requires a 'projectId' argument")?;
+    let repository = arg_str(args, "repository")
+        .ok_or("bind_project_powder requires a 'repository' argument")?;
+    let mut project = ctx
+        .captains
+        .projects()
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("bind_project_powder: unknown projectId '{project_id}'"))?;
+    project.powder = Some(PowderProjectBinding {
+        connection_profile: arg_str(args, "connectionProfile")
+            .or_else(|| arg_str(args, "connection_profile"))
+            .unwrap_or_else(default_powder_profile),
+        repository,
+    });
+    serde_json::to_value(ctx.captains.upsert_project(project)?).map_err(|e| e.to_string())
 }
 
 /// `report_workspace_tabs` (T12 / headless-org): a UI client up-syncs its live tab
@@ -10896,6 +10988,62 @@ mod tests {
         assert_eq!(v["captains"][0]["terminalId"], "cap-1");
         assert_eq!(v["captains"][0]["workspaceTabIds"][0], "tab-1");
         assert_eq!(v["captains"][0]["crew"], json!([]));
+    }
+
+    #[test]
+    fn project_commands_register_idempotently_and_bind_powder() {
+        let ctx = test_ctx("secret");
+        let repo = env!("CARGO_MANIFEST_DIR");
+        let first = dispatch(
+            &ctx,
+            "register_project",
+            &json!({"repoRoot": repo, "name": "T-Hub"}),
+        )
+        .unwrap();
+        let second = dispatch(
+            &ctx,
+            "register_project",
+            &json!({"repoRoot": repo, "name": "T-Hub"}),
+        )
+        .unwrap();
+        assert_eq!(first["projectId"], second["projectId"]);
+        let project_id = first["projectId"].as_str().unwrap();
+
+        let bound = dispatch(
+            &ctx,
+            "bind_project_powder",
+            &json!({
+                "projectId": project_id,
+                "repository": "t-hub-app",
+                "connectionProfile": "production"
+            }),
+        )
+        .unwrap();
+        assert_eq!(bound["powder"]["repository"], "t-hub-app");
+        assert_eq!(bound["powder"]["connectionProfile"], "production");
+
+        let catalog = dispatch(&ctx, "list_projects", &json!({})).unwrap();
+        assert_eq!(catalog["count"], 1);
+        assert_eq!(catalog["projects"][0]["projectId"], first["projectId"]);
+    }
+
+    #[test]
+    fn register_project_refuses_a_non_repository() {
+        let ctx = test_ctx("secret");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-register-nonrepo-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let error = dispatch(
+            &ctx,
+            "register_project",
+            &json!({"repoRoot": dir.to_string_lossy()}),
+        )
+        .unwrap_err();
+        assert!(error.contains("Git repository"), "got: {error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
