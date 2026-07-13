@@ -46,6 +46,19 @@ pub struct Claim {
     pub expires_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CardEvent {
+    pub sequence: i64,
+    pub event_id: String,
+    pub event_type: String,
+    pub occurred_at: i64,
+    pub card_id: String,
+    pub card_title: String,
+    pub card_status: String,
+    pub repository: Option<String>,
+    pub change: Value,
+}
+
 pub struct Client {
     base_url: String,
     agent_name: String,
@@ -220,6 +233,29 @@ impl Client {
         parse_claim(value)
     }
 
+    pub fn tail_events(&self, after: i64, limit: usize) -> Result<Vec<CardEvent>, String> {
+        let limit = limit.clamp(1, 1000);
+        let body = self.request_text(&format!(
+            "/api/v1/events/tail?after={}&limit={limit}",
+            after.max(0)
+        ))?;
+        parse_event_stream(&body, after)
+    }
+
+    fn request_text(&self, path: &str) -> Result<String, String> {
+        let url = format!("{}{path}", self.base_url);
+        let mut request = self.agent.get(&url);
+        if let Some(key) = self.api_key.as_deref() {
+            request = request.set("Authorization", &format!("Bearer {key}"));
+        }
+        match request.call() {
+            Ok(response) => response
+                .into_string()
+                .map_err(|error| format!("Powder returned unreadable text: {error}")),
+            Err(error) => Err(response_error(error)),
+        }
+    }
+
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
         let url = format!("{}{path}", self.base_url);
         let mut request = match method {
@@ -238,16 +274,22 @@ impl Client {
             Ok(response) => response
                 .into_json()
                 .map_err(|error| format!("Powder returned invalid JSON: {error}")),
-            Err(ureq::Error::Status(status, response)) => {
-                let detail = response
-                    .into_json::<Value>()
-                    .ok()
-                    .and_then(|body| body["error"].as_str().map(str::to_string))
-                    .unwrap_or_else(|| format!("HTTP {status}"));
-                Err(format!("Powder HTTP {status}: {detail}"))
-            }
-            Err(ureq::Error::Transport(error)) => Err(format!("Powder is unreachable: {error}")),
+            Err(error) => Err(response_error(error)),
         }
+    }
+}
+
+fn response_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let detail = response
+                .into_json::<Value>()
+                .ok()
+                .and_then(|body| body["error"].as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            format!("Powder HTTP {status}: {detail}")
+        }
+        ureq::Error::Transport(error) => format!("Powder is unreachable: {error}"),
     }
 }
 
@@ -291,6 +333,58 @@ fn parse_claim(value: Value) -> Result<Claim, String> {
             .as_i64()
             .ok_or("Powder claim response is missing expires_at")?,
     })
+}
+
+fn parse_event_stream(body: &str, after: i64) -> Result<Vec<CardEvent>, String> {
+    let mut events = Vec::new();
+    for frame in body.replace("\r\n", "\n").split("\n\n") {
+        let mut sequence = None;
+        let mut data = Vec::new();
+        for line in frame.lines() {
+            if let Some(raw) = line.strip_prefix("id:") {
+                sequence = raw.trim().parse::<i64>().ok();
+            } else if let Some(raw) = line.strip_prefix("data:") {
+                data.push(raw.trim_start());
+            }
+        }
+        if data.is_empty() {
+            continue;
+        }
+        let sequence = sequence.ok_or("Powder event stream frame is missing a numeric id")?;
+        if sequence <= after
+            || events
+                .last()
+                .is_some_and(|event: &CardEvent| event.sequence >= sequence)
+        {
+            return Err("Powder event stream sequence is not strictly increasing".into());
+        }
+        let payload: Value = serde_json::from_str(&data.join("\n"))
+            .map_err(|error| format!("Powder event stream contains invalid JSON: {error}"))?;
+        if payload["schema_version"].as_str() != Some("powder.card_event.v1") {
+            return Err("Powder event stream contains an unsupported schema_version".into());
+        }
+        events.push(CardEvent {
+            sequence,
+            event_id: required_event_string(&payload, "event_id")?,
+            event_type: required_event_string(&payload, "event_type")?,
+            occurred_at: payload["occurred_at"]
+                .as_i64()
+                .ok_or("Powder event is missing occurred_at")?,
+            card_id: required_event_string(&payload["card"], "id")?,
+            card_title: required_event_string(&payload["card"], "title")?,
+            card_status: required_event_string(&payload["card"], "status")?,
+            repository: payload["card"]["repo"].as_str().map(str::to_string),
+            change: payload["change"].clone(),
+        });
+    }
+    Ok(events)
+}
+
+fn required_event_string(value: &Value, key: &str) -> Result<String, String> {
+    value[key]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("Powder event is missing {key}"))
 }
 
 fn required_string(value: &Value, key: &str) -> Result<String, String> {
@@ -383,6 +477,7 @@ mod tests {
                 "/api/v1/cards/card-1/heartbeat",
                 "/api/v1/cards/card-1/renew",
                 "/api/v1/cards/card-1/release",
+                "/api/v1/events/tail?after=4&limit=25",
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
@@ -431,8 +526,20 @@ mod tests {
                 if expected_path.ends_with("/claim") {
                     assert!(request.contains(r#""agent":"t-hub""#));
                 }
-                let body = if expected_path.contains("?detail=") {
-                    json!({ "id": "card-1", "repo": "repo-1" })
+                let body = if expected_path.contains("events/tail") {
+                    concat!(
+                        "id: 5\n",
+                        "event: completed\n",
+                        "data: {\"schema_version\":\"powder.card_event.v1\",",
+                        "\"event_id\":\"evt-5\",\"event_type\":\"completed\",",
+                        "\"occurred_at\":500,\"actor\":\"crew\",",
+                        "\"card\":{\"id\":\"card-1\",\"title\":\"Ship it\",",
+                        "\"status\":\"done\",\"repo\":\"repo-1\"},",
+                        "\"change\":{\"proof\":\"tests\"}}\n\n"
+                    )
+                    .to_string()
+                } else if expected_path.contains("?detail=") {
+                    json!({ "id": "card-1", "repo": "repo-1" }).to_string()
                 } else {
                     json!({
                         "card_id": "card-1",
@@ -440,11 +547,16 @@ mod tests {
                         "agent": "t-hub",
                         "expires_at": 1234,
                     })
-                }
-                .to_string();
+                    .to_string()
+                };
+                let content_type = if expected_path.contains("events/tail") {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 )
@@ -465,6 +577,31 @@ mod tests {
         assert_eq!(client.heartbeat(&claim).unwrap().run_id, "run-1");
         assert_eq!(client.renew(&claim, 3600).unwrap().expires_at, 1234);
         assert_eq!(client.release(&claim).unwrap().card_id, "card-1");
+        let events = client.tail_events(4, 25).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 5);
+        assert_eq!(events[0].event_type, "completed");
+        assert_eq!(events[0].repository.as_deref(), Some("repo-1"));
+        assert_eq!(events[0].change["proof"], "tests");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn event_stream_rejects_replayed_or_unsupported_frames() {
+        let replayed = concat!(
+            "id: 4\n",
+            "data: {\"schema_version\":\"powder.card_event.v1\"}\n\n"
+        );
+        assert!(parse_event_stream(replayed, 4)
+            .unwrap_err()
+            .contains("strictly increasing"));
+
+        let unsupported = concat!(
+            "id: 5\n",
+            "data: {\"schema_version\":\"powder.card_event.v2\"}\n\n"
+        );
+        assert!(parse_event_stream(unsupported, 4)
+            .unwrap_err()
+            .contains("unsupported"));
     }
 }
