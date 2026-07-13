@@ -30,6 +30,11 @@ if ! "$SOURCE" --list-tools >/dev/null 2>&1; then
   exit 1
 fi
 
+# Refuse every known skill conflict before replacing the MCP binary or changing
+# Codex registration. The installer repeats validation inside its own
+# transaction to cover races between preflight and commit.
+bash "$HERE/install-captain-skills.sh" --check
+
 install -d -m 700 "$BIN_DIR" "$CAPTAIN_DIR"
 TEMP="$(mktemp "$BIN_DIR/.t-hub-mcp.XXXXXX")"
 trap 'rm -f "$TEMP"' EXIT

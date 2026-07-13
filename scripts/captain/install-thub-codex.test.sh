@@ -77,6 +77,41 @@ else
   fail "repeat install exited non-zero"
 fi
 
+CONFLICT_WORK="$WORK/conflict"
+CONFLICT_CODEX_HOME="$CONFLICT_WORK/codex-home"
+CONFLICT_CLAUDE_HOME="$CONFLICT_WORK/claude-home"
+CONFLICT_BIN_DIR="$CONFLICT_WORK/install/bin"
+CONFLICT_CAPTAIN_DIR="$CONFLICT_WORK/install/captain"
+mkdir -p "$CONFLICT_CODEX_HOME" "$CONFLICT_CLAUDE_HOME/skills/shipmate"
+printf 'user-owned\n' > "$CONFLICT_CLAUDE_HOME/skills/shipmate/SKILL.md"
+
+if CODEX_HOME="$CONFLICT_CODEX_HOME" \
+  CLAUDE_HOME="$CONFLICT_CLAUDE_HOME" \
+  T_HUB_MCP_SOURCE="$SOURCE" \
+  T_HUB_BIN_DIR="$CONFLICT_BIN_DIR" \
+  T_HUB_CAPTAIN_DIR="$CONFLICT_CAPTAIN_DIR" \
+  bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "unmanaged late-target conflict unexpectedly succeeded"
+else
+  pass "unmanaged late-target conflict is refused"
+fi
+
+if [ ! -e "$CONFLICT_BIN_DIR/t-hub-mcp" ] \
+  && [ ! -e "$CONFLICT_CODEX_HOME/skills/captain" ] \
+  && [ ! -e "$CONFLICT_CODEX_HOME/skills/shipmate" ] \
+  && [ ! -e "$CONFLICT_CLAUDE_HOME/skills/captain" ] \
+  && [ "$(cat "$CONFLICT_CLAUDE_HOME/skills/shipmate/SKILL.md")" = "user-owned" ]; then
+  pass "conflict leaves the binary and every skill target unchanged"
+else
+  fail "conflict left a partial installation"
+fi
+
+if CODEX_HOME="$CONFLICT_CODEX_HOME" codex mcp get t-hub >/dev/null 2>&1; then
+  fail "conflict registered an MCP server"
+else
+  pass "conflict leaves Codex registration absent"
+fi
+
 if [ "$FAILED" -eq 0 ]; then
   echo "install-thub-codex.test: PASS"
 else
