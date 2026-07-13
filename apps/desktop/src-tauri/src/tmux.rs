@@ -479,6 +479,34 @@ pub fn session_liveness(name: &str) -> SessionLiveness {
     }
 }
 
+/// Verify that a tmux session exists and its foreground process is the expected
+/// coding harness. A surviving fallback shell is a definitive `Gone` harness,
+/// even though the terminal session itself remains alive.
+pub fn harness_liveness(name: &str, harness: &str) -> SessionLiveness {
+    match session_liveness(name) {
+        SessionLiveness::Gone => return SessionLiveness::Gone,
+        SessionLiveness::Unknown => return SessionLiveness::Unknown,
+        SessionLiveness::Alive => {}
+    }
+    let expected = harness.trim().to_ascii_lowercase();
+    if !matches!(expected.as_str(), "codex" | "claude") {
+        return SessionLiveness::Unknown;
+    }
+    match pane_info() {
+        Ok(panes) => panes.into_iter().find(|pane| pane.session == name).map_or(
+            SessionLiveness::Unknown,
+            |pane| {
+                if pane.command.eq_ignore_ascii_case(&expected) {
+                    SessionLiveness::Alive
+                } else {
+                    SessionLiveness::Gone
+                }
+            },
+        ),
+        Err(_) => SessionLiveness::Unknown,
+    }
+}
+
 /// The transfer-grade / reap-grade death signal (R1): `true` ONLY when a probe
 /// DEFINITIVELY reported the session absent. `Alive` (obviously) and `Unknown` (a
 /// timed-out/failed probe) are BOTH not-gone, so a degraded control plane can
@@ -1208,5 +1236,46 @@ mod tests {
             SessionLiveness::Gone,
             "a killed session is a definitive Gone"
         );
+    }
+
+    #[test]
+    fn harness_liveness_rejects_the_fallback_shell_after_agent_exit() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::harness_liveness_rejects_the_fallback_shell_after_agent_exit: \
+                 tmux not on PATH - skipping"
+            );
+            return;
+        }
+        let name = format!("th_harness-exit-{}", uuid::Uuid::new_v4().simple());
+        let pane = crate::commands::pane_command(None, Some("true")).unwrap();
+        new_session_with_env(&name, "/tmp", Some(&pane), &[]).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+
+        assert_eq!(session_liveness(&name), SessionLiveness::Alive);
+        assert_eq!(harness_liveness(&name, "codex"), SessionLiveness::Gone);
+        let _ = kill_session(&name);
+    }
+
+    #[test]
+    fn harness_liveness_accepts_the_expected_foreground_process() {
+        if !tmux_available() {
+            eprintln!(
+                "tmux::tests::harness_liveness_accepts_the_expected_foreground_process: \
+                 tmux not on PATH - skipping"
+            );
+            return;
+        }
+        let name = format!("th_harness-live-{}", uuid::Uuid::new_v4().simple());
+        let bin_dir = std::env::temp_dir().join(format!("{name}-bin"));
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let executable = bin_dir.join("codex");
+        std::fs::copy("/bin/sleep", &executable).unwrap();
+        let command = format!("{} 60", executable.display());
+        new_session_with_env(&name, "/tmp", Some(&command), &[]).unwrap();
+
+        assert_eq!(harness_liveness(&name, "codex"), SessionLiveness::Alive);
+        let _ = kill_session(&name);
+        std::fs::remove_dir_all(bin_dir).unwrap();
     }
 }

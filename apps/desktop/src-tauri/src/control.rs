@@ -5776,13 +5776,45 @@ fn existing_project_captain(
     let Some(terminal_id) = captain.terminal_id.as_deref() else {
         return Ok(None);
     };
-    match tmux::session_liveness(&tmux_target(terminal_id)) {
+    let harness = captain.harness.as_deref().ok_or_else(|| {
+        retryable_error(format!(
+            "commission_captain: existing Captain '{}' has no recorded harness",
+            captain.ship_slug
+        ))
+    })?;
+    match tmux::harness_liveness(&tmux_target(terminal_id), harness) {
         tmux::SessionLiveness::Alive => Ok(Some(captain)),
         tmux::SessionLiveness::Gone => Ok(None),
         tmux::SessionLiveness::Unknown => Err(retryable_error(format!(
             "commission_captain: existing Captain '{}' could not be verified alive or gone; retry when terminal liveness recovers",
             captain.ship_slug
         ))),
+    }
+}
+
+fn wait_for_harness_started(session_id: &str, harness: &str) -> Result<(), String> {
+    let target = tmux_target(session_id);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match tmux::harness_liveness(&target, harness) {
+            tmux::SessionLiveness::Alive => return Ok(()),
+            tmux::SessionLiveness::Gone if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            tmux::SessionLiveness::Gone => {
+                return Err(format!(
+                    "{harness} did not remain active in terminal '{session_id}'"
+                ));
+            }
+            tmux::SessionLiveness::Unknown if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            tmux::SessionLiveness::Unknown => {
+                return Err(retryable_error(format!(
+                    "{harness} liveness is unavailable for terminal '{session_id}'"
+                )));
+            }
+        }
     }
 }
 
@@ -5929,6 +5961,12 @@ fn commission_captain(ctx: &ControlContext, args: &Value) -> Result<Value, Strin
         .as_str()
         .ok_or("commission_captain: spawn returned no terminal id")?
         .to_string();
+    if let Err(error) = wait_for_harness_started(&terminal_id, harness.as_provider()) {
+        let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
+        return Err(format!(
+            "commission_captain: harness startup failed and the terminal was rolled back: {error}"
+        ));
+    }
     let claim = claim_captain(
         ctx,
         &json!({
@@ -6015,7 +6053,11 @@ fn captain_and_project_for_dispatch(
         .terminal_id
         .as_deref()
         .ok_or("dispatch_crew: Captain is not attached to a live terminal")?;
-    match tmux::session_liveness(&tmux_target(captain_session_id)) {
+    let captain_harness = captain
+        .harness
+        .as_deref()
+        .ok_or("dispatch_crew: Captain has no recorded harness")?;
+    match tmux::harness_liveness(&tmux_target(captain_session_id), captain_harness) {
         tmux::SessionLiveness::Alive => {}
         tmux::SessionLiveness::Gone => {
             return Err("dispatch_crew: Captain terminal is gone".into());
@@ -6203,6 +6245,12 @@ fn dispatch_crew(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             "dispatch_crew: harness launch failed and all side effects were rolled back: {error}"
         ));
     }
+    if let Err(error) = wait_for_harness_started(&crew_session_id, harness.as_provider()) {
+        rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
+        return Err(format!(
+            "dispatch_crew: harness startup failed and all side effects were rolled back: {error}"
+        ));
+    }
     let _ = captains_sync_apply(ctx);
     Ok(json!({
         "accepted": "dispatch_crew",
@@ -6289,7 +6337,17 @@ fn heartbeat_crew_powder(ctx: &ControlContext, args: &Value) -> Result<Value, St
         .or_else(|| arg_str(args, "crew_session_id"))
         .or_else(|| arg_str(args, "sessionId"))
         .ok_or("heartbeat_crew_powder requires a 'crewSessionId' argument")?;
-    match tmux::session_liveness(&tmux_target(&crew_session_id)) {
+    let crew_harness = ctx
+        .captains
+        .snapshot()
+        .captains
+        .iter()
+        .flat_map(|captain| captain.crew.iter())
+        .find(|crew| crew.terminal_id == crew_session_id)
+        .and_then(|crew| crew.harness.as_deref())
+        .map(str::to_string)
+        .ok_or_else(|| format!("Crew session '{crew_session_id}' has no recorded harness"))?;
+    match tmux::harness_liveness(&tmux_target(&crew_session_id), &crew_harness) {
         tmux::SessionLiveness::Alive => {}
         tmux::SessionLiveness::Gone => {
             return Err(format!(
@@ -6412,22 +6470,26 @@ fn reconcile_powder_leases(ctx: &ControlContext) {
                 continue;
             }
             if let Some(powder_work) = crew.powder_work.clone() {
+                let Some(harness) = crew.harness.clone() else {
+                    continue;
+                };
                 work.push((
                     crew.terminal_id.clone(),
                     binding.connection_profile.clone(),
+                    harness,
                     powder_work,
                 ));
             }
         }
     }
-    for (crew_session_id, profile, work) in work {
+    for (crew_session_id, profile, harness, work) in work {
         let claim = powder::Claim {
             card_id: work.card_id,
             run_id: work.run_id,
             agent: String::new(),
             expires_at: work.claim_expires_at.unwrap_or_default(),
         };
-        match tmux::session_liveness(&tmux_target(&crew_session_id)) {
+        match tmux::harness_liveness(&tmux_target(&crew_session_id), &harness) {
             tmux::SessionLiveness::Alive => {
                 let result = powder::Client::from_profile(&profile)
                     .and_then(|client| client.renew(&claim, 3600));
@@ -8741,6 +8803,19 @@ mod tests {
         ControlContext::new(Arc::new(StatusBridge::new()), visitor, token.to_string())
             .with_read_token(format!("read-{token}"))
             .with_audit(Arc::new(crate::audit::AuditLog::new(audit_dir)))
+    }
+
+    fn test_harness_command(harness: &str) -> (std::path::PathBuf, String) {
+        let bin_dir = std::env::temp_dir().join(format!(
+            "t-hub-test-harness-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let executable = bin_dir.join(harness);
+        std::fs::copy("/bin/sleep", &executable).unwrap();
+        let command = format!("{} 60", executable.display());
+        (bin_dir, command)
     }
 
     #[test]
@@ -12182,13 +12257,14 @@ mod tests {
             })
             .unwrap();
 
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
         let args = json!({
             "projectId": "project-e2e",
             "assignment": "Keep this project stable",
             "harness": "codex",
             "shipSlug": "commission-e2e",
             "workspaceTabIds": ["project-tab"],
-            "testStartupCommand": "sleep 60",
+            "testStartupCommand": harness_command,
             "testSkipPowderHealth": true,
         });
         let first = dispatch(&ctx, "commission_captain", &args).unwrap();
@@ -12223,6 +12299,7 @@ mod tests {
         assert_eq!(ctx.captains.snapshot().captains.len(), 1);
 
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
+        std::fs::remove_dir_all(harness_bin_dir).unwrap();
     }
 
     #[test]
