@@ -238,7 +238,12 @@ fn report_workspace_tabs(
             // captains snapshot (webview + socket clients) when anything changed.
             let mut pruned = false;
             for tab_id in &removed_tab_ids {
-                pruned |= captains.prune_tab(tab_id);
+                match captains.prune_tab(tab_id) {
+                    Ok(changed) => pruned |= changed,
+                    Err(error) => {
+                        eprintln!("t-hub: Captain tab pruning failed for '{tab_id}': {error}")
+                    }
+                }
             }
             if pruned {
                 commands::forward_captains_sync(&app, &captains, &fanout);

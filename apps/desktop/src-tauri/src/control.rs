@@ -1126,7 +1126,7 @@ pub struct CaptainsSnapshot {
     pub projects: Vec<ProjectRecord>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CaptainsInner {
     captains: Vec<CaptainRecord>,
     projects: Vec<ProjectRecord>,
@@ -1152,6 +1152,9 @@ struct CaptainsInner {
 /// state-file write never wedges a reader on the registry lock.
 pub struct CaptainsRegistry {
     inner: Mutex<CaptainsInner>,
+    /// Serializes mutations so a candidate is published in memory only after its
+    /// durable write succeeds, without racing another accepted mutation.
+    mutation: Mutex<()>,
     /// Persistence target; `None` = in-memory only (unit tests / headless proofs).
     path: Option<PathBuf>,
     /// Serializes disk write-throughs WITHOUT holding `inner`, guarding the last
@@ -1198,6 +1201,7 @@ impl CaptainsRegistry {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(CaptainsInner::default()),
+            mutation: Mutex::new(()),
             path: None,
             persist: Mutex::new(0),
             #[cfg(test)]
@@ -1232,6 +1236,7 @@ impl CaptainsRegistry {
         let loaded_seq = inner.seq;
         Self {
             inner: Mutex::new(inner),
+            mutation: Mutex::new(()),
             path: Some(path),
             persist: Mutex::new(loaded_seq),
             #[cfg(test)]
@@ -1280,15 +1285,14 @@ impl CaptainsRegistry {
         }
     }
 
-    /// Best-effort write-through of a snapshot to disk, WITHOUT the `inner` lock
+    /// Fallible write-through of a snapshot to disk, WITHOUT the `inner` lock
     /// held (Incident D). Serialized by the dedicated `persist` mutex - never
     /// taken together with `inner` - so a stalled state write can't wedge a
     /// registry reader or the spawn hot path. The `persist` mutex also guards the
     /// last revision that reached disk: a snapshot older than what already landed
     /// is dropped, so two writers that dropped `inner` in one order but reach disk
-    /// in the other never regress the file. A write failure is logged and never
-    /// fails the mutation (the in-memory registry stays authoritative for this
-    /// run; the next successful write heals the file).
+    /// in the other never regress the file. A write failure is returned to the
+    /// mutation, which restores its prior in-memory snapshot and fails the command.
     ///
     /// ATOMIC (temp + rename), mirroring `voice.rs`: the loader treats a corrupt
     /// file as empty (silently dropping every claim), so a crash mid-write must
@@ -1296,14 +1300,16 @@ impl CaptainsRegistry {
     /// `rename` it over the target - `rename` replaces atomically (on Windows too,
     /// MOVEFILE_REPLACE_EXISTING), so a reader/loader always sees either the old
     /// complete file or the new complete file, never a partial one.
-    fn persist(&self, snap: CaptainsSnapshot) {
-        let Some(path) = &self.path else { return };
+    fn persist(&self, snap: CaptainsSnapshot) -> Result<(), String> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         // The ONLY lock held across the disk write. Never nested inside `inner`.
         let mut last = self.persist.lock().unwrap_or_else(|p| p.into_inner());
         if snap.seq < *last {
             // A newer revision already reached disk; this stale snapshot must not
             // clobber it.
-            return;
+            return Ok(());
         }
         // Test seam: stand in for a slow/stalled disk write, holding `persist` but
         // NOT `inner`, so a test can prove a concurrent reader/mutator is unblocked.
@@ -1311,15 +1317,15 @@ impl CaptainsRegistry {
         if let Some(hook) = self.persist_hook.lock().unwrap().as_ref() {
             hook();
         }
-        let body = match serde_json::to_vec_pretty(&snap) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("t-hub-control: captains registry serialize failed: {e}");
-                return;
-            }
-        };
+        let body = serde_json::to_vec_pretty(&snap)
+            .map_err(|error| format!("captains registry serialize failed: {error}"))?;
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "captains registry directory '{}' could not be created: {error}",
+                    parent.display()
+                )
+            })?;
         }
         // A unique temp name (pid + a process-wide counter) so two writers can
         // never interleave on the same temp file - each renames its own complete
@@ -1330,13 +1336,12 @@ impl CaptainsRegistry {
             std::process::id(),
             TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
-        if let Err(e) = std::fs::write(&tmp, &body) {
-            eprintln!(
-                "t-hub-control: captains registry temp write to {} failed: {e}",
+        std::fs::write(&tmp, &body).map_err(|error| {
+            format!(
+                "captains registry temp write to '{}' failed: {error}",
                 tmp.display()
-            );
-            return;
-        }
+            )
+        })?;
         // MED-4: item-2's BIND writes a per-session SECRET (the widened identity
         // binding) into this store, so 0600 it - the captains `persist` inherited the
         // process umask before (the 0600 discipline lived only in `write_handshake`
@@ -1346,17 +1351,39 @@ impl CaptainsRegistry {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(
+                |error| {
+                    let _ = std::fs::remove_file(&tmp);
+                    format!(
+                        "captains registry permissions on '{}' failed: {error}",
+                        tmp.display()
+                    )
+                },
+            )?;
         }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            eprintln!(
-                "t-hub-control: captains registry rename to {} failed: {e}",
-                path.display()
-            );
+        if let Err(error) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
-            return;
+            return Err(format!(
+                "captains registry rename to '{}' failed: {error}",
+                path.display()
+            ));
         }
         *last = snap.seq;
+        Ok(())
+    }
+
+    fn commit_mutation(
+        &self,
+        mut current: std::sync::MutexGuard<'_, CaptainsInner>,
+        previous: CaptainsInner,
+    ) -> Result<(), String> {
+        let candidate = current.clone();
+        let snap = Self::snapshot_for_persist(&candidate);
+        *current = previous;
+        drop(current);
+        self.persist(snap)?;
+        *self.lock() = candidate;
+        Ok(())
     }
 
     /// Install the test-only persist hook (see [`persist_hook`](Self::persist_hook)).
@@ -1405,7 +1432,9 @@ impl CaptainsRegistry {
             }
         }
 
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        let previous = g.clone();
         let by_id = g
             .projects
             .iter()
@@ -1449,9 +1478,7 @@ impl CaptainsRegistry {
             g.projects.push(project.clone());
         }
         g.seq = g.seq.saturating_add(1);
-        let snap = Self::snapshot_for_persist(&g);
-        drop(g);
-        self.persist(snap);
+        self.commit_mutation(g, previous)?;
         Ok(project)
     }
 
@@ -1464,7 +1491,9 @@ impl CaptainsRegistry {
         repository: &str,
         cursor: i64,
     ) -> Result<ProjectRecord, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        let previous = g.clone();
         let project = g
             .projects
             .iter_mut()
@@ -1486,9 +1515,7 @@ impl CaptainsRegistry {
         project.updated_at = now_ms();
         let updated = project.clone();
         g.seq = g.seq.saturating_add(1);
-        let snap = Self::snapshot_for_persist(&g);
-        drop(g);
-        self.persist(snap);
+        self.commit_mutation(g, previous)?;
         Ok(updated)
     }
 
@@ -1510,7 +1537,9 @@ impl CaptainsRegistry {
         if harness.is_empty() {
             return Err("harness must not be empty".into());
         }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        let previous = g.clone();
         if !g.projects.iter().any(|p| p.project_id == project_id) {
             return Err(format!("unknown projectId '{project_id}'"));
         }
@@ -1524,9 +1553,7 @@ impl CaptainsRegistry {
         captain.harness = Some(harness.to_string());
         let result = captain.clone();
         g.seq = g.seq.saturating_add(1);
-        let snap = Self::snapshot_for_persist(&g);
-        drop(g);
-        self.persist(snap);
+        self.commit_mutation(g, previous)?;
         Ok(result)
     }
 
@@ -1545,7 +1572,9 @@ impl CaptainsRegistry {
         if task.trim().is_empty() {
             return Err("crew task must not be empty".into());
         }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        let previous = g.clone();
         let captain = g
             .captains
             .iter_mut()
@@ -1563,9 +1592,7 @@ impl CaptainsRegistry {
         crew.powder_work = Some(powder_work);
         let result = crew.clone();
         g.seq = g.seq.saturating_add(1);
-        let snap = Self::snapshot_for_persist(&g);
-        drop(g);
-        self.persist(snap);
+        self.commit_mutation(g, previous)?;
         Ok(result)
     }
 
@@ -1574,7 +1601,9 @@ impl CaptainsRegistry {
         crew_session_id: &str,
         expires_at: i64,
     ) -> Result<CrewRef, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        let previous = g.clone();
         let crew = g
             .captains
             .iter_mut()
@@ -1591,9 +1620,7 @@ impl CaptainsRegistry {
         binding.claim_expires_at = Some(expires_at);
         let result = crew.clone();
         g.seq = g.seq.saturating_add(1);
-        let snap = Self::snapshot_for_persist(&g);
-        drop(g);
-        self.persist(snap);
+        self.commit_mutation(g, previous)?;
         Ok(result)
     }
 
@@ -1636,20 +1663,19 @@ impl CaptainsRegistry {
     fn commit_claim(
         &self,
         mut g: std::sync::MutexGuard<'_, CaptainsInner>,
+        previous: CaptainsInner,
         record: FleetIdentity,
         disposition: ClaimDisposition,
         changed: bool,
-    ) -> ClaimOutcome {
+    ) -> Result<ClaimOutcome, String> {
         if changed {
             g.seq += 1;
-            let snap = Self::snapshot_for_persist(&g);
-            drop(g);
-            self.persist(snap);
+            self.commit_mutation(g, previous)?;
         }
-        ClaimOutcome {
+        Ok(ClaimOutcome {
             record,
             disposition,
-        }
+        })
     }
 
     /// Claim (or re-key / rebind) an identity on the DURABLE ship/role key (item-2
@@ -1704,6 +1730,8 @@ impl CaptainsRegistry {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| slugify_ship(&format!("ship-{terminal_id}"))),
         };
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = self.lock().clone();
 
         for _attempt in 0..CLAIM_CAS_ATTEMPTS {
             // Phase 1 (under `inner`): decide whether an incumbent liveness probe is
@@ -1781,7 +1809,13 @@ impl CaptainsRegistry {
                         }
                         c.state = ClaimState::Active;
                         let rec = c.clone();
-                        return Ok(self.commit_claim(g, rec, ClaimDisposition::Refreshed, true));
+                        return self.commit_claim(
+                            g,
+                            previous.clone(),
+                            rec,
+                            ClaimDisposition::Refreshed,
+                            true,
+                        );
                     }
                     let rec = FleetIdentity {
                         ship_slug: slug.clone(),
@@ -1798,7 +1832,13 @@ impl CaptainsRegistry {
                         state: ClaimState::Active,
                     };
                     g.captains.push(rec.clone());
-                    return Ok(self.commit_claim(g, rec, ClaimDisposition::Created, true));
+                    return self.commit_claim(
+                        g,
+                        previous.clone(),
+                        rec,
+                        ClaimDisposition::Created,
+                        true,
+                    );
                 }
                 Some(i) => {
                     // Idempotent refresh by the SAME terminal.
@@ -1821,7 +1861,13 @@ impl CaptainsRegistry {
                         }
                         let changed = tabs_change || uuid_change || reactivate;
                         let rec = c.clone();
-                        return Ok(self.commit_claim(g, rec, ClaimDisposition::Refreshed, changed));
+                        return self.commit_claim(
+                            g,
+                            previous.clone(),
+                            rec,
+                            ClaimDisposition::Refreshed,
+                            changed,
+                        );
                     }
 
                     // A DIFFERENT terminal holds the key. Classify per the matrix.
@@ -1869,7 +1915,7 @@ impl CaptainsRegistry {
                     c.state = ClaimState::Active;
                     Self::readopt_orphaned_crew(c, crew_liveness);
                     let rec = c.clone();
-                    return Ok(self.commit_claim(g, rec, disposition, true));
+                    return self.commit_claim(g, previous.clone(), rec, disposition, true);
                 }
             }
         }
@@ -1920,7 +1966,9 @@ impl CaptainsRegistry {
     /// a childless claim is removed outright (§3.1 release row). Returns the record
     /// as it stands after release.
     pub fn release(&self, target: &str) -> Result<CaptainRecord, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        let previous = g.clone();
         let Some(idx) = g
             .captains
             .iter()
@@ -1944,9 +1992,7 @@ impl CaptainsRegistry {
             g.captains.remove(idx)
         };
         g.seq += 1;
-        let snap = Self::snapshot_for_persist(&g);
-        drop(g);
-        self.persist(snap);
+        self.commit_mutation(g, previous)?;
         Ok(released)
     }
 
@@ -1958,14 +2004,16 @@ impl CaptainsRegistry {
     /// proceeds) or the crew is already an Active member. The `CrewRef`'s
     /// `claude_uuid` is `None` here (the crew's own SessionStart has not fired yet,
     /// MED-7) and is backfilled later via [`backfill_uuid`](Self::backfill_uuid).
-    pub fn record_crew(&self, spawned_by: &str, crew_session_id: &str) -> bool {
+    pub fn record_crew(&self, spawned_by: &str, crew_session_id: &str) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        let previous = g.clone();
         let Some(c) = g
             .captains
             .iter_mut()
             .find(|c| c.terminal_id.as_deref() == Some(spawned_by))
         else {
-            return false;
+            return Ok(false);
         };
         if let Some(existing) = c
             .crew
@@ -1973,24 +2021,24 @@ impl CaptainsRegistry {
             .find(|cr| cr.terminal_id == crew_session_id)
         {
             if matches!(existing.state, CrewState::Active) {
-                return false;
+                return Ok(false);
             }
             existing.state = CrewState::Active;
         } else {
             c.crew.push(CrewRef::new(crew_session_id));
         }
         g.seq += 1;
-        let snap = Self::snapshot_for_persist(&g);
-        drop(g);
-        self.persist(snap);
-        true
+        self.commit_mutation(g, previous)?;
+        Ok(true)
     }
 
     /// Remove a Crew reference created by a dispatch transaction that failed
     /// before work started. Normal terminal death remains a retained Removed
     /// record; this method is only rollback for an uncommitted dispatch.
-    pub fn rollback_crew(&self, crew_session_id: &str) -> bool {
+    pub fn rollback_crew(&self, crew_session_id: &str) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        let previous = g.clone();
         let mut changed = false;
         for captain in &mut g.captains {
             let before = captain.crew.len();
@@ -2001,11 +2049,9 @@ impl CaptainsRegistry {
         }
         if changed {
             g.seq = g.seq.saturating_add(1);
-            let snap = Self::snapshot_for_persist(&g);
-            drop(g);
-            self.persist(snap);
+            self.commit_mutation(g, previous)?;
         }
-        changed
+        Ok(changed)
     }
 
     /// Backfill the Claude continuity anchor for a tile once the StatusBridge
@@ -2014,11 +2060,13 @@ impl CaptainsRegistry {
     /// `CrewRef` whose `terminal_id` matches, but ONLY when currently `None` (never
     /// overwrites a resolved anchor). Returns true (revision bumped) if it filled
     /// one. A pure enrichment - it changes no ownership.
-    pub fn backfill_uuid(&self, tile: &str, uuid: &str) -> bool {
+    pub fn backfill_uuid(&self, tile: &str, uuid: &str) -> Result<bool, String> {
         if tile.is_empty() || uuid.is_empty() {
-            return false;
+            return Ok(false);
         }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        let previous = g.clone();
         let mut changed = false;
         for c in g.captains.iter_mut() {
             if c.terminal_id.as_deref() == Some(tile) && c.claude_uuid.is_none() {
@@ -2034,11 +2082,9 @@ impl CaptainsRegistry {
         }
         if changed {
             g.seq += 1;
-            let snap = Self::snapshot_for_persist(&g);
-            drop(g);
-            self.persist(snap);
+            self.commit_mutation(g, previous)?;
         }
-        changed
+        Ok(changed)
     }
 
     /// Resolve which SHIP (and, for a supervisor, which role) a terminal id belongs
@@ -2084,8 +2130,10 @@ impl CaptainsRegistry {
     ///
     /// Records are retained INDEFINITELY (D6); reap timing stays reap-ship's. Returns
     /// true (revision bumped) if anything changed.
-    pub fn remove_session(&self, session_id: &str) -> bool {
+    pub fn remove_session(&self, session_id: &str) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        let previous = g.clone();
         let now = now_ms();
         let mut changed = false;
         // Case 1: a supervisor's terminal died -> Orphaned, un-pointed, crew orphaned.
@@ -2112,19 +2160,19 @@ impl CaptainsRegistry {
         }
         if changed {
             g.seq += 1;
-            let snap = Self::snapshot_for_persist(&g);
-            drop(g);
-            self.persist(snap);
+            self.commit_mutation(g, previous)?;
         }
-        changed
+        Ok(changed)
     }
 
     /// Drop a closed workspace tab from every captain's `workspaceTabIds` (the
     /// registry must never advertise ownership of a tab that no longer exists).
     /// The claim itself survives - a captain can control zero tabs. Returns true
     /// (revision bumped) if anything changed.
-    pub fn prune_tab(&self, tab_id: &str) -> bool {
+    pub fn prune_tab(&self, tab_id: &str) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
+        let previous = g.clone();
         let mut changed = false;
         for c in g.captains.iter_mut() {
             let before = c.workspace_tab_ids.len();
@@ -2133,11 +2181,9 @@ impl CaptainsRegistry {
         }
         if changed {
             g.seq += 1;
-            let snap = Self::snapshot_for_persist(&g);
-            drop(g);
-            self.persist(snap);
+            self.commit_mutation(g, previous)?;
         }
-        changed
+        Ok(changed)
     }
 }
 
@@ -6131,7 +6177,7 @@ fn rollback_crew_dispatch(
             }
         }
     }
-    ctx.captains.rollback_crew(crew_session_id);
+    let _ = ctx.captains.rollback_crew(crew_session_id);
     let _ = captains_sync_apply(ctx);
 }
 
@@ -6528,7 +6574,12 @@ fn reconcile_powder_leases(ctx: &ControlContext) {
                     .and_then(|client| client.release(&claim));
                 let released = result.is_ok();
                 let error = result.err();
-                ctx.captains.remove_session(&crew_session_id);
+                if let Err(error) = ctx.captains.remove_session(&crew_session_id) {
+                    eprintln!(
+                        "t-hub-control: dead Crew registry reconciliation failed for \
+                         '{crew_session_id}': {error}"
+                    );
+                }
                 let _ = captains_sync_apply(ctx);
                 ctx.fanout.emit_event(
                     "control://powder",
@@ -6698,7 +6749,7 @@ fn report_workspace_tabs(ctx: &ControlContext, args: &Value) -> Result<Value, St
             // converge.
             let mut pruned = false;
             for tab_id in &removed_tab_ids {
-                pruned |= ctx.captains.prune_tab(tab_id);
+                pruned |= ctx.captains.prune_tab(tab_id)?;
             }
             if pruned {
                 let _ = captains_sync_apply(ctx);
@@ -7241,7 +7292,15 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     // Captain-chat phase 2: link the spawned worktree terminal to its captain.
     // No terminal (headless boot / spawn failure) = no crew session to record.
     let crew_recorded = match (&spawned_by, &terminal_id) {
-        (Some(cap), Some(id)) => ctx.captains.record_crew(cap, id),
+        (Some(cap), Some(id)) => match ctx.captains.record_crew(cap, id) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                let _ = close_terminal(ctx, &json!({ "sessionId": id }));
+                return Err(format!(
+                    "create_worktree: Crew registry persistence failed and the terminal was rolled back: {error}"
+                ));
+            }
+        },
         _ => false,
     };
     if crew_recorded {
@@ -7573,7 +7632,7 @@ fn close_tab(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let orphaned = ctx.tabs.remove_tab(&tab_id, force)?;
     // Captains must never advertise ownership of a tab that no longer exists
     // (the claim itself survives - a captain can control zero tabs).
-    if ctx.captains.prune_tab(&tab_id) {
+    if ctx.captains.prune_tab(&tab_id)? {
         let _ = captains_sync_apply(ctx);
     }
     let mut res =
@@ -8047,9 +8106,22 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // Captain-chat phase 2: record the crew link under the spawning captain.
     // The spawn NEVER fails on this - an unclaimed spawnedBy simply records
     // nothing (crewRecorded: false tells the caller to claim_captain first).
-    let crew_recorded = spawned_by
-        .as_deref()
-        .is_some_and(|cap| ctx.captains.record_crew(cap, &id));
+    let crew_recorded = match spawned_by.as_deref() {
+        Some(cap) => match ctx.captains.record_crew(cap, &id) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                let _ = tmux::kill_session_tree(&tmux_session);
+                ctx.tabs.remove_tile(&id);
+                if let Some(identity) = &minted_identity {
+                    ctx.identity.retire(&identity.id);
+                }
+                return Err(format!(
+                    "spawn_terminal: Crew registry persistence failed and the terminal was rolled back: {error}"
+                ));
+            }
+        },
+        None => false,
+    };
     if crew_recorded {
         let _ = captains_sync_apply(ctx);
     }
@@ -8457,7 +8529,7 @@ fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     }
     // Captain-chat phase 2: a dead session leaves the captains registry too -
     // its captaincy is released and it drops out of every crew list.
-    if ctx.captains.remove_session(tile_id) {
+    if ctx.captains.remove_session(tile_id)? {
         let _ = captains_sync_apply(ctx);
     }
     // Comms-plane Phase 2 (review M3): a dead session's per-session identity is
@@ -11562,7 +11634,7 @@ mod tests {
 
         // Re-claim by the SAME terminal to a new ship is a re-designation: slug/tabs
         // refresh, crew kept, no duplicate record.
-        assert!(reg.record_crew("cap-1", "crew-1"));
+        assert!(reg.record_crew("cap-1", "crew-1").unwrap());
         let out = reg
             .claim(
                 "cap-1",
@@ -11627,7 +11699,7 @@ mod tests {
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-old", Some("t-hub-app"), vec![])
             .unwrap();
-        assert!(reg.record_crew("cap-old", "crew-1"));
+        assert!(reg.record_crew("cap-old", "crew-1").unwrap());
         // cap-old's pane is gone; cap-new re-claims the same ship (no UUID resolved).
         let dead_is_old = |tile: &str| tile == "cap-old";
         let out = reg
@@ -11668,7 +11740,7 @@ mod tests {
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-old", Some("t-hub-app"), vec![])
             .unwrap();
-        assert!(reg.record_crew("cap-old", "crew-1"));
+        assert!(reg.record_crew("cap-old", "crew-1").unwrap());
         let before_seq = reg.snapshot().seq;
         let probe_times_out = |_: &str| tmux::is_definitively_gone(tmux::SessionLiveness::Unknown);
         let err = reg
@@ -11736,9 +11808,9 @@ mod tests {
         // needed) re-adopts the record → Active and resurrects its Orphaned crew.
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-old", Some("shipx"), vec![]).unwrap();
-        assert!(reg.record_crew("cap-old", "crew-1"));
+        assert!(reg.record_crew("cap-old", "crew-1").unwrap());
         assert!(
-            reg.remove_session("cap-old"),
+            reg.remove_session("cap-old").unwrap(),
             "captain death marks orphaned"
         );
         assert!(matches!(only(&reg).state, ClaimState::Orphaned { .. }));
@@ -11766,10 +11838,10 @@ mod tests {
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-old", Some("shipx"), vec![]).unwrap();
         for c in ["crew-alive", "crew-gone", "crew-unknown"] {
-            assert!(reg.record_crew("cap-old", c));
+            assert!(reg.record_crew("cap-old", c).unwrap());
         }
         assert!(
-            reg.remove_session("cap-old"),
+            reg.remove_session("cap-old").unwrap(),
             "captain death orphans the crew"
         );
         assert!(
@@ -11834,9 +11906,9 @@ mod tests {
         // captain's record is retained Orphaned, un-pointed, with its crew Orphaned.
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
-        assert!(reg.record_crew("cap-1", "crew-1"));
-        assert!(reg.record_crew("cap-1", "crew-2"));
-        assert!(reg.remove_session("cap-1"));
+        assert!(reg.record_crew("cap-1", "crew-1").unwrap());
+        assert!(reg.record_crew("cap-1", "crew-2").unwrap());
+        assert!(reg.remove_session("cap-1").unwrap());
         let rec = only(&reg);
         assert!(
             matches!(rec.state, ClaimState::Orphaned { .. }),
@@ -11857,9 +11929,9 @@ mod tests {
         // leaving the live captain + sibling crew untouched.
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
-        assert!(reg.record_crew("cap-1", "crew-1"));
-        assert!(reg.record_crew("cap-1", "crew-2"));
-        assert!(reg.remove_session("crew-1"));
+        assert!(reg.record_crew("cap-1", "crew-1").unwrap());
+        assert!(reg.record_crew("cap-1", "crew-2").unwrap());
+        assert!(reg.remove_session("crew-1").unwrap());
         let rec = only(&reg);
         assert_eq!(rec.state, ClaimState::Active, "captain still alive");
         let c1 = rec.crew.iter().find(|c| c.terminal_id == "crew-1").unwrap();
@@ -11871,7 +11943,7 @@ mod tests {
         assert_eq!(c2.state, CrewState::Active);
         // Removing an unknown session changes nothing (no revision bump).
         let seq = reg.snapshot().seq;
-        assert!(!reg.remove_session("nobody"));
+        assert!(!reg.remove_session("nobody").unwrap());
         assert_eq!(reg.snapshot().seq, seq);
     }
 
@@ -11880,18 +11952,18 @@ mod tests {
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
         assert!(
-            !reg.record_crew("cap-ghost", "crew-1"),
+            !reg.record_crew("cap-ghost", "crew-1").unwrap(),
             "unclaimed spawner is a no-op"
         );
-        assert!(reg.record_crew("cap-1", "crew-1"));
+        assert!(reg.record_crew("cap-1", "crew-1").unwrap());
         assert!(
-            !reg.record_crew("cap-1", "crew-1"),
+            !reg.record_crew("cap-1", "crew-1").unwrap(),
             "duplicate Active crew must not re-add"
         );
         // A reused tile id after its ref was Removed re-activates (does not duplicate).
-        assert!(reg.remove_session("crew-1"));
+        assert!(reg.remove_session("crew-1").unwrap());
         assert!(
-            reg.record_crew("cap-1", "crew-1"),
+            reg.record_crew("cap-1", "crew-1").unwrap(),
             "reused tile reactivates"
         );
         let rec = only(&reg);
@@ -11960,7 +12032,7 @@ mod tests {
     fn release_with_crew_becomes_vacant_childless_removes() {
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-1", Some("alpha"), vec![]).unwrap();
-        assert!(reg.record_crew("cap-1", "crew-1"));
+        assert!(reg.record_crew("cap-1", "crew-1").unwrap());
         // Release with crew: transition to Vacant (re-claimable), crew preserved.
         let released = reg.release("alpha").unwrap();
         assert_eq!(released.state, ClaimState::Vacant);
@@ -12000,7 +12072,7 @@ mod tests {
             &crew_all_alive,
         )
         .unwrap();
-        assert!(reg.record_crew("cap-1", "crew-1"));
+        assert!(reg.record_crew("cap-1", "crew-1").unwrap());
         assert_eq!(
             reg.ship_of("cap-1"),
             Some(ShipMembership::Supervisor {
@@ -12016,7 +12088,7 @@ mod tests {
         );
         assert_eq!(reg.ship_of("nobody"), None);
         // A Removed crew tile no longer resolves.
-        assert!(reg.remove_session("crew-1"));
+        assert!(reg.remove_session("crew-1").unwrap());
         assert_eq!(reg.ship_of("crew-1"), None);
     }
 
@@ -12025,15 +12097,15 @@ mod tests {
         // MED-7: the async-resolved anchor is backfilled once, never overwritten.
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-1", Some("shipx"), vec![]).unwrap();
-        assert!(reg.record_crew("cap-1", "crew-1"));
-        assert!(reg.backfill_uuid("cap-1", "uuid-cap"));
-        assert!(reg.backfill_uuid("crew-1", "uuid-crew"));
+        assert!(reg.record_crew("cap-1", "crew-1").unwrap());
+        assert!(reg.backfill_uuid("cap-1", "uuid-cap").unwrap());
+        assert!(reg.backfill_uuid("crew-1", "uuid-crew").unwrap());
         let rec = only(&reg);
         assert_eq!(rec.claude_uuid.as_deref(), Some("uuid-cap"));
         assert_eq!(rec.crew[0].claude_uuid.as_deref(), Some("uuid-crew"));
         // A second backfill of an already-resolved anchor is a no-op (no seq bump).
         let seq = reg.snapshot().seq;
-        assert!(!reg.backfill_uuid("cap-1", "uuid-other"));
+        assert!(!reg.backfill_uuid("cap-1", "uuid-other").unwrap());
         assert_eq!(reg.snapshot().seq, seq);
         assert_eq!(only(&reg).claude_uuid.as_deref(), Some("uuid-cap"));
     }
@@ -12096,17 +12168,17 @@ mod tests {
         let reg = CaptainsRegistry::new();
         reg.claim_test("cap-1", Some("alpha"), vec!["tab-1".into(), "tab-2".into()])
             .unwrap();
-        assert!(reg.prune_tab("tab-1"));
+        assert!(reg.prune_tab("tab-1").unwrap());
         let snap = reg.snapshot();
         assert_eq!(
             snap.captains[0].workspace_tab_ids,
             vec!["tab-2".to_string()]
         );
         assert!(
-            !reg.prune_tab("tab-1"),
+            !reg.prune_tab("tab-1").unwrap(),
             "already-pruned tab must not bump the revision"
         );
-        assert!(reg.prune_tab("tab-2"));
+        assert!(reg.prune_tab("tab-2").unwrap());
         // Zero controlled tabs is a valid claim state.
         assert_eq!(reg.snapshot().captains.len(), 1);
     }
@@ -12118,7 +12190,7 @@ mod tests {
             let reg = CaptainsRegistry::load(path.clone());
             reg.claim_test("cap-1", Some("alpha"), vec!["tab-1".into()])
                 .unwrap();
-            reg.record_crew("cap-1", "crew-1");
+            reg.record_crew("cap-1", "crew-1").unwrap();
         }
         // A fresh load (an app restart) resumes the same claims AND revision.
         let reg = CaptainsRegistry::load(path.clone());
@@ -12143,6 +12215,22 @@ mod tests {
             });
         assert!(!leftover_tmp, "atomic write must leave no .tmp file behind");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn registry_mutation_fails_and_restores_memory_when_persistence_fails() {
+        let blocker = captains_tmp("persist-blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let reg = CaptainsRegistry::load(blocker.join("captains.json"));
+
+        let error = reg
+            .claim_test("cap-1", Some("alpha"), vec!["tab-1".into()])
+            .unwrap_err();
+
+        assert!(error.contains("could not be created"), "got: {error}");
+        assert_eq!(reg.snapshot().seq, 0);
+        assert!(reg.snapshot().captains.is_empty());
+        std::fs::remove_file(blocker).unwrap();
     }
 
     #[test]
@@ -13888,7 +13976,7 @@ mod tests {
         let store = Arc::new(crate::identity::IdentityStore::ephemeral());
         let reg = Arc::new(CaptainsRegistry::new());
         reg.claim_test("cap-b", Some("ship-b"), vec![]).unwrap();
-        assert!(reg.record_crew("cap-b", "crew-b"));
+        assert!(reg.record_crew("cap-b", "crew-b").unwrap());
         let crew_a = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
         let ctx = test_ctx("ctrl")
             .with_read_token("read-t".to_string())
@@ -13941,9 +14029,9 @@ mod tests {
         let store = Arc::new(crate::identity::IdentityStore::ephemeral());
         let reg = Arc::new(CaptainsRegistry::new());
         reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
-        assert!(reg.record_crew("cap-a", "crew-a"));
+        assert!(reg.record_crew("cap-a", "crew-a").unwrap());
         reg.claim_test("cap-b", Some("ship-b"), vec![]).unwrap();
-        assert!(reg.record_crew("cap-b", "crew-b"));
+        assert!(reg.record_crew("cap-b", "crew-b").unwrap());
         let crew_a = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
         let cap_a = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
         let cortana = mint_session(&store, crate::identity::Role::Cortana, "cortana", "cor");
@@ -14023,7 +14111,7 @@ mod tests {
         let reg = Arc::new(CaptainsRegistry::new());
         reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
         reg.claim_test("cap-b", Some("ship-b"), vec![]).unwrap();
-        assert!(reg.record_crew("cap-b", "crew-b"));
+        assert!(reg.record_crew("cap-b", "crew-b").unwrap());
         let cap_a = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
         let ctx = test_ctx("ctrl")
             .with_identity_store(store)
@@ -14104,8 +14192,8 @@ mod tests {
         let store = Arc::new(crate::identity::IdentityStore::ephemeral());
         let reg = Arc::new(CaptainsRegistry::new());
         reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
-        assert!(reg.record_crew("cap-a", "crew-a"));
-        assert!(reg.record_crew("cap-a", "crew-a2"));
+        assert!(reg.record_crew("cap-a", "crew-a").unwrap());
+        assert!(reg.record_crew("cap-a", "crew-a2").unwrap());
         let inbox = Arc::new(crate::inbox::Inbox::ephemeral());
         let crew_a = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
         let cap_a = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
@@ -14181,8 +14269,8 @@ mod tests {
         let reg = Arc::new(CaptainsRegistry::new());
         reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
         reg.claim_test("cap-b", Some("ship-b"), vec![]).unwrap();
-        assert!(reg.record_crew("cap-b", "crew-b"));
-        assert!(reg.record_crew("cap-a", "crew-a"));
+        assert!(reg.record_crew("cap-b", "crew-b").unwrap());
+        assert!(reg.record_crew("cap-a", "crew-a").unwrap());
         let cap_a = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
         let crew_a = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
         let ctx = test_ctx("ctrl")
@@ -14709,14 +14797,15 @@ mod tests {
             seq: 0,
             captains: vec![],
             projects: vec![],
-        });
+        })
+        .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(
             body.contains("alpha"),
             "stale seq-0 snapshot must not clobber the claim: {body}"
         );
         // A NEWER snapshot (seq 1, already on disk) is allowed to (re)write.
-        reg.persist(newer);
+        reg.persist(newer).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14842,7 +14931,7 @@ mod tests {
             .unwrap();
         reg.bind_ship_context("crew-project", "project-crew", "Own delivery", "codex")
             .unwrap();
-        assert!(reg.record_crew("captain-1", "crew-1"));
+        assert!(reg.record_crew("captain-1", "crew-1").unwrap());
         reg.bind_crew_context(
             "captain-1",
             "crew-1",
@@ -14913,11 +15002,11 @@ mod tests {
     }
 
     #[test]
-    fn a_stalled_persist_does_not_block_a_concurrent_registry_reader_or_mutator() {
+    fn a_stalled_persist_keeps_the_previous_snapshot_readable() {
         // The core Incident-D proof: with persistence moved OFF the `inner` lock, a
         // STALLED disk write (here a hook that blocks while holding only the
-        // `persist` mutex) must NOT block a concurrent reader or mutator that only
-        // touches `inner`. Under the OLD code (persist under the registry lock) the
+        // `persist` mutex) must NOT block a concurrent reader that only touches
+        // `inner`. Under the OLD code (persist under the registry lock) the
         // reader below would hang for the duration of the stall - so this test would
         // TIME OUT and fail, which is exactly the regression guard we want.
         use std::sync::mpsc;
@@ -14938,9 +15027,8 @@ mod tests {
             let _ = release_rx.lock().unwrap().recv(); // block: the write is stalled
         }));
 
-        // A background mutator triggers a persist and stalls inside it. Its `inner`
-        // mutation (the claim) has ALREADY committed + released `inner` by the time
-        // persist runs, so `inner` is free while this stalls.
+        // A background mutator builds a candidate and stalls while persisting it.
+        // The prior snapshot remains published and `inner` is free while this stalls.
         let writer_reg = reg.clone();
         let writer = std::thread::spawn(move || {
             writer_reg
@@ -14965,7 +15053,7 @@ mod tests {
             .expect(
                 "a reader was BLOCKED by a stalled persist (regression: persist holds `inner`)",
             );
-        assert_eq!(n, 1, "the reader sees the already-committed claim");
+        assert_eq!(n, 0, "the reader sees only the last durable snapshot");
 
         // Release the stalled write; the mutator finishes cleanly.
         let _ = release_tx.send(());

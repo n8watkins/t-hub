@@ -647,7 +647,7 @@ pub async fn kill_terminal(
     // via forgetCaptain -> release_captain; remove_session is idempotent, so the
     // overlap is a harmless no-op.)
     let captains = app.state::<std::sync::Arc<crate::control::CaptainsRegistry>>();
-    if captains.remove_session(&id) {
+    if captains.remove_session(&id)? {
         let fanout = app.state::<std::sync::Arc<crate::control::EventFanout>>();
         forward_captains_sync(&app, &captains, &fanout);
     }

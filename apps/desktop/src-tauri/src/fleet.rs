@@ -286,7 +286,11 @@ impl FleetNotifier {
         // a CrewRef minted with `claude_uuid: None` at record time). A no-op once
         // filled / when the tile is not a member; the anchor is a fast-path hint, never
         // load-bearing, so gating it on an armed watch is fine.
-        self.captains.backfill_uuid(&tile, session_uuid);
+        if let Err(error) = self.captains.backfill_uuid(&tile, session_uuid) {
+            eprintln!(
+                "t-hub-fleet: continuity backfill persistence failed for tile '{tile}': {error}"
+            );
+        }
 
         let mut st = self.state.lock().expect("fleet notifier mutex poisoned");
 
