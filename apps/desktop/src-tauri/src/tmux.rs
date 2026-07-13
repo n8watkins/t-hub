@@ -498,13 +498,22 @@ pub fn harness_liveness(name: &str, harness: &str) -> SessionLiveness {
             |pane| {
                 if pane.command.eq_ignore_ascii_case(&expected) {
                     SessionLiveness::Alive
-                } else {
+                } else if is_fallback_shell(&pane.command) {
                     SessionLiveness::Gone
+                } else {
+                    SessionLiveness::Unknown
                 }
             },
         ),
         Err(_) => SessionLiveness::Unknown,
     }
+}
+
+fn is_fallback_shell(command: &str) -> bool {
+    matches!(
+        command.trim().to_ascii_lowercase().as_str(),
+        "bash" | "cmd" | "fish" | "nu" | "powershell" | "pwsh" | "sh" | "zsh"
+    )
 }
 
 /// The transfer-grade / reap-grade death signal (R1): `true` ONLY when a probe
@@ -728,10 +737,12 @@ pub fn pane_info() -> Result<Vec<PaneInfo>, TmuxError> {
     // foreground process's comm — which is the RUNTIME (e.g. `node`) for agents
     // shipped as scripts: the Codex CLI is `node …/codex`, so it'd read as "node"
     // and never be detected as Codex (Claude runs as `claude`, so it's fine). So
-    // when the foreground is a runtime, we resolve the real agent from the pane
-    // pid's child argv (`/proc/<kid>/cmdline`) and substitute `codex`/`claude` as
-    // the command. Output shape is unchanged, so the parser/callers don't change.
-    // Best-effort: no pgrep / no match leaves the original command intact.
+    // when the foreground is a runtime, we resolve the real agent from the pane's
+    // foreground process group and substitute `codex`/`claude` as the command.
+    // `pane_pid` is normally the long-lived shell, not the foreground runtime, so
+    // inspecting only its immediate children misses launchers such as
+    // shell -> node -> native codex. Best-effort: no foreground pid / no match
+    // leaves the original command intact.
     let script = format!(
         "tmux -L {sock} list-panes -a -F \
 '#{{session_name}}|#{{pane_current_command}}|#{{pane_current_path}}|#{{pane_pid}}' \
@@ -740,7 +751,12 @@ case \"$cmd\" in node|bun|deno|python|python3) \
 for kid in $(pgrep -P \"$pid\" 2>/dev/null); do \
 line=$(tr '\\0' ' ' < /proc/$kid/cmdline 2>/dev/null); \
 case \"$line\" in *codex*) eff=codex; break;; *claude*) eff=claude; break;; esac; \
-done;; esac; printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done",
+done;; esac; case \"$eff\" in node|bun|deno|python|python3) \
+fgpid=$(ps -o tpgid= -p \"$pid\" 2>/dev/null | tr -d ' '); \
+case \"$fgpid\" in ''|*[!0-9]*|0) fgpid=\"$pid\";; esac; \
+line=$(tr '\\0' ' ' < /proc/$fgpid/cmdline 2>/dev/null); \
+case \"$line\" in *codex*) eff=codex;; *claude*) eff=claude;; esac;; esac; \
+printf '%s|%s|%s\\n' \"$s\" \"$eff\" \"$path\"; done",
         sock = socket()
     );
     let output =
@@ -1277,5 +1293,32 @@ mod tests {
         assert_eq!(harness_liveness(&name, "codex"), SessionLiveness::Alive);
         let _ = kill_session(&name);
         std::fs::remove_dir_all(bin_dir).unwrap();
+    }
+
+    #[test]
+    fn harness_liveness_accepts_a_node_wrapped_codex_process() {
+        if !tmux_available()
+            || !Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            eprintln!(
+                "tmux::tests::harness_liveness_accepts_a_node_wrapped_codex_process: \
+                 tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let name = format!("th_harness-node-{}", uuid::Uuid::new_v4().simple());
+        let fixture_dir = std::env::temp_dir().join(format!("{name}-fixture"));
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let launcher = fixture_dir.join("codex.js");
+        std::fs::write(&launcher, "setInterval(() => {}, 1000);\n").unwrap();
+        let command = format!("node {}", launcher.display());
+        new_session_with_env(&name, "/tmp", Some(&command), &[]).unwrap();
+
+        assert_eq!(harness_liveness(&name, "codex"), SessionLiveness::Alive);
+        let _ = kill_session(&name);
+        std::fs::remove_dir_all(fixture_dir).unwrap();
     }
 }
