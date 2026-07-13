@@ -2,8 +2,8 @@
 
 **Date:** 2026-07-13.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
-**Local branch:** `main` at `4776194`.
-**Status:** Implementation and local verification are complete, but independent review found seven high-severity blockers that must be fixed before installation or runtime acceptance.
+**Local branch:** `main` at `85eb54d`.
+**Status:** The implementation, first review fixes, second review fixes, and local verification are complete.
 The Windows T-Hub application has not been rebuilt or installed and the commits have not been pushed.
 
 ## Reset Resume Point
@@ -12,7 +12,7 @@ The canonical role is now Captain.
 Shipmate remains only as a compatibility alias that loads the Captain skill.
 Codex and Claude use the same repository-managed Captain protocol.
 
-T-Hub now persists projects, Captain assignments, harness identity, Crew metadata, Powder mappings, Powder claims, and Powder event cursors in the versioned Captain registry.
+T-Hub now persists projects, Captain assignments, harness identity, Captain and Crew conversation checkpoints, Crew metadata, Powder mappings, Powder claims, and Powder event cursors in the versioned Captain registry.
 This state is designed to reconstruct a Captain after conversation replacement, context reset, application restart, or terminal relocation.
 
 Powder remains authoritative for cards, runs, claims, work logs, input requests, completion evidence, and its event stream.
@@ -21,7 +21,7 @@ No Powder source files were changed.
 
 ## Commits
 
-The implementation is the contiguous review range `15840dd^..4776194`.
+The implementation and review fixes are the contiguous range `15840dd^..85eb54d`.
 
 1. `15840dd feat(skills): rename shipmate protocol to captain`
 2. `baf18eb feat(captain): persist project and Powder context`
@@ -33,6 +33,20 @@ The implementation is the contiguous review range `15840dd^..4776194`.
 8. `400db3b feat(powder): consume durable event tail`
 9. `4d0e378 feat(powder): reconcile events into captain inbox`
 10. `4776194 ci: gate main and releases on quality checks`
+11. `b6de34e fix(captain): verify coding harness liveness`
+12. `7cff5de fix(captain): fail closed on registry persistence`
+13. `375f0d2 fix(captain): retain incomplete Crew rollbacks`
+14. `545ea4d fix(captain): preserve Powder events across rebinds`
+15. `049706d docs(captain): route staffing through Crew dispatch`
+16. `fc691f6 feat(captain): persist conversation checkpoints`
+17. `2bfaf34 fix(powder): require secure authorized preflight`
+18. `b45b01e feat(captain): install skills for both harnesses`
+19. `9bc2ae2 ci: enforce MSRV and warning-free Clippy`
+20. `fa70f1d fix(captain): detect runtime-wrapped harnesses`
+21. `96a9314 fix(captain): retain failed Crew cleanup state`
+22. `82f25c4 fix(captain): preflight dual-harness installs`
+23. `5441c0e fix(captain): restore skill installer executable`
+24. `85eb54d fix(captain): preserve repeated Crew cleanup retries`
 
 ## What Was Implemented
 
@@ -47,7 +61,7 @@ The implementation is the contiguous review range `15840dd^..4776194`.
 
 ### Durable Project and Captain Identity
 
-- `captains.json` schema version 3 stores registered projects and Powder event cursors.
+- `captains.json` schema version 4 stores registered projects, conversation checkpoints, and Powder event cursors.
 - Project registration canonicalizes the Git main worktree and prevents split identities for one checkout.
 - A project stores its canonical repository root, display name, remote metadata, default branch, Powder repository, and protected connection-profile name.
 - A Captain stores its project ID, assignment, harness, conversation continuity, reset source, and Crew roster.
@@ -68,7 +82,8 @@ The implementation is the contiguous review range `15840dd^..4776194`.
 - `dispatch_crew` validates the project checkout and Powder card repository before creating work.
 - T-Hub starts a bare read-capability terminal before claiming the card.
 - T-Hub persists the authoritative card ID and run ID before launching Codex or Claude.
-- Failures roll back the terminal, claim, and uncommitted Crew record.
+- Failures roll back the terminal, claim, and uncommitted Crew record only after terminal stop and Powder release are both confirmed.
+- A failed Powder release leaves a durable `cleanupPending` Crew record with its card and run binding intact.
 - The lease reconciler renews claims only when tmux proves that the Crew terminal is alive.
 - The reconciler releases claims and marks Crew removed only when tmux proves that the terminal is gone.
 - Ambiguous terminal liveness causes no Powder mutation.
@@ -93,22 +108,23 @@ The implementation is the contiguous review range `15840dd^..4776194`.
 - The quality workflow now runs for pull requests, pushes to `main`, manual dispatch, and as a reusable release gate.
 - Rust formatting, Rust workspace tests, Clippy, TypeScript, Vitest, and the production frontend bundle are checked.
 - Windows installer signing cannot begin until the reusable quality jobs pass on the exact release commit.
-- Strict `clippy -D warnings` is not enabled for the full workspace because the existing baseline has approximately 98 warnings.
-- The protocol crate does pass strict Clippy after replacing its manual Priority default implementation.
+- CI validates the declared Rust 1.89 MSRV with the locked workspace.
+- Full-workspace Clippy runs with `-D warnings`.
 
 ### Local Harness Installation
 
-- `scripts/captain/install-thub-codex.sh` rebuilt and installed the current release MCP binary at `~/.t-hub/bin/t-hub-mcp`.
-- The installed binary hash matched `apps/desktop/src-tauri/target/release/t-hub-mcp` after installation.
-- Codex already points its `t-hub` MCP registration at that installed binary.
-- A new Codex session is required before the expanded MCP tool catalog is available.
+- `scripts/captain/install-thub-codex.sh` installs the MCP binary and the Captain and Shipmate skills for both Codex and Claude.
+- Skill conflicts are checked before the MCP binary or Codex registration changes.
+- The four skill destinations are committed as one rollback-capable transaction.
+- The current review-fix build has not been installed.
+- New Codex and Claude sessions are required after installation so their cached MCP and skill catalogs reload.
 
 ## Verification Evidence
 
-- `cargo test --workspace`: 653 passed, 0 failed, 1 ignored.
-- `cargo check --workspace`: passed without warnings after the final edits.
+- `cargo test --workspace`: 664 passed, 0 failed, 1 ignored.
+- `cargo +1.89.0 check --workspace --locked`: passed.
 - `cargo fmt --all -- --check`: passed.
-- `cargo clippy -p t-hub-protocol --all-targets -- -D warnings`: passed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `pnpm typecheck`: passed.
 - `pnpm --filter t-hub-desktop test`: 400 passed across 40 files.
 - `pnpm build`: passed.
@@ -158,9 +174,9 @@ Workflow YAML parses locally, but GitHub must validate the reusable workflow cal
 
 An independent review of `15840dd^..4776194` completed without modifying files.
 The reviewer found seven high-severity blockers and four medium-severity findings.
-Do not install or runtime-accept the integration until high findings 1 through 7 are fixed and independently re-reviewed.
+All eleven first-review findings were addressed and verified in focused tests.
 
-### High-Severity Findings
+### First-Review High-Severity Findings - Resolved
 
 1. Relevant Powder events are skipped permanently when no active Captain terminal exists.
 `apply_powder_events` advances the cursor even when it cannot enqueue to a recipient, and terminal-keyed inbox state is not migrated when a ship is re-adopted.
@@ -197,7 +213,7 @@ The client accepts arbitrary `http://` endpoints and attaches its bearer token.
 See `apps/desktop/src-tauri/src/powder.rs:154`.
 Require HTTPS for production profiles and allow HTTP only for an explicit loopback development mode.
 
-### Medium-Severity Findings
+### First-Review Medium-Severity Findings - Resolved
 
 1. Captain commissioning checks `/healthz` but does not prove that the configured credential can perform an authorized read.
 Add an authorization probe before process creation.
@@ -211,11 +227,31 @@ Raise or validate the MSRV and establish a warning-clean Clippy baseline.
 4. MCP schemas do not encode the backend requirement that `dispatch_crew` and `captain_bootstrap` receive a Captain session or ship address.
 Add schema `anyOf` requirements for the supported addressing fields.
 
-### Review Test Gaps
+### Second Review
+
+A second independent review covered the first-review fix range through `9bc2ae2`.
+It confirmed eight first-review fixes and found three remaining regressions.
+
+1. Real Codex sessions launch through Node and were still classified as dead.
+`fa70f1d` now resolves the pane foreground process group and treats unfamiliar commands as indeterminate instead of dead.
+A live tmux test covers the Node-wrapped Codex topology.
+2. A failed rollback release marked the Crew terminal removed despite claiming the binding was retained.
+`96a9314` introduces a durable `cleanupPending` state and keeps the Powder card/run binding available for retry.
+An end-to-end tmux lifecycle test forces profile resolution failure and verifies the retained record.
+3. A late unmanaged Claude skill conflict could leave Codex and the MCP binary partially updated.
+`82f25c4` preflights every destination before MCP mutation and installs all four skill targets transactionally.
+The isolated installer test verifies that a final-target conflict leaves the binary, registration, and every skill destination unchanged.
+
+The second-review findings are resolved locally.
+
+A final focused review found that a second failed manual cleanup attempt could change `cleanupPending` to `removed`.
+`85eb54d` makes cleanup-pending retention automatic until Powder confirms release and extends the lifecycle test through two failed attempts.
+The reviewer found no other blocker in runtime-wrapped Codex detection or the four-target skill transaction.
+
+### Remaining Test Gaps
 
 - No process-level test exits Codex or Claude while leaving the fallback shell alive and then checks Captain deduplication and lease renewal.
 - No persistence-failure test covers commissioning or dispatch rollback.
-- No event test covers an absent Captain, ship rebind, or terminal-keyed inbox migration.
 - No dispatch end-to-end test exercises a real Powder server, authorization, claim, and rollback together.
 - UI tests omit failure paths, cancellation during commissioning, focus handling, and duplicate submissions.
 - CI has no Windows and WSL packaged end-to-end coverage, and the reusable workflow has not run remotely.
@@ -224,19 +260,16 @@ Add schema `anyOf` requirements for the supported addressing fields.
 
 1. Read this handoff, the repository `AGENTS.md`, `skills/captain/SKILL.md`, `docs/POWDER-INTEGRATION.md`, and `docs/PRODUCTION-READINESS.md`.
 2. Run `git status --short` and confirm only `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` remain as pre-existing untracked user artifacts.
-3. Run `git log --oneline -12` and confirm local `main` ends at `4776194` or a later review-fix commit.
+3. Run `git log --oneline -16` and confirm local `main` ends at `85eb54d` or a later commit.
 4. Do not push, release, install, merge, or modify Powder without explicit user authorization.
-5. Reproduce and fix high-severity review findings 1 through 7 in that order unless dependency analysis requires a different sequence.
-6. Add focused regression tests for each review finding.
-7. Run a second independent review over the original range plus every review-fix commit.
-8. Re-run the complete Rust and frontend gates only after focused tests pass.
-9. Confirm the Powder endpoint and obtain a sanctioned agent-scoped credential command.
-10. Create the protected Powder profile and verify it with the new `powder_status` command after the reviewed T-Hub build is installed.
-11. Push only when the user explicitly requests it.
-12. Build and install the Windows application only after remote CI passes, high findings are closed, and the user explicitly authorizes installation.
-13. Restart T-Hub after installation.
-14. Start a new Codex or Claude session so its cached MCP and skill catalog reloads.
-15. Run the runtime acceptance plan below before calling the integration complete.
+5. Re-run the complete Rust and frontend gates after any additional change.
+6. Confirm the Powder endpoint and obtain a sanctioned agent-scoped credential command.
+7. Create the protected Powder profile and verify it with the new `powder_status` command after the reviewed T-Hub build is installed.
+8. Push only when the user explicitly requests it.
+9. Build and install the Windows application only after remote CI passes, high findings are closed, and the user explicitly authorizes installation.
+10. Restart T-Hub after installation.
+11. Start a new Codex or Claude session so its cached MCP and skill catalog reloads.
+12. Run the runtime acceptance plan below before calling the integration complete.
 
 ## Runtime Acceptance Plan
 
@@ -290,12 +323,12 @@ Add schema `anyOf` requirements for the supported addressing fields.
 
 The requested integration is implemented, but the project is not yet stable-release ready.
 The current stop-ship items remain documented in `docs/PRODUCTION-READINESS.md`.
-The highest priorities are packaged Windows and WSL end-to-end automation, Authenticode signing, dependency and secret scanning, webview CSP and devtools hardening, strict branch protection, Clippy baseline cleanup, and correcting the Rust 1.77 MSRV mismatch.
+The highest priorities are packaged Windows and WSL end-to-end automation, Authenticode signing, dependency and secret scanning, webview CSP and devtools hardening, and strict branch protection.
 The production frontend also needs intentional chunk splitting because the icon bundle is approximately 3.72 MB and the main application bundle is approximately 1.20 MB before compression.
 
 ## Decision Boundary
 
-The next safe action is to fix the seven high-severity independent-review findings and add their regression tests.
+The next safe action is push and remote CI when explicitly authorized.
 The next external dependency is a confirmed Powder endpoint plus a sanctioned agent-scoped credential source.
-Deployment remains blocked until a second independent review clears the fixes.
+Deployment remains blocked until the Windows build passes remote CI and the Powder profile is configured.
 After that, the deployment sequence is push, remote CI, Windows build, install, T-Hub restart, and new harness sessions, each requiring the user's explicit authorization where it is outward-facing or changes the installed application.
