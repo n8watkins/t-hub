@@ -10332,22 +10332,44 @@ mod tests {
             },
         ]);
         assert!(ctx.tab_registry().set_active_tab("keep"));
+        let spawn_started = std::env::temp_dir().join(format!(
+            "t-hub-spawn-race-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
 
         let closer = {
             let ctx = ctx.clone();
+            let spawn_started = spawn_started.clone();
             std::thread::spawn(move || {
+                // Wait until the pane command proves spawn passed strict tab
+                // validation. This targets the intended resolve->place race
+                // without allowing the close to invalidate the request before
+                // spawn_terminal begins.
+                for _ in 0..200 {
+                    if spawn_started.exists() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(spawn_started.exists(), "spawn pane never signaled startup");
                 // Either outcome is legal: the close wins (spawn falls back to
                 // "keep") or the placement wins (close refuses the non-empty tab).
                 let _ = dispatch(&ctx, "close_tab", &json!({"tabId": "doomed"}));
             })
         };
+        let startup_command = format!("touch {}", spawn_started.display());
         let v = dispatch(
             &ctx,
             "spawn_terminal",
-            &json!({"cwd": "/tmp", "tabId": "doomed"}),
+            &json!({
+                "cwd": "/tmp",
+                "tabId": "doomed",
+                "startupCommand": startup_command,
+            }),
         )
         .unwrap();
         closer.join().unwrap();
+        let _ = std::fs::remove_file(spawn_started);
 
         let id = v["id"].as_str().unwrap().to_string();
         let placed_tab = v["tabId"].as_str().expect("always placed").to_string();
