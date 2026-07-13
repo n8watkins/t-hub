@@ -75,5 +75,6 @@ Then `pnpm tauri dev` (a window opens through WSLg).
 
 ## Roadmap & docs
 
+- **[docs/PRODUCTION-READINESS.md](./docs/PRODUCTION-READINESS.md)** - the active stabilization program, CI target, security workstreams, and measurable Alpha/Beta/Stable release gates.
 - **[docs/PLAN.md](./docs/PLAN.md)** — the original phased plan (0.5 → 2.0). Most of the 0.5 supervision track has since shipped; kept as the design-rationale record.
 - **[PRD.md](./PRD.md)** — full product spec. **[REVIEW.md](./REVIEW.md)** — review + the verified Claude Code integration facts (hooks, sessions, statusline, SDK) the plan relies on.
