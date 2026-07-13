@@ -2,7 +2,7 @@
 
 How T-Hub launches, steers, and recalls an OpenAI Codex (`codex-cli`) agent, and the doctrine that keeps it safe.
 Phase 1 adds the adapter seam, the spawn presets, MCP provisioning, and resume wiring (PR-A); the `codex exec --json` lifecycle producer (PR-B) and the continuity catalog (PR-C) build on top.
-Verified against the fleet-pinned `codex-cli 0.142.5`.
+Originally verified against `codex-cli 0.142.5`; MCP provisioning was re-verified against `codex-cli 0.144.3` on 2026-07-13.
 
 ## The seam
 
@@ -66,9 +66,11 @@ Explicit non-goal for Phase 1: `db.rs` orphan recovery stays Claude-keyed.
 
 ## Provisioning
 
-`scripts/captain/ensure-thub-codex.sh` registers the t-hub MCP server with Codex via `codex mcp add t-hub -- $BIN` (deploy it to `~/.t-hub/captain/` by copy or symlink).
+`scripts/captain/install-thub-codex.sh` builds the release MCP binary, atomically installs it at `~/.t-hub/bin/t-hub-mcp`, deploys the provisioner, and registers the server.
+`scripts/captain/ensure-thub-codex.sh` is the idempotent registration-only entry point and converges a stale command path to the installed binary through `codex mcp remove` plus `codex mcp add`.
 It never hand-writes `config.toml` - `codex mcp add` merges natively and preserves user `[hooks]`/`[hooks.state]` trust blocks byte-for-byte.
 Codex MCP registration is user-global (`$CODEX_HOME/config.toml`), not per-repo like Claude's `.mcp.json`; least-privilege still holds because the READ capability token is injected at the tmux session level and inherited by the `t-hub-mcp` child.
+Start a new Codex session after installation so the new MCP tool catalog is loaded.
 
 ## Tab naming (MED-4)
 

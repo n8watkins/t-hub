@@ -6,6 +6,7 @@
 #   1. [mcp_servers.t-hub] is added.
 #   2. the pre-seeded [hooks] / [hooks.state] block is byte-preserved (MED-3).
 #   3. a re-run is idempotent (config.toml unchanged, exit 0).
+#   4. a stale t-hub command converges to the requested binary.
 #
 # Requires codex on PATH (the merge is codex-native); SKIPs cleanly if absent so
 # it never fails a host without codex-cli. Run: bash ensure-thub-codex.test.sh
@@ -28,6 +29,17 @@ fi
 WORK="$(mktemp -d "${HOME}/.thub-codex-provtest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 export CODEX_HOME="$WORK"
+FAKE_BIN="$WORK/t-hub-mcp"
+
+cat > "$FAKE_BIN" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--list-tools" ]; then
+  printf '[{"name":"list_terminals"}]\n'
+  exit 0
+fi
+exit 1
+EOF
+chmod 700 "$FAKE_BIN"
 
 # Pre-seed a user config with [hooks] + [hooks.state] trust blocks (the clobber
 # risk the provisioner must not touch).
@@ -45,7 +57,7 @@ EOF
 HOOKS_BEFORE="$(sed -n '/^\[hooks\]/,/^\[mcp_servers/p' "$WORK/config.toml" | grep -v '^\[mcp_servers')"
 
 # --- 1. first run registers the server --------------------------------------
-if T_HUB_MCP_BIN="/fake/bin/t-hub-mcp" bash "$SCRIPT" >/dev/null 2>&1; then
+if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
   pass "first run exits 0"
 else
   fail "first run exited non-zero"
@@ -75,7 +87,7 @@ fi
 
 # --- 3. idempotent re-run ---------------------------------------------------
 SNAP="$(cat "$WORK/config.toml")"
-if T_HUB_MCP_BIN="/fake/bin/t-hub-mcp" bash "$SCRIPT" >/dev/null 2>&1; then
+if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
   pass "re-run exits 0"
 else
   fail "re-run exited non-zero"
@@ -84,6 +96,24 @@ if [ "$SNAP" = "$(cat "$WORK/config.toml")" ]; then
   pass "re-run left config.toml unchanged (idempotent)"
 else
   fail "re-run mutated config.toml"
+fi
+
+# --- 4. stale registration converges ----------------------------------------
+STALE_BIN="$WORK/stale-t-hub-mcp"
+cp "$FAKE_BIN" "$STALE_BIN"
+codex mcp remove t-hub >/dev/null 2>&1
+codex mcp add t-hub -- "$STALE_BIN" >/dev/null 2>&1
+
+if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
+  pass "stale registration update exits 0"
+else
+  fail "stale registration update exited non-zero"
+fi
+
+if codex mcp get t-hub --json | grep -Fq "\"command\": \"$FAKE_BIN\""; then
+  pass "stale registration converged to requested binary"
+else
+  fail "stale registration did not converge"
 fi
 
 if [ "$FAILED" -eq 0 ]; then

@@ -9,7 +9,7 @@
 //! Tiers (PRD §11.2):
 //!   - **Read** (allowed): `list_terminals`, `get_status`, `wait_for_status`,
 //!     `supervision_tree`, `wsl_health`, `search_files`, `list_tabs`,
-//!     `list_captains`, `list_fleet_watches`, `read_terminal`.
+//!     `list_captains`, `list_fleet_watches`, `read_terminal`, `my_capability`.
 //!   - **Organization** (allowed, audited): `focus_session`, `move_tile`,
 //!     `rename_tab`, `new_tab`, `focus_tab`, `close_tab`, `claim_captain`,
 //!     `release_captain`, `watch_fleet`, `unwatch_fleet`, `open_file`,
@@ -423,6 +423,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_empty,
         },
         ToolDef {
+            name: "my_capability",
+            tier: Tier::Read,
+            summary: "Report whether the presented T-Hub token grants read or control capability.",
+            input_schema: schema_empty,
+        },
+        ToolDef {
             name: "get_status",
             tier: Tier::Read,
             summary: "Get the FR-012 status (+ latest statusline snapshot) for one session.",
@@ -618,6 +624,7 @@ mod tests {
         let names: Vec<&str> = catalog().iter().map(|t| t.name).collect();
         for expected in [
             "list_terminals",
+            "my_capability",
             "get_status",
             "wait_for_status",
             "supervision_tree",
@@ -653,9 +660,15 @@ mod tests {
         for name in ["send_text", "send_keys", "close_terminal"] {
             let mcp = find(name).unwrap().to_mcp();
             let desc = mcp["description"].as_str().unwrap();
-            assert!(desc.contains("CONFIRMATION REQUIRED"), "{name} desc: {desc}");
+            assert!(
+                desc.contains("CONFIRMATION REQUIRED"),
+                "{name} desc: {desc}"
+            );
             assert_eq!(mcp["annotations"]["confirmationRequired"], true, "{name}");
-            assert_eq!(mcp["annotations"]["t-hubTier"], "process-changing", "{name}");
+            assert_eq!(
+                mcp["annotations"]["t-hubTier"], "process-changing",
+                "{name}"
+            );
         }
     }
 
@@ -678,13 +691,27 @@ mod tests {
 
     #[test]
     fn read_tools_are_not_confirmation_gated() {
-        for name in ["list_terminals", "get_status", "wsl_health"] {
+        for name in [
+            "list_terminals",
+            "my_capability",
+            "get_status",
+            "wsl_health",
+        ] {
             let mcp = find(name).unwrap().to_mcp();
             assert_eq!(
                 mcp["annotations"]["confirmationRequired"], false,
                 "{name} should not require confirmation"
             );
         }
+    }
+
+    #[test]
+    fn my_capability_is_read_tier_with_no_arguments() {
+        let tool = find("my_capability").unwrap();
+        let mcp = tool.to_mcp();
+        assert_eq!(mcp["annotations"]["t-hubTier"], "read");
+        assert_eq!(mcp["annotations"]["confirmationRequired"], false);
+        assert_eq!((tool.input_schema)(), schema_empty());
     }
 
     #[test]
@@ -714,7 +741,10 @@ mod tests {
             let mcp = find(name).unwrap().to_mcp();
             assert_eq!(mcp["annotations"]["t-hubTier"], "organization", "{name}");
             assert_eq!(mcp["annotations"]["confirmationRequired"], false, "{name}");
-            assert!(mcp["description"].as_str().unwrap().contains("audited"), "{name}");
+            assert!(
+                mcp["description"].as_str().unwrap().contains("audited"),
+                "{name}"
+            );
         }
         let claim_schema = (find("claim_captain").unwrap().input_schema)();
         assert_eq!(claim_schema["required"], json!(["captainSessionId"]));

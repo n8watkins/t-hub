@@ -26,7 +26,7 @@ Allow crew to use bounded ephemeral subagents only when the brief and active pol
 1. Run `scripts/check_environment.sh` from this skill directory.
 2. Require a tmux session named `th_<terminal-id>`.
 3. Require the `t-hub` MCP registration.
-4. If registration is missing, stop orchestration and report that `scripts/captain/ensure-thub-codex.sh` must be deployed and run, then start a new Codex session.
+4. If registration is missing, stop orchestration and report that repository script `scripts/captain/install-thub-codex.sh` must be run, then start a new Codex session.
 5. Never hand-edit `~/.codex/config.toml` to add the MCP server.
 6. Call `my_capability` when the T-Hub tools are available.
 7. Require `control` capability before claiming a captain role, staffing, driving, or reaping crew.
@@ -156,7 +156,7 @@ After restart, bootstrap again, reclaim the same ship, and reconcile the durable
 ## Known Integration Limits
 
 - Codex MCP registration is user-global and takes effect for new Codex sessions.
-- The current provisioning script points to a development `t-hub-mcp` binary until a packaged sidecar is shipped.
+- The WSL-side MCP binary is installed at `~/.t-hub/bin/t-hub-mcp`; producing it automatically from the Windows release pipeline remains future release work.
 - Codex lifecycle production and provider-aware recovery remain incomplete until the repository's PR-B and PR-C work lands.
 - T-Hub control authority comes from the spawned session capability, not from the presence of the skill or MCP registration.
 - Powder work-state integration is separate and must not be implied unless the Powder MCP and production endpoint are configured.
