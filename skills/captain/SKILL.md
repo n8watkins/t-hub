@@ -83,16 +83,25 @@ Default to no more than three concurrent crew unless the user requests more.
 Group crew for the same repository under one named T-Hub tab.
 Use separate tabs for separate projects, not for every worktree.
 
-## Staff Codex Crew
+## Staff Crew
 
 1. Decompose the assignment into independent tasks with non-overlapping ownership where practical.
-2. Use `create_worktree` with a short branch, explicit worktree path, shared project tab name, and `startupCommand: "codex"`.
-3. Do not silently elevate Codex permissions.
-4. Use the repository's established permission policy or obtain explicit authorization for a more permissive launch command.
-5. Read the terminal after spawn and verify that the Codex TUI is active before sending prose.
-6. Send one concise brief containing scope, constraints, definition of done, owned files or boundaries, required tests, commit and push expectations, and escalation rules.
-7. End every brief with the exact completion command `touch /tmp/t-hub-crew-done/<ship-slug>/<crew-name>.done` as the final action.
-8. Add the new terminal and worktree to the ship roster immediately.
+2. Require an authoritative Powder card mapped to the Captain project's Powder repository before staffing.
+3. Select the project's canonical checkout or prepare an isolated Git worktree with a short branch and an explicit path.
+4. Do not use `create_worktree`, `spawn_terminal`, raw tmux, Codex collaboration subagents, or Claude subagents to start durable Crew.
+5. Call `dispatch_crew` with the Captain address, Powder `cardId`, full task brief, `worktreePath`, branch, shared project tab, and `harness: "codex"` or `harness: "claude"`.
+6. Treat `dispatch_crew` as one transaction that validates the project checkout, validates and claims the Powder card, persists the Crew binding, launches the selected harness, verifies harness liveness, and rolls back on failure.
+7. Do not send a second prose brief after dispatch because the task passed to `dispatch_crew` is the authoritative launch prompt.
+8. Read the terminal after dispatch and verify that the selected harness is active and the prompt contains the expected ship, card, run, checkout, and Captain session.
+9. Add the returned terminal, worktree, branch, harness, conversation identifier, Powder card, and run to the durable roster immediately.
+10. If dispatch reports incomplete rollback, stop staffing and reconcile the retained Crew binding and Powder claim before retrying.
+
+Build the `task` passed to `dispatch_crew` as one concise brief containing scope, constraints, definition of done, owned files or boundaries, required tests, commit and push expectations, escalation rules, and the exact final completion command `touch /tmp/t-hub-crew-done/<ship-slug>/<crew-name>.done`.
+
+Use the same dispatch flow for Codex and Claude Crew.
+Choose the harness deliberately from task needs and repository policy rather than inheriting it accidentally from the Captain.
+Never silently elevate either harness's permissions.
+Use the repository's established permission policy or obtain explicit authorization for a more permissive launch.
 
 Include these decision rules in every crew brief:
 
