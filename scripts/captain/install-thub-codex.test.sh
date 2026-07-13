@@ -18,6 +18,8 @@ WORK="$(mktemp -d "${HOME}/.thub-codex-installtest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 export CODEX_HOME="$WORK/codex-home"
 mkdir -p "$CODEX_HOME"
+export CLAUDE_HOME="$WORK/claude-home"
+mkdir -p "$CLAUDE_HOME"
 
 SOURCE="$WORK/source-t-hub-mcp"
 cat > "$SOURCE" <<'EOF'
@@ -50,6 +52,18 @@ if [ -x "$CAPTAIN_DIR/ensure-thub-codex.sh" ]; then
 else
   fail "deployed provisioner is missing or not executable"
 fi
+
+for skill in \
+  "$CODEX_HOME/skills/captain/SKILL.md" \
+  "$CODEX_HOME/skills/shipmate/SKILL.md" \
+  "$CLAUDE_HOME/skills/captain/SKILL.md" \
+  "$CLAUDE_HOME/skills/shipmate/SKILL.md"; do
+  if [ -f "$skill" ]; then
+    pass "installed skill ${skill#"$WORK/"}"
+  else
+    fail "missing installed skill ${skill#"$WORK/"}"
+  fi
+done
 
 if codex mcp get t-hub --json 2>/dev/null | grep -Fq "\"command\": \"$BIN_DIR/t-hub-mcp\""; then
   pass "Codex registration points at the installed binary"

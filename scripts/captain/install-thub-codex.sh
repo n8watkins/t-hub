@@ -40,6 +40,7 @@ trap - EXIT
 
 install -m 700 "$HERE/ensure-thub-codex.sh" "$CAPTAIN_DIR/ensure-thub-codex.sh"
 T_HUB_MCP_BIN="$DEST" "$CAPTAIN_DIR/ensure-thub-codex.sh"
+bash "$HERE/install-captain-skills.sh"
 
 echo "install-thub-codex: installed $DEST"
-echo "install-thub-codex: start a new Codex session to load the t-hub tools"
+echo "install-thub-codex: start new Codex and Claude sessions to load the updated integration"
