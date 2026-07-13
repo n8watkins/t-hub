@@ -3,7 +3,7 @@ name = "t-hub-mcp"
 version = "0.5.0"
 description = "T-Hub's local MCP server: speaks the MCP protocol (JSON-RPC over stdio) and forwards tools/call to the running T-Hub app over the loopback control channel (PRD §9.6)."
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.89"
 
 # A single binary launched by the MCP client (Claude) over stdio. It is
 # deliberately dependency-light: no async runtime, no MCP SDK — the MCP protocol

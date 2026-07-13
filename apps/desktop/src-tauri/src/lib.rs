@@ -1,3 +1,10 @@
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 // --- 0.1 nucleus (unchanged) ---
 mod bounded_exec; // shared bounded-subprocess exec (drain+kill+reap on timeout); the single choke point tmux.rs + git.rs route every child through so no control handler parks forever
 mod commands;
@@ -727,7 +734,7 @@ pub fn run() {
             // global flip, so the wheel still sent arrow keys in old panes). Run
             // off-thread: it spawns one `wsl.exe tmux` per live session, which we
             // never want to block the window's first paint on. Best-effort.
-            std::thread::spawn(|| tmux::ensure_mouse_on());
+            std::thread::spawn(tmux::ensure_mouse_on);
             // (The durable workspace DB — app_data_dir/t-hub.db, WAL+NORMAL — is
             // opened + managed + wired into the status bridge above, before any
             // statusline ingest; see the WS-6 block.)

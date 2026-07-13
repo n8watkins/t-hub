@@ -424,24 +424,23 @@ mod tests {
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
-                    match journal_arc.tail_from(offset, last_seq) {
-                        Ok((entries, new_offset, new_seq)) => {
-                            for entry in entries {
-                                let frame = AgentFrame {
-                                    channel: Channel::Events,
-                                    msg: AgentToCore::Journal {
-                                        seq: entry.seq,
-                                        entry,
-                                    },
-                                };
-                                if tx.send(frame).is_err() {
-                                    return;
-                                }
+                    if let Ok((entries, new_offset, new_seq)) =
+                        journal_arc.tail_from(offset, last_seq)
+                    {
+                        for entry in entries {
+                            let frame = AgentFrame {
+                                channel: Channel::Events,
+                                msg: AgentToCore::Journal {
+                                    seq: entry.seq,
+                                    entry,
+                                },
+                            };
+                            if tx.send(frame).is_err() {
+                                return;
                             }
-                            offset = new_offset;
-                            last_seq = new_seq;
                         }
-                        Err(_) => {}
+                        offset = new_offset;
+                        last_seq = new_seq;
                     }
                 }
             });

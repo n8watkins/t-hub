@@ -3,7 +3,7 @@ name = "t-hub-protocol"
 version = "0.5.0"
 description = "Shared, versioned NDJSON-over-stdio protocol between the T-Hub core (Windows) and the WSL-side t-hub-agent."
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.89"
 
 [lib]
 name = "t_hub_protocol"

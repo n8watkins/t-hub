@@ -115,7 +115,7 @@ fn newest_rollout_usage(codex_dir: &std::path::Path) -> Option<CodexUsage> {
     let sessions = codex_dir.join("sessions");
     let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
     collect_rollouts(&sessions, &mut files, 0);
-    files.sort_by(|a, b| b.0.cmp(&a.0)); // newest mtime first
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.0)); // newest mtime first
     let mut best: Option<(String, CodexUsage)> = None; // (event timestamp, usage)
     for (_, path) in files.iter().take(8) {
         let Some((ts, body)) = last_rate_limits_in(path) else {

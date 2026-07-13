@@ -34,12 +34,12 @@ pub fn note_emit() {
 /// main-thread probe RUNS. LOWERED to hunt the residual "staggered" sub-500ms
 /// stutter (A1): probe every 100ms and log whenever two consecutive probe runs land
 /// >=200ms apart — i.e. the main-thread pump was starved for ~PERIOD beyond the
-/// normal cadence. With PERIOD=100 a true block of duration D yields a gap in
-/// [D, D+PERIOD], so a >=200ms stall is RELIABLY caught regardless of phase (the old
-/// per-probe "remaining wait" metric only saw one probe's tail and missed
-/// sub-PERIOD-aligned blocks). The gap metric also emits ONE line per stall: the
-/// queued probes that burst out right after a block see a ~0 gap. Raise back toward
-/// 500 once the culprit is fixed to quiet the log.
+/// > normal cadence. With PERIOD=100 a true block of duration D yields a gap in
+/// > [D, D+PERIOD], so a >=200ms stall is RELIABLY caught regardless of phase (the old
+/// > per-probe "remaining wait" metric only saw one probe's tail and missed
+/// > sub-PERIOD-aligned blocks). The gap metric also emits ONE line per stall: the
+/// > queued probes that burst out right after a block see a ~0 gap. Raise back toward
+/// > 500 once the culprit is fixed to quiet the log.
 const PERIOD: Duration = Duration::from_millis(100);
 const STALL_MS: u64 = 200;
 

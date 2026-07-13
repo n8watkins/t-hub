@@ -70,8 +70,10 @@ use super::AgentBridge;
 /// the agent down and the core must re-handshake + replay the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum ConnectionState {
     /// No agent process / pipe.
+    #[default]
     Disconnected,
     /// Child spawned; `Hello` sent, awaiting `Ready`.
     Handshaking,
@@ -83,12 +85,6 @@ pub enum ConnectionState {
     Reconnecting,
     /// Permanently failed (e.g. agent binary missing); needs user action.
     Failed,
-}
-
-impl Default for ConnectionState {
-    fn default() -> Self {
-        ConnectionState::Disconnected
-    }
 }
 
 // ---------------------------------------------------------------------------

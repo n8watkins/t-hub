@@ -1,3 +1,5 @@
+#![allow(clippy::doc_overindented_list_items)]
+
 //! `t-hub-agent` — the WSL-side control agent (PLAN.md Workstream A).
 //!
 //! Launched by the T-Hub core as:

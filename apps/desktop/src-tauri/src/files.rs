@@ -739,7 +739,7 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<i64> {
             } else {
                 // Gap penalty grows with distance (capped) so tight matches win.
                 let gap = (idx - prev) as i64;
-                score -= (gap.min(8)) * 1;
+                score -= gap.min(8);
             }
         } else {
             // First matched char: prefix start is best.

@@ -967,14 +967,14 @@ where
     #[serde(untagged)]
     enum CrewWire {
         Legacy(String),
-        Modern(CrewRef),
+        Modern(Box<CrewRef>),
     }
     let raw = Vec::<CrewWire>::deserialize(d)?;
     Ok(raw
         .into_iter()
         .map(|c| match c {
             CrewWire::Legacy(tile) => CrewRef::new(&tile),
-            CrewWire::Modern(r) => r,
+            CrewWire::Modern(r) => *r,
         })
         .collect())
 }
@@ -3497,7 +3497,7 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
                     // Read-tier stream: the read token may subscribe too (a
                     // least-privilege monitor legitimately needs the event feed).
                     // PTY attach below stays control-token-only (it can type).
-                    if !token_is_valid(&ctx, &req.token) {
+                    if !token_is_valid(ctx, &req.token) {
                         write_response(
                             &mut writer,
                             &ControlResponse::err("unauthorized: bad control token"),
@@ -5421,7 +5421,7 @@ fn supervision_tree(ctx: &ControlContext, args: &Value) -> Result<Value, String>
         .ok_or("supervision_tree requires a 'sessionId' argument")?;
     let key = resolve_supervisor_key(ctx, &session_id);
     let tree = ctx.with_supervisor(|s| s.tree(&key));
-    Ok(serde_json::to_value(tree).map_err(|e| e.to_string())?)
+    serde_json::to_value(tree).map_err(|e| e.to_string())
 }
 
 /// `wsl_health`: a compact WSL host snapshot. We synthesize it from the locally
@@ -6021,7 +6021,7 @@ fn commission_captain(ctx: &ControlContext, args: &Value) -> Result<Value, Strin
             && captain.harness.as_deref() == Some(harness.as_provider())
             && requested_slug
                 .as_deref()
-                .map_or(true, |slug| slug == captain.ship_slug);
+                .is_none_or(|slug| slug == captain.ship_slug);
         if !same_contract {
             return Err(format!(
                 "commission_captain: project '{}' already has live Captain '{}' with a different assignment, harness, or shipSlug; release or update that Captain explicitly",
@@ -7291,7 +7291,7 @@ fn open_file(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // under the operator allowlist; loopback (the local MCP) is unrestricted.
     let contents =
         files::control_read_text(&path, !ctx.peer_is_loopback, files::remote_file_roots())?;
-    Ok(serde_json::to_value(contents).map_err(|e| e.to_string())?)
+    serde_json::to_value(contents).map_err(|e| e.to_string())
 }
 
 /// `create_worktree` (WS-4): create a git worktree, then open it as a new
@@ -8762,7 +8762,7 @@ fn collect_host_metrics() -> Value {
             .unwrap_or(0);
         let process_count = count_procs();
         let distro = read_pretty_name();
-        return json!({
+        json!({
             "memTotalKib": mem_total,
             "memAvailableKib": mem_avail,
             "swapTotalKib": swap_total,
@@ -8772,7 +8772,7 @@ fn collect_host_metrics() -> Value {
             "processCount": process_count,
             "distro": distro,
             "capturedAtMs": now_ms,
-        });
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {

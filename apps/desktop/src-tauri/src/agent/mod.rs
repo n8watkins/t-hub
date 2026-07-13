@@ -722,7 +722,7 @@ impl AgentBridge {
         // just skip the redundant emit.
         let prev = status_bridge.get(sid);
         let snap = status_bridge.ingest(sid, raw, entry.timestamp_ms);
-        if prev.as_ref().map_or(true, |p| !p.same_status(&snap)) {
+        if prev.as_ref().is_none_or(|p| !p.same_status(&snap)) {
             self.inner.emit(EVT_STATUS_SNAPSHOT, &snap);
         }
     }
@@ -1014,8 +1014,7 @@ mod tests {
             .events
             .lock()
             .iter()
-            .filter(|(c, _)| c == super::EVT_SESSION_STATUS)
-            .last()
+            .rfind(|(c, _)| c == super::EVT_SESSION_STATUS)
             .cloned()
             .unwrap();
         assert_eq!(last_status.1["status"], "waitingOnSubagents");
@@ -1046,8 +1045,7 @@ mod tests {
             .events
             .lock()
             .iter()
-            .filter(|(c, _)| c == super::EVT_SESSION_STATUS)
-            .last()
+            .rfind(|(c, _)| c == super::EVT_SESSION_STATUS)
             .cloned()
             .expect("a session://status must be emitted on SessionEnd");
         assert_eq!(last_status.1["sessionId"], "o1");
@@ -1076,8 +1074,7 @@ mod tests {
             .events
             .lock()
             .iter()
-            .filter(|(c, _)| c == super::EVT_SESSION_STATUS)
-            .last()
+            .rfind(|(c, _)| c == super::EVT_SESSION_STATUS)
             .cloned()
             .expect("a session://status must be emitted on SessionEnd");
         assert_eq!(last_status2.1["sessionId"], "o2");

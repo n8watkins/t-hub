@@ -3,7 +3,7 @@ name = "t-hub-agent"
 version = "0.5.0"
 description = "T-Hub WSL-side control agent: NDJSON-over-stdio bridge, append-only event journal, tmux/git/metrics RPCs."
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.89"
 
 # A single binary launched by the core as `wsl.exe -d <distro> -- t-hub-agent
 # --stdio` (or directly on a unix dev box).

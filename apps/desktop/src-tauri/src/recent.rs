@@ -274,7 +274,7 @@ fn collect_recent() -> Vec<RecentSession> {
     // Global newest-first ordering. The reader already bounded the set by project,
     // so there is no flat session-count cap to re-apply here (doing so would
     // re-introduce the very eviction the per-project cap exists to prevent).
-    sessions.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    sessions.sort_by_key(|entry| std::cmp::Reverse(entry.last_seen));
     sessions
 }
 
@@ -581,7 +581,7 @@ fn read_sessions_from_dir(
         }
         total += sessions.len();
         // Newest sessions first; keep just this project's newest few.
-        sessions.sort_by(|a, b| b.2.cmp(&a.2));
+        sessions.sort_by_key(|entry| std::cmp::Reverse(entry.2));
         sessions.truncate(per_project_limit);
         let newest = sessions.first().map(|s| s.2).unwrap_or(0);
         buckets.push((newest, sessions));
@@ -589,7 +589,7 @@ fn read_sessions_from_dir(
 
     // Keep the newest `project_limit` projects (by their most-recent session),
     // then flatten back to a session list for the prefix-read phase.
-    buckets.sort_by(|a, b| b.0.cmp(&a.0));
+    buckets.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     buckets.truncate(project_limit);
     let kept_projects = buckets.len();
     let metas: Vec<(String, std::path::PathBuf, i64)> = buckets

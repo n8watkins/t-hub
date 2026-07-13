@@ -29,6 +29,40 @@ permissions:
   contents: read
 
 jobs:
+  rust-msrv:
+    name: Rust MSRV 1.89
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libglib2.0-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            file
+        working-directory: .
+
+      - uses: dtolnay/rust-toolchain@1.89.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+          key: msrv-1.89
+
+      - name: cargo check --workspace --locked
+        run: cargo check --workspace --locked
+
   rust:
     name: Rust (cargo test + clippy)
     runs-on: ubuntu-latest
@@ -84,14 +118,8 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
-      # Clippy runs as a gate but is NOT `-D warnings`: the workspace carries a
-      # large set of pre-existing, tolerated style/doc/MSRV lints (the same bar the
-      # local crews hold), so deny-all would be red from day one. This still fails
-      # the check on genuine clippy ERRORS (the deny-by-default correctness lints)
-      # and on any compile error. Flipping to `-D warnings` belongs in a dedicated
-      # lint-cleanup PR, not this additive gate.
-      - name: cargo clippy --workspace
-        run: cargo clippy --workspace --all-targets
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   frontend:
     name: Frontend (vitest + tsc)

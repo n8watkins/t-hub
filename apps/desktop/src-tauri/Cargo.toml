@@ -24,7 +24,7 @@ version = "0.3.64"
 description = "T-Hub — terminal-first command center for Claude Code sessions in WSL2"
 authors = ["Nathan Watkins"]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.89"
 
 # The Tauri desktop entrypoint lives in `src/main.rs`, which calls into this lib.
 # The lib crate-type set keeps the door open for Tauri's mobile targets later.

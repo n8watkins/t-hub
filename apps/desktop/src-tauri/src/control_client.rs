@@ -186,7 +186,6 @@ pub async fn control_request(
     // on the blocking pool keeps the main thread pumping. (Frontend unchanged —
     // `invoke` already returns a promise.)
     let ep = endpoint.inner().clone();
-    drop(endpoint); // release the State borrow BEFORE the await (keeps the future Send)
     let args = args.unwrap_or(Value::Null);
     tauri::async_runtime::spawn_blocking(move || {
         match request(&ep.addr(), ep.token(), &command, &args) {

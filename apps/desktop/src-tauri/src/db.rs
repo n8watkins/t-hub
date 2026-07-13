@@ -633,7 +633,8 @@ fn classify_orphans(
             session_id: r.session_id,
         });
     }
-    scan.orphans.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    scan.orphans
+        .sort_by_key(|entry| std::cmp::Reverse(entry.last_seen));
     scan
 }
 

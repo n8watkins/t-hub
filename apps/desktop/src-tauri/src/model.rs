@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 /// whose `Stop` fired while `agent_id` children / tasks remain outstanding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum SessionStatus {
     /// Active turn; `UserPromptSubmit` seen, no terminal `Stop` yet.
     Working,
@@ -50,13 +51,8 @@ pub enum SessionStatus {
     /// Transcript missing on a resumability check.
     Expired,
     /// Initial/unknown — no signal yet.
+    #[default]
     Unknown,
-}
-
-impl Default for SessionStatus {
-    fn default() -> Self {
-        SessionStatus::Unknown
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -66,19 +62,15 @@ impl Default for SessionStatus {
 /// Resumability of a Claude session against `~/.claude/projects/.../<id>.jsonl`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum Resumability {
     /// Transcript present; `-r <id>` should work.
     Resumable,
     /// Transcript cleaned up / moved; resume will fail.
     Expired,
     /// Not yet checked.
+    #[default]
     Unknown,
-}
-
-impl Default for Resumability {
-    fn default() -> Self {
-        Resumability::Unknown
-    }
 }
 
 /// The live-attachment lease state (PLAN.md §E "lease, not latch"). A crash with
@@ -86,8 +78,10 @@ impl Default for Resumability {
 /// `LiveInTHub` back to `Free`, not strand the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum LiveAttachmentState {
     /// No live attachment known.
+    #[default]
     Free,
     /// A T-Hub-owned terminal currently holds this session.
     LiveInTHub,
@@ -96,12 +90,6 @@ pub enum LiveAttachmentState {
     LiveExternally,
     /// Lease expired / under reconciliation (heartbeat TTL elapsed).
     Stale,
-}
-
-impl Default for LiveAttachmentState {
-    fn default() -> Self {
-        LiveAttachmentState::Free
-    }
 }
 
 /// A discovered/owned Claude Code session (PRD §8). Populated incrementally:
@@ -223,14 +211,10 @@ pub struct SupervisionTree {
 /// Grid vs. (future) freeform layout for a workspace tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum LayoutMode {
+    #[default]
     Grid,
-}
-
-impl Default for LayoutMode {
-    fn default() -> Self {
-        LayoutMode::Grid
-    }
 }
 
 /// A workspace tab (PLAN.md §F, PRD §8 snapshot track).
@@ -257,35 +241,27 @@ fn default_zoom() -> f32 {
 /// What happens to the backing process when a tile is closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum CloseBehavior {
     /// Detach the tile, keep the tmux process (the 0.1 default).
+    #[default]
     Detach,
     /// Kill the tmux session.
     Kill,
 }
 
-impl Default for CloseBehavior {
-    fn default() -> Self {
-        CloseBehavior::Detach
-    }
-}
-
 /// Recovery policy after a WSL/Windows restart (PLAN.md §G reviewed recovery).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum RecoveryPolicy {
     /// Offer in the recovery review; do nothing automatically.
+    #[default]
     Review,
     /// Eligible for auto-recovery (resume conversation + restart shell).
     Auto,
     /// Never auto-recover.
     Never,
-}
-
-impl Default for RecoveryPolicy {
-    fn default() -> Self {
-        RecoveryPolicy::Review
-    }
 }
 
 /// A persisted terminal record (PRD §8 snapshot track). Distinct from the
