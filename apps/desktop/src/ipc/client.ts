@@ -81,8 +81,34 @@ export function killTerminal(id: TerminalId): Promise<void> {
   return invoke(Commands.killTerminal, { id });
 }
 
+let inflightListTerminals: Promise<TerminalInfo[]> | null = null;
+
+function isBoundedTmuxTimeout(error: unknown): boolean {
+  return String(error).includes("command exceeded 10s timeout");
+}
+
+/**
+ * List the tmux-backed terminals without multiplying cold-start WSL probes.
+ *
+ * Canvas intentionally has both a mount seed and a metadata refresh path, and
+ * other surfaces may mount at the same time. Concurrent callers share one
+ * request. A bounded tmux timeout receives one fresh attempt after the first
+ * handler has returned; other errors remain visible without retry.
+ */
 export function listTerminals(): Promise<TerminalInfo[]> {
-  return invoke(Commands.listTerminals);
+  if (inflightListTerminals) return inflightListTerminals;
+  const request = (async () => {
+    try {
+      return await invoke<TerminalInfo[]>(Commands.listTerminals);
+    } catch (error) {
+      if (!isBoundedTmuxTimeout(error)) throw error;
+      return invoke<TerminalInfo[]>(Commands.listTerminals);
+    }
+  })().finally(() => {
+    if (inflightListTerminals === request) inflightListTerminals = null;
+  });
+  inflightListTerminals = request;
+  return request;
 }
 
 // ---------------------------------------------------------------------------
