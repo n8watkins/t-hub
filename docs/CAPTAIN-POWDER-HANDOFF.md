@@ -3,8 +3,8 @@
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `7f395fb`.
-**Installed Windows build:** T-Hub `0.3.64` produced by production release workflow `29308870690` from `7f395fb`.
+**Source head before this handoff update:** `a4fd704`.
+**Installed Windows build:** locally built T-Hub `0.3.66` from `a4fd704`.
 
 ## Executive Status
 
@@ -13,13 +13,14 @@ The final independent authority review reports no remaining Critical, High, or M
 The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
 
 The final production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `ad5872e4bdf327c11035fb205c7d799a561f96d05a050e52d8a743c3f38e3e8c`.
-The exact release installer SHA-256 is `ff9b71a8b520ffff393d8d67d2e47150dd52df84ee1e79bc7d8b850da5b81a37`.
-It is running as PID `45508` with protocol version `2` and control address `127.0.0.1:60501`.
+The installed executable SHA-256 is `3192f4f18a637dfde6b5e74358b504d05839b19452f94644a08d15c73a3dd141`.
+It is running as PID `13092`.
 
-The T-Hub repository is registered as a durable project but is not bound to Powder.
-The authoritative Powder endpoint remains unreachable from the current tailnet, and no approved agent-scoped credential command is configured.
-Real Powder-backed Captain commissioning and Crew dispatch remain externally blocked and must continue to fail closed.
+The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
+The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
+The `t-hub` Powder board and `thub-local-acceptance` card exist.
+No T-Hub project is currently registered, and the two visible legacy Captain records have no project or Powder binding.
+Real commissioned Captain and Crew acceptance therefore remains incomplete rather than externally blocked.
 
 ## Integrated Commits
 
@@ -48,6 +49,11 @@ The main implementation sequence in this work is:
 - `e2a55c0 fix(identity): prefer durable harness metadata`
 - `212774a fix(tmux): allow healthy WSL command latency`
 - `7f395fb docs: hand off final runtime validation`
+- `21379d2 perf(terminal): expose live resource counters`
+- `d827882 perf(terminal): add hot warm cold lifecycle`
+- `6cd97f8 test(terminal): cover pool lifecycle rehydration`
+- `12c9e0b chore(release): bump desktop to 0.3.65`
+- `a4fd704 fix(windows): own supervisor job handle`
 
 ## Captain and Crew Model
 
@@ -111,19 +117,12 @@ Commissioning requires a healthy protected Powder profile.
 Crew dispatch validates the project checkout and Powder card, claims work, persists the binding, starts the selected harness, verifies liveness, and rolls back failures.
 Ambiguous liveness causes no Powder mutation.
 
-The expected historical endpoint is `https://sanctum.tail5f5eb4.ts.net:10001`.
-The current machine is on the `tailae53f1` tailnet, where no `sanctum`, `powder`, or `bastion` peer is visible and the documented endpoint does not resolve.
-`~/.t-hub/powder-profiles.json` is absent.
-No approved password-manager command, environment source, or other agent-scoped key command is available.
-
-The external requirements are:
-
-1. Make the authoritative Powder deployment reachable from this machine or provide its replacement endpoint.
-2. Provide a command that prints an existing agent-scoped Powder API key.
-3. Provide the Powder agent name that matches that key.
-
-Do not put the raw key in this repository, this handoff, logs, or chat.
-Do not create a separate local Powder authority as a production substitute.
+The historical endpoint `https://sanctum.tail5f5eb4.ts.net:10001` belongs to the Powder author's environment and is not the authority for this installation.
+This installation intentionally uses its own local Powder authority for testing.
+Powder runs on WSL at `127.0.0.1:4017` and Tailscale Serve exposes it privately to this tailnet at `https://n8desktop-wsl.tailae53f1.ts.net`.
+The protected profile is named `n8desktop-wsl`, not `production`.
+Its credential command retrieves the agent key from WSL without storing the raw key in the T-Hub project registry.
+The remaining integration task is to register the T-Hub codebase, bind it to the `t-hub` Powder board with this profile, and perform real Captain and Crew acceptance.
 
 The protected profile should use mode `0600` and this shape:
 
@@ -131,10 +130,10 @@ The protected profile should use mode `0600` and this shape:
 {
   "schemaVersion": 1,
   "profiles": {
-    "production": {
-      "baseUrl": "https://confirmed-powder-endpoint",
-      "agentName": "matching-agent-name",
-      "apiKeyCommand": "command that prints the existing agent-scoped key"
+    "n8desktop-wsl": {
+      "baseUrl": "https://n8desktop-wsl.tailae53f1.ts.net",
+      "agentName": "t-hub",
+      "apiKeyCommand": "protected command that retrieves the WSL agent key"
     }
   }
 }
@@ -216,6 +215,13 @@ Completed low-risk performance changes are:
 - Disabled voice and attention announcements perform no steady Scribe polling.
 - Voice settings hydration races no longer transiently arm polling.
 - PTY output, state, and exit events use keyed subscribers instead of per-terminal global fanout.
+- The UI exposes live terminal resource counters.
+- Parked terminals now move through hot, warm, and cold lifecycle states while tmux remains authoritative.
+- Lifecycle tests cover cold disposal and rehydration.
+
+The installed application is logging current xterm rendering failures involving `loadCell` and `isWrapped`.
+Treat this as a lifecycle race until reproduced and disproved.
+It is the highest-priority correctness issue before further lifecycle optimization.
 
 The fresh general performance review ranked the next work as:
 
@@ -227,20 +233,22 @@ The fresh general performance review ranked the next work as:
 6. Coalesce focus-driven terminal and Git scans, pause low-priority hidden polling, and reduce permanent watchdog cadence after measurement.
 7. Lazy-load and prune the non-Lucide icon resolver stack by selected theme.
 
-The hot, warm, and cold terminal lifecycle is the highest-value RAM and idle CPU change.
-It is also the highest-risk performance change because terminal visibility, scrollback recovery, input readiness, and canvas reattachment require packaged end-to-end testing.
+The hot, warm, and cold terminal lifecycle is now implemented, but it remains the highest-risk performance change.
+Terminal visibility, scrollback recovery, input readiness, and canvas reattachment still require packaged end-to-end testing, and the current xterm errors must be resolved before the lifecycle is accepted for production.
 
 ## Remaining Production Work
 
 The ordered continuation is:
 
-1. Confirm the Codex versus Claude terminal-header label interactively in the installed application.
-2. Make the authoritative Powder deployment reachable and configure the protected agent profile.
-3. Commission disposable Codex and Claude project Captains once Powder is reachable and the protected profile exists.
-4. Verify context reset recovery, Crew dispatch, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
-5. Add in-app lifecycle counters and run stable packaged 1, 4, 8, and 16 terminal acceptance measurements.
-6. Implement hot, warm, and cold terminal parking while preserving authoritative tmux rehydration.
-7. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
+1. Reproduce and fix the installed xterm lifecycle rendering errors.
+2. Replace manual Captain repository entry with a WSL codebase picker, simplify project terminology, and add a commissioning preflight summary.
+3. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
+4. Verify context reset recovery, Crew dispatch into a deliberate shared workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
+5. Wire the Board panel to the focused project's Powder profile instead of the global `http://localhost:4000` default.
+6. Replace the unclear Dev then Preview sequence with a guided Run and Preview flow.
+7. Confirm the Claude terminal-header label interactively in the installed application.
+8. Run stable packaged 1, 4, 8, and 16 terminal acceptance measurements, including cold rehydration, input readiness, and canvas rendering.
+9. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
 
 Additional production-readiness gaps remain outside the Captain slice:
 
@@ -269,6 +277,7 @@ Additional production-readiness gaps remain outside the Captain slice:
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
 The WSL skill migration, authority hardening, immutable CI action migration, provider identity fix, push, CI, production release, Windows installation, and four-terminal packaged measurement are complete through `7f395fb`.
 The live smoke reproduced a five-second tmux timeout against a healthy `4.3s` Windows-to-WSL command, widened the bounded default to ten seconds, and verified the final packaged request in `0.673s`.
-The immediate local action is an interactive terminal-header visual check, followed by the measured terminal lifecycle optimization tranche.
-Powder-backed acceptance remains externally blocked until the authoritative endpoint and agent-scoped credential source are available.
-Performance optimization has a reviewed, measured order, with inactive terminal lifecycle as the primary next implementation tranche.
+The source is ahead of `origin/main` by five commits through `a4fd704`, and the locally installed Windows build is `0.3.66`.
+The local Powder endpoint and protected agent credential path are operational.
+The immediate action is to fix the xterm lifecycle race, then improve Captain creation and run real Powder-backed Captain and Crew acceptance.
+The Board endpoint, Preview workflow, Claude header check, packaged performance matrix, and release hardening remain open.

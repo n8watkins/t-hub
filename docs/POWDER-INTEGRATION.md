@@ -4,6 +4,77 @@ T-Hub integrates with Powder through Powder's versioned HTTP API and does not mo
 Powder remains authoritative for cards, claims, runs, work logs, input requests, and completion evidence.
 T-Hub remains authoritative for projects, ships, terminal identity, Crew liveness, harness selection, checkout paths, and card/run-to-terminal bindings.
 
+## Product Terms
+
+A **codebase** is the Git checkout on disk that the user wants a Captain to manage.
+The current API and persisted registry call its durable T-Hub record a **project**.
+In normal use, one project represents one canonical Git repository checkout and its worktrees.
+A **Powder board** is the Powder repository namespace containing cards for that codebase.
+It is not another Git checkout.
+
+A project may be registered without Powder, but a commissioned Captain requires a verified Powder binding.
+Older pinned Captain tiles may lack a project or Powder binding because pinning is only visual state and does not commission a Captain.
+
+## User-Facing Captain Flow
+
+The intended creation flow is:
+
+1. Open **Commission Captain**.
+2. Choose a saved codebase or browse WSL for a new Git checkout.
+3. Let T-Hub detect the canonical main worktree, display name, remote, default branch, and existing worktrees.
+4. Select or confirm the matching Powder board.
+5. Keep the protected Powder connection profile under **Advanced** unless more than one valid profile is available.
+6. Describe the Captain's assignment.
+7. Choose the Captain harness, Codex or Claude.
+8. Review a preflight summary covering the codebase, Git state, Powder health and authorization, board match, assignment, and harness.
+9. Commission the Captain.
+
+Commissioning creates a control-capability terminal in the reserved Captains workspace, starts the selected harness, claims a durable ship, binds it to the project and assignment, and provides bootstrap instructions.
+If any required preflight or startup step fails, commissioning fails closed and rolls back the incomplete Captain.
+
+The current dialog does not yet implement the WSL browser, automatic Git and Powder discovery, simplified terminology, or the preflight summary.
+It still exposes manual repository path, project name, Powder repository, and connection profile fields.
+
+## Captain Options and Crew Flow
+
+Commissioning creates only the Captain.
+It does not create Crew automatically.
+
+After commissioning, the Captain can:
+
+- Read the project, assignment, Powder board, active Crew, and recovery state through `captain_bootstrap`.
+- Decompose the assignment into independent Powder cards.
+- Dispatch a Crew member for an existing card with a selected Codex or Claude harness.
+- Run Crew in the canonical checkout or a validated Git worktree belonging to the project.
+- Select a branch and a shared workspace for each Crew member.
+- Monitor Crew status, context, questions, blockers, terminal output, Powder claims, and completion evidence.
+- Send verified input, focus a Crew terminal, checkpoint recovery state, interrupt its own Crew, and close completed Crew safely.
+
+The default operating limit is three concurrent Crew unless the General requests more.
+Durable Crew are leaf workers and do not create more durable Crew.
+Work that needs another orchestration layer should receive another commissioned Captain.
+
+Each Crew dispatch requires an existing Powder card belonging to the Captain project's Powder board.
+`dispatch_crew` validates the checkout and card, creates a read-capability terminal, claims the card, records the Crew binding, launches the chosen harness, verifies liveness, and rolls the operation back if any step fails.
+
+## Crew in Workspaces
+
+A Captain always appears as a tile in the reserved Captains workspace and as a row in the Captains sidebar section.
+A Crew member appears as a normal terminal tile in the workspace selected during dispatch.
+Crew for the same codebase should normally share one named workspace rather than receive one workspace per worktree.
+
+When dispatch supplies `tabId`, T-Hub places the Crew tile in that existing workspace.
+When dispatch supplies `tabName`, T-Hub uses or creates the named workspace.
+When neither is supplied, the terminal placement falls back to the currently active workspace and then the first available workspace.
+The Captain protocol should therefore always select the destination workspace deliberately.
+
+The same Crew member also appears under the Captain's expandable sidebar row with its live status.
+Crew attention states roll up to the Captain row so a permission request or question remains visible while another workspace is active.
+Closing a Crew terminal attempts to release its Powder claim and updates the durable roster.
+
+The backend and sidebar support this model, but the desktop application does not yet provide a dedicated graphical **Create Crew** flow or a clear workspace-placement preview.
+Crew creation is currently driven by the commissioned Captain through the T-Hub control tools.
+
 ## Connection Profiles
 
 Projects persist only a Powder repository, connection profile name, and event cursor in `~/.t-hub/captains.json`.
