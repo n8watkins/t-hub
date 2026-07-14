@@ -334,6 +334,10 @@ fn trim_backup(path: &Path, max_bytes: u64) -> std::io::Result<()> {
     source.seek(SeekFrom::Start(len - max_bytes))?;
     let mut tail = Vec::with_capacity(max_bytes as usize);
     source.read_to_end(&mut tail)?;
+    // MoveFileEx replacement can fail while this process still has the
+    // destination open on Windows. Close the legacy backup before the atomic
+    // replacement step; Unix permits the rename either way.
+    drop(source);
     if let Some(newline) = tail.iter().position(|byte| *byte == b'\n') {
         tail.drain(..=newline);
     } else {
