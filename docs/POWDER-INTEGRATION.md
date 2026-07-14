@@ -17,10 +17,18 @@ Older pinned Captain tiles may lack a project or Powder binding because pinning 
 
 ## User-Facing Captain Flow
 
-The intended creation flow is:
+Captain creation has three valid entry paths:
+
+- Use a saved codebase already registered in T-Hub.
+- Choose an existing WSL folder or Git repository and register it.
+- Create a brand-new codebase directly or ask the orchestrator to prepare it.
+
+The complete orchestrator contract and new-project transaction are defined in [ORCHESTRATOR-OPERATING-MODEL.md](./ORCHESTRATOR-OPERATING-MODEL.md).
+
+After selecting an entry path, the intended creation flow is:
 
 1. Open **Commission Captain**.
-2. Choose a saved codebase or browse WSL for a new Git checkout.
+2. Choose a saved codebase, browse WSL for an existing folder, or configure a new codebase.
 3. Let T-Hub detect the canonical main worktree, display name, remote, default branch, and existing worktrees.
 4. Select or confirm the matching Powder board.
 5. Keep the protected Powder connection profile under **Advanced** unless more than one valid profile is available.

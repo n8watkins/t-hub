@@ -241,7 +241,7 @@ Terminal visibility, scrollback recovery, input readiness, and canvas reattachme
 The ordered continuation is:
 
 1. Reproduce and fix the installed xterm lifecycle rendering errors.
-2. Replace manual Captain repository entry with a WSL codebase picker, simplify project terminology, and add a commissioning preflight summary.
+2. Replace manual Captain repository entry with saved, existing WSL folder, and new codebase paths, simplify project terminology, and add a commissioning preflight summary.
 3. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
 4. Verify context reset recovery, Crew dispatch into a deliberate shared workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
 5. Wire the Board panel to the focused project's Powder profile instead of the global `http://localhost:4000` default.
