@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.66` from `35fbae2`, running as Windows PID `42280` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.66` from `3b83b9e`, running as Windows PID `46816` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -68,8 +68,9 @@ The visible legacy Captain records are pinned visual records without complete Pr
 
 Terminal resource counters and hot, warm, and cold lifecycle states are implemented.
 The earlier installed application reproduced xterm `loadCell` and `isWrapped` lifecycle failures.
-Source commit `6870444` fixed the teardown race, and the packaged `35fbae2` build completed cold rehydration with zero `loadCell`, `isWrapped`, or window errors.
+Source commit `6870444` fixed the teardown race, and the packaged `3b83b9e` build completed cold rehydration with zero `loadCell`, `isWrapped`, or window errors.
 Source commit `35fbae2` also prevents a second packaged launch from creating a competing control server and duplicate PTY attachments.
+Source commit `3b83b9e` defers frontend resize commands until remote PTY attachment is confirmed, eliminating repetitive startup `no live terminal` diagnostics in packaged testing.
 Diagnostic logs are oversized.
 Board still defaults to the wrong global endpoint.
 Preview still exposes an unclear Dev then Preview sequence.
@@ -117,8 +118,8 @@ The release critical path is:
 ## Phase 1 - Terminal and Control Reliability
 
 **Status:** Active.
-The packaged xterm lifecycle, stale-endpoint CLI recovery, application restart, session survival, and single-instance gates pass through installed source `35fbae2`.
-Transient WSL command timeouts and repetitive startup `no live terminal` diagnostics remain open before the full phase exit gate is closed.
+The packaged xterm lifecycle, stale-endpoint CLI recovery, application restart, session survival, single-instance, and attach-aware resize gates pass through installed source `3b83b9e`.
+Transient WSL command timeouts remain open before the full phase exit gate is closed.
 
 ### Goal
 

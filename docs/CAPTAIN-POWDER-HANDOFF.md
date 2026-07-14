@@ -13,8 +13,8 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `35fbae2`.
-**Installed Windows build:** locally built T-Hub `0.3.66` from `35fbae2`.
+**Source head before this handoff update:** `3b83b9e`.
+**Installed Windows build:** locally built T-Hub `0.3.66` from `3b83b9e`.
 
 ## Executive Status
 
@@ -23,9 +23,9 @@ The final independent authority review reports no remaining Critical, High, or M
 The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
 
 The final production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `864769634bc6b3b4d664f5dd2c94592b96aa25a20b7a54ea0bb6fc9b647c775f`.
-It is running as PID `42280`.
-The exact NSIS installer SHA-256 is `dbcf8405212e7eed2a3986128e210ed5e6338e97c22df39cdb5dae6a72849b1a`.
+The installed executable SHA-256 is `2c4d4b4d94ebd7f0c564f2eb681c7702a08487681fc64016e8cebd9c71690c53`.
+It is running as PID `46816`.
+The exact NSIS installer SHA-256 is `ae34c2caedcc07cf912046596a6a99444cf99d4b6a7dc58476ac2c9a5f931e5b`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
@@ -237,6 +237,8 @@ Three Captain terminals were parked past the 30-second cold threshold and rehydr
 The packaged launch produced zero `loadCell`, `isWrapped`, or window errors.
 A repeated application launch initially reproduced competing processes and visibly corrupted canvases, so source commit `35fbae2` added the official Tauri single-instance guard as the first plugin.
 The rebuilt package kept one PID, preserved the control endpoint, and rendered cleanly when launched again.
+Source commit `3b83b9e` gates frontend resize delivery on confirmed remote PTY attachment.
+The rebuilt package restored eight live terminals with zero `no live terminal`, xterm, window, or terminal-list errors in the fresh startup diagnostic slice.
 
 The fresh general performance review ranked the next work as:
 
@@ -257,7 +259,7 @@ The canonical gated sequence is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-
 
 The ordered continuation is:
 
-1. Resolve transient WSL command timeouts and repetitive startup `no live terminal` diagnostics, then close the remaining Phase 1 control gate.
+1. Resolve transient WSL command timeouts, then close the remaining Phase 1 control gate.
 2. Complete new-codebase creation, explicit Git initialization, Powder board selection or creation, transactional rollback, and packaged Captain-creation E2E.
 3. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
 4. Verify context reset recovery, Crew dispatch into a deliberate shared workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
@@ -292,16 +294,17 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The installed Windows process was reverified at PID `42280`, start time `2026-07-14T13:26:05-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-Its file and product version are `0.3.66`, and its SHA-256 is `864769634BC6B3B4D664F5DD2C94592B96AA25A20B7A54EA0BB6FC9B647C775F`.
-The installed build was produced from source `35fbae2` with NSIS installer SHA-256 `DBCF8405212E7EED2A3986128E210ED5E6338E97C22DF39CDB5DAE6A72849B1A`.
+The installed Windows process was reverified at PID `46816`, start time `2026-07-14T13:41:24-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its file and product version are `0.3.66`, and its SHA-256 is `2C4D4B4D94EBD7F0C564F2EB681C7702A08487681FC64016E8CEBD9C71690C53`.
+The installed build was produced from source `3b83b9e` with NSIS installer SHA-256 `AE34C2CAEDCC07CF912046596A6A99444CF99D4B6A7DC58476AC2C9A5F931E5B`.
 The installed `th` CLI is version `0.2.0` from source `07e74f4`.
 Source commit `6870444` fixes the reproduced xterm teardown race.
 Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
 The latest source gate passed 441 frontend tests, the production frontend build, 580 Rust library tests, formatting, and warnings-denied Clippy.
 The latest T-Hub capability probe for this session remained `read`, so no canonical Project mutation, Powder binding, Captain commissioning, or Crew dispatch was attempted.
 The local Powder endpoint and protected agent credential path are operational.
-The packaged xterm lifecycle and duplicate-launch gates pass with seven live tmux sessions preserved.
+The packaged xterm lifecycle and duplicate-launch gates pass with eight live tmux sessions preserved.
+The fresh startup diagnostic slice contains zero premature-resize, xterm, window, or terminal-list errors.
 The stale-endpoint CLI path passes, but one `th ls` call hit the bounded 10-second WSL command timeout before succeeding on retry.
 The immediate source action is to finish Phase 1 control reliability, then implement explicit Git initialization and transactional rollback for non-repository and new-codebase flows.
 Real Powder acceptance still requires a control-capable Captain session.
