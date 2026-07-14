@@ -13,7 +13,7 @@ interface WritableTerminal {
 export class TerminalWriteLifecycle {
   private pendingWrites = 0;
   private retired = false;
-  private readonly idleActions: Array<() => void> = [];
+  private readonly idleActions: Array<{ key?: string; action: () => void }> = [];
 
   constructor(private readonly terminal: WritableTerminal) {}
 
@@ -43,7 +43,20 @@ export class TerminalWriteLifecycle {
       action();
       return;
     }
-    this.idleActions.push(action);
+    this.idleActions.push({ action });
+  }
+
+  afterWritesCoalesced(key: string, action: () => void): void {
+    if (this.pendingWrites === 0) {
+      action();
+      return;
+    }
+    const pending = this.idleActions.find((entry) => entry.key === key);
+    if (pending) {
+      pending.action = action;
+      return;
+    }
+    this.idleActions.push({ key, action });
   }
 
   waitForWrites(): Promise<void> {
@@ -60,6 +73,6 @@ export class TerminalWriteLifecycle {
   private flushIdleActions(): void {
     if (this.pendingWrites !== 0) return;
     const actions = this.idleActions.splice(0, this.idleActions.length);
-    for (const action of actions) action();
+    for (const { action } of actions) action();
   }
 }

@@ -44,4 +44,21 @@ describe("TerminalWriteLifecycle", () => {
     lifecycle.disposeWhenIdle();
     expect(terminal.dispose).toHaveBeenCalledOnce();
   });
+
+  it("coalesces resize work behind accepted writes", () => {
+    const terminal = new FakeTerminal();
+    const lifecycle = new TerminalWriteLifecycle(terminal);
+    const firstResize = vi.fn();
+    const latestResize = vi.fn();
+
+    lifecycle.write("output still parsing");
+    lifecycle.afterWritesCoalesced("resize", firstResize);
+    lifecycle.afterWritesCoalesced("resize", latestResize);
+
+    expect(firstResize).not.toHaveBeenCalled();
+    expect(latestResize).not.toHaveBeenCalled();
+    terminal.callbacks.shift()?.();
+    expect(firstResize).not.toHaveBeenCalled();
+    expect(latestResize).toHaveBeenCalledOnce();
+  });
 });

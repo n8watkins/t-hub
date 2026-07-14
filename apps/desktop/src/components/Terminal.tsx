@@ -341,6 +341,10 @@ export function TerminalView({
   // trigger here once it exists; before that (or after teardown) it is null and
   // the sweep is a no-op (the initial attach flow owns recovery until then).
   const reattachRef = useRef<(() => void) | null>(null);
+  // Buffer resize mutates xterm's line storage and must run behind its async
+  // write parser. The zoom effect lives outside the init closure, so it calls
+  // through this serialized bridge instead of fitting xterm directly.
+  const resizeRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     foregroundRef.current = foreground;
@@ -675,7 +679,7 @@ export function TerminalView({
     // garbled reflowed scrollback needs clearing (see settleResize).
     let lastCols = 0;
 
-    const pushResize = () => {
+    const performResize = () => {
       if (disposed || !ptyAttachedRef.current) return;
       // NEVER push a degenerate resize. A parked/hidden/not-yet-laid-out tile
       // measures ~0px wide and FitAddon would propose ~2 cols; pushing that to
@@ -706,9 +710,10 @@ export function TerminalView({
     // duplicated history above it. We only clear when the column count actually
     // changed (height-only changes / re-shows at the same width don't reflow),
     // so a pure vertical resize never throws away readable scrollback.
-    const settleResize = () => {
-      if (disposed) return;
-      pushResize();
+    const performSettledResize = () => {
+      if (disposed || !ptyAttachedRef.current) return;
+      if (!saneFitProposal(term, fit)) return;
+      performResize();
       // A width change is the only thing that reflows xterm's wrapped scrollback;
       // compare against the LAST settled width (not the pre-fit value) so an
       // unchanged width during a resize burst is a true no-op.
@@ -722,7 +727,7 @@ export function TerminalView({
       // can redraw, so the pane (and, because a spawn reflows every tile, the
       // WHOLE grid) reads blank/muted until something else redraws it. We
       // therefore NEVER clear while the alt buffer is active: full-screen apps
-      // repaint themselves on the SIGWINCH from pushResize(), so there is no
+      // repaint themselves on the SIGWINCH from the settled resize, so there is no
       // duplicated scrollback for us to clean up. We also only clear on a REAL
       // width change of an inline (normal-buffer) terminal, and skip the very
       // first settle (nothing to dedupe yet). This collapses the boot/spawn
@@ -756,6 +761,14 @@ export function TerminalView({
         forceFullRedraw();
       }
     };
+    const settleResize = () => {
+      // xterm parses write() input asynchronously. Resizing its buffer while a
+      // line-feed parser action is in flight can leave the next row absent and
+      // throw from InputHandler.isWrapped. Keep one latest resize queued behind
+      // all accepted writes; repeated observer/zoom events coalesce in place.
+      writes.afterWritesCoalesced("resize", performSettledResize);
+    };
+    resizeRef.current = settleResize;
 
     // Defer the first fit until the browser has completed the constrained-flex
     // layout pass. A synchronous fit here reads a
@@ -1419,7 +1432,7 @@ export function TerminalView({
       const eid = (e as CustomEvent<{ id?: string }>).detail?.id;
       if (eid && eid !== terminalId) return;
       // A no-id BROADCAST (repaintMount's window-resize/maximize settle) would
-      // otherwise pushResize() EVERY pooled terminal — ~16 synchronous fit.fit()
+      // otherwise resize EVERY pooled terminal - ~16 synchronous fit.fit()
       // calls = the observed ~327ms main-thread stall. Background tiles re-fit on
       // un-park via the IntersectionObserver, so for a broadcast only fit+heal the
       // FOREGROUND tile. A TARGETED refresh (eid set — the ⟳ reload button on this
@@ -1430,9 +1443,9 @@ export function TerminalView({
       // buffer) mangles the formatting. Deep scroll-up is handled by Page Up (tmux
       // copy-mode), which reads the real tmux history (up to history-limit).
       // forceFullRedraw (not refresh) is why the ⟳ button now actually clears a
-      // stale frame: when cols/rows are unchanged, pushResize()'s fit is a no-op,
+      // stale frame: when cols/rows are unchanged, the fit is a no-op,
       // so only the atlas-clear re-composite heals it.
-      pushResize();
+      settleResize();
       requestAnimationFrame(forceFullRedraw);
     };
     window.addEventListener(REFRESH_TERMINAL_EVENT, onRefresh);
@@ -1480,6 +1493,7 @@ export function TerminalView({
       // Abandon any in-flight reattach: the cleared timer never resolves its
       // sleep, and the loop's `disposed` checks bail on every other await.
       reattachRef.current = null;
+      if (resizeRef.current === settleResize) resizeRef.current = null;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -1560,18 +1574,7 @@ export function TerminalView({
     const term = termRef.current;
     if (!term) return;
     term.options.fontSize = fontSize;
-    const fit = fitRef.current;
-    if (!fit || !ptyAttachedRef.current) return;
-    try {
-      // Same degenerate-measurement guard as pushResize: a zoom change on a
-      // parked/hidden tile must not fit-and-push ~2 cols to the PTY. When it
-      // un-parks, the pool-move / ResizeObserver re-fits at the new font size.
-      if (!saneFitProposal(term, fit)) return;
-      fit.fit();
-      void resizeTerminal(terminalId, term.cols, term.rows);
-    } catch {
-      /* container detached mid-zoom; ignore */
-    }
+    resizeRef.current?.();
   }, [fontSize, terminalId]);
 
   // Live-apply terminal palette changes — global (theme editor / MCP set_theme)
