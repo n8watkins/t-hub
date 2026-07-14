@@ -125,6 +125,7 @@ t-hub-protocol = { path = "crates/t-hub-protocol" }
 # hwnd()` is the same type we pass to SetWindowSubclass. Only the features this
 # module uses are enabled; on non-Windows targets this dependency is absent.
 [target.'cfg(windows)'.dependencies]
+tauri-plugin-single-instance = "2"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     # OpenProcess/CloseHandle for the Scribe voice-gate pid-liveness check

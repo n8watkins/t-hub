@@ -427,7 +427,23 @@ pub fn run() {
     // first touched — i.e. before the Tauri builder spawns anything.
     apply_devbuild_isolation();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // Register this before every other plugin. A second packaged launch must hand
+    // focus to the existing cockpit instead of starting another control server and
+    // attaching a second set of PTY clients to the same tmux sessions.
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        use tauri::Manager;
+
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+
+    builder
         // Shell plugin: lets the frontend open URLs/paths in the OS default
         // browser (web-preview "Open externally"). Without it the JS open() is a
         // no-op. Paired with the `shell:allow-open` capability.
