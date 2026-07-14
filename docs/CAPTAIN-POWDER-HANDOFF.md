@@ -229,9 +229,9 @@ Completed low-risk performance changes are:
 - Parked terminals now move through hot, warm, and cold lifecycle states while tmux remains authoritative.
 - Lifecycle tests cover cold disposal and rehydration.
 
-The installed application is logging current xterm rendering failures involving `loadCell` and `isWrapped`.
-Treat this as a lifecycle race until reproduced and disproved.
-It is the highest-priority correctness issue before further lifecycle optimization.
+The installed `0.3.66` application logged xterm rendering failures involving `loadCell` and `isWrapped` after terminal parking and restoration.
+Source commit `6870444` serializes destructive xterm teardown after accepted writes, discards unreplayed pending output during cold teardown, upgrades xterm, and removes the unmaintained canvas renderer.
+The source fix passed automated frontend and Rust validation, but it is not yet installed and therefore has not passed the packaged Phase 1 exit gate.
 
 The fresh general performance review ranked the next work as:
 
@@ -252,8 +252,8 @@ The canonical gated sequence is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-
 
 The ordered continuation is:
 
-1. Reproduce and fix the installed xterm lifecycle rendering errors.
-2. Replace manual Captain repository entry with saved, existing WSL folder, and new codebase paths, simplify project terminology, and add a commissioning preflight summary.
+1. Build and install the reviewed source only after explicit authorization, then run the packaged xterm lifecycle and control-client acceptance matrix.
+2. Complete new-codebase creation, explicit Git initialization, Powder board selection or creation, transactional rollback, and packaged Captain-creation E2E.
 3. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
 4. Verify context reset recovery, Crew dispatch into a deliberate shared workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
 5. Wire the Board panel to the focused project's Powder profile instead of the global `http://localhost:4000` default.
@@ -287,9 +287,16 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The WSL skill migration, authority hardening, immutable CI action migration, provider identity fix, push, CI, production release, Windows installation, and four-terminal packaged measurement are complete through `7f395fb`.
-The live smoke reproduced a five-second tmux timeout against a healthy `4.3s` Windows-to-WSL command, widened the bounded default to ten seconds, and verified the final packaged request in `0.673s`.
-The source is ahead of `origin/main` by five commits through `a4fd704`, and the locally installed Windows build is `0.3.66`.
+The installed Windows process was reverified at PID `35612`, start time `2026-07-14T11:56:19.2412232-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its file and product version are `0.3.66`, and its SHA-256 is `3192F4F18A637DFDE6B5E74358B504D05839B19452F94644A08D15C73A3DD141`.
+The installed build remains the previously released `a4fd704` source relationship.
+The reviewed implementation changes are complete through `d8e891e`, eleven commits newer than the installed source.
+The branch was sixteen commits ahead of `origin/main` before this handoff update.
+Source commit `6870444` fixes the reproduced xterm teardown race.
+Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
+The latest source gate passed 441 frontend tests, the production frontend build, 579 Rust library tests with one ignored, all workspace integration and crate tests, formatting, and warnings-denied Clippy.
+The latest T-Hub capability probe for this session remained `read`, so no canonical Project mutation, Powder binding, Captain commissioning, or Crew dispatch was attempted.
 The local Powder endpoint and protected agent credential path are operational.
-The immediate action is to fix the xterm lifecycle race, then improve Captain creation and run real Powder-backed Captain and Crew acceptance.
+The immediate source action is explicit Git initialization and transactional rollback for non-repository and new-codebase flows.
+The immediate installed-runtime action requires authorization to package and install the reviewed source, followed by xterm lifecycle verification and a control-capable session for real Powder acceptance.
 The Board endpoint, Preview workflow, Claude header check, packaged performance matrix, and release hardening remain open.
