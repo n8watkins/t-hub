@@ -58,7 +58,7 @@ Keep representative artifacts with test reports or release evidence outside Git 
 ## Compare Runs
 
 Compare runs only when terminal count, workload, window state, installed build, warmup duration, sample duration, and host power conditions match.
-Use the summary means for steady-state CPU and memory, and the maxima to identify spikes.
+Use the summary means for steady-state CPU and memory, p95 for recurring high-load behavior, and the maxima to identify isolated spikes.
 Inspect category totals before attributing growth to the Rust application, WebView2, or WSL host bridge.
 
 This first slice measures the Windows process tree only.

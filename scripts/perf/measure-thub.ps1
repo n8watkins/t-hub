@@ -195,10 +195,12 @@ function Get-Statistics {
         $sum += $value
     }
     $middle = [int][Math]::Floor(($sorted.Count - 1) / 2.0)
+    $p95Index = [Math]::Max(0, [int][Math]::Ceiling($sorted.Count * 0.95) - 1)
     return [ordered]@{
         min = $sorted[0]
         mean = $sum / $sorted.Count
         p50 = $sorted[$middle]
+        p95 = $sorted[$p95Index]
         max = $sorted[$sorted.Count - 1]
     }
 }

@@ -37,6 +37,7 @@ grep -Fq 'working_set_bytes' "$COLLECTOR" || fail "collector does not expose wor
 grep -Fq 'private_bytes' "$COLLECTOR" || fail "collector does not expose private bytes"
 grep -Fq 'thread_count' "$COLLECTOR" || fail "collector does not expose thread counts"
 grep -Fq 'schema_version = 1' "$COLLECTOR" || fail "collector schema is not versioned"
+grep -Fq 'p95 = $sorted[$p95Index]' "$COLLECTOR" || fail "collector summary does not expose p95"
 grep -Fq 'Unrelated WSL, agent-browser, Next.js, and Codex processes are excluded' "$COLLECTOR" \
   || fail "artifact does not state process isolation assumptions"
 git -C "$HERE/../.." check-ignore -q artifacts/perf/contract-test.json \
