@@ -1,7 +1,7 @@
 {
   "name": "t-hub-desktop",
   "private": true,
-  "version": "0.3.66",
+  "version": "0.3.67",
   "type": "module",
   "description": "T-Hub — terminal-first command center for supervising many persistent Claude Code sessions in WSL2.",
   "scripts": {

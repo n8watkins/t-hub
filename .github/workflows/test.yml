@@ -157,6 +157,9 @@ jobs:
       - name: Production frontend build
         run: pnpm build
 
+      - name: Desktop version contract
+        run: bash apps/desktop/scripts/check-version.sh --history
+
       - name: Packaged runtime benchmark contract
         run: bash scripts/perf/perf-benchmark.test.sh
 

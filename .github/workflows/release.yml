@@ -63,6 +63,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Verify release version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: bash apps/desktop/scripts/check-version.sh --history --tag "${GITHUB_REF_NAME}"
+
       - name: Build installers
         working-directory: apps/desktop
         shell: pwsh
