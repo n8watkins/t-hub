@@ -73,6 +73,7 @@ interface VoiceState extends VoiceSettings {
 }
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let loadGeneration = 0;
 
 /** Fields THIS store instance changed since the last successful load/persist.
  *  Persist is read-MERGE-write over this set: dirty fields carry the store's
@@ -80,6 +81,14 @@ let persistTimer: ReturnType<typeof setTimeout> | null = null;
  *  edit (a captain script flipping `enabled` off) survives an unrelated
  *  slider drag instead of being resurrected from stale store state. */
 let dirtyFields = new Set<keyof VoiceSettings>();
+const fieldGenerations: Record<keyof VoiceSettings, number> = {
+  enabled: 0,
+  engine: 0,
+  voice: 0,
+  volume: 0,
+  sapiRate: 0,
+  announceOnAttention: 0,
+};
 
 export const useVoice = create<VoiceState>((set, get) => {
   /** Flush to voice.json now: re-read the file, merge (dirty fields win from
@@ -157,16 +166,50 @@ export const useVoice = create<VoiceState>((set, get) => {
     health: { piper: "unknown", kokoro: "unknown" },
 
     load: async () => {
-      // Unflushed local intent (a pending debounce or an unpersisted dirty
-      // field) must not be clobbered by stale file values - the imminent
-      // merge-persist re-reads the file itself, so skipping here loses nothing.
-      if (persistTimer !== null || dirtyFields.size > 0) return;
+      const generation = ++loadGeneration;
+      const observedFieldGenerations = { ...fieldGenerations };
+      const changedDuringLoad = (field: keyof VoiceSettings) =>
+        dirtyFields.has(field) ||
+        fieldGenerations[field] !== observedFieldGenerations[field];
       try {
-        const s = await readVoiceSettings();
-        set({ ...s, loaded: true });
-        dirtyFields.clear();
+        const file = await readVoiceSettings();
+        if (generation !== loadGeneration) return;
+        const current = get();
+        set({
+          enabled: changedDuringLoad("enabled") ? current.enabled : file.enabled,
+          engine: changedDuringLoad("engine") ? current.engine : file.engine,
+          voice: changedDuringLoad("voice") ? current.voice : file.voice,
+          volume: changedDuringLoad("volume") ? current.volume : file.volume,
+          sapiRate: changedDuringLoad("sapiRate") ? current.sapiRate : file.sapiRate,
+          announceOnAttention: changedDuringLoad("announceOnAttention")
+            ? current.announceOnAttention
+            : file.announceOnAttention,
+          loaded: true,
+        });
       } catch {
-        set({ ...DEFAULT_VOICE_SETTINGS, loaded: true });
+        if (generation !== loadGeneration) return;
+        const current = get();
+        set({
+          enabled: changedDuringLoad("enabled")
+            ? current.enabled
+            : DEFAULT_VOICE_SETTINGS.enabled,
+          engine: changedDuringLoad("engine")
+            ? current.engine
+            : DEFAULT_VOICE_SETTINGS.engine,
+          voice: changedDuringLoad("voice")
+            ? current.voice
+            : DEFAULT_VOICE_SETTINGS.voice,
+          volume: changedDuringLoad("volume")
+            ? current.volume
+            : DEFAULT_VOICE_SETTINGS.volume,
+          sapiRate: changedDuringLoad("sapiRate")
+            ? current.sapiRate
+            : DEFAULT_VOICE_SETTINGS.sapiRate,
+          announceOnAttention: changedDuringLoad("announceOnAttention")
+            ? current.announceOnAttention
+            : DEFAULT_VOICE_SETTINGS.announceOnAttention,
+          loaded: true,
+        });
       }
     },
 
@@ -208,6 +251,7 @@ export const useVoice = create<VoiceState>((set, get) => {
 
     setEnabled: (v) => {
       set({ enabled: v });
+      fieldGenerations.enabled += 1;
       dirtyFields.add("enabled");
       schedulePersist();
     },
@@ -218,21 +262,25 @@ export const useVoice = create<VoiceState>((set, get) => {
       // section's engine-keyed effect (the single refreshVoices seam), so this
       // action stays pure state + persist and never double-queries.
       set({ engine: v, voices: null, voicesUnavailable: false });
+      fieldGenerations.engine += 1;
       dirtyFields.add("engine");
       schedulePersist();
     },
     setVoice: (v) => {
       set({ voice: v });
+      fieldGenerations.voice += 1;
       dirtyFields.add("voice");
       schedulePersist();
     },
     setVolume: (v) => {
       set({ volume: Math.max(0, Math.min(1, v)) });
+      fieldGenerations.volume += 1;
       dirtyFields.add("volume");
       schedulePersist();
     },
     setAnnounceOnAttention: (v) => {
       set({ announceOnAttention: v });
+      fieldGenerations.announceOnAttention += 1;
       dirtyFields.add("announceOnAttention");
       schedulePersist();
     },

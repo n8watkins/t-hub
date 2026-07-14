@@ -81,9 +81,11 @@ let speaking = false;
 let mounted = false;
 
 /** Cached Scribe voice-gate state, refreshed by the poll. The hot path
- *  (handleStatusesChange) only ever READS this - it never awaits IPC. Defaults
- *  false (fail-open: speak) until the first poll says otherwise. */
+ *  (handleStatusesChange) only ever READS this - it never awaits IPC. */
 let scribeListening = false;
+/** False while an enabled poll generation has not produced its first valid
+ * result. Unknown is fail-safe: hold cues until Scribe confirms idle. */
+let scribeStatusKnown = false;
 /** The single held announcement while the general is dictating (coalesced to
  *  the latest transition - no backlog). Null when nothing is held. */
 let pending: { text: string } | null = null;
@@ -236,7 +238,7 @@ export function handleStatusesChange(
   // pending slot (coalesced to the latest) instead of talking over them. It
   // is delivered on the listening falling edge (flushPending). Reads the
   // cached boolean only; never blocks on IPC.
-  if (scribeListening) {
+  if (!scribeStatusKnown || scribeListening) {
     pending = { text };
     return;
   }
@@ -258,6 +260,8 @@ export function applyScribeListening(
   listening: boolean,
   now: number = Date.now(),
 ): void {
+  const wasKnown = scribeStatusKnown;
+  scribeStatusKnown = true;
   const was = scribeListening;
   scribeListening = listening;
   if (!was && listening) {
@@ -276,6 +280,16 @@ export function applyScribeListening(
       flushPending(Date.now());
     }, SCRIBE_TAIL_MS);
     void now;
+    return;
+  }
+  if (!wasKnown && !listening && pending) {
+    // The first result for this enabled generation confirms Scribe is idle.
+    // A cue held while status was unknown can now follow the normal tail path.
+    if (tailTimer) clearTimeout(tailTimer);
+    tailTimer = setTimeout(() => {
+      tailTimer = null;
+      flushPending(Date.now());
+    }, SCRIBE_TAIL_MS);
   }
 }
 
@@ -341,6 +355,7 @@ function stopScribePoll(): void {
     pollTimer = null;
   }
   scribeListening = false;
+  scribeStatusKnown = false;
   pending = null;
   if (tailTimer) {
     clearTimeout(tailTimer);
@@ -354,6 +369,8 @@ function stopScribePoll(): void {
 function armScribePoll(): void {
   if (pollTimer) return;
   const generation = ++pollGeneration;
+  scribeStatusKnown = false;
+  scribeListening = false;
   let polling = false;
   const tick = () => {
     if (polling) return;
@@ -402,6 +419,7 @@ export function _resetVoiceAnnounceForTest(): void {
   lastFallbackAlertAt = Number.NEGATIVE_INFINITY;
   speaking = false;
   scribeListening = false;
+  scribeStatusKnown = false;
   pending = null;
   pollLifecycleMounted = false;
   unsubscribePollLifecycle?.();
@@ -416,6 +434,7 @@ export function _resetVoiceAnnounceForTest(): void {
 /** Test-only: set the cached Scribe listening state directly (no edge/timer),
  *  so hold/flush are unit-testable without a real Scribe or the poll. */
 export function _setScribeListeningForTest(listening: boolean): void {
+  scribeStatusKnown = true;
   scribeListening = listening;
 }
 

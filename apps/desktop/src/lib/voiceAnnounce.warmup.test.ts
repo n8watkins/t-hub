@@ -25,6 +25,7 @@ import { synthesizeVoice } from "../ipc/voice";
 import {
   handleStatusesChange,
   _startVoiceAnnounceWarmupForTest,
+  _setScribeListeningForTest,
   ANNOUNCE_MIN_GAP_MS,
 } from "./voiceAnnounce";
 import { useVoice, DEFAULT_VOICE_SETTINGS } from "../store/voice";
@@ -100,6 +101,7 @@ describe("startup warmup (journal replay)", () => {
 
       // A REAL post-startup transition speaks (no terminal mapping seeded, so
       // the generic label is used - the announcement itself is the assertion).
+      _setScribeListeningForTest(false);
       handleStatusesChange(
         statuses({
           "sess-1": "needsPermission",

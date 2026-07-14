@@ -64,6 +64,7 @@ beforeEach(() => {
   // Default unmanaged so the #52 chime path is exercised; the F6 case sets this.
   useEngineRuntime.setState({ status: null });
   _resetVoiceAnnounceForTest();
+  _setScribeListeningForTest(false);
   useVoice.setState({
     ...DEFAULT_VOICE_SETTINGS,
     enabled: true,
