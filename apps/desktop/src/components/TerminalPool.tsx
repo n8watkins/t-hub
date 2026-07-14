@@ -17,9 +17,9 @@
 // when its box changes size, so we never touch Terminal.tsx.
 //
 // Placeholders that belong to an inactive tab (or that don't exist this render,
-// e.g. a terminal that has no tile yet) are kept mounted but hidden
-// (visibility:hidden) and parked offscreen so they stay attached in the
-// background, exactly like before.
+// e.g. a terminal that has no tile yet) are hidden and parked offscreen. Their
+// xterm stays warm briefly for fast tab switching, then goes cold and disposes
+// its renderer and PTY attachment while this stable wrapper remains mounted.
 import {
   createContext,
   useCallback,
@@ -46,6 +46,7 @@ import {
   removeTerminalResources,
   updateTerminalResources,
 } from "../lib/terminalResources";
+import { TerminalLifecycleController } from "../lib/terminalLifecycle";
 
 // Upper bound on the chained deferred re-syncs the pool will schedule while an
 // active-tab terminal's placeholder rect is still degenerate. A transient
@@ -185,12 +186,19 @@ interface PoolLayerProps {
 
 /**
  * The absolute overlay holding one pooled <TerminalView> per live terminal. The
- * wrappers are keyed by terminal id and never unmount while the terminal exists,
- * so xterm stays mounted/attached across tab moves and reorders. A layout-sync
- * effect positions each wrapper over its placeholder; wrappers with no visible
- * placeholder are hidden and parked.
+ * wrappers are keyed by terminal id and never unmount while the terminal exists.
+ * Hot and warm xterms therefore survive tab moves and reorders without DOM
+ * reparenting. Cold terminals dispose their xterm inside the stable wrapper and
+ * rehydrate from authoritative tmux capture when they become hot again.
  */
 function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) {
+  const [lifecycleVersion, renderLifecycle] = useState(0);
+  const lifecycleRef = useRef<TerminalLifecycleController | null>(null);
+  if (lifecycleRef.current === null) {
+    lifecycleRef.current = new TerminalLifecycleController(() =>
+      renderLifecycle((value) => value + 1),
+    );
+  }
   // Every terminal id that has a tile somewhere (across ALL tabs), de-duped.
   // We render the union of tab orders rather than the live `terminals` map so a
   // wrapper exists exactly for tiles the user placed (and survives tab switches).
@@ -334,20 +342,24 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
 
   const measuredPoolIdsRef = useRef<Set<TerminalId>>(new Set());
   useEffect(() => {
+    const lifecycle = lifecycleRef.current;
+    if (!lifecycle) return;
+    lifecycle.reconcile(poolIds, foregroundIds);
     const current = new Set(poolIds);
     for (const id of measuredPoolIdsRef.current) {
       if (!current.has(id)) removeTerminalResources(id);
     }
     for (const id of poolIds) {
       updateTerminalResources(id, {
-        temperature: foregroundIds.has(id) ? "hot" : "warm",
+        temperature: lifecycle.temperature(id, foregroundIds.has(id)),
       });
     }
     measuredPoolIdsRef.current = current;
-  }, [poolIds, foregroundIds]);
+  }, [poolIds, foregroundIds, lifecycleVersion]);
 
   useEffect(
     () => () => {
+      lifecycleRef.current?.dispose();
       for (const id of measuredPoolIdsRef.current) removeTerminalResources(id);
       measuredPoolIdsRef.current.clear();
     },
@@ -885,22 +897,28 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
             zIndex: captainOpen && id === captainId ? 2 : undefined,
           }}
         >
-          {/* Rendered ONCE, here, for this terminal's whole lifetime. Stable key
-              + stable parent => xterm is never remounted on a tab move/reorder.
-              visible stays true (pool keeps every terminal attached); foreground
-              controls whether output uses foreground rAF flushing or the
-              background throttled path.
+          {/* Rendered in this stable wrapper for the terminal's hot/warm lifetime.
+              Fast tab moves and reorders keep the same xterm and parent. A terminal
+              parked past the warm grace period goes cold and disposes here; its
+              next hot render subscribes before attaching and restores from tmux.
+              Foreground controls whether warm output uses foreground rAF flushing
+              or the background throttled path.
 
               Per-tile fault isolation: the boundary contains any render/commit
               throw to THIS tile, so one bad/dead/weird session can never blank the
               whole pool (the incident's zero-attach failure mode). Siblings render
               and attach normally; the failing tile shows an inline retry. */}
           <TileErrorBoundary terminalId={id}>
-            <TerminalView
-              terminalId={id}
-              visible={true}
-              foreground={foregroundIds.has(id)}
-            />
+            {lifecycleRef.current?.temperature(
+              id,
+              foregroundIds.has(id),
+            ) !== "cold" ? (
+              <TerminalView
+                terminalId={id}
+                visible={true}
+                foreground={foregroundIds.has(id)}
+              />
+            ) : null}
           </TileErrorBoundary>
         </div>
       ))}

@@ -28,9 +28,10 @@
 //   - Dispose cleanly on unmount. The persistent pool keeps terminals mounted
 //     across tab switches; `foreground` only changes output flush cadence.
 //
-// Lifecycle is keyed on [terminalId, visible]. Hidden/parked terminals stay
-// attached so switching tabs does not reload, but background output is flushed on
-// a slower bounded timer instead of the foreground rAF path.
+// Lifecycle is keyed on [terminalId, visible]. Warm parked terminals stay
+// attached for fast switching and flush output on a slower bounded timer. The
+// pool eventually unmounts cold terminals, which runs the complete teardown
+// below; a later hot mount subscribes before attach and replays tmux capture.
 import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -67,6 +68,10 @@ import type { ITheme, ILink } from "@xterm/xterm";
 import { clipboardRead, clipboardWrite } from "../lib/clipboard";
 import { TerminalCursorBlinkController } from "../lib/terminalCursorBlink";
 import { updateTerminalResources } from "../lib/terminalResources";
+import {
+  beginTerminalDetach,
+  waitForTerminalDetach,
+} from "../lib/terminalLifecycle";
 import "./Terminal.css";
 
 // Paste into a terminal, preferring an IMAGE on the clipboard over text. When the
@@ -1224,6 +1229,8 @@ export function TerminalView({
               `subscribed ${terminalId} (listeners live BEFORE attach); requesting attach ${term.cols}x${term.rows}`,
             );
 
+            await waitForTerminalDetach(terminalId);
+            if (disposed) return;
             const scrollback = await attachTerminal(
               terminalId,
               term.cols,
@@ -1542,6 +1549,9 @@ export function TerminalView({
 
       unregisterTerminalTail(terminalId, term);
       term.dispose();
+      void beginTerminalDetach(terminalId, () => closeTerminal(terminalId)).catch(
+        () => undefined,
+      );
       updateTerminalResources(terminalId, {
         xterm: false,
         canvas: false,
