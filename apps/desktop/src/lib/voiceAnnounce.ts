@@ -89,9 +89,11 @@ let scribeListening = false;
 let pending: { text: string } | null = null;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let tailTimer: ReturnType<typeof setTimeout> | null = null;
-/** True while a scribe_status IPC is in flight, so a slow read never stacks
- *  overlapping poll ticks. */
-let scribePolling = false;
+/** Incremented whenever the poller starts or stops.
+ * Results from an older generation are ignored after a settings transition. */
+let pollGeneration = 0;
+let pollLifecycleMounted = false;
+let unsubscribePollLifecycle: (() => void) | null = null;
 
 /** Synthesize + play one announcement. Guards a single in-flight request and
  *  charges the burst-debounce clock only on SUCCESS (a failed synthesis leaves
@@ -325,27 +327,72 @@ export function mountVoiceAnnounce(): void {
   useSupervision.subscribe((s) => handleStatusesChange(s.statuses));
 }
 
-/** Start the ~250ms Scribe voice-gate poll (idempotent). Each tick reads the
- *  cached listening state off the loopback command and feeds the edge machine;
- *  an IPC failure fails open (listening=false). Called once from
- *  voiceAnnounceMount (which the tests never import), so no real poll spins in
- *  the unit suite - the gate is driven there via applyScribeListening /
- *  _setScribeListeningForTest instead. The `pollTimer` guard keeps it
- *  single-armed even if called twice. */
-export function startScribePoll(): void {
+function voiceAnnouncementsEnabled(): boolean {
+  const voice = useVoice.getState();
+  return voice.enabled && voice.announceOnAttention;
+}
+
+/** Stop the Scribe poll and discard all voice-gate state.
+ * A disabled announcement feature must not later flush a cue that it held while enabled. */
+function stopScribePoll(): void {
+  pollGeneration += 1;
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  scribeListening = false;
+  pending = null;
+  if (tailTimer) {
+    clearTimeout(tailTimer);
+    tailTimer = null;
+  }
+}
+
+/** Arm the ~250ms Scribe voice-gate poll.
+ * Each tick reads the cached listening state off the loopback command and feeds the edge machine.
+ * An IPC failure fails open (listening=false), and a slow read never stacks overlapping ticks. */
+function armScribePoll(): void {
   if (pollTimer) return;
+  const generation = ++pollGeneration;
+  let polling = false;
   const tick = () => {
-    if (scribePolling) return; // a prior read is still in flight - skip
-    scribePolling = true;
+    if (polling) return;
+    polling = true;
     void scribeStatus()
-      .then((s) => applyScribeListening(!!s.listening, Date.now()))
-      .catch(() => applyScribeListening(false, Date.now()))
+      .then((s) => {
+        if (generation === pollGeneration) {
+          applyScribeListening(!!s.listening, Date.now());
+        }
+      })
+      .catch(() => {
+        if (generation === pollGeneration) {
+          applyScribeListening(false, Date.now());
+        }
+      })
       .finally(() => {
-        scribePolling = false;
+        polling = false;
       });
   };
-  tick(); // seed immediately so the gate reflects reality without a poll wait
+  tick();
   pollTimer = setInterval(tick, SCRIBE_POLL_MS);
+}
+
+/** Mount the settings-driven Scribe poll lifecycle once.
+ * Polling is needed only while both the voice master switch and announce-on-attention are enabled.
+ * Store changes synchronize the timer immediately, while the idempotent mount prevents duplicate subscriptions. */
+export function startScribePoll(): void {
+  if (pollLifecycleMounted) return;
+  pollLifecycleMounted = true;
+
+  let enabled = voiceAnnouncementsEnabled();
+  if (enabled) armScribePoll();
+  unsubscribePollLifecycle = useVoice.subscribe(() => {
+    const next = voiceAnnouncementsEnabled();
+    if (next === enabled) return;
+    enabled = next;
+    if (enabled) armScribePoll();
+    else stopScribePoll();
+  });
 }
 
 /** Test-only: clear the transition/debounce + Scribe-gate state between cases. */
@@ -356,15 +403,14 @@ export function _resetVoiceAnnounceForTest(): void {
   speaking = false;
   scribeListening = false;
   pending = null;
-  scribePolling = false;
+  pollLifecycleMounted = false;
+  unsubscribePollLifecycle?.();
+  unsubscribePollLifecycle = null;
   if (tailTimer) {
     clearTimeout(tailTimer);
     tailTimer = null;
   }
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
+  stopScribePoll();
 }
 
 /** Test-only: set the cached Scribe listening state directly (no edge/timer),

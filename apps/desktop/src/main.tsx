@@ -5,7 +5,7 @@ import "./index.css";
 // once at startup (idempotent). See src/lib/notifyMount.ts.
 import "./lib/notifyMount";
 // Side-effect import: hydrates voice settings from ~/.t-hub/voice.json and
-// arms the announce-on-attention voice watcher (Settings > Voice). Idempotent.
+// arms the announce-on-attention watcher and its settings-gated Scribe poll.
 // See src/lib/voiceAnnounceMount.ts.
 import "./lib/voiceAnnounceMount";
 // Side-effect import: hydrate + subscribe the managed TTS-engine runtime status

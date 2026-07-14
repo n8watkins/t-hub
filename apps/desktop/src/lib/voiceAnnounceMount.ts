@@ -1,7 +1,7 @@
 // Side-effect module (mirrors notifyMount/statusMount): hydrate the voice
 // store from ~/.t-hub/voice.json, arm the announce-on-attention watcher, and
-// start the Scribe voice-gate poll once at startup. main.tsx imports this for
-// its side effect.
+// mount the settings-driven Scribe voice-gate lifecycle. main.tsx imports this
+// for its side effect.
 import { useVoice } from "../store/voice";
 import { mountVoiceAnnounce, startScribePoll } from "./voiceAnnounce";
 
@@ -9,6 +9,7 @@ import { mountVoiceAnnounce, startScribePoll } from "./voiceAnnounce";
 // (plain `pnpm dev`) load() falls back to defaults (everything off).
 void useVoice.getState().load();
 mountVoiceAnnounce();
-// Poll Scribe so announcements HOLD while the general dictates and DELIVER when
-// they stop. Fail-open (listening=false) when Scribe isn't running.
+// Poll Scribe only while voice announcements are enabled, so announcements HOLD
+// while the general dictates and DELIVER when they stop. Fail-open
+// (listening=false) when Scribe isn't running.
 startScribePoll();
