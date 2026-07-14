@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.66` from `3b83b9e`, running as Windows PID `46816` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.66` from `a00ce7d`, running as Windows PID `49836` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -71,6 +71,8 @@ The earlier installed application reproduced xterm `loadCell` and `isWrapped` li
 Source commit `6870444` fixed the teardown race, and the packaged `3b83b9e` build completed cold rehydration with zero `loadCell`, `isWrapped`, or window errors.
 Source commit `35fbae2` also prevents a second packaged launch from creating a competing control server and duplicate PTY attachments.
 Source commit `3b83b9e` defers frontend resize commands until remote PTY attachment is confirmed, eliminating repetitive startup `no live terminal` diagnostics in packaged testing.
+Source commit `a00ce7d` adds explicit Git initialization to the shared Project registration transaction used by Captain creation and MCP.
+The transaction atomically reserves a new `.git` directory, initializes `main`, refuses any pre-existing `.git` entry, and removes only the `.git` directory it created when a later registration boundary fails.
 Diagnostic logs are oversized.
 Board still defaults to the wrong global endpoint.
 Preview still exposes an unclear Dev then Preview sequence.
@@ -441,6 +443,11 @@ Make Captain creation understandable for saved, existing, and completely new cod
 15. Commission the Captain identity without forcing creation of an unrelated work Workspace.
 16. Offer creation of an initial Workspace when the Assignment already names a coherent workstream.
 17. Roll back incomplete state while preserving pre-existing directories and useful work.
+
+Phase 7 remains active.
+Items 1 through 7, 9, 11, and the existing-codebase portions of 13 through 15 are implemented.
+The packaged `a00ce7d` build is installed, while the complete graphical packaged E2E matrix for existing non-Git, empty, template, and clone flows remains open.
+The shared registration contract now requires `initializeGit: true` before it changes a non-repository folder, and its Rust integration tests cover success, downstream-failure rollback, pre-existing-file preservation, and refusal to rewrite a pre-existing `.git` entry.
 
 ### Tests and Evidence
 
