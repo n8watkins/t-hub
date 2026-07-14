@@ -235,6 +235,7 @@ Each Harness adapter must define:
 - Turn lifecycle and structured failures.
 - Context telemetry.
 - Provider-limit telemetry.
+- Provider-limit auto-continue scheduling, cancellation, and recovery.
 - Tool, task, and subagent lifecycle where available.
 - History discovery and resume metadata.
 - Hook installation, trust, health, repair, and removal.
@@ -276,6 +277,9 @@ Adapters should map provider events into:
 9. Replace **Claude hooks** settings with **Agent integrations**.
 10. Show each adapter's installed version, hooks, telemetry, History, permissions, and degraded capabilities.
 11. Design the registry so a GLM-compatible adapter can be added without changing History or organizational schemas.
+12. Implement Codex auto-continue after provider-limit reset by preserving the exact thread, pending continuation, reset time, and durable Captain or Crew identity.
+13. Deduplicate scheduled continuation across app restarts, provider retries, repeated limit events, and simultaneous frontend clients.
+14. Allow the General, Captain, or owning Crew policy to cancel or disable a pending continuation before it runs.
 
 ### Tests and Evidence
 
@@ -284,12 +288,15 @@ Adapters should map provider events into:
 - Add explicit degraded-capability tests where one provider lacks an event.
 - Verify hook trust and repair behavior without overwriting user-authored hooks.
 - Verify provider switching preserves T-Hub identity but never mixes incompatible conversation IDs.
+- Test Codex auto-continue with real and fixture limit events, exact reset-time scheduling, early retry backoff, app restart, duplicate events, cancellation, missing threads, and already-completed work.
+- Verify auto-continue never submits a continuation to a different thread, retired identity, closed Assignment, or manually stopped session.
 
 ### Exit Gate
 
 - Codex and Claude both drive dependable working, needs-input, completed, and failed states.
 - Both Harnesses expose effective permission mode and provider identity.
 - Codex context and resume identity are visible and recoverable.
+- Codex auto-continue resumes the exact limited thread once after the provider window resets, or reports a clear recoverable failure.
 - A future adapter can implement the normalized contract without changing Project, Captain, Workspace, History, or inbox schemas.
 
 ## Phase 5 - CLI-First Control Plane
@@ -471,14 +478,17 @@ Make Board, Run and Preview, Files, History, Provider limits, Messages, Resource
 15. Keep conversation context, provider limits, and local resource pressure visually distinct.
 16. Add Messages and Resources surfaces with compact unread and warning badges.
 17. Add Agent integrations settings and effective unrestricted-permission badges.
-18. Add clear Project, Assignment, Captain, Workspace, Crew, worktree, and board labels.
-19. Verify keyboard access, narrow layouts, high DPI, error states, and visual quality.
+18. Add per-session Codex and Claude auto-continue controls with pending, scheduled, cancelled, resumed, and failed states.
+19. Show the provider reset time, exact target session, and cancellation action without exposing internal credentials or prompts unnecessarily.
+20. Add clear Project, Assignment, Captain, Workspace, Crew, worktree, and board labels.
+21. Verify keyboard access, narrow layouts, high DPI, error states, and visual quality.
 
 ### Tests and Evidence
 
 - Add component tests for every empty, loading, degraded, error, and success state.
 - Add browser E2E for Board and Preview, including iframe fallback.
 - Add History resume tests across Codex and Claude.
+- Add auto-continue UI tests for opt-in, opt-out, cancellation, scheduled recovery, duplicate events, and failed exact-thread resume.
 - Add accessibility checks and keyboard-only flows.
 - Perform packaged pixel review at representative Windows scaling values.
 
@@ -488,6 +498,7 @@ Make Board, Run and Preview, Files, History, Provider limits, Messages, Resource
 - Run and Preview starts and stops representative Vite, Next.js, and static projects.
 - Files and Captain creation use the same canonical WSL path semantics.
 - History resumes Codex and Claude sessions accurately.
+- Codex and Claude auto-continue state is visible, controllable, and bound to the correct session.
 - Hidden surfaces produce no sustained CPU activity.
 
 ## Phase 10 - Cortana Operations, Context, Voice, and Notifications
@@ -708,7 +719,7 @@ The matrix describes current T-Hub support, not the provider's theoretical capab
 | Tool lifecycle | Not currently part of T-Hub supervision | Codex has pre and post tool hooks | Keep optional and avoid noisy default UI |
 | History and resume | Claude-only Recent implementation | No unified History | Build adapter-backed History for both |
 | Context meter in tiles | Claude-only | Missing | Make provider-independent |
-| Auto-continue after provider limit | Claude-specific | Missing | Reassess as a provider policy rather than assume parity |
+| Auto-continue after provider limit | Implemented through the Claude-specific flow | Missing | Build durable exact-thread Codex scheduling, cancellation, deduplication, and recovery |
 | Voice attention announcements | Works when Claude status transitions arrive | Usually absent because interactive status is weak | Drive voice from normalized events |
 | Chimes and OS notifications | Stronger through Claude events | Degraded | Drive both from normalized events |
 | Hook installation UI | Claude-only | Missing | Replace with Agent integrations |
@@ -765,7 +776,10 @@ Recommended policy: redact known secret shapes, avoid implicit body logging, use
 ### Provider Limits and Auto-Continue
 
 Provider limit behavior differs across services and can change.
-Recommended policy: expose provider limits globally, keep context per conversation, and make any auto-continue behavior an adapter capability with an explicit user setting.
+Expose provider limits globally and keep context per conversation.
+Implement auto-continue as a normalized adapter capability with an explicit per-session setting.
+Codex auto-continue must persist the exact thread ID, intended continuation, earliest reset time, owning T-Hub identity, cancellation state, and idempotency key.
+If Codex cannot resume safely, T-Hub must retain the pending recovery visibly rather than sending input to an uncertain shell or conversation.
 
 ### Model and Harness Switching
 
@@ -789,12 +803,10 @@ The following questions can be resolved before their dependent phases:
 5. Should completion voice announcements remain opt-in and separate from needs-input speech?
 6. Should Codex interactive telemetry combine lifecycle hooks with app-server or structured turn events for states the hooks cannot prove?
 7. Should provider-specific capabilities appear in an Advanced detail view while the normal UI presents the shared workflow?
-8. Should auto-continue remain a Claude-only capability until a safe Codex equivalent is proven?
 
 Recommended answers are already recorded above so implementation need not pause unless the General wants different policy.
 The recommended Codex telemetry answer is to use hooks for lifecycle boundaries and a structured Codex event source for context, failures, and any missing turn detail.
 The recommended UI answer is to preserve provider-specific detail in Agent integrations while keeping the normal Captain and Crew workflow common.
-The recommended auto-continue answer is to keep it adapter-specific and disabled where no safe provider contract exists.
 
 ## Zero-Context Resume Checklist
 
