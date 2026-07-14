@@ -85,6 +85,9 @@ Automatic spoken announcements currently depend on needs-input status transition
 
 The installed `th` CLI reports version `0.1.0` and timed out during live `health` and `ls` checks in the planning audit.
 The source documents a newer interface, but the CLI still lacks most Captain, Powder, Workspace, resource, and inbox commands.
+The source CLI already has a useful Rust control-client boundary, a no-argument fleet view, deterministic human rendering, a stable JSON envelope, and an established exit-code taxonomy that should be preserved.
+The CLI contract audit also found that unknown flags can be accepted silently, per-subcommand help is absent, `worktree rm` has no explicit confirmation gate, some diagnostics can leak into JSON-mode stderr without a structured suggestion, and JSON collections are described as unbounded.
+The project-specific target is now defined in `docs/cli-contract.md` and intentionally uses stable JSON without an AXI dependency or a claim of AXI compliance.
 
 ## Critical Path
 
@@ -305,25 +308,36 @@ Adapters should map provider events into:
 
 Make `th` the canonical token-efficient control interface and keep MCP as an optional adapter.
 
+Normalize the existing Rust CLI against `docs/cli-contract.md` before expanding its command surface.
+Preserve the existing control-client architecture, JSON envelope, compatible aliases, and exit-code taxonomy unless a separately reviewed versioned migration requires a change.
+
 ### Work
 
-1. Define one shared command catalog and schema source for the control server, CLI, and MCP adapter.
-2. Add CLI groups for fleet, Projects, Captains, Crew, Workspaces, resources, Powder, History, inbox, context, provider limits, recovery, and retirement.
-3. Provide stable `--json` envelopes and documented exit codes for every command.
-4. Preserve per-session identity, role, Project, and ownership checks through CLI calls.
-5. Add idempotency keys and request-status recovery to every retryable mutation.
-6. Add bounded waits and event subscriptions instead of encouraging polling loops.
-7. Filter MCP tool exposure by role and capability.
-8. Keep MCP for typed clients while avoiding a forty-tool schema burden in every agent context.
-9. Add concise skills or command help so agents discover CLI syntax on demand.
-10. Ensure CLI and MCP return equivalent results for the same backend operation.
+1. Normalize the existing argument parser so every command rejects unknown flags and extra positional arguments before side effects.
+2. Add concise per-subcommand `--help` with arguments, flags, defaults, and examples.
+3. Preserve the stable `{ ok, command, data, error }` JSON envelope and established `0`, `2`, `3`, `4`, `5`, and `6` exit taxonomy.
+4. Extend structured errors compatibly with stable symbolic kinds, actionable suggestions, and bounded optional details.
+5. Make empty collections explicit, ordering deterministic, and human and JSON output bounded with totals plus `--all` or `--full` escape hatches.
+6. Require `--confirm` before destructive effects, retain `--yes` only as a temporary compatibility alias where it already exists, and add `--dry-run` where practical.
+7. Define one shared command catalog and schema source for the control server, CLI, and MCP adapter.
+8. Add CLI groups for fleet, Projects, Captains, Crew, Workspaces, resources, Powder, History, inbox, context, provider limits, recovery, and retirement.
+9. Preserve per-session identity, role, Project, and ownership checks through CLI calls.
+10. Add idempotency keys and request-status recovery to every retryable mutation.
+11. Add bounded waits and event subscriptions instead of encouraging polling loops.
+12. Filter MCP tool exposure by role and capability.
+13. Keep MCP for typed clients while avoiding a forty-tool schema burden in every agent context.
+14. Add concise agent instructions and command help so agents discover CLI syntax on demand.
+15. Ensure CLI and MCP return equivalent results for the same backend operation.
+16. Consider `th capabilities --json` only after the expanded catalog makes capability discovery worth its maintenance cost.
 
 ### Tests and Evidence
 
+- Add process-level contract tests for JSON isolation, strict flags and arguments, empty results, exit categories, no-ops, destructive confirmation, deterministic ordering, truncation, and `--full` behavior.
 - Add parity tests that execute each shared operation through CLI and MCP.
 - Add authorization tests for General, Cortana, Captain, Crew, read-only, and trusted-host callers.
 - Measure prompt and tool-schema token overhead before and after role filtering.
 - Test restart, timeout, retry, idempotency, and ambiguous-response recovery.
+- Prefer structural JSON assertions and use exact-output snapshots only for a small set of intentionally reviewed public contracts.
 
 ### Exit Gate
 
@@ -331,6 +345,7 @@ Make `th` the canonical token-efficient control interface and keep MCP as an opt
 - MCP remains functional without defining separate behavior.
 - CLI and MCP cannot bypass each other's authorization or identity rules.
 - The reduced tool surface demonstrates lower context overhead.
+- Unknown input fails before side effects, destructive actions require explicit confirmation, and all supported JSON output remains bounded, parseable, and compatible.
 
 ## Phase 6 - Durable Inbox and Agent Communication
 
@@ -628,7 +643,7 @@ Parallel lanes must not edit the same registry schema, migration, or core lifecy
 These lanes may proceed in parallel:
 
 - **A1 Terminal correctness:** xterm race reproduction, lifecycle fixes, and packaged tests.
-- **A2 CLI reliability:** upgrade `th`, fix restart recovery, add timeout tests, and preserve protocol compatibility.
+- **A2 CLI reliability:** upgrade `th`, fix restart recovery, add timeout tests, preserve protocol compatibility, and do not expand the command catalog yet.
 - **A3 Resource schema design:** specify ownership records and reconciliation without enabling cleanup yet.
 - **A4 Provider event research and fixtures:** capture Codex and Claude lifecycle fixtures without changing the live reducer.
 - **A5 Documentation and terminology:** keep canonical definitions synchronized without changing historical artifacts.
@@ -643,12 +658,13 @@ These lanes may proceed in parallel after the Phase 1 control contract is stable
 - **B2 Workspace model:** Captain-to-Workspace control and Crew membership.
 - **B3 Codex adapter:** hooks, interactive telemetry, context, History, and permission launch behavior.
 - **B4 Claude adapter normalization:** move existing hooks and status telemetry behind the shared contract.
-- **B5 CLI and MCP shared catalog:** shared schemas, role filtering, and parity tests.
+- **B5 CLI contract and shared catalog:** first normalize the existing CLI to `docs/cli-contract.md`, then add shared schemas, role filtering, command groups, and CLI-to-MCP parity tests.
 - **B6 Inbox identity and UI data model:** durable recipients, message states, retention, and read APIs.
 
 B1 owns shared identity migrations.
 B3 and B4 must consume B1's identity interfaces rather than each introducing provider-specific durable fields.
 B5 owns command definitions.
+B5 must land contract behavior and process-level tests before broad command generation so new commands inherit the correct interface.
 B6 owns messaging schema and must not bypass B1 authority.
 
 ### Tranche C - Product Flows
