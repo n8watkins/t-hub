@@ -238,6 +238,8 @@ Terminal visibility, scrollback recovery, input readiness, and canvas reattachme
 
 ## Remaining Production Work
 
+The canonical gated sequence is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
+
 The ordered continuation is:
 
 1. Reproduce and fix the installed xterm lifecycle rendering errors.
