@@ -3,26 +3,26 @@
 **Updated:** 2026-07-13.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Implementation head before this handoff:** `c8f00cc`.
-**Installed Windows build:** `52c984b`, T-Hub `0.3.64`.
+**Implementation head before the final deployment update:** `154e1a1`.
+**Installed Windows build:** `154e1a1`, T-Hub `0.3.64`.
 
 ## Executive Status
 
 The reviewed Captain, Crew, Powder, CI, and installer changes are committed through `c8f00cc`.
-The Windows production build from `52c984b` is installed and running.
+The Windows production build from `154e1a1` is installed and running.
 T-Hub MCP control has been proven against the installed application.
 A generic Captain create, claim, inventory, release, process close, and tab cleanup smoke passed against the installed application.
 The T-Hub repository is registered as a durable project, but it is not Powder-bound.
 The authoritative Powder deployment is unreachable from the current tailnet and no agent-scoped credential source is configured.
 Canonical project commissioning, reset recovery, Powder claims, and Crew dispatch therefore remain blocked and correctly fail closed.
-The right-click Codex header defect is fixed locally in `c8f00cc`, but that commit has not yet been released or installed.
+The right-click Codex header defect from `c8f00cc` is released and installed.
 Three independent skill and handoff reviews identified additional Captain parity and production gaps that are recorded below.
 
 ## Current Runtime
 
 - The installed application is `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-- The application was installed from the successful production release run for commit `52c984b`.
-- The running application reported PID `26096`, control protocol version `2`, and address `127.0.0.1:49870` during verification.
+- The application was installed from the successful production release run for commit `154e1a1`.
+- The running application reported PID `18228`, control protocol version `2`, and address `127.0.0.1:64871` after installation.
 - The Windows control handshake is `C:\Users\natha\.t-hub\control.json`.
 - The WSL handshake path resolves to the same Windows control state.
 - The installed MCP binary is `~/.t-hub/bin/t-hub-mcp`.
@@ -85,10 +85,10 @@ Three independent skill and handoff reviews identified additional Captain parity
 - Pull requests and pushes to `main` run Rust formatting, workspace tests, warning-free Clippy, TypeScript, Vitest, and the production frontend build.
 - CI validates Rust `1.89.0` as the declared MSRV.
 - The release workflow depends on the reusable quality workflow.
-- CI run `29293723636` passed for commit `52c984b`.
-- Production release run `29294005256` passed for commit `52c984b`.
+- CI run `29296074677` passed for commit `154e1a1`.
+- Production release run `29296200008` passed for commit `154e1a1`.
 - The release produced `T-Hub_0.3.64_x64-setup.exe` and its Tauri updater signature.
-- The installer SHA-256 was `cc1f31f700bcc7af0369a6e531f9e2893a34491e7cc68df48a2ebee6d1eec33a`.
+- The installer SHA-256 was `3953339031442323beb318012b53b41bf0cf458701397f291fb047ee263c3e04`.
 - The installer is not Authenticode signed.
 
 ## Runtime Acceptance Completed
@@ -219,26 +219,25 @@ Captain continuity and rebind logic must be provider-aware.
 
 ## Ordered Next Work
 
-1. Push `c8f00cc` and this handoff, then require remote CI to pass.
-2. Build, install, and visually verify the Codex header fix.
-3. Redesign right-click pinning so the UI clearly distinguishes overlay pinning from full project commissioning.
-4. Add an atomic project-attachment or commissioning path for an existing terminal when that workflow is desired.
-5. Make Captain identity, bootstrap prompts, checkpointing, and MCP installation harness-aware.
-6. Make MCP registration and top-level installation transactional and convergence-complete.
-7. Resolve Powder network reachability and configure the agent-scoped protected profile.
-8. Bind the registered T-Hub project and require `powder_status` to pass.
-9. Commission disposable Codex and Claude project Captains.
-10. Verify reset recovery by terminal ID and ship slug.
-11. Dispatch disposable Codex and Claude Crew against real ready Powder cards.
-12. Verify claim renewal, terminal close release, rollback retention, and event delivery.
-13. Complete Windows signing, security scanning, CSP hardening, strict branch protection, and packaged end-to-end CI.
+1. Visually confirm that the installed Codex header no longer displays a Claude session ID.
+2. Redesign right-click pinning so the UI clearly distinguishes overlay pinning from full project commissioning.
+3. Add an atomic project-attachment or commissioning path for an existing terminal when that workflow is desired.
+4. Make Captain identity, bootstrap prompts, checkpointing, and MCP installation harness-aware.
+5. Make MCP registration and top-level installation transactional and convergence-complete.
+6. Resolve Powder network reachability and configure the agent-scoped protected profile.
+7. Bind the registered T-Hub project and require `powder_status` to pass.
+8. Commission disposable Codex and Claude project Captains.
+9. Verify reset recovery by terminal ID and ship slug.
+10. Dispatch disposable Codex and Claude Crew against real ready Powder cards.
+11. Verify claim renewal, terminal close release, rollback retention, and event delivery.
+12. Complete Windows signing, security scanning, CSP hardening, strict branch protection, and packaged end-to-end CI.
 
 ## Fresh Context Procedure
 
 1. Read `AGENTS.md`, this handoff, `skills/captain/SKILL.md`, `docs/POWDER-INTEGRATION.md`, and `docs/PRODUCTION-READINESS.md`.
 2. Run `git status --short` and preserve the user's `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` artifacts.
 3. Run `git log --oneline -8` and inspect any commits after `c8f00cc`.
-4. Confirm whether `c8f00cc` has passed remote CI and has been installed.
+4. Confirm that the installed build is still `154e1a1` or later.
 5. Do not treat a right-click pin as proof of control capability or project commissioning.
 6. Use `my_capability`, `list_captains`, and `captain_bootstrap` to verify runtime truth.
 7. Do not dispatch canonical Crew until the project has a verified Powder binding.
@@ -247,5 +246,5 @@ Captain continuity and rebind logic must be provider-aware.
 
 ## Resume Point
 
-The immediate continuation is to deploy `c8f00cc`, then address the reviewed Captain skill and pinning gaps before calling the Captain and Crew relationship stable.
+The immediate continuation is to address the reviewed Captain skill and pinning gaps before calling the Captain and Crew relationship stable.
 Powder-backed acceptance remains externally blocked until the authoritative endpoint and agent-scoped credential command are available.
