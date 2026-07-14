@@ -28,7 +28,7 @@
 //! growth by rotating the file to a single `.1` backup once it exceeds 8 MiB.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{LazyLock, OnceLock};
@@ -168,12 +168,7 @@ fn writer() -> &'static SyncSender<Msg> {
 /// The background writer loop: owns one open file handle, appends each line, and
 /// rotates to a single `.1` backup once the file exceeds [`ROTATE_BYTES`].
 fn writer_loop(path: PathBuf, rx: mpsc::Receiver<Msg>) {
-    let mut file = open_log(&path);
-    // Track the size ourselves so we don't `stat` per line.
-    let mut size = file
-        .as_ref()
-        .and_then(|f| f.metadata().ok())
-        .map_or(0, |m| m.len());
+    let (mut file, mut size) = open_retained_log(&path, ROTATE_BYTES);
 
     for msg in rx {
         match msg {
@@ -208,6 +203,7 @@ fn writer_loop(path: PathBuf, rx: mpsc::Receiver<Msg>) {
                     // ROTATE_BYTES before trying again.
                     if rotated {
                         size = 0;
+                        let _ = trim_backup(&path, ROTATE_BYTES);
                     }
                 }
             }
@@ -241,6 +237,22 @@ fn writer_loop(path: PathBuf, rx: mpsc::Receiver<Msg>) {
     }
 }
 
+/// Open the primary log after enforcing the retention bound on both files.
+/// Legacy builds could leave a primary or `.1` backup far beyond the current
+/// cap, so startup normalizes those files before accepting new entries.
+fn open_retained_log(path: &Path, max_bytes: u64) -> (Option<File>, u64) {
+    let _ = trim_backup(path, max_bytes);
+    let size = fs::metadata(path).map_or(0, |metadata| metadata.len());
+    if size >= max_bytes {
+        let (file, rotated) = rotate(path);
+        if rotated {
+            let _ = trim_backup(path, max_bytes);
+            return (file, 0);
+        }
+    }
+    (open_log(path), size)
+}
+
 /// Open (creating the `.t-hub` dir + file as needed) the primary log for
 /// appending. Returns `None` on any IO error so the caller stays best-effort.
 fn open_log(path: &Path) -> Option<File> {
@@ -258,16 +270,93 @@ fn open_log(path: &Path) -> Option<File> {
 fn rotate(path: &Path) -> (Option<File>, bool) {
     // Append ".1" to the FULL filename (e.g. `diag.log` -> `diag.log.1`) rather
     // than replacing the extension, so the primary keeps its `.log` name.
+    let backup = backup_path(path);
+    // Windows' std::fs::rename does not replace an existing destination, so use
+    // the platform replacement helper to keep the backup single-file. Our own
+    // append handle uses FILE_SHARE_DELETE, so holding it open does not block the
+    // move; a foreign reader without share-delete can still make it fail.
+    let rotated = replace_file(path, &backup).is_ok();
+    (open_log(path), rotated)
+}
+
+fn backup_path(path: &Path) -> PathBuf {
     let mut backup = path.as_os_str().to_owned();
     backup.push(".1");
-    let backup = PathBuf::from(backup);
-    // rename() overwrites an existing destination on both unix and Windows
-    // (the latter via the std MoveFileEx replace path), so the .1 backup is
-    // single and self-overwriting. Our own append handle uses FILE_SHARE_DELETE,
-    // so holding it open does NOT block the rename; only a foreign reader without
-    // share-delete would, and that's the failure we report.
-    let rotated = fs::rename(path, &backup).is_ok();
-    (open_log(path), rotated)
+    PathBuf::from(backup)
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    result.map_err(|_| std::io::Error::last_os_error())
+}
+
+/// Keep the newest complete lines from an oversized backup.
+///
+/// The rewrite goes through a sibling temporary file and rename, so a failed
+/// read or write leaves the original diagnostic evidence intact. A partial
+/// first line is discarded after seeking into the tail.
+fn trim_backup(path: &Path, max_bytes: u64) -> std::io::Result<()> {
+    let backup = backup_path(path);
+    let len = match fs::metadata(&backup) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if len <= max_bytes {
+        return Ok(());
+    }
+
+    let mut source = File::open(&backup)?;
+    source.seek(SeekFrom::Start(len - max_bytes))?;
+    let mut tail = Vec::with_capacity(max_bytes as usize);
+    source.read_to_end(&mut tail)?;
+    if let Some(newline) = tail.iter().position(|byte| *byte == b'\n') {
+        tail.drain(..=newline);
+    } else {
+        tail.clear();
+    }
+
+    let mut temp_name = backup.as_os_str().to_owned();
+    temp_name.push(".retention.tmp");
+    let temp = PathBuf::from(temp_name);
+    let _ = fs::remove_file(&temp);
+    let result = (|| {
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        output.write_all(&tail)?;
+        output.sync_all()?;
+        replace_file(&temp, &backup)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 /// Append `<ISO-8601 timestamp> <line>\n` to the diag log. NON-BLOCKING: formats
@@ -288,4 +377,72 @@ pub fn diag_log(line: String) {
 #[tauri::command]
 pub fn diag_clear() {
     let _ = writer().try_send(Msg::Clear);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "t-hub-diag-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn startup_trims_an_oversized_legacy_backup_to_recent_complete_lines() {
+        let dir = fixture("legacy-backup");
+        let path = dir.join("diag.log");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"current\n").unwrap();
+        fs::write(backup_path(&path), b"old-1\nold-2\nrecent-1\nrecent-2\n").unwrap();
+
+        let (_file, size) = open_retained_log(&path, 20);
+
+        let retained = fs::read(backup_path(&path)).unwrap();
+        assert!(retained.len() <= 20);
+        assert_eq!(String::from_utf8(retained).unwrap(), "recent-1\nrecent-2\n");
+        assert_eq!(size, 8);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "current\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replacement_overwrites_an_existing_destination() {
+        let dir = fixture("replace");
+        let source = dir.join("source");
+        let destination = dir.join("destination");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&source, b"new").unwrap();
+        fs::write(&destination, b"old").unwrap();
+
+        replace_file(&source, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert!(!source.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_rotates_and_caps_an_oversized_primary() {
+        let dir = fixture("legacy-primary");
+        let path = dir.join("diag.log");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"old-1\nold-2\nrecent-1\nrecent-2\n").unwrap();
+
+        let (mut file, size) = open_retained_log(&path, 20);
+        file.as_mut().unwrap().write_all(b"new\n").unwrap();
+
+        assert_eq!(size, 0);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        let retained = fs::read(backup_path(&path)).unwrap();
+        assert!(retained.len() <= 20);
+        assert_eq!(String::from_utf8(retained).unwrap(), "recent-1\nrecent-2\n");
+        let _ = fs::remove_dir_all(dir);
+    }
 }

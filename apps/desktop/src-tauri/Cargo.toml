@@ -128,6 +128,9 @@ t-hub-protocol = { path = "crates/t-hub-protocol" }
 tauri-plugin-single-instance = "2"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    # MoveFileExW with replace + write-through semantics for atomic diagnostic
+    # log rotation when a previous `.1` backup already exists.
+    "Win32_Storage_FileSystem",
     # OpenProcess/CloseHandle for the Scribe voice-gate pid-liveness check
     # (scribe.rs): T-Hub-on-Windows confirms Scribe's pid is alive so a long
     # continuous dictation holds regardless of the status file's mtime.
