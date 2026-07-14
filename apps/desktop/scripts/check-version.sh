@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Validate the desktop release version and optionally require the version bump
-# to be newer than every committed desktop change.
+# Validate the desktop release version and optionally reject reuse of a version
+# that has already been tagged for a different commit.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -39,14 +39,10 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --history)
-      version_commit=$(git log -1 --format=%H -- package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json)
-      [[ -n "$version_commit" ]] || { echo "desktop version has no Git history" >&2; exit 1; }
-      if ! git diff --quiet "$version_commit"..HEAD -- . \
-        ':(exclude)package.json' \
-        ':(exclude)src-tauri/Cargo.toml' \
-        ':(exclude)src-tauri/Cargo.lock' \
-        ':(exclude)src-tauri/tauri.conf.json'; then
-        echo "desktop changes exist after the last version bump; run scripts/bump-version.sh" >&2
+      version_tag="v$package_version"
+      if git rev-parse --verify --quiet "refs/tags/$version_tag" >/dev/null && \
+        [[ "$(git rev-list -n 1 "$version_tag")" != "$(git rev-parse HEAD)" ]]; then
+        echo "desktop version $package_version is already tagged at $(git rev-list -n 1 --abbrev-commit "$version_tag"); run scripts/bump-version.sh" >&2
         exit 1
       fi
       shift
