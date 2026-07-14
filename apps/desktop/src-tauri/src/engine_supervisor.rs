@@ -610,7 +610,7 @@ pub mod platform {
     /// same discipline as PR #50/#52). On non-Windows it is a no-op.
     #[cfg(windows)]
     pub fn assign_kill_on_close_job(child: &std::process::Child) -> std::io::Result<()> {
-        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -619,15 +619,17 @@ pub mod platform {
         };
         unsafe {
             let job = CreateJobObjectW(None, None)?;
+            let job = OwnedHandle::from_raw_handle(job.0);
+            let job_handle = HANDLE(job.as_raw_handle() as _);
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             SetInformationJobObject(
-                job,
+                job_handle,
                 JobObjectExtendedLimitInformation,
                 &info as *const _ as *const core::ffi::c_void,
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )?;
-            AssignProcessToJobObject(job, HANDLE(child.as_raw_handle() as _))?;
+            AssignProcessToJobObject(job_handle, HANDLE(child.as_raw_handle() as _))?;
             // NOTE: the job handle is intentionally leaked - it must stay open for
             // the app's lifetime so KILL_ON_JOB_CLOSE fires when the app process
             // (and thus this handle) is torn down by the OS.

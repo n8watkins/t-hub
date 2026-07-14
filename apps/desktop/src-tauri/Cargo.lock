@@ -4038,7 +4038,7 @@ dependencies = [
 
 [[package]]
 name = "t-hub"
-version = "0.3.65"
+version = "0.3.66"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
