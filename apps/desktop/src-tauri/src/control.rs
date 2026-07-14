@@ -6420,12 +6420,18 @@ fn list_projects(ctx: &ControlContext) -> Result<Value, String> {
         Ok(names) => (names, None),
         Err(error) => (Vec::new(), Some(error)),
     };
+    let (wsl_home, wsl_home_error) = match files::user_home_path() {
+        Ok(home) => (Some(home), None),
+        Err(error) => (None, Some(error)),
+    };
     Ok(json!({
         "projects": snap.projects,
         "count": snap.projects.len(),
         "seq": snap.seq,
         "powderProfiles": powder_profiles,
         "powderProfilesError": powder_profiles_error,
+        "wslHome": wsl_home,
+        "wslHomeError": wsl_home_error,
     }))
 }
 

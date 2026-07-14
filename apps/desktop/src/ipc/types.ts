@@ -235,6 +235,8 @@ export interface DirEntry {
   /** Absolute path to this entry. */
   path: string;
   isDir: boolean;
+  /** True when this directory is itself a Git worktree or repository root. */
+  isGitRepo: boolean;
   /** File size in bytes (0 for directories). */
   size: number;
 }

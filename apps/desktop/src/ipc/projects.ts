@@ -23,6 +23,8 @@ export interface ProjectCatalog {
   seq: number;
   powderProfiles?: string[];
   powderProfilesError?: string;
+  wslHome?: string;
+  wslHomeError?: string;
 }
 
 export function listProjects(): Promise<ProjectCatalog> {

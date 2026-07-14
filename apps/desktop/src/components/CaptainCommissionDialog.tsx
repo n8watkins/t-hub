@@ -7,6 +7,7 @@ import {
   registerProject,
   type RegisteredProject,
 } from "../ipc/projects";
+import { WslFolderPicker } from "./WslFolderPicker";
 
 interface CaptainCommissionDialogProps {
   open: boolean;
@@ -27,6 +28,8 @@ export function CaptainCommissionDialog({
   const [powderProfilesError, setPowderProfilesError] = useState<string | null>(
     null,
   );
+  const [wslHome, setWslHome] = useState("");
+  const [wslHomeError, setWslHomeError] = useState<string | null>(null);
   const [projectId, setProjectId] = useState("");
   const [repoRoot, setRepoRoot] = useState("");
   const [projectName, setProjectName] = useState("");
@@ -47,8 +50,11 @@ export function CaptainCommissionDialog({
         setProjects(catalog.projects);
         setPowderProfiles(catalog.powderProfiles ?? []);
         setPowderProfilesError(catalog.powderProfilesError ?? null);
+        setWslHome(catalog.wslHome ?? "");
+        setWslHomeError(catalog.wslHomeError ?? null);
         const first = catalog.projects[0];
         setProjectId((current) => current || first?.projectId || "");
+        setRepoRoot((current) => current || catalog.wslHome || first?.repoRoot || "/home");
         if (catalog.projects.length === 0) setMode("existing");
         if (catalog.powderProfiles?.length === 1) {
           setConnectionProfile(catalog.powderProfiles[0]);
@@ -224,14 +230,20 @@ export function CaptainCommissionDialog({
           ) : (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Field label="WSL folder" wide>
-                <input
-                  aria-label="WSL folder"
-                  value={repoRoot}
-                  onChange={(event) => setRepoRoot(event.target.value)}
-                  className={inputClass}
-                  style={fieldStyle}
-                  placeholder="/home/user/project"
+                <WslFolderPicker
+                  path={repoRoot}
+                  home={wslHome || undefined}
+                  recentPaths={[...projects]
+                    .sort((a, b) => b.updatedAt - a.updatedAt)
+                    .map((project) => ({
+                      label: project.name,
+                      path: project.repoRoot,
+                    }))}
+                  onPathChange={setRepoRoot}
                 />
+                {wslHomeError && (
+                  <p className="mt-1 text-xs text-amber-300">{wslHomeError}</p>
+                )}
               </Field>
               <Field label="Codebase name">
                 <input

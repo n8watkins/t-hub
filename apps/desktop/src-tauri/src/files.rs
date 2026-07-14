@@ -172,8 +172,58 @@ pub struct DirEntry {
     /// Absolute path to this entry (so the UI can drill in / open directly).
     pub path: String,
     pub is_dir: bool,
+    /// True when this directory is itself a Git worktree or repository root.
+    pub is_git_repo: bool,
     /// File size in bytes (0 for directories).
     pub size: u64,
+}
+
+/// Resolve the user's native WSL home for folder browsing.
+///
+/// The packaged Windows app must ask the configured distro because its process
+/// HOME points at Windows. Native Linux and WSL builds can use HOME directly.
+pub fn user_home_path() -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let distro = host_distro();
+        let mut command = std::process::Command::new("wsl.exe");
+        command
+            .arg("-d")
+            .arg(&distro)
+            .arg("-e")
+            .arg("bash")
+            .arg("-lc")
+            .arg("printf %s \"$HOME\"")
+            .creation_flags(0x0800_0000);
+        let output = crate::bounded_exec::output_with_timeout(
+            command,
+            crate::bounded_exec::WSL_PROBE_TIMEOUT,
+        )
+        .map_err(|error| format!("could not resolve WSL home for {distro}: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not resolve WSL home for {distro}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        normalize_home_output(&output.stdout)
+    }
+    #[cfg(unix)]
+    {
+        std::env::var("HOME")
+            .map_err(|_| "HOME is unavailable".to_string())
+            .and_then(|home| normalize_home_output(home.as_bytes()))
+    }
+}
+
+fn normalize_home_output(output: &[u8]) -> Result<String, String> {
+    let home = String::from_utf8_lossy(output).trim().to_string();
+    if home.starts_with('/') && home.len() > 1 {
+        Ok(home.trim_end_matches('/').to_string())
+    } else {
+        Err("WSL home is not an absolute POSIX path".to_string())
+    }
 }
 
 /// The capped result of reading a text file for the reader.
@@ -396,20 +446,27 @@ fn wsl_list_dir(dir: &str, show_ignored: bool) -> Result<Vec<DirEntry>, String> 
     // matches, so `|| true` keeps the pipeline alive. Already in `dir` via wsl.exe
     // --cd, so we operate on `.` (no `cd "$1"`).
     const SCRIPT_FILTER: &str = r#"
-emit() { find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null; }
+emit() {
+  find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null |
+    while IFS=$'\t' read -r f y; do
+      g=0
+      [ "$y" = d ] && [ -e "$f/.git" ] && g=1
+      printf '%s\t%s\t%s\n' "$f" "$y" "$g"
+    done
+}
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  ign=$(emit | while IFS=$'\t' read -r f y; do
+  ign=$(emit | while IFS=$'\t' read -r f y g; do
           [ "$y" = d ] && printf '%s/\n' "$f"
         done | git check-ignore --stdin 2>/dev/null | sed 's#/$##' || true)
-  emit | while IFS=$'\t' read -r f y; do
+  emit | while IFS=$'\t' read -r f y g; do
     if [ "$y" = d ]; then
       skip=
       while IFS= read -r ig; do [ "$f" = "$ig" ] && skip=1 && break; done <<EOF
 $ign
 EOF
-      [ -z "$skip" ] && printf '%s\t%s\n' "$f" "$y"
+      [ -z "$skip" ] && printf '%s\t%s\t%s\n' "$f" "$y" "$g"
     else
-      printf '%s\t%s\n' "$f" "$y"
+      printf '%s\t%s\t%s\n' "$f" "$y" "$g"
     fi
   done
 else
@@ -417,7 +474,14 @@ else
 fi
 "#;
     // "Show ignored": no filtering — list every child (ignored dirs included).
-    const SCRIPT_ALL: &str = r#"find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null"#;
+    const SCRIPT_ALL: &str = r#"
+find . -maxdepth 1 -mindepth 1 -printf '%f\t%y\n' 2>/dev/null |
+  while IFS=$'\t' read -r f y; do
+    g=0
+    [ "$y" = d ] && [ -e "$f/.git" ] && g=1
+    printf '%s\t%s\t%s\n' "$f" "$y" "$g"
+  done
+"#;
     let script = if show_ignored {
         SCRIPT_ALL
     } else {
@@ -442,9 +506,10 @@ fi
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut out = Vec::new();
     for line in stdout.lines() {
-        let (name, ty) = match line.split_once('\t') {
-            Some(parts) => parts,
-            None => continue,
+        let mut fields = line.splitn(3, '\t');
+        let (name, ty, git) = match (fields.next(), fields.next(), fields.next()) {
+            (Some(name), Some(ty), Some(git)) => (name, ty, git),
+            _ => continue,
         };
         if name.is_empty() || name == "." || name == ".." {
             continue;
@@ -460,6 +525,7 @@ fi
             name: name.to_string(),
             path: format!("{base}/{name}"),
             is_dir,
+            is_git_repo: is_dir && git == "1",
             // Size is not surfaced in the tree UI; computing it would cost an
             // extra stat per entry. Report 0 (dirs already report 0 on the fs
             // path too); the reader stats the real size on open.
@@ -975,6 +1041,7 @@ fn read_dir_shallow_fs(dir: &Path, show_ignored: bool) -> Result<Vec<DirEntry>, 
             name,
             path: path.to_string_lossy().into_owned(),
             is_dir,
+            is_git_repo: is_dir && path.join(".git").exists(),
             size,
         });
     }
@@ -1032,6 +1099,7 @@ fn read_dir_raw(dir: &Path, keep: impl Fn(&str, bool) -> bool) -> Result<Vec<Dir
             name,
             path: path.to_string_lossy().into_owned(),
             is_dir,
+            is_git_repo: is_dir && path.join(".git").exists(),
             size,
         });
     }
@@ -1793,6 +1861,7 @@ mod tests {
     #[test]
     fn list_dir_is_shallow_dirs_first_and_prunes() {
         let root = make_fixture();
+        std::fs::create_dir_all(root.join("nested-repo/.git")).unwrap();
         let entries = read_dir_shallow(&root, false).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
 
@@ -1842,7 +1911,10 @@ mod tests {
         // src must be a directory with size 0.
         let src = entries.iter().find(|e| e.name == "src").unwrap();
         assert!(src.is_dir);
+        assert!(!src.is_git_repo);
         assert_eq!(src.size, 0);
+        let nested_repo = entries.iter().find(|e| e.name == "nested-repo").unwrap();
+        assert!(nested_repo.is_git_repo);
         // The .env we added back via the raw pass must report a real (non-dir)
         // size, not 0 — i.e. it's classified as a file.
         let env = entries.iter().find(|e| e.name == ".env").unwrap();
@@ -1850,6 +1922,17 @@ mod tests {
         assert!(env.size > 0, "added-back .env should carry its byte size");
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn home_output_requires_an_absolute_posix_path() {
+        assert_eq!(
+            normalize_home_output(b" /home/natkins/\n").unwrap(),
+            "/home/natkins"
+        );
+        assert!(normalize_home_output(b"C:\\Users\\natha").is_err());
+        assert!(normalize_home_output(b"/").is_err());
+        assert!(normalize_home_output(b"").is_err());
     }
 
     #[test]

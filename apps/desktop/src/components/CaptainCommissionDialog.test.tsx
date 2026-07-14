@@ -6,6 +6,8 @@ import {
   listProjects,
   registerProject,
 } from "../ipc/projects";
+import { listDir } from "../ipc/files";
+import { gitInfo } from "../ipc/git";
 import { CaptainCommissionDialog } from "./CaptainCommissionDialog";
 
 vi.mock("../ipc/projects", () => ({
@@ -14,6 +16,8 @@ vi.mock("../ipc/projects", () => ({
   bindProjectPowder: vi.fn(),
   commissionCaptain: vi.fn(),
 }));
+vi.mock("../ipc/files", () => ({ listDir: vi.fn() }));
+vi.mock("../ipc/git", () => ({ gitInfo: vi.fn() }));
 
 const project = {
   projectId: "project-1",
@@ -30,6 +34,14 @@ describe("CaptainCommissionDialog", () => {
     vi.mocked(registerProject).mockReset();
     vi.mocked(bindProjectPowder).mockReset();
     vi.mocked(commissionCaptain).mockReset();
+    vi.mocked(listDir).mockResolvedValue([]);
+    vi.mocked(gitInfo).mockResolvedValue({
+      isRepo: false,
+      branch: null,
+      worktreeRoot: null,
+      isLinkedWorktree: false,
+      dirtyCount: 0,
+    });
   });
 
   it("saves an existing codebase with Powder before creating its Captain", async () => {
@@ -61,7 +73,7 @@ describe("CaptainCommissionDialog", () => {
       />,
     );
 
-    const wslFolder = await screen.findByLabelText("WSL folder");
+    const wslFolder = await screen.findByLabelText("Manual WSL path");
     expect(screen.getByRole("dialog", { name: "Create Captain" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Use saved codebase" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Choose existing WSL folder" })).toBeTruthy();
@@ -69,6 +81,7 @@ describe("CaptainCommissionDialog", () => {
     fireEvent.change(wslFolder, {
       target: { value: "/repo/t-hub" },
     });
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
     fireEvent.change(screen.getByLabelText("Powder board"), {
       target: { value: "t-hub" },
     });
