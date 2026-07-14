@@ -2,7 +2,7 @@
 
 ## Canonical Planning Note
 
-The runtime evidence in this handoff remains the baseline for the installed `0.3.66` build.
+The runtime evidence in this handoff is current through the installed `0.3.71` build.
 The authoritative forward roadmap is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
 The document-status authority is [REVIEW-INDEX.md](./REVIEW-INDEX.md).
 That plan now includes the settled permanent Cortana identity, multiple Captains per Project, Assignment-based ownership, provider-agnostic Harness integration, CLI-first control, durable messaging, History, voice parity, and parallel implementation lanes.
@@ -13,8 +13,8 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `e5948c8`.
-**Installed Windows build:** locally built T-Hub `0.3.66` from `e5948c8`.
+**Source head before this handoff update:** `3576957`.
+**Installed Windows build:** locally built T-Hub `0.3.71` from `3576957`.
 
 ## Executive Status
 
@@ -22,10 +22,10 @@ The Captain, Crew, cross-harness provisioning, Handoff skill, authority hardenin
 The final independent authority review reports no remaining Critical, High, or Medium application-level finding under the documented same-user threat model.
 The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
 
-The final production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `28866e19fcbfd782319010334116306455df758fff8cf8ade055b63caf864749`.
-It is running as PID `39760`.
-The exact NSIS installer SHA-256 is `3e3dee7599192bd1251d57d67c7118198d65beb5b418b557a8ca94ad1b81ff98`.
+The current production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+The installed executable SHA-256 is `1F6D857300807C7024846679FC72D986C6C05F80CBDBB950D7A5D0F7EACDEC81`.
+It is running as PID `24216`.
+The exact NSIS installer SHA-256 is `BA156573303F71496599D25EF40CE50205A41C82EAD72A393999325E936FDFDD`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
@@ -65,6 +65,12 @@ The main implementation sequence in this work is:
 - `6cd97f8 test(terminal): cover pool lifecycle rehydration`
 - `12c9e0b chore(release): bump desktop to 0.3.65`
 - `a4fd704 fix(windows): own supervisor job handle`
+- `a6230aa fix: bound retained diagnostic logs`
+- `67fd348 fix: close diagnostic backup before replacement`
+- `cfa4139 fix: serialize terminal resize behind writes`
+- `cbc558b fix: leave xterm parser before buffer mutation`
+- `1e005e6 fix: recover terminal IPC detach races`
+- `3576957 chore: bump desktop to 0.3.71`
 
 ## Captain and Crew Model
 
@@ -259,15 +265,14 @@ The canonical gated sequence is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-
 
 The ordered continuation is:
 
-1. Resolve transient WSL command timeouts, then close the remaining Phase 1 control gate.
-2. Complete new-codebase creation, explicit Git initialization, Powder board selection or creation, transactional rollback, and packaged Captain-creation E2E.
-3. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
-4. Verify context reset recovery, Crew dispatch into a deliberate shared workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
-5. Wire the Board panel to the focused project's Powder profile instead of the global `http://localhost:4000` default.
-6. Replace the unclear Dev then Preview sequence with a guided Run and Preview flow.
-7. Confirm the Claude terminal-header label interactively in the installed application.
-8. Run stable packaged 1, 4, 8, and 16 terminal acceptance measurements, including cold rehydration, input readiness, and canvas rendering.
-9. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
+1. Complete new-codebase creation, Powder board selection or creation, transactional rollback, and packaged Captain-creation E2E.
+2. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
+3. Verify context reset recovery, Crew dispatch into a deliberate shared Workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
+4. Wire the Board panel to the focused project's Powder profile instead of the global `http://localhost:4000` default.
+5. Replace the unclear Dev then Preview sequence with a guided Run and Preview flow.
+6. Confirm the Claude terminal-header label interactively in the installed application.
+7. Run stable packaged 1, 4, 8, and 16 terminal acceptance measurements, including cold rehydration, input readiness, and canvas rendering.
+8. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
 
 Additional production-readiness gaps remain outside the Captain slice:
 
@@ -294,24 +299,26 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The installed Windows process was reverified at PID `39760`, start time `2026-07-14T14:26:37-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-Its file and product version are `0.3.66`.
-The installed executable SHA-256 is `28866E19FCBFD782319010334116306455DF758FFF8CF8ADE055B63CAF864749`.
-The installed build was produced from source `e5948c8` with NSIS installer SHA-256 `3E3DEE7599192BD1251D57D67C7118198D65BEB5B418B557A8CA94AD1B81FF98`.
+The installed Windows process was reverified at PID `24216`, start time `2026-07-14T16:25:51-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its file and product version are `0.3.71`.
+The installed executable SHA-256 is `1F6D857300807C7024846679FC72D986C6C05F80CBDBB950D7A5D0F7EACDEC81`.
+The installed build was produced from source `3576957` with NSIS installer SHA-256 `BA156573303F71496599D25EF40CE50205A41C82EAD72A393999325E936FDFDD`.
 The installed `th` CLI is version `0.2.0` from source `07e74f4`.
 Source commit `6870444` fixes the reproduced xterm teardown race.
 Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
 Source commit `a00ce7d` adds explicit Git initialization to the shared Project registration transaction.
 It never initializes without `initializeGit: true`, refuses a pre-existing `.git` entry, defaults the new repository to `main`, and rolls back only the `.git` directory it created if a later boundary fails.
 Source commit `e5948c8` collapses concurrent frontend terminal enumeration into one in-flight request and retries one bounded tmux timeout without retrying unrelated failures.
-The latest source gate passed 445 frontend tests, the production frontend build, 582 Rust library tests with 1 ignored, formatting, and warnings-denied Clippy.
+The latest source gate passed 447 frontend tests and TypeScript typechecking.
+The preceding runtime and log-retention tranche passed 585 Rust desktop tests with 1 ignored, the Rust workspace suites, MCP end-to-end tests, formatting, warnings-denied Clippy, the production frontend build, and the performance contract.
 The latest T-Hub capability probe for this session remained `read`, so no canonical Project mutation, Powder binding, Captain commissioning, or Crew dispatch was attempted.
 The local Powder endpoint and protected agent credential path are operational.
-The packaged xterm lifecycle and duplicate-launch gates pass with eight live tmux sessions preserved.
+The packaged xterm lifecycle, detach recovery, duplicate-launch, and diagnostic-retention gates pass with eight live tmux sessions preserved.
 The installed `a00ce7d` build reproduced one `listTerminals failed` event from the bounded 10-second WSL command timeout before recovery.
 After installing `e5948c8`, three consecutive application starts preserved all eight tmux sessions.
 Their combined fresh diagnostic slice contains zero `listTerminals failed`, premature-resize, xterm, or window errors, and `th ls` returns all eight sessions.
-The packaged graphical E2E matrix for the new non-Git choice remains open, so Phase 7 is active rather than complete.
-The immediate source action is to finish Phase 1 control reliability, then continue the reviewed new-codebase transaction and packaged Phase 7 E2E matrix.
+Installed `0.3.71` completed one warm stress pass and two cold restart passes with zero `loadCell`, `isWrapped`, `replaceCells`, `no live terminal`, window, or unhandled errors in the targeted fresh slices.
+The packaged graphical E2E matrix for the new non-Git choice remains open, so Phase 7 is now the earliest unblocked active phase.
+The immediate source action is to continue the reviewed new-codebase transaction and packaged Phase 7 E2E matrix.
 Real Powder acceptance still requires a control-capable Captain session.
 The Board endpoint, Preview workflow, Claude header check, packaged performance matrix, and release hardening remain open.

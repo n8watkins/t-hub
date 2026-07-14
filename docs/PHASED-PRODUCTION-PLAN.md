@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.66` from `e5948c8`, running as Windows PID `39760` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.71` from `3576957`, running as Windows PID `24216` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -73,7 +73,8 @@ Source commit `35fbae2` also prevents a second packaged launch from creating a c
 Source commit `3b83b9e` defers frontend resize commands until remote PTY attachment is confirmed, eliminating repetitive startup `no live terminal` diagnostics in packaged testing.
 Source commit `a00ce7d` adds explicit Git initialization to the shared Project registration transaction used by Captain creation and MCP.
 The transaction atomically reserves a new `.git` directory, initializes `main`, refuses any pre-existing `.git` entry, and removes only the `.git` directory it created when a later registration boundary fails.
-Diagnostic logs are oversized.
+Diagnostic logs are bounded at startup.
+Installed `0.3.68` reduced the retained backup from `135,278,300` bytes to `8,388,493` bytes while preserving complete newest lines.
 Board still defaults to the wrong global endpoint.
 Preview still exposes an unclear Dev then Preview sequence.
 The Codex header identity has been checked interactively, while the Claude header still needs interactive confirmation.
@@ -119,11 +120,13 @@ The release critical path is:
 
 ## Phase 1 - Terminal and Control Reliability
 
-**Status:** Active.
-The packaged xterm lifecycle, stale-endpoint CLI recovery, application restart, session survival, single-instance, attach-aware resize, and terminal-enumeration recovery gates pass through installed source `e5948c8`.
-Source commit `e5948c8` deduplicates concurrent frontend terminal enumeration and retries one bounded tmux timeout after the failed handler returns.
-Three consecutive packaged starts preserved eight tmux sessions and produced zero terminal-list, premature-resize, xterm, or window errors in the combined fresh diagnostic slice.
-Diagnostic log rotation and retention remain open before the full phase exit gate is closed.
+**Status:** Complete through installed `0.3.71` from source `3576957`.
+Installed `0.3.67` reproduced the end-user xterm lifecycle failure as `Cannot set properties of undefined (setting 'isWrapped')` during parser line feed.
+Installed `0.3.69` then reproduced `Cannot read properties of undefined (reading 'replaceCells')` during rapid Workspace switching and zoom-driven resize.
+Source commits `cfa4139` and `cbc558b` serialize resize behind accepted xterm writes and leave xterm's parser callback stack before buffer mutation.
+Source commit `1e005e6` converts matching backend detach races into liveness-checked reattachment instead of unhandled `no live terminal` rejections.
+One warm stress pass and two cold restart passes on installed `0.3.71` preserved the same eight tmux session IDs and produced zero xterm corruption, detach-race, or unhandled errors.
+Duplicate launch retained one Windows PID, `th ls --json` returned all eight sessions after every restart, and diagnostic retention remained within its configured bound.
 
 ### Goal
 
@@ -652,7 +655,7 @@ Make the validated product safe, traceable, installable, and understandable.
 14. Preserve Lavish and deck artifacts as instructed by the General.
 15. Update the zero-context handoff with exact source, runtime state, tests, measurements, and remaining risks.
 16. Keep `docs/REVIEW-INDEX.md` current so historical and archived reviews cannot silently become active backlog.
-17. Bump the desktop version only after the intended release contents pass acceptance.
+17. Bump the desktop version for every changed packaged build and reject reuse of a version already tagged to different source.
 18. Build and install the signed production artifact from the exact reviewed commit.
 19. Push and publish only when the General requests it.
 
