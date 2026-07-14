@@ -198,6 +198,17 @@ impl Client {
         )
     }
 
+    /// Resolve the canonical repository through Powder's agent-authorized API.
+    /// A successful response proves both that the mapping exists and that this
+    /// profile may access it; health and the global event stream cannot do that.
+    pub fn get_repository(&self, repository: &str) -> Result<Value, String> {
+        self.request(
+            "GET",
+            &format!("/api/v1/repositories/{}", encode_path(repository)),
+            None,
+        )
+    }
+
     pub fn claim(&self, card_id: &str, ttl_seconds: u64) -> Result<Claim, String> {
         let value = self.request(
             "POST",
@@ -562,6 +573,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             for expected_path in [
+                "/api/v1/repositories/repo%2Fone",
                 "/api/v1/cards/card-1?detail=detailed",
                 "/api/v1/cards/card-1/claim",
                 "/api/v1/cards/card-1/heartbeat",
@@ -628,6 +640,8 @@ mod tests {
                         "\"change\":{\"proof\":\"tests\"}}\n\n"
                     )
                     .to_string()
+                } else if expected_path.contains("repositories/") {
+                    json!({ "name": "repo/one" }).to_string()
                 } else if expected_path.contains("?detail=") {
                     json!({ "id": "card-1", "repo": "repo-1" }).to_string()
                 } else {
@@ -661,6 +675,10 @@ mod tests {
             api_key_command: None,
         })
         .unwrap();
+        assert_eq!(
+            client.get_repository("repo/one").unwrap()["name"],
+            "repo/one"
+        );
         assert_eq!(client.get_card("card-1").unwrap()["repo"], "repo-1");
         let claim = client.claim("card-1", 3600).unwrap();
         assert_eq!(claim.agent, "t-hub");
