@@ -65,6 +65,7 @@ import { REPAINT_ALL_EVENT, REFRESH_TERMINAL_EVENT } from "../lib/repaint";
 import { registerTerminalTail, unregisterTerminalTail } from "../lib/terminalTail";
 import type { ITheme, ILink } from "@xterm/xterm";
 import { clipboardRead, clipboardWrite } from "../lib/clipboard";
+import { TerminalCursorBlinkController } from "../lib/terminalCursorBlink";
 import "./Terminal.css";
 
 // Paste into a terminal, preferring an IMAGE on the clipboard over text. When the
@@ -309,6 +310,7 @@ export function TerminalView({
 }: TerminalViewProps): JSX.Element | null {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  const cursorBlinkRef = useRef<TerminalCursorBlinkController | null>(null);
   const foregroundRef = useRef(foreground);
   // Guards against a second init for the same (id, visible) effect run even
   // though main.tsx omits StrictMode — belt-and-braces against double `open()`.
@@ -391,7 +393,8 @@ export function TerminalView({
       allowProposedApi: true,
       fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "JetBrains Mono", monospace',
       fontSize: useWorkspace.getState().fontSize,
-      cursorBlink: true,
+      // Enabled in place only while this xterm owns visible keyboard focus.
+      cursorBlink: false,
       scrollback: 20000,
       // Animate viewport paging (PageUp/PageDown, wheel) over ~125ms instead of
       // jumping, so repeated paging reads as a continuous smooth scroll.
@@ -525,6 +528,25 @@ export function TerminalView({
     });
 
     term.open(container);
+
+    // xterm keeps cursor animation alive even when its pooled wrapper is parked.
+    // Gate the live option on the helper textarea's actual DOM focus plus the
+    // workspace/pool visibility state. This never remounts or resets xterm.
+    if (term.textarea) {
+      cursorBlinkRef.current = new TerminalCursorBlinkController(
+        term.textarea,
+        (enabled) => {
+          term.options.cursorBlink = enabled;
+        },
+        {
+          visible,
+          foreground: foregroundRef.current,
+          tileFocused: useWorkspace.getState().focusedId === terminalId,
+          terminalRegionFocused:
+            useWorkspace.getState().focusedRegion === "terminal",
+        },
+      );
+    }
 
     // RENDERER: the CANVAS addon (GPU-accelerated 2D), NOT WebGL. The DOM renderer
     // can't keep up with a busy Claude TUI's full-screen repaints — that was the
@@ -1509,6 +1531,9 @@ export function TerminalView({
       // point of assigning `drainPending` (teardown beat the async attach).
       drainPending?.();
 
+      cursorBlinkRef.current?.dispose();
+      cursorBlinkRef.current = null;
+
       unregisterTerminalTail(terminalId, term);
       term.dispose();
       termRef.current = null;
@@ -1562,6 +1587,19 @@ export function TerminalView({
         mergeTermPalette(termPalette, termOverride),
       );
   }, [termPalette, termOverride]);
+
+  // Update cursor animation eligibility without touching xterm's mount or
+  // attachment. `foreground` covers active-tab, expanded-panel, fullscreen, and
+  // captain-overlay parking; the controller separately verifies actual input,
+  // window, and document focus.
+  useEffect(() => {
+    cursorBlinkRef.current?.update({
+      visible,
+      foreground,
+      tileFocused: focusedId === terminalId,
+      terminalRegionFocused: focusedRegion === "terminal",
+    });
+  }, [visible, foreground, focusedId, terminalId, focusedRegion]);
 
   // When this terminal becomes the focused tile, put the KEYBOARD into its xterm
   // (not just the tile highlight) so the user can type right away — e.g. the
