@@ -156,9 +156,18 @@ describe("Tile header context menu: IDs + Mark as Cortana", () => {
     // Unbound: no session id in the supervision reverse index.
     let menu = openMenu("cap00001");
     expect(within(menu).queryByTitle("Copy Claude Session ID")).toBeNull();
-    // Bind a Claude UUID to this tile's tmux session (`th_<id>`), as a
-    // statusline snapshot would, then re-open the menu.
+    // Identify the foreground client as Claude and bind its UUID to this tile's
+    // tmux session (`th_<id>`), as a statusline snapshot would, then re-open.
     act(() => {
+      useWorkspace.setState((state) => ({
+        terminals: {
+          ...state.terminals,
+          cap00001: {
+            ...state.terminals.cap00001,
+            title: "claude",
+          },
+        },
+      }));
       useSupervision.setState({
         sessionIdByTmux: { th_cap00001: "uuid-abc-123" },
       });
@@ -170,6 +179,27 @@ describe("Tile header context menu: IDs + Mark as Cortana", () => {
       fireEvent.click(sessionRow);
     });
     expect(clipboardWrites).toEqual(["uuid-abc-123"]);
+  });
+
+  it("does not label a stale Claude binding as the session ID of a Codex tile", () => {
+    act(() => {
+      useWorkspace.setState((state) => ({
+        terminals: {
+          ...state.terminals,
+          cap00001: {
+            ...state.terminals.cap00001,
+            title: "codex",
+          },
+        },
+      }));
+      useSupervision.setState({
+        sessionIdByTmux: { th_cap00001: "stale-claude-uuid" },
+      });
+    });
+
+    const menu = openMenu("cap00001");
+    expect(within(menu).queryByTitle("Copy Claude Session ID")).toBeNull();
+    expect(menu.textContent).not.toContain("stale-claude-uuid");
   });
 
   it("labels the mark affordance 'Mark as Cortana' and 'Unmark Cortana' when set", () => {

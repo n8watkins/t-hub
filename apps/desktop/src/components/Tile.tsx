@@ -264,9 +264,8 @@ export function Tile({
   const isOrchestrator = useCaptain((s) => s.orchestratorId === terminalId);
   const setOrchestratorId = useCaptain((s) => s.setOrchestratorId);
   // The Claude session UUID bound to this tile, for the header menu's copyable
-  // ID row. Resolved through the supervision store's tmux->session reverse index
-  // (the agent stamps each statusline with its owning `th_<id>` session); absent
-  // until a bound Claude session has reported, so the menu hides the row then.
+  // ID row. The supervision index is Claude-only and can briefly retain a stale
+  // binding after a tile starts Codex, so the menu also gates it on `client`.
   const claudeSessionId = useSupervision(
     (s) => s.sessionIdByTmux[sessionNameForTerminal(terminalId)],
   );
@@ -1120,15 +1119,15 @@ export function Tile({
             onPointerDown={(e) => e.stopPropagation()}
           >
             {/* Identity first: the tile's Terminal ID (the 8-char tmux-derived
-                id) and the bound Claude Session ID (only once a Claude session
-                has reported). Click either to copy - handy for telling tiles
-                apart when coordinating with captains. */}
+                id) and the bound Claude Session ID for Claude tiles. Click
+                either to copy - handy for telling tiles apart when coordinating
+                with captains. */}
             <CtxCopyItem
               label="Terminal ID"
               value={terminalId}
               onClick={() => copyId("Terminal ID", terminalId)}
             />
-            {claudeSessionId && (
+            {client === "claude" && claudeSessionId && (
               <CtxCopyItem
                 label="Claude Session ID"
                 value={claudeSessionId}
