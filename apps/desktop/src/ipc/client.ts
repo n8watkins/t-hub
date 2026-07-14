@@ -107,24 +107,36 @@ export function listTerminals(): Promise<TerminalInfo[]> {
 // callers are unchanged), and unsubscribe is a synchronous map delete.
 // ---------------------------------------------------------------------------
 
-/** A per-channel fan-out hub: one real Tauri listener, many JS subscribers. */
-class EventHub<T> {
-  private readonly subs = new Set<(e: T) => void>();
+type EventCallback<T> = (event: T) => void;
+
+interface OrderedSubscriber<T> {
+  callback: EventCallback<T>;
+  order: number;
+}
+
+/** A per-channel fan-out hub: one real Tauri listener, keyed JS subscribers. */
+class EventHub<T extends { id: TerminalId }> {
+  private readonly globalSubs = new Map<EventCallback<T>, number>();
+  private readonly keyedSubs = new Map<
+    TerminalId,
+    Map<EventCallback<T>, number>
+  >();
   private backing: Promise<UnlistenFn> | null = null;
+  private nextOrder = 0;
 
   constructor(private readonly event: string) {}
 
   /** Ensure the single backing Tauri listener is registered (idempotent). */
   private ensureBacking(): void {
     if (this.backing) return;
-    // One listener for the whole app; it dispatches to every subscriber. We
-    // snapshot the subscriber set per event so a subscribe/unsubscribe during
-    // dispatch can't disturb the in-progress iteration.
+    // One listener for the whole app. Only global subscribers and subscribers
+    // for this terminal are considered. Snapshotting before dispatch preserves
+    // event semantics when a callback subscribes or unsubscribes re-entrantly.
     this.backing = listen<T>(this.event, (ev) => {
-      if (this.subs.size === 0) return;
-      for (const cb of [...this.subs]) {
+      const subscribers = this.subscribersFor(ev.payload.id);
+      for (const { callback } of subscribers) {
         try {
-          cb(ev.payload);
+          callback(ev.payload);
         } catch {
           // A throwing subscriber must not starve the others on this event.
         }
@@ -138,13 +150,60 @@ class EventHub<T> {
     });
   }
 
-  /** Register a subscriber; returns an unsubscribe fn (synchronous removal). */
-  subscribe(cb: (e: T) => void): UnlistenFn {
-    this.subs.add(cb);
+  private subscribersFor(id: TerminalId): OrderedSubscriber<T>[] {
+    const keyedSubscribers = this.keyedSubs.get(id);
+    if (this.globalSubs.size === 0) {
+      return Array.from(keyedSubscribers ?? [], ([callback, order]) => ({
+        callback,
+        order,
+      }));
+    }
+    if (!keyedSubscribers || keyedSubscribers.size === 0) {
+      return Array.from(this.globalSubs, ([callback, order]) => ({ callback, order }));
+    }
+
+    const subscribers: OrderedSubscriber<T>[] = [];
+    for (const [callback, order] of this.globalSubs) {
+      subscribers.push({ callback, order });
+    }
+    for (const [callback, order] of keyedSubscribers) {
+      subscribers.push({ callback, order });
+    }
+    subscribers.sort((a, b) => a.order - b.order);
+    return subscribers;
+  }
+
+  /** Register a global subscriber; returns a synchronous unsubscribe fn. */
+  subscribe(cb: EventCallback<T>): UnlistenFn;
+  /** Register a subscriber for one terminal; returns a synchronous unsubscribe fn. */
+  subscribe(id: TerminalId, cb: EventCallback<T>): UnlistenFn;
+  subscribe(idOrCb: TerminalId | EventCallback<T>, cb?: EventCallback<T>): UnlistenFn {
+    const id = typeof idOrCb === "string" ? idOrCb : null;
+    const callback = typeof idOrCb === "function" ? idOrCb : cb;
+    if (!callback) throw new TypeError("terminal event subscriber is required");
+
+    const subscribers = id === null ? this.globalSubs : this.subscribersForId(id);
+    if (!subscribers.has(callback)) subscribers.set(callback, this.nextOrder++);
     this.ensureBacking();
     return () => {
-      this.subs.delete(cb);
+      subscribers.delete(callback);
+      if (
+        id !== null &&
+        subscribers.size === 0 &&
+        this.keyedSubs.get(id) === subscribers
+      ) {
+        this.keyedSubs.delete(id);
+      }
     };
+  }
+
+  private subscribersForId(id: TerminalId): Map<EventCallback<T>, number> {
+    let subscribers = this.keyedSubs.get(id);
+    if (!subscribers) {
+      subscribers = new Map();
+      this.keyedSubs.set(id, subscribers);
+    }
+    return subscribers;
   }
 }
 
@@ -152,16 +211,52 @@ const outputHub = new EventHub<OutputEvent>(Events.output);
 const stateHub = new EventHub<StateEvent>(Events.state);
 const exitHub = new EventHub<ExitEvent>(Events.exit);
 
-export function onOutput(cb: (e: OutputEvent) => void): Promise<UnlistenFn> {
-  return Promise.resolve(outputHub.subscribe(cb));
+export function onOutput(cb: EventCallback<OutputEvent>): Promise<UnlistenFn>;
+export function onOutput(
+  id: TerminalId,
+  cb: EventCallback<OutputEvent>,
+): Promise<UnlistenFn>;
+export function onOutput(
+  idOrCb: TerminalId | EventCallback<OutputEvent>,
+  cb?: EventCallback<OutputEvent>,
+): Promise<UnlistenFn> {
+  return Promise.resolve(
+    typeof idOrCb === "string"
+      ? outputHub.subscribe(idOrCb, cb!)
+      : outputHub.subscribe(idOrCb),
+  );
 }
 
-export function onState(cb: (e: StateEvent) => void): Promise<UnlistenFn> {
-  return Promise.resolve(stateHub.subscribe(cb));
+export function onState(cb: EventCallback<StateEvent>): Promise<UnlistenFn>;
+export function onState(
+  id: TerminalId,
+  cb: EventCallback<StateEvent>,
+): Promise<UnlistenFn>;
+export function onState(
+  idOrCb: TerminalId | EventCallback<StateEvent>,
+  cb?: EventCallback<StateEvent>,
+): Promise<UnlistenFn> {
+  return Promise.resolve(
+    typeof idOrCb === "string"
+      ? stateHub.subscribe(idOrCb, cb!)
+      : stateHub.subscribe(idOrCb),
+  );
 }
 
-export function onExit(cb: (e: ExitEvent) => void): Promise<UnlistenFn> {
-  return Promise.resolve(exitHub.subscribe(cb));
+export function onExit(cb: EventCallback<ExitEvent>): Promise<UnlistenFn>;
+export function onExit(
+  id: TerminalId,
+  cb: EventCallback<ExitEvent>,
+): Promise<UnlistenFn>;
+export function onExit(
+  idOrCb: TerminalId | EventCallback<ExitEvent>,
+  cb?: EventCallback<ExitEvent>,
+): Promise<UnlistenFn> {
+  return Promise.resolve(
+    typeof idOrCb === "string"
+      ? exitHub.subscribe(idOrCb, cb!)
+      : exitHub.subscribe(idOrCb),
+  );
 }
 
 /**

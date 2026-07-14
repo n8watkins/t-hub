@@ -1164,8 +1164,8 @@ export function TerminalView({
             // synchronous, so nothing received was ever pending at teardown).
             drainPending = drainQueue;
 
-            const offOutput = await onOutput((e) => {
-              if (e.id !== terminalId || disposed) return;
+            const offOutput = await onOutput(terminalId, (e) => {
+              if (disposed) return;
               // HOT PATH: decode + enqueue only. The heavy work (URL scan, store
               // bump, term.write) is deferred to the coalesced rAF flush above so
               // a flood of events doesn't block the JS thread chunk-by-chunk.
@@ -1192,8 +1192,8 @@ export function TerminalView({
               document.removeEventListener("visibilitychange", onVisibilityChanged);
             });
 
-            const offExit = await onExit((e) => {
-              if (e.id !== terminalId || disposed) return;
+            const offExit = await onExit(terminalId, (e) => {
+              if (disposed) return;
               // VERIFY BEFORE EXIT: an exit event alone doesn't prove the
               // process died — the server-side attach client also exits on a
               // detach while the tmux session lives on. (The backend now
