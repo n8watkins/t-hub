@@ -3,8 +3,8 @@
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Released source:** `a50e60bccb29cc78e1813476017630fca4f8766b`.
-**Installed Windows build:** T-Hub `0.3.64` produced by production release workflow `29302822551` from `a50e60b`.
+**Source head before this handoff update:** `212774a`.
+**Installed Windows build:** T-Hub `0.3.64` produced by production release workflow `29304129133` from `e2a55c0`.
 
 ## Executive Status
 
@@ -12,10 +12,11 @@ The Captain, Crew, cross-harness provisioning, Handoff skill, authority hardenin
 The final independent authority review reports no remaining Critical, High, or Medium application-level finding under the documented same-user threat model.
 The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
 
-The production artifact is installed and running as PID `34492` from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `bb93923092f23a5051b72437de4029d0b52f03871b56213779db1876b98a5929`.
-The live control handshake reports protocol version `2` and address `127.0.0.1:49782`.
-The exact release installer SHA-256 is `dbc6fdf5f1e3f2f53d9e9c148fe207f6b2350a0caebb6f26bf01d5f27f7e44bc`.
+The `e2a55c0` production artifact was installed successfully from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+The installed executable SHA-256 is `04e104f13fc881371825d19ff8f9a865e27aa6069d2dfc7038deb3012c09cb1c`.
+The exact release installer SHA-256 is `cc51623565ec2f4613c438226a1f5ce82729e355274e4db23b360a0c0c3ab44c`.
+It started as PID `23864` with protocol version `2` and control address `127.0.0.1:65465`.
+The subsequent timeout-verification restart hit a Windows-to-WSL interop failure, so the handshake is currently stale and T-Hub must be relaunched from Windows before further packaged validation.
 
 The T-Hub repository is registered as a durable project but is not bound to Powder.
 The authoritative Powder endpoint remains unreachable from the current tailnet, and no approved agent-scoped credential command is configured.
@@ -42,6 +43,11 @@ The main implementation sequence in this work is:
 - `29328c9 test(tmux): tolerate transient probe pressure`
 - `47a099a fix(captain): validate runtime identity metadata`
 - `e59977f fix(identity): make lifecycle persistence transactional`
+- `a50e60b docs: refresh captain powder handoff`
+- `2f17a71 docs: record production deployment validation`
+- `c0881a3 ci: pin actions to immutable Node 24 releases`
+- `e2a55c0 fix(identity): prefer durable harness metadata`
+- `212774a fix(tmux): allow healthy WSL command latency`
 
 ## Captain and Crew Model
 
@@ -174,11 +180,16 @@ These warnings are tracked as performance work rather than ignored.
 GitHub Test workflow `29302705909` completed successfully for `a50e60b`.
 Production Release workflow `29302822551` completed successfully for the same exact source, including its quality gate and Windows build.
 The release artifact is `t-hub-prod-installer`, artifact ID `8299295908`.
-GitHub emitted Node 20 action-runtime deprecation warnings, so immutable action upgrades remain CI backlog even though the release passed.
+GitHub Test workflow `29304036452` completed successfully for `e2a55c0`.
+Production Release workflow `29304129133` completed successfully for the same exact source, including its quality gate and Windows build.
+That release artifact is `t-hub-prod-installer`, artifact ID `8299745666`.
+All external workflow actions are now pinned to immutable commit SHAs, JavaScript actions use Node 24 releases, and CI enforces the pinning contract.
 
 The installed runtime smoke check discovered all four existing terminals, read tabs and repository state, rejected an invalid token, and denied a control-only spawn from this read-only resumed session.
 Automated Windows desktop capture returned a black frame in the non-interactive WSL execution context.
-The Codex versus Claude terminal-header label therefore still requires an interactive visual confirmation in the running application.
+The frontend now hydrates authoritative Captain and Crew provider identity after restart and prefers it over stale terminal heuristics.
+A commissioned Codex tile cannot expose a stale Claude Session ID, and a Claude tile can recover its authoritative provider session ID before supervision rehydrates.
+The full frontend suite passes 45 files and 426 tests with this behavior.
 
 ## Performance Baseline and Review
 
@@ -219,14 +230,16 @@ It is also the highest-risk performance change because terminal visibility, scro
 
 The ordered continuation is:
 
-1. Confirm the Codex versus Claude terminal-header label interactively in the installed application.
-2. Upgrade GitHub Actions dependencies away from deprecated Node 20 runtimes and pin them to immutable revisions.
-3. Make the authoritative Powder deployment reachable and configure the protected agent profile.
-4. Commission disposable Codex and Claude project Captains once Powder is reachable and the protected profile exists.
-5. Verify context reset recovery, Crew dispatch, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
-6. Add in-app lifecycle counters and run stable packaged 1, 4, 8, and 16 terminal acceptance measurements.
-7. Implement hot, warm, and cold terminal parking while preserving authoritative tmux rehydration.
-8. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
+1. Relaunch T-Hub from Windows and confirm that `~/.t-hub/control.json` receives a new live PID and endpoint.
+2. Wait for Test workflow completion at source `212774a`, then build and install its production artifact.
+3. Re-run `list_terminals` against the `212774a` build and confirm the healthy Windows-to-WSL path completes within the new bounded timeout.
+4. Confirm the Codex versus Claude terminal-header label interactively in the installed application.
+5. Make the authoritative Powder deployment reachable and configure the protected agent profile.
+6. Commission disposable Codex and Claude project Captains once Powder is reachable and the protected profile exists.
+7. Verify context reset recovery, Crew dispatch, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
+8. Add in-app lifecycle counters and run stable packaged 1, 4, 8, and 16 terminal acceptance measurements.
+9. Implement hot, warm, and cold terminal parking while preserving authoritative tmux rehydration.
+10. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
 
 Additional production-readiness gaps remain outside the Captain slice:
 
@@ -253,7 +266,8 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The WSL skill migration, push, CI, production release, Windows installation, live control smoke check, and four-terminal packaged measurement are complete.
-The immediate local action is an interactive terminal-header visual check, followed by the measured terminal lifecycle optimization tranche.
+The WSL skill migration, authority hardening, immutable CI action migration, provider identity fix, push, CI, production release, Windows installation, and four-terminal packaged measurement are complete through `e2a55c0`.
+The live smoke reproduced a five-second tmux timeout against a healthy `4.3s` Windows-to-WSL command and widened the bounded default to ten seconds in `212774a`.
+The immediate action is a Windows-side T-Hub relaunch because WSL interop currently returns `UtilAcceptVsock: accept4 failed 110` for both `cmd.exe` and `powershell.exe`.
 Powder-backed acceptance remains externally blocked until the authoritative endpoint and agent-scoped credential source are available.
 Performance optimization has a reviewed, measured order, with inactive terminal lifecycle as the primary next implementation tranche.
