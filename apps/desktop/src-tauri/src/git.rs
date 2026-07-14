@@ -82,6 +82,12 @@ pub struct GitInfo {
     pub is_linked_worktree: bool,
     /// Number of changed entries (`git status --porcelain` line count). 0 = clean.
     pub dirty_count: u32,
+    /// Current HEAD commit, or unknown for an unborn or unreadable repository.
+    pub head_commit: Option<String>,
+    /// The origin fetch URL when configured.
+    pub remote_url: Option<String>,
+    /// The branch named by origin/HEAD when configured.
+    pub default_branch: Option<String>,
 }
 
 /// How long a `git_info` answer stays fresh per cwd. The Files panel re-polls
@@ -158,6 +164,9 @@ impl GitInfo {
             worktree_root: None,
             is_linked_worktree: false,
             dirty_count: 0,
+            head_commit: None,
+            remote_url: None,
+            default_branch: None,
         }
     }
 }
@@ -258,6 +267,9 @@ fn build_git_command(cwd: &str, args: &[&str]) -> Command {
 ///   - `gitdir\t<path>`        — `rev-parse --git-dir`;
 ///   - `commondir\t<path>`     — `rev-parse --git-common-dir`;
 ///   - `dirty\t<n>`            — `git status --porcelain | wc -l` (dirty count).
+///   - `head\t<commit>`         — `rev-parse HEAD`;
+///   - `remote\t<url>`          — the origin fetch URL;
+///   - `default\t<branch>`      — the branch named by origin/HEAD.
 /// We short-circuit to ONLY the `inside` line when not in a work tree, so a
 /// non-repo collapses to `is_repo:false` exactly like the old cheap gate did.
 /// Every git invocation is silenced (`2>/dev/null`) so stderr never pollutes the
@@ -272,6 +284,9 @@ printf 'toplevel\\t%s\\n' \"$(git rev-parse --show-toplevel 2>/dev/null)\"; \
 printf 'gitdir\\t%s\\n' \"$(git rev-parse --git-dir 2>/dev/null)\"; \
 printf 'commondir\\t%s\\n' \"$(git rev-parse --git-common-dir 2>/dev/null)\"; \
 printf 'dirty\\t%s\\n' \"$(git status --porcelain 2>/dev/null | wc -l)\"; \
+printf 'head\\t%s\\n' \"$(git rev-parse HEAD 2>/dev/null)\"; \
+printf 'remote\\t%s\\n' \"$(git remote get-url origin 2>/dev/null)\"; \
+printf 'default\\t%s\\n' \"$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')\"; \
 fi";
 
 /// Run [`GIT_INFO_SCRIPT`] in ONE shell against `cwd`, returning its stdout.
@@ -369,6 +384,9 @@ fn parse_git_info_output(stdout: &str) -> GitInfo {
         .get("dirty")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(0);
+    let head_commit = fields.get("head").and_then(|v| first_line_opt(v));
+    let remote_url = fields.get("remote").and_then(|v| first_line_opt(v));
+    let default_branch = fields.get("default").and_then(|v| first_line_opt(v));
 
     GitInfo {
         is_repo: true,
@@ -376,6 +394,9 @@ fn parse_git_info_output(stdout: &str) -> GitInfo {
         worktree_root,
         is_linked_worktree,
         dirty_count,
+        head_commit,
+        remote_url,
+        default_branch,
     }
 }
 
@@ -933,6 +954,9 @@ toplevel\t/home/u/repo
 gitdir\t/home/u/repo/.git
 commondir\t/home/u/repo/.git
 dirty\t3
+head\t0123456789abcdef
+remote\thttps://example.test/repo.git
+default\tmain
 ";
         let info = parse_git_info_output(out);
         assert!(info.is_repo);
@@ -940,6 +964,12 @@ dirty\t3
         assert_eq!(info.worktree_root.as_deref(), Some("/home/u/repo"));
         assert!(!info.is_linked_worktree);
         assert_eq!(info.dirty_count, 3);
+        assert_eq!(info.head_commit.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(
+            info.remote_url.as_deref(),
+            Some("https://example.test/repo.git")
+        );
+        assert_eq!(info.default_branch.as_deref(), Some("main"));
     }
 
     #[test]
@@ -991,6 +1021,9 @@ dirty\t0
         assert_eq!(info.worktree_root, None);
         assert!(!info.is_linked_worktree); // both gitdir/commondir absent
         assert_eq!(info.dirty_count, 0); // "nope" -> 0
+        assert_eq!(info.head_commit, None);
+        assert_eq!(info.remote_url, None);
+        assert_eq!(info.default_branch, None);
     }
 
     #[test]
@@ -1001,6 +1034,9 @@ dirty\t0
         assert_eq!(info.worktree_root, None);
         assert!(!info.is_linked_worktree);
         assert_eq!(info.dirty_count, 0);
+        assert_eq!(info.head_commit, None);
+        assert_eq!(info.remote_url, None);
+        assert_eq!(info.default_branch, None);
     }
 
     #[test]
@@ -1076,6 +1112,9 @@ detached
             worktree_root: Some("/home/u/repo".to_string()),
             is_linked_worktree: false,
             dirty_count: 2,
+            head_commit: Some("0123456789abcdef".to_string()),
+            remote_url: Some("https://example.test/repo.git".to_string()),
+            default_branch: Some("main".to_string()),
         }
     }
 

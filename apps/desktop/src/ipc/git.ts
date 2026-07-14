@@ -36,6 +36,12 @@ export interface GitInfo {
   isLinkedWorktree: boolean;
   /** Changed-entry count (`git status --porcelain` line count). 0 = clean. */
   dirtyCount: number;
+  /** Current HEAD commit when available. */
+  headCommit?: string | null;
+  /** The origin fetch URL when configured. */
+  remoteUrl?: string | null;
+  /** The branch named by origin/HEAD when configured. */
+  defaultBranch?: string | null;
 }
 
 /**

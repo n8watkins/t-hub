@@ -7,7 +7,7 @@ import {
   registerProject,
 } from "../ipc/projects";
 import { listDir } from "../ipc/files";
-import { gitInfo } from "../ipc/git";
+import { gitInfo, gitWorktreeList } from "../ipc/git";
 import { CaptainCommissionDialog } from "./CaptainCommissionDialog";
 
 vi.mock("../ipc/projects", () => ({
@@ -17,7 +17,7 @@ vi.mock("../ipc/projects", () => ({
   commissionCaptain: vi.fn(),
 }));
 vi.mock("../ipc/files", () => ({ listDir: vi.fn() }));
-vi.mock("../ipc/git", () => ({ gitInfo: vi.fn() }));
+vi.mock("../ipc/git", () => ({ gitInfo: vi.fn(), gitWorktreeList: vi.fn() }));
 
 const project = {
   projectId: "project-1",
@@ -42,6 +42,7 @@ describe("CaptainCommissionDialog", () => {
       isLinkedWorktree: false,
       dirtyCount: 0,
     });
+    vi.mocked(gitWorktreeList).mockResolvedValue([]);
   });
 
   it("saves an existing codebase with Powder before creating its Captain", async () => {
@@ -52,6 +53,20 @@ describe("CaptainCommissionDialog", () => {
       powderProfiles: ["production"],
     });
     vi.mocked(registerProject).mockResolvedValue(project);
+    vi.mocked(gitInfo).mockResolvedValue({
+      isRepo: true,
+      branch: "main",
+      worktreeRoot: "/repo/t-hub",
+      isLinkedWorktree: false,
+      dirtyCount: 2,
+      headCommit: "0123456789abcdef",
+      remoteUrl: "https://example.test/t-hub.git",
+      defaultBranch: "main",
+    });
+    vi.mocked(gitWorktreeList).mockResolvedValue([
+      { path: "/repo/t-hub", branch: "main", isLinked: false },
+      { path: "/repo/t-hub-feature", branch: "feature", isLinked: true },
+    ]);
     vi.mocked(commissionCaptain).mockResolvedValue({
       captain: {
         shipSlug: "t-hub",
@@ -91,6 +106,9 @@ describe("CaptainCommissionDialog", () => {
     expect(screen.getByText("Review before creating")).toBeTruthy();
     expect(screen.getByText("Existing WSL codebase")).toBeTruthy();
     expect(screen.getByText("Harness default")).toBeTruthy();
+    expect(await screen.findByText("main · 2 changed · main worktree")).toBeTruthy();
+    expect(screen.getByText("https://example.test/t-hub.git")).toBeTruthy();
+    expect(screen.getByText("2 detected")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
 
     await waitFor(() => expect(registerProject).toHaveBeenCalledOnce());

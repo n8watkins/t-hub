@@ -7,6 +7,12 @@ import {
   registerProject,
   type RegisteredProject,
 } from "../ipc/projects";
+import {
+  gitInfo,
+  gitWorktreeList,
+  type GitInfo,
+  type WorktreeInfo,
+} from "../ipc/git";
 import { WslFolderPicker } from "./WslFolderPicker";
 
 interface CaptainCommissionDialogProps {
@@ -30,6 +36,8 @@ export function CaptainCommissionDialog({
   );
   const [wslHome, setWslHome] = useState("");
   const [wslHomeError, setWslHomeError] = useState<string | null>(null);
+  const [folderGit, setFolderGit] = useState<GitInfo | null>(null);
+  const [folderWorktrees, setFolderWorktrees] = useState<WorktreeInfo[]>([]);
   const [projectId, setProjectId] = useState("");
   const [repoRoot, setRepoRoot] = useState("");
   const [projectName, setProjectName] = useState("");
@@ -82,6 +90,26 @@ export function CaptainCommissionDialog({
     setPowderRepository(selected.powder?.repository ?? "");
     setConnectionProfile(selected.powder?.connectionProfile ?? "default");
   }, [selected]);
+
+  useEffect(() => {
+    if (mode !== "existing" || !repoRoot) return;
+    let cancelled = false;
+    setFolderGit(null);
+    setFolderWorktrees([]);
+    void gitInfo(repoRoot)
+      .then((info) => {
+        if (!cancelled) setFolderGit(info);
+      })
+      .catch(() => undefined);
+    void gitWorktreeList(repoRoot)
+      .then((worktrees) => {
+        if (!cancelled) setFolderWorktrees(worktrees);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, repoRoot]);
 
   if (!open) return null;
 
@@ -355,6 +383,8 @@ export function CaptainCommissionDialog({
             connectionProfile={connectionProfile}
             assignment={assignment}
             harness={harness}
+            folderGit={folderGit}
+            folderWorktrees={folderWorktrees}
           />
 
           {error && (
@@ -397,6 +427,8 @@ function ReviewSummary({
   connectionProfile,
   assignment,
   harness,
+  folderGit,
+  folderWorktrees,
 }: {
   mode: ProjectMode;
   selected?: RegisteredProject;
@@ -405,6 +437,8 @@ function ReviewSummary({
   connectionProfile: string;
   assignment: string;
   harness: "codex" | "claude";
+  folderGit: GitInfo | null;
+  folderWorktrees: WorktreeInfo[];
 }) {
   const source = mode === "saved" ? "Saved codebase" : "Existing WSL codebase";
   const location =
@@ -426,6 +460,38 @@ function ReviewSummary({
       <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
         <ReviewRow label="Source" value={source} />
         <ReviewRow label="Codebase" value={location} />
+        {mode === "existing" && folderGit && (
+          <>
+            <ReviewRow
+              label="Git"
+              value={
+                folderGit.isRepo
+                  ? `${folderGit.branch ?? "Detached HEAD"} · ${folderGit.dirtyCount ? `${folderGit.dirtyCount} changed` : "clean"} · ${folderGit.isLinkedWorktree ? "linked worktree" : "main worktree"}`
+                  : "Not a Git repository"
+              }
+            />
+            {folderGit.isRepo && (
+              <>
+                <ReviewRow
+                  label="Remote"
+                  value={folderGit.remoteUrl || "No origin remote"}
+                />
+                <ReviewRow
+                  label="Default branch"
+                  value={folderGit.defaultBranch || "Not advertised by origin"}
+                />
+                <ReviewRow
+                  label="HEAD"
+                  value={folderGit.headCommit?.slice(0, 12) || "Unknown"}
+                />
+                <ReviewRow
+                  label="Worktrees"
+                  value={`${folderWorktrees.length || 1} detected`}
+                />
+              </>
+            )}
+          </>
+        )}
         <ReviewRow
           label="Powder"
           value={`${powderRepository.trim() || "Not selected"} via ${connectionProfile.trim() || "Not selected"}`}

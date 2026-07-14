@@ -6470,6 +6470,7 @@ fn register_project(
         .projects()
         .into_iter()
         .find(|project| project.repo_root == repo_root);
+    let git_info = git::git_info_cached(&repo_root);
     enforce_project_authority(
         ctx,
         caller,
@@ -6508,8 +6509,22 @@ fn register_project(
             .unwrap_or_else(|| format!("project-{}", uuid::Uuid::new_v4())),
         name,
         repo_root,
-        remote_url: arg_str(args, "remoteUrl").or_else(|| arg_str(args, "remote_url")),
-        default_branch: main.branch.clone(),
+        remote_url: arg_str(args, "remoteUrl")
+            .or_else(|| arg_str(args, "remote_url"))
+            .or(git_info.remote_url)
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|project| project.remote_url.clone())
+            }),
+        default_branch: git_info
+            .default_branch
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|project| project.default_branch.clone())
+            })
+            .or_else(|| main.branch.clone()),
         powder: powder.or_else(|| existing.as_ref().and_then(|project| project.powder.clone())),
         created_at: existing.as_ref().map_or(0, |project| project.created_at),
         updated_at: 0,
