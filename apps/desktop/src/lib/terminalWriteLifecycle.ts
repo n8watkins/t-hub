@@ -13,6 +13,7 @@ interface WritableTerminal {
 export class TerminalWriteLifecycle {
   private pendingWrites = 0;
   private retired = false;
+  private idleFlushScheduled = false;
   private readonly idleActions: Array<{ key?: string; action: () => void }> = [];
 
   constructor(private readonly terminal: WritableTerminal) {}
@@ -26,7 +27,7 @@ export class TerminalWriteLifecycle {
       if (settled) return;
       settled = true;
       this.pendingWrites -= 1;
-      this.flushIdleActions();
+      this.scheduleIdleFlush();
     };
 
     try {
@@ -39,7 +40,7 @@ export class TerminalWriteLifecycle {
   }
 
   afterWrites(action: () => void): void {
-    if (this.pendingWrites === 0) {
+    if (this.pendingWrites === 0 && !this.idleFlushScheduled) {
       action();
       return;
     }
@@ -47,7 +48,7 @@ export class TerminalWriteLifecycle {
   }
 
   afterWritesCoalesced(key: string, action: () => void): void {
-    if (this.pendingWrites === 0) {
+    if (this.pendingWrites === 0 && !this.idleFlushScheduled) {
       action();
       return;
     }
@@ -68,6 +69,20 @@ export class TerminalWriteLifecycle {
     if (this.retired) return;
     this.retired = true;
     this.afterWrites(() => this.terminal.dispose());
+  }
+
+  private scheduleIdleFlush(): void {
+    if (this.pendingWrites !== 0 || this.idleFlushScheduled) return;
+    this.idleFlushScheduled = true;
+    // xterm invokes a write callback before it advances its own buffer offset,
+    // clears the write queue, and emits onWriteParsed. Running a resize or clear
+    // directly from that callback re-enters the parser with half-settled buffer
+    // bookkeeping. Leave the xterm stack first, then mutate its buffer.
+    queueMicrotask(() => {
+      this.idleFlushScheduled = false;
+      if (this.pendingWrites !== 0) return;
+      this.flushIdleActions();
+    });
   }
 
   private flushIdleActions(): void {

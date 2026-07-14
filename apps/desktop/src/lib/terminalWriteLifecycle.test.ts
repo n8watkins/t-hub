@@ -11,7 +11,7 @@ class FakeTerminal {
 }
 
 describe("TerminalWriteLifecycle", () => {
-  it("defers destructive work until every accepted write is parsed", () => {
+  it("defers destructive work until every accepted write has left the parser stack", async () => {
     const terminal = new FakeTerminal();
     const lifecycle = new TerminalWriteLifecycle(terminal);
     const clear = vi.fn();
@@ -24,10 +24,12 @@ describe("TerminalWriteLifecycle", () => {
     terminal.callbacks.shift()?.();
     expect(clear).not.toHaveBeenCalled();
     terminal.callbacks.shift()?.();
+    expect(clear).not.toHaveBeenCalled();
+    await Promise.resolve();
     expect(clear).toHaveBeenCalledOnce();
   });
 
-  it("retires only after queued writes finish and refuses later writes", () => {
+  it("retires only after queued writes finish and refuses later writes", async () => {
     const terminal = new FakeTerminal();
     const lifecycle = new TerminalWriteLifecycle(terminal);
 
@@ -39,13 +41,15 @@ describe("TerminalWriteLifecycle", () => {
     expect(terminal.write).toHaveBeenCalledTimes(1);
 
     terminal.callbacks.shift()?.();
+    expect(terminal.dispose).not.toHaveBeenCalled();
+    await Promise.resolve();
     expect(terminal.dispose).toHaveBeenCalledOnce();
 
     lifecycle.disposeWhenIdle();
     expect(terminal.dispose).toHaveBeenCalledOnce();
   });
 
-  it("coalesces resize work behind accepted writes", () => {
+  it("coalesces resize work behind accepted writes", async () => {
     const terminal = new FakeTerminal();
     const lifecycle = new TerminalWriteLifecycle(terminal);
     const firstResize = vi.fn();
@@ -59,6 +63,8 @@ describe("TerminalWriteLifecycle", () => {
     expect(latestResize).not.toHaveBeenCalled();
     terminal.callbacks.shift()?.();
     expect(firstResize).not.toHaveBeenCalled();
+    expect(latestResize).not.toHaveBeenCalled();
+    await Promise.resolve();
     expect(latestResize).toHaveBeenCalledOnce();
   });
 });
