@@ -77,6 +77,66 @@ pub fn profiles_path() -> PathBuf {
     home.join(".t-hub").join("powder-profiles.json")
 }
 
+/// Return configured profile names without exposing endpoints or credentials.
+pub fn configured_profile_names() -> Result<Vec<String>, String> {
+    configured_profile_names_from_path(&profiles_path())
+}
+
+fn configured_profile_names_from_path(path: &Path) -> Result<Vec<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(path)
+                    .map_err(|error| {
+                        format!(
+                            "Powder profile file '{}' metadata is unavailable: {error}",
+                            path.display()
+                        )
+                    })?
+                    .permissions()
+                    .mode();
+                if mode & 0o077 != 0 {
+                    return Err(format!(
+                        "Powder profile file '{}' must be private (chmod 600)",
+                        path.display()
+                    ));
+                }
+            }
+            let file: ProfileFile = serde_json::from_str(&body).map_err(|error| {
+                format!(
+                    "Powder profile file '{}' is invalid: {error}",
+                    path.display()
+                )
+            })?;
+            if file.schema_version > 1 {
+                return Err(format!(
+                    "Powder profile file '{}' has unsupported schemaVersion {}",
+                    path.display(),
+                    file.schema_version
+                ));
+            }
+            let mut names: Vec<String> = file.profiles.into_keys().collect();
+            names.sort();
+            Ok(names)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let env_configured = std::env::var_os("POWDER_API_BASE_URL").is_some()
+                && std::env::var_os("POWDER_AGENT_NAME").is_some();
+            Ok(if env_configured {
+                vec!["default".to_string()]
+            } else {
+                Vec::new()
+            })
+        }
+        Err(error) => Err(format!(
+            "Powder profile file '{}' is unavailable: {error}",
+            path.display()
+        )),
+    }
+}
+
 impl Client {
     pub fn from_profile(name: &str) -> Result<Self, String> {
         Self::from_profile_path(name, &profiles_path())
@@ -507,6 +567,36 @@ mod tests {
         assert_eq!(client.base_url, "https://powder.example.test");
         assert_eq!(client.agent_name, "t-hub");
         assert_eq!(client.api_key.as_deref(), Some("secret-key"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn profile_names_are_sorted_without_loading_credentials() {
+        let path = std::env::temp_dir().join(format!(
+            "t-hub-powder-profile-names-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(
+            &path,
+            r#"{
+              "schemaVersion": 1,
+              "profiles": {
+                "zulu": { "baseUrl": "https://z.test", "agentName": "z" },
+                "alpha": { "baseUrl": "https://a.test", "agentName": "a" }
+              }
+            }"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            configured_profile_names_from_path(&path).unwrap(),
+            vec!["alpha".to_string(), "zulu".to_string()]
+        );
         let _ = std::fs::remove_file(path);
     }
 

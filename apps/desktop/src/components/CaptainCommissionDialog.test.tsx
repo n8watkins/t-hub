@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   bindProjectPowder,
@@ -32,8 +32,13 @@ describe("CaptainCommissionDialog", () => {
     vi.mocked(commissionCaptain).mockReset();
   });
 
-  it("registers an existing repository with Powder before commissioning", async () => {
-    vi.mocked(listProjects).mockResolvedValue({ projects: [], count: 0, seq: 0 });
+  it("saves an existing codebase with Powder before creating its Captain", async () => {
+    vi.mocked(listProjects).mockResolvedValue({
+      projects: [],
+      count: 0,
+      seq: 0,
+      powderProfiles: ["production"],
+    });
     vi.mocked(registerProject).mockResolvedValue(project);
     vi.mocked(commissionCaptain).mockResolvedValue({
       captain: {
@@ -56,16 +61,24 @@ describe("CaptainCommissionDialog", () => {
       />,
     );
 
-    fireEvent.change(await screen.findByLabelText("Repository path"), {
+    const wslFolder = await screen.findByLabelText("WSL folder");
+    expect(screen.getByRole("dialog", { name: "Create Captain" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Use saved codebase" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Choose existing WSL folder" })).toBeTruthy();
+
+    fireEvent.change(wslFolder, {
       target: { value: "/repo/t-hub" },
     });
-    fireEvent.change(screen.getByLabelText("Powder repository"), {
+    fireEvent.change(screen.getByLabelText("Powder board"), {
       target: { value: "t-hub" },
     });
     fireEvent.change(screen.getByLabelText("Assignment"), {
       target: { value: "Own production stability" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Commission Captain" }));
+    expect(screen.getByText("Review before creating")).toBeTruthy();
+    expect(screen.getByText("Existing WSL codebase")).toBeTruthy();
+    expect(screen.getByText("Harness default")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
 
     await waitFor(() => expect(registerProject).toHaveBeenCalledOnce());
     expect(registerProject).toHaveBeenCalledWith({
@@ -83,7 +96,7 @@ describe("CaptainCommissionDialog", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it("commissions a registered Powder-bound project without rebinding it", async () => {
+  it("creates a Captain for a saved Powder-bound codebase without rebinding it", async () => {
     vi.mocked(listProjects).mockResolvedValue({ projects: [project], count: 1, seq: 1 });
     vi.mocked(commissionCaptain).mockResolvedValue({
       captain: {
@@ -105,7 +118,10 @@ describe("CaptainCommissionDialog", () => {
       target: { value: "Own releases" },
     });
     fireEvent.click(screen.getByRole("button", { name: /^claude$/i }));
-    fireEvent.click(screen.getByRole("button", { name: "Commission Captain" }));
+    const review = screen.getByRole("region", { name: "Review before creating" });
+    expect(within(review).getByText("Saved codebase")).toBeTruthy();
+    expect(within(review).getByText("t-hub via production")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
 
     await waitFor(() => expect(commissionCaptain).toHaveBeenCalledOnce());
     expect(bindProjectPowder).not.toHaveBeenCalled();

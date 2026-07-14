@@ -76,7 +76,7 @@ export const PRESETS: Preset[] = [
   {
     key: "captain-codex",
     label: "Captain",
-    hint: "Project-aware Codex or Claude captain",
+    hint: "Create a Codex or Claude Captain for a codebase",
     options: {},
     commission: true,
   },

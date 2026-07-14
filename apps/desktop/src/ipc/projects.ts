@@ -21,6 +21,8 @@ export interface ProjectCatalog {
   projects: RegisteredProject[];
   count: number;
   seq: number;
+  powderProfiles?: string[];
+  powderProfilesError?: string;
 }
 
 export function listProjects(): Promise<ProjectCatalog> {

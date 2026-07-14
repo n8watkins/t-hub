@@ -14,20 +14,24 @@ interface CaptainCommissionDialogProps {
   onCommissioned: () => void;
 }
 
-type ProjectMode = "registered" | "register";
+type ProjectMode = "saved" | "existing";
 
 export function CaptainCommissionDialog({
   open,
   onClose,
   onCommissioned,
 }: CaptainCommissionDialogProps) {
-  const [mode, setMode] = useState<ProjectMode>("registered");
+  const [mode, setMode] = useState<ProjectMode>("saved");
   const [projects, setProjects] = useState<RegisteredProject[]>([]);
+  const [powderProfiles, setPowderProfiles] = useState<string[]>([]);
+  const [powderProfilesError, setPowderProfilesError] = useState<string | null>(
+    null,
+  );
   const [projectId, setProjectId] = useState("");
   const [repoRoot, setRepoRoot] = useState("");
   const [projectName, setProjectName] = useState("");
   const [powderRepository, setPowderRepository] = useState("");
-  const [connectionProfile, setConnectionProfile] = useState("production");
+  const [connectionProfile, setConnectionProfile] = useState("default");
   const [assignment, setAssignment] = useState("");
   const [harness, setHarness] = useState<"codex" | "claude">("codex");
   const [busy, setBusy] = useState(false);
@@ -41,9 +45,18 @@ export function CaptainCommissionDialog({
       .then((catalog) => {
         if (cancelled) return;
         setProjects(catalog.projects);
+        setPowderProfiles(catalog.powderProfiles ?? []);
+        setPowderProfilesError(catalog.powderProfilesError ?? null);
         const first = catalog.projects[0];
         setProjectId((current) => current || first?.projectId || "");
-        if (catalog.projects.length === 0) setMode("register");
+        if (catalog.projects.length === 0) setMode("existing");
+        if (catalog.powderProfiles?.length === 1) {
+          setConnectionProfile(catalog.powderProfiles[0]);
+        } else if ((catalog.powderProfiles?.length ?? 0) > 1) {
+          setConnectionProfile((current) =>
+            catalog.powderProfiles?.includes(current) ? current : "",
+          );
+        }
       })
       .catch((cause) => {
         if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
@@ -61,7 +74,7 @@ export function CaptainCommissionDialog({
   useEffect(() => {
     if (!selected) return;
     setPowderRepository(selected.powder?.repository ?? "");
-    setConnectionProfile(selected.powder?.connectionProfile ?? "production");
+    setConnectionProfile(selected.powder?.connectionProfile ?? "default");
   }, [selected]);
 
   if (!open) return null;
@@ -72,15 +85,19 @@ export function CaptainCommissionDialog({
       return;
     }
     if (!powderRepository.trim()) {
-      setError("Powder repository is required.");
+      setError("Powder board is required.");
+      return;
+    }
+    if (!connectionProfile.trim()) {
+      setError("Select a Powder connection profile under Advanced.");
       return;
     }
     setBusy(true);
     setError(null);
     try {
       let project: RegisteredProject;
-      if (mode === "register") {
-        if (!repoRoot.trim()) throw new Error("Repository path is required.");
+      if (mode === "existing") {
+        if (!repoRoot.trim()) throw new Error("WSL folder is required.");
         project = await registerProject({
           repoRoot: repoRoot.trim(),
           name: projectName.trim() || undefined,
@@ -88,7 +105,7 @@ export function CaptainCommissionDialog({
           powderConnectionProfile: connectionProfile.trim() || "default",
         });
       } else {
-        if (!selected) throw new Error("Select a registered project.");
+        if (!selected) throw new Error("Select a saved codebase.");
         project = selected;
         if (
           !selected.powder ||
@@ -128,7 +145,7 @@ export function CaptainCommissionDialog({
       <div
         role="dialog"
         aria-modal="true"
-        aria-labelledby="commission-captain-title"
+        aria-labelledby="create-captain-title"
         className="flex max-h-[calc(100vh-2rem)] w-full max-w-lg flex-col overflow-hidden rounded-lg border shadow-2xl"
         style={{ background: "var(--th-tile-bg)", borderColor: "var(--th-border)" }}
         onPointerDown={(event) => event.stopPropagation()}
@@ -138,8 +155,11 @@ export function CaptainCommissionDialog({
           style={{ borderColor: "var(--th-border)" }}
         >
           <ShipWheel size={18} aria-hidden="true" />
-          <h2 id="commission-captain-title" className="min-w-0 flex-1 text-sm font-semibold">
-            Commission Captain
+          <h2
+            id="create-captain-title"
+            className="min-w-0 flex-1 text-sm font-semibold"
+          >
+            Create Captain
           </h2>
           <button
             type="button"
@@ -154,13 +174,16 @@ export function CaptainCommissionDialog({
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
           <div
+            role="group"
+            aria-label="Codebase source"
             className="grid grid-cols-2 rounded border p-0.5"
             style={{ borderColor: "var(--th-border)" }}
           >
-            {(["registered", "register"] as const).map((value) => (
+            {(["saved", "existing"] as const).map((value) => (
               <button
                 key={value}
                 type="button"
+                aria-pressed={mode === value}
                 className="h-8 rounded text-xs font-medium"
                 style={{
                   background: mode === value ? "var(--th-accent)" : "transparent",
@@ -174,21 +197,23 @@ export function CaptainCommissionDialog({
                   setError(null);
                 }}
               >
-                {value === "registered" ? "Registered project" : "Register repository"}
+                {value === "saved"
+                  ? "Use saved codebase"
+                  : "Choose existing WSL folder"}
               </button>
             ))}
           </div>
 
-          {mode === "registered" ? (
-            <Field label="Project">
+          {mode === "saved" ? (
+            <Field label="Saved codebase">
               <select
-                aria-label="Project"
+                aria-label="Saved codebase"
                 value={projectId}
                 onChange={(event) => setProjectId(event.target.value)}
                 className={inputClass}
                 style={fieldStyle}
               >
-                <option value="">Select project</option>
+                <option value="">Select codebase</option>
                 {projects.map((project) => (
                   <option key={project.projectId} value={project.projectId}>
                     {project.name}
@@ -198,9 +223,9 @@ export function CaptainCommissionDialog({
             </Field>
           ) : (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <Field label="Repository path" wide>
+              <Field label="WSL folder" wide>
                 <input
-                  aria-label="Repository path"
+                  aria-label="WSL folder"
                   value={repoRoot}
                   onChange={(event) => setRepoRoot(event.target.value)}
                   className={inputClass}
@@ -208,39 +233,71 @@ export function CaptainCommissionDialog({
                   placeholder="/home/user/project"
                 />
               </Field>
-              <Field label="Project name">
+              <Field label="Codebase name">
                 <input
-                  aria-label="Project name"
+                  aria-label="Codebase name"
                   value={projectName}
                   onChange={(event) => setProjectName(event.target.value)}
                   className={inputClass}
                   style={fieldStyle}
-                  placeholder="Derived from repository"
+                  placeholder="Derived from folder"
                 />
               </Field>
             </div>
           )}
 
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Field label="Powder repository">
-              <input
-                aria-label="Powder repository"
-                value={powderRepository}
-                onChange={(event) => setPowderRepository(event.target.value)}
-                className={inputClass}
-                style={fieldStyle}
-              />
-            </Field>
-            <Field label="Connection profile">
-              <input
-                aria-label="Connection profile"
-                value={connectionProfile}
-                onChange={(event) => setConnectionProfile(event.target.value)}
-                className={inputClass}
-                style={fieldStyle}
-              />
-            </Field>
-          </div>
+          <Field label="Powder board">
+            <input
+              aria-label="Powder board"
+              value={powderRepository}
+              onChange={(event) => setPowderRepository(event.target.value)}
+              className={inputClass}
+              style={fieldStyle}
+            />
+          </Field>
+
+          <details
+            className="rounded border px-3 py-2"
+            style={{ borderColor: "var(--th-border)" }}
+          >
+            <summary
+              className="cursor-pointer text-xs font-medium"
+              style={{ color: "var(--th-fg-muted)" }}
+            >
+              Advanced
+            </summary>
+            <div className="mt-3 space-y-2">
+              <Field label="Powder connection profile">
+                {powderProfiles.length > 0 ? (
+                  <select
+                    aria-label="Powder connection profile"
+                    value={connectionProfile}
+                    onChange={(event) => setConnectionProfile(event.target.value)}
+                    className={inputClass}
+                    style={fieldStyle}
+                  >
+                    {!connectionProfile && <option value="">Select profile</option>}
+                    {powderProfiles.map((profile) => (
+                      <option key={profile} value={profile}>
+                        {profile}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    aria-label="Powder connection profile"
+                    value={connectionProfile}
+                    onChange={(event) => setConnectionProfile(event.target.value)}
+                    className={inputClass}
+                    style={fieldStyle}
+                  />
+                )}
+              </Field>
+              {powderProfilesError && (
+                <p className="text-xs text-amber-300">{powderProfilesError}</p>
+              )}
+            </div>
+          </details>
 
           <Field label="Assignment">
             <textarea
@@ -261,6 +318,7 @@ export function CaptainCommissionDialog({
                 <button
                   key={value}
                   type="button"
+                  aria-pressed={harness === value}
                   className="h-8 rounded text-xs font-medium capitalize"
                   style={{
                     background: harness === value ? "var(--th-accent)" : "transparent",
@@ -276,6 +334,16 @@ export function CaptainCommissionDialog({
               ))}
             </div>
           </Field>
+
+          <ReviewSummary
+            mode={mode}
+            selected={selected}
+            repoRoot={repoRoot}
+            powderRepository={powderRepository}
+            connectionProfile={connectionProfile}
+            assignment={assignment}
+            harness={harness}
+          />
 
           {error && (
             <div role="alert" className="rounded border border-red-500/50 bg-red-500/10 px-3 py-2 text-xs text-red-300">
@@ -301,11 +369,69 @@ export function CaptainCommissionDialog({
             onClick={() => void submit()}
             disabled={busy}
           >
-            {busy ? "Commissioning..." : "Commission Captain"}
+            {busy ? "Creating..." : "Create Captain"}
           </button>
         </footer>
       </div>
     </div>
+  );
+}
+
+function ReviewSummary({
+  mode,
+  selected,
+  repoRoot,
+  powderRepository,
+  connectionProfile,
+  assignment,
+  harness,
+}: {
+  mode: ProjectMode;
+  selected?: RegisteredProject;
+  repoRoot: string;
+  powderRepository: string;
+  connectionProfile: string;
+  assignment: string;
+  harness: "codex" | "claude";
+}) {
+  const source = mode === "saved" ? "Saved codebase" : "Existing WSL codebase";
+  const location =
+    mode === "saved"
+      ? selected
+        ? `${selected.name} · ${selected.repoRoot}`
+        : "Select a codebase"
+      : repoRoot.trim() || "Choose a WSL folder";
+
+  return (
+    <section
+      aria-labelledby="captain-preflight-title"
+      className="rounded border p-3"
+      style={{ borderColor: "var(--th-border)", background: "var(--th-app-bg)" }}
+    >
+      <h3 id="captain-preflight-title" className="text-xs font-semibold">
+        Review before creating
+      </h3>
+      <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+        <ReviewRow label="Source" value={source} />
+        <ReviewRow label="Codebase" value={location} />
+        <ReviewRow
+          label="Powder"
+          value={`${powderRepository.trim() || "Not selected"} via ${connectionProfile.trim() || "Not selected"}`}
+        />
+        <ReviewRow label="Assignment" value={assignment.trim() || "Required"} />
+        <ReviewRow label="Harness" value={harness === "codex" ? "Codex" : "Claude"} />
+        <ReviewRow label="Permissions" value="Harness default" />
+      </dl>
+    </section>
+  );
+}
+
+function ReviewRow({ label, value }: { label: string; value: string }) {
+  return (
+    <>
+      <dt style={{ color: "var(--th-fg-muted)" }}>{label}</dt>
+      <dd className="min-w-0 break-words">{value}</dd>
+    </>
   );
 }
 

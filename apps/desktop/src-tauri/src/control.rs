@@ -6416,10 +6416,16 @@ fn list_captains(ctx: &ControlContext) -> Result<Value, String> {
 /// which is activity-derived and may include unregistered scratch directories.
 fn list_projects(ctx: &ControlContext) -> Result<Value, String> {
     let snap = ctx.captains.snapshot();
+    let (powder_profiles, powder_profiles_error) = match powder::configured_profile_names() {
+        Ok(names) => (names, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
     Ok(json!({
         "projects": snap.projects,
         "count": snap.projects.len(),
         "seq": snap.seq,
+        "powderProfiles": powder_profiles,
+        "powderProfilesError": powder_profiles_error,
     }))
 }
 
