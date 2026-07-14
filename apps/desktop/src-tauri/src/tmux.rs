@@ -177,11 +177,11 @@ fn is_already_gone(stderr: &str) -> bool {
 ///
 /// Bounding the subprocess turns an indefinite park into a fast, recoverable error
 /// that frees the handler thread and its connection slot, so a transient server
-/// stall can no longer escalate into a channel-wide wedge. Generous: a healthy tmux
-/// answers in well under a second (a few hundred ms through `wsl.exe` on Windows);
-/// a call that blows past this is a stalled server, and failing fast lets the caller
-/// retry once it recovers.
-const TMUX_CMD_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
+/// stall can no longer escalate into a channel-wide wedge. The Windows-to-WSL hop
+/// can take more than four seconds on an otherwise healthy, already-running distro,
+/// so the bound must also leave room for process startup and tmux itself. A call that
+/// exceeds ten seconds is still treated as stalled so the caller can recover.
+const TMUX_CMD_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
 
 /// Effective per-command tmux timeout: `$T_HUB_TMUX_CMD_TIMEOUT_SECS` (seconds) if
 /// set to a positive integer, else [`TMUX_CMD_TIMEOUT_DEFAULT`]. Unset / 0 / junk ⇒
