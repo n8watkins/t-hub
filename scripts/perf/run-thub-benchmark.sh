@@ -12,6 +12,7 @@ sample_seconds=60
 interval_ms=1000
 output=""
 executable=""
+pid=""
 setup_note="idle terminals at shell prompts"
 dry_run=false
 
@@ -26,6 +27,7 @@ Options:
   --interval-ms N     Sample interval, at least 100 ms (default: 1000)
   --output PATH       JSON artifact path (default: artifacts/perf/<timestamp>.json)
   --exe PATH          Exact installed Windows executable path; WSL paths are converted
+  --pid PID           Exact T-Hub root PID; required when multiple roots match
   --setup-note TEXT   Workload and tab-layout note stored in benchmark metadata
   --dry-run           Validate arguments and print the PowerShell invocation only
   --help              Show this help
@@ -55,6 +57,7 @@ while [ "$#" -gt 0 ]; do
     --interval-ms) require_value "$@"; interval_ms="$2"; shift 2 ;;
     --output) require_value "$@"; output="$2"; shift 2 ;;
     --exe) require_value "$@"; executable="$2"; shift 2 ;;
+    --pid) require_value "$@"; pid="$2"; shift 2 ;;
     --setup-note) require_value "$@"; setup_note="$2"; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -66,6 +69,8 @@ case "$terminals" in 1|4|8|16) ;; *) echo "run-thub-benchmark: --terminals must 
 case "$warmup_seconds" in ''|*[!0-9]*) echo "run-thub-benchmark: --warmup-seconds must be an integer" >&2; exit 2 ;; esac
 case "$sample_seconds" in ''|*[!0-9]*) echo "run-thub-benchmark: --sample-seconds must be an integer" >&2; exit 2 ;; esac
 case "$interval_ms" in ''|*[!0-9]*) echo "run-thub-benchmark: --interval-ms must be an integer" >&2; exit 2 ;; esac
+case "$pid" in ''|*[!0-9]*) [ -z "$pid" ] || { echo "run-thub-benchmark: --pid must be a positive integer" >&2; exit 2; } ;; esac
+if [ -n "$pid" ] && [ "$pid" -lt 1 ]; then echo "run-thub-benchmark: --pid must be a positive integer" >&2; exit 2; fi
 if [ "$sample_seconds" -lt 1 ]; then echo "run-thub-benchmark: --sample-seconds must be at least 1" >&2; exit 2; fi
 if [ "$warmup_seconds" -gt 3600 ]; then echo "run-thub-benchmark: --warmup-seconds must not exceed 3600" >&2; exit 2; fi
 if [ "$sample_seconds" -gt 86400 ]; then echo "run-thub-benchmark: --sample-seconds must not exceed 86400" >&2; exit 2; fi
@@ -89,16 +94,19 @@ output_windows="$(to_windows_path "$output")"
 command=(
   powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
   -File "$script_windows"
-  -ScenarioTerminals "$terminals"
+  -DeclaredScenarioTerminals "$terminals"
   -WarmupSeconds "$warmup_seconds"
   -SampleSeconds "$sample_seconds"
   -IntervalMilliseconds "$interval_ms"
   -OutputPath "$output_windows"
   -SetupNote "$setup_note"
-  -RepositoryCommit "$commit"
+  -CollectorRepositoryCommit "$commit"
 )
 if [ -n "$executable" ]; then
   command+=( -ExecutablePath "$executable" )
+fi
+if [ -n "$pid" ]; then
+  command+=( -RootProcessId "$pid" )
 fi
 
 if "$dry_run"; then
