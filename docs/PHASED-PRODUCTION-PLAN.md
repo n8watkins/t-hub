@@ -8,6 +8,7 @@
 ## How to Use This Plan
 
 Read this document before starting a new implementation session.
+Use [REVIEW-INDEX.md](./REVIEW-INDEX.md) to distinguish canonical, supporting, historical, and archived documents.
 Treat the phase exit gates as product requirements, not suggestions.
 Work may proceed in parallel only where the dependency map explicitly permits it.
 Do not use a later phase to waive an earlier correctness or safety gate.
@@ -53,6 +54,8 @@ The user artifacts `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` must remain untou
 18. History, lifecycle telemetry, voice, notifications, and settings should be provider-agnostic.
 19. Powder remains authoritative for work state, while T-Hub remains authoritative for runtime identity, terminals, Workspaces, and owned resources.
 20. Raw CPU, RAM, process, and context samples remain local to T-Hub rather than turning Powder into a telemetry database.
+21. Agent work state and runtime health are independent axes governed by [STATUS-MODEL.md](./STATUS-MODEL.md).
+22. Worktree identity, ownership, freshness, and cleanup safety are computed once by the backend under [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md).
 
 ## Current Baseline
 
@@ -88,6 +91,9 @@ The source documents a newer interface, but the CLI still lacks most Captain, Po
 The source CLI already has a useful Rust control-client boundary, a no-argument fleet view, deterministic human rendering, a stable JSON envelope, and an established exit-code taxonomy that should be preserved.
 The CLI contract audit also found that unknown flags can be accepted silently, per-subcommand help is absent, `worktree rm` has no explicit confirmation gate, some diagnostics can leak into JSON-mode stderr without a structured suggestion, and JSON collections are described as unbounded.
 The project-specific target is now defined in `docs/cli-contract.md` and intentionally uses stable JSON without an AXI dependency or a claim of AXI compliance.
+Tile headers use authoritative Git branch and dirty data, but the Worktrees dialog exposes only branch, path, and main or linked state.
+Recent, Captain, and Workspace rows still contain folder-name worktree heuristics that can disagree with authoritative Git state.
+The shared status indicator also combines agent work with terminal lifecycle in some surfaces and can replace exact agent status with a generic terminal tooltip.
 
 ## Critical Path
 
@@ -162,6 +168,7 @@ Prevent terminals, browsers, development servers, worktrees, and Powder claims f
 13. Add a Resources view with owner, state, age, activity, and proposed cleanup effect.
 14. Add a reviewed **Clean orphaned resources** action.
 15. Reconcile owned resources at T-Hub startup and after WSL restart.
+16. Implement the unified worktree status service and safety decisions defined in `docs/WORKTREE-STATUS-CONTRACT.md`.
 
 ### Tests and Evidence
 
@@ -170,6 +177,7 @@ Prevent terminals, browsers, development servers, worktrees, and Powder claims f
 - Verify that dirty, unmerged, or leased worktrees are never automatically removed.
 - Verify that Powder claims release only after confirmed terminal shutdown.
 - Verify process ownership against Windows and WSL operating-system evidence.
+- Verify that backend, CLI, MCP, and graphical surfaces return equivalent worktree identity, ownership, freshness, and safety decisions.
 
 ### Exit Gate
 
@@ -178,6 +186,7 @@ Prevent terminals, browsers, development servers, worktrees, and Powder claims f
 - Ordinary Chrome remains untouched.
 - Failed claim release remains visible and recoverable.
 - The Resources view agrees with operating-system evidence.
+- Dirty, leased, main, locked, stale, and unknown worktrees cannot be automatically removed or reused.
 
 ## Phase 3 - Durable Identity and Organizational Model
 
@@ -243,6 +252,7 @@ Each Harness adapter must define:
 - History discovery and resume metadata.
 - Hook installation, trust, health, repair, and removal.
 - Capability flags for features the provider cannot supply.
+- Authoritative and derived inputs for both axes in `docs/STATUS-MODEL.md`.
 
 ### Normalized Events
 
@@ -283,6 +293,7 @@ Adapters should map provider events into:
 12. Implement Codex auto-continue after provider-limit reset by preserving the exact thread, pending continuation, reset time, and durable Captain or Crew identity.
 13. Deduplicate scheduled continuation across app restarts, provider retries, repeated limit events, and simultaneous frontend clients.
 14. Allow the General, Captain, or owning Crew policy to cancel or disable a pending continuation before it runs.
+15. Replace provider-specific or terminal-output status inference with the two-axis work-state and runtime-health model.
 
 ### Tests and Evidence
 
@@ -291,6 +302,7 @@ Adapters should map provider events into:
 - Add explicit degraded-capability tests where one provider lacks an event.
 - Verify hook trust and repair behavior without overwriting user-authored hooks.
 - Verify provider switching preserves T-Hub identity but never mixes incompatible conversation IDs.
+- Verify authoritative, derived, stale, unknown, and conflicting status observations without fabricating unsupported provider events.
 - Test Codex auto-continue with real and fixture limit events, exact reset-time scheduling, early retry backoff, app restart, duplicate events, cancellation, missing threads, and already-completed work.
 - Verify auto-continue never submits a continuation to a different thread, retired identity, closed Assignment, or manually stopped session.
 
@@ -301,6 +313,7 @@ Adapters should map provider events into:
 - Codex context and resume identity are visible and recoverable.
 - Codex auto-continue resumes the exact limited thread once after the provider window resets, or reports a clear recoverable failure.
 - A future adapter can implement the normalized contract without changing Project, Captain, Workspace, History, or inbox schemas.
+- Work completion, attention, runtime failure, and recovery remain distinct on every supported Harness.
 
 ## Phase 5 - CLI-First Control Plane
 
@@ -329,6 +342,7 @@ Preserve the existing control-client architecture, JSON envelope, compatible ali
 14. Add concise agent instructions and command help so agents discover CLI syntax on demand.
 15. Ensure CLI and MCP return equivalent results for the same backend operation.
 16. Consider `th capabilities --json` only after the expanded catalog makes capability discovery worth its maintenance cost.
+17. Make worktree commands consume the unified backend snapshot rather than maintaining separate Git safety logic in the CLI.
 
 ### Tests and Evidence
 
@@ -407,15 +421,16 @@ Make Captain creation understandable for saved, existing, and completely new cod
 5. Add saved codebase, existing WSL folder, and new codebase entry paths.
 6. Build a WSL-native folder picker with home and recent shortcuts, breadcrumbs, parent navigation, Git indicators, and manual-path fallback.
 7. Detect the canonical main worktree, remote, default branch, dirty state, and existing worktrees.
-8. Offer explicit Git initialization for non-repository folders.
-9. Add a reviewed new-codebase transaction for empty projects, templates, and clones.
-10. Never silently replace a directory or initialize version control.
-11. Add Powder board selection and explicit creation when Powder authorization permits it.
-12. Add a preflight summary for filesystem changes, Git state, Powder, Assignment, Harness, model, permissions, and external effects.
-13. Use the same backend transaction for graphical and Cortana conversational flows.
-14. Commission the Captain identity without forcing creation of an unrelated work Workspace.
-15. Offer creation of an initial Workspace when the Assignment already names a coherent workstream.
-16. Roll back incomplete state while preserving pre-existing directories and useful work.
+8. Use the unified worktree status contract for preflight identity, ownership, freshness, and safety decisions.
+9. Offer explicit Git initialization for non-repository folders.
+10. Add a reviewed new-codebase transaction for empty projects, templates, and clones.
+11. Never silently replace a directory or initialize version control.
+12. Add Powder board selection and explicit creation when Powder authorization permits it.
+13. Add a preflight summary for filesystem changes, Git state, Powder, Assignment, Harness, model, permissions, and external effects.
+14. Use the same backend transaction for graphical and Cortana conversational flows.
+15. Commission the Captain identity without forcing creation of an unrelated work Workspace.
+16. Offer creation of an initial Workspace when the Assignment already names a coherent workstream.
+17. Roll back incomplete state while preserving pre-existing directories and useful work.
 
 ### Tests and Evidence
 
@@ -496,11 +511,14 @@ Make Board, Run and Preview, Files, History, Provider limits, Messages, Resource
 18. Add per-session Codex and Claude auto-continue controls with pending, scheduled, cancelled, resumed, and failed states.
 19. Show the provider reset time, exact target session, and cancellation action without exposing internal credentials or prompts unnecessarily.
 20. Add clear Project, Assignment, Captain, Workspace, Crew, worktree, and board labels.
-21. Verify keyboard access, narrow layouts, high DPI, error states, and visual quality.
+21. Render work state as the primary status and runtime degradation as a separate secondary signal under `docs/STATUS-MODEL.md`.
+22. Replace path-derived worktree labels with authoritative branch and worktree identity wherever current state is available.
+23. Verify keyboard access, narrow layouts, high DPI, error states, and visual quality.
 
 ### Tests and Evidence
 
 - Add component tests for every empty, loading, degraded, error, and success state.
+- Add cross-surface status tests that assert exact labels, tooltips, accessible text, freshness, and worktree identity.
 - Add browser E2E for Board and Preview, including iframe fallback.
 - Add History resume tests across Codex and Claude.
 - Add auto-continue UI tests for opt-in, opt-out, cancellation, scheduled recovery, duplicate events, and failed exact-thread resume.
@@ -614,9 +632,10 @@ Make the validated product safe, traceable, installable, and understandable.
 13. Mark historical design documents superseded only with explicit approval.
 14. Preserve Lavish and deck artifacts as instructed by the General.
 15. Update the zero-context handoff with exact source, runtime state, tests, measurements, and remaining risks.
-16. Bump the desktop version only after the intended release contents pass acceptance.
-17. Build and install the signed production artifact from the exact reviewed commit.
-18. Push and publish only when the General requests it.
+16. Keep `docs/REVIEW-INDEX.md` current so historical and archived reviews cannot silently become active backlog.
+17. Bump the desktop version only after the intended release contents pass acceptance.
+18. Build and install the signed production artifact from the exact reviewed commit.
+19. Push and publish only when the General requests it.
 
 ### Tests and Evidence
 
@@ -649,6 +668,7 @@ These lanes may proceed in parallel:
 - **A5 Documentation and terminology:** keep canonical definitions synchronized without changing historical artifacts.
 
 Integration order is A1 and A2 first, followed by the safe activation of A3.
+A3 must implement worktree ownership and safety from `docs/WORKTREE-STATUS-CONTRACT.md` rather than introducing a resource-only approximation.
 
 ### Tranche B - Identity, Providers, and Control
 
@@ -663,6 +683,7 @@ These lanes may proceed in parallel after the Phase 1 control contract is stable
 
 B1 owns shared identity migrations.
 B3 and B4 must consume B1's identity interfaces rather than each introducing provider-specific durable fields.
+B3 and B4 must emit the two independent status axes defined in `docs/STATUS-MODEL.md`.
 B5 owns command definitions.
 B5 must land contract behavior and process-level tests before broad command generation so new commands inherit the correct interface.
 B6 owns messaging schema and must not bypass B1 authority.
@@ -710,6 +731,7 @@ Release integration waits for every Phase 12 gate.
 10. Run format, lint, warnings-denied compilation, frontend tests, Rust workspace tests, TypeScript, and production builds before each logical commit.
 11. Record interactive checks that cannot yet be automated and convert stable checks into automation later.
 12. Do not declare provider parity based only on both terminals launching.
+13. Test authoritative, derived, stale, unknown, and conflicting state explicitly rather than collapsing uncertainty into a healthy default.
 
 ## Claude and Codex Parity Matrix
 
