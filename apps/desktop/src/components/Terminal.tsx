@@ -66,6 +66,7 @@ import { registerTerminalTail, unregisterTerminalTail } from "../lib/terminalTai
 import type { ITheme, ILink } from "@xterm/xterm";
 import { clipboardRead, clipboardWrite } from "../lib/clipboard";
 import { TerminalCursorBlinkController } from "../lib/terminalCursorBlink";
+import { updateTerminalResources } from "../lib/terminalResources";
 import "./Terminal.css";
 
 // Paste into a terminal, preferring an IMAGE on the clipboard over text. When the
@@ -406,6 +407,7 @@ export function TerminalView({
         ),
       ),
     });
+    updateTerminalResources(terminalId, { xterm: true });
     termRef.current = term;
     // Register this xterm so the captains-deck orchestrator output strip can read
     // its latest visible line on demand (no per-chunk work; the strip polls).
@@ -561,6 +563,7 @@ export function TerminalView({
     // breaking the terminal.
     try {
       term.loadAddon(new CanvasAddon());
+      updateTerminalResources(terminalId, { canvas: true });
     } catch {
       // Canvas unavailable in this webview — fall back to the DOM renderer.
     }
@@ -1063,6 +1066,7 @@ export function TerminalView({
                   // without opening a new socket. close_terminal detaches +
                   // removes it (a no-op when absent); the tmux session survives.
                   await closeTerminal(terminalId);
+                  updateTerminalResources(terminalId, { pty: false });
                   if (disposed) return;
                   // Buffer live output while we await the fresh seed, exactly
                   // like the mount path: bytes from the new conn replay AFTER
@@ -1078,6 +1082,7 @@ export function TerminalView({
                     term.rows,
                   );
                   if (disposed) return;
+                  updateTerminalResources(terminalId, { pty: true });
                   // Repopulate: reset the grid so the stale pre-drop frame (and
                   // the reconnecting banner) never duplicates under the seed.
                   term.reset();
@@ -1225,6 +1230,7 @@ export function TerminalView({
               term.rows,
             );
             if (disposed) return;
+            updateTerminalResources(terminalId, { pty: true });
             // Empty seed => fresh spawn (backend skips capture); non-empty =>
             // reattach history to restore. Only write a real seed; a fresh
             // prompt is drawn by the forced redraw below.
@@ -1536,6 +1542,11 @@ export function TerminalView({
 
       unregisterTerminalTail(terminalId, term);
       term.dispose();
+      updateTerminalResources(terminalId, {
+        xterm: false,
+        canvas: false,
+        pty: false,
+      });
       termRef.current = null;
       fitRef.current = null;
     };

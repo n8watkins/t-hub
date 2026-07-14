@@ -42,6 +42,10 @@ import type { TerminalId } from "../ipc/types";
 // also self-installs the console/window diag hooks once at app startup (the pool
 // mounts with the canvas) — see src/lib/diag.ts.
 import { tlog } from "../lib/diag";
+import {
+  removeTerminalResources,
+  updateTerminalResources,
+} from "../lib/terminalResources";
 
 // Upper bound on the chained deferred re-syncs the pool will schedule while an
 // active-tab terminal's placeholder rect is still degenerate. A transient
@@ -327,6 +331,28 @@ function TerminalPoolLayer({ containerRef, slotsRef, version }: PoolLayerProps) 
     captainOpen,
     captainId,
   ]);
+
+  const measuredPoolIdsRef = useRef<Set<TerminalId>>(new Set());
+  useEffect(() => {
+    const current = new Set(poolIds);
+    for (const id of measuredPoolIdsRef.current) {
+      if (!current.has(id)) removeTerminalResources(id);
+    }
+    for (const id of poolIds) {
+      updateTerminalResources(id, {
+        temperature: foregroundIds.has(id) ? "hot" : "warm",
+      });
+    }
+    measuredPoolIdsRef.current = current;
+  }, [poolIds, foregroundIds]);
+
+  useEffect(
+    () => () => {
+      for (const id of measuredPoolIdsRef.current) removeTerminalResources(id);
+      measuredPoolIdsRef.current.clear();
+    },
+    [],
+  );
 
   // A deferred re-sync scheduled on the next animation frame. A sync that lands
   // mid-reflow (transient zero rect / zero container base) is always followed by
