@@ -1,27 +1,29 @@
-# Orchestrator Operating Model
+# Cortana Operating Model
 
 ## Purpose
 
-The orchestrator is the General's fleet-level coordinator.
-It turns broad intent into projects and Captain assignments, watches the fleet, routes decisions, and keeps durable state coherent.
-It is not the default implementation worker, a hidden administrator, or a substitute for a project Captain.
+Cortana is the General's permanent lightweight T-Hub orchestrator identity.
+Cortana helps create or select codebases, commissions Captains, navigates the fleet, surfaces health and attention, recovers broken runtimes, and performs delegated Captain retirement.
+Cortana is not to Captains what Captains are to Crew.
+Cortana does not decompose Captain Assignments, direct Crew, or resolve implementation conflicts by default.
 
-The orchestrator may prepare or register a project because project registration is an apex operation available to the General or Cortana.
-Once a project has a commissioned Captain, normal implementation ownership moves to that Captain.
+Cortana's identity is independent of its current terminal, Harness, Provider, model, or conversation.
+Replacing Cortana's runtime must preserve its identity, durable checkpoints, and allowed responsibilities.
 
-## Valid Project Entry Paths
+## Valid Codebase Entry Paths
 
 Captain creation must support three equally normal starting points.
 
 ### 1. Saved codebase
 
-The codebase is already registered in T-Hub.
-The user or orchestrator selects it, reviews its Git and Powder status, provides an assignment and harness, and commissions the Captain.
+The codebase is already registered as a T-Hub Project.
+The General or Cortana selects it, reviews Git and Powder status, provides an Assignment and Harness, and commissions a Captain.
+More than one Captain may receive distinct Assignments in the same Project.
 
 ### 2. Existing codebase not yet saved
 
 The folder or Git repository already exists in WSL but is not registered in T-Hub.
-The user or orchestrator browses to it, T-Hub detects the canonical Git main worktree and metadata, and the flow registers it before commissioning.
+The General or Cortana browses to it, T-Hub detects the canonical main worktree and metadata, and the flow registers it before commissioning.
 
 If the selected folder is not a Git repository, the flow must offer an explicit choice to initialize Git or cancel.
 It must not silently initialize or rewrite version control.
@@ -29,93 +31,138 @@ It must not silently initialize or rewrite version control.
 ### 3. Brand-new codebase
 
 The codebase does not exist yet.
-The user may create it directly or ask the orchestrator to prepare it.
+The General may create it through the graphical flow or ask Cortana to prepare it conversationally.
 
 The healthy product flow collects:
 
 - Project name and WSL parent folder.
-- Starting source: empty, template, or clone from an existing remote.
+- Starting source such as empty, template, or clone.
 - Initial stack or template options when relevant.
 - Git initialization and default branch.
 - Whether to create or connect an external remote.
 - Powder board creation or selection.
-- Initial Captain assignment and Codex or Claude harness.
+- Initial Captain Assignment and Harness.
 
 T-Hub should then execute one reviewed transaction:
 
-1. Validate the destination and show the planned filesystem and external changes.
+1. Validate the destination and show planned filesystem and external changes.
 2. Create or clone the codebase.
 3. Initialize and validate the canonical Git main worktree.
-4. Register the durable T-Hub project.
+4. Register the durable T-Hub Project.
 5. Create or select the Powder board and verify authorization.
-6. Bind the project to that board.
-7. Commission the Captain in the reserved Captains workspace.
-8. Create a deliberate project workspace for future Crew.
+6. Bind the Project to that board.
+7. Commission the Captain with a distinct Assignment.
+8. Offer an initial Workspace only when the Assignment already names a coherent workstream.
 
-If a later step fails, T-Hub should preserve useful local work, clearly report partial state, and offer a safe resume or rollback.
+If a later step fails, T-Hub should preserve useful local work, report partial state clearly, and offer safe resume or rollback.
 It must never delete a pre-existing directory during rollback.
 
-The current implementation does not provide this transaction.
-`register_project` requires an existing Git main worktree, and the T-Hub Powder integration does not currently create Powder boards.
+The current implementation does not provide this complete transaction.
+`register_project` requires an existing Git main worktree, and T-Hub does not currently create Powder boards.
 
-## Healthy Orchestrator Responsibilities
+## Healthy Cortana Responsibilities
 
-The orchestrator should:
+Cortana should:
 
-- Translate the General's broad objective into one or more clearly named projects.
-- Detect whether the request targets a saved codebase, an existing unsaved codebase, or a new codebase.
-- Ask only for decisions that materially change the result, such as destination, template, remote visibility, destructive replacement, spending, or publication.
-- Present a preflight summary before creating durable or external state.
-- Use the same project creation and commissioning operations exposed in the graphical UI.
-- Create concise Captain assignments with scope, constraints, success criteria, and escalation rules.
-- Choose Codex or Claude deliberately rather than inheriting a harness accidentally.
-- Commission no more than one live Captain for the same project under the current registry contract.
-- Watch Captain status and Powder events, surface decisions, and recover fleet state after resets or restarts.
-- Commission another Captain when work belongs to a separate project or exceeds one Captain's healthy span.
+- Detect whether a request targets a saved codebase, existing unsaved codebase, or new codebase.
+- Ask only for decisions that materially change the result.
+- Present a preflight summary before durable or external changes.
+- Use the same Project creation and commissioning operations as the graphical UI.
+- Commission one or more Captains with clearly distinct Assignments.
+- Let the General choose a Harness or use the configured default.
+- Navigate or summon Captains.
+- Show a lightweight fleet overview.
+- Surface Captain health, needs-input states, context pressure, and local resource pressure.
+- Recommend a checkpoint or context reset when evidence supports it.
+- Recover a broken Captain runtime without replacing its durable identity.
+- Retire a Captain when the General explicitly requests it or previously delegates retirement on completion.
+- Verify retirement safety before removing runtime and Assignment state.
 
-The orchestrator should not:
+Cortana should not:
 
-- Perform routine project implementation after a Captain is commissioned.
+- Decompose a Captain's Assignment into implementation tasks.
 - Create or manage a Captain's Crew directly.
-- Skip the Captain to steer or abort individual Crew members.
+- Skip the Captain to steer, interrupt, or retire individual Crew members.
 - Treat a pinned terminal as a commissioned Captain.
+- Retire a Captain merely because it is idle, high in context, empty of Crew, or has no open Workspace.
 - Invent a Powder board mapping or dispatch work while Powder state is unavailable or ambiguous.
-- Create a public remote, publish, deploy, install, spend money, or perform destructive replacement without explicit authorization.
-- Auto-spawn itself with elevated or permissionless settings.
+- Resolve Project-level implementation conflicts unless the General explicitly asks for coordination help.
+- Create a public remote, publish, deploy, install, spend money, or perform destructive replacement without authorization.
 
-## Captain and Crew Boundary
+## Captain, Workspace, and Crew Boundary
 
-The orchestrator owns the fleet of Captains.
-A Captain owns one project assignment and its Crew.
-Crew own bounded Powder cards and validated checkouts or worktrees.
+A Captain owns one durable Assignment within a Project.
+Multiple Captains may have Assignments in the same Project.
+A Captain may control zero, one, or several Workspaces.
+A Workspace represents one coherent workstream rather than an entire Project or one Captain terminal.
+Crew own bounded work, normally represented by Powder cards and validated worktrees inside one Workspace.
 
 The normal command path is:
 
 ```text
-General -> Orchestrator -> Captain -> Crew
+General -> Cortana -> Captain -> Crew
 ```
 
-Status and decisions travel back up the same path.
-The orchestrator may focus or wake a Captain, but it should not create skip-level control over that Captain's Crew.
+This hierarchy describes authority, not a ban on useful peer communication.
+Captains may message other Captains for coordination, blockers, overlapping work, or technical help.
+Peer messaging does not grant access to another Captain's terminal, Crew, files, claims, Assignment, or retirement controls.
 
-After commissioning, the Captain decides how to decompose the assignment into Powder cards, which harness each Crew member uses, which validated worktree it owns, and which shared project workspace receives its tile.
-The orchestrator remains responsible for cross-project priority, Captain health, conflicts between projects, and decisions that exceed a Captain's authority.
+After commissioning, a Captain decides how to decompose its Assignment, which Powder cards to create or claim, which Harness each Crew member uses, which worktree it owns, and which Workspace receives it.
+Cortana may surface conflicts or navigate to the relevant Captains, but it does not become their implementation manager.
+
+## Context and Recovery
+
+T-Hub should derive runtime liveness from the terminal, Harness process, provider lifecycle, and owned-resource state.
+Captains should not need to spend model turns sending periodic liveness messages.
+
+Cortana may receive event-driven notifications when:
+
+- A Captain needs input.
+- A Captain runtime fails.
+- Context pressure crosses a threshold.
+- An owned resource becomes orphaned.
+- A delegated Assignment reports completion.
+- Retirement safety checks require attention.
+
+A context reset recommendation should follow a safe turn boundary and require a durable checkpoint.
+Resetting context preserves the Captain, Assignment, Workspaces, Crew, and Powder bindings.
+
+## Retirement Policy
+
+Cortana may retire a Captain when:
+
+- The General explicitly requests retirement.
+- The General previously delegates retirement after Assignment completion.
+- The Captain reports completion and requests retirement under that delegated authority.
+- The General cancels or supersedes the Assignment.
+
+Cortana must verify:
+
+- A durable final checkpoint exists.
+- No active Crew remain.
+- No unresolved claims, runs, or input requests remain.
+- No unsafe dirty, leased, or unmerged worktree remains.
+- No owned browser or development-server process remains.
+- No unread completion, blocker, or decision message remains.
+
+A Captain cannot autonomously destroy its durable identity.
+A broken terminal is a recovery event rather than evidence that the Assignment is complete.
 
 ## Expected User Experience
 
-The main action should be **Create Captain**, followed by a first choice:
+The main action should be **Create Captain**, followed by:
 
 - **Use saved codebase**
 - **Choose existing WSL folder**
 - **Create new codebase**
 
-When invoked through Cortana, the orchestrator should drive the same flow conversationally and leave a visible preflight card for the General to review.
-The graphical and conversational paths must call the same backend operations so they cannot drift in safety or behavior.
+When invoked through Cortana, the same flow should run conversationally and leave a visible preflight card for review.
+The graphical and conversational paths must call the same backend operations.
 
-Successful completion should leave the user with:
+Successful commissioning should leave the General with:
 
-- A registered project with understandable codebase metadata.
-- A verified Powder board binding.
-- One commissioned Captain visible in the Captains workspace.
-- One named project workspace ready for Crew.
-- A concise summary of what was created, what remains local, and what external state changed.
+- An understandable saved codebase record.
+- A verified Powder board binding when Powder is required.
+- One commissioned Captain with a clear Assignment.
+- No forced work Workspace unless one is useful immediately.
+- A concise summary of local changes, external changes, permissions, Harness, and remaining work.

@@ -11,6 +11,9 @@ The current API and persisted registry call its durable T-Hub record a **project
 In normal use, one project represents one canonical Git repository checkout and its worktrees.
 A **Powder board** is the Powder repository namespace containing cards for that codebase.
 It is not another Git checkout.
+A **Captain Assignment** is one durable responsibility within a project.
+Multiple Captains may hold distinct Assignments in the same project.
+A **Workspace** is one coherent workstream controlled by a Captain rather than a synonym for a project, Captain, or Crew member.
 
 A project may be registered without Powder, but a commissioned Captain requires a verified Powder binding.
 Older pinned Captain tiles may lack a project or Powder binding because pinning is only visual state and does not commission a Captain.
@@ -21,9 +24,9 @@ Captain creation has three valid entry paths:
 
 - Use a saved codebase already registered in T-Hub.
 - Choose an existing WSL folder or Git repository and register it.
-- Create a brand-new codebase directly or ask the orchestrator to prepare it.
+- Create a brand-new codebase directly or ask Cortana to prepare it.
 
-The complete orchestrator contract and new-project transaction are defined in [ORCHESTRATOR-OPERATING-MODEL.md](./ORCHESTRATOR-OPERATING-MODEL.md).
+The complete Cortana contract and new-project transaction are defined in [ORCHESTRATOR-OPERATING-MODEL.md](./ORCHESTRATOR-OPERATING-MODEL.md).
 
 After selecting an entry path, the intended creation flow is:
 
@@ -37,7 +40,8 @@ After selecting an entry path, the intended creation flow is:
 8. Review a preflight summary covering the codebase, Git state, Powder health and authorization, board match, assignment, and harness.
 9. Commission the Captain.
 
-Commissioning creates a control-capability terminal in the reserved Captains workspace, starts the selected harness, claims a durable ship, binds it to the project and assignment, and provides bootstrap instructions.
+Commissioning creates a control-capability Captain runtime, starts the selected Harness, claims a durable identity, binds it to the Project and Assignment, and provides bootstrap instructions.
+The Captain remains visible through the Captains surface without forcing creation of an unrelated work Workspace.
 If any required preflight or startup step fails, commissioning fails closed and rolls back the incomplete Captain.
 
 The current dialog does not yet implement the WSL browser, automatic Git and Powder discovery, simplified terminology, or the preflight summary.
@@ -52,24 +56,28 @@ After commissioning, the Captain can:
 
 - Read the project, assignment, Powder board, active Crew, and recovery state through `captain_bootstrap`.
 - Decompose the assignment into independent Powder cards.
+- Create, name, close, and reconcile coherent Workspaces for related work.
 - Dispatch a Crew member for an existing card with a selected Codex or Claude harness.
 - Run Crew in the canonical checkout or a validated Git worktree belonging to the project.
 - Select a branch and a shared workspace for each Crew member.
 - Monitor Crew status, context, questions, blockers, terminal output, Powder claims, and completion evidence.
 - Send verified input, focus a Crew terminal, checkpoint recovery state, interrupt its own Crew, and close completed Crew safely.
+- Message another Captain for coordination or technical help without gaining authority over that Captain or its Crew.
 
-The default operating limit is three concurrent Crew unless the General requests more.
+Six concurrent Crew is the initial operating default for this computer rather than a proven hard limit.
+Packaged 1, 4, 8, and 16-session measurements must establish warning and queue thresholds before T-Hub enforces a resource cap.
 Durable Crew are leaf workers and do not create more durable Crew.
 Work that needs another orchestration layer should receive another commissioned Captain.
 
-Each Crew dispatch requires an existing Powder card belonging to the Captain project's Powder board.
+Each Crew dispatch requires an existing Powder card belonging to the Project's default or explicitly bound Assignment board.
 `dispatch_crew` validates the checkout and card, creates a read-capability terminal, claims the card, records the Crew binding, launches the chosen harness, verifies liveness, and rolls the operation back if any step fails.
 
 ## Crew in Workspaces
 
-A Captain always appears as a tile in the reserved Captains workspace and as a row in the Captains sidebar section.
+A Captain always remains reachable through the Captains surface and its durable terminal binding.
 A Crew member appears as a normal terminal tile in the workspace selected during dispatch.
-Crew for the same codebase should normally share one named workspace rather than receive one workspace per worktree.
+Crew working on the same coherent workstream should normally share one named Workspace.
+Unrelated work in the same Project should use separate Workspaces even when one Captain controls both.
 
 When dispatch supplies `tabId`, T-Hub places the Crew tile in that existing workspace.
 When dispatch supplies `tabName`, T-Hub uses or creates the named workspace.

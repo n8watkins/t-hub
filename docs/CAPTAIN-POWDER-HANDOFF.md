@@ -1,5 +1,12 @@
 # Captain, Crew, Powder, and Performance Handoff
 
+## Canonical Planning Note
+
+The runtime evidence in this handoff remains the baseline for the installed `0.3.66` build.
+The authoritative forward roadmap is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
+That plan now includes the settled permanent Cortana identity, multiple Captains per Project, Assignment-based ownership, provider-agnostic Harness integration, CLI-first control, durable messaging, History, voice parity, and parallel implementation lanes.
+Where the narrower ordered list in this handoff differs from the phased plan, follow the phased plan.
+
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
