@@ -120,6 +120,10 @@ pub trait HarnessAdapter: Send + Sync {
     /// non-empty prompt is passed as the initial instruction, safely quoted.
     fn fresh_argv(&self, prompt: &str) -> String;
 
+    /// Interactive launch with an explicit permission posture. Captain creation
+    /// uses this instead of inheriting a harness or user default implicitly.
+    fn fresh_argv_with_permissions(&self, prompt: &str, perm: PermMode) -> String;
+
     /// Interactive launch string that RESUMES a specific `session_id` (the
     /// harness's own resume entry: `claude --resume '<id>'` / `codex resume
     /// '<id>'`). The frontend "Resume ..." picker preset (no id) is a separate,

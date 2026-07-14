@@ -28,6 +28,16 @@ impl HarnessAdapter for ClaudeHarness {
         }
     }
 
+    fn fresh_argv_with_permissions(&self, prompt: &str, perm: PermMode) -> String {
+        let flags = self.permission_map(perm).join(" ");
+        match (flags.is_empty(), prompt.is_empty()) {
+            (true, true) => "claude".to_string(),
+            (true, false) => format!("claude {}", sh_single_quote(prompt)),
+            (false, true) => format!("claude {flags}"),
+            (false, false) => format!("claude {flags} {}", sh_single_quote(prompt)),
+        }
+    }
+
     fn resume_argv(&self, session_id: &str) -> String {
         // Matches the recall path's `claude --resume '<id>'` (the interactive,
         // id-specific resume). The no-id picker preset lives in SpawnMenu.tsx.
@@ -80,6 +90,15 @@ mod tests {
         let a = ClaudeHarness;
         assert_eq!(a.fresh_argv(""), "claude");
         assert_eq!(a.fresh_argv("do the thing"), "claude 'do the thing'");
+    }
+
+    #[test]
+    fn fresh_argv_applies_explicit_unrestricted_permissions() {
+        let a = ClaudeHarness;
+        assert_eq!(
+            a.fresh_argv_with_permissions("do the thing", PermMode::BypassPermissions),
+            "claude --dangerously-skip-permissions 'do the thing'"
+        );
     }
 
     #[test]

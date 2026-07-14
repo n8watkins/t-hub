@@ -37,6 +37,16 @@ impl HarnessAdapter for CodexHarness {
         }
     }
 
+    fn fresh_argv_with_permissions(&self, prompt: &str, perm: PermMode) -> String {
+        let flags = self.permission_map(perm).join(" ");
+        match (flags.is_empty(), prompt.is_empty()) {
+            (true, true) => "codex".to_string(),
+            (true, false) => format!("codex {}", sh_single_quote(prompt)),
+            (false, true) => format!("codex {flags}"),
+            (false, false) => format!("codex {flags} {}", sh_single_quote(prompt)),
+        }
+    }
+
     fn resume_argv(&self, session_id: &str) -> String {
         // Codex's interactive resume-by-id (verified on 0.142.5). The no-id
         // picker preset (`codex resume`) lives in SpawnMenu.tsx.
@@ -90,6 +100,15 @@ mod tests {
         let a = CodexHarness;
         assert_eq!(a.fresh_argv(""), "codex");
         assert_eq!(a.fresh_argv("build it"), "codex 'build it'");
+    }
+
+    #[test]
+    fn fresh_argv_applies_explicit_unrestricted_permissions() {
+        let a = CodexHarness;
+        assert_eq!(
+            a.fresh_argv_with_permissions("build it", PermMode::BypassPermissions),
+            "codex --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check 'build it'"
+        );
     }
 
     #[test]

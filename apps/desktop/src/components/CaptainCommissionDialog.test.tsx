@@ -105,7 +105,7 @@ describe("CaptainCommissionDialog", () => {
     });
     expect(screen.getByText("Review before creating")).toBeTruthy();
     expect(screen.getByText("Existing WSL codebase")).toBeTruthy();
-    expect(screen.getByText("Harness default")).toBeTruthy();
+    expect(screen.getByText("Unrestricted")).toBeTruthy();
     expect(await screen.findByText("main · 2 changed · main worktree")).toBeTruthy();
     expect(screen.getByText("https://example.test/t-hub.git")).toBeTruthy();
     expect(screen.getByText("2 detected")).toBeTruthy();

@@ -537,7 +537,7 @@ function ReviewSummary({
         />
         <ReviewRow label="Assignment" value={assignment.trim() || "Required"} />
         <ReviewRow label="Harness" value={harness === "codex" ? "Codex" : "Claude"} />
-        <ReviewRow label="Permissions" value="Harness default" />
+        <ReviewRow label="Permissions" value="Unrestricted" />
       </dl>
     </section>
   );

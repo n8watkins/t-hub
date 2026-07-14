@@ -54,7 +54,7 @@ use serde_json::{json, Value};
 use crate::audit::{AuditLog, AuditMeta};
 use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
-use crate::harness::Harness;
+use crate::harness::{Harness, PermMode};
 use crate::supervision::Supervisor;
 use crate::{files, git, plane, powder, pty, tmux};
 
@@ -6982,7 +6982,9 @@ fn commission_captain(
         state: ClaimState::Active,
     };
     let prompt = bootstrap_instructions(&provisional, &project);
-    let startup_command = harness.adapter().fresh_argv(&prompt);
+    let startup_command = harness
+        .adapter()
+        .fresh_argv_with_permissions(&prompt, PermMode::BypassPermissions);
     #[cfg(test)]
     let startup_command =
         arg_str(args, "testStartupCommand").unwrap_or_else(|| startup_command.clone());
