@@ -56,14 +56,23 @@ fi
 for skill in \
   "$CODEX_HOME/skills/captain/SKILL.md" \
   "$CODEX_HOME/skills/shipmate/SKILL.md" \
+  "$CODEX_HOME/skills/handoff/SKILL.md" \
   "$CLAUDE_HOME/skills/captain/SKILL.md" \
-  "$CLAUDE_HOME/skills/shipmate/SKILL.md"; do
+  "$CLAUDE_HOME/skills/shipmate/SKILL.md" \
+  "$CLAUDE_HOME/skills/handoff/SKILL.md"; do
   if [ -f "$skill" ]; then
     pass "installed skill ${skill#"$WORK/"}"
   else
     fail "missing installed skill ${skill#"$WORK/"}"
   fi
 done
+
+if [ -f "$CLAUDE_HOME/commands/handoff.md" ] \
+  && [ "$(head -n 1 "$CLAUDE_HOME/commands/handoff.md")" = '<!-- managed by T-Hub: handoff command -->' ]; then
+  pass "installed managed Claude handoff command"
+else
+  fail "missing or unmanaged Claude handoff command"
+fi
 
 if codex mcp get t-hub --json 2>/dev/null | grep -Fq "\"command\": \"$BIN_DIR/t-hub-mcp\""; then
   pass "Codex registration points at the installed binary"
@@ -99,11 +108,46 @@ fi
 if [ ! -e "$CONFLICT_BIN_DIR/t-hub-mcp" ] \
   && [ ! -e "$CONFLICT_CODEX_HOME/skills/captain" ] \
   && [ ! -e "$CONFLICT_CODEX_HOME/skills/shipmate" ] \
+  && [ ! -e "$CONFLICT_CODEX_HOME/skills/handoff" ] \
   && [ ! -e "$CONFLICT_CLAUDE_HOME/skills/captain" ] \
+  && [ ! -e "$CONFLICT_CLAUDE_HOME/skills/handoff" ] \
+  && [ ! -e "$CONFLICT_CLAUDE_HOME/commands/handoff.md" ] \
   && [ "$(cat "$CONFLICT_CLAUDE_HOME/skills/shipmate/SKILL.md")" = "user-owned" ]; then
   pass "conflict leaves the binary and every skill target unchanged"
 else
   fail "conflict left a partial installation"
+fi
+
+COMMAND_CONFLICT_WORK="$WORK/command-conflict"
+COMMAND_CONFLICT_CODEX_HOME="$COMMAND_CONFLICT_WORK/codex-home"
+COMMAND_CONFLICT_CLAUDE_HOME="$COMMAND_CONFLICT_WORK/claude-home"
+COMMAND_CONFLICT_BIN_DIR="$COMMAND_CONFLICT_WORK/install/bin"
+COMMAND_CONFLICT_CAPTAIN_DIR="$COMMAND_CONFLICT_WORK/install/captain"
+mkdir -p "$COMMAND_CONFLICT_CODEX_HOME" "$COMMAND_CONFLICT_CLAUDE_HOME/commands"
+printf 'user-owned command\n' > "$COMMAND_CONFLICT_CLAUDE_HOME/commands/handoff.md"
+
+if CODEX_HOME="$COMMAND_CONFLICT_CODEX_HOME" \
+  CLAUDE_HOME="$COMMAND_CONFLICT_CLAUDE_HOME" \
+  T_HUB_MCP_SOURCE="$SOURCE" \
+  T_HUB_BIN_DIR="$COMMAND_CONFLICT_BIN_DIR" \
+  T_HUB_CAPTAIN_DIR="$COMMAND_CONFLICT_CAPTAIN_DIR" \
+  bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "unmanaged Claude command conflict unexpectedly succeeded"
+else
+  pass "unmanaged Claude command conflict is refused"
+fi
+
+if [ ! -e "$COMMAND_CONFLICT_BIN_DIR/t-hub-mcp" ] \
+  && [ ! -e "$COMMAND_CONFLICT_CODEX_HOME/skills/captain" ] \
+  && [ ! -e "$COMMAND_CONFLICT_CODEX_HOME/skills/shipmate" ] \
+  && [ ! -e "$COMMAND_CONFLICT_CODEX_HOME/skills/handoff" ] \
+  && [ ! -e "$COMMAND_CONFLICT_CLAUDE_HOME/skills/captain" ] \
+  && [ ! -e "$COMMAND_CONFLICT_CLAUDE_HOME/skills/shipmate" ] \
+  && [ ! -e "$COMMAND_CONFLICT_CLAUDE_HOME/skills/handoff" ] \
+  && [ "$(cat "$COMMAND_CONFLICT_CLAUDE_HOME/commands/handoff.md")" = "user-owned command" ]; then
+  pass "command conflict leaves every managed target unchanged"
+else
+  fail "command conflict left a partial installation"
 fi
 
 if CODEX_HOME="$CONFLICT_CODEX_HOME" codex mcp get t-hub >/dev/null 2>&1; then
