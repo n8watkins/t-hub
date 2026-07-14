@@ -9,7 +9,8 @@
 //! Tiers (PRD §11.2):
 //!   - **Read** (allowed): `list_terminals`, `get_status`, `wait_for_status`,
 //!     `supervision_tree`, `wsl_health`, `search_files`, `list_tabs`,
-//!     `list_captains`, `list_projects`, `list_fleet_watches`, `read_terminal`,
+//!     `list_captains`, `list_projects`, `list_powder_boards`,
+//!     `list_fleet_watches`, `read_terminal`,
 //!     `my_capability`.
 //!   - **Organization** (allowed, audited): `focus_session`, `move_tile`,
 //!     `rename_tab`, `new_tab`, `focus_tab`, `close_tab`, `claim_captain`,
@@ -369,6 +370,18 @@ fn schema_bind_project_powder() -> Value {
     })
 }
 
+fn schema_list_powder_boards() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "connectionProfile": { "type": "string", "minLength": 1, "description": "Protected Powder endpoint profile name; defaults to 'default'." },
+            "offset": { "type": "integer", "minimum": 0, "description": "Zero-based result offset; defaults to 0." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum boards to return; defaults to 100." }
+        },
+        "additionalProperties": false
+    })
+}
+
 fn schema_captain_bootstrap() -> Value {
     json!({
         "type": "object",
@@ -633,6 +646,12 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Read,
             summary: "List durable registered projects and their Powder repository bindings.",
             input_schema: schema_empty,
+        },
+        ToolDef {
+            name: "list_powder_boards",
+            tier: Tier::Read,
+            summary: "List a bounded page of visible canonical Powder boards for a protected connection profile.",
+            input_schema: schema_list_powder_boards,
         },
         ToolDef {
             name: "captain_bootstrap",
@@ -974,6 +993,17 @@ mod tests {
         let list = find("list_projects").unwrap();
         assert_eq!(list.tier, Tier::Read);
         assert_eq!((list.input_schema)(), schema_empty());
+
+        let boards = find("list_powder_boards").unwrap();
+        assert_eq!(boards.tier, Tier::Read);
+        assert_eq!(
+            (boards.input_schema)()["properties"]["limit"]["maximum"],
+            500
+        );
+        assert_eq!(
+            (boards.input_schema)()["additionalProperties"],
+            false
+        );
 
         for name in ["register_project", "bind_project_powder"] {
             let tool = find(name).unwrap();

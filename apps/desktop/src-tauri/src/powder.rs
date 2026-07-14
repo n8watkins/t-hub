@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::bounded_exec;
@@ -57,6 +57,29 @@ pub struct CardEvent {
     pub card_status: String,
     pub repository: Option<String>,
     pub change: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PowderBoard {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub tier: String,
+    pub card_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct PowderRepositoryList {
+    repositories: Vec<PowderRepositorySummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PowderRepositorySummary {
+    name: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    tier: String,
+    card_count: usize,
 }
 
 pub struct Client {
@@ -269,6 +292,12 @@ impl Client {
         )
     }
 
+    /// List visible Powder repository entities for T-Hub's board picker.
+    /// Creation remains a separate admin-authorized Powder operation.
+    pub fn list_boards(&self) -> Result<Vec<PowderBoard>, String> {
+        parse_board_list(self.request("GET", "/api/v1/repositories", None)?)
+    }
+
     pub fn claim(&self, card_id: &str, ttl_seconds: u64) -> Result<Claim, String> {
         let value = self.request(
             "POST",
@@ -366,6 +395,51 @@ impl Client {
                 .map_err(|error| format!("Powder returned invalid JSON: {error}")),
             Err(error) => Err(response_error(error)),
         }
+    }
+}
+
+fn parse_board_list(value: Value) -> Result<Vec<PowderBoard>, String> {
+    let payload: PowderRepositoryList = serde_json::from_value(value)
+        .map_err(|error| format!("Powder repository list response is invalid: {error}"))?;
+    let mut boards = payload
+        .repositories
+        .into_iter()
+        .map(|repository| {
+            let name = repository.name.trim().to_string();
+            if name.is_empty() {
+                return Err("Powder repository list contains an empty name".to_string());
+            }
+            let tier = repository.tier.trim().to_string();
+            if tier.is_empty() {
+                return Err(format!("Powder repository '{name}' has an empty tier"));
+            }
+            Ok(PowderBoard {
+                name,
+                aliases: repository
+                    .aliases
+                    .into_iter()
+                    .map(|alias| alias.trim().to_string())
+                    .filter(|alias| !alias.is_empty())
+                    .collect(),
+                tier,
+                card_count: repository.card_count,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    boards.sort_by(|left, right| {
+        board_tier_rank(&left.tier)
+            .cmp(&board_tier_rank(&right.tier))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(boards)
+}
+
+fn board_tier_rank(tier: &str) -> u8 {
+    match tier {
+        "active" => 0,
+        "backburner" => 1,
+        "archived" => 2,
+        _ => 3,
     }
 }
 
@@ -617,6 +691,29 @@ mod tests {
     }
 
     #[test]
+    fn repository_list_becomes_a_deterministic_board_catalog() {
+        let boards = parse_board_list(json!({
+            "repositories": [
+                { "name": "later", "aliases": [], "tier": "archived", "card_count": 0 },
+                { "name": "t-hub", "aliases": ["thub"], "tier": "active", "card_count": 4 },
+                { "name": "backlog", "aliases": [], "tier": "backburner", "card_count": 2 }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            boards
+                .iter()
+                .map(|board| board.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t-hub", "backlog", "later"]
+        );
+        assert_eq!(boards[0].aliases, vec!["thub"]);
+        assert_eq!(boards[0].card_count, 4);
+        assert!(parse_board_list(json!({ "repositories": [{ "tier": "active" }] })).is_err());
+        assert!(parse_board_list(json!({ "repositories": "not-an-array" })).is_err());
+    }
+
+    #[test]
     fn path_segments_are_percent_encoded() {
         assert_eq!(encode_path("repo/card 1"), "repo%2Fcard%201");
     }
@@ -663,6 +760,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             for expected_path in [
+                "/api/v1/repositories",
                 "/api/v1/repositories/repo%2Fone",
                 "/api/v1/cards/card-1?detail=detailed",
                 "/api/v1/cards/card-1/claim",
@@ -730,6 +828,16 @@ mod tests {
                         "\"change\":{\"proof\":\"tests\"}}\n\n"
                     )
                     .to_string()
+                } else if expected_path == "/api/v1/repositories" {
+                    json!({
+                        "repositories": [{
+                            "name": "repo-one",
+                            "aliases": [],
+                            "tier": "active",
+                            "card_count": 1
+                        }]
+                    })
+                    .to_string()
                 } else if expected_path.contains("repositories/") {
                     json!({ "name": "repo/one" }).to_string()
                 } else if expected_path.contains("?detail=") {
@@ -765,6 +873,7 @@ mod tests {
             api_key_command: None,
         })
         .unwrap();
+        assert_eq!(client.list_boards().unwrap()[0].name, "repo-one");
         assert_eq!(
             client.get_repository("repo/one").unwrap()["name"],
             "repo/one"

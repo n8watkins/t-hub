@@ -32,10 +32,35 @@ export function listProjects(): Promise<ProjectCatalog> {
   return controlRequest("list_projects") as Promise<ProjectCatalog>;
 }
 
+export interface PowderBoard {
+  name: string;
+  aliases: string[];
+  tier: string;
+  cardCount: number;
+}
+
+export interface PowderBoardCatalog {
+  connectionProfile: string;
+  boards: PowderBoard[];
+  count: number;
+  totalCount: number;
+  hasMore: boolean;
+  nextOffset?: number;
+}
+
+export function listPowderBoards(input: {
+  connectionProfile: string;
+  offset?: number;
+  limit?: number;
+}): Promise<PowderBoardCatalog> {
+  return controlRequest("list_powder_boards", input) as Promise<PowderBoardCatalog>;
+}
+
 export function registerProject(input: {
   repoRoot: string;
   name?: string;
   remoteUrl?: string;
+  initializeGit?: boolean;
   powderRepository?: string;
   powderConnectionProfile?: string;
 }): Promise<RegisteredProject> {

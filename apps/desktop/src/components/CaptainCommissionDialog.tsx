@@ -3,8 +3,10 @@ import { ShipWheel, X } from "lucide-react";
 import {
   bindProjectPowder,
   commissionCaptain,
+  listPowderBoards,
   listProjects,
   registerProject,
+  type PowderBoard,
   type RegisteredProject,
 } from "../ipc/projects";
 import {
@@ -43,7 +45,11 @@ export function CaptainCommissionDialog({
   const [repoRoot, setRepoRoot] = useState("");
   const [projectName, setProjectName] = useState("");
   const [powderRepository, setPowderRepository] = useState("");
-  const [connectionProfile, setConnectionProfile] = useState("default");
+  const [connectionProfile, setConnectionProfile] = useState("");
+  const [powderBoards, setPowderBoards] = useState<PowderBoard[]>([]);
+  const [powderBoardsLoading, setPowderBoardsLoading] = useState(false);
+  const [powderBoardsError, setPowderBoardsError] = useState<string | null>(null);
+  const [powderBoardsRetry, setPowderBoardsRetry] = useState(0);
   const [assignment, setAssignment] = useState("");
   const [harness, setHarness] = useState<"codex" | "claude">("codex");
   const [busy, setBusy] = useState(false);
@@ -71,6 +77,8 @@ export function CaptainCommissionDialog({
           setConnectionProfile((current) =>
             catalog.powderProfiles?.includes(current) ? current : "",
           );
+        } else if (!catalog.powderProfilesError) {
+          setConnectionProfile((current) => current || "default");
         }
       })
       .catch((cause) => {
@@ -87,10 +95,55 @@ export function CaptainCommissionDialog({
   );
 
   useEffect(() => {
-    if (!selected) return;
+    if (mode !== "saved" || !selected) return;
     setPowderRepository(selected.powder?.repository ?? "");
     setConnectionProfile(selected.powder?.connectionProfile ?? "default");
-  }, [selected]);
+  }, [mode, selected]);
+
+  useEffect(() => {
+    if (!open) return;
+    const profile = connectionProfile.trim();
+    if (!profile) {
+      setPowderBoards([]);
+      setPowderBoardsLoading(false);
+      setPowderBoardsError(null);
+      return;
+    }
+    let cancelled = false;
+    setPowderBoards([]);
+    setPowderBoardsLoading(true);
+    setPowderBoardsError(null);
+    void loadAllPowderBoards(profile)
+      .then((boards) => {
+        if (!cancelled) setPowderBoards(boards);
+      })
+      .catch((cause) => {
+        if (!cancelled) {
+          setPowderBoardsError(cause instanceof Error ? cause.message : String(cause));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setPowderBoardsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [connectionProfile, open, powderBoardsRetry]);
+
+  useEffect(() => {
+    if (powderBoardsLoading || powderBoardsError) return;
+    const savedBinding =
+      mode === "saved" &&
+      selected?.powder?.connectionProfile === connectionProfile
+        ? selected.powder.repository
+        : "";
+    setPowderRepository((current) => {
+      if (powderBoards.some((board) => board.name === current)) return current;
+      if (savedBinding) return savedBinding;
+      if (powderBoards.length === 1) return powderBoards[0].name;
+      return "";
+    });
+  }, [connectionProfile, mode, powderBoards, powderBoardsError, powderBoardsLoading, selected]);
 
   useEffect(() => {
     if (mode !== "existing" || !repoRoot) return;
@@ -242,6 +295,7 @@ export function CaptainCommissionDialog({
                 }}
                 onClick={() => {
                   setMode(value);
+                  if (value === "existing") setPowderRepository("");
                   setError(null);
                 }}
               >
@@ -321,13 +375,51 @@ export function CaptainCommissionDialog({
           )}
 
           <Field label="Powder board">
-            <input
+            <select
               aria-label="Powder board"
               value={powderRepository}
               onChange={(event) => setPowderRepository(event.target.value)}
               className={inputClass}
               style={fieldStyle}
-            />
+              disabled={powderBoardsLoading || !!powderBoardsError || !connectionProfile.trim()}
+            >
+              {powderBoardsLoading ? (
+                <option value="">Loading Powder boards...</option>
+              ) : powderBoardsError ? (
+                <option value="">Powder boards unavailable</option>
+              ) : powderBoards.length === 0 && !powderRepository ? (
+                <option value="">No Powder boards found for this profile</option>
+              ) : (
+                <>
+                  {powderBoards.length !== 1 && <option value="">Select Powder board</option>}
+                  {mode === "saved" &&
+                    powderRepository &&
+                    !powderBoards.some((board) => board.name === powderRepository) && (
+                      <option value={powderRepository}>
+                        {powderRepository} (current binding)
+                      </option>
+                    )}
+                  {powderBoards.map((board) => (
+                    <option key={board.name} value={board.name}>
+                      {board.name} ({board.tier}, {board.cardCount} cards)
+                    </option>
+                  ))}
+                </>
+              )}
+            </select>
+            {powderBoardsError && (
+              <div role="alert" className="mt-1 flex items-center justify-between gap-2 text-xs text-amber-300">
+                <span>Could not load Powder boards: {powderBoardsError}</span>
+                <button
+                  type="button"
+                  className="rounded border px-2 py-1"
+                  style={{ borderColor: "var(--th-border)" }}
+                  onClick={() => setPowderBoardsRetry((value) => value + 1)}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
           </Field>
 
           <details
@@ -444,7 +536,7 @@ export function CaptainCommissionDialog({
               color: "var(--th-accent-fg, var(--th-fg))",
             }}
             onClick={() => void submit()}
-            disabled={busy}
+            disabled={busy || powderBoardsLoading || !!powderBoardsError || !powderRepository.trim()}
           >
             {busy ? "Creating..." : "Create Captain"}
           </button>
@@ -452,6 +544,23 @@ export function CaptainCommissionDialog({
       </div>
     </div>
   );
+}
+
+async function loadAllPowderBoards(connectionProfile: string): Promise<PowderBoard[]> {
+  const boards: PowderBoard[] = [];
+  let offset = 0;
+  for (;;) {
+    const page = await listPowderBoards({ connectionProfile, offset, limit: 500 });
+    if (page.connectionProfile !== connectionProfile) {
+      throw new Error("Powder returned boards for a different connection profile.");
+    }
+    boards.push(...page.boards);
+    if (!page.hasMore) return boards;
+    if (page.nextOffset === undefined || page.nextOffset <= offset) {
+      throw new Error("Powder board pagination did not advance.");
+    }
+    offset = page.nextOffset;
+  }
 }
 
 function ReviewSummary({

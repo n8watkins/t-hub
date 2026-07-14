@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   bindProjectPowder,
   commissionCaptain,
+  listPowderBoards,
   listProjects,
   registerProject,
 } from "../ipc/projects";
@@ -12,6 +13,7 @@ import { CaptainCommissionDialog } from "./CaptainCommissionDialog";
 
 vi.mock("../ipc/projects", () => ({
   listProjects: vi.fn(),
+  listPowderBoards: vi.fn(),
   registerProject: vi.fn(),
   bindProjectPowder: vi.fn(),
   commissionCaptain: vi.fn(),
@@ -31,6 +33,7 @@ const project = {
 describe("CaptainCommissionDialog", () => {
   beforeEach(() => {
     vi.mocked(listProjects).mockReset();
+    vi.mocked(listPowderBoards).mockReset();
     vi.mocked(registerProject).mockReset();
     vi.mocked(bindProjectPowder).mockReset();
     vi.mocked(commissionCaptain).mockReset();
@@ -43,6 +46,13 @@ describe("CaptainCommissionDialog", () => {
       dirtyCount: 0,
     });
     vi.mocked(gitWorktreeList).mockResolvedValue([]);
+    vi.mocked(listPowderBoards).mockResolvedValue({
+      connectionProfile: "production",
+      boards: [{ name: "t-hub", aliases: [], tier: "active", cardCount: 2 }],
+      count: 1,
+      totalCount: 1,
+      hasMore: false,
+    });
   });
 
   it("saves an existing codebase with Powder before creating its Captain", async () => {
@@ -218,5 +228,95 @@ describe("CaptainCommissionDialog", () => {
       powderRepository: "t-hub",
       powderConnectionProfile: "production",
     });
+  });
+
+  it("requires an explicit choice when a profile has multiple Powder boards", async () => {
+    vi.mocked(listProjects).mockResolvedValue({
+      projects: [],
+      count: 0,
+      seq: 0,
+      powderProfiles: ["production"],
+    });
+    vi.mocked(listPowderBoards).mockResolvedValue({
+      connectionProfile: "production",
+      boards: [
+        { name: "alpha", aliases: [], tier: "active", cardCount: 3 },
+        { name: "t-hub", aliases: [], tier: "active", cardCount: 2 },
+      ],
+      count: 2,
+      totalCount: 2,
+      hasMore: false,
+    });
+
+    render(
+      <CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />,
+    );
+
+    const board = await screen.findByLabelText("Powder board");
+    await screen.findByRole("option", { name: "alpha (active, 3 cards)" });
+    expect((board as HTMLSelectElement).value).toBe("");
+    expect(
+      (screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    fireEvent.change(board, { target: { value: "t-hub" } });
+    expect((board as HTMLSelectElement).value).toBe("t-hub");
+  });
+
+  it("reports board discovery failure and retries the selected profile", async () => {
+    vi.mocked(listProjects).mockResolvedValue({
+      projects: [],
+      count: 0,
+      seq: 0,
+      powderProfiles: ["production"],
+    });
+    vi.mocked(listPowderBoards)
+      .mockRejectedValueOnce(new Error("Powder HTTP 403: forbidden"))
+      .mockResolvedValueOnce({
+        connectionProfile: "production",
+        boards: [{ name: "t-hub", aliases: [], tier: "active", cardCount: 2 }],
+        count: 1,
+        totalCount: 1,
+        hasMore: false,
+      });
+
+    render(
+      <CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />,
+    );
+
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "Could not load Powder boards",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await screen.findByRole("option", { name: "t-hub (active, 2 cards)" });
+    expect(listPowderBoards).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows a successful empty Powder board catalog", async () => {
+    vi.mocked(listProjects).mockResolvedValue({
+      projects: [],
+      count: 0,
+      seq: 0,
+      powderProfiles: ["production"],
+    });
+    vi.mocked(listPowderBoards).mockResolvedValue({
+      connectionProfile: "production",
+      boards: [],
+      count: 0,
+      totalCount: 0,
+      hasMore: false,
+    });
+
+    render(
+      <CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />,
+    );
+
+    await screen.findByRole("option", {
+      name: "No Powder boards found for this profile",
+    });
+    expect(
+      (screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
   });
 });

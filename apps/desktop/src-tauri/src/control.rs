@@ -5729,6 +5729,7 @@ fn dispatch_with_caller(
         "list_tabs" => list_tabs(ctx),
         "list_captains" => list_captains(ctx),
         "list_projects" => list_projects(ctx),
+        "list_powder_boards" => list_powder_boards(args),
         "captain_bootstrap" => captain_bootstrap(ctx, args),
         "powder_status" => powder_status(ctx, args),
         "list_fleet_watches" => list_fleet_watches(ctx),
@@ -6433,6 +6434,69 @@ fn list_projects(ctx: &ControlContext) -> Result<Value, String> {
         "wslHome": wsl_home,
         "wslHomeError": wsl_home_error,
     }))
+}
+
+/// Return one bounded page of visible Powder boards for a protected profile.
+/// Powder calls these repository entities; T-Hub uses the user-facing board
+/// vocabulary while retaining the canonical Powder name used for bindings.
+fn list_powder_boards(args: &Value) -> Result<Value, String> {
+    let connection_profile = arg_str(args, "connectionProfile")
+        .or_else(|| arg_str(args, "connection_profile"))
+        .unwrap_or_else(default_powder_profile)
+        .trim()
+        .to_string();
+    if connection_profile.is_empty() {
+        return Err("list_powder_boards requires a non-empty connectionProfile".into());
+    }
+    let offset = bounded_collection_arg(args, "offset", 0, usize::MAX)?;
+    let limit = bounded_collection_arg(args, "limit", 100, 500)?;
+    let boards = powder::Client::from_profile(&connection_profile)?.list_boards()?;
+    Ok(powder_board_page(
+        &connection_profile,
+        &boards,
+        offset,
+        limit,
+    ))
+}
+
+fn bounded_collection_arg(
+    args: &Value,
+    key: &str,
+    default: usize,
+    maximum: usize,
+) -> Result<usize, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(default);
+    };
+    let value = value
+        .as_u64()
+        .ok_or_else(|| format!("list_powder_boards {key} must be a non-negative integer"))?;
+    let value =
+        usize::try_from(value).map_err(|_| format!("list_powder_boards {key} is too large"))?;
+    if key == "limit" && value == 0 {
+        return Err("list_powder_boards limit must be at least 1".into());
+    }
+    Ok(value.min(maximum))
+}
+
+fn powder_board_page(
+    connection_profile: &str,
+    boards: &[powder::PowderBoard],
+    offset: usize,
+    limit: usize,
+) -> Value {
+    let total_count = boards.len();
+    let start = offset.min(total_count);
+    let end = start.saturating_add(limit).min(total_count);
+    let has_more = end < total_count;
+    json!({
+        "connectionProfile": connection_profile,
+        "boards": &boards[start..end],
+        "count": end - start,
+        "totalCount": total_count,
+        "hasMore": has_more,
+        "nextOffset": has_more.then_some(end),
+    })
 }
 
 /// Register an existing Git repository using its canonical main-worktree root.
@@ -14456,6 +14520,46 @@ mod tests {
 
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
         std::fs::remove_dir_all(harness_bin_dir).unwrap();
+    }
+
+    #[test]
+    fn powder_board_catalog_is_bounded_and_reports_continuation() {
+        let boards = vec![
+            powder::PowderBoard {
+                name: "alpha".into(),
+                aliases: vec![],
+                tier: "active".into(),
+                card_count: 2,
+            },
+            powder::PowderBoard {
+                name: "beta".into(),
+                aliases: vec!["old-beta".into()],
+                tier: "backburner".into(),
+                card_count: 1,
+            },
+        ];
+        let first = powder_board_page("production", &boards, 0, 1);
+        assert_eq!(first["connectionProfile"], "production");
+        assert_eq!(first["count"], 1);
+        assert_eq!(first["totalCount"], 2);
+        assert_eq!(first["hasMore"], true);
+        assert_eq!(first["nextOffset"], 1);
+        assert_eq!(first["boards"][0]["name"], "alpha");
+
+        let final_page = powder_board_page("production", &boards, 1, 100);
+        assert_eq!(final_page["boards"][0]["name"], "beta");
+        assert_eq!(final_page["boards"][0]["cardCount"], 1);
+        assert_eq!(final_page["hasMore"], false);
+        assert!(final_page["nextOffset"].is_null());
+        assert!(
+            bounded_collection_arg(&json!({ "limit": 0 }), "limit", 100, 500)
+                .unwrap_err()
+                .contains("at least 1")
+        );
+        assert_eq!(
+            bounded_collection_arg(&json!({ "limit": 900 }), "limit", 100, 500).unwrap(),
+            500
+        );
     }
 
     #[test]

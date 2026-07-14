@@ -4,6 +4,13 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 vi.mock("../ipc/projects", () => ({
   listProjects: vi.fn().mockResolvedValue({ projects: [], count: 0, seq: 0 }),
+  listPowderBoards: vi.fn().mockResolvedValue({
+    connectionProfile: "default",
+    boards: [],
+    count: 0,
+    totalCount: 0,
+    hasMore: false,
+  }),
   registerProject: vi.fn(),
   bindProjectPowder: vi.fn(),
   commissionCaptain: vi.fn(),
