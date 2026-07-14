@@ -68,8 +68,9 @@ beforeEach(() => {
     poppedOutTabs: [],
     userLabels: {},
     labels: {},
+    claudeTitles: {},
   });
-  useCaptain.setState({ orchestratorId: null, captainIds: [] });
+  useCaptain.setState({ orchestratorId: null, captainIds: [], claims: {} });
   useSupervision.setState({ sessionIdByTmux: {} });
   clipboardWrites.length = 0;
 });
@@ -200,6 +201,70 @@ describe("Tile header context menu: IDs + Mark as Cortana", () => {
     const menu = openMenu("cap00001");
     expect(within(menu).queryByTitle("Copy Claude Session ID")).toBeNull();
     expect(menu.textContent).not.toContain("stale-claude-uuid");
+  });
+
+  it("does not show a stale Claude ID for node-hosted Codex with registry identity", () => {
+    act(() => {
+      useWorkspace.setState((state) => ({
+        terminals: {
+          ...state.terminals,
+          cap00001: { ...state.terminals.cap00001, title: "node" },
+        },
+        claudeTitles: { cap00001: "Claude review" },
+        labels: { cap00001: "Claude review" },
+      }));
+      useCaptain.setState({
+        claims: {
+          cap00001: {
+            terminalId: "cap00001",
+            shipSlug: "ship-cap00001",
+            provider: "codex",
+            harness: "codex",
+            providerSessionId: "codex-thread",
+            workspaceTabIds: ["t1"],
+            crew: [],
+          },
+        },
+      });
+      useSupervision.setState({
+        sessionIdByTmux: { th_cap00001: "stale-claude-uuid" },
+      });
+    });
+
+    const menu = openMenu("cap00001");
+    expect(within(menu).queryByTitle("Copy Claude Session ID")).toBeNull();
+    expect(menu.textContent).not.toContain("stale-claude-uuid");
+  });
+
+  it("shows a registry-backed Claude ID before supervision rehydrates", () => {
+    act(() => {
+      useWorkspace.setState((state) => ({
+        terminals: {
+          ...state.terminals,
+          cap00001: { ...state.terminals.cap00001, title: "node" },
+        },
+      }));
+      useCaptain.setState({
+        claims: {
+          cap00001: {
+            terminalId: "cap00001",
+            shipSlug: "ship-cap00001",
+            provider: "claude",
+            harness: "claude",
+            providerSessionId: "restored-claude-id",
+            workspaceTabIds: ["t1"],
+            crew: [],
+          },
+        },
+      });
+      useSupervision.setState({ sessionIdByTmux: {} });
+    });
+
+    const menu = openMenu("cap00001");
+    const sessionRow = within(menu).getByTitle("Copy Claude Session ID");
+    expect(sessionRow.textContent).toContain("restored-claude-id");
+    act(() => fireEvent.click(sessionRow));
+    expect(clipboardWrites).toEqual(["restored-claude-id"]);
   });
 
   it("labels the mark affordance 'Mark as Cortana' and 'Unmark Cortana' when set", () => {

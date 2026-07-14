@@ -121,6 +121,41 @@ describe("adoptCaptainsSnapshot seq guard", () => {
     expect(useCaptain.getState().claims["capLegacy"].crew).toEqual([{ terminalId: "c1" }]);
   });
 
+  it("preserves authoritative Captain and Crew runtime identity fields", () => {
+    expect(
+      adoptCaptainsSnapshot({
+        seq: 10,
+        captains: [{
+          ...claim("capA", ["t1"]),
+          provider: "claude",
+          harness: "claude",
+          providerSessionId: "claude-session",
+          claudeUuid: "claude-session",
+          crew: [{
+            terminalId: "crewCodex",
+            provider: "codex",
+            harness: "codex",
+            providerSessionId: "codex-thread",
+          }],
+        }],
+      }),
+    ).toBe(true);
+
+    const adopted = useCaptain.getState().claims.capA;
+    expect(adopted).toMatchObject({
+      provider: "claude",
+      harness: "claude",
+      providerSessionId: "claude-session",
+      claudeUuid: "claude-session",
+    });
+    expect(adopted.crew[0]).toMatchObject({
+      terminalId: "crewCodex",
+      provider: "codex",
+      harness: "codex",
+      providerSessionId: "codex-thread",
+    });
+  });
+
   it("ignores a malformed snapshot (missing seq / non-array captains)", () => {
     seedCaptains(["capA"]);
     expect(adoptCaptainsSnapshot(null)).toBe(false);

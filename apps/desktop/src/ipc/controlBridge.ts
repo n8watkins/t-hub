@@ -46,6 +46,10 @@ function str(
   return typeof v === "string" && v ? v : undefined;
 }
 
+function harness(value: unknown): "codex" | "claude" | undefined {
+  return value === "codex" || value === "claude" ? value : undefined;
+}
+
 // The last authoritative registry revision this window applied (from an apply's
 // `sync` payload or a report response). Rides every report as `baseSeq`.
 let lastSeq = 0;
@@ -118,7 +122,19 @@ export function adoptCaptainsSnapshot(sync: unknown): boolean {
       ? r.crew.flatMap((t): CrewRef[] => {
           if (typeof t === "string") return [{ terminalId: t }];
           if (t && typeof t === "object" && typeof (t as CrewRef).terminalId === "string") {
-            return [t as CrewRef];
+            const raw = t as unknown as Record<string, unknown>;
+            return [
+              {
+                terminalId: raw.terminalId as string,
+                claudeUuid: str(raw, "claudeUuid"),
+                provider: harness(raw.provider),
+                providerSessionId: str(raw, "providerSessionId"),
+                harness: harness(raw.harness),
+                conversationId: str(raw, "conversationId"),
+                resumePoint: str(raw, "resumePoint"),
+                state: raw.state as CrewRef["state"],
+              },
+            ];
           }
           return [];
         })
@@ -127,10 +143,21 @@ export function adoptCaptainsSnapshot(sync: unknown): boolean {
       terminalId,
       shipSlug: typeof r.shipSlug === "string" ? r.shipSlug : "",
       role: r.role === "cortana" ? "cortana" : "captain",
+      claudeUuid: typeof r.claudeUuid === "string" ? r.claudeUuid : undefined,
+      provider: harness(r.provider),
+      providerSessionId:
+        typeof r.providerSessionId === "string" ? r.providerSessionId : undefined,
+      projectId: typeof r.projectId === "string" ? r.projectId : undefined,
+      assignment: typeof r.assignment === "string" ? r.assignment : undefined,
+      harness: harness(r.harness),
+      conversationId:
+        typeof r.conversationId === "string" ? r.conversationId : undefined,
+      resumePoint: typeof r.resumePoint === "string" ? r.resumePoint : undefined,
       workspaceTabIds: Array.isArray(r.workspaceTabIds)
         ? r.workspaceTabIds.filter((t): t is string => typeof t === "string")
         : [],
       crew,
+      state: r.state,
     });
   }
   useCaptain.getState().adoptCaptainsRegistry(records);

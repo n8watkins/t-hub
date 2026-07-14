@@ -39,7 +39,10 @@ import { useTerminalSlot } from "./TerminalPool";
 import { TilePanel } from "./TilePanel";
 import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
-import { clientForTerminal } from "../store/clientType";
+import {
+  useAuthoritativeIdentityForTerminal,
+  useClientForTerminal,
+} from "../store/clientType";
 import { useAutoContinue } from "../store/autoContinue";
 import { useSettings } from "../store/settings";
 import { ContextMeter } from "./ContextMeter";
@@ -266,9 +269,10 @@ export function Tile({
   // The Claude session UUID bound to this tile, for the header menu's copyable
   // ID row. The supervision index is Claude-only and can briefly retain a stale
   // binding after a tile starts Codex, so the menu also gates it on `client`.
-  const claudeSessionId = useSupervision(
+  const supervisedClaudeSessionId = useSupervision(
     (s) => s.sessionIdByTmux[sessionNameForTerminal(terminalId)],
   );
+  const authoritativeIdentity = useAuthoritativeIdentityForTerminal(terminalId);
   // Per-terminal color override (the ⋯ menu): the effective color comes from
   // this terminal's override first, then the global theme, then a fallback.
   const termPalette = useTheme((s) => s.active.terminal);
@@ -388,17 +392,15 @@ export function Tile({
         title: info?.title,
         cwd: info?.cwd,
       });
-  // Which client runs in this tile — Claude / Codex / a plain shell — from the
-  // workspace store (spawn command/title + any live label). Drives the header
-  // client icon below. clientForTerminal reads three signals: the terminal
-  // record's title, the merged `labels` entry, and the Claude-suggested title.
-  // `info` + `userLabel` above subscribe to the first two; subscribe to the
-  // third here too, because once a tile has an explicit rename `labels[id]`
-  // stops tracking `claudeTitles[id]` (the rename wins in the merge), so without
-  // this the icon could miss a late Claude title. With it, the icon re-renders
-  // on any signal clientForTerminal reads and never goes stale.
-  useWorkspace((s) => s.claudeTitles[terminalId]);
-  const client = clientForTerminal(terminalId);
+  // Which client runs in this tile. A commissioned Captain/Crew registry identity
+  // is authoritative and survives app restarts; unregistered terminals retain the
+  // title/label heuristic. The hook subscribes to both stores so either signal can
+  // update the icon without waiting for an unrelated terminal poll.
+  const client = useClientForTerminal(terminalId);
+  const claudeSessionId =
+    client === "claude"
+      ? authoritativeIdentity?.providerSessionId ?? supervisedClaudeSessionId
+      : undefined;
   const isSelfDragging = draggingTileId === terminalId;
   const isDropTarget = dropTileId === terminalId && draggingTileId !== terminalId;
 

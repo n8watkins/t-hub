@@ -487,6 +487,25 @@ describe("overlay pins and commissioned Captain claims", () => {
     expect(localStorage.getItem("t-hub.captain.v2")).toBeNull();
   });
 
+  it("retains Cortana identity without adding it to the Captain pin list", () => {
+    seedCaptains([]);
+    useCaptain.getState().adoptCaptainsRegistry([{
+      ...claim("ccc00001"),
+      role: "cortana",
+      provider: "codex",
+      harness: "codex",
+    }]);
+
+    const state = useCaptain.getState();
+    expect(state.claims.ccc00001).toMatchObject({
+      role: "cortana",
+      provider: "codex",
+      harness: "codex",
+    });
+    expect(state.captainIds).toEqual([]);
+    expect(state.orchestratorId).toBe("ccc00001");
+  });
+
   it("Ctrl+B C summons the captain OWNING the active workspace tab first", () => {
     // MRU order says cap00001, but the active tab (t2) is claimed by ddd00001.
     seedCaptains(["cap00001", "ddd00001"]);
@@ -769,9 +788,13 @@ describe("Mark as Cortana (server captains-registry singleton)", () => {
     const s = useCaptain.getState();
     // The crown renders from server state: ccc00001 is now the orchestrator.
     expect(s.orchestratorId).toBe("ccc00001");
-    // ...but the singleton is NOT a summonable captain pin, and carries no claim.
+    // The singleton is not a summonable Captain pin, but its claim remains
+    // addressable for provider identity and Crew lookups.
     expect(s.captainIds).not.toContain("ccc00001");
-    expect(s.claims["ccc00001"]).toBeUndefined();
+    expect(s.claims["ccc00001"]).toMatchObject({
+      role: "cortana",
+      terminalId: "ccc00001",
+    });
     // The regular captain claim is still a pin.
     expect(s.captainIds).toContain("cap00001");
     expect(s.claims["cap00001"]).toBeDefined();

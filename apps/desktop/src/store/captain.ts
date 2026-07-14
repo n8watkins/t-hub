@@ -150,6 +150,9 @@ export interface CrewRef {
   claudeUuid?: string;
   provider?: "codex" | "claude";
   providerSessionId?: string;
+  harness?: "codex" | "claude";
+  conversationId?: string;
+  resumePoint?: string;
   state?: { kind: "active" | "orphaned" | "removed"; since?: number };
 }
 
@@ -396,17 +399,17 @@ export const useCaptain = create<CaptainState>((set, get) => {
       let serverCortanaId: TerminalId | null = null;
       for (const r of records) {
         if (!r.terminalId) continue;
+        claims[r.terminalId] = r;
         // The Cortana singleton is tracked via `orchestratorId`, NOT the captain
-        // pin list - keep the two designations distinct (mirroring the server's
-        // FleetRole::Cortana vs Captain split), so a mark never also silently
-        // pins the tile as a summonable captain.
+        // pin list. Keep its claim addressable for runtime identity and crew
+        // lookups, but never add it to the summonable Captain list.
         if (r.role === "cortana") {
           serverCortanaId = r.terminalId;
-          continue;
         }
-        claims[r.terminalId] = r;
       }
-      const activeIds = Object.keys(claims);
+      const activeIds = Object.entries(claims)
+        .filter(([, claim]) => claim.role !== "cortana")
+        .map(([id]) => id);
       const added = activeIds.filter((id) => !s.captainIds.includes(id));
       const next = [...s.captainIds, ...added];
       set({ claims });

@@ -30,7 +30,7 @@ import { useTheme, WORKSPACE_COLOR_PALETTE } from "../store/theme";
 import { useSupervision, sessionStatusForTmux } from "../store/supervision";
 import { useActivity } from "../store/activity";
 import { sessionNameForTerminal } from "../store/sessionContext";
-import { clientForTerminal } from "../store/clientType";
+import { useClientForTerminal } from "../store/clientType";
 import { ClaudeIcon } from "./ClaudeIcon";
 import { CodexIcon } from "./CodexIcon";
 import type { TerminalId, TerminalInfo, TerminalState } from "../ipc/types";
@@ -785,7 +785,7 @@ function TerminalRow({
   const variant = terminalVariant(state, sessionStatus, outputActive);
   // Which agent runs here (claude/codex/shell) — drives the leading icon so the
   // sidebar row reads as the AGENT, not just a generic dot.
-  const client = clientForTerminal(id);
+  const client = useClientForTerminal(id);
   const label = deriveLabel({
     id,
     label: userLabel,
