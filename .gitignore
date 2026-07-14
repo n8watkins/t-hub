@@ -35,6 +35,10 @@ __pycache__/
 Thumbs.db
 *.log
 
+# Local packaged-runtime performance captures. Keep the directory available for
+# benchmark output without committing machine-specific measurements.
+artifacts/perf/*.json
+
 # Python (test probes under scripts/)
 __pycache__/
 *.pyc

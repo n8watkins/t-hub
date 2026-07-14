@@ -153,3 +153,6 @@ jobs:
       # This catches Vite import, asset, and bundling failures that jsdom does not.
       - name: Production frontend build
         run: pnpm build
+
+      - name: Packaged runtime benchmark contract
+        run: bash scripts/perf/perf-benchmark.test.sh
