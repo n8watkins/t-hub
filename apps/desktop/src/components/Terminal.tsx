@@ -308,6 +308,11 @@ export function TerminalView({
   // though main.tsx omits StrictMode — belt-and-braces against double `open()`.
   const initializedRef = useRef(false);
   const fitRef = useRef<FitAddon | null>(null);
+  // ResizeObserver and zoom effects can run before the async remote PTY attach
+  // finishes. Keep their resize commands local until the backend connection is
+  // confirmed, otherwise the rejected `resize_terminal` promise becomes a noisy
+  // global "no live terminal" error during every restored-tile startup.
+  const ptyAttachedRef = useRef(false);
   // Skips the zoom effect's first (mount) run so it doesn't double-fit on open.
   const zoomMountRef = useRef(true);
   // Global zoom: every tile reads the same font size so they scale together.
@@ -671,7 +676,7 @@ export function TerminalView({
     let lastCols = 0;
 
     const pushResize = () => {
-      if (disposed) return;
+      if (disposed || !ptyAttachedRef.current) return;
       // NEVER push a degenerate resize. A parked/hidden/not-yet-laid-out tile
       // measures ~0px wide and FitAddon would propose ~2 cols; pushing that to
       // the PTY wedges the whole tmux window to 2 columns (the 2x24-client bug).
@@ -1039,6 +1044,7 @@ export function TerminalView({
                   // would see "already streaming" and return an empty seed
                   // without opening a new socket. close_terminal detaches +
                   // removes it (a no-op when absent); the tmux session survives.
+                  ptyAttachedRef.current = false;
                   await closeTerminal(terminalId);
                   updateTerminalResources(terminalId, { pty: false });
                   if (disposed) return;
@@ -1056,6 +1062,7 @@ export function TerminalView({
                     term.rows,
                   );
                   if (disposed) return;
+                  ptyAttachedRef.current = true;
                   updateTerminalResources(terminalId, { pty: true });
                   // Repopulate: reset the grid so the stale pre-drop frame (and
                   // the reconnecting banner) never duplicates under the seed.
@@ -1209,6 +1216,7 @@ export function TerminalView({
               term.rows,
             );
             if (disposed) return;
+            ptyAttachedRef.current = true;
             updateTerminalResources(terminalId, { pty: true });
             // Empty seed => fresh spawn (backend skips capture); non-empty =>
             // reattach history to restore. Only write a real seed; a fresh
@@ -1506,6 +1514,7 @@ export function TerminalView({
       unlisteners.length = 0;
 
       discardPending?.();
+      ptyAttachedRef.current = false;
 
       cursorBlinkRef.current?.dispose();
       cursorBlinkRef.current = null;
@@ -1552,7 +1561,7 @@ export function TerminalView({
     if (!term) return;
     term.options.fontSize = fontSize;
     const fit = fitRef.current;
-    if (!fit) return;
+    if (!fit || !ptyAttachedRef.current) return;
     try {
       // Same degenerate-measurement guard as pushResize: a zoom change on a
       // parked/hidden tile must not fit-and-push ~2 cols to the PTY. When it
