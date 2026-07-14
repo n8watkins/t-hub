@@ -11,6 +11,7 @@ export interface RegisteredProject {
   name: string;
   repoRoot: string;
   remoteUrl?: string;
+  initializeGit?: boolean;
   defaultBranch?: string;
   powder?: PowderProjectBinding;
   createdAt: number;

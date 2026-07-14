@@ -117,6 +117,78 @@ fn invalidate_git_info_cache(cwd: &str) {
     }
 }
 
+/// Initialize a new repository in an existing directory after the caller has
+/// obtained explicit user authorization. Refuses to touch an existing `.git`
+/// entry, including a malformed one, so this operation never rewrites version
+/// control state that T-Hub did not create.
+pub(crate) fn initialize_repository(cwd: &str) -> Result<(), String> {
+    let host_root = crate::files::to_host_path(cwd);
+    let metadata = std::fs::metadata(&host_root)
+        .map_err(|error| format!("could not inspect selected folder: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("selected path is not a directory".to_string());
+    }
+    let git_dir = host_root.join(".git");
+    if git_dir
+        .try_exists()
+        .map_err(|error| format!("could not inspect .git: {error}"))?
+    {
+        return Err("selected folder already contains a .git entry".to_string());
+    }
+    std::fs::create_dir(&git_dir)
+        .map_err(|error| format!("could not reserve a new .git directory: {error}"))?;
+
+    let (ok, stdout, stderr) = match run_git(cwd, &["init", "-b", "main"]) {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(initialization_error_with_rollback(cwd, error));
+        }
+    };
+    if !ok {
+        let detail = if stderr.trim().is_empty() {
+            stdout
+        } else {
+            stderr
+        };
+        return Err(initialization_error_with_rollback(
+            cwd,
+            format!("git init failed: {}", detail.trim()),
+        ));
+    }
+    invalidate_git_info_cache(cwd);
+    Ok(())
+}
+
+/// Roll back only the `.git` directory created by [`initialize_repository`].
+/// The selected directory and every pre-existing file remain untouched.
+pub(crate) fn rollback_initialized_repository(cwd: &str) -> Result<(), String> {
+    let git_dir = crate::files::to_host_path(cwd).join(".git");
+    if !git_dir
+        .try_exists()
+        .map_err(|error| format!("could not inspect initialized .git: {error}"))?
+    {
+        return Ok(());
+    }
+    let metadata = std::fs::metadata(&git_dir)
+        .map_err(|error| format!("could not inspect initialized .git: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("refusing to remove an initialized .git entry that is not a directory".into());
+    }
+    std::fs::remove_dir_all(&git_dir)
+        .map_err(|error| format!("could not remove initialized .git directory: {error}"))?;
+    invalidate_git_info_cache(cwd);
+    Ok(())
+}
+
+fn initialization_error_with_rollback(cwd: &str, error: String) -> String {
+    match rollback_initialized_repository(cwd) {
+        Ok(()) => format!("{error}; removed the reserved .git directory"),
+        Err(rollback_error) => {
+            format!("{error}; could not remove the reserved .git directory: {rollback_error}")
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure TTL-cache seams (unit-tested on Linux). These operate on an explicit map +
 // `now`/`ttl` so the freshness/invalidation logic is testable WITHOUT the global

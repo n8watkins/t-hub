@@ -162,4 +162,61 @@ describe("CaptainCommissionDialog", () => {
       harness: "claude",
     });
   });
+
+  it("requires explicit Git initialization for a non-repository folder", async () => {
+    vi.mocked(listProjects).mockResolvedValue({
+      projects: [],
+      count: 0,
+      seq: 0,
+      powderProfiles: ["production"],
+    });
+    vi.mocked(registerProject).mockResolvedValue(project);
+    vi.mocked(commissionCaptain).mockResolvedValue({
+      captain: {
+        shipSlug: "t-hub",
+        projectId: "project-1",
+        workspaceTabIds: [],
+        crew: [],
+      },
+      project,
+      instructions: "recover",
+      alreadyCommissioned: false,
+    });
+    render(
+      <CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />,
+    );
+
+    const path = await screen.findByLabelText("Manual WSL path");
+    fireEvent.change(path, { target: { value: "/repo/empty" } });
+    fireEvent.click(screen.getByRole("button", { name: "Go" }));
+    fireEvent.change(screen.getByLabelText("Powder board"), {
+      target: { value: "t-hub" },
+    });
+    fireEvent.change(screen.getByLabelText("Assignment"), {
+      target: { value: "Build the new codebase" },
+    });
+
+    const initialize = await screen.findByRole("checkbox", {
+      name: "Initialize Git repository",
+    });
+    expect(screen.getByText("Not a Git repository - initialization not authorized")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "Initialize Git explicitly",
+    );
+    expect(registerProject).not.toHaveBeenCalled();
+
+    fireEvent.click(initialize);
+    expect(screen.getByText("Initialize with main as the default branch")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+
+    await waitFor(() => expect(registerProject).toHaveBeenCalledOnce());
+    expect(registerProject).toHaveBeenCalledWith({
+      repoRoot: "/repo/empty",
+      name: undefined,
+      initializeGit: true,
+      powderRepository: "t-hub",
+      powderConnectionProfile: "production",
+    });
+  });
 });

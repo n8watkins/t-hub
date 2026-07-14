@@ -315,7 +315,7 @@ pub(crate) fn host_distro() -> String {
 ///
 /// On unix this is the identity function: a native path already *is* the Linux
 /// path, so the project is indexed directly (see the module-level scope note).
-fn to_host_path(path: &str) -> PathBuf {
+pub(crate) fn to_host_path(path: &str) -> PathBuf {
     #[cfg(windows)]
     {
         // Already a Windows/UNC path (drive-letter, `\\server\...`, or a

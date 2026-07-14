@@ -6447,89 +6447,138 @@ fn register_project(
     let requested_root = arg_str(args, "repoRoot")
         .or_else(|| arg_str(args, "repo_root"))
         .ok_or("register_project requires a 'repoRoot' argument")?;
-    let worktrees = git::worktree_list(&requested_root)
+    let initialize_git = args
+        .get("initializeGit")
+        .or_else(|| args.get("initialize_git"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut worktrees = git::worktree_list(&requested_root)
         .map_err(|e| format!("register_project: repository validation failed: {e}"))?;
-    let main = worktrees
-        .iter()
-        .find(|worktree| !worktree.is_linked)
-        .ok_or("register_project: path is not inside a Git repository with a main worktree")?;
-    let repo_root = std::fs::canonicalize(&main.path)
-        .unwrap_or_else(|_| std::path::PathBuf::from(&main.path))
-        .to_string_lossy()
-        .into_owned();
-    let name = arg_str(args, "name")
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::path::Path::new(&repo_root)
-                .file_name()
-                .map(|value| value.to_string_lossy().into_owned())
-        })
-        .ok_or("register_project: could not derive a project name")?;
-    let existing = ctx
-        .captains
-        .projects()
-        .into_iter()
-        .find(|project| project.repo_root == repo_root);
-    let git_info = git::git_info_cached(&repo_root);
-    enforce_project_authority(
-        ctx,
-        caller,
-        trusted_internal,
-        existing.as_ref().map(|project| project.project_id.as_str()),
-    )?;
-    let powder_repository =
-        arg_str(args, "powderRepository").or_else(|| arg_str(args, "powder_repository"));
-    let powder = if let Some(repository) = powder_repository {
-        let connection_profile = arg_str(args, "powderConnectionProfile")
-            .or_else(|| arg_str(args, "powder_connection_profile"))
-            .unwrap_or_else(default_powder_profile);
-        let repository = validate_powder_repository(&connection_profile, &repository, args)?;
-        let matching_binding = existing
-            .as_ref()
-            .and_then(|project| project.powder.as_ref())
-            .filter(|binding| {
-                binding.connection_profile == connection_profile && binding.repository == repository
-            });
-        let event_cursor = match matching_binding {
-            Some(binding) => binding.event_cursor,
-            None => initial_powder_event_cursor(&connection_profile, args)?,
+    let initialized_git = if worktrees.iter().any(|worktree| !worktree.is_linked) {
+        false
+    } else if initialize_git {
+        git::initialize_repository(&requested_root)
+            .map_err(|error| format!("register_project: Git initialization failed: {error}"))?;
+        worktrees = match git::worktree_list(&requested_root) {
+            Ok(worktrees) => worktrees,
+            Err(error) => {
+                return Err(rollback_initialized_git_error(
+                    &requested_root,
+                    format!("register_project: initialized repository validation failed: {error}"),
+                ));
+            }
         };
-        Some(PowderProjectBinding {
-            connection_profile,
-            repository,
-            event_cursor,
-        })
+        true
     } else {
-        None
+        return Err(
+            "register_project: path is not inside a Git repository with a main worktree"
+                .to_string(),
+        );
     };
-    let project = ctx.captains.upsert_project(ProjectRecord {
-        project_id: existing
-            .as_ref()
-            .map(|project| project.project_id.clone())
-            .unwrap_or_else(|| format!("project-{}", uuid::Uuid::new_v4())),
-        name,
-        repo_root,
-        remote_url: arg_str(args, "remoteUrl")
-            .or_else(|| arg_str(args, "remote_url"))
-            .or(git_info.remote_url)
+
+    let result = (|| {
+        let main = worktrees
+            .iter()
+            .find(|worktree| !worktree.is_linked)
+            .ok_or("register_project: initialized repository has no main worktree")?;
+        let repo_root = std::fs::canonicalize(&main.path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&main.path))
+            .to_string_lossy()
+            .into_owned();
+        let name = arg_str(args, "name")
+            .filter(|value| !value.trim().is_empty())
             .or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|project| project.remote_url.clone())
-            }),
-        default_branch: git_info
-            .default_branch
-            .or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|project| project.default_branch.clone())
+                std::path::Path::new(&repo_root)
+                    .file_name()
+                    .map(|value| value.to_string_lossy().into_owned())
             })
-            .or_else(|| main.branch.clone()),
-        powder: powder.or_else(|| existing.as_ref().and_then(|project| project.powder.clone())),
-        created_at: existing.as_ref().map_or(0, |project| project.created_at),
-        updated_at: 0,
-    })?;
-    serde_json::to_value(project).map_err(|e| e.to_string())
+            .ok_or("register_project: could not derive a project name")?;
+        let existing = ctx
+            .captains
+            .projects()
+            .into_iter()
+            .find(|project| project.repo_root == repo_root);
+        let git_info = git::git_info_cached(&repo_root);
+        enforce_project_authority(
+            ctx,
+            caller,
+            trusted_internal,
+            existing.as_ref().map(|project| project.project_id.as_str()),
+        )?;
+        let powder_repository =
+            arg_str(args, "powderRepository").or_else(|| arg_str(args, "powder_repository"));
+        let powder = if let Some(repository) = powder_repository {
+            let connection_profile = arg_str(args, "powderConnectionProfile")
+                .or_else(|| arg_str(args, "powder_connection_profile"))
+                .unwrap_or_else(default_powder_profile);
+            let repository = validate_powder_repository(&connection_profile, &repository, args)?;
+            let matching_binding = existing
+                .as_ref()
+                .and_then(|project| project.powder.as_ref())
+                .filter(|binding| {
+                    binding.connection_profile == connection_profile
+                        && binding.repository == repository
+                });
+            let event_cursor = match matching_binding {
+                Some(binding) => binding.event_cursor,
+                None => initial_powder_event_cursor(&connection_profile, args)?,
+            };
+            Some(PowderProjectBinding {
+                connection_profile,
+                repository,
+                event_cursor,
+            })
+        } else {
+            None
+        };
+        let project = ctx.captains.upsert_project(ProjectRecord {
+            project_id: existing
+                .as_ref()
+                .map(|project| project.project_id.clone())
+                .unwrap_or_else(|| format!("project-{}", uuid::Uuid::new_v4())),
+            name,
+            repo_root,
+            remote_url: arg_str(args, "remoteUrl")
+                .or_else(|| arg_str(args, "remote_url"))
+                .or(git_info.remote_url)
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|project| project.remote_url.clone())
+                }),
+            default_branch: git_info
+                .default_branch
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|project| project.default_branch.clone())
+                })
+                .or_else(|| main.branch.clone()),
+            powder: powder.or_else(|| existing.as_ref().and_then(|project| project.powder.clone())),
+            created_at: existing.as_ref().map_or(0, |project| project.created_at),
+            updated_at: 0,
+        })?;
+        serde_json::to_value(project).map_err(|e| e.to_string())
+    })();
+
+    if let Err(error) = result {
+        if initialized_git {
+            return Err(rollback_initialized_git_error(&requested_root, error));
+        }
+        return Err(error);
+    }
+    result
+}
+
+fn rollback_initialized_git_error(repo_root: &str, error: String) -> String {
+    match git::rollback_initialized_repository(repo_root) {
+        Ok(()) => format!(
+            "{error}. T-Hub rolled back the Git repository it initialized; the existing folder and files were preserved"
+        ),
+        Err(rollback_error) => format!(
+            "{error}. T-Hub could not roll back the Git repository it initialized: {rollback_error}. The existing folder and files were preserved"
+        ),
+    }
 }
 
 /// Attach a registered project to its canonical Powder repository. Endpoint
@@ -14653,6 +14702,99 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("Git repository"), "got: {error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn register_project_initializes_git_only_when_explicitly_requested() {
+        let ctx = test_ctx("secret");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-register-init-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keep.txt"), "preserve me").unwrap();
+
+        let project = dispatch(
+            &ctx,
+            "register_project",
+            &json!({"repoRoot": dir.to_string_lossy(), "initializeGit": true}),
+        )
+        .unwrap();
+
+        assert_eq!(project["repoRoot"], dir.to_string_lossy().as_ref());
+        assert_eq!(project["defaultBranch"], "main");
+        assert!(dir.join(".git").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("keep.txt")).unwrap(),
+            "preserve me"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn register_project_rolls_back_initialized_git_after_later_failure() {
+        let ctx = test_ctx("secret");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-register-init-rollback-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("keep.txt"), "preserve me").unwrap();
+
+        let error = dispatch(
+            &ctx,
+            "register_project",
+            &json!({
+                "repoRoot": dir.to_string_lossy(),
+                "initializeGit": true,
+                "powderRepository": " "
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("rolled back the Git repository"),
+            "got: {error}"
+        );
+        assert!(!dir.join(".git").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("keep.txt")).unwrap(),
+            "preserve me"
+        );
+        assert!(ctx.captains.projects().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn register_project_never_rewrites_an_existing_git_entry() {
+        let ctx = test_ctx("secret");
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-register-existing-git-entry-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/owner"), "pre-existing").unwrap();
+
+        let error = dispatch(
+            &ctx,
+            "register_project",
+            &json!({"repoRoot": dir.to_string_lossy(), "initializeGit": true}),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("already contains a .git entry"),
+            "got: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/owner")).unwrap(),
+            "pre-existing"
+        );
+        assert!(ctx.captains.projects().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

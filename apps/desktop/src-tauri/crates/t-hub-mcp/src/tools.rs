@@ -344,7 +344,8 @@ fn schema_register_project() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "repoRoot": { "type": "string", "description": "Path inside an existing Git repository; T-Hub resolves its canonical main worktree." },
+            "repoRoot": { "type": "string", "description": "Path inside an existing Git repository, or an existing folder when initializeGit is explicitly true; T-Hub resolves its canonical main worktree." },
+            "initializeGit": { "type": "boolean", "description": "Explicitly initialize Git with main as the default branch when repoRoot is not already a repository. Defaults to false and never replaces an existing .git entry." },
             "name": { "type": "string", "description": "Optional display name; defaults to the repository directory name." },
             "remoteUrl": { "type": "string", "description": "Optional canonical Git remote URL." },
             "powderRepository": { "type": "string", "description": "Optional canonical Powder repository name to bind during registration." },
@@ -982,6 +983,11 @@ mod tests {
         assert_eq!(
             (find("register_project").unwrap().input_schema)()["required"],
             json!(["repoRoot"])
+        );
+        assert_eq!(
+            (find("register_project").unwrap().input_schema)()["properties"]["initializeGit"]
+                ["type"],
+            "boolean"
         );
         assert_eq!(
             (find("bind_project_powder").unwrap().input_schema)()["required"],

@@ -38,6 +38,7 @@ export function CaptainCommissionDialog({
   const [wslHomeError, setWslHomeError] = useState<string | null>(null);
   const [folderGit, setFolderGit] = useState<GitInfo | null>(null);
   const [folderWorktrees, setFolderWorktrees] = useState<WorktreeInfo[]>([]);
+  const [initializeGit, setInitializeGit] = useState(false);
   const [projectId, setProjectId] = useState("");
   const [repoRoot, setRepoRoot] = useState("");
   const [projectName, setProjectName] = useState("");
@@ -96,6 +97,7 @@ export function CaptainCommissionDialog({
     let cancelled = false;
     setFolderGit(null);
     setFolderWorktrees([]);
+    setInitializeGit(false);
     void gitInfo(repoRoot)
       .then((info) => {
         if (!cancelled) setFolderGit(info);
@@ -126,15 +128,27 @@ export function CaptainCommissionDialog({
       setError("Select a Powder connection profile under Advanced.");
       return;
     }
+    if (mode === "existing") {
+      if (folderGit === null) {
+        setError("Wait for Git inspection to finish before creating the Captain.");
+        return;
+      }
+      if (!folderGit.isRepo && !initializeGit) {
+        setError("Initialize Git explicitly or choose a folder that is already a Git repository.");
+        return;
+      }
+    }
     setBusy(true);
     setError(null);
     try {
       let project: RegisteredProject;
       if (mode === "existing") {
         if (!repoRoot.trim()) throw new Error("WSL folder is required.");
+        if (!folderGit) throw new Error("Git inspection is incomplete.");
         project = await registerProject({
           repoRoot: repoRoot.trim(),
           name: projectName.trim() || undefined,
+          ...(folderGit.isRepo ? {} : { initializeGit: true }),
           powderRepository: powderRepository.trim(),
           powderConnectionProfile: connectionProfile.trim() || "default",
         });
@@ -286,6 +300,26 @@ export function CaptainCommissionDialog({
             </div>
           )}
 
+          {mode === "existing" && folderGit && !folderGit.isRepo && (
+            <label
+              className="flex items-start gap-2 rounded border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-xs"
+            >
+              <input
+                type="checkbox"
+                aria-label="Initialize Git repository"
+                checked={initializeGit}
+                onChange={(event) => setInitializeGit(event.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="block font-medium">Initialize Git repository</span>
+                <span style={{ color: "var(--th-fg-muted)" }}>
+                  Creates only a .git directory in this existing folder and uses main as the default branch.
+                </span>
+              </span>
+            </label>
+          )}
+
           <Field label="Powder board">
             <input
               aria-label="Powder board"
@@ -385,6 +419,7 @@ export function CaptainCommissionDialog({
             harness={harness}
             folderGit={folderGit}
             folderWorktrees={folderWorktrees}
+            initializeGit={initializeGit}
           />
 
           {error && (
@@ -429,6 +464,7 @@ function ReviewSummary({
   harness,
   folderGit,
   folderWorktrees,
+  initializeGit,
 }: {
   mode: ProjectMode;
   selected?: RegisteredProject;
@@ -439,6 +475,7 @@ function ReviewSummary({
   harness: "codex" | "claude";
   folderGit: GitInfo | null;
   folderWorktrees: WorktreeInfo[];
+  initializeGit: boolean;
 }) {
   const source = mode === "saved" ? "Saved codebase" : "Existing WSL codebase";
   const location =
@@ -467,7 +504,9 @@ function ReviewSummary({
               value={
                 folderGit.isRepo
                   ? `${folderGit.branch ?? "Detached HEAD"} · ${folderGit.dirtyCount ? `${folderGit.dirtyCount} changed` : "clean"} · ${folderGit.isLinkedWorktree ? "linked worktree" : "main worktree"}`
-                  : "Not a Git repository"
+                  : initializeGit
+                    ? "Initialize with main as the default branch"
+                    : "Not a Git repository - initialization not authorized"
               }
             />
             {folderGit.isRepo && (
