@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.66` from `a00ce7d`, running as Windows PID `49836` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.66` from `e5948c8`, running as Windows PID `39760` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -120,8 +120,10 @@ The release critical path is:
 ## Phase 1 - Terminal and Control Reliability
 
 **Status:** Active.
-The packaged xterm lifecycle, stale-endpoint CLI recovery, application restart, session survival, single-instance, and attach-aware resize gates pass through installed source `3b83b9e`.
-Transient WSL command timeouts remain open before the full phase exit gate is closed.
+The packaged xterm lifecycle, stale-endpoint CLI recovery, application restart, session survival, single-instance, attach-aware resize, and terminal-enumeration recovery gates pass through installed source `e5948c8`.
+Source commit `e5948c8` deduplicates concurrent frontend terminal enumeration and retries one bounded tmux timeout after the failed handler returns.
+Three consecutive packaged starts preserved eight tmux sessions and produced zero terminal-list, premature-resize, xterm, or window errors in the combined fresh diagnostic slice.
+Diagnostic log rotation and retention remain open before the full phase exit gate is closed.
 
 ### Goal
 

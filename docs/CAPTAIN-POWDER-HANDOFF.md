@@ -13,8 +13,8 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `a00ce7d`.
-**Installed Windows build:** locally built T-Hub `0.3.66` from `a00ce7d`.
+**Source head before this handoff update:** `e5948c8`.
+**Installed Windows build:** locally built T-Hub `0.3.66` from `e5948c8`.
 
 ## Executive Status
 
@@ -23,9 +23,9 @@ The final independent authority review reports no remaining Critical, High, or M
 The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
 
 The final production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `fd81f800bf1faf7d9fbcaa88099460d81e9d7c4da5c0de60ec08ce994a6ae58f`.
-It is running as PID `49836`.
-The exact NSIS installer SHA-256 is `e309f903f47531b7055982ed7ce412da7161e1ca449d1c3c36390a2c5a056b24`.
+The installed executable SHA-256 is `28866e19fcbfd782319010334116306455df758fff8cf8ade055b63caf864749`.
+It is running as PID `39760`.
+The exact NSIS installer SHA-256 is `3e3dee7599192bd1251d57d67c7118198d65beb5b418b557a8ca94ad1b81ff98`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
@@ -294,21 +294,23 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The installed Windows process was reverified at PID `49836`, start time `2026-07-14T14:05:46-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+The installed Windows process was reverified at PID `39760`, start time `2026-07-14T14:26:37-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
 Its file and product version are `0.3.66`.
-The installed executable SHA-256 is `FD81F800BF1FAF7D9FBCAA88099460D81E9D7C4DA5C0DE60EC08CE994A6AE58F`.
-The installed build was produced from source `a00ce7d` with NSIS installer SHA-256 `E309F903F47531B7055982ED7CE412DA7161E1CA449D1C3C36390A2C5A056B24`.
+The installed executable SHA-256 is `28866E19FCBFD782319010334116306455DF758FFF8CF8ADE055B63CAF864749`.
+The installed build was produced from source `e5948c8` with NSIS installer SHA-256 `3E3DEE7599192BD1251D57D67C7118198D65BEB5B418B557A8CA94AD1B81FF98`.
 The installed `th` CLI is version `0.2.0` from source `07e74f4`.
 Source commit `6870444` fixes the reproduced xterm teardown race.
 Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
 Source commit `a00ce7d` adds explicit Git initialization to the shared Project registration transaction.
 It never initializes without `initializeGit: true`, refuses a pre-existing `.git` entry, defaults the new repository to `main`, and rolls back only the `.git` directory it created if a later boundary fails.
-The latest source gate passed 442 frontend tests, the production frontend build, 582 Rust library tests with 1 ignored, formatting, and warnings-denied Clippy.
+Source commit `e5948c8` collapses concurrent frontend terminal enumeration into one in-flight request and retries one bounded tmux timeout without retrying unrelated failures.
+The latest source gate passed 445 frontend tests, the production frontend build, 582 Rust library tests with 1 ignored, formatting, and warnings-denied Clippy.
 The latest T-Hub capability probe for this session remained `read`, so no canonical Project mutation, Powder binding, Captain commissioning, or Crew dispatch was attempted.
 The local Powder endpoint and protected agent credential path are operational.
 The packaged xterm lifecycle and duplicate-launch gates pass with eight live tmux sessions preserved.
-The fresh `a00ce7d` startup diagnostic slice contains zero premature-resize, xterm, or window errors.
-It contains one `listTerminals failed` event from the bounded 10-second WSL command timeout, after which `th ls` succeeded with all eight sessions.
+The installed `a00ce7d` build reproduced one `listTerminals failed` event from the bounded 10-second WSL command timeout before recovery.
+After installing `e5948c8`, three consecutive application starts preserved all eight tmux sessions.
+Their combined fresh diagnostic slice contains zero `listTerminals failed`, premature-resize, xterm, or window errors, and `th ls` returns all eight sessions.
 The packaged graphical E2E matrix for the new non-Git choice remains open, so Phase 7 is active rather than complete.
 The immediate source action is to finish Phase 1 control reliability, then continue the reviewed new-codebase transaction and packaged Phase 7 E2E matrix.
 Real Powder acceptance still requires a control-capable Captain session.
