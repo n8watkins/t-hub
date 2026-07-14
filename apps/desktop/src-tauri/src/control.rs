@@ -5883,8 +5883,14 @@ fn bootstrap_instructions(captain: &CaptainRecord, project: &ProjectRecord) -> S
             )
         })
         .unwrap_or_else(|| "This project has no Powder binding.".to_string());
+    let invocation = match captain.harness.as_deref() {
+        Some(provider) => Harness::from_provider(provider).captain_invocation(),
+        // Historical Captain records did not store a harness. Preserve the
+        // existing Codex bootstrap behavior until the record is commissioned.
+        None => Harness::Codex.captain_invocation(),
+    };
     format!(
-        "Use $captain. Recover ship '{}' for project '{}' at '{}'. Assignment: {} {} Read the durable Captain and Crew records before acting, reconcile Powder state before dispatching work, and keep the registry resume point current.",
+        "Use {invocation}. Recover ship '{}' for project '{}' at '{}'. Assignment: {} {} Read the durable Captain and Crew records before acting, reconcile Powder state before dispatching work, and keep the registry resume point current.",
         captain.ship_slug, project.name, project.repo_root, assignment, powder
     )
 }
@@ -12698,6 +12704,13 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("commission-e2e"));
+
+        let mut claude_captain = ctx.captains.snapshot().captains[0].clone();
+        claude_captain.harness = Some("claude".into());
+        let claude_instructions =
+            bootstrap_instructions(&claude_captain, &ctx.captains.projects()[0]);
+        assert!(claude_instructions.contains("Use /captain"));
+        assert!(!claude_instructions.contains("Use $captain"));
 
         let retry = dispatch(&ctx, "commission_captain", &args).unwrap();
         assert_eq!(retry["alreadyCommissioned"], true);

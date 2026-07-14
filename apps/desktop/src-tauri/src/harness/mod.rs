@@ -73,6 +73,14 @@ impl Harness {
             Harness::Codex => &codex::CodexHarness,
         }
     }
+
+    /// Harness-native syntax for explicitly loading the Captain skill.
+    pub fn captain_invocation(self) -> &'static str {
+        match self {
+            Harness::Claude => "/captain",
+            Harness::Codex => "$captain",
+        }
+    }
 }
 
 impl std::fmt::Display for Harness {
@@ -228,6 +236,12 @@ mod tests {
     fn adapter_matches_harness() {
         assert_eq!(Harness::Claude.adapter().harness(), Harness::Claude);
         assert_eq!(Harness::Codex.adapter().harness(), Harness::Codex);
+    }
+
+    #[test]
+    fn captain_invocation_is_harness_native() {
+        assert_eq!(Harness::Codex.captain_invocation(), "$captain");
+        assert_eq!(Harness::Claude.captain_invocation(), "/captain");
     }
 
     #[test]

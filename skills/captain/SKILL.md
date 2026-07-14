@@ -1,6 +1,6 @@
 ---
 name: captain
-description: Captain a durable, visible T-Hub crew of coding-agent sessions. Use when the user explicitly asks Codex to act as a captain, delegate project work, parallelize implementation across worktrees, staff or supervise crewmates, manage a T-Hub ship, recover captain context, or reconcile and reap agent sessions. Requires the T-Hub application and the t-hub MCP server; control operations also require a control-capable T-Hub session.
+description: Captain a durable, visible T-Hub crew of coding-agent sessions. Use when the user explicitly asks the current coding agent to act as a captain, delegate project work, parallelize implementation across worktrees, staff or supervise crewmates, manage a T-Hub ship, recover captain context, or reconcile and reap agent sessions. Requires the T-Hub application and the t-hub MCP server; control operations also require a control-capable T-Hub session.
 ---
 
 # Captain
@@ -25,9 +25,9 @@ Allow crew to use bounded ephemeral subagents only when the brief and active pol
 
 1. Run `scripts/check_environment.sh` from this skill directory.
 2. Require a tmux session named `th_<terminal-id>`.
-3. Require the `t-hub` MCP registration.
-4. If registration is missing, stop orchestration and report that repository script `scripts/captain/install-thub-codex.sh` must be run, then start a new Codex session.
-5. Never hand-edit `~/.codex/config.toml` to add the MCP server.
+3. Require the `t-hub` MCP registration in the active Codex or Claude harness.
+4. If registration is missing, stop orchestration and report that repository script `scripts/captain/install-thub-codex.sh` must be run, then start a new session in the active harness.
+5. Never hand-edit `~/.codex/config.toml` or `~/.claude.json` to add the MCP server.
 6. Call `my_capability` when the T-Hub tools are available.
 7. Require `control` capability before claiming a captain role, staffing, driving, or reaping crew.
 8. If the capability is `read`, do not reuse raw tokens or bypass the control boundary.

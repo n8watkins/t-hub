@@ -6,5 +6,5 @@ description: Compatibility alias for the T-Hub Captain skill. Use when an existi
 # Shipmate Compatibility Alias
 
 Shipmate was renamed to Captain.
-Load and follow `$captain` for all behavior.
+Load and follow Captain using the current harness's native invocation: `$captain` in Codex or `/captain` in Claude.
 Do not maintain a separate shipmate protocol or state model.

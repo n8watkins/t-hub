@@ -16,6 +16,8 @@ fi
 
 WORK="$(mktemp -d "${HOME}/.thub-codex-installtest.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
+export HOME="$WORK/home"
+mkdir -p "$HOME"
 export CODEX_HOME="$WORK/codex-home"
 mkdir -p "$CODEX_HOME"
 export CLAUDE_HOME="$WORK/claude-home"
@@ -52,6 +54,11 @@ if [ -x "$CAPTAIN_DIR/ensure-thub-codex.sh" ]; then
 else
   fail "deployed provisioner is missing or not executable"
 fi
+if [ -x "$CAPTAIN_DIR/ensure-thub-claude.sh" ]; then
+  pass "deployed Claude provisioner is executable"
+else
+  fail "deployed Claude provisioner is missing or not executable"
+fi
 
 for skill in \
   "$CODEX_HOME/skills/captain/SKILL.md" \
@@ -78,6 +85,28 @@ if codex mcp get t-hub --json 2>/dev/null | grep -Fq "\"command\": \"$BIN_DIR/t-
   pass "Codex registration points at the installed binary"
 else
   fail "Codex registration does not point at the installed binary"
+fi
+if jq -e --arg bin "$BIN_DIR/t-hub-mcp" '.mcpServers["t-hub"].command == $bin' "$HOME/.claude.json" >/dev/null; then
+  pass "Claude user registration points at the installed binary"
+else
+  fail "Claude user registration does not point at the installed binary"
+fi
+
+if T_HUB_CODEX_SKILLS_DIR="$CODEX_HOME/skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$CLAUDE_HOME/skills" \
+  bash "$HERE/install-captain-skills.sh" --verify >/dev/null; then
+  pass "installed skill hashes match source"
+else
+  fail "installed skill hash verification failed"
+fi
+
+printf '\nlocal modification\n' >> "$CODEX_HOME/skills/captain/SKILL.md"
+if CODEX_HOME="$CODEX_HOME" T_HUB_HARNESS=codex \
+  "$CODEX_HOME/skills/captain/scripts/check_environment.sh" \
+  | grep -Fq 'skill_integrity=drifted'; then
+  pass "Captain environment check detects installed skill drift"
+else
+  fail "Captain environment check missed installed skill drift"
 fi
 
 if T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BIN_DIR" T_HUB_CAPTAIN_DIR="$CAPTAIN_DIR" bash "$SCRIPT" >/dev/null 2>&1; then
@@ -154,6 +183,50 @@ if CODEX_HOME="$CONFLICT_CODEX_HOME" codex mcp get t-hub >/dev/null 2>&1; then
   fail "conflict registered an MCP server"
 else
   pass "conflict leaves Codex registration absent"
+fi
+
+ROLLBACK_WORK="$WORK/rollback"
+ROLLBACK_HOME="$ROLLBACK_WORK/home"
+ROLLBACK_CODEX_HOME="$ROLLBACK_WORK/codex-home"
+ROLLBACK_CLAUDE_HOME="$ROLLBACK_WORK/claude-home"
+ROLLBACK_BIN_DIR="$ROLLBACK_WORK/install/bin"
+ROLLBACK_CAPTAIN_DIR="$ROLLBACK_WORK/install/captain"
+mkdir -p "$ROLLBACK_HOME" "$ROLLBACK_CODEX_HOME" "$ROLLBACK_CLAUDE_HOME" \
+  "$ROLLBACK_BIN_DIR" "$ROLLBACK_CAPTAIN_DIR" "$ROLLBACK_WORK/fail-bin"
+printf 'old binary\n' > "$ROLLBACK_BIN_DIR/t-hub-mcp"
+printf 'old codex config\n' > "$ROLLBACK_CODEX_HOME/config.toml"
+printf '{"oldClaudeConfig":true}\n' > "$ROLLBACK_HOME/.claude.json"
+cat > "$ROLLBACK_WORK/fail-bin/claude" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = mcp ] && [ "${2:-}" = remove ]; then exit 0; fi
+if [ "${1:-}" = mcp ] && [ "${2:-}" = add ]; then exit 29; fi
+exit 1
+EOF
+chmod 700 "$ROLLBACK_WORK/fail-bin/claude"
+
+if HOME="$ROLLBACK_HOME" \
+  CODEX_HOME="$ROLLBACK_CODEX_HOME" \
+  CLAUDE_HOME="$ROLLBACK_CLAUDE_HOME" \
+  PATH="$ROLLBACK_WORK/fail-bin:$PATH" \
+  T_HUB_MCP_SOURCE="$SOURCE" \
+  T_HUB_BIN_DIR="$ROLLBACK_BIN_DIR" \
+  T_HUB_CAPTAIN_DIR="$ROLLBACK_CAPTAIN_DIR" \
+  bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "injected Claude registration failure unexpectedly succeeded"
+else
+  pass "injected Claude registration failure is reported"
+fi
+
+if [ "$(cat "$ROLLBACK_BIN_DIR/t-hub-mcp")" = "old binary" ] \
+  && [ "$(cat "$ROLLBACK_CODEX_HOME/config.toml")" = "old codex config" ] \
+  && [ "$(cat "$ROLLBACK_HOME/.claude.json")" = '{"oldClaudeConfig":true}' ] \
+  && [ ! -e "$ROLLBACK_CAPTAIN_DIR/ensure-thub-codex.sh" ] \
+  && [ ! -e "$ROLLBACK_CAPTAIN_DIR/ensure-thub-claude.sh" ] \
+  && [ ! -e "$ROLLBACK_CODEX_HOME/skills" ] \
+  && [ ! -e "$ROLLBACK_CLAUDE_HOME/skills" ]; then
+  pass "top-level rollback restores binary, helpers, configs, and skills"
+else
+  fail "top-level rollback left a partial installation"
 fi
 
 if [ "$FAILED" -eq 0 ]; then

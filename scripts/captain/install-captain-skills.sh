@@ -9,13 +9,28 @@ CODEX_SKILLS="${T_HUB_CODEX_SKILLS_DIR:-${CODEX_HOME:-${HOME}/.codex}/skills}"
 CLAUDE_SKILLS="${T_HUB_CLAUDE_SKILLS_DIR:-${CLAUDE_HOME:-${HOME}/.claude}/skills}"
 CLAUDE_COMMANDS="${T_HUB_CLAUDE_COMMANDS_DIR:-${CLAUDE_HOME:-${HOME}/.claude}/commands}"
 COMMAND_MARKER='<!-- managed by T-Hub: handoff command -->'
-CHECK_ONLY=false
+MODE=install
 if [ "${1:-}" = "--check" ]; then
-  CHECK_ONLY=true
+  MODE=check
+elif [ "${1:-}" = "--verify" ]; then
+  MODE=verify
 elif [ "$#" -ne 0 ]; then
-  echo "usage: install-captain-skills.sh [--check]" >&2
+  echo "usage: install-captain-skills.sh [--check|--verify]" >&2
   exit 2
 fi
+
+tree_hash() {
+  local root="$1"
+  (
+    cd "$root"
+    find . -type f ! -name .t-hub-managed -print0 \
+      | sort -z \
+      | while IFS= read -r -d '' file; do
+          printf '%s\0' "$file"
+          sha256sum "$file"
+        done
+  ) | sha256sum | awk '{print $1}'
+}
 
 SOURCES=(
   "$SOURCE_ROOT/captain"
@@ -75,8 +90,27 @@ for index in "${!SOURCES[@]}"; do
   fi
 done
 
-if "$CHECK_ONLY"; then
+if [ "$MODE" = check ]; then
   echo "install-captain-skills: preflight passed"
+  exit 0
+fi
+
+if [ "$MODE" = verify ]; then
+  for index in "${!SOURCES[@]}"; do
+    if [ "${KINDS[$index]}" = directory ]; then
+      source_hash="$(tree_hash "${SOURCES[$index]}")"
+      target_hash="$(tree_hash "${TARGETS[$index]}")"
+      recorded_hash="$(sed -n 's/^source-sha256=//p' "${TARGETS[$index]}/.t-hub-managed")"
+      if [ "$recorded_hash" != "$source_hash" ] || [ "$target_hash" != "$source_hash" ]; then
+        echo "install-captain-skills: stale or modified skill: ${TARGETS[$index]}" >&2
+        exit 1
+      fi
+    elif ! cmp -s "${SOURCES[$index]}" "${TARGETS[$index]}"; then
+      echo "install-captain-skills: stale or modified command: ${TARGETS[$index]}" >&2
+      exit 1
+    fi
+  done
+  echo "install-captain-skills: installed skills and commands match source"
   exit 0
 fi
 
@@ -109,7 +143,7 @@ for index in "${!SOURCES[@]}"; do
   if [ "${KINDS[$index]}" = directory ]; then
     temp="$(mktemp -d "$target_root/.$name.staged.XXXXXX")"
     cp -a "$source/." "$temp/"
-    printf 'managed by T-Hub\n' > "$temp/.t-hub-managed"
+    printf 'managed by T-Hub\nsource-sha256=%s\n' "$(tree_hash "$source")" > "$temp/.t-hub-managed"
   else
     temp="$(mktemp "$target_root/.$name.staged.XXXXXX")"
     install -m 600 "$source" "$temp"

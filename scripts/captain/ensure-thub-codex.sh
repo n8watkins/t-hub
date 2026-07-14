@@ -23,13 +23,17 @@
 # The normal binary is the stable WSL-side install produced by
 # install-thub-codex.sh. Override it with T_HUB_MCP_BIN only for development or
 # an isolated test.
-set -u
+set -euo pipefail
 
 BIN_DIR="${T_HUB_BIN_DIR:-${HOME}/.t-hub/bin}"
 BIN="${T_HUB_MCP_BIN:-${BIN_DIR}/t-hub-mcp}"
 
 if ! command -v codex >/dev/null 2>&1; then
   echo "ensure-thub-codex: codex not on PATH - install codex-cli first" >&2
+  exit 1
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "ensure-thub-codex: jq is required to verify the complete registration" >&2
   exit 1
 fi
 
@@ -46,10 +50,41 @@ fi
 
 # --- Converge the native registration without hand-writing config.toml -------
 CURRENT="$(codex mcp get t-hub --json 2>/dev/null || true)"
-if [ -n "$CURRENT" ] && printf '%s' "$CURRENT" | grep -Fq "\"command\": \"$BIN\""; then
+if [ -n "$CURRENT" ] && printf '%s' "$CURRENT" | jq -e --arg bin "$BIN" '
+  .enabled == true and
+  .disabled_reason == null and
+  .transport.type == "stdio" and
+  .transport.command == $bin and
+  .transport.args == [] and
+  (.transport.env == null or .transport.env == {}) and
+  .transport.env_vars == [] and
+  .transport.cwd == null and
+  .enabled_tools == null and
+  .disabled_tools == null and
+  .startup_timeout_sec == null and
+  .tool_timeout_sec == null
+' >/dev/null; then
   echo "ensure-thub-codex: t-hub already points at $BIN"
   exit 0
 fi
+
+CONFIG="${CODEX_HOME:-${HOME}/.codex}/config.toml"
+BACKUP=""
+HAD_CONFIG=false
+if [ -f "$CONFIG" ]; then
+  HAD_CONFIG=true
+  BACKUP="$(mktemp "${CONFIG}.t-hub-backup.XXXXXX")"
+  cp -p "$CONFIG" "$BACKUP"
+fi
+rollback() {
+  if "$HAD_CONFIG"; then
+    cp -p "$BACKUP" "$CONFIG"
+  else
+    rm -f "$CONFIG"
+  fi
+  [ -z "$BACKUP" ] || rm -f "$BACKUP"
+}
+trap rollback EXIT
 
 if [ -n "$CURRENT" ]; then
   if ! codex mcp remove t-hub >/dev/null; then
@@ -59,6 +94,20 @@ if [ -n "$CURRENT" ]; then
 fi
 
 if codex mcp add t-hub -- "$BIN"; then
+  VERIFIED="$(codex mcp get t-hub --json 2>/dev/null || true)"
+  if ! printf '%s' "$VERIFIED" | jq -e --arg bin "$BIN" '
+    .enabled == true and .transport.type == "stdio" and
+    .transport.command == $bin and .transport.args == [] and
+    (.transport.env == null or .transport.env == {}) and
+    .transport.env_vars == [] and .transport.cwd == null and
+    .enabled_tools == null and .disabled_tools == null and
+    .startup_timeout_sec == null and .tool_timeout_sec == null
+  ' >/dev/null; then
+    echo "ensure-thub-codex: registration verification failed" >&2
+    exit 1
+  fi
+  trap - EXIT
+  [ -z "$BACKUP" ] || rm -f "$BACKUP"
   echo "ensure-thub-codex: registered t-hub server via 'codex mcp add' ($BIN)"
 else
   echo "ensure-thub-codex: 'codex mcp add' failed" >&2

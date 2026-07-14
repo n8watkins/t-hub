@@ -102,7 +102,8 @@ fi
 STALE_BIN="$WORK/stale-t-hub-mcp"
 cp "$FAKE_BIN" "$STALE_BIN"
 codex mcp remove t-hub >/dev/null 2>&1
-codex mcp add t-hub -- "$STALE_BIN" >/dev/null 2>&1
+codex mcp add t-hub --env BAD=1 -- "$STALE_BIN" --stale >/dev/null 2>&1
+sed -i '/^\[mcp_servers.t-hub.env\]/i enabled = false\n' "$WORK/config.toml"
 
 if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
   pass "stale registration update exits 0"
@@ -114,6 +115,17 @@ if codex mcp get t-hub --json | grep -Fq "\"command\": \"$FAKE_BIN\""; then
   pass "stale registration converged to requested binary"
 else
   fail "stale registration did not converge"
+fi
+if codex mcp get t-hub --json | jq -e '
+  .enabled == true and .disabled_reason == null and .transport.args == [] and
+  (.transport.env == null or .transport.env == {}) and
+  .transport.env_vars == [] and .transport.cwd == null and
+  .enabled_tools == null and .disabled_tools == null and
+  .startup_timeout_sec == null and .tool_timeout_sec == null
+' >/dev/null; then
+  pass "stale args, env, disabled fields, cwd, tools, and timeouts are absent"
+else
+  fail "complete registration shape did not converge"
 fi
 
 if [ "$FAILED" -eq 0 ]; then
