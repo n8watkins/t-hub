@@ -392,13 +392,19 @@ pub async fn spawn_terminal(
     if let Err(error) =
         tmux::new_session_with_env(&tmux_session, &cwd, command.as_deref(), &elevation)
     {
+        let mut rollback_error = None;
         if let (Some(store), Some(identity)) = (
             app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>(),
             minted_identity.as_ref(),
         ) {
-            store.retire(&identity.id);
+            rollback_error = store.retire(&identity.id).err();
         }
-        return Err(format!("failed to create tmux session: {error}"));
+        return Err(match rollback_error {
+            Some(rollback) => format!(
+                "failed to create tmux session: {error}; identity rollback also failed: {rollback}"
+            ),
+            None => format!("failed to create tmux session: {error}"),
+        });
     }
     if let (Some(store), Some(identity)) = (
         app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>(),
@@ -406,9 +412,13 @@ pub async fn spawn_terminal(
     ) {
         if let Err(error) = store.bind_tile(&identity.id, &id) {
             let _ = tmux::kill_session_tree(&tmux_session);
-            store.retire(&identity.id);
+            let rollback = store.retire(&identity.id);
             return Err(format!(
-                "failed to persist terminal identity binding; the terminal was rolled back: {error}"
+                "failed to persist terminal identity binding; the terminal was rolled back: {error}{}",
+                rollback
+                    .err()
+                    .map(|rollback| format!("; identity rollback also failed: {rollback}"))
+                    .unwrap_or_default()
             ));
         }
     }
@@ -712,7 +722,7 @@ pub async fn kill_terminal(
         .map_err(|e| format!("failed to kill tmux session {tmux_session}: {e}"));
     if kill_result.is_ok() {
         if let Some(identity) = app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>() {
-            identity.retire_tile(&id);
+            identity.retire_tile(&id)?;
         }
     }
 
@@ -850,7 +860,7 @@ pub async fn list_terminals(
     let stale_ids = stale_session_ids(&reap_candidates, &live_sessions);
     if let Some(identity) = app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>() {
         for id in &stale_ids {
-            identity.retire_tile(id);
+            identity.retire_tile(id)?;
         }
     }
     if !stale_ids.is_empty() {

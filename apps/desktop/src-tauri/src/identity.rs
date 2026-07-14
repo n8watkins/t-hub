@@ -332,22 +332,24 @@ impl IdentityStore {
     /// when a session closes (review M3 - bound the secret-bearing store to live +
     /// not-yet-closed sessions rather than letting it grow forever). A no-op for an
     /// unknown id. After this, the retired secret no longer `resolve`s.
-    pub fn retire(&self, id: &str) -> bool {
+    pub fn retire(&self, id: &str) -> Result<bool, String> {
         let mut snap = self.lock();
+        let previous = snap.clone();
         let removed = snap.identities.remove(id).is_some();
         if removed {
             if let Err(error) = self.persist(&snap) {
-                eprintln!("t-hub-identity: retire persist failed: {error}");
+                *snap = previous;
+                return Err(error);
             }
         }
-        removed
+        Ok(removed)
     }
 
     /// Retire the identity bound to a tile id (the session-close GC hook, M3). Removes
     /// the identity whose `session_tile` matches, so a dead session's secret stops
     /// resolving and the store does not accrete dead sessions. A no-op if no identity
     /// is bound to that tile.
-    pub fn retire_tile(&self, tile: &str) -> bool {
+    pub fn retire_tile(&self, tile: &str) -> Result<bool, String> {
         let id = {
             let snap = self.lock();
             snap.identities
@@ -357,7 +359,7 @@ impl IdentityStore {
         };
         match id {
             Some(id) => self.retire(&id),
-            None => false,
+            None => Ok(false),
         }
     }
 
@@ -379,8 +381,9 @@ impl IdentityStore {
     /// A still-live tile is KEPT. Returns the number retired. Call ONCE at load, from
     /// the construction site that can supply the liveness predicate (`lib.rs`); the
     /// store itself stays tmux-free and unit-testable via an injected predicate.
-    pub fn prune_dead(&self, is_live: impl Fn(&str) -> bool) -> usize {
+    pub fn prune_dead(&self, is_live: impl Fn(&str) -> bool) -> Result<usize, String> {
         let mut snap = self.lock();
+        let previous = snap.clone();
         let before = snap.identities.len();
         snap.identities
             .retain(|_, ident| match ident.session_tile.as_deref() {
@@ -390,10 +393,11 @@ impl IdentityStore {
         let removed = before - snap.identities.len();
         if removed > 0 {
             if let Err(error) = self.persist(&snap) {
-                eprintln!("t-hub-identity: prune persist failed: {error}");
+                *snap = previous;
+                return Err(error);
             }
         }
-        removed
+        Ok(removed)
     }
 
     /// Explicitly REVOKE an identity by its minted id (item-3 Pillar B): record it in
@@ -402,16 +406,18 @@ impl IdentityStore {
     /// [`retire`](Self::retire) (lifecycle GC): revocation is a deliberate "this
     /// credential is burned" act and leaves a persistent tombstone so the id can never
     /// resolve again. Returns true if anything changed (newly revoked or removed).
-    pub fn revoke(&self, id: &str) -> bool {
+    pub fn revoke(&self, id: &str) -> Result<bool, String> {
         let mut snap = self.lock();
+        let previous = snap.clone();
         let newly_revoked = snap.revoked.insert(id.to_string());
         let removed = snap.identities.remove(id).is_some();
         if newly_revoked || removed {
             if let Err(error) = self.persist(&snap) {
-                eprintln!("t-hub-identity: revoke persist failed: {error}");
+                *snap = previous;
+                return Err(error);
             }
         }
-        newly_revoked || removed
+        Ok(newly_revoked || removed)
     }
 
     /// Whether an identity id has been revoked.
@@ -574,7 +580,7 @@ mod tests {
                 store.resolve(&a.secret).is_some(),
                 "mints resolve before revoke"
             );
-            assert!(store.revoke(&a.id), "revoke reports a change");
+            assert!(store.revoke(&a.id).unwrap(), "revoke reports a change");
             assert!(
                 store.resolve(&a.secret).is_none(),
                 "a revoked secret must not resolve"
@@ -770,6 +776,57 @@ mod tests {
     }
 
     #[test]
+    fn retire_failure_keeps_memory_and_disk_consistent() {
+        let path = temp_path();
+        let store = IdentityStore::load(path.clone());
+        let identity = store.mint(Role::Crew).unwrap();
+        store.fail_persist_after(0);
+
+        assert!(store.retire(&identity.id).is_err());
+        assert!(store.resolve(&identity.secret).is_some());
+        let reloaded = IdentityStore::load(path.clone());
+        assert!(reloaded.resolve(&identity.secret).is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prune_failure_restores_every_removed_identity() {
+        let path = temp_path();
+        let store = IdentityStore::load(path.clone());
+        let a = store.mint(Role::Crew).unwrap();
+        store.bind_tile(&a.id, "dead-a").unwrap();
+        let b = store.mint(Role::Crew).unwrap();
+        store.bind_tile(&b.id, "dead-b").unwrap();
+        store.fail_persist_after(0);
+
+        assert!(store.prune_dead(|_| false).is_err());
+        assert_eq!(store.len(), 2);
+        assert!(store.resolve(&a.secret).is_some());
+        assert!(store.resolve(&b.secret).is_some());
+        assert_eq!(IdentityStore::load(path.clone()).len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn revoke_failure_never_temporarily_revokes_then_resurrects_on_reload() {
+        let path = temp_path();
+        let store = IdentityStore::load(path.clone());
+        let identity = store.mint(Role::Crew).unwrap();
+        store.fail_persist_after(0);
+
+        assert!(store.revoke(&identity.id).is_err());
+        assert!(!store.is_revoked(&identity.id));
+        assert!(
+            store.resolve(&identity.secret).is_some(),
+            "failed revoke must roll memory back instead of denying until restart"
+        );
+        let reloaded = IdentityStore::load(path.clone());
+        assert!(!reloaded.is_revoked(&identity.id));
+        assert!(reloaded.resolve(&identity.secret).is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn retire_drops_the_identity_and_stops_resolving() {
         // Review L2/M3: a retired identity is forgotten - its secret no longer
         // resolves and the store shrinks (no unbounded secret-bearing growth).
@@ -777,7 +834,10 @@ mod tests {
         let a = store.mint(Role::Crew).unwrap();
         let b = store.mint(Role::Crew).unwrap();
         assert!(store.resolve(&a.secret).is_some());
-        assert!(store.retire(&a.id), "retire reports it removed something");
+        assert!(
+            store.retire(&a.id).unwrap(),
+            "retire reports it removed something"
+        );
         assert!(
             store.resolve(&a.secret).is_none(),
             "retired secret no longer resolves"
@@ -788,7 +848,7 @@ mod tests {
             "the other identity is untouched"
         );
         // Retiring an unknown id is a no-op.
-        assert!(!store.retire("no-such-id"));
+        assert!(!store.retire("no-such-id").unwrap());
     }
 
     #[test]
@@ -818,7 +878,7 @@ mod tests {
         let unbound = store.mint(Role::Crew).unwrap(); // never bound (prior-run failed spawn)
         assert_eq!(store.len(), 3);
 
-        let removed = store.prune_dead(|tile| tile == "live-tile");
+        let removed = store.prune_dead(|tile| tile == "live-tile").unwrap();
         assert_eq!(
             removed, 2,
             "the dead tile AND the unbound identity are pruned"
@@ -843,7 +903,7 @@ mod tests {
         let store = IdentityStore::ephemeral();
         let a = store.mint(Role::Crew).unwrap();
         store.bind_tile(&a.id, "t").unwrap();
-        assert_eq!(store.prune_dead(|_| true), 0);
+        assert_eq!(store.prune_dead(|_| true).unwrap(), 0);
         assert_eq!(store.len(), 1);
     }
 
@@ -853,10 +913,10 @@ mod tests {
         let store = IdentityStore::ephemeral();
         let a = store.mint(Role::Crew).unwrap();
         store.bind_tile(&a.id, "deadtile").unwrap();
-        assert!(store.retire_tile("deadtile"));
+        assert!(store.retire_tile("deadtile").unwrap());
         assert!(store.resolve(&a.secret).is_none());
         assert!(store.is_empty());
         // No binding for that tile => no-op.
-        assert!(!store.retire_tile("never-bound"));
+        assert!(!store.retire_tile("never-bound").unwrap());
     }
 }

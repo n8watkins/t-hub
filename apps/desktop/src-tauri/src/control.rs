@@ -8533,10 +8533,14 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
                 if let Some(identity) = &minted_identity {
                     if let Err(error) = ctx.identity.bind_tile(&identity.id, &id) {
                         let _ = tmux::kill_session_tree(&tmux_target(&id));
-                        ctx.identity.retire(&identity.id);
+                        let rollback = ctx.identity.retire(&identity.id);
                         let _ = git::worktree_remove(&repo_root, &worktree_path, true);
                         return Err(format!(
-                            "create_worktree: identity binding persistence failed and the terminal/worktree were rolled back: {error}"
+                            "create_worktree: identity binding persistence failed and the terminal/worktree were rolled back: {error}{}",
+                            rollback
+                                .err()
+                                .map(|rollback| format!("; identity rollback also failed: {rollback}"))
+                                .unwrap_or_default()
                         ));
                     }
                 }
@@ -8553,7 +8557,12 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
                 // Review L2: retire the just-minted identity so a failed worktree
                 // spawn does not leave an orphaned, secret-bearing entry.
                 if let Some(identity) = &minted_identity {
-                    ctx.identity.retire(&identity.id);
+                    if let Err(rollback) = ctx.identity.retire(&identity.id) {
+                        let _ = git::worktree_remove(&repo_root, &worktree_path, true);
+                        return Err(format!(
+                            "create_worktree: terminal spawn failed ({e}); identity rollback also failed: {rollback}"
+                        ));
+                    }
                 }
                 eprintln!("t-hub-control: create_worktree: worktree terminal spawn failed: {e}")
             }
@@ -9474,7 +9483,9 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             // leave an orphaned, secret-bearing identity for a session that never
             // existed. Retire it on the error leg.
             if let Some(identity) = &minted_identity {
-                ctx.identity.retire(&identity.id);
+                if let Err(rollback) = ctx.identity.retire(&identity.id) {
+                    return Err(format!("{e}; identity rollback also failed: {rollback}"));
+                }
             }
             return Err(e);
         }
@@ -9484,9 +9495,13 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     if let Some(identity) = &minted_identity {
         if let Err(error) = ctx.identity.bind_tile(&identity.id, &id) {
             let _ = tmux::kill_session_tree(&tmux_session);
-            ctx.identity.retire(&identity.id);
+            let rollback = ctx.identity.retire(&identity.id);
             return Err(format!(
-                "spawn_terminal: identity binding persistence failed and the terminal was rolled back: {error}"
+                "spawn_terminal: identity binding persistence failed and the terminal was rolled back: {error}{}",
+                rollback
+                    .err()
+                    .map(|rollback| format!("; identity rollback also failed: {rollback}"))
+                    .unwrap_or_default()
             ));
         }
     }
@@ -9507,7 +9522,11 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
                 let _ = tmux::kill_session_tree(&tmux_session);
                 ctx.tabs.remove_tile(&id);
                 if let Some(identity) = &minted_identity {
-                    ctx.identity.retire(&identity.id);
+                    if let Err(rollback) = ctx.identity.retire(&identity.id) {
+                        return Err(format!(
+                            "spawn_terminal: Crew registry persistence failed ({error}); identity rollback also failed: {rollback}"
+                        ));
+                    }
                 }
                 return Err(format!(
                     "spawn_terminal: Crew registry persistence failed and the terminal was rolled back: {error}"
@@ -9966,7 +9985,7 @@ fn close_terminal_with_policy(
     // Comms-plane Phase 2 (review M3): a dead session's per-session identity is
     // retired too, so its secret stops resolving and the identity store does not
     // accrete dead sessions (it is bounded to live + not-yet-closed sessions).
-    ctx.identity.retire_tile(tile_id);
+    ctx.identity.retire_tile(tile_id)?;
     Ok(json!({
         "accepted": "close_terminal",
         "sessionId": session_id,
@@ -16157,6 +16176,42 @@ mod tests {
         assert!(
             persisted.is_empty(),
             "rollback must remove the durable identity"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn socket_close_reports_identity_retirement_persistence_failure() {
+        let path = captains_tmp("identity-retire-close-failure");
+        let store = Arc::new(crate::identity::IdentityStore::load(path.clone()));
+        let identity = store.mint(crate::identity::Role::Crew).unwrap();
+        store.bind_tile(&identity.id, "already-gone").unwrap();
+        store.fail_persist_after(0);
+        let ctx = test_ctx("ctrl").with_identity_store(store.clone());
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req(
+                "ctrl",
+                "close_terminal",
+                json!({"sessionId": "already-gone"}),
+            ),
+        );
+
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .unwrap_or_default()
+                .contains("identity store persist failure injected"),
+            "close must surface failed durable identity retirement"
+        );
+        assert!(store.resolve(&identity.secret).is_some());
+        assert!(
+            crate::identity::IdentityStore::load(path.clone())
+                .resolve(&identity.secret)
+                .is_some(),
+            "failed retirement must leave memory and disk aligned"
         );
         let _ = std::fs::remove_file(path);
     }

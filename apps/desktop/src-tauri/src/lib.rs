@@ -615,15 +615,18 @@ pub fn run() {
             // identity - a degraded spawn path must never retire a live session's
             // secret. `prune_dead` retires only where `is_live` is false.
             {
-                let pruned = identity_store.prune_dead(|tile| {
+                match identity_store.prune_dead(|tile| {
                     !tmux::is_definitively_gone(tmux::session_liveness(&tmux::target_for_id(tile)))
-                });
-                if pruned > 0 {
-                    eprintln!(
+                }) {
+                    Ok(pruned) if pruned > 0 => eprintln!(
                         "t-hub-identity: load-time prune retired {pruned} dead/unbound \
                          identit{} (session gone without a clean close)",
                         if pruned == 1 { "y" } else { "ies" }
-                    );
+                    ),
+                    Err(error) => eprintln!(
+                        "t-hub-identity: load-time prune was rolled back after persistence failed: {error}"
+                    ),
+                    _ => {}
                 }
             }
             // Comms-plane Phase 2 observability (§2.8): fan out each message's
