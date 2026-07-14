@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.66` from `a4fd704`, running as Windows PID `13092` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.66` from `35fbae2`, running as Windows PID `42280` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -67,7 +67,9 @@ No T-Hub Project is currently registered.
 The visible legacy Captain records are pinned visual records without complete Project or Powder bindings.
 
 Terminal resource counters and hot, warm, and cold lifecycle states are implemented.
-The installed application has logged xterm `loadCell` and `isWrapped` failures that may be lifecycle races.
+The earlier installed application reproduced xterm `loadCell` and `isWrapped` lifecycle failures.
+Source commit `6870444` fixed the teardown race, and the packaged `35fbae2` build completed cold rehydration with zero `loadCell`, `isWrapped`, or window errors.
+Source commit `35fbae2` also prevents a second packaged launch from creating a competing control server and duplicate PTY attachments.
 Diagnostic logs are oversized.
 Board still defaults to the wrong global endpoint.
 Preview still exposes an unclear Dev then Preview sequence.
@@ -86,7 +88,10 @@ The Windows and WSL TTS endpoints are healthy on ports `7477` and `7478`.
 Voice settings are enabled with Kokoro selected and attention announcements enabled.
 Automatic spoken announcements currently depend on needs-input status transitions, which interactive Codex does not reliably produce.
 
-The installed `th` CLI reports version `0.1.0` and timed out during live `health` and `ls` checks in the planning audit.
+The installed `th` CLI reports version `0.2.0`.
+Source commit `07e74f4` upgrades the control protocol and recovers from a stale inherited endpoint after application port rotation while preserving the caller's token capability.
+Live `health` and `ls` checks now rediscover the packaged application promptly in the normal case.
+One post-install `ls` call still hit the bounded 10-second WSL command timeout and succeeded on retry, so transient WSL command latency remains Phase 1 work.
 The source documents a newer interface, but the CLI still lacks most Captain, Powder, Workspace, resource, and inbox commands.
 The source CLI already has a useful Rust control-client boundary, a no-argument fleet view, deterministic human rendering, a stable JSON envelope, and an established exit-code taxonomy that should be preserved.
 The CLI contract audit also found that unknown flags can be accepted silently, per-subcommand help is absent, `worktree rm` has no explicit confirmation gate, some diagnostics can leak into JSON-mode stderr without a structured suggestion, and JSON collections are described as unbounded.
@@ -110,6 +115,10 @@ The release critical path is:
 9. Measured performance, security, and release hardening.
 
 ## Phase 1 - Terminal and Control Reliability
+
+**Status:** Active.
+The packaged xterm lifecycle, stale-endpoint CLI recovery, application restart, session survival, and single-instance gates pass through installed source `35fbae2`.
+Transient WSL command timeouts and repetitive startup `no live terminal` diagnostics remain open before the full phase exit gate is closed.
 
 ### Goal
 

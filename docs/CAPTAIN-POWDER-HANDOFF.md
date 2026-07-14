@@ -13,8 +13,8 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `a4fd704`.
-**Installed Windows build:** locally built T-Hub `0.3.66` from `a4fd704`.
+**Source head before this handoff update:** `35fbae2`.
+**Installed Windows build:** locally built T-Hub `0.3.66` from `35fbae2`.
 
 ## Executive Status
 
@@ -23,8 +23,9 @@ The final independent authority review reports no remaining Critical, High, or M
 The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
 
 The final production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `3192f4f18a637dfde6b5e74358b504d05839b19452f94644a08d15c73a3dd141`.
-It is running as PID `13092`.
+The installed executable SHA-256 is `864769634bc6b3b4d664f5dd2c94592b96aa25a20b7a54ea0bb6fc9b647c775f`.
+It is running as PID `42280`.
+The exact NSIS installer SHA-256 is `dbcf8405212e7eed2a3986128e210ed5e6338e97c22df39cdb5dae6a72849b1a`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
@@ -229,9 +230,13 @@ Completed low-risk performance changes are:
 - Parked terminals now move through hot, warm, and cold lifecycle states while tmux remains authoritative.
 - Lifecycle tests cover cold disposal and rehydration.
 
-The installed `0.3.66` application logged xterm rendering failures involving `loadCell` and `isWrapped` after terminal parking and restoration.
+The earlier installed `0.3.66` application logged xterm rendering failures involving `loadCell` and `isWrapped` after terminal parking and restoration.
 Source commit `6870444` serializes destructive xterm teardown after accepted writes, discards unreplayed pending output during cold teardown, upgrades xterm, and removes the unmaintained canvas renderer.
-The source fix passed automated frontend and Rust validation, but it is not yet installed and therefore has not passed the packaged Phase 1 exit gate.
+The fix is installed in the package built from `35fbae2`.
+Three Captain terminals were parked past the 30-second cold threshold and rehydrated with readable live output.
+The packaged launch produced zero `loadCell`, `isWrapped`, or window errors.
+A repeated application launch initially reproduced competing processes and visibly corrupted canvases, so source commit `35fbae2` added the official Tauri single-instance guard as the first plugin.
+The rebuilt package kept one PID, preserved the control endpoint, and rendered cleanly when launched again.
 
 The fresh general performance review ranked the next work as:
 
@@ -243,8 +248,8 @@ The fresh general performance review ranked the next work as:
 6. Coalesce focus-driven terminal and Git scans, pause low-priority hidden polling, and reduce permanent watchdog cadence after measurement.
 7. Lazy-load and prune the non-Lucide icon resolver stack by selected theme.
 
-The hot, warm, and cold terminal lifecycle is now implemented, but it remains the highest-risk performance change.
-Terminal visibility, scrollback recovery, input readiness, and canvas reattachment still require packaged end-to-end testing, and the current xterm errors must be resolved before the lifecycle is accepted for production.
+The hot, warm, and cold terminal lifecycle is now implemented and has passed packaged cold rehydration and application-restart testing.
+The full performance matrix and a control-capable input mutation check remain open.
 
 ## Remaining Production Work
 
@@ -252,7 +257,7 @@ The canonical gated sequence is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-
 
 The ordered continuation is:
 
-1. Build and install the reviewed source only after explicit authorization, then run the packaged xterm lifecycle and control-client acceptance matrix.
+1. Resolve transient WSL command timeouts and repetitive startup `no live terminal` diagnostics, then close the remaining Phase 1 control gate.
 2. Complete new-codebase creation, explicit Git initialization, Powder board selection or creation, transactional rollback, and packaged Captain-creation E2E.
 3. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
 4. Verify context reset recovery, Crew dispatch into a deliberate shared workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
@@ -287,16 +292,17 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The installed Windows process was reverified at PID `35612`, start time `2026-07-14T11:56:19.2412232-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-Its file and product version are `0.3.66`, and its SHA-256 is `3192F4F18A637DFDE6B5E74358B504D05839B19452F94644A08D15C73A3DD141`.
-The installed build remains the previously released `a4fd704` source relationship.
-The reviewed implementation changes are complete through `d8e891e`, eleven commits newer than the installed source.
-The branch was sixteen commits ahead of `origin/main` before this handoff update.
+The installed Windows process was reverified at PID `42280`, start time `2026-07-14T13:26:05-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its file and product version are `0.3.66`, and its SHA-256 is `864769634BC6B3B4D664F5DD2C94592B96AA25A20B7A54EA0BB6FC9B647C775F`.
+The installed build was produced from source `35fbae2` with NSIS installer SHA-256 `DBCF8405212E7EED2A3986128E210ED5E6338E97C22DF39CDB5DAE6A72849B1A`.
+The installed `th` CLI is version `0.2.0` from source `07e74f4`.
 Source commit `6870444` fixes the reproduced xterm teardown race.
 Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
-The latest source gate passed 441 frontend tests, the production frontend build, 579 Rust library tests with one ignored, all workspace integration and crate tests, formatting, and warnings-denied Clippy.
+The latest source gate passed 441 frontend tests, the production frontend build, 580 Rust library tests, formatting, and warnings-denied Clippy.
 The latest T-Hub capability probe for this session remained `read`, so no canonical Project mutation, Powder binding, Captain commissioning, or Crew dispatch was attempted.
 The local Powder endpoint and protected agent credential path are operational.
-The immediate source action is explicit Git initialization and transactional rollback for non-repository and new-codebase flows.
-The immediate installed-runtime action requires authorization to package and install the reviewed source, followed by xterm lifecycle verification and a control-capable session for real Powder acceptance.
+The packaged xterm lifecycle and duplicate-launch gates pass with seven live tmux sessions preserved.
+The stale-endpoint CLI path passes, but one `th ls` call hit the bounded 10-second WSL command timeout before succeeding on retry.
+The immediate source action is to finish Phase 1 control reliability, then implement explicit Git initialization and transactional rollback for non-repository and new-codebase flows.
+Real Powder acceptance still requires a control-capable Captain session.
 The Board endpoint, Preview workflow, Claude header check, packaged performance matrix, and release hardening remain open.
