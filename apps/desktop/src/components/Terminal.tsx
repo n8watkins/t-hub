@@ -1,24 +1,10 @@
 // xterm.js terminal tile for the 0.1 terminal nucleus.
 //
-// RENDERER: we load the **CANVAS addon** (GPU-accelerated 2D), with the **DOM
-// renderer as the automatic fallback**, and **deliberately avoid the WebGL
-// addon**. Rationale (the full version lives next to `term.open()` below):
-//   - The DOM renderer couldn't keep up with a busy Claude TUI's full-screen
-//     repaints (symptom D — the last thing still freezing a terminal after the
-//     rest of the app went smooth), so we moved to a GPU path.
-//   - We do NOT use WebGL: each xterm WebGL addon opens its OWN WebGL context,
-//     and WebView2 (Chromium) caps simultaneously-live WebGL contexts (~16) and
-//     HARD-EVICTS the least-recently-used under GPU/memory pressure. With 6+
-//     terminals plus a relayout/repaint, WebView2 evicted contexts across the
-//     grid; xterm's WebGL addon then preventDefault()s `webglcontextlost` and
-//     waits a HARD-CODED 3000ms before its fallback — during which every evicted
-//     canvas is blank. That is the "all terminals go blank / uniform muted gray,
-//     then a tab switch resets them" symptom (the "mutedbug" this build fixed).
-//   - The 2D CANVAS context has no such hard ceiling/evict (Chromium falls back
-//     to software for overflow instead of blanking), so it gives most of the GPU
-//     speedup without reintroducing the blank-grid failure. If the canvas addon
-//     can't load, we fall back to the DOM renderer (still correct, just slower on
-//     a busy TUI) rather than break the terminal.
+// RENDERER: xterm 6's built-in DOM renderer is the maintained multi-terminal
+// path. The Canvas addon is not supported by xterm 6, and its delayed render
+// path appears in the installed lifecycle crash. We also deliberately avoid
+// the WebGL addon because each terminal owns a WebGL context and WebView2
+// evicts contexts under a dense grid, temporarily blanking terminal tiles.
 //
 // Responsibilities (PRD §9.1, FR-004/FR-005, §12.1):
 //   - Create an xterm.js Terminal with Fit + Search + Unicode11 addons.
@@ -38,7 +24,6 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { CanvasAddon } from "@xterm/addon-canvas";
 import { saneFitProposal } from "./terminalFit";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -68,6 +53,7 @@ import type { ITheme, ILink } from "@xterm/xterm";
 import { clipboardRead, clipboardWrite } from "../lib/clipboard";
 import { TerminalCursorBlinkController } from "../lib/terminalCursorBlink";
 import { updateTerminalResources } from "../lib/terminalResources";
+import { TerminalWriteLifecycle } from "../lib/terminalWriteLifecycle";
 import {
   beginTerminalDetach,
   waitForTerminalDetach,
@@ -384,11 +370,10 @@ export function TerminalView({
     // write per event on the single WebView2 JS thread. 0 == none scheduled;
     // torn down in cleanup like `rafId` so it can't fire into a disposed term.
     let flushRaf = 0;
-    // Drains any queued bytes synchronously. Set inside the async attach block
-    // (which owns the pending queue); cleanup calls it ONCE before disposing the
-    // term so a partial frame of output isn't dropped on unmount, matching the
-    // old synchronous path's completeness. Stays null if teardown beats setup.
-    let drainPending: (() => void) | null = null;
+    // Drops bytes that T-Hub has not submitted to xterm yet. A cold unmount can
+    // safely discard them because tmux remains authoritative and replays its
+    // capture on the next attach.
+    let discardPending: (() => void) | null = null;
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     // The reattach loop's pending backoff timer, held at effect scope so cleanup
     // can cancel it — a cleared timer never resolves its sleep, which (with the
@@ -412,6 +397,7 @@ export function TerminalView({
         ),
       ),
     });
+    const writes = new TerminalWriteLifecycle(term);
     updateTerminalResources(terminalId, { xterm: true });
     termRef.current = term;
     // Register this xterm so the captains-deck orchestrator output strip can read
@@ -555,24 +541,6 @@ export function TerminalView({
       );
     }
 
-    // RENDERER: the CANVAS addon (GPU-accelerated 2D), NOT WebGL. The DOM renderer
-    // can't keep up with a busy Claude TUI's full-screen repaints — that was the
-    // last thing freezing the terminal even after the rest of the app went smooth.
-    // We deliberately do NOT use the WebGL addon: each WebGL terminal opens its own
-    // WebGL context, WebView2 caps those (~16) and HARD-EVICTS the least-recent one
-    // under pressure → the whole grid blanks (the "mutedbug" this build originally
-    // fixed by dropping WebGL). A 2D canvas context has no such hard ceiling/evict
-    // (Chromium falls back to software for overflow instead of blanking), so canvas
-    // gives most of the GPU speedup without reintroducing the blank-grid failure.
-    // Loaded AFTER open(); a failure falls back to the DOM renderer rather than
-    // breaking the terminal.
-    try {
-      term.loadAddon(new CanvasAddon());
-      updateTerminalResources(terminalId, { canvas: true });
-    } catch {
-      // Canvas unavailable in this webview — fall back to the DOM renderer.
-    }
-
     // COPY-ON-SELECT (WS-1): mirror Claude Code / iTerm — selecting text in the
     // terminal auto-copies it to the clipboard, no Ctrl+C needed. onSelectionChange
     // fires rapidly during a drag, so we DEBOUNCE (~120ms) and only write once the
@@ -599,8 +567,8 @@ export function TerminalView({
     // SIGINT; Ctrl+V pastes (bracketed-paste aware via term.paste). Ctrl +/-/0
     // zoom is handled here too because a focused xterm otherwise swallows those
     // before they reach the window-level handler. Returning false stops xterm
-    // from sending the key to the PTY; stopPropagation prevents the Canvas
-    // window handler from double-firing.
+    // from sending the key to the PTY; stopPropagation prevents the window
+    // handler from double-firing.
     // Tracks whether THIS pane is in tmux copy-mode after a Page Up (set below).
     // A closure flag living for the terminal's lifetime; only ever true after a
     // scroll, so ordinary typing is unaffected while it's false.
@@ -765,13 +733,19 @@ export function TerminalView({
         // live line, then the forced repaint shows a clean, single frame.
         requestAnimationFrame(() => {
           if (disposed) return;
-          try {
-            term.clear();
-          } catch {
-            // Renderer/buffer detached mid-call; ignore.
-          }
-          tlog("resize", `${terminalId} cleared scrollback + repaint (rows=${term.rows})`);
-          forceFullRedraw();
+          writes.afterWrites(() => {
+            if (disposed) return;
+            try {
+              term.clear();
+            } catch {
+              // Renderer/buffer detached mid-call; ignore.
+            }
+            tlog(
+              "resize",
+              `${terminalId} cleared scrollback + repaint (rows=${term.rows})`,
+            );
+            forceFullRedraw();
+          });
         });
       } else {
         forceFullRedraw();
@@ -871,19 +845,14 @@ export function TerminalView({
             // rAF flush per terminal does the writing + (bounded) URL scan once
             // per frame, collapsing a burst of small events into one frame of
             // work. Byte ORDER is preserved because the queue is FIFO and a flush
-            // drains it in arrival order; COMPLETENESS is preserved because every
-            // decoded chunk lands in the queue and the queue is fully drained on
-            // every flush (and one final flush runs before teardown disposes the
-            // term — see cleanup).
+            // drains it in arrival order. T-Hub's not-yet-submitted queue is
+            // discarded on cold teardown because tmux replays authoritative
+            // output on the next attach.
             const pending: Uint8Array[] = [];
             let pendingBytes = 0;
 
             // Drain the queued bytes: URL-scan + activity-bump + write, ONCE for
-            // the whole frame's worth of chunks. Shared by the rAF flush and the
-            // teardown drain; the only difference is the rAF path's `disposed`
-            // guard (it must not write into an about-to-be-disposed term on a
-            // late frame), whereas the teardown path runs deliberately while the
-            // term is still alive (cleanup disposes it only afterward).
+            // the whole frame's worth of chunks.
             const drainQueue = (): void => {
               if (pending.length === 0) return;
               // Snapshot + clear up front so anything that arrives DURING this
@@ -909,7 +878,7 @@ export function TerminalView({
               // seed has landed we still route into `liveBuffer` (flushed after
               // the seed) so history/live ordering is preserved exactly as before.
               if (seeded) {
-                for (const bytes of chunks) term.write(bytes);
+                for (const bytes of chunks) writes.write(bytes);
               } else {
                 for (const bytes of chunks) liveBuffer.push(bytes);
               }
@@ -1028,7 +997,7 @@ export function TerminalView({
               // Flush queued output first so the process's final bytes land
               // before the banner (same ordering the old exit handler kept).
               drainQueue();
-              term.writeln("\r\n[process exited]");
+              writes.write("\r\n[process exited]\r\n");
               useWorkspace.getState().updateState(terminalId, "exited");
             };
 
@@ -1041,7 +1010,7 @@ export function TerminalView({
               if (disposed || reconnecting || !initialAttachSettled) return;
               reconnecting = true;
               needsReattach = false;
-              term.writeln("\r\n[session detached - reconnecting...]");
+              writes.write("\r\n[session detached - reconnecting...]\r\n");
               let delay = RECONNECT_INITIAL_MS;
               for (;;) {
                 await reconnectSleep(delay);
@@ -1090,12 +1059,14 @@ export function TerminalView({
                   updateTerminalResources(terminalId, { pty: true });
                   // Repopulate: reset the grid so the stale pre-drop frame (and
                   // the reconnecting banner) never duplicates under the seed.
+                  await writes.waitForWrites();
+                  if (disposed) return;
                   term.reset();
                   const seed = decodeBase64(scrollback);
-                  if (seed.length > 0) term.write(seed);
+                  if (seed.length > 0) writes.write(seed);
                   seeded = true;
                   if (liveBuffer.length > 0) {
-                    for (const chunk of liveBuffer) term.write(chunk);
+                    for (const chunk of liveBuffer) writes.write(chunk);
                     liveBuffer.length = 0;
                   }
                   // An empty capture renders nothing — nudge the shell to
@@ -1169,10 +1140,11 @@ export function TerminalView({
             window.addEventListener(TERMINAL_FOREGROUND_EVENT, onForegroundChanged);
             document.addEventListener("visibilitychange", onVisibilityChanged);
 
-            // Expose a synchronous drain to the outer cleanup so a partial frame
-            // of output queued at unmount isn't lost (the old write path was
-            // synchronous, so nothing received was ever pending at teardown).
-            drainPending = drainQueue;
+            discardPending = () => {
+              pending.length = 0;
+              pendingBytes = 0;
+              liveBuffer.length = 0;
+            };
 
             const offOutput = await onOutput(terminalId, (e) => {
               if (disposed) return;
@@ -1243,13 +1215,13 @@ export function TerminalView({
             // prompt is drawn by the forced redraw below.
             const seed = decodeBase64(scrollback);
             const freshSpawn = seed.length === 0;
-            if (!freshSpawn) term.write(seed);
+            if (!freshSpawn) writes.write(seed);
 
             // Seed is on screen; switch to live writes and flush anything that
             // arrived on the listener while we were awaiting attach/seed.
             seeded = true;
             if (liveBuffer.length > 0) {
-              for (const chunk of liveBuffer) term.write(chunk);
+              for (const chunk of liveBuffer) writes.write(chunk);
               tlog(
                 "attach",
                 `attached ${terminalId}: seed ${seed.length}B, flushed ${liveBuffer.length} buffered live chunk(s)`,
@@ -1484,11 +1456,8 @@ export function TerminalView({
       initializedRef.current = false;
 
       cancelAnimationFrame(rafId);
-      // Cancel any scheduled coalesced-write flush, then drain its queue ONCE
-      // synchronously below (before term.dispose) so the final partial frame of
-      // output isn't lost. The cancel stops a late rAF from firing into the
-      // disposed term; flushPending also re-checks `disposed`, so even a frame
-      // that slips through the cancel is a no-op.
+      // Cancel any scheduled coalesced-write flush. The unsubmitted queue is
+      // discarded below; tmux replays it from authoritative capture on attach.
       if (flushRaf !== 0) {
         cancelAnimationFrame(flushRaf);
         flushRaf = 0;
@@ -1536,19 +1505,15 @@ export function TerminalView({
       });
       unlisteners.length = 0;
 
-      // Final synchronous drain of any output that was queued for the next rAF
-      // frame but never flushed (the cancel above stopped that frame). The term
-      // is still alive here — it's disposed on the next line — so this writes the
-      // last partial frame's bytes in order, preserving completeness the same way
-      // the old per-event synchronous write did. No-op if setup never reached the
-      // point of assigning `drainPending` (teardown beat the async attach).
-      drainPending?.();
+      discardPending?.();
 
       cursorBlinkRef.current?.dispose();
       cursorBlinkRef.current = null;
 
       unregisterTerminalTail(terminalId, term);
-      term.dispose();
+      // xterm parses accepted writes asynchronously. Retire immediately so no
+      // later write is accepted, then dispose only after parser callbacks settle.
+      writes.disposeWhenIdle();
       void beginTerminalDetach(terminalId, () => closeTerminal(terminalId)).catch(
         () => undefined,
       );
