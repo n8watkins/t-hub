@@ -126,7 +126,11 @@ fn control_endpoint(app: &tauri::AppHandle) -> Result<std::sync::Arc<ControlEndp
 fn ui_spawn_capability_env(
     app: &tauri::AppHandle,
     opts: &SpawnOptions,
-) -> (Vec<(String, String)>, bool) {
+) -> (
+    Vec<(String, String)>,
+    bool,
+    Option<crate::identity::SessionIdentity>,
+) {
     // LOW-1: the scrub is UNCONDITIONAL - env-inheritance must never decide a
     // session's capability. When the control endpoint is unresolvable / unbound (a
     // pre-bind race, no live control server), we still explicitly BLANK
@@ -137,14 +141,18 @@ fn ui_spawn_capability_env(
         vec![
             ("T_HUB_CONTROL_TOKEN".to_string(), String::new()),
             ("T_HUB_CONTROL_ADDR".to_string(), String::new()),
+            (
+                crate::identity::SESSION_TOKEN_ENV.to_string(),
+                String::new(),
+            ),
         ]
     };
     let Ok(endpoint) = control_endpoint(app) else {
-        return (scrub(), false);
+        return (scrub(), false, None);
     };
     let addr = endpoint.addr();
     if addr.is_empty() {
-        return (scrub(), false);
+        return (scrub(), false, None);
     }
     let is_control = opts
         .capability
@@ -162,11 +170,28 @@ fn ui_spawn_capability_env(
     };
     // Set BOTH explicitly at the session level so they override (scrub) any inherited
     // values. The MCP env override is all-or-nothing, so both must be present.
-    let env = vec![
+    let identity_store = app
+        .try_state::<std::sync::Arc<crate::identity::IdentityStore>>()
+        .map(|state| state.inner().clone());
+    let identity = identity_store
+        .as_ref()
+        .map(|store| store.mint_for(crate::identity::Role::Crew, None));
+    let mut env = vec![
         ("T_HUB_CONTROL_ADDR".to_string(), addr),
         ("T_HUB_CONTROL_TOKEN".to_string(), token),
     ];
-    (env, is_control)
+    if let Some(identity) = &identity {
+        env.push((
+            crate::identity::SESSION_TOKEN_ENV.to_string(),
+            identity.secret.clone(),
+        ));
+    } else {
+        env.push((
+            crate::identity::SESSION_TOKEN_ENV.to_string(),
+            String::new(),
+        ));
+    }
+    (env, is_control, identity)
 }
 
 /// item-3 §2.1.1 piece 4: audit a UI control-capability spawn against the SHARED
@@ -356,12 +381,27 @@ pub async fn spawn_terminal(
     // inherited `T_HUB_CONTROL_TOKEN`/`_ADDR` the polluted app env would otherwise
     // leak - env-inheritance must never decide a session's capability. Default READ;
     // an explicit `capability:"control"` is a deliberate, audited elevation.
-    let (elevation, is_control) = ui_spawn_capability_env(&app, &opts);
+    let (elevation, is_control, minted_identity) = ui_spawn_capability_env(&app, &opts);
     if is_control {
         audit_ui_control_spawn(&app, &opts);
     }
-    tmux::new_session_with_env(&tmux_session, &cwd, command.as_deref(), &elevation)
-        .map_err(|e| format!("failed to create tmux session: {e}"))?;
+    if let Err(error) =
+        tmux::new_session_with_env(&tmux_session, &cwd, command.as_deref(), &elevation)
+    {
+        if let (Some(store), Some(identity)) = (
+            app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>(),
+            minted_identity.as_ref(),
+        ) {
+            store.retire(&identity.id);
+        }
+        return Err(format!("failed to create tmux session: {error}"));
+    }
+    if let (Some(store), Some(identity)) = (
+        app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>(),
+        minted_identity.as_ref(),
+    ) {
+        store.bind_tile(&identity.id, &id);
+    }
 
     // Mark this id FRESH so its first `attach_terminal` returns empty scrollback
     // (the frontend then draws one clean prompt via Ctrl-L instead of replaying the
@@ -651,7 +691,6 @@ pub async fn kill_terminal(
         let fanout = app.state::<std::sync::Arc<crate::control::EventFanout>>();
         forward_captains_sync(&app, &captains, &fanout);
     }
-
     // The tmux session name is reconstructed from the id (the RemotePty doesn't
     // carry it); this is the same `th_<id[..8]>` derivation as everywhere else.
     let tmux_session = tmux_target(&id);
@@ -661,6 +700,11 @@ pub async fn kill_terminal(
     // and the workspace reap (closeWorkspace loops killTerminal over a tab's tiles).
     let kill_result = tmux::kill_session_tree(&tmux_session)
         .map_err(|e| format!("failed to kill tmux session {tmux_session}: {e}"));
+    if kill_result.is_ok() {
+        if let Some(identity) = app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>() {
+            identity.retire_tile(&id);
+        }
+    }
 
     // Detaching the RemotePty shuts down the socket + joins the reader; do this
     // regardless of whether the tmux kill reported an error. (Killing the tmux
@@ -675,6 +719,7 @@ pub async fn kill_terminal(
 
 #[tauri::command]
 pub async fn list_terminals(
+    app: tauri::AppHandle,
     remote: tauri::State<'_, RemotePtyManager>,
 ) -> Result<Vec<TerminalInfo>, String> {
     // Snapshot what the reconciliation needs from the in-memory map BEFORE we
@@ -793,6 +838,11 @@ pub async fn list_terminals(
     // reports as gone, so we can neither kill a live process nor double-free one:
     // we do NOT touch tmux here, only drop the already-dead in-memory handle.
     let stale_ids = stale_session_ids(&reap_candidates, &live_sessions);
+    if let Some(identity) = app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>() {
+        for id in &stale_ids {
+            identity.retire_tile(id);
+        }
+    }
     if !stale_ids.is_empty() {
         // Re-confirm UNDER THE LOCK that the entry we're about to drop STILL maps to
         // the same (now-dead) tmux session before dropping it. The conn map doesn't

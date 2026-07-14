@@ -66,6 +66,8 @@ pub struct ControlEndpoint {
     /// (there is no local read/control split there). Never authenticates the webview
     /// itself - that always uses the full `token` above.
     read_token: String,
+    /// In-process-only origin proof. Empty for remote thin-client endpoints.
+    host_token: String,
     /// Local handshake file to re-read the rotated addr from. `None` in REMOTE
     /// thin-client mode (there is no local rebind to track).
     refresh_path: Option<PathBuf>,
@@ -87,6 +89,10 @@ impl ControlEndpoint {
     /// remote thin-client mode. See the field doc.
     pub fn read_token(&self) -> &str {
         &self.read_token
+    }
+
+    pub fn host_token(&self) -> &str {
+        &self.host_token
     }
 
     /// After a transport failure, re-read the LOCAL handshake for a rotated addr (the
@@ -118,7 +124,13 @@ impl ControlEndpoint {
 /// Open a one-shot connection to the control listener, send one request frame, and
 /// await one response line. Connections are short-lived by design (the listener is
 /// built for one MCP round-trip per connection); pooling is a later M1 widening.
-fn request(addr: &str, token: &str, command: &str, args: &Value) -> Result<Value, String> {
+fn request(
+    addr: &str,
+    token: &str,
+    host_token: &str,
+    command: &str,
+    args: &Value,
+) -> Result<Value, String> {
     let socket: SocketAddr = addr
         .parse()
         .map_err(|e| format!("control_request: bad control addr {addr:?}: {e}"))?;
@@ -132,6 +144,7 @@ fn request(addr: &str, token: &str, command: &str, args: &Value) -> Result<Value
         .map_err(|e| format!("control_request: clone stream failed: {e}"))?;
     let mut frame = serde_json::to_vec(&json!({
         "token": token,
+        "host": host_token,
         "command": command,
         "args": args,
         "v": control::PROTOCOL_VERSION,
@@ -188,14 +201,14 @@ pub async fn control_request(
     let ep = endpoint.inner().clone();
     let args = args.unwrap_or(Value::Null);
     tauri::async_runtime::spawn_blocking(move || {
-        match request(&ep.addr(), ep.token(), &command, &args) {
+        match request(&ep.addr(), ep.token(), ep.host_token(), &command, &args) {
             Ok(v) => Ok(v),
             // A local rebind may have rotated the listener port (relay-wedge
             // self-heal). Re-read the fresh addr from control.json and retry ONCE;
             // `refresh_addr` returns Some only when the addr actually changed, so a
             // normal app-level error is surfaced unchanged (no pointless retry).
             Err(e) => match ep.refresh_addr() {
-                Some(fresh) => request(&fresh, ep.token(), &command, &args),
+                Some(fresh) => request(&fresh, ep.token(), ep.host_token(), &command, &args),
                 None => Err(e),
             },
         }
@@ -389,10 +402,16 @@ pub fn install(app: &AppHandle, handshake: &control::ControlHandshake) {
     } else {
         handshake.read_token.clone()
     };
+    let host_token = if is_remote {
+        String::new()
+    } else {
+        handshake.local_host_token.clone()
+    };
     let endpoint = Arc::new(ControlEndpoint {
         addr: RwLock::new(addr),
         token,
         read_token,
+        host_token,
         refresh_path,
     });
     app.manage(endpoint.clone());
@@ -441,6 +460,7 @@ mod tests {
             pid: 1,
             protocol_version: PROTOCOL_VERSION,
             local_control_token: "full-control".into(),
+            local_host_token: "host-only".into(),
         }
     }
 
@@ -521,6 +541,7 @@ mod tests {
             addr: RwLock::new("127.0.0.1:6000".into()),
             token: "full-control".into(),
             read_token: "read-only".into(),
+            host_token: "host".into(),
             refresh_path: Some(cj.clone()),
         };
         assert_eq!(ep.addr(), "127.0.0.1:6000");
@@ -546,6 +567,7 @@ mod tests {
             addr: RwLock::new("10.0.0.9:8787".into()),
             token: "remote-secret".into(),
             read_token: String::new(),
+            host_token: String::new(),
             refresh_path: None,
         };
         assert_eq!(remote_ep.refresh_addr(), None);

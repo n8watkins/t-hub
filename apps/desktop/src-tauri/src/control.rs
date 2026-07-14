@@ -80,6 +80,10 @@ pub struct ControlRequest {
     /// `#[serde(default)]` so every pre-Phase-3 client keeps working unchanged.
     #[serde(default)]
     pub session: String,
+    /// In-process-only proof that this request came through the local Tauri shim.
+    /// Never published or injected into terminal sessions.
+    #[serde(default)]
+    pub host: String,
     /// Wire protocol version the client speaks (server-split M2b). Absent for the
     /// MCP / any legacy client (then unchecked, for backward compatibility); when
     /// present it must be `<=` [`PROTOCOL_VERSION`] or the server rejects the request.
@@ -199,6 +203,9 @@ pub struct ControlHandshake {
     /// hardening); `#[serde(default)]` keeps older handshake files/readers parseable.
     #[serde(skip_serializing, default)]
     pub local_control_token: String,
+    /// In-process-only origin credential for the local Tauri request shim.
+    #[serde(skip_serializing, default)]
+    pub local_host_token: String,
 }
 
 /// A sink that delivers an Organization-tier UI mutation to the frontend. The
@@ -1056,6 +1063,25 @@ pub struct FleetIdentity {
 /// references and call sites read unchanged.
 pub type CaptainRecord = FleetIdentity;
 
+#[derive(Debug)]
+enum SnapshotReadError {
+    Invalid(String),
+    UnsupportedSchema { path: PathBuf, version: u32 },
+}
+
+impl std::fmt::Display for SnapshotReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::UnsupportedSchema { path, version } => write!(
+                f,
+                "'{}' uses unsupported schemaVersion {version}",
+                path.display()
+            ),
+        }
+    }
+}
+
 /// What a [`CaptainsRegistry::claim`] resolved to - for the audit/telemetry trail
 /// (D6: orphan/rebind lifecycle is surfaced, never silent). Distinguishes a fresh
 /// claim from an idempotent refresh, an orphan/vacant re-adoption, and a
@@ -1177,6 +1203,9 @@ pub struct CaptainsRegistry {
     provision: Mutex<()>,
     /// Persistence target; `None` = in-memory only (unit tests / headless proofs).
     path: Option<PathBuf>,
+    /// Set when a newer on-disk schema is encountered. The old binary may expose
+    /// no state, but it must never overwrite or quarantine the newer registry.
+    write_blocked: Option<String>,
     /// Serializes disk write-throughs WITHOUT holding `inner`, guarding the last
     /// revision that reached disk so an out-of-order write (a slower older
     /// snapshot racing a newer one after both dropped `inner`) can never regress
@@ -1224,6 +1253,7 @@ impl CaptainsRegistry {
             mutation: Mutex::new(()),
             provision: Mutex::new(()),
             path: None,
+            write_blocked: None,
             persist: Mutex::new(0),
             #[cfg(test)]
             persist_hook: Mutex::new(None),
@@ -1245,23 +1275,32 @@ impl CaptainsRegistry {
         } else {
             Self::read_snapshot(&path)
         };
-        let recovered_from_backup = primary.is_err() && backup.exists();
-        let loaded = primary.or_else(|primary_error| {
-            let backup_snapshot = Self::read_snapshot(&backup).map_err(|backup_error| {
-                format!(
-                    "captains registry primary failed ({primary_error}); backup failed ({backup_error})"
-                )
-            });
-            if backup_snapshot.is_err() && path.exists() {
-                let quarantine = path.with_extension(format!("json.corrupt.{}", now_ms()));
-                let _ = std::fs::rename(&path, &quarantine);
-                eprintln!(
-                    "t-hub-control: captains registry was quarantined at '{}': {primary_error}",
-                    quarantine.display()
-                );
+        let mut recovered_from_backup = false;
+        let mut write_blocked = None;
+        let loaded = match primary {
+            Err(primary_error @ SnapshotReadError::UnsupportedSchema { .. }) => {
+                write_blocked = Some(primary_error.to_string());
+                Err(primary_error)
             }
-            backup_snapshot
-        });
+            Ok(snapshot) => Ok(snapshot),
+            Err(primary_error) => {
+                let backup_snapshot = Self::read_snapshot(&backup).map_err(|backup_error| {
+                    SnapshotReadError::Invalid(format!(
+                        "captains registry primary failed ({primary_error}); backup failed ({backup_error})"
+                    ))
+                });
+                recovered_from_backup = backup_snapshot.is_ok();
+                if backup_snapshot.is_err() && path.exists() {
+                    let quarantine = path.with_extension(format!("json.corrupt.{}", now_ms()));
+                    let _ = std::fs::rename(&path, &quarantine);
+                    eprintln!(
+                        "t-hub-control: captains registry was quarantined at '{}': {primary_error}",
+                        quarantine.display()
+                    );
+                }
+                backup_snapshot
+            }
+        };
         if recovered_from_backup {
             if path.exists() {
                 let quarantine = path.with_extension(format!("json.corrupt.{}", now_ms()));
@@ -1307,25 +1346,88 @@ impl CaptainsRegistry {
             mutation: Mutex::new(()),
             provision: Mutex::new(()),
             path: Some(path),
+            write_blocked,
             persist: Mutex::new(loaded_seq),
             #[cfg(test)]
             persist_hook: Mutex::new(None),
         }
     }
 
-    fn read_snapshot(path: &Path) -> Result<CaptainsSnapshot, String> {
-        let body = std::fs::read_to_string(path)
-            .map_err(|error| format!("'{}' could not be read: {error}", path.display()))?;
-        let snapshot: CaptainsSnapshot = serde_json::from_str(&body)
-            .map_err(|error| format!("'{}' is invalid JSON: {error}", path.display()))?;
+    fn read_snapshot(path: &Path) -> Result<CaptainsSnapshot, SnapshotReadError> {
+        let body = std::fs::read_to_string(path).map_err(|error| {
+            SnapshotReadError::Invalid(format!("'{}' could not be read: {error}", path.display()))
+        })?;
+        let snapshot: CaptainsSnapshot = serde_json::from_str(&body).map_err(|error| {
+            SnapshotReadError::Invalid(format!("'{}' is invalid JSON: {error}", path.display()))
+        })?;
         if snapshot.schema_version > CAPTAINS_SCHEMA_VERSION {
-            return Err(format!(
-                "'{}' uses unsupported schemaVersion {}",
-                path.display(),
-                snapshot.schema_version
-            ));
+            return Err(SnapshotReadError::UnsupportedSchema {
+                path: path.to_path_buf(),
+                version: snapshot.schema_version,
+            });
         }
+        Self::validate_snapshot(&snapshot).map_err(SnapshotReadError::Invalid)?;
         Ok(snapshot)
+    }
+
+    fn validate_snapshot(snapshot: &CaptainsSnapshot) -> Result<(), String> {
+        let mut project_ids = std::collections::HashSet::new();
+        let mut roots = std::collections::HashSet::new();
+        for project in &snapshot.projects {
+            if project.project_id.trim().is_empty()
+                || !project_ids.insert(project.project_id.as_str())
+            {
+                return Err("captains registry contains an empty or duplicate projectId".into());
+            }
+            if project.repo_root.trim().is_empty() || !roots.insert(project.repo_root.as_str()) {
+                return Err("captains registry contains an empty or duplicate repoRoot".into());
+            }
+        }
+        let mut ships = std::collections::HashSet::new();
+        let mut terminals = std::collections::HashSet::new();
+        let mut bound_projects = std::collections::HashSet::new();
+        let mut cortana_count = 0;
+        for captain in &snapshot.captains {
+            if captain.ship_slug.trim().is_empty() || !ships.insert(captain.ship_slug.as_str()) {
+                return Err("captains registry contains an empty or duplicate shipSlug".into());
+            }
+            if captain.role == FleetRole::Cortana {
+                cortana_count += 1;
+                if cortana_count > 1 {
+                    return Err("captains registry contains multiple Cortana records".into());
+                }
+            }
+            if snapshot.schema_version >= CAPTAINS_SCHEMA_VERSION
+                && ((captain.role == FleetRole::Cortana) != (captain.ship_slug == CORTANA_SLUG))
+            {
+                return Err(
+                    "captains registry must use the reserved Cortana role and slug together".into(),
+                );
+            }
+            if let Some(terminal) = captain.terminal_id.as_deref() {
+                if terminal.trim().is_empty() || !terminals.insert(terminal) {
+                    return Err("captains registry assigns one terminal more than once".into());
+                }
+            }
+            if let Some(project_id) = captain.project_id.as_deref() {
+                if !project_ids.contains(project_id) {
+                    return Err(format!(
+                        "Captain references unknown projectId '{project_id}'"
+                    ));
+                }
+                if !bound_projects.insert(project_id) {
+                    return Err(format!("project '{project_id}' has multiple Captains"));
+                }
+            }
+            for crew in &captain.crew {
+                if crew.terminal_id.trim().is_empty()
+                    || !terminals.insert(crew.terminal_id.as_str())
+                {
+                    return Err("captains registry assigns one terminal more than once".into());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, CaptainsInner> {
@@ -1417,6 +1519,11 @@ impl CaptainsRegistry {
     /// MOVEFILE_REPLACE_EXISTING), so a reader/loader always sees either the old
     /// complete file or the new complete file, never a partial one.
     fn persist(&self, snap: CaptainsSnapshot) -> Result<(), String> {
+        if let Some(reason) = &self.write_blocked {
+            return Err(format!(
+                "captains registry is read-only until T-Hub is upgraded: {reason}"
+            ));
+        }
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -2908,6 +3015,9 @@ pub struct ControlContext {
     /// Empty when unconfigured (headless tests) — an empty read token authorizes
     /// nothing (guarded in [`resolve_capability`]).
     read_token: String,
+    /// Secret known only to the in-process Tauri transport. It distinguishes the
+    /// trusted UI from a terminal that merely possesses the shared control token.
+    host_token: String,
     /// The loopback address the listener bound to (`127.0.0.1:<port>`), set in
     /// [`start`] after bind. Injected (with a capability token) into the
     /// environment of spawned sessions so their in-session MCP/clients authenticate
@@ -3320,6 +3430,7 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
         // takes its credential from here to keep terminal attach working while
         // `control.json` still withholds full power from external scrapers.
         local_control_token: ctx.token.clone(),
+        local_host_token: ctx.host_token.clone(),
     };
     write_handshake(&handshake)?;
 
@@ -4467,8 +4578,11 @@ fn enforce_session_access(
     })
 }
 
-fn caller_is_apex(caller: Option<&ResolvedIdentity>) -> bool {
-    let Some(caller) = caller else { return true };
+fn caller_is_apex(caller: Option<&ResolvedIdentity>, trusted_internal: bool) -> bool {
+    if trusted_internal {
+        return true;
+    }
+    let Some(caller) = caller else { return false };
     caller.fleet_role == Some(FleetRole::Cortana)
         || matches!(
             caller.mint_role,
@@ -4478,9 +4592,10 @@ fn caller_is_apex(caller: Option<&ResolvedIdentity>) -> bool {
 
 fn enforce_ship_authority(
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
     ship_slug: &str,
 ) -> Result<(), String> {
-    if caller_is_apex(caller) {
+    if caller_is_apex(caller, trusted_internal) {
         return Ok(());
     }
     let caller = caller.expect("non-apex caller must be identified");
@@ -4496,11 +4611,15 @@ fn enforce_ship_authority(
 
 fn enforce_attach_authority(
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
     target_terminal: &str,
-    _ship_slug: &str,
+    role: FleetRole,
 ) -> Result<(), String> {
-    if caller_is_apex(caller) {
+    if caller_is_apex(caller, trusted_internal) {
         return Ok(());
+    }
+    if role == FleetRole::Cortana {
+        return Err("acl: only General/Cortana may assign the Cortana role or slug".into());
     }
     let caller = caller.expect("non-apex caller must be identified");
     if caller.tile.as_deref() != Some(target_terminal) {
@@ -4511,6 +4630,78 @@ fn enforce_attach_authority(
     // Crew session cannot use this path. Once attached, registry resolution promotes
     // the caller to Captain and subsequent lifecycle operations require its same ship.
     Ok(())
+}
+
+fn require_socket_identity(
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    command: &str,
+) -> Result<(), String> {
+    if trusted_internal || caller.is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "acl: '{command}' requires a valid T_HUB_SESSION_TOKEN over the control socket"
+        ))
+    }
+}
+
+fn enforce_target_lifecycle_authority(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    target_terminal: &str,
+) -> Result<(), String> {
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(());
+    }
+    let caller = caller.ok_or("acl: lifecycle mutation requires a session identity")?;
+    if caller.tile.as_deref() == Some(target_terminal) {
+        return Ok(());
+    }
+    let target_ship = ctx.captains.ship_of(target_terminal);
+    if caller.fleet_role == Some(FleetRole::Captain)
+        && target_ship
+            .as_ref()
+            .is_some_and(|target| caller.ship_slug.as_deref() == Some(target.ship_slug()))
+        && matches!(target_ship, Some(ShipMembership::Crew { .. }))
+    {
+        return Ok(());
+    }
+    Err(
+        "acl: only General/Cortana, the target session, or its Captain may mutate this lifecycle"
+            .into(),
+    )
+}
+
+fn enforce_project_authority(
+    ctx: &ControlContext,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    project_id: Option<&str>,
+) -> Result<(), String> {
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(());
+    }
+    let caller = caller.ok_or("acl: project mutation requires a session identity")?;
+    let Some(project_id) = project_id else {
+        return Err("acl: only General/Cortana may register a new project".into());
+    };
+    let owner = ctx
+        .captains
+        .snapshot()
+        .captains
+        .into_iter()
+        .find(|captain| captain.project_id.as_deref() == Some(project_id));
+    if caller.fleet_role == Some(FleetRole::Captain)
+        && owner
+            .as_ref()
+            .is_some_and(|owner| caller.ship_slug.as_deref() == Some(owner.ship_slug.as_str()))
+    {
+        Ok(())
+    } else {
+        Err("acl: project mutation requires General/Cortana or the owning Captain".into())
+    }
 }
 
 /// Whether the pre-item-3 fail-OPEN spawn default is restored (instant rollback,
@@ -4861,6 +5052,8 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     // (`resolve_identity` is not authorization); the per-command ACL wiring consumes it.
     // A control-token HOST (no session token) resolves to `None`.
     let caller = resolve_identity(ctx, &req.session);
+    let trusted_internal =
+        ctx.peer_is_loopback && !req.host.is_empty() && ct_token_eq(&req.host, &ctx.host_token);
 
     // item-3 §2.4: the effective tier is args-refined - an UNSCOPED `inbox_status`
     // (fleet-wide enumeration) is Organization even though its base tier is Read.
@@ -4980,7 +5173,14 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     // retry replays exactly this result. `finish` returns the outcome back. The caller
     // identity resolved above is threaded in so the per-command ACL wiring can enforce
     // the enqueue/access/ack cells against an unforgeable-across-sessions identity.
-    let outcome = dispatch_with_caller(ctx, &req.command, &req.args, caller.as_ref(), cap);
+    let outcome = dispatch_with_caller(
+        ctx,
+        &req.command,
+        &req.args,
+        caller.as_ref(),
+        trusted_internal,
+        cap,
+    );
     let outcome = match &request_id {
         Some(id) => ctx.requests.finish(id, outcome),
         None => outcome,
@@ -5208,6 +5408,7 @@ fn rebind_control(ctx: &ControlContext) -> Result<Value, String> {
         pid: std::process::id(),
         protocol_version: PROTOCOL_VERSION,
         local_control_token: ctx.token.clone(),
+        local_host_token: ctx.host_token.clone(),
     };
     if let Err(e) = write_handshake(&handshake) {
         // Roll back to a fully-consistent old state: retire the just-spawned listener
@@ -5249,7 +5450,7 @@ fn rebind_control(ctx: &ControlContext) -> Result<Value, String> {
 /// dispatch tests read unchanged; the Phase-3 ACL tests call `dispatch_with_caller`.
 #[cfg(test)]
 fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, String> {
-    dispatch_with_caller(ctx, command, args, None, Capability::Full)
+    dispatch_with_caller(ctx, command, args, None, true, Capability::Full)
 }
 
 fn dispatch_with_caller(
@@ -5260,6 +5461,7 @@ fn dispatch_with_caller(
     // host that presented no session token), and its resolved tier capability. The ACL
     // wiring for the enqueue/access/ack cells consumes both.
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
     cap: Capability,
 ) -> Result<Value, String> {
     match command {
@@ -5348,14 +5550,14 @@ fn dispatch_with_caller(
         // scanned catalog into projects-archive (reversible). App-initiated from
         // the sidebar; filesystem-mutating like the worktree ops above.
         "archive_recent_project" => archive_recent_project(args),
-        "register_project" => register_project(ctx, args),
-        "bind_project_powder" => bind_project_powder(ctx, args),
+        "register_project" => register_project(ctx, args, caller, trusted_internal),
+        "bind_project_powder" => bind_project_powder(ctx, args, caller, trusted_internal),
         // Captain-chat phase 2: captaincy is a SERVER mutation (audited) - the
         // UI's pin action and an MCP captain's self-registration both land here,
         // and every mutation forwards the authoritative captains snapshot.
-        "claim_captain" => claim_captain(ctx, args, caller),
-        "release_captain" => release_captain(ctx, args, caller),
-        "captain_checkpoint" => captain_checkpoint(ctx, args, caller),
+        "claim_captain" => claim_captain(ctx, args, caller, trusted_internal),
+        "release_captain" => release_captain(ctx, args, caller, trusted_internal),
+        "captain_checkpoint" => captain_checkpoint(ctx, args, caller, trusted_internal),
         // Orchestrator wake: arm/disarm a server-side push that re-invokes the
         // orchestrator's loop when a watched session goes idle / needs-input /
         // completes. Organization tier (audited); the wake itself injects via the
@@ -5380,10 +5582,10 @@ fn dispatch_with_caller(
         // session — execute directly against tmux (they only act on a `th_*`
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args),
-        "commission_captain" => commission_captain(ctx, args, caller),
-        "attach_captain" => attach_captain(ctx, args, caller),
-        "dispatch_crew" => dispatch_crew(ctx, args, caller),
-        "heartbeat_crew_powder" => heartbeat_crew_powder(ctx, args),
+        "commission_captain" => commission_captain(ctx, args, caller, trusted_internal),
+        "attach_captain" => attach_captain(ctx, args, caller, trusted_internal),
+        "dispatch_crew" => dispatch_crew(ctx, args, caller, trusted_internal),
+        "heartbeat_crew_powder" => heartbeat_crew_powder(ctx, args, caller, trusted_internal),
         // comms-plane Phase 1: `send_text`/`send_keys` are DEMOTED to audited
         // break-glass. They still execute (H2: demote, not deny) but every use is
         // marked loudly, because the primary automation path is now the plane
@@ -5407,7 +5609,7 @@ fn dispatch_with_caller(
             mark_break_glass(ctx, "send_keys", args);
             send_keys(args)
         }
-        "close_terminal" => close_terminal(ctx, args),
+        "close_terminal" => close_terminal_authorized(ctx, args, caller, trusted_internal),
         // Comms-plane Phase 3: the ABORT/interrupt-subordinate primitive (§2.7 R-H3). A
         // preempt CONTROL signal (an Escape interrupt), NOT a queued input message, so it
         // cannot be typed over or corrupt a draft. Gated by `can_abort` (Cortana->captain,
@@ -5986,7 +6188,13 @@ fn list_projects(ctx: &ControlContext) -> Result<Value, String> {
 
 /// Register an existing Git repository using its canonical main-worktree root.
 /// Re-registering the same root updates metadata while preserving its project id.
-fn register_project(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn register_project(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "register_project")?;
     let requested_root = arg_str(args, "repoRoot")
         .or_else(|| arg_str(args, "repo_root"))
         .ok_or("register_project requires a 'repoRoot' argument")?;
@@ -6013,13 +6221,19 @@ fn register_project(ctx: &ControlContext, args: &Value) -> Result<Value, String>
         .projects()
         .into_iter()
         .find(|project| project.repo_root == repo_root);
+    enforce_project_authority(
+        ctx,
+        caller,
+        trusted_internal,
+        existing.as_ref().map(|project| project.project_id.as_str()),
+    )?;
     let powder_repository =
         arg_str(args, "powderRepository").or_else(|| arg_str(args, "powder_repository"));
     let powder = if let Some(repository) = powder_repository {
         let connection_profile = arg_str(args, "powderConnectionProfile")
             .or_else(|| arg_str(args, "powder_connection_profile"))
             .unwrap_or_else(default_powder_profile);
-        validate_powder_repository(&connection_profile, &repository, args)?;
+        let repository = validate_powder_repository(&connection_profile, &repository, args)?;
         let matching_binding = existing
             .as_ref()
             .and_then(|project| project.powder.as_ref())
@@ -6057,7 +6271,13 @@ fn register_project(ctx: &ControlContext, args: &Value) -> Result<Value, String>
 /// Attach a registered project to its canonical Powder repository. Endpoint
 /// credentials remain outside this registry; only the protected profile name is
 /// persisted with the mapping.
-fn bind_project_powder(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn bind_project_powder(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "bind_project_powder")?;
     let project_id = arg_str(args, "projectId")
         .or_else(|| arg_str(args, "project_id"))
         .ok_or("bind_project_powder requires a 'projectId' argument")?;
@@ -6069,10 +6289,11 @@ fn bind_project_powder(ctx: &ControlContext, args: &Value) -> Result<Value, Stri
         .into_iter()
         .find(|project| project.project_id == project_id)
         .ok_or_else(|| format!("bind_project_powder: unknown projectId '{project_id}'"))?;
+    enforce_project_authority(ctx, caller, trusted_internal, Some(&project_id))?;
     let connection_profile = arg_str(args, "connectionProfile")
         .or_else(|| arg_str(args, "connection_profile"))
         .unwrap_or_else(default_powder_profile);
-    validate_powder_repository(&connection_profile, &repository, args)?;
+    let repository = validate_powder_repository(&connection_profile, &repository, args)?;
     let matching_binding = project.powder.as_ref().filter(|binding| {
         binding.connection_profile == connection_profile && binding.repository == repository
     });
@@ -6100,9 +6321,16 @@ fn validate_powder_repository(
     connection_profile: &str,
     repository: &str,
     _args: &Value,
-) -> Result<(), String> {
+) -> Result<String, String> {
     if repository.trim().is_empty() {
         return Err("Powder repository must not be empty".into());
+    }
+    #[cfg(test)]
+    if let Some(canonical) = _args
+        .get("testCanonicalPowderRepository")
+        .and_then(Value::as_str)
+    {
+        return Ok(canonical.trim().to_string());
     }
     #[cfg(test)]
     if _args
@@ -6111,13 +6339,19 @@ fn validate_powder_repository(
         .unwrap_or(false)
         || _args.get("testInitialEventCursor").is_some()
     {
-        return Ok(());
+        return Ok(repository.trim().to_string());
     }
     let client = powder::Client::from_profile(connection_profile)?;
     client.health()?;
     client.authorization_probe()?;
-    client.get_repository(repository)?;
-    Ok(())
+    let resolved = client.get_repository(repository)?;
+    resolved
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Powder repository response has no canonical name".to_string())
 }
 
 fn resolve_bootstrap_context(
@@ -6303,6 +6537,11 @@ fn trusted_provider_session_id(
             ));
         }
     }
+    if runtime.is_none() && presented.is_some() {
+        return Err(format!(
+            "providerSessionId cannot be trusted because the {provider} runtime has not reported an identity"
+        ));
+    }
     Ok(runtime.or(presented))
 }
 
@@ -6312,8 +6551,10 @@ fn commission_captain(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
 ) -> Result<Value, String> {
-    if !caller_is_apex(caller) {
+    require_socket_identity(caller, trusted_internal, "commission_captain")?;
+    if !caller_is_apex(caller, trusted_internal) {
         return Err("acl: only General/Cortana may commission a project Captain".into());
     }
     let project_id = arg_str(args, "projectId")
@@ -6483,6 +6724,7 @@ fn commission_captain(
             "workspaceTabIds": workspace_tab_ids,
         }),
         None,
+        true,
     );
     if let Err(error) = claim {
         let _ = close_terminal(ctx, &json!({ "sessionId": terminal_id }));
@@ -6529,13 +6771,15 @@ fn attach_captain(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
 ) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "attach_captain")?;
     let terminal_id = arg_str(args, "captainSessionId")
         .or_else(|| arg_str(args, "captain_session_id"))
         .or_else(|| arg_str(args, "sessionId"))
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("attach_captain requires a 'captainSessionId' argument")?;
-    if !caller_is_apex(caller)
+    if !caller_is_apex(caller, trusted_internal)
         && caller.and_then(|identity| identity.tile.as_deref()) != Some(terminal_id.as_str())
     {
         return Err("acl: only General/Cortana may attach a different terminal as Captain".into());
@@ -6605,7 +6849,7 @@ fn attach_captain(
         .map(|value| slugify_ship(&value))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| slugify_ship(&project.name));
-    enforce_attach_authority(caller, &terminal_id, &ship_slug)?;
+    enforce_attach_authority(caller, trusted_internal, &terminal_id, FleetRole::Captain)?;
     let powder_binding = project.powder.as_ref().ok_or_else(|| {
         format!(
             "attach_captain: project '{}' must be bound to Powder before attachment",
@@ -6687,7 +6931,7 @@ fn attach_captain(
             captain.terminal_id.as_deref() == Some(terminal_id.as_str())
                 || captain.ship_slug == ship_slug
         });
-    claim_captain(ctx, &claim_args, None)?;
+    claim_captain(ctx, &claim_args, None, true)?;
     let claimed = ctx
         .captains
         .captain_for_session(&terminal_id)
@@ -6726,6 +6970,9 @@ fn attach_captain(
             let rollback =
                 ctx.captains
                     .rollback_provisioned_claim(&terminal_id, &captain, previous_claim);
+            if rollback.is_ok() {
+                let _ = captains_sync_apply(ctx);
+            }
             return Err(format!(
                 "attach_captain: target bootstrap delivery failed: {error}{}",
                 rollback
@@ -6929,9 +7176,11 @@ fn dispatch_crew(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
 ) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "dispatch_crew")?;
     let (captain, project) = captain_and_project_for_dispatch(ctx, args)?;
-    enforce_ship_authority(caller, &captain.ship_slug)?;
+    enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
     let captain_session_id = captain.terminal_id.as_deref().unwrap().to_string();
     let binding = project.powder.as_ref().ok_or_else(|| {
         format!(
@@ -6968,14 +7217,20 @@ fn dispatch_crew(
         .unwrap_or(3600)
         .clamp(300, 86_400);
     let client = powder::Client::from_profile(&binding.connection_profile)?;
+    let canonical_repository = client
+        .get_repository(&binding.repository)?
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or("dispatch_crew: Powder repository response has no canonical name")?;
     let card = client.get_card(&card_id)?;
     let card_repo = card["repo"].as_str().ok_or_else(|| {
         format!("dispatch_crew: Powder card '{card_id}' has no repository mapping")
     })?;
-    if card_repo != binding.repository {
+    if card_repo != canonical_repository {
         return Err(format!(
             "dispatch_crew: Powder card '{card_id}' belongs to repository '{card_repo}', not '{}'",
-            binding.repository
+            canonical_repository
         ));
     }
 
@@ -7132,21 +7387,37 @@ fn crew_powder_context(
     Ok((client, authoritative))
 }
 
-fn heartbeat_crew_powder(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+fn heartbeat_crew_powder(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "heartbeat_crew_powder")?;
     let crew_session_id = arg_str(args, "crewSessionId")
         .or_else(|| arg_str(args, "crew_session_id"))
         .or_else(|| arg_str(args, "sessionId"))
         .ok_or("heartbeat_crew_powder requires a 'crewSessionId' argument")?;
-    let crew_harness = ctx
+    let (crew_harness, crew_ship) = ctx
         .captains
         .snapshot()
         .captains
-        .iter()
-        .flat_map(|captain| captain.crew.iter())
-        .find(|crew| crew.terminal_id == crew_session_id)
-        .and_then(|crew| crew.harness.as_deref())
-        .map(str::to_string)
+        .into_iter()
+        .find_map(|captain| {
+            captain
+                .crew
+                .iter()
+                .find(|crew| crew.terminal_id == crew_session_id)
+                .and_then(|crew| {
+                    crew.harness
+                        .as_ref()
+                        .map(|harness| (harness.clone(), captain.ship_slug.clone()))
+                })
+        })
         .ok_or_else(|| format!("Crew session '{crew_session_id}' has no recorded harness"))?;
+    if caller.and_then(|identity| identity.tile.as_deref()) != Some(crew_session_id.as_str()) {
+        enforce_ship_authority(caller, trusted_internal, &crew_ship)?;
+    }
     match tmux::harness_liveness(&tmux_target(&crew_session_id), &crew_harness) {
         tmux::SessionLiveness::Alive => {}
         tmux::SessionLiveness::Gone => {
@@ -8431,7 +8702,9 @@ fn captain_checkpoint(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
 ) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "captain_checkpoint")?;
     let captain_session_id =
         arg_str(args, "captainSessionId").or_else(|| arg_str(args, "captain_session_id"));
     let ship_slug = arg_str(args, "shipSlug").or_else(|| arg_str(args, "ship_slug"));
@@ -8457,7 +8730,7 @@ fn captain_checkpoint(
         .as_deref()
         .or(captain.terminal_id.as_deref())
         .ok_or("captain_checkpoint: Captain has no active terminal")?;
-    enforce_session_access(ctx, caller, target)?;
+    enforce_target_lifecycle_authority(ctx, caller, trusted_internal, target)?;
 
     let captain = ctx.captains.checkpoint(
         captain_session_id.as_deref(),
@@ -8492,7 +8765,9 @@ fn claim_captain(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
 ) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "claim_captain")?;
     let captain_session_id = arg_str(args, "captainSessionId")
         .or_else(|| arg_str(args, "captain_session_id"))
         .or_else(|| arg_str(args, "sessionId"))
@@ -8508,15 +8783,7 @@ fn claim_captain(
         }
         _ => FleetRole::Captain,
     };
-    let authority_slug = match role {
-        FleetRole::Cortana => CORTANA_SLUG.to_string(),
-        FleetRole::Captain => ship_slug
-            .as_deref()
-            .map(slugify_ship)
-            .filter(|slug| !slug.is_empty())
-            .unwrap_or_else(|| slugify_ship(&format!("ship-{captain_session_id}"))),
-    };
-    enforce_attach_authority(caller, &captain_session_id, &authority_slug)?;
+    enforce_attach_authority(caller, trusted_internal, &captain_session_id, role)?;
     // Liveness: refuse a claim for a session with no live terminal, so a bogus
     // or raced id can never be persisted into captains.json to linger forever.
     // De-conflation (spawn-wedge): only a DEFINITIVE `Gone` rejects; an `Unknown`
@@ -8547,13 +8814,32 @@ fn claim_captain(
         .captains
         .captain_for_session(&captain_session_id)
         .and_then(|captain| captain.provider.or(captain.harness));
+    let runtime_provider = detected_harness(&captain_session_id);
+    if let Some(requested) = requested_provider.as_deref() {
+        if runtime_provider.as_deref() != Some(requested) {
+            return Err(format!(
+                "claim_captain: declared provider '{requested}' does not match a live harness in terminal '{captain_session_id}'"
+            ));
+        }
+    }
     let provider = requested_provider
-        .or_else(|| detected_harness(&captain_session_id))
+        .or(runtime_provider)
         .or(existing_provider)
-        .unwrap_or_else(|| "claude".into());
+        .ok_or_else(|| {
+            format!(
+                "claim_captain: no supported harness is live in terminal '{captain_session_id}'"
+            )
+        })?;
     if provider != "claude" && provider != "codex" {
         return Err(format!(
             "claim_captain: unsupported provider '{provider}' (expected 'codex' or 'claude')"
+        ));
+    }
+    if tmux::harness_liveness(&tmux_target(&captain_session_id), &provider)
+        != tmux::SessionLiveness::Alive
+    {
+        return Err(format!(
+            "claim_captain: provider '{provider}' is not verifiably live in terminal '{captain_session_id}'"
         ));
     }
     let presented_provider_session_id = arg_str(args, "providerSessionId")
@@ -8656,7 +8942,9 @@ fn release_captain(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
 ) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "release_captain")?;
     let target = arg_str(args, "captainSessionId")
         .or_else(|| arg_str(args, "captain_session_id"))
         .or_else(|| arg_str(args, "sessionId"))
@@ -8674,7 +8962,7 @@ fn release_captain(
                 || captain.ship_slug == slugify_ship(&target)
         })
         .ok_or_else(|| format!("release_captain: no claim matches '{target}'"))?;
-    enforce_ship_authority(caller, &record.ship_slug)?;
+    enforce_ship_authority(caller, trusted_internal, &record.ship_slug)?;
     let released = ctx.captains.release(&target)?;
     let applied = captains_sync_apply(ctx);
     let snap = ctx.captains.snapshot();
@@ -9320,6 +9608,20 @@ fn plan_close(
 /// normal close reaps a confirmed-`Alive` session cleanly and refuses on `Unknown`.
 /// If a forced close is refused, the re-probe confirmed the tile LIVE - investigate,
 /// do not re-force.
+fn close_terminal_authorized(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "close_terminal")?;
+    let target = arg_str(args, "sessionId")
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("close_terminal requires a 'sessionId' argument")?;
+    enforce_target_lifecycle_authority(ctx, caller, trusted_internal, &target)?;
+    close_terminal(ctx, args)
+}
+
 fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     close_terminal_with_policy(ctx, args, false)
 }
@@ -9591,6 +9893,11 @@ impl ControlContext {
             peer_is_loopback: true,
             token,
             read_token: String::new(),
+            host_token: format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
             addr: String::new(),
             governor: Arc::new(SpawnGovernor::from_env()),
             audit: Arc::new(AuditLog::from_env()),
@@ -9754,9 +10061,12 @@ mod tests {
         let audit_dir = std::env::temp_dir().join(format!("t-hub-ctl-test-{token}"));
         // A known read token so capability tests can present it; distinct from the
         // control token so ReadOnly vs Full resolution is exercised.
-        ControlContext::new(Arc::new(StatusBridge::new()), visitor, token.to_string())
-            .with_read_token(format!("read-{token}"))
-            .with_audit(Arc::new(crate::audit::AuditLog::new(audit_dir)))
+        let mut ctx =
+            ControlContext::new(Arc::new(StatusBridge::new()), visitor, token.to_string())
+                .with_read_token(format!("read-{token}"))
+                .with_audit(Arc::new(crate::audit::AuditLog::new(audit_dir)));
+        ctx.host_token = token.to_string();
+        ctx
     }
 
     fn test_harness_command(harness: &str) -> (std::path::PathBuf, String) {
@@ -9780,6 +10090,7 @@ mod tests {
             command: "list_tabs".into(),
             args: Value::Null,
             session: String::new(),
+            host: String::new(),
             v: None,
         };
         let resp = dispatch_authenticated(&ctx, req);
@@ -9795,6 +10106,7 @@ mod tests {
             command: "list_tabs".into(),
             args: Value::Null,
             session: String::new(),
+            host: "secret".into(),
             v: None,
         };
         let resp = dispatch_authenticated(&ctx, req);
@@ -11885,6 +12197,7 @@ mod tests {
             pid: 42,
             protocol_version: PROTOCOL_VERSION,
             local_control_token: "full".into(),
+            local_host_token: "host".into(),
         };
         let s = serde_json::to_string(&h).unwrap();
         let back: ControlHandshake = serde_json::from_str(&s).unwrap();
@@ -13354,6 +13667,88 @@ mod tests {
     }
 
     #[test]
+    fn future_registry_schema_is_preserved_and_blocks_writes() {
+        let path = captains_tmp("future-schema");
+        let body = json!({
+            "schemaVersion": CAPTAINS_SCHEMA_VERSION + 1,
+            "seq": 99,
+            "captains": [],
+            "projects": [],
+            "futureField": {"must": "survive"},
+        })
+        .to_string();
+        std::fs::write(&path, &body).unwrap();
+
+        let registry = CaptainsRegistry::load(path.clone());
+        assert!(registry.write_blocked.is_some());
+        let error = registry
+            .claim_test("cap-future", Some("future"), vec![])
+            .unwrap_err();
+        assert!(error.contains("read-only"), "got: {error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+
+        let prefix = format!("{}.corrupt.", path.file_name().unwrap().to_string_lossy());
+        let quarantined = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix));
+        assert!(!quarantined, "future schemas must never be quarantined");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn semantic_registry_corruption_recovers_from_validated_backup() {
+        let path = captains_tmp("semantic-corruption");
+        let backup = path.with_extension("json.bak");
+        let invalid = json!({
+            "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+            "seq": 2,
+            "captains": [],
+            "projects": [
+                {
+                    "projectId": "duplicate",
+                    "name": "One",
+                    "repoRoot": "/tmp/one",
+                    "createdAt": 0,
+                    "updatedAt": 0
+                },
+                {
+                    "projectId": "duplicate",
+                    "name": "Two",
+                    "repoRoot": "/tmp/two",
+                    "createdAt": 0,
+                    "updatedAt": 0
+                }
+            ]
+        });
+        let valid = CaptainsSnapshot {
+            schema_version: CAPTAINS_SCHEMA_VERSION,
+            seq: 1,
+            captains: vec![],
+            projects: vec![],
+        };
+        std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        std::fs::write(&backup, serde_json::to_vec(&valid).unwrap()).unwrap();
+
+        let registry = CaptainsRegistry::load(path.clone());
+        let restored = registry.snapshot();
+        assert_eq!(restored.seq, valid.seq);
+        assert!(restored.captains.is_empty());
+        assert!(restored.projects.is_empty());
+        assert!(!path.exists(), "invalid primary should be quarantined");
+        assert!(backup.exists());
+
+        let prefix = format!("{}.corrupt.", path.file_name().unwrap().to_string_lossy());
+        let quarantined = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .expect("semantic corruption should be quarantined");
+        let _ = std::fs::remove_file(quarantined.path());
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
     fn list_captains_returns_the_versioned_snapshot() {
         let ctx = test_ctx("secret");
         ctx.captains
@@ -13392,8 +13787,9 @@ mod tests {
             "bind_project_powder",
             &json!({
                 "projectId": project_id,
-                "repository": "t-hub-app",
+                "repository": "thub-alias",
                 "connectionProfile": "production",
+                "testCanonicalPowderRepository": "t-hub-app",
                 "testInitialEventCursor": 0
             }),
         )
@@ -13408,9 +13804,9 @@ mod tests {
             "bind_project_powder",
             &json!({
                 "projectId": project_id,
-                "repository": "t-hub-app",
+                "repository": "thub-alias",
                 "connectionProfile": "production",
-                "testSkipPowderHealth": true
+                "testCanonicalPowderRepository": "t-hub-app"
             }),
         )
         .unwrap();
@@ -13599,7 +13995,6 @@ mod tests {
                 "projectId": "project-attach",
                 "assignment": "Own stability",
                 "provider": "codex",
-                "providerSessionId": "thread-attach",
                 "testSkipPowderHealth": true,
             }),
         )
@@ -13607,7 +14002,7 @@ mod tests {
         assert_eq!(attached["accepted"], "attach_captain");
         assert_eq!(attached["capabilityPreserved"], "control");
         assert_eq!(attached["captain"]["provider"], "codex");
-        assert_eq!(attached["captain"]["providerSessionId"], "thread-attach");
+        assert!(attached["captain"].get("providerSessionId").is_none());
         assert!(attached["captain"].get("claudeUuid").is_none());
 
         let checkpoint = dispatch(
@@ -13770,6 +14165,7 @@ mod tests {
             calls: StdMutex::new(Vec::new()),
         });
         let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
         ctx.tab_registry().replace(vec![TabRecord {
             id: "tab-1".into(),
             name: "Main".into(),
@@ -13779,12 +14175,17 @@ mod tests {
         let cap_id = dispatch(
             &ctx,
             "spawn_terminal",
-            &json!({"cwd": "/tmp", "tabId": "tab-1"}),
+            &json!({
+                "cwd": "/tmp",
+                "tabId": "tab-1",
+                "startupCommand": harness_command,
+            }),
         )
         .unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
+        wait_for_harness_started(&cap_id, "codex").unwrap();
 
         // Claim with NO explicit workspaceTabIds: defaults to the tab holding
         // the captain's tile (the UI pin path sends exactly this shape).
@@ -13821,6 +14222,7 @@ mod tests {
         assert_eq!(sync_calls[1].1["sync"]["captains"], json!([]));
 
         dispatch(&ctx, "close_terminal", &json!({"sessionId": cap_id})).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
     }
 
     #[test]
@@ -13839,7 +14241,38 @@ mod tests {
                 calls: StdMutex::new(Vec::new()),
             },
         ));
-        tmux::new_session_with_env(&tmux_target(&terminal_id), "/tmp", None, &[]).unwrap();
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        tmux::new_session_with_env(
+            &tmux_target(&terminal_id),
+            "/tmp",
+            Some(&harness_command),
+            &[],
+        )
+        .unwrap();
+        wait_for_harness_started(&terminal_id, "codex").unwrap();
+
+        let mismatched_provider = dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({
+                "captainSessionId": terminal_id,
+                "provider": "claude",
+                "providerSessionId": "spoofed-claude-id",
+            }),
+        )
+        .unwrap_err();
+        assert!(mismatched_provider.contains("does not match a live harness"));
+        let spoofed_id = dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({
+                "captainSessionId": terminal_id,
+                "provider": "codex",
+                "providerSessionId": "spoofed-codex-id",
+            }),
+        )
+        .unwrap_err();
+        assert!(spoofed_id.contains("cannot be trusted"));
 
         let value = dispatch(
             &ctx,
@@ -13847,16 +14280,16 @@ mod tests {
             &json!({
                 "captainSessionId": terminal_id,
                 "provider": "codex",
-                "providerSessionId": "codex-thread-1",
             }),
         )
         .unwrap();
         assert_eq!(value["captain"]["provider"], "codex");
-        assert_eq!(value["captain"]["providerSessionId"], "codex-thread-1");
-        assert_eq!(value["captain"]["conversationId"], "codex-thread-1");
+        assert!(value["captain"].get("providerSessionId").is_none());
+        assert!(value["captain"].get("conversationId").is_none());
         assert!(value["captain"].get("claudeUuid").is_none());
 
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
     }
 
     #[test]
@@ -13864,6 +14297,7 @@ mod tests {
         let ctx = test_ctx("t").with_apply_sink(Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         }));
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
         ctx.tab_registry().replace(vec![TabRecord {
             id: "tab-1".into(),
             name: "Main".into(),
@@ -13872,21 +14306,31 @@ mod tests {
         let id1 = dispatch(
             &ctx,
             "spawn_terminal",
-            &json!({"cwd": "/tmp", "tabId": "tab-1"}),
+            &json!({
+                "cwd": "/tmp",
+                "tabId": "tab-1",
+                "startupCommand": harness_command,
+            }),
         )
         .unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
+        wait_for_harness_started(&id1, "codex").unwrap();
         let id2 = dispatch(
             &ctx,
             "spawn_terminal",
-            &json!({"cwd": "/tmp", "tabId": "tab-1"}),
+            &json!({
+                "cwd": "/tmp",
+                "tabId": "tab-1",
+                "startupCommand": harness_command,
+            }),
         )
         .unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
+        wait_for_harness_started(&id2, "codex").unwrap();
 
         dispatch(
             &ctx,
@@ -13918,6 +14362,7 @@ mod tests {
 
         dispatch(&ctx, "close_terminal", &json!({"sessionId": id1})).unwrap();
         dispatch(&ctx, "close_terminal", &json!({"sessionId": id2})).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
     }
 
     #[test]
@@ -13926,6 +14371,7 @@ mod tests {
             calls: StdMutex::new(Vec::new()),
         });
         let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
         ctx.tab_registry().replace(vec![TabRecord {
             id: "tab-1".into(),
             name: "Main".into(),
@@ -13934,12 +14380,17 @@ mod tests {
         let id = dispatch(
             &ctx,
             "spawn_terminal",
-            &json!({"cwd": "/tmp", "tabId": "tab-1"}),
+            &json!({
+                "cwd": "/tmp",
+                "tabId": "tab-1",
+                "startupCommand": harness_command,
+            }),
         )
         .unwrap()["id"]
             .as_str()
             .unwrap()
             .to_string();
+        wait_for_harness_started(&id, "codex").unwrap();
 
         let v1 = dispatch(&ctx, "claim_captain", &json!({"captainSessionId": id})).unwrap();
         assert_eq!(v1["applied"], true);
@@ -13962,6 +14413,7 @@ mod tests {
         assert_eq!(sync_count, 1, "only the first (changing) claim forwards");
 
         dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+        let _ = std::fs::remove_dir_all(harness_bin_dir);
     }
 
     #[test]
@@ -14192,6 +14644,7 @@ mod tests {
             command: command.to_string(),
             args,
             session: String::new(),
+            host: token.to_string(),
             v: None,
         }
     }
@@ -14205,6 +14658,7 @@ mod tests {
             command: command.to_string(),
             args,
             session: session.to_string(),
+            host: String::new(),
             v: None,
         }
     }
@@ -14897,6 +15351,7 @@ mod tests {
             pid: 7,
             protocol_version: PROTOCOL_VERSION,
             local_control_token: full.into(),
+            local_host_token: "host".into(),
         };
 
         // (a) Published discovery is read-only and never leaks the full token.
@@ -15027,6 +15482,7 @@ mod tests {
             pid: 1,
             protocol_version: PROTOCOL_VERSION,
             local_control_token: ctx.token.clone(),
+            local_host_token: ctx.host_token.clone(),
         };
         assert_eq!(
             handshake.local_control_token, ctx.token,
@@ -15349,7 +15805,7 @@ mod tests {
             "the refusal must be the isolation ACL, not a downstream tmux error"
         );
 
-        // A tokenless control-token HOST (webview/MCP) fails OPEN - it is not refused by
+        // A trusted in-process host fails open - it is not refused by
         // the ACL (it errors later at the tmux capture, which is a different message).
         let host = dispatch_authenticated(
             &ctx,
@@ -15378,9 +15834,11 @@ mod tests {
             .with_captains_registry(reg);
 
         let promoted = resolve_identity(&ctx, &promoted).unwrap();
-        assert!(enforce_attach_authority(Some(&promoted), "new-cap", "ship-new").is_ok());
         assert!(
-            enforce_attach_authority(Some(&promoted), "other", "ship-new")
+            enforce_attach_authority(Some(&promoted), false, "new-cap", FleetRole::Captain).is_ok()
+        );
+        assert!(
+            enforce_attach_authority(Some(&promoted), false, "other", FleetRole::Captain)
                 .unwrap_err()
                 .contains("attach a different terminal")
         );
@@ -15424,6 +15882,92 @@ mod tests {
             ),
         );
         assert!(apex.ok, "General release failed: {:?}", apex.error);
+    }
+
+    #[test]
+    fn full_socket_token_without_session_identity_has_no_lifecycle_authority() {
+        let reg = Arc::new(CaptainsRegistry::new());
+        reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
+        let ctx = test_ctx("ctrl").with_captains_registry(reg);
+
+        for session in ["", "invalid-session-secret"] {
+            let response = dispatch_authenticated(
+                &ctx,
+                ControlRequest {
+                    token: "ctrl".into(),
+                    command: "release_captain".into(),
+                    args: json!({"shipSlug": "ship-a"}),
+                    session: session.into(),
+                    host: String::new(),
+                    v: None,
+                },
+            );
+            assert!(!response.ok);
+            assert!(response
+                .error
+                .unwrap_or_default()
+                .contains("requires a valid T_HUB_SESSION_TOKEN"));
+        }
+        assert_eq!(ctx.captains.snapshot().captains.len(), 1);
+    }
+
+    #[test]
+    fn crew_cannot_self_assign_the_reserved_cortana_role_or_slug() {
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let crew = mint_session(&store, crate::identity::Role::Crew, "ship-a", "crew-a");
+        let ctx = test_ctx("ctrl").with_identity_store(store);
+
+        for args in [
+            json!({"captainSessionId": "crew-a", "role": "cortana"}),
+            json!({"captainSessionId": "crew-a", "shipSlug": "cortana"}),
+        ] {
+            let response =
+                dispatch_authenticated(&ctx, req_session("ctrl", &crew, "claim_captain", args));
+            assert!(!response.ok);
+            assert!(response
+                .error
+                .unwrap_or_default()
+                .contains("General/Cortana"));
+        }
+        assert!(ctx.captains.snapshot().captains.is_empty());
+    }
+
+    #[test]
+    fn captain_cannot_close_or_heartbeat_foreign_crew() {
+        let store = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let reg = Arc::new(CaptainsRegistry::new());
+        reg.claim_test("cap-a", Some("ship-a"), vec![]).unwrap();
+        reg.claim_test("cap-b", Some("ship-b"), vec![]).unwrap();
+        assert!(reg.record_crew("cap-b", "crew-b").unwrap());
+        reg.bind_crew_context(
+            "cap-b",
+            "crew-b",
+            "foreign task",
+            "codex",
+            None,
+            None,
+            PowderWorkBinding {
+                card_id: "card-b".into(),
+                run_id: "run-b".into(),
+                claim_expires_at: None,
+            },
+        )
+        .unwrap();
+        let captain = mint_session(&store, crate::identity::Role::Captain, "ship-a", "cap-a");
+        let ctx = test_ctx("ctrl")
+            .with_identity_store(store)
+            .with_captains_registry(reg);
+
+        for (command, args) in [
+            ("close_terminal", json!({"sessionId": "crew-b"})),
+            ("heartbeat_crew_powder", json!({"crewSessionId": "crew-b"})),
+        ] {
+            let response =
+                dispatch_authenticated(&ctx, req_session("ctrl", &captain, command, args));
+            assert!(!response.ok);
+            let error = response.error.unwrap_or_default();
+            assert!(error.starts_with("acl:"), "got: {error}");
+        }
     }
 
     #[test]
@@ -16049,6 +16593,7 @@ mod tests {
                 command: "spawn_terminal".into(),
                 args: args.clone(),
                 session: String::new(),
+                host: "t".into(),
                 v: None,
             },
         );
@@ -16066,6 +16611,7 @@ mod tests {
                 command: "spawn_terminal".into(),
                 args,
                 session: String::new(),
+                host: "t".into(),
                 v: None,
             },
         );
@@ -16115,6 +16661,7 @@ mod tests {
                 command: "spawn_terminal".into(),
                 args: json!({"cwd": "/tmp", "requestId": "spawn-status-1"}),
                 session: String::new(),
+                host: "t".into(),
                 v: None,
             },
         );

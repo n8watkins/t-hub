@@ -600,6 +600,7 @@ pub fn run() {
             // each is shared between the fleet notifier (the inbox's first client) and
             // the control listener (identity resolve + inbox ack/status).
             let identity_store = std::sync::Arc::new(identity::IdentityStore::load_default());
+            app.manage(identity_store.clone());
             // Item-2 (PR-56 review LOW residual, now owned here): the identity store's
             // GC is close-path-driven only, so a session that died without a clean
             // `close_terminal` leaves its secret in the store forever, accreting across
