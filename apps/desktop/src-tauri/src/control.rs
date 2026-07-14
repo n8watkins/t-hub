@@ -997,6 +997,83 @@ where
         .collect())
 }
 
+fn validate_harness_name(value: &str, field: &str) -> Result<(), String> {
+    if matches!(value, "codex" | "claude") {
+        Ok(())
+    } else {
+        Err(format!("{field} must be 'codex' or 'claude'"))
+    }
+}
+
+fn validate_runtime_identity(
+    scope: &str,
+    harness: Option<&str>,
+    provider: Option<&str>,
+    provider_session_id: Option<&str>,
+    claude_uuid: Option<&str>,
+    strict: bool,
+) -> Result<(), String> {
+    if let Some(harness) = harness {
+        validate_harness_name(harness, &format!("{scope} harness"))?;
+    }
+    if let Some(provider) = provider {
+        validate_harness_name(provider, &format!("{scope} provider"))?;
+    }
+    if let (Some(harness), Some(provider)) = (harness, provider) {
+        if harness != provider {
+            return Err(format!("{scope} provider must match its harness"));
+        }
+    }
+    if strict && provider_session_id.is_some() && provider.is_none() {
+        return Err(format!("{scope} providerSessionId requires a provider"));
+    }
+    match provider {
+        Some("claude") => {
+            if (strict || provider_session_id.is_some() && claude_uuid.is_some())
+                && provider_session_id != claude_uuid
+            {
+                return Err(format!(
+                    "{scope} Claude providerSessionId and claudeUuid must match"
+                ));
+            }
+        }
+        Some("codex") => {
+            if claude_uuid.is_some() {
+                return Err(format!("{scope} Codex identity must not carry claudeUuid"));
+            }
+        }
+        None if strict && claude_uuid.is_some() => {
+            return Err(format!("{scope} claudeUuid requires the Claude provider"));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn reconcile_legacy_runtime_identity(
+    harness: &mut Option<String>,
+    provider: &mut Option<String>,
+    provider_session_id: &mut Option<String>,
+    claude_uuid: &mut Option<String>,
+) {
+    if provider.is_none() {
+        *provider = harness
+            .clone()
+            .or_else(|| claude_uuid.as_ref().map(|_| "claude".to_string()));
+    }
+    if harness.is_none() {
+        *harness = provider.clone();
+    }
+    if provider.as_deref() == Some("claude") {
+        if provider_session_id.is_none() {
+            *provider_session_id = claude_uuid.clone();
+        }
+        if claude_uuid.is_none() {
+            *claude_uuid = provider_session_id.clone();
+        }
+    }
+}
+
 /// A fleet identity as the control channel sees it (item-2 §2.1: the ship/role
 /// re-key). The record is keyed on the DURABLE `ship_slug` (was a mere label); the
 /// terminal id is demoted to a rebindable `Option` pointer, `role` is first-class,
@@ -1388,6 +1465,7 @@ impl CaptainsRegistry {
     }
 
     fn validate_snapshot(snapshot: &CaptainsSnapshot) -> Result<(), String> {
+        let strict_runtime_identity = snapshot.schema_version >= CAPTAINS_SCHEMA_VERSION;
         let mut project_ids = std::collections::HashSet::new();
         let mut roots = std::collections::HashSet::new();
         for project in &snapshot.projects {
@@ -1449,6 +1527,14 @@ impl CaptainsRegistry {
                     "captains registry must use the reserved Cortana role and slug together".into(),
                 );
             }
+            validate_runtime_identity(
+                &format!("ship '{}'", captain.ship_slug),
+                captain.harness.as_deref(),
+                captain.provider.as_deref(),
+                captain.provider_session_id.as_deref(),
+                captain.claude_uuid.as_deref(),
+                strict_runtime_identity,
+            )?;
             if let Some(terminal) = captain.terminal_id.as_deref() {
                 if terminal.trim().is_empty() || !terminals.insert(terminal) {
                     return Err("captains registry assigns one terminal more than once".into());
@@ -1510,6 +1596,14 @@ impl CaptainsRegistry {
                 {
                     return Err("captains registry assigns one terminal more than once".into());
                 }
+                validate_runtime_identity(
+                    &format!("Crew '{}'", crew.terminal_id),
+                    crew.harness.as_deref(),
+                    crew.provider.as_deref(),
+                    crew.provider_session_id.as_deref(),
+                    crew.claude_uuid.as_deref(),
+                    strict_runtime_identity,
+                )?;
                 for (field, value) in [
                     ("provider", crew.provider.as_deref()),
                     ("providerSessionId", crew.provider_session_id.as_deref()),
@@ -1598,6 +1692,20 @@ impl CaptainsRegistry {
     fn reconcile_on_load(caps: &mut [FleetIdentity]) {
         let mut seen_cortana = false;
         for c in caps.iter_mut() {
+            reconcile_legacy_runtime_identity(
+                &mut c.harness,
+                &mut c.provider,
+                &mut c.provider_session_id,
+                &mut c.claude_uuid,
+            );
+            for crew in &mut c.crew {
+                reconcile_legacy_runtime_identity(
+                    &mut crew.harness,
+                    &mut crew.provider,
+                    &mut crew.provider_session_id,
+                    &mut crew.claude_uuid,
+                );
+            }
             if c.ship_slug == CORTANA_SLUG {
                 c.role = FleetRole::Cortana;
                 if seen_cortana {
@@ -1891,6 +1999,7 @@ impl CaptainsRegistry {
         if harness.is_empty() {
             return Err("harness must not be empty".into());
         }
+        validate_harness_name(harness, "Captain harness")?;
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
         let previous = g.clone();
@@ -1943,6 +2052,7 @@ impl CaptainsRegistry {
         if task.trim().is_empty() {
             return Err("crew task must not be empty".into());
         }
+        validate_harness_name(harness.trim(), "Crew harness")?;
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
         let previous = g.clone();
@@ -2051,28 +2161,34 @@ impl CaptainsRegistry {
                     )
                 })?;
             if let Some(value) = conversation_id {
-                let is_claude = crew
+                let provider = crew
                     .provider
                     .as_deref()
                     .or(crew.harness.as_deref())
-                    .is_none_or(|provider| provider == "claude");
+                    .unwrap_or("claude")
+                    .to_string();
+                crew.provider = Some(provider.clone());
+                crew.harness.get_or_insert_with(|| provider.clone());
                 crew.conversation_id = Some(value.to_string());
                 crew.provider_session_id = Some(value.to_string());
-                crew.claude_uuid = is_claude.then(|| value.to_string());
+                crew.claude_uuid = (provider == "claude").then(|| value.to_string());
             }
             if let Some(value) = resume_point {
                 crew.resume_point = Some(value.to_string());
             }
         } else {
             if let Some(value) = conversation_id {
-                let is_claude = captain
+                let provider = captain
                     .provider
                     .as_deref()
                     .or(captain.harness.as_deref())
-                    .is_none_or(|provider| provider == "claude");
+                    .unwrap_or("claude")
+                    .to_string();
+                captain.provider = Some(provider.clone());
+                captain.harness.get_or_insert_with(|| provider.clone());
                 captain.conversation_id = Some(value.to_string());
                 captain.provider_session_id = Some(value.to_string());
-                captain.claude_uuid = is_claude.then(|| value.to_string());
+                captain.claude_uuid = (provider == "claude").then(|| value.to_string());
             }
             if let Some(value) = resume_point {
                 captain.resume_point = Some(value.to_string());
@@ -2185,6 +2301,16 @@ impl CaptainsRegistry {
         if terminal_id.trim().is_empty() {
             return Err("claim_captain requires a non-empty 'captainSessionId'".into());
         }
+        validate_runtime_identity(
+            "Captain claim",
+            None,
+            provider,
+            provider_session_id,
+            (provider == Some("claude"))
+                .then_some(provider_session_id)
+                .flatten(),
+            true,
+        )?;
         // The Cortana singleton always occupies the reserved slug; a Captain slugifies
         // its ship name, falling back to `ship-<terminal>` so a UI pin always claims
         // something addressable.
@@ -13990,6 +14116,52 @@ mod tests {
                     }],
                 }),
             ),
+            (
+                "unknown-captain-provider",
+                json!({
+                    "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+                    "seq": 1,
+                    "captains": [{"shipSlug": "alpha", "role": "captain", "terminalId": "cap-a", "provider": "other"}],
+                    "projects": [],
+                }),
+            ),
+            (
+                "captain-provider-harness-mismatch",
+                json!({
+                    "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+                    "seq": 1,
+                    "captains": [{"shipSlug": "alpha", "role": "captain", "terminalId": "cap-a", "provider": "codex", "harness": "claude"}],
+                    "projects": [],
+                }),
+            ),
+            (
+                "claude-continuity-mismatch",
+                json!({
+                    "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+                    "seq": 1,
+                    "captains": [{
+                        "shipSlug": "alpha", "role": "captain", "terminalId": "cap-a",
+                        "provider": "claude", "harness": "claude",
+                        "providerSessionId": "provider-a", "claudeUuid": "claude-b"
+                    }],
+                    "projects": [],
+                }),
+            ),
+            (
+                "codex-crew-with-claude-uuid",
+                json!({
+                    "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+                    "seq": 1,
+                    "captains": [{
+                        "shipSlug": "alpha", "role": "captain", "terminalId": "cap-a",
+                        "crew": [{
+                            "terminalId": "crew-a", "provider": "codex", "harness": "codex",
+                            "providerSessionId": "codex-a", "claudeUuid": "claude-a"
+                        }]
+                    }],
+                    "projects": [],
+                }),
+            ),
         ];
         assert!(
             CaptainsRegistry::validate_snapshot(&serde_json::from_value(base).unwrap()).is_ok()
@@ -14001,6 +14173,43 @@ mod tests {
                 "{name} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn registry_mutations_reject_noncanonical_harnesses_and_providers() {
+        let registry = CaptainsRegistry::new();
+        let invalid_claim = registry.claim_provider(
+            "cap-a",
+            Some("alpha"),
+            FleetRole::Captain,
+            Some("other"),
+            Some("session-a"),
+            vec![],
+            &|_| false,
+            &|_| tmux::SessionLiveness::Alive,
+        );
+        assert!(invalid_claim.unwrap_err().contains("codex"));
+        assert!(registry
+            .bind_ship_context("alpha", "project-a", "task", "other")
+            .unwrap_err()
+            .contains("codex"));
+        assert!(registry
+            .bind_crew_context(
+                "cap-a",
+                "crew-a",
+                "task",
+                "other",
+                None,
+                None,
+                PowderWorkBinding {
+                    card_id: "card-a".into(),
+                    run_id: "run-a".into(),
+                    claim_expires_at: None,
+                },
+            )
+            .unwrap_err()
+            .contains("codex"));
+        assert!(registry.snapshot().captains.is_empty());
     }
 
     #[test]
