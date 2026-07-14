@@ -126,11 +126,14 @@ fn control_endpoint(app: &tauri::AppHandle) -> Result<std::sync::Arc<ControlEndp
 fn ui_spawn_capability_env(
     app: &tauri::AppHandle,
     opts: &SpawnOptions,
-) -> (
-    Vec<(String, String)>,
-    bool,
-    Option<crate::identity::SessionIdentity>,
-) {
+) -> Result<
+    (
+        Vec<(String, String)>,
+        bool,
+        Option<crate::identity::SessionIdentity>,
+    ),
+    String,
+> {
     // LOW-1: the scrub is UNCONDITIONAL - env-inheritance must never decide a
     // session's capability. When the control endpoint is unresolvable / unbound (a
     // pre-bind race, no live control server), we still explicitly BLANK
@@ -148,11 +151,11 @@ fn ui_spawn_capability_env(
         ]
     };
     let Ok(endpoint) = control_endpoint(app) else {
-        return (scrub(), false, None);
+        return Ok((scrub(), false, None));
     };
     let addr = endpoint.addr();
     if addr.is_empty() {
-        return (scrub(), false, None);
+        return Ok((scrub(), false, None));
     }
     let is_control = opts
         .capability
@@ -175,7 +178,8 @@ fn ui_spawn_capability_env(
         .map(|state| state.inner().clone());
     let identity = identity_store
         .as_ref()
-        .map(|store| store.mint_for(crate::identity::Role::Crew, None));
+        .map(|store| store.mint_for(crate::identity::Role::Crew, None))
+        .transpose()?;
     let mut env = vec![
         ("T_HUB_CONTROL_ADDR".to_string(), addr),
         ("T_HUB_CONTROL_TOKEN".to_string(), token),
@@ -191,7 +195,7 @@ fn ui_spawn_capability_env(
             String::new(),
         ));
     }
-    (env, is_control, identity)
+    Ok((env, is_control, identity))
 }
 
 /// item-3 §2.1.1 piece 4: audit a UI control-capability spawn against the SHARED
@@ -381,7 +385,7 @@ pub async fn spawn_terminal(
     // inherited `T_HUB_CONTROL_TOKEN`/`_ADDR` the polluted app env would otherwise
     // leak - env-inheritance must never decide a session's capability. Default READ;
     // an explicit `capability:"control"` is a deliberate, audited elevation.
-    let (elevation, is_control, minted_identity) = ui_spawn_capability_env(&app, &opts);
+    let (elevation, is_control, minted_identity) = ui_spawn_capability_env(&app, &opts)?;
     if is_control {
         audit_ui_control_spawn(&app, &opts);
     }
@@ -400,7 +404,13 @@ pub async fn spawn_terminal(
         app.try_state::<std::sync::Arc<crate::identity::IdentityStore>>(),
         minted_identity.as_ref(),
     ) {
-        store.bind_tile(&identity.id, &id);
+        if let Err(error) = store.bind_tile(&identity.id, &id) {
+            let _ = tmux::kill_session_tree(&tmux_session);
+            store.retire(&identity.id);
+            return Err(format!(
+                "failed to persist terminal identity binding; the terminal was rolled back: {error}"
+            ));
+        }
     }
 
     // Mark this id FRESH so its first `attach_terminal` returns empty scrollback

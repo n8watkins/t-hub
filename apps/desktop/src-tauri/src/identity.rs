@@ -198,6 +198,8 @@ fn identity_ttl_ms() -> u64 {
 pub struct IdentityStore {
     path: Option<PathBuf>,
     inner: Mutex<IdentitiesSnapshot>,
+    #[cfg(test)]
+    persist_fail_after: Mutex<Option<usize>>,
 }
 
 impl IdentityStore {
@@ -220,6 +222,8 @@ impl IdentityStore {
         IdentityStore {
             path: Some(path),
             inner: Mutex::new(inner),
+            #[cfg(test)]
+            persist_fail_after: Mutex::new(None),
         }
     }
 
@@ -234,6 +238,8 @@ impl IdentityStore {
         IdentityStore {
             path: None,
             inner: Mutex::new(IdentitiesSnapshot::default()),
+            #[cfg(test)]
+            persist_fail_after: Mutex::new(None),
         }
     }
 
@@ -241,17 +247,36 @@ impl IdentityStore {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn persist(&self, snap: &IdentitiesSnapshot) {
-        let Some(path) = &self.path else { return };
-        if let Err(e) = write_atomic(path, snap) {
-            eprintln!("t-hub-identity: persist failed: {e}");
+    fn persist(&self, snap: &IdentitiesSnapshot) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let mut fail_after = self
+                .persist_fail_after
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(remaining) = fail_after.as_mut() {
+                if *remaining == 0 {
+                    *fail_after = None;
+                    return Err("identity store persist failure injected by test".into());
+                }
+                *remaining -= 1;
+            }
         }
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        write_atomic(path, snap).map_err(|error| {
+            format!(
+                "identity store persist to '{}' failed: {error}",
+                path.display()
+            )
+        })
     }
 
     /// Mint a fresh per-session identity: a distinct id + secret, recorded in the
     /// store. The secret is what gets env-injected; the returned identity carries it
     /// so the caller can inject it, but the STAMP (id/role) is what attribution uses.
-    pub fn mint(&self, role: Role) -> SessionIdentity {
+    pub fn mint(&self, role: Role) -> Result<SessionIdentity, String> {
         self.mint_for(role, None)
     }
 
@@ -259,7 +284,7 @@ impl IdentityStore {
     /// D5: the widened binding). `ship` is the spawner captain's ship_slug when it
     /// could be resolved at spawn (a crew inherits its spawner's ship), else `None`.
     /// Everything else matches [`mint`](Self::mint) - one seam, wider payload.
-    pub fn mint_for(&self, role: Role, ship: Option<String>) -> SessionIdentity {
+    pub fn mint_for(&self, role: Role, ship: Option<String>) -> Result<SessionIdentity, String> {
         let identity = SessionIdentity {
             id: uuid::Uuid::new_v4().simple().to_string(),
             // Two v4 uuids => ~244 bits of entropy; a bearer secret, not a display id.
@@ -274,20 +299,31 @@ impl IdentityStore {
             minted_at: now_ms(),
         };
         let mut snap = self.lock();
+        let previous = snap.clone();
         snap.identities
             .insert(identity.id.clone(), identity.clone());
-        self.persist(&snap);
-        identity
+        if let Err(error) = self.persist(&snap) {
+            *snap = previous;
+            return Err(error);
+        }
+        Ok(identity)
     }
 
     /// Bind a minted identity to the tile id its session landed on (after spawn). The
     /// tile is a mutable pointer; the durable key stays the minted id.
-    pub fn bind_tile(&self, id: &str, tile: &str) {
+    pub fn bind_tile(&self, id: &str, tile: &str) -> Result<(), String> {
         let mut snap = self.lock();
-        if let Some(ident) = snap.identities.get_mut(id) {
-            ident.session_tile = Some(tile.to_string());
+        let previous = snap.clone();
+        let ident = snap
+            .identities
+            .get_mut(id)
+            .ok_or_else(|| format!("cannot bind unknown identity '{id}'"))?;
+        ident.session_tile = Some(tile.to_string());
+        if let Err(error) = self.persist(&snap) {
+            *snap = previous;
+            return Err(error);
         }
-        self.persist(&snap);
+        Ok(())
     }
 
     /// Retire (forget) an identity by its minted id, dropping its persisted secret.
@@ -300,7 +336,9 @@ impl IdentityStore {
         let mut snap = self.lock();
         let removed = snap.identities.remove(id).is_some();
         if removed {
-            self.persist(&snap);
+            if let Err(error) = self.persist(&snap) {
+                eprintln!("t-hub-identity: retire persist failed: {error}");
+            }
         }
         removed
     }
@@ -351,7 +389,9 @@ impl IdentityStore {
             });
         let removed = before - snap.identities.len();
         if removed > 0 {
-            self.persist(&snap);
+            if let Err(error) = self.persist(&snap) {
+                eprintln!("t-hub-identity: prune persist failed: {error}");
+            }
         }
         removed
     }
@@ -367,7 +407,9 @@ impl IdentityStore {
         let newly_revoked = snap.revoked.insert(id.to_string());
         let removed = snap.identities.remove(id).is_some();
         if newly_revoked || removed {
-            self.persist(&snap);
+            if let Err(error) = self.persist(&snap) {
+                eprintln!("t-hub-identity: revoke persist failed: {error}");
+            }
         }
         newly_revoked || removed
     }
@@ -423,6 +465,14 @@ impl IdentityStore {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    #[cfg(test)]
+    pub fn fail_persist_after(&self, successful_writes: usize) {
+        *self
+            .persist_fail_after
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(successful_writes);
     }
 }
 
@@ -485,8 +535,8 @@ mod tests {
     #[test]
     fn mint_produces_distinct_ids_and_secrets() {
         let store = IdentityStore::ephemeral();
-        let a = store.mint(Role::Crew);
-        let b = store.mint(Role::Crew);
+        let a = store.mint(Role::Crew).unwrap();
+        let b = store.mint(Role::Crew).unwrap();
         assert_ne!(a.id, b.id, "ids are distinct");
         assert_ne!(a.secret, b.secret, "secrets are distinct");
         assert!(!a.secret.is_empty());
@@ -498,7 +548,7 @@ mod tests {
         // LOW-3: a stray {:?} must never print the bearer secret in cleartext (it would
         // undo the at-rest sealing). Non-secret fields still print.
         let store = IdentityStore::ephemeral();
-        let a = store.mint(Role::Crew);
+        let a = store.mint(Role::Crew).unwrap();
         let dbg = format!("{a:?}");
         assert!(
             !dbg.contains(&a.secret),
@@ -519,7 +569,7 @@ mod tests {
         let path = temp_path();
         let a = {
             let store = IdentityStore::load(path.clone());
-            let a = store.mint(Role::Crew);
+            let a = store.mint(Role::Crew).unwrap();
             assert!(
                 store.resolve(&a.secret).is_some(),
                 "mints resolve before revoke"
@@ -547,7 +597,7 @@ mod tests {
         // item-3 Pillar B TTL mechanism (pure, race-free via resolve_with). ttl=0
         // disables expiry (the default); a positive ttl rejects a secret older than it.
         let store = IdentityStore::ephemeral();
-        let a = store.mint(Role::Crew);
+        let a = store.mint(Role::Crew).unwrap();
         let minted = a.minted_at;
         // ttl disabled: resolves at any clock.
         assert!(store
@@ -571,7 +621,7 @@ mod tests {
         let path = temp_path();
         let secret = {
             let store = IdentityStore::load(path.clone());
-            store.mint(Role::Crew).secret
+            store.mint(Role::Crew).unwrap().secret
         };
         // The raw file's stored secret unseals back to the plaintext secret.
         let body = std::fs::read_to_string(&path).unwrap();
@@ -601,8 +651,8 @@ mod tests {
     #[test]
     fn resolve_returns_the_minting_identity_only_for_its_own_secret() {
         let store = IdentityStore::ephemeral();
-        let a = store.mint(Role::Captain);
-        let b = store.mint(Role::Crew);
+        let a = store.mint(Role::Captain).unwrap();
+        let b = store.mint(Role::Crew).unwrap();
         // A's secret resolves to A, never B (unforgeable across sessions).
         assert_eq!(store.resolve(&a.secret).unwrap().id, a.id);
         assert_eq!(store.resolve(&b.secret).unwrap().id, b.id);
@@ -618,8 +668,8 @@ mod tests {
         // you can never resolve as another identity. There is no secret that maps to B
         // except B's own, which A never learns.
         let store = IdentityStore::ephemeral();
-        let a = store.mint(Role::Crew);
-        let b = store.mint(Role::Crew);
+        let a = store.mint(Role::Crew).unwrap();
+        let b = store.mint(Role::Crew).unwrap();
         // Present A's secret => you are A, full stop; you cannot become B.
         let resolved = store.resolve(&a.secret).unwrap();
         assert_ne!(resolved.id, b.id);
@@ -628,9 +678,9 @@ mod tests {
     #[test]
     fn bind_tile_records_the_mutable_pointer() {
         let store = IdentityStore::ephemeral();
-        let a = store.mint(Role::Crew);
+        let a = store.mint(Role::Crew).unwrap();
         assert!(a.session_tile.is_none());
-        store.bind_tile(&a.id, "abc12345");
+        store.bind_tile(&a.id, "abc12345").unwrap();
         assert_eq!(
             store.get(&a.id).unwrap().session_tile.as_deref(),
             Some("abc12345")
@@ -646,8 +696,8 @@ mod tests {
         let secret;
         {
             let store = IdentityStore::load(path.clone());
-            let a = store.mint(Role::Captain);
-            store.bind_tile(&a.id, "tile-1");
+            let a = store.mint(Role::Captain).unwrap();
+            store.bind_tile(&a.id, "tile-1").unwrap();
             id = a.id.clone();
             secret = a.secret.clone();
         }
@@ -665,7 +715,7 @@ mod tests {
     #[test]
     fn sender_label_is_role_scoped_and_carries_no_secret() {
         let store = IdentityStore::ephemeral();
-        let a = store.mint(Role::Crew);
+        let a = store.mint(Role::Crew).unwrap();
         let label = a.sender_label();
         assert!(label.starts_with("crew:"));
         assert!(
@@ -686,12 +736,46 @@ mod tests {
     }
 
     #[test]
+    fn mint_fails_without_publishing_an_in_memory_identity_when_persistence_fails() {
+        let blocker = temp_path();
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let store = IdentityStore::load(blocker.join("identities.json"));
+
+        let error = store.mint(Role::Crew).unwrap_err();
+
+        assert!(error.contains("persist"), "got: {error}");
+        assert!(
+            store.is_empty(),
+            "a failed durable mint must roll back memory"
+        );
+        std::fs::remove_file(blocker).unwrap();
+    }
+
+    #[test]
+    fn bind_failure_restores_the_prior_unbound_identity() {
+        let path = temp_path();
+        let store = IdentityStore::load(path.clone());
+        let identity = store.mint(Role::Crew).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let error = store.bind_tile(&identity.id, "tile-a").unwrap_err();
+
+        assert!(error.contains("persist"), "got: {error}");
+        assert!(
+            store.get(&identity.id).unwrap().session_tile.is_none(),
+            "a failed durable bind must not remain published in memory"
+        );
+        std::fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
     fn retire_drops_the_identity_and_stops_resolving() {
         // Review L2/M3: a retired identity is forgotten - its secret no longer
         // resolves and the store shrinks (no unbounded secret-bearing growth).
         let store = IdentityStore::ephemeral();
-        let a = store.mint(Role::Crew);
-        let b = store.mint(Role::Crew);
+        let a = store.mint(Role::Crew).unwrap();
+        let b = store.mint(Role::Crew).unwrap();
         assert!(store.resolve(&a.secret).is_some());
         assert!(store.retire(&a.id), "retire reports it removed something");
         assert!(
@@ -712,10 +796,12 @@ mod tests {
         // Item-2 §2.6 D5: the widened binding carries the spawner's ship, resolved at
         // mint. A plain mint leaves it None (ship not resolvable / a captain claim).
         let store = IdentityStore::ephemeral();
-        let crew = store.mint_for(Role::Crew, Some("t-hub-app".to_string()));
+        let crew = store
+            .mint_for(Role::Crew, Some("t-hub-app".to_string()))
+            .unwrap();
         assert_eq!(crew.ship_slug.as_deref(), Some("t-hub-app"));
         assert_eq!(crew.stamp().ship_slug.as_deref(), Some("t-hub-app"));
-        let plain = store.mint(Role::Crew);
+        let plain = store.mint(Role::Crew).unwrap();
         assert!(plain.ship_slug.is_none());
     }
 
@@ -725,11 +811,11 @@ mod tests {
         // unambiguously gone (dead tile OR never-bound prior-run leak) and KEEPS live
         // ones. A BYPASS - keeping a dead session's secret resolvable - fails here.
         let store = IdentityStore::ephemeral();
-        let live = store.mint(Role::Crew);
-        store.bind_tile(&live.id, "live-tile");
-        let dead = store.mint(Role::Crew);
-        store.bind_tile(&dead.id, "dead-tile");
-        let unbound = store.mint(Role::Crew); // never bound (prior-run failed spawn)
+        let live = store.mint(Role::Crew).unwrap();
+        store.bind_tile(&live.id, "live-tile").unwrap();
+        let dead = store.mint(Role::Crew).unwrap();
+        store.bind_tile(&dead.id, "dead-tile").unwrap();
+        let unbound = store.mint(Role::Crew).unwrap(); // never bound (prior-run failed spawn)
         assert_eq!(store.len(), 3);
 
         let removed = store.prune_dead(|tile| tile == "live-tile");
@@ -755,8 +841,8 @@ mod tests {
     #[test]
     fn prune_dead_is_a_noop_when_all_live() {
         let store = IdentityStore::ephemeral();
-        let a = store.mint(Role::Crew);
-        store.bind_tile(&a.id, "t");
+        let a = store.mint(Role::Crew).unwrap();
+        store.bind_tile(&a.id, "t").unwrap();
         assert_eq!(store.prune_dead(|_| true), 0);
         assert_eq!(store.len(), 1);
     }
@@ -765,8 +851,8 @@ mod tests {
     fn retire_tile_removes_the_identity_bound_to_a_closed_session() {
         // Review M3: the session-close GC hook retires by tile binding.
         let store = IdentityStore::ephemeral();
-        let a = store.mint(Role::Crew);
-        store.bind_tile(&a.id, "deadtile");
+        let a = store.mint(Role::Crew).unwrap();
+        store.bind_tile(&a.id, "deadtile").unwrap();
         assert!(store.retire_tile("deadtile"));
         assert!(store.resolve(&a.secret).is_none());
         assert!(store.is_empty());

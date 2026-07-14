@@ -1275,30 +1275,47 @@ impl CaptainsRegistry {
         } else {
             Self::read_snapshot(&path)
         };
+        let backup_probe = backup.exists().then(|| Self::read_snapshot(&backup));
         let mut recovered_from_backup = false;
         let mut write_blocked = None;
-        let loaded = match primary {
-            Err(primary_error @ SnapshotReadError::UnsupportedSchema { .. }) => {
-                write_blocked = Some(primary_error.to_string());
-                Err(primary_error)
+        let future_schema = match (&primary, &backup_probe) {
+            (Err(error @ SnapshotReadError::UnsupportedSchema { .. }), _) => {
+                Some(error.to_string())
             }
-            Ok(snapshot) => Ok(snapshot),
-            Err(primary_error) => {
-                let backup_snapshot = Self::read_snapshot(&backup).map_err(|backup_error| {
-                    SnapshotReadError::Invalid(format!(
-                        "captains registry primary failed ({primary_error}); backup failed ({backup_error})"
-                    ))
-                });
-                recovered_from_backup = backup_snapshot.is_ok();
-                if backup_snapshot.is_err() && path.exists() {
-                    let quarantine = path.with_extension(format!("json.corrupt.{}", now_ms()));
-                    let _ = std::fs::rename(&path, &quarantine);
-                    eprintln!(
-                        "t-hub-control: captains registry was quarantined at '{}': {primary_error}",
-                        quarantine.display()
-                    );
+            (_, Some(Err(error @ SnapshotReadError::UnsupportedSchema { .. }))) => {
+                Some(error.to_string())
+            }
+            _ => None,
+        };
+        let loaded = if let Some(reason) = future_schema {
+            // Either file may be the last copy written by a newer T-Hub. Preserve
+            // both byte-for-byte and block every write. A supported primary remains
+            // readable, but an unsupported primary is never replaced by an older
+            // backup and neither file is mislabeled as corruption.
+            write_blocked = Some(reason);
+            primary
+        } else {
+            match primary {
+                Ok(snapshot) => Ok(snapshot),
+                Err(primary_error) => {
+                    let backup_snapshot = backup_probe
+                        .unwrap_or_else(|| Self::read_snapshot(&backup))
+                        .map_err(|backup_error| {
+                            SnapshotReadError::Invalid(format!(
+                                "captains registry primary failed ({primary_error}); backup failed ({backup_error})"
+                            ))
+                        });
+                    recovered_from_backup = backup_snapshot.is_ok();
+                    if backup_snapshot.is_err() && path.exists() {
+                        let quarantine = path.with_extension(format!("json.corrupt.{}", now_ms()));
+                        let _ = std::fs::rename(&path, &quarantine);
+                        eprintln!(
+                            "t-hub-control: captains registry was quarantined at '{}': {primary_error}",
+                            quarantine.display()
+                        );
+                    }
+                    backup_snapshot
                 }
-                backup_snapshot
             }
         };
         if recovered_from_backup {
@@ -1382,6 +1399,34 @@ impl CaptainsRegistry {
             if project.repo_root.trim().is_empty() || !roots.insert(project.repo_root.as_str()) {
                 return Err("captains registry contains an empty or duplicate repoRoot".into());
             }
+            if !std::path::Path::new(&project.repo_root).is_absolute() {
+                return Err(format!(
+                    "project '{}' has a non-absolute repoRoot",
+                    project.project_id
+                ));
+            }
+            if project.name.trim().is_empty() {
+                return Err(format!(
+                    "project '{}' has an empty name",
+                    project.project_id
+                ));
+            }
+            if let Some(powder) = &project.powder {
+                if powder.connection_profile.trim().is_empty()
+                    || powder.repository.trim().is_empty()
+                {
+                    return Err(format!(
+                        "project '{}' has an incomplete Powder binding",
+                        project.project_id
+                    ));
+                }
+                if powder.event_cursor < 0 {
+                    return Err(format!(
+                        "project '{}' has a negative Powder event cursor",
+                        project.project_id
+                    ));
+                }
+            }
         }
         let mut ships = std::collections::HashSet::new();
         let mut terminals = std::collections::HashSet::new();
@@ -1409,6 +1454,32 @@ impl CaptainsRegistry {
                     return Err("captains registry assigns one terminal more than once".into());
                 }
             }
+            match (&captain.state, &captain.terminal_id) {
+                (ClaimState::Active, None) => {
+                    return Err(format!(
+                        "active ship '{}' has no terminalId",
+                        captain.ship_slug
+                    ));
+                }
+                (ClaimState::Orphaned { .. } | ClaimState::Vacant, Some(_)) => {
+                    return Err(format!(
+                        "inactive ship '{}' still has a terminalId",
+                        captain.ship_slug
+                    ));
+                }
+                _ => {}
+            }
+            let mut tabs = std::collections::HashSet::new();
+            if captain
+                .workspace_tab_ids
+                .iter()
+                .any(|tab| tab.trim().is_empty() || !tabs.insert(tab.as_str()))
+            {
+                return Err(format!(
+                    "ship '{}' has an empty or duplicate workspace tab",
+                    captain.ship_slug
+                ));
+            }
             if let Some(project_id) = captain.project_id.as_deref() {
                 if !project_ids.contains(project_id) {
                     return Err(format!(
@@ -1418,12 +1489,48 @@ impl CaptainsRegistry {
                 if !bound_projects.insert(project_id) {
                     return Err(format!("project '{project_id}' has multiple Captains"));
                 }
+                if captain
+                    .assignment
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                    || captain
+                        .harness
+                        .as_deref()
+                        .is_none_or(|value| value.trim().is_empty())
+                {
+                    return Err(format!(
+                        "ship '{}' has a project but no durable assignment or harness",
+                        captain.ship_slug
+                    ));
+                }
             }
             for crew in &captain.crew {
                 if crew.terminal_id.trim().is_empty()
                     || !terminals.insert(crew.terminal_id.as_str())
                 {
                     return Err("captains registry assigns one terminal more than once".into());
+                }
+                for (field, value) in [
+                    ("provider", crew.provider.as_deref()),
+                    ("providerSessionId", crew.provider_session_id.as_deref()),
+                    ("conversationId", crew.conversation_id.as_deref()),
+                    ("resumePoint", crew.resume_point.as_deref()),
+                    ("task", crew.task.as_deref()),
+                    ("harness", crew.harness.as_deref()),
+                    ("worktreePath", crew.worktree_path.as_deref()),
+                    ("branch", crew.branch.as_deref()),
+                ] {
+                    if value.is_some_and(|value| value.trim().is_empty()) {
+                        return Err(format!("Crew '{}' has an empty {field}", crew.terminal_id));
+                    }
+                }
+                if let Some(work) = &crew.powder_work {
+                    if work.card_id.trim().is_empty() || work.run_id.trim().is_empty() {
+                        return Err(format!(
+                            "Crew '{}' has an incomplete Powder work binding",
+                            crew.terminal_id
+                        ));
+                    }
                 }
             }
         }
@@ -1627,6 +1734,7 @@ impl CaptainsRegistry {
         let snap = Self::snapshot_for_persist(&candidate);
         *current = previous;
         drop(current);
+        Self::validate_snapshot(&snap)?;
         self.persist(snap)?;
         *self.lock() = candidate;
         Ok(())
@@ -4547,16 +4655,17 @@ fn message_target(ctx: &ControlContext, tile: &str) -> crate::acl::MessageTarget
 }
 
 /// The cross-ship isolation gate on a READ/WRITE session handler (§2.6 H3, the one
-/// mechanization add). FAIL-OPEN for the trusted control-token host (`caller == None` -
-/// the app's own webview / MCP / fleet wake presented no per-session token): those
-/// callers are unconstrained (NORM-now). For an IDENTIFIED session, enforce
+/// mechanization add). A caller without a session identity is admitted only with
+/// the in-process host proof. For an IDENTIFIED session, enforce
 /// [`crate::acl::can_access_session`] against the target tile's ship, refusing +
 /// attributing a cross-ship reach.
 fn enforce_session_access(
     ctx: &ControlContext,
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
     target_tile: &str,
 ) -> Result<(), String> {
+    require_socket_identity(caller, trusted_internal, "session access")?;
     let Some(id) = caller else { return Ok(()) };
     let actor = acl_actor(id);
     let target = target_ship_ref(ctx, target_tile);
@@ -4896,15 +5005,18 @@ fn spawn_env_with_identity(
     ctx: &ControlContext,
     args: &Value,
     command: &str,
-) -> (
-    Vec<(String, String)>,
-    Option<crate::identity::SessionIdentity>,
-) {
+) -> Result<
+    (
+        Vec<(String, String)>,
+        Option<crate::identity::SessionIdentity>,
+    ),
+    String,
+> {
     let mut env = elevation_env(ctx, args);
     if env.is_empty() {
         // No addr => headless; do not mint (there is no channel for the session to
         // present its token over anyway).
-        return (env, None);
+        return Ok((env, None));
     }
     // item-3 §2.1.1 piece 4: every control-capability spawn is audited so an
     // elevation is never silent. The default (READ) spawn is not elevated.
@@ -4923,12 +5035,12 @@ fn spawn_env_with_identity(
         .or_else(|| arg_str(args, "spawned_by"))
         .and_then(|spawner| ctx.captains.ship_of(&spawner))
         .map(|m| m.ship_slug().to_string());
-    let identity = ctx.identity.mint_for(crate::identity::Role::Crew, ship);
+    let identity = ctx.identity.mint_for(crate::identity::Role::Crew, ship)?;
     env.push((
         crate::identity::SESSION_TOKEN_ENV.to_string(),
         identity.secret.clone(),
     ));
-    (env, Some(identity))
+    Ok((env, Some(identity)))
 }
 
 /// The authoritative count of live `th_*` tmux sessions, reconciled from the tmux
@@ -5065,7 +5177,8 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
     // presents a valid token resolving to the recipient's OWN tile may self-ack even with
     // a bare READ token (the crew ack loop, no relay needed). The tier refusal below is
     // bypassed ONLY for this proven self-ack; a cross-session ack still needs the control
-    // capability (the host/relay path) and is re-checked by `can_ack` in the handler.
+    // capability and is re-checked by `can_ack` in the handler. The Full capability
+    // never substitutes for the separate in-process host proof.
     let inbox_self_ack = req.command == "inbox_ack"
         && caller
             .as_ref()
@@ -5179,7 +5292,6 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         &req.args,
         caller.as_ref(),
         trusted_internal,
-        cap,
     );
     let outcome = match &request_id {
         Some(id) => ctx.requests.finish(id, outcome),
@@ -5450,7 +5562,7 @@ fn rebind_control(ctx: &ControlContext) -> Result<Value, String> {
 /// dispatch tests read unchanged; the Phase-3 ACL tests call `dispatch_with_caller`.
 #[cfg(test)]
 fn dispatch(ctx: &ControlContext, command: &str, args: &Value) -> Result<Value, String> {
-    dispatch_with_caller(ctx, command, args, None, true, Capability::Full)
+    dispatch_with_caller(ctx, command, args, None, true)
 }
 
 fn dispatch_with_caller(
@@ -5462,7 +5574,6 @@ fn dispatch_with_caller(
     // wiring for the enqueue/access/ack cells consumes both.
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
-    cap: Capability,
 ) -> Result<Value, String> {
     match command {
         // ---- Read tier (PRD §11.2: allowed) --------------------------------
@@ -5500,7 +5611,7 @@ fn dispatch_with_caller(
         // registry the webview reports into, so `list_tabs` stays truthful
         // whichever client is attached.
         "report_workspace_tabs" => report_workspace_tabs(ctx, args),
-        "read_terminal" | "capture_pane" => read_terminal(ctx, args, caller),
+        "read_terminal" | "capture_pane" => read_terminal(ctx, args, caller, trusted_internal),
         // Comms-plane Phase 2: the durable inbox's read-tier surface. `inbox_ack` is
         // the recipient's `delivered -> processed` intake confirmation (the receipt
         // state machine's ack channel, §2.4 M2); `inbox_status` is the per-recipient
@@ -5508,15 +5619,15 @@ fn dispatch_with_caller(
         // recipient's own already-delivered message (idempotent, never a re-write),
         // and status is counts-only. Phase 3 adds the ownership ACL that gates a
         // cross-session ack; Phase 2 does not authorize (no ACLs yet).
-        "inbox_ack" => inbox_ack(ctx, args, caller, cap),
+        "inbox_ack" => inbox_ack(ctx, args, caller, trusted_internal),
         "inbox_status" => inbox_status(ctx, args),
         // Comms-plane Phase 3: the agent-to-agent plane SEND, gated by the settled
         // matrix message rows (`can_message`) + the EMERGENCY-flag authority
         // (`can_flag_emergency`). Read base tier so an identified CREW (least-privilege
         // read token) can send up to its captain; the handler REQUIRES a resolved
-        // session identity (or a Full host) - a bare read token with no session cannot
+        // session identity (or proven in-process host) - a token with no session cannot
         // enqueue.
-        "plane_send" => plane_send(ctx, args, caller, cap),
+        "plane_send" => plane_send(ctx, args, caller, trusted_internal),
         // The resolve-and-verify GATE a captain's money/publish gate consults
         // (`general_authorization_present`): read-only, Read tier.
         "check_authorization" => check_authorization(ctx, args),
@@ -5595,16 +5706,16 @@ fn dispatch_with_caller(
         "send_text" => {
             // Phase 3 (§2.6 H3): break-glass STILL rides the cross-ship isolation ACL -
             // an identified session may only write a pane on its OWN ship. The host
-            // (webview/MCP, no session token) fails open.
+            // with valid in-process host provenance is admitted.
             if let Some(tile) = arg_str(args, "sessionId").or_else(|| arg_str(args, "session_id")) {
-                enforce_session_access(ctx, caller, &tile)?;
+                enforce_session_access(ctx, caller, trusted_internal, &tile)?;
             }
             mark_break_glass(ctx, "send_text", args);
             send_text(args)
         }
         "send_keys" => {
             if let Some(tile) = arg_str(args, "sessionId").or_else(|| arg_str(args, "session_id")) {
-                enforce_session_access(ctx, caller, &tile)?;
+                enforce_session_access(ctx, caller, trusted_internal, &tile)?;
             }
             mark_break_glass(ctx, "send_keys", args);
             send_keys(args)
@@ -5614,7 +5725,7 @@ fn dispatch_with_caller(
         // preempt CONTROL signal (an Escape interrupt), NOT a queued input message, so it
         // cannot be typed over or corrupt a draft. Gated by `can_abort` (Cortana->captain,
         // captain->own crew, general->anyone; cross-ship/sibling DENIED; crew never).
-        "abort_session" => abort_session(ctx, args, caller),
+        "abort_session" => abort_session(ctx, args, caller, trusted_internal),
         // Comms-plane Phase 3: record a durable general-authorization artifact (the
         // delegation-gate carrier, M1). Gated by `can_originate_authorization` (only the
         // general ORIGINATES; Cortana may relay by reference, never originate).
@@ -5622,7 +5733,7 @@ fn dispatch_with_caller(
         // Comms-plane Phase 3: operate-fleet-infra (§2.7 R-L2) - the plane's own
         // administrative ops (queue purge/flush), gated to the apex fleet-infra owner
         // (`can_operate_fleet_infra`).
-        "plane_admin" => plane_admin(ctx, args, caller),
+        "plane_admin" => plane_admin(ctx, args, caller, trusted_internal),
 
         // ---- Theme (forwarded by name; parallel track owns the handlers) ----
         "get_theme" | "set_theme" => Err(format!(
@@ -7812,8 +7923,9 @@ fn inbox_ack(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
-    cap: Capability,
+    trusted_internal: bool,
 ) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "inbox_ack")?;
     let recipient = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("inbox_ack requires a 'sessionId' argument")?;
@@ -7827,25 +7939,21 @@ fn inbox_ack(
     // recipient is refused - the cross-session spoof the interim Organization gate feared
     // is closed by the per-session identity, not re-opened.
     // A session identity that is NOT the recipient itself may only ack with the control
-    // capability (the host/relay ack-on-behalf path); a Read caller acking someone else's
-    // inbox is refused. No session identity (`None`) only reaches this handler with the
-    // control capability (the tier gate required Organization for a non-self-ack), i.e.
-    // the trusted host/relay - allowed.
+    // capability does not override self-scope; only a proven in-process host may ack
+    // without a session identity.
     if let Some(id) = caller {
         if let Err(d) = crate::acl::can_ack(&acl_actor(id), &recipient) {
-            if cap != Capability::Full {
-                ctx.fanout.emit_event(
-                    "control://acl",
-                    &json!({
-                        "cell": "inbox-ack-self-scope",
-                        "decision": "refused",
-                        "session": id.session_id.as_str(),
-                        "recipient": recipient.as_str(),
-                        "reason": d.reason.as_str(),
-                    }),
-                );
-                return Err(format!("acl: {}", d.reason));
-            }
+            ctx.fanout.emit_event(
+                "control://acl",
+                &json!({
+                    "cell": "inbox-ack-self-scope",
+                    "decision": "refused",
+                    "session": id.session_id.as_str(),
+                    "recipient": recipient.as_str(),
+                    "reason": d.reason.as_str(),
+                }),
+            );
+            return Err(format!("acl: {}", d.reason));
         }
     }
     let outcome = ctx.inbox.ack(&recipient, seq);
@@ -7902,14 +8010,15 @@ fn parse_priority(args: &Value) -> Result<crate::inbox::Priority, String> {
 /// message rows (`can_message`) at enqueue time and the EMERGENCY-flag authority
 /// (`can_flag_emergency`), then enqueues a durable, attributed message. A denied send is
 /// REFUSED + attributed on `control://acl`, never a silent drop. An identified session is
-/// REQUIRED (or a Full-capability host/relay) - a bare read token with no session cannot
+/// REQUIRED (or a proven in-process host) - a token with no session cannot
 /// enqueue as anyone.
 fn plane_send(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
-    cap: Capability,
+    trusted_internal: bool,
 ) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "plane_send")?;
     let recipient = arg_str(args, "recipient")
         .or_else(|| arg_str(args, "sessionId"))
         .or_else(|| arg_str(args, "session_id"))
@@ -7934,30 +8043,15 @@ fn plane_send(
         format!("acl: {reason}")
     };
 
-    match caller {
-        Some(id) => {
-            let actor = acl_actor(id);
-            let target = message_target(ctx, &recipient);
-            if let Err(d) = crate::acl::can_message(&actor, &target) {
-                return Err(refuse(ctx, "message-send", &actor.session_id, &d.reason));
-            }
-            if priority == crate::inbox::Priority::Emergency {
-                if let Err(d) = crate::acl::can_flag_emergency(&actor) {
-                    return Err(refuse(ctx, "emergency-flag", &actor.session_id, &d.reason));
-                }
-            }
+    if let Some(id) = caller {
+        let actor = acl_actor(id);
+        let target = message_target(ctx, &recipient);
+        if let Err(d) = crate::acl::can_message(&actor, &target) {
+            return Err(refuse(ctx, "message-send", &actor.session_id, &d.reason));
         }
-        // No session identity: only a Full-capability host/relay (the app / fleet) may
-        // enqueue tokenless; a bare read token with no session is refused (the send
-        // cannot be attributed to any session, so it is not a fail-open case like a read).
-        None => {
-            if cap != Capability::Full {
-                return Err(refuse(
-                    ctx,
-                    "message-send",
-                    "<no-session>",
-                    "plane_send requires a per-session identity (present T_HUB_SESSION_TOKEN)",
-                ));
+        if priority == crate::inbox::Priority::Emergency {
+            if let Err(d) = crate::acl::can_flag_emergency(&actor) {
+                return Err(refuse(ctx, "emergency-flag", &actor.session_id, &d.reason));
             }
         }
     }
@@ -7983,13 +8077,14 @@ fn plane_send(
 /// runtime - a preempt signal, NOT a queued input message, so it cannot be typed over or
 /// corrupt a human draft. Gated by `can_abort`; an identified caller must own the target
 /// (Cortana->captain, captain->own crew, general->anyone), cross-ship/sibling is DENIED,
-/// and crew have no subordinate to abort. A Full-capability host (no session) acts as the
-/// trusted apex.
+/// and crew have no subordinate to abort. A proven in-process host acts as the apex.
 fn abort_session(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
 ) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "abort_session")?;
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .or_else(|| arg_str(args, "target"))
@@ -8013,8 +8108,7 @@ fn abort_session(
             return Err(format!("acl: {}", d.reason));
         }
     }
-    // A Full-capability host with no session identity is the trusted apex (the general
-    // driving the app); allowed. (The coarse ProcessChanging tier already required Full.)
+    // A caller without a session identity reached this point only with in-process host proof.
 
     let target = tmux_target(&session_id);
     writer_liveness_gate(
@@ -8114,7 +8208,9 @@ fn plane_admin(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
 ) -> Result<Value, String> {
+    require_socket_identity(caller, trusted_internal, "plane_admin")?;
     if let Some(id) = caller {
         let actor = acl_actor(id);
         if let Err(d) = crate::acl::can_operate_fleet_infra(&actor) {
@@ -8131,7 +8227,7 @@ fn plane_admin(
             return Err(format!("acl: {}", d.reason));
         }
     }
-    // A Full-capability host with no session identity is the trusted apex; allowed.
+    // A caller without a session identity reached this point only with in-process host proof.
     let op = arg_str(args, "op").unwrap_or_default();
     match op.as_str() {
         "purge" => {
@@ -8156,14 +8252,15 @@ fn read_terminal(
     ctx: &ControlContext,
     args: &Value,
     caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
 ) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("read_terminal requires a 'sessionId' argument")?;
     // Phase 3 (§2.6 H3): the cross-ship READ hole - `read_terminal` captures another
     // session's scrollback directly via tmux, bypassing the plane entirely. An
-    // identified session may read a pane ONLY on its own ship; the host fails open.
-    enforce_session_access(ctx, caller, &session_id)?;
+    // identified session may read a pane ONLY on its own ship; the proven host is unrestricted.
+    enforce_session_access(ctx, caller, trusted_internal, &session_id)?;
     let target = tmux_target(&session_id);
     let history = args
         .get("historyLines")
@@ -8287,7 +8384,19 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         // item-3: the worktree terminal follows the same inverted least-privilege
         // default as spawn_terminal (READ unless `capability:"control"`). Comms-plane
         // Phase 2 (§2.3): mint + inject its per-session identity token too.
-        let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "create_worktree");
+        let (elevation, minted_identity) = match spawn_env_with_identity(
+            ctx,
+            args,
+            "create_worktree",
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = git::worktree_remove(&repo_root, &worktree_path, true);
+                return Err(format!(
+                        "create_worktree: identity persistence failed and the worktree was rolled back: {error}"
+                    ));
+            }
+        };
         // Wrap the startupCommand into the pane exec the SAME way spawn_terminal
         // does (pane_command → an interactive login shell that execs the command);
         // None keeps the prior bare-shell behavior. No `shell` preset for a
@@ -8296,7 +8405,14 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         match spawn_tmux_terminal(&worktree_path, pane.as_deref(), &elevation) {
             Ok((id, _)) => {
                 if let Some(identity) = &minted_identity {
-                    ctx.identity.bind_tile(&identity.id, &id);
+                    if let Err(error) = ctx.identity.bind_tile(&identity.id, &id) {
+                        let _ = tmux::kill_session_tree(&tmux_target(&id));
+                        ctx.identity.retire(&identity.id);
+                        let _ = git::worktree_remove(&repo_root, &worktree_path, true);
+                        return Err(format!(
+                            "create_worktree: identity binding persistence failed and the terminal/worktree were rolled back: {error}"
+                        ));
+                    }
                 }
                 // Atomic placement with fallback: if the named tab was closed in
                 // the race window between resolution and placement, the tile
@@ -9223,7 +9339,7 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // control only on an explicit `capability:"control"`), so its in-session MCP
     // authenticates as the granted capability. Comms-plane Phase 2 (§2.3): also mint
     // + inject this session's per-session identity token alongside the tier token.
-    let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "spawn_terminal");
+    let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "spawn_terminal")?;
     let (id, tmux_session) = match spawn_tmux_terminal(&cwd_effective, pane.as_deref(), &elevation)
     {
         Ok(v) => v,
@@ -9240,7 +9356,13 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // Bind the minted identity to the tile id now it is known (the tile is a mutable
     // pointer; the durable key is the minted identity id - item-2 re-key flagged).
     if let Some(identity) = &minted_identity {
-        ctx.identity.bind_tile(&identity.id, &id);
+        if let Err(error) = ctx.identity.bind_tile(&identity.id, &id) {
+            let _ = tmux::kill_session_tree(&tmux_session);
+            ctx.identity.retire(&identity.id);
+            return Err(format!(
+                "spawn_terminal: identity binding persistence failed and the terminal was rolled back: {error}"
+            ));
+        }
     }
 
     // Atomic placement with fallback: if the resolved tab was closed in the race
@@ -13697,6 +13819,77 @@ mod tests {
     }
 
     #[test]
+    fn future_backup_schema_is_preserved_and_blocks_writes() {
+        let path = captains_tmp("future-backup-schema");
+        let backup = path.with_extension("json.bak");
+        let primary = CaptainsSnapshot {
+            schema_version: CAPTAINS_SCHEMA_VERSION,
+            seq: 4,
+            captains: vec![],
+            projects: vec![],
+        };
+        let backup_body = json!({
+            "schemaVersion": CAPTAINS_SCHEMA_VERSION + 1,
+            "seq": 5,
+            "captains": [],
+            "projects": [],
+            "futureField": "preserve",
+        })
+        .to_string();
+        std::fs::write(&path, serde_json::to_vec(&primary).unwrap()).unwrap();
+        std::fs::write(&backup, &backup_body).unwrap();
+
+        let registry = CaptainsRegistry::load(path.clone());
+        assert_eq!(
+            registry.snapshot().seq,
+            4,
+            "supported primary remains readable"
+        );
+        assert!(registry.write_blocked.is_some());
+        assert!(registry
+            .claim_test("cap-future", Some("future"), vec![])
+            .unwrap_err()
+            .contains("read-only"));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), backup_body);
+
+        let prefix = format!("{}.corrupt.", backup.file_name().unwrap().to_string_lossy());
+        assert!(!std::fs::read_dir(backup.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix)));
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn future_backup_is_not_quarantined_when_primary_is_corrupt() {
+        let path = captains_tmp("future-backup-corrupt-primary");
+        let backup = path.with_extension("json.bak");
+        let primary_body = "{ invalid";
+        let backup_body = json!({
+            "schemaVersion": CAPTAINS_SCHEMA_VERSION + 1,
+            "seq": 9,
+            "captains": [],
+            "projects": [],
+        })
+        .to_string();
+        std::fs::write(&path, primary_body).unwrap();
+        std::fs::write(&backup, &backup_body).unwrap();
+
+        let registry = CaptainsRegistry::load(path.clone());
+        assert!(registry.write_blocked.is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), primary_body);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), backup_body);
+        assert!(registry
+            .claim_test("cap-future", Some("future"), vec![])
+            .unwrap_err()
+            .contains("read-only"));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
     fn semantic_registry_corruption_recovers_from_validated_backup() {
         let path = captains_tmp("semantic-corruption");
         let backup = path.with_extension("json.bak");
@@ -13746,6 +13939,68 @@ mod tests {
             .expect("semantic corruption should be quarantined");
         let _ = std::fs::remove_file(quarantined.path());
         let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn current_schema_rejects_semantically_impossible_snapshots() {
+        let base = json!({
+            "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+            "seq": 1,
+            "captains": [],
+            "projects": [],
+        });
+        let cases = [
+            (
+                "active-without-terminal",
+                json!({
+                    "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+                    "seq": 1,
+                    "captains": [{"shipSlug": "alpha", "role": "captain", "state": {"kind": "active"}}],
+                    "projects": [],
+                }),
+            ),
+            (
+                "relative-project-root",
+                json!({
+                    "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+                    "seq": 1,
+                    "captains": [],
+                    "projects": [{
+                        "projectId": "p",
+                        "name": "P",
+                        "repoRoot": "relative/path",
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }],
+                }),
+            ),
+            (
+                "incomplete-powder-binding",
+                json!({
+                    "schemaVersion": CAPTAINS_SCHEMA_VERSION,
+                    "seq": 1,
+                    "captains": [],
+                    "projects": [{
+                        "projectId": "p",
+                        "name": "P",
+                        "repoRoot": "/tmp/p",
+                        "powder": {"connectionProfile": "", "repository": "repo"},
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }],
+                }),
+            ),
+        ];
+        assert!(
+            CaptainsRegistry::validate_snapshot(&serde_json::from_value(base).unwrap()).is_ok()
+        );
+        for (name, value) in cases {
+            let snapshot: CaptainsSnapshot = serde_json::from_value(value).unwrap();
+            assert!(
+                CaptainsRegistry::validate_snapshot(&snapshot).is_err(),
+                "{name} was accepted"
+            );
+        }
     }
 
     #[test]
@@ -14653,6 +14908,17 @@ mod tests {
     /// end-to-end with a resolved caller identity, so the ACL wiring is exercised through
     /// the real authenticated path (not just the pure predicate).
     fn req_session(token: &str, session: &str, command: &str, args: Value) -> ControlRequest {
+        ControlRequest {
+            token: token.to_string(),
+            command: command.to_string(),
+            args,
+            session: session.to_string(),
+            host: String::new(),
+            v: None,
+        }
+    }
+
+    fn req_untrusted(token: &str, session: &str, command: &str, args: Value) -> ControlRequest {
         ControlRequest {
             token: token.to_string(),
             command: command.to_string(),
@@ -15579,7 +15845,7 @@ mod tests {
     fn spawn_env_mints_and_injects_a_per_session_identity_token() {
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
-        let (env, minted) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
+        let (env, minted) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal").unwrap();
         // The tier token is injected; the item-3 default is the READ token ...
         assert!(env
             .iter()
@@ -15605,9 +15871,85 @@ mod tests {
 
         // Headless (no addr): no identity minted, env empty, spawns behave as before.
         ctx.addr = String::new();
-        let (env2, minted2) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
+        let (env2, minted2) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal").unwrap();
         assert!(env2.is_empty());
         assert!(minted2.is_none());
+    }
+
+    #[test]
+    fn socket_spawn_fails_before_tmux_when_identity_mint_is_not_durable() {
+        let blocker = captains_tmp("identity-mint-blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let store = Arc::new(crate::identity::IdentityStore::load(
+            blocker.join("identities.json"),
+        ));
+        let mut ctx = test_ctx("ctrl")
+            .with_identity_store(store.clone())
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }));
+        ctx.addr = "127.0.0.1:4242".to_string();
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req(
+                "ctrl",
+                "spawn_terminal",
+                json!({"cwd": "/tmp", "requestId": "identity-persist-failure"}),
+            ),
+        );
+
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .unwrap_or_default()
+                .contains("identity store persist"),
+            "spawn must surface the durability failure"
+        );
+        assert!(store.is_empty());
+        std::fs::remove_file(blocker).unwrap();
+    }
+
+    #[test]
+    fn socket_spawn_kills_terminal_when_identity_bind_is_not_durable() {
+        let path = captains_tmp("identity-bind-failure");
+        let store = Arc::new(crate::identity::IdentityStore::load(path.clone()));
+        store.fail_persist_after(1);
+        let mut ctx = test_ctx("ctrl")
+            .with_identity_store(store.clone())
+            .with_apply_sink(Arc::new(RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            }));
+        ctx.addr = "127.0.0.1:4242".to_string();
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req(
+                "ctrl",
+                "spawn_terminal",
+                json!({"cwd": "/tmp", "requestId": "identity-bind-failure"}),
+            ),
+        );
+
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .unwrap_or_default()
+                .contains("terminal was rolled back"),
+            "spawn must report its compensating rollback"
+        );
+        assert!(
+            store.is_empty(),
+            "the rolled-back spawn must retire its identity"
+        );
+        let persisted = crate::identity::IdentityStore::load(path.clone());
+        assert!(
+            persisted.is_empty(),
+            "rollback must remove the durable identity"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -15619,7 +15961,7 @@ mod tests {
         let mut ctx = test_ctx("t");
         ctx.addr = "127.0.0.1:4242".to_string();
 
-        let (env, _) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal");
+        let (env, _) = spawn_env_with_identity(&ctx, &json!({}), "spawn_terminal").unwrap();
         let gh_dir = env
             .iter()
             .find(|(k, _)| k == "GH_CONFIG_DIR")
@@ -15645,7 +15987,8 @@ mod tests {
         );
 
         let (env2, _) =
-            spawn_env_with_identity(&ctx, &json!({"capability": "control"}), "spawn_terminal");
+            spawn_env_with_identity(&ctx, &json!({"capability": "control"}), "spawn_terminal")
+                .unwrap();
         assert!(
             !env2.iter().any(|(k, _)| k == "GH_CONFIG_DIR"),
             "a control-class spawn must keep its gh credentials"
@@ -15716,23 +16059,11 @@ mod tests {
         assert_eq!(status["recipient"]["enqueued"].as_u64(), Some(0));
 
         // Ack retires it (`delivered -> processed`).
-        let ack = inbox_ack(
-            &ctx,
-            &json!({"sessionId": "tileX", "seq": 0}),
-            None,
-            Capability::Full,
-        )
-        .unwrap();
+        let ack = inbox_ack(&ctx, &json!({"sessionId": "tileX", "seq": 0}), None, true).unwrap();
         assert_eq!(ack["accepted"], "inbox_ack");
         assert_eq!(ack["state"], "processed");
         // A duplicate ack is a benign no-op (a lost-then-retried ack never re-writes).
-        let reack = inbox_ack(
-            &ctx,
-            &json!({"sessionId": "tileX", "seq": 0}),
-            None,
-            Capability::Full,
-        )
-        .unwrap();
+        let reack = inbox_ack(&ctx, &json!({"sessionId": "tileX", "seq": 0}), None, true).unwrap();
         assert_eq!(reack["state"], "alreadyProcessed");
 
         // No sessionId => the all-recipients snapshot.
@@ -15740,16 +16071,10 @@ mod tests {
         assert!(all["recipients"].is_array());
 
         // A malformed ack (missing seq) is rejected, not silently accepted.
-        assert!(inbox_ack(&ctx, &json!({"sessionId": "tileX"}), None, Capability::Full).is_err());
+        assert!(inbox_ack(&ctx, &json!({"sessionId": "tileX"}), None, true).is_err());
         // Acking an unknown recipient/seq is honest, not a crash.
         assert_eq!(
-            inbox_ack(
-                &ctx,
-                &json!({"sessionId": "nope", "seq": 7}),
-                None,
-                Capability::Full
-            )
-            .unwrap()["state"],
+            inbox_ack(&ctx, &json!({"sessionId": "nope", "seq": 7}), None, true).unwrap()["state"],
             "unknown"
         );
     }
@@ -15769,8 +16094,8 @@ mod tests {
         ship: &str,
         tile: &str,
     ) -> String {
-        let id = store.mint_for(role, Some(ship.to_string()));
-        store.bind_tile(&id.id, tile);
+        let id = store.mint_for(role, Some(ship.to_string())).unwrap();
+        store.bind_tile(&id.id, tile).unwrap();
         id.secret
     }
 
@@ -15818,6 +16143,40 @@ mod tests {
                 .contains("cross-ship isolation"),
             "the trusted host must fail open (NORM-now), not be ACL-refused"
         );
+    }
+
+    #[test]
+    fn full_token_without_host_provenance_cannot_reach_identity_sensitive_handlers() {
+        let ctx = test_ctx("ctrl");
+        let cases = [
+            ("read_terminal", json!({"sessionId": "target"})),
+            ("send_text", json!({"sessionId": "target", "text": "x"})),
+            (
+                "send_keys",
+                json!({"sessionId": "target", "keys": ["Escape"]}),
+            ),
+            ("abort_session", json!({"sessionId": "target"})),
+            ("plane_admin", json!({"op": "purge", "recipient": "target"})),
+            ("plane_send", json!({"recipient": "target", "text": "x"})),
+            ("inbox_ack", json!({"sessionId": "target", "seq": 0})),
+        ];
+
+        for (command, args) in cases {
+            for session in ["", "invalid-session-token"] {
+                let response = dispatch_authenticated(
+                    &ctx,
+                    req_untrusted("ctrl", session, command, args.clone()),
+                );
+                assert!(!response.ok, "{command} accepted omitted identity");
+                assert!(
+                    response
+                        .error
+                        .unwrap_or_default()
+                        .contains("requires a valid T_HUB_SESSION_TOKEN"),
+                    "{command} did not fail at the provenance boundary"
+                );
+            }
+        }
     }
 
     #[test]
@@ -16045,8 +16404,7 @@ mod tests {
             "cortana skip-level into foreign crew must be refused"
         );
 
-        // FULL-TOKEN HOST: the tokenless control-token host (the app webview/MCP) presents
-        // no per-session identity -> fails OPEN (never ACL-refused).
+        // IN-PROCESS HOST: the local host proof admits a request without a session identity.
         let host = dispatch_authenticated(
             &ctx,
             req("ctrl", "read_terminal", json!({"sessionId": "crew-b"})),
@@ -16141,6 +16499,21 @@ mod tests {
             1,
             "a refused cross-session ack must not process crew-b's message"
         );
+
+        let full_token_cross = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "ctrl",
+                &crew_a,
+                "inbox_ack",
+                json!({"sessionId": "crew-b", "seq": 0}),
+            ),
+        );
+        assert!(
+            !full_token_cross.ok,
+            "Full capability must not substitute for host provenance"
+        );
+        assert_eq!(inbox.depth("crew-b").delivered, 1);
     }
 
     #[test]
