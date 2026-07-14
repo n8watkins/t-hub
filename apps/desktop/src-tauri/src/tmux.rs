@@ -217,6 +217,23 @@ fn run(op: &'static str, args: &[&str]) -> Result<std::process::Output, TmuxErro
     }
 }
 
+/// Read one value from a tmux session's private environment without exposing it
+/// through process arguments or logs. Missing variables return `None`.
+pub fn session_environment(name: &str, key: &str) -> Result<Option<String>, TmuxError> {
+    let output = run("show-environment", &["show-environment", "-t", name, key]);
+    match output {
+        Ok(output) => {
+            let line = String::from_utf8_lossy(&output.stdout);
+            Ok(line
+                .trim()
+                .split_once('=')
+                .map(|(_, value)| value.to_string()))
+        }
+        Err(error) if error.message.contains("unknown variable") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Create a new detached tmux session named `name`, rooted at `cwd`, with optional
 /// per-session environment variables via tmux `-e` (socket-gate Phase 2b).
 ///

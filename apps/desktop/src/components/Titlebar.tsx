@@ -323,7 +323,7 @@ function CaptainButton() {
         title={
           count > 0
             ? "Pinned captains - click to list, Ctrl+B C summons/cycles"
-            : "No captain pinned - right-click a tile header → Pin as captain"
+            : "No terminal pinned - right-click a tile header and choose Pin to Captain overlay"
         }
         onClick={() => {
           if (count > 0) useCaptain.getState().setAnchorMenu(!menuOpen);

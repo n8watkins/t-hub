@@ -1147,11 +1147,11 @@ export function Tile({
               }}
             />
             <CtxItem
-              label={isCaptain ? "Unpin captain" : "Pin as captain"}
+              label={isCaptain ? "Unpin from Captain overlay" : "Pin to Captain overlay"}
               hint={
                 isCaptain
-                  ? "This is a pinned captain - unpin to drop it from the summon list"
-                  : "Add this session to the captains the overlay summons (Ctrl+B C)"
+                  ? "Remove this terminal from the summon overlay without changing its role"
+                  : "Add this terminal to the summon overlay without granting Captain permissions"
               }
               onClick={() => {
                 setCtxMenu(null);

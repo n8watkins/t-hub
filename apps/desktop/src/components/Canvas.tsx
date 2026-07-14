@@ -254,9 +254,8 @@ export function Canvas({ onFocusSidebar }: CanvasProps = {}) {
         );
         addAfterFocused(info);
         if (pinAsCaptain) {
-          // Captain presets are a complete designation workflow, not merely an
-          // elevated work tile. pinCaptain optimistically registers the tile,
-          // claims it server-side, and moves it into the reserved Captains tab.
+          // Legacy visual-only preset support. Project-aware Captain presets use
+          // the commissioning dialog instead of this overlay pin.
           useCaptain.getState().pinCaptain(info.id);
         }
       } catch (err) {

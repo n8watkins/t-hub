@@ -25,8 +25,8 @@ import {
 } from "./workspace";
 import type { TerminalInfo } from "../ipc/types";
 
-// Capture the store's fire-and-forget server captaincy mutations (phase 2:
-// pin = claim_captain, unpin = release_captain) without a control channel.
+// Capture the store's Cortana mutations without a control channel. Overlay pins
+// must never appear here because pinning is presentational only.
 const controlRequests: Array<{ command: string; args: unknown }> = [];
 vi.mock("../ipc/controlClient", () => ({
   controlRequest: (command: string, args: unknown) => {
@@ -431,7 +431,7 @@ describe("server registry adoption (headless-org PR #8)", () => {
   });
 });
 
-describe("phase 2: pinning is claiming (server captains registry)", () => {
+describe("overlay pins and commissioned Captain claims", () => {
   const claim = (
     id: string,
     tabs: string[] = [],
@@ -443,24 +443,16 @@ describe("phase 2: pinning is claiming (server captains registry)", () => {
     crew: crew.map((c) => ({ terminalId: c })),
   });
 
-  it("pin fires claim_captain and unpin fires release_captain (best-effort)", async () => {
+  it("pin and unpin never mutate server authority or workspace placement", async () => {
+    const beforeTabs = useWorkspace.getState().tabs;
     useCaptain.getState().pinCaptain("bbb00001");
-    await vi.waitFor(() => {
-      expect(controlRequests).toEqual([
-        { command: "claim_captain", args: { captainSessionId: "bbb00001" } },
-      ]);
-    });
     useCaptain.getState().unpinCaptain("bbb00001");
-    await vi.waitFor(() => {
-      expect(controlRequests[1]).toEqual({
-        command: "release_captain",
-        args: { captainSessionId: "bbb00001" },
-      });
-    });
-    // Re-pinning an already-pinned id is a full no-op (no duplicate claim).
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(controlRequests).toEqual([]);
+    expect(useWorkspace.getState().tabs).toEqual(beforeTabs);
     useCaptain.getState().pinCaptain("cap00001");
     await new Promise((r) => setTimeout(r, 0));
-    expect(controlRequests).toHaveLength(2);
+    expect(controlRequests).toHaveLength(0);
   });
 
   it("adoption preserves local MRU for survivors and appends new claims at the tail", () => {
@@ -478,14 +470,14 @@ describe("phase 2: pinning is claiming (server captains registry)", () => {
     expect(s.claims["cap00001"].workspaceTabIds).toEqual(["t1"]);
   });
 
-  it("adoption drops a local pin the server no longer holds, closing the overlay if summoned", () => {
+  it("adoption never drops an explicit visual pin when a claim disappears", () => {
     seedCaptains(["cap00001", "bbb00001"]);
     useCaptain.getState().openOverlay(); // summons cap00001
     useCaptain.getState().adoptCaptainsRegistry([claim("bbb00001")]);
     const s = useCaptain.getState();
-    expect(s.captainIds).toEqual(["bbb00001"]);
-    expect(s.open).toBe(false);
-    expect(useWorkspace.getState().focusedId).toBe("ccc00001"); // focus restored
+    expect(s.captainIds).toEqual(["cap00001", "bbb00001"]);
+    expect(s.open).toBe(true);
+    expect(s.claims["cap00001"]).toBeUndefined();
   });
 
   it("adoption of an unchanged membership refreshes claims without a persist write", () => {
@@ -601,21 +593,12 @@ describe("orchestrator designation", () => {
     expect(workTab).toBeTruthy();
   });
 
-  it("pinning a captain moves its tile into the Captains tab; unpinning returns it", () => {
+  it("overlay pinning never changes workspace placement", () => {
+    const before = useWorkspace.getState().tabs;
     useCaptain.getState().pinCaptain("ddd00001");
-    expect(
-      useWorkspace.getState().tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order,
-    ).toContain("ddd00001");
+    expect(useWorkspace.getState().tabs).toEqual(before);
     useCaptain.getState().unpinCaptain("ddd00001");
-    const ws = useWorkspace.getState();
-    expect(
-      ws.tabs.find((t) => t.id === CAPTAINS_TAB_ID)?.order,
-    ).not.toContain("ddd00001");
-    expect(
-      ws.tabs.some(
-        (t) => t.id !== CAPTAINS_TAB_ID && t.order.includes("ddd00001"),
-      ),
-    ).toBe(true);
+    expect(useWorkspace.getState().tabs).toEqual(before);
   });
 
   it("unpinning a captain that is STILL the orchestrator keeps its tile in the Captains tab", () => {

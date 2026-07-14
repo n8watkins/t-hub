@@ -331,6 +331,8 @@ fn schema_claim_captain() -> Value {
         "properties": {
             "captainSessionId": { "type": "string", "description": "The captain's own session/terminal id (the tmux target is th_<id>)." },
             "shipSlug":         { "type": "string", "description": "Optional ship name (slugified server-side; defaults to ship-<captainSessionId>). One captain per ship: a slug held by another captain is refused." },
+            "provider":         { "type": "string", "enum": ["codex", "claude"], "description": "Harness that owns providerSessionId. Legacy callers default to Claude." },
+            "providerSessionId": { "type": "string", "description": "Optional provider-native conversation id, such as CODEX_THREAD_ID or a Claude session UUID." },
             "workspaceTabIds":  { "type": "array", "items": { "type": "string" }, "description": "Optional workspace tab ids this captain controls (defaults to the tab currently holding the captain's tile)." }
         },
         "required": ["captainSessionId"],
@@ -392,6 +394,23 @@ fn schema_commission_captain() -> Value {
             "workspaceTabIds": { "type": "array", "items": { "type": "string" }, "description": "Project workspace tabs this Captain owns." }
         },
         "required": ["projectId", "assignment"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_attach_captain() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "captainSessionId": { "type": "string", "description": "Live terminal to attach. It must already have control capability; read-only terminals are refused without elevation." },
+            "projectId": { "type": "string", "description": "Powder-bound registered project to supervise." },
+            "assignment": { "type": "string", "description": "Durable Captain assignment restored after resets." },
+            "provider": { "type": "string", "enum": ["codex", "claude"], "description": "Agent harness. Defaults to codex." },
+            "providerSessionId": { "type": "string", "description": "Provider-native conversation id to checkpoint immediately." },
+            "shipSlug": { "type": "string", "description": "Optional durable ship slug. Defaults to the project name." },
+            "workspaceTabIds": { "type": "array", "items": { "type": "string" }, "description": "Project workspace tabs this Captain owns. Defaults to the terminal's current tab." }
+        },
+        "required": ["captainSessionId", "projectId", "assignment"],
         "additionalProperties": false
     })
 }
@@ -738,6 +757,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_commission_captain,
         },
         ToolDef {
+            name: "attach_captain",
+            tier: Tier::ProcessChanging,
+            summary: "Attach an existing control-capability terminal as a Powder-backed project Captain without rewriting or elevating its bearer token.",
+            input_schema: schema_attach_captain,
+        },
+        ToolDef {
             name: "dispatch_crew",
             tier: Tier::ProcessChanging,
             summary: "Claim a project Powder card, spawn one least-privilege Crew harness, and persist the card/run-to-terminal binding transactionally.",
@@ -839,6 +864,7 @@ mod tests {
             "create_worktree",
             "remove_worktree",
             "claim_captain",
+            "attach_captain",
             "release_captain",
             "get_theme",
             "set_theme",
@@ -985,6 +1011,13 @@ mod tests {
         assert_eq!(
             (commission.input_schema)()["required"],
             json!(["projectId", "assignment"])
+        );
+
+        let attach = find("attach_captain").unwrap();
+        assert_eq!(attach.tier, Tier::ProcessChanging);
+        assert_eq!(
+            (attach.input_schema)()["required"],
+            json!(["captainSessionId", "projectId", "assignment"])
         );
 
         let status = find("powder_status").unwrap();

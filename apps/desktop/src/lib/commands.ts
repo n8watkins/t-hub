@@ -154,9 +154,9 @@ export const COMMANDS: CommandMeta[] = [
   },
   {
     id: "pinCaptainFocused",
-    label: "Pin as captain",
+    label: "Pin to Captain overlay",
     description:
-      "Pin (or unpin) the focused tile as a captain the overlay can summon - pinning is additive",
+      "Pin or unpin the focused terminal in the summon overlay without changing its permissions or role",
     category: "App",
   },
 ];

@@ -868,6 +868,12 @@ pub struct CrewRef {
     /// and BACKFILLED on the first StatusBridge resolution. Never load-bearing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_uuid: Option<String>,
+    /// Harness that owns `provider_session_id`. Missing on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Provider-native conversation id, such as a Codex thread id or Claude UUID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
     /// Harness-neutral conversation identifier used to resume or reconcile a
     /// replaced Crew conversation. Provider continuity is useful, but never the
     /// durable crew identity.
@@ -898,6 +904,8 @@ impl CrewRef {
         CrewRef {
             terminal_id: terminal_id.to_string(),
             claude_uuid: None,
+            provider: None,
+            provider_session_id: None,
             conversation_id: None,
             resume_point: None,
             task: None,
@@ -1006,6 +1014,13 @@ pub struct FleetIdentity {
     /// HIGH-1); correctness never rests on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_uuid: Option<String>,
+    /// Harness that owns `provider_session_id`. Missing means a legacy Claude claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Provider-native continuity anchor. This replaces Claude-only identity for
+    /// new claims while `claude_uuid` remains a read-compatible migration field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
     /// The MUTABLE terminal pointer (was `captain_session_id`, the old primary key).
     /// `None` while orphaned/vacant - un-pointed but not lost (the exact window that
     /// deadlocked R-H2). Accepts the legacy `captainSessionId` field on load.
@@ -1147,10 +1162,9 @@ struct CaptainsInner {
 ///
 /// Captain identity previously lived in two disconnected places: the UI's
 /// localStorage designation and the captain's own ship files. This registry is
-/// the ONE source of truth the UI and MCP both read: pinning in the UI is a
-/// `claim_captain` server mutation, captains self-register over MCP the same
-/// way, and every mutation forwards a seq'd [`CaptainsSnapshot`] to the UI
-/// exactly like the tab registry does.
+/// the source of truth for commissioned Captain authority. Overlay pins remain
+/// independent UI view state. Captains claim through the control plane, and every
+/// mutation forwards a seq'd [`CaptainsSnapshot`] to the UI like the tab registry.
 ///
 /// Unlike [`TabRegistry`] this IS persistent (the phases doc: "survives restarts
 /// server-side; localStorage keeps only view state"): every mutation is written
@@ -1558,6 +1572,15 @@ impl CaptainsRegistry {
         captain.project_id = Some(project_id.to_string());
         captain.assignment = Some(assignment.to_string());
         captain.harness = Some(harness.to_string());
+        let provider_changed = captain.provider.as_deref() != Some(harness);
+        captain.provider = Some(harness.to_string());
+        if harness != "claude" {
+            captain.claude_uuid = None;
+        }
+        if provider_changed {
+            captain.provider_session_id = None;
+            captain.conversation_id = None;
+        }
         let result = captain.clone();
         g.seq = g.seq.saturating_add(1);
         self.commit_mutation(g, previous)?;
@@ -1594,6 +1617,10 @@ impl CaptainsRegistry {
             .ok_or_else(|| format!("unknown Crew session '{crew_session_id}'"))?;
         crew.task = Some(task.trim().to_string());
         crew.harness = Some(harness.to_string());
+        crew.provider = Some(harness.to_string());
+        if harness != "claude" {
+            crew.claude_uuid = None;
+        }
         crew.worktree_path = worktree_path.map(str::to_string);
         crew.branch = branch.map(str::to_string);
         crew.powder_work = Some(powder_work);
@@ -1723,10 +1750,43 @@ impl CaptainsRegistry {
     /// Does record `c`'s RESOLVED continuity anchor equal the presented one? Only a
     /// non-empty, both-present, equal pair matches - an absent anchor (the async
     /// window, HIGH-1) never matches, so this is a fast-path hint only.
-    fn uuid_matches(c: &FleetIdentity, presented: Option<&str>) -> bool {
-        match (c.claude_uuid.as_deref(), presented) {
+    fn provider_session_matches(
+        c: &FleetIdentity,
+        provider: Option<&str>,
+        presented: Option<&str>,
+    ) -> bool {
+        let record_provider = c
+            .provider
+            .as_deref()
+            .or_else(|| c.claude_uuid.as_ref().map(|_| "claude"));
+        let record_session = c
+            .provider_session_id
+            .as_deref()
+            .or(c.claude_uuid.as_deref());
+        if record_provider != provider {
+            return false;
+        }
+        match (record_session, presented) {
             (Some(a), Some(b)) => !a.is_empty() && a == b,
             _ => false,
+        }
+    }
+
+    fn set_provider_identity(
+        captain: &mut FleetIdentity,
+        provider: Option<&str>,
+        provider_session_id: Option<&str>,
+    ) {
+        let Some(provider) = provider else { return };
+        captain.provider = Some(provider.to_string());
+        captain.provider_session_id = provider_session_id.map(str::to_string);
+        captain.claude_uuid = if provider == "claude" {
+            provider_session_id.map(str::to_string)
+        } else {
+            None
+        };
+        if let Some(id) = provider_session_id {
+            captain.conversation_id = Some(id.to_string());
         }
     }
 
@@ -1780,12 +1840,13 @@ impl CaptainsRegistry {
     /// in production (the SOLE transfer-grade signal, R1): true ONLY for a completed
     /// probe reporting the session absent, so a timed-out/ambiguous probe never
     /// seizes a live ship. Tests inject a deterministic predicate.
-    pub fn claim(
+    pub fn claim_provider(
         &self,
         terminal_id: &str,
         ship_slug: Option<&str>,
         role: FleetRole,
-        claude_uuid: Option<&str>,
+        provider: Option<&str>,
+        provider_session_id: Option<&str>,
         workspace_tab_ids: Vec<String>,
         is_terminal_dead: &dyn Fn(&str) -> bool,
         crew_liveness: &dyn Fn(&str) -> tmux::SessionLiveness,
@@ -1819,7 +1880,9 @@ impl CaptainsRegistry {
                 {
                     Some(h) => {
                         let same_terminal = h.terminal_id.as_deref() == Some(terminal_id);
-                        if same_terminal || Self::uuid_matches(h, claude_uuid) {
+                        if same_terminal
+                            || Self::provider_session_matches(h, provider, provider_session_id)
+                        {
                             None
                         } else {
                             match (&h.terminal_id, &h.state) {
@@ -1874,9 +1937,7 @@ impl CaptainsRegistry {
                         let c = &mut g.captains[mi];
                         c.ship_slug = slug.clone();
                         c.role = role;
-                        if let Some(u) = claude_uuid {
-                            c.claude_uuid = Some(u.to_string());
-                        }
+                        Self::set_provider_identity(c, provider, provider_session_id);
                         if !workspace_tab_ids.is_empty() {
                             c.workspace_tab_ids = workspace_tab_ids;
                         }
@@ -1893,12 +1954,16 @@ impl CaptainsRegistry {
                     let rec = FleetIdentity {
                         ship_slug: slug.clone(),
                         role,
-                        claude_uuid: claude_uuid.map(str::to_string),
+                        claude_uuid: (provider == Some("claude"))
+                            .then(|| provider_session_id.map(str::to_string))
+                            .flatten(),
+                        provider: provider.map(str::to_string),
+                        provider_session_id: provider_session_id.map(str::to_string),
                         terminal_id: Some(terminal_id.to_string()),
                         project_id: None,
                         assignment: None,
                         harness: None,
-                        conversation_id: None,
+                        conversation_id: provider_session_id.map(str::to_string),
                         resume_point: None,
                         workspace_tab_ids,
                         crew: Vec::new(),
@@ -1919,20 +1984,22 @@ impl CaptainsRegistry {
                         let c = &mut g.captains[i];
                         let tabs_change = !workspace_tab_ids.is_empty()
                             && c.workspace_tab_ids != workspace_tab_ids;
-                        let uuid_change =
-                            claude_uuid.is_some() && c.claude_uuid.as_deref() != claude_uuid;
+                        let provider_change = provider.is_some()
+                            && (c.provider.as_deref() != provider
+                                || provider_session_id.is_some()
+                                    && c.provider_session_id.as_deref() != provider_session_id);
                         let reactivate = c.state != ClaimState::Active;
                         if tabs_change {
                             c.workspace_tab_ids = workspace_tab_ids;
                         }
-                        if uuid_change {
-                            c.claude_uuid = claude_uuid.map(str::to_string);
+                        if provider_change {
+                            Self::set_provider_identity(c, provider, provider_session_id);
                         }
                         if reactivate {
                             c.state = ClaimState::Active;
                             Self::readopt_orphaned_crew(c, crew_liveness);
                         }
-                        let changed = tabs_change || uuid_change || reactivate;
+                        let changed = tabs_change || provider_change || reactivate;
                         let rec = c.clone();
                         return self.commit_claim(
                             g,
@@ -1944,7 +2011,11 @@ impl CaptainsRegistry {
                     }
 
                     // A DIFFERENT terminal holds the key. Classify per the matrix.
-                    let uuid_hit = Self::uuid_matches(&g.captains[i], claude_uuid);
+                    let uuid_hit = Self::provider_session_matches(
+                        &g.captains[i],
+                        provider,
+                        provider_session_id,
+                    );
                     let orphan_or_vacant = g.captains[i].terminal_id.is_none()
                         || matches!(
                             g.captains[i].state,
@@ -1979,9 +2050,7 @@ impl CaptainsRegistry {
                     // Rebind the pointer, re-activate, re-adopt orphaned crew.
                     let c = &mut g.captains[i];
                     c.terminal_id = Some(terminal_id.to_string());
-                    if let Some(u) = claude_uuid {
-                        c.claude_uuid = Some(u.to_string());
-                    }
+                    Self::set_provider_identity(c, provider, provider_session_id);
                     if !workspace_tab_ids.is_empty() {
                         c.workspace_tab_ids = workspace_tab_ids;
                     }
@@ -1996,6 +2065,30 @@ impl CaptainsRegistry {
             "claim_captain: ship '{slug}' claim was contended across {CLAIM_CAS_ATTEMPTS} \
              attempts - retry"
         ))
+    }
+
+    /// Compatibility entry point for legacy Claude callers and persisted tests.
+    /// New multi-harness paths must use `claim_provider` explicitly.
+    pub fn claim(
+        &self,
+        terminal_id: &str,
+        ship_slug: Option<&str>,
+        role: FleetRole,
+        claude_uuid: Option<&str>,
+        workspace_tab_ids: Vec<String>,
+        is_terminal_dead: &dyn Fn(&str) -> bool,
+        crew_liveness: &dyn Fn(&str) -> tmux::SessionLiveness,
+    ) -> Result<ClaimOutcome, String> {
+        self.claim_provider(
+            terminal_id,
+            ship_slug,
+            role,
+            Some("claude"),
+            claude_uuid,
+            workspace_tab_ids,
+            is_terminal_dead,
+            crew_liveness,
+        )
     }
 
     /// Re-adopt a resuming supervisor's Orphaned crew, GATED on a liveness probe
@@ -2163,13 +2256,30 @@ impl CaptainsRegistry {
         let previous = g.clone();
         let mut changed = false;
         for c in g.captains.iter_mut() {
-            if c.terminal_id.as_deref() == Some(tile) && c.claude_uuid.is_none() {
+            if c.terminal_id.as_deref() == Some(tile)
+                && c.provider
+                    .as_deref()
+                    .is_none_or(|provider| provider == "claude")
+                && c.claude_uuid.is_none()
+            {
                 c.claude_uuid = Some(uuid.to_string());
+                c.provider = Some("claude".to_string());
+                c.provider_session_id = Some(uuid.to_string());
+                c.conversation_id.get_or_insert_with(|| uuid.to_string());
                 changed = true;
             }
             for cr in c.crew.iter_mut() {
-                if cr.terminal_id == tile && cr.claude_uuid.is_none() {
+                if cr.terminal_id == tile
+                    && cr
+                        .provider
+                        .as_deref()
+                        .is_none_or(|provider| provider == "claude")
+                    && cr.claude_uuid.is_none()
+                {
                     cr.claude_uuid = Some(uuid.to_string());
+                    cr.provider = Some("claude".to_string());
+                    cr.provider_session_id = Some(uuid.to_string());
+                    cr.conversation_id.get_or_insert_with(|| uuid.to_string());
                     changed = true;
                 }
             }
@@ -3973,7 +4083,7 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "commission_captain" | "dispatch_crew" | "heartbeat_crew_powder"
+        "spawn_terminal" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder"
         | "send_text" | "send_keys" | "close_terminal"
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
@@ -5118,6 +5228,7 @@ fn dispatch_with_caller(
         // session the app already owns).
         "spawn_terminal" => spawn_terminal(ctx, args),
         "commission_captain" => commission_captain(ctx, args),
+        "attach_captain" => attach_captain(ctx, args),
         "dispatch_crew" => dispatch_crew(ctx, args),
         "heartbeat_crew_powder" => heartbeat_crew_powder(ctx, args),
         // comms-plane Phase 1: `send_text`/`send_keys` are DEMOTED to audited
@@ -6073,6 +6184,8 @@ fn commission_captain(ctx: &ControlContext, args: &Value) -> Result<Value, Strin
         ship_slug: ship_slug.clone(),
         role: FleetRole::Captain,
         claude_uuid: None,
+        provider: Some(harness.as_provider().to_string()),
+        provider_session_id: None,
         terminal_id: None,
         project_id: Some(project.project_id.clone()),
         assignment: Some(assignment.clone()),
@@ -6126,6 +6239,7 @@ fn commission_captain(ctx: &ControlContext, args: &Value) -> Result<Value, Strin
         &json!({
             "captainSessionId": terminal_id,
             "shipSlug": ship_slug,
+            "provider": harness.as_provider(),
             "workspaceTabIds": workspace_tab_ids,
         }),
     );
@@ -6152,6 +6266,152 @@ fn commission_captain(ctx: &ControlContext, args: &Value) -> Result<Value, Strin
     };
     let _ = captains_sync_apply(ctx);
     Ok(commissioned_response(captain, project, false))
+}
+
+/// Bind an already-running terminal as a project Captain without changing the
+/// terminal's bearer token. The terminal must have been explicitly spawned with
+/// control capability. A read-only terminal is refused and must be replaced via
+/// `commission_captain`; mutating tmux environment after launch would not revoke
+/// the read token already inherited by its process tree and would be a silent,
+/// partial elevation.
+fn attach_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let terminal_id = arg_str(args, "captainSessionId")
+        .or_else(|| arg_str(args, "captain_session_id"))
+        .or_else(|| arg_str(args, "sessionId"))
+        .or_else(|| arg_str(args, "session_id"))
+        .ok_or("attach_captain requires a 'captainSessionId' argument")?;
+    let project_id = arg_str(args, "projectId")
+        .or_else(|| arg_str(args, "project_id"))
+        .ok_or("attach_captain requires a 'projectId' argument")?;
+    let assignment = arg_str(args, "assignment")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("attach_captain requires a non-empty 'assignment' argument")?;
+    let provider = arg_str(args, "provider")
+        .or_else(|| arg_str(args, "harness"))
+        .unwrap_or_else(|| "codex".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if provider != "codex" && provider != "claude" {
+        return Err(format!(
+            "attach_captain: unsupported provider '{provider}' (expected 'codex' or 'claude')"
+        ));
+    }
+    match tmux::session_liveness(&tmux_target(&terminal_id)) {
+        tmux::SessionLiveness::Alive => {}
+        tmux::SessionLiveness::Gone => {
+            return Err(format!(
+                "attach_captain: terminal '{terminal_id}' is not live"
+            ));
+        }
+        tmux::SessionLiveness::Unknown => {
+            return Err(retryable_error(format!(
+                "attach_captain: terminal '{terminal_id}' liveness is unavailable"
+            )));
+        }
+    }
+    let inherited = tmux::session_environment(&tmux_target(&terminal_id), "T_HUB_CONTROL_TOKEN")
+        .map_err(|error| {
+            format!("attach_captain: could not verify terminal capability: {error}")
+        })?;
+    if !inherited
+        .as_deref()
+        .is_some_and(|token| ct_token_eq(token, &ctx.token))
+    {
+        return Err(format!(
+            "attach_captain: terminal '{terminal_id}' is read-only; refusing silent elevation. Use commission_captain to start a control-capability Captain and resume this conversation there"
+        ));
+    }
+    match tmux::harness_liveness(&tmux_target(&terminal_id), &provider) {
+        tmux::SessionLiveness::Alive => {}
+        tmux::SessionLiveness::Gone => {
+            return Err(format!(
+                "attach_captain: terminal '{terminal_id}' is not running the declared {provider} harness"
+            ));
+        }
+        tmux::SessionLiveness::Unknown => {
+            return Err(retryable_error(format!(
+                "attach_captain: could not verify the declared {provider} harness in terminal '{terminal_id}'"
+            )));
+        }
+    }
+    let project = ctx
+        .captains
+        .projects()
+        .into_iter()
+        .find(|project| project.project_id == project_id)
+        .ok_or_else(|| format!("attach_captain: unknown projectId '{project_id}'"))?;
+    let powder_binding = project.powder.as_ref().ok_or_else(|| {
+        format!(
+            "attach_captain: project '{}' must be bound to Powder before attachment",
+            project.name
+        )
+    })?;
+    #[cfg(not(test))]
+    {
+        let client = powder::Client::from_profile(&powder_binding.connection_profile)?;
+        client
+            .health()
+            .and_then(|_| client.authorization_probe())
+            .map_err(|error| {
+                format!(
+                    "attach_captain: Powder preflight failed for repository '{}': {error}",
+                    powder_binding.repository
+                )
+            })?;
+    }
+    #[cfg(test)]
+    if !args
+        .get("testSkipPowderHealth")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let client = powder::Client::from_profile(&powder_binding.connection_profile)?;
+        client
+            .health()
+            .and_then(|_| client.authorization_probe())
+            .map_err(|error| {
+                format!(
+                    "attach_captain: Powder preflight failed for repository '{}': {error}",
+                    powder_binding.repository
+                )
+            })?;
+    }
+    if let Some(existing) = existing_project_captain(ctx, &project_id)? {
+        if existing.terminal_id.as_deref() != Some(terminal_id.as_str()) {
+            return Err(format!(
+                "attach_captain: project '{}' already has live Captain '{}'",
+                project.name, existing.ship_slug
+            ));
+        }
+    }
+    let ship_slug = arg_str(args, "shipSlug")
+        .or_else(|| arg_str(args, "ship_slug"))
+        .map(|value| slugify_ship(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| slugify_ship(&project.name));
+    let mut claim_args = json!({
+        "captainSessionId": terminal_id,
+        "shipSlug": ship_slug,
+        "provider": provider,
+    });
+    for key in ["providerSessionId", "conversationId", "workspaceTabIds"] {
+        if let Some(value) = args.get(key) {
+            claim_args[key] = value.clone();
+        }
+    }
+    claim_captain(ctx, &claim_args)?;
+    let captain =
+        ctx.captains
+            .bind_ship_context(&ship_slug, &project_id, &assignment, &provider)?;
+    let _ = captains_sync_apply(ctx);
+    Ok(json!({
+        "accepted": "attach_captain",
+        "audited": true,
+        "captain": captain,
+        "project": project,
+        "instructions": bootstrap_instructions(&captain, &project),
+        "capabilityPreserved": "control",
+    }))
 }
 
 fn powder_status(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
@@ -7878,8 +8138,8 @@ fn captain_checkpoint(
 }
 
 /// `claim_captain` (Organization, audited; captain-chat phase 2): claim captaincy
-/// of a ship. The UI's pin action and an MCP captain's self-registration are the
-/// SAME mutation - registry-first (strict: a ship already captained by another
+/// of a ship. This is a durable authority mutation, separate from the UI's visual
+/// overlay pin. It is registry-first (strict: a ship already captained by another
 /// session is refused), then the authoritative captains snapshot is forwarded via
 /// `sync_captains` so every client renders from it. Args: `captainSessionId` (or
 /// `sessionId`) required; `shipSlug` optional (slugified; defaults to
@@ -7932,7 +8192,30 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     // The Claude continuity anchor, best-effort (async-resolved, HIGH-1): a fast-path
     // idempotency hint only. `None` in the startup window is fine - the ship-slug
     // re-claim is the load-bearing rebind trigger.
-    let claude_uuid = ctx.status.session_for_terminal(&captain_session_id);
+    let requested_provider = arg_str(args, "provider")
+        .or_else(|| arg_str(args, "harness"))
+        .map(|value| value.trim().to_ascii_lowercase());
+    let existing_provider = ctx
+        .captains
+        .captain_for_session(&captain_session_id)
+        .and_then(|captain| captain.provider.or(captain.harness));
+    let provider = requested_provider
+        .or(existing_provider)
+        .unwrap_or_else(|| "claude".into());
+    if provider != "claude" && provider != "codex" {
+        return Err(format!(
+            "claim_captain: unsupported provider '{provider}' (expected 'codex' or 'claude')"
+        ));
+    }
+    let provider_session_id = arg_str(args, "providerSessionId")
+        .or_else(|| arg_str(args, "provider_session_id"))
+        .or_else(|| arg_str(args, "conversationId"))
+        .or_else(|| arg_str(args, "conversation_id"))
+        .or_else(|| {
+            (provider == "claude")
+                .then(|| ctx.status.session_for_terminal(&captain_session_id))
+                .flatten()
+        });
     let workspace_tab_ids: Vec<String> = args
         .get("workspaceTabIds")
         .or_else(|| args.get("workspace_tab_ids"))
@@ -7942,6 +8225,7 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
                 .filter_map(|t| t.as_str().map(str::to_string))
                 .collect()
         })
+        .filter(|tabs: &Vec<String>| !tabs.is_empty())
         .unwrap_or_else(|| {
             // No explicit tabs: default to the tab the captain's tile lives in
             // (the same lookup the UI's liveness check does, but server-side).
@@ -7987,11 +8271,12 @@ fn claim_captain(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
             .copied()
             .unwrap_or(tmux::SessionLiveness::Unknown)
     };
-    let outcome = ctx.captains.claim(
+    let outcome = ctx.captains.claim_provider(
         &captain_session_id,
         ship_slug.as_deref(),
         role,
-        claude_uuid.as_deref(),
+        Some(&provider),
+        provider_session_id.as_deref(),
         workspace_tab_ids,
         &is_terminal_dead,
         &crew_liveness,
@@ -12749,6 +13034,108 @@ mod tests {
     }
 
     #[test]
+    fn attach_captain_refuses_read_only_and_preserves_existing_control_capability() {
+        let mut ctx = test_ctx("control-secret").with_apply_sink(Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        }));
+        ctx.addr = "127.0.0.1:4242".into();
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-attach".into(),
+                name: "Attach Project".into(),
+                repo_root: "/tmp".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "production".into(),
+                    repository: "attach-project".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 0,
+                updated_at: 0,
+            })
+            .unwrap();
+        let read_id = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({ "cwd": "/tmp", "capability": "read" }),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let error = dispatch(
+            &ctx,
+            "attach_captain",
+            &json!({
+                "captainSessionId": read_id,
+                "projectId": "project-attach",
+                "assignment": "Own stability",
+                "provider": "codex",
+                "testSkipPowderHealth": true,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("read-only; refusing silent elevation"),
+            "got: {error}"
+        );
+
+        let (harness_bin_dir, harness_command) = test_harness_command("codex");
+        let control_id = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({
+                "cwd": "/tmp",
+                "capability": "control",
+                "startupCommand": harness_command,
+            }),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        wait_for_harness_started(&control_id, "codex").unwrap();
+        let attached = dispatch(
+            &ctx,
+            "attach_captain",
+            &json!({
+                "captainSessionId": control_id,
+                "projectId": "project-attach",
+                "assignment": "Own stability",
+                "provider": "codex",
+                "providerSessionId": "thread-attach",
+                "testSkipPowderHealth": true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(attached["accepted"], "attach_captain");
+        assert_eq!(attached["capabilityPreserved"], "control");
+        assert_eq!(attached["captain"]["provider"], "codex");
+        assert_eq!(attached["captain"]["providerSessionId"], "thread-attach");
+        assert!(attached["captain"].get("claudeUuid").is_none());
+
+        let checkpoint = dispatch(
+            &ctx,
+            "captain_checkpoint",
+            &json!({
+                "captainSessionId": control_id,
+                "conversationId": "thread-attach",
+                "resumePoint": "Continue verification",
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint["captain"]["resumePoint"],
+            "Continue verification"
+        );
+
+        dispatch(&ctx, "close_terminal", &json!({ "sessionId": read_id })).unwrap();
+        dispatch(&ctx, "close_terminal", &json!({ "sessionId": control_id })).unwrap();
+        std::fs::remove_dir_all(harness_bin_dir).unwrap();
+    }
+
+    #[test]
     fn crew_rollback_requires_a_confirmed_powder_release() {
         let failed = json!({
             "powderRelease": {
@@ -12939,6 +13326,42 @@ mod tests {
         assert_eq!(sync_calls[1].1["sync"]["captains"], json!([]));
 
         dispatch(&ctx, "close_terminal", &json!({"sessionId": cap_id})).unwrap();
+    }
+
+    #[test]
+    fn codex_claim_never_inherits_a_stale_claude_session_id() {
+        let terminal_id = format!("codex{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let status = Arc::new(StatusBridge::new());
+        status.ingest(
+            "stale-claude-uuid",
+            &json!({ "cwd": "/tmp", "tmux_session": tmux_target(&terminal_id) }),
+            1,
+        );
+        let supervisor: Arc<dyn Fn(&mut dyn FnMut(&Supervisor)) + Send + Sync> =
+            Arc::new(|visitor| visitor(&Supervisor::new()));
+        let ctx = ControlContext::new(status, supervisor, "t".into()).with_apply_sink(Arc::new(
+            RecordingSink {
+                calls: StdMutex::new(Vec::new()),
+            },
+        ));
+        tmux::new_session_with_env(&tmux_target(&terminal_id), "/tmp", None, &[]).unwrap();
+
+        let value = dispatch(
+            &ctx,
+            "claim_captain",
+            &json!({
+                "captainSessionId": terminal_id,
+                "provider": "codex",
+                "providerSessionId": "codex-thread-1",
+            }),
+        )
+        .unwrap();
+        assert_eq!(value["captain"]["provider"], "codex");
+        assert_eq!(value["captain"]["providerSessionId"], "codex-thread-1");
+        assert_eq!(value["captain"]["conversationId"], "codex-thread-1");
+        assert!(value["captain"].get("claudeUuid").is_none());
+
+        dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
     }
 
     #[test]
