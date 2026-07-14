@@ -1285,8 +1285,19 @@ mod tests {
         new_session_with_env(&name, "/tmp", Some(&pane), &[]).unwrap();
         std::thread::sleep(Duration::from_millis(250));
 
-        assert_eq!(session_liveness(&name), SessionLiveness::Alive);
-        assert_eq!(harness_liveness(&name, "codex"), SessionLiveness::Gone);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut terminal = SessionLiveness::Unknown;
+        let mut harness = SessionLiveness::Unknown;
+        while std::time::Instant::now() < deadline {
+            terminal = session_liveness(&name);
+            harness = harness_liveness(&name, "codex");
+            if terminal == SessionLiveness::Alive && harness == SessionLiveness::Gone {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(terminal, SessionLiveness::Alive);
+        assert_eq!(harness, SessionLiveness::Gone);
         let _ = kill_session(&name);
     }
 
