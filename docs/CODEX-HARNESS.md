@@ -67,9 +67,13 @@ Explicit non-goal for Phase 1: `db.rs` orphan recovery stays Claude-keyed.
 ## Provisioning
 
 `scripts/captain/install-thub-codex.sh` builds the release MCP binary, atomically installs it at `~/.t-hub/bin/t-hub-mcp`, deploys the provisioner, and registers the server.
-`scripts/captain/ensure-thub-codex.sh` is the idempotent registration-only entry point and converges a stale command path to the installed binary through `codex mcp remove` plus `codex mcp add`.
+`scripts/captain/ensure-thub-codex.sh` is the idempotent registration-only entry point and converges an uncustomized stale command path to the installed binary through `codex mcp remove` plus `codex mcp add`.
+When a Codex registration has tool allowlists, denylists, timeouts, environment, arguments, or another user-authored policy, provisioning preserves it if the command is already correct and otherwise refuses to repoint it.
+Claude registration follows the same preserve-or-refuse rule for custom arguments and environment.
 It never hand-writes `config.toml` - `codex mcp add` merges natively and preserves user `[hooks]`/`[hooks.state]` trust blocks byte-for-byte.
 Codex MCP registration is user-global (`$CODEX_HOME/config.toml`), not per-repo like Claude's `.mcp.json`; least-privilege still holds because the READ capability token is injected at the tmux session level and inherited by the `t-hub-mcp` child.
+Skill and command drift is refused by default.
+After inspecting the drift, run `scripts/captain/install-thub-codex.sh --repair-skills` to replace it intentionally, or run `scripts/captain/install-captain-skills.sh --repair` when only skills need repair.
 Start a new Codex session after installation so the new MCP tool catalog is loaded.
 
 ## Tab naming (MED-4)

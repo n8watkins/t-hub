@@ -75,7 +75,8 @@ for skill in \
 done
 
 if [ -f "$CLAUDE_HOME/commands/handoff.md" ] \
-  && [ "$(head -n 1 "$CLAUDE_HOME/commands/handoff.md")" = '<!-- managed by T-Hub: handoff command -->' ]; then
+  && [ "$(head -n 1 "$CLAUDE_HOME/commands/handoff.md")" = '---' ] \
+  && [ -f "$CLAUDE_HOME/commands/handoff.md.t-hub-managed" ]; then
   pass "installed managed Claude handoff command"
 else
   fail "missing or unmanaged Claude handoff command"
@@ -110,10 +111,41 @@ else
 fi
 
 if T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BIN_DIR" T_HUB_CAPTAIN_DIR="$CAPTAIN_DIR" bash "$SCRIPT" >/dev/null 2>&1; then
-  pass "repeat install exits 0"
+  fail "repeat install unexpectedly erased skill drift"
+elif grep -Fq 'local modification' "$CODEX_HOME/skills/captain/SKILL.md"; then
+  pass "repeat install refuses and preserves skill drift"
 else
-  fail "repeat install exited non-zero"
+  fail "drift refusal did not preserve the modified skill"
 fi
+if T_HUB_MCP_SOURCE="$SOURCE" T_HUB_BIN_DIR="$BIN_DIR" T_HUB_CAPTAIN_DIR="$CAPTAIN_DIR" bash "$SCRIPT" --repair-skills >/dev/null 2>&1 \
+  && ! grep -Fq 'local modification' "$CODEX_HOME/skills/captain/SKILL.md"; then
+  pass "explicit repair replaces skill drift"
+else
+  fail "explicit skill repair failed"
+fi
+
+chmod 600 "$CODEX_HOME/skills/captain/scripts/check_environment.sh"
+if T_HUB_CODEX_SKILLS_DIR="$CODEX_HOME/skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$CLAUDE_HOME/skills" \
+  bash "$HERE/install-captain-skills.sh" --verify >/dev/null 2>&1; then
+  fail "integrity verification missed executable-mode drift"
+else
+  pass "integrity verification detects executable-mode drift"
+fi
+T_HUB_CODEX_SKILLS_DIR="$CODEX_HOME/skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$CLAUDE_HOME/skills" \
+  bash "$HERE/install-captain-skills.sh" --repair >/dev/null 2>&1
+ln -s /tmp/untrusted "$CODEX_HOME/skills/captain/unexpected-link"
+if T_HUB_CODEX_SKILLS_DIR="$CODEX_HOME/skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$CLAUDE_HOME/skills" \
+  bash "$HERE/install-captain-skills.sh" --verify >/dev/null 2>&1; then
+  fail "integrity verification missed added symlink drift"
+else
+  pass "integrity verification detects added symlink drift"
+fi
+T_HUB_CODEX_SKILLS_DIR="$CODEX_HOME/skills" \
+  T_HUB_CLAUDE_SKILLS_DIR="$CLAUDE_HOME/skills" \
+  bash "$HERE/install-captain-skills.sh" --repair >/dev/null 2>&1
 
 CONFLICT_WORK="$WORK/conflict"
 CONFLICT_CODEX_HOME="$CONFLICT_WORK/codex-home"
@@ -227,6 +259,39 @@ if [ "$(cat "$ROLLBACK_BIN_DIR/t-hub-mcp")" = "old binary" ] \
   pass "top-level rollback restores binary, helpers, configs, and skills"
 else
   fail "top-level rollback left a partial installation"
+fi
+
+POST_SKILL_WORK="$WORK/post-skill-rollback"
+POST_SKILL_HOME="$POST_SKILL_WORK/home"
+POST_SKILL_CODEX_HOME="$POST_SKILL_WORK/codex-home"
+POST_SKILL_CLAUDE_HOME="$POST_SKILL_WORK/claude-home"
+POST_SKILL_BIN_DIR="$POST_SKILL_WORK/install/bin"
+POST_SKILL_CAPTAIN_DIR="$POST_SKILL_WORK/install/captain"
+mkdir -p "$POST_SKILL_HOME" "$POST_SKILL_CODEX_HOME" "$POST_SKILL_CLAUDE_HOME" \
+  "$POST_SKILL_BIN_DIR" "$POST_SKILL_CAPTAIN_DIR"
+printf 'old binary\n' > "$POST_SKILL_BIN_DIR/t-hub-mcp"
+
+if HOME="$POST_SKILL_HOME" \
+  CODEX_HOME="$POST_SKILL_CODEX_HOME" \
+  CLAUDE_HOME="$POST_SKILL_CLAUDE_HOME" \
+  T_HUB_MCP_SOURCE="$SOURCE" \
+  T_HUB_BIN_DIR="$POST_SKILL_BIN_DIR" \
+  T_HUB_CAPTAIN_DIR="$POST_SKILL_CAPTAIN_DIR" \
+  T_HUB_SKILL_FAIL_AFTER_INSTALL=1 \
+  bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "injected post-skill failure unexpectedly succeeded"
+else
+  pass "injected post-skill failure is reported"
+fi
+if [ "$(cat "$POST_SKILL_BIN_DIR/t-hub-mcp")" = "old binary" ] \
+  && [ ! -e "$POST_SKILL_CODEX_HOME/config.toml" ] \
+  && [ ! -e "$POST_SKILL_HOME/.claude.json" ] \
+  && [ ! -e "$POST_SKILL_CODEX_HOME/skills/captain" ] \
+  && [ ! -e "$POST_SKILL_CLAUDE_HOME/skills/captain" ] \
+  && [ ! -e "$POST_SKILL_CLAUDE_HOME/commands/handoff.md" ]; then
+  pass "post-skill failure rolls back binary, configs, skills, and command"
+else
+  fail "post-skill failure left a partial installation"
 fi
 
 if [ "$FAILED" -eq 0 ]; then

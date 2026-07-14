@@ -26,7 +26,8 @@ grep -Fq 'Never retrieve or pass Powder credentials' "$SKILL"
 grep -Fq 'Verification commands and exact outcomes' "$SKILL"
 grep -Fq 'Runtime and deployment state observed directly' "$SKILL"
 grep -Fq 'External dependencies, credentials, services, approvals, and reachability' "$SKILL"
-test "$(head -n 1 "$COMMAND")" = '<!-- managed by T-Hub: handoff command -->'
+test "$(head -n 1 "$COMMAND")" = '---'
+grep -Fq 'argument-hint:' "$COMMAND"
 grep -Fq '~/.claude/skills/handoff/SKILL.md' "$COMMAND"
 
 echo "handoff-skill.test: PASS"

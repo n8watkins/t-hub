@@ -36,6 +36,10 @@ if ! command -v jq >/dev/null 2>&1; then
   echo "ensure-thub-codex: jq is required to verify the complete registration" >&2
   exit 1
 fi
+if ! command -v flock >/dev/null 2>&1; then
+  echo "ensure-thub-codex: flock is required for safe config updates" >&2
+  exit 1
+fi
 
 if [ ! -x "$BIN" ]; then
   echo "ensure-thub-codex: t-hub MCP binary is not executable: $BIN" >&2
@@ -48,35 +52,53 @@ if ! "$BIN" --list-tools >/dev/null 2>&1; then
   exit 1
 fi
 
-# --- Converge the native registration without hand-writing config.toml -------
+CONFIG="${CODEX_HOME:-${HOME}/.codex}/config.toml"
+install -d -m 700 "$(dirname "$CONFIG")"
+exec 9>"${CONFIG}.t-hub.lock"
+flock -x 9
+
+# Read and mutate under the installer lock. Existing policy remains user-owned.
 CURRENT="$(codex mcp get t-hub --json 2>/dev/null || true)"
 if [ -n "$CURRENT" ] && printf '%s' "$CURRENT" | jq -e --arg bin "$BIN" '
-  .enabled == true and
-  .disabled_reason == null and
-  .transport.type == "stdio" and
-  .transport.command == $bin and
-  .transport.args == [] and
-  (.transport.env == null or .transport.env == {}) and
-  .transport.env_vars == [] and
-  .transport.cwd == null and
-  .enabled_tools == null and
-  .disabled_tools == null and
-  .startup_timeout_sec == null and
-  .tool_timeout_sec == null
+  .transport.type == "stdio" and .transport.command == $bin
 ' >/dev/null; then
-  echo "ensure-thub-codex: t-hub already points at $BIN"
+  echo "ensure-thub-codex: t-hub already points at $BIN; existing policy preserved"
   exit 0
 fi
+if [ -n "$CURRENT" ] && ! printf '%s' "$CURRENT" | jq -e '
+  .enabled == true and .disabled_reason == null and
+  .transport.type == "stdio" and .transport.args == [] and
+  (.transport.env == null or .transport.env == {}) and
+  .transport.env_vars == [] and .transport.cwd == null and
+  .enabled_tools == null and .disabled_tools == null and
+  .startup_timeout_sec == null and .tool_timeout_sec == null
+' >/dev/null; then
+  echo "ensure-thub-codex: refusing to replace a customized t-hub registration" >&2
+  echo "ensure-thub-codex: preserve or remove its policy manually before changing the command" >&2
+  exit 1
+fi
 
-CONFIG="${CODEX_HOME:-${HOME}/.codex}/config.toml"
 BACKUP=""
 HAD_CONFIG=false
+EXPECTED_HASH=absent
+config_hash() { sha256sum "$CONFIG" | awk '{print $1}'; }
+refresh_expected_hash() {
+  if [ -f "$CONFIG" ]; then EXPECTED_HASH="$(config_hash)"; else EXPECTED_HASH=absent; fi
+}
 if [ -f "$CONFIG" ]; then
   HAD_CONFIG=true
   BACKUP="$(mktemp "${CONFIG}.t-hub-backup.XXXXXX")"
   cp -p "$CONFIG" "$BACKUP"
+  EXPECTED_HASH="$(config_hash)"
 fi
 rollback() {
+  current_hash=absent
+  [ ! -f "$CONFIG" ] || current_hash="$(config_hash)"
+  if [ "$current_hash" != "$EXPECTED_HASH" ]; then
+    echo "ensure-thub-codex: config changed concurrently; refusing unsafe rollback" >&2
+    [ -z "$BACKUP" ] || rm -f "$BACKUP"
+    return
+  fi
   if "$HAD_CONFIG"; then
     cp -p "$BACKUP" "$CONFIG"
   else
@@ -87,13 +109,17 @@ rollback() {
 trap rollback EXIT
 
 if [ -n "$CURRENT" ]; then
-  if ! codex mcp remove t-hub >/dev/null; then
+  if codex mcp remove t-hub >/dev/null; then
+    refresh_expected_hash
+  else
+    refresh_expected_hash
     echo "ensure-thub-codex: failed to remove stale t-hub registration" >&2
     exit 1
   fi
 fi
 
 if codex mcp add t-hub -- "$BIN"; then
+  refresh_expected_hash
   VERIFIED="$(codex mcp get t-hub --json 2>/dev/null || true)"
   if ! printf '%s' "$VERIFIED" | jq -e --arg bin "$BIN" '
     .enabled == true and .transport.type == "stdio" and
@@ -110,6 +136,7 @@ if codex mcp add t-hub -- "$BIN"; then
   [ -z "$BACKUP" ] || rm -f "$BACKUP"
   echo "ensure-thub-codex: registered t-hub server via 'codex mcp add' ($BIN)"
 else
+  refresh_expected_hash
   echo "ensure-thub-codex: 'codex mcp add' failed" >&2
   exit 1
 fi

@@ -98,12 +98,29 @@ else
   fail "re-run mutated config.toml"
 fi
 
-# --- 4. stale registration converges ----------------------------------------
+# --- 4. existing policy is preserved and blocks unsafe repointing ------------
 STALE_BIN="$WORK/stale-t-hub-mcp"
 cp "$FAKE_BIN" "$STALE_BIN"
-codex mcp remove t-hub >/dev/null 2>&1
-codex mcp add t-hub --env BAD=1 -- "$STALE_BIN" --stale >/dev/null 2>&1
-sed -i '/^\[mcp_servers.t-hub.env\]/i enabled = false\n' "$WORK/config.toml"
+sed -i '/^\[mcp_servers.t-hub\]/a enabled_tools = ["list_terminals"]\ntool_timeout_sec = 17' "$WORK/config.toml"
+POLICY_SNAP="$(cat "$WORK/config.toml")"
+if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1 \
+  && [ "$POLICY_SNAP" = "$(cat "$WORK/config.toml")" ]; then
+  pass "matching transport preserves Codex tool and timeout policy"
+else
+  fail "matching transport changed Codex policy"
+fi
+sed -i "s#command = \"$FAKE_BIN\"#command = \"$STALE_BIN\"#" "$WORK/config.toml"
+STALE_POLICY_SNAP="$(cat "$WORK/config.toml")"
+if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "customized stale registration was replaced"
+elif [ "$STALE_POLICY_SNAP" = "$(cat "$WORK/config.toml")" ]; then
+  pass "customized stale registration is refused unchanged"
+else
+  fail "customized stale registration changed on refusal"
+fi
+
+# --- 5. uncustomized stale registration converges ---------------------------
+sed -i '/^enabled_tools = /d; /^tool_timeout_sec = /d' "$WORK/config.toml"
 
 if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
   pass "stale registration update exits 0"
@@ -117,7 +134,7 @@ else
   fail "stale registration did not converge"
 fi
 if codex mcp get t-hub --json | jq -e '
-  .enabled == true and .disabled_reason == null and .transport.args == [] and
+    .enabled == true and .disabled_reason == null and .transport.args == [] and
   (.transport.env == null or .transport.env == {}) and
   .transport.env_vars == [] and .transport.cwd == null and
   .enabled_tools == null and .disabled_tools == null and

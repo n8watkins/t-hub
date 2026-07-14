@@ -53,9 +53,20 @@ if [ -f "$marker" ] && command -v sha256sum >/dev/null 2>&1; then
   actual="$(
     (
       cd "$skill_root"
-      find . -type f ! -name .t-hub-managed -print0 \
+      find . -mindepth 1 ! -name .t-hub-managed -print0 \
         | sort -z \
-        | while IFS= read -r -d '' file; do printf '%s\0' "$file"; sha256sum "$file"; done
+        | while IFS= read -r -d '' entry; do
+            if [ -L "$entry" ]; then
+              printf 'l\0%s\0%s\0%s\0' "$entry" "$(stat -c '%a' "$entry")" "$(readlink "$entry")"
+            elif [ -d "$entry" ]; then
+              printf 'd\0%s\0%s\0' "$entry" "$(stat -c '%a' "$entry")"
+            elif [ -f "$entry" ]; then
+              printf 'f\0%s\0%s\0' "$entry" "$(stat -c '%a' "$entry")"
+              sha256sum "$entry"
+            else
+              printf 'o\0%s\0%s\0' "$entry" "$(stat -c '%f' "$entry")"
+            fi
+          done
     ) | sha256sum | awk '{print $1}'
   )"
   if [ -n "$expected" ] && [ "$actual" = "$expected" ]; then

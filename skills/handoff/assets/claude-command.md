@@ -1,4 +1,3 @@
-<!-- managed by T-Hub: handoff command -->
 ---
 description: Create a verified, zero-context project handoff
 argument-hint: "[optional next-session focus]"

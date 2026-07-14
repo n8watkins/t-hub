@@ -46,11 +46,33 @@ fi
 jq '.mcpServers["t-hub"].args=["--stale"] | .mcpServers["t-hub"].env={"BAD":"1"}' \
   "$HOME/.claude.json" > "$WORK/stale.json"
 mv "$WORK/stale.json" "$HOME/.claude.json"
+CUSTOM_SNAP="$(cat "$HOME/.claude.json")"
 if T_HUB_MCP_BIN="$BIN" "$SCRIPT" >/dev/null 2>&1 \
-  && jq -e '.mcpServers["t-hub"].args == [] and .mcpServers["t-hub"].env == {}' "$HOME/.claude.json" >/dev/null; then
-  pass "stale args and environment converge"
+  && [ "$CUSTOM_SNAP" = "$(cat "$HOME/.claude.json")" ]; then
+  pass "matching transport preserves Claude args and environment"
 else
-  fail "stale registration did not converge"
+  fail "matching transport changed Claude args or environment"
+fi
+
+jq '.mcpServers["t-hub"].command="/stale"' "$HOME/.claude.json" > "$WORK/stale-command.json"
+mv "$WORK/stale-command.json" "$HOME/.claude.json"
+CUSTOM_STALE_SNAP="$(cat "$HOME/.claude.json")"
+if T_HUB_MCP_BIN="$BIN" "$SCRIPT" >/dev/null 2>&1; then
+  fail "customized stale Claude registration was replaced"
+elif [ "$CUSTOM_STALE_SNAP" = "$(cat "$HOME/.claude.json")" ]; then
+  pass "customized stale Claude registration is refused unchanged"
+else
+  fail "customized stale Claude registration changed on refusal"
+fi
+
+jq '.mcpServers["t-hub"].args=[] | .mcpServers["t-hub"].env={}' \
+  "$HOME/.claude.json" > "$WORK/uncustomized-stale.json"
+mv "$WORK/uncustomized-stale.json" "$HOME/.claude.json"
+if T_HUB_MCP_BIN="$BIN" "$SCRIPT" >/dev/null 2>&1 \
+  && jq -e --arg bin "$BIN" '.mcpServers["t-hub"].command == $bin' "$HOME/.claude.json" >/dev/null; then
+  pass "uncustomized stale Claude registration converges"
+else
+  fail "uncustomized stale Claude registration did not converge"
 fi
 
 mkdir -p "$WORK/fail-bin"
