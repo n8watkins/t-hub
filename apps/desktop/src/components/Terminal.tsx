@@ -34,6 +34,7 @@ import {
   listTerminals,
   onExit,
   onOutput,
+  isMissingLiveTerminalError,
   resizeTerminal,
   writeTerminal,
 } from "../ipc/client";
@@ -407,6 +408,33 @@ export function TerminalView({
       ),
     });
     const writes = new TerminalWriteLifecycle(term);
+    const recoverTerminalIpc = (
+      operation: "write" | "resize",
+      error: unknown,
+    ) => {
+      if (disposed) return;
+      if (!isMissingLiveTerminalError(error, terminalId)) {
+        console.error(`[t-hub] terminal ${operation} failed`, error);
+        return;
+      }
+      // A fast tab switch can detach the backend connection after the local
+      // attached flag was checked but before the IPC command acquires the
+      // connection map. Treat that narrow rejection as an attach-loss signal,
+      // not a global unhandled promise rejection. The existing reattach loop
+      // verifies tmux liveness and parks itself while this tile is backgrounded.
+      ptyAttachedRef.current = false;
+      tlog(
+        "attach",
+        `${operation} raced terminal detach for ${terminalId}; reattaching`,
+      );
+      reattachRef.current?.();
+    };
+    const writeAttachedTerminal = (data: string): void => {
+      if (disposed || !ptyAttachedRef.current) return;
+      void writeTerminal(terminalId, data).catch((error: unknown) => {
+        recoverTerminalIpc("write", error);
+      });
+    };
     updateTerminalResources(terminalId, { xterm: true });
     termRef.current = term;
     // Register this xterm so the captains-deck orchestrator output strip can read
@@ -568,7 +596,7 @@ export function TerminalView({
 
     // Forward keystrokes/paste to the PTY.
     const dataSub = term.onData((d) => {
-      void writeTerminal(terminalId, d);
+      writeAttachedTerminal(d);
     });
 
     // Match the user's Windows Terminal bindings: Ctrl+C copies the selection
@@ -625,7 +653,7 @@ export function TerminalView({
                   ? e.key
                   : null;
         void tmuxExitScroll(sessionName).then(() => {
-          if (ch !== null) void writeTerminal(terminalId, ch);
+          if (ch !== null) writeAttachedTerminal(ch);
         });
         e.preventDefault();
         e.stopPropagation();
@@ -689,7 +717,11 @@ export function TerminalView({
       if (!saneFitProposal(term, fit)) return;
       try {
         fit.fit();
-        void resizeTerminal(terminalId, term.cols, term.rows);
+        void resizeTerminal(terminalId, term.cols, term.rows).catch(
+          (error: unknown) => {
+            recoverTerminalIpc("resize", error);
+          },
+        );
       } catch {
         // Container may be detached mid-resize; ignore.
       }
@@ -1091,7 +1123,7 @@ export function TerminalView({
                   }
                   // An empty capture renders nothing — nudge the shell to
                   // repaint its prompt, exactly like the fresh-spawn path.
-                  if (seed.length === 0) void writeTerminal(terminalId, "\x0c");
+                  if (seed.length === 0) writeAttachedTerminal("\x0c");
                   reconnecting = false;
                   tlog(
                     "attach",
@@ -1261,7 +1293,7 @@ export function TerminalView({
             // -- with no seed reflow cascade. Reattach already restored history.
             if (freshSpawn) {
               promptTimer = setTimeout(() => {
-                if (!disposed) void writeTerminal(terminalId, "\x0c");
+                if (!disposed) writeAttachedTerminal("\x0c");
               }, 250);
             }
             initialAttachSettled = true;

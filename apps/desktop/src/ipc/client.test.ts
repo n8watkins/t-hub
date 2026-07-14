@@ -83,6 +83,19 @@ describe("terminal enumeration", () => {
   });
 });
 
+describe("terminal lifecycle errors", () => {
+  it("recognizes only the matching missing-connection rejection", async () => {
+    const { isMissingLiveTerminalError } = await loadClient();
+
+    expect(isMissingLiveTerminalError("no live terminal A", "A")).toBe(true);
+    expect(isMissingLiveTerminalError(new Error("no live terminal A"), "A")).toBe(
+      true,
+    );
+    expect(isMissingLiveTerminalError("no live terminal B", "A")).toBe(false);
+    expect(isMissingLiveTerminalError("resize failed", "A")).toBe(false);
+  });
+});
+
 describe("terminal event fanout", () => {
   it("dispatches output only to subscribers keyed to that terminal", async () => {
     const { onOutput } = await loadClient();

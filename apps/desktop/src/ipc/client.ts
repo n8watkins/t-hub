@@ -73,6 +73,16 @@ export function resizeTerminal(
   return invoke(Commands.resizeTerminal, { id, cols, rows });
 }
 
+/** True only for the expected IPC rejection when a local terminal view loses a
+ *  race with backend detach. Keep the terminal id in the match so an unrelated
+ *  command failure cannot be mistaken for this recoverable lifecycle edge. */
+export function isMissingLiveTerminalError(
+  error: unknown,
+  id: TerminalId,
+): boolean {
+  return String(error).includes(`no live terminal ${id}`);
+}
+
 export function closeTerminal(id: TerminalId): Promise<void> {
   return invoke(Commands.closeTerminal, { id });
 }
