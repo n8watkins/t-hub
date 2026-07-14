@@ -1,10 +1,10 @@
 # Captain, Crew, Powder, and Performance Handoff
 
-**Updated:** 2026-07-13.
+**Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff commit:** `e59977f`.
-**Installed Windows build:** T-Hub `0.3.64` from the older `154e1a1` release.
+**Released source:** `a50e60bccb29cc78e1813476017630fca4f8766b`.
+**Installed Windows build:** T-Hub `0.3.64` produced by production release workflow `29302822551` from `a50e60b`.
 
 ## Executive Status
 
@@ -12,9 +12,10 @@ The Captain, Crew, cross-harness provisioning, Handoff skill, authority hardenin
 The final independent authority review reports no remaining Critical, High, or Medium application-level finding under the documented same-user threat model.
 The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
 
-The new source is not installed in the Windows application yet.
-The running packaged application is still the older `0.3.64` process with PID `18228`, executable `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`, protocol version `2`, and control address `127.0.0.1:64871`.
-Do not use the running application to judge whether the latest authority or performance changes work until the new release is built and installed.
+The production artifact is installed and running as PID `34492` from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+The installed executable SHA-256 is `bb93923092f23a5051b72437de4029d0b52f03871b56213779db1876b98a5929`.
+The live control handshake reports protocol version `2` and address `127.0.0.1:49782`.
+The exact release installer SHA-256 is `dbc6fdf5f1e3f2f53d9e9c148fe207f6b2350a0caebb6f26bf01d5f27f7e44bc`.
 
 The T-Hub repository is registered as a durable project but is not bound to Powder.
 The authoritative Powder endpoint remains unreachable from the current tailnet, and no approved agent-scoped credential command is configured.
@@ -59,6 +60,8 @@ The terminal location, tab, or current working directory does not establish Capt
 The current Codex session is terminal `43c9d74c` and was pinned as `ship-43c9d74c` in the older runtime.
 Its MCP capability is `read`, and `captain_bootstrap` reports that it is not bound to a registered project.
 It is not a full Captain and must not bypass that boundary by reusing raw tokens.
+After the production restart, this resumed session retained a stale endpoint but successfully rediscovered the new listener while preserving its read-only capability.
+The live server rejected `spawn_terminal` from this session because it lacks control capability.
 
 ## Durable State and Reset Recovery
 
@@ -139,10 +142,11 @@ Managed copies carry ownership and integrity metadata, and the installer refuses
 MCP registration convergence preserves custom policy and refuses unsafe replacement of customized stale registrations.
 Top-level installation rolls back the binary, helpers, registrations, skills, and command wrapper on failure.
 
-The existing `~/.claude/commands/handoff.md` is user-owned and unmanaged.
-Its SHA-256 before migration is `d717284857d7e55a0cb2154cd54c327da9b2ff18eec98592307f95d1cbb23d07`.
-Back it up before running the real installer.
-Do not silently overwrite it.
+The prior unmanaged `~/.claude/commands/handoff.md` was backed up to `~/.claude/commands/handoff.md.pre-t-hub-20260713-200444.bak` with mode `0600`.
+Its preserved SHA-256 is `d717284857d7e55a0cb2154cd54c327da9b2ff18eec98592307f95d1cbb23d07`.
+The real installer then installed managed Captain, Shipmate compatibility, and Handoff skills for Codex and Claude.
+The installed MCP binary matches the release build at SHA-256 `8aa375dcb9ed6dcdcf64cf5820e40f3d283757a86cd9a1c9b9a53b9808042f26`.
+`check_environment.sh` reports both harnesses, tmux, the MCP registration, the control handshake, control environment, and skill integrity ready for a capability check.
 
 ## Verification Evidence
 
@@ -167,6 +171,15 @@ The production build still reports the known mixed static/dynamic import warning
 The current build contains a 1.21 MB main JavaScript chunk and a lazy 3.72 MB icon chunk before gzip.
 These warnings are tracked as performance work rather than ignored.
 
+GitHub Test workflow `29302705909` completed successfully for `a50e60b`.
+Production Release workflow `29302822551` completed successfully for the same exact source, including its quality gate and Windows build.
+The release artifact is `t-hub-prod-installer`, artifact ID `8299295908`.
+GitHub emitted Node 20 action-runtime deprecation warnings, so immutable action upgrades remain CI backlog even though the release passed.
+
+The installed runtime smoke check discovered all four existing terminals, read tabs and repository state, rejected an invalid token, and denied a control-only spawn from this read-only resumed session.
+Automated Windows desktop capture returned a black frame in the non-interactive WSL execution context.
+The Codex versus Claude terminal-header label therefore still requires an interactive visual confirmation in the running application.
+
 ## Performance Baseline and Review
 
 The corrected packaged-runtime benchmark pins an exact Windows root PID and creation time, tracks process births and deaths, excludes incomplete CPU intervals from release statistics, and reports duration-weighted CPU.
@@ -174,6 +187,13 @@ The older installed four-terminal sample in `artifacts/perf/baseline-0.3.64-4t-v
 It measured approximately 845.7 MB mean working set, 799.6 MB mean private bytes, and 0.678 of one CPU core across complete intervals.
 The WebView subtree accounted for approximately 0.554 of one CPU core.
 The run is release-ineligible because process births and deaths occurred and the declared terminal count was not recorded.
+
+The released `a50e60b` build was measured with four declared terminals in `artifacts/perf/t-hub-4t-20260714T032523Z.json`.
+It measured approximately 903.7 MB mean working set, 484.2 MB mean private bytes, and 0.788 of one CPU core across complete intervals.
+The application process averaged approximately 50.4 MB working set and 0.063 of one CPU core.
+The WebView2 subtree averaged approximately 571.1 MB working set and 0.718 of one CPU core.
+This run is diagnostic rather than release-acceptance eligible because WebView2 and host-bridge process births or deaths made seven CPU intervals incomplete.
+The lower private-byte result is encouraging, but the runs are not directly comparable because the earlier baseline lacked a declared scenario and both runs contain process churn.
 
 Completed low-risk performance changes are:
 
@@ -199,16 +219,14 @@ It is also the highest-risk performance change because terminal visibility, scro
 
 The ordered continuation is:
 
-1. Commit this handoff update.
-2. Back up and migrate the unmanaged Claude Handoff command.
-3. Run the final WSL installer from `main`, using explicit skill repair only after the backup is confirmed.
-4. Push `main` and wait for CI and the Windows release workflow to complete.
-5. Download and install the produced Windows build, then restart T-Hub.
-6. Recheck the live MCP catalog, `my_capability`, header labels, and overlay-versus-commission behavior.
-7. Run a new packaged performance baseline against the new exact PID.
-8. Commission disposable Codex and Claude project Captains once Powder is reachable and the protected profile exists.
-9. Verify context reset recovery, Crew dispatch, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
-10. Implement the measured performance tranche, beginning with terminal lifecycle counters and parking.
+1. Confirm the Codex versus Claude terminal-header label interactively in the installed application.
+2. Upgrade GitHub Actions dependencies away from deprecated Node 20 runtimes and pin them to immutable revisions.
+3. Make the authoritative Powder deployment reachable and configure the protected agent profile.
+4. Commission disposable Codex and Claude project Captains once Powder is reachable and the protected profile exists.
+5. Verify context reset recovery, Crew dispatch, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
+6. Add in-app lifecycle counters and run stable packaged 1, 4, 8, and 16 terminal acceptance measurements.
+7. Implement hot, warm, and cold terminal parking while preserving authoritative tmux rehydration.
+8. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
 
 Additional production-readiness gaps remain outside the Captain slice:
 
@@ -235,6 +253,7 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The immediate next action is safe Handoff command migration followed by final installer execution, push, CI, Windows installation, and packaged validation.
+The WSL skill migration, push, CI, production release, Windows installation, live control smoke check, and four-terminal packaged measurement are complete.
+The immediate local action is an interactive terminal-header visual check, followed by the measured terminal lifecycle optimization tranche.
 Powder-backed acceptance remains externally blocked until the authoritative endpoint and agent-scoped credential source are available.
 Performance optimization has a reviewed, measured order, with inactive terminal lifecycle as the primary next implementation tranche.
