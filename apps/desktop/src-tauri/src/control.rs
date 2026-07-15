@@ -7905,27 +7905,69 @@ fn validate_crew_checkout(
     requested: Option<String>,
 ) -> Result<String, String> {
     let requested = requested.unwrap_or_else(|| project.repo_root.clone());
-    let canonical = std::fs::canonicalize(&requested).map_err(|error| {
+    require_checkout_wsl_distro(&project.repo_root, "Project root")?;
+    require_checkout_wsl_distro(&requested, "requested checkout")?;
+    let requested_runtime = files::posix_form(&requested);
+    let requested_host = files::to_host_path(&requested_runtime);
+    let canonical_host = std::fs::canonicalize(&requested_host).map_err(|error| {
         format!(
             "dispatch_crew: checkout '{}' is unavailable: {error}",
             requested
         )
     })?;
-    let worktrees = git::worktree_list(&project.repo_root)
+    let project_runtime = files::posix_form(&project.repo_root);
+    let worktrees = git::worktree_list(&project_runtime)
         .map_err(|error| format!("dispatch_crew: could not validate project worktrees: {error}"))?;
     let valid = worktrees.iter().any(|worktree| {
-        std::fs::canonicalize(&worktree.path)
-            .map(|path| path == canonical)
+        let runtime = files::posix_form(&worktree.path);
+        std::fs::canonicalize(files::to_host_path(&runtime))
+            .map(|path| path == canonical_host)
             .unwrap_or(false)
     });
     if !valid {
         return Err(format!(
             "dispatch_crew: checkout '{}' is not a worktree of project '{}'",
-            canonical.display(),
+            canonical_host.display(),
             project.name
         ));
     }
-    Ok(canonical.to_string_lossy().into_owned())
+    Ok(files::posix_form(&canonical_host.to_string_lossy()))
+}
+
+fn require_checkout_wsl_distro(path: &str, field: &str) -> Result<(), String> {
+    let Some(path_distro) = explicit_wsl_unc_distro(path) else {
+        return Ok(());
+    };
+    let configured = std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string());
+    if path_distro.eq_ignore_ascii_case(&configured) {
+        return Ok(());
+    }
+    Err(format!(
+        "dispatch_crew: {field} uses WSL distribution '{path_distro}', but T-Hub is configured for '{configured}'"
+    ))
+}
+
+fn explicit_wsl_unc_distro(path: &str) -> Option<String> {
+    let slashes = path.trim().replace('/', "\\");
+    let extended_prefix = "\\\\?\\UNC\\";
+    let normalized = if slashes
+        .get(..extended_prefix.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(extended_prefix))
+    {
+        format!("\\\\{}", slashes.get(extended_prefix.len()..)?)
+    } else {
+        slashes
+    };
+    let without_leading = normalized.strip_prefix("\\\\")?;
+    let mut parts = without_leading.split('\\');
+    let server = parts.next()?;
+    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+        return None;
+    }
+    parts
+        .next()
+        .filter(|distro| !distro.is_empty())
+        .map(str::to_string)
 }
 
 fn rollback_crew_dispatch(
@@ -11831,6 +11873,146 @@ mod tests {
         sh_git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
         assert!(wt.exists(), "worktree dir created");
         (base, repo, wt)
+    }
+
+    #[cfg(not(windows))]
+    fn checkout_test_distro() -> String {
+        std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+    }
+
+    #[cfg(not(windows))]
+    fn extended_wsl_unc(path: &std::path::Path, distro: &str) -> String {
+        format!(
+            "\\\\?\\UNC\\wsl.localhost\\{distro}{}",
+            path.to_string_lossy().replace('/', "\\")
+        )
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn crew_checkout_accepts_a_wsl_worktree_for_an_extended_unc_project() {
+        let (base, repo, worktree) = scratch_repo_with_worktree();
+        let distro = checkout_test_distro();
+        let durable_root = extended_wsl_unc(&repo, &distro);
+        let project = ProjectRecord {
+            project_id: "project-wsl-worktree".into(),
+            name: "WSL Worktree".into(),
+            repo_root: durable_root.clone(),
+            remote_url: None,
+            default_branch: Some("main".into()),
+            powder: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let checkout =
+            validate_crew_checkout(&project, Some(worktree.to_string_lossy().into_owned()))
+                .expect("the WSL checkout must match the extended-UNC Project root");
+
+        assert_eq!(
+            checkout,
+            std::fs::canonicalize(&worktree).unwrap().to_string_lossy()
+        );
+        assert_eq!(project.repo_root, durable_root);
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn crew_checkout_accepts_a_same_distro_unc_worktree() {
+        let (base, repo, worktree) = scratch_repo_with_worktree();
+        let distro = checkout_test_distro();
+        let project = ProjectRecord {
+            project_id: "project-same-distro".into(),
+            name: "Same Distro".into(),
+            repo_root: extended_wsl_unc(&repo, &distro),
+            remote_url: None,
+            default_branch: Some("main".into()),
+            powder: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let checkout = validate_crew_checkout(&project, Some(extended_wsl_unc(&worktree, &distro)))
+            .expect("an explicit checkout in the configured distro must remain valid");
+
+        assert_eq!(
+            checkout,
+            std::fs::canonicalize(&worktree).unwrap().to_string_lossy()
+        );
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn crew_checkout_rejects_foreign_distro_unc_paths_with_the_same_tail() {
+        let (base, repo, worktree) = scratch_repo_with_worktree();
+        let configured = checkout_test_distro();
+        let foreign = if configured.eq_ignore_ascii_case("Debian") {
+            "Ubuntu-24.04"
+        } else {
+            "Debian"
+        };
+        let mut project = ProjectRecord {
+            project_id: "project-foreign-distro".into(),
+            name: "Foreign Distro".into(),
+            repo_root: extended_wsl_unc(&repo, &configured),
+            remote_url: None,
+            default_branch: Some("main".into()),
+            powder: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let requested_error =
+            validate_crew_checkout(&project, Some(extended_wsl_unc(&worktree, foreign)))
+                .expect_err("the same path tail in a foreign distro must not be remapped");
+        assert!(requested_error.contains("requested checkout"));
+        assert!(requested_error.contains(foreign));
+        assert!(requested_error.contains(&configured));
+
+        project.repo_root = extended_wsl_unc(&repo, foreign);
+        let project_error =
+            validate_crew_checkout(&project, Some(worktree.to_string_lossy().into_owned()))
+                .expect_err("a durable Project root in a foreign distro must fail closed");
+        assert!(project_error.contains("Project root"));
+        assert!(project_error.contains(foreign));
+        assert!(project_error.contains(&configured));
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn crew_checkout_rejects_unregistered_directories_and_foreign_worktrees() {
+        let (base, repo, _worktree) = scratch_repo_with_worktree();
+        let (foreign_base, _foreign_repo, foreign_worktree) = scratch_repo_with_worktree();
+        let ordinary = base.join("ordinary-checkout");
+        std::fs::create_dir(&ordinary).expect("ordinary checkout fixture");
+        let distro = checkout_test_distro();
+        let project = ProjectRecord {
+            project_id: "project-wsl-rejections".into(),
+            name: "WSL Rejections".into(),
+            repo_root: extended_wsl_unc(&repo, &distro),
+            remote_url: None,
+            default_branch: Some("main".into()),
+            powder: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        for rejected in [&ordinary, &foreign_worktree] {
+            let error =
+                validate_crew_checkout(&project, Some(rejected.to_string_lossy().into_owned()))
+                    .expect_err("only worktrees belonging to the Project may be dispatched");
+            assert!(
+                error.contains("is not a worktree of project"),
+                "got: {error}"
+            );
+        }
+
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_dir_all(foreign_base).ok();
     }
 
     fn scratch_product_repo_with_worktree() -> (std::path::PathBuf, String, String) {
