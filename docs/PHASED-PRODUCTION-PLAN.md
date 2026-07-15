@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-15.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.94` from exact detached source `3816bf4`, running on the canonical profile as Windows PID `47452` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.100` from exact detached source `8635374`, running on the canonical profile as Windows PID `14868` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -630,7 +630,7 @@ Codex rows must not be added to that legacy contract because doing so would coll
 Source `0.3.97` at commit `4759df0` preserves a partial Codex session window when the same provider snapshot also contains a recognized weekly window.
 It also advances the retained authoritative snapshot across an expired reset boundary before merging a later partial poll, so an old session percentage cannot reappear.
 The focused regression suite, all 480 frontend tests, TypeScript, the production frontend build, version consistency, diff checks, and independent review passed.
-This source remains uninstalled; the running application is still `0.3.94`.
+That fix is included in installed `0.3.100` from exact detached source `8635374`.
 Source `0.3.98` at commit `4e264f0` adds the backend-only provider-neutral History identity and transcript parser foundation.
 It locks exact Harness-plus-conversation digests, preserves same-cwd and cross-Harness separation, selects filename-matching Codex child metadata, reads the real Codex `model_provider`, normalizes valid timestamps to UTC, degrades malformed records, filters wrapper text, and represents legacy Claude archive entries per conversation.
 The foundation exposes no command or UI, leaves Claude-only Recent byte-for-byte unchanged, and marks every not-yet-connected action unavailable.
@@ -642,7 +642,11 @@ Source `0.3.100` at commit `f8ef9aa` addresses the separately reproduced Powder 
 The 15-second event reconciler now reuses one resolved client per connection profile for five minutes, invalidates it after a Powder request failure, and starts the Windows credential command with `CREATE_NO_WINDOW`.
 The registered T-Hub Project and its `n8desktop-wsl` binding remain durable even though the failed Captain terminal was rolled back, so installed acceptance can retry commissioning without registering a duplicate Project.
 Both changes passed 663 desktop Rust tests with one ignored, all Rust workspace and MCP end-to-end suites, strict all-feature Clippy, all 480 frontend tests, TypeScript, the production build, version consistency, diff checks, and independent review.
-These source builds remain uninstalled, and the running application is still `0.3.94`.
+Exact detached source `8635374` produced the standalone executable, NSIS installer, and MSI with SHA-256 values `950F9C91124CAFBB817FF1A0B1EF496615E9B6222FBC1793D1CABC0D2EAEE8AC`, `85AA44A2A30EB4EF45AC5554E35050A08FD84DBFFDACB1CECB753AA657DCDE53`, and `9BBD43D3A951FFB6E845E7D828AB84AB42437C09B877FE6926CB3BEF9D5D9C6E`.
+The NSIS upgrade installed `0.3.100` successfully, and the installed executable has SHA-256 `AC7B6169A638F57FF7E6CA699E7016C3C9715C7E968753D654A3C9095CD944F0`.
+All five pre-install tmux session names and pane PIDs survived unchanged.
+A 50-second process sample spanning more than three Powder event intervals observed zero PowerShell or cmd children owned by T-Hub PID `14868`.
+The preserved Project still requires one trusted graphical Create Captain retry before the Captain and Crew acceptance sequence can continue.
 The next History slice must add bounded fair discovery, source statuses, collision handling, durable exact joins, complete revision semantics, and only then expose the versioned `history_list` catalog across control, MCP, CLI, and frontend IPC.
 
 ### Tests and Evidence

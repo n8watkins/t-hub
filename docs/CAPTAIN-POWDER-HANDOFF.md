@@ -2,7 +2,7 @@
 
 ## Canonical Planning Note
 
-The runtime evidence in this handoff is current through the installed `0.3.94` build.
+The runtime evidence in this handoff is current through the installed `0.3.100` build.
 The authoritative forward roadmap is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
 The document-status authority is [REVIEW-INDEX.md](./REVIEW-INDEX.md).
 That plan now includes the settled permanent Cortana identity, multiple Captains per Project, Assignment-based ownership, provider-agnostic Harness integration, CLI-first control, durable messaging, History, voice parity, and parallel implementation lanes.
@@ -13,8 +13,8 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `f8ef9aa`.
-**Installed Windows build:** locally built T-Hub `0.3.94` from exact detached source `3816bf4`.
+**Source head before this handoff update:** `8635374`.
+**Installed Windows build:** locally built T-Hub `0.3.100` from exact detached source `8635374`.
 
 ## Executive Status
 
@@ -24,9 +24,9 @@ Source `1484750` passed 55 frontend files and 470 tests, TypeScript, the Rust wo
 The earlier exact `0.3.86` source then passed 621 Linux Rust library tests with one ignored, warning-free Clippy, the production frontend build, and 23 focused native Windows Preview tests without warnings.
 
 The current production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `021E7CAFF58C9A46720A02DD915D09BAC6BFE08235D7E80A8628C1E550223A7E`.
-It is running on the canonical profile as PID `46860`, started at `2026-07-15T03:45:17.4982710-07:00`.
-The exact NSIS installer SHA-256 is `D9BFC8A94572D1ADEEA8E4494696176D3A49138BEB850D3F90AEE726A2DBE947`.
+The installed executable SHA-256 is `AC7B6169A638F57FF7E6CA699E7016C3C9715C7E968753D654A3C9095CD944F0`.
+It is running on the canonical profile as PID `14868`.
+The exact NSIS installer SHA-256 is `85AA44A2A30EB4EF45AC5554E35050A08FD84DBFFDACB1CECB753AA657DCDE53`.
 
 Source `0.3.95` at commit `8231b5e` preserves partial Codex usage snapshots, normalizes 5-hour and weekly windows by duration, and migrates the last-known cache.
 Source `0.3.96` at commit `c40d52a` adds a Windows Explorer folder chooser to the shared WSL picker used by existing-folder and new-codebase Captain flows.
@@ -34,7 +34,7 @@ Source `0.3.97` at commit `4759df0` closes the independent review finding in the
 Source `0.3.98` at commit `4e264f0` establishes the unexposed provider-neutral History identity and Claude/Codex parser foundation without changing the legacy Recent UI or exposing incomplete actions.
 Source `0.3.99` at commit `3afb521` repairs Codex Captain commissioning by removing the exec-only `--skip-git-repo-check` flag from interactive Codex and giving only Captain and Crew orchestration a bounded 120-second response window.
 Source `0.3.100` at commit `f8ef9aa` reuses Powder event clients for five minutes, refreshes after a Powder request failure, and suppresses the Windows credential-command console.
-None of those source builds is installed yet, so the running application remains `0.3.94` and does not contain those changes.
+Exact detached source `8635374` packages those source changes as installed `0.3.100`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The local `http://127.0.0.1:4017/healthz` endpoint returned HTTP 200 with the Powder health payload during the 2026-07-15 review.
@@ -42,11 +42,11 @@ The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, an
 That profile currently has no repository-admin credential.
 The `t-hub` Powder board and `thub-local-acceptance` card exist.
 Project `project-e28c0579-4e78-4de1-b225-d69aab93c143` now durably registers this repository and binds it to the `t-hub` board through `n8desktop-wsl`.
-The installed commissioning attempt spawned one control-capability terminal, but interactive Codex `0.144.4` rejected the exec-only `--skip-git-repo-check` flag and exited.
+The earlier installed `0.3.94` commissioning attempt spawned one control-capability terminal, but interactive Codex `0.144.4` rejected the exec-only `--skip-git-repo-check` flag and exited.
 The backend rolled that terminal back and left the Project intact without a commissioned Captain.
 The installed control client timed out first and surfaced Windows error 10060 instead of the authoritative rollback error.
 The same durable Project also activated the 15-second Powder event reconciler, which rebuilt its client and visibly launched the profile's PowerShell credential command about every 16.5 seconds.
-Source `0.3.99` and `0.3.100` repair both failures, but real commissioned Captain and Crew acceptance remains incomplete until that exact source is packaged and installed.
+Installed `0.3.100` contains both repairs, but real commissioned Captain and Crew acceptance remains incomplete until the preserved Project passes one trusted graphical commissioning retry.
 
 The requested automatic board creation for new codebases is not safe against Powder's current API.
 Powder exposes repository upsert, not create-if-absent, so a concurrent creator can appear between T-Hub's read and write and have its settings overwritten.
@@ -62,10 +62,13 @@ It is not connected to `history_list`, control, MCP, CLI, frontend IPC, or Histo
 Its 16 focused tests, 659 passed desktop Rust tests with one ignored, Rust workspace and MCP end-to-end suites, strict all-feature Clippy, all 480 frontend tests, TypeScript, the production frontend build, version consistency, diff checks, and independent review passed.
 
 The runtime was reverified before this handoff update.
-Installed T-Hub is PID `47452`, version `0.3.94`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`, with SHA-256 `021E7CAFF58C9A46720A02DD915D09BAC6BFE08235D7E80A8628C1E550223A7E`.
+Installed T-Hub is PID `14868`, version `0.3.100`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`, with SHA-256 `AC7B6169A638F57FF7E6CA699E7016C3C9715C7E968753D654A3C9095CD944F0`.
 The installed WSL agent reports `0.5.2` and SHA-256 `813DB68E3DA42A790532258CC89FBBAFC5ABFECFCDD9810FD4D912EB7F14658A`.
 Five tmux sessions are currently visible on the canonical `t-hub` socket.
-The installed-runtime audit did not issue a tmux close command while verifying this state.
+All five pre-install session names and pane PIDs survived the upgrade unchanged.
+The exact detached build produced a standalone executable with SHA-256 `950F9C91124CAFBB817FF1A0B1EF496615E9B6222FBC1793D1CABC0D2EAEE8AC`, an NSIS installer with SHA-256 `85AA44A2A30EB4EF45AC5554E35050A08FD84DBFFDACB1CECB753AA657DCDE53`, and an MSI with SHA-256 `9BBD43D3A951FFB6E845E7D828AB84AB42437C09B877FE6926CB3BEF9D5D9C6E`.
+The expected local updater-signing error occurred only after both installers were complete because the private release key is not present on this machine.
+A 50-second live process sample spanning more than three Powder event poll intervals observed zero PowerShell or cmd children owned by T-Hub PID `14868`.
 
 ## Integrated Commits
 
