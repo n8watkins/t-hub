@@ -570,15 +570,15 @@ fn schema_unwatch_fleet() -> Value {
     })
 }
 
-/// `remove_worktree` schema (WS-4): remove a git worktree (its live tiles are
-/// detached first so no process is orphaned).
+/// `remove_worktree` schema (WS-4). Removal is temporarily unavailable until
+/// the unified worktree status service can authorize it safely.
 fn schema_remove_worktree() -> Value {
     json!({
         "type": "object",
         "properties": {
             "repoRoot":     { "type": "string", "description": "Path inside the repo the worktree belongs to." },
             "worktreePath": { "type": "string", "description": "Absolute POSIX path of the worktree to remove." },
-            "force":        { "type": "boolean", "description": "Force removal even with uncommitted changes (git refuses otherwise). Default false." }
+            "force":        { "type": "boolean", "description": "Reserved removal option. It cannot bypass the temporary safety suspension." }
         },
         "required": ["repoRoot", "worktreePath"],
         "additionalProperties": false
@@ -847,7 +847,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "remove_worktree",
             tier: Tier::Organization,
-            summary: "Remove a git worktree (detaching any live tiles first so no process is orphaned).",
+            summary: "Worktree removal is temporarily unavailable pending the unified safety service.",
             input_schema: schema_remove_worktree,
         },
         // ---- Theme ------------------------------------------------------

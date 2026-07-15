@@ -801,6 +801,7 @@ pub fn run() {
             git::git_commit,
             // WS-4: git worktrees as a first-class primitive (list/add/remove).
             git::git_worktree_list,
+            git::git_worktree_removal_preflight,
             git::git_worktree_add,
             git::git_worktree_remove,
             // ----------------------

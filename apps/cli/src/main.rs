@@ -856,7 +856,7 @@ commands:\n\
   worktree new <repoRoot> <branch>   create a git worktree + tab  [--path P] [--tab T]\n\
                             (recycles a merged+clean+unleased pool worktree\n\
                              in place when one exists; --fresh opts out)\n\
-  worktree rm  <repoRoot> <path>     remove a git worktree        [--force]\n\
+  worktree rm  <repoRoot> <path>     temporarily unavailable pending safety service\n\
   worktree prune [repoRoot] reap merged+clean+unleased worktrees; dry-run by\n\
                             default  [--yes execute] [--force include unmerged]\n\
   tabs                      list workspace tabs                [--json]\n\

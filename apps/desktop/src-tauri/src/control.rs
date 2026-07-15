@@ -606,6 +606,29 @@ impl TabRegistry {
         }
     }
 
+    /// Remove an empty tab created by an uncommitted transaction. A reused tab
+    /// is never passed here. If another actor placed a tile meanwhile, preserve
+    /// the tab and report the ownership conflict instead of deleting shared
+    /// state. Unlike the user-facing close policy, an owned last empty tab may
+    /// be removed because it did not exist before the failed transaction.
+    fn rollback_owned_empty_tab(&self, id: &str) -> Result<(), String> {
+        let mut g = self.lock();
+        let Some(index) = g.tabs.iter().position(|tab| tab.id == id) else {
+            return Ok(());
+        };
+        if !g.tabs[index].tile_ids.is_empty() {
+            return Err(format!(
+                "owned tab rollback refused because tab '{id}' gained a tile"
+            ));
+        }
+        g.tabs.remove(index);
+        if g.active_tab_id.as_deref() == Some(id) {
+            g.active_tab_id = g.tabs.first().map(|tab| tab.id.clone());
+        }
+        g.seq += 1;
+        Ok(())
+    }
+
     /// Move a tile into `tab_id`: drop it from every tab, then append. Errors when
     /// the target tab is unknown (the old silent no-op is exactly how a headless
     /// `move_tile` got accepted-then-lost). A tile id not currently placed anywhere
@@ -9054,10 +9077,9 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         .clone()
         .or_else(|| branch.clone())
         .unwrap_or_else(|| final_path_component(&worktree_path));
-    let tab_id = ctx
-        .tabs
-        .id_for_name(&effective_tab_name)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let existing_tab_id = ctx.tabs.id_for_name(&effective_tab_name);
+    let tab_was_created = existing_tab_id.is_none();
+    let tab_id = existing_tab_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     ctx.tabs.insert_tab(&tab_id, &effective_tab_name);
 
     // Headless-org: spawn the worktree terminal SERVER-side (the server owns tmux
@@ -9074,19 +9096,23 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
         // item-3: the worktree terminal follows the same inverted least-privilege
         // default as spawn_terminal (READ unless `capability:"control"`). Comms-plane
         // Phase 2 (§2.3): mint + inject its per-session identity token too.
-        let (elevation, minted_identity) = match spawn_env_with_identity(
-            ctx,
-            args,
-            "create_worktree",
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = git::worktree_remove(&repo_root, &worktree_path, true);
-                return Err(format!(
-                        "create_worktree: identity persistence failed and the worktree was rolled back: {error}"
+        let (elevation, minted_identity) =
+            match spawn_env_with_identity(ctx, args, "create_worktree") {
+                Ok(value) => value,
+                Err(error) => {
+                    let rollback = rollback_created_worktree_state(
+                        ctx,
+                        &repo_root,
+                        &worktree_path,
+                        &tab_id,
+                        tab_was_created,
+                    );
+                    return Err(create_worktree_rollback_error(
+                        format!("create_worktree: identity persistence failed: {error}"),
+                        rollback,
                     ));
-            }
-        };
+                }
+            };
         // Wrap the startupCommand into the pane exec the SAME way spawn_terminal
         // does (pane_command → an interactive login shell that execs the command);
         // None keeps the prior bare-shell behavior. No `shell` preset for a
@@ -9096,16 +9122,38 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
             Ok((id, _)) => {
                 if let Some(identity) = &minted_identity {
                     if let Err(error) = ctx.identity.bind_tile(&identity.id, &id) {
-                        let _ = tmux::kill_session_tree(&tmux_target(&id));
-                        let rollback = ctx.identity.retire(&identity.id);
-                        let _ = git::worktree_remove(&repo_root, &worktree_path, true);
-                        return Err(format!(
-                            "create_worktree: identity binding persistence failed and the terminal/worktree were rolled back: {error}{}",
-                            rollback
+                        let terminal_reap = tmux::kill_session_tree(&tmux_target(&id));
+                        let identity_rollback = ctx.identity.retire(&identity.id);
+                        let primary = format!(
+                            "create_worktree: identity binding persistence failed: {error}{}",
+                            identity_rollback
                                 .err()
-                                .map(|rollback| format!("; identity rollback also failed: {rollback}"))
+                                .map(|rollback| format!(
+                                    "; identity rollback also failed: {rollback}"
+                                ))
                                 .unwrap_or_default()
-                        ));
+                        );
+                        let rollback = match terminal_reap {
+                            Ok(()) => rollback_created_worktree_state(
+                                ctx,
+                                &repo_root,
+                                &worktree_path,
+                                &tab_id,
+                                tab_was_created,
+                            ),
+                            Err(reap_error) => {
+                                let tab_rollback =
+                                    rollback_created_tab(ctx, &tab_id, tab_was_created);
+                                Err(format!(
+                                    "terminal reap failed ({reap_error}); the worktree was preserved{}",
+                                    tab_rollback
+                                        .err()
+                                        .map(|error| format!("; tab rollback also failed: {error}"))
+                                        .unwrap_or_default()
+                                ))
+                            }
+                        };
+                        return Err(create_worktree_rollback_error(primary, rollback));
                     }
                 }
                 // Atomic placement with fallback: if the named tab was closed in
@@ -9122,10 +9170,8 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
                 // spawn does not leave an orphaned, secret-bearing entry.
                 if let Some(identity) = &minted_identity {
                     if let Err(rollback) = ctx.identity.retire(&identity.id) {
-                        let _ = git::worktree_remove(&repo_root, &worktree_path, true);
-                        return Err(format!(
-                            "create_worktree: terminal spawn failed ({e}); identity rollback also failed: {rollback}"
-                        ));
+                        let tab_rollback = rollback_created_tab(ctx, &tab_id, tab_was_created);
+                        return Err(ambiguous_spawn_rollback_error(&e, &rollback, tab_rollback));
                     }
                 }
                 eprintln!("t-hub-control: create_worktree: worktree terminal spawn failed: {e}")
@@ -9193,6 +9239,58 @@ fn create_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
     }))
 }
 
+fn create_worktree_rollback_error(primary: String, rollback: Result<(), String>) -> String {
+    match rollback {
+        Ok(()) => format!("{primary}; the new worktree was rolled back"),
+        Err(error) => format!("{primary}; worktree rollback also failed: {error}"),
+    }
+}
+
+fn ambiguous_spawn_rollback_error(
+    spawn_error: &str,
+    identity_error: &str,
+    tab_rollback: Result<(), String>,
+) -> String {
+    format!(
+        "create_worktree: terminal spawn failed ({spawn_error}); identity rollback also failed: {identity_error}; the worktree was preserved because terminal cleanup was not confirmed{}",
+        tab_rollback
+            .err()
+            .map(|error| format!("; tab rollback also failed: {error}"))
+            .unwrap_or_default()
+    )
+}
+
+fn rollback_created_tab(
+    ctx: &ControlContext,
+    tab_id: &str,
+    tab_was_created: bool,
+) -> Result<(), String> {
+    if tab_was_created {
+        ctx.tabs.rollback_owned_empty_tab(tab_id)
+    } else {
+        Ok(())
+    }
+}
+
+fn rollback_created_worktree_state(
+    ctx: &ControlContext,
+    repo_root: &str,
+    worktree_path: &str,
+    tab_id: &str,
+    tab_was_created: bool,
+) -> Result<(), String> {
+    let worktree = git::rollback_created_worktree(repo_root, worktree_path);
+    let tab = rollback_created_tab(ctx, tab_id, tab_was_created);
+    match (worktree, tab) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(worktree), Ok(())) => Err(worktree),
+        (Ok(()), Err(tab)) => Err(format!("tab rollback failed: {tab}")),
+        (Err(worktree), Err(tab)) => Err(format!(
+            "worktree rollback failed: {worktree}; tab rollback failed: {tab}"
+        )),
+    }
+}
+
 /// The final non-empty path component of a POSIX path (the worktree dir's name),
 /// used as a fallback tab name when neither `tabName` nor `branch` was given.
 fn final_path_component(path: &str) -> String {
@@ -9202,25 +9300,12 @@ fn final_path_component(path: &str) -> String {
         .to_string()
 }
 
-/// `remove_worktree` (WS-4): remove a git worktree WITHOUT orphaning processes.
-/// With a webview attached we do NOT run `git worktree remove` here, because any
-/// live tiles whose cwd is inside the worktree must be detached FIRST (their tmux
-/// session survives a detach; killing the dir out from under a running process
-/// would orphan it). So we forward a `remove_worktree_workspace` command to the
-/// frontend, which (in the workspace store) detaches every tile rooted in the
-/// worktree dir AND THEN calls `gitWorktreeRemove` — keeping the detach→remove
-/// ordering correct.
+/// `remove_worktree` (WS-4): fail closed until one backend service can prove the
+/// complete removal decision required by the worktree status contract.
 ///
-/// T-B (closing T12 deviation 2): with NO sink but socket event subscribers
-/// present (a native cockpit), the ordering moves SERVER-side: broadcast the
-/// same `remove_worktree_workspace` forward (the native apply module detaches
-/// every tile rooted in the dir — a layout-only mutation; the tmux sessions
-/// survive exactly as on the webview path), then run `git worktree remove` here.
-/// The broadcast is queued to each subscriber's socket before git runs, and the
-/// detach never depends on the dir still existing, so the removal need not wait
-/// on the client. With neither sink nor subscribers (headless), keep refusing:
-/// nothing would even witness the removal. Args: `repoRoot`, `worktreePath`
-/// (required); `force` (optional).
+/// The same gate is used by direct Tauri removal, so control, MCP, CLI, and UI
+/// callers all receive a synchronous refusal before any UI detach or Git
+/// mutation. Args: `repoRoot`, `worktreePath` (required); `force` (optional).
 fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let repo_root = arg_str(args, "repoRoot")
         .or_else(|| arg_str(args, "repo_root"))
@@ -9246,6 +9331,10 @@ fn remove_worktree(ctx: &ControlContext, args: &Value) -> Result<Value, String> 
                 .into_owned(),
         )
     };
+
+    // Preserve the remote path security boundary, then fail every authorized
+    // caller before forwarding UI state or invoking Git.
+    git::require_worktree_removal_safety_service()?;
 
     let forward = json!({
         "worktreePath": worktree_path,
@@ -11511,9 +11600,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_worktree_without_sink_refuses_to_orphan() {
-        // No apply sink (headless): we have no UI to detach the worktree's tiles,
-        // so removal is refused rather than risk orphaning a running process.
+    fn remove_worktree_without_sink_fails_closed_before_mutation() {
         let ctx = test_ctx("t");
         let err = dispatch(
             &ctx,
@@ -11521,44 +11608,73 @@ mod tests {
             &json!({"repoRoot": "/r", "worktreePath": "/r/wt"}),
         )
         .unwrap_err();
-        assert!(err.contains("orphan"), "got: {err}");
+        assert_eq!(err, git::WORKTREE_REMOVAL_UNAVAILABLE);
     }
 
     #[test]
-    fn remove_worktree_with_sink_reports_requested_not_applied() {
-        // With a sink wired, the removal is only *forwarded* to the UI — the real
-        // `git worktree remove` runs later in the frontend and can still fail. The
-        // response must be honest about that: `requested: true`, and NO misleading
-        // `applied` field claiming synchronous success.
+    fn remove_worktree_with_sink_fails_before_forwarding() {
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
         let ctx = test_ctx("t").with_apply_sink(sink.clone());
-        let v = dispatch(
+        let err = dispatch(
             &ctx,
             "remove_worktree",
             &json!({"repoRoot": "/r", "worktreePath": "/r/wt", "force": true}),
         )
-        .unwrap();
-        assert_eq!(v["accepted"], "remove_worktree");
-        assert_eq!(v["audited"], true);
-        assert_eq!(v["requested"], true);
-        assert!(
-            v.get("applied").is_none(),
-            "remove_worktree must not claim synchronous completion via 'applied'; got {v:?}"
-        );
-        // The note must not falsely imply confirmed completion.
-        let note = v["note"].as_str().unwrap();
-        assert!(
-            note.contains("not confirmed") || note.contains("NOT confirmed"),
-            "got: {note}"
-        );
-
-        // The removal was actually forwarded to the UI with the args.
+        .unwrap_err();
+        assert_eq!(err, git::WORKTREE_REMOVAL_UNAVAILABLE);
         let calls = sink.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "remove_worktree_workspace");
-        assert_eq!(calls[0].1["force"], true);
+        assert!(
+            calls.is_empty(),
+            "no UI mutation may be forwarded: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn owned_empty_tab_rollback_preserves_shared_tabs() {
+        let tabs = TabRegistry::new();
+        tabs.insert_tab("owned", "Owned");
+        tabs.rollback_owned_empty_tab("owned").unwrap();
+        assert!(!tabs.has_tab("owned"));
+
+        tabs.insert_tab("shared", "Shared");
+        tabs.move_tile("live", "shared").unwrap();
+        let err = tabs.rollback_owned_empty_tab("shared").unwrap_err();
+        assert!(err.contains("gained a tile"), "got: {err}");
+        assert!(tabs.has_tab("shared"));
+    }
+
+    #[test]
+    fn owned_create_state_rollback_removes_worktree_and_new_tab() {
+        let (base, repo, worktree) = scratch_repo_with_worktree();
+        let ctx = test_ctx("t");
+        ctx.tabs.insert_tab("owned", "Owned");
+
+        rollback_created_worktree_state(
+            &ctx,
+            repo.to_str().unwrap(),
+            worktree.to_str().unwrap(),
+            "owned",
+            true,
+        )
+        .unwrap();
+
+        assert!(!worktree.exists());
+        assert!(!ctx.tabs.has_tab("owned"));
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn ambiguous_spawn_failure_reports_preserved_worktree() {
+        let error = ambiguous_spawn_rollback_error(
+            "spawn outcome unknown",
+            "identity store unavailable",
+            Ok(()),
+        );
+        assert!(error.contains("terminal cleanup was not confirmed"));
+        assert!(error.contains("worktree was preserved"));
+        assert!(!error.contains("worktree was rolled back"));
     }
 
     #[test]
@@ -11613,35 +11729,44 @@ mod tests {
     }
 
     #[test]
-    fn remove_worktree_sinkless_with_subscribers_broadcasts_then_removes() {
-        // T-B (closing T12 deviation 2): with no sink but a socket subscriber,
-        // the server broadcasts the detach forward and then runs the git
-        // removal ITSELF — the native-only path stops refusing.
+    fn remove_worktree_with_subscribers_fails_before_broadcast_or_git() {
         let (base, repo, wt) = scratch_repo_with_worktree();
+
+        for force in [false, true] {
+            let err = git::worktree_remove(repo.to_str().unwrap(), wt.to_str().unwrap(), force)
+                .unwrap_err();
+            assert_eq!(err, git::WORKTREE_REMOVAL_UNAVAILABLE);
+            assert!(wt.exists(), "force={force} must preserve the worktree");
+        }
 
         let fanout = Arc::new(EventFanout::new());
         let ctx = test_ctx("t").with_event_fanout(fanout.clone());
         let mut reader = subscribe_test_reader(&fanout);
-        let v = dispatch(
+        let err = dispatch(
             &ctx,
             "remove_worktree",
             &json!({"repoRoot": repo.to_str().unwrap(), "worktreePath": wt.to_str().unwrap()}),
         )
-        .unwrap();
-        assert_eq!(v["accepted"], "remove_worktree");
-        assert_eq!(v["applied"], true);
-        assert_eq!(v["removed"], true, "this path CONFIRMS the removal: {v:?}");
-
-        // The detach forward was queued to the subscriber before git ran.
-        let frame = read_event_frame(&mut reader);
-        assert_eq!(frame["event"], APPLY_EVENT_CHANNEL);
-        assert_eq!(frame["payload"]["command"], "remove_worktree_workspace");
-        assert_eq!(
-            frame["payload"]["args"]["worktreePath"],
-            json!(wt.to_str().unwrap())
+        .unwrap_err();
+        assert_eq!(err, git::WORKTREE_REMOVAL_UNAVAILABLE);
+        assert_no_event(&mut reader);
+        assert!(wt.exists(), "the worktree directory must remain intact");
+        let listed = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("git worktree list spawns");
+        assert!(
+            String::from_utf8_lossy(&listed.stdout).contains(wt.to_str().unwrap()),
+            "the worktree registration must remain intact"
         );
 
-        assert!(!wt.exists(), "the worktree dir must be gone");
+        git::rollback_created_worktree(repo.to_str().unwrap(), wt.to_str().unwrap())
+            .expect("transaction-owned rollback remains available");
+        assert!(
+            !wt.exists(),
+            "private rollback must remove its owned worktree"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -12675,7 +12800,7 @@ mod tests {
 
     /// Register a real loopback socket as an event subscriber on `fanout`,
     /// returning a line reader over the client end (T12 broadcast tests).
-    fn subscribe_test_reader(fanout: &EventFanout) -> impl std::io::BufRead {
+    fn subscribe_test_reader(fanout: &EventFanout) -> std::io::BufReader<std::net::TcpStream> {
         use std::io::BufReader;
         use std::net::{TcpListener, TcpStream};
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -12687,6 +12812,26 @@ mod tests {
         let (server_side, _) = listener.accept().expect("accept");
         fanout.register(server_side);
         BufReader::new(client)
+    }
+
+    fn assert_no_event(reader: &mut std::io::BufReader<std::net::TcpStream>) {
+        use std::io::BufRead;
+        reader
+            .get_ref()
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let mut line = String::new();
+        let error = reader
+            .read_line(&mut line)
+            .expect_err("no event should be broadcast");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected subscriber read error: {error}"
+        );
+        assert!(line.is_empty());
     }
 
     /// Read one `{"event":..,"payload":..}` frame from a subscriber reader.
@@ -12816,17 +12961,16 @@ mod tests {
         assert_eq!(frame["payload"]["args"]["id"], json!(spawned_id));
         assert!(frame["payload"]["args"]["sync"]["seq"].as_u64().is_some());
 
-        // remove_worktree (sink path): subscribers hear the detach forward too.
-        let v = dispatch(
+        // remove_worktree fails before either the sink or subscribers receive a
+        // detach forward.
+        let err = dispatch(
             &ctx,
             "remove_worktree",
             &json!({"repoRoot": "/r", "worktreePath": "/r/wt"}),
         )
-        .unwrap();
-        assert_eq!(v["accepted"], "remove_worktree");
-        let frame = read_event_frame(&mut reader);
-        assert_eq!(frame["payload"]["command"], "remove_worktree_workspace");
-        assert_eq!(frame["payload"]["args"]["worktreePath"], "/r/wt");
+        .unwrap_err();
+        assert_eq!(err, git::WORKTREE_REMOVAL_UNAVAILABLE);
+        assert_no_event(&mut reader);
 
         // The sink saw every forward, unchanged by the broadcast riding along.
         let names: Vec<String> = sink
@@ -12836,15 +12980,7 @@ mod tests {
             .iter()
             .map(|(c, _)| c.clone())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "focus_tab",
-                "new_tab",
-                "spawn_terminal",
-                "remove_worktree_workspace"
-            ]
-        );
+        assert_eq!(names, ["focus_tab", "new_tab", "spawn_terminal"]);
 
         // Reap the real session the spawn created.
         dispatch(&ctx, "close_terminal", &json!({"sessionId": spawned_id})).unwrap();

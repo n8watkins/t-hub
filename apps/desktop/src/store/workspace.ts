@@ -502,12 +502,9 @@ interface WorkspaceState {
       tabId?: string;
     },
   ) => Promise<TerminalId | null>;
-  /** Remove a git worktree SAFELY: first DETACH every live tile whose cwd is the
-   *  worktree dir (or inside it) — their tmux sessions survive a detach, so no
-   *  process is orphaned — then call `gitWorktreeRemove`. Detaching before git
-   *  tears the dir down is the whole point; a forced removal with live, unsaved
-   *  work is still gated on `force`. Resolves when git has removed the worktree;
-   *  rejects with git's message on failure (the tiles are already detached). */
+  /** Remove a git worktree only after the backend's unified safety service admits
+   *  it. The current backend fails closed before this store detaches any tile;
+   *  activation waits for canonical Git, ownership, lease, and Powder decisions. */
   removeWorktreeWorkspace: (
     repoRoot: string,
     worktreePath: string,
@@ -1593,10 +1590,16 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
       const path = worktreePath.trim().replace(/\/+$/, "");
       if (!path) return;
 
-      // 1) DETACH every live tile whose cwd is the worktree dir (or inside it),
-      // BEFORE git removes the dir. Detaching keeps the tmux session alive (no
-      // orphaned process); the tile just leaves this window's layout. We match on a
-      // path-segment boundary so `/x/wt` does not match `/x/wt-other`.
+      // 1) Ask the backend for the complete authoritative removal verdict BEFORE
+      // changing this window. The current implementation fails closed here.
+      const { gitWorktreeRemovalPreflight, gitWorktreeRemove } = await import(
+        "../ipc/git"
+      );
+      await gitWorktreeRemovalPreflight(path);
+
+      // 2) Any matching UI tile is now stale rather than live. Detach it before
+      // Git removes the directory. We match on a path-segment boundary so
+      // `/x/wt` does not match `/x/wt-other`.
       const { terminals } = get();
       const prefix = path + "/";
       const victims = Object.values(terminals)
@@ -1607,10 +1610,8 @@ export const useWorkspace = create<WorkspaceState>((set, get) => {
         .map((t) => t.id);
       for (const id of victims) get().detachTile(id);
 
-      // 2) Now that no process is rooted in the dir, remove the worktree. A
-      // failure (e.g. uncommitted changes without `force`) rejects with git's
-      // message; the tiles are already safely detached regardless.
-      const { gitWorktreeRemove } = await import("../ipc/git");
+      // 3) Remove the worktree. Once the unified service is activated, the backend
+      // recomputes the complete verdict immediately before Git mutation.
       await gitWorktreeRemove(repo, path, force);
     },
 

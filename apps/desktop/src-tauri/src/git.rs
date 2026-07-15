@@ -901,6 +901,28 @@ pub async fn git_worktree_remove(
         .map_err(|e| format!("git_worktree_remove task failed: {e}"))?
 }
 
+/// Fail closed until the unified worktree status service can prove the complete
+/// removal decision required by `docs/WORKTREE-STATUS-CONTRACT.md`.
+///
+/// A tmux-only check is insufficient: canonical path identity, dirty and locked
+/// Git state, durable ownership, leases, Powder claims, and spawn/removal
+/// serialization must agree in one backend decision. Keeping this gate central
+/// makes Tauri, control, MCP, and CLI callers receive the same refusal without
+/// detaching UI state or invoking Git.
+pub(crate) const WORKTREE_REMOVAL_UNAVAILABLE: &str = "worktree removal is temporarily unavailable until T-Hub can verify canonical Git state, live terminals, durable ownership, leases, and Powder claims through the unified worktree status service";
+
+pub(crate) fn require_worktree_removal_safety_service() -> Result<(), String> {
+    Err(WORKTREE_REMOVAL_UNAVAILABLE.to_string())
+}
+
+#[tauri::command]
+pub async fn git_worktree_removal_preflight(path: String) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("worktree path is empty".to_string());
+    }
+    require_worktree_removal_safety_service()
+}
+
 /// Synchronous core of [`git_worktree_remove`], shared with the MCP control
 /// channel (`control::remove_worktree`).
 pub(crate) fn worktree_remove(cwd: &str, path: &str, force: bool) -> Result<(), String> {
@@ -908,6 +930,24 @@ pub(crate) fn worktree_remove(cwd: &str, path: &str, force: bool) -> Result<(), 
     if path.is_empty() {
         return Err("worktree path is empty".to_string());
     }
+    require_worktree_removal_safety_service()?;
+    worktree_remove_git(cwd, path, force)
+}
+
+/// Roll back a worktree created by the current `create_worktree` transaction.
+///
+/// This is intentionally narrower than user-requested removal: the caller has
+/// just created the path and invokes this only while unwinding that uncommitted
+/// operation. It must not be exposed through Tauri, control, MCP, or CLI.
+pub(crate) fn rollback_created_worktree(cwd: &str, path: &str) -> Result<(), String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("worktree path is empty".to_string());
+    }
+    worktree_remove_git(cwd, path, true)
+}
+
+fn worktree_remove_git(cwd: &str, path: &str, force: bool) -> Result<(), String> {
     let mut args: Vec<&str> = vec!["worktree", "remove"];
     if force {
         args.push("--force");
@@ -936,6 +976,14 @@ pub(crate) fn worktree_remove(cwd: &str, path: &str, force: bool) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_removal_fails_closed_until_unified_status_is_available() {
+        assert_eq!(
+            require_worktree_removal_safety_service().unwrap_err(),
+            WORKTREE_REMOVAL_UNAVAILABLE
+        );
+    }
 
     /// F1 invariant: the git bound is NEVER unbounded. A positive int widens it;
     /// unset / 0 / negative / junk all fall back to the [`GIT_CMD_TIMEOUT_DEFAULT`]

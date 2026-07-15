@@ -312,9 +312,9 @@ export function applyControl(command: string, args: ControlApply["args"]): void 
     }
 
     case "remove_worktree_workspace": {
-      // WS-4: detach any live tiles in the worktree dir (no orphaned process),
-      // then `git worktree remove`. The backend forwarded this INSTEAD of running
-      // git itself so the detach happens before the dir is torn down.
+      // Compatibility handler for older control servers. Current servers fail
+      // closed before forwarding this command until the unified worktree status
+      // service can authorize removal.
       const worktreePath = str(args, "worktreePath") ?? str(args, "worktree_path");
       if (!worktreePath) return;
       const repoRoot = str(args, "repoRoot") ?? str(args, "repo_root") ?? "";

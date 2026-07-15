@@ -19,6 +19,8 @@ export const CommandsGit = {
   gitWorktreeAdd: "git_worktree_add",
   /** Remove the worktree at a path (optionally forced). → void */
   gitWorktreeRemove: "git_worktree_remove",
+  /** Require the backend's complete worktree-removal safety verdict. → void */
+  gitWorktreeRemovalPreflight: "git_worktree_removal_preflight",
 } as const;
 
 /**
@@ -120,6 +122,11 @@ export function gitWorktreeList(cwd: string): Promise<WorktreeInfo[]> {
   return invoke(CommandsGit.gitWorktreeList, { cwd });
 }
 
+/** Require authoritative removal safety before the UI changes tile state. */
+export function gitWorktreeRemovalPreflight(path: string): Promise<void> {
+  return invoke(CommandsGit.gitWorktreeRemovalPreflight, { path });
+}
+
 /**
  * Create (or check out into) a worktree at `path` for the repo containing `cwd`
  * (`git worktree add <path> [branch]`). With `branch`, checks that branch out;
@@ -138,8 +145,8 @@ export function gitWorktreeAdd(
 /**
  * Remove the worktree at `path` from the repo containing `cwd`
  * (`git worktree remove [--force] <path>`). git refuses a worktree with
- * uncommitted changes unless `force` is true. Rejects with git's message on
- * failure.
+ * uncommitted changes unless `force` is true. The backend currently fails closed
+ * before Git until the unified ownership and safety service is available.
  */
 export function gitWorktreeRemove(
   cwd: string,
