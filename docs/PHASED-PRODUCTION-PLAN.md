@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.74` from `00d9207`, running as Windows PID `44668` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.75` from `15ab30f`, running as Windows PID `40844` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -77,7 +77,9 @@ Source commit `2cf4a42` adds explicit creation of one absent empty-codebase leaf
 It requires Git initialization, never replaces an existing path, never creates missing parents, and uses non-recursive rollback for the directory it owns.
 Diagnostic logs are bounded at startup.
 Installed `0.3.68` reduced the retained backup from `135,278,300` bytes to `8,388,493` bytes while preserving complete newest lines.
-Board still defaults to the wrong global endpoint.
+Installed `0.3.75` replaces the global Board URL and iframe with a native read-only Board resolved from the focused terminal's durable Project and protected Powder binding.
+The packaged no-Project path shows an honest state without an iframe or manual Board URL field.
+The bound Project success path remains gated on Phase 8 real Project acceptance.
 Preview still exposes an unclear Dev then Preview sequence.
 The Codex header identity has been checked interactively, while the Claude header still needs interactive confirmation.
 
@@ -543,6 +545,12 @@ Make Board, Run and Preview, Files, History, Provider limits, Messages, Resource
 21. Render work state as the primary status and runtime degradation as a separate secondary signal under `docs/STATUS-MODEL.md`.
 22. Replace path-derived worktree labels with authoritative branch and worktree identity wherever current state is available.
 23. Verify keyboard access, narrow layouts, high DPI, error states, and visual quality.
+
+Board items 1 through 4 and the Board portion of item 8 are implemented in source commit `6c6e4ee` and packaged as installed `0.3.75` from `15ab30f`.
+The backend resolves Captain, Crew, or canonical Git main-worktree identity to one registered Project and returns a bounded repository-filtered Powder snapshot without sending credentials to the frontend.
+The native read-only surface covers loading, empty, unbound, unauthorized, unreachable, missing-repository, truncated, and generic error states, with retry and an explicitly unfiltered external full-board fallback where applicable.
+Packaged verification on the T-Hub tile showed **No registered Project**, zero iframes, and no Board URL input, correcting the reproduced redirect to `http://192.168.0.102:4000/`.
+The registered and bound Project success state still requires the Phase 8 real Powder acceptance flow.
 
 ### Tests and Evidence
 

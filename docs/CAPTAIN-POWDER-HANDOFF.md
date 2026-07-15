@@ -2,7 +2,7 @@
 
 ## Canonical Planning Note
 
-The runtime evidence in this handoff is current through the installed `0.3.74` build.
+The runtime evidence in this handoff is current through the installed `0.3.75` build.
 The authoritative forward roadmap is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
 The document-status authority is [REVIEW-INDEX.md](./REVIEW-INDEX.md).
 That plan now includes the settled permanent Cortana identity, multiple Captains per Project, Assignment-based ownership, provider-agnostic Harness integration, CLI-first control, durable messaging, History, voice parity, and parallel implementation lanes.
@@ -13,8 +13,8 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `00d9207`.
-**Installed Windows build:** locally built T-Hub `0.3.74` from `00d9207`.
+**Source head before this handoff update:** `15ab30f`.
+**Installed Windows build:** locally built T-Hub `0.3.75` from `15ab30f`.
 
 ## Executive Status
 
@@ -23,9 +23,9 @@ The final independent authority review reports no remaining Critical, High, or M
 The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
 
 The current production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `76CE19ED48DD95A7F01753003C4FA50F5A19748C2AB506137DC460F3B04A027B`.
-It is running as PID `44668`.
-The exact NSIS installer SHA-256 is `5BC52883F354BE14CD9B63A0AF8D0CDC7A7E153180A12681162EA3B4DE452032`.
+The installed executable SHA-256 is `544049557671E0BA2B9F3DA6ED5B068329BD1D3A35A511343AF846F1AB814C6E`.
+It is running as PID `40844`.
+The exact NSIS installer SHA-256 is `2B0B5446298BB0E7ED01BAD4953C75512C170D956E92BCBA784A626FFD056F75`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
@@ -303,10 +303,10 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The installed Windows process was reverified at PID `44668`, start time `2026-07-14T17:28:01-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-Its file and product version are `0.3.74`.
-The installed executable SHA-256 is `76CE19ED48DD95A7F01753003C4FA50F5A19748C2AB506137DC460F3B04A027B`.
-The installed build was produced from source `00d9207` with NSIS installer SHA-256 `5BC52883F354BE14CD9B63A0AF8D0CDC7A7E153180A12681162EA3B4DE452032`.
+The installed Windows process was reverified at PID `40844`, start time `2026-07-14T17:59:15-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its file and product version are `0.3.75`.
+The installed executable SHA-256 is `544049557671E0BA2B9F3DA6ED5B068329BD1D3A35A511343AF846F1AB814C6E`.
+The installed build was produced from source `15ab30f` with NSIS installer SHA-256 `2B0B5446298BB0E7ED01BAD4953C75512C170D956E92BCBA784A626FFD056F75`.
 The installed `th` CLI is version `0.2.0` from source `07e74f4`.
 Source commit `6870444` fixes the reproduced xterm teardown race.
 Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
@@ -330,7 +330,13 @@ Source commit `2cf4a42` adds the reviewed empty-codebase transaction, and `00d92
 Its full gate passed 452 frontend tests, 593 Rust desktop tests with 1 ignored, all Rust workspace and MCP end-to-end tests, warnings-denied Clippy, TypeScript, the production frontend build, and the transactional installer test.
 Installed `0.3.74` preserved all eight tmux sessions, displayed the new empty-codebase choice with all 25 Powder boards, reviewed the exact absent destination and unrestricted authority, and left no directory after Cancel.
 Packaged Board reproduction on the T-Hub tile resolved the legacy global `http://localhost:4000` setting to `http://192.168.0.102:4000/` instead of using a Project Powder binding or showing the honest unbound state.
+Source commit `6c6e4ee` replaces that global iframe with a native Project-scoped read-only Board, and `15ab30f` packages it as `0.3.75`.
+The full source gate passed 453 frontend tests, 599 Rust desktop tests with 1 ignored, all Rust workspace and MCP end-to-end tests, warnings-denied Clippy, TypeScript, formatting, and the production frontend build.
+The exact detached Windows build produced an executable SHA-256 of `4F43B4B22982B2E09493A7EF331F938675E43405ABE19450081DD6B4DE1153FA` and the installed upgrade preserved all eight tmux sessions.
+Packaged WebView verification on the T-Hub tile showed **No registered Project**, zero iframes, and no Board URL input.
+The screenshot evidence is `C:\Users\natha\OneDrive\Pictures\Screenshots\T-Hub-0.3.75-Board.png`.
+The native Board's registered and bound Project success state remains gated on real Phase 8 acceptance.
 The packaged graphical success matrix for new codebases remains open, so Phase 7 is still the earliest unblocked active phase.
-The immediate source action is to finish the Phase 7 packaged success matrix or proceed with the already reproduced Project-aware Board contract once real Project acceptance is available.
+The immediate source action is to repair and package the reproduced Run and Preview workflow while the Phase 7 success matrix and real Project acceptance remain available to a control-capable Captain.
 Real Powder acceptance still requires a control-capable Captain session.
-The Board endpoint, Preview workflow, Claude header check, packaged performance matrix, and release hardening remain open.
+The bound Board success state, Preview workflow, Claude header check, packaged performance matrix, and release hardening remain open.
