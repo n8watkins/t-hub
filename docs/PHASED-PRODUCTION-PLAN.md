@@ -631,6 +631,11 @@ Source `0.3.97` at commit `4759df0` preserves a partial Codex session window whe
 It also advances the retained authoritative snapshot across an expired reset boundary before merging a later partial poll, so an old session percentage cannot reappear.
 The focused regression suite, all 480 frontend tests, TypeScript, the production frontend build, version consistency, diff checks, and independent review passed.
 This source remains uninstalled; the running application is still `0.3.94`.
+Source `0.3.98` at commit `4e264f0` adds the backend-only provider-neutral History identity and transcript parser foundation.
+It locks exact Harness-plus-conversation digests, preserves same-cwd and cross-Harness separation, selects filename-matching Codex child metadata, reads the real Codex `model_provider`, normalizes valid timestamps to UTC, degrades malformed records, filters wrapper text, and represents legacy Claude archive entries per conversation.
+The foundation exposes no command or UI, leaves Claude-only Recent byte-for-byte unchanged, and marks every not-yet-connected action unavailable.
+Its 16 focused tests, full Rust workspace, MCP end-to-end, strict all-feature Clippy, all 480 frontend tests, TypeScript, production build, version consistency, diff checks, and independent review passed.
+The next History slice must add bounded fair discovery, source statuses, collision handling, durable exact joins, complete revision semantics, and only then expose the versioned `history_list` catalog across control, MCP, CLI, and frontend IPC.
 
 ### Tests and Evidence
 

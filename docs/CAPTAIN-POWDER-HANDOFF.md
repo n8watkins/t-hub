@@ -13,7 +13,7 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `4759df0`.
+**Source head before this handoff update:** `4e264f0`.
 **Installed Windows build:** locally built T-Hub `0.3.94` from exact detached source `3816bf4`.
 
 ## Executive Status
@@ -31,6 +31,7 @@ The exact NSIS installer SHA-256 is `D9BFC8A94572D1ADEEA8E4494696176D3A49138BEB8
 Source `0.3.95` at commit `8231b5e` preserves partial Codex usage snapshots, normalizes 5-hour and weekly windows by duration, and migrates the last-known cache.
 Source `0.3.96` at commit `c40d52a` adds a Windows Explorer folder chooser to the shared WSL picker used by existing-folder and new-codebase Captain flows.
 Source `0.3.97` at commit `4759df0` closes the independent review finding in the Codex usage merge by preserving an unknown-duration primary beside a recognized weekly window and advancing expired windows before later partial polls merge.
+Source `0.3.98` at commit `4e264f0` establishes the unexposed provider-neutral History identity and Claude/Codex parser foundation without changing the legacy Recent UI or exposing incomplete actions.
 None of those source builds is installed yet, so the running application remains `0.3.94` and does not contain those changes.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
@@ -50,6 +51,9 @@ The rejected prototype also exposed two recovery requirements that remain part o
 Provider-neutral History implementation is now governed by [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md).
 The contract requires deterministic Harness-plus-conversation identity, distinct same-cwd conversations, backend-owned resume and focus actions, non-destructive per-conversation archive overlays, legacy Claude archive discovery, explicit cache disposal, and dual-Harness packaged acceptance.
 The current Claude-only Recent implementation remains unchanged and must not be extended with Codex rows before those identity and action boundaries exist.
+The `0.3.98` foundation now locks exact length-prefixed Harness identity, lowercase Codex rollout identity, filename-matching child metadata, real `model_provider`, UTC timestamp normalization, malformed-record degradation, per-conversation Claude archive identity, bounded Unicode text, and explicit unavailable actions.
+It is not connected to `history_list`, control, MCP, CLI, frontend IPC, or History UI yet.
+Its 16 focused tests, 659 passed desktop Rust tests with one ignored, Rust workspace and MCP end-to-end suites, strict all-feature Clippy, all 480 frontend tests, TypeScript, the production frontend build, version consistency, diff checks, and independent review passed.
 
 The runtime was reverified before this handoff update.
 Installed T-Hub is PID `46860`, version `0.3.94`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`, with SHA-256 `021E7CAFF58C9A46720A02DD915D09BAC6BFE08235D7E80A8628C1E550223A7E`.
