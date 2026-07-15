@@ -64,6 +64,13 @@ An explicit force option must not override dirty state, active leases, unknown s
 Automatic cleanup must require a clean, merged, unleased, known linked worktree with no unresolved Powder claim or owned process.
 Missing directories and stale Git metadata require reconciliation rather than silent deletion.
 
+## Removal Activation Gate
+
+Worktree removal must remain unavailable until one backend verdict implements the complete canonical snapshot and safety policy in this contract.
+While that service is unavailable, graphical preflight and every backend mutation path must fail closed before detaching UI state or invoking Git.
+Force and confirmation cannot bypass the suspension.
+Re-enabling removal requires a mutation-time recomputation or serialized reservation so state cannot change between preflight and Git mutation.
+
 ## Display Contract
 
 Dense tile and sidebar surfaces should show the authoritative branch, linked-worktree marker, dirty marker, and a degraded marker when status is stale or unknown.
@@ -77,6 +84,8 @@ Recent, Captain, and Workspace surfaces must stop deriving branch names from `wt
 Human output may select fewer fields, but it must not recompute or weaken the backend safety decision.
 Destructive commands must support dry-run and explicit confirmation as defined in [cli-contract.md](./cli-contract.md).
 Batch cleanup must report each worktree outcome and must preserve blocked or unknown worktrees.
+All command surfaces must expose the same temporary-unavailable failure while removal is suspended.
+A client-side preflight may improve presentation, but the shared backend mutation remains the final authority.
 
 ## Freshness and Reconciliation
 
@@ -94,6 +103,14 @@ An event-driven refresh should follow T-Hub-owned create, remove, commit, branch
 - Test that CLI, MCP, and graphical views receive equivalent safety decisions.
 - Test that dirty, leased, main, and unknown worktrees cannot be automatically removed or reused.
 - Test that force and confirmation remain independent gates.
+- Test the suspended graphical, Tauri, control, MCP, and CLI paths, preservation of UI state, absence of Git invocation, and force bypass denial.
+- Before activation, test preflight-to-mutation races across Git state, terminal ownership, durable identity, leases, Powder claims, and WSL availability.
+
+## Current Implementation Status
+
+Source commit `2b7d864`, versioned by `cfc72b7` as `0.3.87`, suspends removal through an unconditional backend safety gate and a graphical preflight that runs before tile detachment.
+The canonical snapshot, multi-source verdict, and safe activation path remain unimplemented.
+Installed `0.3.86` predates this suspension.
 
 ## Migration
 

@@ -50,7 +50,7 @@ Use an exact executable path if more than one T-Hub variant is running:
 ```bash
 scripts/perf/run-thub-benchmark.sh \
   --terminals 4 \
-  --exe '/mnt/c/Users/natha/AppData/Local/T-Hub/T-Hub.exe' \
+  --exe '/mnt/c/Users/natha/AppData/Local/T-Hub/t-hub.exe' \
   --setup-note 'four idle PowerShell terminals, 2x2 grid'
 ```
 

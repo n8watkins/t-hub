@@ -13,7 +13,7 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `5ea945c`.
+**Source head before this handoff update:** `cfc72b7`.
 **Installed Windows build:** locally built T-Hub `0.3.86` from `5ea945c`.
 
 ## Executive Status
@@ -25,7 +25,7 @@ The exact `0.3.86` source then passed 621 Linux Rust library tests with one igno
 
 The current production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
 The installed executable SHA-256 is `6C9938814F956E9D2532D1A3E5A020728CFACE302B822DAA033885BD18108D46`.
-It is running as PID `17712`.
+It is running as PID `53764`.
 The exact NSIS installer SHA-256 is `480AAD85F88C20D8105E776E2E84F811096835219F6D97E16999403A6D56714A`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
@@ -290,14 +290,15 @@ The canonical gated sequence is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-
 
 The ordered continuation is:
 
-1. Complete template and clone creation, authorized Powder board creation, injected-failure rollback, and the packaged Captain-creation E2E matrix.
-2. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
-3. Verify context reset recovery, Crew dispatch into a deliberate shared Workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
-4. Complete the native Board's registered and Powder-bound Project success-state acceptance through the Phase 8 flow.
-5. Harden generic non-Tauri Vite launch adapters and stale WSL-address recovery for the unified Run and Preview flow.
-6. Confirm the Claude terminal-header label interactively in the installed application.
-7. Run stable packaged 1, 4, 8, and 16 terminal acceptance measurements, including cold rehydration, input readiness, and canvas rendering.
-8. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
+1. Keep worktree removal suspended until the Phase 2 unified status service consumes Phase 3 B1 ownership and passes its full activation matrix.
+2. In parallel against stable shared contracts, complete template and clone creation, authorized Powder board creation, one shared registration-and-commission transaction with explicit resume or rollback, and the packaged Captain-creation E2E matrix.
+3. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
+4. Verify context reset recovery, Crew dispatch into a deliberate shared Workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
+5. Complete the native Board's registered and Powder-bound Project success-state acceptance through the Phase 8 flow.
+6. Harden generic non-Tauri Vite launch adapters and stale WSL-address recovery for the unified Run and Preview flow.
+7. Confirm the Claude terminal-header label interactively in the installed application.
+8. Run stable packaged 1, 4, 8, and 16 terminal acceptance measurements, including cold rehydration, input readiness, and canvas rendering.
+9. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
 
 Additional production-readiness gaps remain outside the Captain slice:
 
@@ -323,7 +324,7 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The installed Windows process was reverified at PID `17712` and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` after packaged acceptance and a normal relaunch.
+The installed Windows process was reverified at PID `53764` and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` during the current source review.
 Its file and product version are `0.3.86`.
 The installed executable SHA-256 is `6C9938814F956E9D2532D1A3E5A020728CFACE302B822DAA033885BD18108D46`.
 The installed build was produced from source `5ea945c` with standalone executable SHA-256 `EF2ED4C1D610F80555A84255F52CC798C1779F24FA9CA79436318D2A5E07B8E1`, NSIS installer SHA-256 `480AAD85F88C20D8105E776E2E84F811096835219F6D97E16999403A6D56714A`, and MSI SHA-256 `4CC8834E283F1639CDA2FD9DD86C34CD703590D7C4AFDC830AC967B95751AAE6`.
@@ -336,6 +337,14 @@ Source commit `e5948c8` collapses concurrent frontend terminal enumeration into 
 The `e5948c8` source gate passed 447 frontend tests and TypeScript typechecking.
 The preceding runtime and log-retention tranche passed 585 Rust desktop tests with 1 ignored, the Rust workspace suites, MCP end-to-end tests, formatting, warnings-denied Clippy, the production frontend build, and the performance contract.
 The latest T-Hub capability probe for this session remained `read`, so no canonical Project mutation, Powder binding, Captain commissioning, or Crew dispatch was attempted.
+Source commit `2b7d864` suspends worktree removal fail closed across graphical preflight and the shared backend mutation path until the unified worktree status service can prove canonical Git state, terminals, durable ownership, leases, and Powder claims.
+Installed `0.3.86` reproduced the safety failure before that change: direct Tauri removal deleted a disposable linked worktree while tmux session `th_wtrme2e` was rooted inside it, leaving the live pane at a `(deleted)` cwd.
+The disposable worktree and session were cleaned after reproduction, and the six canonical sessions were unchanged.
+The suspension preserves UI state and invokes no Git operation, and force cannot override it.
+Private rollback is limited to worktrees created by the current in-flight `create_worktree` transaction and never removes a worktree after unconfirmed terminal cleanup.
+Commit `cfc72b7` bumps this source to `0.3.87`.
+This behavior is not installed and must not be treated as packaged evidence until the versioned build passes acceptance.
+The source gate passed 471 frontend tests, TypeScript, the production frontend build, 625 Rust desktop tests with one additional test ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, and the performance harness self-tests.
 The local Powder endpoint and protected agent credential path are operational.
 That earlier packaged xterm lifecycle, detach recovery, duplicate-launch, and diagnostic-retention gate passed with eight live tmux sessions preserved.
 The installed `a00ce7d` build reproduced one `listTerminals failed` event from the bounded 10-second WSL command timeout before recovery.
@@ -357,6 +366,8 @@ Packaged WebView verification on the T-Hub tile showed **No registered Project**
 The screenshot evidence is `C:\Users\natha\OneDrive\Pictures\Screenshots\T-Hub-0.3.75-Board.png`.
 The native Board's registered and bound Project success state remains gated on real Phase 8 acceptance.
 The packaged graphical success matrix for new codebases remains open, so Phase 7 remains active on the current Captain-creation sequence.
+Installed `0.3.86` reproduced the new-codebase gap: the dialog exposes only an empty Git repository starting point and explicitly defers templates and clones.
+The graphical flow sequences separate `register_project` and `commission_captain` backend transactions, so cross-operation resume or rollback and graphical-to-Cortana transaction parity remain open.
 Source commit `96998fc` unifies Dev and Preview into one Run and Preview surface and removes all terminal-output URL detection and automatic navigation.
 Commit `7ced938` packages that change as `0.3.76`.
 The full source gate passed 459 frontend tests, 599 Rust desktop tests with 1 ignored, all Rust workspace and MCP end-to-end tests, warnings-denied Clippy, TypeScript, formatting, and the production frontend build.
@@ -407,7 +418,7 @@ A nonreading 16 MiB response stopped in 206 milliseconds while a second terminal
 Restart produced a distinct run ID, stale-run Stop was refused without changing the active run, final Stop cleared the authoritative URL, and final relaunch left no Preview listener.
 The six tmux sessions present immediately before installation retained the same names and pane PIDs through installation, acceptance, and final relaunch.
 The previously recorded `th_a486c7fc` session was already absent before installation and is not claimed as preserved by this run.
-Installed `0.3.86` finally relaunched normally as PID `17712` with executable SHA-256 `6C9938814F956E9D2532D1A3E5A020728CFACE302B822DAA033885BD18108D46`.
+Installed `0.3.86` initially relaunched normally as PID `17712` and was later reverified as PID `53764`, with executable SHA-256 `6C9938814F956E9D2532D1A3E5A020728CFACE302B822DAA033885BD18108D46` unchanged.
 The preceding `0.3.81` source review gate passed 55 frontend files and 466 tests, TypeScript, 604 Rust tests with 603 passed and one ignored, MCP end-to-end, and warning-denied Clippy.
 The fleet contained eight canonical tmux sessions when the preceding `0.3.81` packaged acceptance began.
 During that `0.3.81` review window, the unrelated Scribe session `th_118218d2` and its prior pane PID `3043188` exited, leaving seven live sessions; the managed Stop action owned only the Vite run and did not issue a tmux lifecycle command.

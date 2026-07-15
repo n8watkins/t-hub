@@ -57,8 +57,10 @@ T-Hub should then execute one reviewed transaction:
 If a later step fails, T-Hub should preserve useful local work, report partial state clearly, and offer safe resume or rollback.
 It must never delete a pre-existing directory during rollback.
 
-The current implementation supports saved-codebase selection, WSL folder browsing, explicit Git initialization for an existing non-repository folder, and one reviewed empty-codebase leaf transaction.
-It does not yet provide template or clone creation, Powder board creation, or the complete packaged graphical and conversational transaction matrix.
+Installed `0.3.86` supports saved-codebase selection, WSL folder browsing, explicit Git initialization for an existing non-repository folder, and one reviewed empty-codebase leaf transaction.
+Its **Create new codebase** path offers only **Starting point: Empty Git repository** and explicitly defers template and clone starting points.
+The graphical flow currently sequences `register_project` and `commission_captain` in the frontend, while each backend operation owns only its own rollback boundary.
+Template and clone creation, Powder board creation, one shared graphical-and-conversational backend transaction, explicit cross-operation resume or rollback, and the complete packaged matrix remain open.
 
 ## Healthy Cortana Responsibilities
 

@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.86` from `5ea945c`, running as Windows PID `17712` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.86` from `5ea945c`, running as Windows PID `53764` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -197,7 +197,11 @@ Make the installed terminal cockpit and its control clients trustworthy before e
 
 ## Phase 2 - Unified Owned-Resource Lifecycle
 
-**Status:** Active and unblocked after Phase 1; managed development-server process ownership is partially implemented, while the unified resource record, browser lifecycle, worktree status service, Resources surface, startup reconciliation, and full exit gate remain open.
+**Status:** Active after Phase 1; managed development-server ownership is partially implemented and worktree removal is suspended fail closed in `0.3.87` source pending packaged verification, while the unified resource record, browser lifecycle, worktree status service, Resources surface, startup reconciliation, and full exit gate remain open.
+The unified worktree snapshot's Captain, Assignment, Workspace, Crew, resource-lease, and Powder ownership fields depend on the Phase 3 B1 durable identity interfaces, so independent Phase 2 work may proceed but the full worktree slice cannot exit before B1 stabilizes.
+Installed `0.3.86` reproduced the owned-resource failure by deleting a disposable linked worktree while a live tmux session remained rooted inside it, leaving that pane at a `(deleted)` cwd.
+Source `0.3.87` now refuses graphical, direct Tauri, control, MCP, and CLI removal before UI detachment or Git mutation, including with force.
+This is a temporary suspension rather than implementation of the unified worktree status service, and packaged acceptance remains open.
 
 ### Goal
 
@@ -230,6 +234,8 @@ Prevent terminals, browsers, development servers, worktrees, and Powder claims f
 - Verify that Powder claims release only after confirmed terminal shutdown.
 - Verify process ownership against Windows and WSL operating-system evidence.
 - Verify that backend, CLI, MCP, and graphical surfaces return equivalent worktree identity, ownership, freshness, and safety decisions.
+- Verify that graphical, Tauri, control, MCP, and CLI removal paths all fail closed before UI detachment or Git mutation while the unified service is unavailable, including with force.
+- After the unified service exists, verify main, dirty, locked, terminal-owned, leased, claimed, stale, and unknown decisions plus preflight-to-mutation serialization before re-enabling removal.
 
 ### Exit Gate
 
@@ -485,13 +491,19 @@ Make Captain creation understandable for saved, existing, and completely new cod
 17. Roll back incomplete state while preserving pre-existing directories and useful work.
 
 Phase 7 remains active.
-Phase 7 item 8 and the full Phase 7 exit gate remain dependent on the Phase 2 unified worktree status service; product-flow work may proceed only against the stable shared contracts.
+Phase 7 item 8 depends on the Phase 2 unified worktree status service, whose durable ownership fields consume the Phase 3 B1 identity interfaces.
+The multiple-Captain exit gate also depends on Phase 3 B1 replacing the one-live-Captain-per-Project constraint with durable Assignment identity.
+Product-flow work may proceed only against stable shared contracts.
 Items 1 through 7, 9, 11, and the existing-codebase portions of 13 through 15 are implemented.
 Installed `0.3.72` now launches commissioned Codex and Claude Captains with explicit unrestricted permission flags, and its packaged review screen reports that authority as `Unrestricted`.
 Installed `0.3.73` discovers visible canonical boards through the protected Powder profile, exposes bounded pagination through the shared control and MCP operation, and replaces free-text board entry with an accessible selection flow.
 Packaged verification listed all 25 real boards from `n8desktop-wsl`, including `t-hub` with its one acceptance card, and preserved the selection in preflight.
 Installed `0.3.74` adds a reviewed **Create new codebase** choice for one absent empty-codebase leaf, initializes Git with `main`, and reports the exact filesystem and external effects before creation.
 Packaged cancel verification reviewed `/home/natkins/t-hub-cancel-proof-0-3-74`, closed the dialog, and confirmed that no directory was created.
+Installed `0.3.86` reproduced the open template and clone gap: **Create new codebase** offers only **Starting point: Empty Git repository** and states that template and clone starting points will be added later.
+The graphical flow currently sequences `register_project` and `commission_captain` in the frontend.
+Registration transactionally owns its optional directory, Git initialization, Project record, and selected Powder binding, while commissioning separately rolls back only incomplete Captain state.
+One reviewed backend transaction shared by graphical and Cortana flows, including explicit cross-operation resume or rollback, remains open.
 The complete graphical packaged E2E matrix for existing non-Git success, empty success, template, and clone flows remains open.
 The shared registration contract now requires `initializeGit: true` before it changes a non-repository folder, and its Rust integration tests cover success, downstream-failure rollback, pre-existing-file preservation, and refusal to rewrite a pre-existing `.git` entry.
 
@@ -754,6 +766,7 @@ These lanes may proceed in parallel:
 
 Integration order is A1 and A2 first, followed by the safe activation of A3.
 A3 must implement worktree ownership and safety from `docs/WORKTREE-STATUS-CONTRACT.md` rather than introducing a resource-only approximation.
+A3 may land Git-only suspension and safety scaffolding before B1, but it must consume B1 for Captain, Assignment, Workspace, and Crew ownership rather than creating a parallel identity model.
 
 ### Tranche B - Identity, Providers, and Control
 

@@ -30,7 +30,7 @@ The complete Cortana contract and new-project transaction are defined in [ORCHES
 
 After selecting an entry path, the intended creation flow is:
 
-1. Open **Commission Captain**.
+1. Open **Create Captain**.
 2. Choose a saved codebase, browse WSL for an existing folder, or configure a new codebase.
 3. Let T-Hub detect the canonical main worktree, display name, remote, default branch, and existing worktrees.
 4. Select or confirm the matching Powder board.
@@ -44,8 +44,13 @@ Commissioning creates a control-capability Captain runtime, starts the selected 
 The Captain remains visible through the Captains surface without forcing creation of an unrelated work Workspace.
 If any required preflight or startup step fails, commissioning fails closed and rolls back the incomplete Captain.
 
-The current dialog does not yet implement the WSL browser, automatic Git and Powder discovery, simplified terminology, or the preflight summary.
-It still exposes manual repository path, project name, Powder repository, and connection profile fields.
+For an existing or new unsaved codebase, the graphical flow calls `register_project` with the selected Powder binding and then calls `commission_captain`.
+These are separate backend transactions.
+A commissioning failure rolls back incomplete Captain state but preserves the useful Project, Git repository, and any codebase leaf owned by the earlier successful registration.
+The product still needs an explicit shared resume-or-rollback contract rather than whole-flow atomicity.
+
+Installed `0.3.86` implements the three entry choices, WSL browsing, Git inspection and explicit initialization, protected-profile discovery under **Advanced**, a bounded Powder board selector, current terminology, and a reviewed preflight summary.
+The new-codebase path still supports only an empty Git repository, Powder board creation is absent, and template, clone, and complete packaged success flows remain open.
 
 ## Captain Options and Crew Flow
 
@@ -123,7 +128,8 @@ The `default` profile can be supplied without a file by setting `POWDER_API_BASE
 
 ## Lifecycle
 
-`register_project` records a canonical Git main worktree.
+`register_project` validates an existing canonical main worktree or, only when explicitly requested, initializes Git in an existing folder or creates one absent empty-codebase leaf.
+It may also validate and persist the selected Powder binding.
 `bind_project_powder` maps that project to one Powder repository and one connection profile.
 `commission_captain` starts Codex or Claude with a control capability, claims a durable ship, and persists its project and assignment.
 Commissioning checks Powder health before starting the Captain process.
