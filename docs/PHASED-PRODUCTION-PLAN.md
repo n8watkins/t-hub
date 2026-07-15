@@ -627,6 +627,10 @@ Framework-aware generic Vite arguments and stale WSL-address recovery remain ope
 History items 11 through 13 are governed by [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md).
 The existing Recent implementation is Claude-only, keyed and filtered by cwd, archives an entire Claude project transcript directory, and hardcodes Claude resume behavior.
 Codex rows must not be added to that legacy contract because doing so would collapse same-cwd conversations and resume them through the wrong Harness.
+Source `0.3.97` at commit `4759df0` preserves a partial Codex session window when the same provider snapshot also contains a recognized weekly window.
+It also advances the retained authoritative snapshot across an expired reset boundary before merging a later partial poll, so an old session percentage cannot reappear.
+The focused regression suite, all 480 frontend tests, TypeScript, the production frontend build, version consistency, diff checks, and independent review passed.
+This source remains uninstalled; the running application is still `0.3.94`.
 
 ### Tests and Evidence
 

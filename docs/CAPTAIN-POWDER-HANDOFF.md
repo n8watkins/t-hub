@@ -13,7 +13,7 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `70804df`.
+**Source head before this handoff update:** `4759df0`.
 **Installed Windows build:** locally built T-Hub `0.3.94` from exact detached source `3816bf4`.
 
 ## Executive Status
@@ -30,7 +30,8 @@ The exact NSIS installer SHA-256 is `D9BFC8A94572D1ADEEA8E4494696176D3A49138BEB8
 
 Source `0.3.95` at commit `8231b5e` preserves partial Codex usage snapshots, normalizes 5-hour and weekly windows by duration, and migrates the last-known cache.
 Source `0.3.96` at commit `c40d52a` adds a Windows Explorer folder chooser to the shared WSL picker used by existing-folder and new-codebase Captain flows.
-Neither source build is installed yet, so the running application remains `0.3.94` and does not contain those changes.
+Source `0.3.97` at commit `4759df0` closes the independent review finding in the Codex usage merge by preserving an unknown-duration primary beside a recognized weekly window and advancing expired windows before later partial polls merge.
+None of those source builds is installed yet, so the running application remains `0.3.94` and does not contain those changes.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The local `http://127.0.0.1:4017/healthz` endpoint returned HTTP 200 with the Powder health payload during the 2026-07-15 review.
@@ -42,7 +43,7 @@ Real commissioned Captain and Crew acceptance therefore remains incomplete rathe
 
 The requested automatic board creation for new codebases is not safe against Powder's current API.
 Powder exposes repository upsert, not create-if-absent, so a concurrent creator can appear between T-Hub's read and write and have its settings overwritten.
-The reviewed `0.3.97` prototype was rejected and fully removed before commit because it could not close that race without changing Powder.
+The reviewed uncommitted Powder prototype was rejected and fully removed because it could not close that race without changing Powder.
 T-Hub must not modify Powder to accommodate this flow and must remain fail-closed until Powder independently provides a non-overwriting create precondition.
 The rejected prototype also exposed two recovery requirements that remain part of the Phase 7 gate: reuse one reviewed request identity across ambiguous retries, and make a preserved unbound Project directly resumable after Powder or binding failure.
 
@@ -313,14 +314,15 @@ The canonical gated sequence is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-
 The ordered continuation is:
 
 1. Keep worktree removal suspended until the Phase 2 unified status service consumes Phase 3 B1 ownership and passes its full activation matrix.
-2. In parallel against stable shared contracts, complete template and clone creation, authorized Powder board creation, one shared registration-and-commission transaction with explicit resume or rollback, and the packaged Captain-creation E2E matrix.
-3. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
-4. Verify context reset recovery, Crew dispatch into a deliberate shared Workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
-5. Complete the native Board's registered and Powder-bound Project success-state acceptance through the Phase 8 flow.
-6. Harden generic non-Tauri Vite launch adapters and stale WSL-address recovery for the unified Run and Preview flow.
-7. Confirm the Claude terminal-header label interactively in the installed application.
-8. Run stable packaged 1, 4, 8, and 16 terminal acceptance measurements, including cold rehydration, input readiness, and canvas rendering.
-9. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
+2. In parallel against stable shared contracts, complete template and clone preparation plus the shared registration-and-commission resume or rollback transaction, while keeping automatic Powder board creation fail closed until Powder independently provides a non-overwriting create precondition.
+3. In parallel through the approved B3 and B4 lanes, implement the provider-neutral History adapter and catalog foundation without changing the Claude-only Recent UI or introducing a substitute durable identity schema.
+4. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
+5. Verify context reset recovery, Crew dispatch into a deliberate shared Workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
+6. Complete the native Board's registered and Powder-bound Project success-state acceptance through the Phase 8 flow.
+7. Harden generic non-Tauri Vite launch adapters and stale WSL-address recovery for the unified Run and Preview flow.
+8. Confirm the Claude terminal-header label interactively in the installed application.
+9. Run stable packaged 1, 4, 8, and 16 terminal acceptance measurements, including cold rehydration, input readiness, and canvas rendering.
+10. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
 
 Additional production-readiness gaps remain outside the Captain slice:
 
