@@ -359,6 +359,9 @@ Control, MCP, and CLI parity remains source-test evidence because the installed 
 The upgrade first launched under debug acceptance as PID `30136`.
 The declared one-terminal performance retry ran as isolated PID `49712`, and Windows Explorer separately invalidated the first attempt by launching a normal application process.
 The normal installed application was finally restored as PID `20376` without changing the installed hash or any of the six canonical tmux names and pane PIDs.
+Its live bridge agent is PID `1687604` at `/home/natkins/.local/bin/t-hub-agent`, reports `t-hub-agent 0.5.0`, and has SHA-256 `4BF61DA4DC7BFDBB9AEF8EF464B3AB6E7035D7EF14F715FC5BFE43A78857A706`.
+A direct protocol 1 capability probe against that binary returned the stable `unsupported` response for `git_info`.
+The Windows package does not currently replace this WSL agent binary, so packaging the desktop alone cannot close the performance blocker.
 The retry artifact `artifacts/perf/t-hub-0.3.90-1t-20260715T0044-r2.json` completed 55 samples over 61.05 seconds but observed eight host-bridge births and eight deaths across four incomplete CPU intervals, so `release_acceptance_eligible` is false.
 That artifact is diagnostic only, not an accepted baseline, and the 4, 8, and 16 terminal cells remain blocked until the recurring bridge churn is removed and the one-terminal scenario is eligible.
 The 29.94-second recurrence matches the visible tile's 30-second full Git-header poll, which currently starts a fresh WSL process tree on every cache miss.
