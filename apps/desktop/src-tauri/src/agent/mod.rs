@@ -123,6 +123,34 @@ pub struct AgentBridge {
 static ACTIVE_BRIDGE: LazyLock<Mutex<Weak<BridgeInner>>> =
     LazyLock::new(|| Mutex::new(Weak::new()));
 
+#[cfg(test)]
+static AGENT_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+struct TestEnvVar {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl TestEnvVar {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestEnvVar {
+    fn drop(&mut self) {
+        match self.previous.as_ref() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 struct BridgeInner {
     /// The supervision reducer, fed by incoming journal events. Shared so the
     /// supervision Tauri commands can read snapshots without a round-trip.
@@ -985,9 +1013,14 @@ mod tests {
             .success());
         std::fs::write(repo.join("tracked.txt"), "changed\n").unwrap();
 
-        std::env::set_var("T_HUB_AGENT_BIN", &agent_bin);
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &agent_bin);
         let bridge = AgentBridge::new();
         bridge.connect("ignored").expect("real agent must connect");
+        drop(agent_bin_env);
+        drop(env_lock);
         let info = bridge
             .git_info(repo.to_str().unwrap())
             .expect("real stdio GitInfo request must succeed");
@@ -997,7 +1030,6 @@ mod tests {
         assert_eq!(info.dirty_count, 1);
         assert!(info.head_commit.is_some());
         bridge.disconnect();
-        std::env::remove_var("T_HUB_AGENT_BIN");
         std::fs::remove_dir_all(repo).ok();
     }
 

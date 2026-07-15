@@ -298,7 +298,7 @@ mod transport_tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use crate::agent::AgentBridge;
+    use crate::agent::{AgentBridge, TestEnvVar, AGENT_TEST_ENV_LOCK};
     // `ConnectionState` is defined in this module (the parent of these tests).
     use super::ConnectionState;
 
@@ -345,11 +345,17 @@ mod transport_tests {
             return;
         }
 
-        // Point the escape hatch at the known-good debug binary.
-        std::env::set_var("T_HUB_AGENT_BIN", &bin_path);
-
+        // Point the escape hatch at the known-good debug binary only while the
+        // child is spawned. Restore it immediately so parallel tests never
+        // inherit process-global test configuration.
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &bin_path);
         let bridge = AgentBridge::new();
         bridge.connect("ignored").expect("connect() must succeed");
+        drop(agent_bin_env);
+        drop(env_lock);
 
         // `connect()` blocks until the handshake + replay finish and the state is
         // Live, so this is normally already satisfied — but assert it via a bounded
@@ -477,8 +483,11 @@ mod transport_tests {
         fire_hook("Stop", &format!(r#"{{"session_id":"{sid}"}}"#));
 
         // --- Connect the core bridge to a real --stdio agent (same HOME) ---
-        std::env::set_var("T_HUB_AGENT_BIN", &bin_path);
-        std::env::set_var("HOME", &home); // the spawned --stdio child inherits this
+        let env_lock = AGENT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let agent_bin_env = TestEnvVar::set("T_HUB_AGENT_BIN", &bin_path);
+        let home_env = TestEnvVar::set("HOME", &home);
 
         // Recording emitter to capture the live UI events.
         #[derive(Default, Clone)]
@@ -497,6 +506,9 @@ mod transport_tests {
         let bridge = AgentBridge::new();
         bridge.set_emitter(Arc::new(rec.clone()));
         bridge.connect("ignored").expect("connect must succeed");
+        drop(home_env);
+        drop(agent_bin_env);
+        drop(env_lock);
 
         // `connect()` returns once replay is complete, but the replayed entries are
         // emitted on the reader thread, so the emits may land just after connect()
@@ -556,6 +568,7 @@ mod transport_tests {
         );
         eprintln!("live_emit_demo: live tail path emitted completed ✓");
 
+        bridge.disconnect();
         std::fs::remove_dir_all(&home).ok();
     }
 }
