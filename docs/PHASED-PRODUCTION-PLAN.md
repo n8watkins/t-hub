@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.75` from `15ab30f`, running as Windows PID `40844` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.76` from `7ced938`, running as Windows PID `39044` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -80,7 +80,9 @@ Installed `0.3.68` reduced the retained backup from `135,278,300` bytes to `8,38
 Installed `0.3.75` replaces the global Board URL and iframe with a native read-only Board resolved from the focused terminal's durable Project and protected Powder binding.
 The packaged no-Project path shows an honest state without an iframe or manual Board URL field.
 The bound Project success path remains gated on Phase 8 real Project acceptance.
-Preview still exposes an unclear Dev then Preview sequence.
+Installed `0.3.76` replaces the separate Dev and Preview tabs with one **Run and Preview** surface and removes terminal-output URL scanning and automatic navigation.
+Packaged verification proved that the previously reproduced WebView inspection URL remained in PTY scrollback while the preview URL stayed empty and no iframe was created.
+Typed target discovery, generation-safe lifecycle state, process-tree cleanup, reachable-interface ownership, and representative Vite, Next.js, and static acceptance remain open.
 The Codex header identity has been checked interactively, while the Claude header still needs interactive confirmation.
 
 The durable inbox substrate implements persistence, ordering, priorities, receipts, crash recovery, sender attribution, and role-based access controls.
@@ -551,6 +553,10 @@ The backend resolves Captain, Crew, or canonical Git main-worktree identity to o
 The native read-only surface covers loading, empty, unbound, unauthorized, unreachable, missing-repository, truncated, and generic error states, with retry and an explicitly unfiltered external full-board fallback where applicable.
 Packaged verification on the T-Hub tile showed **No registered Project**, zero iframes, and no Board URL input, correcting the reproduced redirect to `http://192.168.0.102:4000/`.
 The registered and bound Project success state still requires the Phase 8 real Powder acceptance flow.
+Run and Preview item 5 and the Preview portion of item 8 are implemented in source commit `96998fc` and packaged as installed `0.3.76` from `7ced938`.
+The packaged T-Hub tile exposed exactly one combined tab and one unified panel containing both managed runner controls and the empty preview state.
+The old inspection endpoint remained present in terminal scrollback, but the preview URL stayed empty with zero iframes and no detected-URL chips.
+Items 6 and 7 remain open, including typed package targets, backend-authoritative generation-safe lifecycle state, descendant cleanup, reachable URL probing, and representative framework acceptance.
 
 ### Tests and Evidence
 
