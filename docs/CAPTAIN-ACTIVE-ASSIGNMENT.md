@@ -9,6 +9,7 @@ The installed acceptance target is T-Hub `0.3.103` from source commit `8654986`.
 ## Current Authorization
 
 Run Stage 1 only.
+The General authorized exactly one Stage 1 retry after run `run-yK6SiKFdAhJn` was released safely.
 Do not begin the future production queue in this document.
 Do not modify Powder source.
 Do not edit the coordinator worktree.
@@ -18,6 +19,8 @@ Do not merge, push, install, publish, or release anything.
 
 Use Powder card `thub-local-acceptance` from repository `t-hub`.
 Dispatch exactly one Codex Crew through T-Hub MCP.
+
+Before retrying, verify that run `run-yK6SiKFdAhJn` is released, the card is ready and unclaimed, the prior Crew binding is removed, the terminal count returned to six, and the completion sentinel remains absent.
 
 Use these exact checkout values:
 
@@ -30,6 +33,23 @@ The Crew must not change repository files or create an empty commit.
 The Crew must work only inside the assigned worktree and task scope.
 The Crew must escalate destructive, security, installation, release, merge, push, or external decisions.
 
+### Preserved Worktree Baseline
+
+The first dispatch proved that the user's global Codex `SessionStart` hook creates `CLAUDE.md -> AGENTS.md` when a worktree contains `AGENTS.md` without `CLAUDE.md`.
+That hook is configured outside T-Hub in `~/.codex/config.toml` and runs `~/.config/agent-hooks/normalize-agents-md.sh`.
+The hook-created symlink is a protected user artifact rather than a T-Hub source change.
+
+Before the retry, the accepted worktree baseline is exactly:
+
+```text
+## test/local-acceptance
+?? CLAUDE.md
+```
+
+`CLAUDE.md` must be a symlink whose target is exactly `AGENTS.md`.
+The Captain and Crew must preserve that symlink without deleting, replacing, staging, or committing it.
+The checkout is acceptable for this retry only when no other tracked, untracked, staged, or ignored delta appears relative to that baseline.
+
 The Crew must verify all of the following:
 
 1. The Powder card belongs to canonical repository `t-hub`.
@@ -37,10 +57,11 @@ The Crew must verify all of the following:
 3. T-Hub persists a durable Crew binding before launching the Harness.
 4. One Crew terminal starts in the exact worktree and branch.
 5. Interactive Codex is live and received the authoritative dispatch brief.
-6. Powder receives the expected lifecycle and work-log evidence.
-7. The completion sentinel is created only after the runtime checks pass.
-8. The card completes or releases without leaving a stale claim.
-9. The Captain checkpoints the final terminal, card, run, checkout, evidence, outcome, and residual risks.
+6. The protected `CLAUDE.md -> AGENTS.md` baseline remains unchanged and no additional worktree delta appears.
+7. Powder receives the expected lifecycle and work-log evidence.
+8. The completion sentinel is created only after the runtime checks pass.
+9. The card completes or releases without leaving a stale claim.
+10. The Captain checkpoints the final terminal, card, run, checkout, evidence, outcome, and residual risks.
 
 The Captain must inspect the dispatched terminal before sending any additional text.
 The Captain must not trust Codex lifecycle status alone while provider-aware status remains incomplete.
@@ -51,7 +72,8 @@ The Captain must use the Crew binding, terminal process, Powder run, report, and
 Stop immediately if dispatch fails or reports incomplete rollback.
 Stop immediately if the card repository, claim owner, worktree, branch, Harness, or terminal is ambiguous.
 Stop immediately if more than one Crew terminal appears.
-Stop immediately if the Crew attempts to edit the repository.
+Stop immediately if the Crew changes any path beyond the preserved `CLAUDE.md -> AGENTS.md` baseline.
+Stop immediately if the symlink target, identity, or worktree status changes.
 Stop immediately if a raw credential appears in output, prompts, files, or Powder evidence.
 Reconcile authoritative T-Hub and Powder state before reporting any failure.
 Do not retry an ambiguous mutation with a new request identity.
@@ -61,7 +83,7 @@ The Captain must not adopt or clear the existing `card-envelope.done` or `worktr
 
 ## Stage 1 Exit Gate
 
-Stage 1 passes only when the real Powder claim, durable Crew binding, exact checkout, live Codex Harness, work log, completion report, new sentinel, final card state, and Captain checkpoint agree.
+Stage 1 passes only when the real Powder claim, durable Crew binding, exact checkout, preserved symlink baseline, live Codex Harness, work log, completion report, new sentinel, final card state, and Captain checkpoint agree.
 Stage 1 fails if any claim, Crew record, terminal, or owned resource remains stale or ambiguous.
 
 After Stage 1, stop and report one of these exact classifications:
@@ -98,9 +120,10 @@ The external monitor should verify these signals:
 3. Powder card `thub-local-acceptance` moves from `ready` to `claimed` with one run.
 4. The durable Captain record contains the same Crew terminal, card, run, worktree, and branch.
 5. The Crew terminal runs Codex in the exact worktree.
-6. Powder receives attributed work-log evidence and a final state.
-7. A newly timestamped `local-acceptance.done` sentinel appears.
-8. The Captain writes a final checkpoint and no stale claim remains.
+6. The only worktree delta remains the preserved `CLAUDE.md -> AGENTS.md` symlink.
+7. Powder receives attributed work-log evidence and a final state.
+8. A newly timestamped `local-acceptance.done` sentinel appears.
+9. The Captain writes a final checkpoint and no stale claim remains.
 
 Current coordinator monitoring is passive and incomplete.
 Cross-session transcript reads are denied, Codex work status is `unknown`, fleet wake monitoring is not active, and audited messaging currently times out.
