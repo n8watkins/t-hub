@@ -4141,10 +4141,9 @@ fn handle_conn(stream: TcpStream, ctx: &ControlContext) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Serve a PTY stream (M2a) on this connection: send the scrollback seed, spawn
-/// the PTY-runs-`tmux attach` streaming output frames down (via a clone of the
-/// writer — the reader thread owns those writes, so they never interleave with the
-/// scrollback we send first), then read write/resize frames from the client until
+/// Serve a PTY stream (M2a) on this connection: send an empty compatibility seed,
+/// spawn the PTY-runs-`tmux attach` streaming output frames down (via a clone of the
+/// writer), then read write/resize frames from the client until
 /// it disconnects, and detach (the tmux session survives).
 ///
 /// Framing is negotiated from `args.binary` (T13): `true` ⇒ v2 length-prefixed
@@ -4255,17 +4254,19 @@ fn serve_pty_attach(
     // Alive and about to stream, so never fail the attach over this.
     tmux::reassert_window_size_latest(&tmux_session);
 
-    // Scrollback seed as the opening frame — sent BEFORE the stream starts so the
-    // reader thread's output frames never race it. v1: `{"scrollback":"<b64>"}`;
-    // v2: a binary SCROLLBACK frame carrying the raw capture bytes.
-    let scrollback = tmux::capture_pane(&tmux_session).unwrap_or_default();
+    // Opening compatibility frame, sent BEFORE the stream starts so the client can
+    // complete its handshake before output arrives. The attached tmux client is the
+    // single authoritative renderer for the current screen. Replaying capture-pane
+    // here and then streaming tmux's initial redraw rendered the same inline TUI
+    // frame twice, including an apparently duplicated Codex composer draft.
+    let scrollback: &[u8] = &[];
     match framing {
         pty::PtyFraming::V1Json => write_json_line(
             writer,
-            &json!({ "scrollback": STANDARD.encode(&scrollback) }),
+            &json!({ "scrollback": STANDARD.encode(scrollback) }),
         )?,
         pty::PtyFraming::V2Binary => {
-            pty::write_bin_frame(writer, pty::binframe::SCROLLBACK, &scrollback)?
+            pty::write_bin_frame(writer, pty::binframe::SCROLLBACK, scrollback)?
         }
     }
 
@@ -13483,9 +13484,11 @@ mod tests {
         let mut first_writer = first.try_clone().unwrap();
         send_attach_request(&mut first_writer, "cap-secret", &id);
         let mut first_reader = BufReader::new(first);
-        assert!(read_json_frame(&mut first_reader)
-            .get("scrollback")
-            .is_some());
+        assert_eq!(
+            read_json_frame(&mut first_reader)["scrollback"],
+            "",
+            "attach must not replay a second copy of the tmux screen"
+        );
         assert_eq!(attach_forwarder_count(), 1);
 
         // Second attach: refused with an actionable error, then closed.

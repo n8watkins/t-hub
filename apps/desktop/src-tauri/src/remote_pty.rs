@@ -6,7 +6,8 @@
 //! webview by `commands.rs`. M2a routes that same byte stream through the loopback
 //! **control socket** instead: the server half (already live in
 //! [`crate::control`] — `ATTACH_PTY_COMMAND` + `serve_pty_attach`) owns the PTY,
-//! captures scrollback, spawns the `tmux attach`, and streams `{"out"}` / `{"exit"}`
+//! sends an empty compatibility seed, spawns the `tmux attach`, and streams
+//! `{"out"}` / `{"exit"}`
 //! frames down while reading `{"write"}` / `{"resize"}` frames back up. This module
 //! is the **client** for that protocol: it opens the TCP connection, performs the
 //! `attach_pty` handshake, and re-emits the socket's frames into the webview on the
@@ -48,7 +49,7 @@
 //! [`WRITE_TIMEOUT`] so a stalled remote peer errors out rather than deadlocking
 //! the terminal commands.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::thread::JoinHandle;
@@ -102,10 +103,9 @@ pub struct RemotePty {
 impl RemotePty {
     /// Open a connection to the control endpoint, perform the `attach_pty`
     /// handshake, read the opening `{"scrollback"}` frame, and spawn the reader
-    /// thread. Returns the assembled [`RemotePty`] AND the decoded scrollback
-    /// string (the command hands it straight back to the frontend, exactly as the
-    /// old in-process path returned `tmux::capture_pane` as base64 — except here
-    /// the server already base64-encoded it, so we return the raw base64 string).
+    /// thread. Returns the assembled [`RemotePty`] and the compatibility seed.
+    /// The seed is intentionally empty because the attached tmux client supplies
+    /// the one authoritative redraw of the current screen.
     ///
     /// A `{"error":...}` opening frame (e.g. the tmux session vanished server-side)
     /// is surfaced as an `Err` and no thread is spawned.
@@ -478,13 +478,6 @@ fn reader_loop(app: AppHandle, id: String, reader: BufReader<TcpStream>) {
 #[derive(Default)]
 pub struct RemotePtyManager {
     pub conns: Mutex<HashMap<String, RemotePty>>,
-    /// Ids that were just `spawn_terminal`'d but not yet attached. A FRESH spawn's
-    /// `attach_terminal` returns EMPTY scrollback (the frontend `Terminal.tsx` then
-    /// reads `seed.length === 0` as "fresh" and draws one clean prompt via Ctrl-L)
-    /// instead of replaying the reflow-prone pane capture; a reattach (id NOT in
-    /// this set) returns the real scrollback to restore history. This preserves the
-    /// exact fresh-vs-reattach signal the in-process path encoded via `has_live`.
-    pub fresh: Mutex<HashSet<String>>,
 }
 
 #[cfg(test)]

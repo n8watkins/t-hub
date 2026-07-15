@@ -58,7 +58,7 @@ export interface TerminalInfo {
 /** Tauri command names (used with `invoke`). */
 export const Commands = {
   spawnTerminal: "spawn_terminal",
-  /** (Re)attach a PTY client to a tmux session; returns base64 scrollback to seed xterm. */
+  /** (Re)attach a PTY client to a tmux session and start its live redraw stream. */
   attachTerminal: "attach_terminal",
   /** Human-origin + local terminal-management (non-automation-message) input
    *  (comms-plane Phase 1). Automation-message input must use `deliverAgentInput`

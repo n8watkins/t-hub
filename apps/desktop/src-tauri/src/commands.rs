@@ -357,7 +357,6 @@ pub(crate) fn pane_command(shell: Option<&str>, startup_command: Option<&str>) -
 #[tauri::command]
 pub async fn spawn_terminal(
     app: tauri::AppHandle,
-    remote: tauri::State<'_, RemotePtyManager>,
     opts: SpawnOptions,
 ) -> Result<TerminalInfo, String> {
     // The terminal id IS the tmux session's own suffix, so the id is stable and
@@ -422,12 +421,6 @@ pub async fn spawn_terminal(
             ));
         }
     }
-
-    // Mark this id FRESH so its first `attach_terminal` returns empty scrollback
-    // (the frontend then draws one clean prompt via Ctrl-L instead of replaying the
-    // reflow-prone capture). A later reattach-after-close is NOT fresh → real
-    // scrollback. Preserves the in-process path's `has_live` fresh-vs-reattach signal.
-    remote.fresh.lock().insert(id.clone());
 
     // Server-split M2a: spawn NO local PTY here. The detached tmux session is now
     // ready; the frontend's mount flow calls `attach_terminal`, which opens a
@@ -517,11 +510,9 @@ pub async fn attach_terminal(
 
     // First attach (or re-attach after `close_terminal` detached it): open a new
     // RemotePty over the control socket. `connect` performs the attach_pty
-    // handshake and returns the server's base64 scrollback (its opening frame),
-    // which we hand straight back to the frontend — the same wire shape the old
-    // path returned (a base64 string of the pane scrollback).
+    // handshake and returns the empty compatibility seed from its opening frame.
     let endpoint = control_endpoint(&app)?;
-    let (conn, scrollback_b64) =
+    let (conn, _compatibility_seed) =
         match RemotePty::connect(&app, &endpoint.addr(), endpoint.token(), &id, cols, rows) {
             Ok(x) => x,
             // A local rebind may have rotated the listener port (relay-wedge
@@ -533,12 +524,6 @@ pub async fn attach_terminal(
             },
         };
     remote.conns.lock().insert(id.clone(), conn);
-
-    // Fresh spawn (spawn_terminal marked it) → return EMPTY scrollback so the
-    // frontend draws a clean prompt via Ctrl-L instead of replaying the capture's
-    // reflow cascade. A reattach (not in `fresh`) → the real scrollback, to restore
-    // history. Mirrors the old `has_live` ? empty : capture_pane branch.
-    let was_fresh = remote.fresh.lock().remove(&id);
 
     // A successful attach binds a remote PTY to this session, so the terminal is
     // unambiguously Live. After a reload the frontend may have seeded this terminal
@@ -553,11 +538,7 @@ pub async fn attach_terminal(
         },
     );
 
-    Ok(if was_fresh {
-        String::new()
-    } else {
-        scrollback_b64
-    })
+    Ok(String::new())
 }
 
 /// Write bytes to a terminal's PTY - the HUMAN-origin + local terminal-management
@@ -693,10 +674,6 @@ pub async fn kill_terminal(
     // its process tree). Remove the conn (releasing the lock) before any blocking
     // socket op so the Mutex is never held across I/O.
     let conn = remote.conns.lock().remove(&id);
-    // Drop any lingering "fresh" mark for this id (spawned but never attached) so
-    // it can't accumulate — the id is gone for good after a kill.
-    remote.fresh.lock().remove(&id);
-
     // Captain-chat phase 2: a killed tile leaves the captains registry too - its
     // captaincy is released, and it drops out of every crew list. The UI kills
     // via this command (the × and the closeWorkspace reap), so this is the UI's

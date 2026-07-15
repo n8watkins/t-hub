@@ -185,20 +185,17 @@ struct AppHandleApplySink {
 
 impl control::ApplySink for AppHandleApplySink {
     fn apply(&self, command: &str, args: &serde_json::Value) -> Result<(), String> {
-        use tauri::{Emitter, Manager};
+        use tauri::Emitter;
         // Headless-org: control-spawned sessions are created SERVER-side (the id
         // rides the forward), bypassing `commands::spawn_terminal`'s bookkeeping.
-        // Recreate it here so the adopted tile behaves exactly like a "+" spawn:
-        // mark the id FRESH (first attach returns empty scrollback → one clean
-        // prompt) and emit Live so the tile skips the "starting" placeholder.
+        // Recreate its Live event here so the adopted tile behaves exactly like
+        // a "+" spawn and skips the "starting" placeholder.
         if matches!(command, "spawn_terminal" | "add_worktree_workspace") {
             let id = args
                 .get("id")
                 .or_else(|| args.get("terminalId"))
                 .and_then(|v| v.as_str());
             if let Some(id) = id {
-                let remote = self.app.state::<remote_pty::RemotePtyManager>();
-                remote.fresh.lock().insert(id.to_string());
                 let _ = self.app.emit(
                     events::STATE,
                     &events::StateEvent {

@@ -34,7 +34,7 @@ export function reportWorkspaceTabs(
   return invoke(Commands.reportWorkspaceTabs, { tabs, activeTabId, baseSeq });
 }
 
-/** (Re)attach to a terminal; resolves to base64 scrollback to seed xterm. */
+/** (Re)attach to a terminal; the live tmux stream redraws its current screen. */
 export function attachTerminal(
   id: TerminalId,
   cols: number,

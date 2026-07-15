@@ -13,7 +13,6 @@
 //!   - `has_session(name) -> bool`
 //!   - `kill_session(name)`
 //!   - `list_sessions() -> Vec<String>`  (tolerates "no server running")
-//!   - `capture_pane(name) -> Vec<u8>`   (scrollback to seed xterm on attach)
 
 use std::process::Command;
 use std::sync::LazyLock;
@@ -65,9 +64,6 @@ const fn default_socket_name() -> &'static str {
 pub fn socket() -> &'static str {
     &SOCKET_NAME
 }
-
-/// How many lines of scrollback history we capture to seed xterm on attach.
-const SCROLLBACK_LINES: i64 = 2000;
 
 /// tmux per-window scrollback cap for NEW sessions. The default 2000 is why you
 /// couldn't scroll up far. `history-limit` is per-window and FIXED at window
@@ -851,31 +847,6 @@ fn pane_info_command(script: &str) -> Command {
     c
 }
 
-/// Capture the visible pane plus `SCROLLBACK_LINES` of scrollback for `name`,
-/// preserving ANSI escape sequences (`-e`), so the frontend can seed xterm with
-/// the existing screen state on (re)attach.
-///
-/// Returns the raw bytes (which include escape sequences); the caller is
-/// responsible for base64-encoding before sending over IPC.
-pub fn capture_pane(name: &str) -> Result<Vec<u8>, TmuxError> {
-    let start = format!("-{SCROLLBACK_LINES}");
-    let output = run(
-        "capture-pane",
-        &["capture-pane", "-p", "-e", "-S", &start, "-t", name],
-    )?;
-    Ok(output.stdout)
-}
-
-/// Capture only the visible screen of `name` (no scrollback history), ANSI
-/// preserved. Used to seed a freshly spawned tile with a single clean prompt
-/// rather than the 80x24-then-resize redraw trail that full-history capture
-/// would replay.
-#[allow(dead_code)] // retained for potential visible-only reattach seeding
-pub fn capture_visible(name: &str) -> Result<Vec<u8>, TmuxError> {
-    let output = run("capture-pane", &["capture-pane", "-p", "-e", "-t", name])?;
-    Ok(output.stdout)
-}
-
 /// Capture the visible pane of `name` as **plain text** (no ANSI escapes),
 /// optionally including the last `history_lines` of scrollback above the screen.
 ///
@@ -1032,11 +1003,9 @@ mod tests {
     /// passes where tmux is installed (it is in this WSL2 dev shell; it is not
     /// expected to run on the Windows CI target).
     #[test]
-    fn lifecycle_create_list_capture_kill() {
+    fn lifecycle_create_list_kill() {
         if !tmux_available() {
-            eprintln!(
-                "tmux::tests::lifecycle_create_list_capture_kill: tmux not on PATH — skipping"
-            );
+            eprintln!("tmux::tests::lifecycle_create_list_kill: tmux not on PATH - skipping");
             return;
         }
         let name = unique_name();
@@ -1053,13 +1022,6 @@ mod tests {
             sessions.iter().any(|s| s == &name),
             "list_sessions {sessions:?} should contain {name}"
         );
-
-        // capture-pane should succeed for a live session and return some bytes
-        // (at minimum the shell prompt / blank pane).
-        let captured = capture_pane(&name).expect("capture_pane should succeed");
-        // The pane may legitimately be empty bytes if rendering hasn't settled,
-        // but the call itself must succeed; we only assert it returned Ok above.
-        let _ = captured;
 
         kill_session(&name).expect("kill_session should succeed");
         assert!(
