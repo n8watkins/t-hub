@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.72` from `5b4e9d2`, running as Windows PID `27472` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.73` from `4cddab2`, running as Windows PID `30528` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -452,6 +452,8 @@ Make Captain creation understandable for saved, existing, and completely new cod
 Phase 7 remains active.
 Items 1 through 7, 9, 11, and the existing-codebase portions of 13 through 15 are implemented.
 Installed `0.3.72` now launches commissioned Codex and Claude Captains with explicit unrestricted permission flags, and its packaged review screen reports that authority as `Unrestricted`.
+Installed `0.3.73` discovers visible canonical boards through the protected Powder profile, exposes bounded pagination through the shared control and MCP operation, and replaces free-text board entry with an accessible selection flow.
+Packaged verification listed all 25 real boards from `n8desktop-wsl`, including `t-hub` with its one acceptance card, and preserved the selection in preflight.
 The complete graphical packaged E2E matrix for existing non-Git, empty, template, and clone flows remains open.
 The shared registration contract now requires `initializeGit: true` before it changes a non-repository folder, and its Rust integration tests cover success, downstream-failure rollback, pre-existing-file preservation, and refusal to rewrite a pre-existing `.git` entry.
 

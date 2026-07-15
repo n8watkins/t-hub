@@ -2,7 +2,7 @@
 
 ## Canonical Planning Note
 
-The runtime evidence in this handoff is current through the installed `0.3.72` build.
+The runtime evidence in this handoff is current through the installed `0.3.73` build.
 The authoritative forward roadmap is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
 The document-status authority is [REVIEW-INDEX.md](./REVIEW-INDEX.md).
 That plan now includes the settled permanent Cortana identity, multiple Captains per Project, Assignment-based ownership, provider-agnostic Harness integration, CLI-first control, durable messaging, History, voice parity, and parallel implementation lanes.
@@ -13,8 +13,8 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `5b4e9d2`.
-**Installed Windows build:** locally built T-Hub `0.3.72` from `5b4e9d2`.
+**Source head before this handoff update:** `4cddab2`.
+**Installed Windows build:** locally built T-Hub `0.3.73` from `4cddab2`.
 
 ## Executive Status
 
@@ -23,9 +23,9 @@ The final independent authority review reports no remaining Critical, High, or M
 The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
 
 The current production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `EC83E7ED73B4D74CEA770F73CE545E0C0673CA86DACDA66390FCB7C633B8EBB6`.
-It is running as PID `27472`.
-The exact NSIS installer SHA-256 is `0274A102CF44A278D75798FDB548683BF119BED0F624EA6E250E94B65C2FC557`.
+The installed executable SHA-256 is `3A1796E9E12F1E22EEC6B6B526011CB0C7310DAB06F01F692F1C9883D3CA908F`.
+It is running as PID `30528`.
+The exact NSIS installer SHA-256 is `656E85039B3187A04C7EB18F7BA8CAEEC5AF4E8A02D9F72DC761D786978C622F`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
@@ -73,6 +73,8 @@ The main implementation sequence in this work is:
 - `3576957 chore: bump desktop to 0.3.71`
 - `409675a fix: launch captains with unrestricted authority`
 - `5b4e9d2 chore: bump desktop to 0.3.72`
+- `0be8504 feat: select captains from Powder boards`
+- `4cddab2 chore: bump desktop to 0.3.73`
 
 ## Captain and Crew Model
 
@@ -301,10 +303,10 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The installed Windows process was reverified at PID `27472`, start time `2026-07-14T16:46:00-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-Its file and product version are `0.3.72`.
-The installed executable SHA-256 is `EC83E7ED73B4D74CEA770F73CE545E0C0673CA86DACDA66390FCB7C633B8EBB6`.
-The installed build was produced from source `5b4e9d2` with NSIS installer SHA-256 `0274A102CF44A278D75798FDB548683BF119BED0F624EA6E250E94B65C2FC557`.
+The installed Windows process was reverified at PID `30528`, start time `2026-07-14T17:07:17-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its file and product version are `0.3.73`.
+The installed executable SHA-256 is `3A1796E9E12F1E22EEC6B6B526011CB0C7310DAB06F01F692F1C9883D3CA908F`.
+The installed build was produced from source `4cddab2` with NSIS installer SHA-256 `656E85039B3187A04C7EB18F7BA8CAEEC5AF4E8A02D9F72DC761D786978C622F`.
 The installed `th` CLI is version `0.2.0` from source `07e74f4`.
 Source commit `6870444` fixes the reproduced xterm teardown race.
 Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
@@ -322,7 +324,9 @@ Their combined fresh diagnostic slice contains zero `listTerminals failed`, prem
 Installed `0.3.71` completed one warm stress pass and two cold restart passes with zero `loadCell`, `isWrapped`, `replaceCells`, `no live terminal`, window, or unhandled errors in the targeted fresh slices.
 Installed `0.3.72` preserved all eight tmux sessions across upgrade and its packaged Captain review reports `Permissions` as `Unrestricted`.
 The Codex and Claude harness tests lock the exact unrestricted launch flags used by `commission_captain`.
+Installed `0.3.73` preserved all eight tmux sessions and listed all 25 visible canonical Powder boards through `n8desktop-wsl` without free-text entry.
+The packaged dialog selected `t-hub`, reported `t-hub via n8desktop-wsl` in preflight, and performed no Project, Powder, Captain, or filesystem mutation during verification.
 The packaged graphical E2E matrix for the new non-Git choice remains open, so Phase 7 is now the earliest unblocked active phase.
-The immediate source action is to add real Powder board discovery and selection, then continue the reviewed new-codebase transaction and packaged Phase 7 E2E matrix.
+The immediate source action is to continue the reviewed new-codebase transaction and packaged Phase 7 E2E matrix.
 Real Powder acceptance still requires a control-capable Captain session.
 The Board endpoint, Preview workflow, Claude header check, packaged performance matrix, and release hardening remain open.
