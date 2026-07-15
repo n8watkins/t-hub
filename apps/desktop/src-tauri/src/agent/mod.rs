@@ -161,6 +161,14 @@ struct BridgeInner {
 /// orchestrator wake, without coupling the `agent` module to fleet concepts.
 pub type StatusObserver = Arc<dyn Fn(&str, crate::model::SessionStatus) + Send + Sync>;
 
+/// Stable failure categories for the GitInfo capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitInfoBridgeError {
+    Disconnected(String),
+    Unsupported(String),
+    CommandFailed(String),
+}
+
 impl BridgeInner {
     /// Emit a `Serialize` payload on `channel` if an emitter is installed; a
     /// no-op otherwise (pre-`setup()` and under unit tests). Best-effort: the
@@ -546,10 +554,13 @@ impl AgentBridge {
     }
 
     /// Fetch the complete Files-panel git snapshot through the persistent agent.
-    pub fn git_info(&self, cwd: &str) -> Result<GitInfo, String> {
-        map_git_info_response(self.request(AgentRequest::GitInfo {
-            cwd: cwd.to_string(),
-        })?)
+    pub fn git_info(&self, cwd: &str) -> Result<GitInfo, GitInfoBridgeError> {
+        let response = self
+            .request(AgentRequest::GitInfo {
+                cwd: cwd.to_string(),
+            })
+            .map_err(GitInfoBridgeError::Disconnected)?;
+        map_git_info_response(response)
     }
 
     /// Consume one journal entry: advance the cursor, feed supervision, emit the
@@ -741,25 +752,27 @@ impl AgentBridge {
 }
 
 /// Fetch git facts through the current application bridge.
-pub fn git_info(cwd: &str) -> Result<GitInfo, String> {
+pub fn git_info(cwd: &str) -> Result<GitInfo, GitInfoBridgeError> {
     let inner = ACTIVE_BRIDGE
         .lock()
         .upgrade()
-        .ok_or_else(|| "agent bridge unavailable".to_string())?;
+        .ok_or_else(|| GitInfoBridgeError::Disconnected("agent bridge unavailable".to_string()))?;
     AgentBridge { inner }.git_info(cwd)
 }
 
-fn map_git_info_response(response: AgentResponse) -> Result<GitInfo, String> {
+fn map_git_info_response(response: AgentResponse) -> Result<GitInfo, GitInfoBridgeError> {
     match response {
         AgentResponse::GitInfo(info) => Ok(info),
         AgentResponse::Error {
             kind: ResponseErrorKind::Unsupported,
             message,
-        } => Err(format!("agent does not support git_info: {message}")),
-        AgentResponse::Error { kind, message } => {
-            Err(format!("agent git_info failed ({kind:?}): {message}"))
-        }
-        other => Err(format!("unexpected response to git_info: {other:?}")),
+        } => Err(GitInfoBridgeError::Unsupported(message)),
+        AgentResponse::Error { kind, message } => Err(GitInfoBridgeError::CommandFailed(format!(
+            "{kind:?}: {message}"
+        ))),
+        other => Err(GitInfoBridgeError::CommandFailed(format!(
+            "unexpected response: {other:?}"
+        ))),
     }
 }
 
@@ -911,8 +924,81 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error,
-            "agent does not support git_info: unsupported request op"
+            GitInfoBridgeError::Unsupported("unsupported request op".to_string())
         );
+    }
+
+    #[test]
+    fn git_info_response_reports_agent_command_failure() {
+        let error = super::map_git_info_response(AgentResponse::Error {
+            kind: ResponseErrorKind::CommandFailed,
+            message: "git timed out".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            GitInfoBridgeError::CommandFailed("CommandFailed: git timed out".to_string())
+        );
+    }
+
+    #[test]
+    fn live_stdio_git_info_round_trip_with_real_agent() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let agent_bin = manifest.join("target/debug/t-hub-agent");
+        if !agent_bin.exists() {
+            eprintln!(
+                "live_stdio_git_info_round_trip_with_real_agent: binary missing; run cargo build -p t-hub-agent"
+            );
+            return;
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!("t-hub-bridge-git-info-{unique}"));
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "T-Hub Test"],
+            vec!["config", "user.email", "t-hub@example.test"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.join("tracked.txt"), "initial\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["commit", "-m", "initial"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo.join("tracked.txt"), "changed\n").unwrap();
+
+        std::env::set_var("T_HUB_AGENT_BIN", &agent_bin);
+        let bridge = AgentBridge::new();
+        bridge.connect("ignored").expect("real agent must connect");
+        let info = bridge
+            .git_info(repo.to_str().unwrap())
+            .expect("real stdio GitInfo request must succeed");
+        assert!(info.is_repo);
+        assert_eq!(info.branch.as_deref(), Some("main"));
+        assert_eq!(info.worktree_root.as_deref(), repo.to_str());
+        assert_eq!(info.dirty_count, 1);
+        assert!(info.head_commit.is_some());
+        bridge.disconnect();
+        std::env::remove_var("T_HUB_AGENT_BIN");
+        std::fs::remove_dir_all(repo).ok();
     }
 
     #[test]

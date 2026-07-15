@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use t_hub_protocol::GitInfo as AgentGitInfo;
 
+use crate::agent::GitInfoBridgeError;
 use crate::bounded_exec::output_with_timeout;
 
 /// Default per-command timeout for a `git`/`wsl.exe` subprocess (the symmetric half
@@ -106,18 +107,15 @@ impl From<AgentGitInfo> for GitInfo {
     }
 }
 
-/// How long a `git_info` answer stays fresh per cwd. The Files panel re-polls
-/// `git_info` PER TILE every 5s (plus a burst on window focus), so without a
-/// cache M tiles on the same cwd each spawned their own `wsl.exe` every poll —
-/// the storm that pinned the Tokio workers and froze the UI. A TTL just under
-/// the 5s poll collapses every tile sharing a cwd (and the focus re-poll burst)
-/// onto ONE `wsl.exe` invocation per cwd per poll cycle. A few seconds of
-/// staleness on a branch/dirty-count is invisible in the panel header.
+/// How long a `git_info` answer stays fresh per cwd. The Tile polls every 30
+/// seconds and also refreshes on window focus. This short cache coalesces
+/// sibling tiles and focus bursts without making branch or dirty state visibly
+/// stale. Cache misses use the persistent agent whenever it is available.
 const GIT_INFO_TTL: Duration = Duration::from_millis(3500);
 
 /// Per-cwd cache of the last `git_info` answer + when it was computed, shared
-/// across all tiles/windows so rapid same-cwd re-polls collapse onto one real
-/// `wsl.exe` invocation per [`GIT_INFO_TTL`] (mirrors `recent.rs`'s TTL cache).
+/// across all tiles/windows so rapid same-cwd re-polls collapse onto one
+/// collection per [`GIT_INFO_TTL`] (mirrors `recent.rs`'s TTL cache).
 /// Keyed by the raw `cwd` string the frontend passes (tiles for the same project
 /// pass an identical cwd, so they share an entry). `Instant`, never wall-clock.
 static GIT_INFO_CACHE: LazyLock<Mutex<HashMap<String, (Instant, GitInfo)>>> =
@@ -341,14 +339,11 @@ fn build_git_command(cwd: &str, args: &[&str]) -> Command {
 // ---------------------------------------------------------------------------
 // One-shot `git_info` collection: ONE shell invocation computes everything.
 //
-// The Files panel polls `git_info` per tile every 5s (+ a focus burst). The old
-// path made SIX sequential `run_git` calls, and on Windows each one spawned its
-// own blocking `wsl.exe` on the Tokio executor — 6×M `wsl.exe` spawns every 5s,
-// pinning worker threads. We collapse those six into a SINGLE `bash -lc` script
-// (one `wsl.exe` on Windows; one direct `bash` on unix) that runs every git
-// query in one shell and prints `key<TAB>value` lines we parse back into a
-// `GitInfo`. The exact per-field semantics of the old six-call path are
-// preserved by [`parse_git_info_output`].
+// This is the disconnected/unsupported fallback for the persistent agent path.
+// The old collector made six sequential `run_git` calls, each spawning its own
+// blocking `wsl.exe` on Windows. The fallback collapses those calls into one
+// `bash -lc` script and prints `key<TAB>value` lines parsed into `GitInfo`.
+// The exact per-field semantics are preserved by [`parse_git_info_output`].
 // ---------------------------------------------------------------------------
 
 /// The shell script run ONCE per `git_info`. It emits tab-delimited `key\tvalue`
@@ -652,11 +647,12 @@ fn worktree_add_args<'a>(
 ///
 /// PERF (the freeze fix): this used to make SIX sequential blocking `run_git`
 /// calls — on Windows six separate `wsl.exe` spawns — directly on the async
-/// executor, per tile, every 5s poll (+ a focus burst). It now returns a fresh
-/// cached answer or asks the persistent WSL agent. A disconnected, old, or
-/// failed agent falls back to the bounded one-shot script inside
-/// `spawn_blocking`. Many tiles polling the same cwd still collapse onto one
-/// collection per cwd per [`GIT_INFO_TTL`].
+/// executor on every poll. The Tile now polls every 30 seconds, and this command
+/// returns a fresh cached answer or asks the persistent WSL agent.
+/// A disconnected or older unsupported agent falls back to the bounded one-shot
+/// script inside `spawn_blocking`.
+/// Many tiles polling the same cwd still collapse onto one collection per cwd
+/// per [`GIT_INFO_TTL`].
 #[tauri::command]
 pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
     // (1) Serve a fresh-enough cached answer for this cwd. The lock is held only
@@ -671,8 +667,8 @@ pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
     }
 
     // (2) Cache miss / stale: use the persistent bridge, with the one-shot
-    // script retained only as the disconnected/error fallback. The blocking
-    // request and possible subprocess live off the async runtime.
+    // script retained only for a disconnected or older unsupported agent.
+    // The blocking request and possible subprocess live off the async runtime.
     let cwd_for_blocking = cwd.clone();
     let info = tauri::async_runtime::spawn_blocking(move || compute_git_info(&cwd_for_blocking))
         .await
@@ -686,24 +682,54 @@ pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
 }
 
 /// Fetch `cwd` through the persistent agent, falling back to the one-shot
-/// [`GIT_INFO_SCRIPT`] only when the bridge is unavailable or returns an error.
+/// [`GIT_INFO_SCRIPT`] only when the bridge is disconnected or too old to
+/// support GitInfo. Agent command failures do not start competing fallback work.
 /// A fallback spawn failure degrades to the "not a repo" answer, exactly like
 /// the previous best-effort path. Pure blocking IO; no cache.
 fn compute_git_info(cwd: &str) -> GitInfo {
-    compute_git_info_with(cwd, crate::agent::git_info, |cwd| {
+    let (info, source) = compute_git_info_with(cwd, crate::agent::git_info, |cwd| {
         let stdout = run_git_info_script(cwd).unwrap_or_default();
         parse_git_info_output(&stdout)
-    })
+    });
+    eprintln!("t-hub: git_info source={} cwd={cwd}", source.as_str());
+    info
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitInfoSource {
+    Agent,
+    FallbackDisconnected,
+    FallbackUnsupported,
+    AgentError,
+}
+
+impl GitInfoSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::FallbackDisconnected => "fallback_disconnected",
+            Self::FallbackUnsupported => "fallback_unsupported",
+            Self::AgentError => "agent_error",
+        }
+    }
 }
 
 fn compute_git_info_with(
     cwd: &str,
-    bridge: impl FnOnce(&str) -> Result<AgentGitInfo, String>,
+    bridge: impl FnOnce(&str) -> Result<AgentGitInfo, GitInfoBridgeError>,
     fallback: impl FnOnce(&str) -> GitInfo,
-) -> GitInfo {
+) -> (GitInfo, GitInfoSource) {
     match bridge(cwd) {
-        Ok(info) => info.into(),
-        Err(_) => fallback(cwd),
+        Ok(info) => (info.into(), GitInfoSource::Agent),
+        Err(GitInfoBridgeError::Disconnected(_)) => {
+            (fallback(cwd), GitInfoSource::FallbackDisconnected)
+        }
+        Err(GitInfoBridgeError::Unsupported(_)) => {
+            (fallback(cwd), GitInfoSource::FallbackUnsupported)
+        }
+        Err(GitInfoBridgeError::CommandFailed(_)) => {
+            (GitInfo::not_repo(), GitInfoSource::AgentError)
+        }
     }
 }
 
@@ -712,9 +738,8 @@ fn compute_git_info_with(
 /// awareness over the socket, so a thin client gets a project's branch / worktree root /
 /// linked flag / dirty count remotely. Reuses [`GIT_INFO_CACHE`] (the freeze-fix
 /// per-cwd TTL cache) via the same [`cache_lookup`]/[`cache_store`] seams as the async
-/// command, so local + remote per-tile polls collapse onto one `wsl.exe`/`git` spawn
-/// per cwd per [`GIT_INFO_TTL`]. Safe on a (blocking) control connection thread — the
-/// script spawn is blocking IO.
+/// command, so local + remote per-tile polls collapse onto one collection per
+/// cwd per [`GIT_INFO_TTL`]. Safe on a blocking control connection thread.
 pub fn git_info_cached(cwd: &str) -> GitInfo {
     // (1) Fresh cached answer for this cwd (same fast-path as the async command).
     if let Some(cached) = GIT_INFO_CACHE
@@ -1284,28 +1309,65 @@ detached
 
     #[test]
     fn compute_git_info_uses_bridge_without_fallback() {
-        let info = compute_git_info_with(
+        let (info, source) = compute_git_info_with(
             "/repo",
             |_| Ok(sample_agent_info()),
             |_| panic!("fallback must not run after a successful bridge response"),
         );
+        assert_eq!(source, GitInfoSource::Agent);
         assert_eq!(info.branch.as_deref(), Some("agent-main"));
         assert_eq!(info.dirty_count, 7);
         assert!(info.is_linked_worktree);
     }
 
     #[test]
-    fn compute_git_info_falls_back_after_bridge_error() {
+    fn compute_git_info_falls_back_when_bridge_is_disconnected() {
         let expected = sample_info();
-        let info = compute_git_info_with(
+        let (info, source) = compute_git_info_with(
             "/repo",
-            |_| Err("agent bridge not connected".to_string()),
+            |_| {
+                Err(GitInfoBridgeError::Disconnected(
+                    "agent bridge not connected".to_string(),
+                ))
+            },
             |cwd| {
                 assert_eq!(cwd, "/repo");
                 expected.clone()
             },
         );
+        assert_eq!(source, GitInfoSource::FallbackDisconnected);
         assert_eq!(info, expected);
+    }
+
+    #[test]
+    fn compute_git_info_falls_back_for_old_unsupported_agent() {
+        let expected = sample_info();
+        let (info, source) = compute_git_info_with(
+            "/repo",
+            |_| {
+                Err(GitInfoBridgeError::Unsupported(
+                    "unsupported request op".to_string(),
+                ))
+            },
+            |_| expected.clone(),
+        );
+        assert_eq!(source, GitInfoSource::FallbackUnsupported);
+        assert_eq!(info, expected);
+    }
+
+    #[test]
+    fn compute_git_info_does_not_fallback_on_agent_command_failure() {
+        let (info, source) = compute_git_info_with(
+            "/repo",
+            |_| {
+                Err(GitInfoBridgeError::CommandFailed(
+                    "git timed out".to_string(),
+                ))
+            },
+            |_| panic!("command failures must not start a competing fallback"),
+        );
+        assert_eq!(source, GitInfoSource::AgentError);
+        assert_eq!(info, GitInfo::not_repo());
     }
 
     #[test]

@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use t_hub_protocol::{GitInfo, HostMetrics, WorktreeInfo};
 
-const GIT_INFO_TIMEOUT_DEFAULT: Duration = Duration::from_secs(45);
+/// The desktop bridge abandons any RPC after 10 seconds. Keep this collector
+/// strictly shorter so the agent's single request loop is free before desktop
+/// fallback begins instead of continuing stale work in the background.
+const GIT_INFO_TIMEOUT_MAX: Duration = Duration::from_secs(9);
 
 const GIT_INFO_SCRIPT: &str = "\
 inside=$(git rev-parse --is-inside-work-tree 2>/dev/null); \
@@ -30,12 +33,17 @@ printf 'default\\t%s\\n' \"$(git symbolic-ref --short refs/remotes/origin/HEAD 2
 fi";
 
 fn git_info_timeout() -> Duration {
-    std::env::var("T_HUB_GIT_CMD_TIMEOUT_SECS")
+    let configured = std::env::var("T_HUB_GIT_CMD_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
-        .unwrap_or(GIT_INFO_TIMEOUT_DEFAULT)
+        .unwrap_or(GIT_INFO_TIMEOUT_MAX);
+    bound_git_info_timeout(configured)
+}
+
+fn bound_git_info_timeout(configured: Duration) -> Duration {
+    configured.min(GIT_INFO_TIMEOUT_MAX)
 }
 
 /// Current epoch-millis on the agent clock.
@@ -483,5 +491,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(git_info(dir.to_str().unwrap()).unwrap(), GitInfo::default());
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn git_info_timeout_finishes_before_bridge_request_timeout() {
+        assert_eq!(
+            bound_git_info_timeout(Duration::from_secs(45)),
+            Duration::from_secs(9)
+        );
+        assert_eq!(
+            bound_git_info_timeout(Duration::from_secs(4)),
+            Duration::from_secs(4)
+        );
+        assert!(GIT_INFO_TIMEOUT_MAX < Duration::from_secs(10));
     }
 }
