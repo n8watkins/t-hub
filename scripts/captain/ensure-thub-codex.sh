@@ -132,7 +132,7 @@ if [ -L "$CONFIG" ]; then
   echo "ensure-thub-codex: refusing to mutate symlinked config: $CONFIG" >&2
   exit 1
 fi
-if [ -n "$CURRENT" ] && ! has_exact_managed_table_shape; then
+if [ -n "$CURRENT" ] && ! "$LEGACY_MATCH" && ! has_exact_managed_table_shape; then
   echo "ensure-thub-codex: refusing to replace a customized t-hub registration" >&2
   echo "ensure-thub-codex: the managed table contains unknown fields or nested policy" >&2
   exit 1

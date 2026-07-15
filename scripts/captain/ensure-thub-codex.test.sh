@@ -10,7 +10,8 @@
 #   5. an exact managed legacy empty-env registration migrates.
 #   6. a stale t-hub command converges to the requested binary.
 #   7. verification failure restores the original config bytes exactly.
-#   8. hidden policy, disabled registrations, concurrent writes, and symlinked
+#   8. same-command hidden policy is preserved during migration, while stale
+#      hidden policy, disabled registrations, concurrent writes, and symlinked
 #      configs are refused without destroying user state.
 #
 # Requires codex on PATH (the merge is codex-native); SKIPs cleanly if absent so
@@ -240,7 +241,7 @@ fi
 # --- 8. hidden Codex policy prevents replacement ----------------------------
 codex mcp remove t-hub >/dev/null
 codex mcp add t-hub -- "$STALE_BIN" >/dev/null
-sed -i '/^command = /a required = true\nsupports_parallel_tool_calls = true' "$WORK/config.toml"
+sed -i "\|^command = \"$STALE_BIN\"$|a required = true\nsupports_parallel_tool_calls = true" "$WORK/config.toml"
 HIDDEN_POLICY_SNAP="$WORK/config.hidden-policy-snapshot.toml"
 cp -p "$WORK/config.toml" "$HIDDEN_POLICY_SNAP"
 if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
@@ -252,23 +253,46 @@ else
 fi
 sed -i '/^required = true$/d; /^supports_parallel_tool_calls = true$/d' "$WORK/config.toml"
 codex mcp remove t-hub >/dev/null
+NESTED_POLICY_BASE="$WORK/config.nested-policy-base.toml"
+cp -p "$WORK/config.toml" "$NESTED_POLICY_BASE"
 codex mcp add t-hub -- "$FAKE_BIN" >/dev/null
-sed -i '/^command = /a required = true' "$WORK/config.toml"
+sed -i "\|^command = \"$FAKE_BIN\"$|a required = true\nsupports_parallel_tool_calls = true" "$WORK/config.toml"
+cat >> "$WORK/config.toml" <<'EOF'
+
+[mcp_servers.t-hub.tools.my_capability]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.list_terminals]
+approval_mode = "approve"
+
+[mcp_servers.t-hub.tools.list_captains]
+approval_mode = "approve"
+EOF
 HIDDEN_LEGACY_SNAP="$WORK/config.hidden-legacy-snapshot.toml"
+HIDDEN_LEGACY_EXPECTED="$WORK/config.hidden-legacy-expected.toml"
 cp -p "$WORK/config.toml" "$HIDDEN_LEGACY_SNAP"
-if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
-  fail "legacy registration with hidden Codex policy was migrated"
-elif cmp -s "$HIDDEN_LEGACY_SNAP" "$WORK/config.toml"; then
-  pass "hidden legacy Codex policy is refused byte-for-byte"
+cp -p "$WORK/config.toml" "$HIDDEN_LEGACY_EXPECTED"
+sed -i "\|^command = \"$FAKE_BIN\"$|a env_vars = [\"T_HUB_CONTROL_ADDR\", \"T_HUB_CONTROL_TOKEN\", \"T_HUB_SESSION_TOKEN\"]" "$HIDDEN_LEGACY_EXPECTED"
+if ! T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
+  fail "same-command registration with hidden Codex policy was refused"
+elif cmp -s "$HIDDEN_LEGACY_EXPECTED" "$WORK/config.toml"; then
+  pass "same-command hidden and nested policy is preserved byte-for-byte"
 else
-  fail "hidden legacy Codex policy changed on refusal"
+  fail "same-command hidden or nested policy changed during migration"
 fi
-sed -i '/^required = true$/d' "$WORK/config.toml"
+if codex mcp get t-hub --json | jq -e --argjson expected "$EXPECTED_ENV_VARS" '
+  .transport.env_vars == $expected and
+  (.transport.env == null or .transport.env == {})
+' >/dev/null; then
+  pass "hidden-policy migration declares only inherited variable names"
+else
+  fail "hidden-policy migration did not declare inherited variable names"
+fi
+cp -p "$NESTED_POLICY_BASE" "$WORK/config.toml"
 
 # --- 9. disabled canonical registration is not reported ready ---------------
-codex mcp remove t-hub >/dev/null
 codex mcp add t-hub -- "$FAKE_BIN" >/dev/null
-sed -i '/^command = /a env_vars = ["T_HUB_CONTROL_ADDR", "T_HUB_CONTROL_TOKEN", "T_HUB_SESSION_TOKEN"]\nenabled = false' "$WORK/config.toml"
+sed -i "\|^command = \"$FAKE_BIN\"$|a env_vars = [\"T_HUB_CONTROL_ADDR\", \"T_HUB_CONTROL_TOKEN\", \"T_HUB_SESSION_TOKEN\"]\nenabled = false" "$WORK/config.toml"
 DISABLED_SNAP="$WORK/config.disabled-snapshot.toml"
 cp -p "$WORK/config.toml" "$DISABLED_SNAP"
 if T_HUB_MCP_BIN="$FAKE_BIN" bash "$SCRIPT" >/dev/null 2>&1; then
