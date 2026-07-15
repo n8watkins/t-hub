@@ -7235,9 +7235,10 @@ fn bootstrap_instructions(captain: &CaptainRecord, project: &ProjectRecord) -> S
         // existing Codex bootstrap behavior until the record is commissioned.
         None => Harness::Codex.captain_invocation(),
     };
+    let runtime_root = files::posix_form(&project.repo_root);
     format!(
         "Use {invocation}. Recover ship '{}' for project '{}' at '{}'. Assignment: {} {} Read the durable Captain and Crew records before acting, reconcile Powder state before dispatching work, and keep the registry resume point current.",
-        captain.ship_slug, project.name, project.repo_root, assignment, powder
+        captain.ship_slug, project.name, runtime_root, assignment, powder
     )
 }
 
@@ -10179,14 +10180,14 @@ fn spawn_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
     let cwd_effective = cwd
         .clone()
         .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
+    let tmux_cwd = files::posix_form(&cwd_effective);
     let pane = crate::commands::pane_command(shell.as_deref(), startup_command.as_deref());
     // item-3: grant this session its capability token via env (READ by default,
     // control only on an explicit `capability:"control"`), so its in-session MCP
     // authenticates as the granted capability. Comms-plane Phase 2 (§2.3): also mint
     // + inject this session's per-session identity token alongside the tier token.
     let (elevation, minted_identity) = spawn_env_with_identity(ctx, args, "spawn_terminal")?;
-    let (id, tmux_session) = match spawn_tmux_terminal(&cwd_effective, pane.as_deref(), &elevation)
-    {
+    let (id, tmux_session) = match spawn_tmux_terminal(&tmux_cwd, pane.as_deref(), &elevation) {
         Ok(v) => v,
         Err(e) => {
             // Review L2: the mint persisted before this point, so a failed spawn would
@@ -11336,6 +11337,53 @@ mod tests {
             assert!(calls[0].1["sync"]["seq"].as_u64().is_some());
         }
         // Reap the real session this spawned.
+        dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_terminal_converts_wsl_unc_for_tmux_but_preserves_the_public_cwd() {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("t").with_apply_sink(sink.clone());
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let runtime_cwd = runtime_dir.path().canonicalize().unwrap();
+        let runtime_cwd = runtime_cwd.to_str().unwrap();
+        assert!(runtime_cwd.starts_with('/'));
+        let canonical_cwd = format!(
+            "\\\\?\\UNC\\wsl.localhost\\Ubuntu-24.04{}",
+            runtime_cwd.replace('/', "\\")
+        );
+        let result = dispatch(
+            &ctx,
+            "spawn_terminal",
+            &json!({"cwd": &canonical_cwd, "startupCommand": "sleep 60"}),
+        )
+        .unwrap();
+        let id = result["id"].as_str().unwrap().to_string();
+        let target = tmux_target(&id);
+        let pane_cwd = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                tmux::socket(),
+                "display-message",
+                "-p",
+                "-t",
+                &target,
+                "#{pane_current_path}",
+            ])
+            .output()
+            .unwrap();
+
+        assert!(pane_cwd.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&pane_cwd.stdout).trim(),
+            runtime_cwd
+        );
+        assert_eq!(result["cwd"], canonical_cwd);
+        assert_eq!(sink.calls.lock().unwrap()[0].1["cwd"], canonical_cwd);
+
         dispatch(&ctx, "close_terminal", &json!({"sessionId": id})).unwrap();
     }
 
@@ -15219,6 +15267,45 @@ mod tests {
 
         dispatch(&ctx, "close_terminal", &json!({ "sessionId": terminal_id })).unwrap();
         std::fs::remove_dir_all(harness_bin_dir).unwrap();
+    }
+
+    #[test]
+    fn captain_bootstrap_uses_the_wsl_runtime_root_without_mutating_the_project() {
+        let canonical_repo_root =
+            "\\\\?\\UNC\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\projects\\tools\\t-hub\\t-hub-app";
+        let runtime_repo_root = "/home/natkins/projects/tools/t-hub/t-hub-app";
+        let captain = CaptainRecord {
+            ship_slug: "t-hub-app".into(),
+            role: FleetRole::Captain,
+            claude_uuid: None,
+            provider: Some("codex".into()),
+            provider_session_id: None,
+            terminal_id: None,
+            project_id: Some("project-e2e".into()),
+            assignment: Some("Keep this project stable".into()),
+            harness: Some("codex".into()),
+            conversation_id: None,
+            resume_point: None,
+            workspace_tab_ids: Vec::new(),
+            crew: Vec::new(),
+            state: ClaimState::Active,
+        };
+        let project = ProjectRecord {
+            project_id: "project-e2e".into(),
+            name: "T-Hub".into(),
+            repo_root: canonical_repo_root.into(),
+            remote_url: None,
+            default_branch: Some("main".into()),
+            powder: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let instructions = bootstrap_instructions(&captain, &project);
+
+        assert!(instructions.contains(runtime_repo_root));
+        assert!(!instructions.contains(canonical_repo_root));
+        assert_eq!(project.repo_root, canonical_repo_root);
     }
 
     #[test]
