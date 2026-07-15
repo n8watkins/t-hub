@@ -285,11 +285,11 @@ The canonical gated sequence is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-
 
 The ordered continuation is:
 
-1. Complete new-codebase creation, Powder board selection or creation, transactional rollback, and packaged Captain-creation E2E.
+1. Complete template and clone creation, authorized Powder board creation, injected-failure rollback, and the packaged Captain-creation E2E matrix.
 2. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
 3. Verify context reset recovery, Crew dispatch into a deliberate shared Workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
-4. Wire the Board panel to the focused project's Powder profile instead of the global `http://localhost:4000` default.
-5. Complete typed package-target discovery, generation-safe lifecycle state, process-tree cleanup, reachable URL probing, and representative packaged acceptance for the unified Run and Preview flow.
+4. Complete the native Board's registered and Powder-bound Project success-state acceptance through the Phase 8 flow.
+5. Harden generic non-Tauri Vite launch adapters and stale WSL-address recovery for the unified Run and Preview flow.
 6. Confirm the Claude terminal-header label interactively in the installed application.
 7. Run stable packaged 1, 4, 8, and 16 terminal acceptance measurements, including cold rehydration, input readiness, and canvas rendering.
 8. Continue the measured performance tranche with Powder polling, binary PTY transport, focus-scan coalescing, watchdog cadence, and icon loading.
@@ -299,13 +299,12 @@ Additional production-readiness gaps remain outside the Captain slice:
 - Authenticode signing is absent.
 - Tauri CSP hardening is incomplete.
 - Security scanning and strict branch protection need completion.
-- GitHub Actions dependencies should be pinned to immutable revisions.
 - Packaged Windows, WSL, tmux, Codex, and Claude end-to-end CI is incomplete.
 - A 24-hour soak and resource acceptance matrix have not been completed.
 
 ## Fresh Context Procedure
 
-1. Read `AGENTS.md`, this file, `skills/captain/SKILL.md`, `docs/POWDER-INTEGRATION.md`, `docs/PERFORMANCE-BENCHMARK.md`, and `docs/PRODUCTION-READINESS.md`.
+1. Read `AGENTS.md`, this file, and the canonical phased plan, then read only the supporting contracts required by the active phase.
 2. Run `git status --short` and preserve the user's `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` artifacts.
 3. Run `git log --oneline -12` and inspect any commits after this handoff.
 4. Confirm the installed Windows executable and PID rather than assuming source is deployed.
