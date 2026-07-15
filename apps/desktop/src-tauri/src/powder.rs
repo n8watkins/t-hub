@@ -717,8 +717,12 @@ fn typed_response_error(error: ureq::Error) -> PowderError {
 fn resolve_key_command(command: &str) -> Result<String, String> {
     #[cfg(windows)]
     let child = {
+        use std::os::windows::process::CommandExt;
+
         let mut child = Command::new("powershell.exe");
-        child.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+        child
+            .args(["-NoProfile", "-NonInteractive", "-Command", command])
+            .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         child
     };
     #[cfg(not(windows))]

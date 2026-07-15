@@ -8329,11 +8329,63 @@ pub fn start_powder_reconciler(ctx: ControlContext) {
         .ok();
     std::thread::Builder::new()
         .name("t-hub-powder-events".into())
-        .spawn(move || loop {
-            reconcile_powder_events(&event_ctx);
-            std::thread::sleep(powder_event_poll_interval());
+        .spawn(move || {
+            let mut clients = TimedProfileCache::new(Duration::from_secs(300));
+            loop {
+                reconcile_powder_events(&event_ctx, &mut clients);
+                std::thread::sleep(powder_event_poll_interval());
+            }
         })
         .ok();
+}
+
+/// Reuse a resolved Powder profile across event polls. A profile command may
+/// cross the Windows-to-WSL boundary to retrieve a credential, so rebuilding a
+/// client every 15 seconds creates needless process churn. Entries expire to
+/// observe healthy profile changes, and callers invalidate immediately after an
+/// upstream or authorization failure so rotated credentials recover next poll.
+struct TimedProfileCache<T> {
+    entries: std::collections::HashMap<String, (Instant, T)>,
+    ttl: Duration,
+}
+
+impl<T> TimedProfileCache<T> {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            ttl,
+        }
+    }
+
+    fn get_or_try_insert_with<F>(
+        &mut self,
+        profile: &str,
+        now: Instant,
+        load: F,
+    ) -> Result<&T, String>
+    where
+        F: FnOnce() -> Result<T, String>,
+    {
+        let expired = self
+            .entries
+            .get(profile)
+            .is_some_and(|(loaded_at, _)| now.saturating_duration_since(*loaded_at) >= self.ttl);
+        if expired {
+            self.entries.remove(profile);
+        }
+        if !self.entries.contains_key(profile) {
+            self.entries.insert(profile.to_string(), (now, load()?));
+        }
+        Ok(&self
+            .entries
+            .get(profile)
+            .expect("profile was inserted before lookup")
+            .1)
+    }
+
+    fn invalidate(&mut self, profile: &str) {
+        self.entries.remove(profile);
+    }
 }
 
 fn powder_event_poll_interval() -> Duration {
@@ -8447,7 +8499,7 @@ fn reconcile_powder_leases(ctx: &ControlContext) {
     }
 }
 
-fn reconcile_powder_events(ctx: &ControlContext) {
+fn reconcile_powder_events(ctx: &ControlContext, clients: &mut TimedProfileCache<powder::Client>) {
     let snapshot = ctx.captains.snapshot();
     for project in &snapshot.projects {
         let Some(binding) = project.powder.as_ref() else {
@@ -8458,7 +8510,11 @@ fn reconcile_powder_events(ctx: &ControlContext) {
                 && matches!(captain.state, ClaimState::Active)
                 && captain.terminal_id.is_some()
         });
-        let client = match powder::Client::from_profile(&binding.connection_profile) {
+        let client = match clients.get_or_try_insert_with(
+            &binding.connection_profile,
+            Instant::now(),
+            || powder::Client::from_profile(&binding.connection_profile),
+        ) {
             Ok(client) => client,
             Err(error) => {
                 emit_powder_event_sync_error(ctx, project, error);
@@ -8468,6 +8524,7 @@ fn reconcile_powder_events(ctx: &ControlContext) {
         let events = match client.tail_events(binding.event_cursor, 1000) {
             Ok(events) => events,
             Err(error) => {
+                clients.invalidate(&binding.connection_profile);
                 emit_powder_event_sync_error(ctx, project, error);
                 continue;
             }
@@ -18733,6 +18790,46 @@ mod tests {
 
         assert_eq!(cursor, 5, "the relevant event must remain unread");
         assert_eq!(ctx.inbox.depth("ship:waiting-events").enqueued, 0);
+    }
+
+    #[test]
+    fn powder_event_profile_cache_reuses_expires_and_invalidates_clients() {
+        let ttl = Duration::from_secs(300);
+        let now = Instant::now();
+        let mut cache = TimedProfileCache::new(ttl);
+        let loads = std::cell::Cell::new(0usize);
+        let load = || {
+            loads.set(loads.get() + 1);
+            Ok(loads.get())
+        };
+
+        assert_eq!(
+            *cache
+                .get_or_try_insert_with("production", now, load)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            *cache
+                .get_or_try_insert_with("production", now + Duration::from_secs(15), load)
+                .unwrap(),
+            1
+        );
+        assert_eq!(loads.get(), 1, "normal polls must reuse the client");
+
+        assert_eq!(
+            *cache
+                .get_or_try_insert_with("production", now + ttl, load)
+                .unwrap(),
+            2
+        );
+        cache.invalidate("production");
+        assert_eq!(
+            *cache
+                .get_or_try_insert_with("production", now + ttl + Duration::from_secs(15), load,)
+                .unwrap(),
+            3
+        );
     }
 
     #[test]
