@@ -682,8 +682,13 @@ The first isolated attempt was invalidated when Windows Explorer launched a sepa
 The documented retry pinned installed `0.3.90` PID `49712` and completed 55 samples over 61.05 seconds with one visible idle shell tile, but the host bridge produced eight births and eight deaths across four incomplete CPU intervals.
 The artifact therefore reports `release_acceptance_eligible: false` and is diagnostic evidence rather than an accepted baseline.
 The 29.94-second recurrence matches the visible tile's 30-second full Git-header poll, whose Windows fallback creates a new WSL process tree on every cache miss.
-The remediation must preserve the current Git-header freshness by routing the full snapshot over the persistent T-Hub agent bridge and keeping one-shot WSL execution only as an explicit disconnected-agent fallback.
-Packaged acceptance must also prove that the installed agent advertises the new operation and is updated to a matching binary; silently falling back through an older agent does not resolve this blocker.
+Source commits `5ced6c2` and `bd0d8dd` add the `GitInfo` protocol operation, route full snapshots through the persistent agent, cap the agent collector below the desktop request timeout, distinguish disconnected, unsupported, and command-failure outcomes, and add a real stdio round-trip test against the matching agent.
+The one-shot Windows fallback remains only for a disconnected bridge or an explicitly unsupported older agent; an agent command failure returns degraded Git state without starting competing fallback work.
+Commit `8dd94c9` emits one successful agent-source marker per process and keeps every exceptional route visible for packaged acceptance.
+Commits `a9b7082` and `42de985` also remove full-suite attach-test interference by quiescing the churn workload and restoring process-global agent integration-test environment before deleting its fixtures.
+Commit `d73f9cb` versions this uninstalled source as desktop `0.3.93`, with agent and protocol `0.5.1` from `f821957`.
+Phase 11 remains blocked because the installed desktop is still `0.3.90` and its installed `0.5.0` agent reports `git_info` as unsupported, so it still exercises the churn-producing compatibility fallback.
+Packaged acceptance must deploy the matching `0.5.1` agent, prove an agent source marker with no fallback markers during the scenario, and produce an eligible repeated one-terminal artifact.
 The 4, 8, and 16 terminal scenarios must not run until the churn is removed and the one-terminal gate is eligible.
 
 ### Goal

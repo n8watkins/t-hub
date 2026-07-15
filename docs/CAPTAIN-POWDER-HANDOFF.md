@@ -13,7 +13,7 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `6200e35`.
+**Source head before this handoff update:** `d73f9cb`.
 **Installed Windows build:** locally built T-Hub `0.3.90` from detached source `6200e35`.
 
 ## Executive Status
@@ -365,8 +365,14 @@ The Windows package does not currently replace this WSL agent binary, so packagi
 The retry artifact `artifacts/perf/t-hub-0.3.90-1t-20260715T0044-r2.json` completed 55 samples over 61.05 seconds but observed eight host-bridge births and eight deaths across four incomplete CPU intervals, so `release_acceptance_eligible` is false.
 That artifact is diagnostic only, not an accepted baseline, and the 4, 8, and 16 terminal cells remain blocked until the recurring bridge churn is removed and the one-terminal scenario is eligible.
 The 29.94-second recurrence matches the visible tile's 30-second full Git-header poll, which currently starts a fresh WSL process tree on every cache miss.
-The active remediation lane moves that full snapshot onto the persistent T-Hub agent bridge, retains one-shot WSL execution only as a disconnected-agent fallback, and must update or capability-check the installed agent before packaged acceptance.
-The source gate passed 471 frontend tests, TypeScript, the production frontend build, 625 Rust desktop tests with one additional test ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, and the performance harness self-tests.
+Source commits `5ced6c2` and `bd0d8dd` implement bridge-first `GitInfo` collection with typed disconnected, unsupported, and command-failure outcomes, a nine-second agent collector bound below the ten-second desktop request bound, and a real matching-agent stdio acceptance test.
+The compatibility fallback runs only when the bridge is disconnected or the installed agent explicitly reports `GitInfo` unsupported; agent command failures do not start competing WSL work.
+Commit `f821957` bumps the agent and protocol to `0.5.1`, and `8dd94c9` makes successful agent routing one-shot diagnostic evidence while logging every fallback or agent failure.
+The full source gate exposed two existing test-isolation failures under load: a lingering attach-churn firehose that could reset the fresh client, and process-global agent environment that leaked across parallel tests.
+Commits `a9b7082` and `42de985` quiesce the churn workload, restore the agent test environment, and disconnect the fixture agent before deleting its home.
+Commit `d73f9cb` versions the resulting uninstalled desktop source as `0.3.93`.
+The `0.3.93` source gate passed 56 frontend files and 471 tests, TypeScript, the production frontend build, 633 passed desktop Rust tests with one ignored, the real built-agent stdio round trip, all Rust workspace and MCP end-to-end suites, formatting, warning-denied Clippy, and the performance harness self-tests.
+This source is not packaged, the installed `0.5.0` agent remains unchanged, and the Windows installer still does not distribute its replacement, so Phase 11 remains blocked pending matching-agent deployment and an eligible packaged one-terminal rerun.
 The local Powder endpoint and protected agent credential path are operational.
 That earlier packaged xterm lifecycle, detach recovery, duplicate-launch, and diagnostic-retention gate passed with eight live tmux sessions preserved.
 The installed `a00ce7d` build reproduced one `listTerminals failed` event from the bounded 10-second WSL command timeout before recovery.
