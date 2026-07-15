@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -120,6 +121,10 @@ const GIT_INFO_TTL: Duration = Duration::from_millis(3500);
 /// pass an identical cwd, so they share an entry). `Instant`, never wall-clock.
 static GIT_INFO_CACHE: LazyLock<Mutex<HashMap<String, (Instant, GitInfo)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Successful agent routing is expected and only needs one acceptance marker.
+/// Exceptional sources remain visible on every occurrence.
+static GIT_INFO_AGENT_SOURCE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Drop any cached `git_info` for `cwd` so the next poll re-runs git. Called after
 /// a mutation (commit / worktree add+remove) that changes what `git_info` reports —
@@ -691,7 +696,9 @@ fn compute_git_info(cwd: &str) -> GitInfo {
         let stdout = run_git_info_script(cwd).unwrap_or_default();
         parse_git_info_output(&stdout)
     });
-    eprintln!("t-hub: git_info source={} cwd={cwd}", source.as_str());
+    if should_log_git_info_source(source, &GIT_INFO_AGENT_SOURCE_LOGGED) {
+        eprintln!("t-hub: git_info source={} cwd={cwd}", source.as_str());
+    }
     info
 }
 
@@ -711,6 +718,15 @@ impl GitInfoSource {
             Self::FallbackUnsupported => "fallback_unsupported",
             Self::AgentError => "agent_error",
         }
+    }
+}
+
+fn should_log_git_info_source(source: GitInfoSource, agent_logged: &AtomicBool) -> bool {
+    match source {
+        GitInfoSource::Agent => !agent_logged.swap(true, Ordering::Relaxed),
+        GitInfoSource::FallbackDisconnected
+        | GitInfoSource::FallbackUnsupported
+        | GitInfoSource::AgentError => true,
     }
 }
 
@@ -1368,6 +1384,27 @@ detached
         );
         assert_eq!(source, GitInfoSource::AgentError);
         assert_eq!(info, GitInfo::not_repo());
+    }
+
+    #[test]
+    fn git_info_source_logging_is_one_shot_only_for_agent_success() {
+        let agent_logged = AtomicBool::new(false);
+        assert!(should_log_git_info_source(
+            GitInfoSource::Agent,
+            &agent_logged
+        ));
+        assert!(!should_log_git_info_source(
+            GitInfoSource::Agent,
+            &agent_logged
+        ));
+        for source in [
+            GitInfoSource::FallbackDisconnected,
+            GitInfoSource::FallbackUnsupported,
+            GitInfoSource::AgentError,
+        ] {
+            assert!(should_log_git_info_source(source, &agent_logged));
+            assert!(should_log_git_info_source(source, &agent_logged));
+        }
     }
 
     #[test]
