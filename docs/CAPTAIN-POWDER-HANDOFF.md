@@ -13,8 +13,108 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `8635374`.
+**Source head before this handoff update:** `cbe88a5`.
 **Installed Windows build:** locally built T-Hub `0.3.100` from exact detached source `8635374`.
+
+## Active Resume Boundary
+
+This section is the reset-safe starting point for the next session.
+The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
+
+### Current Git and Runtime State
+
+The canonical checkout is on `main` at source head `cbe88a5`, 122 commits ahead of `origin/main` before this handoff-only commit.
+The only working-tree entries before this handoff edit were the protected untracked `.lavish/`, `CLAUDE.md`, and `docs/DECK-AGENTS-DESIGN.md` paths.
+They were not modified.
+No source commit after exact detached build source `8635374` changes the installed runtime.
+
+Installed T-Hub is version `0.3.100`, PID `14868`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its installed SHA-256 is `AC7B6169A638F57FF7E6CA699E7016C3C9715C7E968753D654A3C9095CD944F0`.
+The installed package was built from exact detached commit `8635374` in `/mnt/c/Users/natha/projects/Tools/t-hub/t-hub-build-8635374`.
+Keep that detached worktree until a replacement build has passed installed acceptance or the General authorizes cleanup.
+
+The five tmux sessions present before installation retained their exact names and pane PIDs.
+The commissioned Captain adds a sixth live session, `th_d24b63fa`, with pane PID `2808476`.
+A 50-second installed process sample spanning more than three Powder reconciliation intervals observed no T-Hub-owned PowerShell or cmd child.
+The repeated credential-shell regression is therefore closed in installed `0.3.100`.
+
+### Commissioned Captain Evidence
+
+The durable Project is `project-e28c0579-4e78-4de1-b225-d69aab93c143`, named `t-hub-app`.
+It is bound to Powder profile `n8desktop-wsl` and Powder repository `t-hub`.
+Its durable `repoRoot` is the Windows canonical path `\\?\UNC\wsl.localhost\Ubuntu-24.04\home\natkins\projects\tools\t-hub\t-hub-app`.
+
+Installed `0.3.100` successfully completed `spawn_terminal` at `2026-07-15T13:02:07.957419300-07:00` and `commission_captain` at `2026-07-15T13:02:11.075534-07:00`.
+The Captain registry record uses terminal `d24b63fa`, ship slug `t-hub-app`, role `captain`, Harness `codex`, assignment `continue improving thub as we are`, and the exact Project ID above.
+The live process chain is pane shell PID `2808476`, Codex node PID `2808549`, Codex native PID `2808556`, and T-Hub MCP PID `2808943`.
+The Captain runs Codex `0.144.4`, and its Powder health and repository probes succeeded.
+
+Captain creation now completes without the earlier Windows 10060 timeout or rollback failure.
+The Captain is registered and alive, but it is not yet functionally control-capable because packaged acceptance exposed the two blockers below.
+Do not dispatch canonical Crew until both blockers are repaired and installed acceptance proves the control boundary.
+
+### Blocker 1: Codex MCP Drops Captain Capability Variables
+
+The Captain's `my_capability` call returns `read`, so the Captain skill correctly refuses claims, dispatch, and checkpoint mutation.
+The tmux and Codex parent processes contain `T_HUB_CONTROL_ADDR`, a nonpublished control token, and `T_HUB_SESSION_TOKEN`.
+The Codex-launched T-Hub MCP child contains only `HOME`, `LANG`, `LOGNAME`, `PATH`, `SHELL`, and `TERM`.
+It is missing `T_HUB_CONTROL_ADDR`, `T_HUB_CONTROL_TOKEN`, and `T_HUB_SESSION_TOKEN` because Codex `0.144.4` filters stdio MCP server environment by default.
+
+The current `~/.codex/config.toml` T-Hub registration has an empty `transport.env_vars` list.
+The supported registration must name exactly `T_HUB_CONTROL_ADDR`, `T_HUB_CONTROL_TOKEN`, and `T_HUB_SESSION_TOKEN` as pass-through variables while leaving `transport.env` absent or empty.
+Never persist the rotating values with `codex mcp add --env KEY=VALUE`, and never write a live address, control token, or session token into Codex configuration.
+
+Repair `scripts/captain/ensure-thub-codex.sh` and `scripts/captain/ensure-thub-codex.test.sh`.
+The fast path must require the exact command and exact three-name `transport.env_vars` list.
+Treat the current empty-variable registration as the legacy managed shape eligible for migration.
+Preserve customized user policy when the command and canonical variables already match.
+Because the Codex CLI cannot express inherited variable names, add the canonical `env_vars` entry inside the existing locked, backed-up, hash-checked transaction, verify it through `codex mcp get --json`, and restore the original bytes on any insertion or verification failure.
+
+The focused provisioner test must use sentinel values and prove that only the three variable names enter the registration, no sentinel value enters the config, unrelated hooks remain byte-preserved, a rerun with different values leaves the config byte-identical, the legacy empty registration converges, and a forced failure restores the original bytes.
+
+### Blocker 2: Windows Canonical Project Root Is Not a WSL tmux Cwd
+
+The Captain pane reports cwd `/home/natkins`, and the Codex header reports `directory: ~`.
+Its bootstrap prompt contains the raw extended Windows UNC path.
+`commission_captain` forwards the durable Windows canonical Project root to the WSL tmux `-c` boundary, so tmux cannot use it and falls back to the WSL home directory.
+
+Repair the shared spawn boundary in `apps/desktop/src-tauri/src/files.rs` and `apps/desktop/src-tauri/src/control.rs` rather than adding a commission-only workaround.
+Factor or expose a crate-private, platform-neutral converter for standard `\\wsl.localhost`, legacy `\\wsl$`, and extended `\\?\UNC\wsl.localhost` paths.
+Convert only the cwd handed to WSL tmux.
+Keep the durable Project root and public response in their canonical Windows form so host identity is not rewritten.
+Use the POSIX root in the Captain bootstrap instructions so the prompt and actual working directory agree.
+
+Focused tests must cover bare POSIX paths, standard WSL UNC, legacy WSL UNC, extended WSL UNC, distro root, and a Windows drive path that must not be misclassified as WSL.
+A commission or spawn test must prove that an extended UNC Project retains its canonical registry and response value while tmux receives `/home/natkins/projects/tools/t-hub/t-hub-app`.
+
+### Ordered Next Implementation
+
+1. Create a feature branch such as `fix/captain-control-runtime` before editing source.
+2. Reproduce both failures against installed `0.3.100` using the evidence above, and retain the existing Captain until the replacement is ready.
+3. Add failing focused tests for Codex MCP variable pass-through and WSL cwd conversion.
+4. Implement the transaction-safe Codex registration repair and the shared tmux cwd normalization.
+5. Bump the desktop version from `0.3.100` to `0.3.101` in `apps/desktop/package.json`, `apps/desktop/src-tauri/Cargo.toml`, `apps/desktop/src-tauri/Cargo.lock`, and `apps/desktop/src-tauri/tauri.conf.json`.
+6. Run the focused provisioner and Rust tests, formatting, version consistency, and `git diff --check`, then obtain an independent diff review.
+7. Commit each verified logical change separately without an agent co-author.
+8. Build exact committed `0.3.101` source in a new detached Windows worktree, install it, and preserve every pre-existing tmux session.
+9. Restart or recommission the Captain because Codex reads MCP registration at session start.
+10. Prove `my_capability=control`, the exact WSL repository cwd, a POSIX bootstrap path, and successful `captain_checkpoint` before dispatch.
+11. Commission and complete one real Powder-backed Crew card, including claim, work log, completion evidence, event delivery, and durable recovery.
+12. Continue the canonical sequence with Board and Preview acceptance, the Claude header check, and the packaged 1, 4, 8, and 16 terminal performance matrix.
+
+### Test Cadence and Exit Gate
+
+The General chose a reduced development test cadence.
+During implementation, run only the focused tests needed for changed behavior plus cheap formatting, version, and diff checks.
+Use the comprehensive local suite, no-mistakes review, GitHub CI, and full PR verification at the pull request, install, or release boundary rather than after every small edit.
+This is a cadence change, not permission to merge or install code with a known failure.
+
+The immediate exit gate is an exact committed and installed `0.3.101` package that preserves existing sessions, creates no repeating T-Hub-owned shell children, launches the Captain in `/home/natkins/projects/tools/t-hub/t-hub-app`, passes exactly the three capability variables by name without persisting their values, returns `control` from `my_capability`, writes a real Captain checkpoint, and completes one real Powder-backed Crew lifecycle.
+Do not call the Captain and Crew path functionally complete before this gate passes.
+
+This root session has no sanctioned control-capability token, and the commissioned Captain currently sees only read capability.
+No Captain checkpoint or Powder work log was written for this handoff.
+No branch was pushed.
 
 ## Executive Status
 
@@ -46,7 +146,9 @@ The earlier installed `0.3.94` commissioning attempt spawned one control-capabil
 The backend rolled that terminal back and left the Project intact without a commissioned Captain.
 The installed control client timed out first and surfaced Windows error 10060 instead of the authoritative rollback error.
 The same durable Project also activated the 15-second Powder event reconciler, which rebuilt its client and visibly launched the profile's PowerShell credential command about every 16.5 seconds.
-Installed `0.3.100` contains both repairs, but real commissioned Captain and Crew acceptance remains incomplete until the preserved Project passes one trusted graphical commissioning retry.
+Installed `0.3.100` contains both repairs and passed the trusted graphical commissioning retry.
+That retry created a live registered Captain, then exposed the Codex MCP environment and WSL cwd blockers recorded in the Active Resume Boundary.
+Real control-capable Captain and Crew acceptance therefore remains incomplete.
 
 The requested automatic board creation for new codebases is not safe against Powder's current API.
 Powder exposes repository upsert, not create-if-absent, so a concurrent creator can appear between T-Hub's read and write and have its settings overwritten.
@@ -64,7 +166,7 @@ Its 16 focused tests, 659 passed desktop Rust tests with one ignored, Rust works
 The runtime was reverified before this handoff update.
 Installed T-Hub is PID `14868`, version `0.3.100`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`, with SHA-256 `AC7B6169A638F57FF7E6CA699E7016C3C9715C7E968753D654A3C9095CD944F0`.
 The installed WSL agent reports `0.5.2` and SHA-256 `813DB68E3DA42A790532258CC89FBBAFC5ABFECFCDD9810FD4D912EB7F14658A`.
-Five tmux sessions are currently visible on the canonical `t-hub` socket.
+Six tmux sessions are currently visible on the canonical `t-hub` socket after Captain commissioning.
 All five pre-install session names and pane PIDs survived the upgrade unchanged.
 The exact detached build produced a standalone executable with SHA-256 `950F9C91124CAFBB817FF1A0B1EF496615E9B6222FBC1793D1CABC0D2EAEE8AC`, an NSIS installer with SHA-256 `85AA44A2A30EB4EF45AC5554E35050A08FD84DBFFDACB1CECB753AA657DCDE53`, and an MSI with SHA-256 `9BBD43D3A951FFB6E845E7D828AB84AB42437C09B877FE6926CB3BEF9D5D9C6E`.
 The expected local updater-signing error occurred only after both installers were complete because the private release key is not present on this machine.
@@ -203,7 +305,8 @@ This installation intentionally uses its own local Powder authority for testing.
 Powder runs on WSL at `127.0.0.1:4017` and Tailscale Serve exposes it privately to this tailnet at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected profile is named `n8desktop-wsl`, not `production`.
 Its credential command retrieves the agent key from WSL without storing the raw key in the T-Hub project registry.
-The remaining integration task is to register the T-Hub codebase, bind it to the `t-hub` Powder board with this profile, and perform real Captain and Crew acceptance.
+The T-Hub codebase registration and `t-hub` Powder binding through this profile are complete.
+The remaining integration work is to repair and install the two active Captain blockers, restore a control-capable Captain, and perform real Crew acceptance.
 
 The protected profile should use mode `0600` and this shape:
 
@@ -334,7 +437,7 @@ The ordered continuation is:
 1. Keep worktree removal suspended until the Phase 2 unified status service consumes Phase 3 B1 ownership and passes its full activation matrix.
 2. In parallel against stable shared contracts, complete template and clone preparation plus the shared registration-and-commission resume or rollback transaction, while keeping automatic Powder board creation fail closed until Powder independently provides a non-overwriting create precondition.
 3. In parallel through the approved B3 and B4 lanes, implement the provider-neutral History adapter and catalog foundation without changing the Claude-only Recent UI or introducing a substitute durable identity schema.
-4. Register the T-Hub codebase, bind it to the `t-hub` Powder board through `n8desktop-wsl`, and commission disposable Codex and Claude Captains.
+4. Repair installed Codex Captain control and cwd behavior, then commission accepted disposable Codex and Claude Captains against the already registered and Powder-bound T-Hub Project.
 5. Verify context reset recovery, Crew dispatch into a deliberate shared Workspace, claim renewal, terminal close release, rollback retention, and Powder event delivery against real Powder cards.
 6. Complete the native Board's registered and Powder-bound Project success-state acceptance through the Phase 8 flow.
 7. Harden generic non-Tauri Vite launch adapters and stale WSL-address recovery for the unified Run and Preview flow.
