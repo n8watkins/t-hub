@@ -3668,6 +3668,31 @@ pub fn start(mut ctx: ControlContext) -> std::io::Result<ControlHandshake> {
     };
     write_handshake(&handshake)?;
 
+    // H2 production verifier: recompute the KEYED audit chain + head anchor on
+    // startup and report any breaks LOUDLY on stderr (in `startup_integrity_check`),
+    // replacing the old `cfg(test)`-only recompute that never ran in prod. The fanout
+    // event below is a best-effort live mirror only - it runs before `serve` accepts,
+    // so a subscriber connected at THIS instant is rare; the DURABLE queryable surface
+    // is the `audit_verify` control command (P72-2), which any late-subscribing UI or
+    // health poll can call to get an authoritative, non-stale integrity report.
+    let integrity = ctx.audit.startup_integrity_check();
+    if !integrity.ok() {
+        ctx.fanout.emit_event(
+            "control://audit",
+            &json!({
+                "event": "integrity-check-failed",
+                "breaks": integrity.breaks.len(),
+                "records": integrity.records,
+                "files": integrity.files,
+                "detail": integrity
+                    .breaks
+                    .iter()
+                    .map(|b| format!("{} line {}: {:?} - {}", b.file, b.line, b.kind, b.detail))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
     // Opt-in ADDITIONAL bind for REMOTE access (server-split M2b). GATED — default
     // OFF, so the §8 loopback-only boundary holds unless explicitly enabled. When
     // set, a second listener serves the same dispatch; `handle_conn` restricts peers
@@ -5231,8 +5256,11 @@ fn governor_gate(
 }
 
 /// Write one audit record for an Organization/ProcessChanging command (or a
-/// governor refusal). `decision` is the gate outcome (`allowed` / `refused-*`);
-/// `error` carries a downstream dispatch failure for an allowed command.
+/// governor refusal), **best-effort** (a sink failure is logged to stderr and never
+/// breaks dispatch). Used on the paths that are not process-affecting - Organization
+/// records, governor/authz refusals - where availability is the right posture.
+/// ProcessChanging commands use [`try_audit_command`] so a sink failure fails the
+/// command CLOSED (H3).
 fn audit_command(
     ctx: &ControlContext,
     req: &ControlRequest,
@@ -5241,6 +5269,25 @@ fn audit_command(
     decision: &str,
     error: Option<&str>,
 ) {
+    if let Err(e) = try_audit_command(ctx, req, tier, cap, decision, error) {
+        eprintln!(
+            "t-hub-control: audit write failed for '{}' ({}): {e}",
+            req.command, decision
+        );
+    }
+}
+
+/// The checked audit write behind [`audit_command`]: returns the sink result so the
+/// dispatch path can REFUSE a ProcessChanging command whose durable trace could not
+/// be written (H3 fail-closed).
+fn try_audit_command(
+    ctx: &ControlContext,
+    req: &ControlRequest,
+    tier: CommandTier,
+    cap: Capability,
+    decision: &str,
+    error: Option<&str>,
+) -> std::io::Result<()> {
     let session = req
         .args
         .get("sessionId")
@@ -5251,7 +5298,7 @@ fn audit_command(
         .get("spawnedBy")
         .or_else(|| req.args.get("spawned_by"))
         .and_then(|v| v.as_str());
-    ctx.audit.record(
+    ctx.audit.try_record(
         &req.command,
         tier.label(),
         decision,
@@ -5268,7 +5315,7 @@ fn audit_command(
             spawned_by,
             error,
         },
-    );
+    )
 }
 
 /// Resolve capability, gate + audit, then dispatch. A bad token is rejected before
@@ -5340,6 +5387,18 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         return ControlResponse::ok(json!({ "capability": cap.tier_label() }));
     }
 
+    // P72-2: the queryable integrity surface. The startup integrity check only reaches
+    // stderr (and a fanout event that predates any subscriber), so a late-connecting UI
+    // or an operator had no in-product way to learn the audit chain is broken. This
+    // Read-tier command re-runs the verifier LIVE and returns the report, so a health
+    // poll or a manual query gets an authoritative, non-stale answer. Read-tier (any
+    // valid token passes the gate above), no side effect - answered inline like
+    // `my_capability`, so `required_tier`/the dispatch match/the MCP catalog are
+    // untouched (keeping the contested `control.rs` surface tight).
+    if req.command == "audit_verify" {
+        return ControlResponse::ok(ctx.audit.verify_self().to_json());
+    }
+
     // Spawn-class idempotency (ask #1): a client-supplied `requestId` on a
     // spawn-class command makes it safely retryable across an ambiguous response
     // leg. We consult the outcome cache BEFORE the governor charges budget so a
@@ -5408,6 +5467,39 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         }
     }
 
+    // H3 fail-CLOSED audit sink: a ProcessChanging command's durable authorization
+    // record MUST land BEFORE its side effect. If the audit write fails (ENOSPC,
+    // perms, a locked/hostile sink) we REFUSE the command rather than let an
+    // unlogged spawn/kill/type execute - the audit trail is load-bearing for the
+    // "a control mutation is never silent" guarantee, and disk-pressure/tamper is
+    // exactly when it must not be defeated. The record carries the authorization
+    // (decision `allowed`); a downstream dispatch error is still returned to the
+    // caller and mirrored on the fanout, so no information is lost. Organization-tier
+    // commands are not process-affecting and stay best-effort post-dispatch.
+    if tier == CommandTier::ProcessChanging {
+        if let Err(e) = try_audit_command(ctx, &req, tier, cap, "allowed", None) {
+            // Not an applied outcome: release any idempotency reservation so a retry
+            // after the sink recovers can still succeed.
+            if let Some(id) = &request_id {
+                ctx.requests.cancel(id);
+            }
+            let message = format!(
+                "refused: audit sink unavailable - '{}' is process-changing and must be \
+                 recorded before it runs ({e})",
+                req.command
+            );
+            ctx.fanout.emit_event(
+                "control://governor",
+                &json!({
+                    "command": req.command.as_str(),
+                    "decision": "refused-audit",
+                    "error": message.as_str(),
+                }),
+            );
+            return ControlResponse::err(message);
+        }
+    }
+
     // Dispatch, then record the outcome under the requestId (if any) so a later
     // retry replays exactly this result. `finish` returns the outcome back. The caller
     // identity resolved above is threaded in so the per-command ACL wiring can enforce
@@ -5428,9 +5520,11 @@ fn dispatch_authenticated(ctx: &ControlContext, req: ControlRequest) -> ControlR
         Err(e) => ControlResponse::err(e),
     };
 
-    // Audit every Organization + ProcessChanging command on the allowed path,
-    // capturing the dispatch outcome. Read-tier commands are not audited.
-    if tier != CommandTier::Read {
+    // Audit Organization-tier commands post-dispatch (best-effort), capturing the
+    // dispatch outcome. ProcessChanging commands were already recorded fail-closed
+    // BEFORE dispatch (above), so re-recording here would duplicate the line; Read-tier
+    // commands are never audited.
+    if tier == CommandTier::Organization {
         let err = if response.ok {
             None
         } else {
@@ -15273,6 +15367,30 @@ mod tests {
     }
 
     #[test]
+    fn process_changing_command_is_refused_when_the_audit_sink_fails() {
+        // H3 fail-CLOSED, proven end-to-end through the dispatch path: when the audit
+        // sink cannot be written, a ProcessChanging command is REFUSED before its side
+        // effect (not silently allowed). BYPASS-WOULD-FAIL: drop the pre-dispatch
+        // try_audit_command gate and this goes RED (the spawn would proceed unlogged).
+        let base = std::env::temp_dir().join("t-hub-gate-sinkfail");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&base);
+        // A FILE where the audit dir's parent should be, so create_dir_all(dir) fails.
+        std::fs::write(&base, b"not a dir").unwrap();
+        let unwritable = base.join("audit");
+        let ctx = test_ctx("sink").with_audit(Arc::new(AuditLog::new(unwritable)));
+
+        let resp = dispatch_authenticated(&ctx, req("sink", "spawn_terminal", json!({"cwd": "/tmp"})));
+        assert!(!resp.ok, "spawn must be refused when the audit sink is down");
+        assert!(
+            resp.error.clone().unwrap().contains("audit sink unavailable"),
+            "expected the fail-closed refusal, got: {:?}",
+            resp.error
+        );
+        let _ = std::fs::remove_file(&base);
+    }
+
+    #[test]
     fn bad_token_is_rejected_and_not_audited() {
         // A bad token is rejected before the gate and never audited (no leak of the
         // process-changing surface to an unauthenticated probe).
@@ -16299,6 +16417,30 @@ mod tests {
         assert_eq!(control.result.unwrap()["capability"], "control");
         let read = dispatch_authenticated(&ctx, req("read-t", "my_capability", json!({})));
         assert_eq!(read.result.unwrap()["capability"], "read");
+    }
+
+    #[test]
+    fn audit_verify_reports_integrity_live_to_a_read_token() {
+        // P72-2: the queryable integrity surface. After writing a real chain through
+        // the gate, `audit_verify` returns `ok:true` with the record count; it is
+        // Read-tier so a least-privilege health poll (the read token) can call it.
+        let dir = std::env::temp_dir().join("t-hub-gate-auditverify");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(crate::audit::head_path_for_test(&dir));
+        let ctx = test_ctx("av").with_audit(Arc::new(AuditLog::new(dir.clone())));
+        // A process-changing command lays down a keyed record (fail-closed pre-dispatch).
+        let _ = dispatch_authenticated(
+            &ctx,
+            req("av", "send_text", json!({"sessionId": "x", "text": "hi", "enter": true})),
+        );
+        let resp = dispatch_authenticated(&ctx, req("read-av", "audit_verify", json!({})));
+        assert!(resp.ok, "audit_verify should succeed for a read token");
+        let v = resp.result.unwrap();
+        assert_eq!(v["ok"], true, "an untampered chain verifies");
+        assert!(v["records"].as_u64().unwrap() >= 1, "the written record is counted");
+        assert_eq!(v["breaks"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(crate::audit::head_path_for_test(&dir));
     }
 
     #[test]

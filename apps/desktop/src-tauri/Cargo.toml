@@ -87,6 +87,11 @@ base64 = "0.22"
 # (audit.rs, socket-gate Phase 1). Already in the tree transitively; this only
 # makes it a direct dependency (no lockfile resolution change).
 sha2 = "0.10"
+# HMAC-SHA256 for the audit log's KEYED tamper-evident chain (audit.rs). The
+# chain MAC is keyed by a secret held OUTSIDE the log (sealed via secret_seal),
+# so a same-user file-editor cannot re-sign a forged/edited chain. Pairs with
+# sha2 0.10 (same RustCrypto `digest` 0.10).
+hmac = "0.12"
 # RFC3339 timestamps for the control-socket audit log (audit.rs). Already in the
 # tree transitively; this only makes it a direct dependency.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
