@@ -28,6 +28,7 @@ mod fleet;
 mod governor; // fleet spawn budget + rate limits for process-changing control commands (socket-gate Phase 1)
 mod hangwatch; // host main-thread hang watchdog (sporadic Not-Responding/ghost hunt)
 mod harness; // harness adapter seam (Codex Phase-1 D1): launch/turn argv + permission map, keyed off the provider string
+mod history; // provider-neutral conversation identity and transcript adapter foundation
 mod secret_seal; // item-3 Pillar B: at-rest sealing of secret material (DPAPI on Windows, 0600 fallback elsewhere) // orchestrator wake: FleetWatchRegistry + FleetNotifier (server-side push on supervised transitions)
                  // --- feat/git-panel ---
 mod git; // git awareness for the Files panel: branch/worktree info + commit
