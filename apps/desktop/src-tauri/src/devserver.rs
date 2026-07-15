@@ -296,7 +296,7 @@ fn publish_start_failure(
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 fn take_process_for_stop(
     registry: &mut DevRegistry,
     terminal_id: &str,
