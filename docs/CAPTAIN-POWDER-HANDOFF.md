@@ -2,7 +2,7 @@
 
 ## Canonical Planning Note
 
-The runtime evidence in this handoff is current through the installed `0.3.86` build.
+The runtime evidence in this handoff is current through the installed `0.3.90` build.
 The authoritative forward roadmap is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
 The document-status authority is [REVIEW-INDEX.md](./REVIEW-INDEX.md).
 That plan now includes the settled permanent Cortana identity, multiple Captains per Project, Assignment-based ownership, provider-agnostic Harness integration, CLI-first control, durable messaging, History, voice parity, and parallel implementation lanes.
@@ -10,23 +10,23 @@ The CLI-first phase is governed by [cli-contract.md](./cli-contract.md), which p
 Agent status is governed by [STATUS-MODEL.md](./STATUS-MODEL.md), and shared worktree state is governed by [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md).
 Where the narrower ordered list in this handoff differs from the phased plan, follow the phased plan.
 
-**Updated:** 2026-07-14.
+**Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `e26fe2e`.
-**Installed Windows build:** locally built T-Hub `0.3.86` from `5ea945c`.
+**Source head before this handoff update:** `6200e35`.
+**Installed Windows build:** locally built T-Hub `0.3.90` from detached source `6200e35`.
 
 ## Executive Status
 
 The Captain, Crew, cross-harness provisioning, Handoff skill, authority hardening, and initial performance work are implemented and committed on `main`.
 The final independent authority review reports no remaining Critical, High, or Medium application-level finding under the documented same-user threat model.
 Source `1484750` passed 55 frontend files and 470 tests, TypeScript, the Rust workspace and MCP end-to-end suites, formatting, warning-free Clippy, and the production frontend build.
-The exact `0.3.86` source then passed 621 Linux Rust library tests with one ignored, warning-free Clippy, the production frontend build, and 23 focused native Windows Preview tests without warnings.
+The earlier exact `0.3.86` source then passed 621 Linux Rust library tests with one ignored, warning-free Clippy, the production frontend build, and 23 focused native Windows Preview tests without warnings.
 
 The current production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `6C9938814F956E9D2532D1A3E5A020728CFACE302B822DAA033885BD18108D46`.
-It is running as PID `53764`.
-The exact NSIS installer SHA-256 is `480AAD85F88C20D8105E776E2E84F811096835219F6D97E16999403A6D56714A`.
+The installed executable SHA-256 is `3BECDB6C7142BD073C2272C98239A41085C08D8134B5DCE797E014B5A0E40DE1`.
+It is running as PID `20376`, started at `2026-07-15T00:47:06.5069043-07:00`.
+The exact NSIS installer SHA-256 is `C315CA5B55844D1262C920DDDE0E7AA1AEE5117337E863CFAD194D6F9766D441`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
@@ -324,10 +324,10 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The installed Windows process was reverified at PID `53764` and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` during the current source review.
-Its file and product version are `0.3.86`.
-The installed executable SHA-256 is `6C9938814F956E9D2532D1A3E5A020728CFACE302B822DAA033885BD18108D46`.
-The installed build was produced from source `5ea945c` with standalone executable SHA-256 `EF2ED4C1D610F80555A84255F52CC798C1779F24FA9CA79436318D2A5E07B8E1`, NSIS installer SHA-256 `480AAD85F88C20D8105E776E2E84F811096835219F6D97E16999403A6D56714A`, and MSI SHA-256 `4CC8834E283F1639CDA2FD9DD86C34CD703590D7C4AFDC830AC967B95751AAE6`.
+The installed Windows process was reverified at PID `20376` and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` during the current packaged review.
+Its file and product version are `0.3.90`.
+The installed executable SHA-256 is `3BECDB6C7142BD073C2272C98239A41085C08D8134B5DCE797E014B5A0E40DE1`.
+The installed build was produced from detached source `6200e35` with standalone executable SHA-256 `75E0CE6BA6F7A959E70FF1469A61967F242FCF6D8426844F329E09119627D667`, NSIS installer SHA-256 `C315CA5B55844D1262C920DDDE0E7AA1AEE5117337E863CFAD194D6F9766D441`, and MSI SHA-256 `21BB91902574175A9C75815166C1D20DD11F3213C82B70D4D972C793D38D31B6`.
 The installed `th` CLI is version `0.2.0` from source `07e74f4`.
 Source commit `6870444` fixes the reproduced xterm teardown race.
 Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
@@ -352,7 +352,17 @@ Commit `f62f188` makes the fixture use the same WSL Git and host-path conversion
 The exact detached `0.3.89` build from `ac1e2a6` produced standalone, NSIS, and MSI SHA-256 values `440E36512BD95AF56934FEB4B57BED3DF339E2EA64002E432D5FBBF82644967B`, `8144A5CDA2F8CD1378672AC4BE519DD016401D4B2E902BCBA8DAC6A26338545D`, and `B9AF6D760DC15DC0597D4F3FD889F0FA7B34214CCA9635FC833BFBE05C39A2B0`.
 Its native suite proved WSL Git fixture creation and the exact public refusal, then exposed a Windows UNC access denial in the host-side existence assertion for a mounted-drive fixture.
 Commit `3841c2e` keeps all product operations on WSL Git while checking the retained native fixture path directly, and `e26fe2e` bumps the corrected source to `0.3.90`.
-This behavior is not installed and must not be treated as packaged evidence until the versioned build passes acceptance.
+The exact detached `0.3.90` native suite passed all four focused removal tests.
+Installed `0.3.90` verified graphical and direct Tauri preflight, normal, and forced refusal against disposable worktrees with live UI and tmux tiles.
+Every installed path returned the exact temporary-unavailable error before UI detachment or Git mutation; the tiles, Git registrations, and live pane paths remained intact.
+Control, MCP, and CLI parity remains source-test evidence because the installed session retained its read-only capability and did not reuse raw tokens to invoke mutation channels.
+The upgrade first launched under debug acceptance as PID `30136`.
+The declared one-terminal performance retry ran as isolated PID `49712`, and Windows Explorer separately invalidated the first attempt by launching a normal application process.
+The normal installed application was finally restored as PID `20376` without changing the installed hash or any of the six canonical tmux names and pane PIDs.
+The retry artifact `artifacts/perf/t-hub-0.3.90-1t-20260715T0044-r2.json` completed 55 samples over 61.05 seconds but observed eight host-bridge births and eight deaths across four incomplete CPU intervals, so `release_acceptance_eligible` is false.
+That artifact is diagnostic only, not an accepted baseline, and the 4, 8, and 16 terminal cells remain blocked until the recurring bridge churn is removed and the one-terminal scenario is eligible.
+The 29.94-second recurrence matches the visible tile's 30-second full Git-header poll, which currently starts a fresh WSL process tree on every cache miss.
+The active remediation lane moves that full snapshot onto the persistent T-Hub agent bridge, retains one-shot WSL execution only as a disconnected-agent fallback, and must update or capability-check the installed agent before packaged acceptance.
 The source gate passed 471 frontend tests, TypeScript, the production frontend build, 625 Rust desktop tests with one additional test ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, and the performance harness self-tests.
 The local Powder endpoint and protected agent credential path are operational.
 That earlier packaged xterm lifecycle, detach recovery, duplicate-launch, and diagnostic-retention gate passed with eight live tmux sessions preserved.

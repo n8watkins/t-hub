@@ -1,8 +1,8 @@
 # T-Hub Phased Production Plan
 
-**Updated:** 2026-07-14.
+**Updated:** 2026-07-15.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.86` from `5ea945c`, running as Windows PID `53764` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.90` from detached source `6200e35`, running as Windows PID `20376` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -197,7 +197,7 @@ Make the installed terminal cockpit and its control clients trustworthy before e
 
 ## Phase 2 - Unified Owned-Resource Lifecycle
 
-**Status:** Active after Phase 1; managed development-server ownership is partially implemented and worktree removal is suspended fail closed in `0.3.90` source pending packaged verification, while the unified resource record, browser lifecycle, worktree status service, Resources surface, startup reconciliation, and full exit gate remain open.
+**Status:** Active after Phase 1; managed development-server ownership is partially implemented and packaged `0.3.90` verifies that worktree removal is suspended fail closed, while the unified resource record, browser lifecycle, worktree status service, Resources surface, startup reconciliation, and full exit gate remain open.
 The unified worktree snapshot's Captain, Assignment, Workspace, Crew, resource-lease, and Powder ownership fields depend on the Phase 3 B1 durable identity interfaces, so independent Phase 2 work may proceed but the full worktree slice cannot exit before B1 stabilizes.
 Installed `0.3.86` reproduced the owned-resource failure by deleting a disposable linked worktree while a live tmux session remained rooted inside it, leaving that pane at a `(deleted)` cwd.
 Source `0.3.90` now refuses graphical, direct Tauri, control, MCP, and CLI removal before UI detachment or Git mutation, including with force.
@@ -205,7 +205,10 @@ The exact detached `0.3.88` native Windows suite proved the refusal but exposed 
 Commit `f62f188` replaces that fixture with the real production WSL path boundary, and `2c6a429` bumps the corrected source to `0.3.89` under the every-change version policy.
 The exact detached `0.3.89` suite then proved the WSL Git fixture creation and public refusal but exposed a Windows UNC access denial in its host-side existence assertion for a mounted-drive fixture.
 Commit `3841c2e` checks that same fixture through its retained native host path without changing any production WSL Git operation, and `e26fe2e` bumps the corrected source to `0.3.90`.
-This is a temporary suspension rather than implementation of the unified worktree status service, and packaged acceptance remains open.
+The exact detached `0.3.90` native Windows suite passed all four focused removal tests.
+Installed `0.3.90` then verified the graphical and direct Tauri preflight, normal, and forced paths against disposable live worktrees: every operation returned the exact temporary-unavailable refusal before UI detachment or Git mutation, the graphical tile remained present, Git registration remained intact, and both live tmux pane paths remained valid.
+Source tests cover the same synchronous refusal for control, MCP, and CLI callers; the installed read-only session did not elevate itself with raw credentials to repeat those mutation channels at runtime.
+This is a temporary suspension rather than implementation of the unified worktree status service, so full service activation and acceptance remain open.
 
 ### Goal
 
@@ -673,6 +676,15 @@ Give Cortana lightweight operational awareness and make attention cues provider-
 - Voice failures are visible rather than silent.
 
 ## Phase 11 - Measured Runtime Efficiency
+
+**Status:** Active and blocked at the declared one-terminal packaged baseline because recurring host-bridge process churn makes release CPU acceptance ineligible.
+The first isolated attempt was invalidated when Windows Explorer launched a separate normal T-Hub process.
+The documented retry pinned installed `0.3.90` PID `49712` and completed 55 samples over 61.05 seconds with one visible idle shell tile, but the host bridge produced eight births and eight deaths across four incomplete CPU intervals.
+The artifact therefore reports `release_acceptance_eligible: false` and is diagnostic evidence rather than an accepted baseline.
+The 29.94-second recurrence matches the visible tile's 30-second full Git-header poll, whose Windows fallback creates a new WSL process tree on every cache miss.
+The remediation must preserve the current Git-header freshness by routing the full snapshot over the persistent T-Hub agent bridge and keeping one-shot WSL execution only as an explicit disconnected-agent fallback.
+Packaged acceptance must also prove that the installed agent advertises the new operation and is updated to a matching binary; silently falling back through an older agent does not resolve this blocker.
+The 4, 8, and 16 terminal scenarios must not run until the churn is removed and the one-terminal gate is eligible.
 
 ### Goal
 
