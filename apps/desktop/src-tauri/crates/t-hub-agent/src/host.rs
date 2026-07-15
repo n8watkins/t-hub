@@ -5,8 +5,38 @@
 //! statusline does NOT carry the non-worktree branch, so `git_branch` is how the
 //! core derives it (REVIEW / PLAN §10.4).
 
+use std::collections::HashMap;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
-use t_hub_protocol::{HostMetrics, WorktreeInfo};
+use t_hub_protocol::{GitInfo, HostMetrics, WorktreeInfo};
+
+const GIT_INFO_TIMEOUT_DEFAULT: Duration = Duration::from_secs(45);
+
+const GIT_INFO_SCRIPT: &str = "\
+inside=$(git rev-parse --is-inside-work-tree 2>/dev/null); \
+printf 'inside\\t%s\\n' \"$inside\"; \
+if [ \"$inside\" = true ]; then \
+printf 'branch\\t%s\\n' \"$(git rev-parse --abbrev-ref HEAD 2>/dev/null)\"; \
+printf 'toplevel\\t%s\\n' \"$(git rev-parse --show-toplevel 2>/dev/null)\"; \
+printf 'gitdir\\t%s\\n' \"$(git rev-parse --git-dir 2>/dev/null)\"; \
+printf 'commondir\\t%s\\n' \"$(git rev-parse --git-common-dir 2>/dev/null)\"; \
+printf 'dirty\\t%s\\n' \"$(git status --porcelain 2>/dev/null | wc -l)\"; \
+printf 'head\\t%s\\n' \"$(git rev-parse HEAD 2>/dev/null)\"; \
+printf 'remote\\t%s\\n' \"$(git remote get-url origin 2>/dev/null)\"; \
+printf 'default\\t%s\\n' \"$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')\"; \
+fi";
+
+fn git_info_timeout() -> Duration {
+    std::env::var("T_HUB_GIT_CMD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(GIT_INFO_TIMEOUT_DEFAULT)
+}
 
 /// Current epoch-millis on the agent clock.
 pub fn now_ms() -> u64 {
@@ -105,6 +135,74 @@ pub fn metrics() -> HostMetrics {
         process_count,
         distro,
         captured_at_ms: now_ms(),
+    }
+}
+
+/// Collect the complete Files-panel git snapshot in one bounded shell process.
+pub fn git_info(cwd: &str) -> Result<GitInfo> {
+    let mut child = Command::new("bash")
+        .current_dir(cwd)
+        .args(["-lc", GIT_INFO_SCRIPT])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn git info script: {e}"))?;
+    let deadline = Instant::now() + git_info_timeout();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!("git info script timed out"));
+            }
+            Err(e) => return Err(anyhow::anyhow!("failed waiting for git info script: {e}")),
+        }
+    }
+
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout)
+            .map_err(|e| anyhow::anyhow!("failed reading git info output: {e}"))?;
+    }
+    Ok(parse_git_info_output(&stdout))
+}
+
+fn parse_git_info_output(stdout: &str) -> GitInfo {
+    let fields: HashMap<&str, &str> = stdout
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .collect();
+    if fields.get("inside").map(|value| value.trim()) != Some("true") {
+        return GitInfo::default();
+    }
+
+    let first_line = |key: &str| {
+        fields.get(key).and_then(|value| {
+            let value = value.lines().next().unwrap_or("").trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+    };
+    let git_dir = first_line("gitdir");
+    let common_dir = first_line("commondir");
+    GitInfo {
+        is_repo: true,
+        branch: first_line("branch").filter(|branch| branch != "HEAD"),
+        worktree_root: first_line("toplevel"),
+        is_linked_worktree: matches!(
+            (git_dir.as_deref(), common_dir.as_deref()),
+            (Some(git_dir), Some(common_dir)) if git_dir.trim() != common_dir.trim()
+        ),
+        dirty_count: fields
+            .get("dirty")
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0),
+        head_commit: first_line("head"),
+        remote_url: first_line("remote"),
+        default_branch: first_line("default"),
     }
 }
 
@@ -210,6 +308,41 @@ pub fn git_worktrees(cwd: &str) -> Result<Vec<WorktreeInfo>> {
 mod tests {
     use super::*;
 
+    fn scratch_repo(tag: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("t-hub-agent-{tag}-{unique}"));
+        std::fs::create_dir_all(&path).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "T-Hub Test"],
+            vec!["config", "user.email", "t-hub@example.test"],
+        ] {
+            assert!(Command::new("git")
+                .current_dir(&path)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(path.join("tracked.txt"), "initial\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(&path)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&path)
+            .args(["commit", "-m", "initial"])
+            .status()
+            .unwrap()
+            .success());
+        path
+    }
+
     #[test]
     fn metrics_timestamp_is_set() {
         let m = metrics();
@@ -293,5 +426,62 @@ mod tests {
             worktrees.is_empty(),
             "git_worktrees on /tmp should return empty Vec"
         );
+    }
+
+    #[test]
+    fn git_info_reports_real_repo_and_linked_worktree_facts() {
+        let repo = scratch_repo("git-info");
+        std::fs::write(repo.join("tracked.txt"), "changed\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(&repo)
+            .args(["remote", "add", "origin", "https://example.test/repo.git"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main"
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        let main = git_info(repo.to_str().unwrap()).unwrap();
+        assert!(main.is_repo);
+        assert_eq!(main.branch.as_deref(), Some("main"));
+        assert_eq!(main.worktree_root.as_deref(), repo.to_str());
+        assert!(!main.is_linked_worktree);
+        assert_eq!(main.dirty_count, 1);
+        assert!(main.head_commit.is_some());
+        assert_eq!(
+            main.remote_url.as_deref(),
+            Some("https://example.test/repo.git")
+        );
+        assert_eq!(main.default_branch.as_deref(), Some("main"));
+
+        let linked = repo.with_extension("linked");
+        assert!(Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "add", "-b", "linked", linked.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let linked_info = git_info(linked.to_str().unwrap()).unwrap();
+        assert!(linked_info.is_linked_worktree);
+        assert_eq!(linked_info.branch.as_deref(), Some("linked"));
+
+        std::fs::remove_dir_all(&linked).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn git_info_non_repo_is_empty() {
+        let dir = std::env::temp_dir().join(format!("t-hub-agent-nonrepo-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(git_info(dir.to_str().unwrap()).unwrap(), GitInfo::default());
+        std::fs::remove_dir_all(dir).ok();
     }
 }

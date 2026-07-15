@@ -28,12 +28,12 @@ pub mod emit;
 pub use connection::ConnectionState;
 pub use emit::EventEmitter;
 
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, LazyLock, Weak};
 
 use parking_lot::Mutex;
 use t_hub_protocol::{
-    AgentRequest, AgentResponse, Channel, CoreFrame, CoreToAgent, EventJournalEntry, Hello,
-    HostMetrics, Priority, WorktreeInfo, PROTOCOL_VERSION,
+    AgentRequest, AgentResponse, Channel, CoreFrame, CoreToAgent, EventJournalEntry, GitInfo,
+    Hello, HostMetrics, Priority, ResponseErrorKind, WorktreeInfo, PROTOCOL_VERSION,
 };
 
 use crate::supervision::Supervisor;
@@ -120,6 +120,9 @@ pub struct AgentBridge {
     inner: Arc<BridgeInner>,
 }
 
+static ACTIVE_BRIDGE: LazyLock<Mutex<Weak<BridgeInner>>> =
+    LazyLock::new(|| Mutex::new(Weak::new()));
+
 struct BridgeInner {
     /// The supervision reducer, fed by incoming journal events. Shared so the
     /// supervision Tauri commands can read snapshots without a round-trip.
@@ -172,7 +175,7 @@ impl BridgeInner {
 
 impl Default for AgentBridge {
     fn default() -> Self {
-        Self {
+        let bridge = Self {
             inner: Arc::new(BridgeInner {
                 supervisor: Mutex::new(Supervisor::new()),
                 state: Mutex::new(ConnectionState::Disconnected),
@@ -182,7 +185,9 @@ impl Default for AgentBridge {
                 status: Mutex::new(None),
                 status_observer: Mutex::new(None),
             }),
-        }
+        };
+        *ACTIVE_BRIDGE.lock() = Arc::downgrade(&bridge.inner);
+        bridge
     }
 }
 
@@ -540,6 +545,13 @@ impl AgentBridge {
         }
     }
 
+    /// Fetch the complete Files-panel git snapshot through the persistent agent.
+    pub fn git_info(&self, cwd: &str) -> Result<GitInfo, String> {
+        map_git_info_response(self.request(AgentRequest::GitInfo {
+            cwd: cwd.to_string(),
+        })?)
+    }
+
     /// Consume one journal entry: advance the cursor, feed supervision, emit the
     /// live UI events, and return the affected session id.
     ///
@@ -728,6 +740,29 @@ impl AgentBridge {
     }
 }
 
+/// Fetch git facts through the current application bridge.
+pub fn git_info(cwd: &str) -> Result<GitInfo, String> {
+    let inner = ACTIVE_BRIDGE
+        .lock()
+        .upgrade()
+        .ok_or_else(|| "agent bridge unavailable".to_string())?;
+    AgentBridge { inner }.git_info(cwd)
+}
+
+fn map_git_info_response(response: AgentResponse) -> Result<GitInfo, String> {
+    match response {
+        AgentResponse::GitInfo(info) => Ok(info),
+        AgentResponse::Error {
+            kind: ResponseErrorKind::Unsupported,
+            message,
+        } => Err(format!("agent does not support git_info: {message}")),
+        AgentResponse::Error { kind, message } => {
+            Err(format!("agent git_info failed ({kind:?}): {message}"))
+        }
+        other => Err(format!("unexpected response to git_info: {other:?}")),
+    }
+}
+
 /// Max characters for a derived session title before we ellipsize it. Long
 /// enough to carry a useful task summary, short enough to fit a tile/tab label.
 const TITLE_MAX_CHARS: usize = 60;
@@ -865,6 +900,19 @@ mod tests {
             assert_eq!(argv, vec!["C:/tmp/t-hub-agent.exe", "--stdio"]);
             std::env::remove_var("T_HUB_AGENT_BIN");
         }
+    }
+
+    #[test]
+    fn git_info_response_reports_unsupported_agent_capability() {
+        let error = super::map_git_info_response(AgentResponse::Error {
+            kind: ResponseErrorKind::Unsupported,
+            message: "unsupported request op".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "agent does not support git_info: unsupported request op"
+        );
     }
 
     #[test]

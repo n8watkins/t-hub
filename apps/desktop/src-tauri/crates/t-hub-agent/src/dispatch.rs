@@ -59,6 +59,11 @@ pub fn handle(journal: &Journal, req: AgentRequest) -> AgentResponse {
             Err(e) => err(ResponseErrorKind::CommandFailed, e.to_string()),
         },
 
+        AgentRequest::GitInfo { cwd } => match host::git_info(&cwd) {
+            Ok(info) => AgentResponse::GitInfo(info),
+            Err(e) => err(ResponseErrorKind::CommandFailed, e.to_string()),
+        },
+
         AgentRequest::CapturePane { name } => match registry::capture_pane(&name) {
             Ok(bytes) => AgentResponse::Pane {
                 base64: STANDARD.encode(bytes),
@@ -129,6 +134,24 @@ mod tests {
                 assert_eq!(kind, ResponseErrorKind::Unsupported)
             }
             other => panic!("expected Error, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_info_request_returns_non_repo_snapshot() {
+        let (j, dir) = temp_journal("git-info");
+        let cwd = dir.join("not-a-repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let resp = handle(
+            &j,
+            AgentRequest::GitInfo {
+                cwd: cwd.to_string_lossy().into_owned(),
+            },
+        );
+        match resp {
+            AgentResponse::GitInfo(info) => assert!(!info.is_repo),
+            other => panic!("expected GitInfo, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
     }

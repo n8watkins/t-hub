@@ -28,6 +28,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use t_hub_protocol::GitInfo as AgentGitInfo;
 
 use crate::bounded_exec::output_with_timeout;
 
@@ -88,6 +89,21 @@ pub struct GitInfo {
     pub remote_url: Option<String>,
     /// The branch named by origin/HEAD when configured.
     pub default_branch: Option<String>,
+}
+
+impl From<AgentGitInfo> for GitInfo {
+    fn from(info: AgentGitInfo) -> Self {
+        Self {
+            is_repo: info.is_repo,
+            branch: info.branch,
+            worktree_root: info.worktree_root,
+            is_linked_worktree: info.is_linked_worktree,
+            dirty_count: info.dirty_count,
+            head_commit: info.head_commit,
+            remote_url: info.remote_url,
+            default_branch: info.default_branch,
+        }
+    }
 }
 
 /// How long a `git_info` answer stays fresh per cwd. The Files panel re-polls
@@ -636,12 +652,11 @@ fn worktree_add_args<'a>(
 ///
 /// PERF (the freeze fix): this used to make SIX sequential blocking `run_git`
 /// calls — on Windows six separate `wsl.exe` spawns — directly on the async
-/// executor, per tile, every 5s poll (+ a focus burst). It now does ONE of three
-/// cheap things: (1) returns a fresh cached answer for this cwd, OR (2) runs a
-/// SINGLE one-shot shell script ([`GIT_INFO_SCRIPT`]) — one `wsl.exe` total —
-/// inside `spawn_blocking` so the blocking IO never pins a Tokio worker, then
-/// caches it. Many tiles polling the same cwd (and the focus re-poll burst) thus
-/// collapse onto one `wsl.exe` per cwd per [`GIT_INFO_TTL`].
+/// executor, per tile, every 5s poll (+ a focus burst). It now returns a fresh
+/// cached answer or asks the persistent WSL agent. A disconnected, old, or
+/// failed agent falls back to the bounded one-shot script inside
+/// `spawn_blocking`. Many tiles polling the same cwd still collapse onto one
+/// collection per cwd per [`GIT_INFO_TTL`].
 #[tauri::command]
 pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
     // (1) Serve a fresh-enough cached answer for this cwd. The lock is held only
@@ -655,10 +670,9 @@ pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
         return Ok(cached);
     }
 
-    // (2) Cache miss / stale: run the single one-shot script off the async
-    // runtime. The blocking work (the `wsl.exe`/`bash` spawn + parse) lives in a
-    // closure that captures only OWNED data (the cloned `cwd`) — no `&State` is
-    // held across the await — so it can't pin a worker thread.
+    // (2) Cache miss / stale: use the persistent bridge, with the one-shot
+    // script retained only as the disconnected/error fallback. The blocking
+    // request and possible subprocess live off the async runtime.
     let cwd_for_blocking = cwd.clone();
     let info = tauri::async_runtime::spawn_blocking(move || compute_git_info(&cwd_for_blocking))
         .await
@@ -671,14 +685,26 @@ pub async fn git_info(cwd: String) -> Result<GitInfo, String> {
     Ok(info)
 }
 
-/// Run the one-shot [`GIT_INFO_SCRIPT`] for `cwd` and parse it into a [`GitInfo`] —
-/// the "scan" half shared by the async [`git_info`] command (inside its
-/// `spawn_blocking`) and the sync [`git_info_cached`] control core. A spawn failure
-/// (no git / no wsl.exe / unreadable dir) degrades to the "not a repo" answer,
-/// best-effort exactly like the old per-call path. Pure blocking IO; no cache.
+/// Fetch `cwd` through the persistent agent, falling back to the one-shot
+/// [`GIT_INFO_SCRIPT`] only when the bridge is unavailable or returns an error.
+/// A fallback spawn failure degrades to the "not a repo" answer, exactly like
+/// the previous best-effort path. Pure blocking IO; no cache.
 fn compute_git_info(cwd: &str) -> GitInfo {
-    let stdout = run_git_info_script(cwd).unwrap_or_default();
-    parse_git_info_output(&stdout)
+    compute_git_info_with(cwd, crate::agent::git_info, |cwd| {
+        let stdout = run_git_info_script(cwd).unwrap_or_default();
+        parse_git_info_output(&stdout)
+    })
+}
+
+fn compute_git_info_with(
+    cwd: &str,
+    bridge: impl FnOnce(&str) -> Result<AgentGitInfo, String>,
+    fallback: impl FnOnce(&str) -> GitInfo,
+) -> GitInfo {
+    match bridge(cwd) {
+        Ok(info) => info.into(),
+        Err(_) => fallback(cwd),
+    }
 }
 
 /// SYNC `git_info` for `cwd` — the core of [`git_info`] minus the async/`spawn_blocking`
@@ -698,7 +724,7 @@ pub fn git_info_cached(cwd: &str) -> GitInfo {
     {
         return cached;
     }
-    // (2) Cache miss / stale: run the one-shot script synchronously, then cache it.
+    // (2) Cache miss / stale: use the bridge-first collector, then cache it.
     let info = compute_git_info(cwd);
     if let Ok(mut guard) = GIT_INFO_CACHE.lock() {
         cache_store(&mut guard, cwd.to_string(), Instant::now(), info.clone());
@@ -1241,6 +1267,45 @@ detached
             remote_url: Some("https://example.test/repo.git".to_string()),
             default_branch: Some("main".to_string()),
         }
+    }
+
+    fn sample_agent_info() -> AgentGitInfo {
+        AgentGitInfo {
+            is_repo: true,
+            branch: Some("agent-main".to_string()),
+            worktree_root: Some("/agent/repo".to_string()),
+            is_linked_worktree: true,
+            dirty_count: 7,
+            head_commit: Some("agent-head".to_string()),
+            remote_url: Some("https://example.test/agent.git".to_string()),
+            default_branch: Some("agent-main".to_string()),
+        }
+    }
+
+    #[test]
+    fn compute_git_info_uses_bridge_without_fallback() {
+        let info = compute_git_info_with(
+            "/repo",
+            |_| Ok(sample_agent_info()),
+            |_| panic!("fallback must not run after a successful bridge response"),
+        );
+        assert_eq!(info.branch.as_deref(), Some("agent-main"));
+        assert_eq!(info.dirty_count, 7);
+        assert!(info.is_linked_worktree);
+    }
+
+    #[test]
+    fn compute_git_info_falls_back_after_bridge_error() {
+        let expected = sample_info();
+        let info = compute_git_info_with(
+            "/repo",
+            |_| Err("agent bridge not connected".to_string()),
+            |cwd| {
+                assert_eq!(cwd, "/repo");
+                expected.clone()
+            },
+        );
+        assert_eq!(info, expected);
     }
 
     #[test]
