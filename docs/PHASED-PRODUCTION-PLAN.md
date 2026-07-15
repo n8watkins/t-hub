@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-15.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.93` from exact detached source `e95eb56`, restored on the canonical profile as Windows PID `23436` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.94` from exact detached source `3816bf4`, restored on the canonical profile as Windows PID `46860` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -677,7 +677,7 @@ Give Cortana lightweight operational awareness and make attention cues provider-
 
 ## Phase 11 - Measured Runtime Efficiency
 
-**Status:** Active; matching bridge deployment and graphical `GitInfo` routing acceptance are complete, while recurring host-bridge process churn still makes the declared one-terminal packaged baseline ineligible.
+**Status:** Active; exact desktop `0.3.94` and agent `0.5.2` deployment, graphical agent routing, and the repeated packaged one-terminal baseline are eligible, while the 4, 8, and 16 terminal matrix cells remain pending.
 The first isolated attempt was invalidated when Windows Explorer launched a separate normal T-Hub process.
 The documented retry pinned installed `0.3.90` PID `49712` and completed 55 samples over 61.05 seconds with one visible idle shell tile, but the host bridge produced eight births and eight deaths across four incomplete CPU intervals.
 The artifact therefore reports `release_acceptance_eligible: false` and is diagnostic evidence rather than an accepted baseline.
@@ -694,14 +694,19 @@ Read-only descendant tracing attributed the residual periodic host-bridge lane t
 Source commit `3816bf4` adds the additive `TerminalSnapshot` protocol operation and routes normal `list_terminals` reconciliation through the persistent WSL agent.
 The compatibility scan is limited to one bootstrap attempt for a disconnected or explicitly unsupported agent, is never resumed after agent success, and does not run after a timeout or agent command failure.
 The agent collector bounds each of its two sequential steps to four seconds, drains both output pipes concurrently, and kills and reaps the collector process group on timeout.
-The uninstalled source is desktop `0.3.94` with agent and protocol `0.5.2`.
+The source versions are desktop `0.3.94` with agent and protocol `0.5.2`.
 Its source gate passed 471 frontend tests, TypeScript and the production frontend build, 641 desktop Rust tests with one ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, diff checks, focused inherited-pipe and large-output timeout regressions, and the performance harness self-tests.
 The exact detached `3816bf4` Windows build produced standalone, NSIS, and MSI SHA-256 values `00AA4B113B19B41B2D476E88D9CD5600D42B76F588C294A5D3E06C3B6D59F922`, `D9BFC8A94572D1ADEEA8E4494696176D3A49138BEB850D3F90AEE726A2DBE947`, and `FF467ECB84AF41C5893E60DBD54B71BF7848E4D89FEEB7829130893C1BAEF54D`.
 The matching detached Linux agent reports `0.5.2` with SHA-256 `813DB68E3DA42A790532258CC89FBBAFC5ABFECFCDD9810FD4D912EB7F14658A`.
 A direct real-agent round trip on a disposable isolated socket returned exactly one declared session and one pane, then cleanup preserved all six canonical session names and pane PIDs.
-Installed `0.3.93` with agent `0.5.1` remains unchanged and cannot prove the new capability.
-Phase 11 remains blocked pending exact matching `0.3.94` and agent `0.5.2` deployment, graphical `terminal_snapshot source=agent` evidence with no fallback or error marker, and an eligible repeated packaged one-terminal artifact.
-The 4, 8, and 16 terminal scenarios must not run until the one-terminal gate is eligible.
+The exact NSIS installed desktop is `0.3.94` at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` with SHA-256 `021E7CAFF58C9A46720A02DD915D09BAC6BFE08235D7E80A8628C1E550223A7E`, and the matching installed agent reports `0.5.2` with SHA-256 `813DB68E3DA42A790532258CC89FBBAFC5ABFECFCDD9810FD4D912EB7F14658A`.
+The normal-profile graphical proof emitted one `terminal_snapshot source=agent` marker and one `git_info source=agent` marker with no fallback, timeout, or agent-error marker, while five polls kept all six terminal IDs, states, and current working directories stable.
+The first isolated 95.09-second packaged run in `artifacts/perf/t-hub-0.3.94-1t-20260715T1034.json` recorded zero host-bridge births or deaths and 86 complete host-bridge intervals, proving the targeted recurring churn was removed, but a one-second WebView2 helper lifetime made two total intervals incomplete.
+The warm repeat in `artifacts/perf/t-hub-0.3.94-1t-20260715T1043-r3.json` sampled 95.35 seconds with exactly one declared idle shell, 86 complete total intervals, zero incomplete intervals, zero births or deaths in every category, a stable 17-process tree, and a stable 10-process host bridge.
+Its total CPU release statistic is eligible at `0.10637` logical cores over the run.
+The disposable tmux socket, database, control files, WebView profile, and shared-layout backup were removed after the proof.
+The canonical profile was restored as PID `46860` with all six original tmux names and pane PIDs unchanged.
+The eligible one-terminal gate unblocks the 4, 8, and 16 terminal scenarios, which are the next serialized Phase 11 measurements.
 
 ### Goal
 
