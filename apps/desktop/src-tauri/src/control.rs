@@ -11756,9 +11756,11 @@ mod tests {
             .args(["worktree", "list", "--porcelain"])
             .output()
             .expect("git worktree list spawns");
+        let listed_paths = String::from_utf8_lossy(&listed.stdout).replace('\\', "/");
+        let expected_path = wt.to_string_lossy().replace('\\', "/");
         assert!(
-            String::from_utf8_lossy(&listed.stdout).contains(wt.to_str().unwrap()),
-            "the worktree registration must remain intact"
+            listed_paths.contains(&expected_path),
+            "the worktree registration must remain intact: expected {expected_path:?} in {listed_paths:?}"
         );
 
         git::rollback_created_worktree(repo.to_str().unwrap(), wt.to_str().unwrap())
