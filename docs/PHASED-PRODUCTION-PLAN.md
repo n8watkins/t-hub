@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-15.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.94` from exact detached source `3816bf4`, restored on the canonical profile as Windows PID `46860` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.94` from exact detached source `3816bf4`, running on the canonical profile as Windows PID `47452` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -635,6 +635,14 @@ Source `0.3.98` at commit `4e264f0` adds the backend-only provider-neutral Histo
 It locks exact Harness-plus-conversation digests, preserves same-cwd and cross-Harness separation, selects filename-matching Codex child metadata, reads the real Codex `model_provider`, normalizes valid timestamps to UTC, degrades malformed records, filters wrapper text, and represents legacy Claude archive entries per conversation.
 The foundation exposes no command or UI, leaves Claude-only Recent byte-for-byte unchanged, and marks every not-yet-connected action unavailable.
 Its 16 focused tests, full Rust workspace, MCP end-to-end, strict all-feature Clippy, all 480 frontend tests, TypeScript, production build, version consistency, diff checks, and independent review passed.
+Source `0.3.99` at commit `3afb521` repairs the reproduced Codex Captain commissioning failure.
+Installed `0.3.94` passed the exec-only `--skip-git-repo-check` flag to interactive Codex `0.144.4`, which exited immediately, while the graphical control client timed out before the backend returned its structured rollback error.
+The adapter now keeps that flag on `codex exec` Crew turns only, and Captain and Crew orchestration receive a bounded 120-second response window without widening ordinary control requests.
+Source `0.3.100` at commit `f8ef9aa` addresses the separately reproduced Powder credential process churn.
+The 15-second event reconciler now reuses one resolved client per connection profile for five minutes, invalidates it after a Powder request failure, and starts the Windows credential command with `CREATE_NO_WINDOW`.
+The registered T-Hub Project and its `n8desktop-wsl` binding remain durable even though the failed Captain terminal was rolled back, so installed acceptance can retry commissioning without registering a duplicate Project.
+Both changes passed 663 desktop Rust tests with one ignored, all Rust workspace and MCP end-to-end suites, strict all-feature Clippy, all 480 frontend tests, TypeScript, the production build, version consistency, diff checks, and independent review.
+These source builds remain uninstalled, and the running application is still `0.3.94`.
 The next History slice must add bounded fair discovery, source statuses, collision handling, durable exact joins, complete revision semantics, and only then expose the versioned `history_list` catalog across control, MCP, CLI, and frontend IPC.
 
 ### Tests and Evidence
@@ -736,8 +744,8 @@ Reduce steady CPU, memory, process, and startup cost using packaged measurements
 2. Include hot, warm, cold, Board, Preview, Captain, Crew, browser, inbox, and voice scenarios.
 3. Attribute WebView2 CPU to renderer work, GPU work, xterm, animation, polling, or repaint scheduling.
 4. Stop unnecessary animation frames, canvas redraws, cursor work, and layout measurement on hidden or unchanged surfaces.
-5. Skip Powder event polling when no active Captain can receive events.
-6. Cache Powder profiles, credentials, clients, and HTTP connection pools with explicit refresh behavior.
+5. Preserve bounded Powder event polling for registered Projects without a live Captain so relevant events remain unread until delivery is possible.
+6. Cache Powder profiles, credentials, clients, and HTTP connection pools with explicit refresh behavior; source `0.3.100` completes the event-reconciler client cache and Windows console suppression, while broader shared caching remains open.
 7. Enable binary PTY framing with a tested version fallback.
 8. Remove the live JSON and base64 terminal-output path.
 9. Coalesce terminal, focus, Git, History, usage, resource, and pane scans.
