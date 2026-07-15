@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.81` from `8f5fffa`, running as Windows PID `38472` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.82` from `ec55526`, running as Windows PID `48160` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -86,7 +86,10 @@ Source commit `61f56ba`, packaged first as `0.3.77`, adds typed root-package tar
 Packaged `0.3.78` discovered the T-Hub root's four declared scripts, started `pnpm run dev`, detected Vite at `http://localhost:1420/`, and stopped the exact managed run without leaving its Vite descendant alive.
 Source commits `fbacc8f`, `16480b7`, and `19dc3c7`, packaged as installed `0.3.81` from `8f5fffa`, make standard Tauri Vite targets bind all WSL interfaces and preserve a localhost URL when Windows can already reach it.
 Packaged acceptance started the real T-Hub Vite target, loaded `http://localhost:1420/` in the Preview iframe, returned Windows HTTP 200, bound ports `1420` and `1421` to `0.0.0.0`, and removed both listeners and the exact managed Vite PID on Stop.
-Representative Next.js and static acceptance, generic non-Tauri Vite launch adapters, stale WSL-address recovery, and the broader descendant-cleanup matrix remain open.
+Source commit `9d95fa9`, packaged as installed `0.3.82` from `ec55526`, gives each managed package target one WSL process group behind an application-owned stdin lifeline and retained Windows Job Object.
+Packaged acceptance proved that Stop returned in 161 milliseconds, removed the run marker and every pnpm, Vite, and esbuild process, released ports `1420` and `1421`, and restarted successfully on the same port.
+Forcing the installed application to exit while the restarted target was active also removed the complete process group and both listeners while preserving all seven unrelated tmux sessions and pane PIDs.
+Representative Next.js and static acceptance, generic non-Tauri Vite launch adapters, and stale WSL-address recovery remain open.
 Source commit `776439a`, packaged as `0.3.78` from `b4a1c5d`, removes full tmux capture replay from terminal attachment and stops clearing inline transcript during header Refresh.
 The packaged acceptance preserved all eight tmux pane PIDs and the same Codex process chain through install, header Refresh, and full relaunch while the active draft appeared exactly once.
 The Codex header identity has been checked interactively, while the Claude header still needs interactive confirmation.
@@ -570,7 +573,9 @@ The typed-target and generation-safe lifecycle portions of items 6 and 7 are imp
 The packaged T-Hub root exposed exactly `dev`, `build`, `tauri`, and `typecheck`, started the real Vite target, detected `http://localhost:1420/`, and stopped the managed run and its Vite descendant.
 Source commits `fbacc8f`, `16480b7`, and `19dc3c7`, packaged as installed `0.3.81` from `8f5fffa`, complete Windows reachability for the representative standard Tauri Vite target.
 The installed package kept the Preview iframe on reachable `http://localhost:1420/`, returned Windows HTTP 200, and removed both listeners and the managed Vite PID on Stop.
-Framework-aware generic Vite arguments, representative Next.js and static acceptance, stale WSL-address recovery, and the full descendant-cleanup matrix remain open.
+Source commit `9d95fa9`, packaged as installed `0.3.82` from `ec55526`, owns the complete managed package process group through normal Stop, same-port restart, natural parent exit, TERM-resistant descendants, and forced application exit.
+The installed package removed every pnpm, Vite, and esbuild process plus ports `1420` and `1421` during both normal Stop and forced application exit while preserving the seven unrelated tmux sessions.
+Framework-aware generic Vite arguments, representative Next.js and static acceptance, and stale WSL-address recovery remain open.
 
 ### Tests and Evidence
 
