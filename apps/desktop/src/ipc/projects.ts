@@ -48,12 +48,57 @@ export interface PowderBoardCatalog {
   nextOffset?: number;
 }
 
+export type ProjectBoardStatus =
+  | "ready"
+  | "noProject"
+  | "unbound"
+  | "unauthorized"
+  | "unreachable"
+  | "misconfigured"
+  | "repositoryMissing"
+  | "degraded"
+  | "error";
+
+export interface ProjectBoardSnapshot {
+  schemaVersion: 1;
+  status: ProjectBoardStatus;
+  resolution: "captain" | "crew" | "cwd" | "none";
+  project?: Pick<RegisteredProject, "projectId" | "name" | "repoRoot">;
+  binding?: { repository: string; connectionProfile: string };
+  board?: {
+    repository: PowderBoard;
+    cards: Array<{
+      id: string;
+      title: string;
+      status: string;
+      priority: string;
+      estimate?: string;
+      labels: string[];
+      claim?: { agent: string; expiresAt: number };
+      updatedAt: number;
+    }>;
+    totalCount: number;
+    hasMore: boolean;
+    refreshedAt: number;
+  };
+  external?: { url: string; repositoryFilterApplied: false };
+  problem?: { code: string; message: string; retryable: boolean };
+}
+
 export function listPowderBoards(input: {
   connectionProfile: string;
   offset?: number;
   limit?: number;
 }): Promise<PowderBoardCatalog> {
   return controlRequest("list_powder_boards", input) as Promise<PowderBoardCatalog>;
+}
+
+export function projectBoardSnapshot(input: {
+  terminalId: string;
+  cwd?: string;
+  limit?: number;
+}): Promise<ProjectBoardSnapshot> {
+  return controlRequest("project_board_snapshot", input) as Promise<ProjectBoardSnapshot>;
 }
 
 export function registerProject(input: {

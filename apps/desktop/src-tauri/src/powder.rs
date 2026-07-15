@@ -68,6 +68,57 @@ pub struct PowderBoard {
     pub card_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowderErrorKind {
+    Unauthorized,
+    NotFound,
+    Unreachable,
+    Upstream,
+    InvalidResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowderError {
+    pub kind: PowderErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for PowderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PowderBoardCard {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub priority: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<String>,
+    pub labels: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim: Option<PowderBoardClaim>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PowderBoardClaim {
+    pub agent: String,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PowderBoardPage {
+    pub cards: Vec<PowderBoardCard>,
+    pub total_count: usize,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct PowderRepositoryList {
     repositories: Vec<PowderRepositorySummary>,
@@ -298,6 +349,41 @@ impl Client {
         parse_board_list(self.request("GET", "/api/v1/repositories", None)?)
     }
 
+    /// Return a bounded, repository-scoped card page for T-Hub's native Board.
+    /// The protected credential stays inside this client and the parsed response
+    /// intentionally omits card bodies and other unnecessary upstream fields.
+    pub fn board_page(
+        &self,
+        repository: &str,
+        limit: usize,
+    ) -> Result<PowderBoardPage, PowderError> {
+        let limit = limit.clamp(1, 1000);
+        let value = self.request_typed(
+            "GET",
+            &format!(
+                "/api/v1/cards?repo={}&limit={limit}",
+                encode_path(repository)
+            ),
+            None,
+        )?;
+        parse_board_page(value)
+    }
+
+    pub fn repository_for_board(&self, repository: &str) -> Result<PowderBoard, PowderError> {
+        let value = self.request_typed(
+            "GET",
+            &format!("/api/v1/repositories/{}", encode_path(repository)),
+            None,
+        )?;
+        parse_board_repository(value)
+    }
+
+    /// A credential-free URL for opening Powder's complete board externally.
+    /// Powder does not currently support repository-filtered board URLs.
+    pub fn external_board_url(&self) -> String {
+        format!("{}/board", self.base_url)
+    }
+
     pub fn claim(&self, card_id: &str, ttl_seconds: u64) -> Result<Claim, String> {
         let value = self.request(
             "POST",
@@ -376,11 +462,26 @@ impl Client {
     }
 
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+        self.request_typed(method, path, body)
+            .map_err(|error| error.to_string())
+    }
+
+    fn request_typed(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, PowderError> {
         let url = format!("{}{path}", self.base_url);
         let mut request = match method {
             "GET" => self.agent.get(&url),
             "POST" => self.agent.post(&url),
-            _ => return Err(format!("unsupported Powder HTTP method '{method}'")),
+            _ => {
+                return Err(PowderError {
+                    kind: PowderErrorKind::Upstream,
+                    message: format!("unsupported Powder HTTP method '{method}'"),
+                });
+            }
         };
         if let Some(key) = self.api_key.as_deref() {
             request = request.set("Authorization", &format!("Bearer {key}"));
@@ -390,11 +491,118 @@ impl Client {
             None => request.call(),
         };
         match response {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| format!("Powder returned invalid JSON: {error}")),
-            Err(error) => Err(response_error(error)),
+            Ok(response) => response.into_json().map_err(|error| PowderError {
+                kind: PowderErrorKind::InvalidResponse,
+                message: format!("Powder returned invalid JSON: {error}"),
+            }),
+            Err(error) => Err(typed_response_error(error)),
         }
+    }
+}
+
+fn parse_board_repository(value: Value) -> Result<PowderBoard, PowderError> {
+    let name = value["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| invalid_board_response("repository is missing name"))?;
+    let tier = value["tier"]
+        .as_str()
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .ok_or_else(|| invalid_board_response("repository is missing tier"))?;
+    let aliases = value["aliases"]
+        .as_array()
+        .map(|aliases| {
+            aliases
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let card_count = value["card_count"]
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| invalid_board_response("repository is missing card_count"))?;
+    Ok(PowderBoard {
+        name: name.to_string(),
+        aliases,
+        tier: tier.to_string(),
+        card_count,
+    })
+}
+
+fn parse_board_page(value: Value) -> Result<PowderBoardPage, PowderError> {
+    let cards = value["cards"]
+        .as_array()
+        .ok_or_else(|| invalid_board_response("card page is missing cards"))?
+        .iter()
+        .map(parse_board_card)
+        .collect::<Result<Vec<_>, _>>()?;
+    let total_count = value["total_count"]
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| invalid_board_response("card page is missing total_count"))?;
+    let has_more = value["has_more"]
+        .as_bool()
+        .ok_or_else(|| invalid_board_response("card page is missing has_more"))?;
+    Ok(PowderBoardPage {
+        cards,
+        total_count,
+        has_more,
+    })
+}
+
+fn parse_board_card(value: &Value) -> Result<PowderBoardCard, PowderError> {
+    let string = |key: &str| {
+        value[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| invalid_board_response(&format!("card is missing {key}")))
+    };
+    let labels = value["labels"]
+        .as_array()
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let claim = value.get("claim").and_then(|claim| {
+        let agent = claim["agent"].as_str()?.trim();
+        let expires_at = claim["expires_at"].as_i64()?;
+        (!agent.is_empty()).then(|| PowderBoardClaim {
+            agent: agent.to_string(),
+            expires_at,
+        })
+    });
+    Ok(PowderBoardCard {
+        id: string("id")?,
+        title: string("title")?,
+        status: string("status")?,
+        priority: string("priority")?,
+        estimate: value["estimate"].as_str().map(str::to_string),
+        labels,
+        claim,
+        updated_at: value["updated_at"]
+            .as_i64()
+            .ok_or_else(|| invalid_board_response("card is missing updated_at"))?,
+    })
+}
+
+fn invalid_board_response(message: &str) -> PowderError {
+    PowderError {
+        kind: PowderErrorKind::InvalidResponse,
+        message: format!("Powder board response is invalid: {message}"),
     }
 }
 
@@ -479,6 +687,10 @@ fn validate_base_url(base_url: &str) -> Result<(), String> {
 }
 
 fn response_error(error: ureq::Error) -> String {
+    typed_response_error(error).to_string()
+}
+
+fn typed_response_error(error: ureq::Error) -> PowderError {
     match error {
         ureq::Error::Status(status, response) => {
             let detail = response
@@ -486,9 +698,19 @@ fn response_error(error: ureq::Error) -> String {
                 .ok()
                 .and_then(|body| body["error"].as_str().map(str::to_string))
                 .unwrap_or_else(|| format!("HTTP {status}"));
-            format!("Powder HTTP {status}: {detail}")
+            PowderError {
+                kind: match status {
+                    401 | 403 => PowderErrorKind::Unauthorized,
+                    404 => PowderErrorKind::NotFound,
+                    _ => PowderErrorKind::Upstream,
+                },
+                message: format!("Powder HTTP {status}: {detail}"),
+            }
         }
-        ureq::Error::Transport(error) => format!("Powder is unreachable: {error}"),
+        ureq::Error::Transport(error) => PowderError {
+            kind: PowderErrorKind::Unreachable,
+            message: format!("Powder is unreachable: {error}"),
+        },
     }
 }
 
@@ -714,6 +936,84 @@ mod tests {
     }
 
     #[test]
+    fn board_page_keeps_only_bounded_safe_card_fields() {
+        let page = parse_board_page(json!({
+            "cards": [{
+                "id": "t-hub-1",
+                "title": "Repair Board",
+                "body": "private implementation detail",
+                "status": "running",
+                "priority": "p1",
+                "estimate": "m",
+                "labels": ["desktop"],
+                "repo": "t-hub",
+                "claim": { "agent": "crew-one", "expires_at": 456 },
+                "updated_at": 123
+            }],
+            "total_count": 1,
+            "has_more": false
+        }))
+        .unwrap();
+        assert_eq!(page.cards[0].id, "t-hub-1");
+        assert_eq!(page.cards[0].labels, vec!["desktop"]);
+        assert_eq!(page.cards[0].claim.as_ref().unwrap().agent, "crew-one");
+        let serialized = serde_json::to_string(&page).unwrap();
+        assert!(!serialized.contains("private implementation detail"));
+        assert!(!serialized.contains("repo"));
+    }
+
+    #[test]
+    fn external_board_url_is_credential_free_and_not_falsely_filtered() {
+        let client = Client::new(ProfileConfig {
+            base_url: "https://powder.example.test/".into(),
+            agent_name: "t-hub".into(),
+            api_key: Some("secret-key".into()),
+            api_key_env: None,
+            api_key_command: None,
+        })
+        .unwrap();
+        assert_eq!(
+            client.external_board_url(),
+            "https://powder.example.test/board"
+        );
+        assert!(!client.external_board_url().contains("secret-key"));
+        assert!(!client.external_board_url().contains("repo="));
+    }
+
+    #[test]
+    fn board_requests_preserve_authorization_failure_kind() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let count = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.contains("GET /api/v1/repositories/private"));
+            let body = r#"{"error":"forbidden"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let client = Client::new(ProfileConfig {
+            base_url: format!("http://{addr}"),
+            agent_name: "t-hub".into(),
+            api_key: Some("test-key".into()),
+            api_key_env: None,
+            api_key_command: None,
+        })
+        .unwrap();
+        let error = client.repository_for_board("private").unwrap_err();
+        assert_eq!(error.kind, PowderErrorKind::Unauthorized);
+        assert!(error.message.contains("403"));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn path_segments_are_percent_encoded() {
         assert_eq!(encode_path("repo/card 1"), "repo%2Fcard%201");
     }
@@ -762,6 +1062,8 @@ mod tests {
             for expected_path in [
                 "/api/v1/repositories",
                 "/api/v1/repositories/repo%2Fone",
+                "/api/v1/repositories/repo-board",
+                "/api/v1/cards?repo=repo-board&limit=1000",
                 "/api/v1/cards/card-1?detail=detailed",
                 "/api/v1/cards/card-1/claim",
                 "/api/v1/cards/card-1/heartbeat",
@@ -838,6 +1140,28 @@ mod tests {
                         }]
                     })
                     .to_string()
+                } else if expected_path == "/api/v1/repositories/repo-board" {
+                    json!({
+                        "name": "repo-board",
+                        "aliases": [],
+                        "tier": "active",
+                        "card_count": 1
+                    })
+                    .to_string()
+                } else if expected_path == "/api/v1/cards?repo=repo-board&limit=1000" {
+                    json!({
+                        "cards": [{
+                            "id": "repo-board-1",
+                            "title": "Board card",
+                            "status": "ready",
+                            "priority": "p1",
+                            "labels": [],
+                            "updated_at": 123
+                        }],
+                        "total_count": 1,
+                        "has_more": false
+                    })
+                    .to_string()
                 } else if expected_path.contains("repositories/") {
                     json!({ "name": "repo/one" }).to_string()
                 } else if expected_path.contains("?detail=") {
@@ -877,6 +1201,17 @@ mod tests {
         assert_eq!(
             client.get_repository("repo/one").unwrap()["name"],
             "repo/one"
+        );
+        assert_eq!(
+            client
+                .repository_for_board("repo-board")
+                .unwrap()
+                .card_count,
+            1
+        );
+        assert_eq!(
+            client.board_page("repo-board", 1000).unwrap().cards[0].id,
+            "repo-board-1"
         );
         assert_eq!(client.get_card("card-1").unwrap()["repo"], "repo-1");
         let claim = client.claim("card-1", 3600).unwrap();

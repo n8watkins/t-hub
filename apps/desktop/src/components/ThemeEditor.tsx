@@ -330,8 +330,6 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
   );
   const fileIconTheme = useSettings((s) => s.fileIconTheme);
   const setFileIconTheme = useSettings((s) => s.setFileIconTheme);
-  const powderBoardUrl = useSettings((s) => s.powderBoardUrl);
-  const setPowderBoardUrl = useSettings((s) => s.setPowderBoardUrl);
   // Recovery review modal open state (#recovery) — local to this section; the
   // modal is fully self-contained and renders its own overlay above the panel.
   const [recoveryOpen, setRecoveryOpen] = useState(false);
@@ -414,25 +412,6 @@ function GeneralSection({ onNavigate }: { onNavigate: (s: SectionId) => void }) 
         </Row>
       </Group>
 
-      <Group
-        title="Board"
-        description="The Board tab embeds the powder board (a self-hostable agent work-ledger) in a tile. Set the URL each tile's Board tab loads by default — the local dev server, or a tailnet URL in production."
-      >
-        <Row label="Board URL">
-          <input
-            value={powderBoardUrl}
-            onChange={(e) => setPowderBoardUrl(e.target.value)}
-            placeholder="http://localhost:4000"
-            spellCheck={false}
-            autoCorrect="off"
-            autoCapitalize="off"
-            autoComplete="off"
-            className="w-full rounded border bg-transparent px-2 py-1 text-sm"
-            style={{ borderColor: "var(--th-border)", color: "var(--th-fg)" }}
-            aria-label="Powder board URL"
-          />
-        </Row>
-      </Group>
 
       {/* The notification sound + desktop-notification toggles moved into
           Hooks → "Attention & notifications", next to the events that trigger

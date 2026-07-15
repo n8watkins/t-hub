@@ -81,7 +81,7 @@ export interface WebPreviewProps {
   /** Called with the normalized URL each time the user commits a navigation (URL
    *  bar submit or a detected-URL chip). Lets a host tile persist the last-viewed
    *  address so it survives a tab switch (e.g. usePanels.setPreviewUrl /
-   *  setBoardUrl). Optional — the standalone preview doesn't need it. */
+   *  setPreviewUrl). Optional because standalone previews do not persist it. */
   onNavigate?: (url: string) => void;
 }
 

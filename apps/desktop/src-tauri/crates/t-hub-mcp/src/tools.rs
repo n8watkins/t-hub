@@ -383,6 +383,19 @@ fn schema_list_powder_boards() -> Value {
     })
 }
 
+fn schema_project_board_snapshot() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "terminalId": { "type": "string", "minLength": 1, "description": "Focused T-Hub terminal id. Durable Captain or Crew ownership wins over cwd." },
+            "cwd": { "type": "string", "description": "Optional fallback WSL cwd for an ordinary terminal; T-Hub resolves its canonical Git main worktree." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum repository-scoped cards to return; defaults to 1000." }
+        },
+        "required": ["terminalId"],
+        "additionalProperties": false
+    })
+}
+
 fn schema_captain_bootstrap() -> Value {
     json!({
         "type": "object",
@@ -752,6 +765,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_bind_project_powder,
         },
         ToolDef {
+            name: "project_board_snapshot",
+            tier: Tier::Read,
+            summary: "Resolve a terminal's durable Project and return a bounded, credential-safe snapshot of its Powder board.",
+            input_schema: schema_project_board_snapshot,
+        },
+        ToolDef {
             name: "watch_fleet",
             tier: Tier::Organization,
             summary: "Arm an orchestrator wake: T-Hub re-invokes YOUR loop (injects a prompt into your terminal) when a watched session (default: any captain) goes idle / needs-input / completes. Ends the need to poll. Idempotent; re-arming replaces the prior watch.",
@@ -1001,9 +1020,13 @@ mod tests {
             (boards.input_schema)()["properties"]["limit"]["maximum"],
             500
         );
+        assert_eq!((boards.input_schema)()["additionalProperties"], false);
+        let snapshot = find("project_board_snapshot").unwrap();
+        assert_eq!(snapshot.tier, Tier::Read);
+        assert_eq!((snapshot.input_schema)()["required"], json!(["terminalId"]));
         assert_eq!(
-            (boards.input_schema)()["additionalProperties"],
-            false
+            (snapshot.input_schema)()["properties"]["limit"]["maximum"],
+            1000
         );
 
         for name in ["register_project", "bind_project_powder"] {

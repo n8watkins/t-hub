@@ -18,11 +18,9 @@
 //                 a freshly-started dev server loads automatically.
 //   - dev     -> <DevTab terminalId cwd/>            (the managed dev runner; it
 //                 publishes setDevUrl, which the Preview branch above consumes)
-//   - board   -> <WebPreview initialUrl={boardUrl ?? powderBoardUrl} />
-//                 Embeds the powder board (or any URL). Reuses the SAME
-//                 WebPreview surface as Preview; seeds from the per-tile last
-//                 URL else the configured default (settings.powderBoardUrl), and
-//                 persists committed navigations via usePanels.setBoardUrl.
+//   - board   -> <BoardPanel terminalId cwd />
+//                 Resolves the durable Project and its protected Powder binding
+//                 through one backend snapshot. Credentials never enter the UI.
 //
 // Tile.tsx only renders TilePanel when the active tab is NOT "terminal" (for the
 // terminal tab it renders the pool placeholder instead), so this component never
@@ -30,10 +28,10 @@
 import type { ReactElement } from "react";
 import type { TerminalId } from "../ipc/types";
 import { usePanels, type PanelTab } from "../store/panels";
-import { useSettings } from "../store/settings";
 import { FilePanel } from "./FilePanel";
 import { WebPreview } from "./WebPreview";
 import { DevTab } from "./DevTab";
+import { BoardPanel } from "./BoardPanel";
 
 export interface TilePanelProps {
   /** The terminal/project this tile belongs to (keys all per-tile panel state). */
@@ -68,13 +66,6 @@ export function TilePanel({
   // one-click chips in the Preview bar. Guard undefined (no detections yet) -> [].
   const detectedUrls = usePanels((s) => s.detectedUrls[terminalId]) ?? [];
   const setPreviewUrl = usePanels((s) => s.setPreviewUrl);
-  // Board tab: last-committed per-tile URL, falling back to the configured
-  // powder-board default (settings.powderBoardUrl). Subscribed narrowly so only
-  // this tile / the default changing re-renders the board.
-  const boardUrl = usePanels((s) => s.boardUrl[terminalId]);
-  const powderBoardUrl = useSettings((s) => s.powderBoardUrl);
-  const setBoardUrl = usePanels((s) => s.setBoardUrl);
-
   switch (tab) {
     case "files":
       return (
@@ -94,14 +85,6 @@ export function TilePanel({
       // initialUrl — so starting a server here auto-loads it in Preview.
       return <DevTab terminalId={terminalId} cwd={cwd} />;
     case "board":
-      // Embed the powder board (or any URL). Seeds from the per-tile last URL,
-      // else the configured default; committed navigations persist per tile so
-      // they survive tab switches. Reuses the same WebPreview surface as Preview.
-      return (
-        <WebPreview
-          initialUrl={boardUrl ?? powderBoardUrl}
-          onNavigate={(url) => setBoardUrl(terminalId, url)}
-        />
-      );
+      return <BoardPanel terminalId={terminalId} cwd={cwd} />;
   }
 }

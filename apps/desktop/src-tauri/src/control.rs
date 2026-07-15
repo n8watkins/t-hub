@@ -5730,6 +5730,7 @@ fn dispatch_with_caller(
         "list_captains" => list_captains(ctx),
         "list_projects" => list_projects(ctx),
         "list_powder_boards" => list_powder_boards(args),
+        "project_board_snapshot" => project_board_snapshot(ctx, args),
         "captain_bootstrap" => captain_bootstrap(ctx, args),
         "powder_status" => powder_status(ctx, args),
         "list_fleet_watches" => list_fleet_watches(ctx),
@@ -6457,6 +6458,287 @@ fn list_powder_boards(args: &Value) -> Result<Value, String> {
         offset,
         limit,
     ))
+}
+
+/// Resolve the focused terminal to one durable Project and return a bounded,
+/// credential-safe snapshot of only that Project's Powder board.
+fn project_board_snapshot(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
+    let terminal_id = arg_str(args, "terminalId")
+        .or_else(|| arg_str(args, "terminal_id"))
+        .ok_or("project_board_snapshot requires a 'terminalId' argument")?;
+    let fallback_cwd = arg_str(args, "cwd").filter(|cwd| !cwd.trim().is_empty());
+    let limit = bounded_board_limit(args)?;
+    let (project, resolution) = match resolve_board_project(ctx, &terminal_id, fallback_cwd)? {
+        Some(resolved) => resolved,
+        None => {
+            return Ok(board_problem(
+                "noProject",
+                "no_project",
+                "This terminal is not linked to a registered T-Hub Project.",
+                false,
+                None,
+                None,
+            ));
+        }
+    };
+    let Some(binding) = project.powder.clone() else {
+        return Ok(board_problem(
+            "unbound",
+            "powder_not_bound",
+            "This Project does not have a Powder board binding.",
+            false,
+            Some((&project, resolution)),
+            None,
+        ));
+    };
+    let client = match powder::Client::from_profile(&binding.connection_profile) {
+        Ok(client) => client,
+        Err(_) => {
+            return Ok(board_problem(
+                "misconfigured",
+                "profile_unavailable",
+                "The protected Powder connection profile is unavailable or invalid.",
+                false,
+                Some((&project, resolution)),
+                Some(&binding),
+            ));
+        }
+    };
+    let external = json!({
+        "url": client.external_board_url(),
+        "repositoryFilterApplied": false,
+    });
+    let repository = match client.repository_for_board(&binding.repository) {
+        Ok(repository) => repository,
+        Err(error) => {
+            return Ok(board_powder_error(
+                error,
+                &project,
+                resolution,
+                &binding,
+                Some(external),
+            ));
+        }
+    };
+    let page = match client.board_page(&binding.repository, limit) {
+        Ok(page) => page,
+        Err(error) => {
+            return Ok(board_powder_error(
+                error,
+                &project,
+                resolution,
+                &binding,
+                Some(external),
+            ));
+        }
+    };
+    let status = if page.has_more { "degraded" } else { "ready" };
+    let mut result = json!({
+        "schemaVersion": 1,
+        "status": status,
+        "resolution": resolution,
+        "project": board_project_json(&project),
+        "binding": board_binding_json(&binding),
+        "board": {
+            "repository": repository,
+            "cards": page.cards,
+            "totalCount": page.total_count,
+            "hasMore": page.has_more,
+            "refreshedAt": now_ms(),
+        },
+        "external": external,
+    });
+    if page.has_more {
+        result["problem"] = json!({
+            "code": "card_limit_reached",
+            "message": format!("Showing the first {limit} cards. Narrow the board in Powder to review the complete result."),
+            "retryable": false,
+        });
+    }
+    Ok(result)
+}
+
+fn bounded_board_limit(args: &Value) -> Result<usize, String> {
+    let Some(value) = args.get("limit") else {
+        return Ok(1000);
+    };
+    let value = value
+        .as_u64()
+        .ok_or("project_board_snapshot limit must be a positive integer")?;
+    let value = usize::try_from(value)
+        .map_err(|_| "project_board_snapshot limit is too large".to_string())?;
+    if value == 0 || value > 1000 {
+        return Err("project_board_snapshot limit must be between 1 and 1000".into());
+    }
+    Ok(value)
+}
+
+fn resolve_board_project(
+    ctx: &ControlContext,
+    terminal_id: &str,
+    fallback_cwd: Option<String>,
+) -> Result<Option<(ProjectRecord, &'static str)>, String> {
+    let snapshot = ctx.captains.snapshot();
+    if let Some(project_id) = snapshot
+        .captains
+        .iter()
+        .find(|captain| captain.terminal_id.as_deref() == Some(terminal_id))
+        .and_then(|captain| captain.project_id.as_deref())
+    {
+        return project_by_id(&snapshot.projects, project_id)
+            .map(|project| Some((project, "captain")));
+    }
+    if let Some(project_id) = snapshot.captains.iter().find_map(|captain| {
+        captain
+            .crew
+            .iter()
+            .any(|crew| crew.terminal_id == terminal_id)
+            .then_some(captain.project_id.as_deref())
+            .flatten()
+    }) {
+        return project_by_id(&snapshot.projects, project_id)
+            .map(|project| Some((project, "crew")));
+    }
+    let live_cwd = tmux::pane_info()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|pane| pane.session == format!("th_{terminal_id}"))
+        .map(|pane| pane.cwd)
+        .filter(|cwd| !cwd.trim().is_empty())
+        .or(fallback_cwd);
+    let Some(cwd) = live_cwd else {
+        return Ok(None);
+    };
+    let worktrees = git::worktree_list(&cwd).unwrap_or_default();
+    let Some(main_root) = worktrees
+        .iter()
+        .find(|worktree| !worktree.is_linked)
+        .map(|worktree| worktree.path.as_str())
+    else {
+        return Ok(None);
+    };
+    let canonical_main = canonical_board_root(main_root)?;
+    let matches = snapshot
+        .projects
+        .iter()
+        .filter_map(|project| {
+            canonical_board_root(&project.repo_root)
+                .ok()
+                .filter(|root| *root == canonical_main)
+                .map(|_| project.clone())
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [project] => Ok(Some((project.clone(), "cwd"))),
+        _ => Err(
+            "project_board_snapshot: multiple Projects resolve to the same Git main worktree"
+                .into(),
+        ),
+    }
+}
+
+fn project_by_id(projects: &[ProjectRecord], project_id: &str) -> Result<ProjectRecord, String> {
+    projects
+        .iter()
+        .find(|project| project.project_id == project_id)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "project_board_snapshot: durable terminal identity references unknown projectId '{project_id}'"
+            )
+        })
+}
+
+fn canonical_board_root(path: &str) -> Result<std::path::PathBuf, String> {
+    std::fs::canonicalize(files::to_host_path(path)).map_err(|error| {
+        format!("project_board_snapshot: could not canonicalize Project root: {error}")
+    })
+}
+
+fn board_project_json(project: &ProjectRecord) -> Value {
+    json!({
+        "projectId": project.project_id,
+        "name": project.name,
+        "repoRoot": project.repo_root,
+    })
+}
+
+fn board_binding_json(binding: &PowderProjectBinding) -> Value {
+    json!({
+        "repository": binding.repository,
+        "connectionProfile": binding.connection_profile,
+    })
+}
+
+fn board_problem(
+    status: &str,
+    code: &str,
+    message: &str,
+    retryable: bool,
+    project: Option<(&ProjectRecord, &'static str)>,
+    binding: Option<&PowderProjectBinding>,
+) -> Value {
+    let mut result = json!({
+        "schemaVersion": 1,
+        "status": status,
+        "resolution": project.map(|(_, resolution)| resolution).unwrap_or("none"),
+        "problem": { "code": code, "message": message, "retryable": retryable },
+    });
+    if let Some((project, _)) = project {
+        result["project"] = board_project_json(project);
+    }
+    if let Some(binding) = binding {
+        result["binding"] = board_binding_json(binding);
+    }
+    result
+}
+
+fn board_powder_error(
+    error: powder::PowderError,
+    project: &ProjectRecord,
+    resolution: &'static str,
+    binding: &PowderProjectBinding,
+    external: Option<Value>,
+) -> Value {
+    let (status, code, message, retryable) = match error.kind {
+        powder::PowderErrorKind::Unauthorized => (
+            "unauthorized",
+            "powder_unauthorized",
+            "Powder refused this protected connection profile.",
+            false,
+        ),
+        powder::PowderErrorKind::NotFound => (
+            "repositoryMissing",
+            "repository_missing",
+            "The bound Powder board no longer exists or is not visible.",
+            false,
+        ),
+        powder::PowderErrorKind::Unreachable => (
+            "unreachable",
+            "powder_unreachable",
+            "The Powder service is unreachable.",
+            true,
+        ),
+        powder::PowderErrorKind::InvalidResponse | powder::PowderErrorKind::Upstream => (
+            "error",
+            "powder_error",
+            "Powder returned an unexpected response.",
+            true,
+        ),
+    };
+    let mut result = board_problem(
+        status,
+        code,
+        message,
+        retryable,
+        Some((project, resolution)),
+        Some(binding),
+    );
+    if let Some(external) = external {
+        result["external"] = external;
+    }
+    result
 }
 
 fn bounded_collection_arg(
@@ -15187,6 +15469,118 @@ mod tests {
         assert!(error.contains("parent directory"), "got: {error}");
         assert!(!parent.join("missing").exists());
         let _ = std::fs::remove_dir(parent);
+    }
+
+    #[test]
+    fn project_board_snapshot_prefers_durable_captain_project_identity() {
+        let ctx = test_ctx("secret");
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-board".into(),
+                name: "Board Project".into(),
+                repo_root: "/tmp/registered-board-project".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        ctx.captains
+            .claim_test("captain-board", Some("board-ship"), vec![])
+            .unwrap();
+        ctx.captains
+            .bind_ship_context("board-ship", "project-board", "Own Board", "codex")
+            .unwrap();
+
+        let snapshot = dispatch(
+            &ctx,
+            "project_board_snapshot",
+            &json!({
+                "terminalId": "captain-board",
+                "cwd": "/tmp/an-unrelated-directory"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot["status"], "unbound");
+        assert_eq!(snapshot["resolution"], "captain");
+        assert_eq!(snapshot["project"]["projectId"], "project-board");
+        assert_eq!(snapshot["problem"]["code"], "powder_not_bound");
+
+        ctx.captains
+            .record_crew("captain-board", "crew-board")
+            .unwrap();
+        let crew_snapshot = dispatch(
+            &ctx,
+            "project_board_snapshot",
+            &json!({ "terminalId": "crew-board", "cwd": "/tmp/elsewhere" }),
+        )
+        .unwrap();
+        assert_eq!(crew_snapshot["resolution"], "crew");
+        assert_eq!(crew_snapshot["project"]["projectId"], "project-board");
+    }
+
+    #[test]
+    fn project_board_snapshot_resolves_a_nested_cwd_to_its_git_main_worktree() {
+        let ctx = test_ctx("secret");
+        let root = std::env::temp_dir().join(format!(
+            "t-hub-board-cwd-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let root_text = root.to_string_lossy().to_string();
+        git::initialize_repository(&root_text).unwrap();
+        let nested = root.join("src").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        ctx.captains
+            .upsert_project(ProjectRecord {
+                project_id: "project-cwd".into(),
+                name: "Cwd Project".into(),
+                repo_root: root_text,
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+
+        let snapshot = dispatch(
+            &ctx,
+            "project_board_snapshot",
+            &json!({
+                "terminalId": "ordinary-board-terminal",
+                "cwd": nested.to_string_lossy()
+            }),
+        )
+        .unwrap();
+        assert_eq!(snapshot["status"], "unbound");
+        assert_eq!(snapshot["resolution"], "cwd");
+        assert_eq!(snapshot["project"]["projectId"], "project-cwd");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_board_snapshot_reports_unregistered_and_rejects_bad_limits() {
+        let ctx = test_ctx("secret");
+        let snapshot = dispatch(
+            &ctx,
+            "project_board_snapshot",
+            &json!({ "terminalId": "ordinary", "cwd": "/tmp" }),
+        )
+        .unwrap();
+        assert_eq!(snapshot["status"], "noProject");
+        assert_eq!(snapshot["resolution"], "none");
+
+        let error = dispatch(
+            &ctx,
+            "project_board_snapshot",
+            &json!({ "terminalId": "ordinary", "limit": 1001 }),
+        )
+        .unwrap_err();
+        assert!(error.contains("between 1 and 1000"));
     }
 
     #[test]
