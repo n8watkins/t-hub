@@ -13,7 +13,7 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `e95eb56`.
+**Source head before this handoff update:** `3816bf4`.
 **Installed Windows build:** locally built T-Hub `0.3.93` from exact detached source `e95eb56`.
 
 ## Executive Status
@@ -378,7 +378,14 @@ Installed `0.3.93` passed the graphical same-cwd Git-header proof with one `git_
 The isolated packaged retry at PID `20132` completed 55 samples over 60.96 seconds, but host-bridge triplets produced 12 births, 15 deaths, and seven incomplete intervals even though GitInfo stayed on the persistent agent.
 Artifact `artifacts/perf/t-hub-0.3.93-1t-20260715T0204-r2.json` is diagnostic and reports `release_acceptance_eligible: false`.
 The normal canonical profile was restored as PID `23436`, the disposable performance socket and profiles were removed, and the same six canonical tmux names and pane PIDs remained intact.
-Phase 11 remains blocked on diagnosing and removing the residual host-bridge triplet churn, then producing an eligible packaged one-terminal rerun before the 4, 8, and 16 terminal scenarios.
+Read-only descendant tracing attributed the residual periodic host-bridge lane to terminal reconciliation, which collected tmux sessions and pane metadata through recurring Windows-to-WSL subprocesses.
+Source commit `3816bf4` adds the additive `TerminalSnapshot` protocol operation, routes normal terminal reconciliation through the persistent WSL agent, and versions the uninstalled source as desktop `0.3.94` with agent and protocol `0.5.2`.
+The compatibility scan is limited to one bootstrap attempt for a disconnected or explicitly unsupported agent, never runs after agent success, and does not run after timeout or agent command failure.
+The agent collector bounds each sequential collection step to four seconds, drains output concurrently, and kills and reaps its process group on timeout.
+The `0.3.94` source gate passed 471 frontend tests, TypeScript and the production frontend build, 641 desktop Rust tests with one ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, diff checks, focused timeout regressions, and the performance harness self-tests.
+Runtime re-verification after that commit found the unchanged installed desktop `0.3.93` at PID `23436` with SHA-256 `4F82CCB76A60B8481FF69601CDB0E7BDCB459CE00B83B31CADA125E688BC5643` and the unchanged installed agent `0.5.1` at PID `1930912`.
+The six canonical tmux names and pane PIDs also remained unchanged.
+Phase 11 remains blocked pending matching `0.3.94` and agent `0.5.2` deployment, graphical agent-route proof, and an eligible packaged one-terminal rerun before the 4, 8, and 16 terminal scenarios.
 The local Powder endpoint and protected agent credential path are operational.
 That earlier packaged xterm lifecycle, detach recovery, duplicate-launch, and diagnostic-retention gate passed with eight live tmux sessions preserved.
 The installed `a00ce7d` build reproduced one `listTerminals failed` event from the bounded 10-second WSL command timeout before recovery.

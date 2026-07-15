@@ -690,8 +690,14 @@ Commit `d73f9cb` versions desktop `0.3.93`, with agent and protocol `0.5.1` from
 Installed `0.3.93` with agent `0.5.1` passed the graphical same-cwd Git-header proof, emitted one `git_info source=agent` marker, and emitted no fallback or agent-error marker in the proof window.
 The isolated packaged retry at PID `20132` completed 55 samples over 60.96 seconds with one visible idle shell tile and the same exclusive agent route, but recurring host-bridge triplets produced 12 births, 15 deaths, and seven incomplete intervals.
 Artifact `artifacts/perf/t-hub-0.3.93-1t-20260715T0204-r2.json` therefore remains diagnostic and reports `release_acceptance_eligible: false`.
-The residual churn is not the repaired `GitInfo` fallback and requires separate process-lifecycle diagnosis.
-The remaining Phase 11 gate is to diagnose and remove the residual host-bridge triplet churn, then produce an eligible repeated packaged one-terminal artifact from the matching runtime.
+Read-only descendant tracing attributed the residual periodic host-bridge lane to terminal reconciliation, which collected tmux sessions and pane metadata through recurring Windows-to-WSL subprocesses.
+Source commit `3816bf4` adds the additive `TerminalSnapshot` protocol operation and routes normal `list_terminals` reconciliation through the persistent WSL agent.
+The compatibility scan is limited to one bootstrap attempt for a disconnected or explicitly unsupported agent, is never resumed after agent success, and does not run after a timeout or agent command failure.
+The agent collector bounds each of its two sequential steps to four seconds, drains both output pipes concurrently, and kills and reaps the collector process group on timeout.
+The uninstalled source is desktop `0.3.94` with agent and protocol `0.5.2`.
+Its source gate passed 471 frontend tests, TypeScript and the production frontend build, 641 desktop Rust tests with one ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, diff checks, focused inherited-pipe and large-output timeout regressions, and the performance harness self-tests.
+Installed `0.3.93` with agent `0.5.1` remains unchanged and cannot prove the new capability.
+Phase 11 remains blocked pending exact matching `0.3.94` and agent `0.5.2` deployment, graphical `terminal_snapshot source=agent` evidence with no fallback or error marker, and an eligible repeated packaged one-terminal artifact.
 The 4, 8, and 16 terminal scenarios must not run until the one-terminal gate is eligible.
 
 ### Goal
