@@ -4145,7 +4145,7 @@ dependencies = [
 
 [[package]]
 name = "t-hub"
-version = "0.3.93"
+version = "0.3.94"
 dependencies = [
  "anyhow",
  "async-lock",
@@ -4183,10 +4183,11 @@ dependencies = [
 
 [[package]]
 name = "t-hub-agent"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "libc",
  "serde",
  "serde_json",
  "t-hub-protocol",
@@ -4202,7 +4203,7 @@ dependencies = [
 
 [[package]]
 name = "t-hub-protocol"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "serde",
  "serde_json",

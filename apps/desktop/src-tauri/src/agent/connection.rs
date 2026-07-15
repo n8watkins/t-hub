@@ -381,6 +381,21 @@ mod transport_tests {
             other => panic!("expected Sessions, got {other:?}"),
         }
 
+        // --- TerminalSnapshot ---
+        let resp = bridge
+            .request(t_hub_protocol::AgentRequest::TerminalSnapshot)
+            .expect("TerminalSnapshot must return a response");
+        match resp {
+            t_hub_protocol::AgentResponse::TerminalSnapshot(snapshot) => {
+                eprintln!(
+                    "live_round_trip: terminal_snapshot sessions={} panes={}",
+                    snapshot.sessions.len(),
+                    snapshot.panes.len()
+                );
+            }
+            other => panic!("expected TerminalSnapshot, got {other:?}"),
+        }
+
         // --- Metrics ---
         let resp = bridge
             .request(t_hub_protocol::AgentRequest::Metrics)

@@ -191,6 +191,9 @@ pub enum AgentRequest {
     // --- tmux / session registry (Channel::Control) ---
     /// List tmux sessions on the isolated `t-hub` socket.
     ListSessions,
+    /// Complete terminal reconciliation snapshot collected inside the persistent
+    /// WSL agent, avoiding recurring Windows host-bridge process trees.
+    TerminalSnapshot,
     /// Create a detached tmux session.
     NewSession {
         name: String,
@@ -278,6 +281,8 @@ pub struct Ready {
 pub enum AgentResponse {
     /// `list_sessions` → tmux session names on the `t-hub` socket.
     Sessions { names: Vec<String> },
+    /// `terminal_snapshot` → live sessions plus pane command/cwd metadata.
+    TerminalSnapshot(TerminalSnapshot),
     /// `new_session` succeeded.
     SessionCreated,
     /// `has_session` → existence.
@@ -336,6 +341,21 @@ pub struct GitInfo {
     pub head_commit: Option<String>,
     pub remote_url: Option<String>,
     pub default_branch: Option<String>,
+}
+
+/// One pane's live metadata used to reconcile terminal titles and working dirs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalPane {
+    pub session: String,
+    pub command: String,
+    pub cwd: String,
+}
+
+/// One terminal reconciliation response collected by the persistent WSL agent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSnapshot {
+    pub sessions: Vec<String>,
+    pub panes: Vec<TerminalPane>,
 }
 
 /// A snapshot of WSL host health, surfaced in the utility area (PLAN.md §H).
@@ -636,6 +656,54 @@ mod tests {
                 ..
             } => assert_eq!(actual, info),
             other => panic!("expected GitInfo response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_snapshot_request_and_response_roundtrip() {
+        let req = CoreFrame {
+            channel: Channel::Control,
+            msg: CoreToAgent::Request {
+                id: 44,
+                priority: Priority::Low,
+                body: AgentRequest::TerminalSnapshot,
+            },
+        };
+        let line = encode_core(&req).unwrap();
+        assert!(line.contains(r#""op":"terminal_snapshot""#));
+        let back = decode_core(&line).unwrap();
+        assert!(matches!(
+            back.msg,
+            CoreToAgent::Request {
+                body: AgentRequest::TerminalSnapshot,
+                ..
+            }
+        ));
+
+        let snapshot = TerminalSnapshot {
+            sessions: vec!["th_abc".into()],
+            panes: vec![TerminalPane {
+                session: "th_abc".into(),
+                command: "codex".into(),
+                cwd: "/home/u/repo".into(),
+            }],
+        };
+        let resp = AgentFrame {
+            channel: Channel::Control,
+            msg: AgentToCore::Response {
+                id: 44,
+                body: AgentResponse::TerminalSnapshot(snapshot.clone()),
+            },
+        };
+        let line = encode_agent(&resp).unwrap();
+        assert!(line.contains(r#""result":"terminal_snapshot""#));
+        let back = decode_agent(&line).unwrap();
+        match back.msg {
+            AgentToCore::Response {
+                body: AgentResponse::TerminalSnapshot(actual),
+                ..
+            } => assert_eq!(actual, snapshot),
+            other => panic!("expected TerminalSnapshot response, got {other:?}"),
         }
     }
 

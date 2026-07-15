@@ -25,6 +25,11 @@ pub fn handle(journal: &Journal, req: AgentRequest) -> AgentResponse {
             Err(e) => err(ResponseErrorKind::CommandFailed, e.to_string()),
         },
 
+        AgentRequest::TerminalSnapshot => match registry::terminal_snapshot() {
+            Ok(snapshot) => AgentResponse::TerminalSnapshot(snapshot),
+            Err(e) => err(ResponseErrorKind::CommandFailed, e.to_string()),
+        },
+
         AgentRequest::NewSession { name, cwd, command } => {
             let res = registry::new_session(&name, &cwd, command.as_deref());
             record_command(journal, &name, "new_session", res.as_ref().err());
@@ -122,6 +127,14 @@ mod tests {
         let (j, dir) = temp_journal("metrics");
         let resp = handle(&j, AgentRequest::Metrics);
         assert!(matches!(resp, AgentResponse::Metrics(_)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn terminal_snapshot_request_returns_snapshot() {
+        let (j, dir) = temp_journal("terminal-snapshot");
+        let resp = handle(&j, AgentRequest::TerminalSnapshot);
+        assert!(matches!(resp, AgentResponse::TerminalSnapshot(_)));
         std::fs::remove_dir_all(&dir).ok();
     }
 

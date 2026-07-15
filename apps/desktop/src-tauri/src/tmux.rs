@@ -727,6 +727,7 @@ pub fn list_sessions() -> Result<Vec<String>, TmuxError> {
 /// Per-session foreground command + current working directory, so the UI can
 /// label a tile by what's actually running (`claude`, `zsh`, ...) and where,
 /// instead of a raw session id.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneInfo {
     pub session: String,
     pub command: String,

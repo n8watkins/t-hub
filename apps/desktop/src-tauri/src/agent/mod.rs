@@ -33,7 +33,8 @@ use std::sync::{mpsc, Arc, LazyLock, Weak};
 use parking_lot::Mutex;
 use t_hub_protocol::{
     AgentRequest, AgentResponse, Channel, CoreFrame, CoreToAgent, EventJournalEntry, GitInfo,
-    Hello, HostMetrics, Priority, ResponseErrorKind, WorktreeInfo, PROTOCOL_VERSION,
+    Hello, HostMetrics, Priority, ResponseErrorKind, TerminalSnapshot, WorktreeInfo,
+    PROTOCOL_VERSION,
 };
 
 use crate::supervision::Supervisor;
@@ -195,6 +196,43 @@ pub enum GitInfoBridgeError {
     Disconnected(String),
     Unsupported(String),
     CommandFailed(String),
+}
+
+/// Stable failure categories for the terminal snapshot capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalSnapshotBridgeError {
+    Disconnected(String),
+    TimedOut(String),
+    Unsupported(String),
+    CommandFailed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentRequestError {
+    Disconnected(String),
+    WriteFailed(String),
+    TimedOut(String),
+}
+
+fn classify_request_receive_error(id: u64, error: mpsc::RecvTimeoutError) -> AgentRequestError {
+    match error {
+        mpsc::RecvTimeoutError::Timeout => {
+            AgentRequestError::TimedOut(format!("request id={id} timed out after 10 seconds"))
+        }
+        mpsc::RecvTimeoutError::Disconnected => AgentRequestError::Disconnected(format!(
+            "agent bridge disconnected while awaiting request id={id}"
+        )),
+    }
+}
+
+impl std::fmt::Display for AgentRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected(message) | Self::WriteFailed(message) | Self::TimedOut(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
 }
 
 impl BridgeInner {
@@ -498,14 +536,13 @@ impl AgentBridge {
     /// **Channel / Priority**: `Channel::Control` and `Priority::Normal` are
     /// used for all requests today. A future scheduler can inspect the request
     /// body to select the appropriate channel and priority before writing.
-    pub fn request(&self, req: AgentRequest) -> Result<AgentResponse, String> {
+    pub fn request(&self, req: AgentRequest) -> Result<AgentResponse, AgentRequestError> {
         // Grab the transport handles (returns an error if not connected).
         let handles = {
             let guard = self.inner.transport.lock();
-            guard
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| "agent bridge not connected".to_string())?
+            guard.as_ref().cloned().ok_or_else(|| {
+                AgentRequestError::Disconnected("agent bridge not connected".to_string())
+            })?
         };
 
         // Allocate a unique request id.
@@ -537,25 +574,38 @@ impl AgentBridge {
             write_frame(&mut *stdin_guard, &frame).map_err(|e| {
                 // Remove the dangling correlation entry on write failure.
                 handles.pending.lock().remove(&id);
-                format!("failed to write request id={id}: {e}")
+                AgentRequestError::WriteFailed(format!("failed to write request id={id}: {e}"))
             })?;
         }
 
         // Block until the reader delivers the response or we time out.
         match rx.recv_timeout(std::time::Duration::from_secs(10)) {
             Ok(response) => Ok(response),
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Clean up the correlation entry so the reader doesn't deliver
                 // a stale response after we've given up.
                 handles.pending.lock().remove(&id);
-                Err(format!("request id={id} timed out after 10 seconds"))
+                Err(classify_request_receive_error(
+                    id,
+                    mpsc::RecvTimeoutError::Timeout,
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                handles.pending.lock().remove(&id);
+                Err(classify_request_receive_error(
+                    id,
+                    mpsc::RecvTimeoutError::Disconnected,
+                ))
             }
         }
     }
 
     /// Convenience: fetch a host metrics snapshot.
     pub fn metrics(&self) -> Result<HostMetrics, String> {
-        match self.request(AgentRequest::Metrics)? {
+        match self
+            .request(AgentRequest::Metrics)
+            .map_err(|e| e.to_string())?
+        {
             AgentResponse::Metrics(m) => Ok(m),
             other => Err(format!("unexpected response to metrics: {other:?}")),
         }
@@ -563,9 +613,12 @@ impl AgentBridge {
 
     /// Convenience: derive the current git branch for `cwd` (statusline lacks it).
     pub fn git_branch(&self, cwd: &str) -> Result<Option<String>, String> {
-        match self.request(AgentRequest::GitBranch {
-            cwd: cwd.to_string(),
-        })? {
+        match self
+            .request(AgentRequest::GitBranch {
+                cwd: cwd.to_string(),
+            })
+            .map_err(|e| e.to_string())?
+        {
             AgentResponse::GitBranch { branch } => Ok(branch),
             other => Err(format!("unexpected response to git_branch: {other:?}")),
         }
@@ -573,9 +626,12 @@ impl AgentBridge {
 
     /// Convenience: list worktrees for the repo containing `cwd`.
     pub fn git_worktrees(&self, cwd: &str) -> Result<Vec<WorktreeInfo>, String> {
-        match self.request(AgentRequest::GitWorktrees {
-            cwd: cwd.to_string(),
-        })? {
+        match self
+            .request(AgentRequest::GitWorktrees {
+                cwd: cwd.to_string(),
+            })
+            .map_err(|e| e.to_string())?
+        {
             AgentResponse::GitWorktrees { worktrees } => Ok(worktrees),
             other => Err(format!("unexpected response to git_worktrees: {other:?}")),
         }
@@ -587,8 +643,24 @@ impl AgentBridge {
             .request(AgentRequest::GitInfo {
                 cwd: cwd.to_string(),
             })
-            .map_err(GitInfoBridgeError::Disconnected)?;
+            .map_err(|error| GitInfoBridgeError::Disconnected(error.to_string()))?;
         map_git_info_response(response)
+    }
+
+    /// Fetch terminal reconciliation metadata through the persistent agent.
+    pub fn terminal_snapshot(&self) -> Result<TerminalSnapshot, TerminalSnapshotBridgeError> {
+        let response =
+            self.request(AgentRequest::TerminalSnapshot)
+                .map_err(|error| match error {
+                    AgentRequestError::Disconnected(message)
+                    | AgentRequestError::WriteFailed(message) => {
+                        TerminalSnapshotBridgeError::Disconnected(message)
+                    }
+                    AgentRequestError::TimedOut(message) => {
+                        TerminalSnapshotBridgeError::TimedOut(message)
+                    }
+                })?;
+        map_terminal_snapshot_response(response)
     }
 
     /// Consume one journal entry: advance the cursor, feed supervision, emit the
@@ -788,6 +860,14 @@ pub fn git_info(cwd: &str) -> Result<GitInfo, GitInfoBridgeError> {
     AgentBridge { inner }.git_info(cwd)
 }
 
+/// Fetch terminal reconciliation metadata through the current application bridge.
+pub fn terminal_snapshot() -> Result<TerminalSnapshot, TerminalSnapshotBridgeError> {
+    let inner = ACTIVE_BRIDGE.lock().upgrade().ok_or_else(|| {
+        TerminalSnapshotBridgeError::Disconnected("agent bridge unavailable".to_string())
+    })?;
+    AgentBridge { inner }.terminal_snapshot()
+}
+
 fn map_git_info_response(response: AgentResponse) -> Result<GitInfo, GitInfoBridgeError> {
     match response {
         AgentResponse::GitInfo(info) => Ok(info),
@@ -799,6 +879,24 @@ fn map_git_info_response(response: AgentResponse) -> Result<GitInfo, GitInfoBrid
             "{kind:?}: {message}"
         ))),
         other => Err(GitInfoBridgeError::CommandFailed(format!(
+            "unexpected response: {other:?}"
+        ))),
+    }
+}
+
+fn map_terminal_snapshot_response(
+    response: AgentResponse,
+) -> Result<TerminalSnapshot, TerminalSnapshotBridgeError> {
+    match response {
+        AgentResponse::TerminalSnapshot(snapshot) => Ok(snapshot),
+        AgentResponse::Error {
+            kind: ResponseErrorKind::Unsupported,
+            message,
+        } => Err(TerminalSnapshotBridgeError::Unsupported(message)),
+        AgentResponse::Error { kind, message } => Err(TerminalSnapshotBridgeError::CommandFailed(
+            format!("{kind:?}: {message}"),
+        )),
+        other => Err(TerminalSnapshotBridgeError::CommandFailed(format!(
             "unexpected response: {other:?}"
         ))),
     }
@@ -944,6 +1042,18 @@ mod tests {
     }
 
     #[test]
+    fn request_receive_errors_preserve_timeout_and_disconnect_categories() {
+        assert!(matches!(
+            classify_request_receive_error(7, mpsc::RecvTimeoutError::Timeout),
+            AgentRequestError::TimedOut(message) if message.contains("id=7")
+        ));
+        assert!(matches!(
+            classify_request_receive_error(9, mpsc::RecvTimeoutError::Disconnected),
+            AgentRequestError::Disconnected(message) if message.contains("id=9")
+        ));
+    }
+
+    #[test]
     fn git_info_response_reports_unsupported_agent_capability() {
         let error = super::map_git_info_response(AgentResponse::Error {
             kind: ResponseErrorKind::Unsupported,
@@ -966,6 +1076,32 @@ mod tests {
         assert_eq!(
             error,
             GitInfoBridgeError::CommandFailed("CommandFailed: git timed out".to_string())
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_response_reports_unsupported_agent_capability() {
+        let error = super::map_terminal_snapshot_response(AgentResponse::Error {
+            kind: ResponseErrorKind::Unsupported,
+            message: "unsupported request op".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            TerminalSnapshotBridgeError::Unsupported("unsupported request op".to_string())
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_response_reports_agent_command_failure() {
+        let error = super::map_terminal_snapshot_response(AgentResponse::Error {
+            kind: ResponseErrorKind::CommandFailed,
+            message: "tmux timed out".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            TerminalSnapshotBridgeError::CommandFailed("CommandFailed: tmux timed out".to_string())
         );
     }
 
