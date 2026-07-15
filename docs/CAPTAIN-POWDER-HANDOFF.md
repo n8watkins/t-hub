@@ -383,6 +383,10 @@ Source commit `3816bf4` adds the additive `TerminalSnapshot` protocol operation,
 The compatibility scan is limited to one bootstrap attempt for a disconnected or explicitly unsupported agent, never runs after agent success, and does not run after timeout or agent command failure.
 The agent collector bounds each sequential collection step to four seconds, drains output concurrently, and kills and reaps its process group on timeout.
 The `0.3.94` source gate passed 471 frontend tests, TypeScript and the production frontend build, 641 desktop Rust tests with one ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, diff checks, focused timeout regressions, and the performance harness self-tests.
+The exact detached `3816bf4` Windows build produced a standalone `0.3.94` executable with SHA-256 `00AA4B113B19B41B2D476E88D9CD5600D42B76F588C294A5D3E06C3B6D59F922`, an NSIS installer with SHA-256 `D9BFC8A94572D1ADEEA8E4494696176D3A49138BEB850D3F90AEE726A2DBE947`, and an MSI with SHA-256 `FF467ECB84AF41C5893E60DBD54B71BF7848E4D89FEEB7829130893C1BAEF54D`.
+The build created both bundles and then exited only because the updater public key was present without the private signing key, so these artifacts are for local acceptance and not publication.
+The matching detached Linux agent reports `t-hub-agent 0.5.2`, has SHA-256 `813DB68E3DA42A790532258CC89FBBAFC5ABFECFCDD9810FD4D912EB7F14658A`, and passed a real bridge round trip on a disposable socket with exactly one declared session and one pane.
+The disposable socket was removed after the proof.
 Runtime re-verification after that commit found the unchanged installed desktop `0.3.93` at PID `23436` with SHA-256 `4F82CCB76A60B8481FF69601CDB0E7BDCB459CE00B83B31CADA125E688BC5643` and the unchanged installed agent `0.5.1` at PID `1930912`.
 The six canonical tmux names and pane PIDs also remained unchanged.
 Phase 11 remains blocked pending matching `0.3.94` and agent `0.5.2` deployment, graphical agent-route proof, and an eligible packaged one-terminal rerun before the 4, 8, and 16 terminal scenarios.

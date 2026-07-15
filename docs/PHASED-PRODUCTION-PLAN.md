@@ -696,6 +696,9 @@ The compatibility scan is limited to one bootstrap attempt for a disconnected or
 The agent collector bounds each of its two sequential steps to four seconds, drains both output pipes concurrently, and kills and reaps the collector process group on timeout.
 The uninstalled source is desktop `0.3.94` with agent and protocol `0.5.2`.
 Its source gate passed 471 frontend tests, TypeScript and the production frontend build, 641 desktop Rust tests with one ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, diff checks, focused inherited-pipe and large-output timeout regressions, and the performance harness self-tests.
+The exact detached `3816bf4` Windows build produced standalone, NSIS, and MSI SHA-256 values `00AA4B113B19B41B2D476E88D9CD5600D42B76F588C294A5D3E06C3B6D59F922`, `D9BFC8A94572D1ADEEA8E4494696176D3A49138BEB850D3F90AEE726A2DBE947`, and `FF467ECB84AF41C5893E60DBD54B71BF7848E4D89FEEB7829130893C1BAEF54D`.
+The matching detached Linux agent reports `0.5.2` with SHA-256 `813DB68E3DA42A790532258CC89FBBAFC5ABFECFCDD9810FD4D912EB7F14658A`.
+A direct real-agent round trip on a disposable isolated socket returned exactly one declared session and one pane, then cleanup preserved all six canonical session names and pane PIDs.
 Installed `0.3.93` with agent `0.5.1` remains unchanged and cannot prove the new capability.
 Phase 11 remains blocked pending exact matching `0.3.94` and agent `0.5.2` deployment, graphical `terminal_snapshot source=agent` evidence with no fallback or error marker, and an eligible repeated packaged one-terminal artifact.
 The 4, 8, and 16 terminal scenarios must not run until the one-terminal gate is eligible.
