@@ -108,9 +108,12 @@ An event-driven refresh should follow T-Hub-owned create, remove, commit, branch
 
 ## Current Implementation Status
 
-Source commit `2b7d864`, currently versioned by `b8f7309` as `0.3.88`, suspends removal through an unconditional backend safety gate and a graphical preflight that runs before tile detachment.
+Source commit `2b7d864` suspends removal through an unconditional backend safety gate and a graphical preflight that runs before tile detachment.
+Follow-up commits `f62f188` and `3841c2e` align the native Windows fixtures with the production WSL Git boundary while retaining native path assertions.
+Installed `0.3.90` passed the exact native four-case suite and graphical plus direct Tauri refusal acceptance against disposable worktrees with live tmux panes.
+Every accepted path refused before UI detachment or Git mutation, force did not bypass the suspension, and the Git registrations, tiles, directories, and pane working directories remained intact.
+Control, MCP, and CLI parity remains source-test evidence because the installed session retained read-only capability during that acceptance run.
 The canonical snapshot, multi-source verdict, and safe activation path remain unimplemented.
-Installed `0.3.86` predates this suspension.
 
 ## Migration
 
