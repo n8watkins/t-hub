@@ -2,7 +2,7 @@
 
 ## Canonical Planning Note
 
-The runtime evidence in this handoff is current through the installed `0.3.76` build.
+The runtime evidence in this handoff is current through the installed `0.3.78` build.
 The authoritative forward roadmap is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
 The document-status authority is [REVIEW-INDEX.md](./REVIEW-INDEX.md).
 That plan now includes the settled permanent Cortana identity, multiple Captains per Project, Assignment-based ownership, provider-agnostic Harness integration, CLI-first control, durable messaging, History, voice parity, and parallel implementation lanes.
@@ -13,8 +13,8 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `7ced938`.
-**Installed Windows build:** locally built T-Hub `0.3.76` from `7ced938`.
+**Source head before this handoff update:** `b4a1c5d`.
+**Installed Windows build:** locally built T-Hub `0.3.78` from `b4a1c5d`.
 
 ## Executive Status
 
@@ -23,9 +23,9 @@ The final independent authority review reports no remaining Critical, High, or M
 The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
 
 The current production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `BEDBA76D41BB3CD0C79392EAE9CB3901728A5A11A35759FAE022BA4D74107C4D`.
-It is running as PID `39044`.
-The exact NSIS installer SHA-256 is `3798914846CFAE64F3F7FFC79F9BA964E7AD31E2CD64C587D68310F91E6854E0`.
+The installed executable SHA-256 is `C252214474784DE9DEE0CF8EA92B668BC740BB0E3AE33EBC1B0E78A6CDB41E30`.
+It is running as PID `41680`.
+The exact NSIS installer SHA-256 is `C174D09E7CAEA3546A57923B3A7CF109867CFD78095994886FC37CA7E607CC71`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
@@ -75,6 +75,10 @@ The main implementation sequence in this work is:
 - `5b4e9d2 chore: bump desktop to 0.3.72`
 - `0be8504 feat: select captains from Powder boards`
 - `4cddab2 chore: bump desktop to 0.3.73`
+- `61f56ba feat: discover typed Run targets`
+- `ee5eb66 chore: bump desktop to 0.3.77`
+- `776439a fix: prevent duplicate terminal redraws`
+- `b4a1c5d chore: bump desktop to 0.3.78`
 
 ## Captain and Crew Model
 
@@ -303,10 +307,10 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The installed Windows process was reverified at PID `39044`, start time `2026-07-14T18:27:27-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-Its file and product version are `0.3.76`.
-The installed executable SHA-256 is `BEDBA76D41BB3CD0C79392EAE9CB3901728A5A11A35759FAE022BA4D74107C4D`.
-The installed build was produced from source `7ced938` with NSIS installer SHA-256 `3798914846CFAE64F3F7FFC79F9BA964E7AD31E2CD64C587D68310F91E6854E0`.
+The installed Windows process was reverified at PID `41680`, start time `2026-07-14T19:22:27-07:00`, and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its file and product version are `0.3.78`.
+The installed executable SHA-256 is `C252214474784DE9DEE0CF8EA92B668BC740BB0E3AE33EBC1B0E78A6CDB41E30`.
+The installed build was produced from source `b4a1c5d` with NSIS installer SHA-256 `C174D09E7CAEA3546A57923B3A7CF109867CFD78095994886FC37CA7E607CC71`.
 The installed `th` CLI is version `0.2.0` from source `07e74f4`.
 Source commit `6870444` fixes the reproduced xterm teardown race.
 Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
@@ -345,6 +349,16 @@ The upgrade preserved the exact same eight tmux session names and pane PIDs.
 Packaged WebView verification showed one **Run + Preview** tab, no separate Dev or Preview tab, one unified panel, an empty preview URL, zero iframes, and no detected-URL chips.
 The previously offending `http://127.0.0.1:9223/json/list` text remained in the tile's PTY scrollback during that verification.
 The screenshot evidence is `C:\Users\natha\OneDrive\Pictures\Screenshots\T-Hub-0.3.76-Run-Preview.png`.
-The immediate source action is to implement typed root-package targets and generation-safe backend lifecycle snapshots while the Phase 7 success matrix and real Project acceptance remain available to a control-capable Captain.
+Source commit `61f56ba` implements typed root-package target discovery and generation-safe backend lifecycle snapshots, and `ee5eb66` first packaged it as `0.3.77`.
+Source commit `776439a` fixes the reproduced duplicate Codex frame and header-Refresh transcript loss by making tmux attach the only current-screen renderer and removing resize-time transcript clearing.
+Commit `b4a1c5d` packages that repair as installed `0.3.78`.
+Its full source gate passed 463 frontend tests, 604 Rust desktop tests with 1 ignored, the Rust workspace and MCP end-to-end suites, warnings-denied Clippy, TypeScript, formatting, and the production frontend build.
+The exact detached Windows build produced executable SHA-256 `B5786376AA179B08B973940E9D6002D212C958CD470A0E6B43377C586750ED91`, NSIS installer SHA-256 `C174D09E7CAEA3546A57923B3A7CF109867CFD78095994886FC37CA7E607CC71`, and MSI SHA-256 `BB06C0F74B3A46DA1C9D5FD3E69F8AD408BAA41B4E8BEAB9B1CF19C1E5F270A2`.
+The upgrade, header Refresh, and full relaunch preserved the same eight tmux pane PIDs and the same T-Hub Codex process chain `1505037 -> 1505453 -> 1505460`.
+The active `Run /review on my current changes` draft appeared once after relaunch, and direct visible-pane capture also counted exactly one occurrence.
+Screenshot evidence is `C:\Users\natha\OneDrive\Pictures\Screenshots\T-Hub-0.3.78-thub-after-header-refresh.png` and `C:\Users\natha\OneDrive\Pictures\Screenshots\T-Hub-0.3.78-thub-after-full-relaunch-settled.png`.
+Packaged Run and Preview acceptance discovered only the four declared T-Hub scripts, started the real Vite `dev` target, detected `http://localhost:1420/`, and stopped the exact run without leaving its Vite descendant alive.
+Windows HTTP probing timed out against that WSL loopback-only listener and the preview stayed in its loading state, so reachable-interface ownership is the next Run and Preview implementation boundary.
+The immediate source action is to make typed development targets bind a Windows-reachable WSL interface and prove Vite, Next.js, and static packaged acceptance while the Phase 7 success matrix and real Project acceptance remain available to a control-capable Captain.
 Real Powder acceptance still requires a control-capable Captain session.
 The bound Board success state, complete Run and Preview lifecycle, Claude header check, packaged performance matrix, and release hardening remain open.

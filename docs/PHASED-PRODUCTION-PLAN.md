@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.76` from `7ced938`, running as Windows PID `39044` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.78` from `b4a1c5d`, running as Windows PID `41680` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -82,7 +82,11 @@ The packaged no-Project path shows an honest state without an iframe or manual B
 The bound Project success path remains gated on Phase 8 real Project acceptance.
 Installed `0.3.76` replaces the separate Dev and Preview tabs with one **Run and Preview** surface and removes terminal-output URL scanning and automatic navigation.
 Packaged verification proved that the previously reproduced WebView inspection URL remained in PTY scrollback while the preview URL stayed empty and no iframe was created.
-Typed target discovery, generation-safe lifecycle state, process-tree cleanup, reachable-interface ownership, and representative Vite, Next.js, and static acceptance remain open.
+Source commit `61f56ba`, packaged first as `0.3.77`, adds typed root-package target discovery and generation-safe backend lifecycle snapshots.
+Packaged `0.3.78` discovered the T-Hub root's four declared scripts, started `pnpm run dev`, detected Vite at `http://localhost:1420/`, and stopped the exact managed run without leaving its Vite descendant alive.
+The same acceptance also proved that Windows could not reach the WSL loopback-only Vite listener, so reachable-interface ownership, representative Next.js and static acceptance, and broader descendant cleanup remain open.
+Source commit `776439a`, packaged as `0.3.78` from `b4a1c5d`, removes full tmux capture replay from terminal attachment and stops clearing inline transcript during header Refresh.
+The packaged acceptance preserved all eight tmux pane PIDs and the same Codex process chain through install, header Refresh, and full relaunch while the active draft appeared exactly once.
 The Codex header identity has been checked interactively, while the Claude header still needs interactive confirmation.
 
 The durable inbox substrate implements persistence, ordering, priorities, receipts, crash recovery, sender attribution, and role-based access controls.
@@ -126,13 +130,17 @@ The release critical path is:
 
 ## Phase 1 - Terminal and Control Reliability
 
-**Status:** Complete through installed `0.3.71` from source `3576957`.
+**Status:** Complete through installed `0.3.78` from source `b4a1c5d`.
 Installed `0.3.67` reproduced the end-user xterm lifecycle failure as `Cannot set properties of undefined (setting 'isWrapped')` during parser line feed.
 Installed `0.3.69` then reproduced `Cannot read properties of undefined (reading 'replaceCells')` during rapid Workspace switching and zoom-driven resize.
 Source commits `cfa4139` and `cbc558b` serialize resize behind accepted xterm writes and leave xterm's parser callback stack before buffer mutation.
 Source commit `1e005e6` converts matching backend detach races into liveness-checked reattachment instead of unhandled `no live terminal` rejections.
 One warm stress pass and two cold restart passes on installed `0.3.71` preserved the same eight tmux session IDs and produced zero xterm corruption, detach-race, or unhandled errors.
 Duplicate launch retained one Windows PID, `th ls --json` returned all eight sessions after every restart, and diagnostic retention remained within its configured bound.
+Installed `0.3.77` reproduced a second user-visible lifecycle regression: cold rehydration replayed a linearized tmux capture and then streamed the attach client's current redraw, visually duplicating an entire Codex frame and its composer draft.
+The same path could clear inline transcript during a width-changing header Refresh before the asynchronous backend redraw completed.
+Source commit `776439a` makes the attached tmux client the only current-screen renderer and removes the resize-time transcript clear.
+Installed `0.3.78` restored the same Codex transcript and one visible draft after header Refresh and full application relaunch, with all eight tmux sessions and the exact Codex process chain unchanged.
 
 ### Goal
 
@@ -556,7 +564,9 @@ The registered and bound Project success state still requires the Phase 8 real P
 Run and Preview item 5 and the Preview portion of item 8 are implemented in source commit `96998fc` and packaged as installed `0.3.76` from `7ced938`.
 The packaged T-Hub tile exposed exactly one combined tab and one unified panel containing both managed runner controls and the empty preview state.
 The old inspection endpoint remained present in terminal scrollback, but the preview URL stayed empty with zero iframes and no detected-URL chips.
-Items 6 and 7 remain open, including typed package targets, backend-authoritative generation-safe lifecycle state, descendant cleanup, reachable URL probing, and representative framework acceptance.
+The typed-target and generation-safe lifecycle portions of items 6 and 7 are implemented in source commit `61f56ba` and packaged in installed `0.3.78`.
+The packaged T-Hub root exposed exactly `dev`, `build`, `tauri`, and `typecheck`, started the real Vite target, detected `http://localhost:1420/`, and stopped the managed run and its Vite descendant.
+Windows reachability failed because the package script left Vite bound to WSL loopback, so target-owned reachable-interface binding, framework-aware launch arguments, representative Next.js and static acceptance, and the full descendant-cleanup matrix remain open.
 
 ### Tests and Evidence
 
