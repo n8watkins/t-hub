@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.73` from `4cddab2`, running as Windows PID `30528` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.74` from `00d9207`, running as Windows PID `44668` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -73,6 +73,8 @@ Source commit `35fbae2` also prevents a second packaged launch from creating a c
 Source commit `3b83b9e` defers frontend resize commands until remote PTY attachment is confirmed, eliminating repetitive startup `no live terminal` diagnostics in packaged testing.
 Source commit `a00ce7d` adds explicit Git initialization to the shared Project registration transaction used by Captain creation and MCP.
 The transaction atomically reserves a new `.git` directory, initializes `main`, refuses any pre-existing `.git` entry, and removes only the `.git` directory it created when a later registration boundary fails.
+Source commit `2cf4a42` adds explicit creation of one absent empty-codebase leaf to the same transaction.
+It requires Git initialization, never replaces an existing path, never creates missing parents, and uses non-recursive rollback for the directory it owns.
 Diagnostic logs are bounded at startup.
 Installed `0.3.68` reduced the retained backup from `135,278,300` bytes to `8,388,493` bytes while preserving complete newest lines.
 Board still defaults to the wrong global endpoint.
@@ -454,7 +456,9 @@ Items 1 through 7, 9, 11, and the existing-codebase portions of 13 through 15 ar
 Installed `0.3.72` now launches commissioned Codex and Claude Captains with explicit unrestricted permission flags, and its packaged review screen reports that authority as `Unrestricted`.
 Installed `0.3.73` discovers visible canonical boards through the protected Powder profile, exposes bounded pagination through the shared control and MCP operation, and replaces free-text board entry with an accessible selection flow.
 Packaged verification listed all 25 real boards from `n8desktop-wsl`, including `t-hub` with its one acceptance card, and preserved the selection in preflight.
-The complete graphical packaged E2E matrix for existing non-Git, empty, template, and clone flows remains open.
+Installed `0.3.74` adds a reviewed **Create new codebase** choice for one absent empty-codebase leaf, initializes Git with `main`, and reports the exact filesystem and external effects before creation.
+Packaged cancel verification reviewed `/home/natkins/t-hub-cancel-proof-0-3-74`, closed the dialog, and confirmed that no directory was created.
+The complete graphical packaged E2E matrix for existing non-Git success, empty success, template, and clone flows remains open.
 The shared registration contract now requires `initializeGit: true` before it changes a non-repository folder, and its Rust integration tests cover success, downstream-failure rollback, pre-existing-file preservation, and refusal to rewrite a pre-existing `.git` entry.
 
 ### Tests and Evidence
