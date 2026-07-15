@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-15.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.90` from detached source `6200e35`, running as Windows PID `20376` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.93` from exact detached source `e95eb56`, restored on the canonical profile as Windows PID `23436` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -677,19 +677,22 @@ Give Cortana lightweight operational awareness and make attention cues provider-
 
 ## Phase 11 - Measured Runtime Efficiency
 
-**Status:** Active and blocked at the declared one-terminal packaged baseline because recurring host-bridge process churn makes release CPU acceptance ineligible.
+**Status:** Active; matching bridge deployment and graphical `GitInfo` routing acceptance are complete, while recurring host-bridge process churn still makes the declared one-terminal packaged baseline ineligible.
 The first isolated attempt was invalidated when Windows Explorer launched a separate normal T-Hub process.
 The documented retry pinned installed `0.3.90` PID `49712` and completed 55 samples over 61.05 seconds with one visible idle shell tile, but the host bridge produced eight births and eight deaths across four incomplete CPU intervals.
 The artifact therefore reports `release_acceptance_eligible: false` and is diagnostic evidence rather than an accepted baseline.
-The 29.94-second recurrence matches the visible tile's 30-second full Git-header poll, whose Windows fallback creates a new WSL process tree on every cache miss.
+The 29.94-second recurrence matched the visible tile's then-active 30-second full Git-header poll, whose Windows fallback created a new WSL process tree on every cache miss.
 Source commits `5ced6c2` and `bd0d8dd` add the `GitInfo` protocol operation, route full snapshots through the persistent agent, cap the agent collector below the desktop request timeout, distinguish disconnected, unsupported, and command-failure outcomes, and add a real stdio round-trip test against the matching agent.
 The one-shot Windows fallback remains only for a disconnected bridge or an explicitly unsupported older agent; an agent command failure returns degraded Git state without starting competing fallback work.
 Commit `8dd94c9` emits one successful agent-source marker per process and keeps every exceptional route visible for packaged acceptance.
 Commits `a9b7082` and `42de985` also remove full-suite attach-test interference by quiescing the churn workload and restoring process-global agent integration-test environment before deleting its fixtures.
-Commit `d73f9cb` versions this uninstalled source as desktop `0.3.93`, with agent and protocol `0.5.1` from `f821957`.
-Phase 11 remains blocked because the installed desktop is still `0.3.90` and its installed `0.5.0` agent reports `git_info` as unsupported, so it still exercises the churn-producing compatibility fallback.
-Packaged acceptance must deploy the matching `0.5.1` agent, prove an agent source marker with no fallback markers during the scenario, and produce an eligible repeated one-terminal artifact.
-The 4, 8, and 16 terminal scenarios must not run until the churn is removed and the one-terminal gate is eligible.
+Commit `d73f9cb` versions desktop `0.3.93`, with agent and protocol `0.5.1` from `f821957`; exact source `e95eb56` was then built and installed for packaged acceptance.
+Installed `0.3.93` with agent `0.5.1` passed the graphical same-cwd Git-header proof, emitted one `git_info source=agent` marker, and emitted no fallback or agent-error marker in the proof window.
+The isolated packaged retry at PID `20132` completed 55 samples over 60.96 seconds with one visible idle shell tile and the same exclusive agent route, but recurring host-bridge triplets produced 12 births, 15 deaths, and seven incomplete intervals.
+Artifact `artifacts/perf/t-hub-0.3.93-1t-20260715T0204-r2.json` therefore remains diagnostic and reports `release_acceptance_eligible: false`.
+The residual churn is not the repaired `GitInfo` fallback and requires separate process-lifecycle diagnosis.
+The remaining Phase 11 gate is to diagnose and remove the residual host-bridge triplet churn, then produce an eligible repeated packaged one-terminal artifact from the matching runtime.
+The 4, 8, and 16 terminal scenarios must not run until the one-terminal gate is eligible.
 
 ### Goal
 

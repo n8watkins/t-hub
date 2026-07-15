@@ -2,7 +2,7 @@
 
 ## Canonical Planning Note
 
-The runtime evidence in this handoff is current through the installed `0.3.90` build.
+The runtime evidence in this handoff is current through the installed `0.3.93` build.
 The authoritative forward roadmap is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
 The document-status authority is [REVIEW-INDEX.md](./REVIEW-INDEX.md).
 That plan now includes the settled permanent Cortana identity, multiple Captains per Project, Assignment-based ownership, provider-agnostic Harness integration, CLI-first control, durable messaging, History, voice parity, and parallel implementation lanes.
@@ -13,8 +13,8 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `d73f9cb`.
-**Installed Windows build:** locally built T-Hub `0.3.90` from detached source `6200e35`.
+**Source head before this handoff update:** `e95eb56`.
+**Installed Windows build:** locally built T-Hub `0.3.93` from exact detached source `e95eb56`.
 
 ## Executive Status
 
@@ -24,9 +24,9 @@ Source `1484750` passed 55 frontend files and 470 tests, TypeScript, the Rust wo
 The earlier exact `0.3.86` source then passed 621 Linux Rust library tests with one ignored, warning-free Clippy, the production frontend build, and 23 focused native Windows Preview tests without warnings.
 
 The current production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `3BECDB6C7142BD073C2272C98239A41085C08D8134B5DCE797E014B5A0E40DE1`.
-It is running as PID `20376`, started at `2026-07-15T00:47:06.5069043-07:00`.
-The exact NSIS installer SHA-256 is `C315CA5B55844D1262C920DDDE0E7AA1AEE5117337E863CFAD194D6F9766D441`.
+The installed executable SHA-256 is `4F82CCB76A60B8481FF69601CDB0E7BDCB459CE00B83B31CADA125E688BC5643`.
+It is running on the canonical profile as PID `23436`, started at `2026-07-15T02:05:57.6009879-07:00`.
+The exact NSIS installer SHA-256 is `C4CDC28F278815DC2AE826B139A4F1605250B73E48C87D105DD84C06DF3B7F98`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
@@ -324,10 +324,11 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The installed Windows process was reverified at PID `20376` and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` during the current packaged review.
-Its file and product version are `0.3.90`.
-The installed executable SHA-256 is `3BECDB6C7142BD073C2272C98239A41085C08D8134B5DCE797E014B5A0E40DE1`.
-The installed build was produced from detached source `6200e35` with standalone executable SHA-256 `75E0CE6BA6F7A959E70FF1469A61967F242FCF6D8426844F329E09119627D667`, NSIS installer SHA-256 `C315CA5B55844D1262C920DDDE0E7AA1AEE5117337E863CFAD194D6F9766D441`, and MSI SHA-256 `21BB91902574175A9C75815166C1D20DD11F3213C82B70D4D972C793D38D31B6`.
+The installed Windows process was reverified at PID `23436` and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` during the current packaged review.
+Its file and product version are `0.3.93`.
+The installed executable SHA-256 is `4F82CCB76A60B8481FF69601CDB0E7BDCB459CE00B83B31CADA125E688BC5643`.
+The installed build was produced from exact detached source `e95eb56` with final standalone executable SHA-256 `725EF0B74E0E2ABBC32064D68785E17F85978A2BE997E865B18E2DE4C21C635D`, NSIS installer SHA-256 `C4CDC28F278815DC2AE826B139A4F1605250B73E48C87D105DD84C06DF3B7F98`, and MSI SHA-256 `AC23DC2414CBC19E174C7EED063CADA3EDFDA85A05F7609AA2250BB8535C51DF`.
+The installed executable differs from the final post-bundle standalone hash even though its version, byte length, and build timing align, so byte-for-byte provenance to that final patched standalone is not proven.
 The installed `th` CLI is version `0.2.0` from source `07e74f4`.
 Source commit `6870444` fixes the reproduced xterm teardown race.
 Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
@@ -359,20 +360,25 @@ Control, MCP, and CLI parity remains source-test evidence because the installed 
 The upgrade first launched under debug acceptance as PID `30136`.
 The declared one-terminal performance retry ran as isolated PID `49712`, and Windows Explorer separately invalidated the first attempt by launching a normal application process.
 The normal installed application was finally restored as PID `20376` without changing the installed hash or any of the six canonical tmux names and pane PIDs.
-Its live bridge agent is PID `1687604` at `/home/natkins/.local/bin/t-hub-agent`, reports `t-hub-agent 0.5.0`, and has SHA-256 `4BF61DA4DC7BFDBB9AEF8EF464B3AB6E7035D7EF14F715FC5BFE43A78857A706`.
-A direct protocol 1 capability probe against that binary returned the stable `unsupported` response for `git_info`.
-The Windows package does not currently replace this WSL agent binary, so packaging the desktop alone cannot close the performance blocker.
+During the preceding `0.3.90` retry, its live bridge agent reported `t-hub-agent 0.5.0` and had SHA-256 `4BF61DA4DC7BFDBB9AEF8EF464B3AB6E7035D7EF14F715FC5BFE43A78857A706`.
+That older binary returned the stable `unsupported` response for `git_info` in a direct protocol 1 capability probe.
+The Windows package did not replace that older WSL agent, so packaging the desktop alone could not close the preceding performance blocker.
 The retry artifact `artifacts/perf/t-hub-0.3.90-1t-20260715T0044-r2.json` completed 55 samples over 61.05 seconds but observed eight host-bridge births and eight deaths across four incomplete CPU intervals, so `release_acceptance_eligible` is false.
 That artifact is diagnostic only, not an accepted baseline, and the 4, 8, and 16 terminal cells remain blocked until the recurring bridge churn is removed and the one-terminal scenario is eligible.
-The 29.94-second recurrence matches the visible tile's 30-second full Git-header poll, which currently starts a fresh WSL process tree on every cache miss.
+The 29.94-second recurrence matched the visible tile's then-active 30-second full Git-header poll, whose Windows fallback created a fresh WSL process tree on every cache miss.
 Source commits `5ced6c2` and `bd0d8dd` implement bridge-first `GitInfo` collection with typed disconnected, unsupported, and command-failure outcomes, a nine-second agent collector bound below the ten-second desktop request bound, and a real matching-agent stdio acceptance test.
 The compatibility fallback runs only when the bridge is disconnected or the installed agent explicitly reports `GitInfo` unsupported; agent command failures do not start competing WSL work.
 Commit `f821957` bumps the agent and protocol to `0.5.1`, and `8dd94c9` makes successful agent routing one-shot diagnostic evidence while logging every fallback or agent failure.
 The full source gate exposed two existing test-isolation failures under load: a lingering attach-churn firehose that could reset the fresh client, and process-global agent environment that leaked across parallel tests.
 Commits `a9b7082` and `42de985` quiesce the churn workload, restore the agent test environment, and disconnect the fixture agent before deleting its home.
-Commit `d73f9cb` versions the resulting uninstalled desktop source as `0.3.93`.
+Commit `d73f9cb` versions desktop `0.3.93` before exact source `e95eb56` was built and installed.
 The `0.3.93` source gate passed 56 frontend files and 471 tests, TypeScript, the production frontend build, 633 passed desktop Rust tests with one ignored, the real built-agent stdio round trip, all Rust workspace and MCP end-to-end suites, formatting, warning-denied Clippy, and the performance harness self-tests.
-This source is not packaged, the installed `0.5.0` agent remains unchanged, and the Windows installer still does not distribute its replacement, so Phase 11 remains blocked pending matching-agent deployment and an eligible packaged one-terminal rerun.
+The installed bridge agent is PID `1930912` at `/home/natkins/.local/bin/t-hub-agent`, reports `t-hub-agent 0.5.1`, and has SHA-256 `E96DCA57F831451FDA62BE25346B54FF9B495293F0F55095B7ECAC4A891EF04F`.
+Installed `0.3.93` passed the graphical same-cwd Git-header proof with one `git_info source=agent` marker and no fallback or agent-error marker.
+The isolated packaged retry at PID `20132` completed 55 samples over 60.96 seconds, but host-bridge triplets produced 12 births, 15 deaths, and seven incomplete intervals even though GitInfo stayed on the persistent agent.
+Artifact `artifacts/perf/t-hub-0.3.93-1t-20260715T0204-r2.json` is diagnostic and reports `release_acceptance_eligible: false`.
+The normal canonical profile was restored as PID `23436`, the disposable performance socket and profiles were removed, and the same six canonical tmux names and pane PIDs remained intact.
+Phase 11 remains blocked on diagnosing and removing the residual host-bridge triplet churn, then producing an eligible packaged one-terminal rerun before the 4, 8, and 16 terminal scenarios.
 The local Powder endpoint and protected agent credential path are operational.
 That earlier packaged xterm lifecycle, detach recovery, duplicate-launch, and diagnostic-retention gate passed with eight live tmux sessions preserved.
 The installed `a00ce7d` build reproduced one `listTerminals failed` event from the bounded 10-second WSL command timeout before recovery.
