@@ -2,7 +2,7 @@
 
 ## Canonical Planning Note
 
-The runtime evidence in this handoff is current through the installed `0.3.100` build.
+The runtime evidence in this handoff is current through the installed `0.3.103` build.
 The authoritative forward roadmap is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
 The document-status authority is [REVIEW-INDEX.md](./REVIEW-INDEX.md).
 That plan now includes the settled permanent Cortana identity, multiple Captains per Project, Assignment-based ownership, provider-agnostic Harness integration, CLI-first control, durable messaging, History, voice parity, and parallel implementation lanes.
@@ -12,16 +12,55 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 
 **Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
-**Branch:** `main`.
-**Source head before this handoff update:** `cbe88a5`.
-**Installed Windows build:** locally built T-Hub `0.3.100` from exact detached source `8635374`.
+**Branch:** `fix/captain-control-runtime`.
+**Source head before this handoff update:** `cb1032c`.
+**Installed Windows build:** locally built T-Hub `0.3.103` from exact detached source `8654986`.
 
 ## Active Resume Boundary
 
 This section is the reset-safe starting point for the next session.
 The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
 
-### Current Git and Runtime State
+### Verified 0.3.103 Resume Boundary
+
+The canonical checkout is on `fix/captain-control-runtime` at `cb1032c` before this documentation change.
+The only working-tree entries are the protected untracked `.lavish/`, `CLAUDE.md`, and `docs/DECK-AGENTS-DESIGN.md` paths.
+They remain untouched.
+
+Installed T-Hub is version `0.3.103`, PID `10036`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its installed SHA-256 is `B76F8B54691754AAB7CC8509AE2ED6E14B565DBC7FAA7543D73DEE500CD8A3B3`.
+The installed package was built from exact detached source `8654986` in `/mnt/c/Users/natha/projects/Tools/t-hub/t-hub-build-8654986`.
+Source head and installed source both declare desktop version `0.3.103`; the commits after `8654986` are documentation-only.
+
+Project `project-e28c0579-4e78-4de1-b225-d69aab93c143` is bound to Powder profile `n8desktop-wsl` and canonical repository `t-hub`.
+Captain terminal `c2940be4` runs Codex `0.144.4` with control capability in `/home/natkins/projects/tools/t-hub/t-hub-app`.
+The Captain checkpoint records Codex thread `019f67df-ef69-7bb2-9bc2-f790cf53b949` and the exact Project and Powder binding.
+
+The single authorized Stage 1 retry dispatched Crew terminal `0c9f07ff` into `/home/natkins/projects/tools/t-hub/t-hub-worktrees/local-acceptance` on branch `test/local-acceptance`.
+T-Hub durably bound Powder card `thub-local-acceptance` and run `run-nO9Ih6F-Dt-E` before starting the interactive Codex Harness.
+The exact protected checkout baseline remained `?? CLAUDE.md`, and that path remained symlink inode `3807587` targeting `AGENTS.md` with no additional tracked, staged, untracked, or ignored delta.
+The Captain used the sanctioned heartbeat operation once, and Powder recorded the same attributed run and renewed expiry.
+
+Stage 1 is blocked only because T-Hub `0.3.103` exposes no sanctioned Crew operation for Powder work-log append, bounded work-log evidence read, or completion with proof.
+The Crew correctly withheld `/tmp/t-hub-crew-done/t-hub-app/local-acceptance.done`.
+The Captain collected the blocked report, closed only Crew `0c9f07ff`, released `run-nO9Ih6F-Dt-E`, removed the active Crew binding, returned the card to `ready`, restored the six-terminal baseline, and wrote the final `DECISION-NEEDED: acceptance blocked` checkpoint.
+No claim, run, Crew record, terminal, or sentinel remains stale.
+
+Powder already provides agent-authorized `POST /api/v1/cards/{id}/work-log`, bounded card and run detail reads, and `POST /api/v1/cards/{id}/complete`.
+The next implementation belongs in T-Hub, not Powder.
+It must add a Crew-scoped work-log mutation, bounded evidence read, and Captain-controlled completion operation over the existing protected profile.
+It must also make normal terminal cleanup recognize a card already completed through the same Crew run rather than reporting the absent claim as a failed release.
+The next packaged code version is `0.3.104` under the every-change version policy.
+
+During implementation, follow the General's reduced cadence: run focused tests for the changed Powder client, control authorization, MCP or CLI contract, completion cleanup, formatting, version consistency, and diff checks.
+Reserve comprehensive local, PR, and CI gates for the pull request, install, or release boundary.
+Do not retry Stage 1 until exact committed and installed `0.3.104` exposes the missing evidence path and focused failure tests pass.
+Do not modify Powder source, push, publish, or clean unrelated worktrees or protected artifacts.
+
+The remaining content below preserves the older `0.3.100` evidence and rationale.
+Where it conflicts with this verified boundary, use this boundary.
+
+### Prior 0.3.100 Git and Runtime State
 
 The canonical checkout is on `main` at source head `cbe88a5`, 122 commits ahead of `origin/main` before this handoff-only commit.
 The only working-tree entries before this handoff edit were the protected untracked `.lavish/`, `CLAUDE.md`, and `docs/DECK-AGENTS-DESIGN.md` paths.
@@ -38,7 +77,7 @@ The commissioned Captain adds a sixth live session, `th_d24b63fa`, with pane PID
 A 50-second installed process sample spanning more than three Powder reconciliation intervals observed no T-Hub-owned PowerShell or cmd child.
 The repeated credential-shell regression is therefore closed in installed `0.3.100`.
 
-### Commissioned Captain Evidence
+### Prior 0.3.100 Commissioned Captain Evidence
 
 The durable Project is `project-e28c0579-4e78-4de1-b225-d69aab93c143`, named `t-hub-app`.
 It is bound to Powder profile `n8desktop-wsl` and Powder repository `t-hub`.
@@ -53,7 +92,7 @@ Captain creation now completes without the earlier Windows 10060 timeout or roll
 The Captain is registered and alive, but it is not yet functionally control-capable because packaged acceptance exposed the two blockers below.
 Do not dispatch canonical Crew until both blockers are repaired and installed acceptance proves the control boundary.
 
-### Blocker 1: Codex MCP Drops Captain Capability Variables
+### Resolved 0.3.100 Blocker 1: Codex MCP Drops Captain Capability Variables
 
 The Captain's `my_capability` call returns `read`, so the Captain skill correctly refuses claims, dispatch, and checkpoint mutation.
 The tmux and Codex parent processes contain `T_HUB_CONTROL_ADDR`, a nonpublished control token, and `T_HUB_SESSION_TOKEN`.
@@ -72,7 +111,7 @@ Because the Codex CLI cannot express inherited variable names, add the canonical
 
 The focused provisioner test must use sentinel values and prove that only the three variable names enter the registration, no sentinel value enters the config, unrelated hooks remain byte-preserved, a rerun with different values leaves the config byte-identical, the legacy empty registration converges, and a forced failure restores the original bytes.
 
-### Blocker 2: Windows Canonical Project Root Is Not a WSL tmux Cwd
+### Resolved 0.3.100 Blocker 2: Windows Canonical Project Root Is Not a WSL tmux Cwd
 
 The Captain pane reports cwd `/home/natkins`, and the Codex header reports `directory: ~`.
 Its bootstrap prompt contains the raw extended Windows UNC path.
@@ -87,7 +126,7 @@ Use the POSIX root in the Captain bootstrap instructions so the prompt and actua
 Focused tests must cover bare POSIX paths, standard WSL UNC, legacy WSL UNC, extended WSL UNC, distro root, and a Windows drive path that must not be misclassified as WSL.
 A commission or spawn test must prove that an extended UNC Project retains its canonical registry and response value while tmux receives `/home/natkins/projects/tools/t-hub/t-hub-app`.
 
-### Ordered Next Implementation
+### Superseded 0.3.100 Ordered Next Implementation
 
 1. Create a feature branch such as `fix/captain-control-runtime` before editing source.
 2. Reproduce both failures against installed `0.3.100` using the evidence above, and retain the existing Captain until the replacement is ready.
@@ -102,7 +141,7 @@ A commission or spawn test must prove that an extended UNC Project retains its c
 11. Commission and complete one real Powder-backed Crew card, including claim, work log, completion evidence, event delivery, and durable recovery.
 12. Continue the canonical sequence with Board and Preview acceptance, the Claude header check, and the packaged 1, 4, 8, and 16 terminal performance matrix.
 
-### Test Cadence and Exit Gate
+### Prior 0.3.100 Test Cadence and Exit Gate
 
 The General chose a reduced development test cadence.
 During implementation, run only the focused tests needed for changed behavior plus cheap formatting, version, and diff checks.

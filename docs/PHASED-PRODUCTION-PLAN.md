@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-15.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.100` from exact detached source `8635374`, running on the canonical profile as Windows PID `14868` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.103` from exact detached source `8654986`, running on the canonical profile as Windows PID `10036` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -63,8 +63,11 @@ The local Powder authority is healthy on WSL at `127.0.0.1:4017`.
 Windows reaches Powder privately through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected Powder profile is `n8desktop-wsl` and authenticated remote operations have passed.
 The `t-hub` Powder board and `thub-local-acceptance` card exist.
-No T-Hub Project is currently registered.
-The visible legacy Captain records are pinned visual records without complete Project or Powder bindings.
+Project `project-e28c0579-4e78-4de1-b225-d69aab93c143` now registers the T-Hub codebase and binds it to the `t-hub` Powder board through `n8desktop-wsl`.
+Installed `0.3.103` has a live control-capability Codex Captain at terminal `c2940be4` in the exact WSL repository directory.
+The authorized Stage 1 retry dispatched exactly one Codex Crew, acquired and heartbeated Powder run `run-nO9Ih6F-Dt-E`, preserved the accepted worktree baseline, then released the run and removed the Crew cleanly after a required check failed.
+The failure is now isolated to a missing T-Hub integration surface: installed `0.3.103` can claim, heartbeat, renew, release, and read a bounded board snapshot, but it cannot append or expose Powder work-log and completion evidence through a sanctioned Crew operation.
+Powder already exposes agent-authorized work-log, card-detail, run-detail, criterion, and completion endpoints, so this is T-Hub implementation work and does not require a Powder source change.
 
 Terminal resource counters and hot, warm, and cold lifecycle states are implemented.
 The earlier installed application reproduced xterm `loadCell` and `isWrapped` lifecycle failures.
@@ -536,6 +539,11 @@ The compact new-codebase flow must retain one reviewed operation identity across
 - Preflight and rollback behavior remain understandable at every boundary.
 
 ## Phase 8 - Real Powder Captain and Crew Acceptance
+
+**Status:** Active and blocked on the T-Hub Powder work-log and completion-evidence surface.
+Installed `0.3.103` passed Project binding, Captain control capability, WSL cwd, Crew dispatch, durable binding, exact checkout, live Codex Harness, claim, heartbeat, release, rollback, and cleanup checks.
+The Stage 1 retry correctly withheld its sentinel because T-Hub has no sanctioned operation to append or read attributed work-log evidence or complete the Crew card with proof.
+The next Phase 8 implementation must add those operations over Powder's existing agent-authorized API, preserve Captain and Crew ownership checks, keep responses bounded, and make completed-card terminal cleanup distinguish success from a failed claim release.
 
 ### Goal
 
