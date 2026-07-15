@@ -197,6 +197,8 @@ Make the installed terminal cockpit and its control clients trustworthy before e
 
 ## Phase 2 - Unified Owned-Resource Lifecycle
 
+**Status:** Active and unblocked after Phase 1; managed development-server process ownership is partially implemented, while the unified resource record, browser lifecycle, worktree status service, Resources surface, startup reconciliation, and full exit gate remain open.
+
 ### Goal
 
 Prevent terminals, browsers, development servers, worktrees, and Powder claims from outliving useful owners without destroying recoverable work.
@@ -483,6 +485,7 @@ Make Captain creation understandable for saved, existing, and completely new cod
 17. Roll back incomplete state while preserving pre-existing directories and useful work.
 
 Phase 7 remains active.
+Phase 7 item 8 and the full Phase 7 exit gate remain dependent on the Phase 2 unified worktree status service; product-flow work may proceed only against the stable shared contracts.
 Items 1 through 7, 9, 11, and the existing-codebase portions of 13 through 15 are implemented.
 Installed `0.3.72` now launches commissioned Codex and Claude Captains with explicit unrestricted permission flags, and its packaged review screen reports that authority as `Unrestricted`.
 Installed `0.3.73` discovers visible canonical boards through the protected Powder profile, exposes bounded pagination through the shared control and MCP operation, and replaces free-text board entry with an accessible selection flow.

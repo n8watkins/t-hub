@@ -57,8 +57,8 @@ T-Hub should then execute one reviewed transaction:
 If a later step fails, T-Hub should preserve useful local work, report partial state clearly, and offer safe resume or rollback.
 It must never delete a pre-existing directory during rollback.
 
-The current implementation does not provide this complete transaction.
-`register_project` requires an existing Git main worktree, and T-Hub does not currently create Powder boards.
+The current implementation supports saved-codebase selection, WSL folder browsing, explicit Git initialization for an existing non-repository folder, and one reviewed empty-codebase leaf transaction.
+It does not yet provide template or clone creation, Powder board creation, or the complete packaged graphical and conversational transaction matrix.
 
 ## Healthy Cortana Responsibilities
 

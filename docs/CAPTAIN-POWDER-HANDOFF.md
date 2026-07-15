@@ -356,7 +356,7 @@ The exact detached Windows build produced an executable SHA-256 of `4F43B4B22982
 Packaged WebView verification on the T-Hub tile showed **No registered Project**, zero iframes, and no Board URL input.
 The screenshot evidence is `C:\Users\natha\OneDrive\Pictures\Screenshots\T-Hub-0.3.75-Board.png`.
 The native Board's registered and bound Project success state remains gated on real Phase 8 acceptance.
-The packaged graphical success matrix for new codebases remains open, so Phase 7 is still the earliest unblocked active phase.
+The packaged graphical success matrix for new codebases remains open, so Phase 7 remains active on the current Captain-creation sequence.
 Source commit `96998fc` unifies Dev and Preview into one Run and Preview surface and removes all terminal-output URL detection and automatic navigation.
 Commit `7ced938` packages that change as `0.3.76`.
 The full source gate passed 459 frontend tests, 599 Rust desktop tests with 1 ignored, all Rust workspace and MCP end-to-end tests, warnings-denied Clippy, TypeScript, formatting, and the production frontend build.
