@@ -13,7 +13,7 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `e9aa04f`.
+**Source head before this handoff update:** `c40d52a`.
 **Installed Windows build:** locally built T-Hub `0.3.94` from exact detached source `3816bf4`.
 
 ## Executive Status
@@ -28,11 +28,29 @@ The installed executable SHA-256 is `021E7CAFF58C9A46720A02DD915D09BAC6BFE08235D
 It is running on the canonical profile as PID `46860`, started at `2026-07-15T03:45:17.4982710-07:00`.
 The exact NSIS installer SHA-256 is `D9BFC8A94572D1ADEEA8E4494696176D3A49138BEB850D3F90AEE726A2DBE947`.
 
+Source `0.3.95` at commit `8231b5e` preserves partial Codex usage snapshots, normalizes 5-hour and weekly windows by duration, and migrates the last-known cache.
+Source `0.3.96` at commit `c40d52a` adds a Windows Explorer folder chooser to the shared WSL picker used by existing-folder and new-codebase Captain flows.
+Neither source build is installed yet, so the running application remains `0.3.94` and does not contain those changes.
+
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
+The local `http://127.0.0.1:4017/healthz` endpoint returned HTTP 200 with the Powder health payload during the 2026-07-15 review.
 The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
+That profile currently has no repository-admin credential.
 The `t-hub` Powder board and `thub-local-acceptance` card exist.
 No T-Hub project is currently registered, and the two visible legacy Captain records have no project or Powder binding.
 Real commissioned Captain and Crew acceptance therefore remains incomplete rather than externally blocked.
+
+The requested automatic board creation for new codebases is not safe against Powder's current API.
+Powder exposes repository upsert, not create-if-absent, so a concurrent creator can appear between T-Hub's read and write and have its settings overwritten.
+The reviewed `0.3.97` prototype was rejected and fully removed before commit because it could not close that race without changing Powder.
+T-Hub must not modify Powder to accommodate this flow and must remain fail-closed until Powder independently provides a non-overwriting create precondition.
+The rejected prototype also exposed two recovery requirements that remain part of the Phase 7 gate: reuse one reviewed request identity across ambiguous retries, and make a preserved unbound Project directly resumable after Powder or binding failure.
+
+The runtime was reverified before this handoff update.
+Installed T-Hub is PID `46860`, version `0.3.94`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`, with SHA-256 `021E7CAFF58C9A46720A02DD915D09BAC6BFE08235D7E80A8628C1E550223A7E`.
+The installed WSL agent reports `0.5.2` and SHA-256 `813DB68E3DA42A790532258CC89FBBAFC5ABFECFCDD9810FD4D912EB7F14658A`.
+Seven tmux sessions are currently visible on the canonical `t-hub` socket.
+The six previously recorded sessions retain the same names and pane PIDs, and `th_4b0343f6` for `/home/natkins/projects/public/open-ping` is additional.
 
 ## Integrated Commits
 

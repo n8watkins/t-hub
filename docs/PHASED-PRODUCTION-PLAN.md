@@ -513,6 +513,12 @@ Registration transactionally owns its optional directory, Git initialization, Pr
 One reviewed backend transaction shared by graphical and Cortana flows, including explicit cross-operation resume or rollback, remains open.
 The complete graphical packaged E2E matrix for existing non-Git success, empty success, template, and clone flows remains open.
 The shared registration contract now requires `initializeGit: true` before it changes a non-repository folder, and its Rust integration tests cover success, downstream-failure rollback, pre-existing-file preservation, and refusal to rewrite a pre-existing `.git` entry.
+Automatic Powder board creation for a new codebase is blocked by Powder's current repository API contract.
+`POST /api/v1/repositories` is an upsert without a create-only or conditional precondition, so a T-Hub read-then-create sequence could overwrite a board created concurrently by another actor.
+T-Hub must fail closed rather than use that upsert as create-if-absent, and Powder must not be modified merely to accommodate T-Hub.
+This dependency can unblock only when Powder independently exposes a versioned non-overwriting create contract or equivalent server-enforced precondition.
+The current `n8desktop-wsl` profile also has no separately configured repository-admin credential, so positive packaged creation acceptance remains open even after the API dependency is resolved.
+The compact new-codebase flow must retain one reviewed operation identity across ambiguous retries and provide an actionable resume path from a Project preserved after a later Powder or binding failure.
 
 ### Tests and Evidence
 
