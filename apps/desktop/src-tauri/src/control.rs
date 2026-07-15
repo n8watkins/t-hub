@@ -6516,28 +6516,74 @@ fn register_project(
         .or_else(|| args.get("initialize_git"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut worktrees = git::worktree_list(&requested_root)
-        .map_err(|e| format!("register_project: repository validation failed: {e}"))?;
-    let initialized_git = if worktrees.iter().any(|worktree| !worktree.is_linked) {
+    let create_directory = args
+        .get("createDirectory")
+        .or_else(|| args.get("create_directory"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if create_directory && !initialize_git {
+        return Err(
+            "register_project: createDirectory requires initializeGit: true for a new codebase"
+                .into(),
+        );
+    }
+    if create_directory && !ctx.peer_is_loopback {
+        files::scoped_create_path(&requested_root, true, files::remote_file_roots())?;
+    }
+    let created_directory = if create_directory {
+        create_new_project_directory(&requested_root)?;
+        true
+    } else {
         false
-    } else if initialize_git {
-        git::initialize_repository(&requested_root)
-            .map_err(|error| format!("register_project: Git initialization failed: {error}"))?;
-        worktrees = match git::worktree_list(&requested_root) {
+    };
+    let (worktrees, initialized_git) = if created_directory {
+        if let Err(error) = git::initialize_repository(&requested_root) {
+            return Err(rollback_project_creation_error(
+                &requested_root,
+                false,
+                true,
+                format!("register_project: Git initialization failed: {error}"),
+            ));
+        }
+        let worktrees = match git::worktree_list(&requested_root) {
             Ok(worktrees) => worktrees,
             Err(error) => {
-                return Err(rollback_initialized_git_error(
+                return Err(rollback_project_creation_error(
                     &requested_root,
+                    true,
+                    true,
                     format!("register_project: initialized repository validation failed: {error}"),
                 ));
             }
         };
-        true
+        (worktrees, true)
     } else {
-        return Err(
-            "register_project: path is not inside a Git repository with a main worktree"
-                .to_string(),
-        );
+        let mut worktrees = git::worktree_list(&requested_root)
+            .map_err(|e| format!("register_project: repository validation failed: {e}"))?;
+        let initialized_git = if worktrees.iter().any(|worktree| !worktree.is_linked) {
+            false
+        } else if initialize_git {
+            git::initialize_repository(&requested_root)
+                .map_err(|error| format!("register_project: Git initialization failed: {error}"))?;
+            worktrees = match git::worktree_list(&requested_root) {
+                Ok(worktrees) => worktrees,
+                Err(error) => {
+                    return Err(rollback_initialized_git_error(
+                        &requested_root,
+                        format!(
+                            "register_project: initialized repository validation failed: {error}"
+                        ),
+                    ));
+                }
+            };
+            true
+        } else {
+            return Err(
+                "register_project: path is not inside a Git repository with a main worktree"
+                    .to_string(),
+            );
+        };
+        (worktrees, initialized_git)
     };
 
     let result = (|| {
@@ -6626,12 +6672,105 @@ fn register_project(
     })();
 
     if let Err(error) = result {
-        if initialized_git {
-            return Err(rollback_initialized_git_error(&requested_root, error));
+        if initialized_git || created_directory {
+            return Err(rollback_project_creation_error(
+                &requested_root,
+                initialized_git,
+                created_directory,
+                error,
+            ));
         }
         return Err(error);
     }
     result
+}
+
+fn create_new_project_directory(repo_root: &str) -> Result<(), String> {
+    let path = repo_root.trim();
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.ends_with('/')
+        || path.contains('\\')
+    {
+        return Err(
+            "register_project: new codebase destination must be an absolute WSL path".into(),
+        );
+    }
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.is_empty()
+        || segments
+            .iter()
+            .any(|segment| matches!(*segment, "." | "..") || segment.chars().any(char::is_control))
+    {
+        return Err(
+            "register_project: new codebase destination contains an invalid path segment".into(),
+        );
+    }
+    let host_path = files::to_host_path(path);
+    match std::fs::symlink_metadata(&host_path) {
+        Ok(_) => {
+            return Err(format!(
+                "register_project: new codebase destination '{path}' already exists"
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "register_project: could not inspect new codebase destination: {error}"
+            ));
+        }
+    }
+    let parent = host_path
+        .parent()
+        .ok_or("register_project: new codebase destination has no parent directory")?;
+    let parent_metadata = std::fs::metadata(parent).map_err(|error| {
+        format!("register_project: could not inspect parent directory: {error}")
+    })?;
+    if !parent_metadata.is_dir() {
+        return Err("register_project: new codebase parent is not a directory".into());
+    }
+    std::fs::create_dir(&host_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("register_project: new codebase destination '{path}' already exists")
+        } else {
+            format!("register_project: could not create new codebase directory: {error}")
+        }
+    })
+}
+
+fn rollback_project_creation_error(
+    repo_root: &str,
+    initialized_git: bool,
+    created_directory: bool,
+    error: String,
+) -> String {
+    if !created_directory {
+        return if initialized_git {
+            rollback_initialized_git_error(repo_root, error)
+        } else {
+            error
+        };
+    }
+    let mut rollback_errors = Vec::new();
+    if initialized_git {
+        if let Err(rollback_error) = git::rollback_initialized_repository(repo_root) {
+            rollback_errors.push(format!("Git rollback failed: {rollback_error}"));
+        }
+    }
+    if let Err(rollback_error) = std::fs::remove_dir(files::to_host_path(repo_root)) {
+        rollback_errors.push(format!("directory rollback failed: {rollback_error}"));
+    }
+    if rollback_errors.is_empty() {
+        format!("{error}. T-Hub rolled back the new directory and Git repository it created")
+    } else {
+        format!(
+            "{error}. T-Hub could not completely roll back the new codebase: {}. No recursive directory deletion was attempted",
+            rollback_errors.join("; ")
+        )
+    }
 }
 
 fn rollback_initialized_git_error(repo_root: &str, error: String) -> String {
@@ -14902,6 +15041,152 @@ mod tests {
         );
         assert!(ctx.captains.projects().is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn register_project_creates_an_absent_empty_codebase_leaf() {
+        let ctx = test_ctx("secret");
+        let parent = std::env::temp_dir().join(format!(
+            "t-hub-register-new-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let destination = parent.join("fresh-codebase");
+
+        let project = dispatch(
+            &ctx,
+            "register_project",
+            &json!({
+                "repoRoot": destination.to_string_lossy(),
+                "name": "Fresh Codebase",
+                "createDirectory": true,
+                "initializeGit": true
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(project["name"], "Fresh Codebase");
+        assert_eq!(project["repoRoot"], destination.to_string_lossy().as_ref());
+        assert_eq!(project["defaultBranch"], "main");
+        assert!(destination.join(".git").is_dir());
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn register_project_new_codebase_refuses_any_existing_destination() {
+        let ctx = test_ctx("secret");
+        let parent = std::env::temp_dir().join(format!(
+            "t-hub-register-new-existing-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let destination = parent.join("already-here");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("keep.txt"), "preserve me").unwrap();
+
+        let error = dispatch(
+            &ctx,
+            "register_project",
+            &json!({
+                "repoRoot": destination.to_string_lossy(),
+                "createDirectory": true,
+                "initializeGit": true
+            }),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("already exists"), "got: {error}");
+        assert_eq!(
+            std::fs::read_to_string(destination.join("keep.txt")).unwrap(),
+            "preserve me"
+        );
+        assert!(ctx.captains.projects().is_empty());
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn register_project_new_codebase_rolls_back_owned_leaf_after_later_failure() {
+        let ctx = test_ctx("secret");
+        let parent = std::env::temp_dir().join(format!(
+            "t-hub-register-new-rollback-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let destination = parent.join("rolled-back");
+
+        let error = dispatch(
+            &ctx,
+            "register_project",
+            &json!({
+                "repoRoot": destination.to_string_lossy(),
+                "createDirectory": true,
+                "initializeGit": true,
+                "powderRepository": " "
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("rolled back the new directory"),
+            "got: {error}"
+        );
+        assert!(!destination.exists());
+        assert!(ctx.captains.projects().is_empty());
+        let _ = std::fs::remove_dir(parent);
+    }
+
+    #[test]
+    fn register_project_new_codebase_requires_safe_explicit_creation() {
+        let ctx = test_ctx("secret");
+        let parent = std::env::temp_dir().join(format!(
+            "t-hub-register-new-invalid-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let destination = parent.join("missing-init");
+        let error = dispatch(
+            &ctx,
+            "register_project",
+            &json!({
+                "repoRoot": destination.to_string_lossy(),
+                "createDirectory": true
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("requires initializeGit: true"));
+        assert!(!destination.exists());
+
+        let trailing_slash = format!("{}/", parent.join("ambiguous").to_string_lossy());
+        let error = dispatch(
+            &ctx,
+            "register_project",
+            &json!({
+                "repoRoot": trailing_slash,
+                "createDirectory": true,
+                "initializeGit": true
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("absolute WSL path"), "got: {error}");
+        assert!(!parent.join("ambiguous").exists());
+
+        let missing_parent = parent.join("missing").join("child");
+        let error = dispatch(
+            &ctx,
+            "register_project",
+            &json!({
+                "repoRoot": missing_parent.to_string_lossy(),
+                "createDirectory": true,
+                "initializeGit": true
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("parent directory"), "got: {error}");
+        assert!(!parent.join("missing").exists());
+        let _ = std::fs::remove_dir(parent);
     }
 
     #[test]

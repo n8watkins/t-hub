@@ -346,6 +346,7 @@ fn schema_register_project() -> Value {
         "type": "object",
         "properties": {
             "repoRoot": { "type": "string", "description": "Path inside an existing Git repository, or an existing folder when initializeGit is explicitly true; T-Hub resolves its canonical main worktree." },
+            "createDirectory": { "type": "boolean", "description": "Explicitly create repoRoot as one absent leaf for a new empty codebase. Requires initializeGit: true and never replaces an existing path." },
             "initializeGit": { "type": "boolean", "description": "Explicitly initialize Git with main as the default branch when repoRoot is not already a repository. Defaults to false and never replaces an existing .git entry." },
             "name": { "type": "string", "description": "Optional display name; defaults to the repository directory name." },
             "remoteUrl": { "type": "string", "description": "Optional canonical Git remote URL." },
@@ -741,7 +742,7 @@ pub fn catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "register_project",
             tier: Tier::Organization,
-            summary: "Register an existing Git repository as a durable T-Hub project, optionally with its Powder mapping.",
+            summary: "Register an existing Git repository or explicitly create one absent empty-codebase leaf, optionally with its Powder mapping.",
             input_schema: schema_register_project,
         },
         ToolDef {
@@ -1016,6 +1017,11 @@ mod tests {
         );
         assert_eq!(
             (find("register_project").unwrap().input_schema)()["properties"]["initializeGit"]
+                ["type"],
+            "boolean"
+        );
+        assert_eq!(
+            (find("register_project").unwrap().input_schema)()["properties"]["createDirectory"]
                 ["type"],
             "boolean"
         );

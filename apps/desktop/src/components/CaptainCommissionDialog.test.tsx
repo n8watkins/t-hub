@@ -102,6 +102,7 @@ describe("CaptainCommissionDialog", () => {
     expect(screen.getByRole("dialog", { name: "Create Captain" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Use saved codebase" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Choose existing WSL folder" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Create new codebase" })).toBeTruthy();
 
     fireEvent.change(wslFolder, {
       target: { value: "/repo/t-hub" },
@@ -318,5 +319,90 @@ describe("CaptainCommissionDialog", () => {
       (screen.getByRole("button", { name: "Create Captain" }) as HTMLButtonElement)
         .disabled,
     ).toBe(true);
+  });
+
+  it("creates a reviewed empty codebase at one absent WSL leaf", async () => {
+    vi.mocked(listProjects).mockResolvedValue({
+      projects: [],
+      count: 0,
+      seq: 0,
+      powderProfiles: ["production"],
+      wslHome: "/home/tester",
+    });
+    vi.mocked(registerProject).mockResolvedValue(project);
+    vi.mocked(commissionCaptain).mockResolvedValue({
+      captain: {
+        shipSlug: "t-hub",
+        projectId: "project-1",
+        workspaceTabIds: [],
+        crew: [],
+      },
+      project,
+      instructions: "recover",
+      alreadyCommissioned: false,
+    });
+
+    render(
+      <CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Create new codebase" }));
+    await screen.findByRole("option", { name: "t-hub (active, 2 cards)" });
+    fireEvent.change(screen.getByLabelText("New codebase name"), {
+      target: { value: "fresh-project" },
+    });
+    fireEvent.change(screen.getByLabelText("Assignment"), {
+      target: { value: "Build the fresh project" },
+    });
+
+    const review = screen.getByRole("region", { name: "Review before creating" });
+    expect(within(review).getByText("New empty codebase")).toBeTruthy();
+    expect(within(review).getByText("/home/tester/fresh-project")).toBeTruthy();
+    expect(within(review).getByText("Create /home/tester/fresh-project")).toBeTruthy();
+    expect(screen.getByText("Template and clone starting points will be added later.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+
+    await waitFor(() => expect(registerProject).toHaveBeenCalledOnce());
+    expect(registerProject).toHaveBeenCalledWith({
+      repoRoot: "/home/tester/fresh-project",
+      name: "fresh-project",
+      createDirectory: true,
+      initializeGit: true,
+      powderRepository: "t-hub",
+      powderConnectionProfile: "production",
+    });
+    expect(commissionCaptain).toHaveBeenCalledWith({
+      projectId: "project-1",
+      assignment: "Build the fresh project",
+      harness: "codex",
+    });
+  });
+
+  it("refuses an invalid new codebase name before registration", async () => {
+    vi.mocked(listProjects).mockResolvedValue({
+      projects: [],
+      count: 0,
+      seq: 0,
+      powderProfiles: ["production"],
+      wslHome: "/home/tester",
+    });
+
+    render(
+      <CaptainCommissionDialog open onClose={vi.fn()} onCommissioned={vi.fn()} />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Create new codebase" }));
+    await screen.findByRole("option", { name: "t-hub (active, 2 cards)" });
+    fireEvent.change(screen.getByLabelText("New codebase name"), {
+      target: { value: "nested/project" },
+    });
+    fireEvent.change(screen.getByLabelText("Assignment"), {
+      target: { value: "Build the fresh project" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create Captain" }));
+
+    expect(await screen.findByText("Codebase name must be one safe folder name.")).toBeTruthy();
+    expect(registerProject).not.toHaveBeenCalled();
+    expect(commissionCaptain).not.toHaveBeenCalled();
   });
 });

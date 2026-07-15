@@ -23,7 +23,7 @@ interface CaptainCommissionDialogProps {
   onCommissioned: () => void;
 }
 
-type ProjectMode = "saved" | "existing";
+type ProjectMode = "saved" | "existing" | "new";
 
 export function CaptainCommissionDialog({
   open,
@@ -44,6 +44,8 @@ export function CaptainCommissionDialog({
   const [projectId, setProjectId] = useState("");
   const [repoRoot, setRepoRoot] = useState("");
   const [projectName, setProjectName] = useState("");
+  const [newParent, setNewParent] = useState("");
+  const [newName, setNewName] = useState("");
   const [powderRepository, setPowderRepository] = useState("");
   const [connectionProfile, setConnectionProfile] = useState("");
   const [powderBoards, setPowderBoards] = useState<PowderBoard[]>([]);
@@ -67,6 +69,7 @@ export function CaptainCommissionDialog({
         setPowderProfilesError(catalog.powderProfilesError ?? null);
         setWslHome(catalog.wslHome ?? "");
         setWslHomeError(catalog.wslHomeError ?? null);
+        setNewParent((current) => current || catalog.wslHome || "/home");
         const first = catalog.projects[0];
         setProjectId((current) => current || first?.projectId || "");
         setRepoRoot((current) => current || catalog.wslHome || first?.repoRoot || "/home");
@@ -191,6 +194,15 @@ export function CaptainCommissionDialog({
         return;
       }
     }
+    let newCodebaseDestination: string | null = null;
+    if (mode === "new") {
+      try {
+        newCodebaseDestination = validateNewCodebaseDestination(newParent, newName);
+      } catch (validationError) {
+        setError(validationError instanceof Error ? validationError.message : String(validationError));
+        return;
+      }
+    }
     setBusy(true);
     setError(null);
     try {
@@ -202,6 +214,15 @@ export function CaptainCommissionDialog({
           repoRoot: repoRoot.trim(),
           name: projectName.trim() || undefined,
           ...(folderGit.isRepo ? {} : { initializeGit: true }),
+          powderRepository: powderRepository.trim(),
+          powderConnectionProfile: connectionProfile.trim() || "default",
+        });
+      } else if (mode === "new") {
+        project = await registerProject({
+          repoRoot: newCodebaseDestination!,
+          name: newName.trim(),
+          createDirectory: true,
+          initializeGit: true,
           powderRepository: powderRepository.trim(),
           powderConnectionProfile: connectionProfile.trim() || "default",
         });
@@ -277,10 +298,10 @@ export function CaptainCommissionDialog({
           <div
             role="group"
             aria-label="Codebase source"
-            className="grid grid-cols-2 rounded border p-0.5"
+            className="grid grid-cols-3 rounded border p-0.5"
             style={{ borderColor: "var(--th-border)" }}
           >
-            {(["saved", "existing"] as const).map((value) => (
+            {(["saved", "existing", "new"] as const).map((value) => (
               <button
                 key={value}
                 type="button"
@@ -295,13 +316,15 @@ export function CaptainCommissionDialog({
                 }}
                 onClick={() => {
                   setMode(value);
-                  if (value === "existing") setPowderRepository("");
+                  if (value !== "saved") setPowderRepository("");
                   setError(null);
                 }}
               >
                 {value === "saved"
                   ? "Use saved codebase"
-                  : "Choose existing WSL folder"}
+                  : value === "existing"
+                    ? "Choose existing WSL folder"
+                    : "Create new codebase"}
               </button>
             ))}
           </div>
@@ -323,7 +346,7 @@ export function CaptainCommissionDialog({
                 ))}
               </select>
             </Field>
-          ) : (
+          ) : mode === "existing" ? (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Field label="WSL folder" wide>
                 <WslFolderPicker
@@ -351,6 +374,43 @@ export function CaptainCommissionDialog({
                   placeholder="Derived from folder"
                 />
               </Field>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label="Parent WSL folder" wide>
+                <WslFolderPicker
+                  path={newParent}
+                  home={wslHome || undefined}
+                  recentPaths={[...projects]
+                    .sort((a, b) => b.updatedAt - a.updatedAt)
+                    .map((project) => ({
+                      label: project.name,
+                      path: project.repoRoot,
+                    }))}
+                  onPathChange={setNewParent}
+                />
+              </Field>
+              <Field label="Codebase name">
+                <input
+                  aria-label="New codebase name"
+                  value={newName}
+                  onChange={(event) => setNewName(event.target.value)}
+                  className={inputClass}
+                  style={fieldStyle}
+                  placeholder="my-project"
+                />
+              </Field>
+              <Field label="Destination">
+                <output className="block min-h-9 break-all rounded border px-2 py-2 font-mono text-xs" style={fieldStyle}>
+                  {previewNewCodebaseDestination(newParent, newName) || "Choose a parent and name"}
+                </output>
+              </Field>
+              <div className="rounded border border-blue-400/30 bg-blue-400/10 px-3 py-2 text-xs sm:col-span-2">
+                <span className="block font-medium">Starting point: Empty Git repository</span>
+                <span style={{ color: "var(--th-fg-muted)" }}>
+                  Template and clone starting points will be added later.
+                </span>
+              </div>
             </div>
           )}
 
@@ -512,6 +572,8 @@ export function CaptainCommissionDialog({
             folderGit={folderGit}
             folderWorktrees={folderWorktrees}
             initializeGit={initializeGit}
+            newParent={newParent}
+            newName={newName}
           />
 
           {error && (
@@ -563,6 +625,25 @@ async function loadAllPowderBoards(connectionProfile: string): Promise<PowderBoa
   }
 }
 
+function previewNewCodebaseDestination(parent: string, name: string): string {
+  const base = parent.trim().replace(/\/+$/, "");
+  const leaf = name.trim();
+  return base && leaf ? `${base}/${leaf}` : "";
+}
+
+function validateNewCodebaseDestination(parent: string, name: string): string {
+  const base = parent.trim().replace(/\/+$/, "");
+  const leaf = name.trim();
+  if (!base.startsWith("/") || base.startsWith("//") || base.includes("\\")) {
+    throw new Error("Parent must be an absolute WSL path.");
+  }
+  if (!leaf) throw new Error("Codebase name is required.");
+  if (leaf === "." || leaf === ".." || /[\\/\u0000-\u001f\u007f]/.test(leaf)) {
+    throw new Error("Codebase name must be one safe folder name.");
+  }
+  return `${base}/${leaf}`;
+}
+
 function ReviewSummary({
   mode,
   selected,
@@ -574,6 +655,8 @@ function ReviewSummary({
   folderGit,
   folderWorktrees,
   initializeGit,
+  newParent,
+  newName,
 }: {
   mode: ProjectMode;
   selected?: RegisteredProject;
@@ -585,14 +668,23 @@ function ReviewSummary({
   folderGit: GitInfo | null;
   folderWorktrees: WorktreeInfo[];
   initializeGit: boolean;
+  newParent: string;
+  newName: string;
 }) {
-  const source = mode === "saved" ? "Saved codebase" : "Existing WSL codebase";
+  const source =
+    mode === "saved"
+      ? "Saved codebase"
+      : mode === "existing"
+        ? "Existing WSL codebase"
+        : "New empty codebase";
   const location =
     mode === "saved"
       ? selected
         ? `${selected.name} · ${selected.repoRoot}`
         : "Select a codebase"
-      : repoRoot.trim() || "Choose a WSL folder";
+      : mode === "existing"
+        ? repoRoot.trim() || "Choose a WSL folder"
+        : previewNewCodebaseDestination(newParent, newName) || "Choose a parent and name";
 
   return (
     <section
@@ -638,6 +730,16 @@ function ReviewSummary({
                 />
               </>
             )}
+          </>
+        )}
+        {mode === "new" && (
+          <>
+            <ReviewRow label="Git" value="Initialize with main as the default branch" />
+            <ReviewRow label="Filesystem changes" value={`Create ${location}`} />
+            <ReviewRow
+              label="External effects"
+              value="Use an existing Powder board; no remote or board will be created"
+            />
           </>
         )}
         <ReviewRow

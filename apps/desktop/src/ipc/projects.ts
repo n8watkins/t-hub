@@ -60,6 +60,7 @@ export function registerProject(input: {
   repoRoot: string;
   name?: string;
   remoteUrl?: string;
+  createDirectory?: boolean;
   initializeGit?: boolean;
   powderRepository?: string;
   powderConnectionProfile?: string;
