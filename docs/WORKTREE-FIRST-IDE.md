@@ -22,7 +22,7 @@ Worktrees solve the disk-isolation problem cleanly. What's been missing is a coc
 ## 3. What T-Hub Already Does (shipped)
 
 The worktree create, list, and reopen primitives are in place end-to-end.
-Removal is temporarily suspended in source `0.3.87` pending the unified safety verdict.
+Removal is temporarily suspended in source `0.3.88` pending the unified safety verdict.
 
 **Core git surface (`git.rs`, registered in `lib.rs:474`).** Five Tauri async commands shell out via `run_git` (on Windows, through `wsl.exe -d <distro> --cd <cwd> -- git …` with `CREATE_NO_WINDOW`), each argument as its own argv entry so branch names with slashes and shell metacharacters are safe:
 
@@ -40,12 +40,12 @@ Removal is temporarily suspended in source `0.3.87` pending the unified safety v
 The MCP and control channel exposes `create_worktree`, which runs Git and forwards the tab and spawn to the UI with `alreadyCreated:true`, so `store.addWorktreeWorkspace` remains the single creation path.
 The `remove_worktree` tool remains discoverable but synchronously returns the temporary safety refusal.
 
-**Current removal override.** Source `0.3.87` suspends every public worktree-removal entry point before UI detachment or Git mutation until the unified status service exists.
+**Current removal override.** Source `0.3.88` suspends every public worktree-removal entry point before UI detachment or Git mutation until the unified status service exists.
 The creation and reopen paths remain available.
 
 **Error handling is concrete.** "branch already checked out elsewhere" is detected (`already_checked_out_branch`) and surfaced with the branch named; a pre-existing target directory yields an actionable "remove that leftover directory or pick a different branch name."
 
-**Safe lifecycle.** Source `0.3.87` runs an authoritative preflight before any detach and currently fails closed while the unified service is unavailable.
+**Safe lifecycle.** Source `0.3.88` runs an authoritative preflight before any detach and currently fails closed while the unified service is unavailable.
 Closing a worktree tab still detaches its tiles, and the branch and work remain on disk for reopening.
 
 **How it plugs into the cockpit.** Worktrees map cleanly onto T-Hub's model: one git worktree → one workspace **tab** containing a **tile** (terminal) whose cwd is the worktree dir, on its own branch. Each tile can run its own agent, so N feature branches = N concurrent agents, each isolated in its own checkout, all in one window. The per-tile git chip (`Tile.tsx`) and FilePanel badge show branch / linked-worktree tag / dirty count, making the cockpit a fleet view. The layer split is the core UX principle: `Ctrl+T` adds *more hands on the same task* (another terminal in the same worktree); `Ctrl+B w` starts a *new task* (a new worktree).

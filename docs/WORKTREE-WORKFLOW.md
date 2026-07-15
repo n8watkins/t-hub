@@ -43,7 +43,7 @@ Split by **layer** — a *terminal* (a tile) vs a *workspace* (a tab). The frequ
 
 - **Closing a worktree workspace = detach** its tiles (tmux stays alive); the worktree folder **stays on disk** — your branch/work persists.
 - **Removing a worktree** will be a separate, explicit action that deletes the folder only after the unified status service authorizes it.
-- Source `0.3.87` temporarily suspends removal before UI detachment or Git mutation, and `force` cannot bypass that gate.
+- Source `0.3.88` temporarily suspends removal before UI detachment or Git mutation, and `force` cannot bypass that gate.
 - **Re-open** an existing worktree into a new workspace from a **worktrees list** (`git_worktree_list`). Worktrees are durable, not throwaway.
 
 ## The one enabling primitive

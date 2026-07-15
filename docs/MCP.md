@@ -147,7 +147,7 @@ restart that pin points at the dead pre-restart endpoint. Rather than reporting
 | `unwatch_fleet` | Organization | allowed, **audited** | disarms the orchestrator wake previously armed with `watch_fleet` |
 | `open_file` | Organization | allowed, **audited** | capped text read via the Files reader |
 | `create_worktree` | Organization | allowed, **audited** | runs `git worktree add` here, resolves the target tab **by name** (reuse/create, never the focused tab), spawns the worktree terminal **server-side**, places it in the registry, and forwards the snapshot; returns `tabId` + `terminalId` synchronously; optional `spawnedBy` records the worktree terminal as a captain's crew |
-| `remove_worktree` | Organization | temporarily unavailable | source `0.3.87` fails closed before UI detachment or Git mutation until the unified worktree status service is available; `force` cannot bypass the suspension |
+| `remove_worktree` | Organization | temporarily unavailable | source `0.3.88` fails closed before UI detachment or Git mutation until the unified worktree status service is available; `force` cannot bypass the suspension |
 | `spawn_terminal` | **Process-changing** | **confirmation required** | the server spawns the session itself, resolves `tabName`/`tabId` against the registry (reuse-or-create, WITHOUT switching the user's active tab), places the tile, and returns the real `id` synchronously; refused only when no UI is connected at all; optional `spawnedBy` records the session as a captain's crew |
 | `commission_captain` | **Process-changing** | **confirmation required** | starts a new control-capability Codex or Claude Captain and binds it to a registered, Powder-verified project |
 | `attach_captain` | **Process-changing** | **confirmation required** | attaches an existing live harness only when it already holds the current control capability; read-only terminals are refused without changing their token |
@@ -166,7 +166,7 @@ restart that pin points at the dead pre-restart endpoint. Rather than reporting
   side-effect-free backing (the reader) and returns file contents. The two
   worktree tools (`create_worktree`, `remove_worktree`) are also Organization tier.
   `create_worktree` runs `git worktree add` here and forwards a new tab and spawn to the UI.
-  Source `0.3.87` suspends `remove_worktree` with one shared backend refusal before any UI or Git mutation until the complete status service is available.
+  Source `0.3.88` suspends `remove_worktree` with one shared backend refusal before any UI or Git mutation until the complete status service is available.
   The captain tools (`claim_captain`, `release_captain`) are Organization tier
   too: they mutate the authoritative captains registry FIRST (strict - one
   captain per ship, an unknown release is a hard error) and forward the captains

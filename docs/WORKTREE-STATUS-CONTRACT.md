@@ -108,7 +108,7 @@ An event-driven refresh should follow T-Hub-owned create, remove, commit, branch
 
 ## Current Implementation Status
 
-Source commit `2b7d864`, versioned by `cfc72b7` as `0.3.87`, suspends removal through an unconditional backend safety gate and a graphical preflight that runs before tile detachment.
+Source commit `2b7d864`, currently versioned by `b8f7309` as `0.3.88`, suspends removal through an unconditional backend safety gate and a graphical preflight that runs before tile detachment.
 The canonical snapshot, multi-source verdict, and safe activation path remain unimplemented.
 Installed `0.3.86` predates this suspension.
 

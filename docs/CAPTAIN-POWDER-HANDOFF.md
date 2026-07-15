@@ -13,7 +13,7 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `cfc72b7`.
+**Source head before this handoff update:** `b8f7309`.
 **Installed Windows build:** locally built T-Hub `0.3.86` from `5ea945c`.
 
 ## Executive Status
@@ -342,7 +342,9 @@ Installed `0.3.86` reproduced the safety failure before that change: direct Taur
 The disposable worktree and session were cleaned after reproduction, and the six canonical sessions were unchanged.
 The suspension preserves UI state and invokes no Git operation, and force cannot override it.
 Private rollback is limited to worktrees created by the current in-flight `create_worktree` transaction and never removes a worktree after unconfirmed terminal cleanup.
-Commit `cfc72b7` bumps this source to `0.3.87`.
+Commit `cfc72b7` first bumped this source to `0.3.87`.
+The exact detached Windows build produced all three unsigned local artifacts, but its native removal suite exposed a path-separator-only test failure after proving that the directory remained intact.
+Commit `11ccb19` normalizes that cross-platform assertion, and `b8f7309` bumps the corrected source to `0.3.88` under the every-change version policy.
 This behavior is not installed and must not be treated as packaged evidence until the versioned build passes acceptance.
 The source gate passed 471 frontend tests, TypeScript, the production frontend build, 625 Rust desktop tests with one additional test ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, and the performance harness self-tests.
 The local Powder endpoint and protected agent credential path are operational.

@@ -197,10 +197,10 @@ Make the installed terminal cockpit and its control clients trustworthy before e
 
 ## Phase 2 - Unified Owned-Resource Lifecycle
 
-**Status:** Active after Phase 1; managed development-server ownership is partially implemented and worktree removal is suspended fail closed in `0.3.87` source pending packaged verification, while the unified resource record, browser lifecycle, worktree status service, Resources surface, startup reconciliation, and full exit gate remain open.
+**Status:** Active after Phase 1; managed development-server ownership is partially implemented and worktree removal is suspended fail closed in `0.3.88` source pending packaged verification, while the unified resource record, browser lifecycle, worktree status service, Resources surface, startup reconciliation, and full exit gate remain open.
 The unified worktree snapshot's Captain, Assignment, Workspace, Crew, resource-lease, and Powder ownership fields depend on the Phase 3 B1 durable identity interfaces, so independent Phase 2 work may proceed but the full worktree slice cannot exit before B1 stabilizes.
 Installed `0.3.86` reproduced the owned-resource failure by deleting a disposable linked worktree while a live tmux session remained rooted inside it, leaving that pane at a `(deleted)` cwd.
-Source `0.3.87` now refuses graphical, direct Tauri, control, MCP, and CLI removal before UI detachment or Git mutation, including with force.
+Source `0.3.88` now refuses graphical, direct Tauri, control, MCP, and CLI removal before UI detachment or Git mutation, including with force.
 This is a temporary suspension rather than implementation of the unified worktree status service, and packaged acceptance remains open.
 
 ### Goal

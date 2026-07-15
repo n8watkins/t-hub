@@ -102,15 +102,15 @@ Consequences:
 
 ### 1.6 Worktree and MCP flows
 
-> Current source override, 2026-07-14: `0.3.87` suspends public worktree removal across native, webview, Tauri, control, MCP, and CLI surfaces until the unified worktree status service is implemented.
+> Current source override, 2026-07-14: `0.3.88` suspends public worktree removal across native, webview, Tauri, control, MCP, and CLI surfaces until the unified worktree status service is implemented.
 > The T-B removal rows and tally below remain historical acceptance evidence, not current capability claims.
 
 | Capability | Webview reference | Native status | Effort | Covered by |
 |---|---|---|---|---|
 | Worktree create via MCP/socket (`create_worktree` -> named tab + placed tile) | `controlBridge.ts` | **present** (T12, cwd-verified) | - | done |
 | Worktree create via LOCAL UX (prefix `w`: branch focused repo into sibling worktree) | `workspace.ts:1131-1172` | **missing** (UI trigger only) - the server side is COMPLETE: socket `create_worktree` (T12) does git add + named tab + placed tile. The webview's trigger is itself a keymap chord (prefix `w`), so the native trigger rides T-A's keymap - one action calling `create_worktree` on the focused tile's repo | S (in T-A) | T-A (trigger); server done |
-| Worktree list/re-open/remove UX (prefix `l`) | worktrees list dialog | **missing** (UI dialog only) - list and reopen server support exists, while source `0.3.87` temporarily suspends removal pending the unified safety service | M | T-A dialog plus Phase 2 removal activation |
-| `remove_worktree` native-only (no webview attached) | `workspace.ts:1174-1198` | **temporarily unavailable** - historical T-B acceptance proved the old native path, but source `0.3.87` now refuses before broadcast or Git | Phase 2 | historical T-B evidence; current activation open |
+| Worktree list/re-open/remove UX (prefix `l`) | worktrees list dialog | **missing** (UI dialog only) - list and reopen server support exists, while source `0.3.88` temporarily suspends removal pending the unified safety service | M | T-A dialog plus Phase 2 removal activation |
+| `remove_worktree` native-only (no webview attached) | `workspace.ts:1174-1198` | **temporarily unavailable** - historical T-B acceptance proved the old native path, but source `0.3.88` now refuses before broadcast or Git | Phase 2 | historical T-B evidence; current activation open |
 | MCP organization continuity (move_tile, rename_tab, focus_*, new_tab, spawn_terminal, open_file) | `controlBridge.ts` switch | **present** (T12) | - | done |
 | Workspace-tab registry reporting (`report_workspace_tabs`) | Tauri report | **present** (T12; one-reporter rule at flip, §5) | - | done |
 
@@ -150,7 +150,7 @@ Consequences:
 | **rows** | **77** |
 
 > Historical T-B tally from 2026-07-03: resume flow, single-instance guard, chimes, OS notifications, and native-only `remove_worktree` moved to **present** at that time.
-> Source `0.3.87` supersedes the removal classification with **temporarily unavailable** until Phase 2 activation.
+> Source `0.3.88` supersedes the removal classification with **temporarily unavailable** until Phase 2 activation.
 
 Of the 33 missing: 9 sit with the in-flight chrome crews (incl. the panels URL push that rides their mount), 6 fold into one keymap/palette task (T-A) plus the two worktree trigger rows that now ride it, 12 are post-flip polish (T-C, the settings/theming family), 3 are the distribution items (§3), and 1 is server-gated (M4 file write).
 
@@ -209,7 +209,7 @@ Estimated total for the Velopack path: 2-3 days of work plus signing enrollment 
   Blocked on the chrome crews' input-routing seam; should start immediately after they merge.
 - **T-B - Daily-drive flow gaps** - **LANDED 2026-07-03** (branch `tb-flows`; execution-doc §5 entry).
   Historical shipped scope included resume wiring, local "+ terminal", the former native-only `remove_worktree` ordering, `list_worktrees`, sound chimes, OS notifications, and the single-instance guard.
-  Source `0.3.87` intentionally suspends that removal path pending the unified Phase 2 verdict.
+  Source `0.3.88` intentionally suspends that removal path pending the unified Phase 2 verdict.
   Remaining from the original list: the worktree create/list TRIGGERS (keymap chords in the webview too) and the spawn presets/Ctrl+T - all ride T-A's keymap/palette on the now-complete server surface.
 - **T-C - Post-flip polish** (L).
   Settings UI + persistence hub, theming (tokens -> one struct -> JSON), work names, rules engine, auto-continue, drag-drop with `toWslPath`, hooks panel.
