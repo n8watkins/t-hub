@@ -13,7 +13,7 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `c40d52a`.
+**Source head before this handoff update:** `70804df`.
 **Installed Windows build:** locally built T-Hub `0.3.94` from exact detached source `3816bf4`.
 
 ## Executive Status
@@ -45,6 +45,10 @@ Powder exposes repository upsert, not create-if-absent, so a concurrent creator 
 The reviewed `0.3.97` prototype was rejected and fully removed before commit because it could not close that race without changing Powder.
 T-Hub must not modify Powder to accommodate this flow and must remain fail-closed until Powder independently provides a non-overwriting create precondition.
 The rejected prototype also exposed two recovery requirements that remain part of the Phase 7 gate: reuse one reviewed request identity across ambiguous retries, and make a preserved unbound Project directly resumable after Powder or binding failure.
+
+Provider-neutral History implementation is now governed by [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md).
+The contract requires deterministic Harness-plus-conversation identity, distinct same-cwd conversations, backend-owned resume and focus actions, non-destructive per-conversation archive overlays, legacy Claude archive discovery, explicit cache disposal, and dual-Harness packaged acceptance.
+The current Claude-only Recent implementation remains unchanged and must not be extended with Codex rows before those identity and action boundaries exist.
 
 The runtime was reverified before this handoff update.
 Installed T-Hub is PID `46860`, version `0.3.94`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`, with SHA-256 `021E7CAFF58C9A46720A02DD915D09BAC6BFE08235D7E80A8628C1E550223A7E`.

@@ -624,6 +624,9 @@ Source commit `1484750`, completed by `d05073d` and packaged as installed `0.3.8
 Packaged acceptance passed the static HTTP and confinement matrix, stale-run ownership, 206-millisecond nonreading-client Stop, independent cross-terminal Start, listener cleanup, and preservation of the six-session pre-install tmux baseline.
 The Run and Preview exit-gate requirement for representative Vite, Next.js, and static projects is complete.
 Framework-aware generic Vite arguments and stale WSL-address recovery remain open follow-up hardening.
+History items 11 through 13 are governed by [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md).
+The existing Recent implementation is Claude-only, keyed and filtered by cwd, archives an entire Claude project transcript directory, and hardcodes Claude resume behavior.
+Codex rows must not be added to that legacy contract because doing so would collapse same-cwd conversations and resume them through the wrong Harness.
 
 ### Tests and Evidence
 

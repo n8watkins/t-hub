@@ -20,6 +20,7 @@ Historical documents should remain intact as design rationale and evidence unles
 - [PRODUCTION-READINESS.md](./PRODUCTION-READINESS.md) supplies release-quality gates that remain applicable where the phased plan has not superseded their sequencing.
 - [PERFORMANCE-BENCHMARK.md](./PERFORMANCE-BENCHMARK.md) defines the packaged runtime measurement procedure.
 - [POWDER-INTEGRATION.md](./POWDER-INTEGRATION.md) describes the Powder integration boundary and protected profiles.
+- [HISTORY-CONTRACT.md](./HISTORY-CONTRACT.md) defines provider-neutral conversation identity, catalog, resume, recovery, archive, cache, and compatibility behavior.
 - [MCP.md](./MCP.md) documents the existing MCP and control-channel implementation, while the CLI-first roadmap governs its future surface.
 - [WORKTREE-WORKFLOW.md](./WORKTREE-WORKFLOW.md) remains the interaction and path-convention design, while the unified worktree contract governs status and safety.
 - [SESSION_AWARENESS.md](./SESSION_AWARENESS.md) records the existing Claude-oriented event spine, while the two-axis status model governs provider-neutral semantics.
