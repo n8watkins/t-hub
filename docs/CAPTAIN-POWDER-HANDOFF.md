@@ -13,7 +13,7 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `2c6a429`.
+**Source head before this handoff update:** `e26fe2e`.
 **Installed Windows build:** locally built T-Hub `0.3.86` from `5ea945c`.
 
 ## Executive Status
@@ -349,6 +349,9 @@ The exact detached `0.3.88` build from `807c271` produced standalone, NSIS, and 
 Packaging created both installers and then exited only because the updater public key was present without its private signing key, so the artifacts were eligible for local testing but not publication.
 The exact detached `0.3.88` native suite then passed the three public refusal cases but exposed that the transaction-rollback fixture registered its worktree with native Windows Git before exercising the production WSL Git path.
 Commit `f62f188` makes the fixture use the same WSL Git and host-path conversion boundary as production, and `2c6a429` bumps the corrected source to `0.3.89`.
+The exact detached `0.3.89` build from `ac1e2a6` produced standalone, NSIS, and MSI SHA-256 values `440E36512BD95AF56934FEB4B57BED3DF339E2EA64002E432D5FBBF82644967B`, `8144A5CDA2F8CD1378672AC4BE519DD016401D4B2E902BCBA8DAC6A26338545D`, and `B9AF6D760DC15DC0597D4F3FD889F0FA7B34214CCA9635FC833BFBE05C39A2B0`.
+Its native suite proved WSL Git fixture creation and the exact public refusal, then exposed a Windows UNC access denial in the host-side existence assertion for a mounted-drive fixture.
+Commit `3841c2e` keeps all product operations on WSL Git while checking the retained native fixture path directly, and `e26fe2e` bumps the corrected source to `0.3.90`.
 This behavior is not installed and must not be treated as packaged evidence until the versioned build passes acceptance.
 The source gate passed 471 frontend tests, TypeScript, the production frontend build, 625 Rust desktop tests with one additional test ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, and the performance harness self-tests.
 The local Powder endpoint and protected agent credential path are operational.
