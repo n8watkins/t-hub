@@ -425,8 +425,10 @@ fn unc_to_posix(path: &str) -> Option<String> {
 /// `pnpm dev` runs verbatim afterwards. `HOST` is honoured by CRA, Next, Nuxt,
 /// Remix, Astro, Gatsby and many custom servers; the framework-specific aliases
 /// cover the rest. Tauri's standard Vite configuration reads `TAURI_DEV_HOST`,
-/// so it receives the validated WSL interface address rather than binding only
-/// to WSL loopback. Unknown tools remain unchanged and receive no guessed CLI
+/// so it binds all WSL interfaces rather than only WSL loopback. This is
+/// important in mirrored mode, where the first address from `hostname -I` is
+/// also owned by Windows and is not a valid Windows-to-WSL destination for the
+/// listener. Unknown tools remain unchanged and receive no guessed CLI
 /// arguments.
 #[cfg(not(windows))]
 fn apply_host_binding(command: &mut Command) {
@@ -445,7 +447,6 @@ fn build_command(cwd: &str, package_manager: PackageManager, script: &str) -> Co
     {
         use std::os::windows::process::CommandExt;
         let posix_cwd = unc_to_posix(cwd).unwrap_or_else(|| cwd.to_string());
-        let preview_host = wsl_host_ip().unwrap_or_else(|| "0.0.0.0".to_string());
         let mut c = Command::new("wsl.exe");
         c.arg("-d").arg(crate::files::host_distro());
         if !posix_cwd.is_empty() {
@@ -454,9 +455,8 @@ fn build_command(cwd: &str, package_manager: PackageManager, script: &str) -> Co
         c.arg("-e")
             .arg("bash")
             .arg("-lc")
-            .arg("export HOST=0.0.0.0 HOSTNAME=0.0.0.0 NUXT_HOST=0.0.0.0 ASTRO_HOST=0.0.0.0 TAURI_DEV_HOST=\"$1\"; shift; exec \"$@\"")
+            .arg("export HOST=0.0.0.0 HOSTNAME=0.0.0.0 NUXT_HOST=0.0.0.0 ASTRO_HOST=0.0.0.0 TAURI_DEV_HOST=0.0.0.0; exec \"$@\"")
             .arg("t-hub-runner")
-            .arg(preview_host)
             .arg(package_manager.executable())
             .arg("run")
             .arg(script);
