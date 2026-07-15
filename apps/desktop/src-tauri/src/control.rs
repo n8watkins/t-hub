@@ -11797,7 +11797,7 @@ mod tests {
             let err = git::worktree_remove(&repo, &wt, force).unwrap_err();
             assert_eq!(err, git::WORKTREE_REMOVAL_UNAVAILABLE);
             assert!(
-                crate::files::to_host_path(&wt).exists(),
+                base.join("wt").exists(),
                 "force={force} must preserve the worktree"
             );
         }
@@ -11814,7 +11814,7 @@ mod tests {
         assert_eq!(err, git::WORKTREE_REMOVAL_UNAVAILABLE);
         assert_no_event(&mut reader);
         assert!(
-            crate::files::to_host_path(&wt).exists(),
+            base.join("wt").exists(),
             "the worktree directory must remain intact"
         );
         let listed_paths = git::worktree_list(&repo)
@@ -11830,7 +11830,7 @@ mod tests {
         git::rollback_created_worktree(&repo, &wt)
             .expect("transaction-owned rollback remains available");
         assert!(
-            !crate::files::to_host_path(&wt).exists(),
+            !base.join("wt").exists(),
             "private rollback must remove its owned worktree"
         );
         std::fs::remove_dir_all(&base).ok();
