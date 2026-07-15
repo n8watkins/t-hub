@@ -810,8 +810,10 @@ pub fn run() {
             // feat/dev-runner: managed per-project dev server (Dev tab). Self-
             // contained (its own process-global registry; no .manage() needed).
             // Streams output on `devserver://<terminal_id>`.
+            devserver::discover_run_targets,
             devserver::start_dev_server,
             devserver::stop_dev_server,
+            devserver::dev_server_snapshot,
             // feat/preview: WSL2 preview-reachability helpers. `preview_host`
             // returns the Windows-reachable host to substitute for a WSL
             // `localhost`; `probe_tcp` reports whether a host:port accepts a

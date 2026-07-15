@@ -1,7 +1,7 @@
 // Typed wrappers over the Dev-server IPC surface (feat/dev-runner).
 //
-// Run and Preview runs one managed `npm run dev`-style process per project, scoped to
-// that project's directory. These wrappers `invoke` the two Tauri commands and
+// Run and Preview runs one managed package script per project, scoped to that
+// project's directory. These wrappers invoke the discovery and lifecycle commands and
 // `listen` on the per-terminal output channel. Kept separate from ./client (0.1
 // nucleus) and ./files so the dev-runner contract lives in one place. Mirrors
 // `src-tauri/src/devserver.rs` (its `DevServerEvent` uses `rename_all =
@@ -13,15 +13,61 @@ import type { TerminalId } from "./types";
 
 /** Tauri command names for the managed dev runner (used with `invoke`). */
 export const CommandsDevServer = {
-  /** Start (or restart) the dev server for a terminal/project. → void */
+  /** Discover typed root-package targets for a project. */
+  discoverRunTargets: "discover_run_targets",
+  /** Start (or restart) the selected typed target. */
   startDevServer: "start_dev_server",
-  /** Stop the dev server for a terminal/project (idempotent). → void */
+  /** Stop one exact run, or the active run when omitted. */
   stopDevServer: "stop_dev_server",
+  /** Read backend-authoritative lifecycle state. */
+  devServerSnapshot: "dev_server_snapshot",
   /** Host to substitute for a `localhost` preview URL (WSL2 fix). → string|null */
   previewHost: "preview_host",
   /** TCP-reachability probe for a host:port (precise preview errors). → bool */
   probeTcp: "probe_tcp",
 } as const;
+
+export type PackageManager = "pnpm" | "npm" | "yarn" | "bun";
+
+export interface RunTarget {
+  kind: "packageScript";
+  id: string;
+  script: string;
+  label: string;
+  packageManager: PackageManager;
+  commandDisplay: string;
+  recommended: boolean;
+}
+
+export interface PackageScriptTargetRef {
+  kind: "packageScript";
+  script: string;
+}
+
+export interface RunTargetDiscovery {
+  state: "ready" | "notFound" | "unreadable" | "invalid";
+  targets: RunTarget[];
+  message: string | null;
+}
+
+export type RunnerState =
+  | "idle"
+  | "starting"
+  | "running"
+  | "stopping"
+  | "exited"
+  | "failed";
+
+export interface DevServerSnapshot {
+  terminalId: TerminalId;
+  runId: string | null;
+  revision: number;
+  state: RunnerState;
+  target: RunTarget | null;
+  exitCode: number | null;
+  reason: string | null;
+  observedAt: number;
+}
 
 /**
  * One event from a managed dev server, streamed on `devserver://<terminalId>`.
@@ -30,6 +76,10 @@ export const CommandsDevServer = {
 export interface DevServerEvent {
   /** The terminal/project id this event belongs to. */
   id: TerminalId;
+  /** Generation that owns this event. */
+  runId: string;
+  /** Monotonic backend revision for stale-event rejection. */
+  revision: number;
   /**
    * `"line"` — a captured stdout/stderr output line (in `line`).
    * `"started"` means the child process spawned and the runner becomes active.
@@ -38,6 +88,16 @@ export interface DevServerEvent {
   kind: "line" | "started" | "exited";
   /** The output line, or a lifecycle summary, with no trailing newline. */
   line: string;
+}
+
+export function discoverRunTargets(cwd: string): Promise<RunTargetDiscovery> {
+  return invoke(CommandsDevServer.discoverRunTargets, { cwd });
+}
+
+export function devServerSnapshot(
+  terminalId: TerminalId,
+): Promise<DevServerSnapshot> {
+  return invoke(CommandsDevServer.devServerSnapshot, { terminalId });
 }
 
 /**
@@ -50,21 +110,24 @@ export function devServerChannel(terminalId: TerminalId): string {
 }
 
 /**
- * Start (or restart) the managed dev server for `terminalId`, running `command`
- * inside `cwd`. Any dev server already running for this id is replaced. Output
- * arrives via {@link onDevServerEvent}.
+ * Start (or restart) the selected typed target inside `cwd`. The backend validates
+ * the target again and replaces any active run for this terminal. Output arrives
+ * via {@link onDevServerEvent}.
  */
 export function startDevServer(
   terminalId: TerminalId,
   cwd: string,
-  command: string,
-): Promise<void> {
-  return invoke(CommandsDevServer.startDevServer, { terminalId, cwd, command });
+  target: PackageScriptTargetRef,
+): Promise<DevServerSnapshot> {
+  return invoke(CommandsDevServer.startDevServer, { terminalId, cwd, target });
 }
 
-/** Stop the managed dev server for `terminalId` (idempotent — safe if none). */
-export function stopDevServer(terminalId: TerminalId): Promise<void> {
-  return invoke(CommandsDevServer.stopDevServer, { terminalId });
+/** Stop the managed dev server for `terminalId` without touching a replacement. */
+export function stopDevServer(
+  terminalId: TerminalId,
+  runId?: string | null,
+): Promise<DevServerSnapshot> {
+  return invoke(CommandsDevServer.stopDevServer, { terminalId, runId });
 }
 
 /**
