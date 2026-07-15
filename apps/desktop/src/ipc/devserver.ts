@@ -151,12 +151,10 @@ export function onDevServerEvent(
 // Preview reachability (the WSL2 localhost fix).
 //
 // The dev server runs INSIDE WSL; the preview iframe is a WINDOWS process. A
-// `localhost`/`127.0.0.1` URL from the server's banner points at WSL's loopback,
-// which the Windows-side iframe can't reach (separate loopback in mirrored mode,
-// flaky relay in NAT). `preview_host` returns the host to substitute (the WSL
-// interface IP on Windows; null on unix where no rewrite is needed); `probe_tcp`
-// reports whether a host:port actually accepts a connection so the UI can show a
-// precise reason instead of a silent timeout.
+// `localhost`/`127.0.0.1` URL from the server's banner may reach WSL directly in
+// mirrored mode or through WSL's NAT relay. Probe that route first. Only when it
+// is unreachable does `preview_host` provide the WSL interface IP to substitute.
+// `probe_tcp` runs on the Windows side, matching the WebView's network boundary.
 // ---------------------------------------------------------------------------
 
 /** Hosts that name a loopback the WSL-side server may have bound — these are the
@@ -185,10 +183,10 @@ export function previewHost(): Promise<string | null> {
 }
 
 /**
- * Rewrite a `localhost`/`127.0.0.1`/`0.0.0.0` URL to one the Windows-side preview
- * iframe can actually reach, using {@link previewHost}. Non-loopback hosts and
- * already-reachable URLs pass through unchanged; a parse failure returns the
- * input as-is. The port/path/query are preserved.
+ * Resolve a `localhost`/`127.0.0.1`/`0.0.0.0` URL for the Windows-side preview.
+ * An already-reachable loopback URL passes through unchanged. Otherwise the WSL
+ * interface host from {@link previewHost} is substituted. Non-loopback hosts and
+ * parse failures pass through unchanged. The port/path/query are preserved.
  */
 export async function reachablePreviewUrl(raw: string): Promise<string> {
   if (!raw) return raw;
@@ -199,6 +197,7 @@ export async function reachablePreviewUrl(raw: string): Promise<string> {
     return raw; // not a full URL (caller normalizes first); leave it be
   }
   if (!LOOPBACK_HOSTS.has(u.hostname.toLowerCase())) return raw;
+  if ((await probePreviewReachable(raw, 500)) === true) return raw;
   const host = await previewHost();
   if (!host) return raw; // unix / no backend / lookup failed — localhost is fine
   u.hostname = host;
