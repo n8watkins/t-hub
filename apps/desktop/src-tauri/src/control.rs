@@ -11728,15 +11728,78 @@ mod tests {
         (base, repo, wt)
     }
 
+    fn scratch_product_repo_with_worktree() -> (std::path::PathBuf, String, String) {
+        let base = std::env::temp_dir().join(format!(
+            "t-hub-product-tb-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let repo_host = base.join("repo");
+        let worktree_host = base.join("wt");
+        std::fs::create_dir_all(&repo_host).expect("mkdir repo");
+
+        let repo = test_product_path(&repo_host);
+        let worktree = test_product_path(&worktree_host);
+        let run = |args: &[&str]| {
+            let (ok, stdout, stderr) = git::run_git_for_test(&repo, args).expect("git spawns");
+            assert!(
+                ok,
+                "git {args:?} failed: {}",
+                if stderr.trim().is_empty() {
+                    stdout.trim()
+                } else {
+                    stderr.trim()
+                }
+            );
+        };
+
+        run(&["init", "-q"]);
+        std::fs::write(repo_host.join("a.txt"), "hi").expect("seed file");
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        git::worktree_add(&repo, &worktree, None).expect("worktree add succeeds");
+        assert!(worktree_host.exists(), "worktree dir created");
+        (base, repo, worktree)
+    }
+
+    #[cfg(not(windows))]
+    fn test_product_path(path: &std::path::Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(windows)]
+    fn test_product_path(path: &std::path::Path) -> String {
+        let native = path.to_string_lossy().replace('\\', "/");
+        let bytes = native.as_bytes();
+        assert!(
+            bytes.len() >= 3 && bytes[1] == b':' && bytes[2] == b'/',
+            "expected an absolute drive path, got {native:?}"
+        );
+        format!(
+            "/mnt/{}/{}",
+            (bytes[0] as char).to_ascii_lowercase(),
+            &native[3..]
+        )
+    }
+
     #[test]
     fn remove_worktree_with_subscribers_fails_before_broadcast_or_git() {
-        let (base, repo, wt) = scratch_repo_with_worktree();
+        let (base, repo, wt) = scratch_product_repo_with_worktree();
 
         for force in [false, true] {
-            let err = git::worktree_remove(repo.to_str().unwrap(), wt.to_str().unwrap(), force)
-                .unwrap_err();
+            let err = git::worktree_remove(&repo, &wt, force).unwrap_err();
             assert_eq!(err, git::WORKTREE_REMOVAL_UNAVAILABLE);
-            assert!(wt.exists(), "force={force} must preserve the worktree");
+            assert!(
+                crate::files::to_host_path(&wt).exists(),
+                "force={force} must preserve the worktree"
+            );
         }
 
         let fanout = Arc::new(EventFanout::new());
@@ -11745,28 +11808,29 @@ mod tests {
         let err = dispatch(
             &ctx,
             "remove_worktree",
-            &json!({"repoRoot": repo.to_str().unwrap(), "worktreePath": wt.to_str().unwrap()}),
+            &json!({"repoRoot": repo, "worktreePath": wt}),
         )
         .unwrap_err();
         assert_eq!(err, git::WORKTREE_REMOVAL_UNAVAILABLE);
         assert_no_event(&mut reader);
-        assert!(wt.exists(), "the worktree directory must remain intact");
-        let listed = std::process::Command::new("git")
-            .current_dir(&repo)
-            .args(["worktree", "list", "--porcelain"])
-            .output()
-            .expect("git worktree list spawns");
-        let listed_paths = String::from_utf8_lossy(&listed.stdout).replace('\\', "/");
-        let expected_path = wt.to_string_lossy().replace('\\', "/");
         assert!(
-            listed_paths.contains(&expected_path),
-            "the worktree registration must remain intact: expected {expected_path:?} in {listed_paths:?}"
+            crate::files::to_host_path(&wt).exists(),
+            "the worktree directory must remain intact"
+        );
+        let listed_paths = git::worktree_list(&repo)
+            .expect("git worktree list succeeds")
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        assert!(
+            listed_paths.contains(&wt),
+            "the worktree registration must remain intact: expected {wt:?} in {listed_paths:?}"
         );
 
-        git::rollback_created_worktree(repo.to_str().unwrap(), wt.to_str().unwrap())
+        git::rollback_created_worktree(&repo, &wt)
             .expect("transaction-owned rollback remains available");
         assert!(
-            !wt.exists(),
+            !crate::files::to_host_path(&wt).exists(),
             "private rollback must remove its owned worktree"
         );
         std::fs::remove_dir_all(&base).ok();

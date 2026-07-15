@@ -284,6 +284,11 @@ fn run_git(cwd: &str, args: &[&str]) -> Result<(bool, String, String), String> {
     Ok((output.status.success(), stdout, stderr))
 }
 
+#[cfg(test)]
+pub(crate) fn run_git_for_test(cwd: &str, args: &[&str]) -> Result<(bool, String, String), String> {
+    run_git(cwd, args)
+}
+
 /// Build the `git` command for the current platform (see [`run_git`]).
 #[cfg(not(windows))]
 fn build_git_command(cwd: &str, args: &[&str]) -> Command {
