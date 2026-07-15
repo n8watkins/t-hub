@@ -9,9 +9,8 @@ vi.mock("./BoardPanel", () => ({
     return <div data-testid="board-panel">Project Board</div>;
   },
 }));
-vi.mock("./WebPreview", () => ({ WebPreview: () => null }));
 vi.mock("./FilePanel", () => ({ FilePanel: () => null }));
-vi.mock("./DevTab", () => ({ DevTab: () => null }));
+vi.mock("./RunPreviewPanel", () => ({ RunPreviewPanel: () => null }));
 
 import { TilePanel } from "./TilePanel";
 

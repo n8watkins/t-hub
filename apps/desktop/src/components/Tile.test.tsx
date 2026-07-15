@@ -42,6 +42,7 @@ vi.mock("../ipc/controlClient", () => ({
 
 import { Tile } from "./Tile";
 import { useCaptain } from "../store/captain";
+import { usePanels } from "../store/panels";
 import { useSupervision } from "../store/supervision";
 import { useWorkspace, type WorkspaceTab } from "../store/workspace";
 import type { TerminalInfo } from "../ipc/types";
@@ -72,6 +73,7 @@ beforeEach(() => {
   });
   useCaptain.setState({ orchestratorId: null, captainIds: [], claims: {} });
   useSupervision.setState({ sessionIdByTmux: {} });
+  usePanels.setState({ tab: {}, devUrl: {}, previewUrl: {} });
   clipboardWrites.length = 0;
 });
 
@@ -122,6 +124,16 @@ describe("Tile header orchestrator identity", () => {
     expect(header.textContent).toContain("Cortana");
     expect(header.textContent).not.toContain("orchestrator");
     expect(within(header).getByLabelText("Orchestrator")).toBeTruthy();
+  });
+});
+
+describe("Tile Run and Preview entry point", () => {
+  it("offers one Run + Preview tab and no separate Dev tab", () => {
+    const header = renderTile("cap00001");
+
+    expect(within(header).getByTitle("Run + Preview view")).toBeTruthy();
+    expect(within(header).queryByTitle("Preview view")).toBeNull();
+    expect(within(header).queryByTitle("Dev view")).toBeNull();
   });
 });
 

@@ -1,6 +1,6 @@
 // Typed wrappers over the Dev-server IPC surface (feat/dev-runner).
 //
-// The Dev tab runs ONE managed `npm run dev`-style process per project, scoped to
+// Run and Preview runs one managed `npm run dev`-style process per project, scoped to
 // that project's directory. These wrappers `invoke` the two Tauri commands and
 // `listen` on the per-terminal output channel. Kept separate from ./client (0.1
 // nucleus) and ./files so the dev-runner contract lives in one place. Mirrors
@@ -32,7 +32,7 @@ export interface DevServerEvent {
   id: TerminalId;
   /**
    * `"line"` — a captured stdout/stderr output line (in `line`).
-   * `"started"` — the child process spawned (Dev tab flips to "running").
+   * `"started"` means the child process spawned and the runner becomes active.
    * `"exited"` — the child ended on its own; `line` is a human-readable summary.
    */
   kind: "line" | "started" | "exited";
@@ -72,9 +72,8 @@ export function stopDevServer(terminalId: TerminalId): Promise<void> {
  * resolving to an unlisten fn; call it on unmount to tear the listener down.
  *
  * Unlike the multiplexed terminal-output hub (one app-wide listener fanned out in
- * ./client), each Dev tab uses its OWN channel (`devserver://<id>`), so a plain
- * per-terminal `listen` is the right shape: there is exactly one Dev tab per id,
- * and the listener's lifetime matches that tab's mount.
+ * ./client), each managed runner uses its own channel (`devserver://<id>`), so a
+ * plain per-terminal `listen` is the right shape.
  */
 export function onDevServerEvent(
   terminalId: TerminalId,

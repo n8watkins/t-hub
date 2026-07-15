@@ -40,7 +40,6 @@ import {
 } from "../ipc/client";
 import { tmuxScroll, tmuxExitScroll, clipboardImageToTemp } from "../ipc/client05";
 import type { TerminalId } from "../ipc/types";
-import { stripAnsi } from "../lib/ansi";
 import { installFileDropOnce, formatPathsForInsert } from "../lib/dropPaste";
 import { usePanels } from "../store/panels";
 import { useFileOpen } from "../store/fileOpen";
@@ -106,20 +105,6 @@ async function openExternal(url: string): Promise<void> {
     }
   }
 }
-
-// Matches a localhost-style URL printed in terminal output so we can surface it
-// as a one-click Preview chip for the tile (Claude/Vite/Next/etc. announce the
-// dev server this way). Intentionally narrow — only loopback hosts, with an
-// optional :port and path — so we never offer to preview an arbitrary internet
-// link the user didn't start. `g` so one chunk can yield several matches.
-const LOCALHOST_URL_RE =
-  /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?(?:\/[^\s"'<>]*)?/gi;
-
-// How many trailing chars of one output chunk we prepend to the next before
-// scanning, so a URL split across two PTY writes is still matched whole. A URL
-// here is well under this; the tail just has to outspan the longest plausible
-// split point. Kept small — it runs on every output chunk.
-const URL_SCAN_TAIL = 256;
 
 // Output scheduling. Foreground terminals flush on rAF for low-latency typing.
 // Parked/inactive terminals keep their xterm buffers current, but flush less
@@ -851,43 +836,7 @@ export function TerminalView({
             let seeded = false;
             const liveBuffer: Uint8Array[] = [];
 
-            // LOCALHOST-URL DETECTION: scan the LIVE PTY stream for dev-server
-            // URLs and publish each NEW one to the panels store, where the tile's
-            // Preview tab renders them as one-click chips. Decoupled from xterm's
-            // write path so it can't perturb rendering. A streaming TextDecoder
-            // carries multi-byte UTF-8 across chunk boundaries; a rolling tail of
-            // the previous chunk is prepended so a URL split across two writes is
-            // still matched whole. We dedupe against the last few URLs we pushed
-            // so a server logging its URL on every request doesn't spam the store
-            // (addDetectedUrl also dedupes, but this avoids the regex+set churn).
-            const urlDecoder = new TextDecoder("utf-8");
-            let scanTail = "";
-            const recentUrls: string[] = [];
-            const scanForUrls = (bytes: Uint8Array): void => {
-              // `stream: true` keeps a trailing partial code point for next time.
-              const raw = scanTail + urlDecoder.decode(bytes, { stream: true });
-              // Strip ANSI/VT escapes BEFORE matching: the raw pty stream
-              // interleaves color/cursor/erase codes with the text, and without
-              // this they get captured into the URL (e.g. ".../preview\x1b[K\x1b[m
-              // \x1b[28;1H"). Match on the cleaned text; carry the RAW tail so an
-              // escape — or a URL — split across two writes still resolves on the
-              // next chunk.
-              const text = stripAnsi(raw);
-              LOCALHOST_URL_RE.lastIndex = 0;
-              for (const m of text.matchAll(LOCALHOST_URL_RE)) {
-                const url = m[0];
-                if (recentUrls.includes(url)) continue;
-                recentUrls.push(url);
-                if (recentUrls.length > 16) recentUrls.shift();
-                usePanels.getState().addDetectedUrl(terminalId, url);
-              }
-              // Carry the tail so a URL spanning this chunk and the next is caught.
-              scanTail =
-                raw.length > URL_SCAN_TAIL ? raw.slice(-URL_SCAN_TAIL) : raw;
-            };
-
-            // PER-TERMINAL COALESCED WRITE (perf): the old path decoded, scanned
-            // for URLs (stripAnsi + regex over a rolling buffer), and wrote to
+            // PER-TERMINAL COALESCED WRITE (perf): the old path decoded and wrote to
             // xterm SYNCHRONOUSLY for every single output event, on the one
             // WebView2 JS thread, for every live terminal. A burst from a few
             // busy terminals turned into a decode/ANSI/regex storm that froze the
@@ -901,22 +850,14 @@ export function TerminalView({
             const pending: Uint8Array[] = [];
             let pendingBytes = 0;
 
-            // Drain the queued bytes: URL-scan + activity-bump + write, ONCE for
-            // the whole frame's worth of chunks.
+            // Drain the queued bytes: activity-bump + write, once for the whole
+            // frame's worth of chunks.
             const drainQueue = (): void => {
               if (pending.length === 0) return;
               // Snapshot + clear up front so anything that arrives DURING this
               // drain queues cleanly for the next frame (FIFO order intact).
               const chunks = pending.splice(0, pending.length);
               pendingBytes = 0;
-
-              // URL detection runs at most ONCE per flush over the frame's bytes
-              // (in arrival order), not once per chunk — same stripAnsi/regex
-              // work, far fewer invocations. The dedup ring + tail carry-over
-              // make this identical in effect to the old per-chunk scan: a URL
-              // split across chunks within or across frames still resolves via
-              // `scanTail`, and `recentUrls` still suppresses repeats.
-              for (const bytes of chunks) scanForUrls(bytes);
 
               // RUNNING signal (#11): bump ONCE per flush rather than per chunk.
               // The sidebar pulse is a coarse "output is flowing" indicator, so a

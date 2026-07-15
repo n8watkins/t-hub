@@ -1,4 +1,4 @@
-// DevTab — the per-project "Dev" view: a managed `npm run dev` runner.
+// DevTab is the managed-runner portion of the per-project Run and Preview view.
 //
 // OWNED by the Dev-runner agent (feat/dev-runner). The per-tile panel mounts
 // <DevTab terminalId cwd/> and must not edit this file; keep these props stable.
@@ -11,8 +11,8 @@
 //   - Streams the server's combined stdout+stderr into a scrolling output pane.
 //   - Sniffs each line for the localhost URL the server prints
 //     (`http://localhost:PORT` / `http://127.0.0.1:PORT`) and publishes it via
-//     `usePanels.getState().setDevUrl(terminalId, url)` so the Preview tab loads
-//     it automatically.
+//     `usePanels.getState().setDevUrl(terminalId, url)` so the sibling preview
+//     loads it automatically.
 //   - Run/Stop button + a status row (idle / running / exited + detected URL).
 //
 // State is kept PER terminalId in a module-level store (below) so switching tabs
@@ -75,7 +75,7 @@ interface DevState {
   status: RunStatus;
   /** Rolling output log (newest appended; capped at MAX_LINES). */
   lines: string[];
-  /** The detected dev-server URL, mirrored into usePanels for the Preview tab. */
+  /** The detected dev-server URL, mirrored into usePanels for the preview. */
   url: string | null;
   /** The editable command. `undefined` until we've resolved the default. */
   command: string | undefined;
@@ -149,7 +149,7 @@ function subscribe(id: TerminalId, cb: () => void): () => void {
  *     attached once and intentionally NOT removed on unmount), and
  *   - delete its `states` / `listeners` / `unlisteners` map entries so none of
  *     these module-level maps grow once per spawned terminal.
- * Idempotent and safe to call for a terminal that never opened its Dev tab.
+ * Idempotent and safe when the terminal never opened Run and Preview.
  */
 export function forgetDevState(id: TerminalId): void {
   const un = unlisteners.get(id);
@@ -230,7 +230,7 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
   // Subscribe to the backend dev-server channel for this terminal. We attach the
   // listener ONCE per terminal id (tracked on the state's `subscribed` flag) so a
   // remount doesn't double-subscribe; the listener lives for the app session,
-  // which is fine since there's exactly one Dev tab per terminal.
+  // which is fine since there is exactly one managed runner per terminal.
   useEffect(() => {
     if (state.subscribed) return;
     update(terminalId, { subscribed: true });
@@ -279,7 +279,7 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
       lines: [],
       url: null,
     });
-    // Clear any stale detected URL for the Preview tab until the new run prints one.
+    // Clear any stale preview URL until the new run reports one.
     usePanels.getState().setDevUrl(terminalId, null);
     void startDevServer(terminalId, cwd, cmd).catch((err) => {
       appendLine(terminalId, `[t-hub] failed to start: ${String(err)}`);

@@ -107,13 +107,11 @@ function useGitInfo(cwd: string): GitInfo | null {
   return info;
 }
 
-/** The tile-header tab bar order + labels. Terminal is the default view. The
- *  Dev view runs the project's dev server and feeds its URL to Preview. */
+/** The tile-header tab bar order + labels. Terminal is the default view. */
 const PANEL_TABS: { id: PanelTab; label: string }[] = [
   { id: "terminal", label: "Terminal" },
   { id: "files", label: "Files" },
-  { id: "preview", label: "Preview" },
-  { id: "dev", label: "Dev" },
+  { id: "preview", label: "Run + Preview" },
   { id: "board", label: "Board" },
 ];
 
@@ -239,20 +237,21 @@ export function Tile({
   const busy =
     (typeof devUrl === "string" && devUrl.length > 0) || claudeMidTurn;
 
-  // Per-tile panel state (the Terminal / Files / Preview / Dev workbench). Kept
-  // in usePanels — NOT workspace.ts — so this presentational state doesn't
+  // Per-tile panel state (the Terminal / Files / Run + Preview / Board workbench).
+  // Kept in usePanels so this presentational state doesn't
   // contend with the workspace store. The active tab decides whether the body
-  // shows the pooled terminal (terminal) or an in-tile surface (files/preview/
-  // dev); fullscreen blows this one tile up to fill the window. Any unknown
-  // value (e.g. a tab dropped in a past build) falls back to "terminal".
-  const rawTab = usePanels((s) => s.tab[terminalId]);
+  // shows the pooled terminal or an in-tile surface. Fullscreen blows this one
+  // tile up to fill the window. Legacy "dev" state migrates to the unified flow.
+  const rawTab = usePanels((s) => s.tab[terminalId]) as
+    | PanelTab
+    | "dev"
+    | undefined;
   const activeTab: PanelTab =
-    rawTab === "files" ||
-    rawTab === "preview" ||
-    rawTab === "dev" ||
-    rawTab === "board"
-      ? rawTab
-      : "terminal";
+    rawTab === "dev"
+      ? "preview"
+      : rawTab === "files" || rawTab === "preview" || rawTab === "board"
+        ? rawTab
+        : "terminal";
   const setTab = usePanels((s) => s.setTab);
   const toggleFullscreen = usePanels((s) => s.toggleFullscreen);
   const isFullscreen = usePanels((s) => s.fullscreenId === terminalId);
@@ -844,7 +843,7 @@ export function Tile({
           <ContextMeter usedPct={client === "claude" ? contextUsedPct : null} />
         )}
 
-        {/* Per-tile view switcher: Terminal / Files / Preview. Clicking a tab
+        {/* Per-tile view switcher. Clicking a tab
             sets THIS tile's usePanels tab; the body (below) swaps to that surface
             and the terminal pool re-syncs (it subscribes to the tab) so the
             pooled xterm is shown only on the Terminal tab and parked otherwise.
@@ -1345,7 +1344,7 @@ export function Tile({
           and positioned over the placeholder DIV below; whichever placeholder is
           mounted (full tile on the Terminal tab, or just the terminal HALF in a
           split) is where the xterm lands + sizes itself. The non-terminal tabs
-          render their surface (Files/Preview/Dev) via <TilePanel>:
+          render their surface via <TilePanel>:
             - SPLIT (default for a non-terminal tab): terminal half + panel half
               side by side; the pool keeps showing the xterm in its half.
             - EXPANDED: the panel fills the tile; no placeholder is mounted, so
@@ -1445,7 +1444,10 @@ function PanelPane({
   onClose: () => void;
   onToggleExpand: () => void;
 }) {
-  const title = tab.charAt(0).toUpperCase() + tab.slice(1);
+  const title =
+    tab === "preview"
+      ? "Run and Preview"
+      : tab.charAt(0).toUpperCase() + tab.slice(1);
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div
