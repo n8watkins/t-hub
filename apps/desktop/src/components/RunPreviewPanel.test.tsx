@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen } from "@testing-library/react";
+import { useEffect, useState } from "react";
 import { usePanels } from "../store/panels";
 import { RunPreviewPanel } from "./RunPreviewPanel";
 
@@ -19,8 +20,18 @@ vi.mock("./WebPreview", () => ({
     initialUrl?: string;
     onNavigate?: (url: string) => void;
   }) => {
-    previewProps.push(props);
-    return <div data-testid="preview">{props.initialUrl ?? "empty"}</div>;
+    const [url, setUrl] = useState(props.initialUrl);
+    useEffect(() => {
+      if (props.initialUrl) setUrl(props.initialUrl);
+    }, [props.initialUrl]);
+    previewProps.push({
+      ...props,
+      onNavigate: (next: string) => {
+        setUrl(next);
+        props.onNavigate?.(next);
+      },
+    });
+    return <div data-testid="preview">{url ?? "empty"}</div>;
   },
 }));
 
@@ -54,5 +65,22 @@ describe("RunPreviewPanel", () => {
     expect(usePanels.getState().previewUrl["terminal-1"]).toBe(
       "http://localhost:4173",
     );
+  });
+
+  it("does not persist a managed URL and clears its frame when the run stops", () => {
+    usePanels.setState({
+      devUrl: { "terminal-1": "http://127.0.0.1:43123/" },
+      previewUrl: { "terminal-1": "http://127.0.0.1:43123/" },
+    });
+    render(<RunPreviewPanel terminalId="terminal-1" cwd="/static" />);
+
+    act(() => {
+      previewProps.at(-1)?.onNavigate?.("http://127.0.0.1:43123/");
+    });
+    expect(usePanels.getState().previewUrl["terminal-1"]).toBeNull();
+
+    act(() => usePanels.getState().setDevUrl("terminal-1", null));
+
+    expect(screen.getByTestId("preview").textContent).toBe("empty");
   });
 });

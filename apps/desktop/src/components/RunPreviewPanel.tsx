@@ -25,8 +25,14 @@ export function RunPreviewPanel({
   const previewUrl = usePanels((state) => state.previewUrl[terminalId]);
   const setPreviewUrl = usePanels((state) => state.setPreviewUrl);
   const rememberPreviewUrl = useCallback(
-    (url: string) => setPreviewUrl(terminalId, url),
-    [setPreviewUrl, terminalId],
+    (url: string) => {
+      if (url === devUrl) {
+        if (previewUrl === url) setPreviewUrl(terminalId, null);
+        return;
+      }
+      setPreviewUrl(terminalId, url);
+    },
+    [devUrl, previewUrl, setPreviewUrl, terminalId],
   );
 
   return (
@@ -42,6 +48,7 @@ export function RunPreviewPanel({
       </div>
       <div className="min-h-0 overflow-hidden">
         <WebPreview
+          key={devUrl ? `managed:${devUrl}` : "manual"}
           initialUrl={devUrl ?? previewUrl ?? undefined}
           onNavigate={rememberPreviewUrl}
         />
