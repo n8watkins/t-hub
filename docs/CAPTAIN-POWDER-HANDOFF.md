@@ -13,7 +13,7 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `b8f7309`.
+**Source head before this handoff update:** `2c6a429`.
 **Installed Windows build:** locally built T-Hub `0.3.86` from `5ea945c`.
 
 ## Executive Status
@@ -344,7 +344,11 @@ The suspension preserves UI state and invokes no Git operation, and force cannot
 Private rollback is limited to worktrees created by the current in-flight `create_worktree` transaction and never removes a worktree after unconfirmed terminal cleanup.
 Commit `cfc72b7` first bumped this source to `0.3.87`.
 The exact detached Windows build produced all three unsigned local artifacts, but its native removal suite exposed a path-separator-only test failure after proving that the directory remained intact.
-Commit `11ccb19` normalizes that cross-platform assertion, and `b8f7309` bumps the corrected source to `0.3.88` under the every-change version policy.
+Commit `11ccb19` normalizes that cross-platform assertion, and `b8f7309` bumps that source to `0.3.88` under the every-change version policy.
+The exact detached `0.3.88` build from `807c271` produced standalone, NSIS, and MSI SHA-256 values `349F899E1938F4C615FC13822FE1DEAEACE47BFB002E90C0C6A108459F4301FE`, `CD4E30FF6A484EF64FAF2E38748C737522A2FED32413F68B65BD5EA6B8AFE973`, and `B135C2D3C8B52B870426B3EC3CB3C84A1737DC5660D4F05F078F1E0EE1C28003`.
+Packaging created both installers and then exited only because the updater public key was present without its private signing key, so the artifacts were eligible for local testing but not publication.
+The exact detached `0.3.88` native suite then passed the three public refusal cases but exposed that the transaction-rollback fixture registered its worktree with native Windows Git before exercising the production WSL Git path.
+Commit `f62f188` makes the fixture use the same WSL Git and host-path conversion boundary as production, and `2c6a429` bumps the corrected source to `0.3.89`.
 This behavior is not installed and must not be treated as packaged evidence until the versioned build passes acceptance.
 The source gate passed 471 frontend tests, TypeScript, the production frontend build, 625 Rust desktop tests with one additional test ignored, all Rust workspace and MCP end-to-end suites, warning-denied Clippy, formatting, and the performance harness self-tests.
 The local Powder endpoint and protected agent credential path are operational.
