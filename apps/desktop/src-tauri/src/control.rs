@@ -13600,6 +13600,22 @@ mod tests {
             || attach_forwarder_count() == 0,
         );
 
+        // The forwarder timeout proves the wedged socket was reaped, but it does
+        // not stop the firehose command running inside tmux. Under full-suite CPU
+        // load that command can still fill the fresh client's receive window and
+        // trip the deliberately tiny 300 ms server write timeout before this test
+        // starts reading. Return the shared pane to a quiet prompt and observe a
+        // marker there before testing recovery, so this assertion measures attach
+        // health rather than a race with the previous client's output workload.
+        tmux::send_keys(&target, &["C-c"]).expect("interrupt churn firehose");
+        tmux::send_text(&target, "printf S27_FIREHOSE_STOPPED", true)
+            .expect("write quiet-shell marker");
+        eventually("churn firehose to stop", Duration::from_secs(10), || {
+            tmux::capture_pane_text(&target, 100)
+                .map(|text| text.contains("S27_FIREHOSE_STOPPED"))
+                .unwrap_or(false)
+        });
+
         // A FRESH attach must now succeed end to end - the exact operation that
         // failed for every client in the incident.
         let fresh = TcpStream::connect(addr).expect("connect fresh client");
