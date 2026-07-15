@@ -2,7 +2,7 @@
 
 ## Canonical Planning Note
 
-The runtime evidence in this handoff is current through the installed `0.3.82` build.
+The runtime evidence in this handoff is current through the installed `0.3.84` build.
 The authoritative forward roadmap is [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
 The document-status authority is [REVIEW-INDEX.md](./REVIEW-INDEX.md).
 That plan now includes the settled permanent Cortana identity, multiple Captains per Project, Assignment-based ownership, provider-agnostic Harness integration, CLI-first control, durable messaging, History, voice parity, and parallel implementation lanes.
@@ -13,8 +13,8 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-14.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `main`.
-**Source head before this handoff update:** `ec55526`.
-**Installed Windows build:** locally built T-Hub `0.3.82` from `ec55526`.
+**Source head before this handoff update:** `0cd5861`.
+**Installed Windows build:** locally built T-Hub `0.3.84` from `0cd5861`.
 
 ## Executive Status
 
@@ -23,9 +23,9 @@ The final independent authority review reports no remaining Critical, High, or M
 The exact integrated source passed Rust workspace tests, MCP end-to-end tests, frontend tests, TypeScript, the production frontend build, formatting, warning-free Clippy, installer tests, and the PowerShell performance contract test.
 
 The current production artifact is installed and running from `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
-The installed executable SHA-256 is `DF0EC491922EABCD1C15D71F21F271C3F1E2AE9BC81398B37C364979641E0111`.
-It is running as PID `48160`.
-The exact NSIS installer SHA-256 is `A5FB2B0E9D1077AEB0C6FA0E4343FD89F1074339D954256B3E1C284C41B0BCF5`.
+The installed executable SHA-256 is `B9A390F51A8648B14DE349E840F3006E317209BD051E1EFFA563A3E00433EEB5`.
+It is running as PID `17664`.
+The exact NSIS installer SHA-256 is `A93A772CDDFA9AD6B7609A0AA6CEA8036EEFB482704853898EB959B65556166D`.
 
 The local Powder authority is running as a WSL user service on `127.0.0.1:4017` and is reachable from Windows through Tailscale Serve at `https://n8desktop-wsl.tailae53f1.ts.net`.
 The protected `n8desktop-wsl` profile retrieves an agent-scoped key from WSL, and an authenticated remote write has passed.
@@ -87,6 +87,10 @@ The main implementation sequence in this work is:
 - `8f5fffa chore: bump desktop to 0.3.81`
 - `9d95fa9 fix: own managed development process trees`
 - `ec55526 chore: bump desktop to 0.3.82`
+- `5011803 feat: serve typed static Preview targets`
+- `2cbdbb8 chore: bump desktop to 0.3.83`
+- `3177d81 fix: clear stopped managed Preview URLs`
+- `0cd5861 chore: bump desktop to 0.3.84`
 
 ## Captain and Crew Model
 
@@ -315,10 +319,10 @@ Additional production-readiness gaps remain outside the Captain slice:
 ## Resume Point
 
 The application-level Captain authority review is closed with no Critical, High, or Medium finding.
-The installed Windows process was reverified at PID `48160` and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` after forced-exit acceptance and relaunch.
-Its file and product version are `0.3.82`.
-The installed executable SHA-256 is `DF0EC491922EABCD1C15D71F21F271C3F1E2AE9BC81398B37C364979641E0111`.
-The installed build was produced from source `ec55526` with standalone executable SHA-256 `FB7B185EB6263C93236BC132475752FA6F9563CFF362E9941DED4F37EDEB6416`, NSIS installer SHA-256 `A5FB2B0E9D1077AEB0C6FA0E4343FD89F1074339D954256B3E1C284C41B0BCF5`, and MSI SHA-256 `1031E5B018065CE27D6535F811E616C9ABFA5FCF1552062A396CFE80D1F83C6D`.
+The installed Windows process was reverified at PID `17664` and path `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe` after forced-exit acceptance and relaunch.
+Its file and product version are `0.3.84`.
+The installed executable SHA-256 is `B9A390F51A8648B14DE349E840F3006E317209BD051E1EFFA563A3E00433EEB5`.
+The installed build was produced from source `0cd5861` with standalone executable SHA-256 `BA963B72684ECCAA4AFA84346F9B5204AC9DC0FB470712B6D66847DF9F006EB3`, NSIS installer SHA-256 `A93A772CDDFA9AD6B7609A0AA6CEA8036EEFB482704853898EB959B65556166D`, and MSI SHA-256 `00EB32A91A644B12B45ECEAF5D684C1006EF29E480ED79B512FD95A793BB22C9`.
 The installed `th` CLI is version `0.2.0` from source `07e74f4`.
 Source commit `6870444` fixes the reproduced xterm teardown race.
 Source commits `585b867`, `70daa67`, and `d8e891e` add clearer Captain vocabulary and preflight, protected Powder profile discovery, a WSL-native folder picker, and Git metadata detection.
@@ -376,9 +380,21 @@ The installed package launched the real root `pnpm run dev` as one process group
 Normal Stop returned in 161 milliseconds, removed all six observed group processes and the run marker, released ports `1420` and `1421`, and a second run reused port `1420` successfully.
 Forcing PID `51332` to exit during the second run removed its complete process group, marker, and listeners without changing any of the seven unrelated tmux session names or pane PIDs.
 The application then relaunched as installed `0.3.82` PID `48160`.
-The full source review gate passed 55 frontend files and 466 tests, TypeScript, 604 Rust tests with 603 passed and one ignored, MCP end-to-end, and warning-denied Clippy.
+Installed `0.3.82` also passed representative Next.js acceptance against the real `apps/site` fixture.
+The application discovered npm `dev`, started Next `14.2.35`, returned Windows HTTP 200 with both expected page sentinels, loaded `http://localhost:3000/` in Preview, stopped in 161 milliseconds, and removed the full npm and Next process group.
+Source commit `5011803` adds a typed static-site target for a regular root `index.html`, an authoritative snapshot URL, and a Windows `127.0.0.1` server with bounded files and strict traversal, hidden-path, symlink, reparse-point, method, and MIME handling.
+Packaged `0.3.83` reproduced and exposed a remaining lifecycle defect after successful security acceptance: Stop closed the listener but retained the dead managed URL and iframe as if they were a user URL.
+Source commit `3177d81` separates managed and manual Preview URLs so Stop remounts the honest empty state, and `0cd5861` packages the repair as installed `0.3.84`.
+The final source gate passed all 469 frontend tests, TypeScript, 613 Rust desktop tests with 612 passed and one ignored, the Rust workspace and MCP end-to-end suites, formatting, and warning-denied Clippy.
+Packaged `0.3.84` discovered exactly one package-less static target, auto-loaded `http://127.0.0.1:63437/`, returned the expected HTML sentinel with correct CSS and JavaScript MIME types, and bound only Windows loopback under the T-Hub PID.
+Raw, encoded, and double-encoded traversal, backslash, hidden-file, and outside-symlink requests all returned 404, while POST returned 405 and GET and HEAD returned the required security headers.
+Stop returned in 406 milliseconds, removed the iframe and URL input, restored the empty Preview state, and closed the listener.
+A second run restored its authoritative URL across a Terminal to Run and Preview tab remount, and forced application exit closed that listener while preserving the disposable fixture session and all seven canonical sessions.
+The disposable session and files were then removed, and installed `0.3.84` relaunched as PID `17664` with the same seven canonical tmux session names and pane PIDs.
+The preceding `0.3.81` source review gate passed 55 frontend files and 466 tests, TypeScript, 604 Rust tests with 603 passed and one ignored, MCP end-to-end, and warning-denied Clippy.
 The fleet contained eight canonical tmux sessions when packaged acceptance began.
 The unrelated Scribe session `th_118218d2` and its prior pane PID `3043188` exited during the review window, leaving seven live sessions; the managed Stop action owned only the Vite run and did not issue a tmux lifecycle command.
-The immediate Run and Preview action is representative Next.js and static packaged acceptance, followed by generic non-Tauri Vite launch adapters and stale WSL-address recovery.
+Representative Vite, Next.js, and package-less static packaged acceptance is complete.
+The remaining Run and Preview hardening is generic non-Tauri Vite launch adapters and stale WSL-address recovery.
 Real Powder acceptance still requires a control-capable Captain session.
-The bound Board success state, complete Run and Preview lifecycle, Claude header check, packaged performance matrix, and release hardening remain open.
+The bound Board success state, remaining Run and Preview hardening, Claude header check, packaged performance matrix, and release hardening remain open.

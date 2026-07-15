@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.82` from `ec55526`, running as Windows PID `48160` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.84` from `0cd5861`, running as Windows PID `17664` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -89,7 +89,12 @@ Packaged acceptance started the real T-Hub Vite target, loaded `http://localhost
 Source commit `9d95fa9`, packaged as installed `0.3.82` from `ec55526`, gives each managed package target one WSL process group behind an application-owned stdin lifeline and retained Windows Job Object.
 Packaged acceptance proved that Stop returned in 161 milliseconds, removed the run marker and every pnpm, Vite, and esbuild process, released ports `1420` and `1421`, and restarted successfully on the same port.
 Forcing the installed application to exit while the restarted target was active also removed the complete process group and both listeners while preserving all seven unrelated tmux sessions and pane PIDs.
-Representative Next.js and static acceptance, generic non-Tauri Vite launch adapters, and stale WSL-address recovery remain open.
+Installed `0.3.82` also passed representative Next.js acceptance against `apps/site`: Next `14.2.35` returned Windows HTTP 200, loaded both expected site sentinels in Preview, stopped in 161 milliseconds, and removed the complete npm and Next process group.
+Source commit `5011803` adds a typed package-less static target backed by a Windows loopback-only server with traversal, hidden-path, reparse-point, symlink, MIME, method, and file-size protections.
+Source commit `3177d81` clears a managed Preview URL and iframe when its run stops, and `0cd5861` packages the final result as installed `0.3.84`.
+Packaged static acceptance auto-loaded the authoritative loopback URL, served HTML, CSS, JavaScript, and a nested page, denied raw, encoded, and double-encoded traversal plus hidden and symlink paths, stopped and remounted cleanly, and closed its listener on forced application exit.
+The disposable acceptance session was removed afterward, and all seven canonical tmux sessions and pane PIDs remained unchanged.
+Generic non-Tauri Vite launch adapters and stale WSL-address recovery remain open.
 Source commit `776439a`, packaged as `0.3.78` from `b4a1c5d`, removes full tmux capture replay from terminal attachment and stops clearing inline transcript during header Refresh.
 The packaged acceptance preserved all eight tmux pane PIDs and the same Codex process chain through install, header Refresh, and full relaunch while the active draft appeared exactly once.
 The Codex header identity has been checked interactively, while the Claude header still needs interactive confirmation.
@@ -575,7 +580,11 @@ Source commits `fbacc8f`, `16480b7`, and `19dc3c7`, packaged as installed `0.3.8
 The installed package kept the Preview iframe on reachable `http://localhost:1420/`, returned Windows HTTP 200, and removed both listeners and the managed Vite PID on Stop.
 Source commit `9d95fa9`, packaged as installed `0.3.82` from `ec55526`, owns the complete managed package process group through normal Stop, same-port restart, natural parent exit, TERM-resistant descendants, and forced application exit.
 The installed package removed every pnpm, Vite, and esbuild process plus ports `1420` and `1421` during both normal Stop and forced application exit while preserving the seven unrelated tmux sessions.
-Framework-aware generic Vite arguments, representative Next.js and static acceptance, and stale WSL-address recovery remain open.
+Installed `0.3.82` passed the representative Next.js target, including Windows HTTP 200, expected rendered sentinels, exact-run Stop, and full npm and Next process-group cleanup.
+Source commits `5011803` and `3177d81`, packaged as installed `0.3.84` from `0cd5861`, add and complete the representative package-less static target.
+The installed static server bound only Windows `127.0.0.1`, published its authoritative URL without log parsing, auto-loaded and restored the iframe across tab remount, denied traversal, hidden, and symlink requests, removed the iframe and URL on Stop, restarted cleanly, and closed on forced application exit.
+The Run and Preview exit-gate requirement for representative Vite, Next.js, and static projects is complete.
+Framework-aware generic Vite arguments and stale WSL-address recovery remain open follow-up hardening.
 
 ### Tests and Evidence
 
