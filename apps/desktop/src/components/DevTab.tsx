@@ -1,8 +1,8 @@
 // Managed-runner portion of the per-project Run and Preview surface.
 //
-// The backend discovers and validates typed package-script targets, constructs
-// executable arguments, and owns lifecycle state. This component never accepts
-// or sends arbitrary shell text.
+// The backend discovers and validates typed package-script or static-site
+// targets, constructs executable arguments or a confined loopback server, and
+// owns lifecycle state. This component never accepts or sends shell text.
 
 import { useEffect, useRef, useState } from "react";
 import { usePanels } from "../store/panels";
@@ -68,6 +68,7 @@ function idleSnapshot(terminalId: TerminalId): DevServerSnapshot {
     target: null,
     exitCode: null,
     reason: null,
+    previewUrl: null,
     observedAt: 0,
   };
 }
@@ -162,8 +163,14 @@ function chooseTarget(
 function applySnapshot(id: TerminalId, snapshot: DevServerSnapshot): void {
   const current = getState(id).snapshot;
   if (snapshot.revision < current.revision) return;
-  update(id, { snapshot });
-  if (snapshot.state !== "running") {
+  const url = snapshot.state === "running" ? snapshot.previewUrl : null;
+  update(id, {
+    snapshot,
+    ...(url ? { url } : snapshot.state !== "running" ? { url: null } : {}),
+  });
+  if (url) {
+    usePanels.getState().setDevUrl(id, url);
+  } else if (snapshot.state !== "running") {
     usePanels.getState().setDevUrl(id, null);
   }
 }
@@ -251,8 +258,15 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
       .then(([discovery, authoritative]) => {
         if (cancelled) return;
         const current = getState(terminalId);
+        const authoritativeUrl =
+          authoritative.state === "running" ? authoritative.previewUrl : null;
         update(terminalId, {
           snapshot: authoritative,
+          ...(authoritativeUrl
+            ? { url: authoritativeUrl }
+            : authoritative.state !== "running"
+              ? { url: null }
+              : {}),
           targets: discovery.targets,
           discoveryState: discovery.state,
           discoveryMessage: discovery.message,
@@ -262,6 +276,11 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
             current.selectedTargetId,
           ),
         });
+        if (authoritativeUrl) {
+          usePanels.getState().setDevUrl(terminalId, authoritativeUrl);
+        } else if (authoritative.state !== "running") {
+          usePanels.getState().setDevUrl(terminalId, null);
+        }
       })
       .catch((error) => {
         if (cancelled) return;
@@ -309,10 +328,11 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
       url: null,
     });
     usePanels.getState().setDevUrl(terminalId, null);
-    void startDevServer(terminalId, cwd, {
-      kind: "packageScript",
-      script: target.script,
-    })
+    const targetRef =
+      target.kind === "packageScript"
+        ? { kind: target.kind, script: target.script }
+        : { kind: target.kind, id: target.id };
+    void startDevServer(terminalId, cwd, targetRef)
       .then((authoritative) => applySnapshot(terminalId, authoritative))
       .catch((error) => {
         const failed = getState(terminalId).snapshot;
@@ -370,7 +390,7 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
           {state.discoveryState === "loading" ? (
             <option value="">Loading run targets...</option>
           ) : state.targets.length === 0 ? (
-            <option value="">No package scripts found</option>
+            <option value="">No run targets found</option>
           ) : (
             state.targets.map((target) => (
               <option key={target.id} value={target.id}>
@@ -397,7 +417,7 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
             disabled={!selectedTarget}
             className="shrink-0 px-3 py-1.5 text-sm font-medium disabled:opacity-60"
             style={ACCENT_BUTTON_STYLE}
-            title="Run the selected package script"
+            title="Run the selected target"
           >
             Run
           </button>
@@ -470,8 +490,8 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
             {snapshot.state === "starting"
               ? "Starting..."
               : state.discoveryState === "ready" && state.targets.length === 0
-                ? "No root package scripts are available."
-                : `Select a package script to run in ${cwd || "this project"}.`}
+                ? "No run targets are available."
+                : `Select a run target in ${cwd || "this project"}.`}
           </div>
         ) : (
           lines.map((line, index) => (

@@ -96,6 +96,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # server rejects browser-origin requests.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 uuid = { version = "1", features = ["v4"] }
+# Backend-owned static Preview targets use a small synchronous loopback server.
+# The frontend selects only the typed root target and never supplies a command,
+# executable, port, or alternate serving directory.
+tiny_http = "0.12"
+mime_guess = "2"
+percent-encoding = "2"
 # OS cache-dir resolution for the Scribe voice-gate status file (scribe.rs):
 # LOCALAPPDATA on Windows, ~/.cache on Linux, ~/Library/Caches on macOS - so the
 # reader points at Scribe's Tauri app_cache_dir on whatever OS T-Hub runs on.
@@ -165,6 +171,7 @@ windows = { version = "0.61", features = [
 # (item-3 ledger #16). The shipped app binary does not link this.
 [dev-dependencies]
 t-hub-mcp = { path = "crates/t-hub-mcp" }
+tempfile = "3"
 
 [profile.release]
 codegen-units = 1

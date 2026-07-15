@@ -1,6 +1,6 @@
 // Typed wrappers over the Dev-server IPC surface (feat/dev-runner).
 //
-// Run and Preview runs one managed package script per project, scoped to that
+// Run and Preview runs one managed typed target per project, scoped to that
 // project's directory. These wrappers invoke the discovery and lifecycle commands and
 // `listen` on the per-terminal output channel. Kept separate from ./client (0.1
 // nucleus) and ./files so the dev-runner contract lives in one place. Mirrors
@@ -13,7 +13,7 @@ import type { TerminalId } from "./types";
 
 /** Tauri command names for the managed dev runner (used with `invoke`). */
 export const CommandsDevServer = {
-  /** Discover typed root-package targets for a project. */
+  /** Discover typed package-script and static-site targets for a project. */
   discoverRunTargets: "discover_run_targets",
   /** Start (or restart) the selected typed target. */
   startDevServer: "start_dev_server",
@@ -29,7 +29,7 @@ export const CommandsDevServer = {
 
 export type PackageManager = "pnpm" | "npm" | "yarn" | "bun";
 
-export interface RunTarget {
+export interface PackageScriptRunTarget {
   kind: "packageScript";
   id: string;
   script: string;
@@ -39,10 +39,29 @@ export interface RunTarget {
   recommended: boolean;
 }
 
+export interface StaticSiteRunTarget {
+  kind: "staticSite";
+  id: "static-site:root";
+  entrypoint: "index.html";
+  relativeRoot: ".";
+  label: string;
+  commandDisplay: string;
+  recommended: boolean;
+}
+
+export type RunTarget = PackageScriptRunTarget | StaticSiteRunTarget;
+
 export interface PackageScriptTargetRef {
   kind: "packageScript";
   script: string;
 }
+
+export interface StaticSiteTargetRef {
+  kind: "staticSite";
+  id: "static-site:root";
+}
+
+export type RunTargetRef = PackageScriptTargetRef | StaticSiteTargetRef;
 
 export interface RunTargetDiscovery {
   state: "ready" | "notFound" | "unreadable" | "invalid";
@@ -66,6 +85,7 @@ export interface DevServerSnapshot {
   target: RunTarget | null;
   exitCode: number | null;
   reason: string | null;
+  previewUrl: string | null;
   observedAt: number;
 }
 
@@ -117,7 +137,7 @@ export function devServerChannel(terminalId: TerminalId): string {
 export function startDevServer(
   terminalId: TerminalId,
   cwd: string,
-  target: PackageScriptTargetRef,
+  target: RunTargetRef,
 ): Promise<DevServerSnapshot> {
   return invoke(CommandsDevServer.startDevServer, { terminalId, cwd, target });
 }

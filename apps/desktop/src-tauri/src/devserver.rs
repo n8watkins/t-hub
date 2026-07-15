@@ -1,14 +1,16 @@
-//! Managed package-script runner for the per-project Run and Preview surface.
+//! Managed typed-target runner for the per-project Run and Preview surface.
 //!
-//! The backend discovers typed targets from the root `package.json`, validates a
-//! selected target again at start time, constructs executable arguments itself,
-//! and owns authoritative generation-safe lifecycle snapshots. Frontend-provided
-//! shell text is never executed.
+//! The backend discovers package scripts and package-less static sites, validates
+//! a selected target again at start time, constructs executable arguments or a
+//! confined loopback server itself, and owns authoritative generation-safe
+//! lifecycle snapshots. Frontend-provided shell text is never executed.
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, BufReader};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::LazyLock;
+use std::sync::{mpsc, LazyLock};
 use std::thread::JoinHandle;
 
 use parking_lot::Mutex;
@@ -47,18 +49,25 @@ impl PackageManager {
 pub struct RunTarget {
     pub kind: String,
     pub id: String,
-    pub script: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
     pub label: String,
-    pub package_manager: PackageManager,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_manager: Option<PackageManager>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_root: Option<String>,
     pub command_display: String,
     pub recommended: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct PackageScriptTargetRef {
+pub struct RunTargetRef {
     pub kind: String,
-    pub script: String,
+    pub script: Option<String>,
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -79,6 +88,7 @@ pub struct DevServerSnapshot {
     pub target: Option<RunTarget>,
     pub exit_code: Option<i32>,
     pub reason: Option<String>,
+    pub preview_url: Option<String>,
     pub observed_at: u64,
 }
 
@@ -148,9 +158,25 @@ impl DevProcess {
     }
 }
 
+struct StaticServer {
+    run_id: String,
+    shutdown: mpsc::Sender<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl StaticServer {
+    fn stop(mut self) {
+        let _ = self.shutdown.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 #[derive(Default)]
 struct DevRegistry {
     processes: HashMap<String, DevProcess>,
+    static_servers: HashMap<String, StaticServer>,
     snapshots: HashMap<String, DevServerSnapshot>,
     revision: u64,
 }
@@ -176,6 +202,7 @@ fn poll_run(registry: &mut DevRegistry, terminal_id: &str, run_id: &str) -> Poll
     }
 }
 
+#[cfg(test)]
 fn take_process_for_stop(
     registry: &mut DevRegistry,
     terminal_id: &str,
@@ -210,6 +237,7 @@ fn idle_snapshot(terminal_id: &str, revision: u64) -> DevServerSnapshot {
         target: None,
         exit_code: None,
         reason: None,
+        preview_url: None,
         observed_at: observed_at(),
     }
 }
@@ -287,11 +315,57 @@ fn parse_targets(text: &str, package_manager: PackageManager) -> Result<Vec<RunT
             id: format!("package-script:{script}"),
             label: script.clone(),
             command_display: format!("{} run {script}", package_manager.executable()),
-            package_manager,
+            package_manager: Some(package_manager),
+            entrypoint: None,
+            relative_root: None,
             recommended: index == 0,
-            script,
+            script: Some(script),
         })
         .collect())
+}
+
+fn static_target(cwd: &str) -> Result<Option<RunTarget>, String> {
+    let entrypoint = crate::files::to_host_path(cwd).join("index.html");
+    let metadata = match fs::symlink_metadata(&entrypoint) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to inspect index.html: {error}")),
+    };
+    if metadata.file_type().is_symlink() || has_reparse_point(&metadata) || !metadata.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(RunTarget {
+        kind: "staticSite".to_string(),
+        id: "static-site:root".to_string(),
+        script: None,
+        label: "Static site".to_string(),
+        package_manager: None,
+        entrypoint: Some("index.html".to_string()),
+        relative_root: Some(".".to_string()),
+        command_display: "Serve ./index.html".to_string(),
+        recommended: true,
+    }))
+}
+
+fn select_target(targets: Vec<RunTarget>, target: &RunTargetRef) -> Option<RunTarget> {
+    targets
+        .into_iter()
+        .find(|candidate| match target.kind.as_str() {
+            "packageScript" => {
+                candidate.kind == "packageScript"
+                    && candidate.script.as_deref() == target.script.as_deref()
+                    && target
+                        .script
+                        .as_deref()
+                        .is_some_and(|script| !script.trim().is_empty())
+            }
+            "staticSite" => {
+                candidate.kind == "staticSite"
+                    && candidate.id == "static-site:root"
+                    && target.id.as_deref() == Some("static-site:root")
+            }
+            _ => false,
+        })
 }
 
 #[tauri::command]
@@ -313,11 +387,28 @@ pub async fn discover_run_targets(cwd: String) -> Result<RunTargetDiscovery, Str
             });
         }
     };
+    let static_target = match static_target(&cwd) {
+        Ok(target) => target,
+        Err(error) => {
+            return Ok(RunTargetDiscovery {
+                state: "unreadable".to_string(),
+                targets: Vec::new(),
+                message: Some(error),
+            });
+        }
+    };
     if !entries.iter().any(|entry| entry.name == "package.json") {
+        if let Some(target) = static_target {
+            return Ok(RunTargetDiscovery {
+                state: "ready".to_string(),
+                targets: vec![target],
+                message: None,
+            });
+        }
         return Ok(RunTargetDiscovery {
             state: "notFound".to_string(),
             targets: Vec::new(),
-            message: Some("No root package.json was found.".to_string()),
+            message: Some("No run target was found.".to_string()),
         });
     }
     let package_path = if cwd.starts_with('/') {
@@ -377,13 +468,19 @@ pub async fn discover_run_targets(cwd: String) -> Result<RunTargetDiscovery, Str
         ),
     };
     match parse_targets(&contents.text, package_manager) {
-        Ok(targets) => Ok(RunTargetDiscovery {
-            state: "ready".to_string(),
-            message: targets
-                .is_empty()
-                .then(|| "No package scripts are defined.".to_string()),
-            targets,
-        }),
+        Ok(mut targets) => {
+            if let Some(mut target) = static_target {
+                target.recommended = targets.is_empty();
+                targets.push(target);
+            }
+            Ok(RunTargetDiscovery {
+                state: "ready".to_string(),
+                message: targets
+                    .is_empty()
+                    .then(|| "No run targets are defined.".to_string()),
+                targets,
+            })
+        }
         Err(error) => Ok(RunTargetDiscovery {
             state: "invalid".to_string(),
             targets: Vec::new(),
@@ -582,14 +679,212 @@ fn pump<R: std::io::Read>(app: &AppHandle, id: &str, run_id: &str, reader: R) {
     }
 }
 
+const MAX_STATIC_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn has_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn decode_static_path(raw: &str) -> Result<String, ()> {
+    let path = raw.split('?').next().unwrap_or(raw);
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(());
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .map_err(|_| ())?
+        .into_owned();
+    if decoded.contains(['\0', '\\', '%']) {
+        return Err(());
+    }
+    Ok(decoded)
+}
+
+fn resolve_static_file(root: &Path, raw: &str) -> Result<PathBuf, ()> {
+    let decoded = decode_static_path(raw)?;
+    let mut candidate = root.to_path_buf();
+    let mut saw_component = false;
+    for component in Path::new(decoded.trim_start_matches('/')).components() {
+        let name = match component {
+            Component::Normal(name) => name,
+            Component::CurDir if !saw_component => continue,
+            _ => return Err(()),
+        };
+        let text = name.to_str().ok_or(())?;
+        if text.starts_with('.') || text.contains(':') {
+            return Err(());
+        }
+        candidate.push(name);
+        let metadata = fs::symlink_metadata(&candidate).map_err(|_| ())?;
+        if metadata.file_type().is_symlink() || has_reparse_point(&metadata) {
+            return Err(());
+        }
+        saw_component = true;
+    }
+    if !saw_component || fs::metadata(&candidate).map_err(|_| ())?.is_dir() {
+        candidate.push("index.html");
+        let metadata = fs::symlink_metadata(&candidate).map_err(|_| ())?;
+        if metadata.file_type().is_symlink() || has_reparse_point(&metadata) {
+            return Err(());
+        }
+    }
+    let metadata = fs::metadata(&candidate).map_err(|_| ())?;
+    if !metadata.is_file() || metadata.len() > MAX_STATIC_FILE_BYTES {
+        return Err(());
+    }
+    let canonical = candidate.canonicalize().map_err(|_| ())?;
+    if !canonical.starts_with(root) {
+        return Err(());
+    }
+    Ok(canonical)
+}
+
+fn response_header(name: &str, value: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
+        .expect("static response header is valid")
+}
+
+fn respond_static(request: tiny_http::Request, root: &Path) {
+    let method = request.method().clone();
+    if method != tiny_http::Method::Get && method != tiny_http::Method::Head {
+        let response = tiny_http::Response::from_string("Method not allowed")
+            .with_status_code(405)
+            .with_header(response_header("Allow", "GET, HEAD"))
+            .with_header(response_header("X-Content-Type-Options", "nosniff"))
+            .with_header(response_header("Referrer-Policy", "no-referrer"))
+            .with_header(response_header("Cache-Control", "no-store"));
+        let _ = request.respond(response);
+        return;
+    }
+    let path = match resolve_static_file(root, request.url()) {
+        Ok(path) => path,
+        Err(()) => {
+            let response = tiny_http::Response::from_string("Not found")
+                .with_status_code(404)
+                .with_header(response_header("X-Content-Type-Options", "nosniff"))
+                .with_header(response_header("Referrer-Policy", "no-referrer"))
+                .with_header(response_header("Cache-Control", "no-store"));
+            let _ = request.respond(response);
+            return;
+        }
+    };
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            let _ = request.respond(
+                tiny_http::Response::from_string("Not found")
+                    .with_status_code(404)
+                    .with_header(response_header("X-Content-Type-Options", "nosniff"))
+                    .with_header(response_header("Referrer-Policy", "no-referrer"))
+                    .with_header(response_header("Cache-Control", "no-store")),
+            );
+            return;
+        }
+    };
+    let body = if method == tiny_http::Method::Head {
+        Vec::new()
+    } else {
+        match fs::read(&path) {
+            Ok(body) => body,
+            Err(_) => {
+                let _ = request.respond(
+                    tiny_http::Response::from_string("Not found")
+                        .with_status_code(404)
+                        .with_header(response_header("X-Content-Type-Options", "nosniff"))
+                        .with_header(response_header("Referrer-Policy", "no-referrer"))
+                        .with_header(response_header("Cache-Control", "no-store")),
+                );
+                return;
+            }
+        }
+    };
+    let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    let response = tiny_http::Response::from_data(body)
+        .with_status_code(200)
+        .with_header(response_header("Content-Type", mime.as_ref()))
+        .with_header(response_header(
+            "Content-Length",
+            &metadata.len().to_string(),
+        ))
+        .with_header(response_header("X-Content-Type-Options", "nosniff"))
+        .with_header(response_header("Referrer-Policy", "no-referrer"))
+        .with_header(response_header("Cache-Control", "no-store"));
+    let _ = request.respond(response);
+}
+
+fn start_static_server(cwd: &str, run_id: &str) -> Result<(StaticServer, String), String> {
+    let root = crate::files::to_host_path(cwd)
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve static site root: {error}"))?;
+    let entrypoint = fs::symlink_metadata(root.join("index.html"))
+        .map_err(|error| format!("failed to inspect index.html: {error}"))?;
+    if entrypoint.file_type().is_symlink()
+        || has_reparse_point(&entrypoint)
+        || !entrypoint.is_file()
+    {
+        return Err("the static site entrypoint is no longer a regular file".to_string());
+    }
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|error| format!("failed to bind static preview: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("failed to inspect static preview address: {error}"))?;
+    let server = tiny_http::Server::from_listener(listener, None)
+        .map_err(|error| format!("failed to start static preview: {error}"))?;
+    let (shutdown, shutdown_rx) = mpsc::channel();
+    let name = format!("t-hub-static-preview-{run_id}");
+    let thread = std::thread::Builder::new()
+        .name(name)
+        .spawn(move || loop {
+            if shutdown_rx.try_recv().is_ok() {
+                break;
+            }
+            match server.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(Some(request)) => respond_static(request, &root),
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        })
+        .map_err(|error| format!("failed to start static preview thread: {error}"))?;
+    Ok((
+        StaticServer {
+            run_id: run_id.to_string(),
+            shutdown,
+            thread: Some(thread),
+        },
+        format!("http://127.0.0.1:{}/", address.port()),
+    ))
+}
+
 #[tauri::command]
 pub async fn start_dev_server(
     app: AppHandle,
     terminal_id: String,
     cwd: String,
-    target: PackageScriptTargetRef,
+    target: RunTargetRef,
 ) -> Result<DevServerSnapshot, String> {
-    if target.kind != "packageScript" || target.script.trim().is_empty() {
+    if !matches!(target.kind.as_str(), "packageScript" | "staticSite") {
         return Err("invalid run target".to_string());
     }
     let discovery = discover_run_targets(cwd.clone()).await?;
@@ -598,15 +893,22 @@ pub async fn start_dev_server(
             .message
             .unwrap_or_else(|| "run targets are unavailable".to_string()));
     }
-    let selected = discovery
-        .targets
-        .into_iter()
-        .find(|candidate| candidate.script == target.script)
-        .ok_or_else(|| format!("package script no longer exists: {}", target.script))?;
+    let selected = discovery.targets;
+    let selected = select_target(selected, &target)
+        .ok_or_else(|| "the selected run target no longer exists".to_string())?;
 
-    let existing = REGISTRY.lock().processes.remove(&terminal_id);
+    let (existing, existing_static) = {
+        let mut registry = REGISTRY.lock();
+        (
+            registry.processes.remove(&terminal_id),
+            registry.static_servers.remove(&terminal_id),
+        )
+    };
     if let Some(process) = existing {
         process.stop();
+    }
+    if let Some(server) = existing_static {
+        server.stop();
     }
 
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -623,11 +925,74 @@ pub async fn start_dev_server(
                 target: Some(selected.clone()),
                 exit_code: None,
                 reason: None,
+                preview_url: None,
                 observed_at: observed_at(),
             },
         );
     }
-    let mut cmd = build_command(&cwd, &run_id, selected.package_manager, &selected.script);
+    if selected.kind == "staticSite" {
+        let (server, preview_url) = match start_static_server(&cwd, &run_id) {
+            Ok(started) => started,
+            Err(reason) => {
+                let mut registry = REGISTRY.lock();
+                let revision = next_revision(&mut registry);
+                registry.snapshots.insert(
+                    terminal_id.clone(),
+                    DevServerSnapshot {
+                        terminal_id,
+                        run_id: Some(run_id),
+                        revision,
+                        state: "failed".to_string(),
+                        target: Some(selected),
+                        exit_code: None,
+                        reason: Some(reason.clone()),
+                        preview_url: None,
+                        observed_at: observed_at(),
+                    },
+                );
+                return Err(reason);
+            }
+        };
+        let snapshot = {
+            let mut registry = REGISTRY.lock();
+            let revision = next_revision(&mut registry);
+            let snapshot = DevServerSnapshot {
+                terminal_id: terminal_id.clone(),
+                run_id: Some(run_id.clone()),
+                revision,
+                state: "running".to_string(),
+                target: Some(selected),
+                exit_code: None,
+                reason: None,
+                preview_url: Some(preview_url),
+                observed_at: observed_at(),
+            };
+            registry.static_servers.insert(terminal_id.clone(), server);
+            registry
+                .snapshots
+                .insert(terminal_id.clone(), snapshot.clone());
+            snapshot
+        };
+        let _ = app.emit(
+            &channel(&terminal_id),
+            DevServerEvent::new(
+                &terminal_id,
+                &run_id,
+                snapshot.revision,
+                "started",
+                String::new(),
+            ),
+        );
+        return Ok(snapshot);
+    }
+    let package_manager = selected
+        .package_manager
+        .ok_or_else(|| "package script is missing its package manager".to_string())?;
+    let script = selected
+        .script
+        .as_deref()
+        .ok_or_else(|| "package script is missing its script name".to_string())?;
+    let mut cmd = build_command(&cwd, &run_id, package_manager, script);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -644,6 +1009,7 @@ pub async fn start_dev_server(
                     target: Some(selected),
                     exit_code: None,
                     reason: Some(reason.clone()),
+                    preview_url: None,
                     observed_at: observed_at(),
                 },
             );
@@ -669,6 +1035,7 @@ pub async fn start_dev_server(
             target: Some(selected),
             exit_code: None,
             reason: None,
+            preview_url: None,
             observed_at: observed_at(),
         };
         registry.processes.insert(
@@ -771,6 +1138,7 @@ pub async fn start_dev_server(
                         target,
                         exit_code: code,
                         reason: Some(summary.clone()),
+                        preview_url: None,
                         observed_at: observed_at(),
                     },
                 );
@@ -795,12 +1163,33 @@ pub async fn stop_dev_server(
     terminal_id: String,
     run_id: Option<String>,
 ) -> Result<DevServerSnapshot, String> {
-    let process = {
+    let (process, static_server) = {
         let mut registry = REGISTRY.lock();
-        take_process_for_stop(&mut registry, &terminal_id, run_id.as_deref())?
+        if let Some(expected) = run_id.as_deref() {
+            let active = registry
+                .processes
+                .get(&terminal_id)
+                .map(|process| process.run_id.as_str())
+                .or_else(|| {
+                    registry
+                        .static_servers
+                        .get(&terminal_id)
+                        .map(|server| server.run_id.as_str())
+                });
+            if active.is_some_and(|active| active != expected) {
+                return Err("the requested run is no longer active".to_string());
+            }
+        }
+        (
+            registry.processes.remove(&terminal_id),
+            registry.static_servers.remove(&terminal_id),
+        )
     };
     if let Some(process) = process {
         process.stop();
+    }
+    if let Some(server) = static_server {
+        server.stop();
     }
     let mut registry = REGISTRY.lock();
     let revision = next_revision(&mut registry);
@@ -982,12 +1371,12 @@ mod tests {
             PackageManager::Pnpm,
         )
         .expect("valid targets");
-        assert_eq!(targets[0].script, "dev");
+        assert_eq!(targets[0].script.as_deref(), Some("dev"));
         assert!(targets[0].recommended);
-        assert_eq!(targets[1].script, "preview");
-        assert_eq!(targets[2].script, "odd; $name");
+        assert_eq!(targets[1].script.as_deref(), Some("preview"));
+        assert_eq!(targets[2].script.as_deref(), Some("odd; $name"));
         assert_eq!(targets[2].command_display, "pnpm run odd; $name");
-        assert_eq!(targets[3].script, "z");
+        assert_eq!(targets[3].script.as_deref(), Some("z"));
     }
 
     #[test]
@@ -995,6 +1384,200 @@ mod tests {
         assert!(parse_targets("[]", PackageManager::Npm).is_err());
         assert!(parse_targets(r#"{"scripts":[]}"#, PackageManager::Npm).is_err());
         assert!(parse_targets("not json", PackageManager::Npm).is_err());
+    }
+
+    #[test]
+    fn regular_root_index_produces_a_typed_static_target() {
+        let root = tempfile::tempdir().expect("static fixture root");
+        fs::write(root.path().join("index.html"), "STATIC SENTINEL").expect("write index");
+        let target = static_target(root.path().to_str().expect("utf8 path"))
+            .expect("inspect target")
+            .expect("static target");
+        assert_eq!(target.kind, "staticSite");
+        assert_eq!(target.id, "static-site:root");
+        assert_eq!(target.entrypoint.as_deref(), Some("index.html"));
+        assert_eq!(target.relative_root.as_deref(), Some("."));
+        assert!(target.script.is_none());
+        assert!(target.package_manager.is_none());
+    }
+
+    #[test]
+    fn package_and_static_targets_coexist_with_package_priority() {
+        let root = tempfile::tempdir().expect("combined fixture root");
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .expect("write package");
+        fs::write(root.path().join("index.html"), "STATIC SENTINEL").expect("write index");
+        let discovery = tauri::async_runtime::block_on(discover_run_targets(
+            root.path().to_string_lossy().into_owned(),
+        ))
+        .expect("discover combined targets");
+        assert_eq!(discovery.state, "ready");
+        assert_eq!(discovery.targets.len(), 2);
+        assert_eq!(discovery.targets[0].kind, "packageScript");
+        assert!(discovery.targets[0].recommended);
+        assert_eq!(discovery.targets[1].kind, "staticSite");
+        assert!(!discovery.targets[1].recommended);
+    }
+
+    #[test]
+    fn typed_target_selection_rejects_forged_static_and_package_references() {
+        let package = parse_targets(r#"{"scripts":{"dev":"vite"}}"#, PackageManager::Pnpm)
+            .expect("package target")
+            .remove(0);
+        let root = tempfile::tempdir().expect("static fixture root");
+        fs::write(root.path().join("index.html"), "STATIC SENTINEL").expect("write index");
+        let static_site = static_target(root.path().to_str().unwrap())
+            .expect("inspect static")
+            .expect("static target");
+        let targets = vec![package, static_site];
+
+        assert!(select_target(
+            targets.clone(),
+            &RunTargetRef {
+                kind: "staticSite".to_string(),
+                script: None,
+                id: Some("static-site:other".to_string()),
+            },
+        )
+        .is_none());
+        assert!(select_target(
+            targets,
+            &RunTargetRef {
+                kind: "packageScript".to_string(),
+                script: Some("missing".to_string()),
+                id: None,
+            },
+        )
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_and_symlink_entrypoints_are_not_advertised() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("static fixture root");
+        fs::create_dir(root.path().join("index.html")).expect("directory entrypoint");
+        assert!(static_target(root.path().to_str().unwrap())
+            .expect("inspect directory")
+            .is_none());
+        fs::remove_dir(root.path().join("index.html")).expect("remove directory");
+        let outside = root.path().join("outside.html");
+        fs::write(&outside, "OUTSIDE").expect("outside file");
+        symlink(&outside, root.path().join("index.html")).expect("symlink entrypoint");
+        assert!(static_target(root.path().to_str().unwrap())
+            .expect("inspect symlink")
+            .is_none());
+    }
+
+    #[test]
+    fn static_path_resolution_rejects_traversal_hidden_and_oversized_files() {
+        let root = tempfile::tempdir().expect("static fixture root");
+        fs::write(root.path().join("index.html"), "INDEX").expect("write index");
+        fs::write(root.path().join(".env"), "SECRET").expect("write hidden");
+        let oversized = root.path().join("large.bin");
+        let file = fs::File::create(&oversized).expect("create oversized fixture");
+        file.set_len(MAX_STATIC_FILE_BYTES + 1)
+            .expect("size oversized fixture");
+        let canonical = root.path().canonicalize().expect("canonical root");
+
+        assert_eq!(
+            resolve_static_file(&canonical, "/").unwrap(),
+            canonical.join("index.html")
+        );
+        for path in [
+            "/../outside",
+            "/%2e%2e/outside",
+            "/%252e%252e/outside",
+            "/.env",
+            "/%2eenv",
+            "/a\\b",
+            "/C:/secret",
+            "/large.bin",
+        ] {
+            assert!(resolve_static_file(&canonical, path).is_err(), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_path_resolution_rejects_a_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("static fixture root");
+        let outside = tempfile::tempdir().expect("outside fixture root");
+        fs::write(outside.path().join("secret.txt"), "SECRET").expect("outside sentinel");
+        symlink(outside.path(), root.path().join("escape")).expect("escape symlink");
+        let canonical = root.path().canonicalize().expect("canonical root");
+        assert!(resolve_static_file(&canonical, "/escape/secret.txt").is_err());
+    }
+
+    #[test]
+    fn static_server_serves_get_head_and_mime_then_stops_its_port() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        fn request(port: u16, method: &str, path: &str) -> String {
+            let mut stream =
+                TcpStream::connect(("127.0.0.1", port)).expect("connect static server");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            write!(
+                stream,
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read response");
+            response
+        }
+
+        let root = tempfile::tempdir().expect("static fixture root");
+        fs::write(root.path().join("index.html"), "STATIC SENTINEL").expect("write index");
+        fs::write(root.path().join("style.css"), "body { color: red; }").expect("write css");
+        let (server, url) = start_static_server(root.path().to_str().unwrap(), "static-test")
+            .expect("start static server");
+        let port = url
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse::<u16>()
+            .expect("static port");
+
+        let index = request(port, "GET", "/?v=1");
+        assert!(index.starts_with("HTTP/1.1 200"));
+        assert!(index.contains("STATIC SENTINEL"));
+        assert!(index
+            .to_ascii_lowercase()
+            .contains("x-content-type-options: nosniff"));
+        assert!(index
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"));
+        let css = request(port, "GET", "/style.css");
+        assert!(css.to_ascii_lowercase().contains("content-type: text/css"));
+        let head = request(port, "HEAD", "/index.html");
+        assert!(head.starts_with("HTTP/1.1 200"));
+        assert!(!head.contains("STATIC SENTINEL"));
+        assert!(request(port, "POST", "/").starts_with("HTTP/1.1 405"));
+        assert!(request(port, "GET", "/.env").starts_with("HTTP/1.1 404"));
+
+        fs::remove_file(root.path().join("index.html")).expect("remove live entrypoint");
+        assert!(request(port, "GET", "/").starts_with("HTTP/1.1 404"));
+        server.stop();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "static preview port remained reachable after Stop"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(not(windows))]

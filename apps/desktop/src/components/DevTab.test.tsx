@@ -64,6 +64,7 @@ function snapshot(
     target: runId ? discovery.targets[0] : null,
     exitCode: null,
     reason: null,
+    previewUrl: null,
     observedAt: 1,
   };
 }
@@ -91,7 +92,14 @@ beforeEach(() => {
     },
   );
   usePanels.setState({ devUrl: {}, previewUrl: {} });
-  for (const id of ["typed", "error", "running", "stale"]) {
+  for (const id of [
+    "typed",
+    "static",
+    "static-hydrate",
+    "error",
+    "running",
+    "stale",
+  ]) {
     forgetDevState(id);
   }
 });
@@ -113,6 +121,74 @@ describe("DevTab", () => {
       }),
     );
     expect(await screen.findByText("running")).toBeTruthy();
+  });
+
+  it("starts a typed static target and applies its authoritative preview URL", async () => {
+    const target = {
+      kind: "staticSite" as const,
+      id: "static-site:root" as const,
+      entrypoint: "index.html" as const,
+      relativeRoot: "." as const,
+      label: "Static site",
+      commandDisplay: "Serve ./index.html",
+      recommended: true,
+    };
+    mocks.discoverRunTargets.mockResolvedValueOnce({
+      state: "ready",
+      message: null,
+      targets: [target],
+    });
+    mocks.startDevServer.mockResolvedValueOnce({
+      ...snapshot("static", "running", "run-static", 2),
+      target,
+      previewUrl: "http://127.0.0.1:43123/",
+    });
+    render(<DevTab terminalId="static" cwd="/static" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Run" }));
+
+    await waitFor(() =>
+      expect(mocks.startDevServer).toHaveBeenCalledWith("static", "/static", {
+        kind: "staticSite",
+        id: "static-site:root",
+      }),
+    );
+    await waitFor(() =>
+      expect(usePanels.getState().devUrl.static).toBe("http://127.0.0.1:43123/"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await waitFor(() => expect(usePanels.getState().devUrl.static).toBeNull());
+    expect(screen.queryByText("http://127.0.0.1:43123/")).toBeNull();
+  });
+
+  it("hydrates the authoritative URL for an already-running static target", async () => {
+    const target = {
+      kind: "staticSite" as const,
+      id: "static-site:root" as const,
+      entrypoint: "index.html" as const,
+      relativeRoot: "." as const,
+      label: "Static site",
+      commandDisplay: "Serve ./index.html",
+      recommended: true,
+    };
+    mocks.discoverRunTargets.mockResolvedValueOnce({
+      state: "ready",
+      message: null,
+      targets: [target],
+    });
+    mocks.devServerSnapshot.mockResolvedValueOnce({
+      ...snapshot("static-hydrate", "running", "run-static", 8),
+      target,
+      previewUrl: "http://127.0.0.1:43124/",
+    });
+    forgetDevState("static-hydrate");
+    render(<DevTab terminalId="static-hydrate" cwd="/static" />);
+
+    await waitFor(() =>
+      expect(usePanels.getState().devUrl["static-hydrate"]).toBe(
+        "http://127.0.0.1:43124/",
+      ),
+    );
   });
 
   it("renders discovery failures with a retry action", async () => {
