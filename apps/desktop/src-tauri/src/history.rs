@@ -581,16 +581,13 @@ mod tests {
     fn codex_parser_selects_filename_matching_child_meta() {
         let child = "22222222-2222-4222-8222-222222222222";
         let text = format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             json!({"type":"session_meta","payload":{"id":"11111111-1111-4111-8111-111111111111","cwd":"/parent","timestamp":"2026-07-15T09:00:00Z"}}),
             json!({"type":"session_meta","payload":{"id":child,"cwd":"/child","timestamp":"2026-07-15T03:00:00-07:00","model_provider":"openai"}}),
             json!({"type":"response_item","payload":{"role":"user","content":"duplicate noise"}}),
-            format!(
-                "{}\n{}\n{}",
-                json!({"type":"event_msg","payload":{"type":"user_message","message":"<system-reminder>before</system-reminder>"}}),
-                json!({"type":"event_msg","payload":{"type":"user_message","message":"child task"}}),
-                json!({"type":"event_msg","payload":{"type":"user_message","message":"<system-reminder>after</system-reminder>"}})
-            ),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"<system-reminder>before</system-reminder>"}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"child task"}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"<system-reminder>after</system-reminder>"}}),
         );
         let parsed = parse_codex_rollout(&codex_path(child), &text, 300).unwrap();
         assert_eq!(parsed.entry.conversation_id, child);
