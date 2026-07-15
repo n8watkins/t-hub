@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::LazyLock;
 use std::thread::JoinHandle;
 
@@ -111,19 +111,39 @@ impl DevServerEvent {
 struct DevProcess {
     run_id: String,
     child: Child,
+    stdin: Option<ChildStdin>,
     readers: Vec<JoinHandle<()>>,
+    _job: Option<crate::engine_supervisor::platform::KillOnCloseJob>,
 }
 
 impl DevProcess {
-    /// Kill the child and join its reader thread. Best-effort: the child may have
-    /// already exited on its own (the reader will have hit EOF and be exiting).
+    /// Close the process-tree lifeline, wait for its bounded TERM/KILL cleanup,
+    /// and then reap the relay. Reader joins are also bounded so a broken child
+    /// cannot wedge Stop by retaining one inherited pipe forever.
     fn stop(mut self) {
-        // Killing the child closes its stdout pipe, so the reader thread hits EOF
-        // and returns; then we join it so it never outlives the process.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stdin.take();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+        let reader_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         for handle in self.readers.drain(..) {
-            let _ = handle.join();
+            while !handle.is_finished() && std::time::Instant::now() < reader_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -407,6 +427,40 @@ fn unc_to_posix(path: &str) -> Option<String> {
     None
 }
 
+/// Supervise the complete package-manager process group behind a stdin
+/// lifeline. The package manager and validated script remain argv data after
+/// the fixed shell program. EOF from T-Hub triggers TERM, a bounded grace
+/// period, and KILL for the owned group. Natural child exit preserves its code.
+const PROCESS_TREE_SCRIPT: &str = r#"set -u
+MARKER="/tmp/t-hub-devserver-$1.pid"
+shift
+export HOST=0.0.0.0 HOSTNAME=0.0.0.0 NUXT_HOST=0.0.0.0 ASTRO_HOST=0.0.0.0 TAURI_DEV_HOST=0.0.0.0
+exec 3<&0
+setsid "$@" 3<&- </dev/null &
+SRV=$!
+echo "$SRV" > "$MARKER" 2>/dev/null || true
+cleanup() {
+  kill -TERM -- -"$SRV" 2>/dev/null || true
+  i=0
+  while kill -0 "$SRV" 2>/dev/null && [ "$i" -lt 20 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  kill -KILL -- -"$SRV" 2>/dev/null || true
+  wait "$SRV" 2>/dev/null || true
+  rm -f "$MARKER" 2>/dev/null || true
+}
+trap 'cleanup; exit 0' TERM INT HUP
+(cat <&3 >/dev/null; kill -TERM "$$" 2>/dev/null || true) &
+LIFE=$!
+wait "$SRV"
+CODE=$?
+kill "$LIFE" 2>/dev/null || true
+wait "$LIFE" 2>/dev/null || true
+cleanup
+exit "$CODE"
+"#;
+
 /// Wrap the user's dev command so the server binds to ALL interfaces
 /// (`0.0.0.0`) rather than only the WSL loopback (`127.0.0.1`).
 ///
@@ -430,19 +484,14 @@ fn unc_to_posix(path: &str) -> Option<String> {
 /// also owned by Windows and is not a valid Windows-to-WSL destination for the
 /// listener. Unknown tools remain unchanged and receive no guessed CLI
 /// arguments.
-#[cfg(not(windows))]
-fn apply_host_binding(command: &mut Command) {
-    command
-        .env("HOST", "0.0.0.0")
-        .env("HOSTNAME", "0.0.0.0")
-        .env("NUXT_HOST", "0.0.0.0")
-        .env("ASTRO_HOST", "0.0.0.0")
-        .env("TAURI_DEV_HOST", "0.0.0.0");
-}
-
 /// Build a package-manager invocation from backend-owned executable and argv.
 /// The validated script name is always one argument and is never shell source.
-fn build_command(cwd: &str, package_manager: PackageManager, script: &str) -> Command {
+fn build_command(
+    cwd: &str,
+    run_id: &str,
+    package_manager: PackageManager,
+    script: &str,
+) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -454,29 +503,35 @@ fn build_command(cwd: &str, package_manager: PackageManager, script: &str) -> Co
         }
         c.arg("-e")
             .arg("bash")
-            .arg("-lc")
-            .arg("export HOST=0.0.0.0 HOSTNAME=0.0.0.0 NUXT_HOST=0.0.0.0 ASTRO_HOST=0.0.0.0 TAURI_DEV_HOST=0.0.0.0; exec \"$@\"")
+            .arg("-c")
+            .arg(PROCESS_TREE_SCRIPT)
             .arg("t-hub-runner")
+            .arg(run_id)
             .arg(package_manager.executable())
             .arg("run")
             .arg(script);
         c.creation_flags(0x0800_0000);
         c.stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+            .stdin(Stdio::piped());
         c
     }
     #[cfg(not(windows))]
     {
-        let mut c = Command::new(package_manager.executable());
-        c.arg("run").arg(script);
+        let mut c = Command::new("bash");
+        c.arg("-c")
+            .arg(PROCESS_TREE_SCRIPT)
+            .arg("t-hub-runner")
+            .arg(run_id)
+            .arg(package_manager.executable())
+            .arg("run")
+            .arg(script);
         if !cwd.is_empty() {
             c.current_dir(cwd);
         }
-        apply_host_binding(&mut c);
         c.stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+            .stdin(Stdio::piped());
         c
     }
 }
@@ -572,7 +627,7 @@ pub async fn start_dev_server(
             },
         );
     }
-    let mut cmd = build_command(&cwd, selected.package_manager, &selected.script);
+    let mut cmd = build_command(&cwd, &run_id, selected.package_manager, &selected.script);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -598,8 +653,10 @@ pub async fn start_dev_server(
 
     // Take the piped handles BEFORE moving `child` into the registry. Each is
     // drained on its own thread so stdout and stderr can't deadlock each other.
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let job = crate::engine_supervisor::platform::assign_kill_on_close_job(&child).ok();
 
     let snapshot = {
         let mut registry = REGISTRY.lock();
@@ -619,7 +676,9 @@ pub async fn start_dev_server(
             DevProcess {
                 run_id: run_id.clone(),
                 child,
+                stdin,
                 readers: Vec::new(),
+                _job: job,
             },
         );
         registry
@@ -952,7 +1011,9 @@ mod tests {
             DevProcess {
                 run_id: "run-new".to_string(),
                 child,
+                stdin: None,
                 readers: Vec::new(),
+                _job: None,
             },
         );
 
@@ -963,9 +1024,10 @@ mod tests {
         assert!(take_process_for_stop(&mut registry, "tile", Some("run-old")).is_err());
         assert!(registry.processes.contains_key("tile"));
 
-        let process = take_process_for_stop(&mut registry, "tile", Some("run-new"))
+        let mut process = take_process_for_stop(&mut registry, "tile", Some("run-new"))
             .expect("matching stop should be valid")
             .expect("replacement should remain registered");
+        let _ = process.child.kill();
         process.stop();
     }
 
@@ -984,18 +1046,130 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn build_command_keeps_script_as_one_argument() {
-        let command = build_command("/tmp", PackageManager::Pnpm, "odd; $(unsafe) ' name");
-        assert_eq!(command.get_program(), "pnpm");
+        let command = build_command(
+            "/tmp",
+            "run-test",
+            PackageManager::Pnpm,
+            "odd; $(unsafe) ' name",
+        );
+        assert_eq!(command.get_program(), "bash");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["run", "odd; $(unsafe) ' name"]
+            [
+                "-c",
+                PROCESS_TREE_SCRIPT,
+                "t-hub-runner",
+                "run-test",
+                "pnpm",
+                "run",
+                "odd; $(unsafe) ' name",
+            ]
         );
-        assert!(command
-            .get_envs()
-            .any(|(name, value)| name == "HOST" && value == Some(std::ffi::OsStr::new("0.0.0.0"))));
-        assert!(command.get_envs().any(|(name, value)| {
-            name == "TAURI_DEV_HOST" && value == Some(std::ffi::OsStr::new("0.0.0.0"))
-        }));
+        assert!(PROCESS_TREE_SCRIPT.contains("TAURI_DEV_HOST=0.0.0.0"));
+        assert!(PROCESS_TREE_SCRIPT.contains("setsid \"$@\" 3<&- </dev/null &"));
+        assert!(PROCESS_TREE_SCRIPT.contains("kill -TERM -- -\"$SRV\""));
+        assert!(PROCESS_TREE_SCRIPT.contains("kill -KILL -- -\"$SRV\""));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn stop_reaps_a_term_ignoring_descendant_and_unblocks_its_reader() {
+        use std::io::Read;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(PROCESS_TREE_SCRIPT)
+            .arg("t-hub-runner")
+            .arg("tree-test")
+            .arg("sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30 & echo $!; wait")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn supervised fixture");
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().expect("fixture stdout");
+        let mut stderr = child.stderr.take().expect("fixture stderr");
+        let (pid_tx, pid_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut output = BufReader::new(stdout);
+            let mut first = String::new();
+            output.read_line(&mut first).expect("read descendant pid");
+            if first.trim().is_empty() {
+                let mut error = String::new();
+                let _ = stderr.read_to_string(&mut error);
+                panic!("fixture exited before reporting its descendant: {error}");
+            }
+            pid_tx
+                .send(first.trim().parse::<u32>().expect("numeric descendant pid"))
+                .expect("send descendant pid");
+            let mut rest = Vec::new();
+            let _ = output.read_to_end(&mut rest);
+        });
+        let descendant = pid_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fixture should report its descendant");
+        assert!(std::path::Path::new(&format!("/proc/{descendant}")).exists());
+
+        let started = Instant::now();
+        DevProcess {
+            run_id: "tree-test".to_string(),
+            child,
+            stdin,
+            readers: vec![reader],
+            _job: None,
+        }
+        .stop();
+
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(!std::path::Path::new(&format!("/proc/{descendant}")).exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn natural_parent_exit_reaps_its_surviving_descendant() {
+        use std::time::{Duration, Instant};
+
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(PROCESS_TREE_SCRIPT)
+            .arg("t-hub-runner")
+            .arg("early-exit-test")
+            .arg("sh")
+            .arg("-c")
+            .arg("sleep 30 & echo $!; exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().expect("spawn early-exit fixture");
+        let _stdin = child.stdin.take();
+        let mut output = BufReader::new(child.stdout.take().expect("fixture stdout"));
+        let mut first = String::new();
+        output.read_line(&mut first).expect("read descendant pid");
+        let descendant = first.trim().parse::<u32>().expect("numeric descendant pid");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    assert!(status.success());
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => {
+                    let _ = child.kill();
+                    panic!("supervisor did not reap an early-exit tree: {other:?}");
+                }
+            }
+        }
+        assert!(!std::path::Path::new(&format!("/proc/{descendant}")).exists());
     }
 
     /// The TCP probe should connect to a port we open and report it refused once

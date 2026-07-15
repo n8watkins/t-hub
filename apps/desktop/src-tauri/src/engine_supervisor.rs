@@ -601,7 +601,8 @@ pub mod platform {
 
     /// Assign a just-spawned child to a kill-on-close Windows Job Object so the
     /// relay (and thus, together with the lifeline, the whole tree) cannot outlive
-    /// the app even on a hard crash.
+    /// its owner even on a hard crash. The returned handle must remain owned for
+    /// exactly as long as the child should remain alive.
     ///
     /// COMPILE-VERIFIED ON WINDOWS ONLY: the Linux dev env cannot build or run
     /// this leg (no Win32). It is defense-in-depth over the lifeline+reaper, which
@@ -609,7 +610,17 @@ pub mod platform {
     /// feature set needs a tweak, the Windows build surfaces it (honest E2E limit,
     /// same discipline as PR #50/#52). On non-Windows it is a no-op.
     #[cfg(windows)]
-    pub fn assign_kill_on_close_job(child: &std::process::Child) -> std::io::Result<()> {
+    pub struct KillOnCloseJob {
+        _handle: std::os::windows::io::OwnedHandle,
+    }
+
+    #[cfg(not(windows))]
+    pub struct KillOnCloseJob;
+
+    #[cfg(windows)]
+    pub fn assign_kill_on_close_job(
+        child: &std::process::Child,
+    ) -> std::io::Result<KillOnCloseJob> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::{
@@ -630,17 +641,15 @@ pub mod platform {
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )?;
             AssignProcessToJobObject(job_handle, HANDLE(child.as_raw_handle() as _))?;
-            // NOTE: the job handle is intentionally leaked - it must stay open for
-            // the app's lifetime so KILL_ON_JOB_CLOSE fires when the app process
-            // (and thus this handle) is torn down by the OS.
-            std::mem::forget(job);
+            Ok(KillOnCloseJob { _handle: job })
         }
-        Ok(())
     }
 
     #[cfg(not(windows))]
-    pub fn assign_kill_on_close_job(_child: &std::process::Child) -> std::io::Result<()> {
-        Ok(())
+    pub fn assign_kill_on_close_job(
+        _child: &std::process::Child,
+    ) -> std::io::Result<KillOnCloseJob> {
+        Ok(KillOnCloseJob)
     }
 
     /// The `wsl.exe -e bash -c <lifeline>` command for the managed Kokoro child.
@@ -778,6 +787,7 @@ pub mod runtime {
     struct EngineChild {
         child: std::process::Child,
         _stdin: Option<std::process::ChildStdin>,
+        _job: Option<platform::KillOnCloseJob>,
     }
 
     impl Drop for EngineChild {
@@ -969,10 +979,11 @@ pub mod runtime {
         let stdin = child.stdin.take();
         // Best-effort job-object hardening (no-op off Windows; the lifeline is the
         // portable guarantee).
-        let _ = platform::assign_kill_on_close_job(&child);
+        let job = platform::assign_kill_on_close_job(&child).ok();
         Some(EngineChild {
             child,
             _stdin: stdin,
+            _job: job,
         })
     }
 
