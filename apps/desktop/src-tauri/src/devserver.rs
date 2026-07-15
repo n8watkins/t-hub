@@ -7,12 +7,20 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{mpsc, LazyLock};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    mpsc, Arc, LazyLock, Weak,
+};
 use std::thread::JoinHandle;
 
+use cap_fs_ext::{
+    ambient_authority, DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt,
+};
+use cap_std::fs::{Dir as CapDir, File as CapFile, OpenOptions as CapOpenOptions};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
@@ -159,16 +167,27 @@ impl DevProcess {
 }
 
 struct StaticServer {
-    run_id: String,
     shutdown: mpsc::Sender<()>,
     thread: Option<JoinHandle<()>>,
+    active_responses: Arc<AtomicUsize>,
 }
 
 impl StaticServer {
     fn stop(mut self) {
         let _ = self.shutdown.send(());
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !thread.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+            while self.active_responses.load(Ordering::SeqCst) > 0
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
     }
 }
@@ -177,12 +196,39 @@ impl StaticServer {
 struct DevRegistry {
     processes: HashMap<String, DevProcess>,
     static_servers: HashMap<String, StaticServer>,
+    generations: HashMap<String, String>,
+    operations: HashMap<String, u64>,
     snapshots: HashMap<String, DevServerSnapshot>,
     revision: u64,
+    operation_sequence: u64,
 }
 
 static REGISTRY: LazyLock<Mutex<DevRegistry>> =
     LazyLock::new(|| Mutex::new(DevRegistry::default()));
+static OPERATION_GATES: LazyLock<Mutex<HashMap<String, Weak<async_lock::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn operation_gate(terminal_id: &str) -> Arc<async_lock::Mutex<()>> {
+    let mut gates = OPERATION_GATES.lock();
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(terminal_id).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(async_lock::Mutex::new(()));
+    gates.insert(terminal_id.to_string(), Arc::downgrade(&gate));
+    gate
+}
+
+fn reserve_operation(registry: &mut DevRegistry, terminal_id: &str) -> u64 {
+    registry.operation_sequence = registry.operation_sequence.saturating_add(1);
+    let token = registry.operation_sequence;
+    registry.operations.insert(terminal_id.to_string(), token);
+    token
+}
+
+fn owns_operation(registry: &DevRegistry, terminal_id: &str, token: u64) -> bool {
+    registry.operations.get(terminal_id).copied() == Some(token)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum PollOutcome {
@@ -192,6 +238,9 @@ enum PollOutcome {
 }
 
 fn poll_run(registry: &mut DevRegistry, terminal_id: &str, run_id: &str) -> PollOutcome {
+    if registry.generations.get(terminal_id).map(String::as_str) != Some(run_id) {
+        return PollOutcome::Replaced;
+    }
     match registry.processes.get_mut(terminal_id) {
         Some(process) if process.run_id == run_id => match process.child.try_wait() {
             Ok(Some(status)) => PollOutcome::Exited(status.code()),
@@ -200,6 +249,51 @@ fn poll_run(registry: &mut DevRegistry, terminal_id: &str, run_id: &str) -> Poll
         },
         _ => PollOutcome::Replaced,
     }
+}
+
+fn owns_generation(registry: &DevRegistry, terminal_id: &str, run_id: &str) -> bool {
+    registry.generations.get(terminal_id).map(String::as_str) == Some(run_id)
+}
+
+fn finish_validation_error(registry: &mut DevRegistry, terminal_id: &str, operation: u64) -> bool {
+    if !owns_operation(registry, terminal_id, operation) {
+        return false;
+    }
+    registry.operations.remove(terminal_id);
+    true
+}
+
+fn publish_start_failure(
+    registry: &mut DevRegistry,
+    terminal_id: &str,
+    operation: u64,
+    run_id: &str,
+    target: Option<RunTarget>,
+    reason: &str,
+) -> bool {
+    if !owns_operation(registry, terminal_id, operation)
+        || !owns_generation(registry, terminal_id, run_id)
+    {
+        return false;
+    }
+    registry.operations.remove(terminal_id);
+    registry.generations.remove(terminal_id);
+    let revision = next_revision(registry);
+    registry.snapshots.insert(
+        terminal_id.to_string(),
+        DevServerSnapshot {
+            terminal_id: terminal_id.to_string(),
+            run_id: Some(run_id.to_string()),
+            revision,
+            state: "failed".to_string(),
+            target,
+            exit_code: None,
+            reason: Some(reason.to_string()),
+            preview_url: None,
+            observed_at: observed_at(),
+        },
+    );
+    true
 }
 
 #[cfg(test)]
@@ -240,6 +334,27 @@ fn idle_snapshot(terminal_id: &str, revision: u64) -> DevServerSnapshot {
         preview_url: None,
         observed_at: observed_at(),
     }
+}
+
+fn finish_stop_snapshot(
+    registry: &mut DevRegistry,
+    terminal_id: &str,
+    operation: u64,
+) -> Result<DevServerSnapshot, String> {
+    if !owns_operation(registry, terminal_id, operation) {
+        return registry
+            .snapshots
+            .get(terminal_id)
+            .cloned()
+            .ok_or_else(|| "the replacement run has no lifecycle snapshot".to_string());
+    }
+    registry.operations.remove(terminal_id);
+    let revision = next_revision(registry);
+    let snapshot = idle_snapshot(terminal_id, revision);
+    registry
+        .snapshots
+        .insert(terminal_id.to_string(), snapshot.clone());
+    Ok(snapshot)
 }
 
 fn parse_package_manager(value: &str) -> Option<PackageManager> {
@@ -680,6 +795,51 @@ fn pump<R: std::io::Read>(app: &AppHandle, id: &str, run_id: &str, reader: R) {
 }
 
 const MAX_STATIC_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STATIC_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_STATIC_CONCURRENT_RESPONSES: usize = 8;
+const MAX_GLOBAL_STATIC_RESPONSES: usize = 32;
+const STATIC_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+static ACTIVE_GLOBAL_STATIC_RESPONSES: AtomicUsize = AtomicUsize::new(0);
+
+struct StaticResponseGuard {
+    local: Arc<AtomicUsize>,
+}
+
+impl StaticResponseGuard {
+    fn reserve_counter(counter: &AtomicUsize, limit: usize) -> bool {
+        let mut current = counter.load(Ordering::SeqCst);
+        loop {
+            if current >= limit {
+                return false;
+            }
+            match counter.compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn reserve(active: &Arc<AtomicUsize>) -> Option<Self> {
+        if !Self::reserve_counter(&ACTIVE_GLOBAL_STATIC_RESPONSES, MAX_GLOBAL_STATIC_RESPONSES) {
+            return None;
+        }
+        if !Self::reserve_counter(active, MAX_STATIC_CONCURRENT_RESPONSES) {
+            ACTIVE_GLOBAL_STATIC_RESPONSES.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self {
+            local: Arc::clone(active),
+        })
+    }
+}
+
+impl Drop for StaticResponseGuard {
+    fn drop(&mut self) {
+        self.local.fetch_sub(1, Ordering::SeqCst);
+        ACTIVE_GLOBAL_STATIC_RESPONSES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn has_reparse_point(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
@@ -721,157 +881,376 @@ fn decode_static_path(raw: &str) -> Result<String, ()> {
     Ok(decoded)
 }
 
-fn resolve_static_file(root: &Path, raw: &str) -> Result<PathBuf, ()> {
+fn cap_metadata_has_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use cap_fs_ext::OsMetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+struct OpenedStaticFile {
+    file: CapFile,
+    mime_path: PathBuf,
+}
+
+fn nofollow_options(maybe_dir: bool) -> CapOpenOptions {
+    let mut options = CapOpenOptions::new();
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(maybe_dir);
+    options
+}
+
+fn open_static_root(cwd: &str) -> Result<CapDir, String> {
+    let path = crate::files::to_host_path(cwd);
+    let file = CapFile::open_ambient_with(&path, &nofollow_options(true), ambient_authority())
+        .map_err(|error| format!("failed to open static site root: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("failed to inspect static site root: {error}"))?;
+    if !metadata.is_dir() || cap_metadata_has_reparse_point(&metadata) {
+        return Err("the static site root is no longer a regular directory".to_string());
+    }
+    Ok(CapDir::from_std_file(file.into_std()))
+}
+
+fn open_regular_static_file(
+    directory: &CapDir,
+    name: &Path,
+    mime_path: PathBuf,
+) -> Result<OpenedStaticFile, ()> {
+    let file = directory
+        .open_with(name, &nofollow_options(false))
+        .map_err(|_| ())?;
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_file()
+        || metadata.len() > MAX_STATIC_FILE_BYTES
+        || cap_metadata_has_reparse_point(&metadata)
+    {
+        return Err(());
+    }
+    Ok(OpenedStaticFile { file, mime_path })
+}
+
+fn open_static_file(root: &CapDir, raw: &str) -> Result<OpenedStaticFile, ()> {
     let decoded = decode_static_path(raw)?;
-    let mut candidate = root.to_path_buf();
-    let mut saw_component = false;
+    let mut names = Vec::new();
     for component in Path::new(decoded.trim_start_matches('/')).components() {
         let name = match component {
             Component::Normal(name) => name,
-            Component::CurDir if !saw_component => continue,
+            Component::CurDir if names.is_empty() => continue,
             _ => return Err(()),
         };
         let text = name.to_str().ok_or(())?;
         if text.starts_with('.') || text.contains(':') {
             return Err(());
         }
-        candidate.push(name);
-        let metadata = fs::symlink_metadata(&candidate).map_err(|_| ())?;
-        if metadata.file_type().is_symlink() || has_reparse_point(&metadata) {
+        names.push(name.to_os_string());
+    }
+
+    if names.is_empty() {
+        return open_regular_static_file(root, Path::new("index.html"), "index.html".into());
+    }
+
+    let mut directory = root.try_clone().map_err(|_| ())?;
+    let mut mime_path = PathBuf::new();
+    for name in &names[..names.len() - 1] {
+        directory = directory.open_dir_nofollow(name).map_err(|_| ())?;
+        let metadata = directory.dir_metadata().map_err(|_| ())?;
+        if cap_metadata_has_reparse_point(&metadata) {
             return Err(());
         }
-        saw_component = true;
+        mime_path.push(name);
     }
-    if !saw_component || fs::metadata(&candidate).map_err(|_| ())?.is_dir() {
-        candidate.push("index.html");
-        let metadata = fs::symlink_metadata(&candidate).map_err(|_| ())?;
-        if metadata.file_type().is_symlink() || has_reparse_point(&metadata) {
-            return Err(());
+
+    let final_name = Path::new(names.last().ok_or(())?);
+    mime_path.push(final_name);
+    let opened = directory
+        .open_with(final_name, &nofollow_options(true))
+        .map_err(|_| ())?;
+    let metadata = opened.metadata().map_err(|_| ())?;
+    if cap_metadata_has_reparse_point(&metadata) {
+        return Err(());
+    }
+    if metadata.is_dir() {
+        let nested = CapDir::from_std_file(opened.into_std());
+        mime_path.push("index.html");
+        open_regular_static_file(&nested, Path::new("index.html"), mime_path)
+    } else if metadata.is_file() && metadata.len() <= MAX_STATIC_FILE_BYTES {
+        Ok(OpenedStaticFile {
+            file: opened,
+            mime_path,
+        })
+    } else {
+        Err(())
+    }
+}
+
+fn read_static_body(file: CapFile) -> Result<Vec<u8>, ()> {
+    let mut body = Vec::new();
+    file.take(MAX_STATIC_FILE_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| ())?;
+    if body.len() as u64 > MAX_STATIC_FILE_BYTES {
+        return Err(());
+    }
+    Ok(body)
+}
+
+fn write_static_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    send_body: bool,
+    extra_headers: &str,
+) -> std::io::Result<()> {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nConnection: close\r\n{extra_headers}\r\n",
+        body.len()
+    );
+    let deadline = std::time::Instant::now() + STATIC_SOCKET_TIMEOUT;
+    write_before_deadline(stream, header.as_bytes(), deadline)?;
+    if send_body {
+        write_before_deadline(stream, body, deadline)?;
+    }
+    Ok(())
+}
+
+fn write_before_deadline(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "static response deadline elapsed",
+            ));
+        }
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "static response socket closed",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
-    let metadata = fs::metadata(&candidate).map_err(|_| ())?;
-    if !metadata.is_file() || metadata.len() > MAX_STATIC_FILE_BYTES {
-        return Err(());
-    }
-    let canonical = candidate.canonicalize().map_err(|_| ())?;
-    if !canonical.starts_with(root) {
-        return Err(());
-    }
-    Ok(canonical)
+    Ok(())
 }
 
-fn response_header(name: &str, value: &str) -> tiny_http::Header {
-    tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
-        .expect("static response header is valid")
+fn request_has_expected_host(request: &[u8], expected_host: &str) -> bool {
+    let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(headers) = std::str::from_utf8(&request[..header_end]) else {
+        return false;
+    };
+    let mut host = None;
+    for line in headers.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        if name.eq_ignore_ascii_case("host") {
+            if host.is_some() {
+                return false;
+            }
+            host = Some(value.trim());
+        }
+    }
+    host == Some(expected_host)
 }
 
-fn respond_static(request: tiny_http::Request, root: &Path) {
-    let method = request.method().clone();
-    if method != tiny_http::Method::Get && method != tiny_http::Method::Head {
-        let response = tiny_http::Response::from_string("Method not allowed")
-            .with_status_code(405)
-            .with_header(response_header("Allow", "GET, HEAD"))
-            .with_header(response_header("X-Content-Type-Options", "nosniff"))
-            .with_header(response_header("Referrer-Policy", "no-referrer"))
-            .with_header(response_header("Cache-Control", "no-store"));
-        let _ = request.respond(response);
+fn respond_static(
+    stream: &mut TcpStream,
+    root: &CapDir,
+    expected_host: &str,
+    _response_guard: StaticResponseGuard,
+) {
+    if stream.set_nonblocking(true).is_err() {
         return;
     }
-    let path = match resolve_static_file(root, request.url()) {
-        Ok(path) => path,
-        Err(()) => {
-            let response = tiny_http::Response::from_string("Not found")
-                .with_status_code(404)
-                .with_header(response_header("X-Content-Type-Options", "nosniff"))
-                .with_header(response_header("Referrer-Policy", "no-referrer"))
-                .with_header(response_header("Cache-Control", "no-store"));
-            let _ = request.respond(response);
+    let request_deadline = std::time::Instant::now() + STATIC_SOCKET_TIMEOUT;
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 2048];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        if std::time::Instant::now() >= request_deadline {
             return;
         }
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(read) => {
+                request.extend_from_slice(&chunk[..read]);
+                if request.len() > MAX_STATIC_REQUEST_BYTES {
+                    let _ = write_static_response(
+                        stream,
+                        "431 Request Header Fields Too Large",
+                        "text/plain; charset=utf-8",
+                        b"Request headers too large",
+                        true,
+                        "",
+                    );
+                    return;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+    let Some(line_end) = request.windows(2).position(|window| window == b"\r\n") else {
+        return;
     };
-    let metadata = match fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            let _ = request.respond(
-                tiny_http::Response::from_string("Not found")
-                    .with_status_code(404)
-                    .with_header(response_header("X-Content-Type-Options", "nosniff"))
-                    .with_header(response_header("Referrer-Policy", "no-referrer"))
-                    .with_header(response_header("Cache-Control", "no-store")),
+    let Ok(request_line) = std::str::from_utf8(&request[..line_end]) else {
+        return;
+    };
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(path), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        let _ = write_static_response(
+            stream,
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            b"Bad request",
+            true,
+            "",
+        );
+        return;
+    };
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return;
+    }
+    if !request_has_expected_host(&request, expected_host) {
+        let _ = write_static_response(
+            stream,
+            "421 Misdirected Request",
+            "text/plain; charset=utf-8",
+            b"Misdirected request",
+            method != "HEAD",
+            "",
+        );
+        return;
+    }
+    if !matches!(method, "GET" | "HEAD") {
+        let _ = write_static_response(
+            stream,
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"Method not allowed",
+            method != "HEAD",
+            "Allow: GET, HEAD\r\n",
+        );
+        return;
+    }
+    let opened = match open_static_file(root, path) {
+        Ok(opened) => opened,
+        Err(()) => {
+            let _ = write_static_response(
+                stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"Not found",
+                method == "GET",
+                "",
             );
             return;
         }
     };
-    let body = if method == tiny_http::Method::Head {
-        Vec::new()
-    } else {
-        match fs::read(&path) {
-            Ok(body) => body,
-            Err(_) => {
-                let _ = request.respond(
-                    tiny_http::Response::from_string("Not found")
-                        .with_status_code(404)
-                        .with_header(response_header("X-Content-Type-Options", "nosniff"))
-                        .with_header(response_header("Referrer-Policy", "no-referrer"))
-                        .with_header(response_header("Cache-Control", "no-store")),
-                );
-                return;
-            }
+    let mime = mime_guess::from_path(&opened.mime_path).first_or_octet_stream();
+    let body = match read_static_body(opened.file) {
+        Ok(body) => body,
+        Err(()) => {
+            let _ = write_static_response(
+                stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"Not found",
+                method == "GET",
+                "",
+            );
+            return;
         }
     };
-    let mime = mime_guess::from_path(&path).first_or_octet_stream();
-    let response = tiny_http::Response::from_data(body)
-        .with_status_code(200)
-        .with_header(response_header("Content-Type", mime.as_ref()))
-        .with_header(response_header(
-            "Content-Length",
-            &metadata.len().to_string(),
-        ))
-        .with_header(response_header("X-Content-Type-Options", "nosniff"))
-        .with_header(response_header("Referrer-Policy", "no-referrer"))
-        .with_header(response_header("Cache-Control", "no-store"));
-    let _ = request.respond(response);
+    let _ = write_static_response(stream, "200 OK", mime.as_ref(), &body, method == "GET", "");
 }
 
 fn start_static_server(cwd: &str, run_id: &str) -> Result<(StaticServer, String), String> {
-    let root = crate::files::to_host_path(cwd)
-        .canonicalize()
-        .map_err(|error| format!("failed to resolve static site root: {error}"))?;
-    let entrypoint = fs::symlink_metadata(root.join("index.html"))
-        .map_err(|error| format!("failed to inspect index.html: {error}"))?;
-    if entrypoint.file_type().is_symlink()
-        || has_reparse_point(&entrypoint)
-        || !entrypoint.is_file()
-    {
-        return Err("the static site entrypoint is no longer a regular file".to_string());
-    }
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+    let root = open_static_root(cwd)?;
+    open_static_file(&root, "/")
+        .map_err(|()| "the static site entrypoint is no longer a regular file".to_string())?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))
         .map_err(|error| format!("failed to bind static preview: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("failed to configure static preview: {error}"))?;
     let address = listener
         .local_addr()
         .map_err(|error| format!("failed to inspect static preview address: {error}"))?;
-    let server = tiny_http::Server::from_listener(listener, None)
-        .map_err(|error| format!("failed to start static preview: {error}"))?;
     let (shutdown, shutdown_rx) = mpsc::channel();
+    let active_responses = Arc::new(AtomicUsize::new(0));
+    let active_thread = Arc::clone(&active_responses);
+    let expected_host = format!("127.0.0.1:{}", address.port());
     let name = format!("t-hub-static-preview-{run_id}");
     let thread = std::thread::Builder::new()
         .name(name)
         .spawn(move || loop {
-            if shutdown_rx.try_recv().is_ok() {
-                break;
+            match shutdown_rx.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
             }
-            match server.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(Some(request)) => respond_static(request, &root),
-                Ok(None) => {}
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let Some(response_guard) = StaticResponseGuard::reserve(&active_thread) else {
+                        continue;
+                    };
+                    let Ok(request_root) = root.try_clone() else {
+                        continue;
+                    };
+                    let request_host = expected_host.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("t-hub-static-response".to_string())
+                        .spawn(move || {
+                            respond_static(
+                                &mut stream,
+                                &request_root,
+                                &request_host,
+                                response_guard,
+                            )
+                        });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    match shutdown_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
                 Err(_) => break,
             }
         })
         .map_err(|error| format!("failed to start static preview thread: {error}"))?;
     Ok((
         StaticServer {
-            run_id: run_id.to_string(),
             shutdown,
             thread: Some(thread),
+            active_responses,
         },
         format!("http://127.0.0.1:{}/", address.port()),
     ))
@@ -887,33 +1266,54 @@ pub async fn start_dev_server(
     if !matches!(target.kind.as_str(), "packageScript" | "staticSite") {
         return Err("invalid run target".to_string());
     }
-    let discovery = discover_run_targets(cwd.clone()).await?;
+    let gate = operation_gate(&terminal_id);
+    let _operation_guard = gate.lock().await;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let operation = reserve_operation(&mut REGISTRY.lock(), &terminal_id);
+
+    let discovery = match discover_run_targets(cwd.clone()).await {
+        Ok(discovery) => discovery,
+        Err(reason) => {
+            let current = finish_validation_error(&mut REGISTRY.lock(), &terminal_id, operation);
+            return Err(if current {
+                reason
+            } else {
+                "the start request was superseded".to_string()
+            });
+        }
+    };
     if discovery.state != "ready" {
-        return Err(discovery
+        let reason = discovery
             .message
-            .unwrap_or_else(|| "run targets are unavailable".to_string()));
+            .unwrap_or_else(|| "run targets are unavailable".to_string());
+        let current = finish_validation_error(&mut REGISTRY.lock(), &terminal_id, operation);
+        return Err(if current {
+            reason
+        } else {
+            "the start request was superseded".to_string()
+        });
     }
     let selected = discovery.targets;
-    let selected = select_target(selected, &target)
-        .ok_or_else(|| "the selected run target no longer exists".to_string())?;
-
+    let selected = match select_target(selected, &target) {
+        Some(selected) => selected,
+        None => {
+            let reason = "the selected run target no longer exists".to_string();
+            let current = finish_validation_error(&mut REGISTRY.lock(), &terminal_id, operation);
+            return Err(if current {
+                reason
+            } else {
+                "the start request was superseded".to_string()
+            });
+        }
+    };
     let (existing, existing_static) = {
         let mut registry = REGISTRY.lock();
-        (
-            registry.processes.remove(&terminal_id),
-            registry.static_servers.remove(&terminal_id),
-        )
-    };
-    if let Some(process) = existing {
-        process.stop();
-    }
-    if let Some(server) = existing_static {
-        server.stop();
-    }
-
-    let run_id = uuid::Uuid::new_v4().to_string();
-    {
-        let mut registry = REGISTRY.lock();
+        if !owns_operation(&registry, &terminal_id, operation) {
+            return Err("the start request was superseded".to_string());
+        }
+        registry
+            .generations
+            .insert(terminal_id.clone(), run_id.clone());
         let revision = next_revision(&mut registry);
         registry.snapshots.insert(
             terminal_id.clone(),
@@ -929,89 +1329,117 @@ pub async fn start_dev_server(
                 observed_at: observed_at(),
             },
         );
+        (
+            registry.processes.remove(&terminal_id),
+            registry.static_servers.remove(&terminal_id),
+        )
+    };
+    if let Some(process) = existing {
+        process.stop();
+    }
+    if let Some(server) = existing_static {
+        server.stop();
+    }
+    if !owns_operation(&REGISTRY.lock(), &terminal_id, operation) {
+        return Err("the start request was superseded".to_string());
     }
     if selected.kind == "staticSite" {
         let (server, preview_url) = match start_static_server(&cwd, &run_id) {
             Ok(started) => started,
             Err(reason) => {
-                let mut registry = REGISTRY.lock();
-                let revision = next_revision(&mut registry);
-                registry.snapshots.insert(
-                    terminal_id.clone(),
-                    DevServerSnapshot {
-                        terminal_id,
-                        run_id: Some(run_id),
-                        revision,
-                        state: "failed".to_string(),
-                        target: Some(selected),
-                        exit_code: None,
-                        reason: Some(reason.clone()),
-                        preview_url: None,
-                        observed_at: observed_at(),
-                    },
+                publish_start_failure(
+                    &mut REGISTRY.lock(),
+                    &terminal_id,
+                    operation,
+                    &run_id,
+                    Some(selected),
+                    &reason,
                 );
                 return Err(reason);
             }
         };
+        let mut server = Some(server);
         let snapshot = {
             let mut registry = REGISTRY.lock();
-            let revision = next_revision(&mut registry);
-            let snapshot = DevServerSnapshot {
-                terminal_id: terminal_id.clone(),
-                run_id: Some(run_id.clone()),
-                revision,
-                state: "running".to_string(),
-                target: Some(selected),
-                exit_code: None,
-                reason: None,
-                preview_url: Some(preview_url),
-                observed_at: observed_at(),
-            };
-            registry.static_servers.insert(terminal_id.clone(), server);
-            registry
-                .snapshots
-                .insert(terminal_id.clone(), snapshot.clone());
-            snapshot
+            if !owns_operation(&registry, &terminal_id, operation)
+                || !owns_generation(&registry, &terminal_id, &run_id)
+            {
+                None
+            } else {
+                registry.operations.remove(&terminal_id);
+                let revision = next_revision(&mut registry);
+                let snapshot = DevServerSnapshot {
+                    terminal_id: terminal_id.clone(),
+                    run_id: Some(run_id.clone()),
+                    revision,
+                    state: "running".to_string(),
+                    target: Some(selected),
+                    exit_code: None,
+                    reason: None,
+                    preview_url: Some(preview_url),
+                    observed_at: observed_at(),
+                };
+                registry.static_servers.insert(
+                    terminal_id.clone(),
+                    server.take().expect("static server is pending"),
+                );
+                registry
+                    .snapshots
+                    .insert(terminal_id.clone(), snapshot.clone());
+                let _ = app.emit(
+                    &channel(&terminal_id),
+                    DevServerEvent::new(
+                        &terminal_id,
+                        &run_id,
+                        snapshot.revision,
+                        "started",
+                        String::new(),
+                    ),
+                );
+                Some(snapshot)
+            }
         };
-        let _ = app.emit(
-            &channel(&terminal_id),
-            DevServerEvent::new(
-                &terminal_id,
-                &run_id,
-                snapshot.revision,
-                "started",
-                String::new(),
-            ),
-        );
-        return Ok(snapshot);
+        if let Some(server) = server {
+            server.stop();
+        }
+        return snapshot.ok_or_else(|| "the start request was superseded".to_string());
     }
-    let package_manager = selected
-        .package_manager
-        .ok_or_else(|| "package script is missing its package manager".to_string())?;
-    let script = selected
-        .script
-        .as_deref()
-        .ok_or_else(|| "package script is missing its script name".to_string())?;
+    let Some(package_manager) = selected.package_manager else {
+        let reason = "package script is missing its package manager".to_string();
+        publish_start_failure(
+            &mut REGISTRY.lock(),
+            &terminal_id,
+            operation,
+            &run_id,
+            Some(selected),
+            &reason,
+        );
+        return Err(reason);
+    };
+    let Some(script) = selected.script.as_deref() else {
+        let reason = "package script is missing its script name".to_string();
+        publish_start_failure(
+            &mut REGISTRY.lock(),
+            &terminal_id,
+            operation,
+            &run_id,
+            Some(selected),
+            &reason,
+        );
+        return Err(reason);
+    };
     let mut cmd = build_command(&cwd, &run_id, package_manager, script);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
             let reason = format!("failed to start dev server: {error}");
-            let mut registry = REGISTRY.lock();
-            let revision = next_revision(&mut registry);
-            registry.snapshots.insert(
-                terminal_id.clone(),
-                DevServerSnapshot {
-                    terminal_id,
-                    run_id: Some(run_id),
-                    revision,
-                    state: "failed".to_string(),
-                    target: Some(selected),
-                    exit_code: None,
-                    reason: Some(reason.clone()),
-                    preview_url: None,
-                    observed_at: observed_at(),
-                },
+            publish_start_failure(
+                &mut REGISTRY.lock(),
+                &terminal_id,
+                operation,
+                &run_id,
+                Some(selected),
+                &reason,
             );
             return Err(reason);
         }
@@ -1024,35 +1452,60 @@ pub async fn start_dev_server(
     let stderr = child.stderr.take();
     let job = crate::engine_supervisor::platform::assign_kill_on_close_job(&child).ok();
 
+    let mut pending_process = Some(DevProcess {
+        run_id: run_id.clone(),
+        child,
+        stdin,
+        readers: Vec::new(),
+        _job: job,
+    });
     let snapshot = {
         let mut registry = REGISTRY.lock();
-        let revision = next_revision(&mut registry);
-        let snapshot = DevServerSnapshot {
-            terminal_id: terminal_id.clone(),
-            run_id: Some(run_id.clone()),
-            revision,
-            state: "running".to_string(),
-            target: Some(selected),
-            exit_code: None,
-            reason: None,
-            preview_url: None,
-            observed_at: observed_at(),
-        };
-        registry.processes.insert(
-            terminal_id.clone(),
-            DevProcess {
-                run_id: run_id.clone(),
-                child,
-                stdin,
-                readers: Vec::new(),
-                _job: job,
-            },
-        );
-        registry
-            .snapshots
-            .insert(terminal_id.clone(), snapshot.clone());
-        snapshot
+        if !owns_operation(&registry, &terminal_id, operation)
+            || !owns_generation(&registry, &terminal_id, &run_id)
+        {
+            None
+        } else {
+            registry.operations.remove(&terminal_id);
+            let revision = next_revision(&mut registry);
+            let snapshot = DevServerSnapshot {
+                terminal_id: terminal_id.clone(),
+                run_id: Some(run_id.clone()),
+                revision,
+                state: "running".to_string(),
+                target: Some(selected),
+                exit_code: None,
+                reason: None,
+                preview_url: None,
+                observed_at: observed_at(),
+            };
+            registry.processes.insert(
+                terminal_id.clone(),
+                pending_process
+                    .take()
+                    .expect("managed process is pending registration"),
+            );
+            registry
+                .snapshots
+                .insert(terminal_id.clone(), snapshot.clone());
+            let _ = app.emit(
+                &channel(&terminal_id),
+                DevServerEvent::new(
+                    &terminal_id,
+                    &run_id,
+                    snapshot.revision,
+                    "started",
+                    String::new(),
+                ),
+            );
+            Some(snapshot)
+        }
     };
+    if let Some(process) = pending_process {
+        process.stop();
+        return Err("the start request was superseded".to_string());
+    }
+    let snapshot = snapshot.expect("registered process has a snapshot");
 
     let mut readers = Vec::new();
     if let Some(stream) = stdout {
@@ -1087,17 +1540,6 @@ pub async fn start_dev_server(
     for handle in readers {
         let _ = handle.join();
     }
-    let _ = app.emit(
-        &channel(&terminal_id),
-        DevServerEvent::new(
-            &terminal_id,
-            &run_id,
-            snapshot.revision,
-            "started",
-            String::new(),
-        ),
-    );
-
     // A waiter thread reaps the child if it exits ON ITS OWN (crash, or a dev
     // server that runs-then-quits) and emits an `exited` event so the Dev tab can
     // flip back to idle. It only acts if THIS child is still the registered one
@@ -1123,6 +1565,7 @@ pub async fn start_dev_server(
                     None => "dev server exited".to_string(),
                 };
                 let process = registry.processes.remove(&id_wait);
+                registry.generations.remove(&id_wait);
                 let revision = next_revision(&mut registry);
                 let target = registry
                     .snapshots
@@ -1163,24 +1606,38 @@ pub async fn stop_dev_server(
     terminal_id: String,
     run_id: Option<String>,
 ) -> Result<DevServerSnapshot, String> {
-    let (process, static_server) = {
+    let gate = operation_gate(&terminal_id);
+    let _operation_guard = gate.lock().await;
+    let (operation, process, static_server) = {
         let mut registry = REGISTRY.lock();
         if let Some(expected) = run_id.as_deref() {
             let active = registry
-                .processes
+                .generations
                 .get(&terminal_id)
-                .map(|process| process.run_id.as_str())
                 .or_else(|| {
                     registry
-                        .static_servers
+                        .snapshots
                         .get(&terminal_id)
-                        .map(|server| server.run_id.as_str())
-                });
+                        .and_then(|snapshot| snapshot.run_id.as_ref())
+                })
+                .map(String::as_str);
             if active.is_some_and(|active| active != expected) {
                 return Err("the requested run is no longer active".to_string());
             }
         }
+        let operation = reserve_operation(&mut registry, &terminal_id);
+        if let Some(mut snapshot) = registry.snapshots.get(&terminal_id).cloned() {
+            if snapshot.run_id.is_some() {
+                let revision = next_revision(&mut registry);
+                snapshot.revision = revision;
+                snapshot.state = "stopping".to_string();
+                snapshot.observed_at = observed_at();
+                registry.snapshots.insert(terminal_id.clone(), snapshot);
+            }
+        }
+        registry.generations.remove(&terminal_id);
         (
+            operation,
             registry.processes.remove(&terminal_id),
             registry.static_servers.remove(&terminal_id),
         )
@@ -1191,13 +1648,7 @@ pub async fn stop_dev_server(
     if let Some(server) = static_server {
         server.stop();
     }
-    let mut registry = REGISTRY.lock();
-    let revision = next_revision(&mut registry);
-    let snapshot = idle_snapshot(&terminal_id, revision);
-    registry
-        .snapshots
-        .insert(terminal_id.clone(), snapshot.clone());
-    Ok(snapshot)
+    finish_stop_snapshot(&mut REGISTRY.lock(), &terminal_id, operation)
 }
 
 #[tauri::command]
@@ -1474,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn static_path_resolution_rejects_traversal_hidden_and_oversized_files() {
+    fn static_file_open_rejects_traversal_hidden_and_oversized_files() {
         let root = tempfile::tempdir().expect("static fixture root");
         fs::write(root.path().join("index.html"), "INDEX").expect("write index");
         fs::write(root.path().join(".env"), "SECRET").expect("write hidden");
@@ -1482,12 +1933,10 @@ mod tests {
         let file = fs::File::create(&oversized).expect("create oversized fixture");
         file.set_len(MAX_STATIC_FILE_BYTES + 1)
             .expect("size oversized fixture");
-        let canonical = root.path().canonicalize().expect("canonical root");
+        let root_handle = open_static_root(root.path().to_str().unwrap()).expect("open root");
 
-        assert_eq!(
-            resolve_static_file(&canonical, "/").unwrap(),
-            canonical.join("index.html")
-        );
+        let index = open_static_file(&root_handle, "/").expect("open index");
+        assert_eq!(read_static_body(index.file).unwrap(), b"INDEX");
         for path in [
             "/../outside",
             "/%2e%2e/outside",
@@ -1498,21 +1947,98 @@ mod tests {
             "/C:/secret",
             "/large.bin",
         ] {
-            assert!(resolve_static_file(&canonical, path).is_err(), "{path}");
+            assert!(open_static_file(&root_handle, path).is_err(), "{path}");
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn static_path_resolution_rejects_a_symlink_escape() {
+    fn static_file_open_rejects_final_parent_and_root_symlinks() {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().expect("static fixture root");
         let outside = tempfile::tempdir().expect("outside fixture root");
         fs::write(outside.path().join("secret.txt"), "SECRET").expect("outside sentinel");
         symlink(outside.path(), root.path().join("escape")).expect("escape symlink");
-        let canonical = root.path().canonicalize().expect("canonical root");
-        assert!(resolve_static_file(&canonical, "/escape/secret.txt").is_err());
+        symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("final.txt"),
+        )
+        .expect("final symlink");
+        let root_handle = open_static_root(root.path().to_str().unwrap()).expect("open root");
+        assert!(open_static_file(&root_handle, "/escape/secret.txt").is_err());
+        assert!(open_static_file(&root_handle, "/final.txt").is_err());
+
+        let links = tempfile::tempdir().expect("root-link fixture");
+        let root_link = links.path().join("root-link");
+        symlink(root.path(), &root_link).expect("root symlink");
+        assert!(open_static_root(root_link.to_str().unwrap()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn static_file_open_rejects_a_directory_junction() {
+        let root = tempfile::tempdir().expect("static fixture root");
+        let outside = tempfile::tempdir().expect("outside fixture root");
+        fs::write(outside.path().join("secret.txt"), "SECRET").expect("outside sentinel");
+        let junction = root.path().join("escape");
+        let output = Command::new("cmd.exe")
+            .arg("/D")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(outside.path())
+            .output()
+            .expect("create junction");
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let root_handle = open_static_root(root.path().to_str().unwrap()).expect("open root");
+        assert!(open_static_file(&root_handle, "/escape/secret.txt").is_err());
+    }
+
+    #[test]
+    fn opened_static_file_keeps_the_validated_handle_after_path_replacement() {
+        let root = tempfile::tempdir().expect("static fixture root");
+        let slot = root.path().join("slot");
+        fs::create_dir(&slot).expect("create slot");
+        fs::write(slot.join("asset.txt"), "SAFE").expect("write safe asset");
+        let root_handle = open_static_root(root.path().to_str().unwrap()).expect("open root");
+        let opened = open_static_file(&root_handle, "/slot/asset.txt").expect("open asset");
+
+        let old_slot = root.path().join("old-slot");
+        match fs::rename(&slot, &old_slot) {
+            Ok(()) => {
+                fs::create_dir(&slot).expect("replace slot");
+                fs::write(slot.join("asset.txt"), "REPLACEMENT").expect("replacement asset");
+            }
+            Err(error) if cfg!(windows) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            Err(error) => panic!("replace opened parent: {error}"),
+        }
+
+        assert_eq!(read_static_body(opened.file).unwrap(), b"SAFE");
+    }
+
+    #[test]
+    fn bounded_static_read_rejects_growth_after_open() {
+        let root = tempfile::tempdir().expect("static fixture root");
+        fs::write(root.path().join("index.html"), "INDEX").expect("write index");
+        let asset = root.path().join("growing.bin");
+        fs::write(&asset, "small").expect("write growing asset");
+        let root_handle = open_static_root(root.path().to_str().unwrap()).expect("open root");
+        let opened = open_static_file(&root_handle, "/growing.bin").expect("open asset");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(asset)
+            .expect("reopen growing asset")
+            .set_len(MAX_STATIC_FILE_BYTES + 1)
+            .expect("grow asset");
+        assert!(read_static_body(opened.file).is_err());
     }
 
     #[test]
@@ -1521,20 +2047,25 @@ mod tests {
         use std::net::TcpStream;
         use std::time::Duration;
 
-        fn request(port: u16, method: &str, path: &str) -> String {
+        fn raw_request(port: u16, request: &str) -> String {
             let mut stream =
                 TcpStream::connect(("127.0.0.1", port)).expect("connect static server");
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("read timeout");
-            write!(
-                stream,
-                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-            )
-            .expect("write request");
+            stream.write_all(request.as_bytes()).expect("write request");
             let mut response = String::new();
             stream.read_to_string(&mut response).expect("read response");
             response
+        }
+
+        fn request(port: u16, method: &str, path: &str) -> String {
+            raw_request(
+                port,
+                &format!(
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                ),
+            )
         }
 
         let root = tempfile::tempdir().expect("static fixture root");
@@ -1566,6 +2097,16 @@ mod tests {
         assert!(!head.contains("STATIC SENTINEL"));
         assert!(request(port, "POST", "/").starts_with("HTTP/1.1 405"));
         assert!(request(port, "GET", "/.env").starts_with("HTTP/1.1 404"));
+        for bad_host_request in [
+            "GET / HTTP/1.1\r\nConnection: close\r\n\r\n".to_string(),
+            "GET / HTTP/1.1\r\nHost: attacker.example\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            format!(
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        ] {
+            assert!(raw_request(port, &bad_host_request).starts_with("HTTP/1.1 421"));
+        }
 
         fs::remove_file(root.path().join("index.html")).expect("remove live entrypoint");
         assert!(request(port, "GET", "/").starts_with("HTTP/1.1 404"));
@@ -1578,6 +2119,224 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn static_server_stop_is_bounded_by_a_nonreading_client() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().expect("static fixture root");
+        fs::write(root.path().join("index.html"), "INDEX").expect("write index");
+        let large = fs::File::create(root.path().join("large.bin")).expect("large asset");
+        large
+            .set_len(MAX_STATIC_FILE_BYTES)
+            .expect("size large asset");
+        let (server, url) = start_static_server(root.path().to_str().unwrap(), "blocked-test")
+            .expect("start static server");
+        let port = url
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse::<u16>()
+            .expect("static port");
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect client");
+        socket2::SockRef::from(&client)
+            .set_recv_buffer_size(1024)
+            .expect("shrink client receive buffer");
+        client
+            .write_all(
+                format!(
+                    "GET /large.bin HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("send blocked request");
+        let active_responses = Arc::clone(&server.active_responses);
+        let accepted_deadline = Instant::now() + Duration::from_secs(2);
+        while active_responses.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < accepted_deadline,
+                "request was not accepted"
+            );
+            std::thread::yield_now();
+        }
+
+        let started = Instant::now();
+        server.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "static Stop exceeded its response timeout"
+        );
+        assert_eq!(active_responses.load(Ordering::SeqCst), 0);
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+        drop(client);
+    }
+
+    #[test]
+    fn static_server_stop_is_bounded_by_a_trickled_request() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().expect("static fixture root");
+        fs::write(root.path().join("index.html"), "INDEX").expect("write index");
+        let (server, url) = start_static_server(root.path().to_str().unwrap(), "slowloris-test")
+            .expect("start static server");
+        let port = url
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse::<u16>()
+            .expect("static port");
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect client");
+        client.write_all(b"G").expect("start trickled request");
+        let active_responses = Arc::clone(&server.active_responses);
+        let accepted_deadline = Instant::now() + Duration::from_secs(2);
+        while active_responses.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < accepted_deadline,
+                "request was not accepted"
+            );
+            std::thread::yield_now();
+        }
+        let writer = std::thread::spawn(move || {
+            for byte in b"ET / HTTP/1.1\r\nHost: 127.0.0.1" {
+                std::thread::sleep(Duration::from_millis(100));
+                if client.write_all(&[*byte]).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        server.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "static Stop exceeded its absolute request deadline"
+        );
+        assert_eq!(active_responses.load(Ordering::SeqCst), 0);
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+        writer.join().expect("join trickle writer");
+    }
+
+    #[test]
+    fn static_response_admission_is_bounded_per_server() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let guards = (0..MAX_STATIC_CONCURRENT_RESPONSES)
+            .map(|_| StaticResponseGuard::reserve(&active).expect("reserve response worker"))
+            .collect::<Vec<_>>();
+        assert!(StaticResponseGuard::reserve(&active).is_none());
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            MAX_STATIC_CONCURRENT_RESPONSES
+        );
+        drop(guards);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn stale_start_failure_cannot_overwrite_a_replacement_generation() {
+        let mut registry = DevRegistry::default();
+        registry
+            .generations
+            .insert("tile".to_string(), "run-new".to_string());
+        registry.operations.insert("tile".to_string(), 2);
+        let mut replacement = idle_snapshot("tile", 7);
+        replacement.run_id = Some("run-new".to_string());
+        replacement.state = "starting".to_string();
+        registry
+            .snapshots
+            .insert("tile".to_string(), replacement.clone());
+
+        publish_start_failure(
+            &mut registry,
+            "tile",
+            1,
+            "run-old",
+            None,
+            "old start failed",
+        );
+
+        assert!(owns_generation(&registry, "tile", "run-new"));
+        assert_eq!(registry.snapshots.get("tile"), Some(&replacement));
+    }
+
+    #[test]
+    fn validation_failure_preserves_the_active_run() {
+        let mut registry = DevRegistry::default();
+        registry
+            .generations
+            .insert("tile".to_string(), "run-active".to_string());
+        let mut active = idle_snapshot("tile", 5);
+        active.run_id = Some("run-active".to_string());
+        active.state = "running".to_string();
+        registry
+            .snapshots
+            .insert("tile".to_string(), active.clone());
+        let operation = reserve_operation(&mut registry, "tile");
+
+        assert!(finish_validation_error(&mut registry, "tile", operation));
+        assert!(owns_generation(&registry, "tile", "run-active"));
+        assert_eq!(registry.snapshots.get("tile"), Some(&active));
+        assert!(!registry.operations.contains_key("tile"));
+    }
+
+    #[test]
+    fn operation_gate_serializes_one_terminal_without_blocking_another() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let terminal = format!("gate-{}", uuid::Uuid::new_v4());
+        let other_terminal = format!("gate-{}", uuid::Uuid::new_v4());
+        let gate = operation_gate(&terminal);
+        let same_gate = operation_gate(&terminal);
+        let other_gate = operation_gate(&other_terminal);
+        assert!(Arc::ptr_eq(&gate, &same_gate));
+        let held = tauri::async_runtime::block_on(gate.lock());
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tauri::async_runtime::block_on(async {
+                let _guard = same_gate.lock().await;
+                acquired_tx.send(()).expect("report same-terminal lock");
+            });
+        });
+
+        assert!(other_gate.try_lock().is_some());
+        assert!(
+            acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "same-terminal operation was not serialized"
+        );
+        drop(held);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("same-terminal waiter should acquire after release");
+        waiter.join().expect("join operation waiter");
+    }
+
+    #[test]
+    fn blocking_stop_completion_cannot_overwrite_a_replacement_snapshot() {
+        let mut registry = DevRegistry::default();
+        registry
+            .generations
+            .insert("tile".to_string(), "run-new".to_string());
+        registry.operations.insert("tile".to_string(), 2);
+        let mut replacement = idle_snapshot("tile", 9);
+        replacement.run_id = Some("run-new".to_string());
+        replacement.state = "running".to_string();
+        registry
+            .snapshots
+            .insert("tile".to_string(), replacement.clone());
+
+        let returned = finish_stop_snapshot(&mut registry, "tile", 1).expect("finish stale stop");
+
+        assert_eq!(returned, replacement);
+        assert_eq!(registry.snapshots.get("tile"), Some(&replacement));
+        assert!(owns_generation(&registry, "tile", "run-new"));
     }
 
     #[cfg(not(windows))]

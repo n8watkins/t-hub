@@ -82,6 +82,7 @@ serde_json = { workspace = true }
 portable-pty = "0.8"
 anyhow = { workspace = true }
 parking_lot = "0.12"
+async-lock = "3"
 base64 = "0.22"
 # SHA-256 for the control-socket audit log's tamper-evident hash chain
 # (audit.rs, socket-gate Phase 1). Already in the tree transitively; this only
@@ -96,10 +97,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # server rejects browser-origin requests.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 uuid = { version = "1", features = ["v4"] }
-# Backend-owned static Preview targets use a small synchronous loopback server.
-# The frontend selects only the typed root target and never supplies a command,
-# executable, port, or alternate serving directory.
-tiny_http = "0.12"
+# Backend-owned static Preview targets serve through capability-relative file
+# handles so a writable project cannot race path validation with a symlink or
+# reparse-point swap. The frontend selects only the typed root target and never
+# supplies a command, executable, port, or alternate serving directory.
+cap-std = "4.0.2"
+cap-fs-ext = "4.0.2"
 mime_guess = "2"
 percent-encoding = "2"
 # OS cache-dir resolution for the Scribe voice-gate status file (scribe.rs):

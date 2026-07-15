@@ -99,6 +99,7 @@ beforeEach(() => {
     "error",
     "running",
     "stale",
+    "start-error",
   ]) {
     forgetDevState(id);
   }
@@ -216,6 +217,20 @@ describe("DevTab", () => {
     await waitFor(() =>
       expect(mocks.stopDevServer).toHaveBeenCalledWith("running", "run-42"),
     );
+  });
+
+  it("rehydrates after a rejected start instead of overwriting a newer run", async () => {
+    mocks.devServerSnapshot
+      .mockResolvedValueOnce(snapshot("start-error"))
+      .mockResolvedValueOnce(snapshot("start-error", "running", "run-newer", 4));
+    mocks.startDevServer.mockRejectedValueOnce("the start request was superseded");
+    render(<DevTab terminalId="start-error" cwd="/repo" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Run" }));
+
+    await waitFor(() => expect(mocks.devServerSnapshot).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("running")).toBeTruthy();
+    expect(screen.queryByText("failed")).toBeNull();
   });
 
   it("ignores output and exits from an older run generation", async () => {

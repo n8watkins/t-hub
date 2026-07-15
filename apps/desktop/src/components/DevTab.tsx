@@ -335,15 +335,19 @@ export function DevTab({ terminalId, cwd }: DevTabProps) {
     void startDevServer(terminalId, cwd, targetRef)
       .then((authoritative) => applySnapshot(terminalId, authoritative))
       .catch((error) => {
-        const failed = getState(terminalId).snapshot;
         appendLine(terminalId, `[t-hub] failed to start: ${String(error)}`);
-        update(terminalId, {
-          snapshot: {
-            ...failed,
-            state: "failed",
-            reason: String(error),
-          },
-        });
+        void devServerSnapshot(terminalId)
+          .then((authoritative) => applySnapshot(terminalId, authoritative))
+          .catch(() => {
+            const failed = getState(terminalId).snapshot;
+            update(terminalId, {
+              snapshot: {
+                ...failed,
+                state: "failed",
+                reason: String(error),
+              },
+            });
+          });
       });
   };
 
