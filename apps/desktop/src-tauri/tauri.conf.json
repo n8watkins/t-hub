@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "T-Hub",
-  "version": "0.3.85",
+  "version": "0.3.86",
   "identifier": "com.t-hub.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
