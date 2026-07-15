@@ -2,7 +2,7 @@
 
 **Updated:** 2026-07-14.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.84` from `0cd5861`, running as Windows PID `17664` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.86` from `5ea945c`, running as Windows PID `17712` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -94,6 +94,15 @@ Source commit `5011803` adds a typed package-less static target backed by a Wind
 Source commit `3177d81` clears a managed Preview URL and iframe when its run stops, and `0cd5861` packages the final result as installed `0.3.84`.
 Packaged static acceptance auto-loaded the authoritative loopback URL, served HTML, CSS, JavaScript, and a nested page, denied raw, encoded, and double-encoded traversal plus hidden and symlink paths, stopped and remounted cleanly, and closed its listener on forced application exit.
 The disposable acceptance session was removed afterward, and all seven canonical tmux sessions and pane PIDs remained unchanged.
+Source commit `1484750` serializes managed Preview operations per terminal, protects snapshots with operation and generation ownership, rehydrates rejected frontend starts from the authoritative backend snapshot, bounds static request and response work, validates exact loopback Host headers, and serves files through capability-relative no-follow handles.
+Commit `9005117` packaged that source as `0.3.85`; its native Windows focused Preview suite passed 23 tests, including directory-junction rejection, and its standalone executable, NSIS, and MSI SHA-256 values are `870E71B240B13675F2F717EB786C97F91FDABBD5BFD89E0504E43B2D9E87624D`, `B227A48FDEEF8589E629CA286898FE42ECFCA336C860AE177AC17A6C02A5E121`, and `81A38DB62EE8A68F43DD3F5C3473BC16044F28BF6B4B225FD85630F7315DA454`.
+That `0.3.85` artifact was not installed because native compilation exposed two platform-specific test warnings.
+Source commit `d05073d` removes those warnings, and `5ea945c` packages the result as installed `0.3.86`.
+The exact `0.3.86` source passed 621 Linux Rust library tests with one ignored, warning-denied Clippy, the production frontend build, and 23 focused native Windows Preview tests without warnings.
+Packaged `0.3.86` discovered exactly one typed static target, enforced MIME, method, security-header, traversal, hidden-path, symlink, size, and exact Host rules, preserved unique run ownership across restart and stale Stop, and cleared its authoritative URL on final Stop.
+While one terminal had a nonreading 16 MiB response, its Stop completed in 206 milliseconds and a second terminal independently reached `running` with a distinct run ID and URL.
+After the final normal relaunch, only the application control listener remained and the six tmux sessions present before installation retained the same names and pane PIDs.
+The previously recorded session `th_a486c7fc` was already absent before installation, so it is not claimed as preserved by this acceptance run.
 Generic non-Tauri Vite launch adapters and stale WSL-address recovery remain open.
 Source commit `776439a`, packaged as `0.3.78` from `b4a1c5d`, removes full tmux capture replay from terminal attachment and stops clearing inline transcript during header Refresh.
 The packaged acceptance preserved all eight tmux pane PIDs and the same Codex process chain through install, header Refresh, and full relaunch while the active draft appeared exactly once.
@@ -583,6 +592,8 @@ The installed package removed every pnpm, Vite, and esbuild process plus ports `
 Installed `0.3.82` passed the representative Next.js target, including Windows HTTP 200, expected rendered sentinels, exact-run Stop, and full npm and Next process-group cleanup.
 Source commits `5011803` and `3177d81`, packaged as installed `0.3.84` from `0cd5861`, add and complete the representative package-less static target.
 The installed static server bound only Windows `127.0.0.1`, published its authoritative URL without log parsing, auto-loaded and restored the iframe across tab remount, denied traversal, hidden, and symlink requests, removed the iframe and URL on Stop, restarted cleanly, and closed on forced application exit.
+Source commit `1484750`, completed by `d05073d` and packaged as installed `0.3.86` from `5ea945c`, hardens concurrent Start and Stop ownership, authoritative rejected-start recovery, static path-race confinement, exact Host validation, bounded request handling, and bounded shutdown.
+Packaged acceptance passed the static HTTP and confinement matrix, stale-run ownership, 206-millisecond nonreading-client Stop, independent cross-terminal Start, listener cleanup, and preservation of the six-session pre-install tmux baseline.
 The Run and Preview exit-gate requirement for representative Vite, Next.js, and static projects is complete.
 Framework-aware generic Vite arguments and stale WSL-address recovery remain open follow-up hardening.
 
