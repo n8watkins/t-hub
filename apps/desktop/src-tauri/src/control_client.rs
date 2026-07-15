@@ -30,9 +30,21 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::agent::EventEmitter;
 use crate::control::{self, EventFanout};
 
-/// How long to wait for the loopback connect / a response line before giving up.
-/// Generous for a same-host round-trip; M2 may widen this for a remote server.
+/// How long to wait for a loopback connect, write, or ordinary response.
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Commissioning and dispatch cross bounded Powder, git, tmux, and harness-start
+/// operations. Their response window must outlive the server's normal request
+/// phase so the client receives the authoritative result instead of abandoning a
+/// mutation that is still running.
+const LONG_ORCHESTRATION_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn response_timeout_for_command(command: &str) -> Duration {
+    match command {
+        "commission_captain" | "dispatch_crew" => LONG_ORCHESTRATION_TIMEOUT,
+        _ => IO_TIMEOUT,
+    }
+}
 
 /// The Tauri event channel the forwarder re-emits each socket event frame on. The
 /// frontend's control-event hub (`src/ipc/controlClient.ts`) subscribes to it and
@@ -131,13 +143,33 @@ fn request(
     command: &str,
     args: &Value,
 ) -> Result<Value, String> {
+    request_with_timeouts(
+        addr,
+        token,
+        host_token,
+        command,
+        args,
+        IO_TIMEOUT,
+        response_timeout_for_command(command),
+    )
+}
+
+fn request_with_timeouts(
+    addr: &str,
+    token: &str,
+    host_token: &str,
+    command: &str,
+    args: &Value,
+    connect_write_timeout: Duration,
+    response_timeout: Duration,
+) -> Result<Value, String> {
     let socket: SocketAddr = addr
         .parse()
         .map_err(|e| format!("control_request: bad control addr {addr:?}: {e}"))?;
-    let stream = TcpStream::connect_timeout(&socket, IO_TIMEOUT)
+    let stream = TcpStream::connect_timeout(&socket, connect_write_timeout)
         .map_err(|e| format!("control_request: connect to {addr} failed: {e}"))?;
-    stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
-    stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
+    stream.set_read_timeout(Some(response_timeout)).ok();
+    stream.set_write_timeout(Some(connect_write_timeout)).ok();
 
     let mut writer = stream
         .try_clone()
@@ -504,6 +536,56 @@ mod tests {
         assert_eq!(token, "full-control");
         let (_, token) = resolve_endpoint(&hs, (None, Some("remote-secret".into())));
         assert_eq!(token, "full-control");
+    }
+
+    #[test]
+    fn commissioning_gets_a_longer_response_window_without_widening_normal_reads() {
+        assert_eq!(response_timeout_for_command("list_tabs"), IO_TIMEOUT);
+        assert_eq!(response_timeout_for_command("codex_usage"), IO_TIMEOUT);
+        assert_eq!(response_timeout_for_command("unknown"), IO_TIMEOUT);
+        assert_eq!(
+            response_timeout_for_command("commission_captain"),
+            LONG_ORCHESTRATION_TIMEOUT
+        );
+        assert_eq!(
+            response_timeout_for_command("dispatch_crew"),
+            LONG_ORCHESTRATION_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn delayed_orchestration_error_reaches_the_client_before_its_response_window() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request_line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request_line)
+                .unwrap();
+            assert!(request_line.contains("commission_captain"));
+            thread::sleep(Duration::from_millis(60));
+            let mut writer = stream;
+            writer
+                .write_all(b"{\"ok\":false,\"error\":\"commissioning failed after rollback\"}\n")
+                .unwrap();
+        });
+
+        let error = request_with_timeouts(
+            &addr,
+            "token",
+            "host",
+            "commission_captain",
+            &json!({}),
+            Duration::from_secs(1),
+            Duration::from_millis(250),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error, "commissioning failed after rollback");
     }
 
     /// F1 REGRESSION (PR #50 fix round): the app's OWN client must follow the server

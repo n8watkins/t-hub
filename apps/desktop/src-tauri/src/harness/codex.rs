@@ -2,7 +2,7 @@
 //!
 //! Builds the interactive launch strings, the headless crew-turn pipeline, and
 //! the permission-flag map for OpenAI Codex (`codex-cli`), all verified against
-//! the fleet-pinned Codex 0.142.5. Everything here is a pure string builder; the
+//! the installed Codex 0.144.4. Everything here is a pure string builder; the
 //! actual lifecycle producer that consumes `exec_turn_argv` is the PR-B
 //! `t-hub-agent --codex-tap` mode.
 //!
@@ -57,9 +57,12 @@ impl HarnessAdapter for CodexHarness {
         // Headless one-turn pipeline, tee'd into the journal via the tap:
         //   fresh:  codex exec        --json <perm> '<prompt>' | t-hub-agent --codex-tap
         //   resume: codex exec resume '<id>' --json <perm> '<prompt>' | t-hub-agent --codex-tap
-        // The perm flags come from `permission_map` uniformly (fresh AND resume),
-        // so a resumed turn in a fresh worktree still carries --skip-git-repo-check.
-        let flags = self.permission_map(perm).join(" ");
+        // `--skip-git-repo-check` belongs to `codex exec`, not the interactive
+        // `codex` command. Append it independently of the sandbox posture so both
+        // fresh and resumed turns can run from newly-created worktrees.
+        let mut flags = self.permission_map(perm);
+        flags.push("--skip-git-repo-check".to_string());
+        let flags = flags.join(" ");
         let head = match resume {
             Some(id) => format!("codex exec resume {}", sh_single_quote(id)),
             None => "codex exec".to_string(),
@@ -72,13 +75,11 @@ impl HarnessAdapter for CodexHarness {
 
     fn permission_map(&self, perm: PermMode) -> Vec<String> {
         match perm {
-            // Crew default. --skip-git-repo-check lets exec run in fresh
-            // worktrees; the long bypass flag (never the `--yolo` alias, which is
-            // absent from the installed help) skips all approvals + sandboxing.
-            PermMode::BypassPermissions => vec![
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--skip-git-repo-check".to_string(),
-            ],
+            // Crew default. The long bypass flag (never the `--yolo` alias, which
+            // is absent from the installed help) skips all approvals + sandboxing.
+            PermMode::BypassPermissions => {
+                vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+            }
             // Approximate acceptEdits. Documented gap: no exact analog, and
             // network is off by default under workspace-write (so no `git push`).
             PermMode::AcceptEdits => vec!["--sandbox".to_string(), "workspace-write".to_string()],
@@ -107,8 +108,11 @@ mod tests {
         let a = CodexHarness;
         assert_eq!(
             a.fresh_argv_with_permissions("build it", PermMode::BypassPermissions),
-            "codex --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check 'build it'"
+            "codex --dangerously-bypass-approvals-and-sandbox 'build it'"
         );
+        assert!(!a
+            .fresh_argv_with_permissions("build it", PermMode::BypassPermissions)
+            .contains("--skip-git-repo-check"));
     }
 
     #[test]
@@ -126,10 +130,7 @@ mod tests {
         let a = CodexHarness;
         assert_eq!(
             a.permission_map(PermMode::BypassPermissions),
-            vec![
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--skip-git-repo-check"
-            ]
+            vec!["--dangerously-bypass-approvals-and-sandbox"]
         );
         assert_eq!(
             a.permission_map(PermMode::AcceptEdits),
@@ -159,6 +160,15 @@ mod tests {
         assert_eq!(
             a.exec_turn_argv("next step", Some("thread-xyz"), PermMode::BypassPermissions),
             "codex exec resume 'thread-xyz' --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check 'next step' | t-hub-agent --codex-tap"
+        );
+    }
+
+    #[test]
+    fn exec_turn_argv_keeps_repo_bypass_independent_of_permissions() {
+        let a = CodexHarness;
+        assert_eq!(
+            a.exec_turn_argv("do work", None, PermMode::AcceptEdits),
+            "codex exec --json --sandbox workspace-write --skip-git-repo-check 'do work' | t-hub-agent --codex-tap"
         );
     }
 
