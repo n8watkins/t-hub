@@ -1,10 +1,11 @@
-import { ChevronRight, Folder, GitBranch, Home, MoveUp } from "lucide-react";
+import { ChevronRight, Folder, FolderOpen, GitBranch, Home, MoveUp } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 
 import { listDir } from "../ipc/files";
 import { gitInfo, type GitInfo } from "../ipc/git";
 import type { DirEntry } from "../ipc/types";
+import { pickWslFolder } from "../ipc/wslFolderDialog";
 
 interface WslFolderPickerProps {
   path: string;
@@ -23,6 +24,7 @@ export function WslFolderPicker({
   const [entries, setEntries] = useState<DirEntry[]>([]);
   const [selectedGit, setSelectedGit] = useState<GitInfo | null>(null);
   const [loading, setLoading] = useState(false);
+  const [picking, setPicking] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => setManualPath(path), [path]);
@@ -64,6 +66,18 @@ export function WslFolderPicker({
   };
   const parent = parentPath(path);
   const breadcrumbs = pathBreadcrumbs(path);
+  const browseInExplorer = async () => {
+    setPicking(true);
+    setError(null);
+    try {
+      const selected = await pickWslFolder(path || home || "/");
+      if (selected) onPathChange(selected);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setPicking(false);
+    }
+  };
 
   return (
     <div
@@ -71,6 +85,12 @@ export function WslFolderPicker({
       style={{ borderColor: "var(--th-border)", background: "var(--th-app-bg)" }}
     >
       <div className="flex flex-wrap gap-1">
+        <ShortcutButton
+          label={picking ? "Opening Explorer..." : "Browse in Explorer"}
+          onClick={() => void browseInExplorer()}
+          icon={<FolderOpen size={12} />}
+          disabled={picking}
+        />
         {home && (
           <ShortcutButton label="Home" onClick={() => navigate(home)} icon={<Home size={12} />} />
         )}
@@ -178,10 +198,12 @@ function ShortcutButton({
   label,
   icon,
   onClick,
+  disabled = false,
 }: {
   label: string;
   icon: ReactNode;
   onClick: () => void;
+  disabled?: boolean;
 }) {
   return (
     <button
@@ -189,6 +211,7 @@ function ShortcutButton({
       className="flex h-7 items-center gap-1 rounded border px-2 text-xs"
       style={{ borderColor: "var(--th-border)" }}
       onClick={onClick}
+      disabled={disabled}
     >
       {icon}
       {label}

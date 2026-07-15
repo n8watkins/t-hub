@@ -296,9 +296,13 @@ fn normalize(path: &str) -> PathBuf {
 /// Canonical definition for the crate: `git.rs`, `recent.rs`, and `devserver.rs`
 /// all call `crate::files::host_distro()` rather than re-declaring this (one
 /// source of truth for the distro default + `T_HUB_DISTRO` override).
+fn configured_wsl_distro() -> String {
+    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+}
+
 #[cfg(windows)]
 pub(crate) fn host_distro() -> String {
-    std::env::var("T_HUB_DISTRO").unwrap_or_else(|_| "Ubuntu-24.04".to_string())
+    configured_wsl_distro()
 }
 
 /// Translate a path so the *Windows-side* file commands can reach a project that
@@ -338,6 +342,71 @@ pub(crate) fn to_host_path(path: &str) -> PathBuf {
     {
         PathBuf::from(path)
     }
+}
+
+fn posix_to_wsl_unc(path: &str, distro: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if !trimmed.starts_with('/') || trimmed.starts_with("//") || trimmed.contains('\0') {
+        return Err("Choose an absolute WSL folder path.".into());
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in trimmed.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            value => parts.push(value),
+        }
+    }
+    let tail = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("\\{}", parts.join("\\"))
+    };
+    Ok(format!("\\\\wsl.localhost\\{distro}{tail}"))
+}
+
+fn wsl_unc_to_posix_for_distro(path: &str, distro: &str) -> Result<String, String> {
+    let replaced = path.trim().replace('/', "\\");
+    let normalized = if let Some(rest) = replaced.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{rest}")
+    } else {
+        replaced
+    };
+    let without_leading = normalized
+        .strip_prefix("\\\\")
+        .ok_or("Choose a folder inside the configured WSL distribution.")?;
+    let mut parts = without_leading.split('\\');
+    let server = parts.next().unwrap_or_default();
+    if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
+        return Err("Choose a folder inside the configured WSL distribution.".into());
+    }
+    let selected_distro = parts.next().unwrap_or_default();
+    if !selected_distro.eq_ignore_ascii_case(distro) {
+        return Err(format!(
+            "Choose a folder inside the configured WSL distribution '{distro}'."
+        ));
+    }
+    let mut posix_parts = Vec::new();
+    for part in parts {
+        match part {
+            "" | "." => {}
+            ".." => return Err("The selected WSL folder path is not safe.".into()),
+            value => posix_parts.push(value),
+        }
+    }
+    Ok(format!("/{}", posix_parts.join("/")))
+}
+
+#[tauri::command]
+pub fn wsl_folder_dialog_initial_path(path: String) -> Result<String, String> {
+    posix_to_wsl_unc(&path, &configured_wsl_distro())
+}
+
+#[tauri::command]
+pub fn wsl_folder_dialog_selection(selected_path: String) -> Result<String, String> {
+    wsl_unc_to_posix_for_distro(&selected_path, &configured_wsl_distro())
 }
 
 // ---------------------------------------------------------------------------
@@ -2059,6 +2128,45 @@ mod tests {
             PathBuf::from("/home/natkins/proj")
         );
         assert_eq!(to_host_path("relative/dir"), PathBuf::from("relative/dir"));
+    }
+
+    #[test]
+    fn explorer_paths_round_trip_only_inside_the_configured_wsl_distro() {
+        let distro = "Ubuntu-24.04";
+        let unc = posix_to_wsl_unc("/home/natkins/My Project", distro).unwrap();
+        assert_eq!(
+            unc,
+            "\\\\wsl.localhost\\Ubuntu-24.04\\home\\natkins\\My Project"
+        );
+        assert_eq!(
+            wsl_unc_to_posix_for_distro(&unc, distro).unwrap(),
+            "/home/natkins/My Project"
+        );
+        assert_eq!(
+            wsl_unc_to_posix_for_distro("\\\\wsl$\\ubuntu-24.04\\home\\natkins\\日本語", distro,)
+                .unwrap(),
+            "/home/natkins/日本語"
+        );
+        assert_eq!(
+            wsl_unc_to_posix_for_distro("\\\\wsl.localhost\\Ubuntu-24.04", distro).unwrap(),
+            "/"
+        );
+    }
+
+    #[test]
+    fn explorer_paths_reject_windows_other_distros_and_parent_segments() {
+        let distro = "Ubuntu-24.04";
+        assert!(wsl_unc_to_posix_for_distro("C:\\Users\\natha", distro).is_err());
+        assert!(
+            wsl_unc_to_posix_for_distro("\\\\wsl.localhost\\Debian\\home\\natkins", distro,)
+                .is_err()
+        );
+        assert!(wsl_unc_to_posix_for_distro(
+            "\\\\wsl.localhost\\Ubuntu-24.04\\home\\..\\root",
+            distro,
+        )
+        .is_err());
+        assert!(posix_to_wsl_unc("C:\\Users\\natha", distro).is_err());
     }
 
     #[cfg(windows)]

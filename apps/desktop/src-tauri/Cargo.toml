@@ -20,7 +20,7 @@ anyhow = "1"
 
 [package]
 name = "t-hub"
-version = "0.3.95"
+version = "0.3.96"
 description = "T-Hub — terminal-first command center for Claude Code sessions in WSL2"
 authors = ["Nathan Watkins"]
 edition = "2021"
@@ -77,6 +77,9 @@ tauri-plugin-process = "2"
 # tauri.conf.json. Without it the frontend degrades to sound-only (see
 # src/lib/notify.ts).
 tauri-plugin-notification = "2"
+# Native Windows folder selection for the Captain codebase picker. The selected
+# host path is validated and converted back to a WSL POSIX path before use.
+tauri-plugin-dialog = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 portable-pty = "0.8"

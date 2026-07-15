@@ -461,6 +461,7 @@ pub fn run() {
         // calls into this; gated by the `notification:*` capabilities + the
         // `plugins.notification` block in tauri.conf.json.
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(TerminalManager::default())
         // Server-split M2a: live remote-PTY connections (terminal tiles streamed
         // over the control socket) live here instead of the in-process
@@ -795,6 +796,8 @@ pub fn run() {
             files::list_dir,
             files::read_text_file,
             files::write_text_file,
+            files::wsl_folder_dialog_initial_path,
+            files::wsl_folder_dialog_selection,
             // --- feat/git-panel ---
             // Git awareness for the Files panel: branch/worktree info + commit.
             git::git_info,

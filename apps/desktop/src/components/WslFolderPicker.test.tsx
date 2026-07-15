@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { listDir } from "../ipc/files";
 import { gitInfo } from "../ipc/git";
+import { pickWslFolder } from "../ipc/wslFolderDialog";
 import {
   normalizePosixPath,
   parentPath,
@@ -12,6 +13,7 @@ import {
 
 vi.mock("../ipc/files", () => ({ listDir: vi.fn() }));
 vi.mock("../ipc/git", () => ({ gitInfo: vi.fn() }));
+vi.mock("../ipc/wslFolderDialog", () => ({ pickWslFolder: vi.fn() }));
 
 describe("WslFolderPicker", () => {
   beforeEach(() => {
@@ -40,6 +42,7 @@ describe("WslFolderPicker", () => {
       isLinkedWorktree: false,
       dirtyCount: 0,
     });
+    vi.mocked(pickWslFolder).mockResolvedValue(null);
   });
 
   it("offers home, recent, breadcrumbs, parent, Git markers, and manual paths", async () => {
@@ -96,5 +99,28 @@ describe("WslFolderPicker", () => {
 
     expect(await screen.findByRole("button", { name: "project Git" })).toBeTruthy();
     expect(screen.queryByText("git unavailable")).toBeNull();
+  });
+
+  it("opens Explorer and adopts only its validated WSL selection", async () => {
+    const onPathChange = vi.fn();
+    vi.mocked(pickWslFolder).mockResolvedValue("/home/me/project");
+    render(
+      <WslFolderPicker path="/home/me" recentPaths={[]} onPathChange={onPathChange} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Browse in Explorer" }));
+    await waitFor(() => expect(pickWslFolder).toHaveBeenCalledWith("/home/me"));
+    expect(onPathChange).toHaveBeenCalledWith("/home/me/project");
+  });
+
+  it("keeps the current folder when Explorer is cancelled", async () => {
+    const onPathChange = vi.fn();
+    render(
+      <WslFolderPicker path="/home/me" recentPaths={[]} onPathChange={onPathChange} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Browse in Explorer" }));
+    await waitFor(() => expect(pickWslFolder).toHaveBeenCalled());
+    expect(onPathChange).not.toHaveBeenCalled();
   });
 });
