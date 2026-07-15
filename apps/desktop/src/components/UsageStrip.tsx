@@ -381,12 +381,28 @@ function mergeCodexWindow(
 }
 
 function normalizeCodexWindows(usage: CodexUsage): CodexUsage {
-  const windows = [usage.primary, usage.secondary].filter(
-    (window): window is CodexRateWindow => window != null,
-  );
-  const fiveHour = windows.find((window) => window.windowMinutes === 300) ?? null;
-  const weekly = windows.find((window) => window.windowMinutes === 10_080) ?? null;
+  const slots = [usage.primary, usage.secondary] as const;
+  let fiveHour = slots.find((window) => window?.windowMinutes === 300) ?? null;
+  let weekly = slots.find((window) => window?.windowMinutes === 10_080) ?? null;
   if (!fiveHour && !weekly) return usage;
+
+  // A partial provider window can omit its duration while still carrying a fresh
+  // percentage. Preserve it in its original provider slot when that semantic
+  // slot is not already occupied, then use the remaining slot as a fallback.
+  // This keeps a partial primary reading beside a recognized weekly secondary.
+  for (const [index, window] of slots.entries()) {
+    if (
+      !window ||
+      window.windowMinutes === 300 ||
+      window.windowMinutes === 10_080
+    ) {
+      continue;
+    }
+    if (index === 0 && !fiveHour) fiveHour = window;
+    else if (index === 1 && !weekly) weekly = window;
+    else if (!fiveHour) fiveHour = window;
+    else if (!weekly) weekly = window;
+  }
   return {
     ...usage,
     primary: fiveHour,
@@ -447,7 +463,7 @@ function advanceWindow(
 
 /** Apply {@link advanceWindow} to both Codex windows for display, so a stale
  *  last-known reading still shows correct "available" windows between polls. */
-function advanceCodexUsage(
+export function advanceCodexUsage(
   u: CodexUsage | null,
   nowMs: number,
 ): CodexUsage | null {
@@ -490,7 +506,9 @@ export function useCodexUsage(enabled = true): CodexUsage | null {
     void codexUsage()
       .then((u) => {
         if (u && isUsableCodexUsage(u)) {
-          const merged = mergeCodexUsage(usageRef.current, u);
+          const current = advanceCodexUsage(usageRef.current, Date.now());
+          usageRef.current = current;
+          const merged = mergeCodexUsage(current, u);
           if (!merged) return;
           usageRef.current = merged;
           lastGoodRef.current = Date.now();

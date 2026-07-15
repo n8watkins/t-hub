@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CodexUsage } from "../ipc/codex";
 import {
+  advanceCodexUsage,
   isUsableCodexUsage,
   loadCachedCodexUsage,
   mergeCodexUsage,
@@ -46,11 +47,40 @@ describe("mergeCodexUsage", () => {
     });
   });
 
+  it("retains a partial primary window beside a recognized weekly window", () => {
+    const partial: CodexUsage = {
+      ...complete,
+      primary: { usedPercent: 52, windowMinutes: null, resetsAt: null },
+      secondary: { usedPercent: 20, windowMinutes: 10_080, resetsAt: 9_100 },
+    };
+
+    expect(mergeCodexUsage(complete, partial)).toEqual({
+      ...complete,
+      primary: {
+        usedPercent: 52,
+        windowMinutes: 300,
+        resetsAt: 2_000,
+      },
+      secondary: partial.secondary,
+    });
+  });
+
   it("keeps the previous reading when the provider snapshot is not usable", () => {
     const empty = { ...complete, primary: null, secondary: null };
     expect(isUsableCodexUsage({ ...complete, ok: false })).toBe(false);
     expect(isUsableCodexUsage(empty)).toBe(false);
     expect(mergeCodexUsage(complete, empty)).toBe(complete);
+  });
+
+  it("does not resurrect an expired session window after a weekly-only poll", () => {
+    const advanced = advanceCodexUsage(complete, 2_001_000);
+    const weeklyOnly: CodexUsage = {
+      ...complete,
+      primary: { usedPercent: 20, windowMinutes: 10_080, resetsAt: 9_100 },
+      secondary: null,
+    };
+
+    expect(mergeCodexUsage(advanced, weeklyOnly)?.primary?.usedPercent).toBe(0);
   });
 });
 
