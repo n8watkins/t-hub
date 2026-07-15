@@ -8039,6 +8039,22 @@ fn dispatch_rollback_error(primary: String, rollback: Result<(), String>) -> Str
     }
 }
 
+fn validate_dispatch_card_repository(
+    card_id: &str,
+    card_repository: Option<&str>,
+    canonical_repository: &str,
+) -> Result<(), String> {
+    let card_repository = card_repository.ok_or_else(|| {
+        format!("dispatch_crew: Powder card '{card_id}' has no repository mapping")
+    })?;
+    if card_repository == canonical_repository {
+        return Ok(());
+    }
+    Err(format!(
+        "dispatch_crew: Powder card '{card_id}' belongs to repository '{card_repository}', not '{canonical_repository}'"
+    ))
+}
+
 fn dispatch_crew(
     ctx: &ControlContext,
     args: &Value,
@@ -8090,16 +8106,10 @@ fn dispatch_crew(
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or("dispatch_crew: Powder repository response has no canonical name")?;
-    let card = client.get_card(&card_id)?;
-    let card_repo = card["repo"].as_str().ok_or_else(|| {
-        format!("dispatch_crew: Powder card '{card_id}' has no repository mapping")
-    })?;
-    if card_repo != canonical_repository {
-        return Err(format!(
-            "dispatch_crew: Powder card '{card_id}' belongs to repository '{card_repo}', not '{}'",
-            canonical_repository
-        ));
-    }
+    let card = client
+        .get_card(&card_id)
+        .map_err(|error| format!("dispatch_crew: {error}"))?;
+    validate_dispatch_card_repository(&card_id, card.repository(), &canonical_repository)?;
 
     let mut spawn_args = json!({
         "cwd": checkout,
@@ -8180,7 +8190,7 @@ fn dispatch_crew(
         "captain": captain,
         "crew": crew,
         "project": project,
-        "powderCard": card,
+        "powderCard": card.envelope(),
         "claim": {
             "cardId": claim.card_id,
             "runId": claim.run_id,
@@ -8225,7 +8235,7 @@ fn crew_powder_context(
         .ok_or("Crew project has no Powder binding")?;
     let client = powder::Client::from_profile(&binding.connection_profile)?;
     let card = client.get_card(&work.card_id)?;
-    let claim = card["claim"]
+    let claim = card.card_value()["claim"]
         .as_object()
         .ok_or_else(|| format!("Powder card '{}' has no active claim", work.card_id))?;
     let authoritative = powder::Claim {
@@ -18947,6 +18957,20 @@ mod tests {
         assert_eq!(captain.assignment.as_deref(), Some("Own T-Hub stability"));
         assert_eq!(captain.harness.as_deref(), Some("codex"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_refuses_a_card_from_another_powder_repository() {
+        assert!(validate_dispatch_card_repository("card-1", Some("t-hub"), "t-hub").is_ok());
+        assert_eq!(
+            validate_dispatch_card_repository("card-1", None, "t-hub").unwrap_err(),
+            "dispatch_crew: Powder card 'card-1' has no repository mapping"
+        );
+        assert_eq!(
+            validate_dispatch_card_repository("card-1", Some("other-project"), "t-hub")
+                .unwrap_err(),
+            "dispatch_crew: Powder card 'card-1' belongs to repository 'other-project', not 't-hub'"
+        );
     }
 
     #[test]

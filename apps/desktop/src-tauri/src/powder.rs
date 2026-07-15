@@ -59,6 +59,26 @@ pub struct CardEvent {
     pub change: Value,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailedCard {
+    envelope: Value,
+    repository: Option<String>,
+}
+
+impl DetailedCard {
+    pub fn envelope(&self) -> &Value {
+        &self.envelope
+    }
+
+    pub fn card_value(&self) -> &Value {
+        &self.envelope["card"]
+    }
+
+    pub fn repository(&self) -> Option<&str> {
+        self.repository.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PowderBoard {
@@ -324,11 +344,14 @@ impl Client {
         self.tail_events(0, 1).map(|_| ())
     }
 
-    pub fn get_card(&self, card_id: &str) -> Result<Value, String> {
-        self.request(
-            "GET",
-            &format!("/api/v1/cards/{}?detail=detailed", encode_path(card_id)),
-            None,
+    pub fn get_card(&self, card_id: &str) -> Result<DetailedCard, String> {
+        parse_detailed_card(
+            card_id,
+            self.request(
+                "GET",
+                &format!("/api/v1/cards/{}?detail=detailed", encode_path(card_id)),
+                None,
+            )?,
         )
     }
 
@@ -819,6 +842,44 @@ fn required_string(value: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("Powder claim response is missing {key}"))
 }
 
+fn parse_detailed_card(card_id: &str, value: Value) -> Result<DetailedCard, String> {
+    let card = value
+        .get("card")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            format!("Powder detailed card response for '{card_id}' is missing its card envelope")
+        })?;
+    let response_id = card
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            format!("Powder detailed card response for '{card_id}' is missing card id")
+        })?;
+    if response_id != card_id {
+        return Err(format!(
+            "Powder detailed card response returned card '{response_id}', not requested card '{card_id}'"
+        ));
+    }
+    let repository = match card.get("repo") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(repository)) => {
+            let repository = repository.trim();
+            (!repository.is_empty()).then(|| repository.to_string())
+        }
+        Some(_) => {
+            return Err(format!(
+                "Powder detailed card response for '{card_id}' has a non-string repository mapping"
+            ));
+        }
+    };
+    Ok(DetailedCard {
+        envelope: value,
+        repository,
+    })
+}
+
 fn encode_path(raw: &str) -> String {
     let mut out = String::new();
     for byte in raw.bytes() {
@@ -1169,7 +1230,14 @@ mod tests {
                 } else if expected_path.contains("repositories/") {
                     json!({ "name": "repo/one" }).to_string()
                 } else if expected_path.contains("?detail=") {
-                    json!({ "id": "card-1", "repo": "repo-1" }).to_string()
+                    json!({
+                        "card": {
+                            "id": "card-1",
+                            "repo": "repo-1",
+                            "claim": null
+                        }
+                    })
+                    .to_string()
                 } else {
                     json!({
                         "card_id": "card-1",
@@ -1217,7 +1285,10 @@ mod tests {
             client.board_page("repo-board", 1000).unwrap().cards[0].id,
             "repo-board-1"
         );
-        assert_eq!(client.get_card("card-1").unwrap()["repo"], "repo-1");
+        let card = client.get_card("card-1").unwrap();
+        assert_eq!(card.repository(), Some("repo-1"));
+        assert_eq!(card.card_value()["id"], "card-1");
+        assert_eq!(card.envelope()["card"]["id"], "card-1");
         let claim = client.claim("card-1", 3600).unwrap();
         assert_eq!(claim.agent, "t-hub");
         assert_eq!(client.heartbeat(&claim).unwrap().run_id, "run-1");
@@ -1230,6 +1301,57 @@ mod tests {
         assert_eq!(events[0].repository.as_deref(), Some("repo-1"));
         assert_eq!(events[0].change["proof"], "tests");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn detailed_card_validates_the_authoritative_envelope_and_repository() {
+        let card = parse_detailed_card(
+            "card-1",
+            json!({
+                "card": {
+                    "id": "card-1",
+                    "repo": "repo-1",
+                    "unknownCardField": { "preserved": true }
+                },
+                "unknownDetailField": ["preserved"]
+            }),
+        )
+        .unwrap();
+        assert_eq!(card.repository(), Some("repo-1"));
+        assert_eq!(card.card_value()["id"], "card-1");
+        assert_eq!(card.envelope()["unknownDetailField"], json!(["preserved"]));
+        assert_eq!(card.card_value()["unknownCardField"]["preserved"], true);
+
+        let missing_envelope =
+            parse_detailed_card("card-1", json!({ "id": "card-1", "repo": "repo-1" })).unwrap_err();
+        assert!(missing_envelope.contains("missing its card envelope"));
+
+        for response in [
+            json!({ "card": { "id": "card-1" } }),
+            json!({ "card": { "id": "card-1", "repo": null } }),
+            json!({ "card": { "id": "card-1", "repo": " " } }),
+            json!({ "card": { "id": "card-1" }, "repo": "top-level-only" }),
+        ] {
+            let card = parse_detailed_card("card-1", response).unwrap();
+            assert_eq!(card.repository(), None);
+        }
+
+        let malformed_card = parse_detailed_card("card-1", json!({ "card": [] })).unwrap_err();
+        assert!(malformed_card.contains("missing its card envelope"));
+
+        let malformed_repository = parse_detailed_card(
+            "card-1",
+            json!({ "card": { "id": "card-1", "repo": ["repo-1"] } }),
+        )
+        .unwrap_err();
+        assert!(malformed_repository.contains("non-string repository mapping"));
+
+        let mismatched_card = parse_detailed_card(
+            "card-1",
+            json!({ "card": { "id": "card-2", "repo": "repo-1" } }),
+        )
+        .unwrap_err();
+        assert!(mismatched_card.contains("not requested card 'card-1'"));
     }
 
     #[test]
