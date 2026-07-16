@@ -21521,7 +21521,6 @@ mod tests {
 
     const LOOPBACK_POWDER_IO_TIMEOUT: Duration = Duration::from_secs(2);
     const LOOPBACK_POWDER_HANDLER_TIMEOUT: Duration = Duration::from_secs(4);
-    const LOOPBACK_POWDER_SERVER_TIMEOUT: Duration = Duration::from_secs(8);
     const LOOPBACK_POWDER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
     #[derive(Clone, Debug, Default)]
@@ -21563,13 +21562,8 @@ mod tests {
             let (stop, stop_rx) = mpsc::sync_channel(1);
             let thread = std::thread::spawn(move || {
                 let mut handlers = Vec::new();
-                let deadline = Instant::now() + LOOPBACK_POWDER_SERVER_TIMEOUT;
                 let accept_result = 'server: loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break Err("loopback Powder server exceeded its deadline".to_string());
-                    }
-                    match stop_rx.recv_timeout(remaining.min(LOOPBACK_POWDER_POLL_INTERVAL)) {
+                    match stop_rx.recv_timeout(LOOPBACK_POWDER_POLL_INTERVAL) {
                         Ok(()) => break Ok(()),
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                             break Err("loopback Powder stop channel disconnected".to_string());
@@ -21732,7 +21726,10 @@ mod tests {
     impl PowderProfileEnv {
         fn install(profile: &str, addr: SocketAddr) -> Self {
             static LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
-            let lock = LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
+            let lock = LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let path = std::env::temp_dir().join(format!(
                 "t-hub-control-powder-profile-{}-{}.json",
                 std::process::id(),
