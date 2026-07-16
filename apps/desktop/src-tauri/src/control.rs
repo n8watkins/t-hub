@@ -8902,6 +8902,11 @@ fn crew_powder_context(
     crew_session_id: &str,
 ) -> Result<(powder::Client, powder::Claim), String> {
     let scope = resolve_crew_powder_scope(ctx, crew_session_id)?;
+    if !matches!(scope.crew.state, CrewState::Active) {
+        return Err(format!(
+            "Crew session '{crew_session_id}' lifecycle is not active; refusing to renew its Powder claim"
+        ));
+    }
     if !matches!(scope.work.state, PowderWorkState::Active) {
         return Err(format!(
             "Crew session '{crew_session_id}' Powder work is not active"
@@ -21535,6 +21540,18 @@ mod tests {
         renew_posts: usize,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LoopbackPowderBlockedOperation {
+        Completion,
+        Release,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct LoopbackPowderBehavior {
+        blocked_operation: Option<LoopbackPowderBlockedOperation>,
+        fail_release: bool,
+    }
+
     struct LoopbackPowderServer {
         addr: SocketAddr,
         state: Arc<StdMutex<LoopbackPowderState>>,
@@ -21548,6 +21565,26 @@ mod tests {
 
     impl LoopbackPowderServer {
         fn start(expected_requests: usize) -> Self {
+            Self::start_with_behavior(
+                expected_requests,
+                LoopbackPowderBehavior {
+                    blocked_operation: Some(LoopbackPowderBlockedOperation::Completion),
+                    fail_release: false,
+                },
+            )
+        }
+
+        fn start_with_blocked_release_failure(expected_requests: usize) -> Self {
+            Self::start_with_behavior(
+                expected_requests,
+                LoopbackPowderBehavior {
+                    blocked_operation: Some(LoopbackPowderBlockedOperation::Release),
+                    fail_release: true,
+                },
+            )
+        }
+
+        fn start_with_behavior(expected_requests: usize, behavior: LoopbackPowderBehavior) -> Self {
             use std::sync::mpsc;
 
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -21594,6 +21631,7 @@ mod tests {
                                 &state,
                                 &post_started_tx,
                                 &release_post_rx,
+                                behavior,
                             )
                         });
                         handlers.push(handler);
@@ -22065,13 +22103,17 @@ mod tests {
         state: &Arc<StdMutex<LoopbackPowderState>>,
         post_started: &std::sync::mpsc::SyncSender<Value>,
         release_post: &Arc<StdMutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        behavior: LoopbackPowderBehavior,
     ) -> Result<(), String> {
         let method = request.method.as_str();
         let path = request.path.as_str();
         let body = request.body;
         let response = match (method, path) {
             ("GET", "/api/v1/repositories/t-hub") => json!({"name": "t-hub"}),
-            ("GET", "/api/v1/cards/thub-powder-control-lifecycle?detail=detailed") => {
+            ("GET", path)
+                if path
+                    .starts_with("/api/v1/cards/thub-powder-control-lifecycle?detail=detailed") =>
+            {
                 loopback_card_evidence(&state.lock().unwrap())
             }
             ("GET", "/api/v1/cards/thub-powder-control-lifecycle") => {
@@ -22086,7 +22128,10 @@ mod tests {
                     state.completion_posts.push(body.clone());
                     state.completion_posts.len() == 1
                 };
-                if first_post {
+                if first_post
+                    && behavior.blocked_operation
+                        == Some(LoopbackPowderBlockedOperation::Completion)
+                {
                     post_started.try_send(body.clone()).map_err(|_| {
                         "loopback Powder completion observer unavailable".to_string()
                     })?;
@@ -22120,7 +22165,31 @@ mod tests {
             ("POST", path) if path.ends_with("/release") => {
                 let mut state = state.lock().unwrap();
                 state.release_posts += 1;
-                state.release_bodies.push(body);
+                state.release_bodies.push(body.clone());
+                drop(state);
+                if behavior.blocked_operation == Some(LoopbackPowderBlockedOperation::Release) {
+                    post_started
+                        .try_send(body.clone())
+                        .map_err(|_| "loopback Powder release observer unavailable".to_string())?;
+                    let receiver = release_post
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or("loopback Powder release signal was already consumed")?;
+                    receiver
+                        .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+                        .map_err(|_| {
+                            "loopback Powder release exceeded its release deadline".to_string()
+                        })?;
+                }
+                if behavior.fail_release {
+                    return write_loopback_json_status(
+                        &mut stream,
+                        409,
+                        "Conflict",
+                        &json!({"error": "injected release failure"}),
+                    );
+                }
                 json!({"card_id": "thub-powder-control-lifecycle", "run_id": "run-authoritative", "agent": "powder-agent", "expires_at": 100})
             }
             ("POST", path) if path.ends_with("/renew") || path.ends_with("/heartbeat") => {
@@ -22133,10 +22202,19 @@ mod tests {
     }
 
     fn write_loopback_json(stream: &mut TcpStream, response: &Value) -> Result<(), String> {
+        write_loopback_json_status(stream, 200, "OK", response)
+    }
+
+    fn write_loopback_json_status(
+        stream: &mut TcpStream,
+        status: u16,
+        reason: &str,
+        response: &Value,
+    ) -> Result<(), String> {
         let response = response.to_string();
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             response.len(),
             response
         )
@@ -22981,6 +23059,78 @@ mod tests {
         let state = server.finish().unwrap();
         assert_eq!(state.completion_posts.len(), 1);
         assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn powder_cleanup_failure_blocks_a_queued_heartbeat_after_cleanup_pending() {
+        use std::sync::mpsc;
+
+        let server = LoopbackPowderServer::start_with_blocked_release_failure(3);
+        let _profile = PowderProfileEnv::install("loopback-cleanup-heartbeat", server.addr);
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-cleanup-heartbeat");
+        let ctx = test_ctx("loopback-cleanup-heartbeat").with_captains_registry(registry.clone());
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+
+        let cleanup_ctx = ctx.clone();
+        let (cleanup_tx, cleanup_rx) = mpsc::sync_channel(1);
+        let cleanup = std::thread::spawn(move || {
+            cleanup_tx
+                .send(finalize_crew_powder_cleanup(
+                    &cleanup_ctx,
+                    "crew-powder",
+                    false,
+                ))
+                .unwrap();
+        });
+        server
+            .post_started
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let heartbeat_ctx = ctx.clone();
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let heartbeat = std::thread::spawn(move || {
+            heartbeat_tx
+                .send(renew_crew_powder_binding(
+                    &heartbeat_ctx,
+                    "crew-powder",
+                    None,
+                ))
+                .unwrap();
+        });
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "crew-powder"
+        );
+        server.release_post.send(()).unwrap();
+
+        let (release, retained, changed) = cleanup_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(retained);
+        assert!(changed);
+        assert_eq!(release.as_ref().unwrap()["released"], false);
+        assert!(matches!(
+            registry.snapshot().captains[0].crew[0].state,
+            CrewState::CleanupPending { .. }
+        ));
+        let heartbeat_error = heartbeat_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            heartbeat_error.contains("lifecycle is not active"),
+            "unexpected heartbeat error: {heartbeat_error}"
+        );
+        cleanup.join().unwrap();
+        heartbeat.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(state.renew_posts, 0);
     }
 
     #[test]
