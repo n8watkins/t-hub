@@ -99,3 +99,46 @@ fn current_app_server_thread_started_persists_session_start() {
 
     std::fs::remove_dir_all(journal_dir).ok();
 }
+
+#[test]
+fn unobserved_tui_process_records_degraded_health_from_its_tmux_tile() {
+    let journal_dir = temp_dir();
+    let socket = format!("t-hub-codex-degraded-{}", std::process::id());
+    let session = "codexdegraded1";
+    let status = Command::new("tmux")
+        .args(["-L", &socket, "new-session", "-d", "-s", session])
+        .arg(env!("CARGO_BIN_EXE_t-hub-agent"))
+        .args(["--codex-unobserved", "--journal-dir"])
+        .arg(&journal_dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "isolated tmux launch failed");
+
+    let path = journal_dir.join("events.ndjson");
+    for _ in 0..100 {
+        if path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status();
+
+    let journal = std::fs::read_to_string(path).unwrap();
+    let entries: Vec<EventJournalEntry> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].event_type, JournalEventType::CoreAction);
+    assert_eq!(entries[0].payload["tmux_session"], session);
+    assert_eq!(
+        entries[0].payload["telemetry"]["runtime_health"],
+        "degraded"
+    );
+    assert_eq!(entries[0].payload["telemetry"]["transport"], "unavailable");
+    assert_ne!(entries[0].event_type, JournalEventType::SessionStart);
+
+    std::fs::remove_dir_all(journal_dir).ok();
+}
