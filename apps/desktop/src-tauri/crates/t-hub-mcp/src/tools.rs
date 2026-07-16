@@ -1276,16 +1276,28 @@ mod tests {
             assert_eq!(schema["type"], "object", "{name}");
             assert_eq!(schema["additionalProperties"], false, "{name}");
             for escape in [
+                "card",
                 "cardId",
                 "card_id",
+                "run",
                 "runId",
                 "run_id",
                 "profile",
                 "connectionProfile",
                 "connection_profile",
                 "endpoint",
+                "powderEndpoint",
+                "powder_endpoint",
                 "repository",
+                "powderRepository",
+                "powder_repository",
+                "repo",
                 "credential",
+                "apiKey",
+                "api_key",
+                "key",
+                "token",
+                "secret",
             ] {
                 assert!(
                     schema["properties"].get(escape).is_none(),

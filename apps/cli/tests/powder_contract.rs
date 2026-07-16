@@ -220,12 +220,14 @@ fn invalid_flags_positionals_and_limits_fail_before_endpoint_discovery() {
         vec!["powder", "evidence", "--card", "escape", "--json"],
         vec!["powder", "evidence", "extra", "--json"],
         vec!["powder", "evidence", "--limit", "21", "--json"],
+        vec!["powder", "evidence", "--crew", " \t\n ", "--json"],
         vec!["powder", "work-log", "append", "", "--json"],
         vec!["powder", "work-log", "append", " \t\n ", "--json"],
         vec!["powder", "complete", "crew-123", "--json"],
         vec![
             "powder", "complete", "crew-123", "--proof", " \t\n ", "--json",
         ],
+        vec!["powder", "complete", " \t\n ", "--proof", "tests", "--json"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_th"))
             .args(args)
@@ -283,9 +285,20 @@ fn invalid_flags_positionals_and_limits_fail_before_endpoint_discovery() {
         "--run-id",
         "--profile",
         "--connection-profile",
+        "--connection_profile",
         "--endpoint",
+        "--powder-endpoint",
+        "--powder_endpoint",
         "--repository",
+        "--powder-repository",
+        "--powder_repository",
+        "--repo",
         "--credential",
+        "--api-key",
+        "--api_key",
+        "--key",
+        "--token",
+        "--secret",
     ] {
         for mut args in [
             vec!["powder", "work-log", "append", "test evidence"],
@@ -313,6 +326,42 @@ fn invalid_flags_positionals_and_limits_fail_before_endpoint_discovery() {
             );
         }
     }
+}
+
+#[test]
+fn exact_utf8_byte_boundaries_are_forwarded_without_truncation() {
+    let message = "é".repeat(8192);
+    assert_eq!(message.len(), 16 * 1024);
+    let append = MockControl::start(json!({
+        "ok": true,
+        "result": { "accepted": "append_crew_powder_work_log" }
+    }));
+    let output = append.run(
+        &["powder", "work-log", "append", &message, "--json"],
+        Some("crew-token"),
+    );
+    assert_clean_json_success(&output, "powder work-log append");
+    let request = append.finish();
+    assert_eq!(
+        request["args"]["message"].as_str().unwrap().len(),
+        16 * 1024
+    );
+
+    let proof = "é".repeat(2048);
+    assert_eq!(proof.len(), 4096);
+    let complete = MockControl::start(json!({
+        "ok": true,
+        "result": { "accepted": "complete_crew_powder" }
+    }));
+    let output = complete.run(
+        &[
+            "powder", "complete", "crew-123", "--proof", &proof, "--json",
+        ],
+        Some("captain-token"),
+    );
+    assert_clean_json_success(&output, "powder complete");
+    let request = complete.finish();
+    assert_eq!(request["args"]["proof"].as_str().unwrap().len(), 4096);
 }
 
 #[test]
