@@ -13,13 +13,54 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 **Updated:** 2026-07-15.
 **Repository:** `/home/natkins/projects/tools/t-hub/t-hub-app`.
 **Branch:** `fix/captain-control-runtime`.
-**Source head before this handoff update:** `cb1032c`.
+**Source head before this handoff update:** `b058b1b`.
 **Installed Windows build:** locally built T-Hub `0.3.103` from exact detached source `8654986`.
 
 ## Active Resume Boundary
 
 This section is the reset-safe starting point for the next session.
 The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
+
+### Verified 2026-07-15 Cross-Repository Work Boundary
+
+This boundary was verified at `2026-07-15T22:04:11-07:00` after the General authorized both Captains to create their required Powder cards through Powder's sanctioned native card-creation surface.
+The authoritative roadmap and complete card register remain in [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
+The exact Powder P1 through P4 implementation contracts remain in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/captain-safety-handoff/docs/POWDER-CAPTAIN-RUN-BOUND-HANDOFF.md` at local commit `c4ab73e98339d651f8f00cacc252db6c4c90c6db`.
+
+The canonical T-Hub checkout is on `fix/captain-control-runtime` at `b058b1b` before this handoff update.
+Source declares version `0.3.104`.
+The only canonical-checkout entries are the protected untracked `.lavish/`, `CLAUDE.md`, and `docs/DECK-AGENTS-DESIGN.md` paths.
+They remain untouched.
+
+Installed T-Hub remains PID `10036`, version `0.3.103`, at `C:\Users\natha\AppData\Local\T-Hub\t-hub.exe`.
+Its installed SHA-256 remains `B76F8B54691754AAB7CC8509AE2ED6E14B565DBC7FAA7543D73DEE500CD8A3B3`.
+The installed package remains related to exact detached source `8654986`, which declares version `0.3.103`.
+Source after `8654986` includes the staged `0.3.104` Powder lifecycle and evidence implementation plus later planning documentation.
+No `0.3.104` merge, push, install, deployment, publication, or release is authorized or claimed by this handoff.
+
+Powder Captain `aae93881` created and reread all four authoritative P0 review cards on repository `powder`.
+`powder-mutation-idempotency` is active under run `run-9RWhdmpyPzXE` with Crew terminal `4e50931c`, branch `feat/mutation-idempotency`, and isolated worktree `/home/natkins/projects/powder-worktrees/mutation-idempotency`.
+The Powder Captain checkpoint records Crew `4e50931c` as the sole integration owner for the shared operation identity, digest, lifecycle, retention, recovery, migration, API, and transactional substrate.
+`powder-run-bound-work-logs` and `powder-run-scoped-criteria` remain blocked by `powder-mutation-idempotency`.
+`powder-run-bound-conditional-completion` remains blocked by `powder-mutation-idempotency` and `powder-run-scoped-criteria`.
+The next Powder action is to supervise P2 reproduction, sanctioned work-log evidence, focused and workspace tests, verified commits, and independent review before dispatching P3 or P4.
+
+T-Hub Captain `c2940be4` created and reread all five authorized P0 review cards on repository `t-hub`.
+`thub-control-client-deadline` and `thub-powder-lifecycle-serialization` are ready.
+`thub-captain-crew-terminal-state` is blocked until lifecycle serialization is stable.
+`thub-powder-run-bound-mutations` and `thub-powder-evidence-recovery` remain blocked on their recorded Powder and T-Hub dependencies.
+The Captain created clean isolated worktrees `/home/natkins/projects/tools/t-hub/t-hub-worktrees/control-client-deadline` on `fix/control-client-deadline` and `/home/natkins/projects/tools/t-hub/t-hub-worktrees/powder-lifecycle-serialization` on `fix/powder-lifecycle-serialization`, both from `b058b1b`.
+Dispatch of T30 `thub-control-client-deadline` was accepted for Crew terminal `2bef9b61` under run `run-Q7QP9N_mqTJF` in the control-client worktree with ownership limited to the three control-client implementations and their focused tests.
+Dispatch of T2 `thub-powder-lifecycle-serialization` was accepted for Crew terminal `0006cfb5` under run `run-trPe9u6_KuU0` in the lifecycle worktree with exclusive ownership of `apps/desktop/src-tauri/src/control.rs` and its focused tests.
+The Captain inspected both terminals and verified that both Crew were live in their exact worktrees and had accepted their complete briefs without permission prompts.
+One bounded native API work-log append for each exact run returned successfully without retry, although the legacy response exposed no entry identity.
+The Captain reread both cards and verified exactly one matching start entry for each exact run and Crew terminal.
+The next T-Hub action is to checkpoint the roster and supervise both independent lanes through reproduction, focused tests, verified commits, and independent review.
+T17 must follow T2 rather than overlap it, while T1 and T3 must remain blocked until the required Powder contracts stabilize.
+
+The Powder Captain has a current durable T-Hub checkpoint, and the T-Hub cards, claims, runs, bindings, terminals, and worktrees are already durable while its Captain finishes the corresponding checkpoint update.
+An orchestrator conversation reset must not recreate cards, claims, runs, worktrees, or Crew from chat memory.
+After reset, read this boundary, recover both Captain manifests and Powder boards, inspect the live terminals, and continue from authoritative checkpoint evidence.
 
 ### Verified 0.3.103 Resume Boundary
 
