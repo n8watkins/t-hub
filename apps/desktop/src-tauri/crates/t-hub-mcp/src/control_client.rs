@@ -32,6 +32,10 @@ const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
 /// window before the current endpoint is tried.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Every control client accepts at most 1 MiB before the NDJSON response newline.
+/// This bounds memory, parsing work, and any structured error derived from a peer.
+const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
+
 /// Spawn-class commands whose retries must dedup via a client `requestId`
 /// (mirrors the app-side `is_idempotent_command`).
 fn is_idempotent_command(command: &str) -> bool {
@@ -857,11 +861,25 @@ fn call_classified(
             next_probe = now + budget.attempt_timeout;
         }
         match (&stream).read(&mut chunk) {
-            Ok(0) => return Err(CallError::Transport("read")),
+            Ok(0) if response.is_empty() => return Err(CallError::Transport("read")),
+            Ok(0) => {
+                return Err(CallError::Protocol(
+                    "control_protocol: unterminated response frame".to_string(),
+                ));
+            }
             Ok(n) => {
-                response.extend_from_slice(&chunk[..n]);
-                if let Some(newline) = response.iter().position(|byte| *byte == b'\n') {
-                    response.truncate(newline);
+                let received = &chunk[..n];
+                let frame_bytes = received
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .unwrap_or(received.len());
+                if response.len().saturating_add(frame_bytes) > MAX_RESPONSE_FRAME_BYTES {
+                    return Err(CallError::Protocol(format!(
+                        "control_protocol: response frame exceeds {MAX_RESPONSE_FRAME_BYTES}-byte limit"
+                    )));
+                }
+                response.extend_from_slice(&received[..frame_bytes]);
+                if frame_bytes < received.len() {
                     break;
                 }
             }
@@ -882,8 +900,9 @@ fn call_classified(
         }
     }
 
-    let resp_line = String::from_utf8(response)
-        .map_err(|_| CallError::Protocol("control response was not UTF-8".to_string()))?;
+    let resp_line = String::from_utf8(response).map_err(|_| {
+        CallError::Protocol("control_protocol: response frame was not UTF-8".to_string())
+    })?;
     let resp: ControlResponse = serde_json::from_str(resp_line.trim_end())
         .map_err(|e| CallError::Protocol(format!("control_protocol: malformed response: {e}")))?;
 
@@ -1152,6 +1171,29 @@ mod tests {
         addr
     }
 
+    fn raw_response_server(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let mut writer = stream;
+            let _ = writer.write_all(&response);
+            let _ = writer.flush();
+        });
+        addr
+    }
+
+    fn exact_limit_response() -> Vec<u8> {
+        let mut response = br#"{"ok":true,"result":null}"#.to_vec();
+        response.resize(MAX_RESPONSE_FRAME_BYTES, b' ');
+        response.push(b'\n');
+        response
+    }
+
     fn silent_then_status_server(hold: Duration) -> (String, Arc<Mutex<Vec<Value>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1395,6 +1437,114 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, CallError::Timeout("read")));
         assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn exact_limit_response_frame_is_accepted() {
+        let addr = raw_response_server(exact_limit_response());
+        let endpoint = ControlEndpoint {
+            addr,
+            token: "control".into(),
+        };
+
+        let value = call_classified(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            CallBudget {
+                deadline: Instant::now() + Duration::from_secs(2),
+                attempt_timeout: Duration::from_millis(100),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(value, Value::Null);
+    }
+
+    #[test]
+    fn over_limit_response_frame_is_bounded_and_credential_safe() {
+        let secret = "oversized-server-token-must-not-leak";
+        let mut response = vec![b'x'; MAX_RESPONSE_FRAME_BYTES];
+        response.extend_from_slice(secret.as_bytes());
+        response.push(b'\n');
+        let addr = raw_response_server(response);
+        let endpoint = ControlEndpoint {
+            addr: addr.clone(),
+            token: "control-token-must-not-leak".into(),
+        };
+
+        let error = call_classified(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            CallBudget {
+                deadline: Instant::now() + Duration::from_secs(2),
+                attempt_timeout: Duration::from_millis(100),
+            },
+            None,
+        )
+        .unwrap_err();
+        let CallError::Protocol(message) = error else {
+            panic!("oversized frame must be a protocol error");
+        };
+        assert!(message.contains("response frame exceeds"));
+        assert!(!message.contains(secret));
+        assert!(!message.contains("control-token-must-not-leak"));
+        assert!(!message.contains(&addr));
+    }
+
+    #[test]
+    fn unterminated_response_frame_is_a_safe_protocol_error() {
+        let secret = "unterminated-server-token-must-not-leak";
+        let addr = raw_response_server(format!("{{\"ok\":true,\"{secret}\":").into_bytes());
+        let endpoint = ControlEndpoint {
+            addr,
+            token: "control".into(),
+        };
+
+        let error = call_classified(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            CallBudget {
+                deadline: Instant::now() + Duration::from_secs(2),
+                attempt_timeout: Duration::from_millis(100),
+            },
+            None,
+        )
+        .unwrap_err();
+        let CallError::Protocol(message) = error else {
+            panic!("unterminated frame must be a protocol error");
+        };
+        assert!(message.contains("unterminated response frame"));
+        assert!(!message.contains(secret));
+    }
+
+    #[test]
+    fn malformed_response_frame_does_not_echo_peer_content() {
+        let secret = "malformed-server-token-must-not-leak";
+        let addr = raw_response_server(format!("{{not-json:{secret}}}\n").into_bytes());
+        let endpoint = ControlEndpoint {
+            addr,
+            token: "control".into(),
+        };
+
+        let error = call_classified(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            CallBudget {
+                deadline: Instant::now() + Duration::from_secs(2),
+                attempt_timeout: Duration::from_millis(100),
+            },
+            None,
+        )
+        .unwrap_err();
+        let CallError::Protocol(message) = error else {
+            panic!("malformed frame must be a protocol error");
+        };
+        assert!(message.contains("malformed response"));
+        assert!(!message.contains(secret));
     }
 
     #[test]

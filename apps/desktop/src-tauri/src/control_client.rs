@@ -39,6 +39,10 @@ const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
 /// bounded by their single overall deadline.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Every control client accepts at most 1 MiB before the NDJSON response newline.
+/// This bounds memory, parsing work, and any structured error derived from a peer.
+const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
+
 /// Commissioning and dispatch cross bounded Powder, git, tmux, and harness-start
 /// operations. Their response window must outlive the server's normal request
 /// phase so the client receives the authoritative result instead of abandoning a
@@ -368,11 +372,25 @@ fn request_once(
             next_probe = now + attempt_timeout;
         }
         match (&stream).read(&mut chunk) {
-            Ok(0) => return Err(RequestError::Transport("read")),
+            Ok(0) if response.is_empty() => return Err(RequestError::Transport("read")),
+            Ok(0) => {
+                return Err(RequestError::Protocol(
+                    "control_protocol: unterminated response frame".into(),
+                ));
+            }
             Ok(n) => {
-                response.extend_from_slice(&chunk[..n]);
-                if let Some(newline) = response.iter().position(|byte| *byte == b'\n') {
-                    response.truncate(newline);
+                let received = &chunk[..n];
+                let frame_bytes = received
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .unwrap_or(received.len());
+                if response.len().saturating_add(frame_bytes) > MAX_RESPONSE_FRAME_BYTES {
+                    return Err(RequestError::Protocol(format!(
+                        "control_protocol: response frame exceeds {MAX_RESPONSE_FRAME_BYTES}-byte limit"
+                    )));
+                }
+                response.extend_from_slice(&received[..frame_bytes]);
+                if frame_bytes < received.len() {
                     break;
                 }
             }
@@ -392,8 +410,9 @@ fn request_once(
             Err(_) => return Err(RequestError::Transport("read")),
         }
     }
-    let line = String::from_utf8(response)
-        .map_err(|_| RequestError::Protocol("control response was not UTF-8".into()))?;
+    let line = String::from_utf8(response).map_err(|_| {
+        RequestError::Protocol("control_protocol: response frame was not UTF-8".into())
+    })?;
     let resp: Value = serde_json::from_str(line.trim()).map_err(|e| {
         RequestError::Protocol(format!("control_protocol: malformed response: {e}"))
     })?;
@@ -773,6 +792,29 @@ mod tests {
         addr
     }
 
+    fn raw_response_server(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let mut writer = stream;
+            let _ = writer.write_all(&response);
+            let _ = writer.flush();
+        });
+        addr
+    }
+
+    fn exact_limit_response() -> Vec<u8> {
+        let mut response = br#"{"ok":true,"result":null}"#.to_vec();
+        response.resize(MAX_RESPONSE_FRAME_BYTES, b' ');
+        response.push(b'\n');
+        response
+    }
+
     fn dead_addr() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -980,6 +1022,82 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("control_timeout"), "error: {error}");
         assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn exact_limit_response_frame_is_accepted() {
+        let addr = raw_response_server(exact_limit_response());
+        let endpoint = test_endpoint(addr, None);
+
+        let value = request_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert_eq!(value, Value::Null);
+    }
+
+    #[test]
+    fn over_limit_response_frame_is_bounded_and_credential_safe() {
+        let secret = "oversized-server-token-must-not-leak";
+        let mut response = vec![b'x'; MAX_RESPONSE_FRAME_BYTES];
+        response.extend_from_slice(secret.as_bytes());
+        response.push(b'\n');
+        let addr = raw_response_server(response);
+        let endpoint = test_endpoint(addr.clone(), None);
+
+        let error = request_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.contains("response frame exceeds"));
+        assert!(!error.contains(secret));
+        assert!(!error.contains("full-control"));
+        assert!(!error.contains("host-only"));
+        assert!(!error.contains(&addr));
+    }
+
+    #[test]
+    fn unterminated_response_frame_is_a_safe_protocol_error() {
+        let secret = "unterminated-server-token-must-not-leak";
+        let addr = raw_response_server(format!("{{\"ok\":true,\"{secret}\":").into_bytes());
+        let endpoint = test_endpoint(addr, None);
+
+        let error = request_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.contains("unterminated response frame"));
+        assert!(!error.contains(secret));
+    }
+
+    #[test]
+    fn malformed_response_frame_does_not_echo_peer_content() {
+        let secret = "malformed-server-token-must-not-leak";
+        let addr = raw_response_server(format!("{{not-json:{secret}}}\n").into_bytes());
+        let endpoint = test_endpoint(addr, None);
+
+        let error = request_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.contains("malformed response"));
+        assert!(!error.contains(secret));
     }
 
     #[test]

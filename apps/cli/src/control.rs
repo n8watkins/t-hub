@@ -31,6 +31,10 @@ const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
 /// the entire recovery window before the current handshake is tried.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Every control client accepts at most 1 MiB before the NDJSON response newline.
+/// This bounds memory, parsing work, and any structured error derived from a peer.
+const MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
+
 /// A resolved, authenticated control endpoint.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
@@ -364,11 +368,25 @@ fn call_once(
             next_probe = now + attempt_timeout;
         }
         match (&stream).read(&mut chunk) {
-            Ok(0) => return Err(CallFailure::Transport("read")),
+            Ok(0) if response.is_empty() => return Err(CallFailure::Transport("read")),
+            Ok(0) => {
+                return Err(CallFailure::Protocol(
+                    "control_protocol: unterminated response frame".to_string(),
+                ));
+            }
             Ok(n) => {
-                response.extend_from_slice(&chunk[..n]);
-                if let Some(newline) = response.iter().position(|byte| *byte == b'\n') {
-                    response.truncate(newline);
+                let received = &chunk[..n];
+                let frame_bytes = received
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .unwrap_or(received.len());
+                if response.len().saturating_add(frame_bytes) > MAX_RESPONSE_FRAME_BYTES {
+                    return Err(CallFailure::Protocol(format!(
+                        "control_protocol: response frame exceeds {MAX_RESPONSE_FRAME_BYTES}-byte limit"
+                    )));
+                }
+                response.extend_from_slice(&received[..frame_bytes]);
+                if frame_bytes < received.len() {
                     break;
                 }
             }
@@ -389,15 +407,12 @@ fn call_once(
         }
     }
 
-    let resp_line = String::from_utf8(response)
-        .map_err(|_| CallFailure::Protocol("control response was not UTF-8".to_string()))?;
-
-    let resp: Response = serde_json::from_str(resp_line.trim_end()).map_err(|e| {
-        CallFailure::Protocol(format!(
-            "malformed control response: {e} (raw: {})",
-            resp_line.trim_end()
-        ))
+    let resp_line = String::from_utf8(response).map_err(|_| {
+        CallFailure::Protocol("control_protocol: response frame was not UTF-8".to_string())
     })?;
+
+    let resp: Response = serde_json::from_str(resp_line.trim_end())
+        .map_err(|e| CallFailure::Protocol(format!("control_protocol: malformed response: {e}")))?;
 
     if resp.ok {
         Ok(resp.result.unwrap_or(Value::Null))
@@ -547,6 +562,29 @@ mod tests {
             }
         });
         addr
+    }
+
+    fn raw_response_server(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let mut writer = stream;
+            let _ = writer.write_all(&response);
+            let _ = writer.flush();
+        });
+        addr
+    }
+
+    fn exact_limit_response() -> Vec<u8> {
+        let mut response = br#"{"ok":true,"result":null}"#.to_vec();
+        response.resize(MAX_RESPONSE_FRAME_BYTES, b' ');
+        response.push(b'\n');
+        response
     }
 
     fn dead_addr() -> String {
@@ -763,6 +801,98 @@ mod tests {
     }
 
     #[test]
+    fn exact_limit_response_frame_is_accepted() {
+        let addr = raw_response_server(exact_limit_response());
+        let path = handshake_for(&addr);
+        let endpoint = inherited_endpoint(addr, path.clone());
+
+        let value = call_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert_eq!(value, Value::Null);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn over_limit_response_frame_is_bounded_and_credential_safe() {
+        let secret = "oversized-server-token-must-not-leak";
+        let mut response = vec![b'x'; MAX_RESPONSE_FRAME_BYTES];
+        response.extend_from_slice(secret.as_bytes());
+        response.push(b'\n');
+        let addr = raw_response_server(response);
+        let path = handshake_for(&addr);
+        let endpoint = inherited_endpoint(addr.clone(), path.clone());
+
+        let error = call_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        let ControlError::Protocol(message) = error else {
+            panic!("oversized frame must be a protocol error");
+        };
+        assert!(message.contains("response frame exceeds"));
+        assert!(!message.contains(secret));
+        assert!(!message.contains("inherited-control"));
+        assert!(!message.contains(&addr));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unterminated_response_frame_is_a_safe_protocol_error() {
+        let secret = "unterminated-server-token-must-not-leak";
+        let addr = raw_response_server(format!("{{\"ok\":true,\"{secret}\":").into_bytes());
+        let path = handshake_for(&addr);
+        let endpoint = inherited_endpoint(addr, path.clone());
+
+        let error = call_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        let ControlError::Protocol(message) = error else {
+            panic!("unterminated frame must be a protocol error");
+        };
+        assert!(message.contains("unterminated response frame"));
+        assert!(!message.contains(secret));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn malformed_response_frame_does_not_echo_peer_content() {
+        let secret = "malformed-server-token-must-not-leak";
+        let addr = raw_response_server(format!("{{not-json:{secret}}}\n").into_bytes());
+        let path = handshake_for(&addr);
+        let endpoint = inherited_endpoint(addr, path.clone());
+
+        let error = call_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        let ControlError::Protocol(message) = error else {
+            panic!("malformed frame must be a protocol error");
+        };
+        assert!(message.contains("malformed response"));
+        assert!(!message.contains(secret));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn stale_discovery_time_exhausts_the_budget_before_connect() {
         let path = handshake_for("127.0.0.1:1");
         let mut endpoint = inherited_endpoint("127.0.0.1:1".to_string(), path.clone());
@@ -844,5 +974,40 @@ mod tests {
         assert!(!message.contains("inherited-control"));
         assert!(timed_out.stderr.is_empty(), "stderr: {timed_out:?}");
         let _ = std::fs::remove_file(timeout_path);
+    }
+
+    #[test]
+    fn process_contract_bounds_oversized_malformed_response_output() {
+        let secret = "oversized-server-token-must-not-leak";
+        let mut response = vec![b'x'; 2 * 1024 * 1024];
+        response.extend_from_slice(secret.as_bytes());
+        response.push(b'\n');
+        let addr = raw_response_server(response);
+        let path = handshake_for(&addr);
+        let started = Instant::now();
+
+        let output = run_cli_process(&addr, "inherited-control", &path);
+        let elapsed = started.elapsed();
+        assert!(
+            output.stdout.len() <= 1024,
+            "oversized response escaped output bound: elapsed={elapsed:?}, stdout_bytes={}, stderr_bytes={}",
+            output.stdout.len(),
+            output.stderr.len()
+        );
+        assert_eq!(output.status.code(), Some(6), "output: {output:?}");
+        assert!(output.stderr.is_empty(), "stderr: {output:?}");
+        assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
+        let output_json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output_json["ok"], false);
+        assert_eq!(output_json["command"], "tabs");
+        assert_eq!(output_json["data"], Value::Null);
+        assert_eq!(output_json["error"]["code"], 6);
+        assert_eq!(output_json["error"]["kind"], "protocol");
+        let message = output_json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("response frame exceeds"));
+        assert!(!message.contains(secret));
+        assert!(!message.contains("inherited-control"));
+        assert!(!message.contains(&addr));
+        let _ = std::fs::remove_file(path);
     }
 }
