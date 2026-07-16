@@ -55,7 +55,10 @@ use sha2::{Digest, Sha256};
 use crate::audit::{AuditLog, AuditMeta};
 use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
-use crate::harness::{Harness, PermMode};
+use crate::harness::{
+    attest_launch_permissions, observe_harness_process, Harness, HarnessPermissionAttestation,
+    PermMode,
+};
 use crate::supervision::Supervisor;
 use crate::{files, git, plane, powder, pty, tmux};
 
@@ -920,6 +923,14 @@ pub struct CrewRef {
     pub task: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
+    /// Effective provider-native permission mode, persisted only after
+    /// authoritative post-launch process evidence verifies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_permission: Option<PermMode>,
+    /// T-Hub control-plane capability is a separate authority axis from local
+    /// Harness execution permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t_hub_capability: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -943,6 +954,8 @@ impl CrewRef {
             resume_point: None,
             task: None,
             harness: None,
+            harness_permission: None,
+            t_hub_capability: None,
             worktree_path: None,
             branch: None,
             powder_work: None,
@@ -2253,6 +2266,8 @@ impl CaptainsRegistry {
         crew.task = Some(task.trim().to_string());
         crew.harness = Some(harness.to_string());
         crew.provider = Some(harness.to_string());
+        crew.harness_permission = None;
+        crew.t_hub_capability = None;
         if harness != "claude" {
             crew.claude_uuid = None;
         }
@@ -2263,6 +2278,61 @@ impl CaptainsRegistry {
         crew.worktree_path = worktree_path.map(str::to_string);
         crew.branch = branch.map(str::to_string);
         crew.powder_work = Some(powder_work);
+        let result = crew.clone();
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok(result)
+    }
+
+    /// Persist the two independent permission axes only after provider-native
+    /// process evidence has verified the effective Harness mode.
+    pub fn record_crew_launch_attestation(
+        &self,
+        crew_session_id: &str,
+        attestation: HarnessPermissionAttestation,
+        t_hub_capability: &str,
+    ) -> Result<CrewRef, String> {
+        if !matches!(t_hub_capability, "read" | "control") {
+            return Err("Crew T-Hub capability is invalid".into());
+        }
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let crew = g
+            .captains
+            .iter_mut()
+            .flat_map(|captain| captain.crew.iter_mut())
+            .find(|crew| crew.terminal_id == crew_session_id)
+            .ok_or_else(|| format!("unknown Crew session '{crew_session_id}'"))?;
+        if !matches!(crew.state, CrewState::Active) {
+            return Err(format!(
+                "Crew session '{crew_session_id}' is not active; refusing launch attestation"
+            ));
+        }
+        let expected_provider = attestation.provider.as_provider();
+        if crew.provider.as_deref() != Some(expected_provider)
+            || crew.harness.as_deref() != Some(expected_provider)
+        {
+            return Err(format!(
+                "Crew session '{crew_session_id}' provider binding conflicts with launch attestation"
+            ));
+        }
+        if !crew
+            .powder_work
+            .as_ref()
+            .is_some_and(|work| matches!(work.state, PowderWorkState::Active))
+        {
+            return Err(format!(
+                "Crew session '{crew_session_id}' has no active authoritative Powder binding"
+            ));
+        }
+        if crew.harness_permission.is_some() || crew.t_hub_capability.is_some() {
+            return Err(format!(
+                "Crew session '{crew_session_id}' already has launch permission evidence"
+            ));
+        }
+        crew.harness_permission = Some(attestation.permission);
+        crew.t_hub_capability = Some(t_hub_capability.to_string());
         let result = crew.clone();
         g.seq = g.seq.saturating_add(1);
         self.commit_mutation(g, previous)?;
@@ -8401,6 +8471,17 @@ fn crew_launch_argv(harness: Harness, prompt: &str) -> String {
         .fresh_argv_with_permissions(prompt, PermMode::BypassPermissions)
 }
 
+fn rollback_crew_launch_failure(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    client: &powder::Client,
+    claim: &powder::Claim,
+    primary: String,
+) -> String {
+    let rollback = rollback_crew_dispatch(ctx, crew_session_id, Some(client), Some(claim));
+    dispatch_rollback_error(primary, rollback)
+}
+
 fn dispatch_crew(
     ctx: &ControlContext,
     args: &Value,
@@ -8483,7 +8564,7 @@ fn dispatch_crew(
             ));
         }
     };
-    let crew = match ctx.captains.bind_crew_context(
+    let _crew = match ctx.captains.bind_crew_context(
         &captain_session_id,
         &crew_session_id,
         &task,
@@ -8511,25 +8592,89 @@ fn dispatch_crew(
         "You are Crew on ship '{}'. Work only Powder card '{}' in run '{}'. Task: {} Use checkout '{}'. Report progress, blockers, and completion to Captain session '{}'. Do not claim other work or spawn additional agents.",
         captain.ship_slug, claim.card_id, claim.run_id, task, checkout, captain_session_id
     );
+    let tmux_target = tmux_target(&crew_session_id);
+    let before_launch = match observe_harness_process(&tmux_target) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return Err(rollback_crew_launch_failure(
+                ctx,
+                &crew_session_id,
+                &client,
+                &claim,
+                format!("dispatch_crew: launch attestation baseline failed: {error}"),
+            ));
+        }
+    };
     let launch = crew_launch_argv(harness, &prompt);
     #[cfg(test)]
     let launch = arg_str(args, "testHarnessCommand").unwrap_or_else(|| launch.clone());
     if let Err(error) =
         send_text(&json!({ "sessionId": crew_session_id, "text": launch, "enter": true }))
     {
-        let rollback = rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
-        return Err(dispatch_rollback_error(
+        return Err(rollback_crew_launch_failure(
+            ctx,
+            &crew_session_id,
+            &client,
+            &claim,
             format!("dispatch_crew: harness launch failed: {error}"),
-            rollback,
         ));
     }
     if let Err(error) = wait_for_harness_started(&crew_session_id, harness.as_provider()) {
-        let rollback = rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
-        return Err(dispatch_rollback_error(
+        return Err(rollback_crew_launch_failure(
+            ctx,
+            &crew_session_id,
+            &client,
+            &claim,
             format!("dispatch_crew: harness startup failed: {error}"),
-            rollback,
         ));
     }
+    let after_launch = match observe_harness_process(&tmux_target) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return Err(rollback_crew_launch_failure(
+                ctx,
+                &crew_session_id,
+                &client,
+                &claim,
+                format!("dispatch_crew: Harness permission attestation failed: {error}"),
+            ));
+        }
+    };
+    let attestation = match attest_launch_permissions(
+        harness.adapter(),
+        &before_launch,
+        &after_launch,
+        PermMode::BypassPermissions,
+    ) {
+        Ok(attestation) => attestation,
+        Err(error) => {
+            return Err(rollback_crew_launch_failure(
+                ctx,
+                &crew_session_id,
+                &client,
+                &claim,
+                format!("dispatch_crew: Harness permission attestation failed: {error}"),
+            ));
+        }
+    };
+    let crew =
+        match ctx
+            .captains
+            .record_crew_launch_attestation(&crew_session_id, attestation, "read")
+        {
+            Ok(crew) => crew,
+            Err(error) => {
+                return Err(rollback_crew_launch_failure(
+                    ctx,
+                    &crew_session_id,
+                    &client,
+                    &claim,
+                    format!(
+                        "dispatch_crew: durable Harness permission attestation failed: {error}"
+                    ),
+                ));
+            }
+        };
     let _ = captains_sync_apply(ctx);
     Ok(json!({
         "accepted": "dispatch_crew",
@@ -8537,6 +8682,8 @@ fn dispatch_crew(
         "captain": captain,
         "crew": crew,
         "project": project,
+        "effectiveHarnessPermission": attestation.permission,
+        "tHubCapability": "read",
         "powderCard": card.envelope(),
         "claim": {
             "cardId": claim.card_id,
@@ -12437,6 +12584,73 @@ mod tests {
         std::fs::copy("/bin/sleep", &executable).unwrap();
         let command = format!("{} 60", executable.display());
         (bin_dir, command)
+    }
+
+    fn process_permission_attestation(
+        expected: Harness,
+        executable_name: &str,
+        flags: &str,
+    ) -> Option<Result<HarnessPermissionAttestation, crate::harness::LaunchAttestationError>> {
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+            || !std::process::Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("process_permission_attestation: tmux or node not on PATH - skipping");
+            return None;
+        }
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "t-hub-permission-harness-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let executable = fixture_dir.join(executable_name);
+        std::fs::write(
+            &executable,
+            "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let session_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let target = tmux_target(&session_id);
+        tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
+        let before = observe_harness_process(&target).unwrap();
+        let command = format!("{} {} 'api_key=supersecret'", executable.display(), flags);
+        tmux::send_text(&target, &command, true).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let result = loop {
+            if let Ok(after) = observe_harness_process(&target) {
+                match attest_launch_permissions(
+                    expected.adapter(),
+                    &before,
+                    &after,
+                    PermMode::BypassPermissions,
+                ) {
+                    Err(crate::harness::LaunchAttestationError::StaleEvidence)
+                        if Instant::now() < deadline => {}
+                    result => break result,
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fake Harness did not produce process evidence"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        tmux::kill_session_tree(&target).unwrap();
+        let _ = std::fs::remove_dir_all(fixture_dir);
+        Some(result)
     }
 
     #[test]
@@ -20319,6 +20533,125 @@ mod tests {
     }
 
     #[test]
+    fn process_level_permission_attestation_accepts_codex_and_claude_native_flags() {
+        let Some(codex) = process_permission_attestation(
+            Harness::Codex,
+            "codex",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ) else {
+            return;
+        };
+        assert_eq!(codex.unwrap().permission, PermMode::BypassPermissions);
+
+        let claude = process_permission_attestation(
+            Harness::Claude,
+            "claude",
+            "--dangerously-skip-permissions",
+        )
+        .unwrap();
+        assert_eq!(claude.unwrap().permission, PermMode::BypassPermissions);
+    }
+
+    #[test]
+    fn process_level_permission_attestation_rejects_missing_wrong_provider_and_wrappers() {
+        let Some(missing) = process_permission_attestation(Harness::Codex, "codex", "") else {
+            return;
+        };
+        assert_eq!(
+            missing.unwrap_err(),
+            crate::harness::LaunchAttestationError::MissingPermission
+        );
+
+        let wrong =
+            process_permission_attestation(Harness::Codex, "codex", "--sandbox workspace-write")
+                .unwrap();
+        assert_eq!(
+            wrong.unwrap_err(),
+            crate::harness::LaunchAttestationError::WrongPermission
+        );
+
+        let wrong_provider = process_permission_attestation(
+            Harness::Codex,
+            "claude",
+            "--dangerously-skip-permissions",
+        )
+        .unwrap();
+        assert_eq!(
+            wrong_provider.unwrap_err(),
+            crate::harness::LaunchAttestationError::WrongProvider
+        );
+
+        let wrapper = process_permission_attestation(
+            Harness::Codex,
+            "wrapper",
+            "--dangerously-bypass-approvals-and-sandbox",
+        )
+        .unwrap();
+        let error = wrapper.unwrap_err();
+        assert_eq!(
+            error,
+            crate::harness::LaunchAttestationError::WrapperObscured
+        );
+        assert!(!error.to_string().contains("supersecret"));
+        assert!(!error.to_string().contains("api_key"));
+    }
+
+    #[test]
+    fn crew_launch_attestation_persists_separate_permission_axes() {
+        let path = captains_tmp("crew-launch-attestation");
+        let _ = std::fs::remove_file(&path);
+        let registry = powder_lifecycle_registry(Some(path.clone()));
+        assert!(registry
+            .record_crew_launch_attestation(
+                "crew-powder",
+                HarnessPermissionAttestation {
+                    provider: Harness::Claude,
+                    permission: PermMode::BypassPermissions,
+                },
+                "read",
+            )
+            .unwrap_err()
+            .contains("provider binding conflicts"));
+        assert!(registry
+            .record_crew_launch_attestation(
+                "crew-powder",
+                HarnessPermissionAttestation {
+                    provider: Harness::Codex,
+                    permission: PermMode::BypassPermissions,
+                },
+                "admin",
+            )
+            .unwrap_err()
+            .contains("capability is invalid"));
+        let crew = registry
+            .record_crew_launch_attestation(
+                "crew-powder",
+                HarnessPermissionAttestation {
+                    provider: Harness::Codex,
+                    permission: PermMode::BypassPermissions,
+                },
+                "read",
+            )
+            .unwrap();
+        assert_eq!(crew.harness_permission, Some(PermMode::BypassPermissions));
+        assert_eq!(crew.t_hub_capability.as_deref(), Some("read"));
+
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        let crew = &restored.captains[0].crew[0];
+        assert_eq!(crew.harness_permission, Some(PermMode::BypassPermissions));
+        assert_eq!(crew.t_hub_capability.as_deref(), Some("read"));
+        assert_eq!(
+            serde_json::to_value(crew).unwrap()["harnessPermission"],
+            "bypassPermissions"
+        );
+        assert_eq!(
+            serde_json::to_value(crew).unwrap()["tHubCapability"],
+            "read"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn powder_events_filter_by_repository_and_wake_the_project_captain() {
         let ctx = test_ctx("secret");
         let project = ctx
@@ -21133,6 +21466,39 @@ mod tests {
             .finish()
             .unwrap_err()
             .contains("expected 0, received 1"));
+    }
+
+    #[test]
+    fn launch_attestation_failure_rolls_back_terminal_binding_and_exact_claim() {
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!(
+                "launch_attestation_failure_rolls_back_terminal_binding_and_exact_claim: tmux not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(3);
+        let profile_name = format!("attestation-rollback-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
+        let target = tmux_target(&crew_id);
+        tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
+        let ctx = test_ctx("secret").with_captains_registry(registry.clone());
+
+        rollback_crew_dispatch(&ctx, &crew_id, None, None).unwrap();
+
+        assert_eq!(tmux::session_liveness(&target), tmux::SessionLiveness::Gone);
+        assert!(registry.snapshot().captains[0]
+            .crew
+            .iter()
+            .all(|crew| crew.terminal_id != crew_id));
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 1);
     }
 
     #[test]
