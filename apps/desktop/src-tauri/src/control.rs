@@ -22429,6 +22429,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "run scripts/captain/verify-codex-permission-integration.sh"]
     fn dispatch_combined_real_agent_marks_exact_codex_crew_before_provider_exec() {
         if !tmux_process_tests_available() {
             eprintln!(
@@ -22436,12 +22437,9 @@ mod tests {
             );
             return;
         }
-        let Some(agent_path) = std::env::var_os("T_HUB_REAL_AGENT_BIN") else {
-            eprintln!(
-                "dispatch_combined_real_agent_marks_exact_codex_crew_before_provider_exec: T_HUB_REAL_AGENT_BIN not set - skipping"
-            );
-            return;
-        };
+        let agent_path = std::env::var_os("T_HUB_REAL_AGENT_BIN").expect(
+            "T_HUB_REAL_AGENT_BIN must identify the combined-tree agent; run scripts/captain/verify-codex-permission-integration.sh",
+        );
         let agent_path = PathBuf::from(agent_path).canonicalize().unwrap();
         assert!(agent_path.is_file(), "real combined agent must be a file");
 
