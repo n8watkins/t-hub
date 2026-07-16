@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use serde_json::{json, Value};
@@ -29,6 +30,7 @@ pub const VERIFIED_CODEX_VERSION: &str = "0.144.4";
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const MAX_ID_BYTES: usize = 512;
 const MAX_PATH_BYTES: usize = 2048;
+static OPAQUE_HOOK_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TapOutcome {
@@ -512,7 +514,7 @@ pub fn entry_from_hook(
                     .or_else(|| raw.get("item_id")),
                 MAX_ID_BYTES,
             )
-            .unwrap_or_else(|| format!("hook:{:016x}", fnv1a64(raw.to_string().as_bytes())));
+            .unwrap_or_else(opaque_hook_request_id);
             let mut envelope = json!({
                 "id": request_id,
                 "params": {
@@ -606,13 +608,18 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+/// Generate a versioned opaque fallback when Codex omits every request/item id.
+///
+/// The generator deliberately accepts no hook payload. In particular, commands,
+/// tool input, reasons, prompts, paths, and credentials cannot influence the
+/// durable identifier, so it is not a dictionary-testable content fingerprint.
+fn opaque_hook_request_id() -> String {
+    let sequence = OPAQUE_HOOK_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "hook-opaque-v1:{:x}:{:x}:{sequence:x}",
+        now_ms(),
+        std::process::id()
+    )
 }
 
 #[cfg(test)]
@@ -776,5 +783,37 @@ mod tests {
         assert_eq!(entry.event_type, JournalEventType::PermissionRequest);
         assert!(!payload.contains("top-secret"));
         assert_eq!(entry.payload["tmux_session"], "th_crew0001");
+    }
+
+    #[test]
+    fn missing_provider_ids_use_non_content_derived_opaque_ids() {
+        let make = |secret: &str| {
+            entry_from_hook(
+                "PermissionRequest",
+                &json!({
+                    "session_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "model": "gpt-5.6-sol",
+                    "permission_mode": "default",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": secret},
+                    "reason": secret
+                }),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let first = make("credential-alpha");
+        let second = make("credential-beta");
+        let first_id = first.payload["permission_request"]["id"].as_str().unwrap();
+        let second_id = second.payload["permission_request"]["id"].as_str().unwrap();
+
+        assert!(first_id.starts_with("hook-opaque-v1:"));
+        assert!(second_id.starts_with("hook-opaque-v1:"));
+        assert_ne!(first_id, second_id);
+        let persisted = serde_json::to_string(&[first, second]).unwrap();
+        assert!(!persisted.contains("credential-alpha"));
+        assert!(!persisted.contains("credential-beta"));
     }
 }
