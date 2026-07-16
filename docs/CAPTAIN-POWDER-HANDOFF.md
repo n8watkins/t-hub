@@ -21,6 +21,25 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 This section is the reset-safe starting point for the next session.
 The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
 
+### Verified 2026-07-15 Active Implementation Boundary
+
+This boundary was verified at `2026-07-15T22:43:08-07:00`.
+T30 Crew terminal `2bef9b61` remains live under run `run-Q7QP9N_mqTJF` with no completion sentinel and no commit yet.
+Its isolated worktree contains tracked changes only in the owned CLI and desktop control clients, plus the protected untracked `CLAUDE.md` artifact.
+The CLI and desktop implementations now share a bounded recovery-deadline shape with deterministic loopback coverage for refused connections, connected-but-silent inherited endpoints, response loss, healthy current endpoints, exhausted discovery budget, structured timeout classification, and credential-safe errors.
+The Crew is running the focused desktop control-client tests after the Captain approved the exact local formatting and loopback-test command.
+The owned MCP control client remains the third implementation target before T30 verification and commits can complete.
+
+Powder card `powder-mutation-idempotency` remains the sole active Powder dependency lane under run `run-9RWhdmpyPzXE`.
+Its Crew has produced four logical commits: `07bd797` for the transactional operation substrate, `c9c7cd7` for stable authenticated authority, `695c0a8` for schema migration coverage, and `44da772` for HTTP, CLI, and MCP adapter exposure.
+Only `README.md` and new `docs/mutation-operations-v1.md` documentation remain uncommitted while focused verification continues.
+The other three Powder cards remain dependency-blocked.
+
+The installed `0.3.103` T-Hub control RPC still times out on capability and board-read calls.
+The Captain therefore used the documented read-only tmux and Git fallbacks and did not mutate claims, lifecycle state, or the installed runtime.
+T2 remains accepted, independently reviewed, and exact-run evidence-complete while its claim is deliberately preserved until run-bound Powder completion is safe.
+No merge, push, install, deploy, publication, release, card completion, run release, or resource reap is authorized or claimed.
+
 ### Verified 2026-07-15 T2 Completion and T30 Reproduction Boundary
 
 This boundary was verified at `2026-07-15T22:33:42-07:00` while the General's authorization to implement T30 and T2 remained active.
