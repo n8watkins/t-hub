@@ -905,3 +905,19 @@ Representative Vite, Next.js, and package-less static packaged acceptance is com
 The remaining Run and Preview hardening is generic non-Tauri Vite launch adapters and stale WSL-address recovery.
 Real Powder acceptance still requires a control-capable Captain session.
 The bound Board success state, remaining Run and Preview hardening, Claude header check, packaged performance matrix, and release hardening remain open.
+
+## Current Captain Reconciliation - 2026-07-16
+
+Powder P1-P4 are complete at local deployment commit `8217c29` with schema version 18 and independent QA verification.
+
+The T-Hub Captain preserved and then fast-forwarded the reviewed Stage 2 candidate `7ea4dc5` onto canonical `fix/captain-control-runtime`.
+
+Canonical descends from corrected Stage 1 commit `d8aa935`, which has the same patch identity as formatting repair `444131b`, and does not descend from the parallel `444131b` history.
+
+T30 translated commits through `171b83b` and T2 commits `59a2cb5` and `7ea4dc5` are present.
+
+The candidate was independently reviewed and passed formatting, diff, Powder race-matrix, MCP, workspace-test, and warnings-denied Clippy gates.
+
+Independent validation of the canonical fast-forward is the current review boundary.
+
+T1 and T3 remain separate later work, and no installation, restart, publication, claim completion or release, or worktree cleanup is authorized by this boundary.

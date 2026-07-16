@@ -491,3 +491,23 @@ The General can begin with this instruction:
 ```text
 Read docs/LOCAL-POWDER-CAPTAIN-EXECUTION-PLAN.md, recover your durable Captain manifest, and execute Stage 0 only.
 ```
+
+## Current Captain State - 2026-07-16
+
+This addendum supersedes the stale immediate-next-action wording above for the recovered `t-hub-app` Captain.
+
+Powder P1-P4 are satisfied by the locally deployed Powder commit `8217c29` with schema version 18 and independent QA verification.
+
+The corrected canonical T-Hub branch `fix/captain-control-runtime` contains the reviewed Stage 2 result at `7ea4dc5`.
+
+Stage 1 formatting repair `d8aa935` has the same patch identity as `444131b`, while the parallel `444131b` history is not an ancestor of the canonical result.
+
+T30 remains represented by the translated history through `171b83b`, and T2 is represented by commits `59a2cb5` and `7ea4dc5`.
+
+The Stage 2 candidate passed the CLI and desktop formatting gates, `git diff --check`, the 32-test Powder matrix across ten runs, MCP E2E, the full desktop workspace tests, and warnings-denied Clippy.
+
+Independent combined T30/T2 review approved the candidate, and a fresh independent validation of the canonical fast-forward is required before any further implementation work.
+
+T1 and T3 remain separate later work and must not be dispatched during this validation boundary.
+
+Installation, restart, publication, claim completion or release, and worktree cleanup remain unauthorized unless separately directed.
