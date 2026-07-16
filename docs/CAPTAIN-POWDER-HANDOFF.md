@@ -31,6 +31,9 @@ Verification passed 37 CLI unit tests, 7 CLI JSON contract tests, 11 focused des
 Desktop full-library clippy remains blocked by a pre-existing warning in unowned `apps/desktop/src-tauri/src/control.rs`.
 The Captain approved one exact final Powder work-log append containing that commit and evidence, but the sanctioned CLI returned `ok: false`.
 The result is not being retried until its failure is reconciled, and T30 still requires independent review.
+Independent review of `e7922ac` found that the two-second attempt slice also truncates healthy ordinary desktop and MCP responses that are entitled to a longer command budget.
+The review also found that the new CLI transport behavior lacks a committed process-level regression for stale recovery, stable JSON error fields, clean stderr, and exit status.
+The Captain has returned both findings to T30 for a separate correction commit and will not accept the card until the healthy slow-response path and CLI process contract are covered.
 
 Permission launch-attestation terminal `10d1093e` committed its provider-neutral Harness attestation layer as `5b033fe` on branch `fix/codex-permission-launch-attestation` after 28 focused tests passed without warnings.
 Effective exclusive implementation ownership of `apps/desktop/src-tauri/src/control.rs` belongs to this launch-attestation lane because T2 is complete, accepted, independently reviewed, exact-run evidence-complete, and evidence-only while its claim is retained.
