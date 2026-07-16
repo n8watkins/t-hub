@@ -134,6 +134,8 @@ impl std::fmt::Display for PermMode {
 pub struct HarnessProcessEvidence {
     pid: u32,
     start_ticks: u64,
+    executable_device: u64,
+    executable_inode: u64,
     argv: Vec<String>,
 }
 
@@ -143,12 +145,34 @@ impl HarnessProcessEvidence {
         Self {
             pid,
             start_ticks,
+            executable_device: u64::from(pid),
+            executable_inode: start_ticks,
+            argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_after_exec(
+        pid: u32,
+        start_ticks: u64,
+        executable_inode: u64,
+        argv: &[&str],
+    ) -> Self {
+        Self {
+            pid,
+            start_ticks,
+            executable_device: u64::from(pid),
+            executable_inode,
             argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
         }
     }
 
     fn identity(&self) -> (u32, u64) {
         (self.pid, self.start_ticks)
+    }
+
+    fn executable_identity(&self) -> (u64, u64) {
+        (self.executable_device, self.executable_inode)
     }
 }
 
@@ -251,7 +275,9 @@ pub fn attest_launch_permissions(
     after: &HarnessProcessEvidence,
     expected: PermMode,
 ) -> Result<HarnessPermissionAttestation, LaunchAttestationError> {
-    if before.identity() == after.identity() {
+    if before.identity() == after.identity()
+        && before.executable_identity() == after.executable_identity()
+    {
         return Err(LaunchAttestationError::StaleEvidence);
     }
     adapter.attest_permissions(after, expected)
@@ -278,11 +304,16 @@ rest=${stat##*) }
 set -- $rest
 [ "$#" -ge 20 ]
 start_ticks=${20}
+set -- $(stat -Lc '%d %i' "/proc/$foreground_pid/exe")
+[ "$#" -eq 2 ]
+case "$1:$2" in *[!0-9:]*) exit 24;; esac
+executable_device=$1
+executable_inode=$2
 cmdline="/proc/$foreground_pid/cmdline"
 size=$(wc -c < "$cmdline" | tr -d ' ')
 case "$size" in ''|*[!0-9]*|0) exit 23;; esac
 [ "$size" -le 65536 ]
-printf 'THPA1\n%s\n%s\n' "$foreground_pid" "$start_ticks"
+printf 'THPA2\n%s\n%s\n%s\n%s\n' "$foreground_pid" "$start_ticks" "$executable_device" "$executable_inode"
 cat "$cmdline"
 "#;
 
@@ -324,12 +355,14 @@ cat "$cmdline"
 }
 
 fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
-    let mut fields = bytes.splitn(4, |byte| *byte == b'\n');
-    if fields.next() != Some(b"THPA1".as_slice()) {
+    let mut fields = bytes.splitn(6, |byte| *byte == b'\n');
+    if fields.next() != Some(b"THPA2".as_slice()) {
         return Err(LaunchAttestationError::UnreadableEvidence);
     }
     let pid = parse_ascii_number(fields.next())?;
     let start_ticks = parse_ascii_number(fields.next())?;
+    let executable_device = parse_ascii_number(fields.next())?;
+    let executable_inode = parse_ascii_number(fields.next())?;
     let cmdline = fields
         .next()
         .ok_or(LaunchAttestationError::UnreadableEvidence)?;
@@ -350,6 +383,8 @@ fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, Launch
     Ok(HarnessProcessEvidence {
         pid: u32::try_from(pid).map_err(|_| LaunchAttestationError::UnreadableEvidence)?,
         start_ticks,
+        executable_device,
+        executable_inode,
         argv,
     })
 }
@@ -649,14 +684,42 @@ mod tests {
     }
 
     #[test]
+    fn launch_attestation_accepts_proven_exec_transition() {
+        let before = HarnessProcessEvidence::test_after_exec(42, 900, 100, &["zsh"]);
+        let after = HarnessProcessEvidence::test_after_exec(
+            42,
+            900,
+            200,
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+        );
+        assert_eq!(
+            attest_launch_permissions(
+                Harness::Codex.adapter(),
+                &before,
+                &after,
+                PermMode::BypassPermissions,
+            )
+            .unwrap()
+            .permission,
+            PermMode::BypassPermissions
+        );
+    }
+
+    #[test]
     fn process_evidence_parser_is_bounded_and_strict() {
         let parsed =
-            parse_process_evidence(b"THPA1\n42\n900\ncodex\0--sandbox\0read-only\0").unwrap();
+            parse_process_evidence(b"THPA2\n42\n900\n8\n1234\ncodex\0--sandbox\0read-only\0")
+                .unwrap();
         assert_eq!(parsed.identity(), (42, 900));
+        assert_eq!(parsed.executable_identity(), (8, 1234));
         assert_eq!(parsed.argv, ["codex", "--sandbox", "read-only"]);
 
         assert_eq!(
-            parse_process_evidence(b"THPA1\n42\n900\ncodex"),
+            parse_process_evidence(b"THPA2\n42\n900\n8\n1234\ncodex"),
             Err(LaunchAttestationError::UnreadableEvidence)
         );
         let oversized = vec![b'x'; 65_537];
