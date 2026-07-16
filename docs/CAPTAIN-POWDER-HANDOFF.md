@@ -33,7 +33,11 @@ The Captain approved one exact final Powder work-log append containing that comm
 The result is not being retried until its failure is reconciled, and T30 still requires independent review.
 Independent review of `e7922ac` found that the two-second attempt slice also truncates healthy ordinary desktop and MCP responses that are entitled to a longer command budget.
 The review also found that the new CLI transport behavior lacks a committed process-level regression for stale recovery, stable JSON error fields, clean stderr, and exit status.
-The Captain has returned both findings to T30 for a separate correction commit and will not accept the card until the healthy slow-response path and CLI process contract are covered.
+T30 addressed both findings in separate commit `b032841`, including healthy slow-response coverage and a CLI process contract regression.
+Independent rereview then found that the MCP unchanged-endpoint read can consume the full deadline before idempotent ambiguity resolution or relay self-heal receives any budget.
+The rereview also reproduced a partial-frame trickle that kept the source CLI alive beyond its ten-second absolute deadline, and the same loop shape exists in all three clients.
+The Captain has returned these new blockers for explicit downstream recovery reserves, hard deadline enforcement during partial reads, and deterministic coverage in all three clients.
+T30 remains unaccepted until a separate correction commit passes another independent rereview.
 
 Permission launch-attestation terminal `10d1093e` committed its provider-neutral Harness attestation layer as `5b033fe` on branch `fix/codex-permission-launch-attestation` after 28 focused tests passed without warnings.
 Effective exclusive implementation ownership of `apps/desktop/src-tauri/src/control.rs` belongs to this launch-attestation lane because T2 is complete, accepted, independently reviewed, exact-run evidence-complete, and evidence-only while its claim is retained.
