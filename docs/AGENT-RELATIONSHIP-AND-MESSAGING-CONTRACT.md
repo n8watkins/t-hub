@@ -103,6 +103,63 @@ A Captain or Crew may use bounded ephemeral subagents only when active policy pe
 Ephemeral subagents are appropriate for read-only research, mapping, or independent verification that does not require durable ownership.
 They do not receive durable Powder claims, worktrees, or authority merely because they were spawned by an authorized identity.
 
+## Authority, Work Profile, and Runtime Resolution
+
+T-Hub separates durable authority role, provider-neutral work profile, and resolved Harness runtime.
+General, Cortana, Captain, Crew, reviewer, and ephemeral-subagent authority comes only from durable identity and the applicable Assignment, card, run, and control capability.
+Provider, Harness, model, reasoning effort, permission mode, latency, price, or context size never grants or removes authority.
+
+The versioned work-profile catalog initially defines:
+
+- `coordination` for fleet navigation, status, prioritization assistance, and Captain commissioning.
+- `product_design` for requirements, user experience, product judgment, and architecture restraint.
+- `technical_architecture` for demanding repository investigation, decomposition, integration, and cross-cutting technical decisions.
+- `exploration` for read-heavy code tracing, dependency inspection, pattern discovery, and bounded research.
+- `mechanical_execution` for explicit tests, documentation, types, CRUD, migrations supplied as plans, and repetitive transformations.
+- `bounded_implementation` for clear multi-file work with stable interfaces and acceptance criteria.
+- `judgment_implementation` for defined outcomes whose safe implementation path still requires substantial local judgment.
+- `independent_review` for fresh, read-only verification of requirements, diffs, commits, tests, security, concurrency, migrations, or architecture.
+- `frontier_escalation` for exceptional long-running, cross-project, or unusually difficult reasoning after ordinary routing is insufficient.
+
+The initial Codex routing defaults are:
+
+| Work profile | Default Codex runtime |
+| --- | --- |
+| `coordination` | `gpt-5.6-terra`, medium reasoning |
+| `product_design` | `gpt-5.6-sol`, medium reasoning, with high only for a demonstrated difficult decision |
+| `technical_architecture` | `gpt-5.6-sol`, medium reasoning, with high only for a demonstrated difficult decision |
+| `exploration` | `gpt-5.6-terra`, medium reasoning, read-only by default |
+| `mechanical_execution` | `gpt-5.6-luna`, medium reasoning |
+| `bounded_implementation` | `gpt-5.6-luna`, high reasoning |
+| `judgment_implementation` | `gpt-5.6-terra`, high reasoning |
+| `independent_review` | `gpt-5.6-sol`, high reasoning, fresh read-only context |
+| `frontier_escalation` | `gpt-5.6-sol` at the highest explicitly authorized supported reasoning level |
+
+These mappings are defaults to evaluate against real T-Hub work, not permanent capability claims about a model family.
+Claude and future Harness adapters may map the same profiles to different models without changing the profile meanings or durable identities.
+Temporary, promotional, account-specific, preview, or uncertain model availability must not appear in the stable profile vocabulary.
+
+Runtime resolution uses this precedence:
+
+1. An explicit General decision for the exact commissioning or dispatch.
+2. An authorized Captain override inside its Assignment and card boundary.
+3. Assignment routing policy.
+4. Project routing policy.
+5. User-wide T-Hub routing policy.
+6. The versioned built-in adapter default.
+
+Before any process starts, T-Hub must show the requested profile, preferred provider policy, resolved provider, Harness, exact model, reasoning effort, effective local permission mode, fallback policy, and any degraded capability.
+The Captain or Crew binding must persist the profile-catalog version, requested profile, resolution inputs, exact resolved runtime, fallback outcome, and runtime replacement history.
+Existing sessions remain pinned to their resolved runtime until an explicit replacement or recovery operation changes it.
+
+An unavailable model must either fail visibly or use one bounded fallback that was displayed and authorized by policy.
+T-Hub must not silently downgrade capability, increase cost class, change provider, weaken permissions, or substitute a conversation identity.
+A cross-provider fallback starts a fresh runtime from a durable checkpoint and never treats a Claude conversation ID as a Codex thread ID or the reverse.
+
+Powder remains provider-neutral and requires no model-routing changes.
+Powder records scope, acceptance, card and run state, claims, evidence, and completion, while T-Hub owns profile selection, runtime resolution, dispatch, identity, fallback, and display.
+Automatic classification from prompt text is deferred until explicit profile selection has produced enough T-Hub-specific evaluation evidence to justify it.
+
 ## Source-of-Truth Matrix
 
 | Concern | Authoritative source | Not sufficient by itself |

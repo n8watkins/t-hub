@@ -1,8 +1,8 @@
 # T-Hub Phased Production Plan
 
-**Updated:** 2026-07-15.
+**Updated:** 2026-07-16.
 **Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
-**Installed build:** T-Hub `0.3.103` from exact detached source `8654986`, running on the canonical profile as Windows PID `10036` when this plan was refreshed.
+**Installed build:** T-Hub `0.3.103` from exact detached source `8654986`, running on the canonical profile as Windows PID `39140` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
 ## How to Use This Plan
@@ -64,6 +64,9 @@ The user artifacts `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` must remain untou
 28. T-Hub must fail closed when a required Powder guarantee is unavailable and must not simulate that guarantee with a read-then-write race.
 29. Every changed packaged build receives a new version across all authoritative version files before it is built, and one version may identify only one exact source commit.
 30. Focused regression tests run during implementation, while the comprehensive quality gate runs at integration, pull-request, packaged-acceptance, and release boundaries.
+31. Durable authority role, provider-neutral work profile, and resolved Harness runtime are separate concepts; changing a model never changes General, Cortana, Captain, Crew, or reviewer authority.
+32. T-Hub resolves versioned work profiles through provider adapters, records the exact provider, Harness, model, effort, permissions, and fallback used, and never silently changes provider, capability, cost class, or authority.
+33. Profile routing is Codex-first for initial delivery, while Claude and future provider mappings remain availability-aware adapter policy rather than permanent product vocabulary.
 
 ## Roadmap, Backlog, and Runtime Evidence
 
@@ -148,6 +151,7 @@ T-Hub must not patch or fork Powder behavior locally to make acceptance pass.
 | T30 | Make control clients recover stale endpoints promptly with one bounded overall deadline, visible retry state, and no inherited-port delay. | 1 and 5 | No | Capability, health, and list calls recover or return a structured timeout without a 30-to-45-second ambiguous hang. | `thub-control-client-deadline` |
 | T31 | Reproduce and eliminate avoidable Workspace-switch terminal restoration delay while preserving bounded terminal resources. | 1, 9, and 11 | No | Packaged warm and cold switches have numeric visual-switch and input-ready budgets; an immediate return never reattaches, and a cold return shows the last authoritative frame immediately while one bounded background attach restores live input. | `thub-workspace-switch-latency` |
 | T32 | Make the sidebar show authoritative, legible agent activity for Codex and Claude instead of treating recent terminal output as equivalent to a running agent. | 4, 8, and 9 | Yes | Packaged Codex and Claude runs remain visibly Working through quiet reasoning and tool execution, distinguish needs-input, idle, completed, failed, stale, and unknown states, and expose degraded telemetry rather than a blank status slot. | `thub-sidebar-agent-status` |
+| T33 | Implement versioned provider-neutral work profiles with Codex-first model and reasoning routing for Captain commissioning, Crew dispatch, scouting, review, and explicit escalation. | 4, 5, 7, 8, and 11 | Yes | CLI-first preflight and dispatch persist the requested profile and exact resolved runtime, existing sessions remain pinned, unavailable models fail visibly or use one explicitly displayed fallback, and no model choice changes authority or Powder state. | `thub-agent-routing-profiles` |
 
 The change register is authoritative planning input even before its cards are created.
 Powder cards should be created only when their lane is near-term, bounded, dependency-ready, and assigned to an isolated worktree with an explicit exit gate.
@@ -166,6 +170,7 @@ Review findings must not disappear merely because a card is deferred, completed,
 9. T13 and T14 stabilize the installed frontend before performance or usage-persistence conclusions are accepted.
 10. T24 defines the numeric Workspace-switch budgets consumed by T31, while T31 owns lifecycle and rendering changes needed to meet them.
 11. T32 consumes the provider-neutral lifecycle model from Phase 4 and the authoritative Captain and Crew terminal-state work from T17; its degraded-state UI may proceed without fabricating missing telemetry.
+12. T33 consumes T7 Assignment identity and T11 shared-operation parity; its contract and adapter scaffolding may proceed independently, but control-plane integration must follow the active T2, T17, and T30 ownership sequence and must not delay Phase 8A safety acceptance.
 
 ### Phase Status and Dependency Summary
 
