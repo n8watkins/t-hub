@@ -315,7 +315,6 @@ fn call_once(
         .map(|left| left.min(attempt_timeout))
         .filter(|budget| !budget.is_zero())
         .ok_or(CallFailure::Timeout("write"))?;
-    let _ = stream.set_read_timeout(Some(io_budget));
     let _ = stream.set_write_timeout(Some(io_budget));
 
     let mut writer = stream
@@ -347,18 +346,32 @@ fn call_once(
 
     let mut reader = BufReader::new(stream);
     let mut resp_line = String::new();
-    let n = reader.read_line(&mut resp_line).map_err(|e| {
-        if matches!(
-            e.kind(),
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-        ) {
-            CallFailure::Timeout("read")
-        } else {
-            CallFailure::Transport("read")
+    loop {
+        let read_budget = remaining(deadline)
+            .map(|left| left.min(attempt_timeout))
+            .filter(|budget| !budget.is_zero())
+            .ok_or(CallFailure::Timeout("read"))?;
+        let _ = reader.get_ref().set_read_timeout(Some(read_budget));
+        match reader.read_line(&mut resp_line) {
+            Ok(0) => return Err(CallFailure::Transport("read")),
+            Ok(_) => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(CallFailure::Timeout("read"));
+                }
+                if refresh_endpoint(ep)
+                    .is_ok_and(|fresh| fresh.addr != ep.addr || fresh.token != ep.token)
+                {
+                    return Err(CallFailure::Timeout("read"));
+                }
+            }
+            Err(_) => return Err(CallFailure::Transport("read")),
         }
-    })?;
-    if n == 0 {
-        return Err(CallFailure::Transport("read"));
     }
 
     let resp: Response = serde_json::from_str(resp_line.trim_end()).map_err(|e| {
@@ -426,6 +439,7 @@ pub fn subscribe<F: FnMut(Value)>(ep: &Endpoint, mut on_frame: F) -> Result<(), 
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::process::Command;
     use std::thread;
 
     fn handshake_file(body: &str) -> PathBuf {
@@ -449,6 +463,10 @@ mod tests {
     }
 
     fn responding_server(result: Value) -> String {
+        delayed_server(result, Duration::ZERO)
+    }
+
+    fn delayed_server(result: Value, delay: Duration) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         thread::spawn(move || {
@@ -457,6 +475,7 @@ mod tests {
             BufReader::new(stream.try_clone().unwrap())
                 .read_line(&mut request)
                 .unwrap();
+            thread::sleep(delay);
             let mut writer = stream;
             serde_json::to_writer(
                 &mut writer,
@@ -507,6 +526,32 @@ mod tests {
             env_pinned: true,
             discovery_elapsed: Duration::ZERO,
         }
+    }
+
+    fn cli_binary() -> PathBuf {
+        if let Some(path) = option_env!("CARGO_BIN_EXE_th") {
+            return PathBuf::from(path);
+        }
+        let test_exe = std::env::current_exe().unwrap();
+        let debug_dir = test_exe.parent().and_then(|path| path.parent()).unwrap();
+        let name = if cfg!(windows) { "th.exe" } else { "th" };
+        let binary = debug_dir.join(name);
+        assert!(
+            binary.is_file(),
+            "CLI process binary missing at {}; run `cargo build` before this focused test",
+            binary.display()
+        );
+        binary
+    }
+
+    fn run_cli_process(addr: &str, token: &str, handshake: &PathBuf) -> std::process::Output {
+        Command::new(cli_binary())
+            .args(["tabs", "--json"])
+            .env("T_HUB_CONTROL_ADDR", addr)
+            .env("T_HUB_CONTROL_TOKEN", token)
+            .env("T_HUB_CONTROL_FILE", handshake)
+            .output()
+            .unwrap()
     }
 
     #[test]
@@ -638,6 +683,27 @@ mod tests {
     }
 
     #[test]
+    fn healthy_response_can_outlive_attempt_slice_within_overall_deadline() {
+        let addr = delayed_server(
+            serde_json::json!({"usage": "ready"}),
+            Duration::from_millis(90),
+        );
+        let path = handshake_for(&addr);
+        let endpoint = inherited_endpoint(addr, path.clone());
+
+        let value = call_with_deadline(
+            &endpoint,
+            "codex_usage",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+        assert_eq!(value["usage"], "ready");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn stale_discovery_time_exhausts_the_budget_before_connect() {
         let path = handshake_for("127.0.0.1:1");
         let mut endpoint = inherited_endpoint("127.0.0.1:1".to_string(), path.clone());
@@ -683,5 +749,41 @@ mod tests {
         assert!(!message.contains("inherited-control"));
         assert!(started.elapsed() < Duration::from_millis(150));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn process_contract_covers_stale_recovery_and_json_timeout_envelope() {
+        let stale_addr = silent_server(Duration::from_secs(5));
+        let fresh = responding_server(serde_json::json!([]));
+        let replacement_path = handshake_for(&fresh);
+        let started = Instant::now();
+
+        let recovered = run_cli_process(&stale_addr, "inherited-control", &replacement_path);
+        let recovered_json: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+        assert!(recovered.status.success(), "output: {recovered:?}");
+        assert_eq!(recovered_json["ok"], true);
+        assert_eq!(recovered_json["command"], "tabs");
+        assert_eq!(recovered_json["error"], Value::Null);
+        assert!(recovered.stderr.is_empty(), "stderr: {recovered:?}");
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let _ = std::fs::remove_file(replacement_path);
+
+        let silent_addr = silent_server(CONTROL_DEADLINE + Duration::from_secs(2));
+        let timeout_path = handshake_for(&silent_addr);
+        let timed_out = run_cli_process(&silent_addr, "inherited-control", &timeout_path);
+        let timeout_json: Value = serde_json::from_slice(&timed_out.stdout).unwrap();
+        assert_eq!(timed_out.status.code(), Some(3), "output: {timed_out:?}");
+        assert_eq!(timeout_json["ok"], false);
+        assert_eq!(timeout_json["command"], "tabs");
+        assert_eq!(timeout_json["data"], Value::Null);
+        assert_eq!(timeout_json["error"]["code"], 3);
+        assert_eq!(timeout_json["error"]["kind"], "app_down");
+        let message = timeout_json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("control_timeout"));
+        assert!(message.contains("retry_state=exhausted"));
+        assert!(!message.contains(&silent_addr));
+        assert!(!message.contains("inherited-control"));
+        assert!(timed_out.stderr.is_empty(), "stderr: {timed_out:?}");
+        let _ = std::fs::remove_file(timeout_path);
     }
 }

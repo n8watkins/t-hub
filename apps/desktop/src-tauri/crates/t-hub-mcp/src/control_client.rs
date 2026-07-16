@@ -434,7 +434,7 @@ fn resolve_and_call_with_deadline(
     if Instant::now() >= budget.deadline {
         return Err(timeout_message(command, 0, "discovery"));
     }
-    match call_classified(&endpoint, command, &args, budget) {
+    match call_classified(&endpoint, command, &args, budget, Some(discovery)) {
         Ok(v) => {
             wedge_detector().on_success();
             Ok(v)
@@ -514,7 +514,7 @@ fn resolve_and_call_with_deadline(
             // having ACTUALLY TRIED and still-failing is the one the wedge decision is
             // based on (F2: NOT the possibly-stale env pin we started from).
             if let Some(f) = fresh {
-                match call_classified(&f, command, &args, budget) {
+                match call_classified(&f, command, &args, budget, None) {
                     Ok(v) => {
                         wedge_detector().on_success();
                         Ok(v)
@@ -583,7 +583,7 @@ fn maybe_heal_and_retry(
 ) -> Result<Value, String> {
     if timeout_class && wedge_detector().on_unchanged_transport_failure(WEDGE_TRIGGER_AFTER) {
         if let Some(healed) = try_bridge_rebind(discovery, &tried, budget.deadline) {
-            return match call_classified(&healed, command, args, budget) {
+            return match call_classified(&healed, command, args, budget, None) {
                 Ok(v) => {
                     wedge_detector().on_success();
                     Ok(v)
@@ -652,7 +652,7 @@ fn resolve_ambiguous_request(
 ) -> Result<Value, String> {
     let status_args = serde_json::json!({ "requestId": request_id });
     loop {
-        match call_classified(endpoint, "get_request_status", &status_args, budget) {
+        match call_classified(endpoint, "get_request_status", &status_args, budget, None) {
             Ok(v) => match v.get("status").and_then(Value::as_str) {
                 Some("completed") => {
                     if v.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -685,7 +685,7 @@ fn resolve_ambiguous_request(
                 // "unknown" (or a server that answered oddly): the command never
                 // landed under this id, so re-running it once is safe + idempotent.
                 _ => {
-                    return call_classified(endpoint, command, args, budget)
+                    return call_classified(endpoint, command, args, budget, None)
                         .map_err(|error| error.into_message(command, 2, false));
                 }
             },
@@ -737,6 +737,7 @@ fn call(endpoint: &ControlEndpoint, command: &str, args: &Value) -> Result<Value
             deadline: Instant::now() + CONTROL_DEADLINE,
             attempt_timeout: ATTEMPT_TIMEOUT,
         },
+        None,
     )
     .map_err(|error| error.into_message(command, 1, false))
 }
@@ -748,6 +749,7 @@ fn call_classified(
     command: &str,
     args: &Value,
     budget: CallBudget,
+    discovery: Option<&Discovery>,
 ) -> Result<Value, CallError> {
     // Comms-plane Phase 3: present the caller session's PER-SESSION token
     // (`T_HUB_SESSION_TOKEN`, injected into this session's env at spawn) ALONGSIDE the
@@ -784,7 +786,6 @@ fn call_classified(
         .map(|left| left.min(budget.attempt_timeout))
         .filter(|budget| !budget.is_zero())
         .ok_or(CallError::Timeout("write"))?;
-    let _ = stream.set_read_timeout(Some(io_budget));
     let _ = stream.set_write_timeout(Some(io_budget));
 
     let mut writer = stream
@@ -816,18 +817,35 @@ fn call_classified(
 
     let mut reader = BufReader::new(stream);
     let mut resp_line = String::new();
-    let n = reader.read_line(&mut resp_line).map_err(|e| {
-        if matches!(
-            e.kind(),
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-        ) {
-            CallError::Timeout("read")
-        } else {
-            CallError::Transport("read")
+    loop {
+        let read_budget = remaining(budget.deadline)
+            .map(|left| left.min(budget.attempt_timeout))
+            .filter(|timeout| !timeout.is_zero())
+            .ok_or(CallError::Timeout("read"))?;
+        let _ = reader.get_ref().set_read_timeout(Some(read_budget));
+        match reader.read_line(&mut resp_line) {
+            Ok(0) => return Err(CallError::Transport("read")),
+            Ok(_) => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if Instant::now() >= budget.deadline {
+                    return Err(CallError::Timeout("read"));
+                }
+                if discovery
+                    .and_then(|source| source.refreshed_endpoint().ok())
+                    .is_some_and(|fresh| {
+                        fresh.addr != endpoint.addr || fresh.token != endpoint.token
+                    })
+                {
+                    return Err(CallError::Timeout("read"));
+                }
+            }
+            Err(_) => return Err(CallError::Transport("read")),
         }
-    })?;
-    if n == 0 {
-        return Err(CallError::Transport("read"));
     }
 
     let resp: ControlResponse = serde_json::from_str(resp_line.trim_end())
@@ -1053,6 +1071,22 @@ mod tests {
         (addr, captured)
     }
 
+    fn delayed_server(reply: &'static str, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            std::thread::sleep(delay);
+            let mut writer = stream;
+            writer.write_all(reply.as_bytes()).unwrap();
+            writer.write_all(b"\n").unwrap();
+        });
+        addr
+    }
+
     // ---- Relay-wedge self-heal: detection state machine (cause 2) --------------
 
     #[test]
@@ -1159,6 +1193,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_millis(200),
                 attempt_timeout: Duration::from_millis(50),
             },
+            None,
         );
         assert!(
             matches!(err, Err(CallError::Transport(_))),
@@ -1212,6 +1247,30 @@ mod tests {
             "inherited-control"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn healthy_response_can_outlive_attempt_slice_within_overall_deadline() {
+        let addr = delayed_server(
+            r#"{"ok":true,"result":{"usage":"ready"}}"#,
+            Duration::from_millis(90),
+        );
+        let discovery = Discovery {
+            addr: Some(addr),
+            token: Some("control".into()),
+            file: Some(PathBuf::from("/nonexistent/control.json")),
+            ..Default::default()
+        };
+
+        let value = resolve_and_call_with_deadline(
+            &discovery,
+            "codex_usage",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+        assert_eq!(value["usage"], "ready");
     }
 
     #[test]

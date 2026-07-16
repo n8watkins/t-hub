@@ -125,10 +125,7 @@ impl ControlEndpoint {
     /// frontend to read-only and break attach. The cached full token still authorizes
     /// the fresh port because the rebind kept it.
     pub fn refresh_addr(&self) -> Option<String> {
-        let path = self.refresh_path.as_ref()?;
-        let body = std::fs::read_to_string(path).ok()?;
-        let hs: Value = serde_json::from_str(&body).ok()?;
-        let fresh = hs.get("addr").and_then(|v| v.as_str())?.to_string();
+        let fresh = self.discovered_addr()?;
         let mut cur = self.addr.write().unwrap_or_else(|e| e.into_inner());
         if *cur != fresh {
             *cur = fresh.clone();
@@ -136,6 +133,19 @@ impl ControlEndpoint {
         } else {
             None
         }
+    }
+
+    fn discovered_addr(&self) -> Option<String> {
+        let path = self.refresh_path.as_ref()?;
+        let body = std::fs::read_to_string(path).ok()?;
+        let hs: Value = serde_json::from_str(&body).ok()?;
+        hs.get("addr")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }
+
+    fn adopt_addr(&self, fresh: String) {
+        *self.addr.write().unwrap_or_else(|e| e.into_inner()) = fresh;
     }
 }
 
@@ -156,6 +166,7 @@ fn request(endpoint: &ControlEndpoint, command: &str, args: &Value) -> Result<Va
 enum RequestError {
     Transport(&'static str),
     Timeout(&'static str),
+    EndpointChanged(String),
     App(String),
     Protocol(String),
 }
@@ -164,13 +175,19 @@ impl RequestError {
     fn stage(&self) -> &'static str {
         match self {
             RequestError::Transport(stage) | RequestError::Timeout(stage) => stage,
+            RequestError::EndpointChanged(_) => "endpoint refresh",
             RequestError::App(_) => "server",
             RequestError::Protocol(_) => "protocol",
         }
     }
 
     fn retryable(&self) -> bool {
-        matches!(self, RequestError::Transport(_) | RequestError::Timeout(_))
+        matches!(
+            self,
+            RequestError::Transport(_)
+                | RequestError::Timeout(_)
+                | RequestError::EndpointChanged(_)
+        )
     }
 }
 
@@ -191,7 +208,7 @@ fn request_with_deadline(
         args,
         deadline,
         attempt_timeout,
-        overall > CONTROL_DEADLINE,
+        Some(endpoint),
     ) {
         Ok(value) => Ok(value),
         Err(RequestError::App(message)) => Err(message),
@@ -200,9 +217,16 @@ fn request_with_deadline(
             if Instant::now() >= deadline {
                 return Err(timeout_message(command, 1, first.stage(), overall));
             }
-            let Some(fresh) = endpoint.refresh_addr() else {
-                return Err(failure_message(command, 1, &first, false, overall));
+            let fresh = match &first {
+                RequestError::EndpointChanged(fresh) => fresh.clone(),
+                _ => {
+                    let Some(fresh) = endpoint.refresh_addr() else {
+                        return Err(failure_message(command, 1, &first, false, overall));
+                    };
+                    fresh
+                }
             };
+            endpoint.adopt_addr(fresh.clone());
             match request_once(
                 &fresh,
                 endpoint.token(),
@@ -211,7 +235,7 @@ fn request_with_deadline(
                 args,
                 deadline,
                 attempt_timeout,
-                overall > CONTROL_DEADLINE,
+                Some(endpoint),
             ) {
                 Ok(value) => Ok(value),
                 Err(RequestError::App(message)) => Err(message),
@@ -258,7 +282,7 @@ fn request_once(
     args: &Value,
     deadline: Instant,
     attempt_timeout: Duration,
-    long_response: bool,
+    refresh: Option<&ControlEndpoint>,
 ) -> Result<Value, RequestError> {
     let socket: SocketAddr = addr.parse().map_err(|_| {
         RequestError::Protocol("control_protocol: malformed endpoint address".into())
@@ -278,19 +302,10 @@ fn request_once(
         }
     })?;
     let io_budget = remaining(deadline)
-        .map(|left| {
-            if long_response {
-                left
-            } else {
-                left.min(attempt_timeout)
-            }
-        })
+        .map(|left| left.min(attempt_timeout))
         .filter(|budget| !budget.is_zero())
         .ok_or(RequestError::Timeout("write"))?;
-    stream.set_read_timeout(Some(io_budget)).ok();
-    stream
-        .set_write_timeout(Some(io_budget.min(attempt_timeout)))
-        .ok();
+    stream.set_write_timeout(Some(io_budget)).ok();
 
     let mut writer = stream
         .try_clone()
@@ -320,18 +335,33 @@ fn request_once(
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let n = reader.read_line(&mut line).map_err(|e| {
-        if matches!(
-            e.kind(),
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-        ) {
-            RequestError::Timeout("read")
-        } else {
-            RequestError::Transport("read")
+    loop {
+        let read_budget = remaining(deadline)
+            .map(|left| left.min(attempt_timeout))
+            .filter(|budget| !budget.is_zero())
+            .ok_or(RequestError::Timeout("read"))?;
+        reader.get_ref().set_read_timeout(Some(read_budget)).ok();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err(RequestError::Transport("read")),
+            Ok(_) => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(RequestError::Timeout("read"));
+                }
+                if let Some(fresh) = refresh
+                    .and_then(ControlEndpoint::discovered_addr)
+                    .filter(|fresh| fresh != addr)
+                {
+                    return Err(RequestError::EndpointChanged(fresh));
+                }
+            }
+            Err(_) => return Err(RequestError::Transport("read")),
         }
-    })?;
-    if n == 0 {
-        return Err(RequestError::Transport("read"));
     }
     let resp: Value = serde_json::from_str(line.trim()).map_err(|e| {
         RequestError::Protocol(format!("control_protocol: malformed response: {e}"))
@@ -647,6 +677,10 @@ mod tests {
     }
 
     fn responding_server(result: Value) -> String {
+        delayed_server(result, Duration::ZERO)
+    }
+
+    fn delayed_server(result: Value, delay: Duration) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         thread::spawn(move || {
@@ -655,6 +689,7 @@ mod tests {
             BufReader::new(stream.try_clone().unwrap())
                 .read_line(&mut request)
                 .unwrap();
+            thread::sleep(delay);
             let mut writer = stream;
             serde_json::to_writer(&mut writer, &json!({"ok": true, "result": result})).unwrap();
             writer.write_all(b"\n").unwrap();
@@ -779,7 +814,7 @@ mod tests {
             &json!({}),
             Instant::now() + Duration::from_millis(250),
             Duration::from_millis(50),
-            true,
+            None,
         )
         .unwrap_err();
         server.join().unwrap();
@@ -859,6 +894,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value["capabilities"], json!(["read"]));
+    }
+
+    #[test]
+    fn healthy_response_can_outlive_attempt_slice_within_overall_deadline() {
+        let addr = delayed_server(json!({"usage": "ready"}), Duration::from_millis(90));
+        let endpoint = test_endpoint(addr, None);
+
+        let value = request_with_deadline(
+            &endpoint,
+            "codex_usage",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+        assert_eq!(value["usage"], "ready");
     }
 
     #[test]
