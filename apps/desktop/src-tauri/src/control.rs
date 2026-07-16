@@ -20941,6 +20941,41 @@ mod tests {
     }
 
     #[test]
+    fn process_level_permission_attestation_rejects_native_alias_and_inline_conflicts() {
+        let Some(codex_sandbox_alias) = process_permission_attestation(
+            Harness::Codex,
+            "codex",
+            "--dangerously-bypass-approvals-and-sandbox -s read-only",
+        ) else {
+            return;
+        };
+        assert_eq!(
+            codex_sandbox_alias.unwrap_err(),
+            crate::harness::LaunchAttestationError::ConflictingPermission
+        );
+        let codex_approval_alias = process_permission_attestation(
+            Harness::Codex,
+            "codex",
+            "--dangerously-bypass-approvals-and-sandbox -a=never",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_approval_alias.unwrap_err(),
+            crate::harness::LaunchAttestationError::ConflictingPermission
+        );
+        let claude_inline_false = process_permission_attestation(
+            Harness::Claude,
+            "claude",
+            "--dangerously-skip-permissions --dangerously-skip-permissions=false",
+        )
+        .unwrap();
+        assert_eq!(
+            claude_inline_false.unwrap_err(),
+            crate::harness::LaunchAttestationError::MalformedPermission
+        );
+    }
+
+    #[test]
     fn crew_launch_attestation_persists_separate_permission_axes() {
         let path = captains_tmp("crew-launch-attestation");
         let _ = std::fs::remove_file(&path);

@@ -162,6 +162,7 @@ pub enum LaunchAttestationError {
     MissingPermission,
     WrongPermission,
     ConflictingPermission,
+    MalformedPermission,
 }
 
 impl std::fmt::Display for LaunchAttestationError {
@@ -175,6 +176,9 @@ impl std::fmt::Display for LaunchAttestationError {
             Self::WrongPermission => "provider-native permission evidence has the wrong mode",
             Self::ConflictingPermission => {
                 "provider-native permission evidence contains conflicting modes"
+            }
+            Self::MalformedPermission => {
+                "provider-native permission evidence contains a malformed option"
             }
         };
         f.write_str(message)
@@ -444,17 +448,16 @@ pub(crate) fn leading_permission_options(
         if argument == "--" || !argument.starts_with('-') {
             break;
         }
-        let (flag, inline_value) = argument
-            .split_once('=')
-            .map_or((argument.as_str(), None), |(flag, value)| {
-                (flag, Some(value))
-            });
-        let takes_value = matches!(
-            flag,
-            "--sandbox" | "--ask-for-approval" | "--permission-mode"
-        );
-        if !takes_value {
+        let Some((flag, takes_value, inline_value)) = native_permission_option(argument) else {
             options.push((argument.as_str(), None));
+            index += 1;
+            continue;
+        };
+        if !takes_value {
+            if inline_value.is_some() {
+                return Err(LaunchAttestationError::MalformedPermission);
+            }
+            options.push((flag, None));
             index += 1;
             continue;
         }
@@ -474,6 +477,41 @@ pub(crate) fn leading_permission_options(
         index += consumed;
     }
     Ok(PermissionOptions { options })
+}
+
+fn native_permission_option(argument: &str) -> Option<(&'static str, bool, Option<&str>)> {
+    let (long_flag, inline_value) = argument
+        .split_once('=')
+        .map_or((argument, None), |(flag, value)| (flag, Some(value)));
+    let long = match long_flag {
+        "--dangerously-bypass-approvals-and-sandbox" => Some((
+            "--dangerously-bypass-approvals-and-sandbox",
+            false,
+            inline_value,
+        )),
+        "--sandbox" => Some(("--sandbox", true, inline_value)),
+        "--ask-for-approval" => Some(("--ask-for-approval", true, inline_value)),
+        "--yolo" => Some(("--yolo", false, inline_value)),
+        "--full-auto" => Some(("--full-auto", false, inline_value)),
+        "--dangerously-skip-permissions" => {
+            Some(("--dangerously-skip-permissions", false, inline_value))
+        }
+        "--permission-mode" => Some(("--permission-mode", true, inline_value)),
+        _ => None,
+    };
+    if long.is_some() {
+        return long;
+    }
+    for (short, canonical) in [("-s", "--sandbox"), ("-a", "--ask-for-approval")] {
+        if argument == short {
+            return Some((canonical, true, None));
+        }
+        if let Some(value) = argument.strip_prefix(short) {
+            let value = value.strip_prefix('=').unwrap_or(value);
+            return Some((canonical, true, Some(value)));
+        }
+    }
+    None
 }
 
 /// Safely single-quote `s` for a POSIX shell (the `startupCommand` runs inside

@@ -323,4 +323,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn permission_attestation_rejects_claude_flag_only_inline_values() {
+        let adapter = ClaudeHarness;
+        for evidence in [
+            HarnessProcessEvidence::test(
+                5,
+                50,
+                &["claude", "--dangerously-skip-permissions=false"],
+            ),
+            HarnessProcessEvidence::test(
+                5,
+                50,
+                &[
+                    "claude",
+                    "--dangerously-skip-permissions",
+                    "--dangerously-skip-permissions=false",
+                ],
+            ),
+        ] {
+            assert_eq!(
+                adapter
+                    .attest_permissions(&evidence, PermMode::BypassPermissions)
+                    .unwrap_err(),
+                LaunchAttestationError::MalformedPermission
+            );
+        }
+    }
 }

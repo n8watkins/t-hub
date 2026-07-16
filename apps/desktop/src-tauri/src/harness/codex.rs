@@ -380,4 +380,53 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn permission_attestation_normalizes_codex_short_aliases_and_rejects_inline_flags() {
+        let adapter = CodexHarness;
+        for evidence in [
+            HarnessProcessEvidence::test(
+                5,
+                50,
+                &[
+                    "codex",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "-s",
+                    "read-only",
+                ],
+            ),
+            HarnessProcessEvidence::test(
+                5,
+                50,
+                &[
+                    "codex",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "-a=never",
+                ],
+            ),
+            HarnessProcessEvidence::test(
+                5,
+                50,
+                &["codex", "--sandbox=read-only", "-sworkspace-write"],
+            ),
+        ] {
+            assert_eq!(
+                adapter
+                    .attest_permissions(&evidence, PermMode::BypassPermissions)
+                    .unwrap_err(),
+                LaunchAttestationError::ConflictingPermission
+            );
+        }
+        let malformed = HarnessProcessEvidence::test(
+            5,
+            50,
+            &["codex", "--dangerously-bypass-approvals-and-sandbox=false"],
+        );
+        assert_eq!(
+            adapter
+                .attest_permissions(&malformed, PermMode::BypassPermissions)
+                .unwrap_err(),
+            LaunchAttestationError::MalformedPermission
+        );
+    }
 }
