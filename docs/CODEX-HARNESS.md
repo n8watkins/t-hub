@@ -60,9 +60,25 @@ Explicit non-goal for Phase 1: `db.rs` orphan recovery stays Claude-keyed.
 
 | t-hub mode | Codex flags |
 |---|---|
-| `BypassPermissions` (crew default) | `--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check` |
+| `BypassPermissions` (Crew default) | `--dangerously-bypass-approvals-and-sandbox` |
 | `AcceptEdits` (approximate) | `--sandbox workspace-write` (no exact analog; network off by default, so no `git push`) |
 | `Default` / read | `--sandbox read-only` |
+
+`BypassPermissions` is the General-authorized default local execution mode for dispatched Codex and Claude Crew in this Captain fleet.
+For interactive Codex Crew, T-Hub must launch the provider with the native `--dangerously-bypass-approvals-and-sandbox` flag.
+The separate `--skip-git-repo-check` option is appended only to headless `codex exec` turns so they can run in newly created worktrees; it is not part of the permission map.
+Bypass is intentional full-worktree local authority without Codex approval prompts, but it does not expand the assigned card, files, worktree, branch, product scope, or external authority.
+Crew must still test, log through sanctioned exact-run surfaces, commit verified logical changes separately, and report exact evidence.
+Crew must not merge, push, install, deploy, publish, release, alter Powder authority, or decide product, security, destructive, spending, or outward-facing actions without the applicable Captain or General authorization.
+Crew must stop the affected path and escalate when scope, credentials, or authority are ambiguous.
+
+Dispatch success requires authoritative post-launch evidence from the foreground provider-native Codex process with the exact expected permission posture.
+T-Hub persists and returns that effective Harness permission separately from the Crew's T-Hub control capability and Powder claim.
+Missing, stale, conflicting, wrong-provider, wrapper-obscured, unreadable, or changed launch evidence fails closed and transactionally rolls back the terminal, Crew binding, and exact Powder claim.
+Before `exec` of today's unmirrored interactive Codex TUI, the owning pane invokes `t-hub-agent --codex-unobserved` so runtime health is visibly degraded, transport is unavailable, and status is unknown instead of falsely Working.
+Failure to establish that degraded marker prevents Codex launch.
+A future provider-native hook or trusted app-server mirror remains the structured telemetry path, and any later permission posture that is missing, unobserved, or changed must fail closed or remain visibly degraded until authoritative evidence restores confidence.
+Harness bypass is not Powder authorization, T-Hub control authority, or General authority.
 
 ## Provisioning
 

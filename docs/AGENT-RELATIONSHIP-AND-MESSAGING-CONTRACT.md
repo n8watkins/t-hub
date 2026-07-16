@@ -303,6 +303,7 @@ Crew must:
 7. Report exact tests, failed checks, residual risk, and final commit hashes honestly.
 8. Request review and completion rather than treating model-turn completion as card completion.
 9. Preserve protected files, unrelated changes, credentials, and other Captains' resources.
+10. Stop the affected path and escalate when scope, credentials, authority, product intent, security posture, destructive impact, or outward-facing impact is ambiguous.
 
 ## Permission and Authority Separation
 
@@ -310,9 +311,22 @@ Local execution permission and T-Hub control-plane capability are separate.
 A Crew may run its coding Harness with unrestricted local repository execution while retaining a read-capability T-Hub token that cannot spawn, type into, close, or control foreign terminals.
 A Captain may hold T-Hub control capability for its own ship without gaining authority over peer Captains.
 
+`BypassPermissions` is the explicitly authorized default local execution mode for dispatched Codex and Claude Crew in this Captain fleet.
+This default is intentional and grants the Harness full local execution authority inside the Crew's assigned worktree without provider approval prompts.
+It does not expand the Crew's card, file, worktree, branch, or product scope.
+Crew remain responsible for testing, exact-run work logging through sanctioned surfaces, separate verified commits, and honest reporting of commits, checks, failures, and residual risks.
+Crew must not merge, push, install, deploy, publish, release, alter Powder authority, or make product, security, destructive, spending, or outward-facing decisions unless the applicable Captain or General authority explicitly authorizes that exact action.
+
+Every dispatched Crew launch must use the selected provider's native bypass flag, attest the authoritative foreground provider process after launch, and persist and return the verified effective Harness permission mode.
+T-Hub must fail closed and transactionally roll back the terminal, Crew binding, and exact Powder claim when permission evidence is missing, stale, conflicting, wrong-provider, wrapper-obscured, unreadable, or changes before durable launch acceptance.
+When structured provider telemetry is unavailable or the permission posture cannot remain observed, T-Hub must expose a degraded or unknown state rather than implying that the Crew is safely working.
+An observed permission posture change after launch must fail closed or degrade visibly until authoritative provider-native evidence re-establishes the expected posture.
+
 A local Codex or Claude approval prompt does not by itself indicate a missing T-Hub role permission.
 T-Hub must display both the effective Harness permission mode and the T-Hub control capability clearly.
 No message, Powder card, work log, terminal location, or inherited environment variable may silently elevate either authority.
+Harness bypass, T-Hub control capability, Powder claims, and General authority are independent authority axes.
+Harness bypass is not Powder authorization and cannot claim, complete, release, or otherwise mutate a Powder run.
 
 ## End-to-End Work Lifecycle
 
