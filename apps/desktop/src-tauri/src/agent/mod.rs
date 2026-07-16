@@ -749,14 +749,25 @@ impl AgentBridge {
             .get("notification_type")
             .and_then(|v| v.as_str());
 
+        // Structured provider lifecycle events carry the exact tmux binding.
+        // Feed that binding into the existing session-to-terminal authority so
+        // fleet attention can resolve this provider session to its Crew tile.
+        if entry.payload.get("provider").and_then(|v| v.as_str()) == Some("codex") {
+            if let (Some(sid), Some(status_bridge)) = (session_id, self.inner.status.lock().clone())
+            {
+                status_bridge.ingest(sid, &entry.payload, entry.timestamp_ms);
+            }
+        }
+
         let affected = self.with_supervisor(|s| {
-            s.ingest(
+            s.ingest_with_payload(
                 session_id,
                 agent_id,
                 agent_type,
                 notification_type,
                 entry.event_type,
                 entry.timestamp_ms,
+                Some(&entry.payload),
             )
         });
 
@@ -773,7 +784,14 @@ impl AgentBridge {
     /// current reducer state. Public-in-crate so the status bridge / commands can
     /// re-emit a session after an out-of-band status change.
     pub(crate) fn emit_session(&self, session_id: &str) {
-        let (tree, status) = self.with_supervisor(|s| (s.tree(session_id), s.status(session_id)));
+        let (tree, status, runtime_health, permission_request) = self.with_supervisor(|s| {
+            (
+                s.tree(session_id),
+                s.status(session_id),
+                s.runtime_health(session_id),
+                s.permission_request(session_id),
+            )
+        });
         if let Some(tree) = tree {
             self.inner.emit(EVT_SUPERVISION, &tree);
         }
@@ -782,6 +800,8 @@ impl AgentBridge {
             &SessionStatusPayload {
                 session_id: session_id.to_string(),
                 status,
+                runtime_health,
+                permission_request,
             },
         );
         // Notify the fleet observer (if wired) so a supervised session's transition
@@ -1266,6 +1286,128 @@ mod tests {
             .unwrap();
         assert_eq!(tree_ev.1["sessionId"], "o1");
         assert_eq!(tree_ev.1["status"], "working");
+    }
+
+    #[test]
+    fn codex_permission_lifecycle_emits_typed_need_health_and_tile_binding() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        let status_bridge = Arc::new(crate::claude::StatusBridge::new());
+        bridge.set_emitter(Arc::new(rec.clone()));
+        bridge.set_status_bridge(Arc::clone(&status_bridge));
+        rec.events.lock().clear();
+
+        let make_entry = |seq, event_type, payload| EventJournalEntry {
+            seq,
+            timestamp_ms: seq * 10,
+            source: JournalSource::Agent,
+            entity_id: Some("thread-1".to_string()),
+            event_type,
+            payload,
+            result: None,
+        };
+        let request = make_entry(
+            1,
+            JournalEventType::PermissionRequest,
+            serde_json::json!({
+                "provider": "codex",
+                "provider_version": "0.144.4",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "lifecycle": "permission_requested",
+                "cwd": "/worktree",
+                "tmux_session": "th_crew0001",
+                "permission_request_id": "request-1",
+                "permission_request": {
+                    "schema_version": "t-hub.permission-request.v1",
+                    "id": "request-1",
+                    "kind": "command_execution",
+                    "provider": "codex",
+                    "provider_request_id": "request-1",
+                    "session_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "item_id": "item-1",
+                    "tool_name": "Bash",
+                    "requested_at_ms": 10
+                },
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "authoritative",
+                    "runtime_health": "ready"
+                }
+            }),
+        );
+        bridge.consume_journal_entry(&request);
+
+        let permission_status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(permission_status.1["status"], "needsPermission");
+        assert_eq!(
+            permission_status.1["permissionRequest"]["providerRequestId"],
+            "request-1"
+        );
+        assert_eq!(permission_status.1["runtimeHealth"]["health"], "ready");
+        assert_eq!(
+            status_bridge.terminal_for_session("thread-1").as_deref(),
+            Some("crew0001")
+        );
+
+        let disconnected = make_entry(
+            2,
+            JournalEventType::CoreAction,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "lifecycle": "telemetry_health",
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "stale",
+                    "runtime_health": "disconnected",
+                    "detail": "structured_stream_ended_mid_turn"
+                }
+            }),
+        );
+        bridge.consume_journal_entry(&disconnected);
+        let degraded_status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(degraded_status.1["status"], "needsPermission");
+        assert_eq!(degraded_status.1["runtimeHealth"]["health"], "disconnected");
+
+        let resolved = make_entry(
+            3,
+            JournalEventType::CoreAction,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "lifecycle": "permission_resolved",
+                "permission_request_id": "request-1",
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "authoritative",
+                    "runtime_health": "ready"
+                }
+            }),
+        );
+        bridge.consume_journal_entry(&resolved);
+        let resolved_status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(resolved_status.1["status"], "working");
+        assert!(resolved_status.1.get("permissionRequest").is_none());
     }
 
     /// The fleet status observer fires on the REAL journal-consume path (the
