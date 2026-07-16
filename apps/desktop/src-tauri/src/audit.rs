@@ -13,7 +13,7 @@
 //!   in-place edit breaks the chain and is detectable by a verifier that recomputes
 //!   forward. The chain is re-seeded from the last line on restart / day-rollover
 //!   so it stays continuous.
-//! - **Redaction**: `send_text` content is never written - only its length and a
+//! - **Redaction**: `send_text` content is never written — only its length and a
 //!   SHA-256 prefix — so the log cannot become a secret-harvesting oracle. `send_keys`
 //!   key names ARE logged (they are exactly the kill-pattern signal we want).
 //! - **Buffered + fsync-flushed** behind a mutex, written after the dispatch

@@ -44,7 +44,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -975,11 +975,14 @@ pub enum PowderWorkState {
     #[default]
     Active,
     CompletionPending {
+        #[serde(rename = "requestDigest", alias = "request_digest")]
         request_digest: String,
         since: u64,
     },
     Completed {
+        #[serde(rename = "requestDigest", alias = "request_digest")]
         request_digest: String,
+        #[serde(rename = "completedAt", alias = "completed_at")]
         completed_at: u64,
     },
 }
@@ -1345,6 +1348,14 @@ pub struct CaptainsRegistry {
     /// Serializes multi-step Captain provisioning so project uniqueness checks,
     /// ship claims, and project binding cannot interleave across requests.
     provision: Mutex<()>,
+    /// Serializes the evidence-read, pending transition, completion POST, and
+    /// verification sequence for each Crew binding. This is intentionally
+    /// in-memory: after a crash, the durable pending digest drives a fresh
+    /// evidence read before a same-proof retry.
+    completion_inflight: Mutex<std::collections::HashSet<String>>,
+    completion_ready: Condvar,
+    #[cfg(test)]
+    completion_waiters: AtomicUsize,
     /// Persistence target; `None` = in-memory only (unit tests / headless proofs).
     path: Option<PathBuf>,
     /// Set when a newer on-disk schema is encountered. The old binary may expose
@@ -1366,6 +1377,30 @@ pub struct CaptainsRegistry {
     /// blocked by it. `None` in every non-test path.
     #[cfg(test)]
     persist_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+struct CrewCompletionGuard<'a> {
+    registry: &'a CaptainsRegistry,
+    crew_session_id: String,
+    waited: bool,
+}
+
+impl CrewCompletionGuard<'_> {
+    fn waited(&self) -> bool {
+        self.waited
+    }
+}
+
+impl Drop for CrewCompletionGuard<'_> {
+    fn drop(&mut self) {
+        let mut inflight = self
+            .registry
+            .completion_inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inflight.remove(&self.crew_session_id);
+        self.registry.completion_ready.notify_all();
+    }
 }
 
 /// Normalize a caller-supplied ship name into a slug: lowercase, runs of
@@ -1390,12 +1425,41 @@ fn slugify_ship(name: &str) -> String {
 }
 
 impl CaptainsRegistry {
+    fn serialize_crew_powder_completion(&self, crew_session_id: &str) -> CrewCompletionGuard<'_> {
+        let mut inflight = self
+            .completion_inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut waited = false;
+        while inflight.contains(crew_session_id) {
+            waited = true;
+            #[cfg(test)]
+            self.completion_waiters.fetch_add(1, Ordering::SeqCst);
+            inflight = self
+                .completion_ready
+                .wait(inflight)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            #[cfg(test)]
+            self.completion_waiters.fetch_sub(1, Ordering::SeqCst);
+        }
+        inflight.insert(crew_session_id.to_string());
+        CrewCompletionGuard {
+            registry: self,
+            crew_session_id: crew_session_id.to_string(),
+            waited,
+        }
+    }
+
     /// An empty, in-memory registry (tests / headless proofs - no persistence).
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(CaptainsInner::default()),
             mutation: Mutex::new(()),
             provision: Mutex::new(()),
+            completion_inflight: Mutex::new(std::collections::HashSet::new()),
+            completion_ready: Condvar::new(),
+            #[cfg(test)]
+            completion_waiters: AtomicUsize::new(0),
             path: None,
             write_blocked: None,
             persist: Mutex::new(0),
@@ -1506,6 +1570,10 @@ impl CaptainsRegistry {
             inner: Mutex::new(inner),
             mutation: Mutex::new(()),
             provision: Mutex::new(()),
+            completion_inflight: Mutex::new(std::collections::HashSet::new()),
+            completion_ready: Condvar::new(),
+            #[cfg(test)]
+            completion_waiters: AtomicUsize::new(0),
             path: Some(path),
             write_blocked,
             persist: Mutex::new(loaded_seq),
@@ -2346,7 +2414,11 @@ impl CaptainsRegistry {
             .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
         let request_digest = match &binding.state {
             PowderWorkState::Active => observation_digest.to_string(),
-            PowderWorkState::CompletionPending { request_digest, .. } => request_digest.clone(),
+            PowderWorkState::CompletionPending { .. } => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' has a completion pending; exact same-proof recovery is required"
+                ));
+            }
             PowderWorkState::Completed { .. } => return Ok((crew.clone(), false)),
         };
         binding.state = PowderWorkState::Completed {
@@ -9197,9 +9269,14 @@ fn complete_crew_powder(
     )?;
     let crew_session_id = arg_str(args, "crewSessionId")
         .ok_or("complete_crew_powder requires a 'crewSessionId' argument")?;
+    let authorization_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    require_same_ship_captain(&authorization_scope, caller, "complete_crew_powder")?;
+    let proof = parse_completion_proof(args)?;
+    let completion_guard = ctx
+        .captains
+        .serialize_crew_powder_completion(&crew_session_id);
     let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
     require_same_ship_captain(&scope, caller, "complete_crew_powder")?;
-    let proof = parse_completion_proof(args)?;
     let digest = proof.digest();
     let was_pending = matches!(scope.work.state, PowderWorkState::CompletionPending { .. });
     let was_completed = matches!(scope.work.state, PowderWorkState::Completed { .. });
@@ -9244,8 +9321,14 @@ fn complete_crew_powder(
         BoundPowderReality::Active => {}
     }
     validate_completion_criteria(&card.criteria, &proof)?;
-    ctx.captains
+    let (_, transitioned_to_pending) = ctx
+        .captains
         .begin_crew_powder_completion(&crew_session_id, &digest)?;
+    if completion_guard.waited() && !transitioned_to_pending {
+        return Err(format!(
+            "Crew session '{crew_session_id}' completion remains pending after a concurrent request; retry the same proof after reviewing fresh evidence"
+        ));
+    }
     let completion = powder::CompletionProof {
         proof: proof.proof.clone(),
         criterion_proofs: proof
@@ -9384,9 +9467,11 @@ fn powder_cleanup_disposition(
 ) -> PowderCleanupDisposition {
     match (state, reality) {
         (PowderWorkState::Completed { .. }, _) => PowderCleanupDisposition::AlreadyCompleted,
-        (_, BoundPowderReality::Completed) => PowderCleanupDisposition::ObserveCompletion,
-        (PowderWorkState::CompletionPending { .. }, BoundPowderReality::Active) => {
+        (PowderWorkState::CompletionPending { .. }, _) => {
             PowderCleanupDisposition::AwaitCompletionRecovery
+        }
+        (PowderWorkState::Active, BoundPowderReality::Completed) => {
+            PowderCleanupDisposition::ObserveCompletion
         }
         (PowderWorkState::Active, BoundPowderReality::Active) => PowderCleanupDisposition::Release,
     }
@@ -20552,6 +20637,152 @@ mod tests {
     }
 
     #[test]
+    fn powder_schema_v4_migrates_to_v5_camel_case_with_snake_case_aliases() {
+        let path = captains_tmp("powder-v4-migration");
+        let backup = path.with_extension("json.bak");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+        drop(powder_lifecycle_registry(Some(path.clone())));
+
+        let mut schema_v4: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        schema_v4["schemaVersion"] = json!(4);
+        schema_v4["captains"][0]["crew"][0]["powderWork"]
+            .as_object_mut()
+            .unwrap()
+            .remove("state");
+        std::fs::write(&path, serde_json::to_vec_pretty(&schema_v4).unwrap()).unwrap();
+
+        let migrated = CaptainsRegistry::load(path.clone());
+        let loaded = migrated.snapshot();
+        assert_eq!(loaded.schema_version, CAPTAINS_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .state,
+            PowderWorkState::Active
+        );
+        let digest = "d".repeat(64);
+        migrated
+            .begin_crew_powder_completion("crew-powder", &digest)
+            .unwrap();
+
+        let mut pending: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(pending["schemaVersion"], CAPTAINS_SCHEMA_VERSION);
+        let pending_state = pending["captains"][0]["crew"][0]["powderWork"]["state"]
+            .as_object_mut()
+            .unwrap();
+        assert_eq!(pending_state.get("kind"), Some(&json!("completionPending")));
+        assert_eq!(pending_state.get("requestDigest"), Some(&json!(digest)));
+        assert!(pending_state.contains_key("since"));
+        assert!(!pending_state.contains_key("request_digest"));
+
+        let request_digest = pending_state.remove("requestDigest").unwrap();
+        pending_state.insert("request_digest".into(), request_digest);
+        std::fs::write(&path, serde_json::to_vec_pretty(&pending).unwrap()).unwrap();
+        let legacy_pending = CaptainsRegistry::load(path.clone());
+        assert!(matches!(
+            legacy_pending.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .state,
+            PowderWorkState::CompletionPending { .. }
+        ));
+        legacy_pending
+            .finish_crew_powder_completion("crew-powder", &digest)
+            .unwrap();
+
+        let mut completed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let completed_state = completed["captains"][0]["crew"][0]["powderWork"]["state"]
+            .as_object_mut()
+            .unwrap();
+        assert_eq!(completed_state.get("kind"), Some(&json!("completed")));
+        assert_eq!(completed_state.get("requestDigest"), Some(&json!(digest)));
+        assert!(completed_state.contains_key("completedAt"));
+        assert!(!completed_state.contains_key("request_digest"));
+        assert!(!completed_state.contains_key("completed_at"));
+
+        let request_digest = completed_state.remove("requestDigest").unwrap();
+        let completed_at = completed_state.remove("completedAt").unwrap();
+        completed_state.insert("request_digest".into(), request_digest);
+        completed_state.insert("completed_at".into(), completed_at);
+        std::fs::write(&path, serde_json::to_vec_pretty(&completed).unwrap()).unwrap();
+        let legacy_completed = CaptainsRegistry::load(path.clone()).snapshot();
+        assert!(matches!(
+            legacy_completed.captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .state,
+            PowderWorkState::Completed { .. }
+        ));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn powder_completion_serializes_same_crew_through_post_and_verification() {
+        use std::sync::mpsc;
+
+        let registry = Arc::new(CaptainsRegistry::new());
+        let post_count = Arc::new(AtomicUsize::new(0));
+        let pending = Arc::new(AtomicBool::new(false));
+        let (first_posted_tx, first_posted_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+
+        let first_registry = registry.clone();
+        let first_posts = post_count.clone();
+        let first_pending = pending.clone();
+        let first = std::thread::spawn(move || {
+            let guard = first_registry.serialize_crew_powder_completion("crew-powder");
+            assert!(!guard.waited());
+            let transitioned_to_pending = !first_pending.swap(true, Ordering::SeqCst);
+            if !guard.waited() || transitioned_to_pending {
+                first_posts.fetch_add(1, Ordering::SeqCst);
+                first_posted_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+            }
+        });
+        first_posted_rx.recv().unwrap();
+
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let (second_acquired_tx, second_acquired_rx) = mpsc::channel();
+        let second_registry = registry.clone();
+        let second_posts = post_count.clone();
+        let second_pending = pending.clone();
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            let guard = second_registry.serialize_crew_powder_completion("crew-powder");
+            second_acquired_tx.send(guard.waited()).unwrap();
+            let transitioned_to_pending = !second_pending.swap(true, Ordering::SeqCst);
+            if !guard.waited() || transitioned_to_pending {
+                second_posts.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        second_started_rx.recv().unwrap();
+        let wait_deadline = Instant::now() + Duration::from_secs(1);
+        while registry.completion_waiters.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < wait_deadline, "second call never queued");
+            std::thread::yield_now();
+        }
+        assert_eq!(post_count.load(Ordering::SeqCst), 1);
+
+        release_first_tx.send(()).unwrap();
+        assert!(second_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap());
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(post_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn powder_cleanup_distinguishes_same_run_completion_from_ordinary_release() {
         let registry = powder_lifecycle_registry(None);
         let ctx = test_ctx("cleanup").with_captains_registry(registry.clone());
@@ -20572,14 +20803,16 @@ mod tests {
             powder_cleanup_disposition(&PowderWorkState::Active, BoundPowderReality::Active),
             PowderCleanupDisposition::Release
         );
+        let pending = PowderWorkState::CompletionPending {
+            request_digest: "a".repeat(64),
+            since: 1,
+        };
         assert_eq!(
-            powder_cleanup_disposition(
-                &PowderWorkState::CompletionPending {
-                    request_digest: "a".repeat(64),
-                    since: 1,
-                },
-                BoundPowderReality::Active,
-            ),
+            powder_cleanup_disposition(&pending, BoundPowderReality::Active),
+            PowderCleanupDisposition::AwaitCompletionRecovery
+        );
+        assert_eq!(
+            powder_cleanup_disposition(&pending, BoundPowderReality::Completed),
             PowderCleanupDisposition::AwaitCompletionRecovery
         );
         let failed_release = json!({"released": false});
@@ -20647,10 +20880,62 @@ mod tests {
                 .contains("not Crew Project repository")
         );
 
-        let digest = "c".repeat(64);
+        let proof_a = parse_completion_proof(&json!({
+            "proof": "proof A",
+            "criterionProofs": [{
+                "criterion": 0,
+                "url": "https://example.test/proof-a"
+            }]
+        }))
+        .unwrap();
+        let digest = proof_a.digest();
         registry
             .begin_crew_powder_completion("crew-powder", &digest)
             .unwrap();
+        let (completed_b_card, completed_b_run) = powder_lifecycle_evidence(
+            "thub-powder-control-lifecycle",
+            "run-authoritative",
+            "t-hub",
+            "done",
+            "complete",
+            Some("proof B"),
+        );
+        assert!(
+            completion_matches_evidence(&scope, &completed_b_card, &completed_b_run, &proof_a,)
+                .unwrap_err()
+                .contains("does not match")
+        );
+        assert!(registry
+            .observe_crew_powder_completion("crew-powder", &observed_completion_digest(&scope))
+            .unwrap_err()
+            .contains("same-proof recovery"));
+        assert!(matches!(
+            registry.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .state,
+            PowderWorkState::CompletionPending { .. }
+        ));
+
+        let (mut completed_a_card, mut completed_a_run) = powder_lifecycle_evidence(
+            "thub-powder-control-lifecycle",
+            "run-authoritative",
+            "t-hub",
+            "done",
+            "complete",
+            Some("proof A"),
+        );
+        let proof_link = powder::EvidenceProofLink {
+            url: "https://example.test/proof-a".into(),
+            actor: "captain-powder".into(),
+            created_at: 124,
+        };
+        completed_a_card.criteria[0]
+            .proof_links
+            .push(proof_link.clone());
+        completed_a_run.criteria[0].proof_links.push(proof_link);
+        completion_matches_evidence(&scope, &completed_a_card, &completed_a_run, &proof_a).unwrap();
         registry
             .finish_crew_powder_completion("crew-powder", &digest)
             .unwrap();
@@ -20794,6 +21079,35 @@ mod tests {
             })
             .collect();
         card.work_log_total = card.work_log.len();
+        card.runs = (0..25)
+            .map(|index| powder::RunSummary {
+                run_id: format!("run-{index}"),
+                card_id: card.card_id.clone(),
+                state: "active".into(),
+                agent: "powder-agent".into(),
+                proof: None,
+                created_at: index,
+                updated_at: index,
+            })
+            .collect();
+        card.runs_total = card.runs.len();
+        let criteria = (0..9)
+            .map(|criterion| powder::CriterionEvidence {
+                criterion,
+                text: format!("Criterion {criterion}"),
+                checked_by: Some("captain-powder".into()),
+                checked_at: Some(123),
+                proof_links: (0..10)
+                    .map(|link| powder::EvidenceProofLink {
+                        url: format!("https://example.test/{criterion}/{link}"),
+                        actor: "captain-powder".into(),
+                        created_at: link,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        card.criteria = criteria.clone();
+        run.criteria = criteria;
         run.activities = (0..25)
             .map(|index| powder::EvidenceActivity {
                 activity_type: "work".into(),
@@ -20802,14 +21116,36 @@ mod tests {
             })
             .collect();
         run.activities_total = run.activities.len();
+        run.links = (0..25)
+            .map(|index| powder::EvidenceLink {
+                label: format!("link {index}"),
+                url: format!("https://example.test/link/{index}"),
+                created_at: index,
+            })
+            .collect();
+        run.links_total = run.links.len();
         let (card, run, truncated) = bounded_crew_evidence(&card, &run, 7);
         assert!(truncated);
         assert!(card.truncated);
         assert!(run.truncated);
         assert_eq!(card.work_log.len(), 7);
+        assert_eq!(card.runs.len(), 7);
+        assert_eq!(card.criteria.len(), 7);
+        assert!(card
+            .criteria
+            .iter()
+            .all(|criterion| criterion.proof_links.len() == 7));
         assert_eq!(run.activities.len(), 7);
+        assert_eq!(run.links.len(), 7);
+        assert_eq!(run.criteria.len(), 7);
+        assert!(run
+            .criteria
+            .iter()
+            .all(|criterion| criterion.proof_links.len() == 7));
         assert_eq!(card.work_log_total, 25);
+        assert_eq!(card.runs_total, 25);
         assert_eq!(run.activities_total, 25);
+        assert_eq!(run.links_total, 25);
     }
 
     #[test]
@@ -21000,6 +21336,101 @@ mod tests {
             ),
         );
         assert!(substituted.error.unwrap().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn powder_dispatch_audit_redacts_refused_and_failed_sensitive_requests() {
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-powder-dispatch-audit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry(None);
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx("powder-audit")
+            .with_identity_store(identities)
+            .with_captains_registry(registry)
+            .with_audit(Arc::new(AuditLog::new(dir.clone())));
+
+        let refused = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "read-powder-audit",
+                &captain,
+                "complete_crew_powder",
+                json!({
+                    "crewSessionId": "crew-powder",
+                    "proof": "SECRET refused overall proof",
+                    "criterionProofs": [{
+                        "criterion": 0,
+                        "url": "https://secret.example.test/refused"
+                    }]
+                }),
+            ),
+        );
+        assert!(!refused.ok);
+
+        let failed_completion = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "powder-audit",
+                &captain,
+                "complete_crew_powder",
+                json!({
+                    "crewSessionId": "crew-powder",
+                    "proof": "SECRET failed overall proof",
+                    "criterionProofs": [{
+                        "criterion": 0,
+                        "url": "https://secret.example.test/failed"
+                    }]
+                }),
+            ),
+        );
+        assert!(failed_completion
+            .error
+            .unwrap()
+            .contains("Powder profile unavailable"));
+
+        let failed_work_log = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "read-powder-audit",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"message": "SECRET failed work-log body"}),
+            ),
+        );
+        assert!(failed_work_log
+            .error
+            .unwrap()
+            .contains("Powder profile unavailable"));
+
+        let records = read_audit(&dir);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["decision"], "refused-authz");
+        assert_eq!(records[1]["decision"], "allowed");
+        assert_eq!(records[1]["error"]["redacted"], true);
+        assert_eq!(records[2]["decision"], "allowed");
+        assert_eq!(records[2]["error"]["redacted"], true);
+        let serialized = serde_json::to_string(&records).unwrap();
+        assert!(!serialized.contains("SECRET"));
+        assert!(!serialized.contains("secret.example.test"));
+        assert!(records[0]["args"]["proofSha256"].is_string());
+        assert!(records[0]["args"]["criterionProofs"][0]["urlSha256"].is_string());
+        assert!(records[2]["args"]["messageSha256"].is_string());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
