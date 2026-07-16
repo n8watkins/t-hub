@@ -8294,6 +8294,12 @@ fn validate_dispatch_card_repository(
     ))
 }
 
+fn crew_launch_argv(harness: Harness, prompt: &str) -> String {
+    harness
+        .adapter()
+        .fresh_argv_with_permissions(prompt, PermMode::BypassPermissions)
+}
+
 fn dispatch_crew(
     ctx: &ControlContext,
     args: &Value,
@@ -8404,7 +8410,7 @@ fn dispatch_crew(
         "You are Crew on ship '{}'. Work only Powder card '{}' in run '{}'. Task: {} Use checkout '{}'. Report progress, blockers, and completion to Captain session '{}'. Do not claim other work or spawn additional agents.",
         captain.ship_slug, claim.card_id, claim.run_id, task, checkout, captain_session_id
     );
-    let launch = harness.adapter().fresh_argv(&prompt);
+    let launch = crew_launch_argv(harness, &prompt);
     #[cfg(test)]
     let launch = arg_str(args, "testHarnessCommand").unwrap_or_else(|| launch.clone());
     if let Err(error) =
@@ -20145,6 +20151,21 @@ mod tests {
                 .unwrap_err(),
             "dispatch_crew: Powder card 'card-1' belongs to repository 'other-project', not 't-hub'"
         );
+    }
+
+    #[test]
+    fn dispatch_crew_launches_both_harnesses_with_explicit_unrestricted_permissions() {
+        let prompt = "work card";
+        let codex = crew_launch_argv(Harness::Codex, prompt);
+        let claude = crew_launch_argv(Harness::Claude, prompt);
+
+        assert_eq!(
+            codex,
+            "codex --dangerously-bypass-approvals-and-sandbox 'work card'"
+        );
+        assert_eq!(claude, "claude --dangerously-skip-permissions 'work card'");
+        assert_ne!(codex, Harness::Codex.adapter().fresh_argv(prompt));
+        assert_ne!(claude, Harness::Claude.adapter().fresh_argv(prompt));
     }
 
     #[test]
