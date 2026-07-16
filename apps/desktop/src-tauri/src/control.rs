@@ -12401,7 +12401,7 @@ impl ControlContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{mpsc, Mutex as StdMutex};
 
     /// Build a ControlContext backed by a real (empty) Supervisor + StatusBridge,
     /// with a fixed token, for dispatch tests.
@@ -20661,6 +20661,7 @@ mod tests {
     const LOOPBACK_POWDER_IO_TIMEOUT: Duration = Duration::from_secs(2);
     const LOOPBACK_POWDER_HANDLER_TIMEOUT: Duration = Duration::from_secs(4);
     const LOOPBACK_POWDER_SERVER_TIMEOUT: Duration = Duration::from_secs(8);
+    const LOOPBACK_POWDER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
     #[derive(Clone, Debug, Default)]
     struct LoopbackPowderState {
@@ -20678,9 +20679,9 @@ mod tests {
         post_started: std::sync::mpsc::Receiver<Value>,
         release_post: std::sync::mpsc::SyncSender<()>,
         result: std::sync::mpsc::Receiver<Result<LoopbackPowderState, String>>,
-        watchdog_cancel: std::sync::mpsc::SyncSender<()>,
+        stop: std::sync::mpsc::SyncSender<()>,
         thread: Option<std::thread::JoinHandle<()>>,
-        watchdog: Option<std::thread::JoinHandle<()>>,
+        joined_outcome: Option<Result<LoopbackPowderState, String>>,
     }
 
     impl LoopbackPowderServer {
@@ -20688,6 +20689,7 @@ mod tests {
             use std::sync::mpsc;
 
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
             let addr = listener.local_addr().unwrap();
             let state = Arc::new(StdMutex::new(LoopbackPowderState::default()));
             let (post_started_tx, post_started) = mpsc::sync_channel(1);
@@ -20695,78 +20697,74 @@ mod tests {
             let release_post_rx = Arc::new(StdMutex::new(Some(release_post_rx)));
             let server_state = state.clone();
             let (result_tx, result) = mpsc::sync_channel(1);
+            let (stop, stop_rx) = mpsc::sync_channel(1);
             let thread = std::thread::spawn(move || {
                 let mut handlers = Vec::new();
-                let accept_result = loop {
-                    let (mut stream, _) = match listener.accept() {
-                        Ok(accepted) => accepted,
-                        Err(error) => break Err(format!("loopback Powder accept failed: {error}")),
-                    };
-                    let request = match read_loopback_powder_request(&mut stream) {
-                        Ok(request) => request,
-                        Err(error) => break Err(error),
-                    };
-                    if request.path == "/shutdown" || request.path == "/watchdog-timeout" {
-                        let response = write_loopback_json(&mut stream, &json!({"ok": true}));
-                        break if request.path == "/watchdog-timeout" {
-                            Err("loopback Powder server exceeded its shutdown deadline".into())
-                        } else {
-                            response
-                        };
+                let deadline = Instant::now() + LOOPBACK_POWDER_SERVER_TIMEOUT;
+                let accept_result = 'server: loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break Err("loopback Powder server exceeded its deadline".to_string());
                     }
-                    let state = server_state.clone();
-                    let post_started_tx = post_started_tx.clone();
-                    let release_post_rx = release_post_rx.clone();
-                    let handler = std::thread::spawn(move || {
-                        handle_loopback_powder_request(
-                            stream,
-                            request,
-                            &state,
-                            &post_started_tx,
-                            &release_post_rx,
-                        )
-                    });
-                    handlers.push(handler);
+                    match stop_rx.recv_timeout(remaining.min(LOOPBACK_POWDER_POLL_INTERVAL)) {
+                        Ok(()) => break Ok(()),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            break Err("loopback Powder stop channel disconnected".to_string());
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    loop {
+                        let (mut stream, _) = match listener.accept() {
+                            Ok(accepted) => accepted,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => {
+                                break 'server Err(format!(
+                                    "loopback Powder accept failed: {error}"
+                                ));
+                            }
+                        };
+                        let request = match read_loopback_powder_request(&mut stream) {
+                            Ok(request) => request,
+                            Err(error) => break 'server Err(error),
+                        };
+                        let state = server_state.clone();
+                        let post_started_tx = post_started_tx.clone();
+                        let release_post_rx = release_post_rx.clone();
+                        let handler = std::thread::spawn(move || {
+                            handle_loopback_powder_request(
+                                stream,
+                                request,
+                                &state,
+                                &post_started_tx,
+                                &release_post_rx,
+                            )
+                        });
+                        handlers.push(handler);
+                    }
                 };
-                let request_count_error = (handlers.len() != expected_requests).then(|| {
-                    format!(
+                let mut errors = Vec::new();
+                if let Err(error) = accept_result {
+                    errors.push(error);
+                }
+                if handlers.len() != expected_requests {
+                    errors.push(format!(
                         "loopback Powder request count mismatch: expected {expected_requests}, received {}",
                         handlers.len()
-                    )
-                });
-                let mut handler_error = None;
+                    ));
+                }
                 for handler in handlers {
                     match handler.join() {
                         Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            handler_error.get_or_insert(error);
-                        }
-                        Err(_) => {
-                            handler_error.get_or_insert_with(|| {
-                                "loopback Powder request handler panicked".to_string()
-                            });
-                        }
+                        Ok(Err(error)) => errors.push(error),
+                        Err(_) => errors.push("loopback Powder request handler panicked".into()),
                     }
                 }
-                let outcome = accept_result.and_then(|()| {
-                    if let Some(error) = request_count_error {
-                        return Err(error);
-                    }
-                    if let Some(error) = handler_error {
-                        return Err(error);
-                    }
+                let outcome = if errors.is_empty() {
                     Ok(server_state.lock().unwrap().clone())
-                });
+                } else {
+                    Err(errors.join("; "))
+                };
                 let _ = result_tx.send(outcome);
-            });
-            let (watchdog_cancel, watchdog_cancel_rx) = mpsc::sync_channel(1);
-            let watchdog = std::thread::spawn(move || {
-                if watchdog_cancel_rx
-                    .recv_timeout(LOOPBACK_POWDER_SERVER_TIMEOUT)
-                    .is_err()
-                {
-                    let _ = send_loopback_powder_shutdown(addr, "/watchdog-timeout");
-                }
             });
             Self {
                 addr,
@@ -20774,41 +20772,58 @@ mod tests {
                 post_started,
                 release_post,
                 result,
-                watchdog_cancel,
+                stop,
                 thread: Some(thread),
-                watchdog: Some(watchdog),
+                joined_outcome: None,
             }
         }
 
         fn finish(mut self) -> Result<LoopbackPowderState, String> {
-            let shutdown = send_loopback_powder_shutdown(self.addr, "/shutdown");
-            if shutdown.is_ok() {
-                let _ = self.watchdog_cancel.try_send(());
+            self.shutdown_and_join()
+        }
+
+        fn shutdown_and_join(&mut self) -> Result<LoopbackPowderState, String> {
+            if let Some(outcome) = self.joined_outcome.as_ref() {
+                return outcome.clone();
             }
-            let watchdog_result = self
-                .watchdog
-                .take()
-                .unwrap()
-                .join()
-                .map_err(|_| "loopback Powder watchdog panicked".to_string());
-            // The accept loop has been woken by the explicit shutdown or bounded
-            // watchdog. Every accepted socket and handler also has its own
-            // deadline, so this direct join cannot wait on unbounded work and no
-            // timeout path can detach an owned server thread.
-            let server_result = self
-                .thread
-                .take()
-                .unwrap()
-                .join()
-                .map_err(|_| "loopback Powder server panicked".to_string());
-            let outcome = self
-                .result
-                .recv_timeout(LOOPBACK_POWDER_IO_TIMEOUT)
-                .map_err(|_| "loopback Powder server returned without a result".to_string());
-            watchdog_result?;
-            server_result?;
-            shutdown?;
-            outcome?
+            let mut errors = Vec::new();
+            match self.stop.try_send(()) {
+                Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
+                Err(mpsc::TrySendError::Disconnected(())) => {
+                    errors.push("loopback Powder stop channel disconnected".to_string());
+                }
+            }
+            if let Some(thread) = self.thread.take() {
+                if thread.join().is_err() {
+                    errors.push("loopback Powder server panicked".to_string());
+                }
+            }
+            let mut state = None;
+            match self.result.try_recv() {
+                Ok(Ok(result)) => state = Some(result),
+                Ok(Err(error)) => errors.push(error),
+                Err(mpsc::TryRecvError::Empty) => {
+                    errors.push("loopback Powder server returned without a result".to_string());
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    errors.push("loopback Powder result channel disconnected".to_string());
+                }
+            }
+            let outcome = if !errors.is_empty() {
+                Err(errors.join("; "))
+            } else if let Some(state) = state {
+                Ok(state)
+            } else {
+                Err("loopback Powder shutdown succeeded without state".to_string())
+            };
+            self.joined_outcome = Some(outcome.clone());
+            outcome
+        }
+    }
+
+    impl Drop for LoopbackPowderServer {
+        fn drop(&mut self) {
+            let _ = self.shutdown_and_join();
         }
     }
 
@@ -20816,19 +20831,6 @@ mod tests {
         method: String,
         path: String,
         body: Value,
-    }
-
-    fn send_loopback_powder_shutdown(addr: SocketAddr, path: &str) -> Result<(), String> {
-        let mut stream = TcpStream::connect_timeout(&addr, LOOPBACK_POWDER_IO_TIMEOUT)
-            .map_err(|error| format!("loopback Powder shutdown connect failed: {error}"))?;
-        stream
-            .set_write_timeout(Some(LOOPBACK_POWDER_IO_TIMEOUT))
-            .map_err(|error| format!("loopback Powder shutdown timeout failed: {error}"))?;
-        write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .map_err(|error| format!("loopback Powder shutdown write failed: {error}"))?;
-        stream
-            .flush()
-            .map_err(|error| format!("loopback Powder shutdown flush failed: {error}"))
     }
 
     fn get_loopback_powder(addr: SocketAddr, path: &str) -> Result<Value, String> {
@@ -21108,6 +21110,15 @@ mod tests {
 
     #[test]
     fn powder_loopback_server_bounds_shutdown_and_reports_request_count_drift() {
+        let mut clean = LoopbackPowderServer::start(0);
+        let first = clean.shutdown_and_join().unwrap();
+        let second = clean.shutdown_and_join().unwrap();
+        assert_eq!(first.completion_posts, second.completion_posts);
+        drop(clean);
+
+        let dropped_without_finish = LoopbackPowderServer::start(0);
+        drop(dropped_without_finish);
+
         let missing = LoopbackPowderServer::start(1);
         assert!(missing
             .finish()
