@@ -22432,6 +22432,95 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_combined_real_agent_marks_exact_codex_crew_before_provider_exec() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_combined_real_agent_marks_exact_codex_crew_before_provider_exec: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let Some(agent_path) = std::env::var_os("T_HUB_REAL_AGENT_BIN") else {
+            eprintln!(
+                "dispatch_combined_real_agent_marks_exact_codex_crew_before_provider_exec: T_HUB_REAL_AGENT_BIN not set - skipping"
+            );
+            return;
+        };
+        let agent_path = PathBuf::from(agent_path).canonicalize().unwrap();
+        assert!(agent_path.is_file(), "real combined agent must be a file");
+
+        let server = LoopbackPowderServer::start(3);
+        let profile_name = format!("dispatch-real-agent-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, _) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let journal_dir = std::env::temp_dir().join(format!(
+            "t-hub-combined-agent-journal-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let agent_path = agent_path.to_string_lossy();
+        let journal_path = journal_dir.to_string_lossy();
+        let agent_command = format!(
+            "{} --codex-unobserved --journal-dir {}",
+            crate::harness::sh_single_quote(&agent_path),
+            crate::harness::sh_single_quote(&journal_path)
+        );
+
+        let result = dispatch_crew(
+            &ctx,
+            &json!({
+                "captainSessionId": captain.session_id,
+                "cardId": "thub-powder-control-lifecycle",
+                "task": "Verify the combined real Codex observer launch",
+                "harness": "codex",
+                "testHarnessCommand": provider.command,
+                "testCodexUnobservedCommand": agent_command,
+            }),
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result["effectiveHarnessPermission"], "bypassPermissions");
+        let crew_session_id = result["crew"]["terminalId"].as_str().unwrap();
+        let expected_tmux_session = tmux_target(crew_session_id);
+        assert_eq!(
+            tmux::session_liveness(&expected_tmux_session),
+            tmux::SessionLiveness::Alive
+        );
+
+        let event_path = journal_dir.join("events.ndjson");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !event_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "real combined agent did not write its degraded marker"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let journal = std::fs::read_to_string(&event_path).unwrap();
+        let entries = journal.lines().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "launch must write exactly one marker");
+        let entry: t_hub_protocol::EventJournalEntry = serde_json::from_str(entries[0]).unwrap();
+        assert_eq!(
+            entry.event_type,
+            t_hub_protocol::JournalEventType::CoreAction
+        );
+        assert_eq!(entry.payload["tmux_session"], expected_tmux_session);
+        assert_eq!(entry.payload["telemetry"]["runtime_health"], "degraded");
+        assert_eq!(entry.payload["telemetry"]["transport"], "unavailable");
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 0);
+        tmux::kill_session_tree(&tmux_target(crew_session_id)).unwrap();
+        let _ = std::fs::remove_dir_all(journal_dir);
+    }
+
+    #[test]
     fn dispatch_restart_rejects_contender_without_releasing_successful_winner() {
         if !tmux_process_tests_available() {
             eprintln!(
