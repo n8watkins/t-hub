@@ -71,6 +71,10 @@ After commissioning, the Captain can:
 - Send verified input, focus a Crew terminal, checkpoint recovery state, interrupt its own Crew, and close completed Crew safely.
 - Message another Captain for coordination or technical help without gaining authority over that Captain or its Crew.
 
+Captain-authorized card authoring is the target contract rather than an installed capability.
+Installed `0.3.103` has no sanctioned card-create operation, so the General currently must create routine implementation cards manually.
+The T4 plan item adds card create, update, relation, proof-plan, and status operations over Powder's generic API through the shared backend, CLI, MCP, and UI catalog.
+
 Six concurrent Crew is the initial operating default for this computer rather than a proven hard limit.
 Packaged 1, 4, 8, and 16-session measurements must establish warning and queue thresholds before T-Hub enforces a resource cap.
 Durable Crew are leaf workers and do not create more durable Crew.
@@ -147,6 +151,9 @@ It releases claims and marks Crew removed when tmux proves the terminal is gone.
 It makes no lease mutation when terminal liveness is ambiguous.
 Closing a Crew terminal also attempts to release its Powder claim after the process tree is stopped.
 
+Completion, renewal, heartbeat, release, close, cleanup, and reconciler work must be serialized through one per-Crew lifecycle-operation guard.
+Automated completion must remain disabled until Powder can enforce the expected current run atomically and T-Hub can reconcile ambiguous results without duplicate effects.
+
 ## Event Synchronization
 
 T-Hub polls Powder's read-authorized `/api/v1/events/tail` SSE endpoint every 15 seconds by default.
@@ -177,8 +184,30 @@ After an app restart, the reconciler reads `captains.json` and resumes lease man
 After a Codex or Claude reset, the Captain calls `captain_bootstrap` using its ship slug or current terminal ID before accepting work.
 No claim is inferred from local state alone, and no new Powder-backed Crew is dispatched while the Powder API is unavailable.
 
+## Generic Powder Dependencies
+
+The initial integration could use Powder's existing read, claim, heartbeat, renew, and release operations without changing Powder.
+The dedicated architecture review found that safe automated evidence and completion need generic Powder guarantees that the current API does not provide.
+These are concurrency and audit-integrity improvements for every Powder client rather than T-Hub-specific accommodations.
+
+Powder must provide:
+
+- Server-enforced run-bound conditional completion with a durable operation identity and idempotent replay.
+- Operation-status recovery for ambiguous work-log and completion responses.
+- Current-run work-log attribution with the normalized stored record returned authoritatively.
+- Current-run acceptance-criterion scope with authenticated reviewer identity.
+- A versioned create-only or equivalent non-overwriting repository operation before any client implements create-if-absent.
+- Idempotency, operation recovery, authorization, and revision preconditions for card create, update, relation, proof-plan, and status mutations where the existing contracts do not already provide them.
+- Complete versioned event documentation, including the existing `work-log-appended` event and its compatibility expectations.
+
+T-Hub owns the policy and integration around those primitives.
+T-Hub must preserve exact Project, Assignment, Captain, Crew, card, run, terminal, and worktree authority, bound responses, role-filtered access, retry recovery, packaged UX, and fail-closed behavior.
+T-Hub must not implement a read-then-write approximation for a missing Powder precondition.
+The authoritative dependency IDs, acceptance gates, and proposed cards are recorded under **Review-Derived Change Boundary** in [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md).
+
 ## Upstream Notes
 
-No Powder code changes are required for this integration.
+No Powder changes are required for T-Hub identity, terminals, Workspaces, Harness adapters, inbox messaging, board relevance, UI, performance, or runtime cleanup.
+Generic Powder changes are required for the safe conditional and retry contracts listed above before T-Hub enables automated completion or create-if-absent board provisioning.
 Powder's `work-log-appended` event exists in code but is not listed in `docs/card-events-v1.md`; that documentation gap should be corrected upstream before T-Hub depends on the event contract.
 T-Hub does not branch on that event name, so the documentation gap does not affect generic event synchronization.

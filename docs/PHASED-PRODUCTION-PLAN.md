@@ -59,6 +59,11 @@ The user artifacts `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` must remain untou
 23. Agent authority, supervision, evidence, dialogue, escalation, review, and completion follow [AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md).
 24. This phased plan governs strategy and dependencies, Powder is the executable backlog and work ledger, T-Hub inbox messages carry durable dialogue, lifecycle events carry attention and runtime transitions, and Git plus verification artifacts provide technical proof.
 25. Terminal typing is an inspected compatibility path rather than an authoritative message or acknowledgement channel.
+26. Every material review finding belongs in this plan even when its implementation is deferred, while only independently executable near-term units belong on the Powder backlog.
+27. A change belongs in Powder only when it improves Powder's generic ledger, concurrency, authorization, or retry contract for every client rather than accommodating a T-Hub-specific workflow.
+28. T-Hub must fail closed when a required Powder guarantee is unavailable and must not simulate that guarantee with a read-then-write race.
+29. Every changed packaged build receives a new version across all authoritative version files before it is built, and one version may identify only one exact source commit.
+30. Focused regression tests run during implementation, while the comprehensive quality gate runs at integration, pull-request, packaged-acceptance, and release boundaries.
 
 ## Roadmap, Backlog, and Runtime Evidence
 
@@ -76,6 +81,110 @@ Lifecycle events provide event-driven attention and runtime-health transitions w
 Git, tests, review, builds, and packaged acceptance remain the technical proof layer.
 The current handoff records the verified resume point across roadmap, backlog, runtime, and technical evidence.
 
+## Review-Derived Change Boundary
+
+The dedicated roadmap, installed-product, and architecture review completed on 2026-07-15.
+The review did not mutate source, runtime, terminals, Powder state, or the active Captain integration.
+It found one Critical staged completion race, several High durability and orchestration gaps, and deferred product and release work that must remain visible from the earliest planning stage.
+
+The review uses three ownership categories.
+
+- **Powder generic** means Powder must provide a server-enforced capability that is correct for every concurrent or retrying client.
+- **T-Hub** means T-Hub owns orchestration policy, durable identity, runtime control, client recovery, user experience, and packaged acceptance.
+- **Cross-repository** means Powder supplies the generic primitive and T-Hub consumes it without adding a local workaround.
+
+Agent orchestration exposed the highest-risk races because Captains and Crew create concurrent claims, retries, and ambiguous network outcomes.
+The Powder-generic findings are not caused only by agents and remain worthwhile for CI runners, human operators, integrations, and any other concurrent Powder clients.
+The T-Hub findings are primarily orchestration-product responsibilities and should not be pushed into Powder.
+
+### Powder-Generic Change Register
+
+| ID | Required generic change | Why it is broadly useful | Orchestration relationship | Dependency and exit condition | Recommended Powder card |
+| --- | --- | --- | --- | --- | --- |
+| P1 | Add server-enforced run-bound conditional completion that accepts the card, expected current run, operation identity, and proof. | Prevents an old worker or delayed request from completing a newly claimed run. | Exposed by Crew reclamation, but applies to every concurrent worker. | Blocks automated T-Hub completion and Phase 8A exit or shipment, while fail-closed scaffolding may proceed, until run A can never complete run B and replay is idempotent. | `powder-run-bound-conditional-completion` |
+| P2 | Add durable idempotency and operation-status recovery for work-log append and completion mutations. | Makes timeouts and lost responses safely retryable without duplicate evidence or effects. | Frequent in agent workflows, but generic distributed-system correctness. | Blocks retry-safe T-Hub work-log and completion claims until response loss can be reconciled by operation ID. | `powder-mutation-idempotency` |
+| P3 | Enforce current-run attribution for work logs and return the normalized stored record as the authoritative result. | Prevents stale workers from attaching evidence to another run and makes server redaction compatible with clients. | Crew supply run evidence, but the audit-integrity rule is client-agnostic. | Blocks final evidence acceptance until stale-run append fails and normalized responses are documented and versioned. | `powder-run-bound-work-logs` |
+| P4 | Define run-scoped acceptance-criterion review semantics with authenticated reviewer identity and current-run proof. | Prevents stale or arbitrary criterion checks from being presented as current approval. | Captain review motivates the requirement, but any approval workflow needs trustworthy attribution. | Blocks proof-based automated completion until criterion checks are tied to the intended run and authorized reviewer. | `powder-run-scoped-criteria` |
+| P5 | Add a versioned create-only or conditional repository operation that never overwrites a concurrently created board. | Provides safe create-if-absent semantics for every provisioning client. | Needed by automatic Project onboarding, but useful to all Powder automation. | Blocks automatic board creation, but not manual selection or binding, until a server-enforced non-overwrite precondition exists. | `powder-conditional-repository-create` |
+| P6 | Verify idempotency, operation recovery, and revision preconditions for card create, update, relation, proof-plan, and status mutations, adding generic guarantees where absent. | Prevents duplicate cards and lost concurrent edits after retries, response loss, or multiple writers. | Captains author cards frequently, but every automated backlog client needs the same mutation safety. | T-Hub Captain card authoring may use each existing operation only after that operation satisfies this gate. | `powder-card-authoring-preconditions` |
+| P7 | Document the complete versioned Powder event contract, including the existing `work-log-appended` event and its compatibility expectations. | Lets every event consumer distinguish supported events from implementation details. | T-Hub discovered the gap, but it affects every event-stream client. | T-Hub may remain event-name agnostic, but it must not depend on undocumented event-specific behavior. | `powder-card-event-contract-docs` |
+
+These changes must be designed and reviewed in the Powder repository as generic API and storage contracts.
+T-Hub must not patch or fork Powder behavior locally to make acceptance pass.
+
+### T-Hub Change Register
+
+| ID | Required T-Hub change | Phase | Orchestration-specific | Dependency or exit condition | Recommended T-Hub card |
+| --- | --- | --- | --- | --- | --- |
+| T1 | Keep automated Powder completion disabled and fail closed until P1 through P4 are available, then send and verify exact card, run, operation, criterion, and proof identity. | 8A | Yes | No card-only completion may ship. | `thub-powder-run-bound-mutations` |
+| T2 | Serialize complete, renew, heartbeat, release, close, cleanup, and reconciler actions with one per-Crew lifecycle-operation guard. | 2 and 8A | Yes | Barrier-controlled concurrency tests prove no stale renewal or release can cross completion. | `thub-powder-lifecycle-serialization` |
+| T3 | Reconcile ambiguous work-log and completion responses by operation ID, accept Powder's authoritative normalized record, and reject stale-run evidence. | 5 and 8A | Yes | Depends on P2 and P3; retries must never duplicate evidence. | `thub-powder-evidence-recovery` |
+| T4 | Expose Captain-authorized Powder card create, update, relation, proof-plan, and status operations through the shared backend, CLI, MCP, and UI catalog. | 5, 7, and 8 | Yes | Each mutation depends on its P6 idempotency, recovery, authorization, and revision-precondition gate. | `thub-captain-card-authoring` |
+| T5 | Make Captain creation one idempotent, observable, resumable transaction with a stable request ID and operation-status recovery. | 7 | Yes | Double-click, timeout, lost response, dialog close, refresh, restart, and retry create at most one Project and Captain. | `thub-captain-creation-recovery` |
+| T6 | Match Powder boards by canonical repository identity, recommend only relevant boards, auto-bind one unambiguous match, and create only through P5 when none exists. | 7 and 9 | Partly | Unrelated boards remain behind an Advanced path and never become the default. | `thub-board-relevance-auto-bind` |
+| T7 | Implement durable Assignment identity and allow multiple Captains in one Project without Workspace, terminal, Crew, or migration collisions. | 3 | Yes | Two distinct Assignments survive restart and retain separate ownership. | `thub-multi-captain-assignment-registry` |
+| T8 | Route Powder events by exact Project, Assignment, card, run, Crew, and Workspace ownership instead of selecting the first Captain. | 3, 6, and 8B | Yes | Depends on T7; unowned and conflicting events stay visible and replay remains idempotent. | `thub-powder-event-owner-router` |
+| T9 | Make inbox persistence fail atomic so enqueue, delivery, read, acknowledgement, and transition success are returned only after durable storage succeeds. | 6 | Yes | Injected create, write, flush, rename, reopen, and restart failures never lose acknowledged state. | `thub-inbox-fail-atomic-durability` |
+| T10 | Bound inbox UTF-8 bodies, standard and Emergency capacity, retention, backpressure, and overflow states. | 6 and 12 | Yes | Emergency priority may not create unbounded memory or disk growth. | `thub-inbox-bounds-retention` |
+| T11 | Derive backend, CLI, MCP, and UI operation schemas from one actor-aware catalog with role-filtered discovery and parity tests. | 5 | Yes | CLI remains canonical; MCP stays a thin optional adapter and cannot expose an unfiltered static catalog. | `thub-shared-operation-catalog` |
+| T12 | Bound control-server JSON frames before parsing or authentication and test oversized and unterminated requests. | 1 and 12 | No | A local peer cannot cause unbounded allocation or exhaust all connection slots. | `thub-control-frame-bounds` |
+| T13 | Reproduce and eliminate the installed callback-ID, IPC fallback, frontend mount, and duplicate background-scan storm, then rerun the duplicate Codex transcript and composer-draft regression. | 1, 9, and 11 | No | A 30-minute packaged stress run has zero missing callbacks, IPC fallbacks from stale callbacks, mount hangs, equivalent duplicate in-flight scans, duplicate transcript frames, or repeated composer text. | `thub-frontend-ipc-scan-storm` |
+| T14 | Put Provider limits and History behind singleton stale-while-revalidate services that retain last-known data through transient backend and WSL failure. | 9 and 11 | No | Refresh, remount, and Workspace switching never blank previously valid usage or History. | `thub-usage-history-cache` |
+| T15 | Disable unsafe account-level Codex auto-continue and implement exact-thread durable scheduling, deduplication, cancellation, restart recovery, and visible failure. | 4 and 9 | Yes | One provider reset can never submit continuation text to multiple or uncertain Codex sessions. | `thub-codex-exact-thread-continue` |
+| T16 | Reproduce and repair Full Board in the installed application, provide a Project-filtered native expansion, and label any external Powder board as global. | 9 | No | Packaged Windows E2E proves browser launch, authentication, focus, unreachable handling, and credential-free URLs. | `thub-full-board-packaged-e2e` |
+| T17 | Make Crew completion, Captain waiting or completion, claim release, run release, terminal retirement, and owned-worktree cleanup reflect authoritative evidence. | 2, 8, and 10 | Yes | Completed Crew and Captains do not remain falsely Working and no stale claims or disposable sessions remain. | `thub-captain-crew-terminal-state` |
+| T18 | Implement the unified worktree status and ownership service before enabling automatic deletion or retirement cleanup. | 2 and 3 | Yes | Every cleanup decision uses one backend snapshot and fails closed under identity, freshness, or ownership uncertainty. | `thub-worktree-status-service` |
+| T19 | Add bounded dual-provider History discovery, collision-safe durable joins, exact resume identity, archive semantics, and user-facing Codex History. | 4 and 9 | Partly | Identical cwd values never merge different conversations and both Harnesses survive restart. | `thub-history-provider-parity` |
+| T20 | Normalize Codex and Claude needs-input, completion, failure, and recovery events into one audible voice and notification path. | 4 and 10 | Yes | Real packaged audible tests cover both Harnesses, duplicate suppression, engine failure, and disabled settings. | `thub-provider-voice-parity` |
+| T21 | Complete packaged Windows folder-picker acceptance for cancellation, path conversion, inaccessible paths, distro mismatch, junctions, and symlinks. | 7 and 9 | No | The graphical picker and conversational flow resolve the same safe WSL path identity. | `thub-folder-picker-packaged-e2e` |
+| T22 | Verify Claude header identity persistence across Refresh, remount, restart, and conversation resume. | 4 and 9 | Yes | Header text remains bound to the same durable session identity. | `thub-claude-header-acceptance` |
+| T23 | Add a durable Project run profile with typed package root, command, environment readiness, port policy, and preview URL rules. | 9 | No | Chat or agents may propose a profile, but only validated and explicitly accepted typed configuration can execute. | `thub-run-target-resolution` |
+| T24 | Define numeric input, visual-switch, cold-restore, first-feedback, process, memory, and scan-deduplication budgets and extend the packaged 1, 4, 8, and 16 matrix. | 11 | No | Release performance conclusions include input readiness and Workspace switching, not only CPU and process counts. | `thub-performance-budgets-matrix` |
+| T25 | Split the control plane into owned modules without changing public behavior or bypassing the shared catalog and lifecycle guards. | 2, 5, and 12 | No | New control-plane growth no longer concentrates in the approximately 21,000-line `control.rs`. | `thub-control-modularization` |
+| T26 | Reconcile phase status, dependency edges, reduced test cadence, global version policy, stale handoff state, and accepted messaging-contract integration. | Plan governance | No | A zero-context session can name the earliest unblocked phase and exact active cards without conversation history. | `thub-plan-status-and-cadence-reconcile` |
+| T27 | Consolidate devtools and capability reduction, MSRV, license, security, privacy, support, runbook, backup, reset, diagnostics export, corruption, disk-full, and operator support gates. | 12 | No | Production acceptance cannot pass while required operational or public documents and recovery paths are absent. | `thub-release-readiness-consolidation` |
+| T28 | Review diagnostic and event-journal retention, including the observed approximately 46.9 MB event journal, and define bounded ownership and cleanup. | 11 and 12 | No | Long-running use has no unbounded log, journal, queue, handle, socket, process, or memory trend. | `thub-journal-retention` |
+| T29 | Make `th health --json` report honest Windows and WSL host telemetry, including explicit unsupported or unavailable fields instead of a healthy all-zero skeleton. | 1, 5, and 10 | No | Health output cannot claim success when the requested host metrics were never collected. | `thub-health-host-telemetry` |
+| T30 | Make control clients recover stale endpoints promptly with one bounded overall deadline, visible retry state, and no inherited-port delay. | 1 and 5 | No | Capability, health, and list calls recover or return a structured timeout without a 30-to-45-second ambiguous hang. | `thub-control-client-deadline` |
+
+The change register is authoritative planning input even before its cards are created.
+Powder cards should be created only when their lane is near-term, bounded, dependency-ready, and assigned to an isolated worktree with an explicit exit gate.
+Review findings must not disappear merely because a card is deferred, completed, superseded, or cleaned from the active board.
+
+### Cross-Repository Dependency Order
+
+1. P1 through P4 define safe evidence and completion primitives in Powder.
+2. T1 through T3 consume those primitives and keep installed automation fail closed until they pass.
+3. P5 optionally enables safe automatic board creation, while T6 continues to support safe selection and binding without it.
+4. P6 verifies every Captain-authoring mutation independently, and T4 may expose only the operations whose generic idempotency, recovery, authorization, and revision-precondition gates pass.
+5. P7 documents the versioned event contract before T-Hub or another client depends on event-specific behavior.
+6. T7 establishes Assignment ownership before T8 activates multi-Captain event routing.
+7. T9 and T10 make the inbox safe before Phase 6 messaging activation or Phase 8B messaging acceptance.
+8. T11 supplies CLI-first parity before broad Captain card authoring and messaging commands are considered complete.
+9. T13 and T14 stabilize the installed frontend before performance or usage-persistence conclusions are accepted.
+
+### Phase Status and Dependency Summary
+
+| Phase | Current status | Hard dependencies and allowed partial work |
+| --- | --- | --- |
+| 1 | Original xterm lifecycle gate complete; follow-on control framing, installed IPC, health, and client-recovery regressions open. | T12, T13, T29, and T30 are unblocked follow-on reliability lanes. |
+| 2 | Active. | Resource schema and fail-closed scaffolding may proceed; activation depends on T7 identity interfaces and T18. |
+| 3 | Earliest unblocked foundational phase. | T7 owns shared identity migrations; B2 and provider lanes consume its interfaces. |
+| 4 | Partially unblocked. | Adapter fixtures may proceed; durable binding depends on T7. T15 must fail closed immediately. |
+| 5 | Active normalization and catalog work. | Strict CLI contract work may proceed; identity-aware expansion depends on T7 and T11. |
+| 6 | Substrate present, activation blocked. | Depends on T7, T9, T10, T11, and the integrated messaging contract. |
+| 7 | Active partial product flow. | Full exit depends on T7, T18, P5 for automatic create-if-absent, and T5 through T6. |
+| 8A | Active immediate Captain vertical slice, blocked from shipment. | Depends on P1 through P4, T1 through T3, and T17 before installed completion acceptance; worktree deletion remains disabled without T18. |
+| 8B | Blocked full orchestration acceptance. | Depends on Phase 8A, Phases 2 through 6, and T7 through T11 plus T17 through T18. |
+| 9 | Active partial product surfaces. | Individual packaged bugs may proceed; complete exit depends on shared identity, adapter, inbox, and resource contracts. |
+| 10 | Blocked for complete parity. | Depends on Phases 3, 4, and 6; fixture and local voice-engine checks may proceed. |
+| 11 | Active measurement foundation. | T13, T14, T24, and T28 are required before the final packaged matrix and soak. |
+| 12 | Continuous preparation; final gate blocked. | T27 and every preceding phase exit are required for production release. |
+
+Phase 2 is the earliest numbered phase with unblocked partial work, but its complete activation requires the Phase 3 B1 identity interface.
+Phase 3 is the earliest foundational dependency whose completion unlocks the largest downstream set.
+Phase 8A remains the authorized immediate product vertical slice because the installed Captain path already reached its evidence boundary, but it may exit only through the P1 through P4, T1 through T3, and T17 safety gates.
+
 ## Current Baseline
 
 The local Powder authority is healthy on WSL at `127.0.0.1:4017`.
@@ -85,8 +194,10 @@ The `t-hub` Powder board and `thub-local-acceptance` card exist.
 Project `project-e28c0579-4e78-4de1-b225-d69aab93c143` now registers the T-Hub codebase and binds it to the `t-hub` Powder board through `n8desktop-wsl`.
 Installed `0.3.103` has a live control-capability Codex Captain at terminal `c2940be4` in the exact WSL repository directory.
 The authorized Stage 1 retry dispatched exactly one Codex Crew, acquired and heartbeated Powder run `run-nO9Ih6F-Dt-E`, preserved the accepted worktree baseline, then released the run and removed the Crew cleanly after a required check failed.
-The failure is now isolated to a missing T-Hub integration surface: installed `0.3.103` can claim, heartbeat, renew, release, and read a bounded board snapshot, but it cannot append or expose Powder work-log and completion evidence through a sanctioned Crew operation.
-Powder already exposes agent-authorized work-log, card-detail, run-detail, criterion, and completion endpoints, so this is T-Hub implementation work and does not require a Powder source change.
+The installed Stage 1 failure first exposed a missing T-Hub integration surface: installed `0.3.103` can claim, heartbeat, renew, release, and read a bounded board snapshot, but it cannot append or expose Powder work-log and completion evidence through a sanctioned Crew operation.
+The subsequent architecture review found that merely exposing the existing endpoints is insufficient for safe automated completion.
+Powder's current completion operation is card-bound rather than run-bound, while work-log and criterion mutations lack the complete retry, attribution, and current-run guarantees required by P1 through P4.
+T-Hub may implement bounded evidence reads and fail-closed client scaffolding now, but automated completion must remain disabled until the generic Powder dependencies pass.
 
 Terminal resource counters and hot, warm, and cold lifecycle states are implemented.
 The earlier installed application reproduced xterm `loadCell` and `isWrapped` lifecycle failures.
@@ -101,7 +212,7 @@ Diagnostic logs are bounded at startup.
 Installed `0.3.68` reduced the retained backup from `135,278,300` bytes to `8,388,493` bytes while preserving complete newest lines.
 Installed `0.3.75` replaces the global Board URL and iframe with a native read-only Board resolved from the focused terminal's durable Project and protected Powder binding.
 The packaged no-Project path shows an honest state without an iframe or manual Board URL field.
-The bound Project success path remains gated on Phase 8 real Project acceptance.
+The bound Project success path remains gated on Phase 8A real Project acceptance.
 Installed `0.3.76` replaces the separate Dev and Preview tabs with one **Run and Preview** surface and removes terminal-output URL scanning and automatic navigation.
 Packaged verification proved that the previously reproduced WebView inspection URL remained in PTY scrollback while the preview URL stayed empty and no iframe was created.
 Source commit `61f56ba`, packaged first as `0.3.77`, adds typed root-package target discovery and generation-safe backend lifecycle snapshots.
@@ -157,21 +268,24 @@ The shared status indicator also combines agent work with terminal lifecycle in 
 
 ## Critical Path
 
-The release critical path is:
+The release critical path maps directly to the numbered phases:
 
 1. Terminal and control reliability.
 2. Owned-resource lifecycle safety.
 3. Durable identity and organizational model.
 4. Provider-agnostic Harness integration.
-5. CLI-first control and durable messaging.
-6. Codebase and Captain creation.
-7. Real Powder-backed Captain and Crew acceptance.
-8. Primary product surfaces and observability.
-9. Measured performance, security, and release hardening.
+5. CLI-first control plane.
+6. Durable inbox and agent communication.
+7. Codebase and Captain creation.
+8. Single-Captain safety acceptance followed by full multi-Captain and cross-Harness acceptance.
+9. Primary product surfaces.
+10. Cortana operations, context, voice, and notifications.
+11. Measured runtime efficiency.
+12. Security, release, documentation, and production acceptance.
 
 ## Phase 1 - Terminal and Control Reliability
 
-**Status:** Complete through installed `0.3.78` from source `b4a1c5d`.
+**Status:** The original xterm lifecycle gate is complete through installed `0.3.78` from source `b4a1c5d`; follow-on T12 control framing, T13 installed IPC and scan stability, T29 health accuracy, and T30 control-client recovery work is active.
 Installed `0.3.67` reproduced the end-user xterm lifecycle failure as `Cannot set properties of undefined (setting 'isWrapped')` during parser line feed.
 Installed `0.3.69` then reproduced `Cannot read properties of undefined (reading 'replaceCells')` during rapid Workspace switching and zoom-driven resize.
 Source commits `cfa4139` and `cbc558b` serialize resize behind accepted xterm writes and leave xterm's parser callback stack before buffer mutation.
@@ -277,6 +391,8 @@ Prevent terminals, browsers, development servers, worktrees, and Powder claims f
 
 ## Phase 3 - Durable Identity and Organizational Model
 
+**Status:** Earliest unblocked foundational phase; B1 Assignment identity is required before full Phase 2 ownership activation and the Phase 8B multi-Captain exit gate.
+
 ### Goal
 
 Implement permanent Cortana identity, multiple Captains per Project, Assignment ownership, and correct Workspace semantics.
@@ -316,6 +432,8 @@ Implement permanent Cortana identity, multiple Captains per Project, Assignment 
 - Recovery and retirement behavior match the settled policy.
 
 ## Phase 4 - Provider-Agnostic Harness Integration
+
+**Status:** Partially unblocked for adapter fixtures and fail-closed Codex auto-continue work; durable identity binding depends on Phase 3 B1.
 
 ### Goal
 
@@ -404,6 +522,8 @@ Adapters should map provider events into:
 
 ## Phase 5 - CLI-First Control Plane
 
+**Status:** Active for CLI contract normalization and shared-catalog work; identity-aware expansion depends on Phase 3 B1.
+
 ### Goal
 
 Make `th` the canonical token-efficient control interface and keep MCP as an optional adapter.
@@ -430,6 +550,10 @@ Preserve the existing control-client architecture, JSON envelope, compatible ali
 15. Ensure CLI and MCP return equivalent results for the same backend operation.
 16. Consider `th capabilities --json` only after the expanded catalog makes capability discovery worth its maintenance cost.
 17. Make worktree commands consume the unified backend snapshot rather than maintaining separate Git safety logic in the CLI.
+18. Include repeated criterion-proof syntax, Powder operation identities, and ambiguous-response status lookup in the shared catalog.
+19. Generate actor-visible CLI and MCP catalogs from one descriptor source rather than maintaining separate hard-coded command and tool lists.
+20. Report unsupported or unavailable host-health fields honestly rather than returning an all-zero healthy WSL skeleton.
+21. Use one bounded control-client deadline with prompt stale-endpoint recovery and structured timeout evidence.
 
 ### Tests and Evidence
 
@@ -449,6 +573,8 @@ Preserve the existing control-client architecture, JSON envelope, compatible ali
 - Unknown input fails before side effects, destructive actions require explicit confirmation, and all supported JSON output remains bounded, parseable, and compatible.
 
 ## Phase 6 - Durable Inbox and Agent Communication
+
+**Status:** Durable substrate exists, while product activation is blocked on Phase 3 identity, T9 and T10 durability and bounds, T11 shared-catalog parity, and integration of the messaging contract.
 
 ### Goal
 
@@ -475,6 +601,9 @@ Implement the authority and channel boundaries in [AGENT-RELATIONSHIP-AND-MESSAG
 16. Make `send_text` an inspected compatibility operation whose acceptance cannot be mistaken for composer submission, recipient acknowledgement, or work completion.
 17. Provide event-driven Captain wake-up for blocker, decision, permission, review, completion, runtime failure, and recovery transitions without periodic model polling.
 18. Implement the contract's sender-recipient authorization matrix, message transition state machine, typed assignment acknowledgement, and typed approval decisions.
+19. Make every inbox mutation fail atomically when durable create, write, flush, rename, reopen, or recovery work fails.
+20. Bound UTF-8 body size, standard capacity, Emergency capacity, retention, retry growth, and telemetry while preserving explicit backpressure and overflow states.
+21. Prevent any persistence failure from returning an acknowledged delivery, read, acceptance, completion, or approval transition.
 
 ### Recommended Retention Default
 
@@ -500,6 +629,8 @@ Keep user-pinned messages until explicitly removed.
 
 ## Phase 7 - Codebase and Captain Creation
 
+**Status:** Active for partial existing-codebase and recovery work; its complete exit depends on Phase 3 B1, T18, T5, T6, and P5 for automatic board creation.
+
 ### Goal
 
 Make Captain creation understandable for saved, existing, and completely new codebases.
@@ -523,6 +654,10 @@ Make Captain creation understandable for saved, existing, and completely new cod
 15. Commission the Captain identity without forcing creation of an unrelated work Workspace.
 16. Offer creation of an initial Workspace when the Assignment already names a coherent workstream.
 17. Roll back incomplete state while preserving pre-existing directories and useful work.
+18. Use one stable operation ID across register, bind, commission, response loss, restart, retry, and recovery.
+19. Prevent double-click, backdrop dismissal, refresh, or timeout from creating duplicate Projects, Captains, terminals, or Powder bindings.
+20. Recommend and auto-bind only an exact canonical repository match, and keep unrelated Powder boards behind an Advanced path.
+21. Expose safe Captain card authoring through the shared operation catalog rather than requiring the General to create routine implementation cards manually.
 
 Phase 7 remains active.
 Phase 7 item 8 depends on the Phase 2 unified worktree status service, whose durable ownership fields consume the Phase 3 B1 identity interfaces.
@@ -540,10 +675,10 @@ Registration transactionally owns its optional directory, Git initialization, Pr
 One reviewed backend transaction shared by graphical and Cortana flows, including explicit cross-operation resume or rollback, remains open.
 The complete graphical packaged E2E matrix for existing non-Git success, empty success, template, and clone flows remains open.
 The shared registration contract now requires `initializeGit: true` before it changes a non-repository folder, and its Rust integration tests cover success, downstream-failure rollback, pre-existing-file preservation, and refusal to rewrite a pre-existing `.git` entry.
-Automatic Powder board creation for a new codebase is blocked by Powder's current repository API contract.
+Automatic Powder board creation for a new codebase is blocked by Powder's current repository API contract and P5.
 `POST /api/v1/repositories` is an upsert without a create-only or conditional precondition, so a T-Hub read-then-create sequence could overwrite a board created concurrently by another actor.
 T-Hub must fail closed rather than use that upsert as create-if-absent, and Powder must not be modified merely to accommodate T-Hub.
-This dependency can unblock only when Powder independently exposes a versioned non-overwriting create contract or equivalent server-enforced precondition.
+This dependency can unblock only when Powder independently exposes the generic versioned non-overwriting create contract or equivalent server-enforced precondition defined by P5.
 The current `n8desktop-wsl` profile also has no separately configured repository-admin credential, so positive packaged creation acceptance remains open even after the API dependency is resolved.
 The compact new-codebase flow must retain one reviewed operation identity across ambiguous retries and provide an actionable resume path from a Project preserved after a later Powder or binding failure.
 
@@ -562,48 +697,89 @@ The compact new-codebase flow must retain one reviewed operation identity across
 - No unwanted Workspace is created merely because a Captain exists.
 - Preflight and rollback behavior remain understandable at every boundary.
 
-## Phase 8 - Real Powder Captain and Crew Acceptance
+## Phase 8A - Single-Captain Powder Stage 1 Acceptance
 
-**Status:** Active and blocked on the T-Hub Powder work-log and completion-evidence surface.
+**Status:** Active and blocked from shipment on P1 through P4, T1 through T3, and T17.
 Installed `0.3.103` passed Project binding, Captain control capability, WSL cwd, Crew dispatch, durable binding, exact checkout, live Codex Harness, claim, heartbeat, release, rollback, and cleanup checks.
 The Stage 1 retry correctly withheld its sentinel because T-Hub has no sanctioned operation to append or read attributed work-log evidence or complete the Crew card with proof.
-The next Phase 8 implementation must add those operations over Powder's existing agent-authorized API, preserve Captain and Crew ownership checks, keep responses bounded, and make completed-card terminal cleanup distinguish success from a failed claim release.
+The next Phase 8A implementation may add bounded evidence reads and the fail-closed T-Hub surfaces, but it must not ship card-only automated completion.
+The staged completion implementation verifies an exact run and then sends a card-only completion mutation, which creates a destructive time-of-check/time-of-use race if another run claims the card before Powder applies the mutation.
+Phase 8A requires a generic Powder run-bound conditional completion contract, retry-safe work logs, current-run criterion semantics, one per-Crew lifecycle guard, safe ambiguous-response recovery, and authoritative Captain and Crew terminal state.
 
 ### Goal
 
-Prove the complete multi-Captain and Crew workflow against the local Powder authority.
+Prove one complete installed Codex Captain and Crew lifecycle against the local Powder authority without claiming full multi-Captain or cross-Harness acceptance.
 
 ### Work
 
 1. Reconcile or retire legacy pinned Captain records without losing live terminal state.
 2. Register the T-Hub codebase and bind it to the canonical `t-hub` Powder board through `n8desktop-wsl`.
-3. Commission Codex and Claude Captains with distinct Assignments in the same Project.
-4. Verify both terminal headers interactively.
-5. Create real acceptance cards and dispatch Codex and Claude Crew into deliberate Workspaces.
-6. Verify checkout, worktree, card ownership, claim acquisition, Harness launch, and sidebar visibility.
-7. Verify claim heartbeat and renewal only while tmux proves liveness.
-8. Exercise Captain-to-Captain and Captain-to-Crew messaging around a real dependency.
-9. Verify terminal close, claim release, Crew state, owned-resource cleanup, and safe worktree retention.
-10. Verify incomplete dispatch rollback at every failure boundary.
-11. Verify Powder event delivery, cursor advancement, idempotent wake handling, and board filtering.
-12. Verify Captain context reset, Cortana recovery, T-Hub restart, WSL restart, and durable bootstrap recovery.
-13. Clean disposable acceptance state through the owned-resource workflow.
+3. Commission one Codex Captain with one bounded Assignment.
+4. Create or select one real acceptance card and dispatch exactly one Codex Crew into one isolated Workspace and worktree.
+5. Verify checkout, worktree, card ownership, claim acquisition, Harness launch, sidebar visibility, heartbeat, and renewal.
+6. Append and read bounded attributed work-log evidence through a retry-safe current-run operation.
+7. Complete only through server-enforced card and run preconditions with operation identity, current-run criterion proof, and bounded completion evidence.
+8. Serialize completion, renewal, heartbeat, release, close, cleanup, and reconciler actions for the Crew.
+9. Verify terminal close, claim release, run release, Crew terminal state, owned-resource cleanup, and safe worktree retention.
+10. Remove an acceptance worktree only through T18, or retain it non-destructively with exact ownership and cleanup status when T18 is unavailable.
+11. Verify timeout, lost response, reclaimed card, stale run, redacted evidence, duplicate retry, and incomplete-dispatch rollback boundaries.
+12. Update the handoff with exact installed source, operation IDs, card, run, work log, proof, terminal state, and cleanup evidence.
 
 ### Tests and Evidence
 
 - Use real Powder cards rather than mocks for final acceptance.
 - Keep deterministic mocked tests for each failure boundary.
-- Capture Project, Captain, Workspace, Crew, terminal, claim, run, and message evidence before and after cleanup.
+- Use barrier-controlled concurrency tests to prove an old run cannot complete, renew, release, or append evidence after a new run owns the card.
+- Capture Project, Captain, Workspace, Crew, terminal, claim, run, work-log, criterion, completion, and cleanup evidence before and after acceptance.
 - Verify no raw key appears in logs, prompts, project state, message history, or documentation.
+
+### Exit Gate
+
+- One installed Codex Captain commissions, supervises, recovers, and returns to an authoritative waiting or completed state.
+- One Codex Crew claims, works, logs evidence, completes the exact current run, and closes cleanly.
+- Run A cannot mutate, complete, release, renew, or attach evidence to run B after a release, expiry, or reclaim boundary.
+- Powder and T-Hub agree on the exact card, run, claim, work log, criterion proof, completion proof, terminal state, and cleanup outcome.
+- No stale claim, active run, or disposable terminal remains after cleanup.
+- An owned acceptance worktree is removed only through T18; otherwise it remains safely retained with an explicit non-cleaned status and resume path.
+
+## Phase 8B - Multi-Captain and Cross-Harness Acceptance
+
+**Status:** Blocked on Phase 8A, Phases 2 through 6, and the T7 through T11 identity, routing, inbox, and shared-catalog gates.
+
+### Goal
+
+Prove the complete multi-Captain, multi-Workspace, Codex, Claude, messaging, recovery, retirement, and owned-resource workflow after the single-Captain safety gate passes.
+
+### Work
+
+1. Commission Codex and Claude Captains with distinct Assignments in the same Project.
+2. Verify both terminal headers and durable Harness identities interactively.
+3. Create real acceptance cards and dispatch Codex and Claude Crew into deliberate Workspaces.
+4. Exercise Captain-to-Captain and Captain-to-Crew messaging around a real dependency.
+5. Route Powder card and run events only to the exact owning Captain or Crew.
+6. Verify cursor advancement, replay idempotency, conflict visibility, and board filtering.
+7. Verify Captain context reset, Cortana recovery, T-Hub restart, WSL restart, terminal replacement, and durable bootstrap recovery.
+8. Verify explicit retirement, terminal close, claim and run release, Crew state, owned-resource cleanup, and safe worktree retention.
+9. Verify incomplete dispatch and partial recovery rollback at every failure boundary.
+10. Clean disposable acceptance state through the owned-resource workflow.
+
+### Tests and Evidence
+
+- Use real Codex and Claude Harnesses plus real Powder cards for final packaged acceptance.
+- Retain deterministic identity, routing, messaging, recovery, and cleanup failure fixtures.
+- Capture Assignment, Workspace, Crew, terminal, card, run, message, lifecycle, and owned-resource evidence before and after cleanup.
+- Prove that peer messages grant no foreign Crew, terminal, completion, or retirement authority.
 
 ### Exit Gate
 
 - Both Harnesses commission, recover, supervise, message, and retire cleanly.
 - Both Crew Harnesses claim, work, report, and close cleanly.
-- Multiple Captains coexist in one Project without identity or Workspace collisions.
+- Multiple Captains coexist in one Project without identity, event-routing, inbox, Workspace, or resource collisions.
 - Powder and T-Hub agree on cards, runs, claims, terminals, messages, and cleanup outcomes.
 
 ## Phase 9 - Primary Product Surfaces
+
+**Status:** Active for independently reproducible packaged product bugs, while the complete exit depends on the shared identity, Harness, inbox, and resource contracts.
 
 ### Goal
 
@@ -634,12 +810,18 @@ Make Board, Run and Preview, Files, History, Provider limits, Messages, Resource
 21. Render work state as the primary status and runtime degradation as a separate secondary signal under `docs/STATUS-MODEL.md`.
 22. Replace path-derived worktree labels with authoritative branch and worktree identity wherever current state is available.
 23. Verify keyboard access, narrow layouts, high DPI, error states, and visual quality.
+24. Reproduce the installed Full Board failure and make the primary expansion Project-filtered, native, authenticated, and packaged-testable.
+25. Label an external Powder browser action as a global board and provide actionable authentication, launch, focus, and unreachable states.
+26. Put Provider limits and History behind singleton stale-while-revalidate services with bounded scans and last-known-data retention.
+27. Add a durable reviewed Project run profile and never execute arbitrary chat text as a command.
+28. Allow agents and chat to propose typed run profiles only through validation and explicit acceptance.
+29. Preserve current usage, History, transcript, and session identity across Refresh, remount, Workspace switching, and transient backend failure.
 
 Board items 1 through 4 and the Board portion of item 8 are implemented in source commit `6c6e4ee` and packaged as installed `0.3.75` from `15ab30f`.
 The backend resolves Captain, Crew, or canonical Git main-worktree identity to one registered Project and returns a bounded repository-filtered Powder snapshot without sending credentials to the frontend.
 The native read-only surface covers loading, empty, unbound, unauthorized, unreachable, missing-repository, truncated, and generic error states, with retry and an explicitly unfiltered external full-board fallback where applicable.
 Packaged verification on the T-Hub tile showed **No registered Project**, zero iframes, and no Board URL input, correcting the reproduced redirect to `http://192.168.0.102:4000/`.
-The registered and bound Project success state still requires the Phase 8 real Powder acceptance flow.
+The registered and bound Project success state still requires the Phase 8A real Powder acceptance flow.
 Run and Preview item 5 and the Preview portion of item 8 are implemented in source commit `96998fc` and packaged as installed `0.3.76` from `7ced938`.
 The packaged T-Hub tile exposed exactly one combined tab and one unified panel containing both managed runner controls and the empty preview state.
 The old inspection endpoint remained present in terminal scrollback, but the preview URL stayed empty with zero iframes and no detected-URL chips.
@@ -688,6 +870,9 @@ The next History slice must add bounded fair discovery, source statuses, collisi
 - Add browser E2E for Board and Preview, including iframe fallback.
 - Add History resume tests across Codex and Claude.
 - Add auto-continue UI tests for opt-in, opt-out, cancellation, scheduled recovery, duplicate events, and failed exact-thread resume.
+- Add packaged Full Board browser-launch tests rather than relying on a mocked `shellOpen` component test.
+- Add duplicate-scan, last-known-data, refresh, remount, and Workspace-switch tests for Provider limits and History.
+- Test run-profile proposal, validation, acceptance, start, restart, port collision, failure, and exact-process cleanup.
 - Add accessibility checks and keyboard-only flows.
 - Perform packaged pixel review at representative Windows scaling values.
 
@@ -698,9 +883,14 @@ The next History slice must add bounded fair discovery, source statuses, collisi
 - Files and Captain creation use the same canonical WSL path semantics.
 - History resumes Codex and Claude sessions accurately.
 - Codex and Claude auto-continue state is visible, controllable, and bound to the correct session.
+- Full Board opens the intended Project context or clearly labels the external global Powder board.
+- Provider limits and History retain last-known valid data through bounded transient failures without duplicate equivalent scans.
+- Run and Preview executes only a validated typed Project target or an explicitly reviewed temporary target.
 - Hidden surfaces produce no sustained CPU activity.
 
 ## Phase 10 - Cortana Operations, Context, Voice, and Notifications
+
+**Status:** Blocked for complete provider parity on Phases 3, 4, and 6, while local voice-engine checks and adapter fixtures may proceed.
 
 ### Goal
 
@@ -720,6 +910,8 @@ Give Cortana lightweight operational awareness and make attention cues provider-
 10. Preserve Scribe talk-over protection and voice-engine fallback visibility.
 11. Attribute cues to the correct Cortana, Captain, or Crew identity.
 12. Consider per-Captain chime or voice identity only after the common cue path is reliable.
+13. Verify Claude and Codex header identity persistence across Refresh, remount, restart, and exact conversation resume.
+14. Fail visibly when a Harness cannot prove a needs-input transition rather than silently claiming voice parity.
 
 ### Tests and Evidence
 
@@ -791,12 +983,27 @@ Reduce steady CPU, memory, process, and startup cost using packaged measurements
 13. Reduce the main and icon JavaScript chunks.
 14. Measure process birth and death, handles, threads, sockets, relays, and memory recovery.
 15. Run a twenty-four-hour packaged soak.
+16. Measure warm Workspace visual switch, input-ready latency, cold terminal visual restore, cold input readiness, and Captain first feedback.
+17. Define reviewed numeric budgets for every release statistic before treating a matrix cell as passing.
+18. Track duplicate equivalent scans, frontend callback failures, IPC fallbacks, mount hangs, WebView heap, GPU activity, and WSL descendant churn.
+
+### Provisional Budget Candidates
+
+These values are review candidates rather than settled release requirements until the measurement harness, hardware profile, and representative scenarios are accepted.
+
+- Warm Workspace visual switch p95 at or below 100 milliseconds.
+- Input-ready after a warm switch p95 at or below 150 milliseconds.
+- Cold terminal visual restore p95 at or below 1 second.
+- Input-ready after cold restore p95 at or below 1.5 seconds.
+- Captain overlay first feedback p95 at or below 100 milliseconds.
+- Zero duplicate equivalent provider, History, Git, terminal, resource, or pane scan while the same request is already in flight.
 
 ### Tests and Evidence
 
 - Keep all scenarios scripted and record exact source, installed hash, PID, terminal count, and interval completeness.
 - Reject performance conclusions from runs with unexplained process churn or incomplete CPU intervals.
 - Measure input latency and cold restoration, not only memory.
+- Record numeric pass or fail results for visual-switch, input-ready, restore, first-feedback, process, memory, callback, IPC, and scan-deduplication budgets.
 - Compare before and after artifacts for each optimization.
 
 ### Exit Gate
@@ -804,9 +1011,12 @@ Reduce steady CPU, memory, process, and startup cost using packaged measurements
 - Hidden and cold terminals create no sustained rendering CPU.
 - Closing resources returns process and memory counts toward baseline.
 - The 1, 4, 8, and 16 session matrix meets documented budgets.
+- The packaged stress window contains no missing callback IDs, stale-callback IPC fallback, frontend mount hang, or duplicate equivalent in-flight scan.
 - The soak shows no growing process, handle, socket, log, queue, or memory trend.
 
 ## Phase 12 - Security, Release, Documentation, and Production Acceptance
+
+**Status:** Continuous preparation is allowed, while the final production gate remains blocked on every preceding phase and T27.
 
 ### Goal
 
@@ -833,6 +1043,14 @@ Make the validated product safe, traceable, installable, and understandable.
 17. Bump the desktop version for every changed packaged build and reject reuse of a version already tagged to different source.
 18. Build and install the signed production artifact from the exact reviewed commit.
 19. Push and publish only when the General requests it.
+20. Disable release devtools and reduce Tauri capabilities to the minimum reviewed production set.
+21. Pin and verify the Rust toolchain and minimum supported Rust version across local and CI builds.
+22. Add and review license, security policy, privacy, support, contribution, and operator-runbook documents.
+23. Implement user-owned backup, reset, and diagnostics-export workflows with explicit scope and confirmation.
+24. Test registry, inbox, History, journal, Project, and resource corruption plus disk-full and partial-write recovery.
+25. Publish the supported Windows, WSL, tmux, Harness, Provider, Powder, and upgrade matrix.
+26. Bound diagnostic and event-journal retention and prove cleanup never removes user-owned evidence silently.
+27. Add native Windows automated tests to complement Ubuntu CI before calling the packaged product release-ready.
 
 ### Tests and Evidence
 
@@ -854,6 +1072,24 @@ Make the validated product safe, traceable, installable, and understandable.
 Parallel work should use isolated worktrees, explicit file ownership, separate Powder cards, and one integration owner.
 Parallel lanes must not edit the same registry schema, migration, or core lifecycle file without an agreed boundary.
 
+### Tranche P - Generic Powder Contract Dependencies
+
+These lanes belong in the Powder repository and must be designed for every Powder client rather than for T-Hub alone:
+
+- **P1 Run-bound completion:** server-enforced expected-run precondition, durable operation identity, idempotent replay, and no effect on a reclaimed card.
+- **P2 Mutation recovery:** append and completion operation-status lookup after timeout or response loss.
+- **P3 Work-log attribution:** current-run enforcement and authoritative normalized stored responses.
+- **P4 Criterion integrity:** current-run review scope and authenticated reviewer identity.
+- **P5 Conditional repository creation:** create-only or equivalent non-overwriting precondition.
+- **P6 Card-authoring safety:** verify idempotency, recovery, authorization, and revision preconditions for create, update, relation, proof-plan, and status mutations.
+- **P7 Event documentation:** publish the complete versioned card-event contract, including `work-log-appended`.
+
+P1 through P4 may run in parallel with T-Hub client scaffolding, lifecycle serialization, deterministic mocks, and read-only evidence surfaces.
+T-Hub automated completion remains disabled until their exact reviewed Powder contracts are deployed and accepted.
+P5 does not block manual board selection or binding.
+P6 permits T-Hub to expose each Captain card-authoring mutation whose existing Powder contract independently passes its gate.
+P7 does not block generic event-name handling, but event-specific behavior cannot depend on an undocumented event.
+
 ### Tranche A - Immediate Foundation
 
 These lanes may proceed in parallel:
@@ -863,6 +1099,8 @@ These lanes may proceed in parallel:
 - **A3 Resource schema design:** specify ownership records and reconciliation without enabling cleanup yet.
 - **A4 Provider event research and fixtures:** capture Codex and Claude lifecycle fixtures without changing the live reducer.
 - **A5 Documentation and terminology:** keep canonical definitions synchronized without changing historical artifacts.
+- **A6 Control framing:** bound unauthenticated and authenticated control frames and connection cleanup.
+- **A7 Installed IPC diagnosis:** reproduce callback loss, custom-protocol fallback, mount hangs, and duplicate scans before fixing them.
 
 Integration order is A1 and A2 first, followed by the safe activation of A3.
 A3 must implement worktree ownership and safety from `docs/WORKTREE-STATUS-CONTRACT.md` rather than introducing a resource-only approximation.
@@ -878,6 +1116,7 @@ These lanes may proceed in parallel after the Phase 1 control contract is stable
 - **B4 Claude adapter normalization:** move existing hooks and status telemetry behind the shared contract.
 - **B5 CLI contract and shared catalog:** first normalize the existing CLI to `docs/cli-contract.md`, then add shared schemas, role filtering, command groups, and CLI-to-MCP parity tests.
 - **B6 Inbox identity and UI data model:** implement `docs/AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md` through durable recipients, message states, card and run links, retention, acknowledgements, and read APIs.
+- **B7 Powder lifecycle safety:** per-Crew serialization and retry-safe integration against P1 through P4.
 
 B1 owns shared identity migrations.
 B3 and B4 must consume B1's identity interfaces rather than each introducing provider-specific durable fields.
@@ -885,6 +1124,7 @@ B3 and B4 must emit the two independent status axes defined in `docs/STATUS-MODE
 B5 owns command definitions.
 B5 must land contract behavior and process-level tests before broad command generation so new commands inherit the correct interface.
 B6 owns messaging schema and must not bypass B1 authority.
+B7 may build mocks and fail-closed scaffolding before P1 through P4 land, but may not ship automated completion against a card-only Powder mutation.
 
 ### Tranche C - Product Flows
 
@@ -898,6 +1138,9 @@ These lanes may proceed in parallel after the identity and adapter contracts sta
 - **C6 Messages and Resources UI.**
 - **C7 Cortana health and recovery commands.**
 - **C8 Voice and notification parity.**
+- **C9 Captain creation recovery and card authoring.**
+- **C10 Full Board packaged repair and relevant-board defaults.**
+- **C11 Provider-limit and History singleton caching.**
 
 Each lane must use shared Project, identity, resource, and adapter APIs.
 No lane may create a local substitute for a missing backend contract.
@@ -906,7 +1149,7 @@ No lane may create a local substitute for a missing backend contract.
 
 These lanes may proceed in parallel after real Powder acceptance passes:
 
-- **D1 Performance matrix and soak automation.**
+- **D1 Final packaged performance matrix and soak:** measurement-harness and diagnostic work may proceed earlier, while the final 1, 4, 8, and 16 acceptance matrix and soak wait for real Powder acceptance and a stable installed build.
 - **D2 Security and credential audit.**
 - **D3 Packaged cross-Harness E2E.**
 - **D4 Accessibility and visual quality.**
@@ -926,10 +1169,11 @@ Release integration waits for every Phase 12 gate.
 7. Test complete user workflows through packaged Windows E2E.
 8. Use real Powder only for final acceptance while retaining deterministic mock failure tests.
 9. Test every mutation at success, explicit rejection, timeout, crash, retry, and rollback boundaries.
-10. Run format, lint, warnings-denied compilation, frontend tests, Rust workspace tests, TypeScript, and production builds before each logical commit.
-11. Record interactive checks that cannot yet be automated and convert stable checks into automation later.
-12. Do not declare provider parity based only on both terminals launching.
-13. Test authoritative, derived, stale, unknown, and conflicting state explicitly rather than collapsing uncertainty into a healthy default.
+10. Run the focused regression, formatter, and directly affected static checks before each logical commit.
+11. Run lint, warnings-denied compilation, frontend tests, Rust workspace tests, TypeScript, production builds, contract parity, and security checks at integration, pull-request, packaged-acceptance, and release boundaries.
+12. Record interactive checks that cannot yet be automated and convert stable checks into automation later.
+13. Do not declare provider parity based only on both terminals launching.
+14. Test authoritative, derived, stale, unknown, and conflicting state explicitly rather than collapsing uncertainty into a healthy default.
 
 ## Claude and Codex Parity Matrix
 

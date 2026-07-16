@@ -345,6 +345,9 @@ If agreement would materially change either Assignment, the General decides or a
 Messages, Powder events, dispatch transactions, approvals, and retryable mutations must carry stable idempotency identities.
 After an ambiguous timeout, reread authoritative state before retrying.
 Never blind-repost a non-idempotent Powder work log or completion mutation.
+Automated Powder completion requires a server-enforced expected-current-run precondition so a delayed operation from run A cannot complete run B after release, expiry, or reclaim.
+Work-log and criterion mutations require current-run attribution and retry recovery before T-Hub may treat them as authoritative current-run evidence.
+When Powder does not provide those generic guarantees, T-Hub must keep the dependent mutation disabled and fail closed rather than approximate it locally.
 
 After T-Hub, WSL, terminal, or Harness restart, recover durable identity and bindings before sending or accepting new work.
 Queued messages must survive terminal replacement.
@@ -389,6 +392,7 @@ Before this contract is considered implemented, packaged tests must prove:
 - A Captain cannot mutate a peer Captain or foreign Crew through messaging.
 - Local unrestricted Harness execution does not grant T-Hub control-plane capability.
 - Completion cannot release, renew, or delete stale Crew state after the completion operation begins.
+- A delayed run A operation cannot append evidence to, approve criteria for, complete, renew, release, or clean up run B.
 - The General can inspect message content, delivery lifecycle, Powder evidence, technical proof, and cleanup outcome without relying on terminal scrollback.
 - CLI, MCP, and UI return equivalent results for the same authorized operation.
 
@@ -402,4 +406,5 @@ Implementation remains incomplete until the phased plan exit gates pass.
 The durable inbox substrate exists, but generic send, receive, acknowledgement, message history, and frontend visibility remain open.
 Interactive Codex lifecycle parity remains incomplete.
 Terminal steering remains a compatibility path and has demonstrated cases where accepted text remained unsubmitted in the interactive composer.
-Powder work-log, bounded evidence, and completion operations are active implementation work for the next packaged T-Hub version.
+Powder work-log and bounded evidence reads are active T-Hub implementation work for the next packaged version.
+Automated completion remains blocked on the generic Powder run-bound, current-run evidence, reviewer-attribution, and idempotent recovery dependencies recorded in the phased plan.
