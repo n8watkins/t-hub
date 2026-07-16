@@ -8618,10 +8618,28 @@ fn ensure_dispatch_powder_binding_available(
     Ok(())
 }
 
+const CODEX_UNOBSERVED_COMMAND: &str = "t-hub-agent --codex-unobserved";
+
+fn crew_interactive_launch(
+    harness: Harness,
+    provider_launch: &str,
+    codex_unobserved_command: &str,
+) -> String {
+    match harness {
+        // The explicit degraded marker is the fail-safe for today's unmirrored
+        // interactive TUI. A native lifecycle hook or trusted app-server mirror
+        // remains the future structured telemetry path. `exec` preserves the
+        // provider-native foreground argv used by launch attestation.
+        Harness::Codex => format!("{codex_unobserved_command} && exec {provider_launch}"),
+        Harness::Claude => provider_launch.to_string(),
+    }
+}
+
 fn crew_launch_argv(harness: Harness, prompt: &str) -> String {
-    harness
+    let provider_launch = harness
         .adapter()
-        .fresh_argv_with_permissions(prompt, PermMode::BypassPermissions)
+        .fresh_argv_with_permissions(prompt, PermMode::BypassPermissions);
+    crew_interactive_launch(harness, &provider_launch, CODEX_UNOBSERVED_COMMAND)
 }
 
 fn rollback_crew_launch_failure(
@@ -8771,9 +8789,19 @@ fn dispatch_crew(
             ));
         }
     };
+    #[cfg(not(test))]
     let launch = crew_launch_argv(harness, &prompt);
     #[cfg(test)]
-    let launch = arg_str(args, "testHarnessCommand").unwrap_or_else(|| launch.clone());
+    let launch = {
+        let provider_launch = arg_str(args, "testHarnessCommand").unwrap_or_else(|| {
+            harness
+                .adapter()
+                .fresh_argv_with_permissions(&prompt, PermMode::BypassPermissions)
+        });
+        let codex_unobserved_command = arg_str(args, "testCodexUnobservedCommand")
+            .unwrap_or_else(|| CODEX_UNOBSERVED_COMMAND.to_string());
+        crew_interactive_launch(harness, &provider_launch, &codex_unobserved_command)
+    };
     if let Err(error) =
         send_text(&json!({ "sessionId": crew_session_id, "text": launch, "enter": true }))
     {
@@ -12827,6 +12855,33 @@ mod tests {
         tmux::kill_session_tree(&target).unwrap();
         let _ = std::fs::remove_dir_all(fixture_dir);
         Some(result)
+    }
+
+    fn wait_for_process_permission_attestation(
+        target: &str,
+        before: &crate::harness::HarnessProcessEvidence,
+        harness: Harness,
+    ) -> Result<HarnessPermissionAttestation, crate::harness::LaunchAttestationError> {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            if let Ok(after) = observe_harness_process(target) {
+                match attest_launch_permissions(
+                    harness.adapter(),
+                    before,
+                    &after,
+                    PermMode::BypassPermissions,
+                ) {
+                    Err(crate::harness::LaunchAttestationError::StaleEvidence)
+                        if Instant::now() < deadline => {}
+                    result => return result,
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fake Harness did not replace the foreground shell"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -20808,7 +20863,7 @@ mod tests {
 
         assert_eq!(
             codex,
-            "codex --dangerously-bypass-approvals-and-sandbox 'work card'"
+            "t-hub-agent --codex-unobserved && exec codex --dangerously-bypass-approvals-and-sandbox 'work card'"
         );
         assert_eq!(claude, "claude --dangerously-skip-permissions 'work card'");
         assert_ne!(codex, Harness::Codex.adapter().fresh_argv(prompt));
@@ -20973,6 +21028,100 @@ mod tests {
             claude_inline_false.unwrap_err(),
             crate::harness::LaunchAttestationError::MalformedPermission
         );
+    }
+
+    #[test]
+    fn codex_unobserved_marker_runs_in_owning_pane_and_fails_closed_without_affecting_claude() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "codex_unobserved_marker_runs_in_owning_pane_and_fails_closed_without_affecting_claude: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+
+        let observer = FakeCodexObserver::new(0);
+        let codex =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let codex_session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let codex_target = tmux_target(&codex_session);
+        tmux::new_session_with_env(&codex_target, "/tmp", None, &[]).unwrap();
+        let codex_before = observe_harness_process(&codex_target).unwrap();
+        let expected_identity = tmux_pane_identity(&codex_target);
+        let launch = crew_interactive_launch(Harness::Codex, &codex.command, &observer.command);
+        tmux::send_text(&codex_target, &launch, true).unwrap();
+        wait_for_harness_started(&codex_session, "codex").unwrap();
+        observer.wait_for_invocation();
+        assert_eq!(
+            std::fs::read_to_string(&observer.invocation_path)
+                .unwrap()
+                .trim(),
+            "--codex-unobserved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&observer.identity_path)
+                .unwrap()
+                .trim(),
+            expected_identity
+        );
+        assert_eq!(
+            wait_for_process_permission_attestation(&codex_target, &codex_before, Harness::Codex,)
+                .unwrap()
+                .permission,
+            PermMode::BypassPermissions
+        );
+        tmux::kill_session_tree(&codex_target).unwrap();
+
+        let failed_observer = FakeCodexObserver::new(23);
+        let blocked_codex =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let blocked_session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let blocked_target = tmux_target(&blocked_session);
+        tmux::new_session_with_env(&blocked_target, "/tmp", None, &[]).unwrap();
+        let blocked_launch = crew_interactive_launch(
+            Harness::Codex,
+            &blocked_codex.command,
+            &failed_observer.command,
+        );
+        tmux::send_text(&blocked_target, &blocked_launch, true).unwrap();
+        failed_observer.wait_for_invocation();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            tmux::harness_liveness(&blocked_target, "codex"),
+            tmux::SessionLiveness::Gone,
+            "Codex must not exec after the degraded marker fails"
+        );
+        assert_eq!(
+            tmux::session_liveness(&blocked_target),
+            tmux::SessionLiveness::Alive,
+            "the owning shell remains available for transactional rollback"
+        );
+        tmux::kill_session_tree(&blocked_target).unwrap();
+
+        let claude_observer = FakeCodexObserver::new(23);
+        let claude = FakeHarnessCommand::new(Harness::Claude, "--dangerously-skip-permissions");
+        let claude_session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let claude_target = tmux_target(&claude_session);
+        tmux::new_session_with_env(&claude_target, "/tmp", None, &[]).unwrap();
+        let claude_before = observe_harness_process(&claude_target).unwrap();
+        let claude_launch =
+            crew_interactive_launch(Harness::Claude, &claude.command, &claude_observer.command);
+        tmux::send_text(&claude_target, &claude_launch, true).unwrap();
+        wait_for_harness_started(&claude_session, "claude").unwrap();
+        assert!(
+            !claude_observer.invocation_path.exists(),
+            "Claude launch must not invoke the Codex degraded marker"
+        );
+        assert_eq!(
+            wait_for_process_permission_attestation(
+                &claude_target,
+                &claude_before,
+                Harness::Claude,
+            )
+            .unwrap()
+            .permission,
+            PermMode::BypassPermissions
+        );
+        tmux::kill_session_tree(&claude_target).unwrap();
     }
 
     #[test]
@@ -21672,6 +21821,82 @@ mod tests {
         }
     }
 
+    struct FakeCodexObserver {
+        fixture_dir: PathBuf,
+        command: String,
+        invocation_path: PathBuf,
+        identity_path: PathBuf,
+    }
+
+    impl FakeCodexObserver {
+        fn new(exit_code: i32) -> Self {
+            let fixture_dir = std::env::temp_dir().join(format!(
+                "t-hub-codex-observer-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&fixture_dir).unwrap();
+            let executable = fixture_dir.join("t-hub-agent");
+            let invocation_path = fixture_dir.join("invocation");
+            let identity_path = fixture_dir.join("identity");
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s\\t%s\\n' \"$TMUX_PANE\" \"$(tmux display-message -p '#{{session_name}}')\" > '{}'\nexit {exit_code}\n",
+                    invocation_path.display(),
+                    identity_path.display()
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            Self {
+                fixture_dir,
+                command: format!("{} --codex-unobserved", executable.display()),
+                invocation_path,
+                identity_path,
+            }
+        }
+
+        fn wait_for_invocation(&self) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !self.invocation_path.exists() || !self.identity_path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "fake Codex observer was not invoked"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for FakeCodexObserver {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.fixture_dir);
+        }
+    }
+
+    fn tmux_pane_identity(target: &str) -> String {
+        let output = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                tmux::socket(),
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "#{pane_id}\t#{session_name}",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
     struct FakeHarnessSession {
         session_id: String,
         _command: FakeHarnessCommand,
@@ -22053,6 +22278,7 @@ mod tests {
 
     fn run_dispatch_attestation_failure(
         command: &str,
+        codex_unobserved_command: &str,
         skip_harness_liveness: bool,
         expected_error: &str,
     ) {
@@ -22068,6 +22294,7 @@ mod tests {
             "task": "Verify launch attestation rollback",
             "harness": "codex",
             "testHarnessCommand": command,
+            "testCodexUnobservedCommand": codex_unobserved_command,
         });
         if skip_harness_liveness {
             args["testSkipHarnessLiveness"] = json!(true);
@@ -22103,6 +22330,7 @@ mod tests {
         let missing = FakeHarnessCommand::new(Harness::Codex, "api_key=supersecret");
         run_dispatch_attestation_failure(
             &missing.command,
+            ":",
             false,
             "required provider-native permission flag is missing",
         );
@@ -22112,11 +22340,13 @@ mod tests {
         );
         run_dispatch_attestation_failure(
             &wrong.command,
+            ":",
             false,
             "provider-native permission evidence has the wrong mode",
         );
         run_dispatch_attestation_failure(
             ": api_key=supersecret",
+            "false",
             true,
             "provider-native process evidence predates this launch",
         );
@@ -22159,6 +22389,7 @@ mod tests {
                     "task": "Verify launch attestation persistence",
                     "harness": harness.as_provider(),
                     "testHarnessCommand": command.command,
+                    "testCodexUnobservedCommand": if harness == Harness::Codex { ":" } else { "false" },
                 }),
                 None,
                 true,
@@ -22228,6 +22459,7 @@ mod tests {
                 "task": "Establish the durable winning Crew",
                 "harness": "codex",
                 "testHarnessCommand": winner_command.command,
+                "testCodexUnobservedCommand": ":",
             }),
             None,
             true,
@@ -22248,6 +22480,7 @@ mod tests {
                 "task": "This contender must never launch",
                 "harness": "codex",
                 "testHarnessCommand": contender_command.command,
+                "testCodexUnobservedCommand": "false",
             }),
             None,
             true,
