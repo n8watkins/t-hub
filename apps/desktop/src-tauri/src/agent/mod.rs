@@ -1490,6 +1490,57 @@ mod tests {
         assert!(resolved_status.1.get("permissionRequest").is_none());
     }
 
+    #[test]
+    fn unobserved_interactive_codex_is_degraded_never_false_working() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        let status_bridge = Arc::new(crate::claude::StatusBridge::new());
+        bridge.set_emitter(Arc::new(rec.clone()));
+        bridge.set_status_bridge(Arc::clone(&status_bridge));
+        rec.events.lock().clear();
+
+        bridge.consume_journal_entry(&EventJournalEntry {
+            seq: 1,
+            timestamp_ms: 10,
+            source: JournalSource::Agent,
+            entity_id: Some("codex-unobserved:th_crew0001".to_string()),
+            event_type: JournalEventType::CoreAction,
+            payload: serde_json::json!({
+                "provider": "codex",
+                "provider_version": "0.144.4",
+                "session_id": "codex-unobserved:th_crew0001",
+                "lifecycle": "telemetry_health",
+                "cwd": "/worktree",
+                "tmux_session": "th_crew0001",
+                "telemetry": {
+                    "transport": "unavailable",
+                    "quality": "stale",
+                    "runtime_health": "degraded",
+                    "detail": "interactive_tui_lifecycle_unsupported"
+                }
+            }),
+            result: None,
+        });
+
+        let status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(status.1["status"], "unknown");
+        assert_ne!(status.1["status"], "working");
+        assert_eq!(status.1["runtimeHealth"]["health"], "degraded");
+        assert_eq!(status.1["runtimeHealth"]["source"], "unavailable");
+        assert_eq!(
+            status_bridge
+                .terminal_for_session("codex-unobserved:th_crew0001")
+                .as_deref(),
+            Some("crew0001")
+        );
+    }
+
     /// The fleet status observer fires on the REAL journal-consume path (the
     /// wiring the orchestrator wake depends on): every `emit_session` invokes the
     /// observer with `(session_uuid, status)`, and the terminal edge is the

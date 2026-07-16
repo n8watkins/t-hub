@@ -57,6 +57,8 @@ use std::sync::Arc;
 /// - `--codex-tap`     Structured Codex lifecycle ingest: read Codex `exec
 ///                     --json` or mirrored app-server JSONL from stdin and append
 ///                     normalized, credential-safe lifecycle events.
+/// - `--codex-unobserved` Record explicit degraded health for an interactive Codex
+///                        TUI whose launch is not connected to structured telemetry.
 /// - `--gate` item-3 Pillar C: the BLOCKING `PreToolUse` gate - reads the hook JSON
 ///   on stdin, classifies the Bash command, and DENIES an outward-facing action a
 ///   crew may not take (fail-closed).
@@ -82,6 +84,8 @@ enum Mode {
     Statusline,
     /// Structured Codex lifecycle ingest for headless and interactive telemetry.
     CodexTap,
+    /// Explicit degraded marker for an interactive TUI without lifecycle wiring.
+    CodexUnobserved,
     /// item-3 Pillar C: the BLOCKING `PreToolUse` gate. Reads the hook JSON on stdin,
     /// classifies the Bash command, resolves the caller's capability class from the
     /// app, and DENIES an outward-facing action a crew may not take (or a significant
@@ -106,6 +110,7 @@ fn parse_args() -> Args {
             },
             "--statusline" => mode = Mode::Statusline,
             "--codex-tap" => mode = Mode::CodexTap,
+            "--codex-unobserved" => mode = Mode::CodexUnobserved,
             "--gate" => mode = Mode::Gate,
             "--journal-dir" => journal_dir = it.next(),
             "--version" | "-V" => {
@@ -160,6 +165,17 @@ fn main() {
             Ok(_) => std::process::exit(0),
             Err(error) => {
                 eprintln!("t-hub-agent --codex-tap: {error:#}");
+                std::process::exit(1);
+            }
+        },
+
+        // ------------------------------------------------------------------
+        // --codex-unobserved: never claim Working without structured telemetry.
+        // ------------------------------------------------------------------
+        Mode::CodexUnobserved => match codex::run_unobserved(args.journal_dir.as_deref()) {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("t-hub-agent --codex-unobserved: {error:#}");
                 std::process::exit(1);
             }
         },
@@ -221,7 +237,7 @@ fn main() {
         // ------------------------------------------------------------------
         Mode::None => {
             eprintln!(
-                "t-hub-agent {}: no mode selected; pass --stdio, --hook <EVENT>, --statusline, or --codex-tap.",
+                "t-hub-agent {}: no mode selected; pass --stdio, --hook <EVENT>, --statusline, --codex-tap, or --codex-unobserved.",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(2);

@@ -66,6 +66,41 @@ pub fn run(journal_dir: Option<&str>) -> anyhow::Result<TapOutcome> {
     ingest_reader(stdin.lock(), &journal, &binding)
 }
 
+/// Record the explicit health state for a plain interactive Codex TUI whose
+/// launch path is not connected to hooks or an app-server mirror.
+///
+/// This mode must run inside the TUI's tmux pane so the marker is attributable
+/// to the exact Crew tile. It intentionally emits no SessionStart and therefore
+/// can never manufacture a false Working state.
+pub fn run_unobserved(journal_dir: Option<&str>) -> anyhow::Result<()> {
+    let dir: PathBuf = crate::journal::resolve_journal_dir(journal_dir);
+    let journal = crate::journal::Journal::open(&dir)
+        .with_context(|| format!("opening journal at {dir:?}"))?;
+    let (pane, session) = crate::hook::resolve_tmux_pane();
+    let entry = unobserved_entry(&TmuxBinding { pane, session })
+        .context("interactive Codex degraded marker requires an owning tmux session")?;
+    journal
+        .append(entry)
+        .context("appending interactive Codex degraded health")?;
+    Ok(())
+}
+
+fn unobserved_entry(binding: &TmuxBinding) -> Option<EventJournalEntry> {
+    let tmux_session = binding.session.as_deref()?;
+    let state = TapState {
+        session_id: Some(format!("codex-unobserved:{tmux_session}")),
+        ..TapState::default()
+    };
+    let mut entry = health_entry(
+        &state,
+        binding,
+        "degraded",
+        "interactive_tui_lifecycle_unsupported",
+    )?;
+    entry.payload["telemetry"]["transport"] = Value::String("unavailable".to_string());
+    Some(entry)
+}
+
 fn ingest_reader(
     reader: impl BufRead,
     journal: &crate::journal::Journal,
@@ -815,5 +850,25 @@ mod tests {
         let persisted = serde_json::to_string(&[first, second]).unwrap();
         assert!(!persisted.contains("credential-alpha"));
         assert!(!persisted.contains("credential-beta"));
+    }
+
+    #[test]
+    fn unobserved_interactive_tui_is_explicitly_degraded_without_session_start() {
+        let entry = unobserved_entry(&TmuxBinding {
+            pane: Some("%42".to_string()),
+            session: Some("th_crew0001".to_string()),
+        })
+        .unwrap();
+        assert_eq!(entry.event_type, JournalEventType::CoreAction);
+        assert_eq!(
+            entry.entity_id.as_deref(),
+            Some("codex-unobserved:th_crew0001")
+        );
+        assert_eq!(entry.payload["telemetry"]["transport"], "unavailable");
+        assert_eq!(entry.payload["telemetry"]["runtime_health"], "degraded");
+        assert_eq!(
+            entry.payload["telemetry"]["detail"],
+            "interactive_tui_lifecycle_unsupported"
+        );
     }
 }
