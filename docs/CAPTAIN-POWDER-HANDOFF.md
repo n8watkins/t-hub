@@ -37,7 +37,11 @@ The Captain has returned both findings to T30 for a separate correction commit a
 
 Permission launch-attestation terminal `10d1093e` committed its provider-neutral Harness attestation layer as `5b033fe` on branch `fix/codex-permission-launch-attestation` after 28 focused tests passed without warnings.
 Effective exclusive implementation ownership of `apps/desktop/src-tauri/src/control.rs` belongs to this launch-attestation lane because T2 is complete, accepted, independently reviewed, exact-run evidence-complete, and evidence-only while its claim is retained.
-The launch-attestation Crew is proceeding with the separate control transaction integration and still requires independent review of all control-plane changes.
+The Crew committed the control integration and cleanup as `35d6c61`, `1283b10`, and `a213d35`, with 28 Harness tests, 238 control tests, formatting, warnings-denied Clippy, and diff checks passing.
+Independent control-plane review requested changes because concurrent same-card dispatches can share one idempotent Powder run and a failed contender can release the sibling claim.
+The review also found that malformed or repeated permission flags can bypass fail-closed parsing and that the rollback tests do not exercise attestation failure through the real dispatch path.
+The Captain has returned these findings for per-card and profile serialization or reservation, strict duplicate and malformed flag rejection, and deterministic end-to-end dispatch success, failure, rollback, and concurrency coverage.
+The launch-attestation lane is not accepted until those corrections are separately committed, verified, and independently rereviewed.
 
 Permission-observability terminal `8026ea1a` remains active on branch `feat/codex-permission-observability` and is mapping the Codex rollout telemetry contract before making source changes.
 It has confirmed that interactive permission requests appear in Codex rollout data as structured approval-bearing tool calls, while the current T-Hub source does not yet provide verified `--codex-tap` production integration.
