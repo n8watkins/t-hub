@@ -8729,14 +8729,23 @@ fn dispatch_crew(
             format!("dispatch_crew: harness launch failed: {error}"),
         ));
     }
-    if let Err(error) = wait_for_harness_started(&crew_session_id, harness.as_provider()) {
-        return Err(rollback_crew_launch_failure(
-            ctx,
-            &crew_session_id,
-            &client,
-            &claim,
-            format!("dispatch_crew: harness startup failed: {error}"),
-        ));
+    #[cfg(test)]
+    let skip_harness_liveness = args
+        .get("testSkipHarnessLiveness")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    #[cfg(not(test))]
+    let skip_harness_liveness = false;
+    if !skip_harness_liveness {
+        if let Err(error) = wait_for_harness_started(&crew_session_id, harness.as_provider()) {
+            return Err(rollback_crew_launch_failure(
+                ctx,
+                &crew_session_id,
+                &client,
+                &claim,
+                format!("dispatch_crew: harness startup failed: {error}"),
+            ));
+        }
     }
     let after_launch = match observe_harness_process(&tmux_target) {
         Ok(evidence) => evidence,
@@ -21218,7 +21227,9 @@ mod tests {
         proof: Option<String>,
         proof_url: Option<String>,
         completion_posts: Vec<Value>,
+        claim_posts: usize,
         release_posts: usize,
+        release_bodies: Vec<Value>,
         renew_posts: usize,
     }
 
@@ -21464,6 +21475,165 @@ mod tests {
         }
     }
 
+    struct FakeHarnessCommand {
+        fixture_dir: PathBuf,
+        command: String,
+    }
+
+    impl FakeHarnessCommand {
+        fn new(harness: Harness, flags: &str) -> Self {
+            let fixture_dir = std::env::temp_dir().join(format!(
+                "t-hub-dispatch-harness-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&fixture_dir).unwrap();
+            let executable = fixture_dir.join(harness.as_provider());
+            std::fs::write(
+                &executable,
+                "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            let command = if flags.is_empty() {
+                executable.display().to_string()
+            } else {
+                format!("{} {flags}", executable.display())
+            };
+            Self {
+                fixture_dir,
+                command,
+            }
+        }
+    }
+
+    impl Drop for FakeHarnessCommand {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.fixture_dir);
+        }
+    }
+
+    struct FakeHarnessSession {
+        session_id: String,
+        _command: FakeHarnessCommand,
+    }
+
+    impl FakeHarnessSession {
+        fn start(harness: Harness) -> Self {
+            let flags = match harness {
+                Harness::Codex => "--dangerously-bypass-approvals-and-sandbox",
+                Harness::Claude => "--dangerously-skip-permissions",
+            };
+            let command = FakeHarnessCommand::new(harness, flags);
+            let session_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let target = tmux_target(&session_id);
+            tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
+            tmux::send_text(&target, &command.command, true).unwrap();
+            wait_for_harness_started(&session_id, harness.as_provider()).unwrap();
+            Self {
+                session_id,
+                _command: command,
+            }
+        }
+    }
+
+    impl Drop for FakeHarnessSession {
+        fn drop(&mut self) {
+            let _ = tmux::kill_session_tree(&tmux_target(&self.session_id));
+        }
+    }
+
+    fn dispatch_test_repo_root() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn dispatch_test_registry(
+        path: Option<PathBuf>,
+        connection_profile: &str,
+        captain_session_id: &str,
+    ) -> Arc<CaptainsRegistry> {
+        let registry = Arc::new(match path {
+            Some(path) => CaptainsRegistry::load(path),
+            None => CaptainsRegistry::new(),
+        });
+        registry
+            .upsert_project(ProjectRecord {
+                project_id: "project-dispatch-attestation".into(),
+                name: "Dispatch Attestation".into(),
+                repo_root: dispatch_test_repo_root(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: connection_profile.into(),
+                    repository: "t-hub".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        registry
+            .claim_test(captain_session_id, Some("dispatch-attestation"), vec![])
+            .unwrap();
+        registry
+            .bind_ship_context(
+                "dispatch-attestation",
+                "project-dispatch-attestation",
+                "Verify dispatch attestation",
+                "codex",
+            )
+            .unwrap();
+        registry
+    }
+
+    fn dispatch_test_context(
+        registry: Arc<CaptainsRegistry>,
+    ) -> (ControlContext, Arc<RecordingSink>) {
+        let sink = Arc::new(RecordingSink {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let ctx = test_ctx("dispatch-attestation")
+            .with_captains_registry(registry)
+            .with_apply_sink(sink.clone());
+        (ctx, sink)
+    }
+
+    fn dispatched_terminal_id(sink: &RecordingSink) -> String {
+        let ids = sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(command, _)| command == "spawn_terminal")
+            .filter_map(|(_, args)| args["id"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 1, "dispatch must spawn exactly one terminal");
+        ids[0].clone()
+    }
+
+    fn tmux_process_tests_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+            && std::process::Command::new("node")
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+    }
+
     fn read_loopback_powder_request(
         stream: &mut TcpStream,
     ) -> Result<LoopbackPowderRequest, String> {
@@ -21524,6 +21694,10 @@ mod tests {
         let path = request.path.as_str();
         let body = request.body;
         let response = match (method, path) {
+            ("GET", "/api/v1/repositories/t-hub") => json!({"name": "t-hub"}),
+            ("GET", "/api/v1/cards/thub-powder-control-lifecycle?detail=detailed") => {
+                loopback_card_evidence(&state.lock().unwrap())
+            }
             ("GET", "/api/v1/cards/thub-powder-control-lifecycle") => {
                 loopback_card_evidence(&state.lock().unwrap())
             }
@@ -21563,8 +21737,14 @@ mod tests {
                 state.proof_url = Some(proof_url);
                 loopback_completed_card(&state)
             }
+            ("POST", "/api/v1/cards/thub-powder-control-lifecycle/claim") => {
+                state.lock().unwrap().claim_posts += 1;
+                json!({"card_id": "thub-powder-control-lifecycle", "run_id": "run-authoritative", "agent": "powder-agent", "expires_at": 100})
+            }
             ("POST", path) if path.ends_with("/release") => {
-                state.lock().unwrap().release_posts += 1;
+                let mut state = state.lock().unwrap();
+                state.release_posts += 1;
+                state.release_bodies.push(body);
                 json!({"card_id": "thub-powder-control-lifecycle", "run_id": "run-authoritative", "agent": "powder-agent", "expires_at": 100})
             }
             ("POST", path) if path.ends_with("/renew") || path.ends_with("/heartbeat") => {
@@ -21715,6 +21895,155 @@ mod tests {
             .all(|crew| crew.terminal_id != crew_id));
         let state = server.finish().unwrap();
         assert_eq!(state.release_posts, 1);
+    }
+
+    fn run_dispatch_attestation_failure(
+        command: &str,
+        skip_harness_liveness: bool,
+        expected_error: &str,
+    ) {
+        let server = LoopbackPowderServer::start(6);
+        let profile_name = format!("dispatch-failure-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let mut args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Verify launch attestation rollback",
+            "harness": "codex",
+            "testHarnessCommand": command,
+        });
+        if skip_harness_liveness {
+            args["testSkipHarnessLiveness"] = json!(true);
+        }
+
+        let error = dispatch_crew(&ctx, &args, None, true).unwrap_err();
+        assert!(error.contains(expected_error), "unexpected error: {error}");
+        assert!(error.contains("all side effects were rolled back"));
+        assert!(!error.contains("supersecret"));
+        assert!(!error.contains("api_key"));
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        assert!(registry.snapshot().captains[0].crew.is_empty());
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(state.release_bodies[0]["run_id"], "run-authoritative");
+    }
+
+    #[test]
+    fn dispatch_test_harness_command_failures_roll_back_all_side_effects() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_test_harness_command_failures_roll_back_all_side_effects: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+
+        let missing = FakeHarnessCommand::new(Harness::Codex, "api_key=supersecret");
+        run_dispatch_attestation_failure(
+            &missing.command,
+            false,
+            "required provider-native permission flag is missing",
+        );
+        let wrong = FakeHarnessCommand::new(
+            Harness::Codex,
+            "--sandbox workspace-write api_key=supersecret",
+        );
+        run_dispatch_attestation_failure(
+            &wrong.command,
+            false,
+            "provider-native permission evidence has the wrong mode",
+        );
+        run_dispatch_attestation_failure(
+            ": api_key=supersecret",
+            true,
+            "provider-native process evidence predates this launch",
+        );
+    }
+
+    #[test]
+    fn dispatch_test_harness_command_success_persists_separate_permission_axes() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_test_harness_command_success_persists_separate_permission_axes: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+
+        for (harness, flags) in [
+            (
+                Harness::Codex,
+                "--dangerously-bypass-approvals-and-sandbox api_key=supersecret",
+            ),
+            (
+                Harness::Claude,
+                "--dangerously-skip-permissions api_key=supersecret",
+            ),
+        ] {
+            let server = LoopbackPowderServer::start(3);
+            let profile_name = format!("dispatch-success-{}", uuid::Uuid::new_v4().simple());
+            let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+            let captain = FakeHarnessSession::start(Harness::Codex);
+            let path = captains_tmp(harness.as_provider());
+            let _ = std::fs::remove_file(&path);
+            let registry =
+                dispatch_test_registry(Some(path.clone()), &profile_name, &captain.session_id);
+            let (ctx, _) = dispatch_test_context(registry.clone());
+            let command = FakeHarnessCommand::new(harness, flags);
+            let result = dispatch_crew(
+                &ctx,
+                &json!({
+                    "captainSessionId": captain.session_id,
+                    "cardId": "thub-powder-control-lifecycle",
+                    "task": "Verify launch attestation persistence",
+                    "harness": harness.as_provider(),
+                    "testHarnessCommand": command.command,
+                }),
+                None,
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(
+                result["effectiveHarnessPermission"],
+                json!("bypassPermissions")
+            );
+            assert_eq!(result["tHubCapability"], json!("read"));
+            assert_eq!(
+                result["crew"]["harnessPermission"],
+                json!("bypassPermissions")
+            );
+            assert_eq!(result["crew"]["tHubCapability"], json!("read"));
+            assert_eq!(result["crew"]["harness"], harness.as_provider());
+            let crew_session_id = result["crew"]["terminalId"].as_str().unwrap();
+            assert_eq!(
+                tmux::session_liveness(&tmux_target(crew_session_id)),
+                tmux::SessionLiveness::Alive
+            );
+
+            let restored = CaptainsRegistry::load(path.clone()).snapshot();
+            let persisted = &restored.captains[0].crew[0];
+            assert_eq!(
+                persisted.harness_permission,
+                Some(PermMode::BypassPermissions)
+            );
+            assert_eq!(persisted.t_hub_capability.as_deref(), Some("read"));
+            assert_eq!(persisted.harness.as_deref(), Some(harness.as_provider()));
+
+            let state = server.finish().unwrap();
+            assert_eq!(state.claim_posts, 1);
+            assert_eq!(state.release_posts, 0);
+            tmux::kill_session_tree(&tmux_target(crew_session_id)).unwrap();
+            let _ = std::fs::remove_file(path.with_extension("json.bak"));
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
