@@ -44,6 +44,8 @@ The Captain returned a shared safe frame limit, incremental scanning, bounded cr
 T30 corrected framing as `570c0c6`, and independent rereview verified the one-mebibyte limit, linear chunk scanning, bounded safe errors, output bounds, and trickle deadline.
 That rereview found a new high-severity MCP ambiguity regression because partial response EOF after an idempotent mutation returns Protocol before `get_request_status` reconciliation.
 The Captain returned partial-EOF ambiguity routing with completed, failed, unknown, unavailable-status, no-duplicate-mutation, process, and credential-safety coverage.
+T30 corrected primary partial-EOF reconciliation as `73ed99f`, but rereview found that a partial EOF on the single same-request-ID reissue after Unknown still skips the final status query.
+The Captain returned an explicit reissued state that permits at most one mutation reissue while continuing authoritative status polling after any ambiguous reissue response.
 T30 remains unaccepted until a separate correction commit passes another independent rereview.
 
 Permission launch-attestation terminal `10d1093e` committed its provider-neutral Harness attestation layer as `5b033fe` on branch `fix/codex-permission-launch-attestation` after 28 focused tests passed without warnings.
