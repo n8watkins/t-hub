@@ -86,14 +86,10 @@ impl HarnessAdapter for ClaudeHarness {
         expected: PermMode,
     ) -> Result<HarnessPermissionAttestation, LaunchAttestationError> {
         let args = provider_arguments(evidence, Harness::Claude)?;
-        let options = leading_permission_options(args);
-        let bypass = options
-            .iter()
-            .any(|(flag, _)| *flag == "--dangerously-skip-permissions");
-        let permission_mode = options
-            .iter()
-            .find(|(flag, _)| *flag == "--permission-mode")
-            .and_then(|(_, value)| *value);
+        let options = leading_permission_options(args)?;
+        options.ensure_unique(&["--dangerously-skip-permissions", "--permission-mode"])?;
+        let bypass = options.contains("--dangerously-skip-permissions");
+        let permission_mode = options.value("--permission-mode");
 
         let valid = match expected {
             PermMode::BypassPermissions => {
@@ -282,5 +278,49 @@ mod tests {
                 .unwrap_err(),
             LaunchAttestationError::WrongProvider
         );
+    }
+
+    #[test]
+    fn permission_attestation_rejects_claude_missing_values_and_repeated_flags() {
+        let adapter = ClaudeHarness;
+        for evidence in [
+            HarnessProcessEvidence::test(4, 40, &["claude", "--permission-mode"]),
+            HarnessProcessEvidence::test(4, 40, &["claude", "--permission-mode="]),
+        ] {
+            assert_eq!(
+                adapter
+                    .attest_permissions(&evidence, PermMode::BypassPermissions)
+                    .unwrap_err(),
+                LaunchAttestationError::MissingPermission
+            );
+        }
+        for evidence in [
+            HarnessProcessEvidence::test(
+                4,
+                40,
+                &[
+                    "claude",
+                    "--dangerously-skip-permissions",
+                    "--dangerously-skip-permissions",
+                ],
+            ),
+            HarnessProcessEvidence::test(
+                4,
+                40,
+                &[
+                    "claude",
+                    "--permission-mode=acceptEdits",
+                    "--permission-mode",
+                    "default",
+                ],
+            ),
+        ] {
+            assert_eq!(
+                adapter
+                    .attest_permissions(&evidence, PermMode::BypassPermissions)
+                    .unwrap_err(),
+                LaunchAttestationError::ConflictingPermission
+            );
+        }
     }
 }

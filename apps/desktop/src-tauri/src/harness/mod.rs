@@ -401,24 +401,79 @@ fn provider_executable(executable: &str) -> Option<Harness> {
     }
 }
 
-pub(crate) fn leading_permission_options(args: &[String]) -> Vec<(&str, Option<&str>)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PermissionOptions<'a> {
+    options: Vec<(&'a str, Option<&'a str>)>,
+}
+
+impl PermissionOptions<'_> {
+    pub(crate) fn contains(&self, flag: &str) -> bool {
+        self.options.iter().any(|(candidate, _)| *candidate == flag)
+    }
+
+    pub(crate) fn value(&self, flag: &str) -> Option<&str> {
+        self.options
+            .iter()
+            .find(|(candidate, _)| *candidate == flag)
+            .and_then(|(_, value)| *value)
+    }
+
+    pub(crate) fn ensure_unique(
+        &self,
+        permission_flags: &[&str],
+    ) -> Result<(), LaunchAttestationError> {
+        if permission_flags.iter().any(|flag| {
+            self.options
+                .iter()
+                .filter(|(candidate, _)| candidate == flag)
+                .count()
+                > 1
+        }) {
+            return Err(LaunchAttestationError::ConflictingPermission);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn leading_permission_options(
+    args: &[String],
+) -> Result<PermissionOptions<'_>, LaunchAttestationError> {
     let mut options = Vec::new();
     let mut index = 0;
-    while let Some(flag) = args.get(index) {
-        if flag == "--" || !flag.starts_with('-') {
+    while let Some(argument) = args.get(index) {
+        if argument == "--" || !argument.starts_with('-') {
             break;
         }
+        let (flag, inline_value) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(flag, value)| {
+                (flag, Some(value))
+            });
         let takes_value = matches!(
-            flag.as_str(),
+            flag,
             "--sandbox" | "--ask-for-approval" | "--permission-mode"
         );
-        let value = takes_value
-            .then(|| args.get(index + 1).map(String::as_str))
-            .flatten();
-        options.push((flag.as_str(), value));
-        index += if takes_value { 2 } else { 1 };
+        if !takes_value {
+            options.push((argument.as_str(), None));
+            index += 1;
+            continue;
+        }
+        let (value, consumed) = match inline_value {
+            Some("") => return Err(LaunchAttestationError::MissingPermission),
+            Some(value) => (value, 1),
+            None => {
+                let value = args
+                    .get(index + 1)
+                    .map(String::as_str)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or(LaunchAttestationError::MissingPermission)?;
+                (value, 2)
+            }
+        };
+        options.push((flag, Some(value)));
+        index += consumed;
     }
-    options
+    Ok(PermissionOptions { options })
 }
 
 /// Safely single-quote `s` for a POSIX shell (the `startupCommand` runs inside

@@ -97,17 +97,19 @@ impl HarnessAdapter for CodexHarness {
         expected: PermMode,
     ) -> Result<HarnessPermissionAttestation, LaunchAttestationError> {
         let args = provider_arguments(evidence, Harness::Codex)?;
-        let options = leading_permission_options(args);
-        let bypass = options
+        let options = leading_permission_options(args)?;
+        options.ensure_unique(&[
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--sandbox",
+            "--yolo",
+            "--full-auto",
+            "--ask-for-approval",
+        ])?;
+        let bypass = options.contains("--dangerously-bypass-approvals-and-sandbox");
+        let sandbox = options.value("--sandbox");
+        let conflicting = ["--yolo", "--full-auto", "--ask-for-approval"]
             .iter()
-            .any(|(flag, _)| *flag == "--dangerously-bypass-approvals-and-sandbox");
-        let sandbox = options
-            .iter()
-            .find(|(flag, _)| *flag == "--sandbox")
-            .and_then(|(_, value)| *value);
-        let conflicting = options
-            .iter()
-            .any(|(flag, _)| matches!(*flag, "--yolo" | "--full-auto" | "--ask-for-approval"));
+            .any(|flag| options.contains(flag));
 
         let valid = match expected {
             PermMode::BypassPermissions => {
@@ -333,5 +335,49 @@ mod tests {
                 .unwrap_err(),
             LaunchAttestationError::WrongProvider
         );
+    }
+
+    #[test]
+    fn permission_attestation_rejects_codex_missing_values_and_repeated_flags() {
+        let adapter = CodexHarness;
+        for evidence in [
+            HarnessProcessEvidence::test(4, 40, &["codex", "--sandbox"]),
+            HarnessProcessEvidence::test(4, 40, &["codex", "--sandbox="]),
+        ] {
+            assert_eq!(
+                adapter
+                    .attest_permissions(&evidence, PermMode::BypassPermissions)
+                    .unwrap_err(),
+                LaunchAttestationError::MissingPermission
+            );
+        }
+        for evidence in [
+            HarnessProcessEvidence::test(
+                4,
+                40,
+                &[
+                    "codex",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                ],
+            ),
+            HarnessProcessEvidence::test(
+                4,
+                40,
+                &[
+                    "codex",
+                    "--sandbox=read-only",
+                    "--sandbox",
+                    "workspace-write",
+                ],
+            ),
+        ] {
+            assert_eq!(
+                adapter
+                    .attest_permissions(&evidence, PermMode::BypassPermissions)
+                    .unwrap_err(),
+                LaunchAttestationError::ConflictingPermission
+            );
+        }
     }
 }
