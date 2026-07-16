@@ -21,6 +21,27 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 This section is the reset-safe starting point for the next session.
 The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
 
+### Verified 2026-07-15 Codex Permission Work Boundary
+
+This boundary was verified at `2026-07-15T23:23:50-07:00` after the General authorized immediate Crew implementation of Codex permission launch and monitoring reliability.
+The Captain created and reread two P0 review cards on authoritative repository `t-hub`, each with six acceptance criteria and three proof gates.
+`thub-codex-permission-launch-attestation` is claimed under run `run-YrFBMtKYHGPM` by Crew terminal `10d1093e` in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/codex-permission-launch-attestation` on branch `fix/codex-permission-launch-attestation`.
+That Crew exclusively owns the provider-neutral Harness adapters, `apps/desktop/src-tauri/src/control.rs`, and directly colocated launch, attestation, rollback, and capability-separation tests.
+Its tracked worktree is clean with only the protected untracked `CLAUDE.md` artifact.
+The Crew reproduced that installed `0.3.103` launched its live Codex process without `--dangerously-bypass-approvals-and-sandbox` and is implementing fail-closed post-launch permission attestation without modifying the installed runtime.
+
+`thub-codex-permission-observability` is claimed under run `run-yZF7-C7sz47t` by Crew terminal `8026ea1a` in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/codex-permission-observability` on branch `feat/codex-permission-observability`.
+That Crew exclusively owns `t-hub-agent`, the agent bridge, supervision, fleet notification, sanitized Codex lifecycle fixtures, and directly colocated tests.
+Its tracked worktree is clean with only the protected untracked `CLAUDE.md` artifact.
+The required result is structured exact-Crew `needsPermission`, explicit degraded telemetry health, and owning-Captain wake routing without relying on terminal dialogue text as the sole production signal.
+
+The Captain appended and reread exactly one attributed start work log for each exact run through protected profile `n8desktop-wsl`.
+Installed `0.3.103` still launches both new Codex Crew without the source-fixed unrestricted flag, so the Captain is temporarily clearing only exact authorized local prompts while these lanes remove that bootstrap defect.
+T30 terminal `2bef9b61` remains the third and final active Crew lane under run `run-Q7QP9N_mqTJF` and is completing MCP process-contract verification.
+No fourth Crew may be dispatched while these three lanes are active.
+All three implementation lanes require focused tests, exact-run evidence, clean logical commits, and independent review before acceptance.
+No merge, push, install, deploy, publication, release, card completion, claim release, or resource reap is authorized or claimed.
+
 ### Verified 2026-07-15 Active Implementation Boundary
 
 This boundary was verified at `2026-07-15T22:43:08-07:00`.
