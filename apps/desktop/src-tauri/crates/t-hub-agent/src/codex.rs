@@ -657,6 +657,53 @@ mod tests {
     }
 
     #[test]
+    fn recorded_exec_fixtures_preserve_clean_resume_and_failure_boundaries() {
+        let fixtures = [
+            (
+                "clean",
+                include_str!("../tests/fixtures/codex-0.142.5-clean-turn.jsonl"),
+                false,
+            ),
+            (
+                "resumed",
+                include_str!("../tests/fixtures/codex-0.142.5-resumed-turn.jsonl"),
+                false,
+            ),
+            (
+                "failed",
+                include_str!("../tests/fixtures/codex-0.142.5-turn-failed.jsonl"),
+                true,
+            ),
+        ];
+        for (tag, input, failed) in fixtures {
+            let dir = temp_dir(tag);
+            let journal = crate::journal::Journal::open(&dir).unwrap();
+            let outcome = ingest_reader(
+                std::io::Cursor::new(input),
+                &journal,
+                &TmuxBinding::default(),
+            )
+            .unwrap();
+            assert_eq!(outcome.recognized_events, 3, "fixture {tag}");
+            assert_eq!(outcome.turn_failed, failed, "fixture {tag}");
+            let entries = journal.replay(0).unwrap();
+            assert_eq!(entries[0].event_type, JournalEventType::SessionStart);
+            assert_eq!(entries[1].event_type, JournalEventType::UserPromptSubmit);
+            assert_eq!(
+                entries[2].event_type,
+                if failed {
+                    JournalEventType::StopFailure
+                } else {
+                    JournalEventType::Stop
+                }
+            );
+            let persisted = serde_json::to_string(&entries).unwrap();
+            assert!(!persisted.contains("this-model-does-not-exist-xyz"));
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
     fn duplicate_permission_callbacks_are_journaled_once() {
         let dir = temp_dir("dedup");
         let journal = crate::journal::Journal::open(&dir).unwrap();
