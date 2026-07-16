@@ -112,7 +112,7 @@ jobs:
 
       # This committed gate builds the real MCP binary before workspace tests.
       - name: cargo workspace gate
-        run: apps/desktop/scripts/workspace_gate.sh
+        run: ../scripts/workspace_gate.sh
 
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
