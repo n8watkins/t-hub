@@ -358,10 +358,10 @@ fn parse_ascii_number(field: Option<&[u8]>) -> Result<u64, LaunchAttestationErro
         .ok_or(LaunchAttestationError::UnreadableEvidence)
 }
 
-pub(crate) fn provider_arguments<'a>(
-    evidence: &'a HarnessProcessEvidence,
+pub(crate) fn provider_arguments(
+    evidence: &HarnessProcessEvidence,
     expected: Harness,
-) -> Result<&'a [String], LaunchAttestationError> {
+) -> Result<&[String], LaunchAttestationError> {
     let (provider, provider_index) =
         process_provider(&evidence.argv).ok_or(LaunchAttestationError::WrapperObscured)?;
     if provider != expected {
