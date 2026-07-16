@@ -28,7 +28,10 @@ pub struct Ui {
 // ---- shared field / sort helpers -------------------------------------------
 
 fn str_field(v: &Value, key: &str) -> String {
-    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// The `terminals` array from `list_terminals`, sorted by `id` for stable diffs.
@@ -66,7 +69,11 @@ fn row(ui: &Ui, cols: &[&str], widths: &[usize]) -> String {
             out.push_str("  ");
         }
         if ui.tty && i < last {
-            out.push_str(&format!("{:<width$}", c, width = widths.get(i).copied().unwrap_or(0)));
+            out.push_str(&format!(
+                "{:<width$}",
+                c,
+                width = widths.get(i).copied().unwrap_or(0)
+            ));
         } else {
             out.push_str(c);
         }
@@ -100,14 +107,23 @@ fn first_id(terms: &[Value]) -> Option<String> {
 fn read_hint(id: &Option<String>) -> (String, &'static str) {
     match id {
         Some(i) => (format!("th read {i}"), "view that terminal's recent output"),
-        None => ("th read <session>".to_string(), "view a terminal's recent output"),
+        None => (
+            "th read <session>".to_string(),
+            "view a terminal's recent output",
+        ),
     }
 }
 
 fn status_hint(id: &Option<String>) -> (String, &'static str) {
     match id {
-        Some(i) => (format!("th status {i}"), "status + supervision tree for that session"),
-        None => ("th status <session>".to_string(), "status for one session + its tree"),
+        Some(i) => (
+            format!("th status {i}"),
+            "status + supervision tree for that session",
+        ),
+        None => (
+            "th status <session>".to_string(),
+            "status for one session + its tree",
+        ),
     }
 }
 
@@ -158,11 +174,25 @@ fn print_terminals(terms: &[Value], ui: &Ui) {
         println!("  (no live terminals)");
         return;
     }
-    let shown = if ui.all { terms.len() } else { terms.len().min(LIMIT) };
+    let shown = if ui.all {
+        terms.len()
+    } else {
+        terms.len().min(LIMIT)
+    };
     let slice = &terms[..shown];
 
-    let idw = slice.iter().map(|t| str_field(t, "id").len()).max().unwrap_or(8).max(2);
-    let stw = slice.iter().map(|t| str_field(t, "state").len()).max().unwrap_or(4).max(5);
+    let idw = slice
+        .iter()
+        .map(|t| str_field(t, "id").len())
+        .max()
+        .unwrap_or(8)
+        .max(2);
+    let stw = slice
+        .iter()
+        .map(|t| str_field(t, "state").len())
+        .max()
+        .unwrap_or(4)
+        .max(5);
     for t in slice {
         let id = str_field(t, "id");
         let state = str_field(t, "state");
@@ -188,9 +218,18 @@ fn print_tabs(tabs_v: &[Value], raw: &Value, ui: &Ui) {
         println!("  (none — {note})");
         return;
     }
-    let shown = if ui.all { tabs_v.len() } else { tabs_v.len().min(LIMIT) };
+    let shown = if ui.all {
+        tabs_v.len()
+    } else {
+        tabs_v.len().min(LIMIT)
+    };
     let slice = &tabs_v[..shown];
-    let idw = slice.iter().map(|t| str_field(t, "id").len()).max().unwrap_or(8).max(2);
+    let idw = slice
+        .iter()
+        .map(|t| str_field(t, "id").len())
+        .max()
+        .unwrap_or(8)
+        .max(2);
     for t in slice {
         let id = str_field(t, "id");
         let name = str_field(t, "name");
@@ -219,11 +258,25 @@ pub fn status_table(rows: &[StatusRow], ui: &Ui) {
         println!("  (no sessions)");
         return;
     }
-    let shown = if ui.all { rows.len() } else { rows.len().min(LIMIT) };
+    let shown = if ui.all {
+        rows.len()
+    } else {
+        rows.len().min(LIMIT)
+    };
     let slice = &rows[..shown];
 
-    let idw = slice.iter().map(|r| r.session.len()).max().unwrap_or(8).max(7);
-    let stw = slice.iter().map(|r| r.status.len()).max().unwrap_or(6).max(6);
+    let idw = slice
+        .iter()
+        .map(|r| r.session.len())
+        .max()
+        .unwrap_or(8)
+        .max(7);
+    let stw = slice
+        .iter()
+        .map(|r| r.status.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
     println!("{}", row(ui, &["SESSION", "STATUS", "CTX"], &[idw, stw]));
     for r in slice {
         println!("{}", row(ui, &[&r.session, &r.status, &r.ctx], &[idw, stw]));
@@ -242,7 +295,10 @@ pub fn status_table(rows: &[StatusRow], ui: &Ui) {
 
 /// Single-session status: `get_status` + `supervision_tree`.
 pub fn status_one(session: &str, status: &Value, tree: &Value, ui: &Ui) {
-    let st = status.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
+    let st = status
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown");
     println!("session   {session}");
     println!("status    {st}");
     match status.get("snapshot") {
@@ -269,7 +325,10 @@ pub fn status_one(session: &str, status: &Value, tree: &Value, ui: &Ui) {
         ui,
         &[
             read_hint(&id),
-            (format!("th send {session} <text>"), "type into this session"),
+            (
+                format!("th send {session} <text>"),
+                "type into this session",
+            ),
         ],
     );
 }
@@ -278,14 +337,23 @@ pub fn status_one(session: &str, status: &Value, tree: &Value, ui: &Ui) {
 pub fn read_output(result: &Value, ui: &Ui) {
     let text = result.get("text").and_then(|t| t.as_str()).unwrap_or("");
     let target = result.get("target").and_then(|t| t.as_str()).unwrap_or("");
-    let hist = result.get("historyLines").and_then(|h| h.as_i64()).unwrap_or(0);
-    let sid = result.get("sessionId").and_then(|s| s.as_str()).unwrap_or("<session>");
+    let hist = result
+        .get("historyLines")
+        .and_then(|h| h.as_i64())
+        .unwrap_or(0);
+    let sid = result
+        .get("sessionId")
+        .and_then(|s| s.as_str())
+        .unwrap_or("<session>");
     println!("── {target}  (history: {hist} lines) ──");
     println!("{}", text.trim_end_matches('\n'));
     next(
         ui,
         &[
-            (format!("th read {sid} --history 200"), "include more scrollback"),
+            (
+                format!("th read {sid} --history 200"),
+                "include more scrollback",
+            ),
             (format!("th send {sid} <text>"), "respond into this session"),
         ],
     );
@@ -303,7 +371,13 @@ pub struct WorktreeRow {
 /// `th worktree ls` - the lifecycle table: every worktree with its branch and
 /// the three reap-relevant facts (DIRTY / MERGED / LEASED). Rows arrive sorted
 /// (main first, then linked worktrees by path).
-pub fn worktrees(repo_root: &str, default_branch: &str, lease_note: Option<&str>, rows: &[WorktreeRow], ui: &Ui) {
+pub fn worktrees(
+    repo_root: &str,
+    default_branch: &str,
+    lease_note: Option<&str>,
+    rows: &[WorktreeRow],
+    ui: &Ui,
+) {
     println!(
         "{} worktree{} on {repo_root}  (default branch: {default_branch})",
         rows.len(),
@@ -317,26 +391,69 @@ pub fn worktrees(repo_root: &str, default_branch: &str, lease_note: Option<&str>
         println!("  (no worktrees)");
         return;
     }
-    let shown = if ui.all { rows.len() } else { rows.len().min(LIMIT) };
+    let shown = if ui.all {
+        rows.len()
+    } else {
+        rows.len().min(LIMIT)
+    };
     let slice = &rows[..shown];
 
     let pw = slice.iter().map(|r| r.path.len()).max().unwrap_or(4).max(4);
-    let bw = slice.iter().map(|r| r.branch.len()).max().unwrap_or(6).max(6);
-    let dw = slice.iter().map(|r| r.dirty.len()).max().unwrap_or(5).max(5);
-    let mw = slice.iter().map(|r| r.merged.len()).max().unwrap_or(6).max(6);
-    println!("{}", row(ui, &["PATH", "BRANCH", "DIRTY", "MERGED", "LEASED"], &[pw, bw, dw, mw]));
+    let bw = slice
+        .iter()
+        .map(|r| r.branch.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    let dw = slice
+        .iter()
+        .map(|r| r.dirty.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let mw = slice
+        .iter()
+        .map(|r| r.merged.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    println!(
+        "{}",
+        row(
+            ui,
+            &["PATH", "BRANCH", "DIRTY", "MERGED", "LEASED"],
+            &[pw, bw, dw, mw]
+        )
+    );
     for r in slice {
-        println!("{}", row(ui, &[&r.path, &r.branch, &r.dirty, &r.merged, &r.leased], &[pw, bw, dw, mw]));
+        println!(
+            "{}",
+            row(
+                ui,
+                &[&r.path, &r.branch, &r.dirty, &r.merged, &r.leased],
+                &[pw, bw, dw, mw]
+            )
+        );
     }
     if shown < rows.len() {
-        println!("  … showing {} of {} - use --all or --json for the rest", shown, rows.len());
+        println!(
+            "  … showing {} of {} - use --all or --json for the rest",
+            shown,
+            rows.len()
+        );
     }
 
     next(
         ui,
         &[
-            (format!("th worktree prune {repo_root}"), "dry-run reap plan (merged + clean + unleased)"),
-            (format!("th worktree new {repo_root} <branch>"), "new worktree (recycles a reapable one first)"),
+            (
+                format!("th worktree prune {repo_root}"),
+                "dry-run reap plan (merged + clean + unleased)",
+            ),
+            (
+                format!("th worktree new {repo_root} <branch>"),
+                "new worktree (recycles a reapable one first)",
+            ),
         ],
     );
 }
@@ -354,11 +471,21 @@ pub struct PruneRow {
 
 /// `th worktree prune` - the plan (dry-run) or the executed report. Skips print
 /// their protecting reason; forced reaps print exactly what would be lost.
-pub fn prune_plan(repo_root: &str, default_branch: &str, dry_run: bool, rows: &[PruneRow], ui: &Ui) {
+pub fn prune_plan(
+    repo_root: &str,
+    default_branch: &str,
+    dry_run: bool,
+    rows: &[PruneRow],
+    ui: &Ui,
+) {
     let reaps = rows.iter().filter(|r| r.action.starts_with("REAP")).count();
     println!(
         "worktree prune on {repo_root}  (default branch: {default_branch}){}",
-        if dry_run { "  - DRY-RUN, nothing changed" } else { "" },
+        if dry_run {
+            "  - DRY-RUN, nothing changed"
+        } else {
+            ""
+        },
     );
     println!();
     if rows.is_empty() {
@@ -366,11 +493,28 @@ pub fn prune_plan(repo_root: &str, default_branch: &str, dry_run: bool, rows: &[
         return;
     }
 
-    let aw = rows.iter().map(|r| r.action.len()).max().unwrap_or(4).max(4);
+    let aw = rows
+        .iter()
+        .map(|r| r.action.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
     let pw = rows.iter().map(|r| r.path.len()).max().unwrap_or(4).max(4);
-    let bw = rows.iter().map(|r| r.branch.len()).max().unwrap_or(6).max(6);
+    let bw = rows
+        .iter()
+        .map(|r| r.branch.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
     for r in rows {
-        println!("{}", row(ui, &[&r.action, &r.path, &r.branch, &r.detail], &[aw, pw, bw]));
+        println!(
+            "{}",
+            row(
+                ui,
+                &[&r.action, &r.path, &r.branch, &r.detail],
+                &[aw, pw, bw]
+            )
+        );
         for c in &r.would_lose {
             println!("{}      would lose: {c}", " ".repeat(aw));
         }
@@ -385,12 +529,24 @@ pub fn prune_plan(repo_root: &str, default_branch: &str, dry_run: bool, rows: &[
         next(
             ui,
             &[
-                (format!("th worktree prune {repo_root} --yes"), "execute this plan"),
-                (format!("th worktree ls {repo_root}"), "the full lifecycle table"),
+                (
+                    format!("th worktree prune {repo_root} --yes"),
+                    "execute this plan",
+                ),
+                (
+                    format!("th worktree ls {repo_root}"),
+                    "the full lifecycle table",
+                ),
             ],
         );
     } else {
-        next(ui, &[(format!("th worktree ls {repo_root}"), "the full lifecycle table")]);
+        next(
+            ui,
+            &[(
+                format!("th worktree ls {repo_root}"),
+                "the full lifecycle table",
+            )],
+        );
     }
 }
 
@@ -405,13 +561,19 @@ pub fn tabs(result: &Value, ui: &Ui) {
 /// `th health` — the WSL host snapshot.
 pub fn health(result: &Value, ui: &Ui) {
     let m = result.get("metrics").cloned().unwrap_or(Value::Null);
-    let supervised = result.get("supervisedSessions").and_then(|s| s.as_i64()).unwrap_or(0);
+    let supervised = result
+        .get("supervisedSessions")
+        .and_then(|s| s.as_i64())
+        .unwrap_or(0);
     let f = |k: &str| m.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
 
     println!("WSL host");
     println!("  cpuCount            {}", f("cpuCount"));
     if let Some(la) = m.get("loadAvg").and_then(|l| l.as_array()) {
-        let parts: Vec<String> = la.iter().map(|v| format!("{:.2}", v.as_f64().unwrap_or(0.0))).collect();
+        let parts: Vec<String> = la
+            .iter()
+            .map(|v| format!("{:.2}", v.as_f64().unwrap_or(0.0)))
+            .collect();
         println!("  loadAvg             {}", parts.join(" "));
     }
     println!("  memTotalKib         {}", f("memTotalKib"));
