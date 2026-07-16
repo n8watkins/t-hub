@@ -21,6 +21,42 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 This section is the reset-safe starting point for the next session.
 The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
 
+### Verified 2026-07-16 Combined Codex Permission Integration Boundary
+
+The General authorized an isolated combined-tree integration and real-agent verification, with an explicit stop before merge or installation.
+The integration worktree is `/home/natkins/projects/tools/t-hub/t-hub-worktrees/codex-permission-integration` on branch `integrate/codex-permission-failsafe` from canonical base `4d5e900`.
+The ten reviewed observability commits were cherry-picked first as `cc85d07` through `25a87e2`.
+The ten reviewed launch-attestation commits were then cherry-picked as `7a0dfd0` through `ea78d31`.
+`git range-diff` reports every commit in both series as an exact match after hash translation.
+
+Commit `87d9470` adds the missing combined proof through the real `dispatch_crew` path.
+It builds and invokes the agent from the integration worktree, records exactly one degraded marker for the spawned Crew tmux session, then executes and attests the Codex provider with bypass permissions.
+The proof observed one Powder claim and no release on success.
+Commit `83dde88` makes the existing timed-out descendant test wait for bounded kernel reaping after a process-group kill.
+That correction passed the 56-test agent suite and 3 agent process E2E tests twenty consecutive times with default parallelism.
+Commit `0d42ce8` removes an inappropriate test-server lifetime deadline that began before the serialized Powder profile lock was acquired and recovers the restored test environment lock after a prior panic.
+The full workspace passed three consecutive parallel runs after that correction.
+
+Commit `8601f2a` adds the named repository gate `scripts/captain/verify-codex-permission-integration.sh` and makes the real-agent test explicitly ignored in ordinary workspace runs instead of silently reporting success.
+Commit `5f38a89` records the gate as mode `100755`, requires tmux and Node, asserts those prerequisites in the ignored test, and pins one worktree-local Cargo target directory for both the agent build and the exact test.
+The executable gate passed even with a conflicting external `CARGO_TARGET_DIR`, proving that it built and used this worktree's agent.
+The final built agent reports `t-hub-agent 0.5.2` and SHA-256 `9ac6813f5f84436c2b708c687063c5ad2fe184fdaa9a50055ec163a9ebe34071`.
+
+Focused verification passed 33 Harness tests, 8 dispatch tests, the exact marker process test, 23 agent-bridge tests, 30 supervision tests, 18 fleet tests, and 18 Powder control tests.
+Final workspace verification passed 724 desktop tests with 2 explicit ignores, 2 MCP process E2E tests with 1 helper ignored, 56 agent tests, 3 agent Codex process E2E tests, 16 MCP library tests, 51 MCP binary tests, and 8 protocol tests.
+The named combined gate passed separately and is not counted as one of the ignored workspace results.
+Strict `t-hub-agent` and desktop library-test Clippy, formatting, full-range diff checks, shell syntax, executable mode, and tracked-worktree cleanliness all passed.
+
+Independent control-plane review found no high or medium production issue.
+The reviewer requested hardening the combined gate against silent skip, missing executable mode, Cargo target-directory drift, and missing tmux or Node prerequisites.
+Commits `8601f2a` and `5f38a89` addressed every finding, and final focused rereview reported no remaining finding.
+
+The integration branch is accepted as locally implementation-complete and independently reviewed.
+It has not been merged, pushed, installed, deployed, published, released, or used to complete or release any Powder card or claim.
+The installed agent remains stale, so production dispatch must not use these commits until a separately authorized coordinated merge and installation places the combined agent on the Crew PATH.
+A stale agent fails closed with transactional rollback but causes dispatch unavailability.
+Exact-run final Powder work-log backfill also remains pending the sanctioned operation in the installed runtime.
+
 ### Verified 2026-07-16 Permission Monitor and Powder Profile Boundary
 
 This boundary was verified on `2026-07-16` after the General moved the Codex Crew into the normal Crew workspace and asked the Captain to continue permission monitoring.
