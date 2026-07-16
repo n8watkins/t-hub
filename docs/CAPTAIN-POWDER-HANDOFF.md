@@ -46,7 +46,10 @@ That rereview found a new high-severity MCP ambiguity regression because partial
 The Captain returned partial-EOF ambiguity routing with completed, failed, unknown, unavailable-status, no-duplicate-mutation, process, and credential-safety coverage.
 T30 corrected primary partial-EOF reconciliation as `73ed99f`, but rereview found that a partial EOF on the single same-request-ID reissue after Unknown still skips the final status query.
 The Captain returned an explicit reissued state that permits at most one mutation reissue while continuing authoritative status polling after any ambiguous reissue response.
-T30 remains unaccepted until a separate correction commit passes another independent rereview.
+T30 corrected the final reconciliation state machine as `96aacb2`.
+Independent rereview found no defects and verified exact same-request-ID spawn, status, spawn, status sequences for completed, failed, still-unknown, and unavailable outcomes with one mutation retry maximum and one total deadline.
+It also verified fail-closed non-idempotent and pre-write cases, bounded clean output, credential safety, 16 MCP library tests, 75 MCP binary tests, 2 MCP process E2E tests with 1 helper ignored, strict Clippy, formatting, and diff checks.
+T30 is accepted as implementation-complete and independently reviewed, with only live PowerShell relay timing remaining as an environment-dependent integration risk.
 
 Permission launch-attestation terminal `10d1093e` committed its provider-neutral Harness attestation layer as `5b033fe` on branch `fix/codex-permission-launch-attestation` after 28 focused tests passed without warnings.
 Effective exclusive implementation ownership of `apps/desktop/src-tauri/src/control.rs` belongs to this launch-attestation lane because T2 is complete, accepted, independently reviewed, exact-run evidence-complete, and evidence-only while its claim is retained.
