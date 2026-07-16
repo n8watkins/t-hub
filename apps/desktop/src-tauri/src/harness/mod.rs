@@ -100,7 +100,7 @@ impl std::fmt::Display for Harness {
 #[serde(rename_all = "camelCase")]
 pub enum PermMode {
     /// Crew default: no approval prompts. Claude `--dangerously-skip-permissions`;
-    /// Codex `--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`.
+    /// Codex `--dangerously-bypass-approvals-and-sandbox`.
     BypassPermissions,
     /// Approximate "edits allowed without prompt". Codex `--sandbox
     /// workspace-write` (documented gap: no exact analog, and network is off by
@@ -109,6 +109,12 @@ pub enum PermMode {
     /// Read-only / default posture.
     Default,
 }
+
+/// The General-authorized local execution posture for dispatched Crew in this
+/// Captain fleet. This grants full local worktree execution through the
+/// provider Harness, but does not expand Crew scope, T-Hub capability, Powder
+/// authority, or authority over destructive and outward-facing actions.
+pub const CREW_DEFAULT_PERMISSION: PermMode = PermMode::BypassPermissions;
 
 impl PermMode {
     pub fn as_str(self) -> &'static str {
@@ -736,5 +742,22 @@ mod tests {
             serde_json::json!("bypassPermissions")
         );
         assert_eq!(PermMode::BypassPermissions.to_string(), "bypassPermissions");
+    }
+
+    #[test]
+    fn crew_default_permission_uses_exact_provider_native_bypass_flags() {
+        assert_eq!(CREW_DEFAULT_PERMISSION, PermMode::BypassPermissions);
+        assert_eq!(
+            Harness::Codex
+                .adapter()
+                .permission_map(CREW_DEFAULT_PERMISSION),
+            ["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        assert_eq!(
+            Harness::Claude
+                .adapter()
+                .permission_map(CREW_DEFAULT_PERMISSION),
+            ["--dangerously-skip-permissions"]
+        );
     }
 }

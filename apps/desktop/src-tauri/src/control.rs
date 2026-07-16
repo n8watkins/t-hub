@@ -58,7 +58,7 @@ use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
 use crate::harness::{
     attest_launch_permissions, observe_harness_process, Harness, HarnessPermissionAttestation,
-    PermMode,
+    PermMode, CREW_DEFAULT_PERMISSION,
 };
 use crate::supervision::Supervisor;
 use crate::{files, git, plane, powder, pty, tmux};
@@ -2295,6 +2295,12 @@ impl CaptainsRegistry {
     ) -> Result<CrewRef, String> {
         if !matches!(t_hub_capability, "read" | "control") {
             return Err("Crew T-Hub capability is invalid".into());
+        }
+        if attestation.permission != CREW_DEFAULT_PERMISSION {
+            return Err(format!(
+                "Crew Harness permission '{}' conflicts with the fleet default '{}'",
+                attestation.permission, CREW_DEFAULT_PERMISSION
+            ));
         }
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
@@ -8638,7 +8644,7 @@ fn crew_interactive_launch(
 fn crew_launch_argv(harness: Harness, prompt: &str) -> String {
     let provider_launch = harness
         .adapter()
-        .fresh_argv_with_permissions(prompt, PermMode::BypassPermissions);
+        .fresh_argv_with_permissions(prompt, CREW_DEFAULT_PERMISSION);
     crew_interactive_launch(harness, &provider_launch, CODEX_UNOBSERVED_COMMAND)
 }
 
@@ -8796,7 +8802,7 @@ fn dispatch_crew(
         let provider_launch = arg_str(args, "testHarnessCommand").unwrap_or_else(|| {
             harness
                 .adapter()
-                .fresh_argv_with_permissions(&prompt, PermMode::BypassPermissions)
+                .fresh_argv_with_permissions(&prompt, CREW_DEFAULT_PERMISSION)
         });
         let codex_unobserved_command = arg_str(args, "testCodexUnobservedCommand")
             .unwrap_or_else(|| CODEX_UNOBSERVED_COMMAND.to_string());
@@ -8847,7 +8853,7 @@ fn dispatch_crew(
         harness.adapter(),
         &before_launch,
         &after_launch,
-        PermMode::BypassPermissions,
+        CREW_DEFAULT_PERMISSION,
     ) {
         Ok(attestation) => attestation,
         Err(error) => {
@@ -21145,6 +21151,17 @@ mod tests {
                 "crew-powder",
                 HarnessPermissionAttestation {
                     provider: Harness::Codex,
+                    permission: PermMode::Default,
+                },
+                "read",
+            )
+            .unwrap_err()
+            .contains("conflicts with the fleet default"));
+        assert!(registry
+            .record_crew_launch_attestation(
+                "crew-powder",
+                HarnessPermissionAttestation {
+                    provider: Harness::Codex,
                     permission: PermMode::BypassPermissions,
                 },
                 "admin",
@@ -21163,6 +21180,29 @@ mod tests {
             .unwrap();
         assert_eq!(crew.harness_permission, Some(PermMode::BypassPermissions));
         assert_eq!(crew.t_hub_capability.as_deref(), Some("read"));
+
+        assert!(registry
+            .record_crew_launch_attestation(
+                "crew-powder",
+                HarnessPermissionAttestation {
+                    provider: Harness::Codex,
+                    permission: PermMode::Default,
+                },
+                "read",
+            )
+            .unwrap_err()
+            .contains("conflicts with the fleet default"));
+        assert!(registry
+            .record_crew_launch_attestation(
+                "crew-powder",
+                HarnessPermissionAttestation {
+                    provider: Harness::Codex,
+                    permission: PermMode::BypassPermissions,
+                },
+                "read",
+            )
+            .unwrap_err()
+            .contains("already has launch permission evidence"));
 
         let restored = CaptainsRegistry::load(path.clone()).snapshot();
         let crew = &restored.captains[0].crew[0];
