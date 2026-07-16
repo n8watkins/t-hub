@@ -363,6 +363,9 @@ cargo build -p t-hub-mcp --manifest-path apps/desktop/src-tauri/Cargo.toml      
 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml -p t-hub --test mcp_e2e # end-to-end
 ```
 
+For the canonical clean-target workspace gate, run `apps/desktop/scripts/workspace_gate.sh` from the repository root.
+The gate builds `t-hub-mcp` before `cargo test --workspace` so the real-binary MCP E2E tests do not depend on a prior command having populated the target directory.
+
 ---
 
 ## 8. Security notes (PRD §11.3)
