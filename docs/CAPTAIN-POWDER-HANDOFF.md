@@ -21,6 +21,28 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 This section is the reset-safe starting point for the next session.
 The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
 
+### Verified 2026-07-16 Permission Monitor and Powder Profile Boundary
+
+This boundary was verified on `2026-07-16` after the General moved the Codex Crew into the normal Crew workspace and asked the Captain to continue permission monitoring.
+Direct tmux inspection found T30 terminal `2bef9b61`, launch-attestation terminal `10d1093e`, and permission-observability terminal `8026ea1a` alive, detached, and idle at their Codex prompts with no permission dialogue open.
+Their pane activity and commit tips are unchanged from the accepted review boundary.
+The T30 worktree remains tracked-clean at `96aacb2`, the launch-attestation worktree remains tracked-clean at `03e7aa8`, and the permission-observability worktree remains tracked-clean at `0c23665`.
+Each worktree contains only the protected untracked `CLAUDE.md` artifact.
+The three independent reviewers remain complete.
+T30 remains fully accepted, permission observability remains review-clean pending combined launch integration, and launch attestation remains conditionally unaccepted until observability lands first and the real agent from the combined tree passes its exact launch proof.
+
+The installed `0.3.103` automatic fleet wake could not be armed because the Captain liveness probe timed out even though tmux proved the Captain session attached and the Crew sessions alive.
+Direct pane inspection therefore remains the active permission-monitoring fallback whenever a Crew resumes.
+The installed runtime still lacks the reviewed unrestricted launch and structured permission failsafe changes.
+
+Authoritative Powder reconciliation now reports the registered binding `n8desktop-wsl` and repository `t-hub` as misconfigured because the protected profile is unavailable or invalid.
+The dedicated protected health check identified the immediate failure as `Powder apiKeyCommand failed: command exceeded 10s timeout`.
+The Captain did not bypass the protected profile, inspect credentials, retry any ambiguous mutation, modify Powder, or change the binding.
+Exact-run Powder evidence and final work-log backfill cannot be reconciled until that protected profile command is healthy again.
+
+No merge, push, install, deploy, publication, release, card completion, claim release, or resource reap is authorized or claimed.
+The next ordered implementation action still requires separate General authorization to integrate observability before launch attestation, run the real combined-tree agent launch proof, and only then consider merge or installation.
+
 ### Verified 2026-07-15 Permission Crew Progress Boundary
 
 This boundary was verified at `2026-07-15T23:38:08-07:00` while the Captain actively monitored the three authorized Codex Crew for permission prompts.
