@@ -19,10 +19,14 @@
 //! assertion; if the `t-hub-mcp` binary can't be located it fails with a clear
 //! message telling you to `cargo build -p t-hub-mcp` first.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -67,18 +71,27 @@ struct McpProc {
 
 impl McpProc {
     fn spawn(bin: &PathBuf, handshake_file: &PathBuf) -> Self {
-        let mut child = Command::new(bin)
-            // Point the binary's discovery at our temp handshake file so it
-            // connects to the listener this test started.
+        Self::spawn_with_session(bin, handshake_file, None)
+    }
+
+    fn spawn_with_session(
+        bin: &PathBuf,
+        handshake_file: &PathBuf,
+        session_token: Option<&str>,
+    ) -> Self {
+        let mut command = Command::new(bin);
+        command
             .env("T_HUB_CONTROL_FILE", handshake_file)
-            // Make sure no stray addr/token override leaks in from the harness.
             .env_remove("T_HUB_CONTROL_ADDR")
             .env_remove("T_HUB_CONTROL_TOKEN")
+            .env_remove("T_HUB_SESSION_TOKEN")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn t-hub-mcp");
+            .stderr(Stdio::inherit());
+        if let Some(token) = session_token {
+            command.env("T_HUB_SESSION_TOKEN", token);
+        }
+        let mut child = command.spawn().expect("spawn t-hub-mcp");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Self {
@@ -115,6 +128,81 @@ impl McpProc {
     }
 }
 
+struct MockControl {
+    handshake_file: PathBuf,
+    requests: Receiver<Value>,
+    server: thread::JoinHandle<()>,
+}
+
+impl MockControl {
+    fn start<F>(expected_calls: usize, handler: F) -> Self
+    where
+        F: Fn(&Value) -> Value + Send + 'static,
+    {
+        Self::start_with_token(expected_calls, "mock-read-capability", handler)
+    }
+
+    fn start_with_token<F>(expected_calls: usize, token: &str, handler: F) -> Self
+    where
+        F: Fn(&Value) -> Value + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock control listener");
+        let addr = listener.local_addr().expect("mock control address");
+        let tmp = std::env::temp_dir().join(format!(
+            "th-mcp-powder-contract-{}-{}",
+            std::process::id(),
+            addr.port()
+        ));
+        fs::create_dir_all(&tmp).expect("create mock control directory");
+        let handshake_file = tmp.join("control.json");
+        fs::write(
+            &handshake_file,
+            serde_json::to_vec(&json!({
+                "addr": addr.to_string(),
+                "token": token
+            }))
+            .unwrap(),
+        )
+        .expect("write mock control handshake");
+
+        let (tx, requests) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for _ in 0..expected_calls {
+                let (mut stream, _) = listener.accept().expect("accept MCP control call");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone mock control stream"))
+                    .read_line(&mut line)
+                    .expect("read MCP control request");
+                let request: Value = serde_json::from_str(&line).expect("control request JSON");
+                let response = handler(&request);
+                tx.send(request).expect("publish MCP control request");
+                let mut encoded = serde_json::to_vec(&response).expect("control response JSON");
+                encoded.push(b'\n');
+                stream
+                    .write_all(&encoded)
+                    .expect("write MCP control response");
+            }
+        });
+
+        Self {
+            handshake_file,
+            requests,
+            server,
+        }
+    }
+
+    fn finish(self, expected_calls: usize) -> Vec<Value> {
+        let requests: Vec<Value> = (0..expected_calls)
+            .map(|_| self.requests.recv().expect("receive MCP control request"))
+            .collect();
+        self.server.join().expect("join mock control server");
+        if let Some(tmp) = self.handshake_file.parent() {
+            let _ = fs::remove_dir_all(tmp);
+        }
+        requests
+    }
+}
+
 impl Drop for McpProc {
     fn drop(&mut self) {
         // Closing stdin makes the server loop hit EOF and exit; then reap it.
@@ -131,6 +219,33 @@ fn tool_structured(resp: &Value) -> &Value {
         "tools/call returned a transport error: {resp}"
     );
     &resp["result"]["structuredContent"]
+}
+
+fn tool_error_text<'a>(resp: &'a Value, operation: &str) -> &'a str {
+    assert!(
+        resp.get("error").is_none(),
+        "{operation} returned an MCP transport error: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["isError"], true,
+        "{operation} must fail closed without a bound Crew/Captain identity: {resp}"
+    );
+    assert!(
+        resp["result"]["structuredContent"].is_null(),
+        "{operation} errors must not masquerade as structured success: {resp}"
+    );
+    resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{operation} must return structured MCP error content: {resp}"))
+}
+
+fn assert_authorization_tool_error(resp: &Value, operation: &str, expected: &str) {
+    let message = tool_error_text(resp, operation);
+    assert_eq!(message, expected, "{operation} authorization error");
+    assert!(
+        !message.contains("not exposed over the control channel"),
+        "{operation} must not pass because its control command is absent: {message}"
+    );
 }
 
 #[test]
@@ -246,9 +361,42 @@ fn end_to_end_mcp_round_trip() {
         "search_files",
         "list_tabs",
         "spawn_terminal",
+        "append_crew_powder_work_log",
+        "read_crew_powder_evidence",
+        "complete_crew_powder",
         "get_theme",
     ] {
         assert!(names.contains(&expected), "tools/list missing {expected}");
+    }
+    for (name, tier) in [
+        ("append_crew_powder_work_log", "organization"),
+        ("read_crew_powder_evidence", "read"),
+        ("complete_crew_powder", "organization"),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("tools/list missing {name}"));
+        assert_eq!(tool["annotations"]["t-hubTier"], tier, "{name}");
+        assert_eq!(
+            tool["annotations"]["confirmationRequired"], false,
+            "{name} must reach role-bound backend authorization"
+        );
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{name}");
+        for forbidden in [
+            "cardId",
+            "runId",
+            "profile",
+            "connectionProfile",
+            "endpoint",
+            "repository",
+            "credential",
+        ] {
+            assert!(
+                tool["inputSchema"]["properties"].get(forbidden).is_none(),
+                "{name} must not expose {forbidden} substitution"
+            );
+        }
     }
 
     // tools/call → wsl_health (a Read tool that always works)
@@ -346,6 +494,307 @@ fn end_to_end_mcp_round_trip() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::env::remove_var("T_HUB_CONTROL_FILE");
     std::env::remove_var("T_HUB_TMUX_SOCKET");
+}
+
+#[test]
+fn powder_authorization_errors_are_specific_and_preserve_bound_identity() {
+    let bin = locate_mcp_binary();
+    let read_expected_calls = 7;
+    let read_mock = MockControl::start(read_expected_calls, |request| {
+        let command = request["command"].as_str().unwrap();
+        let session = request["session"].as_str().unwrap();
+        let args = &request["args"];
+        assert_eq!(request["token"], "mock-read-capability");
+        let error = match (session, command) {
+            ("", "append_crew_powder_work_log" | "complete_crew_powder") => format!(
+                "unauthorized: '{command}' requires the control capability (this token is read-only)"
+            ),
+            ("", "read_crew_powder_evidence") => {
+                "acl: read_crew_powder_evidence requires a valid Crew or Captain T_HUB_SESSION_TOKEN"
+                    .to_string()
+            }
+            ("owned-crew-token", "append_crew_powder_work_log") => {
+                "powder unavailable after Crew-self authorization: test sentinel".to_string()
+            }
+            ("owned-crew-token", "read_crew_powder_evidence")
+                if args.get("crewSessionId").is_some() =>
+            {
+                "acl: Crew callers cannot select another Crew identity".to_string()
+            }
+            ("owned-crew-token", "read_crew_powder_evidence") => {
+                "powder unavailable after Crew-self authorization: test sentinel".to_string()
+            }
+            ("owned-crew-token", "complete_crew_powder") => {
+                "unauthorized: 'complete_crew_powder' requires the control capability (this token is read-only)"
+                    .to_string()
+            }
+            _ => panic!("unexpected authorization contract request: {request}"),
+        };
+        json!({ "ok": false, "error": error })
+    });
+
+    let mut anonymous = McpProc::spawn(&bin, &read_mock.handshake_file);
+    let append_without_capability = anonymous.request(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "append_crew_powder_work_log",
+            "arguments": { "message": "bounded evidence" }
+        }
+    }));
+    assert_authorization_tool_error(
+        &append_without_capability,
+        "append_crew_powder_work_log",
+        "unauthorized: 'append_crew_powder_work_log' requires the control capability (this token is read-only)",
+    );
+    let complete_without_capability = anonymous.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {
+            "name": "complete_crew_powder",
+            "arguments": { "crewSessionId": "owned-crew", "proof": "tests pass" }
+        }
+    }));
+    assert_authorization_tool_error(
+        &complete_without_capability,
+        "complete_crew_powder",
+        "unauthorized: 'complete_crew_powder' requires the control capability (this token is read-only)",
+    );
+    let read_without_identity = anonymous.request(json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {
+            "name": "read_crew_powder_evidence",
+            "arguments": { "limit": 20 }
+        }
+    }));
+    assert_authorization_tool_error(
+        &read_without_identity,
+        "read_crew_powder_evidence",
+        "acl: read_crew_powder_evidence requires a valid Crew or Captain T_HUB_SESSION_TOKEN",
+    );
+
+    let mut crew =
+        McpProc::spawn_with_session(&bin, &read_mock.handshake_file, Some("owned-crew-token"));
+    let owned_append = crew.request(json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {
+            "name": "append_crew_powder_work_log",
+            "arguments": { "message": "bounded evidence" }
+        }
+    }));
+    assert_eq!(
+        tool_error_text(&owned_append, "append_crew_powder_work_log"),
+        "powder unavailable after Crew-self authorization: test sentinel"
+    );
+    let owned_read = crew.request(json!({
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": {
+            "name": "read_crew_powder_evidence",
+            "arguments": { "limit": 20 }
+        }
+    }));
+    assert_eq!(
+        tool_error_text(&owned_read, "read_crew_powder_evidence"),
+        "powder unavailable after Crew-self authorization: test sentinel"
+    );
+    let foreign_read = crew.request(json!({
+        "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+        "params": {
+            "name": "read_crew_powder_evidence",
+            "arguments": { "crewSessionId": "foreign-crew", "limit": 20 }
+        }
+    }));
+    assert_authorization_tool_error(
+        &foreign_read,
+        "read_crew_powder_evidence",
+        "acl: Crew callers cannot select another Crew identity",
+    );
+    let crew_completion = crew.request(json!({
+        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": {
+            "name": "complete_crew_powder",
+            "arguments": { "crewSessionId": "owned-crew", "proof": "tests pass" }
+        }
+    }));
+    assert_authorization_tool_error(
+        &crew_completion,
+        "complete_crew_powder",
+        "unauthorized: 'complete_crew_powder' requires the control capability (this token is read-only)",
+    );
+
+    drop(anonymous);
+    drop(crew);
+    let read_requests = read_mock.finish(read_expected_calls);
+    assert_eq!(read_requests[0]["session"], "");
+    assert_eq!(read_requests[1]["command"], "complete_crew_powder");
+    assert_eq!(read_requests[2]["command"], "read_crew_powder_evidence");
+    assert_eq!(read_requests[3]["session"], "owned-crew-token");
+    assert_eq!(
+        read_requests[3]["args"],
+        json!({ "message": "bounded evidence" })
+    );
+    assert!(read_requests[4]["args"].get("crewSessionId").is_none());
+    assert_eq!(read_requests[5]["args"]["crewSessionId"], "foreign-crew");
+    assert_eq!(read_requests[6]["session"], "owned-crew-token");
+
+    let control_expected_calls = 2;
+    let control_mock = MockControl::start_with_token(
+        control_expected_calls,
+        "mock-control-capability",
+        |request| {
+            assert_eq!(request["token"], "mock-control-capability");
+            assert_eq!(request["session"], "owning-captain-token");
+            assert_eq!(request["command"], "complete_crew_powder");
+            let error = if request["args"]["crewSessionId"] == "owned-crew" {
+                "powder unavailable after Captain authorization: test sentinel"
+            } else {
+                "acl: Crew session is not owned by the calling Captain"
+            };
+            json!({ "ok": false, "error": error })
+        },
+    );
+    let mut captain = McpProc::spawn_with_session(
+        &bin,
+        &control_mock.handshake_file,
+        Some("owning-captain-token"),
+    );
+    let owned_completion = captain.request(json!({
+        "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+        "params": {
+            "name": "complete_crew_powder",
+            "arguments": { "crewSessionId": "owned-crew", "proof": "tests pass" }
+        }
+    }));
+    assert_eq!(
+        tool_error_text(&owned_completion, "complete_crew_powder"),
+        "powder unavailable after Captain authorization: test sentinel"
+    );
+    let foreign_completion = captain.request(json!({
+        "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+        "params": {
+            "name": "complete_crew_powder",
+            "arguments": { "crewSessionId": "foreign-crew", "proof": "tests pass" }
+        }
+    }));
+    assert_authorization_tool_error(
+        &foreign_completion,
+        "complete_crew_powder",
+        "acl: Crew session is not owned by the calling Captain",
+    );
+
+    drop(captain);
+    let control_requests = control_mock.finish(control_expected_calls);
+    assert_eq!(control_requests[0]["args"]["crewSessionId"], "owned-crew");
+    assert_eq!(control_requests[1]["args"]["crewSessionId"], "foreign-crew");
+}
+
+#[test]
+fn powder_backend_validation_errors_survive_the_mcp_adapter() {
+    let bin = locate_mcp_binary();
+    let forbidden_fields = [
+        "cardId",
+        "runId",
+        "profile",
+        "endpoint",
+        "repository",
+        "credential",
+    ];
+    let expected_calls = 4 + forbidden_fields.len();
+    let mock =
+        MockControl::start_with_token(expected_calls, "mock-control-capability", |request| {
+            assert_eq!(request["token"], "mock-control-capability");
+            let command = request["command"].as_str().unwrap();
+            let args = &request["args"];
+            let error = if let Some(field) = [
+                "cardId",
+                "runId",
+                "profile",
+                "endpoint",
+                "repository",
+                "credential",
+            ]
+            .into_iter()
+            .find(|field| args.get(field).is_some())
+            {
+                format!("invalid arguments: forbidden authority field '{field}'")
+            } else {
+                let (field, maximum) = match command {
+                    "append_crew_powder_work_log" => ("message", 16 * 1024),
+                    "complete_crew_powder" => ("proof", 4096),
+                    _ => panic!("unexpected validation contract request: {request}"),
+                };
+                let value = args[field].as_str().unwrap();
+                if value.trim().is_empty() {
+                    format!("invalid arguments: {field} must not be empty")
+                } else if value.len() > maximum {
+                    format!("invalid arguments: {field} exceeds its UTF-8 byte limit")
+                } else {
+                    panic!("validation contract accepted invalid input: {request}");
+                }
+            };
+            json!({ "ok": false, "error": error })
+        });
+    let mut crew =
+        McpProc::spawn_with_session(&bin, &mock.handshake_file, Some("owned-crew-token"));
+    let mut captain =
+        McpProc::spawn_with_session(&bin, &mock.handshake_file, Some("owning-captain-token"));
+
+    for (id, message, expected) in [
+        (1, "é".repeat(8193), "message exceeds its UTF-8 byte limit"),
+        (2, " \t\n ".to_string(), "message must not be empty"),
+    ] {
+        let response = crew.request(json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {
+                "name": "append_crew_powder_work_log",
+                "arguments": { "message": message }
+            }
+        }));
+        assert!(
+            tool_error_text(&response, "append_crew_powder_work_log").contains(expected),
+            "response: {response}"
+        );
+    }
+    for (id, proof, expected) in [
+        (3, "é".repeat(2049), "proof exceeds its UTF-8 byte limit"),
+        (4, " \t\n ".to_string(), "proof must not be empty"),
+    ] {
+        let response = captain.request(json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {
+                "name": "complete_crew_powder",
+                "arguments": { "crewSessionId": "owned-crew", "proof": proof }
+            }
+        }));
+        assert!(
+            tool_error_text(&response, "complete_crew_powder").contains(expected),
+            "response: {response}"
+        );
+    }
+    for (offset, field) in forbidden_fields.into_iter().enumerate() {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("limit".to_string(), json!(20));
+        arguments.insert(field.to_string(), json!("substitution"));
+        let response = crew.request(json!({
+            "jsonrpc": "2.0", "id": 5 + offset, "method": "tools/call",
+            "params": {
+                "name": "read_crew_powder_evidence",
+                "arguments": Value::Object(arguments)
+            }
+        }));
+        let message = tool_error_text(&response, "read_crew_powder_evidence");
+        assert_eq!(
+            message,
+            format!("invalid arguments: forbidden authority field '{field}'")
+        );
+    }
+
+    drop(crew);
+    drop(captain);
+    let requests = mock.finish(expected_calls);
+    assert_eq!(
+        requests[0]["args"]["message"].as_str().unwrap().len(),
+        16 * 1024 + 2
+    );
+    assert_eq!(requests[2]["args"]["proof"].as_str().unwrap().len(), 4098);
 }
 
 /// Kills its session on drop - including on a panicking assertion - so this E2E

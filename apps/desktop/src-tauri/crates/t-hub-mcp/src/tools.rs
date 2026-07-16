@@ -17,6 +17,10 @@
 //!     `release_captain`, `watch_fleet`, `unwatch_fleet`, `open_file`,
 //!     `create_worktree`, `remove_worktree`, `register_project`,
 //!     `bind_project_powder`.
+//!   - **Powder Crew evidence**: append and completion are Organization tier;
+//!     evidence read is Read tier. The backend narrowly lets a bound Crew use a
+//!     read-capability token for its own work-log append, then rechecks the exact
+//!     Crew tile and ship before mutating Powder.
 //!   - **Process-changing** (confirmation required): `spawn_terminal`,
 //!     `send_text`, `send_keys`, `close_terminal`.
 //!   - **Theme**: `get_theme`, `set_theme` — forwarded by name verbatim.
@@ -517,6 +521,65 @@ fn schema_heartbeat_crew_powder() -> Value {
     })
 }
 
+fn schema_append_crew_powder_work_log() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 16384,
+                "description": "Work-log message up to 16 KiB UTF-8, attributed to the calling Crew session's bound card and run."
+            }
+        },
+        "required": ["message"],
+        "additionalProperties": false
+    })
+}
+
+fn schema_read_crew_powder_evidence() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "crewSessionId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Optional Crew session owned by the calling Captain. Crew callers omit this to use their own binding."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "description": "Maximum recent evidence items to return. Defaults to 20."
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn schema_complete_crew_powder() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "crewSessionId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Crew session owned by the calling Captain. Its durable binding supplies the Powder card and run."
+            },
+            "proof": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "description": "Completion proof up to 4096 UTF-8 bytes, recorded against the Crew-bound card and run."
+            }
+        },
+        "required": ["crewSessionId", "proof"],
+        "additionalProperties": false
+    })
+}
+
 /// `release_captain` schema (captain-chat phase 2): release a claimed captaincy.
 fn schema_release_captain() -> Value {
     json!({
@@ -753,6 +816,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_captain_checkpoint,
         },
         ToolDef {
+            name: "append_crew_powder_work_log",
+            tier: Tier::Organization,
+            summary: "Append an attributed, bounded work-log message to the calling Crew session's bound Powder card and run. A narrow backend override admits only a read-capability Crew appending to its own binding.",
+            input_schema: schema_append_crew_powder_work_log,
+        },
+        ToolDef {
             name: "register_project",
             tier: Tier::Organization,
             summary: "Register an existing Git repository or explicitly create one absent empty-codebase leaf, optionally with its Powder mapping.",
@@ -769,6 +838,12 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::Read,
             summary: "Resolve a terminal's durable Project and return a bounded, credential-safe snapshot of its Powder board.",
             input_schema: schema_project_board_snapshot,
+        },
+        ToolDef {
+            name: "read_crew_powder_evidence",
+            tier: Tier::Read,
+            summary: "Read bounded card, run, criterion, and work-log evidence through a Crew binding; Captains may select only Crew they own.",
+            input_schema: schema_read_crew_powder_evidence,
         },
         ToolDef {
             name: "watch_fleet",
@@ -813,6 +888,12 @@ pub fn catalog() -> Vec<ToolDef> {
             tier: Tier::ProcessChanging,
             summary: "Heartbeat a Crew Powder claim only after verifying its terminal is live.",
             input_schema: schema_heartbeat_crew_powder,
+        },
+        ToolDef {
+            name: "complete_crew_powder",
+            tier: Tier::Organization,
+            summary: "Complete a Crew-bound Powder card with proof; only the Crew session's owning Captain is authorized.",
+            input_schema: schema_complete_crew_powder,
         },
         ToolDef {
             name: "send_text",
@@ -906,6 +987,9 @@ mod tests {
             "claim_captain",
             "attach_captain",
             "release_captain",
+            "append_crew_powder_work_log",
+            "read_crew_powder_evidence",
+            "complete_crew_powder",
             "get_theme",
             "set_theme",
         ] {
@@ -1116,6 +1200,99 @@ mod tests {
             (heartbeat.input_schema)()["required"],
             json!(["crewSessionId"])
         );
+    }
+
+    #[test]
+    fn powder_evidence_tools_share_minimal_bound_authority_schemas() {
+        let append = find("append_crew_powder_work_log").unwrap();
+        assert_eq!(append.tier, Tier::Organization);
+        assert_eq!((append.input_schema)()["required"], json!(["message"]));
+
+        let evidence = find("read_crew_powder_evidence").unwrap();
+        assert_eq!(evidence.tier, Tier::Read);
+        assert_eq!(
+            (evidence.input_schema)()["properties"]["limit"]["maximum"],
+            20
+        );
+
+        let complete = find("complete_crew_powder").unwrap();
+        assert_eq!(complete.tier, Tier::Organization);
+        assert_eq!(
+            (complete.input_schema)()["required"],
+            json!(["crewSessionId", "proof"])
+        );
+        assert_eq!(
+            (append.input_schema)()["properties"]["message"]["maxLength"],
+            16384
+        );
+        assert_eq!(
+            (complete.input_schema)()["properties"]["proof"]["maxLength"],
+            4096
+        );
+        assert_eq!(
+            complete.to_mcp()["annotations"]["confirmationRequired"],
+            false
+        );
+
+        // Append and completion have the same Organization base tier as the
+        // combined control contract. Organization carries no generic process
+        // confirmation. The backend separately admits the narrow Crew-self
+        // work-log case through a read token, then rechecks exact Crew and ship
+        // ownership. Completion has no such read-token override.
+        for name in ["append_crew_powder_work_log", "complete_crew_powder"] {
+            let tool = find(name).unwrap().to_mcp();
+            assert_eq!(tool["annotations"]["t-hubTier"], "organization", "{name}");
+            assert_eq!(
+                tool["annotations"]["confirmationRequired"], false,
+                "{name} must reach role-bound backend authorization"
+            );
+        }
+        let read = evidence.to_mcp();
+        assert_eq!(read["annotations"]["t-hubTier"], "read");
+        assert_eq!(read["annotations"]["confirmationRequired"], false);
+
+        // JSON Schema maxLength counts Unicode scalar values. The descriptions
+        // therefore state the backend's byte contract explicitly; CLI process
+        // and combined-control tests enforce the UTF-8 byte limit itself.
+        assert!(
+            (append.input_schema)()["properties"]["message"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("16 KiB UTF-8")
+        );
+        assert!(
+            (complete.input_schema)()["properties"]["proof"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("4096 UTF-8 bytes")
+        );
+
+        for name in [
+            "append_crew_powder_work_log",
+            "read_crew_powder_evidence",
+            "complete_crew_powder",
+        ] {
+            let schema = (find(name).unwrap().input_schema)();
+            assert_eq!(schema["type"], "object", "{name}");
+            assert_eq!(schema["additionalProperties"], false, "{name}");
+            for escape in [
+                "cardId",
+                "card_id",
+                "runId",
+                "run_id",
+                "profile",
+                "connectionProfile",
+                "connection_profile",
+                "endpoint",
+                "repository",
+                "credential",
+            ] {
+                assert!(
+                    schema["properties"].get(escape).is_none(),
+                    "{name} must not expose {escape}"
+                );
+            }
+        }
     }
 
     #[test]

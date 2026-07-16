@@ -113,6 +113,20 @@ name over the loopback channel:
 | `th tabs` | `list_tabs` | |
 | `th health` | `wsl_health` | |
 | `th events` | `__subscribe_events` | streams the event bus until Ctrl-C |
+| `th powder work-log append <message>` | `append_crew_powder_work_log` | uses the calling Crew session's bound card and run |
+| `th powder evidence` | `read_crew_powder_evidence` | bounded to 20 recent entries; owning Captains may use `--crew` |
+| `th powder complete <crew> --proof <text>` | `complete_crew_powder` | owning Captain only |
+
+## Powder Crew evidence
+
+The Powder commands never accept card ids, run ids, repositories, connection profiles, endpoints, or credentials.
+T-Hub resolves those authority-bearing fields from the authenticated Crew binding.
+`work-log append` is Crew-scoped, `evidence` is a bounded Crew read with an owning-Captain target option, and `complete` is restricted to the Crew session's owning Captain.
+Work-log messages are limited to 16 KiB of UTF-8 and completion proof is limited to 4096 UTF-8 bytes.
+
+Every Powder command supports `--json` and emits the stable CLI envelope on success or failure.
+Argument and flag validation finishes before endpoint discovery or any side effect.
+Run `th powder --help` for concise examples and bounds.
 
 ## Worktree lifecycle (treehouse-style)
 
