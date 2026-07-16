@@ -34,8 +34,11 @@ Independent read-only review completed with no findings.
 The reviewer reran the 23-test focused suite ten times for 230 passing test executions with zero failures, and independently confirmed `cargo fmt --check`, `git diff --check`, and tracked worktree cleanliness.
 The reviewer confirmed that renewal revalidates active lifecycle state inside the serialized per-Crew guard before any remote renew, cleanup holds the same guard through disposition and final mutation, unrelated Crew can still progress, and the deterministic regression prevents a queued heartbeat from renewing a cleanup-pending Crew.
 The residual review risk is limited to live Powder integration, which was outside the read-only review scope.
-The card, run, Crew, and worktree must remain unreaped and unmerged until required final Powder work-log evidence is reconciled and the Captain accepts the result.
-T17 `thub-captain-crew-terminal-state` may start only after that evidence reconciliation and Captain acceptance.
+The Captain appended exactly one `T2_FINAL_VERIFIED` work-log entry through the protected `n8desktop-wsl` profile for exact run `run-trPe9u6_KuU0` and reread exactly one matching entry.
+The entry records both commits, the Crew's 23 passing tests, the independent review's 230 passing repeated executions, formatting and diff checks, tracked cleanliness, and the remaining live-integration risk.
+The Captain accepts the T2 implementation and review result.
+The card remains claimed, and the run, Crew, and worktree remain unreaped and unmerged because card-only completion remains unsafe until Powder's run-bound mutation contract stabilizes.
+T17 `thub-captain-crew-terminal-state` remains blocked on that safe lifecycle transition and must not be dispatched from a blocked card.
 
 T-Hub Crew terminal `2bef9b61` remains active on T30 `thub-control-client-deadline` under authoritative run `run-Q7QP9N_mqTJF` in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/control-client-deadline` on branch `fix/control-client-deadline`.
 The Crew reproduced the defect through the source CLI with a stale inherited endpoint that accepted a request but stayed silent while the handshake pointed to a live replacement.
