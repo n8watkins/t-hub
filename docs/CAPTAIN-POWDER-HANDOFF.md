@@ -46,6 +46,8 @@ Exact-run final work-log backfill remains unavailable because installed `0.3.103
 
 No merge, push, install, deploy, publication, release, card completion, claim release, or resource reap is authorized or claimed.
 The next ordered implementation action still requires separate General authorization to integrate observability before launch attestation, run the real combined-tree agent launch proof, and only then consider merge or installation.
+After more than three consecutive monitoring turns, the exact-run final work-log gap remains unchanged because the installed sanctioned T-Hub surface exposes no append operation.
+The Captain goal is blocked at that evidence gate and the separately authorized combined-tree integration gate, while the verified fleet wake remains armed and all three Crew remain preserved for recovery.
 
 ### Verified 2026-07-15 Permission Crew Progress Boundary
 
