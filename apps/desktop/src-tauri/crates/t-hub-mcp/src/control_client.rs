@@ -281,6 +281,10 @@ enum CallError {
     /// The peer answered with a malformed protocol frame. Retrying on another
     /// endpoint would hide a compatibility failure.
     Protocol(String),
+    /// The request was fully written, then the peer closed after sending only part
+    /// of its response frame. A requestId-bearing mutation may have applied, so its
+    /// caller must reconcile status rather than treating this as terminal protocol.
+    PartialResponse,
 }
 
 impl CallError {
@@ -291,6 +295,7 @@ impl CallError {
             }
             CallError::Timeout(stage) => timeout_message(command, attempts, stage),
             CallError::App(message) | CallError::Protocol(message) => message,
+            CallError::PartialResponse => partial_response_message(),
         }
     }
 
@@ -305,8 +310,13 @@ impl CallError {
             CallError::Transport(stage) | CallError::Timeout(stage) => stage,
             CallError::App(_) => "server",
             CallError::Protocol(_) => "protocol",
+            CallError::PartialResponse => "read",
         }
     }
+}
+
+fn partial_response_message() -> String {
+    "control_protocol: unterminated response frame after request write".to_string()
 }
 
 fn unavailable_message(
@@ -474,6 +484,10 @@ fn resolve_and_call_with_deadline(
             wedge_detector().on_success();
             Err(msg)
         }
+        Err(CallError::PartialResponse) if request_id.is_none() => {
+            wedge_detector().on_success();
+            Err(partial_response_message())
+        }
         Err(first) => {
             let first_is_timeout = first.is_timeout();
             let first_stage = first.stage();
@@ -558,6 +572,7 @@ fn resolve_and_call_with_deadline(
                         }
                     }
                     Err(CallError::Protocol(msg)) => Err(msg),
+                    Err(CallError::PartialResponse) => Err(partial_response_message()),
                     Err(e2) => {
                         let e2_is_timeout = e2.is_timeout();
                         let e2_msg = e2.into_message(command, 2, true);
@@ -621,6 +636,7 @@ fn maybe_heal_and_retry(
                     Err(stale_env_token_error(&msg))
                 }
                 Err(CallError::App(msg)) | Err(CallError::Protocol(msg)) => Err(msg),
+                Err(CallError::PartialResponse) => Err(partial_response_message()),
                 Err(other) => Err(other.into_message(command, 3, true)),
             };
         }
@@ -727,6 +743,7 @@ fn resolve_ambiguous_request(
                 return Err(first_err);
             }
             Err(CallError::Protocol(msg)) => return Err(msg),
+            Err(CallError::PartialResponse) => return Err(first_err),
             // The channel is still unreachable (fast transport failure) or wedged
             // (timeout): keep trying to reach the status endpoint until the deadline,
             // else give up with the original error.
@@ -862,11 +879,7 @@ fn call_classified(
         }
         match (&stream).read(&mut chunk) {
             Ok(0) if response.is_empty() => return Err(CallError::Transport("read")),
-            Ok(0) => {
-                return Err(CallError::Protocol(
-                    "control_protocol: unterminated response frame".to_string(),
-                ));
-            }
+            Ok(0) => return Err(CallError::PartialResponse),
             Ok(n) => {
                 let received = &chunk[..n];
                 let frame_bytes = received
@@ -1081,7 +1094,14 @@ fn wait_with_timeout(child: &mut std::process::Child, budget: Duration) -> Optio
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
+
+    enum ScriptedReply {
+        Line(&'static str),
+        Partial(&'static str),
+        Close,
+    }
 
     /// A fake control server that services a scripted SEQUENCE of connections. For
     /// each entry it accepts one connection, reads the one request line (captured
@@ -1115,6 +1135,106 @@ mod tests {
             }
         });
         (addr, captured)
+    }
+
+    fn byte_scripted_server(replies: Vec<ScriptedReply>) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_ok() {
+                    if let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) {
+                        cap.lock().unwrap().push(value);
+                    }
+                }
+                match reply {
+                    ScriptedReply::Line(body) => {
+                        let _ = writer.write_all(body.as_bytes());
+                        let _ = writer.write_all(b"\n");
+                        let _ = writer.flush();
+                    }
+                    ScriptedReply::Partial(body) => {
+                        let _ = writer.write_all(body.as_bytes());
+                        let _ = writer.flush();
+                    }
+                    ScriptedReply::Close => {}
+                }
+            }
+        });
+        (addr, captured)
+    }
+
+    fn mcp_binary() -> PathBuf {
+        if let Some(path) = option_env!("CARGO_BIN_EXE_t-hub-mcp") {
+            return PathBuf::from(path);
+        }
+        let test_exe = std::env::current_exe().unwrap();
+        let debug_dir = test_exe.parent().and_then(|path| path.parent()).unwrap();
+        let name = if cfg!(windows) {
+            "t-hub-mcp.exe"
+        } else {
+            "t-hub-mcp"
+        };
+        let binary = debug_dir.join(name);
+        assert!(
+            binary.is_file(),
+            "MCP process binary missing at {}; run `cargo build -p t-hub-mcp` before this focused test",
+            binary.display()
+        );
+        binary
+    }
+
+    fn run_mcp_spawn_process(addr: &str, token: &str) -> (std::process::Output, Duration) {
+        let mut child = Command::new(mcp_binary())
+            .env("T_HUB_CONTROL_ADDR", addr)
+            .env("T_HUB_CONTROL_TOKEN", token)
+            .env("T_HUB_CONTROL_FILE", "/nonexistent/th-control.json")
+            .env_remove("T_HUB_SESSION_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "spawn_terminal",
+                "arguments": {
+                    "cwd": "/tmp",
+                    "requestId": "partial-eof-process-request"
+                }
+            }
+        });
+        let mut stdin = child.stdin.take().unwrap();
+        serde_json::to_writer(&mut stdin, &request).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        drop(stdin);
+
+        let started = Instant::now();
+        let deadline = started + CONTROL_DEADLINE + Duration::from_secs(2);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("MCP process exceeded test deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let elapsed = started.elapsed();
+        (child.wait_with_output().unwrap(), elapsed)
     }
 
     fn silent_server(hold: Duration) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -1497,27 +1617,17 @@ mod tests {
     fn unterminated_response_frame_is_a_safe_protocol_error() {
         let secret = "unterminated-server-token-must-not-leak";
         let addr = raw_response_server(format!("{{\"ok\":true,\"{secret}\":").into_bytes());
-        let endpoint = ControlEndpoint {
-            addr,
-            token: "control".into(),
-        };
 
-        let error = call_classified(
-            &endpoint,
+        let error = resolve_and_call_with_deadline(
+            &discovery_for(addr),
             "list_tabs",
             &Value::Null,
-            CallBudget {
-                deadline: Instant::now() + Duration::from_secs(2),
-                attempt_timeout: Duration::from_millis(100),
-            },
-            None,
+            Duration::from_secs(2),
+            Duration::from_millis(100),
         )
         .unwrap_err();
-        let CallError::Protocol(message) = error else {
-            panic!("unterminated frame must be a protocol error");
-        };
-        assert!(message.contains("unterminated response frame"));
-        assert!(!message.contains(secret));
+        assert!(error.contains("unterminated response frame after request write"));
+        assert!(!error.contains(secret));
     }
 
     #[test]
@@ -1753,6 +1863,257 @@ mod tests {
             rid,
             "the status query reuses the original requestId"
         );
+    }
+
+    #[test]
+    fn partial_eof_idempotent_call_resolves_completed_outcome() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":true,"result":{"id":"sess-partial"}}}"#,
+            ),
+        ]);
+
+        let value = resolve_and_call_with_deadline(
+            &discovery_for(addr),
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp", "requestId": "partial-completed"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        assert_eq!(value["id"], "sess-partial");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert_eq!(
+            requests[1]["args"]["requestId"],
+            requests[0]["args"]["requestId"]
+        );
+    }
+
+    #[test]
+    fn partial_eof_idempotent_call_resolves_failed_outcome() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":false,"error":"spawn failed safely"}}"#,
+            ),
+        ]);
+
+        let error = resolve_and_call_with_deadline(
+            &discovery_for(addr),
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp", "requestId": "partial-failed"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "spawn failed safely");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["command"], "get_request_status");
+    }
+
+    #[test]
+    fn partial_eof_unknown_status_reruns_once_with_same_request_id() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"id":"sess-retried"}}"#),
+        ]);
+
+        let value = resolve_and_call_with_deadline(
+            &discovery_for(addr),
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp", "requestId": "partial-unknown"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        assert_eq!(value["id"], "sess-retried");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert_eq!(requests[2]["command"], "spawn_terminal");
+        assert_eq!(
+            requests[2]["args"]["requestId"],
+            requests[0]["args"]["requestId"]
+        );
+    }
+
+    #[test]
+    fn partial_eof_status_unavailable_exhausts_budget_without_duplicate_mutation() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Close,
+        ]);
+        let started = Instant::now();
+
+        let error = resolve_and_call_with_deadline(
+            &discovery_for(addr),
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp", "requestId": "partial-unavailable"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("control_timeout"));
+        assert!(error.contains("request status"));
+        assert!(error.contains("partial-unavailable"));
+        assert!(!error.contains("cut"));
+        assert!(started.elapsed() < Duration::from_millis(400));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
+    }
+
+    #[test]
+    fn idempotent_pre_write_protocol_error_remains_fail_closed() {
+        let discovery = Discovery {
+            addr: Some("not-a-control-address".into()),
+            token: Some("pre-write-token-must-not-leak".into()),
+            file: Some(PathBuf::from("/nonexistent/th-control.json")),
+            ..Default::default()
+        };
+
+        let error = resolve_and_call_with_deadline(
+            &discovery,
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp", "requestId": "pre-write-malformed"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("malformed endpoint address"));
+        assert!(!error.contains("pre-write-token-must-not-leak"));
+    }
+
+    #[test]
+    fn process_partial_eof_resolves_completed_without_duplicate_mutation() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":true,"result":{"id":"sess-process"}}}"#,
+            ),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(
+            response["result"]["structuredContent"]["id"],
+            "sess-process"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.stdout.len() < 4096);
+        assert!(output.stderr.is_empty(), "stderr: {output:?}");
+        assert!(!stdout.contains("process-control-token"));
+        assert!(!stdout.contains("cut"));
+        assert!(!stdout.contains(&addr));
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert_eq!(
+            requests[1]["args"]["requestId"],
+            requests[0]["args"]["requestId"]
+        );
+    }
+
+    #[test]
+    fn process_partial_eof_resolves_failed_without_duplicate_mutation() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":false,"error":"spawn failed safely"}}"#,
+            ),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "spawn failed safely"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.stdout.len() < 4096);
+        assert!(output.stderr.is_empty(), "stderr: {output:?}");
+        assert!(!stdout.contains("process-control-token"));
+        assert!(!stdout.contains("cut"));
+        assert!(!stdout.contains(&addr));
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["command"], "get_request_status");
+    }
+
+    #[test]
+    fn process_partial_eof_unknown_reruns_once_with_same_request_id() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"id":"sess-process-retried"}}"#),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(
+            response["result"]["structuredContent"]["id"],
+            "sess-process-retried"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.stdout.len() < 4096);
+        assert!(output.stderr.is_empty(), "stderr: {output:?}");
+        assert!(!stdout.contains("process-control-token"));
+        assert!(!stdout.contains("cut"));
+        assert!(!stdout.contains(&addr));
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert_eq!(requests[2]["command"], "spawn_terminal");
+        assert_eq!(
+            requests[2]["args"]["requestId"],
+            requests[0]["args"]["requestId"]
+        );
+    }
+
+    #[test]
+    fn process_partial_eof_status_unavailable_is_bounded_without_duplicate_mutation() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"cut""#),
+            ScriptedReply::Close,
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(message.contains("control_timeout"));
+        assert!(message.contains("request status"));
+        assert!(message.contains("partial-eof-process-request"));
+        assert!(!message.contains("process-control-token"));
+        assert!(!message.contains("cut"));
+        assert!(!message.contains(&addr));
+        assert!(output.stdout.len() < 4096);
+        assert!(output.stderr.is_empty(), "stderr: {output:?}");
+        assert!(elapsed >= CONTROL_DEADLINE - Duration::from_secs(1));
+        assert!(elapsed <= CONTROL_DEADLINE + Duration::from_secs(1));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
     }
 
     #[test]
