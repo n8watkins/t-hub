@@ -54,7 +54,11 @@ Independent review requested changes because duplicate or out-of-order journal e
 The review also found that current Codex `thread/started` events using `params.thread.id` are silently dropped and that missing identifiers fall back to an unsalted fingerprint of raw credential-bearing input.
 The parser is not yet wired to plain interactive Codex TUI dispatch through hooks or an app-server mirror, so the implementation must either add an in-scope producer or expose explicit unsupported and degraded runtime health that prevents false Working.
 The Captain has returned all findings for separate correction commits, focused and workspace verification, and independent rereview.
-The observability lane remains unaccepted.
+The Crew corrected replay rejection, current thread identity parsing, opaque fallback identifiers, explicit unobserved-TUI degraded health, and its isolated process proof as `119f672`, `4c707ef`, `6c1c24f`, `3715943`, and `0c23665`.
+All focused and workspace verification is green, and those correction commits are under independent rereview.
+Plain interactive Codex launch still invokes neither structured telemetry nor the degraded marker because that integration belongs to the launch and Harness ownership lane.
+The Captain selected automatic degraded-marker invocation as the immediate fail-safe integration while retaining a native hook or app-server mirror as the required path to structured automatic permission detection.
+The observability lane remains unaccepted until launch integration lands and the combined behavior is independently verified.
 
 Installed `0.3.103` still launches these Codex Crew without the unrestricted source flag.
 Until the launch and observability changes are reviewed and later authorized for installation, the Captain is monitoring all three live panes and approving only exact routine local read, build, test, and evidence operations already authorized by the General.
