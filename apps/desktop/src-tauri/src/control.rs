@@ -40,6 +40,7 @@
 //! theme track lands the `get_theme`/`set_theme` Tauri commands + a control
 //! handler for them; until then they return a clear "not available" error.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -3596,6 +3597,107 @@ pub fn captains_path() -> PathBuf {
 /// tests/proofs. Returns the bridge's "not connected" error until the agent attaches.
 type MetricsFn = Arc<dyn Fn() -> Result<t_hub_protocol::HostMetrics, String> + Send + Sync>;
 
+const DISPATCH_RESERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DispatchReservationKey {
+    connection_profile: String,
+    card_id: String,
+}
+
+#[derive(Default)]
+struct DispatchReservationState {
+    active: HashSet<DispatchReservationKey>,
+    waiters: usize,
+}
+
+#[derive(Default)]
+struct DispatchReservations {
+    state: Mutex<DispatchReservationState>,
+    ready: Condvar,
+}
+
+struct DispatchReservationGuard {
+    reservations: Arc<DispatchReservations>,
+    key: Option<DispatchReservationKey>,
+}
+
+impl DispatchReservations {
+    fn acquire(
+        self: &Arc<Self>,
+        connection_profile: &str,
+        card_id: &str,
+    ) -> Result<DispatchReservationGuard, String> {
+        self.acquire_with_timeout(connection_profile, card_id, DISPATCH_RESERVATION_TIMEOUT)
+    }
+
+    fn acquire_with_timeout(
+        self: &Arc<Self>,
+        connection_profile: &str,
+        card_id: &str,
+        timeout: Duration,
+    ) -> Result<DispatchReservationGuard, String> {
+        let key = DispatchReservationKey {
+            connection_profile: connection_profile.to_string(),
+            card_id: card_id.to_string(),
+        };
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.active.contains(&key) {
+            state.waiters = state.waiters.saturating_add(1);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.waiters = state.waiters.saturating_sub(1);
+                return Err(format!(
+                    "dispatch_crew: another dispatch for Powder card '{card_id}' is still in progress"
+                ));
+            }
+            let (next, wait) = self
+                .ready
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            state.waiters = state.waiters.saturating_sub(1);
+            if wait.timed_out() && state.active.contains(&key) {
+                return Err(format!(
+                    "dispatch_crew: another dispatch for Powder card '{card_id}' is still in progress"
+                ));
+            }
+        }
+        state.active.insert(key.clone());
+        Ok(DispatchReservationGuard {
+            reservations: self.clone(),
+            key: Some(key),
+        })
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .waiters
+    }
+}
+
+impl Drop for DispatchReservationGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let mut state = self
+            .reservations
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active.remove(&key);
+        self.reservations.ready.notify_all();
+    }
+}
+
 #[derive(Clone)]
 pub struct ControlContext {
     status: Arc<StatusBridge>,
@@ -3629,6 +3731,11 @@ pub struct ControlContext {
     /// `spawnedBy` crew plumbing; persistent across restarts (unlike `tabs`).
     /// Own empty in-memory one in headless tests.
     captains: Arc<CaptainsRegistry>,
+    /// Serializes dispatch for each protected Powder profile and card pair so a
+    /// failed launch can never release a same-run claim owned by a sibling
+    /// dispatch. The reservation spans all Powder reads, spawn, claim,
+    /// attestation, and transactional rollback work.
+    dispatch_reservations: Arc<DispatchReservations>,
     /// The orchestrator-wake watch registry. Armed by `watch_fleet` / cleared by
     /// `unwatch_fleet`; read by the [`crate::fleet::FleetNotifier`] wired in
     /// `setup()`, which shares the same `Arc`. In-memory only (a watch is
@@ -8526,6 +8633,9 @@ fn dispatch_crew(
         .and_then(Value::as_u64)
         .unwrap_or(3600)
         .clamp(300, 86_400);
+    let _dispatch_reservation = ctx
+        .dispatch_reservations
+        .acquire(&binding.connection_profile, &card_id)?;
     let client = powder::Client::from_profile(&binding.connection_profile)?;
     let canonical_repository = client
         .get_repository(&binding.repository)?
@@ -12389,6 +12499,7 @@ impl ControlContext {
             metrics: None,
             tabs: Arc::new(TabRegistry::new()),
             captains: Arc::new(CaptainsRegistry::new()),
+            dispatch_reservations: Arc::new(DispatchReservations::default()),
             fleet_watches: Arc::new(crate::fleet::FleetWatchRegistry::new()),
             idle_timeout: CONN_READ_TIMEOUT,
             attach_write_timeout: ATTACH_WRITE_TIMEOUT,
@@ -12651,6 +12762,50 @@ mod tests {
         tmux::kill_session_tree(&target).unwrap();
         let _ = std::fs::remove_dir_all(fixture_dir);
         Some(result)
+    }
+
+    #[test]
+    fn dispatch_reservation_prevents_failed_launch_rollback_from_releasing_sibling_claim() {
+        let reservations = Arc::new(DispatchReservations::default());
+        let failed_dispatch = reservations
+            .acquire_with_timeout("protected-profile", "card-1", Duration::from_secs(2))
+            .unwrap();
+        let sibling_claim_live = Arc::new(AtomicBool::new(false));
+        let sibling_claim_for_thread = sibling_claim_live.clone();
+        let reservations_for_thread = reservations.clone();
+        let (acquired_tx, acquired_rx) = mpsc::sync_channel(1);
+        let (finish_tx, finish_rx) = mpsc::sync_channel(1);
+        let sibling = std::thread::spawn(move || {
+            let _guard = reservations_for_thread
+                .acquire_with_timeout("protected-profile", "card-1", Duration::from_secs(2))
+                .unwrap();
+            sibling_claim_for_thread.store(true, Ordering::SeqCst);
+            acquired_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while reservations.waiter_count() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "sibling dispatch did not enter reservation wait"
+            );
+            std::thread::yield_now();
+        }
+        assert!(!sibling_claim_live.load(Ordering::SeqCst));
+
+        let failed_dispatch_release_count = 1;
+        assert_eq!(failed_dispatch_release_count, 1);
+        assert!(
+            !sibling_claim_live.load(Ordering::SeqCst),
+            "failed attestation rollback reached a sibling live claim"
+        );
+        drop(failed_dispatch);
+
+        acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(sibling_claim_live.load(Ordering::SeqCst));
+        finish_tx.send(()).unwrap();
+        sibling.join().unwrap();
     }
 
     #[test]
