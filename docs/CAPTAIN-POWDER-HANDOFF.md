@@ -27,12 +27,14 @@ This boundary was verified at `2026-07-15T22:43:08-07:00`.
 T30 Crew terminal `2bef9b61` remains live under run `run-Q7QP9N_mqTJF` with no completion sentinel and no commit yet.
 Its isolated worktree contains tracked changes only in the owned CLI and desktop control clients, plus the protected untracked `CLAUDE.md` artifact.
 The CLI and desktop implementations now share a bounded recovery-deadline shape with deterministic loopback coverage for refused connections, connected-but-silent inherited endpoints, response loss, healthy current endpoints, exhausted discovery budget, structured timeout classification, and credential-safe errors.
-The Crew is running the focused desktop control-client tests after the Captain approved the exact local formatting and loopback-test command.
+The focused desktop control-client suite passed all 11 tests on three executions after the Captain approved the exact local formatting and loopback-test command.
 The owned MCP control client remains the third implementation target before T30 verification and commits can complete.
 
 Powder card `powder-mutation-idempotency` remains the sole active Powder dependency lane under run `run-9RWhdmpyPzXE`.
 Its Crew has produced five logical commits: `07bd797` for the transactional operation substrate, `c9c7cd7` for stable authenticated authority, `695c0a8` for schema migration coverage, `44da772` for HTTP, CLI, and MCP adapter exposure, and `e18e6e9` for the mutation recovery contract.
-The mutation-idempotency worktree is tracked-clean while final verification continues.
+The mutation-idempotency worktree is tracked-clean.
+Exact verification passed `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `git diff --check` across all workspace targets.
+The next Powder gate is independent review and exact-run evidence reconciliation before any dependency transition.
 The other three Powder cards remain dependency-blocked.
 
 The installed `0.3.103` T-Hub control RPC still times out on capability and board-read calls.
