@@ -41,6 +41,9 @@ The Captain has returned these new blockers for explicit downstream recovery res
 T30 corrected those three issues as `58b6ec5`, and independent rereview verified the absolute trickle deadline, MCP recovery reserves, idle polling, and concurrency-safe endpoint adoption.
 That rereview found one remaining blocker because all three clients still accumulate and repeatedly rescan an unbounded response frame, and the CLI can echo the raw malformed frame.
 The Captain returned a shared safe frame limit, incremental scanning, bounded credential-safe protocol errors, and exact-limit, over-limit, malformed, unterminated, output-bound, and non-leak coverage.
+T30 corrected framing as `570c0c6`, and independent rereview verified the one-mebibyte limit, linear chunk scanning, bounded safe errors, output bounds, and trickle deadline.
+That rereview found a new high-severity MCP ambiguity regression because partial response EOF after an idempotent mutation returns Protocol before `get_request_status` reconciliation.
+The Captain returned partial-EOF ambiguity routing with completed, failed, unknown, unavailable-status, no-duplicate-mutation, process, and credential-safety coverage.
 T30 remains unaccepted until a separate correction commit passes another independent rereview.
 
 Permission launch-attestation terminal `10d1093e` committed its provider-neutral Harness attestation layer as `5b033fe` on branch `fix/codex-permission-launch-attestation` after 28 focused tests passed without warnings.
