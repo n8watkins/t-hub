@@ -9092,7 +9092,7 @@ fn validate_completion_criteria(
             .map(str::trim)
             .filter(|actor| !actor.is_empty());
         let checked_at = criterion.checked_at;
-        if checked_by.is_none() || !checked_at.is_some_and(|timestamp| timestamp > 0) {
+        if checked_by.is_none() || checked_at.is_none_or(|timestamp| timestamp <= 0) {
             return Err(format!(
                 "Powder acceptance criterion {} is not checked; refusing completion",
                 criterion.criterion
