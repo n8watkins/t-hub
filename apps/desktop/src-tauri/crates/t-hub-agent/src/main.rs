@@ -33,6 +33,7 @@
 //! transport scheduler that exploits this is implemented in [`transport`]
 //! (filled in by a subagent); `main` wires the pieces together.
 
+mod codex;
 mod dispatch;
 mod gate;
 mod hook;
@@ -53,6 +54,11 @@ use std::sync::Arc;
 /// - `--statusline`    Statusline ingest: read Claude's statusline JSON from
 ///                     stdin, append a `StatusSnapshot` journal entry, echo a
 ///                     short readout to stdout, exit 0. Never blocks Claude.
+/// - `--codex-tap`     Structured Codex lifecycle ingest: read Codex `exec
+///                     --json` or mirrored app-server JSONL from stdin and append
+///                     normalized, credential-safe lifecycle events.
+/// - `--codex-unobserved` Record explicit degraded health for an interactive Codex
+///                        TUI whose launch is not connected to structured telemetry.
 /// - `--gate` item-3 Pillar C: the BLOCKING `PreToolUse` gate - reads the hook JSON
 ///   on stdin, classifies the Bash command, and DENIES an outward-facing action a
 ///   crew may not take (fail-closed).
@@ -76,6 +82,10 @@ enum Mode {
     /// Statusline ingest: read Claude's statusline JSON from stdin, journal a
     /// `StatusSnapshot`, echo a readout, exit 0.
     Statusline,
+    /// Structured Codex lifecycle ingest for headless and interactive telemetry.
+    CodexTap,
+    /// Explicit degraded marker for an interactive TUI without lifecycle wiring.
+    CodexUnobserved,
     /// item-3 Pillar C: the BLOCKING `PreToolUse` gate. Reads the hook JSON on stdin,
     /// classifies the Bash command, resolves the caller's capability class from the
     /// app, and DENIES an outward-facing action a crew may not take (or a significant
@@ -99,6 +109,8 @@ fn parse_args() -> Args {
                 }
             },
             "--statusline" => mode = Mode::Statusline,
+            "--codex-tap" => mode = Mode::CodexTap,
+            "--codex-unobserved" => mode = Mode::CodexUnobserved,
             "--gate" => mode = Mode::Gate,
             "--journal-dir" => journal_dir = it.next(),
             "--version" | "-V" => {
@@ -144,6 +156,29 @@ fn main() {
             // Always exit 0 — never fail Claude's statusline render.
             std::process::exit(0);
         }
+
+        // ------------------------------------------------------------------
+        // --codex-tap: structured Codex lifecycle ingest.
+        // ------------------------------------------------------------------
+        Mode::CodexTap => match codex::run(args.journal_dir.as_deref()) {
+            Ok(outcome) if outcome.turn_failed => std::process::exit(1),
+            Ok(_) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("t-hub-agent --codex-tap: {error:#}");
+                std::process::exit(1);
+            }
+        },
+
+        // ------------------------------------------------------------------
+        // --codex-unobserved: never claim Working without structured telemetry.
+        // ------------------------------------------------------------------
+        Mode::CodexUnobserved => match codex::run_unobserved(args.journal_dir.as_deref()) {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("t-hub-agent --codex-unobserved: {error:#}");
+                std::process::exit(1);
+            }
+        },
 
         // ------------------------------------------------------------------
         // --gate: the BLOCKING PreToolUse gate (item-3 Pillar C). Emits a deny
@@ -202,7 +237,7 @@ fn main() {
         // ------------------------------------------------------------------
         Mode::None => {
             eprintln!(
-                "t-hub-agent {}: no mode selected; pass --stdio, --hook <EVENT>, or --statusline.",
+                "t-hub-agent {}: no mode selected; pass --stdio, --hook <EVENT>, --statusline, --codex-tap, or --codex-unobserved.",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(2);

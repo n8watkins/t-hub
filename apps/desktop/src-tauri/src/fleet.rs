@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::claude::StatusBridge;
-use crate::control::CaptainsRegistry;
+use crate::control::{CaptainsRegistry, CrewState};
 use crate::model::SessionStatus;
 
 /// The default set of session states that warrant an orchestrator wake, mapping
@@ -238,6 +238,28 @@ pub struct FleetNotifier {
 }
 
 impl FleetNotifier {
+    /// Resolve a Crew tile to the only Captain terminal authorized to receive
+    /// its attention edges. Removed Crew and ships without a live Captain
+    /// pointer are deliberately unroutable.
+    fn owning_captain(&self, crew_tile: &str) -> Option<(String, String)> {
+        self.captains
+            .snapshot()
+            .captains
+            .into_iter()
+            .find_map(|captain| {
+                let owns = captain.crew.iter().any(|crew| {
+                    crew.terminal_id == crew_tile
+                        && !matches!(crew.state, CrewState::Removed { .. })
+                });
+                owns.then(|| {
+                    captain
+                        .terminal_id
+                        .map(|terminal| (terminal, captain.ship_slug))
+                })
+                .flatten()
+            })
+    }
+
     pub fn new(
         watches: Arc<FleetWatchRegistry>,
         captains: Arc<CaptainsRegistry>,
@@ -303,7 +325,10 @@ impl FleetNotifier {
 
         let is_captain_record = self.captains.captain_for_session(&tile);
         let is_captain = is_captain_record.is_some();
-        let ship_slug = is_captain_record.map(|c| c.ship_slug);
+        let owning_captain = (!is_captain).then(|| self.owning_captain(&tile)).flatten();
+        let ship_slug = is_captain_record
+            .map(|c| c.ship_slug)
+            .or_else(|| owning_captain.as_ref().map(|(_, ship)| ship.clone()));
 
         let watches = self.watches.snapshot();
         for w in &watches {
@@ -316,7 +341,17 @@ impl FleetNotifier {
                 }
                 continue;
             }
-            if w.wants(&tile, is_captain, status) {
+            // A Crew edge belongs exclusively to its owning Captain. Peer
+            // watches cannot subscribe around that ownership with `All` or an
+            // explicit Sessions scope. The owner's actionable-state filter is
+            // still honored, while its scope is intentionally irrelevant: Crew
+            // supervision is part of Captain ownership, not a global broadcast.
+            let wants = if let Some((owner_tile, _)) = &owning_captain {
+                w.orchestrator_tile_id == *owner_tile && w.states.contains(&status)
+            } else {
+                w.wants(&tile, is_captain, status)
+            };
+            if wants {
                 let entry = st
                     .pending
                     .entry(w.orchestrator_tile_id.clone())
@@ -682,6 +717,46 @@ mod tests {
     }
 
     #[test]
+    fn crew_attention_wakes_only_its_owning_captain() {
+        let (n, rec, watches, captains) = harness();
+        captains
+            .claim_test("peer1111", Some("ship-peer-one"), vec![])
+            .unwrap();
+        captains
+            .claim_test("peer2222", Some("ship-peer-two"), vec![])
+            .unwrap();
+        captains.record_crew("capaaaaa", "crew1111").unwrap();
+        n.status_bridge_ingest("u-peer-1", "th_peer1111");
+        n.status_bridge_ingest("u-peer-2", "th_peer2222");
+        n.status_bridge_ingest("u-crew", "th_crew1111");
+
+        // Prime every Captain's ready edge under scopes that cover no source.
+        for captain in ["capaaaaa", "peer1111", "peer2222"] {
+            watches.arm(captain, WatchScope::Sessions(vec![]), vec![]);
+        }
+        n.on_status("u-cap", SessionStatus::Completed);
+        n.on_status("u-peer-1", SessionStatus::Completed);
+        n.on_status("u-peer-2", SessionStatus::Completed);
+        assert!(rec.calls().is_empty());
+
+        // The owner uses the default Captains scope. Peers attempt both broad
+        // and exact subscriptions, neither of which may bypass Crew ownership.
+        watches.arm("capaaaaa", WatchScope::Captains, vec![]);
+        watches.arm("peer1111", WatchScope::All, vec![]);
+        watches.arm(
+            "peer2222",
+            WatchScope::Sessions(vec!["crew1111".to_string()]),
+            vec![],
+        );
+        n.on_status("u-crew", SessionStatus::NeedsPermission);
+
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 1, "one owning-Captain wake only");
+        assert_eq!(calls[0].0, "capaaaaa");
+        assert!(calls[0].1.contains("crew1111"));
+    }
+
+    #[test]
     fn failed_injection_is_retried_on_the_next_idle_edge() {
         let (n, rec, w, _c) = harness();
         rec.fail.store(1, Ordering::SeqCst); // fail the first inject only
@@ -843,6 +918,34 @@ mod tests {
         assert_eq!(
             inbox.ack("orcbbbbb", 0),
             crate::inbox::AckOutcome::AlreadyProcessed { seq: 0 }
+        );
+    }
+
+    #[test]
+    fn durable_crew_attention_never_wakes_a_peer_captain() {
+        let (n, rec, watches, captains, _inbox) = harness_durable();
+        captains
+            .claim_test("peer1111", Some("ship-peer"), vec![])
+            .unwrap();
+        captains.record_crew("capaaaaa", "crew1111").unwrap();
+        n.status_bridge_ingest("u-peer", "th_peer1111");
+        n.status_bridge_ingest("u-crew", "th_crew1111");
+
+        watches.arm("capaaaaa", WatchScope::Sessions(vec![]), vec![]);
+        watches.arm("peer1111", WatchScope::Sessions(vec![]), vec![]);
+        n.on_status("u-cap", SessionStatus::Completed);
+        n.on_status("u-peer", SessionStatus::Completed);
+
+        watches.arm("capaaaaa", WatchScope::Captains, vec![]);
+        watches.arm("peer1111", WatchScope::All, vec![]);
+        n.on_status("u-crew", SessionStatus::NeedsPermission);
+
+        assert_eq!(
+            rec.calls(),
+            vec![(
+                "capaaaaa".to_string(),
+                "[T-HUB FLEET WAKE] session crew1111 -> needsPermission. Supervise that session (get_status / read_terminal, then act).".to_string()
+            )]
         );
     }
 

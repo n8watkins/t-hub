@@ -74,6 +74,10 @@ pub struct JournalEventPayload<'a> {
 pub struct SessionStatusPayload {
     pub session_id: String,
     pub status: crate::model::SessionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_health: Option<crate::supervision::RuntimeHealthObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_request: Option<crate::supervision::PermissionRequest>,
 }
 
 /// Payload of the `agent://title` event (mirrors `SessionTitleEvent` in
@@ -153,6 +157,8 @@ mod tests {
             &SessionStatusPayload {
                 session_id: "s1".into(),
                 status: crate::model::SessionStatus::Working,
+                runtime_health: None,
+                permission_request: None,
             },
         );
         let events = rec.events.lock();

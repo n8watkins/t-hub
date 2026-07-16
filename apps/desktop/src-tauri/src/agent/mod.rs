@@ -680,6 +680,15 @@ impl AgentBridge {
     /// (so the unit tests that call this directly still pass). Returns the
     /// affected session id for callers/tests that want it.
     pub fn consume_journal_entry(&self, entry: &EventJournalEntry) -> Option<String> {
+        // The journal sequence is the replay idempotency boundary. Reject an
+        // already-consumed or out-of-order entry before every side effect,
+        // including status ingestion, UI emission, title derivation, provider
+        // binding, and supervision reduction. Otherwise a late SessionStart can
+        // erase a newer pending permission and falsely report Working.
+        if !self.advance_cursor(entry.seq) {
+            return None;
+        }
+
         // StatusSnapshot entries get a DEDICATED minimal path. The statusline
         // re-journals an IDENTICAL snapshot ~25x/sec/session (only `ingested_at_ms`
         // ticks). On that path the full fan-out below is pure waste and a sustained
@@ -695,7 +704,6 @@ impl AgentBridge {
             entry.event_type,
             t_hub_protocol::JournalEventType::StatusSnapshot
         ) {
-            self.advance_cursor(entry.seq);
             self.ingest_status_from_journal(entry);
             // Return the entry's own session id for callers/tests; no tree/status
             // emit (the reducer status is unchanged by a status snapshot).
@@ -708,16 +716,12 @@ impl AgentBridge {
             });
         }
 
-        let cursor_advanced = self.advance_cursor(entry.seq);
-
         // 1. Forward the raw journal entry to the UI (snake_case, verbatim — it's
         //    the protocol type). Serialize once and reuse the value.
         self.inner.emit(EVT_JOURNAL, &JournalEventPayload { entry });
 
-        // 2. If the replay cursor moved, the health area's journalCursor changed.
-        if cursor_advanced {
-            self.emit_agent_state();
-        }
+        // 2. The replay cursor moved, so the health area's journalCursor changed.
+        self.emit_agent_state();
 
         // NOTE: StatusSnapshot entries never reach here — they are short-circuited
         // at the top of this method onto a dedicated minimal path (status bridge +
@@ -749,14 +753,25 @@ impl AgentBridge {
             .get("notification_type")
             .and_then(|v| v.as_str());
 
+        // Structured provider lifecycle events carry the exact tmux binding.
+        // Feed that binding into the existing session-to-terminal authority so
+        // fleet attention can resolve this provider session to its Crew tile.
+        if entry.payload.get("provider").and_then(|v| v.as_str()) == Some("codex") {
+            if let (Some(sid), Some(status_bridge)) = (session_id, self.inner.status.lock().clone())
+            {
+                status_bridge.ingest(sid, &entry.payload, entry.timestamp_ms);
+            }
+        }
+
         let affected = self.with_supervisor(|s| {
-            s.ingest(
+            s.ingest_with_payload(
                 session_id,
                 agent_id,
                 agent_type,
                 notification_type,
                 entry.event_type,
                 entry.timestamp_ms,
+                Some(&entry.payload),
             )
         });
 
@@ -773,7 +788,14 @@ impl AgentBridge {
     /// current reducer state. Public-in-crate so the status bridge / commands can
     /// re-emit a session after an out-of-band status change.
     pub(crate) fn emit_session(&self, session_id: &str) {
-        let (tree, status) = self.with_supervisor(|s| (s.tree(session_id), s.status(session_id)));
+        let (tree, status, runtime_health, permission_request) = self.with_supervisor(|s| {
+            (
+                s.tree(session_id),
+                s.status(session_id),
+                s.runtime_health(session_id),
+                s.permission_request(session_id),
+            )
+        });
         if let Some(tree) = tree {
             self.inner.emit(EVT_SUPERVISION, &tree);
         }
@@ -782,6 +804,8 @@ impl AgentBridge {
             &SessionStatusPayload {
                 session_id: session_id.to_string(),
                 status,
+                runtime_health,
+                permission_request,
             },
         );
         // Notify the fleet observer (if wired) so a supervised session's transition
@@ -1192,8 +1216,84 @@ mod tests {
         bridge.consume_journal_entry(&entry(5, "o1", None, JournalEventType::SessionStart));
         assert_eq!(bridge.journal_cursor(), 5);
         // A late/duplicate lower seq must not move the cursor backwards.
-        bridge.consume_journal_entry(&entry(3, "o1", None, JournalEventType::UserPromptSubmit));
+        assert!(bridge
+            .consume_journal_entry(&entry(3, "o1", None, JournalEventType::UserPromptSubmit))
+            .is_none());
         assert_eq!(bridge.journal_cursor(), 5);
+    }
+
+    #[test]
+    fn replay_restart_and_late_session_start_cannot_clear_a_permission_need() {
+        fn permission(seq: u64) -> EventJournalEntry {
+            EventJournalEntry {
+                seq,
+                timestamp_ms: seq,
+                source: JournalSource::Agent,
+                entity_id: Some("thread-1".to_string()),
+                event_type: JournalEventType::PermissionRequest,
+                payload: serde_json::json!({
+                    "provider": "codex",
+                    "session_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "lifecycle": "permission_requested",
+                    "permission_request_id": "request-1",
+                    "permission_request": {
+                        "schema_version": "t-hub.permission-request.v1",
+                        "id": "request-1",
+                        "kind": "command_execution",
+                        "provider": "codex",
+                        "provider_request_id": "request-1",
+                        "session_id": "thread-1",
+                        "turn_id": "turn-1",
+                        "item_id": "item-1",
+                        "tool_name": "Bash",
+                        "requested_at_ms": 2
+                    },
+                    "telemetry": {
+                        "transport": "structured",
+                        "quality": "authoritative",
+                        "runtime_health": "ready"
+                    }
+                }),
+                result: None,
+            }
+        }
+
+        let replay = [
+            entry(1, "thread-1", None, JournalEventType::SessionStart),
+            permission(2),
+        ];
+        for restarted in [false, true] {
+            let bridge = AgentBridge::new();
+            let rec = RecordingEmitter::default();
+            bridge.set_emitter(Arc::new(rec.clone()));
+            rec.events.lock().clear();
+            for journal_entry in &replay {
+                bridge.consume_journal_entry(journal_entry);
+            }
+            assert_eq!(
+                bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+                crate::model::SessionStatus::NeedsPermission,
+                "replay must restore the permission need (restarted={restarted})"
+            );
+            assert!(bridge
+                .with_supervisor(|supervisor| supervisor.permission_request("thread-1"))
+                .is_some());
+
+            let emitted_before_late = rec.events.lock().len();
+            let late_start = entry(1, "thread-1", None, JournalEventType::SessionStart);
+            assert!(bridge.consume_journal_entry(&late_start).is_none());
+            let duplicate_start = entry(2, "thread-1", None, JournalEventType::SessionStart);
+            assert!(bridge.consume_journal_entry(&duplicate_start).is_none());
+            assert_eq!(rec.events.lock().len(), emitted_before_late);
+            assert_eq!(
+                bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+                crate::model::SessionStatus::NeedsPermission
+            );
+            assert!(bridge
+                .with_supervisor(|supervisor| supervisor.permission_request("thread-1"))
+                .is_some());
+        }
     }
 
     /// A recording emitter for the live-emit tests: captures (channel, payload).
@@ -1266,6 +1366,179 @@ mod tests {
             .unwrap();
         assert_eq!(tree_ev.1["sessionId"], "o1");
         assert_eq!(tree_ev.1["status"], "working");
+    }
+
+    #[test]
+    fn codex_permission_lifecycle_emits_typed_need_health_and_tile_binding() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        let status_bridge = Arc::new(crate::claude::StatusBridge::new());
+        bridge.set_emitter(Arc::new(rec.clone()));
+        bridge.set_status_bridge(Arc::clone(&status_bridge));
+        rec.events.lock().clear();
+
+        let make_entry = |seq, event_type, payload| EventJournalEntry {
+            seq,
+            timestamp_ms: seq * 10,
+            source: JournalSource::Agent,
+            entity_id: Some("thread-1".to_string()),
+            event_type,
+            payload,
+            result: None,
+        };
+        let request = make_entry(
+            1,
+            JournalEventType::PermissionRequest,
+            serde_json::json!({
+                "provider": "codex",
+                "provider_version": "0.144.4",
+                "session_id": "thread-1",
+                "turn_id": "turn-1",
+                "lifecycle": "permission_requested",
+                "cwd": "/worktree",
+                "tmux_session": "th_crew0001",
+                "permission_request_id": "request-1",
+                "permission_request": {
+                    "schema_version": "t-hub.permission-request.v1",
+                    "id": "request-1",
+                    "kind": "command_execution",
+                    "provider": "codex",
+                    "provider_request_id": "request-1",
+                    "session_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "item_id": "item-1",
+                    "tool_name": "Bash",
+                    "requested_at_ms": 10
+                },
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "authoritative",
+                    "runtime_health": "ready"
+                }
+            }),
+        );
+        bridge.consume_journal_entry(&request);
+
+        let permission_status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(permission_status.1["status"], "needsPermission");
+        assert_eq!(
+            permission_status.1["permissionRequest"]["providerRequestId"],
+            "request-1"
+        );
+        assert_eq!(permission_status.1["runtimeHealth"]["health"], "ready");
+        assert_eq!(
+            status_bridge.terminal_for_session("thread-1").as_deref(),
+            Some("crew0001")
+        );
+
+        let disconnected = make_entry(
+            2,
+            JournalEventType::CoreAction,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "lifecycle": "telemetry_health",
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "stale",
+                    "runtime_health": "disconnected",
+                    "detail": "structured_stream_ended_mid_turn"
+                }
+            }),
+        );
+        bridge.consume_journal_entry(&disconnected);
+        let degraded_status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(degraded_status.1["status"], "needsPermission");
+        assert_eq!(degraded_status.1["runtimeHealth"]["health"], "disconnected");
+
+        let resolved = make_entry(
+            3,
+            JournalEventType::CoreAction,
+            serde_json::json!({
+                "provider": "codex",
+                "session_id": "thread-1",
+                "lifecycle": "permission_resolved",
+                "permission_request_id": "request-1",
+                "telemetry": {
+                    "transport": "structured",
+                    "quality": "authoritative",
+                    "runtime_health": "ready"
+                }
+            }),
+        );
+        bridge.consume_journal_entry(&resolved);
+        let resolved_status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(resolved_status.1["status"], "working");
+        assert!(resolved_status.1.get("permissionRequest").is_none());
+    }
+
+    #[test]
+    fn unobserved_interactive_codex_is_degraded_never_false_working() {
+        let bridge = AgentBridge::new();
+        let rec = RecordingEmitter::default();
+        let status_bridge = Arc::new(crate::claude::StatusBridge::new());
+        bridge.set_emitter(Arc::new(rec.clone()));
+        bridge.set_status_bridge(Arc::clone(&status_bridge));
+        rec.events.lock().clear();
+
+        bridge.consume_journal_entry(&EventJournalEntry {
+            seq: 1,
+            timestamp_ms: 10,
+            source: JournalSource::Agent,
+            entity_id: Some("codex-unobserved:th_crew0001".to_string()),
+            event_type: JournalEventType::CoreAction,
+            payload: serde_json::json!({
+                "provider": "codex",
+                "provider_version": "0.144.4",
+                "session_id": "codex-unobserved:th_crew0001",
+                "lifecycle": "telemetry_health",
+                "cwd": "/worktree",
+                "tmux_session": "th_crew0001",
+                "telemetry": {
+                    "transport": "unavailable",
+                    "quality": "stale",
+                    "runtime_health": "degraded",
+                    "detail": "interactive_tui_lifecycle_unsupported"
+                }
+            }),
+            result: None,
+        });
+
+        let status = rec
+            .events
+            .lock()
+            .iter()
+            .rfind(|(channel, _)| channel == super::EVT_SESSION_STATUS)
+            .cloned()
+            .unwrap();
+        assert_eq!(status.1["status"], "unknown");
+        assert_ne!(status.1["status"], "working");
+        assert_eq!(status.1["runtimeHealth"]["health"], "degraded");
+        assert_eq!(status.1["runtimeHealth"]["source"], "unavailable");
+        assert_eq!(
+            status_bridge
+                .terminal_for_session("codex-unobserved:th_crew0001")
+                .as_deref(),
+            Some("crew0001")
+        );
     }
 
     /// The fleet status observer fires on the REAL journal-consume path (the

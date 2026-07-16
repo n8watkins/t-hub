@@ -14,7 +14,11 @@
 
 use std::path::PathBuf;
 
-use super::{home_dir, sh_single_quote, Harness, HarnessAdapter, PermMode};
+use super::{
+    home_dir, leading_permission_options, provider_arguments, sh_single_quote, Harness,
+    HarnessAdapter, HarnessPermissionAttestation, HarnessProcessEvidence, LaunchAttestationError,
+    PermMode,
+};
 
 /// The tap that reads Codex `exec --json` ThreadEvent JSONL from stdin and
 /// appends journal entries (the PR-B producer). Kept as one constant so the
@@ -85,6 +89,66 @@ impl HarnessAdapter for CodexHarness {
             PermMode::AcceptEdits => vec!["--sandbox".to_string(), "workspace-write".to_string()],
             PermMode::Default => vec!["--sandbox".to_string(), "read-only".to_string()],
         }
+    }
+
+    fn attest_permissions(
+        &self,
+        evidence: &HarnessProcessEvidence,
+        expected: PermMode,
+    ) -> Result<HarnessPermissionAttestation, LaunchAttestationError> {
+        let args = provider_arguments(evidence, Harness::Codex)?;
+        let options = leading_permission_options(args)?;
+        options.ensure_unique(&[
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--sandbox",
+            "--yolo",
+            "--full-auto",
+            "--ask-for-approval",
+        ])?;
+        let bypass = options.contains("--dangerously-bypass-approvals-and-sandbox");
+        let sandbox = options.value("--sandbox");
+        let conflicting = ["--yolo", "--full-auto", "--ask-for-approval"]
+            .iter()
+            .any(|flag| options.contains(flag));
+
+        let valid = match expected {
+            PermMode::BypassPermissions => {
+                if bypass && (sandbox.is_some() || conflicting) {
+                    return Err(LaunchAttestationError::ConflictingPermission);
+                }
+                if !bypass {
+                    return Err(if sandbox.is_some() || conflicting {
+                        LaunchAttestationError::WrongPermission
+                    } else {
+                        LaunchAttestationError::MissingPermission
+                    });
+                }
+                true
+            }
+            PermMode::AcceptEdits => {
+                if bypass || conflicting {
+                    return Err(LaunchAttestationError::ConflictingPermission);
+                }
+                sandbox == Some("workspace-write")
+            }
+            PermMode::Default => {
+                if bypass || conflicting {
+                    return Err(LaunchAttestationError::ConflictingPermission);
+                }
+                sandbox == Some("read-only")
+            }
+        };
+        if !valid {
+            return Err(if sandbox.is_some() {
+                LaunchAttestationError::WrongPermission
+            } else {
+                LaunchAttestationError::MissingPermission
+            });
+        }
+        Ok(HarnessPermissionAttestation {
+            provider: Harness::Codex,
+            permission: expected,
+        })
     }
 
     fn session_home(&self) -> PathBuf {
@@ -185,5 +249,184 @@ mod tests {
     fn session_home_is_codex_sessions() {
         let a = CodexHarness;
         assert!(a.session_home().ends_with(".codex/sessions"));
+    }
+
+    #[test]
+    fn permission_attestation_accepts_only_direct_codex_bypass() {
+        let adapter = CodexHarness;
+        let correct = HarnessProcessEvidence::test(
+            2,
+            20,
+            &[
+                "node",
+                "/opt/codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+        );
+        assert_eq!(
+            adapter
+                .attest_permissions(&correct, PermMode::BypassPermissions)
+                .unwrap()
+                .permission,
+            PermMode::BypassPermissions
+        );
+
+        let missing = HarnessProcessEvidence::test(2, 20, &["codex", "work"]);
+        assert_eq!(
+            adapter
+                .attest_permissions(&missing, PermMode::BypassPermissions)
+                .unwrap_err(),
+            LaunchAttestationError::MissingPermission
+        );
+        let wrong =
+            HarnessProcessEvidence::test(2, 20, &["codex", "--sandbox", "workspace-write", "work"]);
+        assert_eq!(
+            adapter
+                .attest_permissions(&wrong, PermMode::BypassPermissions)
+                .unwrap_err(),
+            LaunchAttestationError::WrongPermission
+        );
+    }
+
+    #[test]
+    fn permission_attestation_rejects_codex_wrappers_conflicts_and_wrong_provider() {
+        let adapter = CodexHarness;
+        let wrapper = HarnessProcessEvidence::test(
+            3,
+            30,
+            &[
+                "node",
+                "/opt/wrapper",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ],
+        );
+        assert_eq!(
+            adapter
+                .attest_permissions(&wrapper, PermMode::BypassPermissions)
+                .unwrap_err(),
+            LaunchAttestationError::WrapperObscured
+        );
+        let conflicting = HarnessProcessEvidence::test(
+            3,
+            30,
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--sandbox",
+                "read-only",
+                "work",
+            ],
+        );
+        assert_eq!(
+            adapter
+                .attest_permissions(&conflicting, PermMode::BypassPermissions)
+                .unwrap_err(),
+            LaunchAttestationError::ConflictingPermission
+        );
+        let claude = HarnessProcessEvidence::test(
+            3,
+            30,
+            &["claude", "--dangerously-skip-permissions", "work"],
+        );
+        assert_eq!(
+            adapter
+                .attest_permissions(&claude, PermMode::BypassPermissions)
+                .unwrap_err(),
+            LaunchAttestationError::WrongProvider
+        );
+    }
+
+    #[test]
+    fn permission_attestation_rejects_codex_missing_values_and_repeated_flags() {
+        let adapter = CodexHarness;
+        for evidence in [
+            HarnessProcessEvidence::test(4, 40, &["codex", "--sandbox"]),
+            HarnessProcessEvidence::test(4, 40, &["codex", "--sandbox="]),
+        ] {
+            assert_eq!(
+                adapter
+                    .attest_permissions(&evidence, PermMode::BypassPermissions)
+                    .unwrap_err(),
+                LaunchAttestationError::MissingPermission
+            );
+        }
+        for evidence in [
+            HarnessProcessEvidence::test(
+                4,
+                40,
+                &[
+                    "codex",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                ],
+            ),
+            HarnessProcessEvidence::test(
+                4,
+                40,
+                &[
+                    "codex",
+                    "--sandbox=read-only",
+                    "--sandbox",
+                    "workspace-write",
+                ],
+            ),
+        ] {
+            assert_eq!(
+                adapter
+                    .attest_permissions(&evidence, PermMode::BypassPermissions)
+                    .unwrap_err(),
+                LaunchAttestationError::ConflictingPermission
+            );
+        }
+    }
+
+    #[test]
+    fn permission_attestation_normalizes_codex_short_aliases_and_rejects_inline_flags() {
+        let adapter = CodexHarness;
+        for evidence in [
+            HarnessProcessEvidence::test(
+                5,
+                50,
+                &[
+                    "codex",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "-s",
+                    "read-only",
+                ],
+            ),
+            HarnessProcessEvidence::test(
+                5,
+                50,
+                &[
+                    "codex",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "-a=never",
+                ],
+            ),
+            HarnessProcessEvidence::test(
+                5,
+                50,
+                &["codex", "--sandbox=read-only", "-sworkspace-write"],
+            ),
+        ] {
+            assert_eq!(
+                adapter
+                    .attest_permissions(&evidence, PermMode::BypassPermissions)
+                    .unwrap_err(),
+                LaunchAttestationError::ConflictingPermission
+            );
+        }
+        let malformed = HarnessProcessEvidence::test(
+            5,
+            50,
+            &["codex", "--dangerously-bypass-approvals-and-sandbox=false"],
+        );
+        assert_eq!(
+            adapter
+                .attest_permissions(&malformed, PermMode::BypassPermissions)
+                .unwrap_err(),
+            LaunchAttestationError::MalformedPermission
+        );
     }
 }
