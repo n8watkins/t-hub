@@ -13,29 +13,22 @@
 //! fresh connection keeps the client stateless and robust to app restarts.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Per-attempt socket read timeout. A response that has not started arriving
-/// within this window bounces to the overall-deadline retry loop (the command may
-/// have been accepted and its response is merely late), rather than surfacing an
-/// ambiguous error on the first idle.
-const READ_TIMEOUT_PER_ATTEMPT: Duration = Duration::from_secs(10);
+/// One control operation, including discovery, connect, write, read, endpoint
+/// invalidation, retry, bridge recovery, and ambiguous-response lookup, must
+/// finish within this wall-clock budget.
+const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Overall deadline for reading one response before the round-trip is declared a
-/// transport failure. Retrying WouldBlock up to here (instead of failing at the
-/// first 15s idle, as before) directly fixes the ask-#2 client leg: a briefly
-/// busy/wedged app still gets its late response delivered.
-const READ_OVERALL_DEADLINE: Duration = Duration::from_secs(45);
-
-/// How long to keep resolving an AMBIGUOUS spawn-class failure via
-/// `get_request_status` (polling while the original is still in flight) before
-/// giving up and telling the caller to poll it themselves.
-const AMBIGUOUS_RESOLVE_DEADLINE: Duration = Duration::from_secs(30);
+/// A single endpoint gets only a short slice of the overall budget so an
+/// inherited port that accepts but stays silent cannot consume the recovery
+/// window before the current endpoint is tried.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Spawn-class commands whose retries must dedup via a client `requestId`
 /// (mirrors the app-side `is_idempotent_command`).
@@ -268,22 +261,29 @@ enum CallError {
     /// garbage. A restarted/rebound app on a new ephemeral port looks exactly like
     /// this (connect to the retired port refuses), so the caller re-reads
     /// control.json and retries - but this is NOT the relay-wedge signature.
-    Transport(String),
+    Transport(&'static str),
     /// The round-trip CONNECTED but no response arrived before the deadline. This is
     /// the relay-wedge signature: the WSL2 mirrored-loopback relay accepts the
     /// connect locally then never carries the flow, so the app (healthy, reachable
     /// Windows-side) never answers. Distinguished from [`Transport`] so the self-heal
     /// fires ONLY on a wedge, never on an app-down (which refuses fast).
-    Timeout(String),
+    Timeout(&'static str),
     /// The app answered and rejected the command (bad token, unknown command,
     /// governor refusal). A different endpoint won't change the verdict.
     App(String),
+    /// The peer answered with a malformed protocol frame. Retrying on another
+    /// endpoint would hide a compatibility failure.
+    Protocol(String),
 }
 
 impl CallError {
-    fn into_message(self) -> String {
+    fn into_message(self, command: &str, attempts: u8, endpoint_replaced: bool) -> String {
         match self {
-            CallError::Transport(m) | CallError::Timeout(m) | CallError::App(m) => m,
+            CallError::Transport(stage) => {
+                unavailable_message(command, attempts, stage, endpoint_replaced)
+            }
+            CallError::Timeout(stage) => timeout_message(command, attempts, stage),
+            CallError::App(message) | CallError::Protocol(message) => message,
         }
     }
 
@@ -292,13 +292,49 @@ impl CallError {
     fn is_timeout(&self) -> bool {
         matches!(self, CallError::Timeout(_))
     }
+
+    fn stage(&self) -> &'static str {
+        match self {
+            CallError::Transport(stage) | CallError::Timeout(stage) => stage,
+            CallError::App(_) => "server",
+            CallError::Protocol(_) => "protocol",
+        }
+    }
+}
+
+fn unavailable_message(
+    command: &str,
+    attempts: u8,
+    stage: &str,
+    endpoint_replaced: bool,
+) -> String {
+    format!(
+        "control_unavailable: command '{command}' failed during {stage} after {attempts} attempt(s); endpoint_replaced={endpoint_replaced}"
+    )
+}
+
+fn timeout_message(command: &str, attempts: u8, stage: &str) -> String {
+    format!(
+        "control_timeout: command '{command}' failed within its {}s recovery deadline during {stage} after {attempts} attempt(s); retry_state=exhausted",
+        CONTROL_DEADLINE.as_secs()
+    )
+}
+
+fn remaining(deadline: Instant) -> Option<Duration> {
+    deadline.checked_duration_since(Instant::now())
+}
+
+#[derive(Clone, Copy)]
+struct CallBudget {
+    deadline: Instant,
+    attempt_timeout: Duration,
 }
 
 /// Consecutive same-endpoint transport failures before the relay-wedge self-heal
 /// fires one bridge-triggered rebind. `1` = heal on the first confirmed failure: a
-/// wedged round-trip already burned ~[`READ_OVERALL_DEADLINE`] (45s) proving the
-/// endpoint is unreachable, so waiting for a second full timeout only doubles the
-/// outage. False positives (a genuinely-down app, or a rare >45s command) are cheap
+/// wedged round-trip already consumed one bounded attempt slice proving the
+/// endpoint is unresponsive, so waiting for another full deadline only doubles the
+/// outage. False positives (a genuinely-down app, or a rare slow command) are cheap
 /// and self-correcting - the bridge attempt just fails/rate-limits and the episode
 /// guard blocks any repeat until a success resets it.
 const WEDGE_TRIGGER_AFTER: u32 = 1;
@@ -375,13 +411,30 @@ pub fn resolve_and_call(
     command: &str,
     args: &Value,
 ) -> Result<Value, String> {
+    resolve_and_call_with_deadline(discovery, command, args, CONTROL_DEADLINE, ATTEMPT_TIMEOUT)
+}
+
+fn resolve_and_call_with_deadline(
+    discovery: &Discovery,
+    command: &str,
+    args: &Value,
+    overall: Duration,
+    attempt_timeout: Duration,
+) -> Result<Value, String> {
+    let budget = CallBudget {
+        deadline: Instant::now() + overall,
+        attempt_timeout,
+    };
     // Idempotency (ask #1): a spawn-class command carries a `requestId` so every
     // retry below dedups server-side (a retry never double-applies; a completed
     // outcome is replayed). The SAME id is reused for the initial call and every
     // recovery path.
     let (args, request_id) = ensure_request_id(command, args);
     let endpoint = discovery.resolve()?;
-    match call_classified(&endpoint, command, &args) {
+    if Instant::now() >= budget.deadline {
+        return Err(timeout_message(command, 0, "discovery"));
+    }
+    match call_classified(&endpoint, command, &args, budget) {
         Ok(v) => {
             wedge_detector().on_success();
             Ok(v)
@@ -392,9 +445,18 @@ pub fn resolve_and_call(
             wedge_detector().on_success();
             Err(msg)
         }
+        Err(CallError::Protocol(msg)) => {
+            wedge_detector().on_success();
+            Err(msg)
+        }
         Err(first) => {
             let first_is_timeout = first.is_timeout();
-            let first_msg = first.into_message();
+            let first_stage = first.stage();
+            let first_msg = first.into_message(command, 1, false);
+
+            if Instant::now() >= budget.deadline {
+                return Err(timeout_message(command, 1, first_stage));
+            }
 
             // The endpoint we tried is unreachable/unresponsive. If control.json now
             // names a *different* addr (the app restarted or already rebound onto a new
@@ -425,7 +487,8 @@ pub fn resolve_and_call(
                         if first_is_timeout
                             && wedge_detector().on_unchanged_transport_failure(WEDGE_TRIGGER_AFTER)
                         {
-                            try_bridge_rebind(discovery, &endpoint).unwrap_or(endpoint)
+                            try_bridge_rebind(discovery, &endpoint, budget.deadline)
+                                .unwrap_or(endpoint)
                         } else {
                             endpoint
                         }
@@ -438,6 +501,7 @@ pub fn resolve_and_call(
                     id,
                     first_msg,
                     discovery.has_env_pin(),
+                    budget,
                 );
                 if r.is_ok() {
                     wedge_detector().on_success();
@@ -450,7 +514,7 @@ pub fn resolve_and_call(
             // having ACTUALLY TRIED and still-failing is the one the wedge decision is
             // based on (F2: NOT the possibly-stale env pin we started from).
             if let Some(f) = fresh {
-                match call_classified(&f, command, &args) {
+                match call_classified(&f, command, &args, budget) {
                     Ok(v) => {
                         wedge_detector().on_success();
                         Ok(v)
@@ -468,15 +532,18 @@ pub fn resolve_and_call(
                             Err(msg)
                         }
                     }
+                    Err(CallError::Protocol(msg)) => Err(msg),
                     Err(e2) => {
                         let e2_is_timeout = e2.is_timeout();
+                        let e2_msg = e2.into_message(command, 2, true);
                         maybe_heal_and_retry(
                             discovery,
                             command,
                             &args,
                             f,
-                            e2.into_message(),
+                            e2_msg,
                             e2_is_timeout,
+                            budget,
                         )
                     }
                 }
@@ -489,6 +556,7 @@ pub fn resolve_and_call(
                     endpoint,
                     first_msg,
                     first_is_timeout,
+                    budget,
                 )
             }
         }
@@ -511,10 +579,11 @@ fn maybe_heal_and_retry(
     tried: ControlEndpoint,
     err: String,
     timeout_class: bool,
+    budget: CallBudget,
 ) -> Result<Value, String> {
     if timeout_class && wedge_detector().on_unchanged_transport_failure(WEDGE_TRIGGER_AFTER) {
-        if let Some(healed) = try_bridge_rebind(discovery, &tried) {
-            return match call_classified(&healed, command, args) {
+        if let Some(healed) = try_bridge_rebind(discovery, &tried, budget.deadline) {
+            return match call_classified(&healed, command, args, budget) {
                 Ok(v) => {
                     wedge_detector().on_success();
                     Ok(v)
@@ -526,7 +595,8 @@ fn maybe_heal_and_retry(
                 Err(CallError::App(msg)) if discovery.has_env_pin() && is_auth_rejection(&msg) => {
                     Err(stale_env_token_error(&msg))
                 }
-                other => other.map_err(CallError::into_message),
+                Err(CallError::App(msg)) | Err(CallError::Protocol(msg)) => Err(msg),
+                Err(other) => Err(other.into_message(command, 3, true)),
             };
         }
     }
@@ -559,15 +629,6 @@ fn stale_env_token_error(app_msg: &str) -> String {
     )
 }
 
-/// A socket read timeout / would-block surfaces as `WouldBlock` (unix SO_RCVTIMEO)
-/// or `TimedOut` (windows). Both mean "no data yet", not a dead transport.
-fn is_would_block(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    )
-}
-
 /// Resolve an ambiguous spawn-class transport failure (ask #1/#2): the command was
 /// possibly accepted but its response leg failed. Query `get_request_status` for
 /// the SAME `request_id` and act on the authoritative answer:
@@ -587,11 +648,11 @@ fn resolve_ambiguous_request(
     request_id: &str,
     first_err: String,
     has_env_pin: bool,
+    budget: CallBudget,
 ) -> Result<Value, String> {
-    let deadline = Instant::now() + AMBIGUOUS_RESOLVE_DEADLINE;
     let status_args = serde_json::json!({ "requestId": request_id });
     loop {
-        match call_classified(endpoint, "get_request_status", &status_args) {
+        match call_classified(endpoint, "get_request_status", &status_args, budget) {
             Ok(v) => match v.get("status").and_then(Value::as_str) {
                 Some("completed") => {
                     if v.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -604,7 +665,7 @@ fn resolve_ambiguous_request(
                         .to_string());
                 }
                 Some("inFlight") => {
-                    if Instant::now() >= deadline {
+                    if Instant::now() >= budget.deadline {
                         // PENDING, not failed (ask #2): the app ACCEPTED the spawn and
                         // is still materializing it (e.g. a Windows memory trough slowed
                         // it past our deadline). Hand back the resolvable requestId with
@@ -616,16 +677,16 @@ fn resolve_ambiguous_request(
                              still materializing after {}s - poll get_request_status with that \
                              requestId for its final outcome (do NOT re-issue the command). \
                              (Original client-deadline note: {first_err})",
-                            AMBIGUOUS_RESOLVE_DEADLINE.as_secs()
+                            CONTROL_DEADLINE.as_secs()
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(500));
+                    sleep_within(budget.deadline, Duration::from_millis(200));
                 }
                 // "unknown" (or a server that answered oddly): the command never
                 // landed under this id, so re-running it once is safe + idempotent.
                 _ => {
-                    return call_classified(endpoint, command, args)
-                        .map_err(CallError::into_message);
+                    return call_classified(endpoint, command, args, budget)
+                        .map_err(|error| error.into_message(command, 2, false));
                 }
             },
             // The app answered but rejected the STATUS query itself. Under a kept env
@@ -640,16 +701,26 @@ fn resolve_ambiguous_request(
                 }
                 return Err(first_err);
             }
+            Err(CallError::Protocol(msg)) => return Err(msg),
             // The channel is still unreachable (fast transport failure) or wedged
             // (timeout): keep trying to reach the status endpoint until the deadline,
             // else give up with the original error.
             Err(CallError::Transport(_)) | Err(CallError::Timeout(_)) => {
-                if Instant::now() >= deadline {
-                    return Err(first_err);
+                if Instant::now() >= budget.deadline {
+                    return Err(format!(
+                        "{}; request_id='{request_id}'",
+                        timeout_message(command, 2, "request status")
+                    ));
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                sleep_within(budget.deadline, Duration::from_millis(200));
             }
         }
+    }
+}
+
+fn sleep_within(deadline: Instant, desired: Duration) {
+    if let Some(left) = remaining(deadline) {
+        std::thread::sleep(left.min(desired));
     }
 }
 
@@ -658,7 +729,16 @@ fn resolve_ambiguous_request(
 /// goes through [`resolve_and_call`], which adds the restart-recovery retry.
 #[cfg(test)]
 fn call(endpoint: &ControlEndpoint, command: &str, args: &Value) -> Result<Value, String> {
-    call_classified(endpoint, command, args).map_err(CallError::into_message)
+    call_classified(
+        endpoint,
+        command,
+        args,
+        CallBudget {
+            deadline: Instant::now() + CONTROL_DEADLINE,
+            attempt_timeout: ATTEMPT_TIMEOUT,
+        },
+    )
+    .map_err(|error| error.into_message(command, 1, false))
 }
 
 /// The single round-trip, with its failure classified so [`resolve_and_call`]
@@ -667,6 +747,7 @@ fn call_classified(
     endpoint: &ControlEndpoint,
     command: &str,
     args: &Value,
+    budget: CallBudget,
 ) -> Result<Value, CallError> {
     // Comms-plane Phase 3: present the caller session's PER-SESSION token
     // (`T_HUB_SESSION_TOKEN`, injected into this session's env at spawn) ALONGSIDE the
@@ -682,71 +763,75 @@ fn call_classified(
         "args": args,
     });
 
-    let stream = TcpStream::connect(&endpoint.addr).map_err(|e| {
-        CallError::Transport(format!(
-            "failed to connect to T-Hub control channel {}: {e}",
-            endpoint.addr
-        ))
+    let socket: SocketAddr = endpoint.addr.parse().map_err(|_| {
+        CallError::Protocol("control_protocol: malformed endpoint address".to_string())
     })?;
-    // Bounded timeouts so a hung app surfaces as a tool error, not a stuck MCP
-    // server. The per-attempt read timeout is short; the read loop below retries
-    // WouldBlock up to READ_OVERALL_DEADLINE so a merely-late response (the app was
-    // briefly busy/wedged) is still delivered rather than surfaced as an ambiguous
-    // failure on the first idle (ask #2, client leg).
-    let _ = stream.set_read_timeout(Some(READ_TIMEOUT_PER_ATTEMPT));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+    let connect_budget = remaining(budget.deadline)
+        .map(|left| left.min(budget.attempt_timeout))
+        .filter(|budget| !budget.is_zero())
+        .ok_or(CallError::Timeout("connect"))?;
+    let stream = TcpStream::connect_timeout(&socket, connect_budget).map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            CallError::Timeout("connect")
+        } else {
+            CallError::Transport("connect")
+        }
+    })?;
+    let io_budget = remaining(budget.deadline)
+        .map(|left| left.min(budget.attempt_timeout))
+        .filter(|budget| !budget.is_zero())
+        .ok_or(CallError::Timeout("write"))?;
+    let _ = stream.set_read_timeout(Some(io_budget));
+    let _ = stream.set_write_timeout(Some(io_budget));
 
     let mut writer = stream
         .try_clone()
-        .map_err(|e| CallError::Transport(format!("failed to clone control stream: {e}")))?;
-    let mut line = serde_json::to_vec(&request).map_err(|e| CallError::Transport(e.to_string()))?;
+        .map_err(|_| CallError::Transport("stream setup"))?;
+    let mut line = serde_json::to_vec(&request)
+        .map_err(|e| CallError::Protocol(format!("control_protocol: serialize failed: {e}")))?;
     line.push(b'\n');
-    writer
-        .write_all(&line)
-        .map_err(|e| CallError::Transport(format!("failed to send control request: {e}")))?;
-    writer
-        .flush()
-        .map_err(|e| CallError::Transport(format!("failed to flush control request: {e}")))?;
+    writer.write_all(&line).map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            CallError::Timeout("write")
+        } else {
+            CallError::Transport("write")
+        }
+    })?;
+    writer.flush().map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            CallError::Timeout("write")
+        } else {
+            CallError::Transport("write")
+        }
+    })?;
 
     let mut reader = BufReader::new(stream);
     let mut resp_line = String::new();
-    let deadline = Instant::now() + READ_OVERALL_DEADLINE;
-    loop {
-        match reader.read_line(&mut resp_line) {
-            Ok(0) => {
-                return Err(CallError::Transport(
-                    "T-Hub control channel closed without responding".to_string(),
-                ));
-            }
-            // A full line arrived (read_line stops at the newline).
-            Ok(_) => break,
-            // A per-attempt read timeout: the response is late, not (yet) gone.
-            // Keep waiting until the overall deadline before declaring the
-            // round-trip ambiguous - the command may already have been accepted.
-            Err(e) if is_would_block(&e) => {
-                if Instant::now() >= deadline {
-                    // Connected but silent past the deadline: the relay-wedge
-                    // signature (Timeout), NOT a fast transport failure.
-                    return Err(CallError::Timeout(format!(
-                        "failed to read control response: {e} (no response within {}s)",
-                        READ_OVERALL_DEADLINE.as_secs()
-                    )));
-                }
-            }
-            Err(e) => {
-                return Err(CallError::Transport(format!(
-                    "failed to read control response: {e}"
-                )));
-            }
+    let n = reader.read_line(&mut resp_line).map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            CallError::Timeout("read")
+        } else {
+            CallError::Transport("read")
         }
+    })?;
+    if n == 0 {
+        return Err(CallError::Transport("read"));
     }
 
-    let resp: ControlResponse = serde_json::from_str(resp_line.trim_end()).map_err(|e| {
-        CallError::Transport(format!(
-            "malformed control response: {e} (raw: {})",
-            resp_line.trim_end()
-        ))
-    })?;
+    let resp: ControlResponse = serde_json::from_str(resp_line.trim_end())
+        .map_err(|e| CallError::Protocol(format!("control_protocol: malformed response: {e}")))?;
 
     if resp.ok {
         Ok(resp.result.unwrap_or(Value::Null))
@@ -762,6 +847,9 @@ fn call_classified(
 /// heal attempt never spawns a missing `powershell.exe`; there the client degrades to
 /// the existing file-re-read recovery.
 fn wsl_powershell_available() -> bool {
+    if cfg!(test) {
+        return false;
+    }
     std::env::var_os("WSL_INTEROP").is_some() || std::env::var_os("WSL_DISTRO_NAME").is_some()
 }
 
@@ -779,11 +867,15 @@ fn wsl_powershell_available() -> bool {
 /// [`healed_endpoint_after_rebind`] rather than adopting control.json's (read-only,
 /// under item-3 harden) token - closing the same silent read-only downgrade the
 /// primary path fixes (P71-1).
-fn try_bridge_rebind(discovery: &Discovery, stale: &ControlEndpoint) -> Option<ControlEndpoint> {
+fn try_bridge_rebind(
+    discovery: &Discovery,
+    stale: &ControlEndpoint,
+    deadline: Instant,
+) -> Option<ControlEndpoint> {
     if !wsl_powershell_available() {
         return None;
     }
-    if !send_rebind_via_powershell(stale) {
+    if !send_rebind_via_powershell(stale, deadline) {
         return None;
     }
     healed_endpoint_after_rebind(discovery, stale)
@@ -811,7 +903,7 @@ fn healed_endpoint_after_rebind(
 /// the one-line JSON request from them. Bounded by powershell's own 8s socket
 /// timeouts so a hung bridge can't park the MCP server. Returns true iff the app
 /// answered with a rebind (`"rebound"`), i.e. the port actually moved.
-fn send_rebind_via_powershell(stale: &ControlEndpoint) -> bool {
+fn send_rebind_via_powershell(stale: &ControlEndpoint, deadline: Instant) -> bool {
     // control.json addr is always loopback `host:port`; split from the right so a
     // stray host colon (there is none for 127.0.0.1) can't misparse the port.
     let (host, port) = match stale.addr.rsplit_once(':') {
@@ -856,7 +948,12 @@ try {
         Ok(c) => c,
         Err(_) => return false, // powershell.exe not found / spawn failed
     };
-    match wait_with_timeout(&mut child, BRIDGE_TIMEOUT) {
+    let Some(budget) = remaining(deadline).map(|left| left.min(BRIDGE_TIMEOUT)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    match wait_with_timeout(&mut child, budget) {
         Some(out) => out.contains("\"rebound\""),
         None => false, // timed out (child killed) or read failed
     }
@@ -933,6 +1030,25 @@ mod tests {
                 }
                 // `None`: drop the connection with no response (failed response leg).
             }
+        });
+        (addr, captured)
+    }
+
+    fn silent_server(hold: Duration) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_ok() {
+                if let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) {
+                    cap.lock().unwrap().push(value);
+                }
+            }
+            std::thread::sleep(hold);
         });
         (addr, captured)
     }
@@ -1029,14 +1145,21 @@ mod tests {
         // ONLY on the Timeout class = connected-but-silent, the relay-wedge signature.
         // A connection that CLOSES without responding (app down / old listener
         // retired) must classify as Transport so it recovers via the file re-read and
-        // never triggers a spurious rebind. This guards that gate hermetically (a true
-        // connected-but-silent Timeout would need the full 45s deadline to reproduce).
+        // never triggers a spurious rebind. This guards that gate hermetically.
         let (addr, _captured) = scripted_server(vec![None]); // accept, read, drop, no reply
         let ep = ControlEndpoint {
             addr,
             token: "t".into(),
         };
-        let err = call_classified(&ep, "list_terminals", &serde_json::json!({}));
+        let err = call_classified(
+            &ep,
+            "list_terminals",
+            &serde_json::json!({}),
+            CallBudget {
+                deadline: Instant::now() + Duration::from_millis(200),
+                attempt_timeout: Duration::from_millis(50),
+            },
+        );
         assert!(
             matches!(err, Err(CallError::Transport(_))),
             "a connection closed without responding must be Transport (app-down class), \
@@ -1045,17 +1168,128 @@ mod tests {
     }
 
     #[test]
+    fn connected_but_silent_inherited_port_recovers_via_current_endpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-mcp-silent-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+        let (stale_addr, _stale_requests) = silent_server(Duration::from_millis(180));
+        let (fresh_addr, fresh_requests) = scripted_server(vec![Some(
+            r#"{"ok":true,"result":{"capabilities":["read"]}}"#,
+        )]);
+        std::fs::write(
+            &file,
+            format!(r#"{{"addr":"{fresh_addr}","token":"published-read"}}"#),
+        )
+        .unwrap();
+        let discovery = Discovery {
+            addr: Some(stale_addr),
+            token: Some("inherited-control".into()),
+            file: Some(file.clone()),
+            ..Default::default()
+        };
+        let started = Instant::now();
+
+        let value = resolve_and_call_with_deadline(
+            &discovery,
+            "capabilities",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        assert_eq!(value["capabilities"], serde_json::json!(["read"]));
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(
+            fresh_requests.lock().unwrap()[0]["token"],
+            "inherited-control"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_discovery_consumes_the_same_overall_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "th-mcp-stale-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("control.json");
+        std::fs::write(&file, r#"{"addr":"127.0.0.1:1","token":"read"}"#).unwrap();
+        let discovery = Discovery {
+            file: Some(file),
+            ..Default::default()
+        };
+
+        let error = resolve_and_call_with_deadline(
+            &discovery,
+            "list_tabs",
+            &Value::Null,
+            Duration::ZERO,
+            Duration::from_millis(40),
+        )
+        .unwrap_err();
+        assert!(error.contains("control_timeout"));
+        assert!(error.contains("discovery"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_budget_exhaustion_is_classified_and_credential_safe() {
+        let (addr, _requests) = silent_server(Duration::from_millis(180));
+        let discovery = Discovery {
+            addr: Some(addr.clone()),
+            token: Some("inherited-control".into()),
+            file: Some(PathBuf::from("/nonexistent/control.json")),
+            ..Default::default()
+        };
+        let started = Instant::now();
+
+        let error = resolve_and_call_with_deadline(
+            &discovery,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_millis(70),
+            Duration::from_millis(60),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("control_timeout"), "error: {error}");
+        assert!(error.contains("retry_state=exhausted"));
+        assert!(!error.contains(&addr));
+        assert!(!error.contains("inherited-control"));
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
     fn send_rebind_via_powershell_rejects_malformed_addr_without_spawning() {
         // No colon and a non-numeric port both fail the parse guards BEFORE any
         // powershell spawn, so these are deterministic on any platform.
-        assert!(!send_rebind_via_powershell(&ControlEndpoint {
-            addr: "no-colon-here".to_string(),
-            token: "t".to_string(),
-        }));
-        assert!(!send_rebind_via_powershell(&ControlEndpoint {
-            addr: "127.0.0.1:not-a-port".to_string(),
-            token: "t".to_string(),
-        }));
+        assert!(!send_rebind_via_powershell(
+            &ControlEndpoint {
+                addr: "no-colon-here".to_string(),
+                token: "t".to_string(),
+            },
+            Instant::now() + Duration::from_millis(50),
+        ));
+        assert!(!send_rebind_via_powershell(
+            &ControlEndpoint {
+                addr: "127.0.0.1:not-a-port".to_string(),
+                token: "t".to_string(),
+            },
+            Instant::now() + Duration::from_millis(50),
+        ));
     }
 
     fn discovery_for(addr: String) -> Discovery {

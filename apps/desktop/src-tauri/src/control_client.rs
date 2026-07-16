@@ -22,7 +22,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
@@ -30,8 +30,14 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::agent::EventEmitter;
 use crate::control::{self, EventFanout};
 
-/// How long to wait for a loopback connect, write, or ordinary response.
-const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// One ordinary request, including connect, write, read, endpoint invalidation,
+/// and one retry, must finish within this wall-clock budget.
+const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// A stale endpoint gets only a short slice before recovery checks the current
+/// handshake. Long orchestration responses are exempt from this slice but remain
+/// bounded by their single overall deadline.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Commissioning and dispatch cross bounded Powder, git, tmux, and harness-start
 /// operations. Their response window must outlive the server's normal request
@@ -42,7 +48,7 @@ const LONG_ORCHESTRATION_TIMEOUT: Duration = Duration::from_secs(120);
 fn response_timeout_for_command(command: &str) -> Duration {
     match command {
         "commission_captain" | "dispatch_crew" => LONG_ORCHESTRATION_TIMEOUT,
-        _ => IO_TIMEOUT,
+        _ => CONTROL_DEADLINE,
     }
 }
 
@@ -136,44 +142,159 @@ impl ControlEndpoint {
 /// Open a one-shot connection to the control listener, send one request frame, and
 /// await one response line. Connections are short-lived by design (the listener is
 /// built for one MCP round-trip per connection); pooling is a later M1 widening.
-fn request(
-    addr: &str,
-    token: &str,
-    host_token: &str,
-    command: &str,
-    args: &Value,
-) -> Result<Value, String> {
-    request_with_timeouts(
-        addr,
-        token,
-        host_token,
+fn request(endpoint: &ControlEndpoint, command: &str, args: &Value) -> Result<Value, String> {
+    request_with_deadline(
+        endpoint,
         command,
         args,
-        IO_TIMEOUT,
         response_timeout_for_command(command),
+        ATTEMPT_TIMEOUT,
     )
 }
 
-fn request_with_timeouts(
+#[derive(Debug)]
+enum RequestError {
+    Transport(&'static str),
+    Timeout(&'static str),
+    App(String),
+    Protocol(String),
+}
+
+impl RequestError {
+    fn stage(&self) -> &'static str {
+        match self {
+            RequestError::Transport(stage) | RequestError::Timeout(stage) => stage,
+            RequestError::App(_) => "server",
+            RequestError::Protocol(_) => "protocol",
+        }
+    }
+
+    fn retryable(&self) -> bool {
+        matches!(self, RequestError::Transport(_) | RequestError::Timeout(_))
+    }
+}
+
+fn request_with_deadline(
+    endpoint: &ControlEndpoint,
+    command: &str,
+    args: &Value,
+    overall: Duration,
+    attempt_timeout: Duration,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + overall;
+    let first_addr = endpoint.addr();
+    match request_once(
+        &first_addr,
+        endpoint.token(),
+        endpoint.host_token(),
+        command,
+        args,
+        deadline,
+        attempt_timeout,
+        overall > CONTROL_DEADLINE,
+    ) {
+        Ok(value) => Ok(value),
+        Err(RequestError::App(message)) => Err(message),
+        Err(RequestError::Protocol(message)) => Err(message),
+        Err(first) if first.retryable() => {
+            if Instant::now() >= deadline {
+                return Err(timeout_message(command, 1, first.stage(), overall));
+            }
+            let Some(fresh) = endpoint.refresh_addr() else {
+                return Err(failure_message(command, 1, &first, false, overall));
+            };
+            match request_once(
+                &fresh,
+                endpoint.token(),
+                endpoint.host_token(),
+                command,
+                args,
+                deadline,
+                attempt_timeout,
+                overall > CONTROL_DEADLINE,
+            ) {
+                Ok(value) => Ok(value),
+                Err(RequestError::App(message)) => Err(message),
+                Err(RequestError::Protocol(message)) => Err(message),
+                Err(second) => Err(failure_message(command, 2, &second, true, overall)),
+            }
+        }
+        Err(_) => unreachable!("app and protocol errors returned above"),
+    }
+}
+
+fn failure_message(
+    command: &str,
+    attempts: u8,
+    error: &RequestError,
+    endpoint_replaced: bool,
+    overall: Duration,
+) -> String {
+    if matches!(error, RequestError::Timeout(_)) {
+        return timeout_message(command, attempts, error.stage(), overall);
+    }
+    let stage = error.stage();
+    format!(
+        "control_unavailable: command '{command}' failed during {stage} after {attempts} attempt(s); endpoint_replaced={endpoint_replaced}"
+    )
+}
+
+fn timeout_message(command: &str, attempts: u8, stage: &str, overall: Duration) -> String {
+    format!(
+        "control_timeout: command '{command}' failed within its {}s recovery deadline during {stage} after {attempts} attempt(s); retry_state=exhausted",
+        overall.as_secs()
+    )
+}
+
+fn remaining(deadline: Instant) -> Option<Duration> {
+    deadline.checked_duration_since(Instant::now())
+}
+
+fn request_once(
     addr: &str,
     token: &str,
     host_token: &str,
     command: &str,
     args: &Value,
-    connect_write_timeout: Duration,
-    response_timeout: Duration,
-) -> Result<Value, String> {
-    let socket: SocketAddr = addr
-        .parse()
-        .map_err(|e| format!("control_request: bad control addr {addr:?}: {e}"))?;
-    let stream = TcpStream::connect_timeout(&socket, connect_write_timeout)
-        .map_err(|e| format!("control_request: connect to {addr} failed: {e}"))?;
-    stream.set_read_timeout(Some(response_timeout)).ok();
-    stream.set_write_timeout(Some(connect_write_timeout)).ok();
+    deadline: Instant,
+    attempt_timeout: Duration,
+    long_response: bool,
+) -> Result<Value, RequestError> {
+    let socket: SocketAddr = addr.parse().map_err(|_| {
+        RequestError::Protocol("control_protocol: malformed endpoint address".into())
+    })?;
+    let connect_budget = remaining(deadline)
+        .map(|left| left.min(attempt_timeout))
+        .filter(|budget| !budget.is_zero())
+        .ok_or(RequestError::Timeout("connect"))?;
+    let stream = TcpStream::connect_timeout(&socket, connect_budget).map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            RequestError::Timeout("connect")
+        } else {
+            RequestError::Transport("connect")
+        }
+    })?;
+    let io_budget = remaining(deadline)
+        .map(|left| {
+            if long_response {
+                left
+            } else {
+                left.min(attempt_timeout)
+            }
+        })
+        .filter(|budget| !budget.is_zero())
+        .ok_or(RequestError::Timeout("write"))?;
+    stream.set_read_timeout(Some(io_budget)).ok();
+    stream
+        .set_write_timeout(Some(io_budget.min(attempt_timeout)))
+        .ok();
 
     let mut writer = stream
         .try_clone()
-        .map_err(|e| format!("control_request: clone stream failed: {e}"))?;
+        .map_err(|_| RequestError::Transport("stream setup"))?;
     let mut frame = serde_json::to_vec(&json!({
         "token": token,
         "host": host_token,
@@ -181,33 +302,49 @@ fn request_with_timeouts(
         "args": args,
         "v": control::PROTOCOL_VERSION,
     }))
-    .map_err(|e| format!("control_request: serialize request failed: {e}"))?;
+    .map_err(|e| RequestError::Protocol(format!("control_protocol: serialize failed: {e}")))?;
     frame.push(b'\n');
     writer
         .write_all(&frame)
         .and_then(|()| writer.flush())
-        .map_err(|e| format!("control_request: write '{command}' failed: {e}"))?;
+        .map_err(|e| {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                RequestError::Timeout("write")
+            } else {
+                RequestError::Transport("write")
+            }
+        })?;
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let n = reader
-        .read_line(&mut line)
-        .map_err(|e| format!("control_request: read response for '{command}' failed: {e}"))?;
+    let n = reader.read_line(&mut line).map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            RequestError::Timeout("read")
+        } else {
+            RequestError::Transport("read")
+        }
+    })?;
     if n == 0 {
-        return Err(format!(
-            "control_request: connection closed before a response for '{command}'"
-        ));
+        return Err(RequestError::Transport("read"));
     }
-    let resp: Value = serde_json::from_str(line.trim())
-        .map_err(|e| format!("control_request: malformed response for '{command}': {e}"))?;
+    let resp: Value = serde_json::from_str(line.trim()).map_err(|e| {
+        RequestError::Protocol(format!("control_protocol: malformed response: {e}"))
+    })?;
     if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     } else {
-        Err(resp
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("control_request: unknown error")
-            .to_string())
+        Err(RequestError::App(
+            resp.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("control_request: unknown error")
+                .to_string(),
+        ))
     }
 }
 
@@ -232,21 +369,9 @@ pub async fn control_request(
     // `invoke` already returns a promise.)
     let ep = endpoint.inner().clone();
     let args = args.unwrap_or(Value::Null);
-    tauri::async_runtime::spawn_blocking(move || {
-        match request(&ep.addr(), ep.token(), ep.host_token(), &command, &args) {
-            Ok(v) => Ok(v),
-            // A local rebind may have rotated the listener port (relay-wedge
-            // self-heal). Re-read the fresh addr from control.json and retry ONCE;
-            // `refresh_addr` returns Some only when the addr actually changed, so a
-            // normal app-level error is surfaced unchanged (no pointless retry).
-            Err(e) => match ep.refresh_addr() {
-                Some(fresh) => request(&fresh, ep.token(), ep.host_token(), &command, &args),
-                None => Err(e),
-            },
-        }
-    })
-    .await
-    .map_err(|e| format!("control_request: task join failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || request(&ep, &command, &args))
+        .await
+        .map_err(|e| format!("control_request: task join failed: {e}"))?
 }
 
 /// The production [`EventEmitter`]: writes every backend event to the control
@@ -336,7 +461,7 @@ fn forward_once(app: &AppHandle, addr: &str, token: &str) -> Result<(), String> 
     let socket: SocketAddr = addr
         .parse()
         .map_err(|e| format!("bad control addr {addr:?}: {e}"))?;
-    let stream = TcpStream::connect_timeout(&socket, IO_TIMEOUT)
+    let stream = TcpStream::connect_timeout(&socket, CONTROL_DEADLINE)
         .map_err(|e| format!("connect to {addr} failed: {e}"))?;
     let mut writer = stream
         .try_clone()
@@ -480,6 +605,8 @@ fn resolve_endpoint(
 mod tests {
     use super::*;
     use crate::control::{ControlHandshake, PROTOCOL_VERSION};
+    use std::net::TcpListener;
+    use std::thread;
 
     /// A handshake as `control::start` builds it under Phase 3 hardening: the
     /// published `token` is the READ token, while `local_control_token` carries the
@@ -494,6 +621,76 @@ mod tests {
             local_control_token: "full-control".into(),
             local_host_token: "host-only".into(),
         }
+    }
+
+    fn temp_handshake(addr: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "t-hub-desktop-client-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&path, serde_json::to_vec(&json!({"addr": addr})).unwrap()).unwrap();
+        path
+    }
+
+    fn test_endpoint(addr: String, refresh_path: Option<PathBuf>) -> ControlEndpoint {
+        ControlEndpoint {
+            addr: RwLock::new(addr),
+            token: "full-control".into(),
+            read_token: "read-only".into(),
+            host_token: "host-only".into(),
+            refresh_path,
+        }
+    }
+
+    fn responding_server(result: Value) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let mut writer = stream;
+            serde_json::to_writer(&mut writer, &json!({"ok": true, "result": result})).unwrap();
+            writer.write_all(b"\n").unwrap();
+        });
+        addr
+    }
+
+    fn silent_server(hold: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            let mut reader = BufReader::new(stream);
+            reader.read_line(&mut request).unwrap();
+            thread::sleep(hold);
+        });
+        addr
+    }
+
+    fn closing_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream).read_line(&mut request).unwrap();
+        });
+        addr
+    }
+
+    fn dead_addr() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        addr
     }
 
     #[test]
@@ -540,9 +737,12 @@ mod tests {
 
     #[test]
     fn commissioning_gets_a_longer_response_window_without_widening_normal_reads() {
-        assert_eq!(response_timeout_for_command("list_tabs"), IO_TIMEOUT);
-        assert_eq!(response_timeout_for_command("codex_usage"), IO_TIMEOUT);
-        assert_eq!(response_timeout_for_command("unknown"), IO_TIMEOUT);
+        assert_eq!(response_timeout_for_command("list_tabs"), CONTROL_DEADLINE);
+        assert_eq!(
+            response_timeout_for_command("codex_usage"),
+            CONTROL_DEADLINE
+        );
+        assert_eq!(response_timeout_for_command("unknown"), CONTROL_DEADLINE);
         assert_eq!(
             response_timeout_for_command("commission_captain"),
             LONG_ORCHESTRATION_TIMEOUT
@@ -555,9 +755,6 @@ mod tests {
 
     #[test]
     fn delayed_orchestration_error_reaches_the_client_before_its_response_window() {
-        use std::net::TcpListener;
-        use std::thread;
-
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let server = thread::spawn(move || {
@@ -574,18 +771,113 @@ mod tests {
                 .unwrap();
         });
 
-        let error = request_with_timeouts(
+        let error = request_once(
             &addr,
             "token",
             "host",
             "commission_captain",
             &json!({}),
-            Duration::from_secs(1),
-            Duration::from_millis(250),
+            Instant::now() + Duration::from_millis(250),
+            Duration::from_millis(50),
+            true,
         )
         .unwrap_err();
         server.join().unwrap();
-        assert_eq!(error, "commissioning failed after rollback");
+        assert!(matches!(error, RequestError::App(message) if
+            message == "commissioning failed after rollback"));
+    }
+
+    #[test]
+    fn refused_connect_recovers_through_replacement_endpoint() {
+        let fresh = responding_server(json!({"healthy": true}));
+        let path = temp_handshake(&fresh);
+        let endpoint = test_endpoint(dead_addr(), Some(path.clone()));
+
+        let value = request_with_deadline(
+            &endpoint,
+            "wsl_health",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(60),
+        )
+        .unwrap();
+        assert_eq!(value["healthy"], true);
+        assert_eq!(endpoint.addr(), fresh);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn connected_but_silent_inherited_port_recovers_promptly() {
+        let stale = silent_server(Duration::from_millis(180));
+        let fresh = responding_server(json!({"tabs": []}));
+        let path = temp_handshake(&fresh);
+        let endpoint = test_endpoint(stale, Some(path.clone()));
+        let started = Instant::now();
+
+        let value = request_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+        assert_eq!(value["tabs"], json!([]));
+        assert!(started.elapsed() < Duration::from_millis(150));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn response_loss_invalidates_endpoint_and_recovers() {
+        let stale = closing_server();
+        let fresh = responding_server(json!({"terminals": []}));
+        let path = temp_handshake(&fresh);
+        let endpoint = test_endpoint(stale, Some(path.clone()));
+
+        let value = request_with_deadline(
+            &endpoint,
+            "list_terminals",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(60),
+        )
+        .unwrap();
+        assert_eq!(value["terminals"], json!([]));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn current_endpoint_succeeds_without_refresh() {
+        let addr = responding_server(json!({"capabilities": ["read"]}));
+        let endpoint = test_endpoint(addr, None);
+        let value = request_with_deadline(
+            &endpoint,
+            "capabilities",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(60),
+        )
+        .unwrap();
+        assert_eq!(value["capabilities"], json!(["read"]));
+    }
+
+    #[test]
+    fn budget_exhaustion_is_classified_and_does_not_leak_credentials() {
+        let addr = silent_server(Duration::from_millis(180));
+        let endpoint = test_endpoint(addr.clone(), None);
+        let error = request_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_millis(70),
+            Duration::from_millis(60),
+        )
+        .unwrap_err();
+        assert!(error.contains("control_timeout"), "error: {error}");
+        assert!(error.contains("retry_state=exhausted"));
+        assert!(!error.contains(&addr));
+        assert!(!error.contains("full-control"));
+        assert!(!error.contains("host-only"));
     }
 
     /// F1 REGRESSION (PR #50 fix round): the app's OWN client must follow the server
