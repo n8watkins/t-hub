@@ -36,7 +36,8 @@ The review also found that the new CLI transport behavior lacks a committed proc
 T30 addressed both findings in separate commit `b032841`, including healthy slow-response coverage and a CLI process contract regression.
 Independent rereview then found that the MCP unchanged-endpoint read can consume the full deadline before idempotent ambiguity resolution or relay self-heal receives any budget.
 The rereview also reproduced a partial-frame trickle that kept the source CLI alive beyond its ten-second absolute deadline, and the same loop shape exists in all three clients.
-The Captain has returned these new blockers for explicit downstream recovery reserves, hard deadline enforcement during partial reads, and deterministic coverage in all three clients.
+The rereview additionally found that desktop endpoint adoption can overwrite a newer rotation with a stale captured address.
+The Captain has returned these new blockers for explicit downstream recovery reserves, hard deadline enforcement during partial reads, concurrency-safe endpoint adoption, and deterministic coverage in all three clients.
 T30 remains unaccepted until a separate correction commit passes another independent rereview.
 
 Permission launch-attestation terminal `10d1093e` committed its provider-neutral Harness attestation layer as `5b033fe` on branch `fix/codex-permission-launch-attestation` after 28 focused tests passed without warnings.
