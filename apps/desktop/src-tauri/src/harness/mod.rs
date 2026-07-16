@@ -37,7 +37,10 @@ mod codex;
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::process::Command;
+use std::time::Duration;
 
 /// Which agent harness backs a session. Keyed to `AgentSessionRecord::provider`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +96,8 @@ impl std::fmt::Display for Harness {
 /// harness's own flags by [`HarnessAdapter::permission_map`]. Named after the
 /// Claude `defaultMode` values it mirrors so the crew doctrine reads the same
 /// across harnesses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum PermMode {
     /// Crew default: no approval prompts. Claude `--dangerously-skip-permissions`;
     /// Codex `--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check`.
@@ -104,6 +108,85 @@ pub enum PermMode {
     AcceptEdits,
     /// Read-only / default posture.
     Default,
+}
+
+impl PermMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermMode::BypassPermissions => "bypassPermissions",
+            PermMode::AcceptEdits => "acceptEdits",
+            PermMode::Default => "default",
+        }
+    }
+}
+
+impl std::fmt::Display for PermMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A bounded, provider-neutral view of the foreground process that owns a
+/// terminal at one instant. The raw argv is used only for in-process provider
+/// verification and is never included in a response or error because the
+/// initial Harness prompt may contain sensitive task context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessProcessEvidence {
+    pid: u32,
+    start_ticks: u64,
+    argv: Vec<String>,
+}
+
+impl HarnessProcessEvidence {
+    #[cfg(test)]
+    pub(crate) fn test(pid: u32, start_ticks: u64, argv: &[&str]) -> Self {
+        Self {
+            pid,
+            start_ticks,
+            argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
+        }
+    }
+
+    fn identity(&self) -> (u32, u64) {
+        (self.pid, self.start_ticks)
+    }
+}
+
+/// Credential-safe failure classes for fail-closed launch attestation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchAttestationError {
+    UnreadableEvidence,
+    StaleEvidence,
+    WrongProvider,
+    WrapperObscured,
+    MissingPermission,
+    WrongPermission,
+    ConflictingPermission,
+}
+
+impl std::fmt::Display for LaunchAttestationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::UnreadableEvidence => "provider-native process evidence is unreadable",
+            Self::StaleEvidence => "provider-native process evidence predates this launch",
+            Self::WrongProvider => "process evidence belongs to the wrong Harness provider",
+            Self::WrapperObscured => "a wrapper obscures the provider-native foreground process",
+            Self::MissingPermission => "the required provider-native permission flag is missing",
+            Self::WrongPermission => "provider-native permission evidence has the wrong mode",
+            Self::ConflictingPermission => {
+                "provider-native permission evidence contains conflicting modes"
+            }
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for LaunchAttestationError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HarnessPermissionAttestation {
+    pub provider: Harness,
+    pub permission: PermMode,
 }
 
 /// The Phase-1 slice of the harness capability surface. The audit documents a
@@ -140,10 +223,202 @@ pub trait HarnessAdapter: Send + Sync {
     /// The harness-native flags for a t-hub [`PermMode`] (D4 permission map).
     fn permission_map(&self, perm: PermMode) -> Vec<String>;
 
+    /// Verify the effective permission posture from authoritative foreground
+    /// process argv after launch. Implementations must recognize only their own
+    /// provider-native executable shape and must reject wrappers and conflicting
+    /// permission modes.
+    fn attest_permissions(
+        &self,
+        evidence: &HarnessProcessEvidence,
+        expected: PermMode,
+    ) -> Result<HarnessPermissionAttestation, LaunchAttestationError>;
+
     /// The directory this harness writes its recall/rollout state under
     /// (`~/.claude/projects` / `~/.codex/sessions`). The D6/PR-C continuity
     /// catalog walks this tree.
     fn session_home(&self) -> PathBuf;
+}
+
+/// Require evidence from a process created by this launch, then delegate the
+/// provider-native permission interpretation to the selected adapter.
+pub fn attest_launch_permissions(
+    adapter: &dyn HarnessAdapter,
+    before: &HarnessProcessEvidence,
+    after: &HarnessProcessEvidence,
+    expected: PermMode,
+) -> Result<HarnessPermissionAttestation, LaunchAttestationError> {
+    if before.identity() == after.identity() {
+        return Err(LaunchAttestationError::StaleEvidence);
+    }
+    adapter.attest_permissions(after, expected)
+}
+
+/// Read one authoritative foreground process identity and argv from the tmux
+/// pane. The shell performs only bounded local reads: exactly one pane, one
+/// foreground process, and at most 64 KiB of cmdline data. Any malformed,
+/// oversized, missing, or non-UTF-8 result collapses to the same credential-safe
+/// unreadable-evidence error.
+pub fn observe_harness_process(
+    tmux_target: &str,
+) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
+    const SCRIPT: &str = r#"
+set -eu
+pane_pid=$(tmux -L "$1" list-panes -t "$2" -F '#{pane_pid}')
+set -- $pane_pid
+[ "$#" -eq 1 ]
+case "$1" in ''|*[!0-9]*) exit 21;; esac
+foreground_pid=$(ps -o tpgid= -p "$1" | tr -d ' ')
+case "$foreground_pid" in ''|*[!0-9]*|0) exit 22;; esac
+stat=$(cat "/proc/$foreground_pid/stat")
+rest=${stat##*) }
+set -- $rest
+[ "$#" -ge 20 ]
+start_ticks=${20}
+cmdline="/proc/$foreground_pid/cmdline"
+size=$(wc -c < "$cmdline" | tr -d ' ')
+case "$size" in ''|*[!0-9]*|0) exit 23;; esac
+[ "$size" -le 65536 ]
+printf 'THPA1\n%s\n%s\n' "$foreground_pid" "$start_ticks"
+cat "$cmdline"
+"#;
+
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("wsl.exe");
+        command
+            .arg("--cd")
+            .arg("~")
+            .arg("-e")
+            .arg("sh")
+            .arg("-c")
+            .arg(SCRIPT)
+            .arg("t-hub-permission-attestation")
+            .arg(crate::tmux::socket())
+            .arg(tmux_target);
+        command.creation_flags(0x0800_0000);
+        command
+    };
+    #[cfg(unix)]
+    let command = {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(SCRIPT)
+            .arg("t-hub-permission-attestation")
+            .arg(crate::tmux::socket())
+            .arg(tmux_target);
+        command
+    };
+
+    let output = crate::bounded_exec::output_with_timeout(command, Duration::from_secs(2))
+        .map_err(|_| LaunchAttestationError::UnreadableEvidence)?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    parse_process_evidence(&output.stdout)
+}
+
+fn parse_process_evidence(bytes: &[u8]) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
+    let mut fields = bytes.splitn(4, |byte| *byte == b'\n');
+    if fields.next() != Some(b"THPA1".as_slice()) {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let pid = parse_ascii_number(fields.next())?;
+    let start_ticks = parse_ascii_number(fields.next())?;
+    let cmdline = fields
+        .next()
+        .ok_or(LaunchAttestationError::UnreadableEvidence)?;
+    if cmdline.is_empty() || cmdline.len() > 65_536 || !cmdline.ends_with(&[0]) {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    let argv = cmdline[..cmdline.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(|arg| {
+            std::str::from_utf8(arg)
+                .map(str::to_string)
+                .map_err(|_| LaunchAttestationError::UnreadableEvidence)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if argv.is_empty() || argv.len() > 256 || argv.iter().any(|arg| arg.len() > 16_384) {
+        return Err(LaunchAttestationError::UnreadableEvidence);
+    }
+    Ok(HarnessProcessEvidence {
+        pid: u32::try_from(pid).map_err(|_| LaunchAttestationError::UnreadableEvidence)?,
+        start_ticks,
+        argv,
+    })
+}
+
+fn parse_ascii_number(field: Option<&[u8]>) -> Result<u64, LaunchAttestationError> {
+    let field = field.ok_or(LaunchAttestationError::UnreadableEvidence)?;
+    std::str::from_utf8(field)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or(LaunchAttestationError::UnreadableEvidence)
+}
+
+pub(crate) fn provider_arguments<'a>(
+    evidence: &'a HarnessProcessEvidence,
+    expected: Harness,
+) -> Result<&'a [String], LaunchAttestationError> {
+    let (provider, provider_index) =
+        process_provider(&evidence.argv).ok_or(LaunchAttestationError::WrapperObscured)?;
+    if provider != expected {
+        return Err(LaunchAttestationError::WrongProvider);
+    }
+    Ok(&evidence.argv[provider_index + 1..])
+}
+
+fn process_provider(argv: &[String]) -> Option<(Harness, usize)> {
+    let executable = argv.first().map(|arg| executable_name(arg))?;
+    if let Some(provider) = provider_executable(executable) {
+        return Some((provider, 0));
+    }
+    if matches!(executable, "node" | "nodejs" | "bun" | "deno") {
+        return argv
+            .get(1)
+            .and_then(|arg| provider_executable(executable_name(arg)))
+            .map(|provider| (provider, 1));
+    }
+    None
+}
+
+fn executable_name(value: &str) -> &str {
+    value
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(value)
+        .strip_suffix(".exe")
+        .unwrap_or_else(|| value.rsplit(['/', '\\']).next().unwrap_or(value))
+}
+
+fn provider_executable(executable: &str) -> Option<Harness> {
+    match executable.to_ascii_lowercase().as_str() {
+        "codex" => Some(Harness::Codex),
+        "claude" => Some(Harness::Claude),
+        _ => None,
+    }
+}
+
+pub(crate) fn leading_permission_options(args: &[String]) -> Vec<(&str, Option<&str>)> {
+    let mut options = Vec::new();
+    let mut index = 0;
+    while let Some(flag) = args.get(index) {
+        if flag == "--" || !flag.starts_with('-') {
+            break;
+        }
+        let takes_value = matches!(
+            flag.as_str(),
+            "--sandbox" | "--ask-for-approval" | "--permission-mode"
+        );
+        let value = takes_value
+            .then(|| args.get(index + 1).map(String::as_str))
+            .flatten();
+        options.push((flag.as_str(), value));
+        index += if takes_value { 2 } else { 1 };
+    }
+    options
 }
 
 /// Safely single-quote `s` for a POSIX shell (the `startupCommand` runs inside
@@ -255,5 +530,55 @@ mod tests {
         assert_eq!(sh_single_quote("a `b` $(c) > d"), "'a `b` $(c) > d'");
         // Embedded single quote becomes '\'' .
         assert_eq!(sh_single_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn launch_attestation_rejects_stale_process_identity() {
+        let evidence = HarnessProcessEvidence::test(
+            42,
+            900,
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+        );
+        assert_eq!(
+            attest_launch_permissions(
+                Harness::Codex.adapter(),
+                &evidence,
+                &evidence,
+                PermMode::BypassPermissions,
+            )
+            .unwrap_err(),
+            LaunchAttestationError::StaleEvidence
+        );
+    }
+
+    #[test]
+    fn process_evidence_parser_is_bounded_and_strict() {
+        let parsed =
+            parse_process_evidence(b"THPA1\n42\n900\ncodex\0--sandbox\0read-only\0").unwrap();
+        assert_eq!(parsed.identity(), (42, 900));
+        assert_eq!(parsed.argv, ["codex", "--sandbox", "read-only"]);
+
+        assert_eq!(
+            parse_process_evidence(b"THPA1\n42\n900\ncodex"),
+            Err(LaunchAttestationError::UnreadableEvidence)
+        );
+        let oversized = vec![b'x'; 65_537];
+        assert_eq!(
+            parse_process_evidence(&oversized),
+            Err(LaunchAttestationError::UnreadableEvidence)
+        );
+    }
+
+    #[test]
+    fn permission_modes_serialize_as_separate_harness_axis() {
+        assert_eq!(
+            serde_json::to_value(PermMode::BypassPermissions).unwrap(),
+            serde_json::json!("bypassPermissions")
+        );
+        assert_eq!(PermMode::BypassPermissions.to_string(), "bypassPermissions");
     }
 }
