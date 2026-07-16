@@ -680,6 +680,15 @@ impl AgentBridge {
     /// (so the unit tests that call this directly still pass). Returns the
     /// affected session id for callers/tests that want it.
     pub fn consume_journal_entry(&self, entry: &EventJournalEntry) -> Option<String> {
+        // The journal sequence is the replay idempotency boundary. Reject an
+        // already-consumed or out-of-order entry before every side effect,
+        // including status ingestion, UI emission, title derivation, provider
+        // binding, and supervision reduction. Otherwise a late SessionStart can
+        // erase a newer pending permission and falsely report Working.
+        if !self.advance_cursor(entry.seq) {
+            return None;
+        }
+
         // StatusSnapshot entries get a DEDICATED minimal path. The statusline
         // re-journals an IDENTICAL snapshot ~25x/sec/session (only `ingested_at_ms`
         // ticks). On that path the full fan-out below is pure waste and a sustained
@@ -695,7 +704,6 @@ impl AgentBridge {
             entry.event_type,
             t_hub_protocol::JournalEventType::StatusSnapshot
         ) {
-            self.advance_cursor(entry.seq);
             self.ingest_status_from_journal(entry);
             // Return the entry's own session id for callers/tests; no tree/status
             // emit (the reducer status is unchanged by a status snapshot).
@@ -708,16 +716,12 @@ impl AgentBridge {
             });
         }
 
-        let cursor_advanced = self.advance_cursor(entry.seq);
-
         // 1. Forward the raw journal entry to the UI (snake_case, verbatim — it's
         //    the protocol type). Serialize once and reuse the value.
         self.inner.emit(EVT_JOURNAL, &JournalEventPayload { entry });
 
-        // 2. If the replay cursor moved, the health area's journalCursor changed.
-        if cursor_advanced {
-            self.emit_agent_state();
-        }
+        // 2. The replay cursor moved, so the health area's journalCursor changed.
+        self.emit_agent_state();
 
         // NOTE: StatusSnapshot entries never reach here — they are short-circuited
         // at the top of this method onto a dedicated minimal path (status bridge +
@@ -1212,8 +1216,84 @@ mod tests {
         bridge.consume_journal_entry(&entry(5, "o1", None, JournalEventType::SessionStart));
         assert_eq!(bridge.journal_cursor(), 5);
         // A late/duplicate lower seq must not move the cursor backwards.
-        bridge.consume_journal_entry(&entry(3, "o1", None, JournalEventType::UserPromptSubmit));
+        assert!(bridge
+            .consume_journal_entry(&entry(3, "o1", None, JournalEventType::UserPromptSubmit))
+            .is_none());
         assert_eq!(bridge.journal_cursor(), 5);
+    }
+
+    #[test]
+    fn replay_restart_and_late_session_start_cannot_clear_a_permission_need() {
+        fn permission(seq: u64) -> EventJournalEntry {
+            EventJournalEntry {
+                seq,
+                timestamp_ms: seq,
+                source: JournalSource::Agent,
+                entity_id: Some("thread-1".to_string()),
+                event_type: JournalEventType::PermissionRequest,
+                payload: serde_json::json!({
+                    "provider": "codex",
+                    "session_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "lifecycle": "permission_requested",
+                    "permission_request_id": "request-1",
+                    "permission_request": {
+                        "schema_version": "t-hub.permission-request.v1",
+                        "id": "request-1",
+                        "kind": "command_execution",
+                        "provider": "codex",
+                        "provider_request_id": "request-1",
+                        "session_id": "thread-1",
+                        "turn_id": "turn-1",
+                        "item_id": "item-1",
+                        "tool_name": "Bash",
+                        "requested_at_ms": 2
+                    },
+                    "telemetry": {
+                        "transport": "structured",
+                        "quality": "authoritative",
+                        "runtime_health": "ready"
+                    }
+                }),
+                result: None,
+            }
+        }
+
+        let replay = [
+            entry(1, "thread-1", None, JournalEventType::SessionStart),
+            permission(2),
+        ];
+        for restarted in [false, true] {
+            let bridge = AgentBridge::new();
+            let rec = RecordingEmitter::default();
+            bridge.set_emitter(Arc::new(rec.clone()));
+            rec.events.lock().clear();
+            for journal_entry in &replay {
+                bridge.consume_journal_entry(journal_entry);
+            }
+            assert_eq!(
+                bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+                crate::model::SessionStatus::NeedsPermission,
+                "replay must restore the permission need (restarted={restarted})"
+            );
+            assert!(bridge
+                .with_supervisor(|supervisor| supervisor.permission_request("thread-1"))
+                .is_some());
+
+            let emitted_before_late = rec.events.lock().len();
+            let late_start = entry(1, "thread-1", None, JournalEventType::SessionStart);
+            assert!(bridge.consume_journal_entry(&late_start).is_none());
+            let duplicate_start = entry(2, "thread-1", None, JournalEventType::SessionStart);
+            assert!(bridge.consume_journal_entry(&duplicate_start).is_none());
+            assert_eq!(rec.events.lock().len(), emitted_before_late);
+            assert_eq!(
+                bridge.with_supervisor(|supervisor| supervisor.status("thread-1")),
+                crate::model::SessionStatus::NeedsPermission
+            );
+            assert!(bridge
+                .with_supervisor(|supervisor| supervisor.permission_request("thread-1"))
+                .is_some());
+        }
     }
 
     /// A recording emitter for the live-emit tests: captures (channel, payload).
