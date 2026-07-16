@@ -38,6 +38,9 @@ Independent rereview then found that the MCP unchanged-endpoint read can consume
 The rereview also reproduced a partial-frame trickle that kept the source CLI alive beyond its ten-second absolute deadline, and the same loop shape exists in all three clients.
 The rereview additionally found that desktop endpoint adoption can overwrite a newer rotation with a stale captured address.
 The Captain has returned these new blockers for explicit downstream recovery reserves, hard deadline enforcement during partial reads, concurrency-safe endpoint adoption, and deterministic coverage in all three clients.
+T30 corrected those three issues as `58b6ec5`, and independent rereview verified the absolute trickle deadline, MCP recovery reserves, idle polling, and concurrency-safe endpoint adoption.
+That rereview found one remaining blocker because all three clients still accumulate and repeatedly rescan an unbounded response frame, and the CLI can echo the raw malformed frame.
+The Captain returned a shared safe frame limit, incremental scanning, bounded credential-safe protocol errors, and exact-limit, over-limit, malformed, unterminated, output-bound, and non-leak coverage.
 T30 remains unaccepted until a separate correction commit passes another independent rereview.
 
 Permission launch-attestation terminal `10d1093e` committed its provider-neutral Harness attestation layer as `5b033fe` on branch `fix/codex-permission-launch-attestation` after 28 focused tests passed without warnings.
