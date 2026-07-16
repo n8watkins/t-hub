@@ -670,6 +670,18 @@ fn stale_env_token_error(app_msg: &str) -> String {
     )
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MutationReissueState {
+    NotAttempted,
+    Attempted,
+}
+
+fn unknown_after_reissue_message(command: &str, request_id: &str) -> String {
+    format!(
+        "control_request_unknown: command '{command}' remained unknown after one idempotent reissue; request_id='{request_id}'; retry_state=exhausted"
+    )
+}
+
 /// Resolve an ambiguous spawn-class transport failure (ask #1/#2): the command was
 /// possibly accepted but its response leg failed. Query `get_request_status` for
 /// the SAME `request_id` and act on the authoritative answer:
@@ -692,6 +704,7 @@ fn resolve_ambiguous_request(
     budget: CallBudget,
 ) -> Result<Value, String> {
     let status_args = serde_json::json!({ "requestId": request_id });
+    let mut reissue_state = MutationReissueState::NotAttempted;
     loop {
         match call_classified(endpoint, "get_request_status", &status_args, budget, None) {
             Ok(v) => match v.get("status").and_then(Value::as_str) {
@@ -724,10 +737,32 @@ fn resolve_ambiguous_request(
                     sleep_within(budget.deadline, Duration::from_millis(200));
                 }
                 // "unknown" (or a server that answered oddly): the command never
-                // landed under this id, so re-running it once is safe + idempotent.
+                // landed under this id. Permit exactly one idempotent mutation
+                // reissue. If that reissue loses its response, return to status
+                // resolution; a later unknown is authoritative and never mutates.
                 _ => {
-                    return call_classified(endpoint, command, args, budget, None)
-                        .map_err(|error| error.into_message(command, 2, false));
+                    if reissue_state == MutationReissueState::Attempted {
+                        return Err(unknown_after_reissue_message(command, request_id));
+                    }
+                    if Instant::now() >= budget.deadline {
+                        return Err(format!(
+                            "{}; request_id='{request_id}'",
+                            timeout_message(command, 2, "request status")
+                        ));
+                    }
+                    reissue_state = MutationReissueState::Attempted;
+                    match call_classified(endpoint, command, args, budget, None) {
+                        Ok(value) => return Ok(value),
+                        Err(CallError::App(msg)) if has_env_pin && is_auth_rejection(&msg) => {
+                            return Err(stale_env_token_error(&msg));
+                        }
+                        Err(CallError::App(msg)) | Err(CallError::Protocol(msg)) => {
+                            return Err(msg);
+                        }
+                        Err(CallError::PartialResponse)
+                        | Err(CallError::Transport(_))
+                        | Err(CallError::Timeout(_)) => continue,
+                    }
                 }
             },
             // The app answered but rejected the STATUS query itself. Under a kept env
@@ -1235,6 +1270,37 @@ mod tests {
         }
         let elapsed = started.elapsed();
         (child.wait_with_output().unwrap(), elapsed)
+    }
+
+    fn assert_safe_mcp_process_output(output: &std::process::Output, addr: &str) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.stdout.len() < 4096);
+        assert!(output.stderr.is_empty(), "stderr: {output:?}");
+        assert!(!stdout.contains("process-control-token"));
+        assert!(!stdout.contains("initial-cut"));
+        assert!(!stdout.contains("retry-cut"));
+        assert!(!stdout.contains(addr));
+    }
+
+    fn assert_single_reissue_sequence(requests: &[Value]) {
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert_eq!(requests[2]["command"], "spawn_terminal");
+        assert_eq!(requests[3]["command"], "get_request_status");
+        let request_id = &requests[0]["args"]["requestId"];
+        assert!(request_id.is_string());
+        for request in &requests[1..] {
+            assert_eq!(&request["args"]["requestId"], request_id);
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["command"] == "spawn_terminal")
+                .count(),
+            2,
+            "the mutation may be reissued at most once"
+        );
     }
 
     fn silent_server(hold: Duration) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -2087,6 +2153,99 @@ mod tests {
             requests[2]["args"]["requestId"],
             requests[0]["args"]["requestId"]
         );
+    }
+
+    #[test]
+    fn process_reissue_partial_then_completed_queries_status_again() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"initial-cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"retry-cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":true,"result":{"id":"sess-after-reissue"}}}"#,
+            ),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(
+            response["result"]["structuredContent"]["id"],
+            "sess-after-reissue"
+        );
+        assert_safe_mcp_process_output(&output, &addr);
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_single_reissue_sequence(&requests);
+    }
+
+    #[test]
+    fn process_reissue_partial_then_failed_queries_status_again() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"initial-cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"retry-cut""#),
+            ScriptedReply::Line(
+                r#"{"ok":true,"result":{"status":"completed","ok":false,"error":"spawn failed after reissue"}}"#,
+            ),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "spawn failed after reissue"
+        );
+        assert_safe_mcp_process_output(&output, &addr);
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_single_reissue_sequence(&requests);
+    }
+
+    #[test]
+    fn process_reissue_partial_then_still_unknown_never_mutates_again() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"initial-cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"retry-cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(message.contains("control_request_unknown"));
+        assert!(message.contains("partial-eof-process-request"));
+        assert!(message.contains("retry_state=exhausted"));
+        assert_safe_mcp_process_output(&output, &addr);
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        let requests = captured.lock().unwrap();
+        assert_single_reissue_sequence(&requests);
+    }
+
+    #[test]
+    fn process_reissue_partial_then_status_unavailable_is_bounded() {
+        let (addr, captured) = byte_scripted_server(vec![
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"initial-cut""#),
+            ScriptedReply::Line(r#"{"ok":true,"result":{"status":"unknown"}}"#),
+            ScriptedReply::Partial(r#"{"ok":true,"result":{"id":"retry-cut""#),
+            ScriptedReply::Close,
+        ]);
+
+        let (output, elapsed) = run_mcp_spawn_process(&addr, "process-control-token");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(message.contains("control_timeout"));
+        assert!(message.contains("request status"));
+        assert!(message.contains("partial-eof-process-request"));
+        assert_safe_mcp_process_output(&output, &addr);
+        assert!(elapsed >= CONTROL_DEADLINE - Duration::from_secs(1));
+        assert!(elapsed <= CONTROL_DEADLINE + Duration::from_secs(1));
+        let requests = captured.lock().unwrap();
+        assert_single_reissue_sequence(&requests);
     }
 
     #[test]
