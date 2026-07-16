@@ -146,6 +146,8 @@ T-Hub must not patch or fork Powder behavior locally to make acceptance pass.
 | T28 | Review diagnostic and event-journal retention, including the observed approximately 46.9 MB event journal, and define bounded ownership and cleanup. | 11 and 12 | No | Long-running use has no unbounded log, journal, queue, handle, socket, process, or memory trend. | `thub-journal-retention` |
 | T29 | Make `th health --json` report honest Windows and WSL host telemetry, including explicit unsupported or unavailable fields instead of a healthy all-zero skeleton. | 1, 5, and 10 | No | Health output cannot claim success when the requested host metrics were never collected. | `thub-health-host-telemetry` |
 | T30 | Make control clients recover stale endpoints promptly with one bounded overall deadline, visible retry state, and no inherited-port delay. | 1 and 5 | No | Capability, health, and list calls recover or return a structured timeout without a 30-to-45-second ambiguous hang. | `thub-control-client-deadline` |
+| T31 | Reproduce and eliminate avoidable Workspace-switch terminal restoration delay while preserving bounded terminal resources. | 1, 9, and 11 | No | Packaged warm and cold switches have numeric visual-switch and input-ready budgets; an immediate return never reattaches, and a cold return shows the last authoritative frame immediately while one bounded background attach restores live input. | `thub-workspace-switch-latency` |
+| T32 | Make the sidebar show authoritative, legible agent activity for Codex and Claude instead of treating recent terminal output as equivalent to a running agent. | 4, 8, and 9 | Yes | Packaged Codex and Claude runs remain visibly Working through quiet reasoning and tool execution, distinguish needs-input, idle, completed, failed, stale, and unknown states, and expose degraded telemetry rather than a blank status slot. | `thub-sidebar-agent-status` |
 
 The change register is authoritative planning input even before its cards are created.
 Powder cards should be created only when their lane is near-term, bounded, dependency-ready, and assigned to an isolated worktree with an explicit exit gate.
@@ -162,6 +164,8 @@ Review findings must not disappear merely because a card is deferred, completed,
 7. T9 and T10 make the inbox safe before Phase 6 messaging activation or Phase 8B messaging acceptance.
 8. T11 supplies CLI-first parity before broad Captain card authoring and messaging commands are considered complete.
 9. T13 and T14 stabilize the installed frontend before performance or usage-persistence conclusions are accepted.
+10. T24 defines the numeric Workspace-switch budgets consumed by T31, while T31 owns lifecycle and rendering changes needed to meet them.
+11. T32 consumes the provider-neutral lifecycle model from Phase 4 and the authoritative Captain and Crew terminal-state work from T17; its degraded-state UI may proceed without fabricating missing telemetry.
 
 ### Phase Status and Dependency Summary
 
