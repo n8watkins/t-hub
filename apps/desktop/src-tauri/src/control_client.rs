@@ -18,7 +18,7 @@
 //! event re-emit). They meet at the NDJSON wire protocol and the shared
 //! [`crate::control::EventFanout`].
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -125,8 +125,8 @@ impl ControlEndpoint {
     /// frontend to read-only and break attach. The cached full token still authorizes
     /// the fresh port because the rebind kept it.
     pub fn refresh_addr(&self) -> Option<String> {
-        let fresh = self.discovered_addr()?;
         let mut cur = self.addr.write().unwrap_or_else(|e| e.into_inner());
+        let fresh = self.discovered_addr()?;
         if *cur != fresh {
             *cur = fresh.clone();
             Some(fresh)
@@ -144,8 +144,21 @@ impl ControlEndpoint {
             .map(str::to_string)
     }
 
-    fn adopt_addr(&self, fresh: String) {
-        *self.addr.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+    /// Adopt an address observed while using `attempted` only if shared state still
+    /// points at that attempted address. A different current address means another
+    /// request or the event forwarder already observed a newer rotation.
+    fn adopt_addr_after(&self, attempted: &str, observed: String) -> String {
+        let mut current = self.addr.write().unwrap_or_else(|e| e.into_inner());
+        if *current == attempted {
+            *current = observed;
+        }
+        current.clone()
+    }
+
+    fn refresh_addr_after(&self, attempted: &str) -> Option<String> {
+        let observed = self.discovered_addr()?;
+        let current = self.adopt_addr_after(attempted, observed);
+        (current != attempted).then_some(current)
     }
 }
 
@@ -218,15 +231,16 @@ fn request_with_deadline(
                 return Err(timeout_message(command, 1, first.stage(), overall));
             }
             let fresh = match &first {
-                RequestError::EndpointChanged(fresh) => fresh.clone(),
+                RequestError::EndpointChanged(observed) => {
+                    endpoint.adopt_addr_after(&first_addr, observed.clone())
+                }
                 _ => {
-                    let Some(fresh) = endpoint.refresh_addr() else {
+                    let Some(fresh) = endpoint.refresh_addr_after(&first_addr) else {
                         return Err(failure_message(command, 1, &first, false, overall));
                     };
                     fresh
                 }
             };
-            endpoint.adopt_addr(fresh.clone());
             match request_once(
                 &fresh,
                 endpoint.token(),
@@ -333,36 +347,53 @@ fn request_once(
             }
         })?;
 
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
+    stream
+        .set_nonblocking(true)
+        .map_err(|_| RequestError::Transport("stream setup"))?;
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let mut next_probe = Instant::now() + attempt_timeout;
     loop {
-        let read_budget = remaining(deadline)
-            .map(|left| left.min(attempt_timeout))
-            .filter(|budget| !budget.is_zero())
-            .ok_or(RequestError::Timeout("read"))?;
-        reader.get_ref().set_read_timeout(Some(read_budget)).ok();
-        match reader.read_line(&mut line) {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(RequestError::Timeout("read"));
+        }
+        if now >= next_probe {
+            if let Some(fresh) = refresh
+                .and_then(ControlEndpoint::discovered_addr)
+                .filter(|fresh| fresh != addr)
+            {
+                return Err(RequestError::EndpointChanged(fresh));
+            }
+            next_probe = now + attempt_timeout;
+        }
+        match (&stream).read(&mut chunk) {
             Ok(0) => return Err(RequestError::Transport("read")),
-            Ok(_) => break,
+            Ok(n) => {
+                response.extend_from_slice(&chunk[..n]);
+                if let Some(newline) = response.iter().position(|byte| *byte == b'\n') {
+                    response.truncate(newline);
+                    break;
+                }
+            }
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                if Instant::now() >= deadline {
-                    return Err(RequestError::Timeout("read"));
-                }
-                if let Some(fresh) = refresh
-                    .and_then(ControlEndpoint::discovered_addr)
-                    .filter(|fresh| fresh != addr)
-                {
-                    return Err(RequestError::EndpointChanged(fresh));
-                }
+                let wake_at = deadline.min(next_probe);
+                std::thread::sleep(
+                    wake_at
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
             }
             Err(_) => return Err(RequestError::Transport("read")),
         }
     }
+    let line = String::from_utf8(response)
+        .map_err(|_| RequestError::Protocol("control response was not UTF-8".into()))?;
     let resp: Value = serde_json::from_str(line.trim()).map_err(|e| {
         RequestError::Protocol(format!("control_protocol: malformed response: {e}"))
     })?;
@@ -456,7 +487,8 @@ pub fn spawn_event_forwarder(app: AppHandle, endpoint: Arc<ControlEndpoint>) {
                 // rotated listener port. Existing subscriptions survive a rebind (the
                 // fanout is shared across the server's listeners), so this only matters
                 // once the connection actually drops and must reconnect.
-                let result = forward_once(&app, &endpoint.addr(), endpoint.token());
+                let attempted_addr = endpoint.addr();
+                let result = forward_once(&app, &attempted_addr, endpoint.token());
                 let lived = started.elapsed();
                 match result {
                     Ok(()) if lived >= healthy_after => {
@@ -471,7 +503,7 @@ pub fn spawn_event_forwarder(app: AppHandle, endpoint: Arc<ControlEndpoint>) {
                         // A reconnect failure may be the retired old port after a
                         // rebind: re-read control.json so the NEXT cycle targets the
                         // fresh addr (relay-wedge self-heal).
-                        endpoint.refresh_addr();
+                        endpoint.refresh_addr_after(&attempted_addr);
                         eprintln!(
                             "t-hub-control: event forwarder reconnect failed: {e} (retry in {backoff:?})"
                         );
@@ -721,6 +753,26 @@ mod tests {
         addr
     }
 
+    fn trickle_server(interval: Duration, writes: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let mut writer = stream;
+            for _ in 0..writes {
+                if writer.write_all(b"{").is_err() || writer.flush().is_err() {
+                    break;
+                }
+                thread::sleep(interval);
+            }
+        });
+        addr
+    }
+
     fn dead_addr() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -913,6 +965,24 @@ mod tests {
     }
 
     #[test]
+    fn partial_frame_trickle_cannot_bypass_absolute_deadline() {
+        let addr = trickle_server(Duration::from_millis(10), 30);
+        let endpoint = test_endpoint(addr, None);
+        let started = Instant::now();
+
+        let error = request_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_millis(70),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(error.contains("control_timeout"), "error: {error}");
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
     fn budget_exhaustion_is_classified_and_does_not_leak_credentials() {
         let addr = silent_server(Duration::from_millis(180));
         let endpoint = test_endpoint(addr.clone(), None);
@@ -999,5 +1069,31 @@ mod tests {
         assert_eq!(remote_ep.addr(), "10.0.0.9:8787");
 
         let _ = std::fs::remove_file(&cj);
+    }
+
+    #[test]
+    fn concurrent_older_rotation_observation_cannot_replace_newer_endpoint() {
+        let endpoint = Arc::new(test_endpoint("127.0.0.1:6000".into(), None));
+        let older_endpoint = endpoint.clone();
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let older = thread::spawn(move || {
+            let attempted = "127.0.0.1:6000";
+            let observed = "127.0.0.1:6001".to_string();
+            captured_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            older_endpoint.adopt_addr_after(attempted, observed)
+        });
+
+        captured_rx.recv().unwrap();
+        assert_eq!(
+            endpoint.adopt_addr_after("127.0.0.1:6000", "127.0.0.1:6002".into()),
+            "127.0.0.1:6002"
+        );
+        release_tx.send(()).unwrap();
+
+        assert_eq!(older.join().unwrap(), "127.0.0.1:6002");
+        assert_eq!(endpoint.addr(), "127.0.0.1:6002");
     }
 }

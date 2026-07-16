@@ -12,7 +12,9 @@
 //! response line. Connections are not pooled - `tools/call` is infrequent and a
 //! fresh connection keeps the client stateless and robust to app restarts.
 
-use std::io::{BufRead, BufReader, Write};
+#[cfg(test)]
+use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -256,6 +258,7 @@ struct ControlResponse {
 
 /// Why a single control round-trip failed, so the retry layer can tell a moved
 /// endpoint apart from a command the app deliberately rejected.
+#[derive(Debug)]
 enum CallError {
     /// Transport-level FAST failure: connect refused, the stream died, or spoke
     /// garbage. A restarted/rebound app on a new ephemeral port looks exactly like
@@ -328,6 +331,18 @@ fn remaining(deadline: Instant) -> Option<Duration> {
 struct CallBudget {
     deadline: Instant,
     attempt_timeout: Duration,
+}
+
+impl CallBudget {
+    /// Keep two polling slices inside the same overall deadline for stale
+    /// endpoint retry, idempotency-status reconciliation, or bridge recovery.
+    fn initial_attempt(self) -> Self {
+        let reserve = self.attempt_timeout.saturating_mul(2);
+        Self {
+            deadline: self.deadline.checked_sub(reserve).unwrap_or(self.deadline),
+            attempt_timeout: self.attempt_timeout,
+        }
+    }
 }
 
 /// Consecutive same-endpoint transport failures before the relay-wedge self-heal
@@ -434,7 +449,13 @@ fn resolve_and_call_with_deadline(
     if Instant::now() >= budget.deadline {
         return Err(timeout_message(command, 0, "discovery"));
     }
-    match call_classified(&endpoint, command, &args, budget, Some(discovery)) {
+    match call_classified(
+        &endpoint,
+        command,
+        &args,
+        budget.initial_attempt(),
+        Some(discovery),
+    ) {
         Ok(v) => {
             wedge_detector().on_success();
             Ok(v)
@@ -815,39 +836,54 @@ fn call_classified(
         }
     })?;
 
-    let mut reader = BufReader::new(stream);
-    let mut resp_line = String::new();
+    stream
+        .set_nonblocking(true)
+        .map_err(|_| CallError::Transport("stream setup"))?;
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let mut next_probe = Instant::now() + budget.attempt_timeout;
     loop {
-        let read_budget = remaining(budget.deadline)
-            .map(|left| left.min(budget.attempt_timeout))
-            .filter(|timeout| !timeout.is_zero())
-            .ok_or(CallError::Timeout("read"))?;
-        let _ = reader.get_ref().set_read_timeout(Some(read_budget));
-        match reader.read_line(&mut resp_line) {
+        let now = Instant::now();
+        if now >= budget.deadline {
+            return Err(CallError::Timeout("read"));
+        }
+        if now >= next_probe {
+            if discovery
+                .and_then(|source| source.refreshed_endpoint().ok())
+                .is_some_and(|fresh| fresh.addr != endpoint.addr || fresh.token != endpoint.token)
+            {
+                return Err(CallError::Timeout("read"));
+            }
+            next_probe = now + budget.attempt_timeout;
+        }
+        match (&stream).read(&mut chunk) {
             Ok(0) => return Err(CallError::Transport("read")),
-            Ok(_) => break,
+            Ok(n) => {
+                response.extend_from_slice(&chunk[..n]);
+                if let Some(newline) = response.iter().position(|byte| *byte == b'\n') {
+                    response.truncate(newline);
+                    break;
+                }
+            }
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                if Instant::now() >= budget.deadline {
-                    return Err(CallError::Timeout("read"));
-                }
-                if discovery
-                    .and_then(|source| source.refreshed_endpoint().ok())
-                    .is_some_and(|fresh| {
-                        fresh.addr != endpoint.addr || fresh.token != endpoint.token
-                    })
-                {
-                    return Err(CallError::Timeout("read"));
-                }
+                let wake_at = budget.deadline.min(next_probe);
+                std::thread::sleep(
+                    wake_at
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
             }
             Err(_) => return Err(CallError::Transport("read")),
         }
     }
 
+    let resp_line = String::from_utf8(response)
+        .map_err(|_| CallError::Protocol("control response was not UTF-8".to_string()))?;
     let resp: ControlResponse = serde_json::from_str(resp_line.trim_end())
         .map_err(|e| CallError::Protocol(format!("control_protocol: malformed response: {e}")))?;
 
@@ -871,6 +907,12 @@ fn wsl_powershell_available() -> bool {
     std::env::var_os("WSL_INTEROP").is_some() || std::env::var_os("WSL_DISTRO_NAME").is_some()
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_BRIDGE_RESULT: std::cell::RefCell<Option<ControlEndpoint>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Attempt ONE relay-wedge self-heal: trigger an app-side `rebind_control` over the
 /// Windows powershell bridge, then adopt the fresh endpoint the app just published.
 /// Returns the new endpoint on success, or `None` (app genuinely down, rate-limited,
@@ -890,6 +932,10 @@ fn try_bridge_rebind(
     stale: &ControlEndpoint,
     deadline: Instant,
 ) -> Option<ControlEndpoint> {
+    #[cfg(test)]
+    if let Some(endpoint) = TEST_BRIDGE_RESULT.with(|slot| slot.borrow_mut().take()) {
+        return Some(endpoint);
+    }
     if !wsl_powershell_available() {
         return None;
     }
@@ -1087,6 +1133,60 @@ mod tests {
         addr
     }
 
+    fn trickle_server(interval: Duration, writes: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut writer = stream;
+            for _ in 0..writes {
+                if writer.write_all(b"{").is_err() || writer.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(interval);
+            }
+        });
+        addr
+    }
+
+    fn silent_then_status_server(hold: Duration) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            let (first, _) = listener.accept().unwrap();
+            let mut first_reader = BufReader::new(first);
+            let mut first_line = String::new();
+            first_reader.read_line(&mut first_line).unwrap();
+            cap.lock()
+                .unwrap()
+                .push(serde_json::from_str(first_line.trim_end()).unwrap());
+            std::thread::spawn(move || {
+                std::thread::sleep(hold);
+                drop(first_reader);
+            });
+
+            let (second, _) = listener.accept().unwrap();
+            let mut second_reader = BufReader::new(second.try_clone().unwrap());
+            let mut second_line = String::new();
+            second_reader.read_line(&mut second_line).unwrap();
+            cap.lock()
+                .unwrap()
+                .push(serde_json::from_str(second_line.trim_end()).unwrap());
+            let mut writer = second;
+            writer
+                .write_all(
+                    b"{\"ok\":true,\"result\":{\"status\":\"completed\",\"ok\":true,\"result\":{\"id\":\"resolved\"}}}\n",
+                )
+                .unwrap();
+        });
+        (addr, captured)
+    }
+
     // ---- Relay-wedge self-heal: detection state machine (cause 2) --------------
 
     #[test]
@@ -1271,6 +1371,93 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value["usage"], "ready");
+    }
+
+    #[test]
+    fn partial_frame_trickle_cannot_bypass_absolute_deadline() {
+        let addr = trickle_server(Duration::from_millis(10), 30);
+        let endpoint = ControlEndpoint {
+            addr,
+            token: "control".into(),
+        };
+        let started = Instant::now();
+
+        let error = call_classified(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            CallBudget {
+                deadline: Instant::now() + Duration::from_millis(70),
+                attempt_timeout: Duration::from_millis(20),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CallError::Timeout("read")));
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn unchanged_silent_idempotent_call_uses_reserved_status_budget() {
+        let (addr, captured) = silent_then_status_server(Duration::from_millis(300));
+        let discovery = Discovery {
+            addr: Some(addr),
+            token: Some("control".into()),
+            file: Some(PathBuf::from("/nonexistent/control.json")),
+            ..Default::default()
+        };
+        let started = Instant::now();
+
+        let value = resolve_and_call_with_deadline(
+            &discovery,
+            "spawn_terminal",
+            &serde_json::json!({"cwd": "/tmp"}),
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        assert_eq!(value["id"], "resolved");
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests[0]["command"], "spawn_terminal");
+        assert_eq!(requests[1]["command"], "get_request_status");
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn unchanged_silent_read_uses_reserved_maybe_heal_budget() {
+        *wedge_detector() = WedgeDetector::default();
+        let (silent_addr, _requests) = silent_server(Duration::from_millis(300));
+        let (healed_addr, healed_requests) =
+            scripted_server(vec![Some(r#"{"ok":true,"result":{"tabs":[]}}"#)]);
+        TEST_BRIDGE_RESULT.with(|slot| {
+            *slot.borrow_mut() = Some(ControlEndpoint {
+                addr: healed_addr,
+                token: "control".into(),
+            });
+        });
+        let discovery = Discovery {
+            addr: Some(silent_addr),
+            token: Some("control".into()),
+            file: Some(PathBuf::from("/nonexistent/control.json")),
+            ..Default::default()
+        };
+        let started = Instant::now();
+
+        let value = resolve_and_call_with_deadline(
+            &discovery,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_millis(250),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        assert_eq!(value["tabs"], serde_json::json!([]));
+        assert_eq!(healed_requests.lock().unwrap()[0]["command"], "list_tabs");
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 
     #[test]

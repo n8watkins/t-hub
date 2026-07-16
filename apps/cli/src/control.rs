@@ -10,7 +10,7 @@
 //! injected address and token are tried first, while the current handshake file
 //! supplies a rotated address after an application restart.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -344,35 +344,53 @@ fn call_once(
         }
     })?;
 
-    let mut reader = BufReader::new(stream);
-    let mut resp_line = String::new();
+    stream
+        .set_nonblocking(true)
+        .map_err(|_| CallFailure::Transport("stream setup"))?;
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let mut next_probe = Instant::now() + attempt_timeout;
     loop {
-        let read_budget = remaining(deadline)
-            .map(|left| left.min(attempt_timeout))
-            .filter(|budget| !budget.is_zero())
-            .ok_or(CallFailure::Timeout("read"))?;
-        let _ = reader.get_ref().set_read_timeout(Some(read_budget));
-        match reader.read_line(&mut resp_line) {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(CallFailure::Timeout("read"));
+        }
+        if now >= next_probe {
+            if refresh_endpoint(ep)
+                .is_ok_and(|fresh| fresh.addr != ep.addr || fresh.token != ep.token)
+            {
+                return Err(CallFailure::Timeout("read"));
+            }
+            next_probe = now + attempt_timeout;
+        }
+        match (&stream).read(&mut chunk) {
             Ok(0) => return Err(CallFailure::Transport("read")),
-            Ok(_) => break,
+            Ok(n) => {
+                response.extend_from_slice(&chunk[..n]);
+                if let Some(newline) = response.iter().position(|byte| *byte == b'\n') {
+                    response.truncate(newline);
+                    break;
+                }
+            }
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                if Instant::now() >= deadline {
-                    return Err(CallFailure::Timeout("read"));
-                }
-                if refresh_endpoint(ep)
-                    .is_ok_and(|fresh| fresh.addr != ep.addr || fresh.token != ep.token)
-                {
-                    return Err(CallFailure::Timeout("read"));
-                }
+                let wake_at = deadline.min(next_probe);
+                std::thread::sleep(
+                    wake_at
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
             }
             Err(_) => return Err(CallFailure::Transport("read")),
         }
     }
+
+    let resp_line = String::from_utf8(response)
+        .map_err(|_| CallFailure::Protocol("control response was not UTF-8".to_string()))?;
 
     let resp: Response = serde_json::from_str(resp_line.trim_end()).map_err(|e| {
         CallFailure::Protocol(format!(
@@ -507,6 +525,26 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let mut request = String::new();
             BufReader::new(stream).read_line(&mut request).unwrap();
+        });
+        addr
+    }
+
+    fn trickle_server(interval: Duration, writes: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let mut writer = stream;
+            for _ in 0..writes {
+                if writer.write_all(b"{").is_err() || writer.flush().is_err() {
+                    break;
+                }
+                thread::sleep(interval);
+            }
         });
         addr
     }
@@ -700,6 +738,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value["usage"], "ready");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn partial_frame_trickle_cannot_bypass_absolute_deadline() {
+        let addr = trickle_server(Duration::from_millis(10), 30);
+        let path = handshake_for(&addr);
+        let endpoint = inherited_endpoint(addr, path.clone());
+        let started = Instant::now();
+
+        let error = call_with_deadline(
+            &endpoint,
+            "list_tabs",
+            &Value::Null,
+            Duration::from_millis(70),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ControlError::AppDown(message) if
+            message.contains("control_timeout")));
+        assert!(started.elapsed() < Duration::from_millis(150));
         let _ = std::fs::remove_file(path);
     }
 
