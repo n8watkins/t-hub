@@ -21,6 +21,29 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 This section is the reset-safe starting point for the next session.
 The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
 
+### Verified 2026-07-15 Permission Crew Progress Boundary
+
+This boundary was verified at `2026-07-15T23:38:08-07:00` while the Captain actively monitored the three authorized Codex Crew for permission prompts.
+The General moved both permission Crew into the normal Crew workspace, and the Captain preserved their terminal identities, Powder runs, branches, worktrees, and file ownership without moving them again.
+T30 terminal `2bef9b61` committed the bounded control-client recovery change as `e7922ac` on branch `fix/control-client-deadline`.
+The Crew reports that the exact stale-endpoint fixture improved from 15.074 seconds to 2.053 seconds with exit code 0 and clean JSON stdout.
+Verification passed 37 CLI unit tests, 7 CLI JSON contract tests, 11 focused desktop tests, 54 MCP unit tests, 2 MCP process tests, formatting checks, CLI and MCP clippy, and Git diff checks.
+Desktop full-library clippy remains blocked by a pre-existing warning in unowned `apps/desktop/src-tauri/src/control.rs`.
+The Captain approved one exact final Powder work-log append containing that commit and evidence, but the sanctioned CLI returned `ok: false`.
+The result is not being retried until its failure is reconciled, and T30 still requires independent review.
+
+Permission launch-attestation terminal `10d1093e` committed its provider-neutral Harness attestation layer as `5b033fe` on branch `fix/codex-permission-launch-attestation` after 28 focused tests passed without warnings.
+Effective exclusive implementation ownership of `apps/desktop/src-tauri/src/control.rs` belongs to this launch-attestation lane because T2 is complete, accepted, independently reviewed, exact-run evidence-complete, and evidence-only while its claim is retained.
+The launch-attestation Crew is proceeding with the separate control transaction integration and still requires independent review of all control-plane changes.
+
+Permission-observability terminal `8026ea1a` remains active on branch `feat/codex-permission-observability` and is mapping the Codex rollout telemetry contract before making source changes.
+It has confirmed that interactive permission requests appear in Codex rollout data as structured approval-bearing tool calls, while the current T-Hub source does not yet provide verified `--codex-tap` production integration.
+The required implementation remains exact-Crew `needsPermission`, explicit degraded telemetry health when structured observation is unavailable, and owning-Captain wake routing without terminal dialogue text as the sole production signal.
+
+Installed `0.3.103` still launches these Codex Crew without the unrestricted source flag.
+Until the launch and observability changes are reviewed and later authorized for installation, the Captain is monitoring all three live panes and approving only exact routine local read, build, test, and evidence operations already authorized by the General.
+No merge, push, install, deploy, publication, release, card completion, claim release, or resource reap is authorized or claimed.
+
 ### Verified 2026-07-15 Codex Permission Work Boundary
 
 This boundary was verified at `2026-07-15T23:23:50-07:00` after the General authorized immediate Crew implementation of Codex permission launch and monitoring reliability.
