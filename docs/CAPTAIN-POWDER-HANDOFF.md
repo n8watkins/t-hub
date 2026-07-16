@@ -31,8 +31,9 @@ Each worktree contains only the protected untracked `CLAUDE.md` artifact.
 The three independent reviewers remain complete.
 T30 remains fully accepted, permission observability remains review-clean pending combined launch integration, and launch attestation remains conditionally unaccepted until observability lands first and the real agent from the combined tree passes its exact launch proof.
 
-The installed `0.3.103` automatic fleet wake could not be armed because the Captain liveness probe timed out even though tmux proved the Captain session attached and the Crew sessions alive.
-Direct pane inspection therefore remains the active permission-monitoring fallback whenever a Crew resumes.
+The installed `0.3.103` automatic fleet wake initially could not be armed because the Captain liveness probe timed out even though tmux proved the Captain session attached and the Crew sessions alive.
+A later reconciled registry read proved no watch existed, and one idempotent retry successfully armed Captain `c2940be4` for terminals `2bef9b61`, `10d1093e`, and `8026ea1a` on `needsPermission`, `needsQuestion`, `failed`, and `completed` transitions.
+Direct pane inspection remains the verification fallback, while the durable wake now provides automatic attention routing whenever a watched Crew changes into an actionable state.
 The installed runtime still lacks the reviewed unrestricted launch and structured permission failsafe changes.
 
 Authoritative Powder reconciliation now reports the registered binding `n8desktop-wsl` and repository `t-hub` as misconfigured because the protected profile is unavailable or invalid.
