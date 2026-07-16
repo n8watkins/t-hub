@@ -22431,12 +22431,10 @@ mod tests {
     #[test]
     #[ignore = "run scripts/captain/verify-codex-permission-integration.sh"]
     fn dispatch_combined_real_agent_marks_exact_codex_crew_before_provider_exec() {
-        if !tmux_process_tests_available() {
-            eprintln!(
-                "dispatch_combined_real_agent_marks_exact_codex_crew_before_provider_exec: tmux or node not on PATH - skipping"
-            );
-            return;
-        }
+        assert!(
+            tmux_process_tests_available(),
+            "combined Codex integration gate requires tmux and node"
+        );
         let agent_path = std::env::var_os("T_HUB_REAL_AGENT_BIN").expect(
             "T_HUB_REAL_AGENT_BIN must identify the combined-tree agent; run scripts/captain/verify-codex-permission-integration.sh",
         );
