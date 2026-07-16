@@ -188,7 +188,12 @@ fn map_app_server_message(
     binding: &TmuxBinding,
 ) -> Option<EventJournalEntry> {
     let params = value.get("params").unwrap_or(&Value::Null);
-    if let Some(thread_id) = bounded_string(params.get("threadId"), MAX_ID_BYTES) {
+    if let Some(thread_id) = bounded_string(
+        params
+            .get("threadId")
+            .or_else(|| params.get("thread").and_then(|thread| thread.get("id"))),
+        MAX_ID_BYTES,
+    ) {
         state.session_id = Some(thread_id);
     }
     if let Some(turn_id) = bounded_string(

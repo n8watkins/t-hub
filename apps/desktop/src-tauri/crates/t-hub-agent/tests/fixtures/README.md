@@ -9,6 +9,8 @@ producer stays locked to what the pinned Codex version actually emits.
 Its request, resolution, and turn ordering was verified against the live T30 permission prompt on 2026-07-15.
 The raw T30 command, reason, ids, paths, and rollout were not copied into Git.
 
+`codex-0.144.4-app-server-thread-started.jsonl` is a sanitized `ThreadStartedNotification` matching the generated 0.144.4 v2 schema, including the current `params.thread.id` identity path.
+
 ## Provenance
 
 - **Codex version:** `codex-cli 0.142.5` (the fleet-pinned version; filenames

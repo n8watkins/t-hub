@@ -58,3 +58,44 @@ fn codex_tap_process_persists_a_sanitized_permission_lifecycle() {
 
     std::fs::remove_dir_all(journal_dir).ok();
 }
+
+#[test]
+fn current_app_server_thread_started_persists_session_start() {
+    let journal_dir = temp_dir();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_t-hub-agent"))
+        .args(["--codex-tap", "--journal-dir"])
+        .arg(&journal_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(include_bytes!(
+            "fixtures/codex-0.144.4-app-server-thread-started.jsonl"
+        ))
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "tap failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let journal = std::fs::read_to_string(journal_dir.join("events.ndjson")).unwrap();
+    let entries: Vec<EventJournalEntry> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(entries.len(), 1, "current thread start must not disappear");
+    assert_eq!(entries[0].event_type, JournalEventType::SessionStart);
+    assert_eq!(
+        entries[0].entity_id.as_deref(),
+        Some("00000000-0000-7000-8000-000000000144")
+    );
+
+    std::fs::remove_dir_all(journal_dir).ok();
+}
