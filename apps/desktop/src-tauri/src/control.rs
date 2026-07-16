@@ -20752,6 +20752,67 @@ mod tests {
     }
 
     #[test]
+    fn process_level_permission_attestation_rejects_missing_repeated_and_conflicting_flags() {
+        let Some(codex_missing_value) =
+            process_permission_attestation(Harness::Codex, "codex", "--sandbox --")
+        else {
+            return;
+        };
+        assert_eq!(
+            codex_missing_value.unwrap_err(),
+            crate::harness::LaunchAttestationError::MissingPermission
+        );
+        let codex_repeated = process_permission_attestation(
+            Harness::Codex,
+            "codex",
+            "--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-approvals-and-sandbox",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_repeated.unwrap_err(),
+            crate::harness::LaunchAttestationError::ConflictingPermission
+        );
+        let codex_conflicting = process_permission_attestation(
+            Harness::Codex,
+            "codex",
+            "--dangerously-bypass-approvals-and-sandbox --sandbox read-only",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_conflicting.unwrap_err(),
+            crate::harness::LaunchAttestationError::ConflictingPermission
+        );
+
+        let claude_missing_value =
+            process_permission_attestation(Harness::Claude, "claude", "--permission-mode --")
+                .unwrap();
+        assert_eq!(
+            claude_missing_value.unwrap_err(),
+            crate::harness::LaunchAttestationError::MissingPermission
+        );
+        let claude_repeated = process_permission_attestation(
+            Harness::Claude,
+            "claude",
+            "--dangerously-skip-permissions --dangerously-skip-permissions",
+        )
+        .unwrap();
+        assert_eq!(
+            claude_repeated.unwrap_err(),
+            crate::harness::LaunchAttestationError::ConflictingPermission
+        );
+        let claude_conflicting = process_permission_attestation(
+            Harness::Claude,
+            "claude",
+            "--dangerously-skip-permissions --permission-mode acceptEdits",
+        )
+        .unwrap();
+        assert_eq!(
+            claude_conflicting.unwrap_err(),
+            crate::harness::LaunchAttestationError::ConflictingPermission
+        );
+    }
+
+    #[test]
     fn crew_launch_attestation_persists_separate_permission_axes() {
         let path = captains_tmp("crew-launch-attestation");
         let _ = std::fs::remove_file(&path);
