@@ -30,8 +30,12 @@ Test commit `425435d33e57fec26c619de6820a21f272f043fc` expands deterministic lif
 The Crew reports 23 focused tests passed with zero failures, `rustfmt --check` passed, and `git diff --check` passed.
 The T2 worktree is tracked-clean and contains only the protected untracked `CLAUDE.md` artifact.
 The expected completion sentinel exists at `/tmp/t-hub-crew-done/t-hub-app/powder-lifecycle-serialization.done`.
-The card, run, Crew, and worktree must remain unreaped and unmerged until the active independent read-only review completes.
-T17 `thub-captain-crew-terminal-state` must remain blocked until that review passes.
+Independent read-only review completed with no findings.
+The reviewer reran the 23-test focused suite ten times for 230 passing test executions with zero failures, and independently confirmed `cargo fmt --check`, `git diff --check`, and tracked worktree cleanliness.
+The reviewer confirmed that renewal revalidates active lifecycle state inside the serialized per-Crew guard before any remote renew, cleanup holds the same guard through disposition and final mutation, unrelated Crew can still progress, and the deterministic regression prevents a queued heartbeat from renewing a cleanup-pending Crew.
+The residual review risk is limited to live Powder integration, which was outside the read-only review scope.
+The card, run, Crew, and worktree must remain unreaped and unmerged until required final Powder work-log evidence is reconciled and the Captain accepts the result.
+T17 `thub-captain-crew-terminal-state` may start only after that evidence reconciliation and Captain acceptance.
 
 T-Hub Crew terminal `2bef9b61` remains active on T30 `thub-control-client-deadline` under authoritative run `run-Q7QP9N_mqTJF` in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/control-client-deadline` on branch `fix/control-client-deadline`.
 The Crew reproduced the defect through the source CLI with a stale inherited endpoint that accepted a request but stayed silent while the handshake pointed to a live replacement.
