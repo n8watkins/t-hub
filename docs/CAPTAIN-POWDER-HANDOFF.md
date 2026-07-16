@@ -59,7 +59,12 @@ Independent rereview confirmed the real dispatch rollback tests but found that t
 The rereview also found that native Codex short permission aliases and flag-only inline forms such as `--dangerously-skip-permissions=false` can bypass conflict detection.
 The Captain returned these blockers for durable active-binding rejection with restart recovery, a profile, repository, and card key, success-then-contender-failure proof, and full native alias normalization.
 The same correction turn is authorized to integrate automatic `t-hub-agent --codex-unobserved` invocation before plain interactive Codex TUI execution without editing observability-owned files.
-The launch-attestation lane is not accepted until these corrections are separately committed, verified, and independently rereviewed.
+The Crew corrected durable winner protection, native alias normalization, and the degraded marker prelude as `05a5679`, `5527ea2`, and `03e7aa8`.
+Independent rereview found no defect in those three commits and verified 716 library tests with one ignore, 33 Harness tests, restart contention, exact marker identity, rollback, formatting, strict Clippy, diff checks, quoting safety, and credential-safe errors.
+The rereview found one combined integration gate because `--codex-unobserved` exists only on the separate observability branch and the currently installed agent rejects that mode.
+Observability must land before launch attestation, and the real built agent from the combined tree must pass the exact launch process proof before any installation.
+The launch-attestation commits must not be merged or installed alone.
+The launch-attestation lane is implementation-complete but remains conditionally unaccepted until combined-tree verification is separately authorized.
 
 Permission-observability terminal `8026ea1a` remains active on branch `feat/codex-permission-observability` and is mapping the Codex rollout telemetry contract before making source changes.
 The Crew committed structured producer, reducer, runtime-health, owning-Captain routing, fixture coverage, and lint cleanup as `7cc10f0`, `a55c411`, `7f895ab`, `d06a75f`, and `3d496ce`.
