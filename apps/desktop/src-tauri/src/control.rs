@@ -20536,6 +20536,14 @@ mod tests {
         path: Option<PathBuf>,
         connection_profile: &str,
     ) -> Arc<CaptainsRegistry> {
+        powder_lifecycle_registry_with_profile_and_crew(path, connection_profile, "crew-powder")
+    }
+
+    fn powder_lifecycle_registry_with_profile_and_crew(
+        path: Option<PathBuf>,
+        connection_profile: &str,
+        crew_session_id: &str,
+    ) -> Arc<CaptainsRegistry> {
         let registry = Arc::new(match path {
             Some(path) => CaptainsRegistry::load(path),
             None => CaptainsRegistry::new(),
@@ -20568,12 +20576,12 @@ mod tests {
             )
             .unwrap();
         registry
-            .record_crew("captain-powder", "crew-powder")
+            .record_crew("captain-powder", crew_session_id)
             .unwrap();
         registry
             .bind_crew_context(
                 "captain-powder",
-                "crew-powder",
+                crew_session_id,
                 "Implement Powder lifecycle",
                 "codex",
                 Some("/tmp/powder-lifecycle"),
@@ -20650,7 +20658,11 @@ mod tests {
         )
     }
 
-    #[derive(Debug, Default)]
+    const LOOPBACK_POWDER_IO_TIMEOUT: Duration = Duration::from_secs(2);
+    const LOOPBACK_POWDER_HANDLER_TIMEOUT: Duration = Duration::from_secs(4);
+    const LOOPBACK_POWDER_SERVER_TIMEOUT: Duration = Duration::from_secs(8);
+
+    #[derive(Clone, Debug, Default)]
     struct LoopbackPowderState {
         completed: bool,
         proof: Option<String>,
@@ -20665,11 +20677,14 @@ mod tests {
         state: Arc<StdMutex<LoopbackPowderState>>,
         post_started: std::sync::mpsc::Receiver<Value>,
         release_post: std::sync::mpsc::SyncSender<()>,
+        result: std::sync::mpsc::Receiver<Result<LoopbackPowderState, String>>,
+        watchdog_cancel: std::sync::mpsc::SyncSender<()>,
         thread: Option<std::thread::JoinHandle<()>>,
+        watchdog: Option<std::thread::JoinHandle<()>>,
     }
 
     impl LoopbackPowderServer {
-        fn start(expected_requests_including_shutdown: usize) -> Self {
+        fn start(expected_requests: usize) -> Self {
             use std::sync::mpsc;
 
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -20679,24 +20694,78 @@ mod tests {
             let (release_post, release_post_rx) = mpsc::sync_channel(1);
             let release_post_rx = Arc::new(StdMutex::new(Some(release_post_rx)));
             let server_state = state.clone();
+            let (result_tx, result) = mpsc::sync_channel(1);
             let thread = std::thread::spawn(move || {
                 let mut handlers = Vec::new();
-                for _ in 0..expected_requests_including_shutdown {
-                    let (stream, _) = listener.accept().unwrap();
+                let accept_result = loop {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(accepted) => accepted,
+                        Err(error) => break Err(format!("loopback Powder accept failed: {error}")),
+                    };
+                    let request = match read_loopback_powder_request(&mut stream) {
+                        Ok(request) => request,
+                        Err(error) => break Err(error),
+                    };
+                    if request.path == "/shutdown" || request.path == "/watchdog-timeout" {
+                        let response = write_loopback_json(&mut stream, &json!({"ok": true}));
+                        break if request.path == "/watchdog-timeout" {
+                            Err("loopback Powder server exceeded its shutdown deadline".into())
+                        } else {
+                            response
+                        };
+                    }
                     let state = server_state.clone();
                     let post_started_tx = post_started_tx.clone();
                     let release_post_rx = release_post_rx.clone();
-                    handlers.push(std::thread::spawn(move || {
+                    let handler = std::thread::spawn(move || {
                         handle_loopback_powder_request(
                             stream,
+                            request,
                             &state,
                             &post_started_tx,
                             &release_post_rx,
-                        );
-                    }));
-                }
+                        )
+                    });
+                    handlers.push(handler);
+                };
+                let request_count_error = (handlers.len() != expected_requests).then(|| {
+                    format!(
+                        "loopback Powder request count mismatch: expected {expected_requests}, received {}",
+                        handlers.len()
+                    )
+                });
+                let mut handler_error = None;
                 for handler in handlers {
-                    handler.join().unwrap();
+                    match handler.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            handler_error.get_or_insert(error);
+                        }
+                        Err(_) => {
+                            handler_error.get_or_insert_with(|| {
+                                "loopback Powder request handler panicked".to_string()
+                            });
+                        }
+                    }
+                }
+                let outcome = accept_result.and_then(|()| {
+                    if let Some(error) = request_count_error {
+                        return Err(error);
+                    }
+                    if let Some(error) = handler_error {
+                        return Err(error);
+                    }
+                    Ok(server_state.lock().unwrap().clone())
+                });
+                let _ = result_tx.send(outcome);
+            });
+            let (watchdog_cancel, watchdog_cancel_rx) = mpsc::sync_channel(1);
+            let watchdog = std::thread::spawn(move || {
+                if watchdog_cancel_rx
+                    .recv_timeout(LOOPBACK_POWDER_SERVER_TIMEOUT)
+                    .is_err()
+                {
+                    let _ = send_loopback_powder_shutdown(addr, "/watchdog-timeout");
                 }
             });
             Self {
@@ -20704,19 +20773,89 @@ mod tests {
                 state,
                 post_started,
                 release_post,
+                result,
+                watchdog_cancel,
                 thread: Some(thread),
+                watchdog: Some(watchdog),
             }
         }
 
-        fn finish(mut self) -> LoopbackPowderState {
-            let mut stream = TcpStream::connect(self.addr).unwrap();
-            stream
-                .write_all(b"GET /shutdown HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                .unwrap();
-            stream.flush().unwrap();
-            self.thread.take().unwrap().join().unwrap();
-            Arc::try_unwrap(self.state).unwrap().into_inner().unwrap()
+        fn finish(mut self) -> Result<LoopbackPowderState, String> {
+            let shutdown = send_loopback_powder_shutdown(self.addr, "/shutdown");
+            if shutdown.is_ok() {
+                let _ = self.watchdog_cancel.try_send(());
+            }
+            let watchdog_result = self
+                .watchdog
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|_| "loopback Powder watchdog panicked".to_string());
+            // The accept loop has been woken by the explicit shutdown or bounded
+            // watchdog. Every accepted socket and handler also has its own
+            // deadline, so this direct join cannot wait on unbounded work and no
+            // timeout path can detach an owned server thread.
+            let server_result = self
+                .thread
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|_| "loopback Powder server panicked".to_string());
+            let outcome = self
+                .result
+                .recv_timeout(LOOPBACK_POWDER_IO_TIMEOUT)
+                .map_err(|_| "loopback Powder server returned without a result".to_string());
+            watchdog_result?;
+            server_result?;
+            shutdown?;
+            outcome?
         }
+    }
+
+    struct LoopbackPowderRequest {
+        method: String,
+        path: String,
+        body: Value,
+    }
+
+    fn send_loopback_powder_shutdown(addr: SocketAddr, path: &str) -> Result<(), String> {
+        let mut stream = TcpStream::connect_timeout(&addr, LOOPBACK_POWDER_IO_TIMEOUT)
+            .map_err(|error| format!("loopback Powder shutdown connect failed: {error}"))?;
+        stream
+            .set_write_timeout(Some(LOOPBACK_POWDER_IO_TIMEOUT))
+            .map_err(|error| format!("loopback Powder shutdown timeout failed: {error}"))?;
+        write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .map_err(|error| format!("loopback Powder shutdown write failed: {error}"))?;
+        stream
+            .flush()
+            .map_err(|error| format!("loopback Powder shutdown flush failed: {error}"))
+    }
+
+    fn get_loopback_powder(addr: SocketAddr, path: &str) -> Result<Value, String> {
+        let mut stream = TcpStream::connect_timeout(&addr, LOOPBACK_POWDER_IO_TIMEOUT)
+            .map_err(|error| format!("loopback Powder test connect failed: {error}"))?;
+        stream
+            .set_read_timeout(Some(LOOPBACK_POWDER_IO_TIMEOUT))
+            .map_err(|error| format!("loopback Powder test read timeout failed: {error}"))?;
+        stream
+            .set_write_timeout(Some(LOOPBACK_POWDER_IO_TIMEOUT))
+            .map_err(|error| format!("loopback Powder test write timeout failed: {error}"))?;
+        write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .map_err(|error| format!("loopback Powder test write failed: {error}"))?;
+        stream
+            .flush()
+            .map_err(|error| format!("loopback Powder test flush failed: {error}"))?;
+        let mut response = String::new();
+        stream
+            .take(64 * 1024)
+            .read_to_string(&mut response)
+            .map_err(|error| format!("loopback Powder test response failed: {error}"))?;
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .ok_or("loopback Powder test response had no body")?;
+        serde_json::from_str(body)
+            .map_err(|error| format!("loopback Powder test response was invalid: {error}"))
     }
 
     struct PowderProfileEnv {
@@ -20774,20 +20913,26 @@ mod tests {
         }
     }
 
-    fn handle_loopback_powder_request(
-        mut stream: TcpStream,
-        state: &Arc<StdMutex<LoopbackPowderState>>,
-        post_started: &std::sync::mpsc::SyncSender<Value>,
-        release_post: &Arc<StdMutex<Option<std::sync::mpsc::Receiver<()>>>>,
-    ) {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    fn read_loopback_powder_request(
+        stream: &mut TcpStream,
+    ) -> Result<LoopbackPowderRequest, String> {
+        stream
+            .set_read_timeout(Some(LOOPBACK_POWDER_IO_TIMEOUT))
+            .map_err(|error| format!("loopback Powder read timeout failed: {error}"))?;
+        stream
+            .set_write_timeout(Some(LOOPBACK_POWDER_IO_TIMEOUT))
+            .map_err(|error| format!("loopback Powder write timeout failed: {error}"))?;
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut request_line = String::new();
-        reader.read_line(&mut request_line).unwrap();
+        reader
+            .read_line(&mut request_line)
+            .map_err(|error| format!("loopback Powder request line failed: {error}"))?;
         let mut content_length = 0usize;
         loop {
             let mut header = String::new();
-            reader.read_line(&mut header).unwrap();
+            reader
+                .read_line(&mut header)
+                .map_err(|error| format!("loopback Powder request header failed: {error}"))?;
             if header == "\r\n" || header.is_empty() {
                 break;
             }
@@ -20800,17 +20945,34 @@ mod tests {
             }
         }
         let mut body = vec![0; content_length];
-        reader.read_exact(&mut body).unwrap();
+        reader
+            .read_exact(&mut body)
+            .map_err(|error| format!("loopback Powder request body failed: {error}"))?;
         let body = if body.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(&body).unwrap()
+            serde_json::from_slice(&body)
+                .map_err(|error| format!("loopback Powder request JSON failed: {error}"))?
         };
         let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or_default();
-        let path = parts.next().unwrap_or_default();
+        Ok(LoopbackPowderRequest {
+            method: parts.next().unwrap_or_default().to_string(),
+            path: parts.next().unwrap_or_default().to_string(),
+            body,
+        })
+    }
+
+    fn handle_loopback_powder_request(
+        mut stream: TcpStream,
+        request: LoopbackPowderRequest,
+        state: &Arc<StdMutex<LoopbackPowderState>>,
+        post_started: &std::sync::mpsc::SyncSender<Value>,
+        release_post: &Arc<StdMutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    ) -> Result<(), String> {
+        let method = request.method.as_str();
+        let path = request.path.as_str();
+        let body = request.body;
         let response = match (method, path) {
-            ("GET", "/shutdown") => json!({"ok": true}),
             ("GET", "/api/v1/cards/thub-powder-control-lifecycle") => {
                 loopback_card_evidence(&state.lock().unwrap())
             }
@@ -20824,9 +20986,20 @@ mod tests {
                     state.completion_posts.len() == 1
                 };
                 if first_post {
-                    post_started.send(body.clone()).unwrap();
-                    let receiver = release_post.lock().unwrap().take().unwrap();
-                    receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+                    post_started.try_send(body.clone()).map_err(|_| {
+                        "loopback Powder completion observer unavailable".to_string()
+                    })?;
+                    let receiver = release_post
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or("loopback Powder completion release was already consumed")?;
+                    receiver
+                        .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+                        .map_err(|_| {
+                            "loopback Powder completion POST exceeded its release deadline"
+                                .to_string()
+                        })?;
                 }
                 let proof = body["proof"].as_str().unwrap().to_string();
                 let proof_url = body["criterion_proofs"][0]["url"]
@@ -20847,8 +21020,12 @@ mod tests {
                 state.lock().unwrap().renew_posts += 1;
                 json!({"card_id": "thub-powder-control-lifecycle", "run_id": "run-authoritative", "agent": "powder-agent", "expires_at": 200})
             }
-            _ => panic!("unexpected Powder test request: {method} {path}"),
+            _ => return Err(format!("unexpected Powder test request: {method} {path}")),
         };
+        write_loopback_json(&mut stream, &response)
+    }
+
+    fn write_loopback_json(stream: &mut TcpStream, response: &Value) -> Result<(), String> {
         let response = response.to_string();
         write!(
             stream,
@@ -20856,8 +21033,10 @@ mod tests {
             response.len(),
             response
         )
-        .unwrap();
-        stream.flush().unwrap();
+        .map_err(|error| format!("loopback Powder response write failed: {error}"))?;
+        stream
+            .flush()
+            .map_err(|error| format!("loopback Powder response flush failed: {error}"))
     }
 
     fn loopback_criterion(state: &LoopbackPowderState) -> Value {
@@ -20925,6 +21104,24 @@ mod tests {
 
     fn loopback_completed_card(state: &LoopbackPowderState) -> Value {
         loopback_card(state)
+    }
+
+    #[test]
+    fn powder_loopback_server_bounds_shutdown_and_reports_request_count_drift() {
+        let missing = LoopbackPowderServer::start(1);
+        assert!(missing
+            .finish()
+            .unwrap_err()
+            .contains("expected 1, received 0"));
+
+        let extra = LoopbackPowderServer::start(0);
+        let card =
+            get_loopback_powder(extra.addr, "/api/v1/cards/thub-powder-control-lifecycle").unwrap();
+        assert_eq!(card["card"]["id"], "thub-powder-control-lifecycle");
+        assert!(extra
+            .finish()
+            .unwrap_err()
+            .contains("expected 0, received 1"));
     }
 
     #[test]
@@ -21082,7 +21279,7 @@ mod tests {
     fn powder_completion_serializes_same_crew_through_post_and_verification() {
         use std::sync::mpsc;
 
-        let server = LoopbackPowderServer::start(8);
+        let server = LoopbackPowderServer::start(7);
         let _profile = PowderProfileEnv::install("loopback-completion", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
         let registry = powder_lifecycle_registry_with_profile(None, "loopback-completion");
@@ -21192,7 +21389,7 @@ mod tests {
             PowderWorkState::Completed { request_digest, .. }
                 if request_digest == &expected_digest
         ));
-        let state = server.finish();
+        let state = server.finish().unwrap();
         assert_eq!(state.completion_posts.len(), 1);
         let posted_proof = json!({
             "proof": state.completion_posts[0]["proof"],
@@ -21216,7 +21413,7 @@ mod tests {
     fn powder_cleanup_waits_for_completion_and_never_releases_recovery_state() {
         use std::sync::mpsc;
 
-        let server = LoopbackPowderServer::start(6);
+        let server = LoopbackPowderServer::start(5);
         let _profile = PowderProfileEnv::install("loopback-cleanup-race", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
         let registry = powder_lifecycle_registry_with_profile(None, "loopback-cleanup-race");
@@ -21311,14 +21508,131 @@ mod tests {
             PowderWorkState::Completed { request_digest, .. }
                 if request_digest == &expected_digest
         ));
-        let state = server.finish();
+        let state = server.finish().unwrap();
+        assert_eq!(state.completion_posts.len(), 1);
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn powder_close_terminal_entry_point_waits_for_completion_before_cleanup() {
+        use std::sync::mpsc;
+
+        let server = LoopbackPowderServer::start(5);
+        let _profile = PowderProfileEnv::install("loopback-close-race", server.addr);
+        let crew_session_id = format!("powder-close-{}", uuid::Uuid::new_v4().simple());
+        assert!(matches!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        ));
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "loopback-close-race",
+            &crew_session_id,
+        );
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx("loopback-close-race")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let args = json!({
+            "crewSessionId": crew_session_id,
+            "proof": "commit close-race",
+            "criterionProofs": [{
+                "criterion": 0,
+                "url": "https://example.test/close-race"
+            }]
+        });
+        let expected_digest = parse_completion_proof(&args).unwrap().digest();
+        let (wait_tx, wait_rx) = mpsc::sync_channel(2);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let completion_ctx = ctx.clone();
+        let completion = std::thread::spawn(move || {
+            completion_tx
+                .send(dispatch_authenticated(
+                    &completion_ctx,
+                    req_session(
+                        "loopback-close-race",
+                        &captain,
+                        "complete_crew_powder",
+                        args,
+                    ),
+                ))
+                .unwrap();
+        });
+        server
+            .post_started
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let close_start = Arc::new(std::sync::Barrier::new(2));
+        let close_thread_start = close_start.clone();
+        let close_ctx = ctx.clone();
+        let close_session_id = crew_session_id.clone();
+        let (close_tx, close_rx) = mpsc::sync_channel(1);
+        let close = std::thread::spawn(move || {
+            close_thread_start.wait();
+            close_tx
+                .send(close_terminal_with_policy(
+                    &close_ctx,
+                    &json!({"sessionId": close_session_id}),
+                    false,
+                ))
+                .unwrap();
+        });
+        close_start.wait();
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew_session_id
+        );
+        assert!(matches!(
+            &resolve_crew_powder_scope(&ctx, &crew_session_id)
+                .unwrap()
+                .work
+                .state,
+            PowderWorkState::CompletionPending { request_digest, .. }
+                if request_digest == &expected_digest
+        ));
+        server.release_post.send(()).unwrap();
+
+        let completion_result = completion_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(completion_result.ok, "{:?}", completion_result.error);
+        let closed = close_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed["outcome"], "already_gone");
+        assert_eq!(closed["powderRelease"]["outcome"], "already_completed");
+        assert_eq!(closed["crewBindingRetained"], false);
+        completion.join().unwrap();
+        close.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+
+        let snapshot = registry.snapshot();
+        let crew = snapshot.captains[0]
+            .crew
+            .iter()
+            .find(|crew| crew.terminal_id == crew_session_id)
+            .unwrap();
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(matches!(
+            &crew.powder_work.as_ref().unwrap().state,
+            PowderWorkState::Completed { request_digest, .. }
+                if request_digest == &expected_digest
+        ));
+        let state = server.finish().unwrap();
         assert_eq!(state.completion_posts.len(), 1);
         assert_eq!(state.release_posts, 0);
     }
 
     #[test]
     fn powder_reconciler_renewal_rechecks_stale_active_state_before_remote_mutation() {
-        let server = LoopbackPowderServer::start(1);
+        let server = LoopbackPowderServer::start(0);
         let _profile = PowderProfileEnv::install("loopback-stale-renewal", server.addr);
         let registry = powder_lifecycle_registry_with_profile(None, "loopback-stale-renewal");
         let ctx = test_ctx("stale-renewal").with_captains_registry(registry.clone());
@@ -21338,7 +21652,7 @@ mod tests {
                 if request_digest == digest
         ));
         assert_eq!(work.claim_expires_at, Some(100));
-        let state = server.finish();
+        let state = server.finish().unwrap();
         assert_eq!(state.renew_posts, 0);
     }
 
