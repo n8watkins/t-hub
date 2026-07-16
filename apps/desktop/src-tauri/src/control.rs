@@ -22734,6 +22734,59 @@ mod tests {
     }
 
     #[test]
+    fn powder_operation_guard_releases_after_failure_and_does_not_block_other_crew() {
+        use std::sync::mpsc;
+
+        let registry = Arc::new(CaptainsRegistry::new());
+        let first = registry
+            .serialize_crew_powder_operation("crew-guarded", CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let (acquired_tx, acquired_rx) = mpsc::sync_channel(2);
+
+        let same_registry = registry.clone();
+        let same_acquired = acquired_tx.clone();
+        let same_crew = std::thread::spawn(move || {
+            let _guard = same_registry
+                .serialize_crew_powder_operation("crew-guarded", CrewPowderOperationKind::Cleanup);
+            same_acquired.send("same").unwrap();
+        });
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "crew-guarded"
+        );
+
+        let other_registry = registry.clone();
+        let other_crew = std::thread::spawn(move || {
+            let _guard = other_registry.serialize_crew_powder_operation(
+                "crew-unrelated",
+                CrewPowderOperationKind::Renewal,
+            );
+            acquired_tx.send("other").unwrap();
+        });
+        assert_eq!(
+            acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "other",
+            "an unrelated Crew operation must not wait on another Crew's lifecycle guard"
+        );
+
+        drop(first);
+        assert_eq!(
+            acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "same",
+            "dropping the first operation must release its same-Crew waiter"
+        );
+        same_crew.join().unwrap();
+        other_crew.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        assert!(registry
+            .powder_operations_inflight
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn powder_schema_v4_migrates_to_v5_camel_case_with_snake_case_aliases() {
         let path = captains_tmp("powder-v4-migration");
         let backup = path.with_extension("json.bak");
@@ -22958,7 +23011,88 @@ mod tests {
     }
 
     #[test]
-    fn powder_cleanup_waits_for_completion_and_never_releases_recovery_state() {
+    fn powder_complete_vs_renew_blocks_stale_renewal_after_completion() {
+        use std::sync::mpsc;
+
+        let server = LoopbackPowderServer::start(5);
+        let _profile = PowderProfileEnv::install("loopback-complete-renew", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-complete-renew");
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx("loopback-complete-renew")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let args = json!({
+            "crewSessionId": "crew-powder",
+            "proof": "commit complete-renew",
+            "criterionProofs": [{
+                "criterion": 0,
+                "url": "https://example.test/complete-renew"
+            }]
+        });
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+
+        let completion_ctx = ctx.clone();
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let completion = std::thread::spawn(move || {
+            completion_tx
+                .send(dispatch_authenticated(
+                    &completion_ctx,
+                    req_session(
+                        "loopback-complete-renew",
+                        &captain,
+                        "complete_crew_powder",
+                        args,
+                    ),
+                ))
+                .unwrap();
+        });
+        server
+            .post_started
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let renewal_ctx = ctx.clone();
+        let (renewal_tx, renewal_rx) = mpsc::sync_channel(1);
+        let renewal = std::thread::spawn(move || {
+            renewal_tx
+                .send(renew_crew_powder_binding(
+                    &renewal_ctx,
+                    "crew-powder",
+                    Some(3600),
+                ))
+                .unwrap();
+        });
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "crew-powder"
+        );
+        server.release_post.send(()).unwrap();
+
+        let completed = completion_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(completed.ok, "{:?}", completed.error);
+        let renewal_error = renewal_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        assert!(renewal_error.contains("Powder work is not active"));
+        completion.join().unwrap();
+        renewal.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.completion_posts.len(), 1);
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_complete_vs_release_cleanup_waits_and_never_releases_completed_work() {
         use std::sync::mpsc;
 
         let server = LoopbackPowderServer::start(5);
@@ -23134,7 +23268,7 @@ mod tests {
     }
 
     #[test]
-    fn powder_close_terminal_entry_point_waits_for_completion_before_cleanup() {
+    fn powder_close_vs_complete_terminal_entry_point_waits_before_cleanup() {
         use std::sync::mpsc;
 
         let server = LoopbackPowderServer::start(5);
@@ -23274,6 +23408,156 @@ mod tests {
         assert_eq!(work.claim_expires_at, Some(100));
         let state = server.finish().unwrap();
         assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_completion_persistence_failure_rolls_back_and_releases_guard() {
+        let server = LoopbackPowderServer::start(4);
+        let _profile = PowderProfileEnv::install("loopback-persist-failure", server.addr);
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-powder-persist-failure-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = dir.join("captains.json");
+        let registry =
+            powder_lifecycle_registry_with_profile(Some(path.clone()), "loopback-persist-failure");
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx("loopback-persist-failure")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::write(&dir, b"blocks the registry directory").unwrap();
+
+        let failed = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-persist-failure",
+                &captain,
+                "complete_crew_powder",
+                json!({
+                    "crewSessionId": "crew-powder",
+                    "proof": "commit persist-failure",
+                    "criterionProofs": [{
+                        "criterion": 0,
+                        "url": "https://example.test/persist-failure"
+                    }]
+                }),
+            ),
+        );
+        assert!(!failed.ok);
+        assert!(failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("could not be created")));
+        let work = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap().work;
+        assert!(matches!(work.state, PowderWorkState::Active));
+        assert_eq!(work.claim_expires_at, Some(100));
+
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        let (renewed, crew) = renew_crew_powder_binding(&ctx, "crew-powder", None).unwrap();
+        assert_eq!(renewed.expires_at, 200);
+        assert_eq!(
+            crew.powder_work.as_ref().unwrap().claim_expires_at,
+            Some(200)
+        );
+        assert!(registry
+            .powder_operations_inflight
+            .lock()
+            .unwrap()
+            .is_empty());
+
+        let state = server.finish().unwrap();
+        assert!(state.completion_posts.is_empty());
+        assert_eq!(state.renew_posts, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn powder_completion_pending_recovers_after_registry_restart() {
+        let server = LoopbackPowderServer::start(2);
+        let _profile = PowderProfileEnv::install("loopback-restart-recovery", server.addr);
+        let dir = std::env::temp_dir().join(format!(
+            "t-hub-powder-restart-recovery-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = dir.join("captains.json");
+        let args = json!({
+            "crewSessionId": "crew-powder",
+            "proof": "commit restart-recovery",
+            "criterionProofs": [{
+                "criterion": 0,
+                "url": "https://example.test/restart-recovery"
+            }]
+        });
+        let digest = parse_completion_proof(&args).unwrap().digest();
+        let initial =
+            powder_lifecycle_registry_with_profile(Some(path.clone()), "loopback-restart-recovery");
+        initial
+            .begin_crew_powder_completion("crew-powder", &digest)
+            .unwrap();
+        drop(initial);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.completed = true;
+            state.proof = Some("commit restart-recovery".into());
+            state.proof_url = Some("https://example.test/restart-recovery".into());
+        }
+
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        assert!(matches!(
+            restarted.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .state,
+            PowderWorkState::CompletionPending { .. }
+        ));
+        let ctx = test_ctx("loopback-restart-recovery")
+            .with_identity_store(identities)
+            .with_captains_registry(restarted);
+        let recovered = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-restart-recovery",
+                &captain,
+                "complete_crew_powder",
+                args,
+            ),
+        );
+        assert!(recovered.ok, "{:?}", recovered.error);
+        assert_eq!(recovered.result.unwrap()["outcome"], "recovered");
+
+        let restored = CaptainsRegistry::load(path.clone()).snapshot();
+        assert!(matches!(
+            &restored.captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .state,
+            PowderWorkState::Completed { request_digest, .. }
+                if request_digest == &digest
+        ));
+        let state = server.finish().unwrap();
+        assert!(state.completion_posts.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
