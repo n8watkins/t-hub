@@ -21,6 +21,30 @@ Where the narrower ordered list in this handoff differs from the phased plan, fo
 This section is the reset-safe starting point for the next session.
 The older evidence below remains useful history, but this section takes precedence when it describes the current runtime or the next implementation work.
 
+### Verified 2026-07-15 T2 Completion and T30 Reproduction Boundary
+
+This boundary was verified at `2026-07-15T22:33:42-07:00` while the General's authorization to implement T30 and T2 remained active.
+T-Hub Crew terminal `0006cfb5` completed T2 `thub-powder-lifecycle-serialization` under authoritative run `run-trPe9u6_KuU0` in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/powder-lifecycle-serialization` on branch `fix/powder-lifecycle-serialization`.
+Implementation commit `eb75f5ea769144ac6875ab17ccd5851976acd944` revalidates active Crew lifecycle state inside the per-Crew guard so a queued heartbeat cannot renew a Crew after cleanup begins.
+Test commit `425435d33e57fec26c619de6820a21f272f043fc` expands deterministic lifecycle race, rollback, recovery, unrelated-Crew, deadlock, and reconciler coverage.
+The Crew reports 23 focused tests passed with zero failures, `rustfmt --check` passed, and `git diff --check` passed.
+The T2 worktree is tracked-clean and contains only the protected untracked `CLAUDE.md` artifact.
+The expected completion sentinel exists at `/tmp/t-hub-crew-done/t-hub-app/powder-lifecycle-serialization.done`.
+The card, run, Crew, and worktree must remain unreaped and unmerged until the active independent read-only review completes.
+T17 `thub-captain-crew-terminal-state` must remain blocked until that review passes.
+
+T-Hub Crew terminal `2bef9b61` remains active on T30 `thub-control-client-deadline` under authoritative run `run-Q7QP9N_mqTJF` in `/home/natkins/projects/tools/t-hub/t-hub-worktrees/control-client-deadline` on branch `fix/control-client-deadline`.
+The Crew reproduced the defect through the source CLI with a stale inherited endpoint that accepted a request but stayed silent while the handshake pointed to a live replacement.
+The failing bounded case took 15.221 seconds and returned structured exit code 6, while recovery succeeded after 15.074 seconds with clean JSON stdout.
+The current implementation stacks independent stale and replacement timeouts across the CLI, desktop, and MCP clients rather than enforcing one bounded recovery deadline.
+T30 is now implementing the owned three-client fix and has not created a source commit yet.
+The T30 worktree is tracked-clean and contains only the protected untracked `CLAUDE.md` artifact.
+
+The installed `0.3.103` control surface still hangs on some terminal and messaging operations, which directly corroborates T30's defect.
+The Captain used bounded cancellation and owned tmux inspection to recover without changing the installed runtime.
+Required source-runtime Powder work-log append remains unavailable in the installed build, while the Captain's exact-run start entries remain verified on the board.
+No merge, push, install, deploy, publication, release, card completion, run release, or resource reap is authorized or claimed.
+
 ### Verified 2026-07-15 Cross-Repository Work Boundary
 
 This boundary was verified at `2026-07-15T22:04:11-07:00` after the General authorized both Captains to create their required Powder cards through Powder's sanctioned native card-creation surface.
