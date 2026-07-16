@@ -49,8 +49,12 @@ The Captain has returned these findings for per-card and profile serialization o
 The launch-attestation lane is not accepted until those corrections are separately committed, verified, and independently rereviewed.
 
 Permission-observability terminal `8026ea1a` remains active on branch `feat/codex-permission-observability` and is mapping the Codex rollout telemetry contract before making source changes.
-It has confirmed that interactive permission requests appear in Codex rollout data as structured approval-bearing tool calls, while the current T-Hub source does not yet provide verified `--codex-tap` production integration.
-The required implementation remains exact-Crew `needsPermission`, explicit degraded telemetry health when structured observation is unavailable, and owning-Captain wake routing without terminal dialogue text as the sole production signal.
+The Crew committed structured producer, reducer, runtime-health, owning-Captain routing, fixture coverage, and lint cleanup as `7cc10f0`, `a55c411`, `7f895ab`, `d06a75f`, and `3d496ce`.
+Independent review requested changes because duplicate or out-of-order journal entries can still reduce after the cursor and let a late `SessionStart` erase a real permission request with false Working.
+The review also found that current Codex `thread/started` events using `params.thread.id` are silently dropped and that missing identifiers fall back to an unsalted fingerprint of raw credential-bearing input.
+The parser is not yet wired to plain interactive Codex TUI dispatch through hooks or an app-server mirror, so the implementation must either add an in-scope producer or expose explicit unsupported and degraded runtime health that prevents false Working.
+The Captain has returned all findings for separate correction commits, focused and workspace verification, and independent rereview.
+The observability lane remains unaccepted.
 
 Installed `0.3.103` still launches these Codex Crew without the unrestricted source flag.
 Until the launch and observability changes are reviewed and later authorized for installation, the Captain is monitoring all three live panes and approving only exact routine local read, build, test, and evidence operations already authorized by the General.
