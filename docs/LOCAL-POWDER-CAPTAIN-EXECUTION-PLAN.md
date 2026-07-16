@@ -510,4 +510,8 @@ Independent combined T30/T2 review approved the candidate, and a fresh independe
 
 T1 and T3 remain separate later work and must not be dispatched during this validation boundary.
 
+Powder P1-P4 are now verified done, so `thub-powder-run-bound-mutations` is ready and unclaimed with Captain `c2940be4` designated as its sole integration owner across the shared Powder, control, CLI, MCP, and focused E2E surfaces.
+
+T1 Crew dispatch still requires separate authorization, and T3 remains undispatched.
+
 Installation, restart, publication, claim completion or release, and worktree cleanup remain unauthorized unless separately directed.

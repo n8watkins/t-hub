@@ -921,3 +921,7 @@ The candidate was independently reviewed and passed formatting, diff, Powder rac
 Independent validation of the canonical fast-forward is the current review boundary.
 
 T1 and T3 remain separate later work, and no installation, restart, publication, claim completion or release, or worktree cleanup is authorized by this boundary.
+
+The T1 card `thub-powder-run-bound-mutations` is now ready and unclaimed after sanctioned dependency reconciliation, with Captain `c2940be4` designated as the sole shared-surface integration owner pending separate dispatch authorization.
+
+T3 remains undispatched.
