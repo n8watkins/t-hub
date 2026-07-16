@@ -46,7 +46,12 @@ The Crew committed the control integration and cleanup as `35d6c61`, `1283b10`, 
 Independent control-plane review requested changes because concurrent same-card dispatches can share one idempotent Powder run and a failed contender can release the sibling claim.
 The review also found that malformed or repeated permission flags can bypass fail-closed parsing and that the rollback tests do not exercise attestation failure through the real dispatch path.
 The Captain has returned these findings for per-card and profile serialization or reservation, strict duplicate and malformed flag rejection, and deterministic end-to-end dispatch success, failure, rollback, and concurrency coverage.
-The launch-attestation lane is not accepted until those corrections are separately committed, verified, and independently rereviewed.
+The Crew corrected the first review as `c39ff4b`, `10cfb4d`, and `90b3026`.
+Independent rereview confirmed the real dispatch rollback tests but found that the mutex still permits a sequential duplicate binding to the same idempotent run after the winner succeeds, and its key omits repository.
+The rereview also found that native Codex short permission aliases and flag-only inline forms such as `--dangerously-skip-permissions=false` can bypass conflict detection.
+The Captain returned these blockers for durable active-binding rejection with restart recovery, a profile, repository, and card key, success-then-contender-failure proof, and full native alias normalization.
+The same correction turn is authorized to integrate automatic `t-hub-agent --codex-unobserved` invocation before plain interactive Codex TUI execution without editing observability-owned files.
+The launch-attestation lane is not accepted until these corrections are separately committed, verified, and independently rereviewed.
 
 Permission-observability terminal `8026ea1a` remains active on branch `feat/codex-permission-observability` and is mapping the Codex rollout telemetry contract before making source changes.
 The Crew committed structured producer, reducer, runtime-health, owning-Captain routing, fixture coverage, and lint cleanup as `7cc10f0`, `a55c411`, `7f895ab`, `d06a75f`, and `3d496ce`.
