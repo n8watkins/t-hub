@@ -3602,6 +3602,7 @@ const DISPATCH_RESERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DispatchReservationKey {
     connection_profile: String,
+    repository: String,
     card_id: String,
 }
 
@@ -3626,19 +3627,27 @@ impl DispatchReservations {
     fn acquire(
         self: &Arc<Self>,
         connection_profile: &str,
+        repository: &str,
         card_id: &str,
     ) -> Result<DispatchReservationGuard, String> {
-        self.acquire_with_timeout(connection_profile, card_id, DISPATCH_RESERVATION_TIMEOUT)
+        self.acquire_with_timeout(
+            connection_profile,
+            repository,
+            card_id,
+            DISPATCH_RESERVATION_TIMEOUT,
+        )
     }
 
     fn acquire_with_timeout(
         self: &Arc<Self>,
         connection_profile: &str,
+        repository: &str,
         card_id: &str,
         timeout: Duration,
     ) -> Result<DispatchReservationGuard, String> {
         let key = DispatchReservationKey {
             connection_profile: connection_profile.to_string(),
+            repository: repository.to_string(),
             card_id: card_id.to_string(),
         };
         let deadline = Instant::now() + timeout;
@@ -8572,6 +8581,43 @@ fn validate_dispatch_card_repository(
     ))
 }
 
+fn ensure_dispatch_powder_binding_available(
+    ctx: &ControlContext,
+    connection_profile: &str,
+    repository: &str,
+    card_id: &str,
+    authoritative_run_id: Option<&str>,
+) -> Result<(), String> {
+    let snapshot = ctx.captains.snapshot();
+    let conflict = snapshot.captains.iter().find_map(|captain| {
+        let project_id = captain.project_id.as_deref()?;
+        let project = snapshot
+            .projects
+            .iter()
+            .find(|project| project.project_id == project_id)?;
+        let binding = project.powder.as_ref()?;
+        if binding.connection_profile != connection_profile || binding.repository != repository {
+            return None;
+        }
+        captain.crew.iter().find_map(|crew| {
+            let work = crew.powder_work.as_ref()?;
+            if matches!(work.state, PowderWorkState::Completed { .. }) {
+                return None;
+            }
+            let same_card = work.card_id == card_id;
+            let same_run = authoritative_run_id.is_some_and(|run_id| work.run_id == run_id);
+            (same_card || same_run).then_some((crew, work))
+        })
+    });
+    if let Some((crew, work)) = conflict {
+        return Err(format!(
+            "dispatch_crew: Powder card '{card_id}' or run '{}' already has a durable active or recoverable Crew binding in terminal '{}'; resume or clean up that Crew before dispatching a replacement",
+            work.run_id, crew.terminal_id
+        ));
+    }
+    Ok(())
+}
+
 fn crew_launch_argv(harness: Harness, prompt: &str) -> String {
     harness
         .adapter()
@@ -8633,9 +8679,11 @@ fn dispatch_crew(
         .and_then(Value::as_u64)
         .unwrap_or(3600)
         .clamp(300, 86_400);
-    let _dispatch_reservation = ctx
-        .dispatch_reservations
-        .acquire(&binding.connection_profile, &card_id)?;
+    let _dispatch_reservation = ctx.dispatch_reservations.acquire(
+        &binding.connection_profile,
+        &binding.repository,
+        &card_id,
+    )?;
     let client = powder::Client::from_profile(&binding.connection_profile)?;
     let canonical_repository = client
         .get_repository(&binding.repository)?
@@ -8647,6 +8695,14 @@ fn dispatch_crew(
         .get_card(&card_id)
         .map_err(|error| format!("dispatch_crew: {error}"))?;
     validate_dispatch_card_repository(&card_id, card.repository(), &canonical_repository)?;
+    let authoritative_run_id = card.card_value()["claim"]["run_id"].as_str();
+    ensure_dispatch_powder_binding_available(
+        ctx,
+        &binding.connection_profile,
+        &binding.repository,
+        &card_id,
+        authoritative_run_id,
+    )?;
 
     let mut spawn_args = json!({
         "cwd": checkout,
@@ -12777,8 +12833,22 @@ mod tests {
     fn dispatch_reservation_prevents_failed_launch_rollback_from_releasing_sibling_claim() {
         let reservations = Arc::new(DispatchReservations::default());
         let failed_dispatch = reservations
-            .acquire_with_timeout("protected-profile", "card-1", Duration::from_secs(2))
+            .acquire_with_timeout(
+                "protected-profile",
+                "repository-1",
+                "card-1",
+                Duration::from_secs(2),
+            )
             .unwrap();
+        let different_repository = reservations
+            .acquire_with_timeout(
+                "protected-profile",
+                "repository-2",
+                "card-1",
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        drop(different_repository);
         let sibling_claim_live = Arc::new(AtomicBool::new(false));
         let sibling_claim_for_thread = sibling_claim_live.clone();
         let reservations_for_thread = reservations.clone();
@@ -12786,7 +12856,12 @@ mod tests {
         let (finish_tx, finish_rx) = mpsc::sync_channel(1);
         let sibling = std::thread::spawn(move || {
             let _guard = reservations_for_thread
-                .acquire_with_timeout("protected-profile", "card-1", Duration::from_secs(2))
+                .acquire_with_timeout(
+                    "protected-profile",
+                    "repository-1",
+                    "card-1",
+                    Duration::from_secs(2),
+                )
                 .unwrap();
             sibling_claim_for_thread.store(true, Ordering::SeqCst);
             acquired_tx.send(()).unwrap();
@@ -20682,6 +20757,50 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_rejects_durable_powder_bindings_by_card_or_run_in_exact_scope() {
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "protected-profile",
+            "crew-winner",
+        );
+        let ctx = test_ctx("dispatch-binding-scope").with_captains_registry(registry);
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            "protected-profile",
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            None,
+        )
+        .unwrap_err()
+        .contains("durable active or recoverable Crew binding"));
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            "protected-profile",
+            "t-hub",
+            "different-card",
+            Some("run-authoritative"),
+        )
+        .unwrap_err()
+        .contains("durable active or recoverable Crew binding"));
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            "different-profile",
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_ok());
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            "protected-profile",
+            "different-repository",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn dispatch_crew_launches_both_harnesses_with_explicit_unrestricted_permissions() {
         let prompt = "work card";
         let codex = crew_launch_argv(Harness::Codex, prompt);
@@ -22044,6 +22163,85 @@ mod tests {
             let _ = std::fs::remove_file(path.with_extension("json.bak"));
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn dispatch_restart_rejects_contender_without_releasing_successful_winner() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_restart_rejects_contender_without_releasing_successful_winner: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+
+        let server = LoopbackPowderServer::start(5);
+        let profile_name = format!("dispatch-restart-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let path = captains_tmp("dispatch-restart-winner");
+        let _ = std::fs::remove_file(&path);
+        let registry =
+            dispatch_test_registry(Some(path.clone()), &profile_name, &captain.session_id);
+        let (winner_ctx, winner_sink) = dispatch_test_context(registry);
+        let winner_command =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let winner = dispatch_crew(
+            &winner_ctx,
+            &json!({
+                "captainSessionId": captain.session_id,
+                "cardId": "thub-powder-control-lifecycle",
+                "task": "Establish the durable winning Crew",
+                "harness": "codex",
+                "testHarnessCommand": winner_command.command,
+            }),
+            None,
+            true,
+        )
+        .unwrap();
+        let winner_session_id = winner["crew"]["terminalId"].as_str().unwrap().to_string();
+        assert_eq!(dispatched_terminal_id(&winner_sink), winner_session_id);
+
+        drop(winner_ctx);
+        let restarted_registry = Arc::new(CaptainsRegistry::load(path.clone()));
+        let (restarted_ctx, contender_sink) = dispatch_test_context(restarted_registry.clone());
+        let contender_command = FakeHarnessCommand::new(Harness::Codex, "--sandbox read-only");
+        let error = dispatch_crew(
+            &restarted_ctx,
+            &json!({
+                "captainSessionId": captain.session_id,
+                "cardId": "thub-powder-control-lifecycle",
+                "task": "This contender must never launch",
+                "harness": "codex",
+                "testHarnessCommand": contender_command.command,
+            }),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("durable active or recoverable Crew binding"),
+            "unexpected contender error: {error}"
+        );
+        assert!(contender_sink
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(command, _)| command != "spawn_terminal"));
+        let snapshot = restarted_registry.snapshot();
+        assert_eq!(snapshot.captains[0].crew.len(), 1);
+        assert_eq!(snapshot.captains[0].crew[0].terminal_id, winner_session_id);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&winner_session_id)),
+            tmux::SessionLiveness::Alive
+        );
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 0);
+        tmux::kill_session_tree(&tmux_target(&winner_session_id)).unwrap();
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
