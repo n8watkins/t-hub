@@ -31,8 +31,8 @@ The Crew is running the focused desktop control-client tests after the Captain a
 The owned MCP control client remains the third implementation target before T30 verification and commits can complete.
 
 Powder card `powder-mutation-idempotency` remains the sole active Powder dependency lane under run `run-9RWhdmpyPzXE`.
-Its Crew has produced four logical commits: `07bd797` for the transactional operation substrate, `c9c7cd7` for stable authenticated authority, `695c0a8` for schema migration coverage, and `44da772` for HTTP, CLI, and MCP adapter exposure.
-Only `README.md` and new `docs/mutation-operations-v1.md` documentation remain uncommitted while focused verification continues.
+Its Crew has produced five logical commits: `07bd797` for the transactional operation substrate, `c9c7cd7` for stable authenticated authority, `695c0a8` for schema migration coverage, `44da772` for HTTP, CLI, and MCP adapter exposure, and `e18e6e9` for the mutation recovery contract.
+The mutation-idempotency worktree is tracked-clean while final verification continues.
 The other three Powder cards remain dependency-blocked.
 
 The installed `0.3.103` T-Hub control RPC still times out on capability and board-read calls.
