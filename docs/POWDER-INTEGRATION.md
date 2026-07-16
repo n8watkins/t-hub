@@ -3,6 +3,8 @@
 T-Hub integrates with Powder through Powder's versioned HTTP API and does not modify or duplicate Powder state.
 Powder remains authoritative for cards, claims, runs, work logs, input requests, and completion evidence.
 T-Hub remains authoritative for projects, ships, terminal identity, Crew liveness, harness selection, checkout paths, and card/run-to-terminal bindings.
+The complete relationship between Powder work evidence, T-Hub durable dialogue, lifecycle attention, and technical proof is defined in [AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md).
+Powder is the executable backlog and evidence ledger rather than the general Captain and Crew chat transport.
 
 ## Product Terms
 
@@ -153,11 +155,20 @@ Each project stores a monotonic Powder event cursor alongside its repository bin
 Creating or changing a Powder binding snapshots the current event head so a new Captain does not receive the instance's historical backlog.
 An idempotent rebind preserves the existing cursor.
 Events from other repositories advance the cursor without being delivered, because Powder sequences are global to the instance.
-Events for the bound repository are added to the active Captain's durable T-Hub inbox before the cursor advances.
-The wake-up includes the Powder event ID and instructs the Captain to re-read the authoritative card before acting.
+The current implementation adds events for the bound repository to one active Captain's durable T-Hub inbox.
+That compatibility behavior is insufficient for multiple Assignment-owning Captains and must not be treated as the target routing contract.
+
+Target routing resolves an event's exact card and run binding to its Crew, owning Captain, Assignment, and Project before delivery.
+Routine progress updates the authoritative Powder-backed Board state without creating conversational inbox history.
+Actionable input, blocker, claim-conflict, completion, failure, or recovery events create typed lifecycle attention for the owning identities and instruct them to reread the authoritative card.
+An event with no exact owner remains a visible unbound Project event for the General or Cortana rather than being assigned to an arbitrary Captain.
+An event with conflicting owners enters a visible routing-conflict state and does not advance into any Captain's dialogue history.
+
+The routed event includes the Powder event ID and uses it as the idempotency key.
 If T-Hub stops after enqueueing but before persisting the cursor, the wake-up may be delivered again after restart.
 Captains must therefore treat event IDs as idempotency keys.
-If the Captain inbox is full or the Powder stream cannot be read, the cursor does not advance past the undelivered event.
+The cursor advances only after the event is durably stored and either routed to exact owners or retained as an unbound or conflicting Project event.
+If durable routing storage is unavailable or the Powder stream cannot be read, the cursor does not advance past the event.
 T-Hub validates the `powder.card_event.v1` envelope but treats event names and change payloads generically.
 
 ## Recovery

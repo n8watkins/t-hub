@@ -52,10 +52,29 @@ The user artifacts `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` must remain untou
 16. The initial Codex default is the user's configured `gpt-5.6-sol` with medium reasoning effort.
 17. The control plane should be CLI-first, with MCP retained as an optional thin adapter over the same operations.
 18. History, lifecycle telemetry, voice, notifications, and settings should be provider-agnostic.
-19. Powder remains authoritative for work state, while T-Hub remains authoritative for runtime identity, terminals, Workspaces, and owned resources.
+19. Powder remains authoritative for card and run execution state, while T-Hub remains authoritative for runtime identity, terminals, Workspaces, and owned resources.
 20. Raw CPU, RAM, process, and context samples remain local to T-Hub rather than turning Powder into a telemetry database.
 21. Agent work state and runtime health are independent axes governed by [STATUS-MODEL.md](./STATUS-MODEL.md).
 22. Worktree identity, ownership, freshness, and cleanup safety are computed once by the backend under [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md).
+23. Agent authority, supervision, evidence, dialogue, escalation, review, and completion follow [AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md).
+24. This phased plan governs strategy and dependencies, Powder is the executable backlog and work ledger, T-Hub inbox messages carry durable dialogue, lifecycle events carry attention and runtime transitions, and Git plus verification artifacts provide technical proof.
+25. Terminal typing is an inspected compatibility path rather than an authoritative message or acknowledgement channel.
+
+## Roadmap, Backlog, and Runtime Evidence
+
+This plan is the consolidated forward roadmap.
+Record product decisions, dependencies, phase status, parallelization constraints, test doctrine, and exit gates here.
+Do not turn the plan into a high-frequency task log.
+
+Powder is the executable backlog.
+Represent independently assignable work as cards with acceptance criteria, proof plans, claims, runs, work logs, blockers, and completion evidence.
+Use separate cards and isolated worktrees for parallel lanes, with one declared integration owner.
+A Powder card cannot override this plan or another canonical authority contract.
+
+The T-Hub inbox is the durable dialogue layer for instructions, blockers, decisions, permissions, review findings, completion reports, and peer coordination that require delivery or acknowledgement.
+Lifecycle events provide event-driven attention and runtime-health transitions without requiring periodic model polling.
+Git, tests, review, builds, and packaged acceptance remain the technical proof layer.
+The current handoff records the verified resume point across roadmap, backlog, runtime, and technical evidence.
 
 ## Current Baseline
 
@@ -434,35 +453,40 @@ Preserve the existing control-client architecture, JSON envelope, compatible ali
 ### Goal
 
 Complete a visible, recoverable communication layer for General, Cortana, Captains, and Crew.
+Implement the authority and channel boundaries in [AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md) without turning Powder into a chat transport or terminal typing into a durable acknowledgement path.
 
 ### Work
 
 1. Re-key recipients from temporary terminal IDs to durable role identities with terminal delivery bindings.
-2. Expose send, list, read, reply, acknowledge, accept, decline, and complete operations through CLI and MCP.
+2. Expose send, list, read, reply, acknowledge, accept, decline, complete, retry, cancel, supersede, typed approval request, approval decision, approval cancellation, and approval status operations through CLI and MCP.
 3. Drain messages at safe provider turn boundaries for every supported recipient role.
 4. Add an automatic receive and acknowledgement loop to each Harness adapter.
 5. Preserve natural-language bodies alongside structured message types.
 6. Support instruction, status, blocker, decision, completion, lifecycle, and coordination messages.
 7. Link messages to Projects, Assignments, Workspaces, Crew, and Powder cards where applicable.
-8. Distinguish enqueued, delivered, read, accepted, declined, and completed states.
+8. Implement enqueued, delivering, delivered, read, accepted, declined, completed, failed, retrying, expired, cancelled, and superseded states with authorized transitions.
 9. Retain human-readable message history after transport queue compaction.
 10. Add unread badges and an on-demand Messages timeline.
 11. Allow Captain-to-Captain communication without granting terminal, Crew, or retirement authority.
 12. Label cross-Project peer messages clearly.
 13. Require transferred implementation work to receive an explicit Assignment or Powder card when ownership changes materially.
 14. Add secret redaction and bounded retention controls.
+15. Treat Powder as the executable backlog and evidence ledger while linking messages to exact cards and runs when dialogue is required.
+16. Make `send_text` an inspected compatibility operation whose acceptance cannot be mistaken for composer submission, recipient acknowledgement, or work completion.
+17. Provide event-driven Captain wake-up for blocker, decision, permission, review, completion, runtime failure, and recovery transitions without periodic model polling.
+18. Implement the contract's sender-recipient authorization matrix, message transition state machine, typed assignment acknowledgement, and typed approval decisions.
 
 ### Recommended Retention Default
 
-Keep local message bodies for thirty days.
+Use thirty days as the provisional recommended default for local message bodies until the General resolves the retention setting.
 Keep non-secret delivery metadata longer for recovery and audit.
 Keep user-pinned messages until explicitly removed.
 
 ### Tests and Evidence
 
-- Test crash recovery between enqueue, delivery, read, and acknowledgement transitions.
+- Test crash recovery across enqueue, delivery, acknowledgement, completion, failure, retry, expiry, cancellation, and supersession transitions.
 - Test ordering, priorities, overflow, duplicate acknowledgement, and idempotent reply behavior.
-- Test every permitted and denied role pair.
+- Test every permitted and denied role pair by message class, Project, Assignment, ship, card, and run relationship.
 - Test terminal replacement while messages remain queued.
 - Test body redaction and verify that event telemetry does not expose message content implicitly.
 - Run packaged Captain-to-Crew, Crew-to-Captain, Cortana-to-Captain, and Captain-to-Captain conversations.
@@ -853,7 +877,7 @@ These lanes may proceed in parallel after the Phase 1 control contract is stable
 - **B3 Codex adapter:** hooks, interactive telemetry, context, History, and permission launch behavior.
 - **B4 Claude adapter normalization:** move existing hooks and status telemetry behind the shared contract.
 - **B5 CLI contract and shared catalog:** first normalize the existing CLI to `docs/cli-contract.md`, then add shared schemas, role filtering, command groups, and CLI-to-MCP parity tests.
-- **B6 Inbox identity and UI data model:** durable recipients, message states, retention, and read APIs.
+- **B6 Inbox identity and UI data model:** implement `docs/AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md` through durable recipients, message states, card and run links, retention, acknowledgements, and read APIs.
 
 B1 owns shared identity migrations.
 B3 and B4 must consume B1's identity interfaces rather than each introducing provider-specific durable fields.

@@ -6,14 +6,20 @@ This index prevents historical audits, shipped execution plans, and abandoned ex
 When documents disagree, use the precedence below and verify claims against the current source and installed build.
 Historical documents should remain intact as design rationale and evidence unless a separate cleanup explicitly archives them.
 
+Canonical precedence is scope-based, while the numbered list below is the required reading order.
+The phased plan governs product decisions and dependencies, the handoff governs verified current runtime facts only, the operating model governs organizational lifecycle, and narrower canonical contracts govern their named subsystem behavior.
+No handoff or subsystem contract may override an explicit phased-plan decision or General authorization.
+When canonical scopes genuinely conflict, stop the affected action and record the resolved decision in the phased plan.
+
 ## Canonical Current Documents
 
 1. [PHASED-PRODUCTION-PLAN.md](./PHASED-PRODUCTION-PLAN.md) is the authoritative forward roadmap, dependency map, testing doctrine, and exit-gate definition.
 2. [CAPTAIN-POWDER-HANDOFF.md](./CAPTAIN-POWDER-HANDOFF.md) is the current runtime evidence and zero-context resume handoff.
 3. [ORCHESTRATOR-OPERATING-MODEL.md](./ORCHESTRATOR-OPERATING-MODEL.md) defines the current Cortana, Project, Assignment, Captain, Workspace, and Crew operating model.
-4. [cli-contract.md](./cli-contract.md) defines the target public behavior of `th`.
-5. [STATUS-MODEL.md](./STATUS-MODEL.md) defines the provider-agnostic work-state and runtime-health model.
-6. [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md) defines authoritative worktree state and safety decisions across backend, CLI, MCP, and UI.
+4. [AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md) defines authority, supervision, Powder evidence, durable dialogue, escalation, review, and completion across the agent organization.
+5. [cli-contract.md](./cli-contract.md) defines the target public behavior of `th`.
+6. [STATUS-MODEL.md](./STATUS-MODEL.md) defines the provider-agnostic work-state and runtime-health model.
+7. [WORKTREE-STATUS-CONTRACT.md](./WORKTREE-STATUS-CONTRACT.md) defines authoritative worktree state and safety decisions across backend, CLI, MCP, and UI.
 
 ## Current Supporting Specifications
 

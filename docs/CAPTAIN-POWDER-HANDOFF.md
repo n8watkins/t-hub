@@ -280,6 +280,7 @@ The main implementation sequence in this work is:
 ## Captain and Crew Model
 
 `skills/captain/SKILL.md` is the canonical Captain protocol.
+[AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md](./AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md) is the canonical authority, evidence, dialogue, escalation, review, and completion contract for General, Cortana, Captains, peer Captains, and Crew.
 `skills/shipmate/SKILL.md` is a compatibility alias and should not be used as the product name going forward.
 Codex uses `$captain`, while Claude uses `/captain`.
 Both harnesses receive managed Captain, Shipmate compatibility, and Handoff skills.
