@@ -38,7 +38,10 @@ The installed runtime still lacks the reviewed unrestricted launch and structure
 Authoritative Powder reconciliation now reports the registered binding `n8desktop-wsl` and repository `t-hub` as misconfigured because the protected profile is unavailable or invalid.
 The dedicated protected health check identified the immediate failure as `Powder apiKeyCommand failed: command exceeded 10s timeout`.
 The Captain did not bypass the protected profile, inspect credentials, retry any ambiguous mutation, modify Powder, or change the binding.
-Exact-run Powder evidence and final work-log backfill cannot be reconciled until that protected profile command is healthy again.
+One later credential-safe health check succeeded without configuration changes and confirmed `n8desktop-wsl` healthy against repository `t-hub`.
+An authoritative board reread returned status ready with 16 cards and confirmed `thub-control-client-deadline`, `thub-codex-permission-launch-attestation`, and `thub-codex-permission-observability` still claimed by `t-hub`.
+No card was lost, completed, or released during the transient profile failure.
+Exact-run final work-log backfill remains unavailable because installed `0.3.103` exposes no sanctioned append operation, not because the protected Powder service remains unhealthy.
 
 No merge, push, install, deploy, publication, release, card completion, claim release, or resource reap is authorized or claimed.
 The next ordered implementation action still requires separate General authorization to integrate observability before launch attestation, run the real combined-tree agent launch proof, and only then consider merge or installation.
