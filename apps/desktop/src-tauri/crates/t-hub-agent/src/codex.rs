@@ -337,9 +337,7 @@ fn lifecycle_entry(
     event_type: JournalEventType,
     lifecycle: &str,
 ) -> Option<EventJournalEntry> {
-    if state.session_id.is_none() {
-        return None;
-    }
+    state.session_id.as_ref()?;
     Some(base_entry(
         state.session_id.clone(),
         state.turn_id.clone(),
