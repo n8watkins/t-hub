@@ -23,6 +23,7 @@ When canonical scopes genuinely conflict, stop the affected action and record th
 
 ## Current Supporting Specifications
 
+- [CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md](./CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md) is the General-directed integration specification for scoped Captain grants, existing-repository self-bootstrap, and bounded routine delivery; the phased plan remains authoritative for ownership, order, and activation.
 - [PRODUCTION-READINESS.md](./PRODUCTION-READINESS.md) supplies release-quality gates that remain applicable where the phased plan has not superseded their sequencing.
 - [PERFORMANCE-BENCHMARK.md](./PERFORMANCE-BENCHMARK.md) defines the packaged runtime measurement procedure.
 - [POWDER-INTEGRATION.md](./POWDER-INTEGRATION.md) describes the Powder integration boundary and protected profiles.
