@@ -35,6 +35,7 @@ The lifecycle-guard heartbeat reauthorization finding was remediated by commit `
 The removed-Crew close authorization finding was remediated by commit `17c8ed5e7b7f1b31c295631dccd1435a178dccf6`.
 The initial Powder claim receipt identity finding was remediated by commit `a712df7a1d7222272f3c128d20e06ad074ff797c`.
 The initial-claim transactionality finding was remediated by commit `bf3c3ca2f4fafecb40a9a9efea7a1ba7fe3d5f4c`.
+The M4 dispatch-authority ABA and M5 bounded initial-claim identity findings were remediated by commit `021eb3c`.
 
 Both frozen reviewed heads are ancestors of the integration head.
 Neither reviewed head was rebased or modified.
@@ -87,6 +88,11 @@ Terminal close performs minimal lifecycle ownership authorization before checkin
 Initial claim receipts must match both the requested card and the protected profile's configured agent before dispatch can persist a Crew binding.
 Before the initial claim POST, dispatch now persists a trusted pending intent containing the Project, protected profile, repository, card, configured agent, and stable operation identity.
 Malformed, substituted, or response-lost initial receipts retain that intent, remove only the local terminal, never issue a release, and block redispatch until authoritative card reconciliation.
+Dispatch now captures the Captain and Project scoped authority generation before remote preflight and revalidates the exact Captain terminal, ship, Project, repository root, Powder binding, and caller ship authority before spawn, after a claim, before launch, before attestation persistence, and before success.
+The durable Crew bind checks the captured Captain, Crew, and Project generation while holding the registry mutation serializer, so a same-terminal release and reclaim cannot attach work to the replacement Captain.
+An exact trusted claim is released only on a transaction-owned bind failure.
+If that release cannot be confirmed, the pending initial-claim intent remains durable and dispatch reports incomplete rollback instead of claiming completion.
+Initial-claim response parsing uses a 64 KiB bounded reader and rejects empty, whitespace-only, control-containing, and over-512-byte card, run, or agent identities.
 
 The frontend snapshot adapter retains `harnessPermission` and `tHubCapability` as separate compatibility axes.
 Unknown values remain omitted instead of being accepted as authoritative state.
@@ -194,6 +200,12 @@ After initial-claim transactionality remediation, the focused Powder client suit
 The response-loss restart and identical-retry regression, substituted-receipt regression, and foreign removed-Crew close regression passed.
 Formatting, targeted all-target clippy, and `git diff --check` passed at code head `bf3c3ca2f4fafecb40a9a9efea7a1ba7fe3d5f4c`.
 
+After M4 and M5 remediation, deterministic tests passed for a distinct Captain replacement after remote preflight with zero spawn or claim posts, same-terminal release-reclaim plus Powder rebind at bind CAS with exact terminal and claim rollback, and an ambiguous trusted release with durable recovery intent retained.
+The malformed initial-claim dispatch regression passed with no durable Crew binding, no provider launch, and no Powder release.
+The Powder client boundary suite passed empty, whitespace, control, oversized identity, oversized body, and exact-boundary identity cases.
+The focused control Powder suite passed all 63 tests.
+`cargo clippy -p t-hub --lib --tests -- -D warnings`, formatting, and `git diff --check` passed at `021eb3c`.
+
 The standalone CLI Powder contract suite passed 10 tests.
 The MCP Powder schema tests passed in both library and binary targets.
 The real authenticated MCP Powder dispatch E2E initially stopped before execution because its expected standalone debug MCP binary had not been built.
@@ -239,6 +251,11 @@ The exact lint was corrected, and the targeted clippy gate then passed.
 The frontend typecheck and Vitest residual remains because dependencies were unavailable.
 Independent review should inspect the small TypeScript adapter and store diff directly.
 
+The post-M4 focused dispatch filter ran 18 tests with one existing hermetic tmux fixture failure in `dispatch_test_harness_command_failures_roll_back_all_side_effects`.
+The isolated single rerun reproduced the same pre-launch unreadable-process-evidence result instead of the fixture's expected permission-posture assertion.
+All new M4 and M5 dispatch regressions passed in that run.
+No production tmux code was changed because this residual is outside the new dispatch authority and claim parsing paths.
+
 The installed T-Hub runtime was not modified, installed, or restarted.
 The currently installed Crew run-bound mutation surface rejected work-log capability verification during this task, so the Captain must maintain the exact-run Powder work log through a sanctioned working surface.
 
@@ -258,6 +275,8 @@ No independent reviewer has approved this integration yet.
 9. Verify the Codex degraded marker is exact-pane bound, bounded, credential-safe, and cannot create a false working state.
 10. Verify Harness local permission and T-Hub control capability remain separate in persistence, MCP and CLI output, and frontend snapshot compatibility.
 11. Verify production tmux behavior is unchanged and fixture-only serialization cannot leak into runtime behavior.
+12. Verify the captured dispatch authority generation is compared both before side effects and atomically during Crew binding, including release-reclaim ABA.
+13. Verify malformed or oversized initial-claim responses remain recovery-pending and cannot create a durable Crew binding or provider launch.
 12. Decide whether frontend dependency installation and a separate TypeScript gate are required before exact-run approval.
 13. Verify a heartbeat queued behind another Crew lifecycle operation revalidates the exact current Captain and worker liveness before renewal.
 14. Verify terminal close holds the same per-Crew lifecycle guard before tmux teardown and through authoritative Powder cleanup and persistence.
