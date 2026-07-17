@@ -278,6 +278,17 @@ The hermetic Captain fixture now starts its command as tmux's initial session co
 The real-zsh Crew dispatch regressions remain in the serialized dispatch filter.
 At `6f14ae7`, the serialized dispatch filter passed 22 tests with one existing real-agent test intentionally ignored, the Harness filter passed 15 tests, and formatting, `cargo clippy -p t-hub --all-targets -- -D warnings`, and `git diff --check` passed.
 
+Independent review found that a post-bind ambiguous release could retain only a CleanupPending Crew after the initial-claim intent had been cleared.
+That Crew's normal restart cleanup could then resolve the replacement Captain Project and Powder binding instead of the original release scope.
+Commit `2e4a332` introduces a distinct `PendingDispatchRelease` recovery record with the original Project, protected profile, repository, card, run, agent, initial operation identity, and transaction Crew terminal.
+It is retained atomically with the exact CleanupPending Crew only after a trusted post-bind release becomes ambiguous, so it never misrepresents a trusted bound claim as an unresolved initial claim.
+Both periodic reconciliation and ordinary Crew cleanup resolve this record directly from its frozen original profile and exact card, run, and agent receipt identity before any mutable Captain or Project scope lookup.
+Confirmed recovery clears only the exact recovery record and transaction-owned CleanupPending Crew, preserving replacement Captain state and Project or Powder bindings.
+Deterministic barriers at before launch, before attestation persistence, and before success each perform same-terminal release-reclaim plus Project profile and repository rebind, force an EOF-ambiguous first release, restart the registry, and prove recovery sends its second exact release only to the original profile server.
+The replacement-profile server receives zero requests in every phase test.
+The explicit after-claim ambiguity test retains the correctly named initial-claim recovery intent because no durable Crew binding exists at that phase.
+At `2e4a332`, the serialized dispatch filter passed 25 tests with one existing real-agent test intentionally ignored, the Harness filter passed 15 tests, and formatting, `cargo clippy -p t-hub --all-targets -- -D warnings`, and `git diff --check` passed.
+
 The installed T-Hub runtime was not modified, installed, or restarted.
 The currently installed Crew run-bound mutation surface rejected work-log capability verification during this task, so the Captain must maintain the exact-run Powder work log through a sanctioned working surface.
 
