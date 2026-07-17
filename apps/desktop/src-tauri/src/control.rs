@@ -10123,24 +10123,11 @@ fn dispatch_crew_with_observer(
     }))
 }
 
-fn crew_powder_context(
-    ctx: &ControlContext,
-    crew_session_id: &str,
-) -> Result<(powder::Client, powder::Claim), String> {
-    let scope = resolve_crew_powder_scope(ctx, crew_session_id)?;
-    if !matches!(scope.crew.state, CrewState::Active) {
-        return Err(format!(
-            "Crew session '{crew_session_id}' lifecycle is not active; refusing to renew its Powder claim"
-        ));
-    }
-    if !matches!(scope.work.state, PowderWorkState::Active) {
-        return Err(format!(
-            "Crew session '{crew_session_id}' Powder work is not active"
-        ));
-    }
+fn crew_powder_context(scope: &CrewPowderScope) -> Result<(powder::Client, powder::Claim), String> {
+    require_active_crew_powder_renewal(scope)?;
     let client = powder::Client::from_profile(&scope.binding.connection_profile)?;
     let card = client.get_card(&scope.work.card_id)?;
-    validate_bound_detailed_card(&scope, &card)?;
+    validate_bound_detailed_card(scope, &card)?;
     let claim = card.card_value()["claim"]
         .as_object()
         .ok_or_else(|| format!("Powder card '{}' has no active claim", scope.work.card_id))?;
@@ -10167,7 +10154,34 @@ fn crew_powder_context(
             scope.work.card_id, authoritative.run_id, scope.work.run_id
         ));
     }
+    let expected_agent = scope.work.agent.as_deref().ok_or_else(|| {
+        format!(
+            "Crew run '{}' has no durable Powder agent identity",
+            scope.work.run_id
+        )
+    })?;
+    if authoritative.agent != expected_agent {
+        return Err(format!(
+            "Powder card '{}' claim agent is not Crew Powder agent",
+            scope.work.card_id
+        ));
+    }
     Ok((client, authoritative))
+}
+
+fn require_active_crew_powder_renewal(scope: &CrewPowderScope) -> Result<(), String> {
+    let crew_session_id = &scope.crew.terminal_id;
+    if !matches!(scope.crew.state, CrewState::Active) {
+        return Err(format!(
+            "Crew session '{crew_session_id}' lifecycle is not active; refusing to renew its Powder claim"
+        ));
+    }
+    if !matches!(scope.work.state, PowderWorkState::Active) {
+        return Err(format!(
+            "Crew session '{crew_session_id}' Powder work is not active"
+        ));
+    }
+    Ok(())
 }
 
 const MAX_CREW_EVIDENCE_ITEMS: usize = 20;
@@ -12130,24 +12144,7 @@ fn heartbeat_crew_powder(
         trusted_internal,
         "heartbeat_crew_powder",
     )?;
-    let crew_harness = authorization_scope
-        .crew
-        .harness
-        .as_deref()
-        .ok_or_else(|| format!("Crew session '{crew_session_id}' has no recorded harness"))?;
-    match tmux::harness_liveness(&tmux_target(&crew_session_id), crew_harness) {
-        tmux::SessionLiveness::Alive => {}
-        tmux::SessionLiveness::Gone => {
-            return Err(format!(
-                "heartbeat_crew_powder: Crew session '{crew_session_id}' is gone; refusing to extend its claim"
-            ));
-        }
-        tmux::SessionLiveness::Unknown => {
-            return Err(retryable_error(format!(
-                "heartbeat_crew_powder: Crew session '{crew_session_id}' liveness is unavailable"
-            )));
-        }
-    }
+    require_live_crew_harness(&authorization_scope, "heartbeat_crew_powder")?;
     let _operation_guard = ctx
         .captains
         .serialize_crew_powder_operation(&crew_session_id, CrewPowderOperationKind::Renewal);
@@ -12161,25 +12158,8 @@ fn heartbeat_crew_powder(
         trusted_internal,
         "heartbeat_crew_powder",
     )?;
-    let current_harness = current_scope
-        .crew
-        .harness
-        .as_deref()
-        .ok_or_else(|| format!("Crew session '{crew_session_id}' has no recorded harness"))?;
-    match tmux::harness_liveness(&tmux_target(&crew_session_id), current_harness) {
-        tmux::SessionLiveness::Alive => {}
-        tmux::SessionLiveness::Gone => {
-            return Err(format!(
-                "heartbeat_crew_powder: Crew session '{crew_session_id}' is gone; refusing to extend its claim"
-            ));
-        }
-        tmux::SessionLiveness::Unknown => {
-            return Err(retryable_error(format!(
-                "heartbeat_crew_powder: Crew session '{crew_session_id}' liveness is unavailable"
-            )));
-        }
-    }
-    let (renewed, crew) = renew_crew_powder_binding_guarded(ctx, &crew_session_id, None)?;
+    let (renewed, crew) =
+        renew_crew_powder_binding_guarded(ctx, &current_scope, None, "heartbeat_crew_powder")?;
     Ok(json!({
         "accepted": "heartbeat_crew_powder",
         "audited": true,
@@ -12219,6 +12199,24 @@ fn require_crew_heartbeat_authority(
     ))
 }
 
+fn require_live_crew_harness(scope: &CrewPowderScope, command: &str) -> Result<(), String> {
+    let crew_session_id = &scope.crew.terminal_id;
+    let harness = scope
+        .crew
+        .harness
+        .as_deref()
+        .ok_or_else(|| format!("Crew session '{crew_session_id}' has no recorded harness"))?;
+    match tmux::harness_liveness(&tmux_target(crew_session_id), harness) {
+        tmux::SessionLiveness::Alive => Ok(()),
+        tmux::SessionLiveness::Gone => Err(format!(
+            "{command}: Crew session '{crew_session_id}' is gone; refusing to extend its claim"
+        )),
+        tmux::SessionLiveness::Unknown => Err(retryable_error(format!(
+            "{command}: Crew session '{crew_session_id}' liveness is unavailable"
+        ))),
+    }
+}
+
 fn renew_crew_powder_binding(
     ctx: &ControlContext,
     crew_session_id: &str,
@@ -12227,24 +12225,29 @@ fn renew_crew_powder_binding(
     let _operation_guard = ctx
         .captains
         .serialize_crew_powder_operation(crew_session_id, CrewPowderOperationKind::Renewal);
-    renew_crew_powder_binding_guarded(ctx, crew_session_id, ttl_seconds)
+    let scope = resolve_crew_powder_scope(ctx, crew_session_id)?;
+    renew_crew_powder_binding_guarded(ctx, &scope, ttl_seconds, "Powder renewal")
 }
 
 fn renew_crew_powder_binding_guarded(
     ctx: &ControlContext,
-    crew_session_id: &str,
+    scope: &CrewPowderScope,
     ttl_seconds: Option<u64>,
+    command: &str,
 ) -> Result<(powder::Claim, CrewRef), String> {
-    // Resolve again inside the operation guard. A reconciler snapshot may have
-    // observed Active before completion persisted pending or completed state.
-    let (client, claim) = crew_powder_context(ctx, crew_session_id)?;
+    // The scope and liveness are resolved inside the operation guard. A
+    // reconciler snapshot may have observed Active before completion persisted
+    // pending or completed state, or before the Harness process exited.
+    require_active_crew_powder_renewal(scope)?;
+    require_live_crew_harness(scope, command)?;
+    let (client, claim) = crew_powder_context(scope)?;
     let renewed = match ttl_seconds {
         Some(ttl_seconds) => client.renew(&claim, ttl_seconds)?,
         None => client.heartbeat(&claim)?,
     };
     let crew = ctx
         .captains
-        .update_crew_claim_expiry(crew_session_id, renewed.expires_at)?;
+        .update_crew_claim_expiry(&scope.crew.terminal_id, renewed.expires_at)?;
     let _ = captains_sync_apply(ctx);
     Ok((renewed, crew))
 }
@@ -24454,6 +24457,9 @@ mod tests {
         release_receipt_card_id: Option<String>,
         release_receipt_run_id: Option<String>,
         release_receipt_agent: Option<String>,
+        renewal_receipt_card_id: Option<String>,
+        renewal_receipt_run_id: Option<String>,
+        renewal_receipt_agent: Option<String>,
         issued_claim_agent: Option<String>,
         renew_posts: usize,
     }
@@ -25425,8 +25431,28 @@ mod tests {
                 })
             }
             ("POST", path) if path.ends_with("/renew") || path.ends_with("/heartbeat") => {
-                state.lock().unwrap().renew_posts += 1;
-                json!({"card_id": "thub-powder-control-lifecycle", "run_id": "run-authoritative", "agent": "t-hub", "expires_at": 200})
+                let mut state = state.lock().unwrap();
+                state.renew_posts += 1;
+                let response_card_id = state
+                    .renewal_receipt_card_id
+                    .clone()
+                    .unwrap_or_else(|| "thub-powder-control-lifecycle".into());
+                let response_run_id = state
+                    .renewal_receipt_run_id
+                    .clone()
+                    .unwrap_or_else(|| "run-authoritative".into());
+                let response_agent = state
+                    .renewal_receipt_agent
+                    .clone()
+                    .or_else(|| state.evidence_claim_agent.clone())
+                    .or_else(|| state.issued_claim_agent.clone())
+                    .unwrap_or_else(|| "powder-agent".into());
+                json!({
+                    "card_id": response_card_id,
+                    "run_id": response_run_id,
+                    "agent": response_agent,
+                    "expires_at": 200
+                })
             }
             _ => return Err(format!("unexpected Powder test request: {method} {path}")),
         };
@@ -31205,6 +31231,80 @@ mod tests {
     }
 
     #[test]
+    fn powder_renewal_rejects_substituted_authoritative_agent_without_post() {
+        let server = LoopbackPowderServer::start(1);
+        {
+            server.state.lock().unwrap().evidence_claim_agent = Some("substituted-agent".into());
+        }
+        let profile_name = format!("renew-agent-substitution-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let ctx = test_ctx(&profile_name).with_captains_registry(registry.clone());
+
+        let error = renew_crew_powder_binding(&ctx, &crew.session_id, Some(3600)).unwrap_err();
+
+        assert!(error.contains("claim agent is not Crew Powder agent"));
+        assert_eq!(
+            resolve_crew_powder_scope(&ctx, &crew.session_id)
+                .unwrap()
+                .work
+                .claim_expires_at,
+            Some(100)
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_renewal_receipt_requires_exact_card_run_and_agent_before_persistence() {
+        for substituted_field in ["card", "run", "agent"] {
+            let server = LoopbackPowderServer::start(2);
+            {
+                let mut state = server.state.lock().unwrap();
+                match substituted_field {
+                    "card" => state.renewal_receipt_card_id = Some("another-card".into()),
+                    "run" => state.renewal_receipt_run_id = Some("another-run".into()),
+                    "agent" => state.renewal_receipt_agent = Some("another-agent".into()),
+                    _ => unreachable!(),
+                }
+            }
+            let profile_name = format!(
+                "renew-receipt-{substituted_field}-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+            let crew = FakeHarnessSession::start(Harness::Codex);
+            let registry = powder_lifecycle_registry_with_profile_and_crew(
+                None,
+                &profile_name,
+                &crew.session_id,
+            );
+            let ctx = test_ctx(&profile_name).with_captains_registry(registry.clone());
+
+            let error = renew_crew_powder_binding(&ctx, &crew.session_id, Some(3600)).unwrap_err();
+
+            assert!(
+                error.contains(
+                    "renewal response did not match the exact requested card, run, and agent"
+                ),
+                "{substituted_field}: {error}"
+            );
+            assert_eq!(
+                resolve_crew_powder_scope(&ctx, &crew.session_id)
+                    .unwrap()
+                    .work
+                    .claim_expires_at,
+                Some(100),
+                "{substituted_field} receipt must not update durable expiry"
+            );
+            let state = server.finish().unwrap();
+            assert_eq!(state.renew_posts, 1);
+        }
+    }
+
+    #[test]
     fn powder_reconciler_renewal_rechecks_stale_active_state_before_remote_mutation() {
         let server = LoopbackPowderServer::start(0);
         let _profile = PowderProfileEnv::install("loopback-stale-renewal", server.addr);
@@ -31294,17 +31394,90 @@ mod tests {
     }
 
     #[test]
+    fn powder_queued_heartbeat_revalidates_harness_liveness_after_guard_wait() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_queued_heartbeat_revalidates_harness_liveness_after_guard_wait: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("heartbeat-liveness-race-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let heartbeat_ctx = ctx.clone();
+        let heartbeat_crew = crew.session_id.clone();
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let heartbeat = std::thread::spawn(move || {
+            heartbeat_tx
+                .send(dispatch_authenticated(
+                    &heartbeat_ctx,
+                    req_session(
+                        &profile_name,
+                        &captain,
+                        "heartbeat_crew_powder",
+                        json!({"crewSessionId": heartbeat_crew}),
+                    ),
+                ))
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        reap_test_tmux_session(&tmux_target(&crew.session_id)).unwrap();
+        drop(completion_guard);
+
+        let response = heartbeat_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("is gone"));
+        heartbeat.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
     fn powder_completion_persistence_failure_rolls_back_and_releases_guard() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_completion_persistence_failure_rolls_back_and_releases_guard: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
         let server = LoopbackPowderServer::start(4);
         let _profile = PowderProfileEnv::install("loopback-persist-failure", server.addr);
+        let harness = FakeHarnessSession::start(Harness::Codex);
         let dir = std::env::temp_dir().join(format!(
             "t-hub-powder-persist-failure-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
         let path = dir.join("captains.json");
-        let registry =
-            powder_lifecycle_registry_with_profile(Some(path.clone()), "loopback-persist-failure");
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            "loopback-persist-failure",
+            &harness.session_id,
+        );
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
         let captain = mint_session(
             &identities,
@@ -31327,7 +31500,7 @@ mod tests {
                 &captain,
                 "complete_crew_powder",
                 json!({
-                    "crewSessionId": "crew-powder",
+                    "crewSessionId": harness.session_id.clone(),
                     "operationId": "completion:persist-failure",
                     "proof": "commit persist-failure",
                     "criterionProofs": [{
@@ -31343,13 +31516,15 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("could not be created")));
-        let work = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap().work;
+        let work = resolve_crew_powder_scope(&ctx, &harness.session_id)
+            .unwrap()
+            .work;
         assert!(matches!(work.state, PowderWorkState::Active));
         assert_eq!(work.claim_expires_at, Some(100));
 
         std::fs::remove_file(&dir).unwrap();
         std::fs::create_dir(&dir).unwrap();
-        let (renewed, crew) = renew_crew_powder_binding(&ctx, "crew-powder", None).unwrap();
+        let (renewed, crew) = renew_crew_powder_binding(&ctx, &harness.session_id, None).unwrap();
         assert_eq!(renewed.expires_at, 200);
         assert_eq!(
             crew.powder_work.as_ref().unwrap().claim_expires_at,

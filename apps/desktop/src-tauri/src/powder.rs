@@ -778,7 +778,7 @@ impl Client {
             &format!("/api/v1/cards/{}/heartbeat", encode_path(&claim.card_id)),
             Some(json!({ "run_id": claim.run_id })),
         )?;
-        parse_claim(value)
+        validate_claim_receipt("heartbeat", claim, parse_claim(value)?)
     }
 
     pub fn renew(&self, claim: &Claim, ttl_seconds: u64) -> Result<Claim, String> {
@@ -790,7 +790,7 @@ impl Client {
                 "ttl_seconds": ttl_seconds,
             })),
         )?;
-        parse_claim(value)
+        validate_claim_receipt("renewal", claim, parse_claim(value)?)
     }
 
     pub fn release(&self, claim: &Claim) -> Result<Claim, String> {
@@ -799,17 +799,7 @@ impl Client {
             &format!("/api/v1/cards/{}/release", encode_path(&claim.card_id)),
             Some(json!({ "run_id": claim.run_id })),
         )?;
-        let released = parse_claim(value)?;
-        if released.card_id != claim.card_id
-            || released.run_id != claim.run_id
-            || released.agent != claim.agent
-        {
-            return Err(
-                "Powder release response did not match the exact requested card, run, and agent"
-                    .into(),
-            );
-        }
-        Ok(released)
+        validate_claim_receipt("release", claim, parse_claim(value)?)
     }
 
     /// Fail closed unless the connected Powder deployment advertises the full
@@ -2915,6 +2905,22 @@ fn parse_claim(value: Value) -> Result<Claim, String> {
     })
 }
 
+fn validate_claim_receipt(
+    operation: &str,
+    expected: &Claim,
+    actual: Claim,
+) -> Result<Claim, String> {
+    if actual.card_id != expected.card_id
+        || actual.run_id != expected.run_id
+        || actual.agent != expected.agent
+    {
+        return Err(format!(
+            "Powder {operation} response did not match the exact requested card, run, and agent"
+        ));
+    }
+    Ok(actual)
+}
+
 fn parse_event_stream(body: &str, after: i64) -> Result<Vec<CardEvent>, String> {
     let mut events = Vec::new();
     for frame in body.replace("\r\n", "\n").split("\n\n") {
@@ -4870,6 +4876,63 @@ mod tests {
             assert_eq!(
                 error,
                 "Powder release response did not match the exact requested card, run, and agent"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn renewal_rejects_a_structurally_valid_receipt_for_another_claim() {
+        for (operation, receipt_card, receipt_run, receipt_agent) in [
+            ("heartbeat", "card-other", "run-1", "t-hub"),
+            ("heartbeat", "card-1", "run-other", "t-hub"),
+            ("heartbeat", "card-1", "run-1", "another-agent"),
+            ("renewal", "card-other", "run-1", "t-hub"),
+            ("renewal", "card-1", "run-other", "t-hub"),
+            ("renewal", "card-1", "run-1", "another-agent"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(request.starts_with(&format!(
+                    "POST /api/v1/cards/card-1/{} ",
+                    if operation == "heartbeat" {
+                        "heartbeat"
+                    } else {
+                        "renew"
+                    }
+                )));
+                assert!(request.contains(r#""run_id":"run-1""#));
+                let body = json!({
+                    "card_id": receipt_card,
+                    "run_id": receipt_run,
+                    "agent": receipt_agent,
+                    "expires_at": 1234,
+                })
+                .to_string();
+                write_json_response(&mut stream, "200 OK", &body);
+            });
+            let claim = Claim {
+                card_id: "card-1".into(),
+                run_id: "run-1".into(),
+                agent: "t-hub".into(),
+                expires_at: 1234,
+            };
+
+            let client = test_client(addr);
+            let error = if operation == "heartbeat" {
+                client.heartbeat(&claim).unwrap_err()
+            } else {
+                client.renew(&claim, 3600).unwrap_err()
+            };
+
+            assert_eq!(
+                error,
+                format!(
+                    "Powder {operation} response did not match the exact requested card, run, and agent"
+                )
             );
             server.join().unwrap();
         }
