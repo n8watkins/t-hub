@@ -289,6 +289,42 @@ The replacement-profile server receives zero requests in every phase test.
 The explicit after-claim ambiguity test retains the correctly named initial-claim recovery intent because no durable Crew binding exists at that phase.
 At `2e4a332`, the serialized dispatch filter passed 25 tests with one existing real-agent test intentionally ignored, the Harness filter passed 15 tests, and formatting, `cargo clippy -p t-hub --all-targets -- -D warnings`, and `git diff --check` passed.
 
+Fresh durability rereview found that the first frozen-release record was persisted only after a release response error.
+Commits `9d3ce7e` and `1568bbd` replace that behavior with a durable release state machine and preserve it across Captain replacement.
+Before every post-bind release POST, rollback persists the exact frozen recovery and its transaction-owned Crew as `CleanupPending` in `Prepared`, then atomically advances it to `InFlight` before sending the request.
+An error response advances the durable record to `Ambiguous` only after that transition is persisted.
+If that ambiguity persistence fails, the prior durable `InFlight` state remains authoritative rather than being replaced by an in-memory claim of rollback.
+No release success clears either record until an exact trusted release receipt or authoritative released-run evidence is observed.
+Recovery never reconstructs the original scope from the current Captain Project binding.
+It uses only the frozen connection profile, repository, card, run, agent, and operation identity.
+For `InFlight` or `Ambiguous` recovery, it first reads authoritative exact-run evidence.
+If Powder already reports the exact run released after response loss, recovery clears local transaction-owned state without a second release POST.
+If the run remains active with the exact card and agent, recovery may perform one exact release using the frozen scope.
+`Prepared` remains explicitly recovery-pending because no release POST was durably recorded.
+
+Schema version 10 makes this recovery shape incompatible with an older binary that could silently discard it.
+Version 9 snapshots without a release recovery load and upgrade on their next write.
+Version 9 snapshots containing a release recovery fail closed before any recovery or network call.
+Snapshot validation requires each release recovery to map to exactly one `CleanupPending` Crew under the exact Project with matching terminal, card, run, agent, and frozen-scope marker.
+The reciprocal marker check rejects orphaned Crew recovery state, mismatched or foreign records, and duplicate recovery state before any remote release.
+
+Deterministic coverage at `1568bbd` proves a crash-equivalent restart before POST retains `Prepared`, preserves a replacement Powder binding, and emits zero release requests to either original or replacement profile.
+The response-loss test proves a release POST can commit while its response is lost, and that restart reconciles released run evidence without a blind second POST.
+The same test forces ambiguity-state persistence failure after the POST and proves restart recovers from the last durable `InFlight` state without touching the replacement scope.
+Malformed persistence pair coverage exercises orphan, foreign Project, mismatched agent, and missing reciprocal marker records with no network client construction.
+
+At final code head `1568bbd`, the serialized dispatch filter passed 23 tests with one existing real-agent test intentionally ignored.
+The serialized control Powder filter passed 63 tests.
+The Powder client filter passed 30 tests.
+The Harness filter passed 15 tests.
+The close filter passed 7 tests.
+The agent suite passed 55 unit tests, 3 Codex TAP E2E tests, and 1 unobserved E2E test.
+The CLI suite passed 47 unit tests and 10 Powder contract tests.
+The MCP library and binary suites passed 16 and 75 tests respectively.
+Formatting, all-target clippy for the changed desktop crate, and `git diff --check` passed.
+An attempted follow-on Cargo command named a nonexistent `e2e` test target after the agent suite had already run its E2E targets successfully.
+Cargo rejected that command before executing product tests.
+
 The installed T-Hub runtime was not modified, installed, or restarted.
 The currently installed Crew run-bound mutation surface rejected work-log capability verification during this task, so the Captain must maintain the exact-run Powder work log through a sanctioned working surface.
 
