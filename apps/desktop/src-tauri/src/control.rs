@@ -821,9 +821,11 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// exact replay stays stable without wedging replacement work or cleanup.
 /// v10 adds a durable pre-release recovery state machine for exact post-bind
 /// dispatch rollback, preventing an older registry shape from dropping a frozen
-/// Powder scope after an ambiguous release.
+/// Powder scope after an ambiguous release. v11 pins the canonical protected
+/// endpoint as well, preventing a remapped profile name from selecting a new
+/// Powder instance during recovery.
 /// All prior shapes remain readable and upgrade on write.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 10;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 11;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 
 /// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
@@ -1024,6 +1026,7 @@ pub struct PendingDispatchRelease {
     pub crew_session_id: String,
     pub project_id: String,
     pub connection_profile: String,
+    pub connection_endpoint: String,
     pub repository: String,
     pub card_id: String,
     pub run_id: String,
@@ -1042,6 +1045,24 @@ pub enum PendingDispatchReleaseState {
     InFlight,
     /// A returned release error was recorded after an in-flight attempt.
     Ambiguous,
+}
+
+/// Recovery records are loaded before any remote Powder call.
+/// Keep their identifiers as strict as the protected request identities they
+/// will later authorize, so malformed persistence cannot select a scope.
+fn is_canonical_dispatch_recovery_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn is_canonical_dispatch_recovery_endpoint(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 2048
+        && !value.chars().any(char::is_control)
+        && (value.starts_with("https://") || value.starts_with("http://"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2214,14 +2235,15 @@ impl CaptainsRegistry {
         let mut pending_release_crews = std::collections::HashSet::new();
         let mut pending_release_claims = std::collections::HashSet::new();
         for recovery in &snapshot.pending_dispatch_releases {
-            if recovery.crew_session_id.trim().is_empty()
-                || recovery.project_id.trim().is_empty()
-                || recovery.connection_profile.trim().is_empty()
-                || recovery.repository.trim().is_empty()
-                || recovery.card_id.trim().is_empty()
-                || recovery.run_id.trim().is_empty()
-                || recovery.agent.trim().is_empty()
-                || recovery.operation_id.trim().is_empty()
+            if !is_canonical_dispatch_recovery_identity(&recovery.crew_session_id)
+                || !is_canonical_dispatch_recovery_identity(&recovery.project_id)
+                || !is_canonical_dispatch_recovery_identity(&recovery.connection_profile)
+                || !is_canonical_dispatch_recovery_endpoint(&recovery.connection_endpoint)
+                || !is_canonical_dispatch_recovery_identity(&recovery.repository)
+                || !is_canonical_dispatch_recovery_identity(&recovery.card_id)
+                || !is_canonical_dispatch_recovery_identity(&recovery.run_id)
+                || !is_canonical_dispatch_recovery_identity(&recovery.agent)
+                || !is_canonical_dispatch_recovery_identity(&recovery.operation_id)
             {
                 return Err(
                     "captains registry contains an incomplete pending dispatch release".into(),
@@ -2405,7 +2427,7 @@ impl CaptainsRegistry {
             && !snapshot.pending_dispatch_releases.is_empty()
         {
             return Err(
-                "captains registry release recovery requires schema version 10 or newer".into(),
+                "captains registry release recovery requires schema version 11 or newer".into(),
             );
         }
         for recovery in &snapshot.pending_dispatch_releases {
@@ -2847,6 +2869,7 @@ impl CaptainsRegistry {
                 existing.crew_session_id == recovery.crew_session_id
                     && existing.project_id == recovery.project_id
                     && existing.connection_profile == recovery.connection_profile
+                    && existing.connection_endpoint == recovery.connection_endpoint
                     && existing.repository == recovery.repository
                     && existing.card_id == recovery.card_id
                     && existing.run_id == recovery.run_id
@@ -2885,6 +2908,7 @@ impl CaptainsRegistry {
                 existing.crew_session_id == recovery.crew_session_id
                     && existing.project_id == recovery.project_id
                     && existing.connection_profile == recovery.connection_profile
+                    && existing.connection_endpoint == recovery.connection_endpoint
                     && existing.repository == recovery.repository
                     && existing.card_id == recovery.card_id
                     && existing.run_id == recovery.run_id
@@ -2894,6 +2918,28 @@ impl CaptainsRegistry {
         else {
             return Ok((false, false));
         };
+        let owned_crew_count = current
+            .captains
+            .iter()
+            .filter(|captain| captain.project_id.as_deref() == Some(recovery.project_id.as_str()))
+            .flat_map(|captain| captain.crew.iter())
+            .filter(|crew| {
+                crew.terminal_id == recovery.crew_session_id
+                    && matches!(crew.state, CrewState::CleanupPending { .. })
+                    && crew.powder_work.as_ref().is_some_and(|work| {
+                        work.card_id == recovery.card_id
+                            && work.run_id == recovery.run_id
+                            && work.agent.as_deref() == Some(recovery.agent.as_str())
+                            && work.dispatch_release_recovery
+                    })
+            })
+            .count();
+        if owned_crew_count != 1 {
+            return Err(format!(
+                "exact release recovery for Crew '{}' no longer has one transaction-owned CleanupPending binding",
+                recovery.crew_session_id
+            ));
+        }
         let previous = current.clone();
         current.pending_dispatch_releases.remove(position);
         let mut crew_removed = false;
@@ -2915,6 +2961,7 @@ impl CaptainsRegistry {
             });
             crew_removed |= captain.crew.len() != before;
         }
+        debug_assert!(crew_removed, "validated transaction Crew must be removed");
         current.seq = current.seq.saturating_add(1);
         self.commit_mutation(current, previous)?;
         Ok((true, crew_removed))
@@ -10542,11 +10589,19 @@ fn rollback_trusted_dispatch(
     claim: &powder::Claim,
     release_recovery: Option<&PendingDispatchRelease>,
 ) -> Result<(), String> {
+    // Persist the frozen exact-release obligation before tearing down the
+    // terminal. A crash after this point can therefore never fall back to a
+    // replacement Captain's mutable Project binding.
+    if let Some(recovery) = release_recovery {
+        ctx.captains.prepare_dispatch_release(recovery.clone())?;
+        #[cfg(test)]
+        ctx.captains
+            .pause_dispatch("release_prepared_before_teardown");
+    }
     tmux::kill_session_tree(&tmux_target(crew_session_id)).map_err(|error| {
         format!("Crew terminal '{crew_session_id}' could not be stopped: {error}")
     })?;
     if let Some(recovery) = release_recovery {
-        ctx.captains.prepare_dispatch_release(recovery.clone())?;
         #[cfg(test)]
         ctx.captains.pause_dispatch("release_prepared_before_post");
         ctx.captains.transition_dispatch_release(
@@ -10896,6 +10951,7 @@ fn dispatch_crew_with_observer_inner(
         crew_session_id: crew_session_id.clone(),
         project_id: project.project_id.clone(),
         connection_profile: binding.connection_profile.clone(),
+        connection_endpoint: client.base_url().to_string(),
         repository: binding.repository.clone(),
         card_id: claim.card_id.clone(),
         run_id: claim.run_id.clone(),
@@ -13606,7 +13662,7 @@ fn finalize_crew_powder_cleanup_guarded(
     preserve_crew_on_powder_failure: bool,
 ) -> Result<(Option<Value>, bool, bool), String> {
     if let Some(recovery) = ctx.captains.pending_dispatch_release(crew_session_id) {
-        return match recover_pending_dispatch_release(ctx, &recovery) {
+        return match recover_pending_dispatch_release_guarded(ctx, &recovery) {
             Ok(()) => Ok((
                 Some(json!({
                     "released": true,
@@ -13783,34 +13839,94 @@ fn recover_pending_dispatch_release(
     ctx: &ControlContext,
     recovery: &PendingDispatchRelease,
 ) -> Result<(), String> {
-    if recovery.state == PendingDispatchReleaseState::Prepared {
-        return Err("the exact release is prepared but no release POST was sent".into());
+    let _operation_guard = ctx.captains.serialize_crew_powder_operation(
+        &recovery.crew_session_id,
+        CrewPowderOperationKind::Cleanup,
+    );
+    recover_pending_dispatch_release_guarded(ctx, recovery)
+}
+
+fn ensure_recovery_terminal_gone(crew_session_id: &str) -> Result<(), String> {
+    let target = tmux_target(crew_session_id);
+    match tmux::session_liveness(&target) {
+        tmux::SessionLiveness::Gone => Ok(()),
+        tmux::SessionLiveness::Alive => {
+            tmux::kill_session_tree(&target).map_err(|error| {
+                format!("trusted release recovery could not stop Crew terminal '{crew_session_id}': {error}")
+            })?;
+            match tmux::session_liveness(&target) {
+                tmux::SessionLiveness::Gone => Ok(()),
+                tmux::SessionLiveness::Alive => Err(format!(
+                    "trusted release recovery refuses Powder release while Crew terminal '{crew_session_id}' remains alive"
+                )),
+                tmux::SessionLiveness::Unknown => Err(format!(
+                    "trusted release recovery cannot verify Crew terminal '{crew_session_id}' is gone"
+                )),
+            }
+        }
+        tmux::SessionLiveness::Unknown => Err(format!(
+            "trusted release recovery cannot verify Crew terminal '{crew_session_id}' is gone"
+        )),
     }
+}
+
+fn clear_confirmed_dispatch_release_and_retire(
+    ctx: &ControlContext,
+    recovery: &PendingDispatchRelease,
+) -> Result<(), String> {
+    let (cleared, crew_removed) = ctx.captains.clear_confirmed_dispatch_release(recovery)?;
+    if !cleared || !crew_removed {
+        return Err("the exact durable release recovery could not remove its transaction-owned Crew binding".into());
+    }
+    ctx.tabs.remove_tile(&recovery.crew_session_id);
+    ctx.identity.retire_tile(&recovery.crew_session_id)?;
+    let _ = captains_sync_apply(ctx);
+    Ok(())
+}
+
+fn recover_pending_dispatch_release_guarded(
+    ctx: &ControlContext,
+    recovery: &PendingDispatchRelease,
+) -> Result<(), String> {
     let client = powder::Client::from_profile(&recovery.connection_profile)?;
     if client.configured_agent() != recovery.agent {
         return Err("the frozen profile agent changed".into());
     }
+    if client.base_url() != recovery.connection_endpoint {
+        return Err("the frozen profile endpoint changed before release recovery".into());
+    }
+    let repository = client
+        .get_repository(&recovery.repository)
+        .map_err(|error| format!("the frozen repository cannot be reconciled: {error}"))?;
+    if repository.get("name").and_then(Value::as_str) != Some(recovery.repository.as_str()) {
+        return Err("the frozen repository identity changed before release recovery".into());
+    }
     let evidence = client
         .run_evidence(&recovery.run_id)
         .map_err(|error| format!("the exact release cannot be reconciled: {error}"))?;
-    if evidence.run.card_id != recovery.card_id || evidence.run.agent != recovery.agent {
+    if evidence.repository.as_deref() != Some(recovery.repository.as_str())
+        || evidence.run.card_id != recovery.card_id
+        || evidence.run.agent != recovery.agent
+    {
         return Err("the authoritative run identity changed before release recovery".into());
     }
     if evidence.run.state == "released" {
-        let (cleared, _) = ctx.captains.clear_confirmed_dispatch_release(recovery)?;
-        if !cleared {
-            return Err("the exact durable release recovery no longer exists".into());
-        }
-        ctx.tabs.remove_tile(&recovery.crew_session_id);
-        ctx.identity.retire_tile(&recovery.crew_session_id)?;
-        let _ = captains_sync_apply(ctx);
-        return Ok(());
+        ensure_recovery_terminal_gone(&recovery.crew_session_id)?;
+        return clear_confirmed_dispatch_release_and_retire(ctx, recovery);
     }
     if evidence.run.state != "active" {
         return Err(format!(
             "the authoritative run is '{}' rather than active or released",
             evidence.run.state
         ));
+    }
+    ensure_recovery_terminal_gone(&recovery.crew_session_id)?;
+    if recovery.state == PendingDispatchReleaseState::Prepared {
+        ctx.captains.transition_dispatch_release(
+            recovery,
+            PendingDispatchReleaseState::Prepared,
+            PendingDispatchReleaseState::InFlight,
+        )?;
     }
     let claim = powder::Claim {
         card_id: recovery.card_id.clone(),
@@ -13819,14 +13935,7 @@ fn recover_pending_dispatch_release(
         expires_at: 0,
     };
     client.release(&claim)?;
-    let (cleared, _) = ctx.captains.clear_confirmed_dispatch_release(recovery)?;
-    if !cleared {
-        return Err("the exact durable release recovery no longer exists".into());
-    }
-    ctx.tabs.remove_tile(&recovery.crew_session_id);
-    ctx.identity.retire_tile(&recovery.crew_session_id)?;
-    let _ = captains_sync_apply(ctx);
-    Ok(())
+    clear_confirmed_dispatch_release_and_retire(ctx, recovery)
 }
 
 fn reconcile_pending_dispatch_releases(ctx: &ControlContext) {
@@ -20792,11 +20901,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_v9_without_release_recovery_upgrades_to_v10_on_the_next_write() {
-        let path = captains_tmp("schema-v9-upgrade");
+    fn schema_v10_without_release_recovery_upgrades_to_v11_on_the_next_write() {
+        let path = captains_tmp("schema-v10-upgrade");
         let _ = std::fs::remove_file(&path);
         let legacy = CaptainsSnapshot {
-            schema_version: 9,
+            schema_version: 10,
             seq: 1,
             captains: vec![],
             projects: vec![],
@@ -20809,11 +20918,11 @@ mod tests {
             CaptainsRegistry::read_snapshot(&path)
                 .unwrap()
                 .schema_version,
-            9
+            10
         );
         let registry = CaptainsRegistry::load(path.clone());
         registry
-            .claim_test("captain-v10", Some("schema-v10"), vec![])
+            .claim_test("captain-v11", Some("schema-v11"), vec![])
             .unwrap();
         let persisted: CaptainsSnapshot =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -20823,8 +20932,8 @@ mod tests {
     }
 
     #[test]
-    fn pre_v10_release_recovery_is_rejected_before_any_recovery_can_run() {
-        let path = captains_tmp("schema-v9-release-recovery");
+    fn pre_v11_release_recovery_is_rejected_before_any_recovery_can_run() {
+        let path = captains_tmp("schema-v10-release-recovery");
         let _ = std::fs::remove_file(&path);
         let registry = powder_lifecycle_registry_with_profile_and_crew(
             None,
@@ -20842,6 +20951,7 @@ mod tests {
                 crew_session_id: crew.terminal_id.clone(),
                 project_id: "project-powder-lifecycle".into(),
                 connection_profile: "legacy-release-profile".into(),
+                connection_endpoint: "http://127.0.0.1:1".into(),
                 repository: "t-hub".into(),
                 card_id: work.card_id.clone(),
                 run_id: work.run_id.clone(),
@@ -20850,13 +20960,13 @@ mod tests {
                 created_at: 1,
                 state: PendingDispatchReleaseState::InFlight,
             });
-        snapshot.schema_version = 9;
+        snapshot.schema_version = 10;
         std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 
         let error = CaptainsRegistry::read_snapshot(&path).unwrap_err();
         assert!(error
             .to_string()
-            .contains("release recovery requires schema version 10 or newer"));
+            .contains("release recovery requires schema version 11 or newer"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -20875,6 +20985,7 @@ mod tests {
             crew_session_id: crew.terminal_id.clone(),
             project_id: "project-powder-lifecycle".into(),
             connection_profile: "pair-profile".into(),
+            connection_endpoint: "http://127.0.0.1:1".into(),
             repository: "t-hub".into(),
             card_id: work.card_id.clone(),
             run_id: work.run_id.clone(),
@@ -20901,6 +21012,18 @@ mod tests {
         let mut missing_record = paired.clone();
         missing_record.pending_dispatch_releases.clear();
         assert!(CaptainsRegistry::validate_snapshot(&missing_record).is_err());
+
+        let mut active_crew = paired.clone();
+        active_crew.captains[0].crew[0].state = CrewState::Active;
+        assert!(CaptainsRegistry::validate_snapshot(&active_crew).is_err());
+
+        let mut malformed_identity = paired.clone();
+        malformed_identity.pending_dispatch_releases[0].card_id = "card\ncontrol".into();
+        assert!(CaptainsRegistry::validate_snapshot(&malformed_identity).is_err());
+
+        let mut oversized_identity = paired.clone();
+        oversized_identity.pending_dispatch_releases[0].operation_id = "x".repeat(513);
+        assert!(CaptainsRegistry::validate_snapshot(&oversized_identity).is_err());
 
         std::fs::write(&path, serde_json::to_vec(&orphan).unwrap()).unwrap();
         assert!(CaptainsRegistry::read_snapshot(&path).is_err());
@@ -26156,6 +26279,13 @@ mod tests {
                 path,
             }
         }
+
+        fn remap_profile_endpoint(&self, profile: &str, addr: SocketAddr) {
+            let mut document: Value =
+                serde_json::from_slice(&std::fs::read(&self.path).unwrap()).unwrap();
+            document["profiles"][profile]["baseUrl"] = json!(format!("http://{addr}"));
+            std::fs::write(&self.path, serde_json::to_vec(&document).unwrap()).unwrap();
+        }
     }
 
     impl Drop for PowderProfileEnv {
@@ -28229,14 +28359,18 @@ mod tests {
         assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
     }
 
-    fn run_post_bind_ambiguous_release_recovery(phase: &'static str, fail_ambiguity_persist: bool) {
+    fn run_post_bind_ambiguous_release_recovery(
+        phase: &'static str,
+        fail_ambiguity_persist: bool,
+        remap_frozen_profile: bool,
+    ) {
         if !tmux_process_tests_available() {
             eprintln!(
                 "run_post_bind_ambiguous_release_recovery: tmux or node not on PATH - skipping"
             );
             return;
         }
-        let server = LoopbackPowderServer::start(5);
+        let server = LoopbackPowderServer::start(if remap_frozen_profile { 4 } else { 6 });
         server.state.lock().unwrap().release_response_failure =
             Some(LoopbackPowderResponseFailure::Eof);
         let replacement_server = LoopbackPowderServer::start(0);
@@ -28400,19 +28534,25 @@ mod tests {
             replacement_profile
         );
 
+        if remap_frozen_profile {
+            _profiles.remap_profile_endpoint(&profile_name, replacement_server.addr);
+        }
         drop(ctx);
         let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
         let (restarted_ctx, _) = dispatch_test_context(restarted.clone());
         reconcile_powder_leases(&restarted_ctx);
         let recovered = restarted.snapshot();
         assert!(recovered.pending_dispatch_claims.is_empty());
-        assert!(recovered.pending_dispatch_releases.is_empty());
+        assert_eq!(
+            recovered.pending_dispatch_releases.len(),
+            usize::from(remap_frozen_profile)
+        );
         let replacement = recovered
             .captains
             .iter()
             .find(|captain| captain.ship_slug == "dispatch-attestation")
             .unwrap();
-        assert!(replacement.crew.is_empty());
+        assert_eq!(replacement.crew.len(), usize::from(remap_frozen_profile));
         assert_eq!(
             recovered.projects[0]
                 .powder
@@ -28424,7 +28564,7 @@ mod tests {
         let state = server.finish().unwrap();
         assert_eq!(state.claim_posts, 1);
         assert_eq!(state.release_posts, 1);
-        assert_eq!(state.run_evidence_gets, 1);
+        assert_eq!(state.run_evidence_gets, usize::from(!remap_frozen_profile));
         assert_eq!(
             state.release_paths,
             vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
@@ -28434,29 +28574,36 @@ mod tests {
             vec![json!({"run_id": "run-authoritative"})]
         );
         assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
-        replacement_server.finish().unwrap();
+        let replacement_state = replacement_server.finish().unwrap();
+        assert_eq!(replacement_state.release_posts, 0);
+        assert_eq!(replacement_state.run_evidence_gets, 0);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn dispatch_ambiguous_release_before_launch_recovers_from_frozen_scope_after_restart() {
-        run_post_bind_ambiguous_release_recovery("before_launch", false);
+        run_post_bind_ambiguous_release_recovery("before_launch", false, false);
     }
 
     #[test]
     fn dispatch_ambiguous_release_before_attestation_persistence_recovers_from_frozen_scope_after_restart(
     ) {
-        run_post_bind_ambiguous_release_recovery("before_attestation_persistence", false);
+        run_post_bind_ambiguous_release_recovery("before_attestation_persistence", false, false);
     }
 
     #[test]
     fn dispatch_ambiguous_release_before_success_recovers_from_frozen_scope_after_restart() {
-        run_post_bind_ambiguous_release_recovery("before_success", false);
+        run_post_bind_ambiguous_release_recovery("before_success", false, false);
     }
 
     #[test]
     fn dispatch_response_loss_with_ambiguous_persistence_failure_recovers_without_blind_repost() {
-        run_post_bind_ambiguous_release_recovery("before_launch", true);
+        run_post_bind_ambiguous_release_recovery("before_launch", true, false);
+    }
+
+    #[test]
+    fn dispatch_release_recovery_refuses_a_remapped_frozen_profile_without_wrong_scope_io() {
+        run_post_bind_ambiguous_release_recovery("before_launch", false, true);
     }
 
     #[test]
@@ -28490,6 +28637,7 @@ mod tests {
             crew_session_id: "prepared-release-crew".into(),
             project_id: "project-powder-lifecycle".into(),
             connection_profile: original_profile.clone(),
+            connection_endpoint: format!("http://{}", original.addr),
             repository: "t-hub".into(),
             card_id: work.card_id,
             run_id: work.run_id,
@@ -28536,6 +28684,100 @@ mod tests {
         assert_eq!(replacement.finish().unwrap().release_posts, 0);
         let _ = std::fs::remove_file(path.with_extension("json.bak"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_release_prepare_persistence_failure_emits_no_release_post_or_cleanup_mutation() {
+        let path = captains_tmp("release-prepare-persist-failure");
+        let _ = std::fs::remove_file(&path);
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            "prepare-failure-profile",
+            "prepare-failure-crew",
+        );
+        let work = registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .clone()
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: "prepare-failure-crew".into(),
+            project_id: "project-powder-lifecycle".into(),
+            connection_profile: "prepare-failure-profile".into(),
+            connection_endpoint: "http://127.0.0.1:1".into(),
+            repository: "t-hub".into(),
+            card_id: work.card_id,
+            run_id: work.run_id,
+            agent: work.agent.unwrap(),
+            operation_id: "initial-claim:actor-t-hub:prepare-failure".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::Prepared,
+        };
+        registry.fail_next_persist("injected release prepare persistence failure");
+        assert!(registry.prepare_dispatch_release(recovery).is_err());
+        let snapshot = registry.snapshot();
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        assert!(matches!(
+            snapshot.captains[0].crew[0].state,
+            CrewState::Active
+        ));
+        assert!(
+            !snapshot.captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .dispatch_release_recovery
+        );
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn confirmed_release_never_clears_a_reused_terminal_without_its_exact_transaction_crew() {
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            None,
+            "clear-reuse-profile",
+            "clear-reuse-crew",
+        );
+        let work = registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .clone()
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: "clear-reuse-crew".into(),
+            project_id: "project-powder-lifecycle".into(),
+            connection_profile: "clear-reuse-profile".into(),
+            connection_endpoint: "http://127.0.0.1:1".into(),
+            repository: "t-hub".into(),
+            card_id: work.card_id,
+            run_id: work.run_id,
+            agent: work.agent.unwrap(),
+            operation_id: "initial-claim:actor-t-hub:clear-reuse".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::Prepared,
+        };
+        registry.prepare_dispatch_release(recovery.clone()).unwrap();
+        {
+            let mut inner = registry.lock();
+            let crew = &mut inner.captains[0].crew[0];
+            crew.state = CrewState::Active;
+            let work = crew.powder_work.as_mut().unwrap();
+            work.card_id = "replacement-card".into();
+            work.run_id = "replacement-run".into();
+            work.agent = Some("replacement-agent".into());
+            work.dispatch_release_recovery = false;
+        }
+        let error = registry
+            .clear_confirmed_dispatch_release(&recovery)
+            .unwrap_err();
+        assert!(error.contains("transaction-owned CleanupPending"));
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.pending_dispatch_releases, vec![recovery]);
+        let replacement = &snapshot.captains[0].crew[0];
+        assert_eq!(replacement.terminal_id, "clear-reuse-crew");
+        assert_eq!(
+            replacement.powder_work.as_ref().unwrap().card_id,
+            "replacement-card"
+        );
     }
 
     #[test]
@@ -28795,6 +29037,8 @@ mod tests {
             );
             assert_eq!(persisted.t_hub_capability.as_deref(), Some("read"));
             assert_eq!(persisted.harness.as_deref(), Some(harness.as_provider()));
+            assert!(restored.pending_dispatch_claims.is_empty());
+            assert!(restored.pending_dispatch_releases.is_empty());
 
             let state = server.finish().unwrap();
             assert_eq!(state.claim_posts, 1);

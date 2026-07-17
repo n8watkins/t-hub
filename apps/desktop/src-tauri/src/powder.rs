@@ -781,6 +781,12 @@ impl Client {
         &self.agent_name
     }
 
+    /// Canonical endpoint selected by the protected profile after validation.
+    /// Durable recovery compares this value before using a profile name again.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn initial_claim_operation_id(&self, card_id: &str) -> Result<String, PowderError> {
         Ok(format!(
             "initial-claim:{}:{}",
