@@ -10591,6 +10591,25 @@ fn rollback_trusted_dispatch(
     claim: &powder::Claim,
     release_recovery: Option<&PendingDispatchRelease>,
 ) -> Result<(), String> {
+    // The originating transaction and every restart or ordinary cleanup
+    // recovery share one per-Crew guard.  Once Prepared is durable, no
+    // consumer may observe it and race the producer through teardown,
+    // transition, release, or exact clear.
+    let _operation_guard = ctx
+        .captains
+        .serialize_crew_powder_operation(crew_session_id, CrewPowderOperationKind::Cleanup);
+    rollback_trusted_dispatch_guarded(ctx, crew_session_id, client, claim, release_recovery)
+}
+
+/// Inner rollback transaction entered only while the exact Crew cleanup guard
+/// is held by the producer or a recovery consumer.
+fn rollback_trusted_dispatch_guarded(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    client: &powder::Client,
+    claim: &powder::Claim,
+    release_recovery: Option<&PendingDispatchRelease>,
+) -> Result<(), String> {
     // Persist the frozen exact-release obligation before tearing down the
     // terminal. A crash after this point can therefore never fall back to a
     // replacement Captain's mutable Project binding.
@@ -28629,6 +28648,194 @@ mod tests {
     #[test]
     fn dispatch_release_recovery_refuses_a_remapped_frozen_profile_without_wrong_scope_io() {
         run_post_bind_ambiguous_release_recovery("before_launch", false, true);
+    }
+
+    fn run_dispatch_release_producer_serialization(
+        rollback_boundary: &'static str,
+        periodic_consumer: bool,
+    ) {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "run_dispatch_release_producer_serialization: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let original = LoopbackPowderServer::start(4);
+        let replacement = LoopbackPowderServer::start(0);
+        let original_profile = format!(
+            "release-producer-original-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let replacement_profile = format!(
+            "release-producer-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profiles = PowderProfileEnv::install_profiles(&[
+            (&original_profile, original.addr),
+            (&replacement_profile, replacement.addr),
+        ]);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &original_profile, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (authority_reached, wait_for_authority) = mpsc::sync_channel(1);
+        let (authority_resume, continue_dispatch) = mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "before_launch",
+            reached: authority_reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": format!("Serialize producer rollback at {rollback_boundary}"),
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let dispatch_ctx = ctx.clone();
+        let producer = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        assert_eq!(
+            wait_for_authority
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach its post-bind authority barrier"),
+            "before_launch"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                &captain.session_id,
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        let mut replacement_project = registry.projects()[0].clone();
+        replacement_project
+            .powder
+            .as_mut()
+            .unwrap()
+            .connection_profile = replacement_profile.clone();
+        replacement_project.powder.as_mut().unwrap().repository = "replacement-repository".into();
+        registry.upsert_project(replacement_project).unwrap();
+        let (rollback_reached, wait_for_rollback) = mpsc::sync_channel(1);
+        let (rollback_resume, continue_rollback) = mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: rollback_boundary,
+            reached: rollback_reached,
+            resume: continue_rollback,
+        }));
+        authority_resume.send(()).unwrap();
+        assert_eq!(
+            wait_for_rollback
+                .recv_timeout(Duration::from_secs(3))
+                .expect("producer did not reach the rollback serialization barrier"),
+            rollback_boundary
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.pending_dispatch_releases.len(), 1);
+        assert_eq!(
+            snapshot.pending_dispatch_releases[0].state,
+            if rollback_boundary == "release_prepared_before_teardown" {
+                PendingDispatchReleaseState::Prepared
+            } else {
+                PendingDispatchReleaseState::InFlight
+            }
+        );
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let consumer_ctx = ctx.clone();
+        let consumer_crew_session_id = crew_session_id.clone();
+        let consumer = std::thread::spawn(move || {
+            if periodic_consumer {
+                reconcile_powder_leases(&consumer_ctx);
+                Ok(())
+            } else {
+                finalize_crew_powder_cleanup(&consumer_ctx, &consumer_crew_session_id, true)
+                    .map(|_| ())
+            }
+        });
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            crew_session_id,
+            "the consumer must queue behind the originating rollback transaction"
+        );
+        rollback_resume.send(()).unwrap();
+        let error = producer.join().unwrap().unwrap_err();
+        assert!(error.contains("authority changed before launch"), "{error}");
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        consumer.join().unwrap().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        assert!(
+            !provider.was_invoked(),
+            "authority rollback must finish before any provider command"
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        let replacement_captain = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement_captain.terminal_id.as_deref(),
+            Some(captain.session_id.as_str())
+        );
+        assert!(replacement_captain.crew.is_empty());
+        assert_eq!(
+            snapshot.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            replacement_profile
+        );
+        let original_state = original.finish().unwrap();
+        assert_eq!(original_state.claim_posts, 1);
+        assert_eq!(original_state.release_posts, 1);
+        assert_eq!(original_state.run_evidence_gets, 0);
+        assert_eq!(
+            original_state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        let replacement_state = replacement.finish().unwrap();
+        assert_eq!(replacement_state.run_evidence_gets, 0);
+        assert_eq!(replacement_state.release_posts, 0);
+    }
+
+    #[test]
+    fn dispatch_release_producer_blocks_periodic_reconcile_before_teardown() {
+        run_dispatch_release_producer_serialization("release_prepared_before_teardown", true);
+    }
+
+    #[test]
+    fn dispatch_release_producer_blocks_ordinary_cleanup_before_teardown() {
+        run_dispatch_release_producer_serialization("release_prepared_before_teardown", false);
+    }
+
+    #[test]
+    fn dispatch_release_producer_blocks_periodic_reconcile_before_release_post() {
+        run_dispatch_release_producer_serialization("release_inflight_before_post", true);
+    }
+
+    #[test]
+    fn dispatch_release_producer_blocks_ordinary_cleanup_before_release_post() {
+        run_dispatch_release_producer_serialization("release_inflight_before_post", false);
     }
 
     #[test]
