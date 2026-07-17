@@ -12858,6 +12858,27 @@ mod tests {
         (bin_dir, command)
     }
 
+    /// Tear down a real tmux fixture and prove the named session is absent.
+    ///
+    /// tmux can remove its final session successfully and then return
+    /// `server exited unexpectedly` while the server shuts down. Production
+    /// continues to surface that error. Tests tolerate only that exact teardown
+    /// race, and only after a separate liveness probe proves the fixture is gone.
+    fn reap_test_tmux_session_and_assert_absent(target: &str) {
+        let teardown = tmux::kill_session_tree(target);
+        assert_eq!(
+            tmux::session_liveness(target),
+            tmux::SessionLiveness::Gone,
+            "tmux test fixture '{target}' survived teardown: {teardown:?}"
+        );
+        if let Err(error) = teardown {
+            assert_eq!(
+                error.message, "server exited unexpectedly",
+                "tmux test fixture '{target}' reported an unexpected teardown failure"
+            );
+        }
+    }
+
     fn process_permission_attestation(
         expected: Harness,
         executable_name: &str,
@@ -12920,7 +12941,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
-        tmux::kill_session_tree(&target).unwrap();
+        reap_test_tmux_session_and_assert_absent(&target);
         let _ = std::fs::remove_dir_all(fixture_dir);
         Some(result)
     }
@@ -21137,7 +21158,7 @@ mod tests {
                 .permission,
             PermMode::BypassPermissions
         );
-        tmux::kill_session_tree(&codex_target).unwrap();
+        reap_test_tmux_session_and_assert_absent(&codex_target);
 
         let failed_observer = FakeCodexObserver::new(23);
         let blocked_codex =
@@ -21163,7 +21184,7 @@ mod tests {
             tmux::SessionLiveness::Alive,
             "the owning shell remains available for transactional rollback"
         );
-        tmux::kill_session_tree(&blocked_target).unwrap();
+        reap_test_tmux_session_and_assert_absent(&blocked_target);
 
         let claude_observer = FakeCodexObserver::new(23);
         let claude = FakeHarnessCommand::new(Harness::Claude, "--dangerously-skip-permissions");
@@ -21189,7 +21210,7 @@ mod tests {
             .permission,
             PermMode::BypassPermissions
         );
-        tmux::kill_session_tree(&claude_target).unwrap();
+        reap_test_tmux_session_and_assert_absent(&claude_target);
     }
 
     #[test]
