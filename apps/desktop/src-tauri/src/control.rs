@@ -25226,6 +25226,7 @@ mod tests {
         release_response_run_id: Option<String>,
         claim_posts: usize,
         release_posts: usize,
+        release_paths: Vec<String>,
         release_bodies: Vec<Value>,
         release_receipt_card_id: Option<String>,
         release_receipt_run_id: Option<String>,
@@ -25596,6 +25597,7 @@ mod tests {
     struct FakeHarnessCommand {
         fixture_dir: PathBuf,
         command: String,
+        invocation_path: PathBuf,
     }
 
     impl FakeHarnessCommand {
@@ -25607,9 +25609,13 @@ mod tests {
             ));
             std::fs::create_dir_all(&fixture_dir).unwrap();
             let executable = fixture_dir.join(harness.as_provider());
+            let invocation_path = fixture_dir.join("invoked");
             std::fs::write(
                 &executable,
-                "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n",
+                format!(
+                    "#!/usr/bin/env node\nrequire('fs').writeFileSync({}, 'invoked\\n');\nsetInterval(() => {{}}, 1000);\n",
+                    serde_json::to_string(&invocation_path).unwrap()
+                ),
             )
             .unwrap();
             #[cfg(unix)]
@@ -25626,7 +25632,12 @@ mod tests {
             Self {
                 fixture_dir,
                 command,
+                invocation_path,
             }
+        }
+
+        fn was_invoked(&self) -> bool {
+            self.invocation_path.exists()
         }
     }
 
@@ -25728,8 +25739,11 @@ mod tests {
             let command = FakeHarnessCommand::new(harness, flags);
             let session_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
             let target = tmux_target(&session_id);
-            create_test_tmux_session(&target).unwrap();
-            tmux::send_text(&target, &command.command, true).unwrap();
+            // Start the hermetic Captain command as tmux's session command.
+            // Injecting it into a freshly created zsh pane races zsh startup and
+            // intermittently loses the input before liveness can observe Codex.
+            // Crew dispatch tests still exercise the real zsh launch path.
+            tmux::new_session_with_env(&target, "/tmp", Some(&command.command), &[]).unwrap();
             wait_for_harness_started(&session_id, harness.as_provider()).unwrap();
             Self {
                 session_id,
@@ -26185,6 +26199,7 @@ mod tests {
             ("POST", path) if path.ends_with("/release") => {
                 let mut state = state.lock().unwrap();
                 state.release_posts += 1;
+                state.release_paths.push(path.to_string());
                 state.release_bodies.push(body.clone());
                 let response_run_id = state
                     .release_receipt_run_id
@@ -27279,12 +27294,37 @@ mod tests {
             Err(LaunchAttestationError::TerminalChanged)
         );
 
-        let process_changed =
-            dispatch_race_evidence(&["zsh"], 101, 123_456, &[(42, 901), (7, 100)]);
+        let process_changed = HarnessProcessEvidence::test_with_context(
+            43,
+            901,
+            8,
+            100,
+            &["zsh"],
+            123_456,
+            7,
+            &[(42, 900), (7, 100)],
+        );
         let mut process =
             std::collections::VecDeque::from(vec![Ok(stable.clone()), Ok(process_changed)]);
         assert_eq!(
             observe_dispatch_baseline(&mut |_| process.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::ProcessChanged)
+        );
+
+        let executable_changed = HarnessProcessEvidence::test_with_context(
+            42,
+            900,
+            8,
+            101,
+            &["zsh"],
+            123_456,
+            7,
+            &[(42, 900), (7, 100)],
+        );
+        let mut executable =
+            std::collections::VecDeque::from(vec![Ok(stable.clone()), Ok(executable_changed)]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| executable.pop_front().unwrap(), "th-test"),
             Err(LaunchAttestationError::ProcessChanged)
         );
 
@@ -27332,6 +27372,8 @@ mod tests {
         let captain = FakeHarnessSession::start(Harness::Codex);
         let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
         let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
         let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
         let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
         registry.set_dispatch_barrier(Some(DispatchBarrier {
@@ -27344,6 +27386,7 @@ mod tests {
             "cardId": "thub-powder-control-lifecycle",
             "task": "Reject a replacement after stable zsh baseline",
             "harness": "codex",
+            "testHarnessCommand": provider.command,
         });
         let dispatch_ctx = ctx.clone();
         let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
@@ -27381,17 +27424,227 @@ mod tests {
             tmux::session_liveness(&tmux_target(&crew_session_id)),
             tmux::SessionLiveness::Gone
         );
-        assert!(registry
-            .snapshot()
+        assert!(
+            !provider.was_invoked(),
+            "authority revocation before provider send must not execute the provider command"
+        );
+        let snapshot = registry.snapshot();
+        let replacement = snapshot
             .captains
             .iter()
             .find(|captain| captain.ship_slug == "dispatch-attestation")
-            .unwrap()
-            .crew
-            .is_empty());
+            .unwrap();
+        assert_eq!(
+            replacement.terminal_id.as_deref(),
+            Some("replacement-captain")
+        );
+        assert!(replacement.crew.is_empty());
+        assert!(snapshot.pending_dispatch_claims.is_empty());
         let state = server.finish().unwrap();
         assert_eq!(state.claim_posts, 1);
         assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_paths,
+            vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
+        );
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
+    }
+
+    #[test]
+    fn dispatch_same_terminal_reclaim_after_stable_baseline_rejects_before_provider_send() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_same_terminal_reclaim_after_stable_baseline_rejects_before_provider_send: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!(
+            "dispatch-stable-baseline-aba-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "after_stable_baseline",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Reject same-terminal Captain ABA after stable baseline",
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach the stable-baseline barrier"),
+            "after_stable_baseline"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                &captain.session_id,
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        let mut replacement_project = registry
+            .projects()
+            .into_iter()
+            .find(|project| project.project_id == "project-dispatch-attestation")
+            .unwrap();
+        replacement_project
+            .powder
+            .as_mut()
+            .unwrap()
+            .connection_profile = "replacement-powder-profile".into();
+        registry.upsert_project(replacement_project).unwrap();
+        resume.send(()).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            error.contains("after stable baseline before provider send"),
+            "{error}"
+        );
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        assert!(
+            !provider.was_invoked(),
+            "same-terminal ABA must be rejected before the provider command executes"
+        );
+        let snapshot = registry.snapshot();
+        let replacement = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement.terminal_id.as_deref(),
+            Some(captain.session_id.as_str())
+        );
+        assert!(replacement.crew.is_empty());
+        assert_eq!(
+            snapshot.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            "replacement-powder-profile"
+        );
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_paths,
+            vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
+        );
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
+    }
+
+    #[test]
+    fn dispatch_exhausted_unreadable_baseline_releases_exact_claim_without_provider_send() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_exhausted_unreadable_baseline_releases_exact_claim_without_provider_send: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!(
+            "dispatch-unreadable-baseline-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Fail closed when the stable baseline remains unreadable",
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let mut attempts = 0;
+        let error = dispatch_crew_with_observer_inner(
+            &ctx,
+            &args,
+            None,
+            true,
+            &mut |_| {
+                attempts += 1;
+                Err(LaunchAttestationError::UnreadableEvidence)
+            },
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 8);
+        assert!(
+            error.contains("launch attestation baseline failed: provider-native process evidence is unreadable"),
+            "{error}"
+        );
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        assert!(
+            !provider.was_invoked(),
+            "an exhausted baseline must not execute the provider command"
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.captains[0].crew.is_empty());
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_paths,
+            vec!["/api/v1/cards/thub-powder-control-lifecycle/release"]
+        );
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        assert_eq!(state.issued_claim_agent.as_deref(), Some("t-hub"));
     }
 
     #[test]
