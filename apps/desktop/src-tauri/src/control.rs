@@ -1723,6 +1723,13 @@ struct CaptainsInner {
 
 static NEXT_AUTHORITY_REGISTRY_EPOCH: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+struct DispatchBarrier {
+    boundary: &'static str,
+    reached: std::sync::mpsc::SyncSender<&'static str>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
 fn next_authority_registry_epoch() -> u64 {
     NEXT_AUTHORITY_REGISTRY_EPOCH
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -1766,6 +1773,8 @@ pub struct CaptainsRegistry {
     powder_operation_wait_hook: Mutex<Option<std::sync::mpsc::SyncSender<String>>>,
     #[cfg(test)]
     historical_scope_capture_hook: Mutex<Option<HistoricalScopeCaptureHook>>,
+    #[cfg(test)]
+    dispatch_barrier: Mutex<Option<DispatchBarrier>>,
     /// Persistence target; `None` = in-memory only (unit tests / headless proofs).
     path: Option<PathBuf>,
     /// Set when a newer on-disk schema is encountered. The old binary may expose
@@ -1842,6 +1851,28 @@ fn slugify_ship(name: &str) -> String {
 }
 
 impl CaptainsRegistry {
+    #[cfg(test)]
+    fn pause_dispatch(&self, boundary: &'static str) {
+        let mut configured = self.dispatch_barrier.lock().unwrap();
+        let barrier = configured.take();
+        if barrier
+            .as_ref()
+            .is_some_and(|configured_barrier| configured_barrier.boundary != boundary)
+        {
+            *configured = barrier;
+            return;
+        }
+        drop(configured);
+        if let Some(barrier) = barrier {
+            let _ = barrier.reached.send(boundary);
+            let _ = barrier.resume.recv();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_dispatch_barrier(&self, barrier: Option<DispatchBarrier>) {
+        *self.dispatch_barrier.lock().unwrap() = barrier;
+    }
     fn serialize_crew_powder_operation(
         &self,
         crew_session_id: &str,
@@ -1891,6 +1922,8 @@ impl CaptainsRegistry {
             powder_operation_wait_hook: Mutex::new(None),
             #[cfg(test)]
             historical_scope_capture_hook: Mutex::new(None),
+            #[cfg(test)]
+            dispatch_barrier: Mutex::new(None),
             path: None,
             write_blocked: None,
             persist: Mutex::new(0),
@@ -2011,6 +2044,8 @@ impl CaptainsRegistry {
             powder_operation_wait_hook: Mutex::new(None),
             #[cfg(test)]
             historical_scope_capture_hook: Mutex::new(None),
+            #[cfg(test)]
+            dispatch_barrier: Mutex::new(None),
             path: Some(path),
             write_blocked,
             persist: Mutex::new(loaded_seq),
@@ -2762,6 +2797,29 @@ impl CaptainsRegistry {
         branch: Option<&str>,
         powder_work: PowderWorkBinding,
     ) -> Result<CrewRef, String> {
+        self.bind_crew_context_exact(
+            captain_session_id,
+            crew_session_id,
+            task,
+            harness,
+            worktree_path,
+            branch,
+            powder_work,
+            None,
+        )
+    }
+
+    fn bind_crew_context_exact(
+        &self,
+        captain_session_id: &str,
+        crew_session_id: &str,
+        task: &str,
+        harness: &str,
+        worktree_path: Option<&str>,
+        branch: Option<&str>,
+        powder_work: PowderWorkBinding,
+        expected_generation: Option<ScopedAuthorityGeneration>,
+    ) -> Result<CrewRef, String> {
         if task.trim().is_empty() {
             return Err("crew task must not be empty".into());
         }
@@ -2769,6 +2827,22 @@ impl CaptainsRegistry {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
         let previous = g.clone();
+        if let Some(expected) = expected_generation {
+            let captain = g
+                .captains
+                .iter()
+                .find(|captain| captain.terminal_id.as_deref() == Some(captain_session_id))
+                .ok_or_else(|| format!("unknown Captain session '{captain_session_id}'"))?;
+            let current = g.authority_generations.scoped(
+                self.authority_epoch,
+                &captain.ship_slug,
+                crew_session_id,
+                captain.project_id.as_deref().unwrap_or(""),
+            );
+            if current != expected {
+                return Err("acl: dispatch authority changed; refusing Crew bind".into());
+            }
+        }
         let captain = g
             .captains
             .iter_mut()
@@ -9829,13 +9903,24 @@ fn captain_and_project_for_dispatch(
 fn revalidate_dispatch_authority(
     ctx: &ControlContext,
     args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
     expected_captain: &CaptainRecord,
     expected_project: &ProjectRecord,
+    expected_generation: ScopedAuthorityGeneration,
 ) -> Result<(), String> {
     let (captain, project) = captain_and_project_for_dispatch(ctx, args).map_err(|_| {
         "acl: dispatch authority changed; retry from the current Captain".to_string()
     })?;
-    if captain.terminal_id != expected_captain.terminal_id
+    let (_, generations, registry_epoch) = ctx.captains.snapshot_with_authority_generations();
+    let current_generation = generations.scoped(
+        registry_epoch,
+        &expected_captain.ship_slug,
+        "",
+        &expected_project.project_id,
+    );
+    if current_generation != expected_generation
+        || captain.terminal_id != expected_captain.terminal_id
         || captain.ship_slug != expected_captain.ship_slug
         || captain.project_id != expected_captain.project_id
         || project.project_id != expected_project.project_id
@@ -9844,6 +9929,9 @@ fn revalidate_dispatch_authority(
     {
         return Err("acl: dispatch authority changed; retry from the current Captain".into());
     }
+    enforce_ship_authority(caller, trusted_internal, &captain.ship_slug).map_err(|_| {
+        "acl: dispatch authority changed; retry from the current Captain".to_string()
+    })?;
     Ok(())
 }
 
@@ -10094,6 +10182,14 @@ fn dispatch_crew_with_observer(
 ) -> Result<Value, String> {
     require_socket_identity(caller, trusted_internal, "dispatch_crew")?;
     let (captain, project) = captain_and_project_for_dispatch(ctx, args)?;
+    let (_, authority_generations, authority_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    let dispatch_generation = authority_generations.scoped(
+        authority_epoch,
+        &captain.ship_slug,
+        "",
+        captain.project_id.as_deref().unwrap_or(""),
+    );
     enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
     let captain_session_id = captain.terminal_id.as_deref().unwrap().to_string();
     let binding = project.powder.as_ref().ok_or_else(|| {
@@ -10168,7 +10264,26 @@ fn dispatch_crew_with_observer(
         &card_id,
         authoritative_run_id,
     )?;
-    revalidate_dispatch_authority(ctx, args, &captain, &project)?;
+    revalidate_dispatch_authority(
+        ctx,
+        args,
+        caller,
+        trusted_internal,
+        &captain,
+        &project,
+        dispatch_generation,
+    )?;
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("after_preflight");
+    revalidate_dispatch_authority(
+        ctx,
+        args,
+        caller,
+        trusted_internal,
+        &captain,
+        &project,
+        dispatch_generation,
+    )?;
 
     let mut spawn_args = json!({
         "cwd": checkout,
@@ -10219,7 +10334,27 @@ fn dispatch_crew_with_observer(
             });
         }
     };
-    let _crew = match ctx.captains.bind_crew_context(
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("after_claim");
+    revalidate_dispatch_authority(
+        ctx,
+        args,
+        caller,
+        trusted_internal,
+        &captain,
+        &project,
+        dispatch_generation,
+    )?;
+    let (_, bind_generations, bind_epoch) = ctx.captains.snapshot_with_authority_generations();
+    let bind_generation = bind_generations.scoped(
+        bind_epoch,
+        &captain.ship_slug,
+        &crew_session_id,
+        &project.project_id,
+    );
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("before_bind");
+    let _crew = match ctx.captains.bind_crew_context_exact(
         &captain_session_id,
         &crew_session_id,
         &task,
@@ -10234,15 +10369,24 @@ fn dispatch_crew_with_observer(
             mutation_intent: None,
             state: PowderWorkState::Active,
         },
+        Some(bind_generation),
     ) {
         Ok(crew) => crew,
         Err(error) => {
             let rollback =
                 rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
-            return Err(dispatch_rollback_error(
-                format!("dispatch_crew: durable Crew binding failed: {error}"),
-                rollback,
-            ));
+            let primary = format!("dispatch_crew: durable Crew binding failed: {error}");
+            return match rollback {
+                Ok(()) => match ctx.captains.clear_pending_dispatch_claim(&pending_claim) {
+                    Ok(_) => Err(format!("{primary} and all side effects were rolled back")),
+                    Err(clear_error) => Err(format!(
+                        "{primary}; the exact claim was released, but initial-claim recovery intent could not be cleared: {clear_error}; redispatch remains blocked"
+                    )),
+                },
+                Err(rollback_error) => Err(format!(
+                    "{primary}; rollback is incomplete: {rollback_error}; initial-claim recovery remains pending and redispatch is blocked"
+                )),
+            };
         }
     };
     if let Err(error) = ctx.captains.clear_pending_dispatch_claim(&pending_claim) {
@@ -10254,7 +10398,26 @@ fn dispatch_crew_with_observer(
         "You are Crew on ship '{}'. Work only Powder card '{}' in run '{}'. Task: {} Use checkout '{}'. Report progress, blockers, and completion to Captain session '{}'. Do not claim other work or spawn additional agents.",
         captain.ship_slug, claim.card_id, claim.run_id, task, checkout, captain_session_id
     );
-    revalidate_dispatch_authority(ctx, args, &captain, &project)?;
+    revalidate_dispatch_authority(
+        ctx,
+        args,
+        caller,
+        trusted_internal,
+        &captain,
+        &project,
+        dispatch_generation,
+    )?;
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("before_launch");
+    revalidate_dispatch_authority(
+        ctx,
+        args,
+        caller,
+        trusted_internal,
+        &captain,
+        &project,
+        dispatch_generation,
+    )?;
     let tmux_target = tmux_target(&crew_session_id);
     let before_launch = match observer(&tmux_target) {
         Ok(evidence) => evidence,
@@ -10355,7 +10518,27 @@ fn dispatch_crew_with_observer(
             ));
         }
     };
-    revalidate_dispatch_authority(ctx, args, &captain, &project)?;
+    revalidate_dispatch_authority(
+        ctx,
+        args,
+        caller,
+        trusted_internal,
+        &captain,
+        &project,
+        dispatch_generation,
+    )?;
+    #[cfg(test)]
+    ctx.captains
+        .pause_dispatch("before_attestation_persistence");
+    revalidate_dispatch_authority(
+        ctx,
+        args,
+        caller,
+        trusted_internal,
+        &captain,
+        &project,
+        dispatch_generation,
+    )?;
     let crew =
         match ctx
             .captains
@@ -10394,7 +10577,26 @@ fn dispatch_crew_with_observer(
         }
     };
     let _ = captains_sync_apply(ctx);
-    revalidate_dispatch_authority(ctx, args, &captain, &project)?;
+    revalidate_dispatch_authority(
+        ctx,
+        args,
+        caller,
+        trusted_internal,
+        &captain,
+        &project,
+        dispatch_generation,
+    )?;
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("before_success");
+    revalidate_dispatch_authority(
+        ctx,
+        args,
+        caller,
+        trusted_internal,
+        &captain,
+        &project,
+        dispatch_generation,
+    )?;
     Ok(json!({
         "accepted": "dispatch_crew",
         "audited": true,
@@ -24945,6 +25147,7 @@ mod tests {
         renewal_receipt_agent: Option<String>,
         claim_receipt_card_id: Option<String>,
         claim_receipt_agent: Option<String>,
+        claim_response_body: Option<Value>,
         claim_response_failure: Option<LoopbackPowderResponseFailure>,
         issued_claim_agent: Option<String>,
         renew_posts: usize,
@@ -25883,12 +26086,13 @@ mod tests {
                     .clone()
                     .unwrap_or_else(|| "t-hub".into());
                 state.issued_claim_agent = Some(response_agent.clone());
+                let response_body = state.claim_response_body.clone();
                 let response_failure = state.claim_response_failure;
                 drop(state);
                 if response_failure == Some(LoopbackPowderResponseFailure::Eof) {
                     return Ok(());
                 }
-                json!({"card_id": response_card_id, "run_id": "run-authoritative", "agent": response_agent, "expires_at": 100})
+                response_body.unwrap_or_else(|| json!({"card_id": response_card_id, "run_id": "run-authoritative", "agent": response_agent, "expires_at": 100}))
             }
             ("POST", path) if path.ends_with("/release") => {
                 let mut state = state.lock().unwrap();
@@ -26553,6 +26757,350 @@ mod tests {
             assert_eq!(state.claim_posts, 1);
             assert_eq!(state.release_posts, 0);
         }
+    }
+
+    #[test]
+    fn dispatch_rejects_malformed_initial_claim_before_durable_binding_or_provider_launch() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_rejects_malformed_initial_claim_before_durable_binding_or_provider_launch: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(3);
+        server.state.lock().unwrap().claim_response_body = Some(json!({
+            "card_id": "thub-powder-control-lifecycle",
+            "run_id": "run-authoritative",
+            "agent": " \t ",
+            "expires_at": 100,
+        }));
+        let profile_name = format!("dispatch-malformed-claim-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let error = dispatch_crew(
+            &ctx,
+            &json!({
+                "captainSessionId": captain.session_id,
+                "cardId": "thub-powder-control-lifecycle",
+                "task": "Reject malformed initial claim before launch",
+                "harness": "codex",
+            }),
+            None,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("Powder claim response has invalid agent"),
+            "{error}"
+        );
+        assert!(error.contains("pending authoritative recovery"), "{error}");
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.captains[0].crew.is_empty());
+        assert_eq!(snapshot.pending_dispatch_claims.len(), 1);
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn dispatch_distinct_captain_replacement_after_preflight_denies_before_spawn_or_claim() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_distinct_captain_replacement_after_preflight_denies_before_spawn_or_claim: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(2);
+        let profile_name = format!(
+            "dispatch-preflight-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "after_preflight",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Reject a distinct Captain replacement before spawn",
+            "harness": "codex",
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(2))
+                .expect("dispatch did not reach its preflight barrier"),
+            "after_preflight"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                "replacement-captain",
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        resume.send(()).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(
+            error,
+            "acl: dispatch authority changed; retry from the current Captain"
+        );
+        assert!(
+            sink.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(command, _)| command != "spawn_terminal"),
+            "a rejected pre-spawn dispatch must not create a Crew terminal"
+        );
+        let replacement = registry
+            .snapshot()
+            .captains
+            .into_iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement.terminal_id.as_deref(),
+            Some("replacement-captain")
+        );
+        assert!(replacement.crew.is_empty());
+        assert!(registry.snapshot().pending_dispatch_claims.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 0);
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn dispatch_same_terminal_reclaim_after_claim_fails_bind_cas_and_preserves_replacement() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_same_terminal_reclaim_after_claim_fails_bind_cas_and_preserves_replacement: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!(
+            "dispatch-bind-cas-reclaim-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "before_bind",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Reject a same-terminal reclaim at bind CAS",
+            "harness": "codex",
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(2))
+                .expect("dispatch did not reach its bind barrier"),
+            "before_bind"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                &captain.session_id,
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        let mut replacement_project = registry
+            .projects()
+            .into_iter()
+            .find(|project| project.project_id == "project-dispatch-attestation")
+            .unwrap();
+        replacement_project
+            .powder
+            .as_mut()
+            .unwrap()
+            .connection_profile = "replacement-powder-profile".into();
+        registry.upsert_project(replacement_project).unwrap();
+        resume.send(()).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            error.contains("acl: dispatch authority changed; refusing Crew bind"),
+            "{error}"
+        );
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        let snapshot = registry.snapshot();
+        let replacement = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert_eq!(
+            replacement.terminal_id.as_deref(),
+            Some(captain.session_id.as_str())
+        );
+        assert!(replacement.crew.is_empty());
+        assert_eq!(
+            snapshot.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            "replacement-powder-profile"
+        );
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
+        assert_eq!(
+            state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+    }
+
+    #[test]
+    fn dispatch_bind_cas_release_ambiguity_retains_only_recovery_intent() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_bind_cas_release_ambiguity_retains_only_recovery_intent: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start_with_blocked_release_failure(4);
+        let profile_name = format!(
+            "dispatch-bind-cas-ambiguous-release-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "before_bind",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Preserve initial-claim recovery after an ambiguous release",
+            "harness": "codex",
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(2))
+                .expect("dispatch did not reach its bind barrier"),
+            "before_bind"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                &captain.session_id,
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        let mut replacement_project = registry
+            .projects()
+            .into_iter()
+            .find(|project| project.project_id == "project-dispatch-attestation")
+            .unwrap();
+        replacement_project
+            .powder
+            .as_mut()
+            .unwrap()
+            .connection_profile = "replacement-powder-profile".into();
+        registry.upsert_project(replacement_project).unwrap();
+        resume.send(()).unwrap();
+        server
+            .post_started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bind rollback did not attempt the exact trusted release");
+        server.release_post.send(()).unwrap();
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            error.contains("acl: dispatch authority changed; refusing Crew bind"),
+            "{error}"
+        );
+        assert!(error.contains("rollback is incomplete"), "{error}");
+        assert!(
+            error.contains("initial-claim recovery remains pending"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.pending_dispatch_claims.len(), 1);
+        let replacement = snapshot
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap();
+        assert!(replacement
+            .crew
+            .iter()
+            .all(|crew| crew.powder_work.is_none()));
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
     }
 
     #[test]

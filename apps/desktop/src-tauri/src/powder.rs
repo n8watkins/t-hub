@@ -3008,7 +3008,7 @@ fn required_string(value: &Value, key: &str) -> Result<String, String> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| format!("Powder claim response is missing {key}"))?;
-    if identity.is_empty()
+    if identity.trim().is_empty()
         || identity.len() > MAX_CLAIM_IDENTITY_BYTES
         || identity.bytes().any(|byte| byte.is_ascii_control())
     {
@@ -3343,6 +3343,65 @@ mod tests {
         assert_eq!(claim.agent, "terminal-1");
         assert_eq!(claim.expires_at, 123);
         assert!(parse_claim(json!({ "card_id": "card-1" })).is_err());
+    }
+
+    #[test]
+    fn claim_response_rejects_empty_whitespace_control_and_oversized_identities() {
+        for key in ["card_id", "run_id", "agent"] {
+            for invalid in [
+                "",
+                " \t ",
+                "run\n1",
+                &"x".repeat(MAX_CLAIM_IDENTITY_BYTES + 1),
+            ] {
+                let mut receipt = json!({
+                    "card_id": "card-1",
+                    "run_id": "run-1",
+                    "agent": "t-hub",
+                    "expires_at": 123,
+                });
+                receipt[key] = json!(invalid);
+                let error = parse_claim(receipt).unwrap_err();
+                assert_eq!(error, format!("Powder claim response has invalid {key}"));
+            }
+        }
+    }
+
+    #[test]
+    fn claim_response_accepts_identities_at_the_exact_byte_boundary() {
+        let boundary = "x".repeat(MAX_CLAIM_IDENTITY_BYTES);
+        let claim = parse_claim(json!({
+            "card_id": boundary,
+            "run_id": "r".repeat(MAX_CLAIM_IDENTITY_BYTES),
+            "agent": "a".repeat(MAX_CLAIM_IDENTITY_BYTES),
+            "expires_at": 123,
+        }))
+        .unwrap();
+        assert_eq!(claim.card_id.len(), MAX_CLAIM_IDENTITY_BYTES);
+        assert_eq!(claim.run_id.len(), MAX_CLAIM_IDENTITY_BYTES);
+        assert_eq!(claim.agent.len(), MAX_CLAIM_IDENTITY_BYTES);
+    }
+
+    #[test]
+    fn claim_response_body_is_bounded_before_json_parsing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(request.starts_with("POST /api/v1/cards/card-1/claim "));
+            let body = "x".repeat(MAX_CLAIM_RESPONSE_BYTES + 1);
+            write_json_response(&mut stream, "200 OK", &body);
+        });
+
+        let error = test_client(addr).claim("card-1", 3600).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "Powder evidence response is invalid: response exceeds the {MAX_CLAIM_RESPONSE_BYTES}-byte limit"
+            )
+        );
+        server.join().unwrap();
     }
 
     #[test]
