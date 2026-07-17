@@ -343,6 +343,12 @@ The test proves one original-scope release POST, two original-scope evidence rea
 It then simulates process death by dropping the barrier resume, reloads the registry, validates the original repository and exact card/run/agent evidence, sends the only release POST from recovery, and proves the terminated transaction cannot post after restart.
 The test proves the transaction terminal is gone before restart, no provider command ran, the recovered registry has no durable Crew, pending claim, or pending release, and the replacement profile receives zero evidence or release I/O.
 The test-only post-barrier check compares the durable `InFlight` record, not the pre-transition `Prepared` value, so normal rollback paths retain their exact release behavior.
+Final clean-head verification for `e2b2148` and this evidence update passed 27 serialized dispatch tests with one existing real-agent test intentionally ignored, 63 serialized control Powder tests, 30 Powder client tests, 15 Harness tests, 55 agent unit tests, 3 Codex TAP E2E tests, 1 unobserved agent E2E test, 7 close tests, and the foreign close or heartbeat authority regression.
+The CLI suite passed 47 unit tests and 10 Powder contract tests.
+The MCP library and binary suites passed 16 and 75 tests respectively.
+`cargo fmt --all -- --check`, `cargo clippy -p t-hub -p t-hub-agent --all-targets -- -D warnings`, `git diff --check`, and `git diff --cached --check` passed.
+Tracked worktree cleanliness passed.
+The only remaining worktree entry is the protected untracked `CLAUDE.md`, which this work did not modify.
 
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
 No independent reviewer has approved this integration yet.
