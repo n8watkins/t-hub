@@ -9904,6 +9904,7 @@ const MAX_CREW_EVIDENCE_ITEMS: usize = 20;
 #[serde(rename_all = "camelCase")]
 struct CrewCriterionProof {
     criterion: usize,
+    criterion_id: String,
     url: String,
 }
 
@@ -9965,7 +9966,7 @@ fn parse_completion_proof(args: &Value) -> Result<CrewCompletionProof, String> {
             .ok_or("complete_crew_powder criterion proof must be an object")?;
         if let Some(unexpected) = object
             .keys()
-            .find(|key| !matches!(key.as_str(), "criterion" | "url"))
+            .find(|key| !matches!(key.as_str(), "criterion" | "criterionId" | "url"))
         {
             return Err(format!(
                 "complete_crew_powder criterion proof has unexpected field '{unexpected}'"
@@ -9982,6 +9983,15 @@ fn parse_completion_proof(args: &Value) -> Result<CrewCompletionProof, String> {
                 "complete_crew_powder criterion {criterion} appears more than once"
             ));
         }
+        let criterion_id = object
+            .get("criterionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("complete_crew_powder criterion proof requires a non-empty criterionId")?;
+        if criterion_id.len() > 256 {
+            return Err("complete_crew_powder criterion proof criterionId is too long".into());
+        }
         let url = object
             .get("url")
             .and_then(Value::as_str)
@@ -9996,6 +10006,7 @@ fn parse_completion_proof(args: &Value) -> Result<CrewCompletionProof, String> {
         }
         criterion_proofs.push(CrewCriterionProof {
             criterion,
+            criterion_id: criterion_id.to_string(),
             url: url.to_string(),
         });
     }
@@ -10411,12 +10422,18 @@ fn validate_completion_criteria(
         }
     }
     for criterion_proof in &proof.criterion_proofs {
-        if !criteria
+        let Some(criterion) = criteria
             .iter()
-            .any(|criterion| criterion.criterion_index == criterion_proof.criterion)
-        {
+            .find(|criterion| criterion.criterion_index == criterion_proof.criterion)
+        else {
             return Err(format!(
                 "completion proof references missing acceptance criterion {}",
+                criterion_proof.criterion
+            ));
+        };
+        if criterion.criterion_id != criterion_proof.criterion_id {
+            return Err(format!(
+                "completion proof criterion {} has a stale criterion identity",
                 criterion_proof.criterion
             ));
         }
@@ -10424,11 +10441,11 @@ fn validate_completion_criteria(
     Ok(())
 }
 
-fn completion_matches_evidence(
+fn completion_receipt_matches_evidence(
     scope: &CrewPowderScope,
     card: &powder::CardEvidence,
     run: &powder::RunEvidence,
-    proof: &CrewCompletionProof,
+    receipt: &powder::CompletionReceipt,
 ) -> Result<(), String> {
     if bound_powder_reality(scope, card, run)? != BoundPowderReality::Completed {
         return Err(format!(
@@ -10436,13 +10453,13 @@ fn completion_matches_evidence(
             scope.work.card_id, scope.work.run_id
         ));
     }
-    if run.run.proof.as_deref() != Some(proof.proof.as_str()) {
+    if run.run.proof.as_deref() != receipt.proof.as_deref() {
         return Err(format!(
             "Powder run '{}' completion proof does not match this request",
             scope.work.run_id
         ));
     }
-    for expected in &proof.criterion_proofs {
+    for expected in &receipt.criterion_proofs {
         let criterion = card
             .criteria
             .iter()
@@ -10459,7 +10476,7 @@ fn completion_matches_evidence(
             .any(|link| link.url == expected.url)
         {
             return Err(format!(
-                "Powder completion is missing the submitted proof for acceptance criterion {}",
+                "Powder completion evidence does not contain the authoritative proof for acceptance criterion {}",
                 expected.criterion
             ));
         }
@@ -11054,6 +11071,7 @@ fn completion_success(
     intent_digest: &str,
     card: &powder::CardEvidence,
     run: &powder::RunEvidence,
+    receipt: Option<&powder::CompletionReceipt>,
     outcome: &str,
 ) -> Result<Value, String> {
     ctx.captains
@@ -11083,6 +11101,7 @@ fn completion_success(
         "runId": run.run.run_id,
         "cardStatus": card.status,
         "runState": run.run.state,
+        "receipt": receipt,
         "criteria": card.criteria,
     }))
 }
@@ -11092,11 +11111,12 @@ fn verify_completion_receipt(
     operation_id: &str,
     receipt: &powder::CompletionReceipt,
     proof: &CrewCompletionProof,
-) -> Result<CrewCompletionProof, String> {
+) -> Result<(), String> {
     if receipt.card_id != scope.work.card_id
         || receipt.run_id != scope.work.run_id
         || receipt.operation_id != operation_id
         || receipt.status != "done"
+        || receipt.proof.as_deref().is_none_or(str::is_empty)
         || receipt.criterion_proofs.len() != proof.criterion_proofs.len()
     {
         return Err(
@@ -11104,35 +11124,19 @@ fn verify_completion_receipt(
             .into(),
         );
     }
-    let normalized_proof = receipt
-        .proof
-        .as_deref()
-        .map(str::trim)
-        .filter(|proof| !proof.is_empty())
-        .ok_or_else(|| {
-            "Powder completion response omitted its normalized proof; completion remains pending"
-                .to_string()
-        })?;
-    let mut normalized_criterion_proofs = Vec::with_capacity(proof.criterion_proofs.len());
     for expected in &proof.criterion_proofs {
-        let actual = receipt
+        if !receipt
             .criterion_proofs
             .iter()
-            .find(|actual| actual.criterion == expected.criterion)
-            .ok_or_else(|| {
+            .any(|actual| actual.criterion == expected.criterion && !actual.url.is_empty())
+        {
+            return Err(
                 "Powder completion response did not confirm every submitted criterion proof; completion remains pending"
-                    .to_string()
-            })?;
-        normalized_criterion_proofs.push(CrewCriterionProof {
-            criterion: actual.criterion,
-            url: actual.url.clone(),
-        });
+                    .into(),
+            );
+        }
     }
-    normalized_criterion_proofs.sort_by_key(|proof| proof.criterion);
-    Ok(CrewCompletionProof {
-        proof: normalized_proof.to_string(),
-        criterion_proofs: normalized_criterion_proofs,
-    })
+    Ok(())
 }
 
 fn completion_outcome_receipt(
@@ -11221,6 +11225,7 @@ fn complete_crew_powder(
             &intent_digest,
             &card,
             &run,
+            None,
             "already_completed",
         );
     }
@@ -11310,13 +11315,13 @@ fn complete_crew_powder(
         },
     };
     let receipt = completion_outcome_receipt(outcome)?;
-    let normalized_proof = verify_completion_receipt(&scope, &operation_id, &receipt, &proof)?;
+    verify_completion_receipt(&scope, &operation_id, &receipt, &proof)?;
     let (card, run) = read_bound_powder_evidence(&client, &scope).map_err(|error| {
         format!(
             "Powder accepted completion, but verification evidence was unavailable: {error}; completion remains pending for same-proof recovery"
         )
     })?;
-    completion_matches_evidence(&scope, &card, &run, &normalized_proof)?;
+    completion_receipt_matches_evidence(&scope, &card, &run, &receipt)?;
     completion_success(
         ctx,
         &scope,
@@ -11325,6 +11330,7 @@ fn complete_crew_powder(
         &intent_digest,
         &card,
         &run,
+        Some(&receipt),
         if was_pending {
             "recovered"
         } else {
@@ -24339,6 +24345,13 @@ mod tests {
         })
     }
 
+    fn loopback_criterion_id() -> String {
+        loopback_run_criterion("run-authoritative")["criterion_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     fn loopback_run(state: &LoopbackPowderState) -> Value {
         let run_id = state
             .evidence_run_id
@@ -25455,6 +25468,7 @@ mod tests {
                         "proof": "proof POWDER_API_KEY=secret",
                         "criterionProofs": [{
                             "criterion": 0,
+                            "criterionId": loopback_criterion_id(),
                             "url": "https://example.test/?token=secret"
                         }]
                     }),
@@ -25468,7 +25482,13 @@ mod tests {
         server.release_post.send(()).unwrap();
         let response = completion.join().unwrap();
         assert!(response.ok, "{:?}", response.error);
-        assert_eq!(response.result.unwrap()["outcome"], "completed");
+        let result = response.result.unwrap();
+        assert_eq!(result["outcome"], "completed");
+        assert_eq!(result["receipt"]["proof"], "proof [REDACTED]");
+        assert_eq!(
+            result["receipt"]["criterionProofs"][0]["url"],
+            "https://example.test/[REDACTED]"
+        );
         let state = server.finish().unwrap();
         assert_eq!(state.proof.as_deref(), Some("proof [REDACTED]"));
         assert_eq!(
@@ -25571,6 +25591,7 @@ mod tests {
             "proof": "commit rejected",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/rejected"
             }]
         });
@@ -25626,6 +25647,7 @@ mod tests {
             "proof": "commit recovered",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/recovered"
             }]
         });
@@ -25691,6 +25713,7 @@ mod tests {
             "proof": "commit abc123",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/proof"
             }]
         });
@@ -25796,6 +25819,7 @@ mod tests {
                 .iter()
                 .map(|proof| json!({
                     "criterion": proof["criterion"],
+                    "criterionId": loopback_criterion_id(),
                     "url": proof["url"]
                 }))
                 .collect::<Vec<_>>()
@@ -25829,6 +25853,7 @@ mod tests {
             "proof": "commit complete-renew",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/complete-renew"
             }]
         });
@@ -25911,6 +25936,7 @@ mod tests {
             "proof": "commit cleanup-race",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/cleanup-race"
             }]
         });
@@ -26097,6 +26123,7 @@ mod tests {
             "proof": "commit close-race",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/close-race"
             }]
         });
@@ -28494,6 +28521,7 @@ mod tests {
                     "proof": "commit persist-failure",
                     "criterionProofs": [{
                         "criterion": 0,
+                        "criterionId": loopback_criterion_id(),
                         "url": "https://example.test/persist-failure"
                     }]
                 }),
@@ -28544,6 +28572,7 @@ mod tests {
             "proof": "commit restart-recovery",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": loopback_criterion_id(),
                 "url": "https://example.test/restart-recovery"
             }]
         });
@@ -28718,6 +28747,7 @@ mod tests {
             "proof": "proof A",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": "powder.criterion.v1:sha256:test:0",
                 "url": "https://example.test/proof-a"
             }]
         }))
@@ -28734,11 +28764,28 @@ mod tests {
             "complete",
             Some("proof B"),
         );
-        assert!(
-            completion_matches_evidence(&scope, &completed_b_card, &completed_b_run, &proof_a,)
-                .unwrap_err()
-                .contains("does not match")
-        );
+        let receipt_a = powder::CompletionReceipt {
+            schema_version: "powder.run_bound_completion.v1".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            operation_id: "completion:evidence-a".into(),
+            status: "done".into(),
+            proof: Some("proof A".into()),
+            criterion_proofs: vec![powder::CriterionProof {
+                criterion: 0,
+                url: "https://example.test/proof-a".into(),
+            }],
+            updated_at: 124,
+            audit_event_id: "audit-evidence-a".into(),
+        };
+        assert!(completion_receipt_matches_evidence(
+            &scope,
+            &completed_b_card,
+            &completed_b_run,
+            &receipt_a,
+        )
+        .unwrap_err()
+        .contains("does not match"));
         assert!(registry
             .observe_crew_powder_completion("crew-powder", &observed_completion_digest(&scope))
             .unwrap_err()
@@ -28771,7 +28818,13 @@ mod tests {
         completed_a_run.card_criteria[0]
             .proof_links
             .push(proof_link);
-        completion_matches_evidence(&scope, &completed_a_card, &completed_a_run, &proof_a).unwrap();
+        completion_receipt_matches_evidence(
+            &scope,
+            &completed_a_card,
+            &completed_a_run,
+            &receipt_a,
+        )
+        .unwrap();
         registry
             .finish_crew_powder_completion("crew-powder", &digest)
             .unwrap();
@@ -28786,16 +28839,16 @@ mod tests {
         let first = parse_completion_proof(&json!({
             "proof": " commit abc123 ",
             "criterionProofs": [
-                {"criterion": 0, "url": "https://example.test/proof-0"},
-                {"criterion": 1, "url": "https://example.test/proof-1"}
+                {"criterion": 0, "criterionId": "criterion-0", "url": "https://example.test/proof-0"},
+                {"criterion": 1, "criterionId": "criterion-1", "url": "https://example.test/proof-1"}
             ]
         }))
         .unwrap();
         let same = parse_completion_proof(&json!({
             "proof": "commit abc123",
             "criterionProofs": [
-                {"criterion": 1, "url": "https://example.test/proof-1"},
-                {"criterion": 0, "url": "https://example.test/proof-0"}
+                {"criterion": 1, "criterionId": "criterion-1", "url": "https://example.test/proof-1"},
+                {"criterion": 0, "criterionId": "criterion-0", "url": "https://example.test/proof-0"}
             ]
         }))
         .unwrap();
@@ -28811,8 +28864,8 @@ mod tests {
         assert!(parse_completion_proof(&json!({
             "proof": "commit abc123",
             "criterionProofs": [
-                {"criterion": 0, "url": "https://example.test/first"},
-                {"criterion": 0, "url": "https://example.test/duplicate"}
+                {"criterion": 0, "criterionId": "criterion-0", "url": "https://example.test/first"},
+                {"criterion": 0, "criterionId": "criterion-0", "url": "https://example.test/duplicate"}
             ]
         }))
         .unwrap_err()
@@ -28825,6 +28878,7 @@ mod tests {
             "proof": "commit abc123",
             "criterionProofs": [{
                 "criterion": 0,
+                "criterionId": "powder.criterion.v1:sha256:test:0",
                 "url": "https://example.test/proof"
             }]
         }))
@@ -28851,6 +28905,7 @@ mod tests {
             "proof": "commit abc123",
             "criterionProofs": [{
                 "criterion": 1,
+                "criterionId": "powder.criterion.v1:sha256:test:1",
                 "url": "https://example.test/proof"
             }]
         }))
@@ -28865,14 +28920,6 @@ mod tests {
         let ctx =
             test_ctx("proof-evidence").with_captains_registry(powder_lifecycle_registry(None));
         let scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
-        let proof = parse_completion_proof(&json!({
-            "proof": "commit abc123",
-            "criterionProofs": [{
-                "criterion": 0,
-                "url": "https://example.test/criterion-0"
-            }]
-        }))
-        .unwrap();
         let (mut card, mut run) = powder_lifecycle_evidence(
             "thub-powder-control-lifecycle",
             "run-authoritative",
@@ -28888,13 +28935,29 @@ mod tests {
         };
         card.criteria[0].proof_links.push(link.clone());
         run.card_criteria[0].proof_links.push(link);
-        completion_matches_evidence(&scope, &card, &run, &proof).unwrap();
+        let receipt = powder::CompletionReceipt {
+            schema_version: "powder.run_bound_completion.v1".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            operation_id: "completion:evidence".into(),
+            status: "done".into(),
+            proof: Some("commit abc123".into()),
+            criterion_proofs: vec![powder::CriterionProof {
+                criterion: 0,
+                url: "https://example.test/criterion-0".into(),
+            }],
+            updated_at: 124,
+            audit_event_id: "audit-evidence".into(),
+        };
+        completion_receipt_matches_evidence(&scope, &card, &run, &receipt).unwrap();
 
         run.run.proof = Some("different proof".into());
         card.runs[0].proof = Some("different proof".into());
-        assert!(completion_matches_evidence(&scope, &card, &run, &proof)
-            .unwrap_err()
-            .contains("does not match"));
+        assert!(
+            completion_receipt_matches_evidence(&scope, &card, &run, &receipt)
+                .unwrap_err()
+                .contains("does not match")
+        );
     }
 
     #[test]
@@ -29253,6 +29316,7 @@ mod tests {
                     "proof": "SECRET refused overall proof",
                     "criterionProofs": [{
                         "criterion": 0,
+                        "criterionId": "powder.criterion.v1:sha256:test:0",
                         "url": "https://secret.example.test/refused"
                     }]
                 }),
@@ -29272,6 +29336,7 @@ mod tests {
                     "proof": "SECRET failed overall proof",
                     "criterionProofs": [{
                         "criterion": 0,
+                        "criterionId": "powder.criterion.v1:sha256:test:0",
                         "url": "https://secret.example.test/failed"
                     }]
                 }),

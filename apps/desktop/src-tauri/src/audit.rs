@@ -247,9 +247,11 @@ fn redact_args(command: &str, args: &Value) -> Value {
                         .iter()
                         .map(|item| {
                             let criterion = item.get("criterion").and_then(Value::as_u64);
+                            let criterion_id = item.get("criterionId").and_then(Value::as_str);
                             let url = item.get("url").and_then(Value::as_str).unwrap_or("");
                             json!({
                                 "criterion": criterion,
+                                "criterionId": criterion_id,
                                 "urlLen": url.len(),
                                 "urlSha256": &hex(&Sha256::digest(url.as_bytes()))[..16],
                             })
@@ -430,6 +432,7 @@ mod tests {
                 "proof": "https://secret.example.test/overall-proof",
                 "criterionProofs": [{
                     "criterion": 0,
+                    "criterionId": "powder.criterion.v1:sha256:safe:0",
                     "url": "https://secret.example.test/criterion-proof",
                 }],
             }),

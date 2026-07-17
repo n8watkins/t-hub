@@ -628,9 +628,10 @@ fn schema_complete_crew_powder() -> Value {
                     "type": "object",
                     "properties": {
                         "criterion": { "type": "integer", "minimum": 0 },
+                        "criterionId": { "type": "string", "minLength": 1, "maxLength": 256 },
                         "url": { "type": "string", "minLength": 1, "maxLength": 4096 }
                     },
-                    "required": ["criterion", "url"],
+                    "required": ["criterion", "criterionId", "url"],
                     "additionalProperties": false
                 }
             }
