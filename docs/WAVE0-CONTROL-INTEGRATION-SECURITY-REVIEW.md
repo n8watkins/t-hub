@@ -269,6 +269,15 @@ Direct policy coverage includes transient unreadable recovery, identity-change r
 This leaves the provider-native launch and every final attestation check unchanged and does not modify production `tmux.rs` or force bash.
 `dispatch_test_harness_command_failures_roll_back_all_side_effects`, `dispatch_test_harness_command_success_persists_separate_permission_axes`, and `dispatch_restart_rejects_contender_without_releasing_successful_winner` all passed after the correction.
 
+Commit `6f14ae7` adds the H4 rereview coverage required to make those assertions load-bearing.
+The stable-pair policy now has separate process-identity-only and executable-identity-only changes, with unchanged pane generation and ancestry, proving both comparisons independently reject the pair.
+The distinct-Captain replacement test and a new same-terminal release-reclaim ABA test both pause after the stable baseline, assert the original authority generation rejects before provider send, and prove the FakeHarnessCommand invocation marker was never written.
+Both tests retain the replacement Captain and its expected Project or Powder binding, leave no pending initial-claim intent, remove the transaction-owned Crew terminal, and validate the exact release route, run body, and configured claim agent.
+The exhausted `UnreadableEvidence` dispatch test proves all eight bounded attempts fail closed, no provider command executes, the terminal and durable Crew binding are removed, no pending intent remains, and the exact trusted release route, run body, and configured claim agent are retained.
+The hermetic Captain fixture now starts its command as tmux's initial session command instead of injecting it into a fresh zsh pane, eliminating an unrelated fresh-shell input race without changing production `tmux.rs`.
+The real-zsh Crew dispatch regressions remain in the serialized dispatch filter.
+At `6f14ae7`, the serialized dispatch filter passed 22 tests with one existing real-agent test intentionally ignored, the Harness filter passed 15 tests, and formatting, `cargo clippy -p t-hub --all-targets -- -D warnings`, and `git diff --check` passed.
+
 The installed T-Hub runtime was not modified, installed, or restarted.
 The currently installed Crew run-bound mutation surface rejected work-log capability verification during this task, so the Captain must maintain the exact-run Powder work log through a sanctioned working surface.
 
