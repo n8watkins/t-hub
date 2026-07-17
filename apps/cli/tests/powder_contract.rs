@@ -123,6 +123,8 @@ fn append_forwards_only_bound_message_and_session_identity() {
             "work-log",
             "append",
             " focused tests pass ",
+            "--operation-id",
+            "work-log:focused",
             "--json",
         ],
         Some("crew-session-token"),
@@ -135,7 +137,10 @@ fn append_forwards_only_bound_message_and_session_identity() {
     assert_eq!(request["session"], "crew-session-token");
     assert_eq!(
         request["args"],
-        json!({ "message": " focused tests pass " })
+        json!({
+            "message": " focused tests pass ",
+            "operationId": "work-log:focused"
+        })
     );
 }
 
@@ -195,8 +200,13 @@ fn captain_evidence_and_completion_target_only_a_crew_binding() {
             "powder",
             "complete",
             "crew-123",
+            "--operation-id",
+            "completion:focused",
             "--proof",
             "tests: 42 passed",
+            "--criterion-proofs-json",
+            r#"[{"criterion":0,"criterionId":"criterion-0","url":"https://example.test/proof"}]"#,
+            "--confirm",
             "--json",
         ],
         Some("captain-token"),
@@ -206,7 +216,103 @@ fn captain_evidence_and_completion_target_only_a_crew_binding() {
     assert_eq!(request["command"], "complete_crew_powder");
     assert_eq!(
         request["args"],
-        json!({ "crewSessionId": "crew-123", "proof": "tests: 42 passed" })
+        json!({
+            "crewSessionId": "crew-123",
+            "operationId": "completion:focused",
+            "proof": "tests: 42 passed",
+            "criterionProofs": [{
+                "criterion": 0,
+                "criterionId": "criterion-0",
+                "url": "https://example.test/proof"
+            }]
+        })
+    );
+}
+
+#[test]
+fn completion_requires_confirmation_before_endpoint_discovery() {
+    let missing = std::env::temp_dir().join(format!(
+        "th-cli-confirmation-missing-control-{}",
+        NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_th"))
+        .args([
+            "powder",
+            "complete",
+            "crew-123",
+            "--operation-id",
+            "completion:unconfirmed",
+            "--proof",
+            "tests pass",
+            "--criterion-proofs-json",
+            r#"[{"criterion":0,"criterionId":"criterion-0","url":"https://example.test/proof"}]"#,
+            "--json",
+        ])
+        .env("T_HUB_CONTROL_FILE", &missing)
+        .env_remove("T_HUB_CONTROL_ADDR")
+        .env_remove("T_HUB_CONTROL_TOKEN")
+        .output()
+        .expect("run unconfirmed Powder completion");
+
+    assert_eq!(output.status.code(), Some(5), "output: {output:?}");
+    assert!(output.stderr.is_empty(), "JSON stderr: {output:?}");
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["command"], "powder complete");
+    assert_eq!(envelope["error"]["code"], 5);
+    assert_eq!(envelope["error"]["kind"], "gated");
+    assert!(envelope["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("--confirm"));
+}
+
+#[test]
+fn criterion_review_forwards_exact_run_scoped_identity_without_powder_authority_escape() {
+    let mock = MockControl::start(json!({
+        "ok": true,
+        "result": {
+            "accepted": "review_crew_powder_criterion",
+            "operationId": "criterion:focused"
+        }
+    }));
+    let output = mock.run(
+        &[
+            "powder",
+            "criterion",
+            "review",
+            "crew-123",
+            "--operation-id",
+            "criterion:focused",
+            "--criterion",
+            "0",
+            "--criterion-id",
+            "powder.criterion.v1:sha256:abc:0",
+            "--decision",
+            "approved",
+            "--proof",
+            "focused tests pass",
+            "--expected-reviewer-identity",
+            "actor-captain-123",
+            "--json",
+        ],
+        Some("captain-token"),
+    );
+    assert_clean_json_success(&output, "powder criterion review");
+    let request = mock.finish();
+    assert_eq!(request["command"], "review_crew_powder_criterion");
+    assert_eq!(request["session"], "captain-token");
+    assert_eq!(
+        request["args"],
+        json!({
+            "crewSessionId": "crew-123",
+            "operationId": "criterion:focused",
+            "criterion": 0,
+            "criterionId": "powder.criterion.v1:sha256:abc:0",
+            "decision": "approved",
+            "proof": "focused tests pass",
+            "expectedReviewerIdentity": "actor-captain-123"
+        })
     );
 }
 
@@ -221,13 +327,68 @@ fn invalid_flags_positionals_and_limits_fail_before_endpoint_discovery() {
         vec!["powder", "evidence", "extra", "--json"],
         vec!["powder", "evidence", "--limit", "21", "--json"],
         vec!["powder", "evidence", "--crew", " \t\n ", "--json"],
-        vec!["powder", "work-log", "append", "", "--json"],
-        vec!["powder", "work-log", "append", " \t\n ", "--json"],
+        vec![
+            "powder",
+            "work-log",
+            "append",
+            "",
+            "--operation-id",
+            "work-log:empty",
+            "--json",
+        ],
+        vec![
+            "powder",
+            "work-log",
+            "append",
+            " \t\n ",
+            "--operation-id",
+            "work-log:blank",
+            "--json",
+        ],
+        vec!["powder", "work-log", "append", "evidence", "--json"],
+        vec![
+            "powder",
+            "work-log",
+            "append",
+            "evidence",
+            "--operation-id",
+            "bad operation",
+            "--json",
+        ],
         vec!["powder", "complete", "crew-123", "--json"],
         vec![
             "powder", "complete", "crew-123", "--proof", " \t\n ", "--json",
         ],
         vec!["powder", "complete", " \t\n ", "--proof", "tests", "--json"],
+        vec![
+            "powder",
+            "criterion",
+            "review",
+            "crew-123",
+            "--operation-id",
+            "criterion:missing-proof",
+            "--criterion",
+            "0",
+            "--criterion-id",
+            "criterion-0",
+            "--decision",
+            "approved",
+            "--expected-reviewer-identity",
+            "actor-captain",
+            "--json",
+        ],
+        vec![
+            "powder",
+            "complete",
+            "crew-123",
+            "--operation-id",
+            "completion:invalid-json",
+            "--proof",
+            "tests",
+            "--criterion-proofs-json",
+            "{}",
+            "--json",
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_th"))
             .args(args)
@@ -250,6 +411,8 @@ fn invalid_flags_positionals_and_limits_fail_before_endpoint_discovery() {
             "work-log".to_string(),
             "append".to_string(),
             "é".repeat(8193),
+            "--operation-id".to_string(),
+            "work-log:oversized".to_string(),
             "--json".to_string(),
         ],
         vec![
@@ -258,6 +421,10 @@ fn invalid_flags_positionals_and_limits_fail_before_endpoint_discovery() {
             "crew-123".to_string(),
             "--proof".to_string(),
             "é".repeat(2049),
+            "--operation-id".to_string(),
+            "completion:oversized".to_string(),
+            "--criterion-proofs-json".to_string(),
+            "[]".to_string(),
             "--json".to_string(),
         ],
     ] {
@@ -301,9 +468,26 @@ fn invalid_flags_positionals_and_limits_fail_before_endpoint_discovery() {
         "--secret",
     ] {
         for mut args in [
-            vec!["powder", "work-log", "append", "test evidence"],
+            vec![
+                "powder",
+                "work-log",
+                "append",
+                "test evidence",
+                "--operation-id",
+                "work-log:forbidden",
+            ],
             vec!["powder", "evidence"],
-            vec!["powder", "complete", "crew-123", "--proof", "tests"],
+            vec![
+                "powder",
+                "complete",
+                "crew-123",
+                "--operation-id",
+                "completion:forbidden",
+                "--proof",
+                "tests",
+                "--criterion-proofs-json",
+                "[]",
+            ],
         ] {
             args.extend([forbidden, "substitution", "--json"]);
             let output = Command::new(env!("CARGO_BIN_EXE_th"))
@@ -337,7 +521,15 @@ fn exact_utf8_byte_boundaries_are_forwarded_without_truncation() {
         "result": { "accepted": "append_crew_powder_work_log" }
     }));
     let output = append.run(
-        &["powder", "work-log", "append", &message, "--json"],
+        &[
+            "powder",
+            "work-log",
+            "append",
+            &message,
+            "--operation-id",
+            "work-log:utf8-boundary",
+            "--json",
+        ],
         Some("crew-token"),
     );
     assert_clean_json_success(&output, "powder work-log append");
@@ -355,7 +547,17 @@ fn exact_utf8_byte_boundaries_are_forwarded_without_truncation() {
     }));
     let output = complete.run(
         &[
-            "powder", "complete", "crew-123", "--proof", &proof, "--json",
+            "powder",
+            "complete",
+            "crew-123",
+            "--operation-id",
+            "completion:utf8-boundary",
+            "--proof",
+            &proof,
+            "--criterion-proofs-json",
+            r#"[{"criterion":0,"criterionId":"criterion-0","url":"https://example.test/proof"}]"#,
+            "--confirm",
+            "--json",
         ],
         Some("captain-token"),
     );
@@ -373,14 +575,27 @@ fn backend_authorization_rejection_uses_the_gated_exit_taxonomy() {
                 "powder",
                 "complete",
                 "foreign-crew",
+                "--operation-id",
+                "completion:foreign",
                 "--proof",
                 "tests",
+                "--criterion-proofs-json",
+                r#"[{"criterion":0,"criterionId":"criterion-0","url":"https://example.test/proof"}]"#,
+                "--confirm",
                 "--json",
             ],
         ),
         (
             "unauthorized: 'append_crew_powder_work_log' requires the control capability (this token is read-only)",
-            vec!["powder", "work-log", "append", "tests", "--json"],
+            vec![
+                "powder",
+                "work-log",
+                "append",
+                "tests",
+                "--operation-id",
+                "work-log:gated",
+                "--json",
+            ],
         ),
         (
             "acl: read_crew_powder_evidence requires a valid Crew or Captain T_HUB_SESSION_TOKEN",
@@ -401,11 +616,56 @@ fn backend_authorization_rejection_uses_the_gated_exit_taxonomy() {
 }
 
 #[test]
+fn powder_mutation_failures_expose_stable_operation_states() {
+    for state in [
+        "pending",
+        "rejected",
+        "stale",
+        "conflict",
+        "expired",
+        "unsupported",
+        "malformed",
+        "timeout",
+    ] {
+        let mock = MockControl::start(json!({
+            "ok": false,
+            "error": format!(
+                "Powder work-log append: Powder mutation state '{state}': bounded detail"
+            )
+        }));
+        let operation_id = format!("work-log:{state}");
+        let output = mock.run(
+            &[
+                "powder",
+                "work-log",
+                "append",
+                "exact evidence",
+                "--operation-id",
+                &operation_id,
+                "--json",
+            ],
+            Some("crew-token"),
+        );
+        assert_eq!(output.status.code(), Some(4), "output: {output:?}");
+        assert!(output.stderr.is_empty(), "JSON stderr: {output:?}");
+        let envelope = stdout_json(&output);
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], 4);
+        assert_eq!(
+            envelope["error"]["kind"],
+            format!("powder_mutation_{state}")
+        );
+        mock.finish();
+    }
+}
+
+#[test]
 fn powder_help_is_available_without_a_running_app() {
     for args in [
         vec!["powder", "--help"],
         vec!["powder", "work-log", "--help"],
         vec!["powder", "evidence", "--help"],
+        vec!["powder", "criterion", "review", "--help"],
         vec!["powder", "complete", "--help"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_th"))
