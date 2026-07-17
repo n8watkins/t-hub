@@ -261,6 +261,9 @@ The H4 deterministic fixture correction resolved that test without changing prod
 
 The H4 correction is production-path coverage for the authoritative zsh environment.
 Dispatch now requires two identical bounded foreground-process observations before provider launch, so a fresh zsh startup transition cannot be accepted as a stable baseline.
+The stable-baseline policy makes at most eight observation-pair attempts and rejects terminal, process, executable, or ancestry changes explicitly.
+Dispatch revalidates the original authority tuple immediately after stable baseline and before provider send, with transaction-owned exact-claim rollback on revocation.
+Direct policy coverage includes transient unreadable recovery, identity-change rejection, non-unreadable immediate failure, bounded exhaustion, and Captain replacement after stable baseline with zero provider send.
 This leaves the provider-native launch and every final attestation check unchanged and does not modify production `tmux.rs` or force bash.
 `dispatch_test_harness_command_failures_roll_back_all_side_effects`, `dispatch_test_harness_command_success_persists_separate_permission_axes`, and `dispatch_restart_rejects_contender_without_releasing_successful_winner` all passed after the correction.
 
