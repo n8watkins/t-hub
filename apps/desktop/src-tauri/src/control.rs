@@ -10437,6 +10437,89 @@ struct CrewPowderScope {
     authority_generation: Option<ScopedAuthorityGeneration>,
 }
 
+/// A registry snapshot whose target Crew ownership was authorized before any
+/// Project or Powder binding is resolved.
+///
+/// Keeping this deliberately narrow makes a foreign heartbeat probe fail with
+/// the generic ACL denial instead of disclosing target-specific binding state.
+struct CrewHeartbeatAuthorizationSnapshot {
+    snapshot: CaptainsSnapshot,
+    generations: AuthorityGenerations,
+    registry_epoch: u64,
+}
+
+fn authorize_crew_heartbeat_target(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    command: &str,
+) -> Result<CrewHeartbeatAuthorizationSnapshot, String> {
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(CrewHeartbeatAuthorizationSnapshot {
+            snapshot,
+            generations,
+            registry_epoch,
+        });
+    }
+
+    let caller = caller.ok_or_else(|| {
+        format!("acl: '{command}' requires the exact Crew session or its current owning Captain")
+    })?;
+    let owners = snapshot
+        .captains
+        .iter()
+        .filter(|captain| {
+            captain
+                .crew
+                .iter()
+                .any(|crew| crew.terminal_id == crew_session_id)
+        })
+        .collect::<Vec<_>>();
+    let authorized = match owners.as_slice() {
+        [owner] => {
+            let crew_self = caller.mint_role == crate::identity::Role::Crew
+                && caller.fleet_role.is_none()
+                && caller.tile.as_deref() == Some(crew_session_id)
+                && caller.ship_slug.as_deref() == Some(owner.ship_slug.as_str());
+            let owning_captain = caller.fleet_role == Some(FleetRole::Captain)
+                && caller.tile.as_deref() == owner.terminal_id.as_deref()
+                && caller.ship_slug.as_deref() == Some(owner.ship_slug.as_str())
+                && owner.role == FleetRole::Captain
+                && owner.state == ClaimState::Active;
+            crew_self || owning_captain
+        }
+        _ => false,
+    };
+    if !authorized {
+        return Err(format!(
+            "acl: '{command}' requires the exact Crew session or its current owning Captain"
+        ));
+    }
+    Ok(CrewHeartbeatAuthorizationSnapshot {
+        snapshot,
+        generations,
+        registry_epoch,
+    })
+}
+
+fn resolve_crew_powder_scope_from_heartbeat_authorization(
+    authorization: CrewHeartbeatAuthorizationSnapshot,
+    crew_session_id: &str,
+) -> Result<CrewPowderScope, String> {
+    let mut scope =
+        resolve_crew_powder_scope_from_snapshot(&authorization.snapshot, crew_session_id)?;
+    scope.authority_generation = Some(authorization.generations.scoped(
+        authorization.registry_epoch,
+        &scope.ship_slug,
+        crew_session_id,
+        &scope.project_id,
+    ));
+    Ok(scope)
+}
+
 fn resolve_crew_powder_scope(
     ctx: &ControlContext,
     crew_session_id: &str,
@@ -12256,7 +12339,15 @@ fn heartbeat_crew_powder(
         .or_else(|| arg_str(args, "crew_session_id"))
         .or_else(|| arg_str(args, "sessionId"))
         .ok_or("heartbeat_crew_powder requires a 'crewSessionId' argument")?;
-    let authorization_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    let authorization = authorize_crew_heartbeat_target(
+        ctx,
+        &crew_session_id,
+        caller,
+        trusted_internal,
+        "heartbeat_crew_powder",
+    )?;
+    let authorization_scope =
+        resolve_crew_powder_scope_from_heartbeat_authorization(authorization, &crew_session_id)?;
     require_crew_heartbeat_authority(
         &authorization_scope,
         caller,
@@ -22859,6 +22950,68 @@ mod tests {
             let error = response.error.unwrap_or_default();
             assert!(error.starts_with("acl:"), "got: {error}");
         }
+    }
+
+    #[test]
+    fn heartbeat_foreign_cross_ship_crew_is_generic_and_never_contacts_powder() {
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("foreign-heartbeat-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, &profile_name);
+        registry
+            .claim_test("captain-foreign", Some("foreign-ship"), vec![])
+            .unwrap();
+        assert!(registry
+            .record_crew("captain-foreign", "crew-foreign")
+            .unwrap());
+        registry
+            .bind_crew_context(
+                "captain-foreign",
+                "crew-foreign",
+                "foreign task",
+                "codex",
+                None,
+                None,
+                PowderWorkBinding {
+                    card_id: "foreign-card".into(),
+                    run_id: "foreign-run".into(),
+                    agent: Some("foreign-agent".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let foreign_captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &profile_name,
+                &foreign_captain,
+                "heartbeat_crew_powder",
+                json!({"crewSessionId": "crew-foreign"}),
+            ),
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some(
+                "acl: 'heartbeat_crew_powder' requires the exact Crew session or its current owning Captain"
+            )
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
     }
 
     #[test]
