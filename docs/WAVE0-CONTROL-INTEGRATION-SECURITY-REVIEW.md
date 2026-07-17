@@ -260,7 +260,9 @@ The post-M4 focused dispatch filter originally exposed a hermetic pre-launch unr
 The H4 deterministic fixture correction resolved that test without changing production tmux behavior.
 
 The H4 correction is production-path coverage for the authoritative zsh environment.
-Dispatch now requires two identical bounded foreground-process observations before provider launch, so a fresh zsh startup transition cannot be accepted as a stable baseline.
+Fresh zsh startup can transiently yield `LaunchAttestationError::UnreadableEvidence` from the bounded foreground-process observer.
+That error intentionally collapses several lookup and process-evidence failures, so this packet does not attribute the behavior to a specific unreadable subcase.
+Dispatch now requires two identical bounded observations before provider launch, so an unstable fresh-zsh transition cannot be accepted as a stable baseline.
 The stable-baseline policy makes at most eight observation-pair attempts and rejects terminal, process, executable, or ancestry changes explicitly.
 Dispatch revalidates the original authority tuple immediately after stable baseline and before provider send, with transaction-owned exact-claim rollback on revocation.
 Direct policy coverage includes transient unreadable recovery, identity-change rejection, non-unreadable immediate failure, bounded exhaustion, and Captain replacement after stable baseline with zero provider send.

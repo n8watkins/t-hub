@@ -10185,11 +10185,12 @@ fn crew_launch_argv(harness: Harness, prompt: &str) -> String {
     crew_interactive_launch(harness, &provider_launch, CODEX_UNOBSERVED_COMMAND)
 }
 
-/// A newly created tmux pane can briefly expose no readable foreground process
-/// while its login shell is still completing startup.  That is neither a launch
-/// acceptance nor a permission bypass.  Wait for a bounded stable baseline
-/// before attempting the provider launch, then retain the exact normal
-/// attestation checks for every subsequent observation.
+/// A newly created tmux pane can transiently yield unreadable foreground-process
+/// evidence while its login shell is still completing startup.  The observer
+/// intentionally collapses several lookup failures into that one safe error, so
+/// this does not assert a more specific failing subcase.  Wait for a bounded
+/// stable baseline before attempting the provider launch, then retain the exact
+/// normal attestation checks for every subsequent observation.
 fn observe_dispatch_baseline(
     observer: &mut dyn FnMut(&str) -> Result<HarnessProcessEvidence, LaunchAttestationError>,
     target: &str,
