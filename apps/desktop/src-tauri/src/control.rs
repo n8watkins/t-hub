@@ -1021,7 +1021,6 @@ pub struct PendingDispatchClaim {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingDispatchRelease {
-    pub captain_session_id: String,
     pub crew_session_id: String,
     pub project_id: String,
     pub connection_profile: String,
@@ -2215,8 +2214,7 @@ impl CaptainsRegistry {
         let mut pending_release_crews = std::collections::HashSet::new();
         let mut pending_release_claims = std::collections::HashSet::new();
         for recovery in &snapshot.pending_dispatch_releases {
-            if recovery.captain_session_id.trim().is_empty()
-                || recovery.crew_session_id.trim().is_empty()
+            if recovery.crew_session_id.trim().is_empty()
                 || recovery.project_id.trim().is_empty()
                 || recovery.connection_profile.trim().is_empty()
                 || recovery.repository.trim().is_empty()
@@ -2415,8 +2413,7 @@ impl CaptainsRegistry {
                 .captains
                 .iter()
                 .filter(|captain| {
-                    captain.terminal_id.as_deref() == Some(recovery.captain_session_id.as_str())
-                        && captain.project_id.as_deref() == Some(recovery.project_id.as_str())
+                    captain.project_id.as_deref() == Some(recovery.project_id.as_str())
                 })
                 .flat_map(|captain| {
                     captain
@@ -2454,8 +2451,6 @@ impl CaptainsRegistry {
                     .iter()
                     .filter(|recovery| {
                         captain.project_id.as_deref() == Some(recovery.project_id.as_str())
-                            && captain.terminal_id.as_deref()
-                                == Some(recovery.captain_session_id.as_str())
                             && recovery.crew_session_id == crew.terminal_id
                             && recovery.card_id == work.card_id
                             && recovery.run_id == work.run_id
@@ -2803,10 +2798,7 @@ impl CaptainsRegistry {
         let crew = current
             .captains
             .iter_mut()
-            .filter(|captain| {
-                captain.terminal_id.as_deref() == Some(recovery.captain_session_id.as_str())
-                    && captain.project_id.as_deref() == Some(recovery.project_id.as_str())
-            })
+            .filter(|captain| captain.project_id.as_deref() == Some(recovery.project_id.as_str()))
             .flat_map(|captain| captain.crew.iter_mut())
             .find(|crew| crew.terminal_id == recovery.crew_session_id)
             .ok_or_else(|| {
@@ -2854,7 +2846,6 @@ impl CaptainsRegistry {
             .find(|existing| {
                 existing.crew_session_id == recovery.crew_session_id
                     && existing.project_id == recovery.project_id
-                    && existing.captain_session_id == recovery.captain_session_id
                     && existing.connection_profile == recovery.connection_profile
                     && existing.repository == recovery.repository
                     && existing.card_id == recovery.card_id
@@ -2893,7 +2884,6 @@ impl CaptainsRegistry {
             .position(|existing| {
                 existing.crew_session_id == recovery.crew_session_id
                     && existing.project_id == recovery.project_id
-                    && existing.captain_session_id == recovery.captain_session_id
                     && existing.connection_profile == recovery.connection_profile
                     && existing.repository == recovery.repository
                     && existing.card_id == recovery.card_id
@@ -2908,9 +2898,7 @@ impl CaptainsRegistry {
         current.pending_dispatch_releases.remove(position);
         let mut crew_removed = false;
         for captain in &mut current.captains {
-            if captain.terminal_id.as_deref() != Some(recovery.captain_session_id.as_str())
-                || captain.project_id.as_deref() != Some(recovery.project_id.as_str())
-            {
+            if captain.project_id.as_deref() != Some(recovery.project_id.as_str()) {
                 continue;
             }
             let before = captain.crew.len();
@@ -10905,7 +10893,6 @@ fn dispatch_crew_with_observer_inner(
         ));
     }
     release_recovery = Some(PendingDispatchRelease {
-        captain_session_id: captain_session_id.clone(),
         crew_session_id: crew_session_id.clone(),
         project_id: project.project_id.clone(),
         connection_profile: binding.connection_profile.clone(),
@@ -20852,7 +20839,6 @@ mod tests {
         snapshot
             .pending_dispatch_releases
             .push(PendingDispatchRelease {
-                captain_session_id: "captain-powder".into(),
                 crew_session_id: crew.terminal_id.clone(),
                 project_id: "project-powder-lifecycle".into(),
                 connection_profile: "legacy-release-profile".into(),
@@ -20886,7 +20872,6 @@ mod tests {
         let work = crew.powder_work.as_mut().unwrap();
         work.dispatch_release_recovery = true;
         let recovery = PendingDispatchRelease {
-            captain_session_id: "captain-powder".into(),
             crew_session_id: crew.terminal_id.clone(),
             project_id: "project-powder-lifecycle".into(),
             connection_profile: "pair-profile".into(),
@@ -20908,10 +20893,6 @@ mod tests {
         let mut foreign = paired.clone();
         foreign.pending_dispatch_releases[0].project_id = "foreign-project".into();
         assert!(CaptainsRegistry::validate_snapshot(&foreign).is_err());
-
-        let mut foreign_captain = paired.clone();
-        foreign_captain.pending_dispatch_releases[0].captain_session_id = "foreign-captain".into();
-        assert!(CaptainsRegistry::validate_snapshot(&foreign_captain).is_err());
 
         let mut mismatched = paired.clone();
         mismatched.pending_dispatch_releases[0].agent = "foreign-agent".into();
@@ -27815,7 +27796,7 @@ mod tests {
             );
             return;
         }
-        let server = LoopbackPowderServer::start(6);
+        let server = LoopbackPowderServer::start(5);
         server.state.lock().unwrap().claim_response_failure =
             Some(LoopbackPowderResponseFailure::Eof);
         let profile_name = format!(
@@ -28506,7 +28487,6 @@ mod tests {
             .clone()
             .unwrap();
         let recovery = PendingDispatchRelease {
-            captain_session_id: "captain-powder".into(),
             crew_session_id: "prepared-release-crew".into(),
             project_id: "project-powder-lifecycle".into(),
             connection_profile: original_profile.clone(),
