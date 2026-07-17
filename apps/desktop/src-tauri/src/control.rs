@@ -10015,11 +10015,26 @@ fn release_crew_powder_binding_guarded(
         }
         PowderCleanupDisposition::Release => {}
     }
+    // `bound_powder_reality` has just established that the fresh card claim and
+    // run evidence describe the same active owner. Use that authoritative owner
+    // in the expected receipt so a different agent can never retire this Crew's
+    // durable binding.
+    let authoritative_claim = match card.claim.as_ref() {
+        Some(claim) => claim,
+        None => {
+            return Some(json!({
+                "released": false,
+                "cardId": scope.work.card_id,
+                "runId": scope.work.run_id,
+                "error": "Powder release failed because fresh claim ownership was unavailable",
+            }));
+        }
+    };
     let claim = powder::Claim {
         card_id: scope.work.card_id.clone(),
         run_id: scope.work.run_id.clone(),
-        agent: String::new(),
-        expires_at: scope.work.claim_expires_at.unwrap_or_default(),
+        agent: authoritative_claim.agent.clone(),
+        expires_at: authoritative_claim.expires_at,
     };
     Some(match client.release(&claim) {
         Ok(released) => json!({
@@ -21622,6 +21637,7 @@ mod tests {
         release_bodies: Vec<Value>,
         release_receipt_card_id: Option<String>,
         release_receipt_run_id: Option<String>,
+        release_receipt_agent: Option<String>,
         renew_posts: usize,
     }
 
@@ -21734,12 +21750,14 @@ mod tests {
             expected_requests: usize,
             card_id: &str,
             run_id: &str,
+            agent: &str,
         ) -> Self {
             let server = Self::start(expected_requests);
             {
                 let mut state = server.state.lock().unwrap();
                 state.release_receipt_card_id = Some(card_id.into());
                 state.release_receipt_run_id = Some(run_id.into());
+                state.release_receipt_agent = Some(agent.into());
             }
             server
         }
@@ -22230,7 +22248,7 @@ mod tests {
                 json!({
                     "card_id": state.release_receipt_card_id.as_deref().unwrap_or("thub-powder-control-lifecycle"),
                     "run_id": state.release_receipt_run_id.as_deref().unwrap_or("run-authoritative"),
-                    "agent": "powder-agent",
+                    "agent": state.release_receipt_agent.as_deref().unwrap_or("powder-agent"),
                     "expires_at": 100
                 })
             }
@@ -23489,12 +23507,27 @@ mod tests {
 
     #[test]
     fn powder_release_receipt_identity_mismatch_retains_local_binding() {
-        for (index, receipt_card, receipt_run) in [
-            ("card", "thub-other", "run-authoritative"),
-            ("run", "thub-powder-control-lifecycle", "run-other"),
+        for (index, receipt_card, receipt_run, receipt_agent) in [
+            ("card", "thub-other", "run-authoritative", "powder-agent"),
+            (
+                "run",
+                "thub-powder-control-lifecycle",
+                "run-other",
+                "powder-agent",
+            ),
+            (
+                "agent",
+                "thub-powder-control-lifecycle",
+                "run-authoritative",
+                "another-agent",
+            ),
         ] {
-            let server =
-                LoopbackPowderServer::start_with_release_receipt(3, receipt_card, receipt_run);
+            let server = LoopbackPowderServer::start_with_release_receipt(
+                3,
+                receipt_card,
+                receipt_run,
+                receipt_agent,
+            );
             let profile_name = format!("loopback-release-receipt-{index}");
             let _profile = PowderProfileEnv::install(&profile_name, server.addr);
             let registry = powder_lifecycle_registry_with_profile(None, &profile_name);
