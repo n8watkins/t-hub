@@ -36,6 +36,7 @@ The removed-Crew close authorization finding was remediated by commit `17c8ed5e7
 The initial Powder claim receipt identity finding was remediated by commit `a712df7a1d7222272f3c128d20e06ad074ff797c`.
 The initial-claim transactionality finding was remediated by commit `bf3c3ca2f4fafecb40a9a9efea7a1ba7fe3d5f4c`.
 The M4 dispatch-authority ABA and M5 bounded initial-claim identity findings were remediated by commit `021eb3c`.
+The consolidated H1 through H4 rereview remediation was implemented by commit `0a71d32`.
 
 Both frozen reviewed heads are ancestors of the integration head.
 Neither reviewed head was rebased or modified.
@@ -93,6 +94,10 @@ The durable Crew bind checks the captured Captain, Crew, and Project generation 
 An exact trusted claim is released only on a transaction-owned bind failure.
 If that release cannot be confirmed, the pending initial-claim intent remains durable and dispatch reports incomplete rollback instead of claiming completion.
 Initial-claim response parsing uses a 64 KiB bounded reader and rejects empty, whitespace-only, control-containing, and over-512-byte card, run, or agent identities.
+The bind compare-and-set now uses the original dispatch Captain and Project authority tuple under the registry mutation lock, together with the transaction's Crew generation.
+It does not recapture Captain or Project generations after the claim, so a same-terminal release and reclaim cannot become the expected authority.
+Every post-claim dispatch authority failure now follows transaction-owned rollback using the exact trusted receipt rather than rediscovering mutable Project or Powder scope.
+An ambiguous exact release marks a durable Crew cleanup-pending state when a binding exists and retains the initial-claim recovery intent.
 
 The frontend snapshot adapter retains `harnessPermission` and `tHubCapability` as separate compatibility axes.
 Unknown values remain omitted instead of being accepted as authoritative state.
@@ -256,6 +261,9 @@ The isolated single rerun reproduced the same pre-launch unreadable-process-evid
 All new M4 and M5 dispatch regressions passed in that run.
 No production tmux code was changed because this residual is outside the new dispatch authority and claim parsing paths.
 
+The H4 fixture correction replaces timing-sensitive pre-launch tmux observation in the three affected hermetic dispatch tests with deterministic process-evidence fixtures while retaining real terminal creation, durable persistence, and rollback assertions.
+`dispatch_test_harness_command_failures_roll_back_all_side_effects`, `dispatch_test_harness_command_success_persists_separate_permission_axes`, and `dispatch_restart_rejects_contender_without_releasing_successful_winner` all passed after the correction.
+
 The installed T-Hub runtime was not modified, installed, or restarted.
 The currently installed Crew run-bound mutation surface rejected work-log capability verification during this task, so the Captain must maintain the exact-run Powder work log through a sanctioned working surface.
 
@@ -277,6 +285,7 @@ No independent reviewer has approved this integration yet.
 11. Verify production tmux behavior is unchanged and fixture-only serialization cannot leak into runtime behavior.
 12. Verify the captured dispatch authority generation is compared both before side effects and atomically during Crew binding, including release-reclaim ABA.
 13. Verify malformed or oversized initial-claim responses remain recovery-pending and cannot create a durable Crew binding or provider launch.
+14. Verify every post-claim dispatch authority revalidation uses transaction-owned exact-claim rollback rather than returning a bare authority error.
 12. Decide whether frontend dependency installation and a separate TypeScript gate are required before exact-run approval.
 13. Verify a heartbeat queued behind another Crew lifecycle operation revalidates the exact current Captain and worker liveness before renewal.
 14. Verify terminal close holds the same per-Crew lifecycle guard before tmux teardown and through authoritative Powder cleanup and persistence.
