@@ -136,6 +136,8 @@ describe("adoptCaptainsSnapshot seq guard", () => {
             provider: "codex",
             harness: "codex",
             providerSessionId: "codex-thread",
+            harnessPermission: "bypassPermissions",
+            tHubCapability: "read",
           }],
         }],
       }),
@@ -153,6 +155,8 @@ describe("adoptCaptainsSnapshot seq guard", () => {
       provider: "codex",
       harness: "codex",
       providerSessionId: "codex-thread",
+      harnessPermission: "bypassPermissions",
+      tHubCapability: "read",
     });
   });
 

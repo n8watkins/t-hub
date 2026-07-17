@@ -151,6 +151,8 @@ export interface CrewRef {
   provider?: "codex" | "claude";
   providerSessionId?: string;
   harness?: "codex" | "claude";
+  harnessPermission?: "bypassPermissions" | "acceptEdits" | "default";
+  tHubCapability?: "read" | "control";
   conversationId?: string;
   resumePoint?: string;
   state?: { kind: "active" | "orphaned" | "removed"; since?: number };
