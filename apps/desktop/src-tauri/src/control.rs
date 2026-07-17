@@ -10508,6 +10508,28 @@ fn validate_bound_evidence(
             scope.binding.repository
         ));
     }
+    let expected_agent = scope.work.agent.as_deref().ok_or_else(|| {
+        format!(
+            "Crew run '{}' has no durable Powder agent identity",
+            scope.work.run_id
+        )
+    })?;
+    if run.run.agent != expected_agent {
+        return Err(format!(
+            "Powder run '{}' agent is not Crew Powder agent",
+            scope.work.run_id
+        ));
+    }
+    if card
+        .claim
+        .as_ref()
+        .is_some_and(|claim| claim.agent != expected_agent)
+    {
+        return Err(format!(
+            "Powder card '{}' claim agent is not Crew Powder agent",
+            scope.work.card_id
+        ));
+    }
     if card.status != run.card_status {
         return Err(format!(
             "Powder card '{}' and run '{}' report inconsistent card status",
@@ -11235,6 +11257,25 @@ fn append_crew_powder_work_log(
     let intent_created_at = powder_intent_created_at(&intent_crew, &operation_id)?;
     let intent_scope =
         refresh_crew_powder_mutation_scope(ctx, &scope, &operation_id, &intent_digest)?;
+    let pre_mutation_evidence =
+        read_bound_powder_evidence(&client, &intent_scope).and_then(|(card, run)| {
+            if bound_powder_reality(&intent_scope, &card, &run)? != BoundPowderReality::Active {
+                return Err("Powder work-log append requires the exact active Crew run".into());
+            }
+            Ok((card, run))
+        });
+    if let Err(error) = pre_mutation_evidence {
+        if intent_created {
+            ctx.captains
+                .finish_crew_powder_mutation(&intent_scope, &operation_id, &intent_digest)
+                .map_err(|rollback_error| {
+                    format!(
+                        "{error}; durable unsubmitted mutation rollback failed: {rollback_error}"
+                    )
+                })?;
+        }
+        return Err(error);
+    }
     let recovered = if intent_created {
         None
     } else {
@@ -11308,6 +11349,24 @@ fn append_crew_powder_work_log(
     {
         return Err("Powder work-log response did not match the bound Crew run".into());
     }
+    let (authoritative_card, authoritative_run) =
+        read_bound_powder_evidence(&client, &intent_scope).map_err(|error| {
+            format!(
+                "Powder work-log was accepted, but authoritative scope verification failed: {error}; exact operation recovery is required"
+            )
+        })?;
+    if bound_powder_reality(&intent_scope, &authoritative_card, &authoritative_run)?
+        != BoundPowderReality::Active
+    {
+        return Err(
+            "Powder work-log was accepted, but the exact Crew run is no longer active; exact operation recovery is required"
+                .into(),
+        );
+    }
+    let authoritative_repository = authoritative_card.repository.clone().ok_or_else(|| {
+        "Powder work-log was accepted, but authoritative repository evidence is missing; exact operation recovery is required"
+            .to_string()
+    })?;
     ctx.captains
         .finish_crew_powder_mutation(&intent_scope, &operation_id, &intent_digest)
         .map_err(|error| {
@@ -11321,7 +11380,7 @@ fn append_crew_powder_work_log(
         "audited": true,
         "crewSessionId": scope.crew.terminal_id,
         "projectId": scope.project_id,
-        "repository": scope.binding.repository,
+        "repository": authoritative_repository,
         "cardId": entry.card_id,
         "runId": scope.work.run_id,
         "agent": entry.agent,
@@ -24040,7 +24099,7 @@ mod tests {
             run_id: run_id.into(),
             card_id: card_id.into(),
             state: run_state.into(),
-            agent: "t-hub".into(),
+            agent: "powder-agent".into(),
             proof: proof.map(str::to_string),
             created_at: 1,
             updated_at: 2,
@@ -24056,7 +24115,7 @@ mod tests {
                 repository: Some(repository.into()),
                 claim: has_claim.then(|| powder::EvidenceClaim {
                     run_id: run_id.into(),
-                    agent: "t-hub".into(),
+                    agent: "powder-agent".into(),
                     expires_at: 100,
                 }),
                 criteria: criteria.clone(),
@@ -24112,6 +24171,9 @@ mod tests {
         evidence_run_id: Option<String>,
         evidence_card_id: Option<String>,
         evidence_repository: Option<String>,
+        evidence_claim_agent: Option<String>,
+        evidence_run_agent: Option<String>,
+        rehome_repository_after_work_log: Option<String>,
         force_claim: bool,
         omit_card_runs: bool,
         duplicate_card_run: bool,
@@ -24950,6 +25012,10 @@ mod tests {
                     if let Some(response_run_id) = response_run_id {
                         outcome["expected_run_id"] = json!(response_run_id);
                     }
+                    let mut state = state.lock().unwrap();
+                    if let Some(repository) = state.rehome_repository_after_work_log.clone() {
+                        state.evidence_repository = Some(repository);
+                    }
                     outcome
                 }
             }
@@ -25149,7 +25215,7 @@ mod tests {
             } else {
                 "active"
             },
-            "agent": "t-hub",
+            "agent": state.evidence_run_agent.as_deref().unwrap_or("powder-agent"),
             "proof": state.proof.as_deref(),
             "claim_expires_at": if state.completed || state.released { 0 } else { 100 },
             "created_at": 1,
@@ -25181,7 +25247,7 @@ mod tests {
             "updated_at": 2,
             "claim": if (state.completed || state.released) && !state.force_claim { Value::Null } else { json!({
                 "run_id": run_id,
-                "agent": "t-hub",
+                "agent": state.evidence_claim_agent.as_deref().unwrap_or("powder-agent"),
                 "expires_at": 100
             }) },
             "criteria": [loopback_criterion(state)]
@@ -26049,7 +26115,7 @@ mod tests {
 
     #[test]
     fn powder_work_log_uses_stable_atomic_card_run_and_operation_identity() {
-        let server = LoopbackPowderServer::start(3);
+        let server = LoopbackPowderServer::start(11);
         let _profile = PowderProfileEnv::install("loopback-work-log", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
         let registry = powder_lifecycle_registry_with_profile(None, "loopback-work-log");
@@ -26093,10 +26159,9 @@ mod tests {
                 ),
             );
             assert!(response.ok, "{:?}", response.error);
-            assert_eq!(
-                response.result.unwrap()["operationId"],
-                expected_operation_id
-            );
+            let result = response.result.unwrap();
+            assert_eq!(result["operationId"], expected_operation_id);
+            assert_eq!(result["repository"], "t-hub");
         }
 
         let state = server.finish().unwrap();
@@ -26120,6 +26185,180 @@ mod tests {
         );
         assert!(state.work_log_posts[1].get("card_id").is_none());
         assert!(state.work_log_posts[1].get("expected_run_id").is_none());
+    }
+
+    #[test]
+    fn powder_work_log_rejects_substituted_authoritative_agents_without_post() {
+        for target in ["card", "run"] {
+            let server = LoopbackPowderServer::start(2);
+            {
+                let mut state = server.state.lock().unwrap();
+                if target == "card" {
+                    state.evidence_claim_agent = Some("substituted-agent".into());
+                } else {
+                    state.evidence_run_agent = Some("substituted-agent".into());
+                }
+            }
+            let profile = format!("loopback-work-log-substituted-{target}");
+            let _profile = PowderProfileEnv::install(&profile, server.addr);
+            let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+            let registry = powder_lifecycle_registry_with_profile(None, &profile);
+            let crew = mint_session(
+                &identities,
+                crate::identity::Role::Crew,
+                "powder-ship",
+                "crew-powder",
+            );
+            let ctx = test_ctx(&profile)
+                .with_identity_store(identities)
+                .with_captains_registry(registry.clone());
+            let response = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    &profile,
+                    &crew,
+                    "append_crew_powder_work_log",
+                    json!({
+                        "operationId": format!("work-log:substituted-{target}"),
+                        "message": "substituted agent must fail before mutation"
+                    }),
+                ),
+            );
+            let error = response.error.unwrap();
+            assert!(error.contains("not Crew Powder agent"), "{target}: {error}");
+            assert!(registry.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .mutation_intent
+                .is_none());
+            let state = server.finish().unwrap();
+            assert_eq!(state.card_evidence_gets, 1);
+            assert_eq!(state.run_evidence_gets, 1);
+            assert!(state.work_log_posts.is_empty());
+        }
+    }
+
+    #[test]
+    fn powder_work_log_rejects_repository_rehome_without_post() {
+        let server = LoopbackPowderServer::start(2);
+        server.state.lock().unwrap().evidence_repository = Some("merged-repository".into());
+        let profile = "loopback-work-log-repository-rehome";
+        let _profile = PowderProfileEnv::install(profile, server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, profile);
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx(profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile,
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:repository-rehome",
+                    "message": "re-homed card must not mutate"
+                }),
+            ),
+        );
+        assert!(response
+            .error
+            .unwrap()
+            .contains("not Crew Project repository"));
+        let state = server.finish().unwrap();
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_work_log_retains_recovery_when_binding_goes_stale_after_post() {
+        let server = LoopbackPowderServer::start(5);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .rehome_repository_after_work_log = Some("merged-repository".into());
+        let profile = "loopback-work-log-stale-binding";
+        let _profile = PowderProfileEnv::install(profile, server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, profile);
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx(profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile,
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:stale-binding",
+                    "message": "post-write scope must remain authoritative"
+                }),
+            ),
+        );
+        assert!(response
+            .error
+            .unwrap()
+            .contains("not Crew Project repository"));
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .is_some_and(|intent| intent.terminal_rejection.is_none()));
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 1);
+        assert_eq!(state.card_evidence_gets, 2);
+        assert_eq!(state.run_evidence_gets, 2);
+    }
+
+    #[test]
+    fn powder_work_log_rejects_malformed_scope_evidence_without_post() {
+        let server = LoopbackPowderServer::start(1);
+        server.state.lock().unwrap().malformed_card_evidence = true;
+        let profile = "loopback-work-log-malformed-scope";
+        let _profile = PowderProfileEnv::install(profile, server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, profile);
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx(profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                profile,
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:malformed-scope",
+                    "message": "malformed evidence must not mutate"
+                }),
+            ),
+        );
+        assert!(response.error.unwrap().contains("card id"));
+        let state = server.finish().unwrap();
+        assert!(state.work_log_posts.is_empty());
+        assert_eq!(state.run_evidence_gets, 0);
     }
 
     #[test]
@@ -26314,7 +26553,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let operation_id = "work-log:restart-recovery";
         let message = "recover after registry restart";
-        let server = LoopbackPowderServer::start(1);
+        let server = LoopbackPowderServer::start(5);
         let _profile = PowderProfileEnv::install("loopback-work-log-restart", server.addr);
         let registry =
             powder_lifecycle_registry_with_profile(Some(path.clone()), "loopback-work-log-restart");
@@ -26372,7 +26611,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let operation_id = "work-log:legacy-recovery";
         let message = "recover exact legacy operation";
-        let server = LoopbackPowderServer::start(1);
+        let server = LoopbackPowderServer::start(5);
         let _profile = PowderProfileEnv::install("loopback-work-log-legacy", server.addr);
         let registry =
             powder_lifecycle_registry_with_profile(Some(path.clone()), "loopback-work-log-legacy");
@@ -26472,7 +26711,7 @@ mod tests {
             let operation_id = format!("work-log:response-loss-{suffix}");
             let message = format!("recover {suffix} response loss");
             let body = loopback_work_log_body(&operation_id, &message);
-            let server = LoopbackPowderServer::start(2);
+            let server = LoopbackPowderServer::start(6);
             server.state.lock().unwrap().work_log_response_failure = Some(failure);
             server.state.lock().unwrap().recovery_outcome = Some(loopback_work_log_outcome(&body));
             let _profile = PowderProfileEnv::install(&profile, server.addr);
@@ -26514,7 +26753,7 @@ mod tests {
     fn powder_work_log_recovery_rejects_a_different_authoritative_payload() {
         let operation_id = "work-log:wrong-recovery";
         let message = "requested payload";
-        let server = LoopbackPowderServer::start(2);
+        let server = LoopbackPowderServer::start(4);
         {
             let mut state = server.state.lock().unwrap();
             state.work_log_response_failure = Some(LoopbackPowderResponseFailure::Eof);
@@ -26565,7 +26804,7 @@ mod tests {
         let body = loopback_work_log_body(operation_id, message);
         let mut outcome = loopback_work_log_outcome(&body);
         outcome["result"]["body"] = json!("[scrubbed work-log evidence]");
-        let server = LoopbackPowderServer::start(1);
+        let server = LoopbackPowderServer::start(5);
         {
             let mut state = server.state.lock().unwrap();
             state.recovery_operation_id = Some(operation_id.into());
@@ -26613,7 +26852,7 @@ mod tests {
         let operation_id = "work-log:recovered-rejection";
         let message = "terminal rejection evidence";
         let body = loopback_work_log_body(operation_id, message);
-        let server = LoopbackPowderServer::start(1);
+        let server = LoopbackPowderServer::start(3);
         {
             let mut state = server.state.lock().unwrap();
             state.recovery_operation_id = Some(operation_id.into());
@@ -26671,7 +26910,7 @@ mod tests {
     fn powder_work_log_http_conflict_is_durable_and_identical_replay_is_local() {
         let operation_id = "work-log:http-conflict";
         let message = "different requested payload";
-        let server = LoopbackPowderServer::start(1);
+        let server = LoopbackPowderServer::start(3);
         server.state.lock().unwrap().work_log_http_conflict = true;
         let _profile = PowderProfileEnv::install("loopback-work-log-http-conflict", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
@@ -26727,7 +26966,7 @@ mod tests {
 
     #[test]
     fn powder_terminal_conflict_allows_a_changed_operation_after_durable_recording() {
-        let server = LoopbackPowderServer::start(2);
+        let server = LoopbackPowderServer::start(8);
         server.state.lock().unwrap().work_log_http_conflict = true;
         let _profile =
             PowderProfileEnv::install("loopback-work-log-conflict-replacement", server.addr);
@@ -26782,7 +27021,7 @@ mod tests {
 
     #[test]
     fn powder_terminal_conflict_allows_normal_cleanup_after_durable_recording() {
-        let server = LoopbackPowderServer::start(4);
+        let server = LoopbackPowderServer::start(6);
         server.state.lock().unwrap().work_log_http_conflict = true;
         let _profile = PowderProfileEnv::install("loopback-work-log-conflict-cleanup", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
@@ -26830,7 +27069,7 @@ mod tests {
         let operation_id = "work-log:conflict-restart";
         let message = "restart conflict evidence";
         let first_error = {
-            let server = LoopbackPowderServer::start(1);
+            let server = LoopbackPowderServer::start(3);
             server.state.lock().unwrap().work_log_http_conflict = true;
             let _profile = PowderProfileEnv::install(profile, server.addr);
             let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
@@ -26904,7 +27143,7 @@ mod tests {
         let operation_id = "work-log:expired-terminal";
         let message = "expired terminal evidence";
         let body = loopback_work_log_body(operation_id, message);
-        let server = LoopbackPowderServer::start(1);
+        let server = LoopbackPowderServer::start(3);
         {
             let mut state = server.state.lock().unwrap();
             state.recovery_operation_id = Some(operation_id.into());
@@ -26955,7 +27194,7 @@ mod tests {
 
     #[test]
     fn powder_terminal_conflict_persistence_failure_keeps_the_pending_wedge_honest() {
-        let server = LoopbackPowderServer::start(1);
+        let server = LoopbackPowderServer::start(3);
         server.state.lock().unwrap().work_log_http_conflict = true;
         let profile = "loopback-work-log-conflict-persist-failure";
         let _profile = PowderProfileEnv::install(profile, server.addr);
@@ -27024,7 +27263,7 @@ mod tests {
         let operation_id = "work-log:pending-status";
         let message = "operation remains pending";
         let body = loopback_work_log_body(operation_id, message);
-        let server = LoopbackPowderServer::start(1);
+        let server = LoopbackPowderServer::start(3);
         {
             let mut state = server.state.lock().unwrap();
             state.recovery_operation_id = Some(operation_id.into());
@@ -27074,7 +27313,7 @@ mod tests {
         let operation_id = "work-log:unknown-reissue";
         let message = "reissue exact retained operation";
         let body = loopback_work_log_body(operation_id, message);
-        let server = LoopbackPowderServer::start(2);
+        let server = LoopbackPowderServer::start(6);
         server.state.lock().unwrap().recovery_operation_id = Some(operation_id.into());
         let _profile = PowderProfileEnv::install("loopback-work-log-unknown", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
@@ -27109,7 +27348,7 @@ mod tests {
     fn powder_work_log_expired_intent_refuses_unknown_reissue() {
         let operation_id = "work-log:expired-intent";
         let message = "must not reissue outside retention";
-        let server = LoopbackPowderServer::start(1);
+        let server = LoopbackPowderServer::start(3);
         server.state.lock().unwrap().recovery_operation_id = Some(operation_id.into());
         let _profile = PowderProfileEnv::install("loopback-work-log-expired", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
@@ -27236,7 +27475,7 @@ mod tests {
 
     #[test]
     fn powder_mutation_verification_accepts_normalized_scrubbed_evidence() {
-        let server = LoopbackPowderServer::start(1);
+        let server = LoopbackPowderServer::start(5);
         server.state.lock().unwrap().normalized_work_log_body = Some("progress [REDACTED]".into());
         let _profile = PowderProfileEnv::install("loopback-normalized-work-log", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
@@ -27339,7 +27578,7 @@ mod tests {
             ("claim_expired", "claim expired"),
             ("conflict", "stale, released, or reclaimed"),
         ] {
-            let server = LoopbackPowderServer::start(1);
+            let server = LoopbackPowderServer::start(3);
             server.state.lock().unwrap().mutation_failure_code = Some(failure_code.into());
             let profile = format!("loopback-work-log-rejection-{failure_code}");
             let _profile = PowderProfileEnv::install(&profile, server.addr);
@@ -27373,7 +27612,7 @@ mod tests {
             assert_eq!(state.work_log_posts.len(), 1);
         }
 
-        let server = LoopbackPowderServer::start(2);
+        let server = LoopbackPowderServer::start(4);
         server.state.lock().unwrap().response_run_id = Some("run-reclaimed".into());
         let _profile = PowderProfileEnv::install("loopback-work-log-mismatch", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
