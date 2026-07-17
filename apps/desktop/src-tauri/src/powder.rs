@@ -19,6 +19,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(12);
 const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EVIDENCE_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_MUTATION_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_CLAIM_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_CLAIM_IDENTITY_BYTES: usize = 512;
 const MAX_CAPABILITY_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 4096;
 const MAX_EVIDENCE_ITEMS: usize = 20;
@@ -764,11 +766,14 @@ impl Client {
     }
 
     pub fn claim(&self, card_id: &str, ttl_seconds: u64) -> Result<Claim, String> {
-        let value = self.request(
-            "POST",
-            &format!("/api/v1/cards/{}/claim", encode_path(card_id)),
-            Some(json!({ "agent": self.agent_name, "ttl_seconds": ttl_seconds })),
-        )?;
+        let value = self
+            .request_typed_with_limit(
+                "POST",
+                &format!("/api/v1/cards/{}/claim", encode_path(card_id)),
+                Some(json!({ "agent": self.agent_name, "ttl_seconds": ttl_seconds })),
+                MAX_CLAIM_RESPONSE_BYTES,
+            )
+            .map_err(|error| error.to_string())?;
         validate_initial_claim_receipt(card_id, &self.agent_name, parse_claim(value)?)
     }
 
@@ -2999,10 +3004,17 @@ fn required_event_string(value: &Value, key: &str) -> Result<String, String> {
 }
 
 fn required_string(value: &Value, key: &str) -> Result<String, String> {
-    value[key]
+    let identity = value[key]
         .as_str()
         .map(str::to_string)
-        .ok_or_else(|| format!("Powder claim response is missing {key}"))
+        .ok_or_else(|| format!("Powder claim response is missing {key}"))?;
+    if identity.is_empty()
+        || identity.len() > MAX_CLAIM_IDENTITY_BYTES
+        || identity.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(format!("Powder claim response has invalid {key}"));
+    }
+    Ok(identity)
 }
 
 fn parse_detailed_card(card_id: &str, value: Value) -> Result<DetailedCard, String> {
