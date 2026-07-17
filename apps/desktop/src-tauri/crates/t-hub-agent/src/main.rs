@@ -276,7 +276,7 @@ fn run_codex_unobserved(journal_dir: Option<&str>) -> anyhow::Result<()> {
             "codex-unobserved:{}:{}",
             provenance.session_id, provenance.pane_id
         )),
-        event_type: JournalEventType::CoreAction,
+        event_type: JournalEventType::AgentCommand,
         payload: json!({
             "schema": "t-hub.codex.unobserved.v1",
             "provider": "codex",

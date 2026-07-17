@@ -131,7 +131,7 @@ fn unobserved_tui_process_records_degraded_health_from_its_tmux_tile() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].event_type, JournalEventType::CoreAction);
+    assert_eq!(entries[0].event_type, JournalEventType::AgentCommand);
     assert_eq!(entries[0].payload["tmux_session"], session);
     assert_eq!(
         entries[0].payload["telemetry"]["runtime_health"],

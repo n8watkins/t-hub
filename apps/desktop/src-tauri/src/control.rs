@@ -12123,27 +12123,19 @@ fn heartbeat_crew_powder(
         .or_else(|| arg_str(args, "crew_session_id"))
         .or_else(|| arg_str(args, "sessionId"))
         .ok_or("heartbeat_crew_powder requires a 'crewSessionId' argument")?;
-    let (crew_harness, crew_ship) = ctx
-        .captains
-        .snapshot()
-        .captains
-        .into_iter()
-        .find_map(|captain| {
-            captain
-                .crew
-                .iter()
-                .find(|crew| crew.terminal_id == crew_session_id)
-                .and_then(|crew| {
-                    crew.harness
-                        .as_ref()
-                        .map(|harness| (harness.clone(), captain.ship_slug.clone()))
-                })
-        })
+    let authorization_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    require_crew_heartbeat_authority(
+        &authorization_scope,
+        caller,
+        trusted_internal,
+        "heartbeat_crew_powder",
+    )?;
+    let crew_harness = authorization_scope
+        .crew
+        .harness
+        .as_deref()
         .ok_or_else(|| format!("Crew session '{crew_session_id}' has no recorded harness"))?;
-    if caller.and_then(|identity| identity.tile.as_deref()) != Some(crew_session_id.as_str()) {
-        enforce_ship_authority(caller, trusted_internal, &crew_ship)?;
-    }
-    match tmux::harness_liveness(&tmux_target(&crew_session_id), &crew_harness) {
+    match tmux::harness_liveness(&tmux_target(&crew_session_id), crew_harness) {
         tmux::SessionLiveness::Alive => {}
         tmux::SessionLiveness::Gone => {
             return Err(format!(
@@ -12156,7 +12148,38 @@ fn heartbeat_crew_powder(
             )));
         }
     }
-    let (renewed, crew) = renew_crew_powder_binding(ctx, &crew_session_id, None)?;
+    let _operation_guard = ctx
+        .captains
+        .serialize_crew_powder_operation(&crew_session_id, CrewPowderOperationKind::Renewal);
+    // The caller may have waited behind completion or cleanup. Re-resolve both
+    // exact ownership and runtime liveness inside the operation guard so a
+    // released or replaced Captain cannot renew using a stale pre-wait check.
+    let current_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    require_crew_heartbeat_authority(
+        &current_scope,
+        caller,
+        trusted_internal,
+        "heartbeat_crew_powder",
+    )?;
+    let current_harness = current_scope
+        .crew
+        .harness
+        .as_deref()
+        .ok_or_else(|| format!("Crew session '{crew_session_id}' has no recorded harness"))?;
+    match tmux::harness_liveness(&tmux_target(&crew_session_id), current_harness) {
+        tmux::SessionLiveness::Alive => {}
+        tmux::SessionLiveness::Gone => {
+            return Err(format!(
+                "heartbeat_crew_powder: Crew session '{crew_session_id}' is gone; refusing to extend its claim"
+            ));
+        }
+        tmux::SessionLiveness::Unknown => {
+            return Err(retryable_error(format!(
+                "heartbeat_crew_powder: Crew session '{crew_session_id}' liveness is unavailable"
+            )));
+        }
+    }
+    let (renewed, crew) = renew_crew_powder_binding_guarded(ctx, &crew_session_id, None)?;
     Ok(json!({
         "accepted": "heartbeat_crew_powder",
         "audited": true,
@@ -12170,6 +12193,32 @@ fn heartbeat_crew_powder(
     }))
 }
 
+fn require_crew_heartbeat_authority(
+    scope: &CrewPowderScope,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    command: &str,
+) -> Result<(), String> {
+    if caller_is_apex(caller, trusted_internal) {
+        return Ok(());
+    }
+    let caller = caller.ok_or_else(|| format!("acl: '{command}' requires a session identity"))?;
+    if caller.tile.as_deref() == Some(scope.crew.terminal_id.as_str()) {
+        return Ok(());
+    }
+    if caller.fleet_role == Some(FleetRole::Captain)
+        && caller.ship_slug.as_deref() == Some(scope.ship_slug.as_str())
+        && scope.captain_role == FleetRole::Captain
+        && scope.captain_state == ClaimState::Active
+        && scope.captain_terminal_id.as_deref() == caller.tile.as_deref()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "acl: '{command}' requires the exact Crew session or its current owning Captain"
+    ))
+}
+
 fn renew_crew_powder_binding(
     ctx: &ControlContext,
     crew_session_id: &str,
@@ -12178,6 +12227,14 @@ fn renew_crew_powder_binding(
     let _operation_guard = ctx
         .captains
         .serialize_crew_powder_operation(crew_session_id, CrewPowderOperationKind::Renewal);
+    renew_crew_powder_binding_guarded(ctx, crew_session_id, ttl_seconds)
+}
+
+fn renew_crew_powder_binding_guarded(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    ttl_seconds: Option<u64>,
+) -> Result<(powder::Claim, CrewRef), String> {
     // Resolve again inside the operation guard. A reconciler snapshot may have
     // observed Active before completion persisted pending or completed state.
     let (client, claim) = crew_powder_context(ctx, crew_session_id)?;
@@ -12497,6 +12554,14 @@ fn finalize_crew_powder_cleanup(
     let _operation_guard = ctx
         .captains
         .serialize_crew_powder_operation(crew_session_id, CrewPowderOperationKind::Cleanup);
+    finalize_crew_powder_cleanup_guarded(ctx, crew_session_id, preserve_crew_on_powder_failure)
+}
+
+fn finalize_crew_powder_cleanup_guarded(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    preserve_crew_on_powder_failure: bool,
+) -> Result<(Option<Value>, bool, bool), String> {
     let (cleanup_was_pending, completion_recovery_required, has_powder_binding, is_removed) = ctx
         .captains
         .snapshot()
@@ -14961,6 +15026,13 @@ fn close_terminal_with_policy(
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let target = tmux_target(&session_id);
     let tile_id = session_id.strip_prefix("th_").unwrap_or(&session_id);
+    // Serialize the entire terminal-close transaction with completion,
+    // renewal, and cleanup for this Crew. The guard must precede liveness and
+    // tmux teardown so a close queued behind completion cannot kill the worker
+    // before the authoritative Powder transition converges.
+    let _operation_guard = ctx
+        .captains
+        .serialize_crew_powder_operation(tile_id, CrewPowderOperationKind::Cleanup);
     // Registry-vs-reality (Incident C, ask #3): `kill_session_tree` is idempotent -
     // it returns Ok for an already-gone session too - so a caller could never tell
     // a real kill from a phantom close (ghost ids f0f3207b / 709c7252). Probe
@@ -15006,7 +15078,7 @@ fn close_terminal_with_policy(
     // A Powder failure retains the durable Crew binding in CleanupPending so the
     // exact claim or completion can be inspected and retried after its TTL expires.
     let (powder_release, crew_binding_retained, captain_state_changed) =
-        finalize_crew_powder_cleanup(ctx, tile_id, preserve_crew_on_powder_failure)?;
+        finalize_crew_powder_cleanup_guarded(ctx, tile_id, preserve_crew_on_powder_failure)?;
     let outcome = if forced {
         "force_reaped"
     } else if existed {
@@ -20224,9 +20296,10 @@ mod tests {
             );
             return;
         }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let crew_id = format!("rollback-{}", uuid::Uuid::new_v4().simple());
         let target = tmux_target(&crew_id);
-        tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&target).unwrap();
 
         let registry = Arc::new(CaptainsRegistry::new());
         registry
@@ -23393,6 +23466,7 @@ mod tests {
     fn close_terminal_reports_killed_for_a_live_session() {
         // A real session reports outcome=killed, so a caller can tell a genuine kill
         // from a phantom close.
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let sink = Arc::new(RecordingSink {
             calls: StdMutex::new(Vec::new()),
         });
@@ -26228,7 +26302,7 @@ mod tests {
         let entry: t_hub_protocol::EventJournalEntry = serde_json::from_str(entries[0]).unwrap();
         assert_eq!(
             entry.event_type,
-            t_hub_protocol::JournalEventType::CoreAction
+            t_hub_protocol::JournalEventType::AgentCommand
         );
         assert_eq!(entry.payload["tmux_session"], expected_tmux_session);
         assert_eq!(entry.payload["telemetry"]["runtime_health"], "degraded");
@@ -28749,12 +28823,24 @@ mod tests {
     fn powder_close_vs_complete_terminal_entry_point_waits_before_cleanup() {
         use std::sync::mpsc;
 
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!(
+                "powder_close_vs_complete_terminal_entry_point_waits_before_cleanup: tmux not on PATH - skipping"
+            );
+            return;
+        }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let server = LoopbackPowderServer::start(5);
         let _profile = PowderProfileEnv::install("loopback-close-race", server.addr);
         let crew_session_id = format!("powder-close-{}", uuid::Uuid::new_v4().simple());
+        create_test_tmux_session(&tmux_target(&crew_session_id)).unwrap();
         assert!(matches!(
             tmux::session_liveness(&tmux_target(&crew_session_id)),
-            tmux::SessionLiveness::Gone
+            tmux::SessionLiveness::Alive
         ));
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
         let registry = powder_lifecycle_registry_with_profile_and_crew(
@@ -28825,6 +28911,10 @@ mod tests {
             crew_session_id
         );
         assert!(matches!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Alive
+        ));
+        assert!(matches!(
             &resolve_crew_powder_scope(&ctx, &crew_session_id)
                 .unwrap()
                 .work
@@ -28840,9 +28930,13 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .unwrap()
             .unwrap();
-        assert_eq!(closed["outcome"], "already_gone");
+        assert_eq!(closed["outcome"], "killed");
         assert_eq!(closed["powderRelease"]["outcome"], "already_completed");
         assert_eq!(closed["crewBindingRetained"], false);
+        assert!(matches!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        ));
         completion.join().unwrap();
         close.join().unwrap();
         registry.set_powder_operation_wait_hook(None);
@@ -31132,6 +31226,69 @@ mod tests {
                 if request_digest == digest
         ));
         assert_eq!(work.claim_expires_at, Some(100));
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_queued_heartbeat_revalidates_current_captain_after_guard_wait() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_queued_heartbeat_revalidates_current_captain_after_guard_wait: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("heartbeat-authority-race-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let heartbeat_ctx = ctx.clone();
+        let heartbeat_crew = crew.session_id.clone();
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let heartbeat = std::thread::spawn(move || {
+            heartbeat_tx
+                .send(dispatch_authenticated(
+                    &heartbeat_ctx,
+                    req_session(
+                        &profile_name,
+                        &captain,
+                        "heartbeat_crew_powder",
+                        json!({"crewSessionId": heartbeat_crew}),
+                    ),
+                ))
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        registry.release("powder-ship").unwrap();
+        drop(completion_guard);
+
+        let response = heartbeat_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("current owning Captain"));
+        heartbeat.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
         let state = server.finish().unwrap();
         assert_eq!(state.renew_posts, 0);
     }

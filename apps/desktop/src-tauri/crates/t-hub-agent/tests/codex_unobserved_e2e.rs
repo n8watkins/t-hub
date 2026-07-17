@@ -55,7 +55,7 @@ mod unix {
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
         assert_eq!(entry.source, JournalSource::Agent);
-        assert_eq!(entry.event_type, JournalEventType::CoreAction);
+        assert_eq!(entry.event_type, JournalEventType::AgentCommand);
         assert_eq!(entry.entity_id.as_deref(), Some("codex-unobserved:$17:%42"));
         assert_eq!(entry.payload["schema"], "t-hub.codex.unobserved.v1");
         assert_eq!(entry.payload["provider"], "codex");
