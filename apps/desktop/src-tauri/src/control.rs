@@ -24990,7 +24990,7 @@ mod tests {
         };
         json!({
             "card": loopback_card(state),
-            "current_run_criteria": if state.completed || state.released {
+            "current_run_criteria": if (state.completed || state.released) && !state.force_claim {
                 Vec::<Value>::new()
             } else {
                 vec![loopback_run_criterion(
