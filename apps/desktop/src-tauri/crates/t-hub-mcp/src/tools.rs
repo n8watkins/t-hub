@@ -564,6 +564,41 @@ fn schema_read_crew_powder_evidence() -> Value {
     })
 }
 
+fn schema_review_crew_powder_criterion() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "crewSessionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "operationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "criterion": { "type": "integer", "minimum": 0 },
+            "criterionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "decision": { "type": "string", "enum": ["approved", "rejected", "cleared"] },
+            "proof": {
+                "type": ["string", "null"],
+                "minLength": 1,
+                "maxLength": 4096,
+                "description": "Review proof for approved or rejected decisions. Use null only when clearing a review."
+            },
+            "expectedReviewerIdentity": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Exact authenticated Powder reviewer identity expected in the authoritative receipt."
+            }
+        },
+        "required": [
+            "crewSessionId",
+            "operationId",
+            "criterion",
+            "criterionId",
+            "decision",
+            "proof",
+            "expectedReviewerIdentity"
+        ],
+        "additionalProperties": false
+    })
+}
+
 fn schema_complete_crew_powder() -> Value {
     json!({
         "type": "object",
@@ -871,6 +906,12 @@ pub fn catalog() -> Vec<ToolDef> {
             input_schema: schema_read_crew_powder_evidence,
         },
         ToolDef {
+            name: "review_crew_powder_criterion",
+            tier: Tier::Organization,
+            summary: "Record one exact run-scoped criterion review and verify its authoritative reviewer and proof receipt.",
+            input_schema: schema_review_crew_powder_criterion,
+        },
+        ToolDef {
             name: "watch_fleet",
             tier: Tier::Organization,
             summary: "Arm an orchestrator wake: T-Hub re-invokes YOUR loop (injects a prompt into your terminal) when a watched session (default: any captain) goes idle / needs-input / completes. Ends the need to poll. Idempotent; re-arming replaces the prior watch.",
@@ -1014,6 +1055,7 @@ mod tests {
             "release_captain",
             "append_crew_powder_work_log",
             "read_crew_powder_evidence",
+            "review_crew_powder_criterion",
             "complete_crew_powder",
             "get_theme",
             "set_theme",
@@ -1266,12 +1308,31 @@ mod tests {
             false
         );
 
+        let review = find("review_crew_powder_criterion").unwrap();
+        assert_eq!(review.tier, Tier::Organization);
+        assert_eq!(
+            (review.input_schema)()["required"],
+            json!([
+                "crewSessionId",
+                "operationId",
+                "criterion",
+                "criterionId",
+                "decision",
+                "proof",
+                "expectedReviewerIdentity"
+            ])
+        );
+
         // Append and completion have the same Organization base tier as the
         // combined control contract. Organization carries no generic process
         // confirmation. The backend separately admits the narrow Crew-self
         // work-log case through a read token, then rechecks exact Crew and ship
         // ownership. Completion has no such read-token override.
-        for name in ["append_crew_powder_work_log", "complete_crew_powder"] {
+        for name in [
+            "append_crew_powder_work_log",
+            "review_crew_powder_criterion",
+            "complete_crew_powder",
+        ] {
             let tool = find(name).unwrap().to_mcp();
             assert_eq!(tool["annotations"]["t-hubTier"], "organization", "{name}");
             assert_eq!(
@@ -1302,6 +1363,7 @@ mod tests {
         for name in [
             "append_crew_powder_work_log",
             "read_crew_powder_evidence",
+            "review_crew_powder_criterion",
             "complete_crew_powder",
         ] {
             let schema = (find(name).unwrap().input_schema)();

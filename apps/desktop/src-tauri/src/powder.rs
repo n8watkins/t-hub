@@ -90,6 +90,18 @@ pub struct RunBoundWorkLog {
     pub body: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunBoundCriterionReview {
+    pub expected_run_id: String,
+    pub operation_id: String,
+    pub criterion_index: usize,
+    pub criterion_id: String,
+    pub criterion_text: String,
+    pub decision: CriterionReviewDecision,
+    pub proof: Option<String>,
+    pub expected_reviewer_identity: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkLogEntry {
@@ -830,6 +842,58 @@ impl Client {
         )
     }
 
+    /// Atomically review one criterion on an exact current run.
+    pub fn review_run_criterion(
+        &self,
+        card_id: &str,
+        review: &RunBoundCriterionReview,
+    ) -> Result<OperationOutcome<RunCriterionReview>, PowderError> {
+        validate_id("card id", card_id)?;
+        validate_id("expected run id", &review.expected_run_id)?;
+        validate_operation_id(&review.operation_id)?;
+        validate_id("criterion id", &review.criterion_id)?;
+        validate_required_bounded_text(
+            "criterion text",
+            &review.criterion_text,
+            MAX_EVIDENCE_TEXT_BYTES,
+        )?;
+        validate_required_bounded_text(
+            "expected reviewer identity",
+            &review.expected_reviewer_identity,
+            MAX_CRITERION_REVIEWER_BYTES,
+        )?;
+        validate_optional_bounded_text(
+            "criterion review proof",
+            review.proof.as_deref(),
+            MAX_COMPLETION_PROOF_BYTES,
+        )?;
+        let value = self.request_typed_with_limit(
+            "POST",
+            &format!(
+                "/api/v1/cards/{}/runs/{}/criteria/review",
+                encode_path(card_id),
+                encode_path(&review.expected_run_id)
+            ),
+            Some(json!({
+                "operation_id": review.operation_id,
+                "criterion": review.criterion_index,
+                "criterion_id": review.criterion_id,
+                "decision": review.decision,
+                "proof": review.proof,
+            })),
+            MAX_MUTATION_RESPONSE_BYTES,
+        )?;
+        parse_operation_outcome(
+            value,
+            "criterion_review",
+            card_id,
+            &review.expected_run_id,
+            &review.operation_id,
+            false,
+            |result| parse_exact_run_criterion_review(result, card_id, review),
+        )
+    }
+
     /// Read only the concise, server-bounded evidence needed to supervise one card.
     pub fn card_evidence(&self, card_id: &str) -> Result<CardEvidence, PowderError> {
         validate_id("card id", card_id)?;
@@ -921,6 +985,20 @@ impl Client {
             expected_run_id,
             operation_id,
             |result| parse_run_bound_work_log_entry(result, card_id, expected_run_id, None),
+        )
+    }
+
+    pub fn recover_criterion_review_operation(
+        &self,
+        card_id: &str,
+        review: &RunBoundCriterionReview,
+    ) -> Result<OperationOutcome<RunCriterionReview>, PowderError> {
+        self.recover_operation(
+            "criterion_review",
+            card_id,
+            &review.expected_run_id,
+            &review.operation_id,
+            |result| parse_exact_run_criterion_review(result, card_id, review),
         )
     }
 
@@ -1890,6 +1968,47 @@ fn parse_run_criterion_review(
     })
 }
 
+fn parse_exact_run_criterion_review(
+    value: Value,
+    expected_card_id: &str,
+    expected: &RunBoundCriterionReview,
+) -> Result<RunCriterionReview, PowderError> {
+    let review = parse_run_criterion_review(
+        &value,
+        expected_card_id,
+        &expected.expected_run_id,
+        expected.criterion_index,
+        &expected.criterion_id,
+        &expected.criterion_text,
+    )?;
+    if review.operation_id != expected.operation_id {
+        return Err(invalid_response(
+            "criterion review returned a different operation id",
+        ));
+    }
+    if review.decision != expected.decision {
+        return Err(invalid_response(
+            "criterion review returned a different decision",
+        ));
+    }
+    if review.reviewer_identity != expected.expected_reviewer_identity {
+        return Err(invalid_response(
+            "criterion review returned a different reviewer identity",
+        ));
+    }
+    if expected.proof.is_some() && review.proof.is_none() {
+        return Err(invalid_response(
+            "criterion review omitted the authoritative proof record",
+        ));
+    }
+    if expected.proof.is_none() && review.proof.is_some() {
+        return Err(invalid_response(
+            "criterion review returned an unexpected proof record",
+        ));
+    }
+    Ok(review)
+}
+
 fn criterion_identity(criteria: &[CriterionEvidence], index: usize) -> String {
     let criterion = &criteria[index];
     let occurrence = criteria[..index]
@@ -2836,6 +2955,7 @@ mod tests {
                 "/api/v1/cards/card%2Fone",
                 "/api/v1/runs/run%2Fone",
                 "/api/v1/cards/card%2Fone/runs/run%2Fone/work-log",
+                "/api/v1/cards/card%2Fone/runs/run%2Fone/criteria/review",
                 "/api/v1/cards/card%2Fone/runs/run%2Fone/complete",
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -2875,6 +2995,39 @@ mod tests {
                             "body": "focused tests are passing",
                             "created_at": 15,
                             "updated_at": 15
+                        })),
+                        None,
+                    )
+                } else if expected_path.ends_with("criteria/review") {
+                    let request_body: Value =
+                        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    let criterion_id = test_criterion_id("tests pass", 0);
+                    assert_eq!(request_body["operation_id"], "criterion:one");
+                    assert_eq!(request_body["criterion"], 0);
+                    assert_eq!(request_body["criterion_id"], criterion_id);
+                    assert_eq!(request_body["decision"], "approved");
+                    assert_eq!(request_body["proof"], "raw secret-shaped review proof");
+                    assert!(request_body.get("reviewer").is_none());
+                    assert!(request_body.get("reviewer_identity").is_none());
+                    operation_status(
+                        "criterion:one",
+                        "criterion_review",
+                        "card/one",
+                        "run/one",
+                        "succeeded",
+                        Some(json!({
+                            "id": "review-one",
+                            "operation_id": "criterion:one",
+                            "card_id": "card/one",
+                            "run_id": "run/one",
+                            "criterion_index": 0,
+                            "criterion_id": criterion_id,
+                            "criterion_text": "tests pass",
+                            "decision": "approved",
+                            "reviewer": "captain-powder",
+                            "reviewer_identity": "actor-captain-powder",
+                            "proof": "[scrubbed review proof]",
+                            "created_at": 19
                         })),
                         None,
                     )
@@ -3060,6 +3213,26 @@ mod tests {
         let entry = appended.result.unwrap();
         assert_eq!(entry.agent, "crew-87ea2ca1");
         assert_eq!(entry.run_id.as_deref(), Some("run/one"));
+
+        let reviewed = client
+            .review_run_criterion(
+                "card/one",
+                &RunBoundCriterionReview {
+                    expected_run_id: "run/one".into(),
+                    operation_id: "criterion:one".into(),
+                    criterion_index: 0,
+                    criterion_id: test_criterion_id("tests pass", 0),
+                    criterion_text: "tests pass".into(),
+                    decision: CriterionReviewDecision::Approved,
+                    proof: Some("raw secret-shaped review proof".into()),
+                    expected_reviewer_identity: "actor-captain-powder".into(),
+                },
+            )
+            .unwrap();
+        let review = reviewed.result.unwrap();
+        assert_eq!(review.operation_id, "criterion:one");
+        assert_eq!(review.reviewer_identity, "actor-captain-powder");
+        assert_eq!(review.proof.as_deref(), Some("[scrubbed review proof]"));
 
         let completed = client
             .complete_run_with_proof(

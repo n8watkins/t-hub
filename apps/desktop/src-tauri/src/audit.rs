@@ -161,7 +161,7 @@ impl AuditLog {
 fn redact_error(command: &str, error: &str) -> Value {
     if matches!(
         command,
-        "append_crew_powder_work_log" | "complete_crew_powder"
+        "append_crew_powder_work_log" | "review_crew_powder_criterion" | "complete_crew_powder"
     ) {
         return json!({
             "redacted": true,
@@ -218,8 +218,22 @@ fn redact_args(command: &str, args: &Value) -> Value {
         "append_crew_powder_work_log" => {
             let message = s("message").unwrap_or("");
             json!({
+                "operationId": s("operationId"),
                 "messageLen": message.len(),
                 "messageSha256": &hex(&Sha256::digest(message.as_bytes()))[..16],
+            })
+        }
+        "review_crew_powder_criterion" => {
+            let proof = s("proof").unwrap_or("");
+            json!({
+                "crewSessionId": s("crewSessionId"),
+                "operationId": s("operationId"),
+                "criterion": args.get("criterion").and_then(Value::as_u64),
+                "criterionId": s("criterionId"),
+                "decision": s("decision"),
+                "expectedReviewerIdentity": s("expectedReviewerIdentity"),
+                "proofLen": proof.len(),
+                "proofSha256": &hex(&Sha256::digest(proof.as_bytes()))[..16],
             })
         }
         "complete_crew_powder" => {
@@ -245,6 +259,7 @@ fn redact_args(command: &str, args: &Value) -> Value {
                 .unwrap_or_default();
             json!({
                 "crewSessionId": s("crewSessionId").or_else(|| s("crew_session_id")),
+                "operationId": s("operationId"),
                 "proofLen": proof.len(),
                 "proofSha256": &hex(&Sha256::digest(proof.as_bytes()))[..16],
                 "criterionProofs": criterion_proofs,
@@ -373,6 +388,7 @@ mod tests {
             "organization",
             "allowed",
             &json!({
+                "operationId": "work-log:audit",
                 "message": "SECRET work log body",
             }),
             AuditMeta {
@@ -384,11 +400,33 @@ mod tests {
             },
         );
         log.record(
+            "review_crew_powder_criterion",
+            "organization",
+            "allowed",
+            &json!({
+                "crewSessionId": "crew-1",
+                "operationId": "criterion:audit",
+                "criterion": 0,
+                "criterionId": "powder.criterion.v1:sha256:safe:0",
+                "decision": "approved",
+                "proof": "SECRET criterion review proof",
+                "expectedReviewerIdentity": "actor-captain-1",
+            }),
+            AuditMeta {
+                peer: "loopback",
+                token_tier: "control",
+                session: Some("captain-1"),
+                spawned_by: None,
+                error: None,
+            },
+        );
+        log.record(
             "complete_crew_powder",
             "organization",
             "allowed",
             &json!({
                 "crewSessionId": "crew-1",
+                "operationId": "completion:audit",
                 "proof": "https://secret.example.test/overall-proof",
                 "criterionProofs": [{
                     "criterion": 0,
@@ -405,16 +443,20 @@ mod tests {
         );
 
         let lines = read_lines(&dir);
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         let serialized = serde_json::to_string(&lines).unwrap();
         assert!(!serialized.contains("SECRET work log body"));
+        assert!(!serialized.contains("SECRET criterion review proof"));
         assert!(!serialized.contains("secret.example.test"));
         assert_eq!(lines[0]["args"]["messageLen"], 20);
-        assert_eq!(lines[1]["args"]["criterionProofs"][0]["criterion"], 0);
-        assert_eq!(lines[1]["error"]["redacted"], true);
+        assert_eq!(lines[1]["args"]["criterion"], 0);
+        assert_eq!(lines[1]["args"]["operationId"], "criterion:audit");
         assert_eq!(lines[1]["args"]["proofSha256"].as_str().unwrap().len(), 16);
+        assert_eq!(lines[2]["args"]["criterionProofs"][0]["criterion"], 0);
+        assert_eq!(lines[2]["error"]["redacted"], true);
+        assert_eq!(lines[2]["args"]["proofSha256"].as_str().unwrap().len(), 16);
         assert_eq!(
-            lines[1]["args"]["criterionProofs"][0]["urlSha256"]
+            lines[2]["args"]["criterionProofs"][0]["urlSha256"]
                 .as_str()
                 .unwrap()
                 .len(),

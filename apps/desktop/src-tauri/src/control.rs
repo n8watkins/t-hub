@@ -1686,6 +1686,7 @@ struct HistoricalScopeCaptureHook {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrewPowderOperationKind {
+    Mutation,
     Completion,
     Cleanup,
     Renewal,
@@ -5941,7 +5942,8 @@ fn required_tier(command: &str) -> CommandTier {
         | "focus_tab" | "open_file" | "create_worktree" | "remove_worktree"
         | "archive_recent_project" | "register_project" | "bind_project_powder"
         | "claim_captain" | "release_captain" | "captain_checkpoint" | "watch_fleet"
-        | "unwatch_fleet" | "append_crew_powder_work_log" | "complete_crew_powder"
+        | "unwatch_fleet" | "append_crew_powder_work_log" | "review_crew_powder_criterion"
+        | "complete_crew_powder"
         | "rebind_control"
         // Comms-plane Phase 2 (review H1): `inbox_ack` MUTATES durable receipt state
         // (Delivered -> Processed) and force-compacts records, so it must NOT fall
@@ -7292,6 +7294,9 @@ fn dispatch_with_caller(
         "captain_checkpoint" => captain_checkpoint(ctx, args, caller, trusted_internal),
         "append_crew_powder_work_log" => {
             append_crew_powder_work_log(ctx, args, caller, trusted_internal)
+        }
+        "review_crew_powder_criterion" => {
+            review_crew_powder_criterion(ctx, args, caller, trusted_internal)
         }
         "complete_crew_powder" => complete_crew_powder(ctx, args, caller, trusted_internal),
         // Orchestrator wake: arm/disarm a server-side push that re-invokes the
@@ -10620,6 +10625,15 @@ fn append_crew_powder_work_log(
         .tile
         .clone()
         .ok_or("acl: 'append_crew_powder_work_log' requires a terminal-bound Crew identity")?;
+    let authorization_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    require_crew_self(
+        &authorization_scope,
+        Some(caller),
+        "append_crew_powder_work_log",
+    )?;
+    let _operation_guard = ctx
+        .captains
+        .serialize_crew_powder_operation(&crew_session_id, CrewPowderOperationKind::Mutation);
     let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
     require_crew_self(&scope, Some(caller), "append_crew_powder_work_log")?;
     if !matches!(scope.crew.state, CrewState::Active)
@@ -10728,6 +10742,198 @@ fn append_crew_powder_work_log(
         "createdAt": entry.created_at,
         "messageBytes": entry.body.len(),
         "operationId": operation_id,
+    }))
+}
+
+fn review_crew_powder_criterion(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    _trusted_internal: bool,
+) -> Result<Value, String> {
+    require_exact_args(
+        args,
+        "review_crew_powder_criterion",
+        &[
+            "crewSessionId",
+            "operationId",
+            "criterion",
+            "criterionId",
+            "decision",
+            "proof",
+            "expectedReviewerIdentity",
+        ],
+    )?;
+    let crew_session_id = arg_str(args, "crewSessionId")
+        .ok_or("review_crew_powder_criterion requires a 'crewSessionId' argument")?;
+    let authorization_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    require_same_ship_captain(&authorization_scope, caller, "review_crew_powder_criterion")?;
+    let requested_by = caller
+        .and_then(|identity| identity.tile.as_deref())
+        .ok_or("review_crew_powder_criterion requires a terminal-bound Captain identity")?;
+    let operation_id = parse_powder_operation_id(args, "review_crew_powder_criterion")?;
+    let criterion_index = args
+        .get("criterion")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or("review_crew_powder_criterion requires an integer 'criterion' argument")?;
+    let criterion_id = args
+        .get("criterionId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("review_crew_powder_criterion requires a non-empty 'criterionId' argument")?;
+    if criterion_id.len() > 256 {
+        return Err("review_crew_powder_criterion criterionId is too long".into());
+    }
+    let decision = match args.get("decision").and_then(Value::as_str) {
+        Some("approved") => powder::CriterionReviewDecision::Approved,
+        Some("rejected") => powder::CriterionReviewDecision::Rejected,
+        Some("cleared") => powder::CriterionReviewDecision::Cleared,
+        _ => {
+            return Err(
+                "review_crew_powder_criterion decision must be approved, rejected, or cleared"
+                    .into(),
+            );
+        }
+    };
+    let proof = match args.get("proof") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            if value.trim().len() > powder::MAX_COMPLETION_PROOF_BYTES {
+                return Err(format!(
+                    "review_crew_powder_criterion proof must be at most {} bytes",
+                    powder::MAX_COMPLETION_PROOF_BYTES
+                ));
+            }
+            Some(value.trim().to_string())
+        }
+        Some(Value::String(_)) => {
+            return Err("review_crew_powder_criterion proof must not be empty".into());
+        }
+        Some(_) => return Err("review_crew_powder_criterion proof must be a string".into()),
+    };
+    if decision == powder::CriterionReviewDecision::Cleared && proof.is_some() {
+        return Err("review_crew_powder_criterion cleared decisions cannot carry proof".into());
+    }
+    if decision != powder::CriterionReviewDecision::Cleared && proof.is_none() {
+        return Err("review_crew_powder_criterion requires proof for a review decision".into());
+    }
+    let expected_reviewer_identity = args
+        .get("expectedReviewerIdentity")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(
+            "review_crew_powder_criterion requires a non-empty 'expectedReviewerIdentity' argument",
+        )?;
+    if expected_reviewer_identity.len() > 256 {
+        return Err("review_crew_powder_criterion expectedReviewerIdentity is too long".into());
+    }
+
+    let _operation_guard = ctx
+        .captains
+        .serialize_crew_powder_operation(&crew_session_id, CrewPowderOperationKind::Mutation);
+    let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    require_same_ship_captain(&scope, caller, "review_crew_powder_criterion")?;
+    if !matches!(scope.crew.state, CrewState::Active)
+        || !matches!(scope.work.state, PowderWorkState::Active)
+    {
+        return Err(format!(
+            "review_crew_powder_criterion: Crew session '{crew_session_id}' is not active"
+        ));
+    }
+    if scope.work.agent.is_none() {
+        return Err(
+            "Powder run-bound mutations are unavailable for this legacy Crew binding".into(),
+        );
+    }
+    let client = powder::Client::from_profile(&scope.binding.connection_profile)
+        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+    let (card, run) = read_bound_powder_evidence(&client, &scope)?;
+    if bound_powder_reality(&scope, &card, &run)? != BoundPowderReality::Active {
+        return Err("Powder criterion review requires the exact active Crew run".into());
+    }
+    let criterion = run
+        .criteria
+        .iter()
+        .find(|criterion| criterion.criterion_index == criterion_index)
+        .ok_or_else(|| {
+            format!(
+                "review_crew_powder_criterion criterion {criterion_index} is not authoritative for the bound run"
+            )
+        })?;
+    if criterion.criterion_id != criterion_id {
+        return Err("review_crew_powder_criterion criterionId does not match the bound run".into());
+    }
+    let review = powder::RunBoundCriterionReview {
+        expected_run_id: scope.work.run_id.clone(),
+        operation_id: operation_id.clone(),
+        criterion_index,
+        criterion_id: criterion_id.to_string(),
+        criterion_text: criterion.criterion_text.clone(),
+        decision,
+        proof: proof.clone(),
+        expected_reviewer_identity: expected_reviewer_identity.to_string(),
+    };
+    let intent_payload = json!({
+        "criterion": criterion_index,
+        "criterionId": criterion_id,
+        "criterionText": criterion.criterion_text,
+        "decision": decision,
+        "proof": proof,
+        "expectedReviewerIdentity": expected_reviewer_identity,
+    });
+    let intent = powder_mutation_intent(
+        PowderMutationKind::CriterionReview,
+        &scope,
+        &operation_id,
+        requested_by,
+        &intent_payload,
+    );
+    let intent_digest = intent.payload_digest.clone();
+    ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
+    let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    require_same_ship_captain(&scope, caller, "review_crew_powder_criterion")?;
+    let outcome = match client.review_run_criterion(&scope.work.card_id, &review) {
+        Ok(outcome) => outcome,
+        Err(_) => client
+            .recover_criterion_review_operation(&scope.work.card_id, &review)
+            .map_err(|_| {
+                "Powder criterion-review outcome is unavailable; retry the exact operation"
+                    .to_string()
+            })?,
+    };
+    let receipt = match outcome.state {
+        powder::OperationState::Succeeded => outcome
+            .result
+            .ok_or("Powder criterion-review response omitted its authoritative receipt")?,
+        state => {
+            return Err(powder_operation_rejection(
+                "Powder criterion review",
+                state,
+                outcome.failure.as_ref(),
+            ));
+        }
+    };
+    ctx.captains
+        .finish_crew_powder_mutation(&scope, &operation_id, &intent_digest)
+        .map_err(|error| {
+            format!(
+                "Powder criterion review was accepted, but durable mutation convergence failed: {error}"
+            )
+        })?;
+    let _ = captains_sync_apply(ctx);
+    Ok(json!({
+        "accepted": "review_crew_powder_criterion",
+        "audited": true,
+        "crewSessionId": scope.crew.terminal_id,
+        "projectId": scope.project_id,
+        "repository": scope.binding.repository,
+        "cardId": receipt.card_id,
+        "runId": receipt.run_id,
+        "operationId": receipt.operation_id,
+        "review": receipt,
     }))
 }
 
@@ -23197,6 +23403,7 @@ mod tests {
         proof_url: Option<String>,
         completion_posts: Vec<Value>,
         work_log_posts: Vec<Value>,
+        criterion_review_posts: Vec<Value>,
         mutation_failure_code: Option<String>,
         response_run_id: Option<String>,
         recovery_gets: usize,
@@ -23971,6 +24178,21 @@ mod tests {
                     outcome
                 }
             }
+            (
+                "POST",
+                "/api/v1/cards/thub-powder-control-lifecycle/runs/run-authoritative/criteria/review",
+            ) => {
+                let failure_code = {
+                    let mut state = state.lock().unwrap();
+                    state.criterion_review_posts.push(body.clone());
+                    state.mutation_failure_code.clone()
+                };
+                if let Some(failure_code) = failure_code {
+                    loopback_rejected_outcome("criterion_review", &body, &failure_code)
+                } else {
+                    loopback_criterion_review_outcome(&body)
+                }
+            }
             ("GET", path) if path.starts_with("/api/v1/operations/") => {
                 let (operation_id, recovery_succeeds, proof, proof_url) = {
                     let mut state = state.lock().unwrap();
@@ -23978,6 +24200,7 @@ mod tests {
                     let operation_id = state
                         .work_log_posts
                         .last()
+                        .or_else(|| state.criterion_review_posts.last())
                         .or_else(|| state.completion_posts.last())
                         .and_then(|body| body["operation_id"].as_str())
                         .map(str::to_string)
@@ -24293,6 +24516,30 @@ mod tests {
                 "body": body["body"],
                 "created_at": 126,
                 "updated_at": 126,
+            }),
+        )
+    }
+
+    fn loopback_criterion_review_outcome(body: &Value) -> Value {
+        let operation_id = body["operation_id"].as_str().unwrap();
+        let criterion_id = body["criterion_id"].as_str().unwrap();
+        loopback_operation_outcome(
+            "criterion_review",
+            operation_id,
+            json!({
+                "id": "review-authoritative",
+                "operation_id": operation_id,
+                "card_id": "thub-powder-control-lifecycle",
+                "run_id": "run-authoritative",
+                "criterion_index": body["criterion"],
+                "criterion_id": criterion_id,
+                "criterion_text": "Criterion 0",
+                "decision": body["decision"],
+                "reviewer": "captain-powder",
+                "reviewer_identity": "actor-captain-powder",
+                "proof": body["proof"].as_str().map(|_| "[scrubbed review proof]"),
+                "supersedes_review_id": "review-0",
+                "created_at": 126,
             }),
         )
     }
@@ -24955,6 +25202,65 @@ mod tests {
         );
         assert!(state.work_log_posts[1].get("card_id").is_none());
         assert!(state.work_log_posts[1].get("expected_run_id").is_none());
+    }
+
+    #[test]
+    fn powder_criterion_review_binds_run_criterion_reviewer_and_normalized_proof() {
+        let server = LoopbackPowderServer::start(3);
+        let _profile = PowderProfileEnv::install("loopback-criterion-review", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-criterion-review");
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx("loopback-criterion-review")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let criterion_id = loopback_run_criterion("run-authoritative")["criterion_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-criterion-review",
+                &captain,
+                "review_crew_powder_criterion",
+                json!({
+                    "crewSessionId": "crew-powder",
+                    "operationId": "criterion:authoritative",
+                    "criterion": 0,
+                    "criterionId": criterion_id,
+                    "decision": "approved",
+                    "proof": "raw secret-shaped review proof",
+                    "expectedReviewerIdentity": "actor-captain-powder",
+                }),
+            ),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["operationId"], "criterion:authoritative");
+        assert_eq!(result["review"]["reviewerIdentity"], "actor-captain-powder");
+        assert_eq!(result["review"]["proof"], "[scrubbed review proof]");
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.criterion_review_posts.len(), 1);
+        let posted = &state.criterion_review_posts[0];
+        assert_eq!(posted["operation_id"], "criterion:authoritative");
+        assert_eq!(posted["criterion"], 0);
+        assert_eq!(posted["decision"], "approved");
+        assert_eq!(posted["proof"], "raw secret-shaped review proof");
+        assert!(posted.get("reviewer").is_none());
+        assert!(posted.get("reviewer_identity").is_none());
     }
 
     #[test]
