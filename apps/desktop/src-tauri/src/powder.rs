@@ -769,7 +769,7 @@ impl Client {
             &format!("/api/v1/cards/{}/claim", encode_path(card_id)),
             Some(json!({ "agent": self.agent_name, "ttl_seconds": ttl_seconds })),
         )?;
-        parse_claim(value)
+        validate_initial_claim_receipt(card_id, &self.agent_name, parse_claim(value)?)
     }
 
     pub fn heartbeat(&self, claim: &Claim) -> Result<Claim, String> {
@@ -2921,6 +2921,19 @@ fn validate_claim_receipt(
     Ok(actual)
 }
 
+fn validate_initial_claim_receipt(
+    expected_card_id: &str,
+    expected_agent: &str,
+    actual: Claim,
+) -> Result<Claim, String> {
+    if actual.card_id != expected_card_id || actual.agent != expected_agent {
+        return Err(
+            "Powder claim response did not match the requested card and configured agent".into(),
+        );
+    }
+    Ok(actual)
+}
+
 fn parse_event_stream(body: &str, after: i64) -> Result<Vec<CardEvent>, String> {
     let mut events = Vec::new();
     for frame in body.replace("\r\n", "\n").split("\n\n") {
@@ -3306,6 +3319,36 @@ mod tests {
         assert_eq!(claim.agent, "terminal-1");
         assert_eq!(claim.expires_at, 123);
         assert!(parse_claim(json!({ "card_id": "card-1" })).is_err());
+    }
+
+    #[test]
+    fn claim_rejects_card_or_agent_substitution_before_dispatch_can_bind_it() {
+        for (receipt_card, receipt_agent) in [("card-other", "t-hub"), ("card-1", "other")] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(request.starts_with("POST /api/v1/cards/card-1/claim "));
+                assert!(request.contains(r#""agent":"t-hub""#));
+                let body = json!({
+                    "card_id": receipt_card,
+                    "run_id": "run-1",
+                    "agent": receipt_agent,
+                    "expires_at": 1234,
+                })
+                .to_string();
+                write_json_response(&mut stream, "200 OK", &body);
+            });
+
+            let error = test_client(addr).claim("card-1", 3600).unwrap_err();
+
+            assert_eq!(
+                error,
+                "Powder claim response did not match the requested card and configured agent"
+            );
+            server.join().unwrap();
+        }
     }
 
     #[test]

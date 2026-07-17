@@ -24769,6 +24769,8 @@ mod tests {
         renewal_receipt_card_id: Option<String>,
         renewal_receipt_run_id: Option<String>,
         renewal_receipt_agent: Option<String>,
+        claim_receipt_card_id: Option<String>,
+        claim_receipt_agent: Option<String>,
         issued_claim_agent: Option<String>,
         renew_posts: usize,
     }
@@ -25697,8 +25699,16 @@ mod tests {
             ("POST", "/api/v1/cards/thub-powder-control-lifecycle/claim") => {
                 let mut state = state.lock().unwrap();
                 state.claim_posts += 1;
-                state.issued_claim_agent = Some("t-hub".into());
-                json!({"card_id": "thub-powder-control-lifecycle", "run_id": "run-authoritative", "agent": "t-hub", "expires_at": 100})
+                let response_card_id = state
+                    .claim_receipt_card_id
+                    .clone()
+                    .unwrap_or_else(|| "thub-powder-control-lifecycle".into());
+                let response_agent = state
+                    .claim_receipt_agent
+                    .clone()
+                    .unwrap_or_else(|| "t-hub".into());
+                state.issued_claim_agent = Some(response_agent.clone());
+                json!({"card_id": response_card_id, "run_id": "run-authoritative", "agent": response_agent, "expires_at": 100})
             }
             ("POST", path) if path.ends_with("/release") => {
                 let mut state = state.lock().unwrap();
@@ -26308,6 +26318,63 @@ mod tests {
         assert_eq!(state.claim_posts, 1);
         assert_eq!(state.release_posts, 1);
         assert_eq!(state.release_bodies[0]["run_id"], "run-authoritative");
+    }
+
+    #[test]
+    fn dispatch_rejects_substituted_initial_claim_without_foreign_binding() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_rejects_substituted_initial_claim_without_foreign_binding: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        for (receipt_card, receipt_agent) in
+            [(Some("foreign-card"), None), (None, Some("foreign-agent"))]
+        {
+            let server = LoopbackPowderServer::start(3);
+            server.state.lock().unwrap().claim_receipt_card_id = receipt_card.map(str::to_string);
+            server.state.lock().unwrap().claim_receipt_agent = receipt_agent.map(str::to_string);
+            let profile_name = format!(
+                "dispatch-claim-substitution-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+            let captain = FakeHarnessSession::start(Harness::Codex);
+            let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+            let (ctx, sink) = dispatch_test_context(registry.clone());
+            let error = dispatch_crew(
+                &ctx,
+                &json!({
+                    "captainSessionId": captain.session_id,
+                    "cardId": "thub-powder-control-lifecycle",
+                    "task": "Reject substituted initial claim",
+                    "harness": "codex",
+                }),
+                None,
+                true,
+            )
+            .unwrap_err();
+
+            assert!(
+                error.contains(
+                    "Powder claim response did not match the requested card and configured agent"
+                ),
+                "{error}"
+            );
+            assert!(
+                error.contains("all side effects were rolled back"),
+                "{error}"
+            );
+            let crew_session_id = dispatched_terminal_id(&sink);
+            assert_eq!(
+                tmux::session_liveness(&tmux_target(&crew_session_id)),
+                tmux::SessionLiveness::Gone
+            );
+            assert!(registry.snapshot().captains[0].crew.is_empty());
+            let state = server.finish().unwrap();
+            assert_eq!(state.claim_posts, 1);
+            assert_eq!(state.release_posts, 0);
+        }
     }
 
     fn dispatch_race_evidence(
