@@ -29,6 +29,8 @@ The follow-up renewal identity finding was remediated by commit `3b2bd8e8b4d17d8
 That commit binds pre-mutation authority and post-mutation receipts to the durable Powder claim identity.
 The post-rereview authority-generation finding was remediated by commit `e011125bebdbd82be13ab0724fb0fa08c23fcaf4`.
 That commit revalidates queued Captain close authority, rejects authority ABA on queued heartbeat, and protects expiry persistence with an exact-scope compare-and-set.
+The foreign-heartbeat information-disclosure finding was remediated by commit `8b056fb35a59f4a73d257c3239c379a465d3c704`.
+That commit authorizes the target Crew or current Captain from a registry snapshot before resolving Project or Powder scope.
 
 Both frozen reviewed heads are ancestors of the integration head.
 Neither reviewed head was rebased or modified.
@@ -73,6 +75,9 @@ Heartbeat and renewal now reject an authoritative claim agent that differs from 
 Both operations also reject any card, run, or agent receipt substitution before updating durable claim expiry.
 The expiry update compares the exact Crew, Captain, Project, Powder binding, and scoped authority generation observed before remote renewal.
 Terminal close captures exact Captain authority before waiting and revalidates it after the per-Crew lifecycle guard before tmux teardown.
+Heartbeat now performs a minimal Crew and Captain ownership check from one registry snapshot before resolving the full Powder scope.
+Foreign target probes therefore fail with a generic ACL denial without disclosing target Project or Powder binding state.
+The existing full-scope checks, Harness liveness checks, operation guard, and post-guard authority-generation revalidation remain in force.
 
 The frontend snapshot adapter retains `harnessPermission` and `tHubCapability` as separate compatibility axes.
 Unknown values remain omitted instead of being accepted as authoritative state.
@@ -106,6 +111,11 @@ Fresh rereview also required replacement and ABA proof for heartbeat, exact-scop
 Queued heartbeat now rejects both a distinct Captain replacement and release-reclaim ABA with zero renewal posts.
 The renewal compare-and-set refuses to persist an accepted remote receipt after the scope generation changes, retaining the previous expiry.
 The reconciler test observes liveness before its guard, stops the Harness while renewal waits, and proves the post-guard recheck emits zero remote renewals.
+
+Latest rereview found that `heartbeat_crew_powder` resolved full Powder scope before ACL authorization.
+A cross-ship Captain could therefore learn that a foreign Crew ship had no Project binding from the target-specific error.
+Heartbeat now uses a snapshot-only target ownership gate before full scope resolution and returns the generic exact-Crew-or-owning-Captain ACL denial for foreign probes.
+The regression test targets an active foreign Crew with a durable work binding but no Project binding and proves the loopback Powder server observes zero renewal posts.
 
 ## Focused Verification
 
@@ -141,6 +151,10 @@ Targeted `cargo clippy -p t-hub --all-targets -- -D warnings` also passed at the
 After the post-rereview authority-generation remediation, the focused control Powder suite passed all 62 tests and the close-terminal group passed all 4 tests.
 The targeted authenticated lifecycle-authority, full-token denial, Captain checkpoint, and 26-test Powder client suites also passed.
 Formatting, targeted all-target clippy, and `git diff --check` passed at commit `e011125bebdbd82be13ab0724fb0fa08c23fcaf4`.
+
+After the foreign-heartbeat remediation, `captain_cannot_close_or_heartbeat_foreign_crew` and the new deterministic cross-ship non-Project probe test passed.
+The focused control Powder suite passed all 62 tests, the close-terminal group passed all 4 tests, and the Powder client suite passed all 26 tests.
+Formatting, targeted all-target clippy, and `git diff --check` passed at commit `8b056fb35a59f4a73d257c3239c379a465d3c704`.
 
 The standalone CLI Powder contract suite passed 10 tests.
 The MCP Powder schema tests passed in both library and binary targets.
@@ -213,3 +227,4 @@ No independent reviewer has approved this integration yet.
 16. Verify a queued Captain close rejects replacement or authority ABA before tmux teardown and cannot cross into a replacement Captain's Crew lifecycle.
 17. Verify queued heartbeat revalidates current authority generation, and expiry persistence compare-and-sets the exact pre-renewal Crew, Captain, Project, Powder binding, and generation scope.
 18. Verify the reconciler repeats Harness liveness validation inside the renewal guard before it can issue a remote renewal.
+19. Verify a foreign heartbeat probe is authorized from minimal registry ownership before full Project or Powder scope resolution and cannot disclose target binding state or issue a remote renewal.
