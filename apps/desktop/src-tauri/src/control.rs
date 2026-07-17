@@ -15154,10 +15154,13 @@ fn close_terminal_authorized(
     let target = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
         .ok_or("close_terminal requires a 'sessionId' argument")?;
+    // Authorize the target from ownership-only registry state before checking
+    // historical Removed Crew state, which can lead to Project and Powder scope
+    // resolution. Foreign callers must not use close as a binding-state oracle.
+    let authority = enforce_target_lifecycle_authority(ctx, caller, trusted_internal, &target)?;
     if ctx.captains.removed_crew_powder_ship(&target)?.is_some() {
         return reconcile_removed_crew_powder_binding(ctx, caller, &target);
     }
-    let authority = enforce_target_lifecycle_authority(ctx, caller, trusted_internal, &target)?;
     close_terminal_with_policy(ctx, args, false, authority.as_ref())
 }
 
@@ -29404,6 +29407,77 @@ mod tests {
     }
 
     #[test]
+    fn close_foreign_removed_crew_is_generic_before_project_scope_resolution() {
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("foreign-removed-close-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = Arc::new(CaptainsRegistry::new());
+        registry
+            .claim_test("captain-owner", Some("owner-ship"), vec![])
+            .unwrap();
+        assert!(registry
+            .record_crew("captain-owner", "crew-removed")
+            .unwrap());
+        registry
+            .bind_crew_context(
+                "captain-owner",
+                "crew-removed",
+                "removed foreign task",
+                "codex",
+                None,
+                None,
+                PowderWorkBinding {
+                    card_id: "foreign-card".into(),
+                    run_id: "foreign-run".into(),
+                    agent: Some("foreign-agent".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        assert!(registry.remove_session("crew-removed").unwrap());
+        registry
+            .claim_test("captain-attacker", Some("attacker-ship"), vec![])
+            .unwrap();
+        let attacker = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "attacker-ship",
+            "captain-attacker",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                &profile_name,
+                &attacker,
+                "close_terminal",
+                json!({"sessionId": "crew-removed"}),
+            ),
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some(
+                "acl: only General/Cortana, the target session, or its current Captain may mutate this lifecycle"
+            )
+        );
+        let after = registry.snapshot();
+        assert_eq!(after.seq, before.seq);
+        assert!(after.captains[0].crew[0].powder_work.is_some());
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
     fn removed_crew_powder_cleanup_allows_only_owning_captain_and_unblocks_dispatch() {
         let server = LoopbackPowderServer::start(2);
         server.state.lock().unwrap().released = true;
@@ -29468,7 +29542,12 @@ mod tests {
             !denied.ok,
             "a foreign Captain must not clean historical work"
         );
-        assert!(denied.error.unwrap().contains("owning Captain"));
+        assert_eq!(
+            denied.error.as_deref(),
+            Some(
+                "acl: only General/Cortana, the target session, or its current Captain may mutate this lifecycle"
+            )
+        );
         let after_denial = registry.snapshot();
         assert_eq!(after_denial.seq, before.seq);
         assert!(after_denial.captains[0].crew[0].powder_work.is_some());
