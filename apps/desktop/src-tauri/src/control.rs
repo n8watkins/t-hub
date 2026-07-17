@@ -1331,6 +1331,210 @@ pub struct CaptainsSnapshot {
     pub projects: Vec<ProjectRecord>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptainAuthorityProjection {
+    ship_slug: String,
+    role: FleetRole,
+    claude_uuid: Option<String>,
+    provider: Option<String>,
+    provider_session_id: Option<String>,
+    terminal_id: Option<String>,
+    project_id: Option<String>,
+    assignment: Option<String>,
+    harness: Option<String>,
+    conversation_id: Option<String>,
+    resume_point: Option<String>,
+    workspace_tab_ids: Vec<String>,
+    state: ClaimState,
+}
+
+impl From<&CaptainRecord> for CaptainAuthorityProjection {
+    fn from(captain: &CaptainRecord) -> Self {
+        Self {
+            ship_slug: captain.ship_slug.clone(),
+            role: captain.role,
+            claude_uuid: captain.claude_uuid.clone(),
+            provider: captain.provider.clone(),
+            provider_session_id: captain.provider_session_id.clone(),
+            terminal_id: captain.terminal_id.clone(),
+            project_id: captain.project_id.clone(),
+            assignment: captain.assignment.clone(),
+            harness: captain.harness.clone(),
+            conversation_id: captain.conversation_id.clone(),
+            resume_point: captain.resume_point.clone(),
+            workspace_tab_ids: captain.workspace_tab_ids.clone(),
+            state: captain.state.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrewAuthorityProjection {
+    ship_slug: String,
+    crew: CrewRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectAuthorityProjection {
+    project_id: String,
+    repo_root: String,
+    powder: Option<(String, String)>,
+}
+
+impl From<&ProjectRecord> for ProjectAuthorityProjection {
+    fn from(project: &ProjectRecord) -> Self {
+        Self {
+            project_id: project.project_id.clone(),
+            repo_root: project.repo_root.clone(),
+            powder: project.powder.as_ref().map(|binding| {
+                (
+                    binding.connection_profile.clone(),
+                    binding.repository.clone(),
+                )
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct AuthorityGenerationChanges {
+    captains: Vec<String>,
+    crew: Vec<String>,
+    projects: Vec<String>,
+}
+
+impl AuthorityGenerationChanges {
+    fn between(previous: &CaptainsInner, candidate: &CaptainsInner) -> Self {
+        let captain_keys = previous
+            .captains
+            .iter()
+            .chain(candidate.captains.iter())
+            .map(|captain| captain.ship_slug.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let crew_keys = previous
+            .captains
+            .iter()
+            .chain(candidate.captains.iter())
+            .flat_map(|captain| captain.crew.iter())
+            .map(|crew| crew.terminal_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let project_keys = previous
+            .projects
+            .iter()
+            .chain(candidate.projects.iter())
+            .map(|project| project.project_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let captain_projection = |inner: &CaptainsInner, key: &str| {
+            inner
+                .captains
+                .iter()
+                .find(|captain| captain.ship_slug == key)
+                .map(CaptainAuthorityProjection::from)
+        };
+        let crew_projection = |inner: &CaptainsInner, key: &str| {
+            inner
+                .captains
+                .iter()
+                .flat_map(|captain| {
+                    captain
+                        .crew
+                        .iter()
+                        .filter(move |crew| crew.terminal_id == key)
+                        .map(move |crew| CrewAuthorityProjection {
+                            ship_slug: captain.ship_slug.clone(),
+                            crew: crew.clone(),
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        let project_projection = |inner: &CaptainsInner, key: &str| {
+            inner
+                .projects
+                .iter()
+                .find(|project| project.project_id == key)
+                .map(ProjectAuthorityProjection::from)
+        };
+
+        Self {
+            captains: captain_keys
+                .into_iter()
+                .filter(|key| {
+                    captain_projection(previous, key) != captain_projection(candidate, key)
+                })
+                .collect(),
+            crew: crew_keys
+                .into_iter()
+                .filter(|key| crew_projection(previous, key) != crew_projection(candidate, key))
+                .collect(),
+            projects: project_keys
+                .into_iter()
+                .filter(|key| {
+                    project_projection(previous, key) != project_projection(candidate, key)
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScopedAuthorityGeneration {
+    registry_epoch: u64,
+    captain: u64,
+    crew: u64,
+    project: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AuthorityGenerations {
+    clock: u64,
+    captains: std::collections::HashMap<String, u64>,
+    crew: std::collections::HashMap<String, u64>,
+    projects: std::collections::HashMap<String, u64>,
+}
+
+impl AuthorityGenerations {
+    fn advance(&mut self, changes: AuthorityGenerationChanges) -> Result<(), String> {
+        for key in changes.captains {
+            self.clock = self
+                .clock
+                .checked_add(1)
+                .ok_or("Captain authority generation exhausted")?;
+            self.captains.insert(key, self.clock);
+        }
+        for key in changes.crew {
+            self.clock = self
+                .clock
+                .checked_add(1)
+                .ok_or("Crew authority generation exhausted")?;
+            self.crew.insert(key, self.clock);
+        }
+        for key in changes.projects {
+            self.clock = self
+                .clock
+                .checked_add(1)
+                .ok_or("Project authority generation exhausted")?;
+            self.projects.insert(key, self.clock);
+        }
+        Ok(())
+    }
+
+    fn scoped(
+        &self,
+        registry_epoch: u64,
+        ship_slug: &str,
+        crew_session_id: &str,
+        project_id: &str,
+    ) -> ScopedAuthorityGeneration {
+        ScopedAuthorityGeneration {
+            registry_epoch,
+            captain: self.captains.get(ship_slug).copied().unwrap_or(0),
+            crew: self.crew.get(crew_session_id).copied().unwrap_or(0),
+            project: self.projects.get(project_id).copied().unwrap_or(0),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct CaptainsInner {
     captains: Vec<CaptainRecord>,
@@ -1339,6 +1543,21 @@ struct CaptainsInner {
     /// convergence contract as [`RegistryInner::seq`]. Persisted, so it stays
     /// monotonic across app restarts.
     seq: u64,
+    /// Internal non-ABA versions for exact historical Powder authority scopes.
+    /// These are intentionally not serialized: a process restart destroys every
+    /// in-flight request, and the registry epoch makes tokens from another loaded
+    /// instance invalid while new requests start from the loaded durable state.
+    authority_generations: AuthorityGenerations,
+}
+
+static NEXT_AUTHORITY_REGISTRY_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_authority_registry_epoch() -> u64 {
+    NEXT_AUTHORITY_REGISTRY_EPOCH
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("authority registry epoch exhausted")
 }
 
 /// The CORE's authoritative captains registry (captain-chat phase 2).
@@ -1356,6 +1575,9 @@ struct CaptainsInner {
 /// state-file write never wedges a reader on the registry lock.
 pub struct CaptainsRegistry {
     inner: Mutex<CaptainsInner>,
+    /// Unique in-process identity for this loaded registry instance. No request
+    /// can carry an authority token through replacement or restart of the store.
+    authority_epoch: u64,
     /// Serializes mutations so a candidate is published in memory only after its
     /// durable write succeeds, without racing another accepted mutation.
     mutation: Mutex<()>,
@@ -1488,6 +1710,7 @@ impl CaptainsRegistry {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(CaptainsInner::default()),
+            authority_epoch: next_authority_registry_epoch(),
             mutation: Mutex::new(()),
             provision: Mutex::new(()),
             powder_operations_inflight: Mutex::new(std::collections::HashMap::new()),
@@ -1594,6 +1817,7 @@ impl CaptainsRegistry {
                     captains,
                     projects: snap.projects,
                     seq: snap.seq,
+                    authority_generations: AuthorityGenerations::default(),
                 }
             })
             .unwrap_or_default();
@@ -1604,6 +1828,7 @@ impl CaptainsRegistry {
         let loaded_seq = inner.seq;
         Self {
             inner: Mutex::new(inner),
+            authority_epoch: next_authority_registry_epoch(),
             mutation: Mutex::new(()),
             provision: Mutex::new(()),
             powder_operations_inflight: Mutex::new(std::collections::HashMap::new()),
@@ -2037,10 +2262,13 @@ impl CaptainsRegistry {
         mut current: std::sync::MutexGuard<'_, CaptainsInner>,
         previous: CaptainsInner,
     ) -> Result<(), String> {
-        let candidate = current.clone();
-        let snap = Self::snapshot_for_persist(&candidate);
+        let mut candidate = current.clone();
+        let generation_changes = AuthorityGenerationChanges::between(&previous, &candidate);
+        let generation_result = candidate.authority_generations.advance(generation_changes);
         *current = previous;
         drop(current);
+        generation_result?;
+        let snap = Self::snapshot_for_persist(&candidate);
         Self::validate_snapshot(&snap)?;
         self.persist(snap)?;
         *self.lock() = candidate;
@@ -2062,6 +2290,23 @@ impl CaptainsRegistry {
             captains: g.captains.clone(),
             projects: g.projects.clone(),
         }
+    }
+
+    /// Capture durable registry values and their internal authority versions under
+    /// one lock. The returned copies are safe to carry across remote I/O without
+    /// holding either the registry lock or the mutation serializer.
+    fn snapshot_with_authority_generations(&self) -> (CaptainsSnapshot, AuthorityGenerations, u64) {
+        let g = self.lock();
+        (
+            CaptainsSnapshot {
+                schema_version: CAPTAINS_SCHEMA_VERSION,
+                seq: g.seq,
+                captains: g.captains.clone(),
+                projects: g.projects.clone(),
+            },
+            g.authority_generations.clone(),
+            self.authority_epoch,
+        )
     }
 
     /// Return the durable project registry without exposing the registry lock.
@@ -3288,9 +3533,23 @@ impl CaptainsRegistry {
                     "Crew session '{crew_session_id}' historical scope has no authenticated Captain identity"
                 )
             })?;
+        let expected_generation = expected.authority_generation.ok_or_else(|| {
+            format!("Crew session '{crew_session_id}' historical scope has no authority generation")
+        })?;
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
         let previous = g.clone();
+        let current_generation = g.authority_generations.scoped(
+            self.authority_epoch,
+            &expected.ship_slug,
+            crew_session_id,
+            &expected.project_id,
+        );
+        if current_generation != expected_generation {
+            return Err(format!(
+                "Crew session '{crew_session_id}' scoped authority generation changed while Powder release evidence was being read"
+            ));
+        }
         let crew_matches = g
             .captains
             .iter()
@@ -3511,6 +3770,67 @@ impl CaptainsRegistry {
             authenticated,
             resume,
         });
+    }
+
+    fn test_scoped_authority_generation(
+        &self,
+        ship_slug: &str,
+        crew_session_id: &str,
+        project_id: &str,
+    ) -> ScopedAuthorityGeneration {
+        self.lock().authority_generations.scoped(
+            self.authority_epoch,
+            ship_slug,
+            crew_session_id,
+            project_id,
+        )
+    }
+
+    fn test_remove_captain_and_project(
+        &self,
+        ship_slug: &str,
+        project_id: &str,
+    ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let captain_index = g
+            .captains
+            .iter()
+            .position(|captain| captain.ship_slug == ship_slug)
+            .ok_or_else(|| format!("unknown shipSlug '{ship_slug}'"))?;
+        let project_index = g
+            .projects
+            .iter()
+            .position(|project| project.project_id == project_id)
+            .ok_or_else(|| format!("unknown projectId '{project_id}'"))?;
+        g.captains.remove(captain_index);
+        g.projects.remove(project_index);
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)
+    }
+
+    fn test_restore_captain_and_project(
+        &self,
+        captain: CaptainRecord,
+        project: ProjectRecord,
+    ) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        if g.captains
+            .iter()
+            .any(|candidate| candidate.ship_slug == captain.ship_slug)
+            || g.projects
+                .iter()
+                .any(|candidate| candidate.project_id == project.project_id)
+        {
+            return Err("test authority scope already exists".into());
+        }
+        g.projects.push(project);
+        g.captains.push(captain);
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)
     }
 
     fn pause_before_historical_scope_capture(&self, crew_session_id: &str) {
@@ -5694,7 +6014,7 @@ struct AuthenticatedCaptainAuthority {
     terminal_id: String,
     ship_slug: String,
     project_id: String,
-    registry_seq: u64,
+    generation: ScopedAuthorityGeneration,
 }
 
 fn enforce_removed_crew_powder_cleanup_authority(
@@ -5717,7 +6037,8 @@ fn enforce_removed_crew_powder_cleanup_authority(
         );
     }
 
-    let snapshot = ctx.captains.snapshot();
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
     let owners = snapshot
         .captains
         .iter()
@@ -5766,7 +6087,12 @@ fn enforce_removed_crew_powder_cleanup_authority(
         terminal_id: caller_terminal.to_string(),
         ship_slug: caller_ship.to_string(),
         project_id: project_id.to_string(),
-        registry_seq: snapshot.seq,
+        generation: generations.scoped(
+            registry_epoch,
+            &owner.ship_slug,
+            target_terminal,
+            project_id,
+        ),
     })
 }
 
@@ -9391,6 +9717,7 @@ struct CrewPowderScope {
     crew: CrewRef,
     binding: PowderProjectBinding,
     work: PowderWorkBinding,
+    authority_generation: Option<ScopedAuthorityGeneration>,
 }
 
 fn resolve_crew_powder_scope(
@@ -9466,6 +9793,7 @@ fn resolve_crew_powder_scope_from_snapshot(
         crew: crew.clone(),
         binding,
         work,
+        authority_generation: None,
     })
 }
 
@@ -9474,7 +9802,8 @@ fn resolve_historical_removed_crew_powder_scope(
     crew_session_id: &str,
     authority: &AuthenticatedCaptainAuthority,
 ) -> Result<CrewPowderScope, String> {
-    let snapshot = ctx.captains.snapshot();
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
     let mut scope = resolve_crew_powder_scope_from_snapshot(&snapshot, crew_session_id)?;
     let owning_ship_count = snapshot
         .captains
@@ -9486,7 +9815,13 @@ fn resolve_historical_removed_crew_powder_scope(
         .iter()
         .filter(|project| project.repo_root == scope.project_repo_root)
         .count();
-    if snapshot.seq != authority.registry_seq
+    let current_generation = generations.scoped(
+        registry_epoch,
+        &scope.ship_slug,
+        crew_session_id,
+        &scope.project_id,
+    );
+    if current_generation != authority.generation
         || owning_ship_count != 1
         || project_root_count != 1
         || scope.ship_slug != authority.ship_slug
@@ -9500,6 +9835,7 @@ fn resolve_historical_removed_crew_powder_scope(
         ));
     }
     scope.authenticated_captain_terminal_id = Some(authority.terminal_id.clone());
+    scope.authority_generation = Some(authority.generation);
     Ok(scope)
 }
 
@@ -25054,6 +25390,119 @@ mod tests {
     }
 
     #[test]
+    fn removed_crew_cleanup_rejects_same_terminal_release_reclaim_aba_before_scope_capture() {
+        use std::sync::mpsc;
+
+        let server = LoopbackPowderServer::start(0);
+        server.state.lock().unwrap().released = true;
+        let profile_name = "historical-authority-pre-scope-aba";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let path = captains_tmp(profile_name);
+        let crew_session_id = format!("powder-pre-scope-aba-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            profile_name,
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+        let original_captain = before.captains[0].clone();
+        let (authenticated_tx, authenticated_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        registry.set_historical_scope_capture_hook(authenticated_tx, resume_rx);
+
+        let cleanup_ctx = ctx.clone();
+        let cleanup_owner = owner.clone();
+        let cleanup_crew_session_id = crew_session_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &cleanup_ctx,
+                req_session(
+                    profile_name,
+                    &cleanup_owner,
+                    "close_terminal",
+                    json!({"sessionId": cleanup_crew_session_id}),
+                ),
+            )
+        });
+        authenticated_rx
+            .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+            .unwrap();
+        assert!(
+            dispatch_authenticated(
+                &ctx,
+                req_session(
+                    profile_name,
+                    &owner,
+                    "release_captain",
+                    json!({"shipSlug": "powder-ship"}),
+                ),
+            )
+            .ok
+        );
+        registry
+            .claim_provider(
+                "captain-powder",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        let after_aba = registry.snapshot();
+        assert_eq!(after_aba.seq, before.seq + 2);
+        assert_eq!(after_aba.captains[0], original_captain);
+        resume_tx.send(()).unwrap();
+        let stale = cleanup.join().unwrap();
+
+        assert!(!stale.ok);
+        assert!(stale
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("authenticated Captain")));
+        let memory = registry.snapshot();
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(memory.seq, after_aba.seq);
+        assert_eq!(memory.captains[0], original_captain);
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&disk).unwrap()
+        );
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_err());
+        reconcile_powder_leases(&ctx);
+        assert_eq!(registry.snapshot().seq, after_aba.seq);
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 0);
+        assert_eq!(state.run_evidence_gets, 0);
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn removed_crew_cleanup_binds_scope_to_authenticated_captain_and_allows_fresh_replacement() {
         use std::sync::mpsc;
 
@@ -25845,6 +26294,567 @@ mod tests {
     #[test]
     fn removed_crew_historical_cleanup_rejects_powder_unbind_during_evidence_read() {
         assert_removed_crew_historical_cleanup_scope_race(HistoricalProjectScopeRace::PowderUnbind);
+    }
+
+    #[derive(Clone, Copy)]
+    enum HistoricalScopeAba {
+        CaptainReleaseReclaim,
+        CrewWork,
+        Profile,
+        ProjectRemovalRecreation,
+        Repository,
+    }
+
+    impl HistoricalScopeAba {
+        fn label(self) -> &'static str {
+            match self {
+                Self::CaptainReleaseReclaim => "captain-release-reclaim-aba",
+                Self::CrewWork => "crew-work-aba",
+                Self::Profile => "profile-aba",
+                Self::ProjectRemovalRecreation => "project-removal-recreation-aba",
+                Self::Repository => "repository-aba",
+            }
+        }
+    }
+
+    fn assert_removed_crew_historical_cleanup_rejects_aba(race: HistoricalScopeAba) {
+        let server = LoopbackPowderServer::start(2);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.released = true;
+            state.pause_run_evidence = true;
+        }
+        let profile_name = "loopback-historical-aba";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let path = captains_tmp(race.label());
+        let crew_session_id = format!("powder-{}-{}", race.label(), uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            profile_name,
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+        let original_captain = before.captains[0].clone();
+        let original_project = before.projects[0].clone();
+        let original_crew = original_captain.crew[0].clone();
+
+        let cleanup_ctx = ctx.clone();
+        let cleanup_owner = owner.clone();
+        let cleanup_crew_session_id = crew_session_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &cleanup_ctx,
+                req_session(
+                    profile_name,
+                    &cleanup_owner,
+                    "close_terminal",
+                    json!({"sessionId": cleanup_crew_session_id}),
+                ),
+            )
+        });
+        server
+            .run_evidence_started
+            .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+            .expect("historical cleanup must pause during remote run evidence");
+
+        match race {
+            HistoricalScopeAba::CaptainReleaseReclaim => {
+                let released = dispatch_authenticated(
+                    &ctx,
+                    req_session(
+                        profile_name,
+                        &owner,
+                        "release_captain",
+                        json!({"shipSlug": "powder-ship"}),
+                    ),
+                );
+                assert!(released.ok, "Captain release failed: {:?}", released.error);
+                registry
+                    .claim_provider(
+                        "captain-powder",
+                        Some("powder-ship"),
+                        FleetRole::Captain,
+                        Some("codex"),
+                        None,
+                        vec![],
+                        &all_alive,
+                        &crew_all_alive,
+                    )
+                    .unwrap();
+                assert_eq!(registry.snapshot().captains[0], original_captain);
+            }
+            HistoricalScopeAba::CrewWork => {
+                registry
+                    .update_crew_claim_expiry(&crew_session_id, 101)
+                    .unwrap();
+                registry
+                    .update_crew_claim_expiry(&crew_session_id, 100)
+                    .unwrap();
+                assert_eq!(registry.snapshot().captains[0].crew[0], original_crew);
+            }
+            HistoricalScopeAba::Profile | HistoricalScopeAba::Repository => {
+                let mut changed = original_project.clone();
+                let binding = changed.powder.as_mut().unwrap();
+                match race {
+                    HistoricalScopeAba::Profile => {
+                        binding.connection_profile = "loopback-historical-aba-rebound".into();
+                    }
+                    HistoricalScopeAba::Repository => {
+                        binding.repository = "t-hub-rebound".into();
+                    }
+                    _ => unreachable!(),
+                }
+                registry.upsert_project(changed).unwrap();
+                registry.upsert_project(original_project.clone()).unwrap();
+                let restored = registry.projects().into_iter().next().unwrap();
+                assert_eq!(restored.project_id, original_project.project_id);
+                assert_eq!(restored.repo_root, original_project.repo_root);
+                assert_eq!(restored.powder, original_project.powder);
+            }
+            HistoricalScopeAba::ProjectRemovalRecreation => {
+                registry
+                    .test_remove_captain_and_project(
+                        &original_captain.ship_slug,
+                        &original_project.project_id,
+                    )
+                    .unwrap();
+                registry
+                    .test_restore_captain_and_project(
+                        original_captain.clone(),
+                        original_project.clone(),
+                    )
+                    .unwrap();
+                let restored = registry.snapshot();
+                assert_eq!(restored.captains[0], original_captain);
+                assert_eq!(restored.projects[0], original_project);
+            }
+        }
+        let after_aba = registry.snapshot();
+        assert_eq!(after_aba.seq, before.seq + 2);
+
+        server.resume_run_evidence.send(()).unwrap();
+        let stale = cleanup.join().unwrap();
+        let memory = registry.snapshot();
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        let crew = &memory.captains[0].crew[0];
+        let duplicate_dispatch = ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        );
+
+        assert!(
+            !stale.ok,
+            "ABA bug: stale {} cleanup passed final value-only CAS, binding_present={}, duplicate_dispatch={duplicate_dispatch:?}",
+            race.label(),
+            crew.powder_work.is_some(),
+        );
+        assert!(stale.retryable, "stale ABA refusal must be retryable");
+        assert!(
+            stale
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("authority generation changed")),
+            "stale ABA refusal must identify the scoped authority change: {:?}",
+            stale.error
+        );
+        assert_eq!(memory.seq, after_aba.seq);
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&disk).unwrap(),
+            "stale ABA refusal must leave memory and disk equal"
+        );
+        assert_eq!(crew, &original_crew);
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert!(crew.powder_work.is_some());
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert!(duplicate_dispatch.is_err());
+        reconcile_powder_leases(&ctx);
+        assert_eq!(registry.snapshot().seq, after_aba.seq);
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 1);
+        assert_eq!(state.run_evidence_gets, 1);
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_same_terminal_captain_release_reclaim_aba() {
+        assert_removed_crew_historical_cleanup_rejects_aba(
+            HistoricalScopeAba::CaptainReleaseReclaim,
+        );
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_crew_work_aba() {
+        assert_removed_crew_historical_cleanup_rejects_aba(HistoricalScopeAba::CrewWork);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_profile_aba() {
+        assert_removed_crew_historical_cleanup_rejects_aba(HistoricalScopeAba::Profile);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_repository_aba() {
+        assert_removed_crew_historical_cleanup_rejects_aba(HistoricalScopeAba::Repository);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_project_removal_recreation_aba() {
+        assert_removed_crew_historical_cleanup_rejects_aba(
+            HistoricalScopeAba::ProjectRemovalRecreation,
+        );
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_allows_unrelated_scope_mutations() {
+        let server = LoopbackPowderServer::start(2);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.released = true;
+            state.pause_run_evidence = true;
+        }
+        let profile_name = "loopback-historical-unrelated-scope";
+        let _profile = PowderProfileEnv::install(profile_name, server.addr);
+        let path = captains_tmp("historical-unrelated-scope");
+        let crew_session_id = format!("powder-unrelated-scope-{}", uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            profile_name,
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+        let original_crew = before.captains[0].crew[0].clone();
+
+        let cleanup_ctx = ctx.clone();
+        let cleanup_owner = owner.clone();
+        let cleanup_crew_session_id = crew_session_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &cleanup_ctx,
+                req_session(
+                    profile_name,
+                    &cleanup_owner,
+                    "close_terminal",
+                    json!({"sessionId": cleanup_crew_session_id}),
+                ),
+            )
+        });
+        server
+            .run_evidence_started
+            .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+            .expect("historical cleanup must pause during remote run evidence");
+
+        registry
+            .upsert_project(ProjectRecord {
+                project_id: "project-unrelated".into(),
+                name: "Unrelated Project".into(),
+                repo_root: "/tmp/powder-unrelated-project".into(),
+                remote_url: None,
+                default_branch: Some("main".into()),
+                powder: Some(PowderProjectBinding {
+                    connection_profile: "unrelated-profile".into(),
+                    repository: "unrelated-repository".into(),
+                    event_cursor: 0,
+                }),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        registry
+            .claim_provider(
+                "captain-unrelated",
+                Some("unrelated-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        registry
+            .bind_ship_context(
+                "unrelated-ship",
+                "project-unrelated",
+                "Unrelated assignment",
+                "codex",
+            )
+            .unwrap();
+        assert!(registry
+            .record_crew("captain-unrelated", "crew-unrelated")
+            .unwrap());
+        let after_unrelated = registry.snapshot();
+        assert_eq!(after_unrelated.seq, before.seq + 4);
+
+        server.resume_run_evidence.send(()).unwrap();
+        let cleanup = cleanup.join().unwrap();
+        assert!(
+            cleanup.ok,
+            "unrelated scope changes rejected: {:?}",
+            cleanup.error
+        );
+        let memory = registry.snapshot();
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        let crew = &memory
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "powder-ship")
+            .unwrap()
+            .crew[0];
+        let mut expected_crew = original_crew;
+        expected_crew.powder_work = None;
+        assert_eq!(crew, &expected_crew);
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        assert_eq!(memory.seq, after_unrelated.seq + 1);
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&disk).unwrap()
+        );
+        assert!(ensure_dispatch_powder_binding_available(
+            &ctx,
+            profile_name,
+            "t-hub",
+            "thub-powder-control-lifecycle",
+            Some("run-authoritative"),
+        )
+        .is_ok());
+        reconcile_powder_leases(&ctx);
+        assert_eq!(registry.snapshot().seq, memory.seq);
+        let state = server.finish().unwrap();
+        assert_eq!(state.card_evidence_gets, 1);
+        assert_eq!(state.run_evidence_gets, 1);
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scoped_authority_generation_advances_only_for_successful_relevant_mutations() {
+        let path = captains_tmp("scoped-authority-generation");
+        let backup = path.with_extension("json.bak");
+        let crew_session_id = format!("powder-generation-{}", uuid::Uuid::new_v4().simple());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            "generation-profile",
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let generation = || {
+            registry.test_scoped_authority_generation(
+                "powder-ship",
+                &crew_session_id,
+                "project-powder-lifecycle",
+            )
+        };
+        let initial_snapshot = registry.snapshot();
+        let initial_generation = generation();
+
+        registry
+            .update_crew_claim_expiry(&crew_session_id, 100)
+            .unwrap();
+        registry
+            .upsert_project(registry.projects().into_iter().next().unwrap())
+            .unwrap();
+        registry
+            .claim_provider(
+                "captain-powder",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        assert_eq!(registry.snapshot().seq, initial_snapshot.seq);
+        assert_eq!(generation(), initial_generation);
+
+        registry
+            .advance_project_powder_cursor(
+                "project-powder-lifecycle",
+                "generation-profile",
+                "t-hub",
+                1,
+            )
+            .unwrap();
+        let after_irrelevant = registry.snapshot();
+        assert_eq!(after_irrelevant.seq, initial_snapshot.seq + 1);
+        assert_eq!(generation(), initial_generation);
+
+        let _ = std::fs::remove_file(&backup);
+        std::fs::create_dir(&backup).unwrap();
+        let failed = registry.update_crew_claim_expiry(&crew_session_id, 101);
+        assert!(failed.is_err());
+        assert_eq!(registry.snapshot().seq, after_irrelevant.seq);
+        assert_eq!(generation(), initial_generation);
+        let disk_after_failure = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(
+            serde_json::to_value(registry.snapshot()).unwrap(),
+            serde_json::to_value(disk_after_failure).unwrap()
+        );
+
+        std::fs::remove_dir_all(&backup).unwrap();
+        registry
+            .update_crew_claim_expiry(&crew_session_id, 101)
+            .unwrap();
+        let crew_changed = generation();
+        assert_eq!(crew_changed.captain, initial_generation.captain);
+        assert_ne!(crew_changed.crew, initial_generation.crew);
+        assert_eq!(crew_changed.project, initial_generation.project);
+        registry
+            .update_crew_claim_expiry(&crew_session_id, 100)
+            .unwrap();
+        let crew_restored = generation();
+        assert_ne!(crew_restored.crew, crew_changed.crew);
+        assert_eq!(
+            registry.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .claim_expires_at,
+            Some(100)
+        );
+
+        let original_project = registry.projects().into_iter().next().unwrap();
+        let mut rebound_project = original_project.clone();
+        rebound_project.powder.as_mut().unwrap().connection_profile =
+            "generation-profile-rebound".into();
+        registry.upsert_project(rebound_project).unwrap();
+        let project_changed = generation();
+        assert_ne!(project_changed.project, crew_restored.project);
+        registry.upsert_project(original_project).unwrap();
+        let project_restored = generation();
+        assert_ne!(project_restored.project, project_changed.project);
+
+        let original_captain = registry.snapshot().captains[0].clone();
+        registry.release("powder-ship").unwrap();
+        let captain_released = generation();
+        assert_ne!(captain_released.captain, project_restored.captain);
+        registry
+            .claim_provider(
+                "captain-powder",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        let captain_reclaimed = generation();
+        assert_ne!(captain_reclaimed.captain, captain_released.captain);
+        assert_eq!(registry.snapshot().captains[0], original_captain);
+
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scoped_authority_generation_rejects_preload_scope_and_accepts_fresh_scope() {
+        let path = captains_tmp("scoped-authority-reload");
+        let crew_session_id = format!("powder-generation-reload-{}", uuid::Uuid::new_v4().simple());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            "generation-reload-profile",
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let authority = AuthenticatedCaptainAuthority {
+            terminal_id: "captain-powder".into(),
+            ship_slug: "powder-ship".into(),
+            project_id: "project-powder-lifecycle".into(),
+            generation: registry.test_scoped_authority_generation(
+                "powder-ship",
+                &crew_session_id,
+                "project-powder-lifecycle",
+            ),
+        };
+        let old_ctx =
+            test_ctx("generation-reload-profile").with_captains_registry(registry.clone());
+        let old_scope =
+            resolve_historical_removed_crew_powder_scope(&old_ctx, &crew_session_id, &authority)
+                .unwrap();
+        let old_generation = old_scope.authority_generation.unwrap();
+
+        let loaded = Arc::new(CaptainsRegistry::load(path.clone()));
+        let before = loaded.snapshot();
+        let stale = loaded
+            .compare_and_clear_released_removed_crew_powder_binding(&old_scope)
+            .unwrap_err();
+        assert!(stale.contains("authority generation changed"));
+        assert_eq!(loaded.snapshot().seq, before.seq);
+        assert!(loaded.snapshot().captains[0].crew[0].powder_work.is_some());
+
+        let loaded_ctx =
+            test_ctx("generation-reload-profile").with_captains_registry(loaded.clone());
+        let loaded_authority = AuthenticatedCaptainAuthority {
+            terminal_id: "captain-powder".into(),
+            ship_slug: "powder-ship".into(),
+            project_id: "project-powder-lifecycle".into(),
+            generation: loaded.test_scoped_authority_generation(
+                "powder-ship",
+                &crew_session_id,
+                "project-powder-lifecycle",
+            ),
+        };
+        let fresh_scope = resolve_historical_removed_crew_powder_scope(
+            &loaded_ctx,
+            &crew_session_id,
+            &loaded_authority,
+        )
+        .unwrap();
+        let fresh_generation = fresh_scope.authority_generation.unwrap();
+        assert_ne!(
+            fresh_generation.registry_epoch,
+            old_generation.registry_epoch
+        );
+        assert!(loaded
+            .compare_and_clear_released_removed_crew_powder_binding(&fresh_scope)
+            .unwrap());
+        let cleared = loaded.snapshot();
+        assert!(cleared.captains[0].crew[0].powder_work.is_none());
+        assert_eq!(loaded.ship_of(&crew_session_id), None);
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        assert_eq!(
+            serde_json::to_value(cleared).unwrap(),
+            serde_json::to_value(disk).unwrap()
+        );
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -26811,6 +27821,17 @@ mod tests {
         .unwrap();
         let checked = vec![powder_criterion(0, true)];
         validate_completion_criteria(&checked, &proof).unwrap();
+
+        for checked_at in [None, Some(0), Some(-1)] {
+            let mut criterion = powder_criterion(0, true);
+            criterion.checked_at = checked_at;
+            assert!(validate_completion_criteria(&[criterion], &proof)
+                .unwrap_err()
+                .contains("not checked"));
+        }
+        let mut positive_timestamp = powder_criterion(0, true);
+        positive_timestamp.checked_at = Some(1);
+        validate_completion_criteria(&[positive_timestamp], &proof).unwrap();
 
         let unchecked = vec![powder_criterion(0, false)];
         assert!(validate_completion_criteria(&unchecked, &proof)
