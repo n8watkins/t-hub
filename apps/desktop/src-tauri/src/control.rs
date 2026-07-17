@@ -12864,18 +12864,84 @@ mod tests {
     /// `server exited unexpectedly` while the server shuts down. Production
     /// continues to surface that error. Tests tolerate only that exact teardown
     /// race, and only after a separate liveness probe proves the fixture is gone.
-    fn reap_test_tmux_session_and_assert_absent(target: &str) {
+    fn reap_test_tmux_session(target: &str) -> Result<(), String> {
         let teardown = tmux::kill_session_tree(target);
-        assert_eq!(
-            tmux::session_liveness(target),
-            tmux::SessionLiveness::Gone,
-            "tmux test fixture '{target}' survived teardown: {teardown:?}"
-        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while tmux::session_liveness(target) != tmux::SessionLiveness::Gone {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "tmux test fixture '{target}' survived teardown: {teardown:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         if let Err(error) = teardown {
-            assert_eq!(
-                error.message, "server exited unexpectedly",
-                "tmux test fixture '{target}' reported an unexpected teardown failure"
-            );
+            if error.message != "server exited unexpectedly" {
+                return Err(format!(
+                    "tmux test fixture '{target}' reported an unexpected teardown failure: {error}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn reap_test_tmux_session_and_assert_absent(target: &str) {
+        reap_test_tmux_session(target).unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn create_test_tmux_session(target: &str) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match tmux::new_session_with_env(target, "/tmp", None, &[]) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.message == "server exited unexpectedly" => {
+                    match tmux::session_liveness(target) {
+                        tmux::SessionLiveness::Alive => return Ok(()),
+                        tmux::SessionLiveness::Gone if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        liveness => {
+                            return Err(format!(
+                                "tmux test fixture '{target}' could not start after server teardown ({liveness:?}): {error}"
+                            ));
+                        }
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
+    /// Serialize process-attestation fixtures and keep an anchor alive while a
+    /// case runs. This prevents one test's final-session shutdown from racing
+    /// another test's session creation. Dropping the guard reaps the anchor and
+    /// independently probes its absence, including after a successful final
+    /// removal that tmux reports as `server exited unexpectedly`.
+    struct ProcessAttestationTmuxGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        anchor: String,
+    }
+
+    impl ProcessAttestationTmuxGuard {
+        fn acquire() -> Self {
+            static LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
+            let lock = LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let anchor_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let anchor = tmux_target(&anchor_id);
+            create_test_tmux_session(&anchor).unwrap();
+            Self {
+                _lock: lock,
+                anchor,
+            }
+        }
+    }
+
+    impl Drop for ProcessAttestationTmuxGuard {
+        fn drop(&mut self) {
+            let _ = reap_test_tmux_session(&self.anchor);
         }
     }
 
@@ -12896,6 +12962,7 @@ mod tests {
             eprintln!("process_permission_attestation: tmux or node not on PATH - skipping");
             return None;
         }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let fixture_dir = std::env::temp_dir().join(format!(
             "t-hub-permission-harness-{}-{}",
             std::process::id(),
@@ -12916,7 +12983,7 @@ mod tests {
 
         let session_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let target = tmux_target(&session_id);
-        tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&target).unwrap();
         let before = observe_harness_process(&target).unwrap();
         let command = format!("{} {} 'api_key=supersecret'", executable.display(), flags);
         tmux::send_text(&target, &command, true).unwrap();
@@ -21127,13 +21194,14 @@ mod tests {
             );
             return;
         }
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
 
         let observer = FakeCodexObserver::new(0);
         let codex =
             FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
         let codex_session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let codex_target = tmux_target(&codex_session);
-        tmux::new_session_with_env(&codex_target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&codex_target).unwrap();
         let codex_before = observe_harness_process(&codex_target).unwrap();
         let expected_identity = tmux_pane_identity(&codex_target);
         let launch = crew_interactive_launch(Harness::Codex, &codex.command, &observer.command);
@@ -21165,7 +21233,7 @@ mod tests {
             FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
         let blocked_session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let blocked_target = tmux_target(&blocked_session);
-        tmux::new_session_with_env(&blocked_target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&blocked_target).unwrap();
         let blocked_launch = crew_interactive_launch(
             Harness::Codex,
             &blocked_codex.command,
@@ -21190,7 +21258,7 @@ mod tests {
         let claude = FakeHarnessCommand::new(Harness::Claude, "--dangerously-skip-permissions");
         let claude_session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let claude_target = tmux_target(&claude_session);
-        tmux::new_session_with_env(&claude_target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&claude_target).unwrap();
         let claude_before = observe_harness_process(&claude_target).unwrap();
         let claude_launch =
             crew_interactive_launch(Harness::Claude, &claude.command, &claude_observer.command);
@@ -22042,10 +22110,12 @@ mod tests {
     struct FakeHarnessSession {
         session_id: String,
         _command: FakeHarnessCommand,
+        _tmux_guard: ProcessAttestationTmuxGuard,
     }
 
     impl FakeHarnessSession {
         fn start(harness: Harness) -> Self {
+            let tmux_guard = ProcessAttestationTmuxGuard::acquire();
             let flags = match harness {
                 Harness::Codex => "--dangerously-bypass-approvals-and-sandbox",
                 Harness::Claude => "--dangerously-skip-permissions",
@@ -22053,19 +22123,20 @@ mod tests {
             let command = FakeHarnessCommand::new(harness, flags);
             let session_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
             let target = tmux_target(&session_id);
-            tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
+            create_test_tmux_session(&target).unwrap();
             tmux::send_text(&target, &command.command, true).unwrap();
             wait_for_harness_started(&session_id, harness.as_provider()).unwrap();
             Self {
                 session_id,
                 _command: command,
+                _tmux_guard: tmux_guard,
             }
         }
     }
 
     impl Drop for FakeHarnessSession {
         fn drop(&mut self) {
-            let _ = tmux::kill_session_tree(&tmux_target(&self.session_id));
+            let _ = reap_test_tmux_session(&tmux_target(&self.session_id));
         }
     }
 
