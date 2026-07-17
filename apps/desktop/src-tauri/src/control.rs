@@ -13843,7 +13843,14 @@ fn recover_pending_dispatch_release(
         &recovery.crew_session_id,
         CrewPowderOperationKind::Cleanup,
     );
-    recover_pending_dispatch_release_guarded(ctx, recovery)
+    let current = ctx
+        .captains
+        .pending_dispatch_release(&recovery.crew_session_id)
+        .ok_or("the exact durable release recovery no longer exists")?;
+    if current != *recovery {
+        return Err("the exact durable release recovery changed while waiting for cleanup".into());
+    }
+    recover_pending_dispatch_release_guarded(ctx, &current)
 }
 
 fn ensure_recovery_terminal_gone(crew_session_id: &str) -> Result<(), String> {
