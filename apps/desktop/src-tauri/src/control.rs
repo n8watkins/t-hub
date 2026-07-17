@@ -12358,10 +12358,20 @@ fn heartbeat_crew_powder(
     let _operation_guard = ctx
         .captains
         .serialize_crew_powder_operation(&crew_session_id, CrewPowderOperationKind::Renewal);
-    // The caller may have waited behind completion or cleanup. Re-resolve both
-    // exact ownership and runtime liveness inside the operation guard so a
-    // released or replaced Captain cannot renew using a stale pre-wait check.
-    let current_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    // The caller may have waited behind completion or cleanup. Re-authorize the
+    // minimal target ownership before any repeated scope resolution so a former
+    // Captain cannot use an unknown or removed Crew scope as an oracle.
+    let current_authorization = authorize_crew_heartbeat_target(
+        ctx,
+        &crew_session_id,
+        caller,
+        trusted_internal,
+        "heartbeat_crew_powder",
+    )?;
+    let current_scope = resolve_crew_powder_scope_from_heartbeat_authorization(
+        current_authorization,
+        &crew_session_id,
+    )?;
     require_unchanged_powder_authority_generation(
         &authorization_scope,
         &current_scope,
@@ -31885,10 +31895,80 @@ mod tests {
 
         let response = heartbeat_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert!(!response.ok);
-        assert!(response
-            .error
-            .unwrap()
-            .contains("authority generation changed"));
+        assert_eq!(
+            response.error.as_deref(),
+            Some(
+                "acl: 'heartbeat_crew_powder' requires the exact Crew session or its current owning Captain"
+            )
+        );
+        heartbeat.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_queued_heartbeat_rejects_removed_former_captain_scope_before_resolution() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_queued_heartbeat_rejects_removed_former_captain_scope_before_resolution: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("heartbeat-scope-removal-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let heartbeat_ctx = ctx.clone();
+        let heartbeat_crew = crew.session_id.clone();
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let heartbeat = std::thread::spawn(move || {
+            heartbeat_tx
+                .send(dispatch_authenticated(
+                    &heartbeat_ctx,
+                    req_session(
+                        &profile_name,
+                        &captain,
+                        "heartbeat_crew_powder",
+                        json!({"crewSessionId": heartbeat_crew}),
+                    ),
+                ))
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        assert!(registry.rollback_crew(&crew.session_id).unwrap());
+        drop(completion_guard);
+
+        let response = heartbeat_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some(
+                "acl: 'heartbeat_crew_powder' requires the exact Crew session or its current owning Captain"
+            )
+        );
         heartbeat.join().unwrap();
         registry.set_powder_operation_wait_hook(None);
         let state = server.finish().unwrap();
