@@ -772,6 +772,18 @@ impl Client {
         validate_initial_claim_receipt(card_id, &self.agent_name, parse_claim(value)?)
     }
 
+    pub fn configured_agent(&self) -> &str {
+        &self.agent_name
+    }
+
+    pub fn initial_claim_operation_id(&self, card_id: &str) -> Result<String, PowderError> {
+        Ok(format!(
+            "initial-claim:{}:{}",
+            self.require_operation_identity()?,
+            card_id
+        ))
+    }
+
     pub fn heartbeat(&self, claim: &Claim) -> Result<Claim, String> {
         let value = self.request(
             "POST",

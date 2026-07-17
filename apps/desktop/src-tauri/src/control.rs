@@ -820,7 +820,7 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// fail-closed state; v8 records bounded definitive terminal rejections so an
 /// exact replay stays stable without wedging replacement work or cleanup.
 /// All prior shapes remain readable and upgrade on write.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 8;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 9;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 
 /// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
@@ -985,6 +985,22 @@ pub struct PowderWorkBinding {
     pub mutation_intent: Option<PowderMutationIntent>,
     #[serde(default)]
     pub state: PowderWorkState,
+}
+
+/// A claim POST whose remote outcome is not trusted enough to bind to a Crew.
+///
+/// This is deliberately separate from [`PowderWorkBinding`]: no untrusted run,
+/// receipt card, or receipt agent is allowed into a durable Crew binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingDispatchClaim {
+    pub project_id: String,
+    pub connection_profile: String,
+    pub repository: String,
+    pub card_id: String,
+    pub configured_agent: String,
+    pub operation_id: String,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1480,6 +1496,9 @@ pub struct CaptainsSnapshot {
     /// deserialize to an empty registry.
     #[serde(default)]
     pub projects: Vec<ProjectRecord>,
+    /// Initial claim attempts whose remote outcome remains unresolved.
+    #[serde(default)]
+    pub pending_dispatch_claims: Vec<PendingDispatchClaim>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1690,6 +1709,7 @@ impl AuthorityGenerations {
 struct CaptainsInner {
     captains: Vec<CaptainRecord>,
     projects: Vec<ProjectRecord>,
+    pending_dispatch_claims: Vec<PendingDispatchClaim>,
     /// Monotonic revision, bumped on every accepted mutation - the same
     /// convergence contract as [`RegistryInner::seq`]. Persisted, so it stays
     /// monotonic across app restarts.
@@ -1890,6 +1910,7 @@ impl CaptainsRegistry {
                 seq: 0,
                 captains: Vec::new(),
                 projects: Vec::new(),
+                pending_dispatch_claims: Vec::new(),
             })
         } else {
             Self::read_snapshot(&path)
@@ -1968,6 +1989,7 @@ impl CaptainsRegistry {
                 CaptainsInner {
                     captains,
                     projects: snap.projects,
+                    pending_dispatch_claims: snap.pending_dispatch_claims,
                     seq: snap.seq,
                     authority_generations: AuthorityGenerations::default(),
                 }
@@ -2055,6 +2077,29 @@ impl CaptainsRegistry {
                         project.project_id
                     ));
                 }
+            }
+        }
+        let mut pending_claim_scopes = std::collections::HashSet::new();
+        for intent in &snapshot.pending_dispatch_claims {
+            if intent.project_id.trim().is_empty()
+                || intent.connection_profile.trim().is_empty()
+                || intent.repository.trim().is_empty()
+                || intent.card_id.trim().is_empty()
+                || intent.configured_agent.trim().is_empty()
+                || intent.operation_id.trim().is_empty()
+            {
+                return Err(
+                    "captains registry contains an incomplete pending dispatch claim".into(),
+                );
+            }
+            if !pending_claim_scopes.insert((
+                intent.connection_profile.as_str(),
+                intent.repository.as_str(),
+                intent.card_id.as_str(),
+            )) {
+                return Err(
+                    "captains registry contains duplicate pending dispatch claim scope".into(),
+                );
             }
         }
         let mut ships = std::collections::HashSet::new();
@@ -2267,6 +2312,7 @@ impl CaptainsRegistry {
             seq: g.seq,
             captains: g.captains.clone(),
             projects: g.projects.clone(),
+            pending_dispatch_claims: g.pending_dispatch_claims.clone(),
         }
     }
 
@@ -2454,7 +2500,64 @@ impl CaptainsRegistry {
             seq: g.seq,
             captains: g.captains.clone(),
             projects: g.projects.clone(),
+            pending_dispatch_claims: g.pending_dispatch_claims.clone(),
         }
+    }
+
+    fn pending_dispatch_claim(
+        &self,
+        connection_profile: &str,
+        repository: &str,
+        card_id: &str,
+    ) -> Option<PendingDispatchClaim> {
+        self.lock()
+            .pending_dispatch_claims
+            .iter()
+            .find(|intent| {
+                intent.connection_profile == connection_profile
+                    && intent.repository == repository
+                    && intent.card_id == card_id
+            })
+            .cloned()
+    }
+
+    fn begin_pending_dispatch_claim(&self, intent: PendingDispatchClaim) -> Result<(), String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        if let Some(existing) = current.pending_dispatch_claims.iter().find(|existing| {
+            existing.connection_profile == intent.connection_profile
+                && existing.repository == intent.repository
+                && existing.card_id == intent.card_id
+        }) {
+            if existing == &intent {
+                return Ok(());
+            }
+            return Err(format!(
+                "dispatch_crew: Powder card '{}' already has an unresolved initial claim attempt; reconcile it before redispatching",
+                intent.card_id
+            ));
+        }
+        let previous = current.clone();
+        current.pending_dispatch_claims.push(intent);
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)
+    }
+
+    fn clear_pending_dispatch_claim(&self, intent: &PendingDispatchClaim) -> Result<bool, String> {
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut current = self.lock();
+        let Some(position) = current
+            .pending_dispatch_claims
+            .iter()
+            .position(|existing| existing == intent)
+        else {
+            return Ok(false);
+        };
+        let previous = current.clone();
+        current.pending_dispatch_claims.remove(position);
+        current.seq = current.seq.saturating_add(1);
+        self.commit_mutation(current, previous)?;
+        Ok(true)
     }
 
     /// Capture durable registry values and their internal authority versions under
@@ -2468,6 +2571,7 @@ impl CaptainsRegistry {
                 seq: g.seq,
                 captains: g.captains.clone(),
                 projects: g.projects.clone(),
+                pending_dispatch_claims: g.pending_dispatch_claims.clone(),
             },
             g.authority_generations.clone(),
             self.authority_epoch,
@@ -10021,6 +10125,20 @@ fn dispatch_crew_with_observer(
         .get_card(&card_id)
         .map_err(|error| format!("dispatch_crew: {error}"))?;
     validate_dispatch_card_repository(&card_id, card.repository(), &canonical_repository)?;
+    if let Some(pending) = ctx.captains.pending_dispatch_claim(
+        &binding.connection_profile,
+        &binding.repository,
+        &card_id,
+    ) {
+        let authoritative_claim = card.card_value().get("claim");
+        if authoritative_claim.is_none_or(Value::is_null) {
+            ctx.captains.clear_pending_dispatch_claim(&pending)?;
+        } else {
+            return Err(format!(
+                "dispatch_crew: initial Powder claim for card '{card_id}' is pending authoritative recovery; no redispatch or release was attempted"
+            ));
+        }
+    }
     let authoritative_run_id = card.card_value()["claim"]["run_id"].as_str();
     ensure_dispatch_powder_binding_available(
         ctx,
@@ -10041,7 +10159,26 @@ fn dispatch_crew_with_observer(
     } else if let Some(tab_name) = arg_str(args, "tabName").or_else(|| arg_str(args, "tab_name")) {
         spawn_args["tabName"] = json!(tab_name);
     }
-    let spawned = spawn_terminal(ctx, &spawn_args)?;
+    let pending_claim = PendingDispatchClaim {
+        project_id: project.project_id.clone(),
+        connection_profile: binding.connection_profile.clone(),
+        repository: binding.repository.clone(),
+        card_id: card_id.to_string(),
+        configured_agent: client.configured_agent().to_string(),
+        operation_id: client
+            .initial_claim_operation_id(&card_id)
+            .map_err(|error| format!("dispatch_crew: {error}"))?,
+        created_at: now_ms(),
+    };
+    ctx.captains
+        .begin_pending_dispatch_claim(pending_claim.clone())?;
+    let spawned = match spawn_terminal(ctx, &spawn_args) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let _ = ctx.captains.clear_pending_dispatch_claim(&pending_claim);
+            return Err(error);
+        }
+    };
     let crew_session_id = spawned["id"]
         .as_str()
         .ok_or("dispatch_crew: spawn returned no terminal id")?
@@ -10050,10 +10187,14 @@ fn dispatch_crew_with_observer(
         Ok(claim) => claim,
         Err(error) => {
             let rollback = rollback_crew_dispatch(ctx, &crew_session_id, None, None);
-            return Err(dispatch_rollback_error(
-                format!("dispatch_crew: Powder claim failed before the harness started: {error}"),
-                rollback,
-            ));
+            return Err(match rollback {
+                Ok(()) => format!(
+                    "dispatch_crew: initial Powder claim outcome is pending authoritative recovery after: {error}; the local terminal was removed, no Powder release was attempted, and redispatch is blocked"
+                ),
+                Err(rollback_error) => format!(
+                    "dispatch_crew: initial Powder claim outcome is pending authoritative recovery after: {error}; no Powder release was attempted and local terminal cleanup is incomplete: {rollback_error}"
+                ),
+            });
         }
     };
     let _crew = match ctx.captains.bind_crew_context(
@@ -10082,6 +10223,11 @@ fn dispatch_crew_with_observer(
             ));
         }
     };
+    if let Err(error) = ctx.captains.clear_pending_dispatch_claim(&pending_claim) {
+        return Err(format!(
+            "dispatch_crew: Crew binding and exact Powder claim are durable, but initial-claim recovery intent could not be cleared: {error}; redispatch remains blocked"
+        ));
+    }
     let prompt = format!(
         "You are Crew on ship '{}'. Work only Powder card '{}' in run '{}'. Task: {} Use checkout '{}'. Report progress, blockers, and completion to Captain session '{}'. Do not claim other work or spawn additional agents.",
         captain.ship_slug, claim.card_id, claim.run_id, task, checkout, captain_session_id
@@ -19900,6 +20046,7 @@ mod tests {
             seq: 4,
             captains: vec![],
             projects: vec![],
+            pending_dispatch_claims: vec![],
         };
         let backup_body = json!({
             "schemaVersion": CAPTAINS_SCHEMA_VERSION + 1,
@@ -19992,6 +20139,7 @@ mod tests {
             seq: 1,
             captains: vec![],
             projects: vec![],
+            pending_dispatch_claims: vec![],
         };
         std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
         std::fs::write(&backup, serde_json::to_vec(&valid).unwrap()).unwrap();
@@ -23829,6 +23977,7 @@ mod tests {
             seq: 0,
             captains: vec![],
             projects: vec![],
+            pending_dispatch_claims: vec![],
         })
         .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
@@ -24771,6 +24920,7 @@ mod tests {
         renewal_receipt_agent: Option<String>,
         claim_receipt_card_id: Option<String>,
         claim_receipt_agent: Option<String>,
+        claim_response_failure: Option<LoopbackPowderResponseFailure>,
         issued_claim_agent: Option<String>,
         renew_posts: usize,
     }
@@ -25708,6 +25858,11 @@ mod tests {
                     .clone()
                     .unwrap_or_else(|| "t-hub".into());
                 state.issued_claim_agent = Some(response_agent.clone());
+                let response_failure = state.claim_response_failure;
+                drop(state);
+                if response_failure == Some(LoopbackPowderResponseFailure::Eof) {
+                    return Ok(());
+                }
                 json!({"card_id": response_card_id, "run_id": "run-authoritative", "agent": response_agent, "expires_at": 100})
             }
             ("POST", path) if path.ends_with("/release") => {
@@ -26361,20 +26516,66 @@ mod tests {
                 ),
                 "{error}"
             );
-            assert!(
-                error.contains("all side effects were rolled back"),
-                "{error}"
-            );
+            assert!(error.contains("pending authoritative recovery"), "{error}");
             let crew_session_id = dispatched_terminal_id(&sink);
             assert_eq!(
                 tmux::session_liveness(&tmux_target(&crew_session_id)),
                 tmux::SessionLiveness::Gone
             );
             assert!(registry.snapshot().captains[0].crew.is_empty());
+            assert_eq!(registry.snapshot().pending_dispatch_claims.len(), 1);
             let state = server.finish().unwrap();
             assert_eq!(state.claim_posts, 1);
             assert_eq!(state.release_posts, 0);
         }
+    }
+
+    #[test]
+    fn dispatch_initial_claim_response_loss_survives_restart_and_blocks_identical_retry() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_initial_claim_response_loss_survives_restart_and_blocks_identical_retry: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(5);
+        server.state.lock().unwrap().claim_response_failure =
+            Some(LoopbackPowderResponseFailure::Eof);
+        let profile_name = format!(
+            "dispatch-claim-response-loss-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let path = captains_tmp(&profile_name);
+        let _ = std::fs::remove_file(&path);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            dispatch_test_registry(Some(path.clone()), &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Recover initial claim response loss",
+            "harness": "codex",
+        });
+
+        let first = dispatch_crew(&ctx, &args, None, true).unwrap_err();
+        assert!(first.contains("pending authoritative recovery"), "{first}");
+        assert_eq!(registry.snapshot().pending_dispatch_claims.len(), 1);
+        assert_eq!(registry.snapshot().captains[0].crew.len(), 0);
+        assert_eq!(dispatched_terminal_id(&sink).len(), 8);
+
+        server.state.lock().unwrap().force_claim = true;
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let (restarted_ctx, restarted_sink) = dispatch_test_context(restarted.clone());
+        let retry = dispatch_crew(&restarted_ctx, &args, None, true).unwrap_err();
+        assert!(retry.contains("pending authoritative recovery"), "{retry}");
+        assert!(restarted_sink.calls.lock().unwrap().is_empty());
+        assert_eq!(restarted.snapshot().pending_dispatch_claims.len(), 1);
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 0);
+        let _ = std::fs::remove_file(path);
     }
 
     fn dispatch_race_evidence(
