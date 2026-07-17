@@ -9826,6 +9826,27 @@ fn captain_and_project_for_dispatch(
     Ok((captain, project))
 }
 
+fn revalidate_dispatch_authority(
+    ctx: &ControlContext,
+    args: &Value,
+    expected_captain: &CaptainRecord,
+    expected_project: &ProjectRecord,
+) -> Result<(), String> {
+    let (captain, project) = captain_and_project_for_dispatch(ctx, args).map_err(|_| {
+        "acl: dispatch authority changed; retry from the current Captain".to_string()
+    })?;
+    if captain.terminal_id != expected_captain.terminal_id
+        || captain.ship_slug != expected_captain.ship_slug
+        || captain.project_id != expected_captain.project_id
+        || project.project_id != expected_project.project_id
+        || project.repo_root != expected_project.repo_root
+        || project.powder != expected_project.powder
+    {
+        return Err("acl: dispatch authority changed; retry from the current Captain".into());
+    }
+    Ok(())
+}
+
 fn validate_crew_checkout(
     project: &ProjectRecord,
     requested: Option<String>,
@@ -10147,6 +10168,7 @@ fn dispatch_crew_with_observer(
         &card_id,
         authoritative_run_id,
     )?;
+    revalidate_dispatch_authority(ctx, args, &captain, &project)?;
 
     let mut spawn_args = json!({
         "cwd": checkout,
@@ -10232,6 +10254,7 @@ fn dispatch_crew_with_observer(
         "You are Crew on ship '{}'. Work only Powder card '{}' in run '{}'. Task: {} Use checkout '{}'. Report progress, blockers, and completion to Captain session '{}'. Do not claim other work or spawn additional agents.",
         captain.ship_slug, claim.card_id, claim.run_id, task, checkout, captain_session_id
     );
+    revalidate_dispatch_authority(ctx, args, &captain, &project)?;
     let tmux_target = tmux_target(&crew_session_id);
     let before_launch = match observer(&tmux_target) {
         Ok(evidence) => evidence,
@@ -10332,6 +10355,7 @@ fn dispatch_crew_with_observer(
             ));
         }
     };
+    revalidate_dispatch_authority(ctx, args, &captain, &project)?;
     let crew =
         match ctx
             .captains
@@ -10370,6 +10394,7 @@ fn dispatch_crew_with_observer(
         }
     };
     let _ = captains_sync_apply(ctx);
+    revalidate_dispatch_authority(ctx, args, &captain, &project)?;
     Ok(json!({
         "accepted": "dispatch_crew",
         "audited": true,
