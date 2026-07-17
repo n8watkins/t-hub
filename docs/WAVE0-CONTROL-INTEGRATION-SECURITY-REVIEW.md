@@ -25,6 +25,8 @@ Its parents are the run-bound integration commit and the exact frozen launch-att
 
 Independent review findings were remediated by commit `08beabc7f09fa9c9e0d3fde3159f540fadba8bc9`.
 That commit restores the exact reviewed marker contract and closes the queued-heartbeat and terminal-close races described below.
+The follow-up renewal identity finding was remediated by commit `3b2bd8e8b4d17d89f3548ff9fd9c9fb2b8d2af88`.
+That commit binds pre-mutation authority and post-mutation receipts to the durable Powder claim identity.
 
 Both frozen reviewed heads are ancestors of the integration head.
 Neither reviewed head was rebased or modified.
@@ -65,6 +67,8 @@ The marker has bounded credential-safe output and must succeed before the shell 
 Powder release now rejects receipts whose card, run, or agent differs from the exact expected claim.
 Control cleanup builds that expected claim from freshly verified authoritative ownership.
 Local Crew bindings remain retained when a release receipt is substituted or release cannot be confirmed.
+Heartbeat and renewal now reject an authoritative claim agent that differs from the durable Crew binding.
+Both operations also reject any card, run, or agent receipt substitution before updating durable claim expiry.
 
 The frontend snapshot adapter retains `harnessPermission` and `tHubCapability` as separate compatibility axes.
 Unknown values remain omitted instead of being accepted as authoritative state.
@@ -85,13 +89,18 @@ Independent review found that terminal close could kill the tmux session before 
 Terminal close now holds the cleanup guard across liveness planning, tmux tree teardown, remote Powder disposition, and the final durable registry transition.
 A deterministic test queues close behind completion, proves the worker remains alive while close waits, completes the exact run, then proves close reports `killed`, observes `already_completed`, removes the binding, and leaves the session gone.
 
+Independent review found that renewal validated the bound run but not the durable Powder agent before mutation and did not validate exact card, run, and agent identity in the renewal receipt.
+The guarded renewal path now revalidates active lifecycle state and real Harness liveness, compares the authoritative claim agent to durable ownership, and persists expiry only after an exact receipt.
+One test proves authoritative agent substitution produces zero renewal posts, and another proves substituted card, run, or agent receipts cannot update durable expiry.
+A queued-liveness test holds the renewal guard, stops the exact Harness while heartbeat waits, and proves zero renewal posts after the guard is released.
+
 ## Focused Verification
 
 `cargo test -p t-hub-agent` passed 56 unit tests, 3 Codex tap E2E tests, and 1 exact unobserved-marker E2E test before duplicate compatibility code was removed.
 The final workspace run passed the resulting 55 agent unit tests, 3 Codex tap E2E tests, and 1 exact unobserved-marker E2E test.
 
 `cargo test -p t-hub --lib harness::tests -- --test-threads=1` passed 15 Harness adapter, generation, process, ancestry, parser, and final-observation tests.
-`cargo test -p t-hub --lib powder::tests -- --test-threads=1` passed 25 Powder client, capability, operation, evidence, receipt, and bounded-output tests.
+`cargo test -p t-hub --lib powder::tests -- --test-threads=1` initially passed 25 Powder client, capability, operation, evidence, receipt, and bounded-output tests.
 The focused control Powder suite initially passed 53 of 54 tests and exposed one fixture identity inconsistency after exact release-agent validation was integrated.
 The loopback fixture had issued a `t-hub` claim but later described the same run as owned by `powder-agent`.
 The fixture now carries the issued claim agent through evidence and the default release receipt, and the isolated failing test passed.
@@ -109,8 +118,12 @@ The gate verified that the exact owning Codex Crew marker is written before prov
 
 After independent review remediation, the deterministic queued-heartbeat authority race, close-versus-completion race, rollback retention, and complete close-terminal group all passed.
 The exact degraded-marker consumer test passed, and `cargo test -p t-hub-agent` again passed 55 unit tests, 3 Codex tap E2E tests, and 1 exact unobserved-marker E2E test.
-The focused control Powder suite passed all 55 tests after the remediation.
+The focused control Powder suite passed all 55 tests after the first remediation.
 The combined real-agent verification script passed with the restored `AgentCommand` marker.
+
+After the renewal identity remediation, the Powder client suite passed 26 tests and the focused control Powder suite passed all 58 tests.
+The added coverage includes heartbeat and renewal receipt substitution, durable agent substitution, Captain replacement while queued, Harness exit while queued, successful guarded renewal, and stale-state rejection.
+Targeted `cargo clippy -p t-hub --all-targets -- -D warnings` also passed at the renewal-remediation head.
 
 The standalone CLI Powder contract suite passed 10 tests.
 The MCP Powder schema tests passed in both library and binary targets.
@@ -179,3 +192,4 @@ No independent reviewer has approved this integration yet.
 12. Decide whether frontend dependency installation and a separate TypeScript gate are required before exact-run approval.
 13. Verify a heartbeat queued behind another Crew lifecycle operation revalidates the exact current Captain and worker liveness before renewal.
 14. Verify terminal close holds the same per-Crew lifecycle guard before tmux teardown and through authoritative Powder cleanup and persistence.
+15. Verify heartbeat and renewal compare authoritative claim agent to durable Crew ownership before mutation and require exact card, run, and agent receipts before persisting expiry.
