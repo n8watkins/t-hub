@@ -1,7 +1,7 @@
 # T-Hub Phased Production Plan
 
-**Updated:** 2026-07-16.
-**Plan source:** `5b8a542` on `main` plus the product decisions recorded after that commit.
+**Updated:** 2026-07-17.
+**Plan source:** `9d7c9f9` on `fix/captain-control-runtime` plus the General-directed scoped-autonomy integration recorded by this change.
 **Installed build:** T-Hub `0.3.103` from exact detached source `8654986`, running on the canonical profile as Windows PID `39140` when this plan was refreshed.
 **Purpose:** This is the canonical zero-context roadmap for completing T-Hub.
 
@@ -67,6 +67,14 @@ The user artifacts `.lavish/` and `docs/DECK-AGENTS-DESIGN.md` must remain untou
 31. Durable authority role, provider-neutral work profile, and resolved Harness runtime are separate concepts; changing a model never changes General, Cortana, Captain, Crew, or reviewer authority.
 32. T-Hub resolves versioned work profiles through provider adapters, records the exact provider, Harness, model, effort, permissions, and fallback used, and never silently changes provider, capability, cost class, or authority.
 33. Profile routing is Codex-first for initial delivery, while Claude and future provider mappings remain availability-aware adapter policy rather than permanent product vocabulary.
+34. Captain autonomy uses typed scoped delegation rather than a blanket Captain role exception or fleet-wide control.
+35. Durable organizational identity, T-Hub capability, scoped grants, and Harness-local execution permission are separate authority axes, and none silently expands another.
+36. A live control-capable Captain without a Project may consume only an exact one-time existing-repository bootstrap approval with `maxUses=1` that was issued by the General or by Cortana under an exact pre-existing issuance delegation and binds the Captain's durable identity, current session generation, ship, canonical root, Assignment, protected profile identifier, existing board, operation, request digest, and expiry.
+37. `register_project` must not receive a blanket Captain exception because its current transaction can create or initialize Git and update Project metadata or Powder bindings before or after the present role check.
+38. Appturnity is the first installed end-user reproduction for the self-bootstrap slice, and no Appturnity Crew may be dispatched until its Project, Captain, Assignment, protected profile, and Powder board link are authoritatively persisted and reread.
+39. Named authority profiles are visible templates that expand into explicit T34 grant records; `captain-standard`, `captain-project-builder`, and `captain-delivery` are distinct from T33 Harness and model work profiles, while `captain-production-operator` is never a default standing grant and normally resolves to exact one-time approvals.
+40. No standing or delegated Captain profile may authorize protected profile endpoint or credential-command mutation, system-global software installation, or public external repository creation; where supported, only a separately reviewed exact General one-time approval may authorize a narrow instance, while credential reading or export and cross-Project authority remain absolute denials.
+41. T35 atomically consumes the one-time bootstrap approval into an immutable operation-owned recovery lease before its first mutation; only the same durable Captain, ship, request digest, root, Assignment, profile, board, and operation may resume it through a verified replacement-generation handoff, and no new or changed request inherits that authority.
 
 ## Roadmap, Backlog, and Runtime Evidence
 
@@ -152,10 +160,82 @@ T-Hub must not patch or fork Powder behavior locally to make acceptance pass.
 | T31 | Reproduce and eliminate avoidable Workspace-switch terminal restoration delay while preserving bounded terminal resources. | 1, 9, and 11 | No | Packaged warm and cold switches have numeric visual-switch and input-ready budgets; an immediate return never reattaches, and a cold return shows the last authoritative frame immediately while one bounded background attach restores live input. | `thub-workspace-switch-latency` |
 | T32 | Make the sidebar show authoritative, legible agent activity for Codex and Claude instead of treating recent terminal output as equivalent to a running agent. | 4, 8, and 9 | Yes | Packaged Codex and Claude runs remain visibly Working through quiet reasoning and tool execution, distinguish needs-input, idle, completed, failed, stale, and unknown states, and expose degraded telemetry rather than a blank status slot. | `thub-sidebar-agent-status` |
 | T33 | Implement versioned provider-neutral work profiles with Codex-first model and reasoning routing for Captain commissioning, Crew dispatch, scouting, review, and explicit escalation. | 4, 5, 7, 8, and 11 | Yes | CLI-first preflight and dispatch persist the requested profile and exact resolved runtime, existing sessions remain pinned, unavailable models fail visibly or use one explicitly displayed fallback, and no model choice changes authority or Powder state. | `thub-agent-routing-profiles` |
+| T34 | Add a versioned durable scoped-grant contract and one shared evaluator for standing grants, strict delegated subsets, authority templates, approved one-time artifact consumption, revocation, explanation, Project-scoped audit, and bounded decision evidence. | 3, 5, 6, 7, 8, and 12 | Yes | A control token, working directory, prompt, or broad role can never exceed exact identity and grant generation, ship, Project or bootstrap root, Assignment, board, card, run, worktree, branch, environment, external target, expiry, use, and resource constraints; the empty store preserves existing ACL behavior, no authority is inferred from prose or runtime history, and persistence, migration, corruption, revocation races, and redaction fail closed. | `thub-captain-scoped-grants` |
+| T35 | Add an exact existing-repository Captain self-bootstrap operation that composes Project registration, existing-board binding, current-Captain attachment, Assignment binding, checkpoint, and operation-status recovery. | 3, 5, 7, 8, and 12 | Yes | The live Appturnity denial is preserved as the first E2E reproduction, and a granted exact request converges through retry and restart on one Project, Captain, Assignment, binding, and checkpoint while every duplicate-root, foreign, ambiguous, stale-generation, or changed-request case fails before mutation. | `thub-captain-existing-project-self-bootstrap` |
+| T36 | Add bounded routine delivery grants for owned non-protected branch push, draft pull-request and allowed-reviewer operations, owned-branch CI inspection or retry, bounded preview and non-production resource provisioning and retirement, isolated non-production migration, and non-secret configuration metadata reads. | 5, 9, and 12 | Yes | Only reviewed adapters and exact owned resources may be targeted; secret values, protected branches, production, public repository creation, public release, customer outreach, spending, and destructive cleanup remain separately General-gated. | `thub-captain-routine-delivery-grants` |
 
 The change register is authoritative planning input even before its cards are created.
 Powder cards should be created only when their lane is near-term, bounded, dependency-ready, and assigned to an isolated worktree with an explicit exit gate.
 Review findings must not disappear merely because a card is deferred, completed, superseded, or cleaned from the active board.
+
+### Captain Autonomy Delta Classification
+
+The General-directed [Captain autonomy and scoped grants integration plan](./CAPTAIN-AUTONOMY-AND-SCOPED-GRANTS-PLAN.md) is integration input for this existing roadmap.
+It does not replace the active goal, phase order, current Powder work, or the existing owners named below.
+The live Appturnity reproduction returned `acl: only General/Cortana may register a new project` before any Project or Powder binding mutation became observable, but it did not establish which read-only normalization steps ran.
+Current source independently confirms that `enforce_project_authority` rejects a new Project for a Captain and that `register_project` reaches filesystem and Git preparation before its Project authority decision.
+
+| Requirement group | Classification | Canonical owner and required delta |
+| --- | --- | --- |
+| Project, Assignment, ship, Captain, Crew, peer-Captain, and cross-ship isolation | Already covered | T7 and the agent relationship contract remain authoritative; T34 and T35 add negative role and foreign-state non-disclosure tests without weakening those boundaries. |
+| Durable identity, T-Hub capability, work profile, and Harness-local permission separation | Already covered | T7 and T33 retain ownership; T34 adds scoped grants as another independent axis, and Crew retain read-capability T-Hub tokens by default. |
+| Protected Powder credentials and profile storage | Already covered | The Powder integration contract remains authoritative; a grant may contain an authorized profile identifier only and never an endpoint, key, credential command, raw environment value, or caller-supplied arbitrary profile. |
+| General-gated production, protected-branch, destructive, customer, spending, public repository creation, protected profile mutation, system-global installation, publication, release, retirement, and authority-elevation operations | Already covered | The relationship, operating-model, and Phase 12 gates remain authoritative; T34 adds explicit negative grant-evaluator coverage and cannot mint apex authority. |
+| Non-overwriting Powder board creation | Already covered | P5 remains the sole generic owner; existing-board self-bootstrap does not depend on P5 and must not create a board. |
+| Retry-safe Powder card authoring and Captain card operations | Already covered | P6 and T4 retain ownership; T34 supplies authorization descriptors, while exact board and Assignment scope, revision conflicts, stable criterion identity, Captain attribution, and foreign-card non-disclosure strengthen their acceptance. |
+| Captain creation idempotency and operation-status recovery | Requiring stronger acceptance criteria | T5 must carry one canonical request digest and operation identity across Project registration, existing-board binding, current-Captain attachment, Assignment binding, checkpoint, response loss, restart, resume, and explicit partial-state rollback. |
+| Canonical board relevance and protected existing-board binding | Requiring stronger acceptance criteria | T6 must use the protected client, exact canonical repository identity, grant-bound profile and board constraints, and explicit ambiguity handling; a name or alias alone never proves repository identity. |
+| Assignment identity and multiple Captains | Requiring stronger acceptance criteria | T7 must define a transitional durable unbound-Captain and current session-generation interface that can consume only an exact bootstrap grant before binding one Project and Assignment. |
+| Shared actor-aware operation catalog and parity | Requiring stronger acceptance criteria | T11 must describe broad capability, absolute role denials, grant requirements, constraints, effective grant state, dependency availability, provider support, and bounded authorization explanations through equivalent backend, CLI, MCP, and applicable UI results. |
+| Durable inbox and typed approval lifecycle | Requiring stronger acceptance criteria | Phase 6 with T9 and T10 exclusively owns approval request, decision, cancellation, persistence, and state transitions; T34 adds standing grants and delegated subsets and may evaluate and atomically consume an approved exact-operation artifact without creating a parallel approval state machine or schema. |
+| Provider-neutral dispatch and work profiles | Requiring stronger acceptance criteria | T33 must persist requested and resolved runtime, local permission, exact delegated T-Hub operation subset, grant reference, limits, expiry, provider-native attestation, and visible fallback without elevating Crew capability. |
+| Owned worktree and resource lifecycle | Requiring stronger acceptance criteria | T18 and T23 retain canonical snapshot, safety, run-profile, and cleanup ownership; a grant may permit a request but never substitutes for current ownership, liveness, freshness, or cleanup evidence. |
+| Saved, existing, and new codebase onboarding | Requiring stronger acceptance criteria | Phase 7, T5, T6, T18, T21, T23, T33, and P5 remain owners; existing-repository Captain self-bootstrap is the narrow new T35 slice, while Project Builder stays a composition rather than a duplicate workstream. |
+| Exact existing-repository Captain self-bootstrap | Genuinely new work | T35 owns the grant-evaluated service and Appturnity E2E; it may attach only the calling live Captain to one exact canonical existing root and existing authorized board. |
+| Versioned durable scoped grants, standing authority, strict delegated subsets, templates, shared evaluation, explanation, and audit | Genuinely new work | T34 owns the schema, private bounded store, pure policy, approved-artifact consumption and revocation linearization, compatibility migration, decision explanation, Project-scoped audit view, and security matrix while consuming T7 identity, T11 catalog, and Phase 6 approval interfaces. |
+| Actor-visible capability discovery | Requiring stronger acceptance criteria | T11 must distinguish granted, grant required, one-time approval required, temporarily unavailable, external dependency blocked, provider unsupported, and absolutely denied states without exposing foreign metadata. |
+| Routine non-protected delivery operations | Genuinely new work | T36 owns reviewed adapters for owned branches, draft pull requests, CI, previews, and non-production migrations only after T34, T11, T18, and T23 are stable. |
+| Appturnity denial and self-bootstrap E2E | Requiring stronger acceptance criteria | T35 must preserve the live installed denial as immutable first reproduction, use disposable equivalents for mutation tests, pass independent security review, and verify exact installed source, build, installer, binary, operation, Project, Assignment, Captain, profile-name, and board evidence. |
+| Role, retry, restart, concurrency, corruption, redaction, and packaged Windows acceptance | Requiring stronger acceptance criteria | Phase 12 and the testing doctrine remain owners; T34 and T35 add autonomy-specific adversarial matrices and no-success-before-durable-reopen gates. |
+
+The T34 Project-scoped audit view is visible only to the General and the owning Captain unless a narrower reviewed role explicitly requires it.
+Each audit record carries stable operation and grant identifiers, actor, target, decision, failed constraint, recovery disposition, timestamp, and duration.
+Audit records omit prompts, message bodies, credential material, raw environment values, and foreign-Project metadata.
+
+### Captain Autonomy Dependency and Ownership Map
+
+The first vertical slice is T34 followed by T35.
+T34 may design its pure schema and policy interfaces alongside T7 and T11, but activation must consume their authoritative durable identity and operation descriptors rather than minting parallel registries or catalogs.
+T35 depends on T34, T5, T6, T7, the shared canonical Git identity primitive, and the minimum T11 descriptor and parity surface.
+T35 must converge with T18's authoritative canonical-root and ownership model when that interface lands, but the existing-repository slice does not wait for T18 activation and cannot re-enable worktree removal.
+T35 does not depend on P5 because Appturnity already has an existing board and this slice must never create one.
+T25 owns any control-plane modularization needed to keep grant policy out of the monolithic handler, but a mechanical split cannot delay the safe contract or change behavior.
+One integration owner must coordinate the T7 identity, T34 authorization, T5 operation journal, T6 protected-board binding, and T11 catalog boundaries before shared control files change.
+
+Implementation order and exit gates are:
+
+1. Preserve the installed Appturnity ACL denial and current source denial as the immutable end-user reproduction, with no Appturnity mutation or Crew dispatch.
+2. Land T34's versioned grant and decision schemas, fail-atomic private store, pure evaluator, absolute denials, standing and one-time modes, strict delegated subsets, revocation and use linearization, compatibility migration, explanation, audit, and exhaustive General, Cortana, owning Captain, peer Captain, foreign Captain, owning Crew, sibling Crew, foreign Crew, unidentified read-capability caller, control-capability caller without valid per-session identity, trusted in-process host, reviewer, unbound-Captain, stale-generation, and foreign-Project role matrix.
+3. Make the empty grant store preserve current ACL behavior, infer no authority from prompts, messages, handoffs, Powder cards, shell history, conversation history, or working directories, keep deprecated coarse authorization artifacts readable until verified migration, and preserve host-canonical roots instead of rewriting them for WSL convenience.
+4. Require independent security review proving that a control token alone cannot exceed role, ship, exact Project or bootstrap root, Assignment, board, branch, environment, expiry, uses, limits, or current session generation, and that no secret or foreign-state detail appears in persistence, JSON, logs, audit, or errors.
+5. Integrate T34 with T11 descriptors and Phase 6 request and decision surfaces while preserving stable bounded CLI JSON, symbolic denials, operation status, MCP thinness, and applicable UI parity.
+6. Implement T35 as a dedicated existing-root operation whose grant decision, canonical request digest, approval consumption, and immutable recovery lease are atomically persisted before any filesystem, Git, Project, Powder, Captain, Assignment, terminal, or checkpoint mutation; the Captain cannot issue or delegate its own bootstrap grant.
+7. Serialize T35 by the shared canonical Git main-worktree identity and revalidate actor identity, role, ship, session generation or verified recovery handoff, grant version, revocation, expiry, exact root, profile identifier, board identity, request digest, and exclusive operation ownership immediately before each mutation boundary.
+8. Make an existing exact Project converge, reject multiple Projects for the same canonical root without mutation or existence leakage, and make identical retries converge on one Project, Captain, Assignment, binding, checkpoint, and result.
+9. Make changed-request reuse conflict before side effects and give every committed partial state an explicit operation-owned resume or non-destructive rollback disposition.
+10. Permit a replacement generation to assume only that exact in-flight lease when the durable Captain matches, the predecessor is authoritatively dead, no concurrent owner exists, and the grant remains unexpired and unrevoked; this handoff consumes no second use.
+11. If revocation or expiry occurs after a partial commit, block further forward mutation, preserve the resumable state, permit only inspection and non-destructive rollback under the operation contract, and require a fresh exact General resume approval before forward progress.
+12. Prove crash behavior before consumption, after consumption but before first mutation, and after every committed partial boundary, including restart and replacement convergence, concurrent takeover denial, subdirectory and linked-worktree convergence, POSIX and extended-UNC identity, foreign and ambiguous denial, concurrent General, Cortana, and granted-Captain registration, response loss, dialog close, application restart, WSL restart, corruption, and no credential or foreign-existence leakage through deterministic tests.
+13. Run disposable packaged Windows success and denial E2E, then perform an independent identity, authorization, registration, Powder-binding, migration, and rollback review.
+14. Link the live Appturnity Captain only after T35 passes the installed gate, then reread and reconcile the exact Project, Captain, Assignment, protected profile name, and `appturnity` board before any card claim or Crew dispatch.
+
+Later integration order is:
+
+- T4 consumes T34 authorization only as each P6 mutation gate passes.
+- T33 and Phase 6 consume T34 for visible requested work profiles, exact delegated Crew subsets, standing requests, and one-time decisions.
+- T18 and T23 consume T34 only for authorization while retaining authoritative resource and run safety decisions.
+- T36 begins only after T34, T11, T18, T23, and reviewed external adapters are stable.
+- Optional Project Builder remains Phase 7 plus P5, T5, T6, T18, T21, T23, T33, and T34, with no separate duplicate implementation item.
 
 ### Cross-Repository Dependency Order
 
@@ -171,6 +251,12 @@ Review findings must not disappear merely because a card is deferred, completed,
 10. T24 defines the numeric Workspace-switch budgets consumed by T31, while T31 owns lifecycle and rendering changes needed to meet them.
 11. T32 consumes the provider-neutral lifecycle model from Phase 4 and the authoritative Captain and Crew terminal-state work from T17; its degraded-state UI may proceed without fabricating missing telemetry.
 12. T33 consumes T7 Assignment identity and T11 shared-operation parity; its contract and adapter scaffolding may proceed independently, but control-plane integration must follow the active T2, T17, and T30 ownership sequence and must not delay Phase 8A safety acceptance.
+13. T34 consumes T7 durable actor, Assignment, ship, and session-generation identity plus T11 operation descriptors; its schema and pure-policy design may proceed in parallel, but evaluator activation may not create substitute identity or catalog authority.
+14. T35 consumes T34 grant evaluation, T5 operation identity and recovery, T6 protected existing-board matching, T7 transitional unbound-Captain identity, the shared canonical Git identity primitive, and minimum T11 parity; it does not depend on P5 or T18 activation, may not create a board, and must converge with T18's model without implementing a parallel ownership service.
+15. T34 and the Phase 6 lifecycle route grant and approval attention only after exact ownership resolution, while T8 remains limited to Powder event routing and T17 remains authoritative for Captain, Crew, claim, terminal, and cleanup state; neither event routing nor a grant may substitute for current lifecycle evidence.
+16. T33 and Phase 6 consume T34 for exact delegated Crew operation subsets, standing requests, and one-time decisions while preserving Crew read-capability defaults.
+17. T36 waits for T34, T11, T18, T23, and reviewed external adapters, and it cannot absorb protected-branch, production, publication, spending, customer, or destructive operations.
+18. The optional Project Builder flow remains Phase 7 work composed from P5, T5, T6, T18, T21, T23, T33, and T34 rather than a separate duplicate lane.
 
 ### Phase Status and Dependency Summary
 
@@ -178,17 +264,17 @@ Review findings must not disappear merely because a card is deferred, completed,
 | --- | --- | --- |
 | 1 | Original xterm lifecycle gate complete; follow-on control framing, installed IPC, health, and client-recovery regressions open. | T12, T13, T29, and T30 are unblocked follow-on reliability lanes. |
 | 2 | Active. | Resource schema and fail-closed scaffolding may proceed; activation depends on T7 identity interfaces and T18. |
-| 3 | Earliest unblocked foundational phase. | T7 owns shared identity migrations; B2 and provider lanes consume its interfaces. |
+| 3 | Earliest unblocked foundational phase. | T7 owns shared identity migrations and the transitional unbound-Captain and session-generation interfaces consumed by T34 and T35; B2 and provider lanes consume the same interfaces. |
 | 4 | Partially unblocked. | Adapter fixtures may proceed; durable binding depends on T7. T15 must fail closed immediately. |
-| 5 | Active normalization and catalog work. | Strict CLI contract work may proceed; identity-aware expansion depends on T7 and T11. |
-| 6 | Substrate present, activation blocked. | Depends on T7, T9, T10, T11, and the integrated messaging contract. |
-| 7 | Active partial product flow. | Full exit depends on T7, T18, P5 for automatic create-if-absent, and T5 through T6. |
+| 5 | Active normalization and catalog work. | Strict CLI contract work may proceed; identity-aware expansion depends on T7 and T11, and grant-aware discovery consumes T34 without creating adapter-local policy. |
+| 6 | Substrate present, activation blocked. | Depends on T7, T9, T10, T11, and the integrated messaging contract; standing grants and delegated subsets come from T34 while existing typed one-time approval lifecycle remains here. |
+| 7 | Active partial product flow. | Existing-repository Captain self-bootstrap depends on T34, T5, T6, T7, the shared canonical Git identity primitive, and minimum T11 parity without waiting for T18 activation; full Project Builder exit additionally depends on T18 cleanup activation and P5 for automatic create-if-absent. |
 | 8A | Active immediate Captain vertical slice, blocked from shipment. | Depends on P1 through P4, T1 through T3, and T17 before installed completion acceptance; worktree deletion remains disabled without T18. |
 | 8B | Blocked full orchestration acceptance. | Depends on Phase 8A, Phases 2 through 6, and T7 through T11 plus T17 through T18. |
 | 9 | Active partial product surfaces. | Individual packaged bugs may proceed; complete exit depends on shared identity, adapter, inbox, and resource contracts. |
 | 10 | Blocked for complete parity. | Depends on Phases 3, 4, and 6; fixture and local voice-engine checks may proceed. |
 | 11 | Active measurement foundation. | T13, T14, T24, and T28 are required before the final packaged matrix and soak. |
-| 12 | Continuous preparation; final gate blocked. | T27 and every preceding phase exit are required for production release. |
+| 12 | Continuous preparation; final gate blocked. | T27 and every preceding phase exit are required for production release; T34, T35, and T36 also require independent security review plus installed role, retry, restart, concurrency, corruption, redaction, and provenance acceptance. |
 
 Phase 2 is the earliest numbered phase with unblocked partial work, but its complete activation requires the Phase 3 B1 identity interface.
 Phase 3 is the earliest foundational dependency whose completion unlocks the largest downstream set.
@@ -422,6 +508,9 @@ Implement permanent Cortana identity, multiple Captains per Project, Assignment 
 12. Implement the settled Cortana retirement policy with cleanup safety gates.
 13. Display role, Assignment, Project, Harness, model, context, and unrestricted authority clearly.
 14. Migrate legacy pinned and commissioned records without silently granting authority.
+15. Define a transitional durable unbound-Captain state that preserves exact ship, terminal, Harness, and session-generation identity without granting Project authority.
+16. Allow that state to consume only an exact T34 bootstrap grant and bind one Project and Assignment through T35.
+17. Reject stale or replacement terminal generations, conflicting ships or Assignments, and foreign or ambiguous targets without existence leakage.
 
 ### Tests and Evidence
 
@@ -563,6 +652,8 @@ Preserve the existing control-client architecture, JSON envelope, compatible ali
 19. Generate actor-visible CLI and MCP catalogs from one descriptor source rather than maintaining separate hard-coded command and tool lists.
 20. Report unsupported or unavailable host-health fields honestly rather than returning an all-zero healthy WSL skeleton.
 21. Use one bounded control-client deadline with prompt stale-endpoint recovery and structured timeout evidence.
+22. Extend each shared operation descriptor with its broad capability, absolute role denials, grant class, exact constraint vocabulary, external dependencies, provider support, and stable explanation kinds.
+23. Return actor-visible capability discovery that distinguishes granted, grant required, one-time approval required, temporarily unavailable, dependency blocked, provider unsupported, and absolute denial without foreign or credential detail.
 
 ### Tests and Evidence
 
@@ -613,6 +704,9 @@ Implement the authority and channel boundaries in [AGENT-RELATIONSHIP-AND-MESSAG
 19. Make every inbox mutation fail atomically when durable create, write, flush, rename, reopen, or recovery work fails.
 20. Bound UTF-8 body size, standard capacity, Emergency capacity, retention, retry growth, and telemetry while preserving explicit backpressure and overflow states.
 21. Prevent any persistence failure from returning an acknowledged delivery, read, acceptance, completion, or approval transition.
+22. Reuse the typed approval lifecycle for T34 exact one-time grants, including exact arguments, expiry, cancellation, atomic consumption, and stable operation identity.
+23. Add request, issue, list-effective, explain, revoke, use, and expiry communication surfaces for T34 standing grants without treating inbox text as authorization.
+24. Preserve strict-subset delegation and make parent revocation deterministically invalidate or suspend every delegated child before any further use, including across restart and concurrent consumption, while keeping grant evaluation and durable grant state inside T34 rather than the inbox implementation.
 
 ### Recommended Retention Default
 
@@ -667,6 +761,11 @@ Make Captain creation understandable for saved, existing, and completely new cod
 19. Prevent double-click, backdrop dismissal, refresh, or timeout from creating duplicate Projects, Captains, terminals, or Powder bindings.
 20. Recommend and auto-bind only an exact canonical repository match, and keep unrelated Powder boards behind an Advanced path.
 21. Expose safe Captain card authoring through the shared operation catalog rather than requiring the General to create routine implementation cards manually.
+22. Add the T35 existing-repository Captain self-bootstrap path for one live control-capable unbound Captain with an exact T34 bootstrap grant.
+23. Preserve the live Appturnity `register_project` ACL denial as the first installed reproduction and keep Appturnity Crew undispatched until its Project, Captain, Assignment, profile, and board link are authoritative.
+24. Resolve subdirectory and linked-worktree input to one canonical main-worktree identity, serialize by that identity, and reject conflicting or ambiguous registrations before mutation.
+25. Bind only an existing protected-board match in the first T35 slice, with no board creation and no caller-supplied endpoint, credential, or arbitrary profile.
+26. Expose explicit pending, resumable, completed, conflicted, and non-destructive rollback states for a Project preserved after a later attachment or checkpoint failure.
 
 Phase 7 remains active.
 Phase 7 item 8 depends on the Phase 2 unified worktree status service, whose durable ownership fields consume the Phase 3 B1 identity interfaces.
@@ -1060,6 +1159,9 @@ Make the validated product safe, traceable, installable, and understandable.
 25. Publish the supported Windows, WSL, tmux, Harness, Provider, Powder, and upgrade matrix.
 26. Bound diagnostic and event-journal retention and prove cleanup never removes user-owned evidence silently.
 27. Add native Windows automated tests to complement Ubuntu CI before calling the packaged product release-ready.
+28. Independently review the T34 grant evaluator, storage migration, revocation and consumption linearization, foreign-state non-disclosure, and every absolute denial.
+29. Independently review the T35 identity transition, canonical-root uniqueness, operation journal, Project and board convergence, partial-state ownership, and rollback boundaries.
+30. Run installed Windows T34 and T35 matrices for role, stale generation, retry, response loss, application and WSL restart, concurrency, corruption, redaction, exact build provenance, and no-success-before-durable-reopen behavior.
 
 ### Tests and Evidence
 
@@ -1126,6 +1228,7 @@ These lanes may proceed in parallel after the Phase 1 control contract is stable
 - **B5 CLI contract and shared catalog:** first normalize the existing CLI to `docs/cli-contract.md`, then add shared schemas, role filtering, command groups, and CLI-to-MCP parity tests.
 - **B6 Inbox identity and UI data model:** implement `docs/AGENT-RELATIONSHIP-AND-MESSAGING-CONTRACT.md` through durable recipients, message states, card and run links, retention, acknowledgements, and read APIs.
 - **B7 Powder lifecycle safety:** per-Crew serialization and retry-safe integration against P1 through P4.
+- **B8 Scoped grant contract:** add the T34 schema, bounded private store, pure evaluator, standing and one-time modes, strict delegated subsets, compatibility migration, explanation, audit, and role matrix against explicit T7 and T11 interfaces.
 
 B1 owns shared identity migrations.
 B3 and B4 must consume B1's identity interfaces rather than each introducing provider-specific durable fields.
@@ -1134,6 +1237,8 @@ B5 owns command definitions.
 B5 must land contract behavior and process-level tests before broad command generation so new commands inherit the correct interface.
 B6 owns messaging schema and must not bypass B1 authority.
 B7 may build mocks and fail-closed scaffolding before P1 through P4 land, but may not ship automated completion against a card-only Powder mutation.
+B8 owns authorization artifacts and must not introduce a parallel identity registry, operation catalog, inbox approval state machine, resource verdict, or provider work-profile model.
+B8 pure-policy and schema work may proceed alongside B1 and B5 only with explicit interfaces, while evaluator activation waits for authoritative B1 identity and B5 descriptors.
 
 ### Tranche C - Product Flows
 
@@ -1150,9 +1255,13 @@ These lanes may proceed in parallel after the identity and adapter contracts sta
 - **C9 Captain creation recovery and card authoring.**
 - **C10 Full Board packaged repair and relevant-board defaults.**
 - **C11 Provider-limit and History singleton caching.**
+- **C12 Existing-repository Captain self-bootstrap:** compose T35 with T34, T5, T6, T7, T11, and the shared canonical Git identity primitive, preserve the Appturnity denial, and activate only after the backend and parity gates pass without waiting for T18 activation.
+- **C13 Routine delivery grants:** start T36 only after T34, T11, T18, T23, and reviewed external adapters are stable.
 
 Each lane must use shared Project, identity, resource, and adapter APIs.
 No lane may create a local substitute for a missing backend contract.
+C12 does not depend on P5 or T18 activation, may bind only an existing authorized board, and must converge with T18 without implementing a parallel ownership service.
+C13 may cover owned non-protected delivery only and cannot absorb protected profile endpoint or credential-command mutation, system-global installation, public repository creation, production, protected-branch, publication, spending, customer, or destructive authority.
 
 ### Tranche D - Acceptance and Hardening
 
