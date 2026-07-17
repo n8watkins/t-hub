@@ -358,6 +358,28 @@ pub fn attest_launch_permissions(
     adapter.attest_permissions(after, expected)
 }
 
+/// Confirm that two pre-launch observations refer to the exact same foreground
+/// process in the same pane generation.  This is stricter than accepting a
+/// readable shell once: startup may replace a just-observed login shell before
+/// the provider command can be sent.
+pub fn confirm_stable_launch_baseline(
+    first: &HarnessProcessEvidence,
+    second: &HarnessProcessEvidence,
+) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
+    if first.terminal != second.terminal {
+        return Err(LaunchAttestationError::TerminalChanged);
+    }
+    if first.identity() != second.identity()
+        || first.executable_identity() != second.executable_identity()
+    {
+        return Err(LaunchAttestationError::ProcessChanged);
+    }
+    if first.ancestry != second.ancestry {
+        return Err(LaunchAttestationError::AncestryChanged);
+    }
+    Ok(second.clone())
+}
+
 /// Re-verify provider posture and exact process provenance at a durable launch
 /// acceptance boundary. The final observation must belong to the same tmux
 /// pane generation, provider process lifetime, executable, and ancestry as the

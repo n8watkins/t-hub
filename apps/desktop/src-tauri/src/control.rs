@@ -57,9 +57,9 @@ use crate::audit::{AuditLog, AuditMeta};
 use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
 use crate::harness::{
-    attest_final_launch_permissions, attest_launch_permissions, observe_harness_process, Harness,
-    HarnessPermissionAttestation, HarnessProcessEvidence, LaunchAttestationError, PermMode,
-    CREW_DEFAULT_PERMISSION,
+    attest_final_launch_permissions, attest_launch_permissions, confirm_stable_launch_baseline,
+    observe_harness_process, Harness, HarnessPermissionAttestation, HarnessProcessEvidence,
+    LaunchAttestationError, PermMode, CREW_DEFAULT_PERMISSION,
 };
 use crate::supervision::Supervisor;
 use crate::{files, git, plane, powder, pty, tmux};
@@ -10194,31 +10194,19 @@ fn observe_dispatch_baseline(
     observer: &mut dyn FnMut(&str) -> Result<HarnessProcessEvidence, LaunchAttestationError>,
     target: &str,
 ) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
+    const MAX_STABLE_BASELINE_ATTEMPTS: usize = 8;
+    for _ in 0..MAX_STABLE_BASELINE_ATTEMPTS {
         match observer(target) {
-            Ok(evidence) => {
-                std::thread::sleep(Duration::from_millis(30));
-                match observer(target) {
-                    Ok(confirm) if evidence == confirm => {
-                        return Ok(confirm);
-                    }
-                    Ok(_) if Instant::now() < deadline => continue,
-                    Ok(_) => return Err(LaunchAttestationError::UnreadableEvidence),
-                    Err(LaunchAttestationError::UnreadableEvidence)
-                        if Instant::now() < deadline =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(LaunchAttestationError::UnreadableEvidence) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            Ok(evidence) => match observer(target) {
+                Ok(confirm) => return confirm_stable_launch_baseline(&evidence, &confirm),
+                Err(LaunchAttestationError::UnreadableEvidence) => continue,
+                Err(error) => return Err(error),
+            },
+            Err(LaunchAttestationError::UnreadableEvidence) => continue,
             Err(error) => return Err(error),
         }
     }
+    Err(LaunchAttestationError::UnreadableEvidence)
 }
 
 fn rollback_crew_launch_failure(
@@ -10297,6 +10285,7 @@ fn dispatch_crew(
     dispatch_crew_with_observer_inner(ctx, args, caller, trusted_internal, &mut observer, true)
 }
 
+#[cfg(test)]
 fn dispatch_crew_with_observer(
     ctx: &ControlContext,
     args: &Value,
@@ -10558,6 +10547,9 @@ fn dispatch_crew_with_observer_inner(
             ));
         }
     };
+    #[cfg(test)]
+    ctx.captains.pause_dispatch("after_stable_baseline");
+    revalidate_or_rollback!("after stable baseline before provider send");
     #[cfg(not(test))]
     let launch = crew_launch_argv(harness, &prompt);
     #[cfg(test)]
@@ -27262,6 +27254,143 @@ mod tests {
             7,
             ancestry,
         )
+    }
+
+    #[test]
+    fn dispatch_stable_baseline_policy_is_bounded_and_identity_exact() {
+        let stable = dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (7, 100)]);
+        let mut transient = std::collections::VecDeque::from(vec![
+            Err(LaunchAttestationError::UnreadableEvidence),
+            Ok(stable.clone()),
+            Ok(stable.clone()),
+        ]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| transient.pop_front().unwrap(), "th-test").unwrap(),
+            stable
+        );
+
+        let terminal_changed =
+            dispatch_race_evidence(&["zsh"], 100, 123_457, &[(42, 900), (7, 100)]);
+        let mut terminal =
+            std::collections::VecDeque::from(vec![Ok(stable.clone()), Ok(terminal_changed)]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| terminal.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::TerminalChanged)
+        );
+
+        let process_changed =
+            dispatch_race_evidence(&["zsh"], 101, 123_456, &[(42, 901), (7, 100)]);
+        let mut process =
+            std::collections::VecDeque::from(vec![Ok(stable.clone()), Ok(process_changed)]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| process.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::ProcessChanged)
+        );
+
+        let ancestry_changed =
+            dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (8, 101), (7, 100)]);
+        let mut ancestry =
+            std::collections::VecDeque::from(vec![Ok(stable.clone()), Ok(ancestry_changed)]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| ancestry.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::AncestryChanged)
+        );
+
+        let mut immediate =
+            std::collections::VecDeque::from(vec![Err(LaunchAttestationError::WrongProvider)]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| immediate.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::WrongProvider)
+        );
+
+        let mut exhausted =
+            std::collections::VecDeque::from(vec![
+                Err(LaunchAttestationError::UnreadableEvidence);
+                8
+            ]);
+        assert_eq!(
+            observe_dispatch_baseline(&mut |_| exhausted.pop_front().unwrap(), "th-test"),
+            Err(LaunchAttestationError::UnreadableEvidence)
+        );
+    }
+
+    #[test]
+    fn dispatch_replacement_after_stable_baseline_rolls_back_before_provider_send() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_replacement_after_stable_baseline_rolls_back_before_provider_send: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(4);
+        let profile_name = format!(
+            "dispatch-stable-baseline-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let (reached, wait_for_boundary) = std::sync::mpsc::sync_channel(1);
+        let (resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "after_stable_baseline",
+            reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Reject a replacement after stable zsh baseline",
+            "harness": "codex",
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        assert_eq!(
+            wait_for_boundary
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach the stable-baseline barrier"),
+            "after_stable_baseline"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                "replacement-captain",
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        resume.send(()).unwrap();
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            error.contains("after stable baseline before provider send"),
+            "{error}"
+        );
+        assert!(
+            error.contains("all side effects were rolled back"),
+            "{error}"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        assert!(registry
+            .snapshot()
+            .captains
+            .iter()
+            .find(|captain| captain.ship_slug == "dispatch-attestation")
+            .unwrap()
+            .crew
+            .is_empty());
+        let state = server.finish().unwrap();
+        assert_eq!(state.claim_posts, 1);
+        assert_eq!(state.release_posts, 1);
     }
 
     #[test]
