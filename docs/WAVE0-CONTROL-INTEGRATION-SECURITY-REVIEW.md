@@ -335,6 +335,15 @@ No append or Captain message is claimed as delivered.
 The installed T-Hub runtime was not modified, installed, or restarted.
 The currently installed Crew run-bound mutation surface rejected work-log capability verification during this task, so the Captain must maintain the exact-run Powder work log through a sanctioned working surface.
 
+Commit `e2b2148` adds two deterministic recovery-race regressions required by the latest durability review.
+`dispatch_release_recovery_serializes_periodic_reconcile_and_ordinary_cleanup` blocks canonical original-scope run evidence during periodic reconciliation while ordinary close cleanup waits on the same Crew guard.
+The original release commits with an EOF response, the queued ordinary cleanup observes the retained exact recovery after waiting, validates released evidence, and clears it without a second POST.
+The test proves one original-scope release POST, two original-scope evidence reads, zero replacement-profile evidence or release I/O, empty pending claim and release collections, and preservation of the replacement Project Powder binding.
+`dispatch_release_inflight_before_post_survives_restart_without_blind_repost` pauses a post-bind authority rollback at `release_inflight_before_post` after terminal teardown and durable `InFlight` persistence.
+It then simulates process death by dropping the barrier resume, reloads the registry, validates the original repository and exact card/run/agent evidence, sends the only release POST from recovery, and proves the terminated transaction cannot post after restart.
+The test proves the transaction terminal is gone before restart, no provider command ran, the recovered registry has no durable Crew, pending claim, or pending release, and the replacement profile receives zero evidence or release I/O.
+The test-only post-barrier check compares the durable `InFlight` record, not the pre-transition `Prepared` value, so normal rollback paths retain their exact release behavior.
+
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
 No independent reviewer has approved this integration yet.
 
