@@ -280,12 +280,13 @@ At `6f14ae7`, the serialized dispatch filter passed 22 tests with one existing r
 
 Independent review found that a post-bind ambiguous release could retain only a CleanupPending Crew after the initial-claim intent had been cleared.
 That Crew's normal restart cleanup could then resolve the replacement Captain Project and Powder binding instead of the original release scope.
-Commit `2e4a332` introduces a distinct `PendingDispatchRelease` recovery record with the original Project, protected profile, repository, card, run, agent, initial operation identity, and transaction Crew terminal.
-It is retained atomically with the exact CleanupPending Crew only after a trusted post-bind release becomes ambiguous, so it never misrepresents a trusted bound claim as an unresolved initial claim.
-Both periodic reconciliation and ordinary Crew cleanup resolve this record directly from its frozen original profile and exact card, run, and agent receipt identity before any mutable Captain or Project scope lookup.
-Confirmed recovery clears only the exact recovery record and transaction-owned CleanupPending Crew, preserving replacement Captain state and Project or Powder bindings.
-Deterministic barriers at before launch, before attestation persistence, and before success each perform same-terminal release-reclaim plus Project profile and repository rebind, force an EOF-ambiguous first release, restart the registry, and prove recovery sends its second exact release only to the original profile server.
-The replacement-profile server receives zero requests in every phase test.
+Commit `2e4a332` introduced the initial distinct `PendingDispatchRelease` recovery record with the original Project, protected profile name, repository, card, run, agent, initial operation identity, and transaction Crew terminal.
+The profile-name-only recovery description in this historical section is superseded by the later durability remediation below.
+It was not sufficient to defend a protected profile endpoint remap, release preparation before terminal teardown, or concurrent recovery cleanup.
+Current recovery retains a frozen canonical endpoint and repository identity, prepares its exact CleanupPending Crew before teardown, and serializes periodic and ordinary cleanup through one per-Crew guard.
+Confirmed recovery removes a record only with its exact transaction-owned CleanupPending Crew.
+It does not retire a reused terminal identity when that Crew is absent or replaced.
+The newer remap and response-loss regressions replace the older claim of a second release POST.
 The explicit after-claim ambiguity test retains the correctly named initial-claim recovery intent because no durable Crew binding exists at that phase.
 At `2e4a332`, the serialized dispatch filter passed 25 tests with one existing real-agent test intentionally ignored, the Harness filter passed 15 tests, and formatting, `cargo clippy -p t-hub --all-targets -- -D warnings`, and `git diff --check` passed.
 
@@ -302,9 +303,9 @@ If Powder already reports the exact run released after response loss, recovery c
 If the run remains active with the exact card and agent, recovery may perform one exact release using the frozen scope.
 `Prepared` remains explicitly recovery-pending because no release POST was durably recorded.
 
-Schema version 10 makes this recovery shape incompatible with an older binary that could silently discard it.
-Version 9 snapshots without a release recovery load and upgrade on their next write.
-Version 9 snapshots containing a release recovery fail closed before any recovery or network call.
+Schema version 11 makes the endpoint-pinned recovery shape incompatible with an older binary that could silently discard it.
+Version 10 snapshots without a release recovery load and upgrade on their next write.
+Version 10 snapshots containing a release recovery fail closed before any recovery or network call.
 Snapshot validation requires each release recovery to map to exactly one `CleanupPending` Crew under the exact Project with matching terminal, card, run, agent, and frozen-scope marker.
 The reciprocal marker check rejects orphaned Crew recovery state, mismatched or foreign records, and duplicate recovery state before any remote release.
 
@@ -313,7 +314,9 @@ The response-loss test proves a release POST can commit while its response is lo
 The same test forces ambiguity-state persistence failure after the POST and proves restart recovers from the last durable `InFlight` state without touching the replacement scope.
 Malformed persistence pair coverage exercises orphan, foreign Project, mismatched agent, and missing reciprocal marker records with no network client construction.
 
-At final code head `1568bbd`, the serialized dispatch filter passed 23 tests with one existing real-agent test intentionally ignored.
+Commit `5b15f01` adds endpoint and repository validation before recovery, atomic pre-teardown preparation, strict cross-record identity bounds, and exact-Crew-only recovery clearing.
+Commit `ae59b3a` rechecks the durable recovery after entering the shared per-Crew cleanup guard, so a queued periodic reconciliation cannot replay a release after ordinary cleanup has already cleared it.
+At code head `ae59b3a`, the serialized dispatch filter passed 25 tests with one existing real-agent test intentionally ignored.
 The serialized control Powder filter passed 63 tests.
 The Powder client filter passed 30 tests.
 The Harness filter passed 15 tests.
