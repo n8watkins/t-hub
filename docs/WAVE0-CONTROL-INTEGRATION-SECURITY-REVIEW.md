@@ -324,6 +324,10 @@ The MCP library and binary suites passed 16 and 75 tests respectively.
 Formatting, all-target clippy for the changed desktop crate, and `git diff --check` passed.
 An attempted follow-on Cargo command named a nonexistent `e2e` test target after the agent suite had already run its E2E targets successfully.
 Cargo rejected that command before executing product tests.
+The exact-run work-log append was attempted once with stable operation identity `work-log:wave0-durability-1154214`.
+The sanctioned CLI returned `powder_mutation_unsupported` because deployed run-bound capability verification failed before any mutation.
+An authenticated `send` attempt to Captain session `0c7b7560` was also rejected before delivery because this Crew token has only read control capability.
+No append or Captain message is claimed as delivered.
 
 The installed T-Hub runtime was not modified, installed, or restarted.
 The currently installed Crew run-bound mutation surface rejected work-log capability verification during this task, so the Captain must maintain the exact-run Powder work log through a sanctioned working surface.
