@@ -1655,6 +1655,24 @@ struct ScopedAuthorityGeneration {
     project: u64,
 }
 
+/// The authority tuple captured before dispatch performs remote I/O.
+///
+/// This deliberately carries the original Captain and Project values instead of
+/// a later snapshot.  A Crew bind may add its own Crew generation, but it must
+/// never make a replacement Captain or Project become the expected authority.
+#[derive(Clone, Debug)]
+struct DispatchAuthority {
+    captain: CaptainRecord,
+    project: ProjectRecord,
+    generation: ScopedAuthorityGeneration,
+    caller: Option<ResolvedIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DispatchBindAuthority {
+    crew_generation: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 struct AuthorityGenerations {
     clock: u64,
@@ -2806,6 +2824,7 @@ impl CaptainsRegistry {
             branch,
             powder_work,
             None,
+            None,
         )
     }
 
@@ -2818,7 +2837,8 @@ impl CaptainsRegistry {
         worktree_path: Option<&str>,
         branch: Option<&str>,
         powder_work: PowderWorkBinding,
-        expected_generation: Option<ScopedAuthorityGeneration>,
+        expected_dispatch: Option<&DispatchAuthority>,
+        expected_bind: Option<DispatchBindAuthority>,
     ) -> Result<CrewRef, String> {
         if task.trim().is_empty() {
             return Err("crew task must not be empty".into());
@@ -2827,7 +2847,16 @@ impl CaptainsRegistry {
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
         let mut g = self.lock();
         let previous = g.clone();
-        if let Some(expected) = expected_generation {
+        if let (Some(expected_dispatch), Some(expected_bind)) = (expected_dispatch, expected_bind) {
+            if captain_session_id
+                != expected_dispatch
+                    .captain
+                    .terminal_id
+                    .as_deref()
+                    .unwrap_or("")
+            {
+                return Err("acl: dispatch authority changed; refusing Crew bind".into());
+            }
             let captain = g
                 .captains
                 .iter()
@@ -2835,11 +2864,19 @@ impl CaptainsRegistry {
                 .ok_or_else(|| format!("unknown Captain session '{captain_session_id}'"))?;
             let current = g.authority_generations.scoped(
                 self.authority_epoch,
-                &captain.ship_slug,
+                &expected_dispatch.captain.ship_slug,
                 crew_session_id,
-                captain.project_id.as_deref().unwrap_or(""),
+                &expected_dispatch.project.project_id,
             );
-            if current != expected {
+            if current.captain != expected_dispatch.generation.captain
+                || current.project != expected_dispatch.generation.project
+                || current.registry_epoch != expected_dispatch.generation.registry_epoch
+                || current.crew != expected_bind.crew_generation
+                || CaptainAuthorityProjection::from(captain)
+                    != CaptainAuthorityProjection::from(&expected_dispatch.captain)
+                || captain.project_id.as_deref()
+                    != Some(expected_dispatch.project.project_id.as_str())
+            {
                 return Err("acl: dispatch authority changed; refusing Crew bind".into());
             }
         }
@@ -9905,9 +9942,7 @@ fn revalidate_dispatch_authority(
     args: &Value,
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
-    expected_captain: &CaptainRecord,
-    expected_project: &ProjectRecord,
-    expected_generation: ScopedAuthorityGeneration,
+    expected: &DispatchAuthority,
 ) -> Result<(), String> {
     let (captain, project) = captain_and_project_for_dispatch(ctx, args).map_err(|_| {
         "acl: dispatch authority changed; retry from the current Captain".to_string()
@@ -9915,23 +9950,21 @@ fn revalidate_dispatch_authority(
     let (_, generations, registry_epoch) = ctx.captains.snapshot_with_authority_generations();
     let current_generation = generations.scoped(
         registry_epoch,
-        &expected_captain.ship_slug,
+        &expected.captain.ship_slug,
         "",
-        &expected_project.project_id,
+        &expected.project.project_id,
     );
-    if current_generation != expected_generation
-        || captain.terminal_id != expected_captain.terminal_id
-        || captain.ship_slug != expected_captain.ship_slug
-        || captain.project_id != expected_captain.project_id
-        || project.project_id != expected_project.project_id
-        || project.repo_root != expected_project.repo_root
-        || project.powder != expected_project.powder
+    if current_generation != expected.generation
+        || CaptainAuthorityProjection::from(&captain)
+            != CaptainAuthorityProjection::from(&expected.captain)
+        || project != expected.project
+        || caller.cloned() != expected.caller
     {
         return Err("acl: dispatch authority changed; retry from the current Captain".into());
     }
-    enforce_ship_authority(caller, trusted_internal, &captain.ship_slug).map_err(|_| {
-        "acl: dispatch authority changed; retry from the current Captain".to_string()
-    })?;
+    enforce_ship_authority(caller, trusted_internal, &expected.captain.ship_slug).map_err(
+        |_| "acl: dispatch authority changed; retry from the current Captain".to_string(),
+    )?;
     Ok(())
 }
 
@@ -10159,8 +10192,63 @@ fn rollback_crew_launch_failure(
     claim: &powder::Claim,
     primary: String,
 ) -> String {
-    let rollback = rollback_crew_dispatch(ctx, crew_session_id, Some(client), Some(claim));
+    let rollback = rollback_trusted_dispatch(ctx, crew_session_id, client, claim);
     dispatch_rollback_error(primary, rollback)
+}
+
+/// Roll back only the terminal and exact claim created by this dispatch.
+///
+/// This path deliberately does not rediscover Project or Powder scope.  Those
+/// values may have changed precisely because the dispatch authority was
+/// revoked.  The trusted receipt is the sole release identity.
+fn rollback_trusted_dispatch(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    client: &powder::Client,
+    claim: &powder::Claim,
+) -> Result<(), String> {
+    tmux::kill_session_tree(&tmux_target(crew_session_id)).map_err(|error| {
+        format!("Crew terminal '{crew_session_id}' could not be stopped: {error}")
+    })?;
+    if let Err(error) = client.release(claim) {
+        let _ = ctx.captains.mark_crew_cleanup_pending(crew_session_id);
+        return Err(format!(
+            "Crew terminal '{crew_session_id}' stopped, but exact Powder card '{}' run '{}' release is ambiguous: {error}",
+            claim.card_id, claim.run_id
+        ));
+    }
+    ctx.captains.rollback_crew(crew_session_id).map_err(|error| {
+        format!(
+            "Crew terminal '{crew_session_id}' exact claim released, but its transaction-owned durable record could not be removed: {error}"
+        )
+    })?;
+    ctx.tabs.remove_tile(crew_session_id);
+    ctx.identity.retire_tile(crew_session_id)?;
+    let _ = captains_sync_apply(ctx);
+    Ok(())
+}
+
+fn rollback_dispatch_authority_failure(
+    ctx: &ControlContext,
+    crew_session_id: &str,
+    client: &powder::Client,
+    claim: &powder::Claim,
+    pending_claim: &PendingDispatchClaim,
+    phase: &str,
+    authority_error: String,
+) -> String {
+    let primary = format!("dispatch_crew: authority changed {phase}: {authority_error}");
+    match rollback_trusted_dispatch(ctx, crew_session_id, client, claim) {
+        Ok(()) => match ctx.captains.clear_pending_dispatch_claim(pending_claim) {
+            Ok(_) => format!("{primary} and all side effects were rolled back"),
+            Err(error) => format!(
+                "{primary}; exact transaction rollback succeeded, but initial-claim recovery intent could not be cleared: {error}; redispatch remains blocked"
+            ),
+        },
+        Err(error) => format!(
+            "{primary}; rollback is incomplete: {error}; initial-claim recovery remains pending and redispatch is blocked"
+        ),
+    }
 }
 
 fn dispatch_crew(
@@ -10190,6 +10278,12 @@ fn dispatch_crew_with_observer(
         "",
         captain.project_id.as_deref().unwrap_or(""),
     );
+    let dispatch_authority = DispatchAuthority {
+        captain: captain.clone(),
+        project: project.clone(),
+        generation: dispatch_generation,
+        caller: caller.cloned(),
+    };
     enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
     let captain_session_id = captain.terminal_id.as_deref().unwrap().to_string();
     let binding = project.powder.as_ref().ok_or_else(|| {
@@ -10264,26 +10358,10 @@ fn dispatch_crew_with_observer(
         &card_id,
         authoritative_run_id,
     )?;
-    revalidate_dispatch_authority(
-        ctx,
-        args,
-        caller,
-        trusted_internal,
-        &captain,
-        &project,
-        dispatch_generation,
-    )?;
+    revalidate_dispatch_authority(ctx, args, caller, trusted_internal, &dispatch_authority)?;
     #[cfg(test)]
     ctx.captains.pause_dispatch("after_preflight");
-    revalidate_dispatch_authority(
-        ctx,
-        args,
-        caller,
-        trusted_internal,
-        &captain,
-        &project,
-        dispatch_generation,
-    )?;
+    revalidate_dispatch_authority(ctx, args, caller, trusted_internal, &dispatch_authority)?;
 
     let mut spawn_args = json!({
         "cwd": checkout,
@@ -10312,8 +10390,12 @@ fn dispatch_crew_with_observer(
     let spawned = match spawn_terminal(ctx, &spawn_args) {
         Ok(spawned) => spawned,
         Err(error) => {
-            let _ = ctx.captains.clear_pending_dispatch_claim(&pending_claim);
-            return Err(error);
+            return match ctx.captains.clear_pending_dispatch_claim(&pending_claim) {
+                Ok(_) => Err(error),
+                Err(clear_error) => Err(format!(
+                    "{error}; initial-claim recovery intent could not be cleared after spawn failure: {clear_error}; redispatch remains blocked"
+                )),
+            };
         }
     };
     let crew_session_id = spawned["id"]
@@ -10334,24 +10416,38 @@ fn dispatch_crew_with_observer(
             });
         }
     };
+    macro_rules! revalidate_or_rollback {
+        ($phase:literal) => {
+            if let Err(error) = revalidate_dispatch_authority(
+                ctx,
+                args,
+                caller,
+                trusted_internal,
+                &dispatch_authority,
+            ) {
+                return Err(rollback_dispatch_authority_failure(
+                    ctx,
+                    &crew_session_id,
+                    &client,
+                    &claim,
+                    &pending_claim,
+                    $phase,
+                    error,
+                ));
+            }
+        };
+    }
     #[cfg(test)]
     ctx.captains.pause_dispatch("after_claim");
-    revalidate_dispatch_authority(
-        ctx,
-        args,
-        caller,
-        trusted_internal,
-        &captain,
-        &project,
-        dispatch_generation,
-    )?;
-    let (_, bind_generations, bind_epoch) = ctx.captains.snapshot_with_authority_generations();
-    let bind_generation = bind_generations.scoped(
-        bind_epoch,
-        &captain.ship_slug,
-        &crew_session_id,
-        &project.project_id,
-    );
+    revalidate_or_rollback!("after claim before durable Crew binding");
+    let (_, bind_generations, _) = ctx.captains.snapshot_with_authority_generations();
+    let bind_authority = DispatchBindAuthority {
+        crew_generation: bind_generations
+            .crew
+            .get(&crew_session_id)
+            .copied()
+            .unwrap_or(0),
+    };
     #[cfg(test)]
     ctx.captains.pause_dispatch("before_bind");
     let _crew = match ctx.captains.bind_crew_context_exact(
@@ -10369,24 +10465,20 @@ fn dispatch_crew_with_observer(
             mutation_intent: None,
             state: PowderWorkState::Active,
         },
-        Some(bind_generation),
+        Some(&dispatch_authority),
+        Some(bind_authority),
     ) {
         Ok(crew) => crew,
         Err(error) => {
-            let rollback =
-                rollback_crew_dispatch(ctx, &crew_session_id, Some(&client), Some(&claim));
-            let primary = format!("dispatch_crew: durable Crew binding failed: {error}");
-            return match rollback {
-                Ok(()) => match ctx.captains.clear_pending_dispatch_claim(&pending_claim) {
-                    Ok(_) => Err(format!("{primary} and all side effects were rolled back")),
-                    Err(clear_error) => Err(format!(
-                        "{primary}; the exact claim was released, but initial-claim recovery intent could not be cleared: {clear_error}; redispatch remains blocked"
-                    )),
-                },
-                Err(rollback_error) => Err(format!(
-                    "{primary}; rollback is incomplete: {rollback_error}; initial-claim recovery remains pending and redispatch is blocked"
-                )),
-            };
+            return Err(rollback_dispatch_authority_failure(
+                ctx,
+                &crew_session_id,
+                &client,
+                &claim,
+                &pending_claim,
+                "during durable Crew binding",
+                error,
+            ));
         }
     };
     if let Err(error) = ctx.captains.clear_pending_dispatch_claim(&pending_claim) {
@@ -10398,26 +10490,10 @@ fn dispatch_crew_with_observer(
         "You are Crew on ship '{}'. Work only Powder card '{}' in run '{}'. Task: {} Use checkout '{}'. Report progress, blockers, and completion to Captain session '{}'. Do not claim other work or spawn additional agents.",
         captain.ship_slug, claim.card_id, claim.run_id, task, checkout, captain_session_id
     );
-    revalidate_dispatch_authority(
-        ctx,
-        args,
-        caller,
-        trusted_internal,
-        &captain,
-        &project,
-        dispatch_generation,
-    )?;
+    revalidate_or_rollback!("before launch");
     #[cfg(test)]
     ctx.captains.pause_dispatch("before_launch");
-    revalidate_dispatch_authority(
-        ctx,
-        args,
-        caller,
-        trusted_internal,
-        &captain,
-        &project,
-        dispatch_generation,
-    )?;
+    revalidate_or_rollback!("before launch");
     let tmux_target = tmux_target(&crew_session_id);
     let before_launch = match observer(&tmux_target) {
         Ok(evidence) => evidence,
@@ -10518,27 +10594,11 @@ fn dispatch_crew_with_observer(
             ));
         }
     };
-    revalidate_dispatch_authority(
-        ctx,
-        args,
-        caller,
-        trusted_internal,
-        &captain,
-        &project,
-        dispatch_generation,
-    )?;
+    revalidate_or_rollback!("before attestation persistence");
     #[cfg(test)]
     ctx.captains
         .pause_dispatch("before_attestation_persistence");
-    revalidate_dispatch_authority(
-        ctx,
-        args,
-        caller,
-        trusted_internal,
-        &captain,
-        &project,
-        dispatch_generation,
-    )?;
+    revalidate_or_rollback!("before attestation persistence");
     let crew =
         match ctx
             .captains
@@ -10577,26 +10637,10 @@ fn dispatch_crew_with_observer(
         }
     };
     let _ = captains_sync_apply(ctx);
-    revalidate_dispatch_authority(
-        ctx,
-        args,
-        caller,
-        trusted_internal,
-        &captain,
-        &project,
-        dispatch_generation,
-    )?;
+    revalidate_or_rollback!("before success");
     #[cfg(test)]
     ctx.captains.pause_dispatch("before_success");
-    revalidate_dispatch_authority(
-        ctx,
-        args,
-        caller,
-        trusted_internal,
-        &captain,
-        &project,
-        dispatch_generation,
-    )?;
+    revalidate_or_rollback!("before success");
     Ok(json!({
         "accepted": "dispatch_crew",
         "audited": true,
@@ -26668,7 +26712,7 @@ mod tests {
         skip_harness_liveness: bool,
         expected_error: &str,
     ) {
-        let server = LoopbackPowderServer::start(6);
+        let server = LoopbackPowderServer::start(4);
         let profile_name = format!("dispatch-failure-{}", uuid::Uuid::new_v4().simple());
         let _profile = PowderProfileEnv::install(&profile_name, server.addr);
         let captain = FakeHarnessSession::start(Harness::Codex);
@@ -26686,7 +26730,29 @@ mod tests {
             args["testSkipHarnessLiveness"] = json!(true);
         }
 
-        let error = dispatch_crew(&ctx, &args, None, true).unwrap_err();
+        let shell = dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (7, 100)]);
+        let invalid_after_launch =
+            if expected_error.contains("required provider-native permission flag is missing") {
+                dispatch_race_evidence(&["codex", "work"], 200, 123_456, &[(42, 900), (7, 100)])
+            } else if expected_error.contains("wrong mode") {
+                dispatch_race_evidence(
+                    &["codex", "--sandbox", "workspace-write", "work"],
+                    200,
+                    123_456,
+                    &[(42, 900), (7, 100)],
+                )
+            } else {
+                shell.clone()
+            };
+        let mut observations =
+            std::collections::VecDeque::from(vec![Ok(shell), Ok(invalid_after_launch)]);
+        let mut observer = |_target: &str| {
+            observations
+                .pop_front()
+                .expect("dispatch made an unexpected harness observation")
+        };
+        let error =
+            dispatch_crew_with_observer(&ctx, &args, None, true, &mut observer).unwrap_err();
         assert!(error.contains(expected_error), "unexpected error: {error}");
         assert!(error.contains("all side effects were rolled back"));
         assert!(!error.contains("supersecret"));
@@ -27271,7 +27337,7 @@ mod tests {
         ];
 
         for (case_name, observations, expected_error) in cases {
-            let server = LoopbackPowderServer::start(6);
+            let server = LoopbackPowderServer::start(4);
             let profile_name = format!(
                 "dispatch-race-{case_name}-{}",
                 uuid::Uuid::new_v4().simple()
@@ -27386,7 +27452,37 @@ mod tests {
                 dispatch_test_registry(Some(path.clone()), &profile_name, &captain.session_id);
             let (ctx, _) = dispatch_test_context(registry.clone());
             let command = FakeHarnessCommand::new(harness, flags);
-            let result = dispatch_crew(
+            let shell = dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (7, 100)]);
+            let accepted = match harness {
+                Harness::Codex => dispatch_race_evidence(
+                    &[
+                        "codex",
+                        "--dangerously-bypass-approvals-and-sandbox",
+                        "work",
+                    ],
+                    200,
+                    123_456,
+                    &[(42, 900), (7, 100)],
+                ),
+                Harness::Claude => dispatch_race_evidence(
+                    &["claude", "--dangerously-skip-permissions", "work"],
+                    200,
+                    123_456,
+                    &[(42, 900), (7, 100)],
+                ),
+            };
+            let mut observations = std::collections::VecDeque::from(vec![
+                Ok(shell),
+                Ok(accepted.clone()),
+                Ok(accepted.clone()),
+                Ok(accepted),
+            ]);
+            let mut observer = |_target: &str| {
+                observations
+                    .pop_front()
+                    .expect("dispatch made an unexpected harness observation")
+            };
+            let result = dispatch_crew_with_observer(
                 &ctx,
                 &json!({
                     "captainSessionId": captain.session_id,
@@ -27398,6 +27494,7 @@ mod tests {
                 }),
                 None,
                 true,
+                &mut observer,
             )
             .unwrap();
 
@@ -27541,7 +27638,29 @@ mod tests {
         let (winner_ctx, winner_sink) = dispatch_test_context(registry);
         let winner_command =
             FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
-        let winner = dispatch_crew(
+        let shell = dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (7, 100)]);
+        let accepted = dispatch_race_evidence(
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            200,
+            123_456,
+            &[(42, 900), (7, 100)],
+        );
+        let mut observations = std::collections::VecDeque::from(vec![
+            Ok(shell),
+            Ok(accepted.clone()),
+            Ok(accepted.clone()),
+            Ok(accepted),
+        ]);
+        let mut observer = |_target: &str| {
+            observations
+                .pop_front()
+                .expect("dispatch made an unexpected harness observation")
+        };
+        let winner = dispatch_crew_with_observer(
             &winner_ctx,
             &json!({
                 "captainSessionId": captain.session_id,
@@ -27553,6 +27672,7 @@ mod tests {
             }),
             None,
             true,
+            &mut observer,
         )
         .unwrap();
         let winner_session_id = winner["crew"]["terminalId"].as_str().unwrap().to_string();
