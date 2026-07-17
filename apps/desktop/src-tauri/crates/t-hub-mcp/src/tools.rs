@@ -529,6 +529,7 @@ fn schema_append_crew_powder_work_log() -> Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 128,
+                "pattern": "^[A-Za-z0-9._:-]+$",
                 "description": "Stable caller-owned idempotency identity. Exact replay must reuse this value with an identical payload."
             },
             "message": {
@@ -569,7 +570,12 @@ fn schema_review_crew_powder_criterion() -> Value {
         "type": "object",
         "properties": {
             "crewSessionId": { "type": "string", "minLength": 1, "maxLength": 256 },
-            "operationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "operationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9._:-]+$"
+            },
             "criterion": { "type": "integer", "minimum": 0 },
             "criterionId": { "type": "string", "minLength": 1, "maxLength": 256 },
             "decision": { "type": "string", "enum": ["approved", "rejected", "cleared"] },
@@ -613,6 +619,7 @@ fn schema_complete_crew_powder() -> Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 128,
+                "pattern": "^[A-Za-z0-9._:-]+$",
                 "description": "Stable caller-owned idempotency identity. Exact replay must reuse this value with an identical payload."
             },
             "proof": {
@@ -636,7 +643,7 @@ fn schema_complete_crew_powder() -> Value {
                 }
             }
         },
-        "required": ["crewSessionId", "operationId", "proof"],
+        "required": ["crewSessionId", "operationId", "proof", "criterionProofs"],
         "additionalProperties": false
     })
 }
@@ -1290,7 +1297,7 @@ mod tests {
         assert_eq!(complete.tier, Tier::Organization);
         assert_eq!(
             (complete.input_schema)()["required"],
-            json!(["crewSessionId", "operationId", "proof"])
+            json!(["crewSessionId", "operationId", "proof", "criterionProofs"])
         );
         assert_eq!(
             (complete.input_schema)()["properties"]["criterionProofs"]["maxItems"],
