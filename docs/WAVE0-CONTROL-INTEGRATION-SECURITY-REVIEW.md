@@ -27,6 +27,8 @@ Independent review findings were remediated by commit `08beabc7f09fa9c9e0d3fde31
 That commit restores the exact reviewed marker contract and closes the queued-heartbeat and terminal-close races described below.
 The follow-up renewal identity finding was remediated by commit `3b2bd8e8b4d17d89f3548ff9fd9c9fb2b8d2af88`.
 That commit binds pre-mutation authority and post-mutation receipts to the durable Powder claim identity.
+The post-rereview authority-generation finding was remediated by commit `e011125bebdbd82be13ab0724fb0fa08c23fcaf4`.
+That commit revalidates queued Captain close authority, rejects authority ABA on queued heartbeat, and protects expiry persistence with an exact-scope compare-and-set.
 
 Both frozen reviewed heads are ancestors of the integration head.
 Neither reviewed head was rebased or modified.
@@ -69,6 +71,8 @@ Control cleanup builds that expected claim from freshly verified authoritative o
 Local Crew bindings remain retained when a release receipt is substituted or release cannot be confirmed.
 Heartbeat and renewal now reject an authoritative claim agent that differs from the durable Crew binding.
 Both operations also reject any card, run, or agent receipt substitution before updating durable claim expiry.
+The expiry update compares the exact Crew, Captain, Project, Powder binding, and scoped authority generation observed before remote renewal.
+Terminal close captures exact Captain authority before waiting and revalidates it after the per-Crew lifecycle guard before tmux teardown.
 
 The frontend snapshot adapter retains `harnessPermission` and `tHubCapability` as separate compatibility axes.
 Unknown values remain omitted instead of being accepted as authoritative state.
@@ -93,6 +97,15 @@ Independent review found that renewal validated the bound run but not the durabl
 The guarded renewal path now revalidates active lifecycle state and real Harness liveness, compares the authoritative claim agent to durable ownership, and persists expiry only after an exact receipt.
 One test proves authoritative agent substitution produces zero renewal posts, and another proves substituted card, run, or agent receipts cannot update durable expiry.
 A queued-liveness test holds the renewal guard, stops the exact Harness while heartbeat waits, and proves zero renewal posts after the guard is released.
+
+Fresh rereview found that a former Captain could queue terminal close, be replaced while the close waited, and then kill the replacement Captain's Crew.
+Close now captures the current Captain terminal, ship, Project identity, and scoped generation before waiting and revalidates the same authority immediately after the guard is acquired.
+The replacement test proves the old close is rejected before tmux teardown and that the live Crew terminal remains alive.
+
+Fresh rereview also required replacement and ABA proof for heartbeat, exact-scope expiry persistence after an in-flight remote renewal, and reconciler liveness revalidation inside its renewal guard.
+Queued heartbeat now rejects both a distinct Captain replacement and release-reclaim ABA with zero renewal posts.
+The renewal compare-and-set refuses to persist an accepted remote receipt after the scope generation changes, retaining the previous expiry.
+The reconciler test observes liveness before its guard, stops the Harness while renewal waits, and proves the post-guard recheck emits zero remote renewals.
 
 ## Focused Verification
 
@@ -124,6 +137,10 @@ The combined real-agent verification script passed with the restored `AgentComma
 After the renewal identity remediation, the Powder client suite passed 26 tests and the focused control Powder suite passed all 58 tests.
 The added coverage includes heartbeat and renewal receipt substitution, durable agent substitution, Captain replacement while queued, Harness exit while queued, successful guarded renewal, and stale-state rejection.
 Targeted `cargo clippy -p t-hub --all-targets -- -D warnings` also passed at the renewal-remediation head.
+
+After the post-rereview authority-generation remediation, the focused control Powder suite passed all 62 tests and the close-terminal group passed all 4 tests.
+The targeted authenticated lifecycle-authority, full-token denial, Captain checkpoint, and 26-test Powder client suites also passed.
+Formatting, targeted all-target clippy, and `git diff --check` passed at commit `e011125bebdbd82be13ab0724fb0fa08c23fcaf4`.
 
 The standalone CLI Powder contract suite passed 10 tests.
 The MCP Powder schema tests passed in both library and binary targets.
@@ -193,3 +210,6 @@ No independent reviewer has approved this integration yet.
 13. Verify a heartbeat queued behind another Crew lifecycle operation revalidates the exact current Captain and worker liveness before renewal.
 14. Verify terminal close holds the same per-Crew lifecycle guard before tmux teardown and through authoritative Powder cleanup and persistence.
 15. Verify heartbeat and renewal compare authoritative claim agent to durable Crew ownership before mutation and require exact card, run, and agent receipts before persisting expiry.
+16. Verify a queued Captain close rejects replacement or authority ABA before tmux teardown and cannot cross into a replacement Captain's Crew lifecycle.
+17. Verify queued heartbeat revalidates current authority generation, and expiry persistence compare-and-sets the exact pre-renewal Crew, Captain, Project, Powder binding, and generation scope.
+18. Verify the reconciler repeats Harness liveness validation inside the renewal guard before it can issue a remote renewal.
