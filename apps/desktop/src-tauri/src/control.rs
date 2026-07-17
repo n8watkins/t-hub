@@ -21573,6 +21573,8 @@ mod tests {
         claim_posts: usize,
         release_posts: usize,
         release_bodies: Vec<Value>,
+        release_receipt_card_id: Option<String>,
+        release_receipt_run_id: Option<String>,
         renew_posts: usize,
     }
 
@@ -21679,6 +21681,20 @@ mod tests {
                 thread: Some(thread),
                 joined_outcome: None,
             }
+        }
+
+        fn start_with_release_receipt(
+            expected_requests: usize,
+            card_id: &str,
+            run_id: &str,
+        ) -> Self {
+            let server = Self::start(expected_requests);
+            {
+                let mut state = server.state.lock().unwrap();
+                state.release_receipt_card_id = Some(card_id.into());
+                state.release_receipt_run_id = Some(run_id.into());
+            }
+            server
         }
 
         fn finish(mut self) -> Result<LoopbackPowderState, String> {
@@ -22164,7 +22180,12 @@ mod tests {
                 let mut state = state.lock().unwrap();
                 state.release_posts += 1;
                 state.release_bodies.push(body);
-                json!({"card_id": "thub-powder-control-lifecycle", "run_id": "run-authoritative", "agent": "powder-agent", "expires_at": 100})
+                json!({
+                    "card_id": state.release_receipt_card_id.as_deref().unwrap_or("thub-powder-control-lifecycle"),
+                    "run_id": state.release_receipt_run_id.as_deref().unwrap_or("run-authoritative"),
+                    "agent": "powder-agent",
+                    "expires_at": 100
+                })
             }
             ("POST", path) if path.ends_with("/renew") || path.ends_with("/heartbeat") => {
                 state.lock().unwrap().renew_posts += 1;
@@ -23245,6 +23266,42 @@ mod tests {
         assert_eq!(cleanup["released"], true);
         assert_eq!(cleanup["outcome"], "already_completed");
         assert_eq!(cleanup["runId"], "run-authoritative");
+    }
+
+    #[test]
+    fn powder_release_receipt_identity_mismatch_retains_local_binding() {
+        for (index, receipt_card, receipt_run) in [
+            ("card", "thub-other", "run-authoritative"),
+            ("run", "thub-powder-control-lifecycle", "run-other"),
+        ] {
+            let server =
+                LoopbackPowderServer::start_with_release_receipt(3, receipt_card, receipt_run);
+            let profile_name = format!("loopback-release-receipt-{index}");
+            let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+            let registry = powder_lifecycle_registry_with_profile(None, &profile_name);
+            let ctx = test_ctx(&profile_name).with_captains_registry(registry.clone());
+
+            let (release, retained, changed) =
+                finalize_crew_powder_cleanup(&ctx, "crew-powder", false).unwrap();
+
+            let release = release.unwrap();
+            assert_eq!(release["released"], false);
+            assert_eq!(release["cardId"], "thub-powder-control-lifecycle");
+            assert_eq!(release["runId"], "run-authoritative");
+            assert_eq!(retained, true);
+            assert_eq!(changed, true);
+            let scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
+            assert_eq!(scope.work.card_id, "thub-powder-control-lifecycle");
+            assert_eq!(scope.work.run_id, "run-authoritative");
+            assert!(matches!(scope.crew.state, CrewState::CleanupPending { .. }));
+
+            let state = server.finish().unwrap();
+            assert_eq!(state.release_posts, 1);
+            assert_eq!(
+                state.release_bodies,
+                vec![json!({"run_id": "run-authoritative"})]
+            );
+        }
     }
 
     #[test]

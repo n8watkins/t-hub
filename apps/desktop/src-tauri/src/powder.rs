@@ -597,7 +597,13 @@ impl Client {
             &format!("/api/v1/cards/{}/release", encode_path(&claim.card_id)),
             Some(json!({ "run_id": claim.run_id })),
         )?;
-        parse_claim(value)
+        let released = parse_claim(value)?;
+        if released.card_id != claim.card_id || released.run_id != claim.run_id {
+            return Err(
+                "Powder release response did not match the exact requested card and run".into(),
+            );
+        }
+        Ok(released)
     }
 
     /// Append one Crew-attributed entry to Powder's work log.
@@ -2535,6 +2541,42 @@ mod tests {
         assert_eq!(events[0].repository.as_deref(), Some("repo-1"));
         assert_eq!(events[0].change["proof"], "tests");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn release_rejects_a_structurally_valid_receipt_for_another_card_or_run() {
+        for (receipt_card, receipt_run) in [("card-other", "run-1"), ("card-1", "run-other")] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(request.starts_with("POST /api/v1/cards/card-1/release "));
+                assert!(request.contains(r#""run_id":"run-1""#));
+                let body = json!({
+                    "card_id": receipt_card,
+                    "run_id": receipt_run,
+                    "agent": "t-hub",
+                    "expires_at": 1234,
+                })
+                .to_string();
+                write_json_response(&mut stream, "200 OK", &body);
+            });
+            let claim = Claim {
+                card_id: "card-1".into(),
+                run_id: "run-1".into(),
+                agent: "t-hub".into(),
+                expires_at: 1234,
+            };
+
+            let error = test_client(addr).release(&claim).unwrap_err();
+
+            assert_eq!(
+                error,
+                "Powder release response did not match the exact requested card and run"
+            );
+            server.join().unwrap();
+        }
     }
 
     #[test]
