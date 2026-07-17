@@ -84,7 +84,13 @@ impl From<ControlError> for CliError {
                 message: m,
             },
             ControlError::Server(m) => {
-                if is_gated(&m) {
+                if let Some(kind) = powder_mutation_error_kind(&m) {
+                    CliError {
+                        code: exit::SERVER_ERROR,
+                        kind,
+                        message: m,
+                    }
+                } else if is_gated(&m) {
                     CliError {
                         code: exit::GATED,
                         kind: "gated",
@@ -100,6 +106,27 @@ impl From<ControlError> for CliError {
             }
         }
     }
+}
+
+fn powder_mutation_error_kind(message: &str) -> Option<&'static str> {
+    [
+        ("committed", "powder_mutation_committed"),
+        ("pending", "powder_mutation_pending"),
+        ("recovered", "powder_mutation_recovered"),
+        ("rejected", "powder_mutation_rejected"),
+        ("stale", "powder_mutation_stale"),
+        ("conflict", "powder_mutation_conflict"),
+        ("expired", "powder_mutation_expired"),
+        ("unsupported", "powder_mutation_unsupported"),
+        ("malformed", "powder_mutation_malformed"),
+        ("timeout", "powder_mutation_timeout"),
+    ]
+    .into_iter()
+    .find_map(|(state, kind)| {
+        message
+            .contains(&format!("Powder mutation state '{state}'"))
+            .then_some(kind)
+    })
 }
 
 /// Does a server error read as a permission/confirmation gate rather than a
@@ -1028,4 +1055,39 @@ examples:\n\
   th send 052ccbb2 'ls -la'\n\
   th health --json"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn powder_mutation_errors_have_stable_machine_kinds() {
+        for state in [
+            "committed",
+            "pending",
+            "recovered",
+            "rejected",
+            "stale",
+            "conflict",
+            "expired",
+            "unsupported",
+            "malformed",
+            "timeout",
+        ] {
+            let error: CliError = ControlError::Server(format!(
+                "Powder completion: Powder mutation state '{state}': bounded detail"
+            ))
+            .into();
+            assert_eq!(error.code, exit::SERVER_ERROR);
+            assert_eq!(error.kind, format!("powder_mutation_{state}"));
+        }
+    }
+
+    #[test]
+    fn unrelated_server_errors_keep_the_existing_kind() {
+        let error: CliError = ControlError::Server("ordinary failure".into()).into();
+        assert_eq!(error.code, exit::SERVER_ERROR);
+        assert_eq!(error.kind, "server_error");
+    }
 }

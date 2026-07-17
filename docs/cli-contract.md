@@ -74,6 +74,8 @@ Normal output must never contain a stack trace, while an explicit future debug m
 
 T-Hub currently exposes the numeric process exit status as `error.code` and a stable symbolic category as `error.kind`.
 That established shape should be extended compatibly with an optional `suggestion` and optional bounded `details` object rather than rewritten in place.
+Powder mutation failures use `powder_mutation_<state>` as the stable `error.kind`, where state is `pending`, `rejected`, `stale`, `conflict`, `expired`, `unsupported`, `malformed`, or `timeout`.
+Successful Powder mutation results expose `mutationState` as `committed` or `recovered` in the command data.
 
 ```json
 {
