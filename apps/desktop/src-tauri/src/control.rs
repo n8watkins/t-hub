@@ -1941,7 +1941,7 @@ fn slugify_ship(name: &str) -> String {
 
 impl CaptainsRegistry {
     #[cfg(test)]
-    fn pause_dispatch(&self, boundary: &'static str) {
+    fn pause_dispatch(&self, boundary: &'static str) -> bool {
         let mut configured = self.dispatch_barrier.lock().unwrap();
         let barrier = configured.take();
         if barrier
@@ -1949,12 +1949,14 @@ impl CaptainsRegistry {
             .is_some_and(|configured_barrier| configured_barrier.boundary != boundary)
         {
             *configured = barrier;
-            return;
+            return true;
         }
         drop(configured);
         if let Some(barrier) = barrier {
             let _ = barrier.reached.send(boundary);
-            let _ = barrier.resume.recv();
+            barrier.resume.recv().is_ok()
+        } else {
+            true
         }
     }
 
@@ -10610,7 +10612,23 @@ fn rollback_trusted_dispatch(
             PendingDispatchReleaseState::InFlight,
         )?;
         #[cfg(test)]
-        ctx.captains.pause_dispatch("release_inflight_before_post");
+        if !ctx.captains.pause_dispatch("release_inflight_before_post") {
+            return Err(format!(
+                "Crew terminal '{crew_session_id}' test crash occurred after durable release teardown before its release POST"
+            ));
+        }
+        let mut expected_recovery = recovery.clone();
+        expected_recovery.state = PendingDispatchReleaseState::InFlight;
+        if ctx
+            .captains
+            .pending_dispatch_release(crew_session_id)
+            .as_ref()
+            != Some(&expected_recovery)
+        {
+            return Err(format!(
+                "Crew terminal '{crew_session_id}' exact release recovery changed before its release POST"
+            ));
+        }
     }
     if let Err(error) = client.release(claim) {
         let recovery_result = match release_recovery {
@@ -28611,6 +28629,290 @@ mod tests {
     #[test]
     fn dispatch_release_recovery_refuses_a_remapped_frozen_profile_without_wrong_scope_io() {
         run_post_bind_ambiguous_release_recovery("before_launch", false, true);
+    }
+
+    #[test]
+    fn dispatch_release_recovery_serializes_periodic_reconcile_and_ordinary_cleanup() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_release_recovery_serializes_periodic_reconcile_and_ordinary_cleanup: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        // The original scope loses the response after committing the exact
+        // release.  The first periodic reconcile is held at canonical run
+        // evidence while ordinary cleanup queues behind the same Crew guard.
+        let original = LoopbackPowderServer::start(5);
+        {
+            let mut state = original.state.lock().unwrap();
+            state.pause_run_evidence = true;
+            state.release_response_failure = Some(LoopbackPowderResponseFailure::Eof);
+            state.evidence_run_agent = Some("t-hub".into());
+        }
+        let replacement = LoopbackPowderServer::start(0);
+        let original_profile = format!("release-guard-original-{}", uuid::Uuid::new_v4().simple());
+        let replacement_profile = format!(
+            "release-guard-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profiles = PowderProfileEnv::install_profiles(&[
+            (&original_profile, original.addr),
+            (&replacement_profile, replacement.addr),
+        ]);
+        let path = captains_tmp("release-guard-periodic-close");
+        let _ = std::fs::remove_file(&path);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            dispatch_test_registry(Some(path.clone()), &original_profile, &captain.session_id);
+        let crew_session_id = format!("release-guard-{}", uuid::Uuid::new_v4().simple());
+        registry
+            .record_crew(&captain.session_id, &crew_session_id)
+            .unwrap();
+        registry
+            .bind_crew_context(
+                &captain.session_id,
+                &crew_session_id,
+                "Recover one exact release",
+                "codex",
+                Some("/tmp/release-guard"),
+                Some("release-guard"),
+                PowderWorkBinding {
+                    card_id: "thub-powder-control-lifecycle".into(),
+                    run_id: "run-authoritative".into(),
+                    agent: Some("t-hub".into()),
+                    claim_expires_at: Some(100),
+                    mutation_intent: None,
+                    dispatch_release_recovery: false,
+                    state: PowderWorkState::Active,
+                },
+            )
+            .unwrap();
+        let recovery = PendingDispatchRelease {
+            crew_session_id: crew_session_id.clone(),
+            project_id: "project-dispatch-attestation".into(),
+            connection_profile: original_profile.clone(),
+            connection_endpoint: format!("http://{}", original.addr),
+            repository: "t-hub".into(),
+            card_id: "thub-powder-control-lifecycle".into(),
+            run_id: "run-authoritative".into(),
+            agent: "t-hub".into(),
+            operation_id: "initial-claim:actor-t-hub:release-guard".into(),
+            created_at: 1,
+            state: PendingDispatchReleaseState::InFlight,
+        };
+        registry.prepare_dispatch_release(recovery).unwrap();
+        let mut rebound = registry.projects()[0].clone();
+        rebound.powder.as_mut().unwrap().connection_profile = replacement_profile.clone();
+        rebound.powder.as_mut().unwrap().repository = "replacement-repository".into();
+        registry.upsert_project(rebound).unwrap();
+        let (ctx, _) = dispatch_test_context(registry.clone());
+
+        let periodic_ctx = ctx.clone();
+        let periodic = std::thread::spawn(move || reconcile_powder_leases(&periodic_ctx));
+        assert_eq!(
+            original
+                .run_evidence_started
+                .recv_timeout(Duration::from_secs(3))
+                .expect("periodic reconcile did not block at original-scope evidence"),
+            ()
+        );
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let close_ctx = ctx.clone();
+        let close_crew_session_id = crew_session_id.clone();
+        let close = std::thread::spawn(move || {
+            finalize_crew_powder_cleanup(&close_ctx, &close_crew_session_id, true)
+        });
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            crew_session_id,
+            "ordinary cleanup must queue behind periodic recovery for the exact Crew"
+        );
+        original.state.lock().unwrap().pause_run_evidence = false;
+        original.resume_run_evidence.send(()).unwrap();
+        periodic.join().unwrap();
+        let close_result = close.join().unwrap().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        assert_eq!(
+            close_result
+                .0
+                .as_ref()
+                .and_then(|release| release["outcome"].as_str()),
+            Some("released"),
+            "ordinary cleanup result: {close_result:?}"
+        );
+        let snapshot = registry.snapshot();
+        assert!(snapshot.pending_dispatch_claims.is_empty());
+        assert!(snapshot.pending_dispatch_releases.is_empty());
+        assert!(snapshot.captains[0].crew.is_empty());
+        assert_eq!(
+            snapshot.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            replacement_profile
+        );
+        let original_state = original.finish().unwrap();
+        assert_eq!(original_state.run_evidence_gets, 2);
+        assert_eq!(original_state.release_posts, 1);
+        assert_eq!(
+            original_state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        let replacement_state = replacement.finish().unwrap();
+        assert_eq!(replacement_state.run_evidence_gets, 0);
+        assert_eq!(replacement_state.release_posts, 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dispatch_release_inflight_before_post_survives_restart_without_blind_repost() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_release_inflight_before_post_survives_restart_without_blind_repost: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let original = LoopbackPowderServer::start(6);
+        let replacement = LoopbackPowderServer::start(0);
+        let original_profile = format!(
+            "release-inflight-original-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let replacement_profile = format!(
+            "release-inflight-replacement-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let _profiles = PowderProfileEnv::install_profiles(&[
+            (&original_profile, original.addr),
+            (&replacement_profile, replacement.addr),
+        ]);
+        let path = captains_tmp("release-inflight-restart");
+        let _ = std::fs::remove_file(&path);
+        let captain = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            dispatch_test_registry(Some(path.clone()), &original_profile, &captain.session_id);
+        let (ctx, sink) = dispatch_test_context(registry.clone());
+        let provider =
+            FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
+        let (authority_reached, wait_for_authority) = std::sync::mpsc::sync_channel(1);
+        let (authority_resume, continue_dispatch) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "before_launch",
+            reached: authority_reached,
+            resume: continue_dispatch,
+        }));
+        let args = json!({
+            "captainSessionId": captain.session_id,
+            "cardId": "thub-powder-control-lifecycle",
+            "task": "Crash after exact release teardown before POST",
+            "harness": "codex",
+            "testHarnessCommand": provider.command,
+        });
+        let dispatch_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || dispatch_crew(&dispatch_ctx, &args, None, true));
+        assert_eq!(
+            wait_for_authority
+                .recv_timeout(Duration::from_secs(3))
+                .expect("dispatch did not reach the post-bind authority barrier"),
+            "before_launch"
+        );
+        registry.release("dispatch-attestation").unwrap();
+        registry
+            .claim_provider(
+                &captain.session_id,
+                Some("dispatch-attestation"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &|_| false,
+                &|_| tmux::SessionLiveness::Alive,
+            )
+            .unwrap();
+        let mut rebound = registry.projects()[0].clone();
+        rebound.powder.as_mut().unwrap().connection_profile = replacement_profile.clone();
+        rebound.powder.as_mut().unwrap().repository = "replacement-repository".into();
+        registry.upsert_project(rebound).unwrap();
+        let (release_reached, wait_for_release) = std::sync::mpsc::sync_channel(1);
+        let (release_resume, continue_release) = std::sync::mpsc::sync_channel(1);
+        registry.set_dispatch_barrier(Some(DispatchBarrier {
+            boundary: "release_inflight_before_post",
+            reached: release_reached,
+            resume: continue_release,
+        }));
+        authority_resume.send(()).unwrap();
+        assert_eq!(
+            wait_for_release
+                .recv_timeout(Duration::from_secs(3))
+                .expect("rollback did not stop at the durable in-flight release barrier"),
+            "release_inflight_before_post"
+        );
+        let crew_session_id = dispatched_terminal_id(&sink);
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew_session_id)),
+            tmux::SessionLiveness::Gone
+        );
+        let before_restart = registry.snapshot();
+        assert_eq!(before_restart.pending_dispatch_releases.len(), 1);
+        assert_eq!(
+            before_restart.pending_dispatch_releases[0].state,
+            PendingDispatchReleaseState::InFlight
+        );
+        assert!(before_restart.pending_dispatch_claims.is_empty());
+        assert_eq!(
+            before_restart.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            replacement_profile
+        );
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let (restarted_ctx, _) = dispatch_test_context(restarted.clone());
+        reconcile_powder_leases(&restarted_ctx);
+        let recovered = restarted.snapshot();
+        assert!(recovered.pending_dispatch_claims.is_empty());
+        assert!(recovered.pending_dispatch_releases.is_empty());
+        assert!(recovered.captains[0].crew.is_empty());
+        assert_eq!(
+            recovered.projects[0]
+                .powder
+                .as_ref()
+                .unwrap()
+                .connection_profile,
+            replacement_profile
+        );
+        // Dropping the only resume sender is the process-death equivalent at
+        // the exact post-teardown, pre-POST barrier.  The restarted registry
+        // must own the only subsequent release attempt.
+        drop(release_resume);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            error.contains(
+                "test crash occurred after durable release teardown before its release POST"
+            ),
+            "{error}"
+        );
+        assert!(!provider.was_invoked());
+        let original_state = original.finish().unwrap();
+        assert_eq!(original_state.claim_posts, 1);
+        assert_eq!(original_state.run_evidence_gets, 1);
+        assert_eq!(original_state.release_posts, 1);
+        assert_eq!(
+            original_state.release_bodies,
+            vec![json!({"run_id": "run-authoritative"})]
+        );
+        let replacement_state = replacement.finish().unwrap();
+        assert_eq!(replacement_state.run_evidence_gets, 0);
+        assert_eq!(replacement_state.release_posts, 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
