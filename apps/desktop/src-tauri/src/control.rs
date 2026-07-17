@@ -2791,6 +2791,37 @@ impl CaptainsRegistry {
         Ok(result)
     }
 
+    fn compare_and_update_crew_claim_expiry(
+        &self,
+        expected: &CrewPowderScope,
+        expires_at: i64,
+    ) -> Result<CrewRef, String> {
+        let crew_session_id = expected.crew.terminal_id.as_str();
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let (captain_index, crew_index) =
+            exact_powder_scope_indices(&g, self.authority_epoch, expected)?;
+        let crew = &mut g.captains[captain_index].crew[crew_index];
+        let binding = crew
+            .powder_work
+            .as_mut()
+            .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
+        if !matches!(binding.state, PowderWorkState::Active) {
+            return Err(format!(
+                "Crew session '{crew_session_id}' Powder work is not active; refusing to renew completed work"
+            ));
+        }
+        if binding.claim_expires_at == Some(expires_at) {
+            return Ok(crew.clone());
+        }
+        binding.claim_expires_at = Some(expires_at);
+        let result = crew.clone();
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok(result)
+    }
+
     /// Persist an exact Powder mutation intent before any remote write.
     ///
     /// Identical replay is idempotent. Reusing an operation id with any changed
@@ -6497,32 +6528,119 @@ fn require_socket_identity(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetLifecycleAuthority {
+    terminal_id: String,
+    captain_terminal_id: String,
+    ship_slug: String,
+    project_id: Option<String>,
+    generation: ScopedAuthorityGeneration,
+}
+
 fn enforce_target_lifecycle_authority(
     ctx: &ControlContext,
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
     target_terminal: &str,
-) -> Result<(), String> {
+) -> Result<Option<TargetLifecycleAuthority>, String> {
     if caller_is_apex(caller, trusted_internal) {
-        return Ok(());
+        return Ok(None);
     }
     let caller = caller.ok_or("acl: lifecycle mutation requires a session identity")?;
+    let target_terminal = target_terminal
+        .strip_prefix("th_")
+        .unwrap_or(target_terminal);
     if caller.tile.as_deref() == Some(target_terminal) {
-        return Ok(());
+        return Ok(None);
     }
-    let target_ship = ctx.captains.ship_of(target_terminal);
-    if caller.fleet_role == Some(FleetRole::Captain)
-        && target_ship
-            .as_ref()
-            .is_some_and(|target| caller.ship_slug.as_deref() == Some(target.ship_slug()))
-        && matches!(target_ship, Some(ShipMembership::Crew { .. }))
+    let caller_terminal_id = caller
+        .tile
+        .as_deref()
+        .ok_or("acl: authenticated Captain has no terminal identity")?;
+    let caller_ship = caller
+        .ship_slug
+        .as_deref()
+        .ok_or("acl: authenticated Captain has no ship identity")?;
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    let owners = snapshot
+        .captains
+        .iter()
+        .filter(|captain| {
+            captain
+                .crew
+                .iter()
+                .any(|crew| crew.terminal_id == target_terminal)
+        })
+        .collect::<Vec<_>>();
+    let owner = match owners.as_slice() {
+        [owner] => *owner,
+        _ => {
+            return Err(
+                "acl: only General/Cortana, the target session, or its Captain may mutate this lifecycle"
+                    .into(),
+            );
+        }
+    };
+    let project_id = owner.project_id.clone();
+    if caller.fleet_role != Some(FleetRole::Captain)
+        || owner.role != FleetRole::Captain
+        || owner.state != ClaimState::Active
+        || owner.terminal_id.as_deref() != Some(caller_terminal_id)
+        || owner.ship_slug != caller_ship
     {
-        return Ok(());
+        return Err(
+            "acl: only General/Cortana, the target session, or its current Captain may mutate this lifecycle"
+                .into(),
+        );
     }
-    Err(
-        "acl: only General/Cortana, the target session, or its Captain may mutate this lifecycle"
-            .into(),
-    )
+    Ok(Some(TargetLifecycleAuthority {
+        terminal_id: target_terminal.to_string(),
+        captain_terminal_id: caller_terminal_id.to_string(),
+        ship_slug: owner.ship_slug.clone(),
+        project_id: project_id.clone(),
+        generation: generations.scoped(
+            registry_epoch,
+            &owner.ship_slug,
+            target_terminal,
+            project_id.as_deref().unwrap_or(""),
+        ),
+    }))
+}
+
+fn revalidate_target_lifecycle_authority(
+    ctx: &ControlContext,
+    expected: &TargetLifecycleAuthority,
+) -> Result<(), String> {
+    let (snapshot, generations, registry_epoch) =
+        ctx.captains.snapshot_with_authority_generations();
+    let current_generation = generations.scoped(
+        registry_epoch,
+        &expected.ship_slug,
+        &expected.terminal_id,
+        expected.project_id.as_deref().unwrap_or(""),
+    );
+    let owner = snapshot.captains.iter().find(|captain| {
+        captain
+            .crew
+            .iter()
+            .any(|crew| crew.terminal_id == expected.terminal_id)
+    });
+    if current_generation != expected.generation
+        || owner.is_none_or(|owner| {
+            owner.role != FleetRole::Captain
+                || owner.state != ClaimState::Active
+                || owner.terminal_id.as_deref() != Some(expected.captain_terminal_id.as_str())
+                || owner.ship_slug != expected.ship_slug
+                || owner.project_id != expected.project_id
+        })
+    {
+        return Err(format!(
+            "acl: Crew session '{}' lifecycle authority changed while the operation waited; retry from the current owning Captain",
+            expected.terminal_id
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9690,6 +9808,7 @@ fn rollback_crew_dispatch(
         ctx,
         &json!({ "sessionId": crew_session_id }),
         true,
+        None,
     )
     .map_err(|error| {
         format!(
@@ -12152,6 +12271,11 @@ fn heartbeat_crew_powder(
     // exact ownership and runtime liveness inside the operation guard so a
     // released or replaced Captain cannot renew using a stale pre-wait check.
     let current_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
+    require_unchanged_powder_authority_generation(
+        &authorization_scope,
+        &current_scope,
+        "heartbeat_crew_powder",
+    )?;
     require_crew_heartbeat_authority(
         &current_scope,
         caller,
@@ -12197,6 +12321,21 @@ fn require_crew_heartbeat_authority(
     Err(format!(
         "acl: '{command}' requires the exact Crew session or its current owning Captain"
     ))
+}
+
+fn require_unchanged_powder_authority_generation(
+    expected: &CrewPowderScope,
+    current: &CrewPowderScope,
+    command: &str,
+) -> Result<(), String> {
+    if expected.authority_generation.is_none()
+        || expected.authority_generation != current.authority_generation
+    {
+        return Err(format!(
+            "acl: '{command}' Crew authority generation changed while the operation waited; retry from the current exact owner"
+        ));
+    }
+    Ok(())
 }
 
 fn require_live_crew_harness(scope: &CrewPowderScope, command: &str) -> Result<(), String> {
@@ -12247,7 +12386,7 @@ fn renew_crew_powder_binding_guarded(
     };
     let crew = ctx
         .captains
-        .update_crew_claim_expiry(&scope.crew.terminal_id, renewed.expires_at)?;
+        .compare_and_update_crew_claim_expiry(scope, renewed.expires_at)?;
     let _ = captains_sync_apply(ctx);
     Ok((renewed, crew))
 }
@@ -14010,7 +14149,7 @@ fn captain_checkpoint(
         .as_deref()
         .or(captain.terminal_id.as_deref())
         .ok_or("captain_checkpoint: Captain has no active terminal")?;
-    enforce_target_lifecycle_authority(ctx, caller, trusted_internal, target)?;
+    let _ = enforce_target_lifecycle_authority(ctx, caller, trusted_internal, target)?;
 
     let captain = ctx.captains.checkpoint(
         captain_session_id.as_deref(),
@@ -14917,8 +15056,8 @@ fn close_terminal_authorized(
     if ctx.captains.removed_crew_powder_ship(&target)?.is_some() {
         return reconcile_removed_crew_powder_binding(ctx, caller, &target);
     }
-    enforce_target_lifecycle_authority(ctx, caller, trusted_internal, &target)?;
-    close_terminal(ctx, args)
+    let authority = enforce_target_lifecycle_authority(ctx, caller, trusted_internal, &target)?;
+    close_terminal_with_policy(ctx, args, false, authority.as_ref())
 }
 
 fn reconcile_removed_crew_powder_binding(
@@ -15000,7 +15139,7 @@ fn reconcile_removed_crew_powder_binding(
 }
 
 fn close_terminal(ctx: &ControlContext, args: &Value) -> Result<Value, String> {
-    close_terminal_with_policy(ctx, args, false)
+    close_terminal_with_policy(ctx, args, false, None)
 }
 
 fn retain_crew_binding_after_powder_failure(
@@ -15022,6 +15161,7 @@ fn close_terminal_with_policy(
     ctx: &ControlContext,
     args: &Value,
     preserve_crew_on_powder_failure: bool,
+    authority: Option<&TargetLifecycleAuthority>,
 ) -> Result<Value, String> {
     let session_id = arg_str(args, "sessionId")
         .or_else(|| arg_str(args, "session_id"))
@@ -15036,6 +15176,9 @@ fn close_terminal_with_policy(
     let _operation_guard = ctx
         .captains
         .serialize_crew_powder_operation(tile_id, CrewPowderOperationKind::Cleanup);
+    if let Some(authority) = authority {
+        revalidate_target_lifecycle_authority(ctx, authority)?;
+    }
     // Registry-vs-reality (Incident C, ask #3): `kill_session_tree` is idempotent -
     // it returns Ok for an already-gone session too - so a caller could never tell
     // a real kill from a phantom close (ghost ids f0f3207b / 709c7252). Probe
@@ -20354,7 +20497,7 @@ mod tests {
         let ctx = test_ctx("secret").with_captains_registry(registry.clone());
 
         let closed =
-            close_terminal_with_policy(&ctx, &json!({ "sessionId": crew_id }), true).unwrap();
+            close_terminal_with_policy(&ctx, &json!({ "sessionId": crew_id }), true, None).unwrap();
 
         assert_eq!(closed["powderRelease"]["released"], false);
         assert_eq!(closed["crewBindingRetained"], true);
@@ -24468,6 +24611,7 @@ mod tests {
     enum LoopbackPowderBlockedOperation {
         Completion,
         Release,
+        Renewal,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24512,6 +24656,16 @@ mod tests {
                 LoopbackPowderBehavior {
                     blocked_operation: Some(LoopbackPowderBlockedOperation::Release),
                     fail_release: true,
+                },
+            )
+        }
+
+        fn start_with_blocked_renewal(expected_requests: usize) -> Self {
+            Self::start_with_behavior(
+                expected_requests,
+                LoopbackPowderBehavior {
+                    blocked_operation: Some(LoopbackPowderBlockedOperation::Renewal),
+                    fail_release: false,
                 },
             )
         }
@@ -25431,22 +25585,41 @@ mod tests {
                 })
             }
             ("POST", path) if path.ends_with("/renew") || path.ends_with("/heartbeat") => {
-                let mut state = state.lock().unwrap();
-                state.renew_posts += 1;
-                let response_card_id = state
-                    .renewal_receipt_card_id
-                    .clone()
-                    .unwrap_or_else(|| "thub-powder-control-lifecycle".into());
-                let response_run_id = state
-                    .renewal_receipt_run_id
-                    .clone()
-                    .unwrap_or_else(|| "run-authoritative".into());
-                let response_agent = state
-                    .renewal_receipt_agent
-                    .clone()
-                    .or_else(|| state.evidence_claim_agent.clone())
-                    .or_else(|| state.issued_claim_agent.clone())
-                    .unwrap_or_else(|| "powder-agent".into());
+                let (response_card_id, response_run_id, response_agent) = {
+                    let mut state = state.lock().unwrap();
+                    state.renew_posts += 1;
+                    (
+                        state
+                            .renewal_receipt_card_id
+                            .clone()
+                            .unwrap_or_else(|| "thub-powder-control-lifecycle".into()),
+                        state
+                            .renewal_receipt_run_id
+                            .clone()
+                            .unwrap_or_else(|| "run-authoritative".into()),
+                        state
+                            .renewal_receipt_agent
+                            .clone()
+                            .or_else(|| state.evidence_claim_agent.clone())
+                            .or_else(|| state.issued_claim_agent.clone())
+                            .unwrap_or_else(|| "powder-agent".into()),
+                    )
+                };
+                if behavior.blocked_operation == Some(LoopbackPowderBlockedOperation::Renewal) {
+                    post_started
+                        .try_send(body.clone())
+                        .map_err(|_| "loopback Powder renewal observer unavailable".to_string())?;
+                    let receiver = release_post
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or("loopback Powder renewal signal was already consumed")?;
+                    receiver
+                        .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+                        .map_err(|_| {
+                            "loopback Powder renewal exceeded its release deadline".to_string()
+                        })?;
+                }
                 json!({
                     "card_id": response_card_id,
                     "run_id": response_run_id,
@@ -28928,6 +29101,7 @@ mod tests {
                     &close_ctx,
                     &json!({"sessionId": close_session_id}),
                     false,
+                    None,
                 ))
                 .unwrap();
         });
@@ -28981,6 +29155,88 @@ mod tests {
         ));
         let state = server.finish().unwrap();
         assert_eq!(state.completion_posts.len(), 1);
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn powder_queued_close_rejects_captain_replacement_before_tmux_teardown() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_queued_close_rejects_captain_replacement_before_tmux_teardown: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("close-authority-race-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let old_captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let close_ctx = ctx.clone();
+        let close_crew = crew.session_id.clone();
+        let (close_tx, close_rx) = mpsc::sync_channel(1);
+        let close = std::thread::spawn(move || {
+            close_tx
+                .send(dispatch_authenticated(
+                    &close_ctx,
+                    req_session(
+                        &profile_name,
+                        &old_captain,
+                        "close_terminal",
+                        json!({"sessionId": close_crew}),
+                    ),
+                ))
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        registry.release("powder-ship").unwrap();
+        registry
+            .claim_provider(
+                "captain-replacement",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        drop(completion_guard);
+
+        let response = close_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .unwrap()
+            .contains("lifecycle authority changed"));
+        assert_eq!(
+            tmux::session_liveness(&tmux_target(&crew.session_id)),
+            tmux::SessionLiveness::Alive
+        );
+        close.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        let state = server.finish().unwrap();
         assert_eq!(state.release_posts, 0);
     }
 
@@ -31232,6 +31488,12 @@ mod tests {
 
     #[test]
     fn powder_renewal_rejects_substituted_authoritative_agent_without_post() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_renewal_rejects_substituted_authoritative_agent_without_post: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
         let server = LoopbackPowderServer::start(1);
         {
             server.state.lock().unwrap().evidence_claim_agent = Some("substituted-agent".into());
@@ -31259,6 +31521,12 @@ mod tests {
 
     #[test]
     fn powder_renewal_receipt_requires_exact_card_run_and_agent_before_persistence() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_renewal_receipt_requires_exact_card_run_and_agent_before_persistence: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
         for substituted_field in ["card", "run", "agent"] {
             let server = LoopbackPowderServer::start(2);
             {
@@ -31305,6 +31573,72 @@ mod tests {
     }
 
     #[test]
+    fn powder_renewal_expiry_cas_rejects_authority_aba_after_remote_receipt() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_renewal_expiry_cas_rejects_authority_aba_after_remote_receipt: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start_with_blocked_renewal(2);
+        let profile_name = format!("renew-cas-aba-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let ctx = test_ctx(&profile_name).with_captains_registry(registry.clone());
+        let renewal_ctx = ctx.clone();
+        let renewal_crew = crew.session_id.clone();
+        let (renewal_tx, renewal_rx) = mpsc::sync_channel(1);
+        let renewal = std::thread::spawn(move || {
+            renewal_tx
+                .send(renew_crew_powder_binding(
+                    &renewal_ctx,
+                    &renewal_crew,
+                    Some(3600),
+                ))
+                .unwrap();
+        });
+
+        server
+            .post_started
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        registry.release("powder-ship").unwrap();
+        registry
+            .claim_provider(
+                "captain-powder",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        server.release_post.send(()).unwrap();
+
+        let error = renewal_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("authority generation changed"), "{error}");
+        assert_eq!(
+            resolve_crew_powder_scope(&ctx, &crew.session_id)
+                .unwrap()
+                .work
+                .claim_expires_at,
+            Some(100)
+        );
+        renewal.join().unwrap();
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 1);
+    }
+
+    #[test]
     fn powder_reconciler_renewal_rechecks_stale_active_state_before_remote_mutation() {
         let server = LoopbackPowderServer::start(0);
         let _profile = PowderProfileEnv::install("loopback-stale-renewal", server.addr);
@@ -31331,12 +31665,12 @@ mod tests {
     }
 
     #[test]
-    fn powder_queued_heartbeat_revalidates_current_captain_after_guard_wait() {
+    fn powder_queued_heartbeat_rejects_captain_replacement_after_guard_wait() {
         use std::sync::mpsc;
 
         if !tmux_process_tests_available() {
             eprintln!(
-                "powder_queued_heartbeat_revalidates_current_captain_after_guard_wait: tmux or node not on PATH - skipping"
+                "powder_queued_heartbeat_rejects_captain_replacement_after_guard_wait: tmux or node not on PATH - skipping"
             );
             return;
         }
@@ -31382,11 +31716,104 @@ mod tests {
             crew.session_id
         );
         registry.release("powder-ship").unwrap();
+        registry
+            .claim_provider(
+                "captain-replacement",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
         drop(completion_guard);
 
         let response = heartbeat_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert!(!response.ok);
-        assert!(response.error.unwrap().contains("current owning Captain"));
+        assert!(response
+            .error
+            .unwrap()
+            .contains("authority generation changed"));
+        heartbeat.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_queued_heartbeat_rejects_captain_authority_aba_after_guard_wait() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_queued_heartbeat_rejects_captain_authority_aba_after_guard_wait: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("heartbeat-authority-aba-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let captain = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(&profile_name)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let heartbeat_ctx = ctx.clone();
+        let heartbeat_crew = crew.session_id.clone();
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let heartbeat = std::thread::spawn(move || {
+            heartbeat_tx
+                .send(dispatch_authenticated(
+                    &heartbeat_ctx,
+                    req_session(
+                        &profile_name,
+                        &captain,
+                        "heartbeat_crew_powder",
+                        json!({"crewSessionId": heartbeat_crew}),
+                    ),
+                ))
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        registry.release("powder-ship").unwrap();
+        registry
+            .claim_provider(
+                "captain-powder",
+                Some("powder-ship"),
+                FleetRole::Captain,
+                Some("codex"),
+                None,
+                vec![],
+                &all_alive,
+                &crew_all_alive,
+            )
+            .unwrap();
+        drop(completion_guard);
+
+        let response = heartbeat_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .unwrap()
+            .contains("authority generation changed"));
         heartbeat.join().unwrap();
         registry.set_powder_operation_wait_hook(None);
         let state = server.finish().unwrap();
@@ -31451,6 +31878,43 @@ mod tests {
         assert!(!response.ok);
         assert!(response.error.unwrap().contains("is gone"));
         heartbeat.join().unwrap();
+        registry.set_powder_operation_wait_hook(None);
+        let state = server.finish().unwrap();
+        assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_reconciler_revalidates_harness_liveness_after_renewal_guard_wait() {
+        use std::sync::mpsc;
+
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "powder_reconciler_revalidates_harness_liveness_after_renewal_guard_wait: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let server = LoopbackPowderServer::start(0);
+        let profile_name = format!("reconciler-liveness-race-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let crew = FakeHarnessSession::start(Harness::Codex);
+        let registry =
+            powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew.session_id);
+        let ctx = test_ctx(&profile_name).with_captains_registry(registry.clone());
+        let completion_guard = registry
+            .serialize_crew_powder_operation(&crew.session_id, CrewPowderOperationKind::Completion);
+        let (wait_tx, wait_rx) = mpsc::sync_channel(1);
+        registry.set_powder_operation_wait_hook(Some(wait_tx));
+        let reconcile_ctx = ctx.clone();
+        let reconcile = std::thread::spawn(move || reconcile_powder_leases(&reconcile_ctx));
+
+        assert_eq!(
+            wait_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            crew.session_id
+        );
+        reap_test_tmux_session(&tmux_target(&crew.session_id)).unwrap();
+        drop(completion_guard);
+
+        reconcile.join().unwrap();
         registry.set_powder_operation_wait_hook(None);
         let state = server.finish().unwrap();
         assert_eq!(state.renew_posts, 0);
