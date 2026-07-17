@@ -56,6 +56,14 @@ impl CliError {
         }
     }
 
+    fn gated(message: impl Into<String>) -> Self {
+        CliError {
+            code: exit::GATED,
+            kind: "gated",
+            message: message.into(),
+        }
+    }
+
     /// A local git interrogation/mutation failed. Same exit tier as a server
     /// `ok:false` (4 = "the operation failed"), distinguished by `kind`.
     fn git(message: impl Into<String>) -> Self {

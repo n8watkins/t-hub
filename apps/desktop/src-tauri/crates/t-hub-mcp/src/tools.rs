@@ -965,7 +965,7 @@ pub fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "complete_crew_powder",
-            tier: Tier::Organization,
+            tier: Tier::ProcessChanging,
             summary: "Complete a Crew-bound Powder card with proof; only the Crew session's owning Captain is authorized.",
             input_schema: schema_complete_crew_powder,
         },
@@ -1294,7 +1294,7 @@ mod tests {
         );
 
         let complete = find("complete_crew_powder").unwrap();
-        assert_eq!(complete.tier, Tier::Organization);
+        assert_eq!(complete.tier, Tier::ProcessChanging);
         assert_eq!(
             (complete.input_schema)()["required"],
             json!(["crewSessionId", "operationId", "proof", "criterionProofs"])
@@ -1313,7 +1313,7 @@ mod tests {
         );
         assert_eq!(
             complete.to_mcp()["annotations"]["confirmationRequired"],
-            false
+            true
         );
 
         let review = find("review_crew_powder_criterion").unwrap();
@@ -1331,15 +1331,12 @@ mod tests {
             ])
         );
 
-        // Append and completion have the same Organization base tier as the
-        // combined control contract. Organization carries no generic process
-        // confirmation. The backend separately admits the narrow Crew-self
-        // work-log case through a read token, then rechecks exact Crew and ship
-        // ownership. Completion has no such read-token override.
+        // Append and review remain Organization mutations. The backend
+        // separately admits the narrow Crew-self work-log case through a read
+        // token, then rechecks exact Crew and ship ownership.
         for name in [
             "append_crew_powder_work_log",
             "review_crew_powder_criterion",
-            "complete_crew_powder",
         ] {
             let tool = find(name).unwrap().to_mcp();
             assert_eq!(tool["annotations"]["t-hubTier"], "organization", "{name}");
@@ -1348,6 +1345,13 @@ mod tests {
                 "{name} must reach role-bound backend authorization"
             );
         }
+        let complete_mcp = complete.to_mcp();
+        assert_eq!(complete_mcp["annotations"]["t-hubTier"], "process-changing");
+        assert_eq!(complete_mcp["annotations"]["confirmationRequired"], true);
+        assert!(complete_mcp["description"]
+            .as_str()
+            .unwrap()
+            .contains("CONFIRMATION REQUIRED"));
         let read = evidence.to_mcp();
         assert_eq!(read["annotations"]["t-hubTier"], "read");
         assert_eq!(read["annotations"]["confirmationRequired"], false);

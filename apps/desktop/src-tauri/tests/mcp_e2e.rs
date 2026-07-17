@@ -32,7 +32,7 @@ const POWDER_TOOLS: [(&str, &str); 4] = [
     ("append_crew_powder_work_log", "organization"),
     ("read_crew_powder_evidence", "read"),
     ("review_crew_powder_criterion", "organization"),
-    ("complete_crew_powder", "organization"),
+    ("complete_crew_powder", "process-changing"),
 ];
 
 const FORBIDDEN_AUTHORITY_FIELDS: [&str; 22] = [
@@ -1592,7 +1592,11 @@ fn end_to_end_mcp_round_trip() {
             .find(|tool| tool["name"] == name)
             .unwrap_or_else(|| panic!("tools/list missing {name}"));
         assert_eq!(tool["annotations"]["t-hubTier"], tier, "{name}");
-        assert_eq!(tool["annotations"]["confirmationRequired"], false, "{name}");
+        assert_eq!(
+            tool["annotations"]["confirmationRequired"],
+            name == "complete_crew_powder",
+            "{name}"
+        );
         assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{name}");
         for field in FORBIDDEN_AUTHORITY_FIELDS {
             assert!(

@@ -6042,7 +6042,7 @@ impl CommandTier {
 /// process spawns).
 fn required_tier(command: &str) -> CommandTier {
     match command {
-        "spawn_terminal" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder"
+        "spawn_terminal" | "commission_captain" | "attach_captain" | "dispatch_crew" | "heartbeat_crew_powder" | "complete_crew_powder"
         | "send_text" | "send_keys" | "close_terminal"
         // comms-plane Phase 3: `abort_session` interrupts a running process (like
         // send_keys/close) and `plane_admin` purges durable queues - both are
@@ -6055,7 +6055,6 @@ fn required_tier(command: &str) -> CommandTier {
         | "archive_recent_project" | "register_project" | "bind_project_powder"
         | "claim_captain" | "release_captain" | "captain_checkpoint" | "watch_fleet"
         | "unwatch_fleet" | "append_crew_powder_work_log" | "review_crew_powder_criterion"
-        | "complete_crew_powder"
         | "rebind_control"
         // Comms-plane Phase 2 (review H1): `inbox_ack` MUTATES durable receipt state
         // (Delivered -> Processed) and force-compacts records, so it must NOT fall
@@ -20929,6 +20928,10 @@ mod tests {
             CommandTier::ProcessChanging
         );
         assert_eq!(required_tier("send_text"), CommandTier::ProcessChanging);
+        assert_eq!(
+            required_tier("complete_crew_powder"),
+            CommandTier::ProcessChanging
+        );
         assert_eq!(required_tier("new_tab"), CommandTier::Organization);
         assert_eq!(required_tier("create_worktree"), CommandTier::Organization);
         assert_eq!(required_tier("remove_worktree"), CommandTier::Organization);

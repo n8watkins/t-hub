@@ -116,6 +116,7 @@ An idempotent mutation that has already reached the requested state must exit ze
 - Existing `--yes` behavior may remain temporarily as a documented compatibility alias while `--confirm` becomes canonical.
 - Destructive or wide-reaching commands should support `--dry-run` when practical.
 - Confirmation must be validated before endpoint discovery, dependency calls, or local mutation.
+- `th powder complete` must require the canonical `--confirm` flag before endpoint discovery or mutation.
 - `--force` may alter a safety policy only where documented and must not substitute for confirmation.
 - Unknown or misspelled flags must never be ignored.
 - Dry runs must report the proposed effects using the same stable vocabulary as execution results.

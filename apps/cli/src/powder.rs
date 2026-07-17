@@ -214,11 +214,11 @@ fn complete(args: &[String]) -> Result<(), CliError> {
     let flags = StrictFlags::parse(
         args,
         &["--operation-id", "--proof", "--criterion-proofs-json"],
-        &["--json"],
+        &["--confirm", "--json"],
     )?;
     flags.require_positionals(
         1,
-        "th powder complete <crew-session> --operation-id <id> --proof <text> --criterion-proofs-json <json> [--json]",
+        "th powder complete <crew-session> --operation-id <id> --proof <text> --criterion-proofs-json <json> --confirm [--json]",
     )?;
     let crew = bounded_nonempty_text(&flags.positionals[0], "crew-session", 256)?;
     let proof = flags.options.get("--proof").ok_or_else(|| {
@@ -234,6 +234,11 @@ fn complete(args: &[String]) -> Result<(), CliError> {
                 )
             },
         )?)?;
+    if !flags.confirm {
+        return Err(CliError::gated(
+            "th powder complete requires explicit --confirm before any side effect",
+        ));
+    }
     let result = control::call(
         &endpoint()?,
         OP_COMPLETE_CREW_POWDER,
@@ -371,6 +376,7 @@ fn invalid_limit(value: &str) -> CliError {
 struct StrictFlags {
     positionals: Vec<String>,
     options: HashMap<String, String>,
+    confirm: bool,
     json: bool,
 }
 
@@ -419,6 +425,7 @@ impl StrictFlags {
         Ok(Self {
             positionals,
             options,
+            confirm: booleans.contains("--confirm"),
             json: booleans.contains("--json"),
         })
     }
@@ -493,10 +500,11 @@ A Captain may select one Crew it owns with --crew. The default and maximum limit
 
 fn print_complete_help() {
     println!(
-        "usage: th powder complete <crew-session> --operation-id <id> --proof <text> --criterion-proofs-json <json> [--json]\n\
+        "usage: th powder complete <crew-session> --operation-id <id> --proof <text> --criterion-proofs-json <json> --confirm [--json]\n\
 \n\
 Complete the Crew-bound Powder card with non-empty proof up to 4096 UTF-8 bytes.\n\
 Criterion proof JSON entries require criterion, criterionId, and url.\n\
+Explicit --confirm is mandatory and is validated before endpoint discovery.\n\
 The backend requires the caller to be the Crew session's owning Captain."
     );
 }

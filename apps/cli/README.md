@@ -116,7 +116,7 @@ name over the loopback channel:
 | `th powder work-log append <message> --operation-id <id>` | `append_crew_powder_work_log` | uses the calling Crew session's bound card and run |
 | `th powder evidence` | `read_crew_powder_evidence` | bounded to 20 recent entries; owning Captains may use `--crew` |
 | `th powder criterion review <crew> [flags]` | `review_crew_powder_criterion` | exact criterion and reviewer identity; owning Captain only |
-| `th powder complete <crew> [flags]` | `complete_crew_powder` | stable operation id and criterion proof JSON; owning Captain only |
+| `th powder complete <crew> [flags] --confirm` | `complete_crew_powder` | explicit confirmation, stable operation id, and criterion proof JSON; owning Captain only |
 
 ## Powder Crew evidence
 
@@ -124,6 +124,7 @@ The Powder commands never accept card ids, run ids, repositories, connection pro
 T-Hub resolves those authority-bearing fields from the authenticated Crew binding.
 `work-log append` is Crew-scoped, `evidence` is a bounded Crew read with an owning-Captain target option, and criterion review and completion are restricted to the Crew session's owning Captain.
 Every mutation requires a caller-owned stable operation id so an exact retry is distinguishable from a new action.
+Completion additionally requires explicit `--confirm`, which is validated before endpoint discovery or mutation.
 Work-log messages are limited to 16 KiB of UTF-8 and completion proof is limited to 4096 UTF-8 bytes.
 
 Every Powder command supports `--json` and emits the stable CLI envelope on success or failure.

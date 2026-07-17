@@ -206,6 +206,7 @@ fn captain_evidence_and_completion_target_only_a_crew_binding() {
             "tests: 42 passed",
             "--criterion-proofs-json",
             r#"[{"criterion":0,"criterionId":"criterion-0","url":"https://example.test/proof"}]"#,
+            "--confirm",
             "--json",
         ],
         Some("captain-token"),
@@ -226,6 +227,44 @@ fn captain_evidence_and_completion_target_only_a_crew_binding() {
             }]
         })
     );
+}
+
+#[test]
+fn completion_requires_confirmation_before_endpoint_discovery() {
+    let missing = std::env::temp_dir().join(format!(
+        "th-cli-confirmation-missing-control-{}",
+        NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_th"))
+        .args([
+            "powder",
+            "complete",
+            "crew-123",
+            "--operation-id",
+            "completion:unconfirmed",
+            "--proof",
+            "tests pass",
+            "--criterion-proofs-json",
+            r#"[{"criterion":0,"criterionId":"criterion-0","url":"https://example.test/proof"}]"#,
+            "--json",
+        ])
+        .env("T_HUB_CONTROL_FILE", &missing)
+        .env_remove("T_HUB_CONTROL_ADDR")
+        .env_remove("T_HUB_CONTROL_TOKEN")
+        .output()
+        .expect("run unconfirmed Powder completion");
+
+    assert_eq!(output.status.code(), Some(5), "output: {output:?}");
+    assert!(output.stderr.is_empty(), "JSON stderr: {output:?}");
+    let envelope = stdout_json(&output);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["command"], "powder complete");
+    assert_eq!(envelope["error"]["code"], 5);
+    assert_eq!(envelope["error"]["kind"], "gated");
+    assert!(envelope["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("--confirm"));
 }
 
 #[test]
@@ -517,6 +556,7 @@ fn exact_utf8_byte_boundaries_are_forwarded_without_truncation() {
             &proof,
             "--criterion-proofs-json",
             r#"[{"criterion":0,"criterionId":"criterion-0","url":"https://example.test/proof"}]"#,
+            "--confirm",
             "--json",
         ],
         Some("captain-token"),
@@ -541,6 +581,7 @@ fn backend_authorization_rejection_uses_the_gated_exit_taxonomy() {
                 "tests",
                 "--criterion-proofs-json",
                 r#"[{"criterion":0,"criterionId":"criterion-0","url":"https://example.test/proof"}]"#,
+                "--confirm",
                 "--json",
             ],
         ),
