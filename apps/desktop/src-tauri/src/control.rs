@@ -972,6 +972,8 @@ pub struct PowderWorkBinding {
     pub card_id: String,
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_expires_at: Option<i64>,
     #[serde(default)]
     pub state: PowderWorkState,
@@ -2021,6 +2023,16 @@ impl CaptainsRegistry {
                     if work.card_id.trim().is_empty() || work.run_id.trim().is_empty() {
                         return Err(format!(
                             "Crew '{}' has an incomplete Powder work binding",
+                            crew.terminal_id
+                        ));
+                    }
+                    if work
+                        .agent
+                        .as_deref()
+                        .is_some_and(|agent| agent.trim().is_empty())
+                    {
+                        return Err(format!(
+                            "Crew '{}' has an empty Powder agent identity",
                             crew.terminal_id
                         ));
                     }
@@ -9411,6 +9423,7 @@ fn dispatch_crew(
         PowderWorkBinding {
             card_id: claim.card_id.clone(),
             run_id: claim.run_id.clone(),
+            agent: Some(claim.agent.clone()),
             claim_expires_at: Some(claim.expires_at),
             state: PowderWorkState::Active,
         },
@@ -10227,34 +10240,18 @@ fn append_crew_powder_work_log(
     }
     let client = powder::Client::from_profile(&scope.binding.connection_profile)
         .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
-    let (card, run) = read_bound_powder_evidence(&client, &scope)?;
-    if bound_powder_reality(&scope, &card, &run)? != BoundPowderReality::Active {
-        return Err(format!(
-            "append_crew_powder_work_log: Crew run '{}' is already completed",
-            scope.work.run_id
-        ));
-    }
-    let claim_agent = card
-        .claim
-        .as_ref()
-        .map(|claim| claim.agent.clone())
-        .ok_or_else(|| {
-            format!(
-                "append_crew_powder_work_log: Crew run '{}' has no authoritative claim",
-                scope.work.run_id
-            )
-        })?;
+    let powder_agent = scope
+        .work
+        .agent
+        .as_deref()
+        .ok_or("Powder run-bound mutations are unavailable for this legacy Crew binding")?;
     let attribution = powder::WorkLogAttribution {
-        agent: claim_agent.clone(),
+        agent: powder_agent.to_string(),
         model: None,
         reasoning: None,
         harness: scope.crew.harness.clone(),
     };
-    let operation_id = powder_operation_id(
-        "work-log",
-        &scope,
-        &json!({"agent": claim_agent, "message": message}),
-    );
+    let operation_id = powder_operation_id("work-log", &scope, &json!({"message": message}));
     let append = powder::RunBoundWorkLog {
         expected_run_id: scope.work.run_id.clone(),
         operation_id: operation_id.clone(),
@@ -10282,7 +10279,7 @@ fn append_crew_powder_work_log(
         }
     };
     if entry.card_id != scope.work.card_id
-        || entry.agent != claim_agent
+        || entry.agent != powder_agent
         || entry.run_id.as_deref() != Some(scope.work.run_id.as_str())
     {
         return Err("Powder work-log response did not match the bound Crew run".into());
@@ -10601,7 +10598,13 @@ fn complete_crew_powder(
                     .begin_crew_powder_completion(&crew_session_id, &digest)?;
                 return completion_success(ctx, &scope, &digest, &card, &run, "recovered");
             }
-            BoundPowderReality::Active => validate_completion_criteria(&run.criteria, &proof)?,
+            BoundPowderReality::Active => {
+                card.require_completion_criteria_approved(&scope.work.run_id)
+                    .map_err(|error| {
+                        format!("Powder completion criteria are not authoritative: {error}")
+                    })?;
+                validate_completion_criteria(&run.criteria, &proof)?;
+            }
         }
         ctx.captains
             .begin_crew_powder_completion(&crew_session_id, &digest)?;
@@ -18239,6 +18242,7 @@ mod tests {
                 PowderWorkBinding {
                     card_id: "card-a".into(),
                     run_id: "run-a".into(),
+                    agent: None,
                     claim_expires_at: None,
                     state: PowderWorkState::Active,
                 },
@@ -18676,6 +18680,7 @@ mod tests {
                 PowderWorkBinding {
                     card_id: "card-1".into(),
                     run_id: "run-1".into(),
+                    agent: None,
                     claim_expires_at: Some(1),
                     state: PowderWorkState::Active,
                 },
@@ -21020,6 +21025,7 @@ mod tests {
             PowderWorkBinding {
                 card_id: "card-b".into(),
                 run_id: "run-b".into(),
+                agent: None,
                 claim_expires_at: None,
                 state: PowderWorkState::Active,
             },
@@ -22508,6 +22514,7 @@ mod tests {
             PowderWorkBinding {
                 card_id: "card-1".into(),
                 run_id: "run-1".into(),
+                agent: None,
                 claim_expires_at: Some(100),
                 state: PowderWorkState::Active,
             },
@@ -22592,6 +22599,7 @@ mod tests {
                 PowderWorkBinding {
                     card_id: "thub-powder-control-lifecycle".into(),
                     run_id: "run-authoritative".into(),
+                    agent: Some("powder-agent".into()),
                     claim_expires_at: Some(100),
                     state: PowderWorkState::Active,
                 },
@@ -23467,7 +23475,7 @@ mod tests {
                 };
                 if let Some(failure_code) = failure_code {
                     loopback_rejected_outcome("work_log_append", &body, &failure_code)
-                } else if body["agent"] != "t-hub" {
+                } else if body["agent"] != "powder-agent" {
                     loopback_rejected_outcome("work_log_append", &body, "conflict")
                 } else {
                     let mut outcome = loopback_work_log_outcome(&body);
@@ -24393,7 +24401,7 @@ mod tests {
 
     #[test]
     fn powder_work_log_uses_stable_atomic_card_run_and_operation_identity() {
-        let server = LoopbackPowderServer::start(7);
+        let server = LoopbackPowderServer::start(3);
         let _profile = PowderProfileEnv::install("loopback-work-log", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
         let registry = powder_lifecycle_registry_with_profile(None, "loopback-work-log");
@@ -24411,10 +24419,7 @@ mod tests {
         let expected_operation_id = powder_operation_id(
             "work-log",
             &scope,
-            &json!({
-                "agent": "t-hub",
-                "message": "focused atomic work-log evidence"
-            }),
+            &json!({"message": "focused atomic work-log evidence"}),
         );
         let rejected = post_loopback_powder(
             server.addr,
@@ -24460,7 +24465,7 @@ mod tests {
             expected_operation_id
         );
         assert_eq!(state.work_log_posts[1], state.work_log_posts[2]);
-        assert_eq!(state.work_log_posts[1]["agent"], "t-hub");
+        assert_eq!(state.work_log_posts[1]["agent"], "powder-agent");
         assert_ne!(state.work_log_posts[1]["agent"], "crew-powder");
         assert_eq!(state.work_log_posts[1]["harness"], "codex");
         assert_eq!(
@@ -24473,7 +24478,7 @@ mod tests {
 
     #[test]
     fn powder_mutation_verification_accepts_normalized_scrubbed_evidence() {
-        let server = LoopbackPowderServer::start(3);
+        let server = LoopbackPowderServer::start(1);
         server.state.lock().unwrap().normalized_work_log_body = Some("progress [REDACTED]".into());
         let _profile = PowderProfileEnv::install("loopback-normalized-work-log", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
@@ -24565,7 +24570,7 @@ mod tests {
             ("claim_expired", "claim expired"),
             ("conflict", "stale, released, or reclaimed"),
         ] {
-            let server = LoopbackPowderServer::start(3);
+            let server = LoopbackPowderServer::start(1);
             server.state.lock().unwrap().mutation_failure_code = Some(failure_code.into());
             let profile = format!("loopback-work-log-rejection-{failure_code}");
             let _profile = PowderProfileEnv::install(&profile, server.addr);
@@ -24596,7 +24601,7 @@ mod tests {
             assert_eq!(state.work_log_posts.len(), 1);
         }
 
-        let server = LoopbackPowderServer::start(4);
+        let server = LoopbackPowderServer::start(2);
         server.state.lock().unwrap().response_run_id = Some("run-reclaimed".into());
         let _profile = PowderProfileEnv::install("loopback-work-log-mismatch", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
