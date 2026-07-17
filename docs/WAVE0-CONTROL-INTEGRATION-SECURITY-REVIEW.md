@@ -349,6 +349,9 @@ The MCP library and binary suites passed 16 and 75 tests respectively.
 `cargo fmt --all -- --check`, `cargo clippy -p t-hub -p t-hub-agent --all-targets -- -D warnings`, `git diff --check`, and `git diff --cached --check` passed.
 Tracked worktree cleanliness passed.
 The only remaining worktree entry is the protected untracked `CLAUDE.md`, which this work did not modify.
+An authenticated `th send` report to Captain session `0c7b7560` was attempted for frozen head `fa983da06eb83930ff99c148693a82bc14b11b22` with these commits, counts, and residual risk.
+The installed control plane rejected it with gated code 5 because `send_text` requires control capability and this Crew token is read-only.
+No Captain message is claimed as delivered.
 
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
 No independent reviewer has approved this integration yet.
