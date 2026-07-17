@@ -57,8 +57,9 @@ use crate::audit::{AuditLog, AuditMeta};
 use crate::claude::StatusBridge;
 use crate::governor::SpawnGovernor;
 use crate::harness::{
-    attest_launch_permissions, observe_harness_process, Harness, HarnessPermissionAttestation,
-    PermMode, CREW_DEFAULT_PERMISSION,
+    attest_final_launch_permissions, attest_launch_permissions, observe_harness_process, Harness,
+    HarnessPermissionAttestation, HarnessProcessEvidence, LaunchAttestationError, PermMode,
+    CREW_DEFAULT_PERMISSION,
 };
 use crate::supervision::Supervisor;
 use crate::{files, git, plane, powder, pty, tmux};
@@ -8665,6 +8666,17 @@ fn dispatch_crew(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
 ) -> Result<Value, String> {
+    let mut observer = observe_harness_process;
+    dispatch_crew_with_observer(ctx, args, caller, trusted_internal, &mut observer)
+}
+
+fn dispatch_crew_with_observer(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    observer: &mut dyn FnMut(&str) -> Result<HarnessProcessEvidence, LaunchAttestationError>,
+) -> Result<Value, String> {
     require_socket_identity(caller, trusted_internal, "dispatch_crew")?;
     let (captain, project) = captain_and_project_for_dispatch(ctx, args)?;
     enforce_ship_authority(caller, trusted_internal, &captain.ship_slug)?;
@@ -8783,7 +8795,7 @@ fn dispatch_crew(
         captain.ship_slug, claim.card_id, claim.run_id, task, checkout, captain_session_id
     );
     let tmux_target = tmux_target(&crew_session_id);
-    let before_launch = match observe_harness_process(&tmux_target) {
+    let before_launch = match observer(&tmux_target) {
         Ok(evidence) => evidence,
         Err(error) => {
             return Err(rollback_crew_launch_failure(
@@ -8837,7 +8849,7 @@ fn dispatch_crew(
             ));
         }
     }
-    let after_launch = match observe_harness_process(&tmux_target) {
+    let after_launch = match observer(&tmux_target) {
         Ok(evidence) => evidence,
         Err(error) => {
             return Err(rollback_crew_launch_failure(
@@ -8849,20 +8861,36 @@ fn dispatch_crew(
             ));
         }
     };
-    let attestation = match attest_launch_permissions(
+    if let Err(error) = attest_launch_permissions(
         harness.adapter(),
         &before_launch,
         &after_launch,
         CREW_DEFAULT_PERMISSION,
     ) {
-        Ok(attestation) => attestation,
+        return Err(rollback_crew_launch_failure(
+            ctx,
+            &crew_session_id,
+            &client,
+            &claim,
+            format!("dispatch_crew: Harness permission attestation failed: {error}"),
+        ));
+    }
+    let (attestation, final_evidence) = match attest_final_launch_permissions(
+        harness.adapter(),
+        &after_launch,
+        observer(&tmux_target),
+        CREW_DEFAULT_PERMISSION,
+    ) {
+        Ok(accepted) => accepted,
         Err(error) => {
             return Err(rollback_crew_launch_failure(
                 ctx,
                 &crew_session_id,
                 &client,
                 &claim,
-                format!("dispatch_crew: Harness permission attestation failed: {error}"),
+                format!(
+                    "dispatch_crew: final Harness permission attestation failed before durable acceptance: {error}"
+                ),
             ));
         }
     };
@@ -8884,6 +8912,25 @@ fn dispatch_crew(
                 ));
             }
         };
+    let (attestation, _return_evidence) = match attest_final_launch_permissions(
+        harness.adapter(),
+        &final_evidence,
+        observer(&tmux_target),
+        CREW_DEFAULT_PERMISSION,
+    ) {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            return Err(rollback_crew_launch_failure(
+                ctx,
+                &crew_session_id,
+                &client,
+                &claim,
+                format!(
+                    "dispatch_crew: final Harness permission attestation failed after durable persistence: {error}"
+                ),
+            ));
+        }
+    };
     let _ = captains_sync_apply(ctx);
     Ok(json!({
         "accepted": "dispatch_crew",
@@ -22379,6 +22426,178 @@ mod tests {
         assert_eq!(state.release_bodies[0]["run_id"], "run-authoritative");
     }
 
+    fn dispatch_race_evidence(
+        argv: &[&str],
+        executable_inode: u64,
+        session_created: u64,
+        ancestry: &[(u32, u64)],
+    ) -> HarnessProcessEvidence {
+        HarnessProcessEvidence::test_with_context(
+            42,
+            900,
+            8,
+            executable_inode,
+            argv,
+            session_created,
+            7,
+            ancestry,
+        )
+    }
+
+    #[test]
+    fn dispatch_launch_races_fail_closed_and_roll_back_exact_claim() {
+        if !tmux_process_tests_available() {
+            eprintln!(
+                "dispatch_launch_races_fail_closed_and_roll_back_exact_claim: tmux or node not on PATH - skipping"
+            );
+            return;
+        }
+        let shell = dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (7, 100)]);
+        let accepted = dispatch_race_evidence(
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            200,
+            123_456,
+            &[(42, 900), (7, 100)],
+        );
+        let changed_posture = dispatch_race_evidence(
+            &["codex", "--sandbox", "workspace-write", "work"],
+            200,
+            123_456,
+            &[(42, 900), (7, 100)],
+        );
+        let wrapper = dispatch_race_evidence(
+            &["sh", "/tmp/codex-wrapper"],
+            200,
+            123_456,
+            &[(42, 900), (7, 100)],
+        );
+        let changed_ancestry = dispatch_race_evidence(
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            200,
+            123_456,
+            &[(42, 900), (8, 101), (7, 100)],
+        );
+        let changed_generation = dispatch_race_evidence(
+            &[
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "work",
+            ],
+            200,
+            123_457,
+            &[(42, 900), (7, 100)],
+        );
+        let cases = [
+            (
+                "provider-exit",
+                vec![
+                    Ok(shell.clone()),
+                    Ok(accepted.clone()),
+                    Err(LaunchAttestationError::UnreadableEvidence),
+                ],
+                "before durable acceptance: provider-native process evidence is unreadable",
+            ),
+            (
+                "posture-change",
+                vec![Ok(shell.clone()), Ok(accepted.clone()), Ok(changed_posture)],
+                "provider-native permission evidence has the wrong mode",
+            ),
+            (
+                "wrapper-change",
+                vec![Ok(shell.clone()), Ok(accepted.clone()), Ok(wrapper)],
+                "a wrapper obscures the provider-native foreground process",
+            ),
+            (
+                "ancestry-change",
+                vec![
+                    Ok(shell.clone()),
+                    Ok(accepted.clone()),
+                    Ok(changed_ancestry),
+                ],
+                "provider-native process ancestry changed during launch acceptance",
+            ),
+            (
+                "generation-change",
+                vec![
+                    Ok(shell.clone()),
+                    Ok(accepted.clone()),
+                    Ok(changed_generation),
+                ],
+                "terminal pane generation changed during launch",
+            ),
+            (
+                "post-persistence-exit",
+                vec![
+                    Ok(shell.clone()),
+                    Ok(accepted.clone()),
+                    Ok(accepted.clone()),
+                    Err(LaunchAttestationError::UnreadableEvidence),
+                ],
+                "after durable persistence: provider-native process evidence is unreadable",
+            ),
+        ];
+
+        for (case_name, observations, expected_error) in cases {
+            let server = LoopbackPowderServer::start(6);
+            let profile_name = format!(
+                "dispatch-race-{case_name}-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+            let captain = FakeHarnessSession::start(Harness::Codex);
+            let registry = dispatch_test_registry(None, &profile_name, &captain.session_id);
+            let (ctx, sink) = dispatch_test_context(registry.clone());
+            let mut observations = std::collections::VecDeque::from(observations);
+            let mut observer = |_target: &str| {
+                observations
+                    .pop_front()
+                    .expect("dispatch made an unexpected attestation observation")
+            };
+
+            let error = dispatch_crew_with_observer(
+                &ctx,
+                &json!({
+                    "captainSessionId": captain.session_id,
+                    "cardId": "thub-powder-control-lifecycle",
+                    "task": "Reject a launch acceptance race",
+                    "harness": "codex",
+                    "testHarnessCommand": "sleep 60",
+                    "testCodexUnobservedCommand": ":",
+                    "testSkipHarnessLiveness": true,
+                }),
+                None,
+                true,
+                &mut observer,
+            )
+            .unwrap_err();
+
+            assert!(error.contains(expected_error), "{case_name}: {error}");
+            assert!(error.contains("all side effects were rolled back"));
+            assert!(observations.is_empty(), "{case_name}: unused observations");
+            let crew_session_id = dispatched_terminal_id(&sink);
+            assert_eq!(
+                tmux::session_liveness(&tmux_target(&crew_session_id)),
+                tmux::SessionLiveness::Gone
+            );
+            assert!(registry.snapshot().captains[0].crew.is_empty());
+            let state = server.finish().unwrap();
+            assert_eq!(state.claim_posts, 1);
+            assert_eq!(state.release_posts, 1);
+            assert_eq!(
+                state.release_bodies,
+                vec![json!({"run_id": "run-authoritative"})]
+            );
+        }
+    }
+
     #[test]
     fn dispatch_test_harness_command_failures_roll_back_all_side_effects() {
         if !tmux_process_tests_available() {
@@ -23288,8 +23507,8 @@ mod tests {
             assert_eq!(release["released"], false);
             assert_eq!(release["cardId"], "thub-powder-control-lifecycle");
             assert_eq!(release["runId"], "run-authoritative");
-            assert_eq!(retained, true);
-            assert_eq!(changed, true);
+            assert!(retained);
+            assert!(changed);
             let scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
             assert_eq!(scope.work.card_id, "thub-powder-control-lifecycle");
             assert_eq!(scope.work.run_id, "run-authoritative");
