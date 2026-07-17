@@ -814,9 +814,11 @@ const CLAIM_CAS_ATTEMPTS: usize = 8;
 /// identities; v2 adds registered projects plus reset-safe Captain, Crew, and
 /// Powder bindings; v3 adds durable per-project Powder event cursors; v4 makes
 /// provider identity strict; v5 adds durable Powder completion recovery state;
-/// v6 adds exact run-bound mutation intent recovery.
+/// v6 adds exact run-bound mutation intent recovery; v7 binds those intents to
+/// Powder's canonical request digest while preserving legacy v1 intents in a
+/// fail-closed state.
 /// All prior shapes remain readable and upgrade on write.
-pub const CAPTAINS_SCHEMA_VERSION: u32 = 6;
+pub const CAPTAINS_SCHEMA_VERSION: u32 = 7;
 const STRICT_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 4;
 
 /// The durable org ROLE a fleet identity holds (item-2 §2.1, D1). Cortana is the
@@ -997,6 +999,12 @@ pub struct PowderMutationIntent {
     pub schema_version: u32,
     pub operation_id: String,
     pub payload_digest: String,
+    /// Powder's exact canonical request digest for operation-status recovery.
+    ///
+    /// Schema-v1 intents remain readable for honest historical retention, but
+    /// cannot be mutated or reconciled without an exact caller replay upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub powder_request_digest: Option<String>,
     pub repository: String,
     pub card_id: String,
     pub expected_run_id: String,
@@ -1005,7 +1013,8 @@ pub struct PowderMutationIntent {
     pub created_at: u64,
 }
 
-const POWDER_MUTATION_INTENT_SCHEMA_VERSION: u32 = 1;
+const POWDER_MUTATION_INTENT_SCHEMA_VERSION: u32 = 2;
+const POWDER_OPERATION_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 fn valid_lower_hex_digest(value: &str) -> bool {
     value.len() == 64
@@ -1014,12 +1023,26 @@ fn valid_lower_hex_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn valid_powder_request_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(valid_lower_hex_digest)
+}
+
 fn validate_powder_mutation_intent(
     crew_session_id: &str,
     work: &PowderWorkBinding,
     intent: &PowderMutationIntent,
 ) -> Result<(), String> {
-    if intent.schema_version != POWDER_MUTATION_INTENT_SCHEMA_VERSION
+    let request_digest_is_valid = match intent.schema_version {
+        1 => intent.powder_request_digest.is_none(),
+        POWDER_MUTATION_INTENT_SCHEMA_VERSION => intent
+            .powder_request_digest
+            .as_deref()
+            .is_some_and(valid_powder_request_digest),
+        _ => false,
+    };
+    if !request_digest_is_valid
         || powder::validate_operation_id(&intent.operation_id).is_err()
         || intent.repository.trim().is_empty()
         || intent.card_id != work.card_id
@@ -1033,6 +1056,15 @@ fn validate_powder_mutation_intent(
         ));
     }
     Ok(())
+}
+
+fn powder_mutation_request_digest(intent: &PowderMutationIntent) -> Result<&str, String> {
+    intent.powder_request_digest.as_deref().ok_or_else(|| {
+        format!(
+            "Powder operation '{}' uses a legacy mutation intent without Powder's canonical request digest; refusing mutation and cleanup until the exact operation is reconciled",
+            intent.operation_id
+        )
+    })
 }
 
 /// Durable T-Hub-side state for a Crew member's exact Powder run.
@@ -2696,7 +2728,7 @@ impl CaptainsRegistry {
     fn begin_crew_powder_mutation(
         &self,
         expected: &CrewPowderScope,
-        intent: PowderMutationIntent,
+        mut intent: PowderMutationIntent,
     ) -> Result<(CrewRef, bool), String> {
         let crew_session_id = expected.crew.terminal_id.as_str();
         let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
@@ -2710,6 +2742,10 @@ impl CaptainsRegistry {
             .as_mut()
             .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
         validate_powder_mutation_intent(crew_session_id, binding, &intent)?;
+        if intent.schema_version != POWDER_MUTATION_INTENT_SCHEMA_VERSION {
+            return Err("refusing to create a legacy Powder mutation intent".into());
+        }
+        let _ = powder_mutation_request_digest(&intent)?;
         let requester_matches = match intent.mutation_kind {
             PowderMutationKind::WorkLogAppend => intent.requested_by == crew_session_id,
             PowderMutationKind::CriterionReview | PowderMutationKind::Completion => expected
@@ -2727,15 +2763,42 @@ impl CaptainsRegistry {
                 "Crew session '{crew_session_id}' Powder work is already completed"
             ));
         }
+        let mut created = false;
         let changed = match &binding.mutation_intent {
             None => {
                 binding.mutation_intent = Some(intent);
+                created = true;
                 true
+            }
+            Some(existing) if existing.schema_version < POWDER_MUTATION_INTENT_SCHEMA_VERSION => {
+                if existing.operation_id == intent.operation_id
+                    && existing.payload_digest == intent.payload_digest
+                    && existing.repository == intent.repository
+                    && existing.card_id == intent.card_id
+                    && existing.expected_run_id == intent.expected_run_id
+                    && existing.mutation_kind == intent.mutation_kind
+                    && existing.requested_by == intent.requested_by
+                {
+                    intent.created_at = existing.created_at;
+                    binding.mutation_intent = Some(intent);
+                    true
+                } else if existing.operation_id == intent.operation_id {
+                    return Err(format!(
+                        "Powder operation '{}' conflicts with its durable payload or identity",
+                        intent.operation_id
+                    ));
+                } else {
+                    return Err(format!(
+                        "Crew session '{crew_session_id}' already has legacy Powder operation '{}' pending",
+                        existing.operation_id
+                    ));
+                }
             }
             Some(existing)
                 if existing.schema_version == intent.schema_version
                     && existing.operation_id == intent.operation_id
                     && existing.payload_digest == intent.payload_digest
+                    && existing.powder_request_digest == intent.powder_request_digest
                     && existing.repository == intent.repository
                     && existing.card_id == intent.card_id
                     && existing.expected_run_id == intent.expected_run_id
@@ -2762,7 +2825,7 @@ impl CaptainsRegistry {
             g.seq = g.seq.saturating_add(1);
             self.commit_mutation(g, previous)?;
         }
-        Ok((result, changed))
+        Ok((result, created))
     }
 
     /// Clear only the exact authoritative mutation intent after convergence.
@@ -2804,6 +2867,55 @@ impl CaptainsRegistry {
             self.commit_mutation(g, previous)?;
         }
         Ok((result, changed))
+    }
+
+    /// Converge one exact authoritative rejected or failed mutation.
+    ///
+    /// A rejected completion also restores Active in the same commit so a
+    /// corrected operation cannot remain stranded behind an obsolete marker.
+    fn reject_crew_powder_mutation(
+        &self,
+        expected: &CrewPowderScope,
+        operation_id: &str,
+        payload_digest: &str,
+    ) -> Result<(CrewRef, bool), String> {
+        let crew_session_id = expected.crew.terminal_id.as_str();
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let (captain_index, crew_index) =
+            exact_powder_scope_indices(&g, self.authority_epoch, expected)?;
+        let crew = &mut g.captains[captain_index].crew[crew_index];
+        let binding = crew
+            .powder_work
+            .as_mut()
+            .ok_or_else(|| format!("Crew session '{crew_session_id}' has no Powder binding"))?;
+        let intent = binding.mutation_intent.as_ref().ok_or_else(|| {
+            format!("Powder operation '{operation_id}' has no durable mutation intent")
+        })?;
+        if intent.operation_id != operation_id || intent.payload_digest != payload_digest {
+            return Err(format!(
+                "Powder operation '{operation_id}' does not match the durable mutation intent"
+            ));
+        }
+        if intent.mutation_kind == PowderMutationKind::Completion {
+            match binding.state {
+                PowderWorkState::CompletionPending { .. } => {
+                    binding.state = PowderWorkState::Active;
+                }
+                PowderWorkState::Active => {}
+                PowderWorkState::Completed { .. } => {
+                    return Err(format!(
+                        "Crew session '{crew_session_id}' is already completed"
+                    ));
+                }
+            }
+        }
+        binding.mutation_intent = None;
+        let result = crew.clone();
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok((result, true))
     }
 
     fn begin_crew_powder_completion_for_scope(
@@ -10586,17 +10698,19 @@ fn powder_mutation_digest(
         .collect()
 }
 
-fn powder_mutation_intent(
+fn powder_mutation_intent_with_request_digest(
     kind: PowderMutationKind,
     scope: &CrewPowderScope,
     operation_id: &str,
     requested_by: &str,
     payload: &Value,
+    powder_request_digest: String,
 ) -> PowderMutationIntent {
     PowderMutationIntent {
         schema_version: POWDER_MUTATION_INTENT_SCHEMA_VERSION,
         operation_id: operation_id.to_string(),
         payload_digest: powder_mutation_digest(kind, scope, operation_id, requested_by, payload),
+        powder_request_digest: Some(powder_request_digest),
         repository: scope.binding.repository.clone(),
         card_id: scope.work.card_id.clone(),
         expected_run_id: scope.work.run_id.clone(),
@@ -10606,23 +10720,251 @@ fn powder_mutation_intent(
     }
 }
 
+#[cfg(test)]
+fn powder_mutation_intent(
+    kind: PowderMutationKind,
+    scope: &CrewPowderScope,
+    operation_id: &str,
+    requested_by: &str,
+    payload: &Value,
+) -> PowderMutationIntent {
+    let powder_request_digest = match kind {
+        PowderMutationKind::WorkLogAppend => powder::work_log_operation_request_digest(
+            "actor-t-hub",
+            &scope.work.card_id,
+            &powder::RunBoundWorkLog {
+                expected_run_id: scope.work.run_id.clone(),
+                operation_id: operation_id.into(),
+                attribution: powder::WorkLogAttribution {
+                    agent: payload["agent"].as_str().unwrap().into(),
+                    model: None,
+                    reasoning: None,
+                    harness: payload["harness"].as_str().map(str::to_string),
+                },
+                body: payload["message"].as_str().unwrap().into(),
+            },
+        ),
+        PowderMutationKind::CriterionReview => powder::criterion_review_operation_request_digest(
+            "actor-t-hub",
+            &scope.work.card_id,
+            &powder::RunBoundCriterionReview {
+                expected_run_id: scope.work.run_id.clone(),
+                operation_id: operation_id.into(),
+                criterion_index: payload["criterion"].as_u64().unwrap() as usize,
+                criterion_id: payload["criterionId"].as_str().unwrap().into(),
+                criterion_text: payload["criterionText"].as_str().unwrap().into(),
+                decision: match payload["decision"].as_str().unwrap() {
+                    "approved" => powder::CriterionReviewDecision::Approved,
+                    "rejected" => powder::CriterionReviewDecision::Rejected,
+                    "cleared" => powder::CriterionReviewDecision::Cleared,
+                    _ => panic!("unsupported test criterion decision"),
+                },
+                proof: payload["proof"].as_str().map(str::to_string),
+                expected_reviewer_identity: payload["expectedReviewerIdentity"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+            },
+        ),
+        PowderMutationKind::Completion => powder::completion_operation_request_digest(
+            "actor-t-hub",
+            &scope.work.card_id,
+            &powder::RunBoundCompletion {
+                expected_run_id: scope.work.run_id.clone(),
+                operation_id: operation_id.into(),
+                proof: payload["proof"].as_str().unwrap().into(),
+                criterion_proofs: payload["criterionProofs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|proof| powder::CriterionProof {
+                        criterion: proof["criterion"].as_u64().unwrap() as usize,
+                        url: proof["url"].as_str().unwrap().into(),
+                    })
+                    .collect(),
+            },
+        ),
+    }
+    .unwrap();
+    powder_mutation_intent_with_request_digest(
+        kind,
+        scope,
+        operation_id,
+        requested_by,
+        payload,
+        powder_request_digest,
+    )
+}
+
 fn powder_operation_rejection(
     command: &str,
     state: powder::OperationState,
     failure: Option<&powder::OperationFailure>,
 ) -> String {
-    let disposition = match (state, failure.map(|failure| failure.code.as_str())) {
-        (powder::OperationState::Rejected, Some("claim_expired")) => "the claim expired",
-        (powder::OperationState::Rejected, Some("conflict")) => {
-            "the run is stale, released, or reclaimed"
+    let (normalized, disposition) = match (state, failure.map(|failure| failure.code.as_str())) {
+        (powder::OperationState::Rejected, Some("claim_expired")) => {
+            ("expired", "the claim expired")
         }
-        (powder::OperationState::Rejected, _) => "the exact run-bound operation was rejected",
-        (powder::OperationState::Failed, _) => "the exact run-bound operation failed",
-        (powder::OperationState::Pending, _) => "the exact run-bound operation remains pending",
-        (powder::OperationState::Unknown, _) => "the exact operation is not yet recorded",
-        (powder::OperationState::Succeeded, _) => "the operation response was incomplete",
+        (powder::OperationState::Rejected, Some("conflict")) => {
+            ("conflict", "the run is stale, released, or reclaimed")
+        }
+        (powder::OperationState::Rejected, Some("not_found")) => {
+            ("stale", "the exact run is no longer authoritative")
+        }
+        (powder::OperationState::Rejected, _) => {
+            ("rejected", "the exact run-bound operation was rejected")
+        }
+        (powder::OperationState::Failed, _) => ("rejected", "the exact run-bound operation failed"),
+        (powder::OperationState::Pending, _) => {
+            ("pending", "the exact run-bound operation remains pending")
+        }
+        (powder::OperationState::Unknown, _) => {
+            ("pending", "the exact operation is not yet recorded")
+        }
+        (powder::OperationState::Succeeded, _) => {
+            ("malformed", "the operation response was incomplete")
+        }
     };
-    format!("{command}: {disposition}")
+    let message = format!("{command}: Powder mutation state '{normalized}': {disposition}");
+    if matches!(
+        state,
+        powder::OperationState::Pending | powder::OperationState::Unknown
+    ) {
+        retryable_error(message)
+    } else {
+        message
+    }
+}
+
+fn powder_recovery_unavailable(command: &str, error: &powder::PowderError) -> String {
+    let message = error.message.to_ascii_lowercase();
+    let state = match error.kind {
+        powder::PowderErrorKind::InvalidResponse => "malformed",
+        powder::PowderErrorKind::Unauthorized => "rejected",
+        powder::PowderErrorKind::NotFound => "stale",
+        powder::PowderErrorKind::Conflict => "conflict",
+        powder::PowderErrorKind::Unreachable
+            if message.contains("timed out") || message.contains("timeout") =>
+        {
+            "timeout"
+        }
+        powder::PowderErrorKind::Unreachable | powder::PowderErrorKind::Upstream => "pending",
+    };
+    let message = format!(
+        "{command}: Powder mutation state '{state}': authoritative operation recovery is unavailable"
+    );
+    if matches!(state, "pending" | "timeout") {
+        retryable_error(message)
+    } else {
+        message
+    }
+}
+
+fn powder_mutation_error_is_ambiguous(error: &powder::PowderError) -> bool {
+    matches!(
+        error.kind,
+        powder::PowderErrorKind::Unreachable | powder::PowderErrorKind::InvalidResponse
+    )
+}
+
+fn powder_direct_mutation_error(command: &str, error: &powder::PowderError) -> String {
+    let state = match error.kind {
+        powder::PowderErrorKind::Conflict => "conflict",
+        powder::PowderErrorKind::Unauthorized => "rejected",
+        powder::PowderErrorKind::NotFound => "stale",
+        powder::PowderErrorKind::Upstream => "pending",
+        powder::PowderErrorKind::Unreachable | powder::PowderErrorKind::InvalidResponse => {
+            "pending"
+        }
+    };
+    let message = format!(
+        "{command}: Powder mutation state '{state}': the mutation response was not ambiguous and operation recovery was not attempted"
+    );
+    if state == "pending" {
+        retryable_error(message)
+    } else {
+        message
+    }
+}
+
+fn powder_unknown_reissue_guard(command: &str, intent_created_at: u64) -> Result<(), String> {
+    let within_retention = now_ms()
+        .checked_sub(intent_created_at)
+        .is_some_and(|age| age < POWDER_OPERATION_RETENTION_MS);
+    if within_retention {
+        Ok(())
+    } else {
+        Err(format!(
+            "{command}: Powder mutation state 'expired': the durable operation intent is outside Powder's seven-day recovery window; refusing to reissue"
+        ))
+    }
+}
+
+fn powder_intent_created_at(crew: &CrewRef, operation_id: &str) -> Result<u64, String> {
+    crew.powder_work
+        .as_ref()
+        .and_then(|work| work.mutation_intent.as_ref())
+        .filter(|intent| intent.operation_id == operation_id)
+        .map(|intent| intent.created_at)
+        .ok_or_else(|| {
+            format!(
+                "Powder operation '{operation_id}' has no matching durable mutation intent after persistence"
+            )
+        })
+}
+
+fn refresh_crew_powder_mutation_scope(
+    ctx: &ControlContext,
+    expected: &CrewPowderScope,
+    operation_id: &str,
+    payload_digest: &str,
+) -> Result<CrewPowderScope, String> {
+    let current = resolve_crew_powder_scope(ctx, &expected.crew.terminal_id)?;
+    let intent_matches = current.work.mutation_intent.as_ref().is_some_and(|intent| {
+        intent.operation_id == operation_id && intent.payload_digest == payload_digest
+    });
+    if current.ship_slug != expected.ship_slug
+        || current.captain_role != expected.captain_role
+        || current.captain_terminal_id != expected.captain_terminal_id
+        || current.project_id != expected.project_id
+        || current.project_repo_root != expected.project_repo_root
+        || current.binding != expected.binding
+        || current.crew.terminal_id != expected.crew.terminal_id
+        || current.crew.harness != expected.crew.harness
+        || current.work.card_id != expected.work.card_id
+        || current.work.run_id != expected.work.run_id
+        || current.work.agent != expected.work.agent
+        || !intent_matches
+    {
+        return Err(format!(
+            "Crew session '{}' authoritative Powder scope changed during mutation persistence",
+            expected.crew.terminal_id
+        ));
+    }
+    Ok(current)
+}
+
+fn powder_capability_unavailable(command: &str, error: &powder::PowderError) -> String {
+    let message = error.message.to_ascii_lowercase();
+    let state = match error.kind {
+        powder::PowderErrorKind::InvalidResponse => "unsupported",
+        powder::PowderErrorKind::Unauthorized => "rejected",
+        powder::PowderErrorKind::NotFound | powder::PowderErrorKind::Conflict => "unsupported",
+        powder::PowderErrorKind::Unreachable
+            if message.contains("timed out") || message.contains("timeout") =>
+        {
+            "timeout"
+        }
+        powder::PowderErrorKind::Unreachable | powder::PowderErrorKind::Upstream => "pending",
+    };
+    let message = format!(
+        "{command}: Powder mutation state '{state}': deployed run-bound capability verification failed"
+    );
+    if matches!(state, "pending" | "timeout") {
+        retryable_error(message)
+    } else {
+        message
+    }
 }
 
 fn append_crew_powder_work_log(
@@ -10687,28 +11029,7 @@ fn append_crew_powder_work_log(
         .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
     client
         .require_run_bound_mutation_capabilities()
-        .map_err(|_| "Powder run-bound mutation capability check failed".to_string())?;
-    let payload = json!({
-        "agent": powder_agent,
-        "harness": scope.crew.harness.clone(),
-        "message": message,
-    });
-    let intent = powder_mutation_intent(
-        PowderMutationKind::WorkLogAppend,
-        &scope,
-        &operation_id,
-        &crew_session_id,
-        &payload,
-    );
-    let intent_digest = intent.payload_digest.clone();
-    ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
-    let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
-    require_crew_self(&scope, Some(caller), "append_crew_powder_work_log")?;
-    let powder_agent = scope
-        .work
-        .agent
-        .as_deref()
-        .ok_or("Powder run-bound mutations are unavailable for this legacy Crew binding")?;
+        .map_err(|error| powder_capability_unavailable("Powder work-log append", &error))?;
     let attribution = powder::WorkLogAttribution {
         agent: powder_agent.to_string(),
         model: None,
@@ -10721,24 +11042,81 @@ fn append_crew_powder_work_log(
         attribution,
         body: message.to_string(),
     };
-    let outcome = match client.append_run_work_log(&scope.work.card_id, &append) {
-        Ok(outcome) => outcome,
-        Err(_) => client
-            .recover_work_log_operation(&scope.work.card_id, &append)
-            .map_err(|_| {
-                "Powder work-log outcome is unavailable; retry the exact same message".to_string()
-            })?,
+    let powder_request_digest = client
+        .work_log_request_digest(&scope.work.card_id, &append)
+        .map_err(|error| powder_capability_unavailable("Powder work-log append", &error))?;
+    let payload = json!({
+        "agent": powder_agent,
+        "harness": scope.crew.harness.clone(),
+        "message": message,
+    });
+    let intent = powder_mutation_intent_with_request_digest(
+        PowderMutationKind::WorkLogAppend,
+        &scope,
+        &operation_id,
+        &crew_session_id,
+        &payload,
+        powder_request_digest,
+    );
+    let intent_digest = intent.payload_digest.clone();
+    let (intent_crew, intent_created) = ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
+    let intent_created_at = powder_intent_created_at(&intent_crew, &operation_id)?;
+    let intent_scope =
+        refresh_crew_powder_mutation_scope(ctx, &scope, &operation_id, &intent_digest)?;
+    let recovered = if intent_created {
+        None
+    } else {
+        match client.recover_work_log_operation(&scope.work.card_id, &append) {
+            Ok(outcome) if outcome.state == powder::OperationState::Unknown => {
+                powder_unknown_reissue_guard("Powder work-log append", intent_created_at)?;
+                None
+            }
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                return Err(powder_recovery_unavailable(
+                    "Powder work-log append",
+                    &error,
+                ));
+            }
+        }
+    };
+    let (outcome, recovered_outcome) = match recovered {
+        Some(outcome) => (outcome, true),
+        None => match client.append_run_work_log(&scope.work.card_id, &append) {
+            Ok(outcome) => (outcome, false),
+            Err(error) if powder_mutation_error_is_ambiguous(&error) => client
+                .recover_work_log_operation(&scope.work.card_id, &append)
+                .map_err(|error| powder_recovery_unavailable("Powder work-log append", &error))
+                .map(|outcome| (outcome, true))?,
+            Err(error) => {
+                return Err(powder_direct_mutation_error(
+                    "Powder work-log append",
+                    &error,
+                ));
+            }
+        },
     };
     let entry = match outcome.state {
         powder::OperationState::Succeeded => outcome
             .result
             .ok_or("Powder work-log response did not include the exact run-bound entry")?,
         state => {
-            return Err(powder_operation_rejection(
+            let error = powder_operation_rejection(
                 "Powder work-log append",
                 state,
                 outcome.failure.as_ref(),
-            ));
+            );
+            if matches!(
+                state,
+                powder::OperationState::Rejected | powder::OperationState::Failed
+            ) {
+                ctx.captains
+                    .reject_crew_powder_mutation(&intent_scope, &operation_id, &intent_digest)
+                    .map_err(|convergence_error| {
+                        format!("{error}; durable terminal convergence failed: {convergence_error}")
+                    })?;
+            }
+            return Err(error);
         }
     };
     if entry.card_id != scope.work.card_id
@@ -10748,7 +11126,7 @@ fn append_crew_powder_work_log(
         return Err("Powder work-log response did not match the bound Crew run".into());
     }
     ctx.captains
-        .finish_crew_powder_mutation(&scope, &operation_id, &intent_digest)
+        .finish_crew_powder_mutation(&intent_scope, &operation_id, &intent_digest)
         .map_err(|error| {
             format!(
                 "Powder work-log was accepted, but durable mutation convergence failed: {error}"
@@ -10766,8 +11144,9 @@ fn append_crew_powder_work_log(
         "agent": entry.agent,
         "harness": entry.harness,
         "createdAt": entry.created_at,
-        "messageBytes": entry.body.len(),
+        "messageBytes": message.len(),
         "operationId": operation_id,
+        "mutationState": if recovered_outcome { "recovered" } else { "committed" },
     }))
 }
 
@@ -10878,7 +11257,7 @@ fn review_crew_powder_criterion(
         .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
     client
         .require_run_bound_mutation_capabilities()
-        .map_err(|_| "Powder run-bound mutation capability check failed".to_string())?;
+        .map_err(|error| powder_capability_unavailable("Powder criterion review", &error))?;
     let (card, run) = read_bound_powder_evidence(&client, &scope)?;
     if bound_powder_reality(&scope, &card, &run)? != BoundPowderReality::Active {
         return Err("Powder criterion review requires the exact active Crew run".into());
@@ -10913,40 +11292,80 @@ fn review_crew_powder_criterion(
         "proof": proof,
         "expectedReviewerIdentity": expected_reviewer_identity,
     });
-    let intent = powder_mutation_intent(
+    let powder_request_digest = client
+        .criterion_review_request_digest(&scope.work.card_id, &review)
+        .map_err(|error| powder_capability_unavailable("Powder criterion review", &error))?;
+    let intent = powder_mutation_intent_with_request_digest(
         PowderMutationKind::CriterionReview,
         &scope,
         &operation_id,
         requested_by,
         &intent_payload,
+        powder_request_digest,
     );
     let intent_digest = intent.payload_digest.clone();
-    ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
-    let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
-    require_same_ship_captain(&scope, caller, "review_crew_powder_criterion")?;
-    let outcome = match client.review_run_criterion(&scope.work.card_id, &review) {
-        Ok(outcome) => outcome,
-        Err(_) => client
-            .recover_criterion_review_operation(&scope.work.card_id, &review)
-            .map_err(|_| {
-                "Powder criterion-review outcome is unavailable; retry the exact operation"
-                    .to_string()
-            })?,
+    let (intent_crew, intent_created) = ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
+    let intent_created_at = powder_intent_created_at(&intent_crew, &operation_id)?;
+    let intent_scope =
+        refresh_crew_powder_mutation_scope(ctx, &scope, &operation_id, &intent_digest)?;
+    let recovered = if intent_created {
+        None
+    } else {
+        match client.recover_criterion_review_operation(&scope.work.card_id, &review) {
+            Ok(outcome) if outcome.state == powder::OperationState::Unknown => {
+                powder_unknown_reissue_guard("Powder criterion review", intent_created_at)?;
+                None
+            }
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                return Err(powder_recovery_unavailable(
+                    "Powder criterion review",
+                    &error,
+                ));
+            }
+        }
+    };
+    let (outcome, recovered_outcome) = match recovered {
+        Some(outcome) => (outcome, true),
+        None => match client.review_run_criterion(&scope.work.card_id, &review) {
+            Ok(outcome) => (outcome, false),
+            Err(error) if powder_mutation_error_is_ambiguous(&error) => client
+                .recover_criterion_review_operation(&scope.work.card_id, &review)
+                .map_err(|error| powder_recovery_unavailable("Powder criterion review", &error))
+                .map(|outcome| (outcome, true))?,
+            Err(error) => {
+                return Err(powder_direct_mutation_error(
+                    "Powder criterion review",
+                    &error,
+                ));
+            }
+        },
     };
     let receipt = match outcome.state {
         powder::OperationState::Succeeded => outcome
             .result
             .ok_or("Powder criterion-review response omitted its authoritative receipt")?,
         state => {
-            return Err(powder_operation_rejection(
+            let error = powder_operation_rejection(
                 "Powder criterion review",
                 state,
                 outcome.failure.as_ref(),
-            ));
+            );
+            if matches!(
+                state,
+                powder::OperationState::Rejected | powder::OperationState::Failed
+            ) {
+                ctx.captains
+                    .reject_crew_powder_mutation(&intent_scope, &operation_id, &intent_digest)
+                    .map_err(|convergence_error| {
+                        format!("{error}; durable terminal convergence failed: {convergence_error}")
+                    })?;
+            }
+            return Err(error);
         }
     };
     ctx.captains
-        .finish_crew_powder_mutation(&scope, &operation_id, &intent_digest)
+        .finish_crew_powder_mutation(&intent_scope, &operation_id, &intent_digest)
         .map_err(|error| {
             format!(
                 "Powder criterion review was accepted, but durable mutation convergence failed: {error}"
@@ -10962,6 +11381,7 @@ fn review_crew_powder_criterion(
         "cardId": receipt.card_id,
         "runId": receipt.run_id,
         "operationId": receipt.operation_id,
+        "mutationState": if recovered_outcome { "recovered" } else { "committed" },
         "review": receipt,
     }))
 }
@@ -11085,6 +11505,7 @@ fn completion_success(
     run: &powder::RunEvidence,
     receipt: Option<&powder::CompletionReceipt>,
     outcome: &str,
+    mutation_state: &str,
 ) -> Result<Value, String> {
     ctx.captains
         .finish_crew_powder_completion_for_scope(scope, digest)
@@ -11106,6 +11527,7 @@ fn completion_success(
         "accepted": "complete_crew_powder",
         "audited": true,
         "outcome": outcome,
+        "mutationState": mutation_state,
         "crewSessionId": scope.crew.terminal_id,
         "projectId": scope.project_id,
         "repository": scope.binding.repository,
@@ -11151,25 +11573,6 @@ fn verify_completion_receipt(
     Ok(())
 }
 
-fn completion_outcome_receipt(
-    outcome: powder::OperationOutcome<powder::CompletionReceipt>,
-) -> Result<powder::CompletionReceipt, String> {
-    match outcome.state {
-        powder::OperationState::Succeeded => outcome.result.ok_or_else(|| {
-            "Powder completion response omitted the exact run-bound receipt; completion remains pending"
-                .to_string()
-        }),
-        state => Err(format!(
-            "{}; the same-ship Captain may retry only with the same proof",
-            powder_operation_rejection(
-                "Powder completion",
-                state,
-                outcome.failure.as_ref(),
-            )
-        )),
-    }
-}
-
 fn complete_crew_powder(
     ctx: &ControlContext,
     args: &Value,
@@ -11196,14 +11599,36 @@ fn complete_crew_powder(
     let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
     require_same_ship_captain(&scope, caller, "complete_crew_powder")?;
     let digest = proof.digest();
+    let completion = powder::RunBoundCompletion {
+        expected_run_id: scope.work.run_id.clone(),
+        operation_id: operation_id.clone(),
+        proof: proof.proof.clone(),
+        criterion_proofs: proof
+            .criterion_proofs
+            .iter()
+            .map(|proof| powder::CriterionProof {
+                criterion: proof.criterion,
+                url: proof.url.clone(),
+            })
+            .collect(),
+    };
+    let client = powder::Client::from_profile(&scope.binding.connection_profile)
+        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+    client
+        .require_run_bound_mutation_capabilities()
+        .map_err(|error| powder_capability_unavailable("Powder completion", &error))?;
     let intent_payload =
         serde_json::to_value(&proof).expect("completion proof serialization cannot fail");
-    let intent = powder_mutation_intent(
+    let powder_request_digest = client
+        .completion_request_digest(&scope.work.card_id, &completion)
+        .map_err(|error| powder_capability_unavailable("Powder completion", &error))?;
+    let intent = powder_mutation_intent_with_request_digest(
         PowderMutationKind::Completion,
         &scope,
         &operation_id,
         requested_by,
         &intent_payload,
+        powder_request_digest,
     );
     let intent_digest = intent.payload_digest.clone();
     let was_pending = matches!(scope.work.state, PowderWorkState::CompletionPending { .. });
@@ -11220,11 +11645,6 @@ fn complete_crew_powder(
         _ => {}
     }
 
-    let client = powder::Client::from_profile(&scope.binding.connection_profile)
-        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
-    client
-        .require_run_bound_mutation_capabilities()
-        .map_err(|_| "Powder run-bound mutation capability check failed".to_string())?;
     if was_completed {
         let (card, run) = read_bound_powder_evidence(&client, &scope)?;
         if bound_powder_reality(&scope, &card, &run)? == BoundPowderReality::Active {
@@ -11242,27 +11662,16 @@ fn complete_crew_powder(
             &run,
             None,
             "already_completed",
+            "recovered",
         );
     }
-
-    let completion = powder::RunBoundCompletion {
-        expected_run_id: scope.work.run_id.clone(),
-        operation_id: operation_id.clone(),
-        proof: proof.proof.clone(),
-        criterion_proofs: proof
-            .criterion_proofs
-            .iter()
-            .map(|proof| powder::CriterionProof {
-                criterion: proof.criterion,
-                url: proof.url.clone(),
-            })
-            .collect(),
-    };
-    let scope = if was_pending {
-        ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
-        let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
-        require_same_ship_captain(&scope, caller, "complete_crew_powder")?;
-        scope
+    let (scope, intent_created, intent_created_at) = if was_pending {
+        let (intent_crew, intent_created) =
+            ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
+        let intent_created_at = powder_intent_created_at(&intent_crew, &operation_id)?;
+        let intent_scope =
+            refresh_crew_powder_mutation_scope(ctx, &scope, &operation_id, &intent_digest)?;
+        (intent_scope, intent_created, intent_created_at)
     } else {
         let (card, run) = read_bound_powder_evidence(&client, &scope)?;
         match bound_powder_reality(&scope, &card, &run)? {
@@ -11279,49 +11688,90 @@ fn complete_crew_powder(
                 validate_completion_criteria(&run.criteria, &proof)?;
             }
         }
-        ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
-        let intent_scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
-        require_same_ship_captain(&intent_scope, caller, "complete_crew_powder")?;
+        let (intent_crew, intent_created) =
+            ctx.captains.begin_crew_powder_mutation(&scope, intent)?;
+        let intent_created_at = powder_intent_created_at(&intent_crew, &operation_id)?;
+        let intent_scope =
+            refresh_crew_powder_mutation_scope(ctx, &scope, &operation_id, &intent_digest)?;
         ctx.captains
             .begin_crew_powder_completion_for_scope(&intent_scope, &digest)?;
-        let scope = resolve_crew_powder_scope(ctx, &crew_session_id)?;
-        require_same_ship_captain(&scope, caller, "complete_crew_powder")?;
-        scope
+        let pending_scope =
+            refresh_crew_powder_mutation_scope(ctx, &scope, &operation_id, &intent_digest)?;
+        (pending_scope, intent_created, intent_created_at)
     };
 
-    let recovered = if was_pending {
+    let recovered = if was_pending || !intent_created {
         match client.recover_completion_operation(&scope.work.card_id, &completion) {
             Ok(outcome) if outcome.state != powder::OperationState::Unknown => Some(outcome),
             Ok(_) => {
-                return Err(
-                    "Powder completion operation is not recorded; completion remains pending and blind retry is disabled"
-                        .into(),
-                );
+                powder_unknown_reissue_guard("Powder completion", intent_created_at)?;
+                None
             }
-            Err(_) => {
-                return Err(
-                    "Powder completion recovery is unavailable; completion remains pending and the same-ship Captain may retry only with the same proof"
-                        .into(),
-                );
+            Err(error) => {
+                return Err(format!(
+                    "{}; completion remains pending and the same-ship Captain may retry only with the same proof",
+                    powder_recovery_unavailable("Powder completion", &error)
+                ));
             }
         }
     } else {
         None
     };
 
-    let outcome = match recovered {
-        Some(outcome) => outcome,
+    let (outcome, recovered_outcome) = match recovered {
+        Some(outcome) => (outcome, true),
         None => match client.complete_run_with_proof(&scope.work.card_id, &completion) {
-            Ok(outcome) => outcome,
-            Err(_) => client
+            Ok(outcome) => (outcome, false),
+            Err(error) if powder_mutation_error_is_ambiguous(&error) => client
                 .recover_completion_operation(&scope.work.card_id, &completion)
-                .map_err(|_| {
-                    "Powder completion outcome is unavailable; completion remains pending and the same-ship Captain may retry only with the same proof"
-                        .to_string()
-                })?,
+                .map_err(|error| {
+                    format!(
+                        "{}; completion remains pending and the same-ship Captain may retry only with the same proof",
+                        powder_recovery_unavailable("Powder completion", &error)
+                    )
+                })
+                .map(|outcome| (outcome, true))?,
+            Err(error) => {
+                return Err(format!(
+                    "{}; completion remains pending and the same-ship Captain may retry only with the same proof",
+                    powder_direct_mutation_error("Powder completion", &error)
+                ));
+            }
         },
     };
-    let receipt = completion_outcome_receipt(outcome)?;
+    let receipt = match outcome.state {
+        powder::OperationState::Succeeded => outcome.result.ok_or_else(|| {
+            "Powder completion response omitted the exact run-bound receipt; completion remains pending"
+                .to_string()
+        })?,
+        state => {
+            let terminal_rejection = matches!(
+                state,
+                powder::OperationState::Rejected | powder::OperationState::Failed
+            );
+            let guidance = if terminal_rejection {
+                "the rejected attempt was cleared; the same-ship Captain may submit corrected proof with a new operation identity"
+            } else {
+                "the same-ship Captain may retry only with the same proof"
+            };
+            let error = format!(
+                "{}; {guidance}",
+                powder_operation_rejection(
+                    "Powder completion",
+                    state,
+                    outcome.failure.as_ref(),
+                )
+            );
+            if terminal_rejection {
+                ctx.captains
+                    .reject_crew_powder_mutation(&scope, &operation_id, &intent_digest)
+                    .map_err(|convergence_error| {
+                        format!("{error}; durable terminal convergence failed: {convergence_error}")
+                    })?;
+            }
+            return Err(error);
+        }
+    };
     verify_completion_receipt(&scope, &operation_id, &receipt, &proof)?;
     let (card, run) = read_bound_powder_evidence(&client, &scope).map_err(|error| {
         format!(
@@ -11338,10 +11788,15 @@ fn complete_crew_powder(
         &card,
         &run,
         Some(&receipt),
-        if was_pending {
+        if recovered_outcome {
             "recovered"
         } else {
             "completed"
+        },
+        if recovered_outcome {
+            "recovered"
+        } else {
+            "committed"
         },
     )
 }
@@ -11558,6 +12013,21 @@ fn release_crew_powder_binding_guarded(
         Ok(scope) => scope,
         Err(error) => return Some(json!({ "released": false, "error": error })),
     };
+    if let Some(intent) = scope.work.mutation_intent.as_ref() {
+        let error = if intent.powder_request_digest.is_none() {
+            "A legacy Powder mutation intent lacks its canonical request digest; refusing release and Crew cleanup"
+        } else {
+            "A Powder mutation intent remains unresolved; refusing release and Crew cleanup"
+        };
+        return Some(json!({
+            "released": false,
+            "outcome": "recovery_pending",
+            "projectId": scope.project_id,
+            "cardId": scope.work.card_id,
+            "runId": scope.work.run_id,
+            "error": error,
+        }));
+    }
     if matches!(scope.work.state, PowderWorkState::Completed { .. }) {
         return Some(json!({
             "released": true,
@@ -23419,10 +23889,13 @@ mod tests {
         proof_url: Option<String>,
         completion_posts: Vec<Value>,
         work_log_posts: Vec<Value>,
+        work_log_http_conflict: bool,
+        work_log_response_failure: Option<LoopbackPowderResponseFailure>,
         criterion_review_posts: Vec<Value>,
         mutation_failure_code: Option<String>,
         response_run_id: Option<String>,
         recovery_gets: usize,
+        recovery_outcome: Option<Value>,
         recovery_succeeds: bool,
         recovery_operation_id: Option<String>,
         normalized_work_log_body: Option<String>,
@@ -23450,6 +23923,12 @@ mod tests {
     enum LoopbackPowderBlockedOperation {
         Completion,
         Release,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LoopbackPowderResponseFailure {
+        Eof,
+        Partial,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -24209,15 +24688,48 @@ mod tests {
                 "POST",
                 "/api/v1/cards/thub-powder-control-lifecycle/runs/run-authoritative/work-log",
             ) => {
-                let (failure_code, response_run_id, normalized_body) = {
+                let (
+                    failure_code,
+                    http_conflict,
+                    response_run_id,
+                    normalized_body,
+                    response_failure,
+                ) = {
                     let mut state = state.lock().unwrap();
                     state.work_log_posts.push(body.clone());
                     (
                         state.mutation_failure_code.clone(),
+                        state.work_log_http_conflict,
                         state.response_run_id.clone(),
                         state.normalized_work_log_body.clone(),
+                        state.work_log_response_failure.take(),
                     )
                 };
+                if http_conflict {
+                    return write_loopback_json_status(
+                        &mut stream,
+                        409,
+                        "Conflict",
+                        &json!({"error": "operation identity already has another payload"}),
+                    );
+                }
+                match response_failure {
+                    Some(LoopbackPowderResponseFailure::Eof) => return Ok(()),
+                    Some(LoopbackPowderResponseFailure::Partial) => {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{{\"schema_version\":"
+                        )
+                        .map_err(|error| {
+                            format!("loopback Powder partial response failed: {error}")
+                        })?;
+                        stream.flush().map_err(|error| {
+                            format!("loopback Powder partial response flush failed: {error}")
+                        })?;
+                        return Ok(());
+                    }
+                    None => {}
+                }
                 if let Some(failure_code) = failure_code {
                     loopback_rejected_outcome("work_log_append", &body, &failure_code)
                 } else if body["agent"] != "powder-agent" {
@@ -24249,7 +24761,13 @@ mod tests {
                 }
             }
             ("GET", path) if path.starts_with("/api/v1/operations/") => {
-                let (operation_id, recovery_succeeds, proof, proof_url) = {
+                let (
+                    operation_id,
+                    recovery_outcome,
+                    recovery_succeeds,
+                    proof,
+                    proof_url,
+                ) = {
                     let mut state = state.lock().unwrap();
                     state.recovery_gets += 1;
                     let operation_id = state
@@ -24263,12 +24781,15 @@ mod tests {
                         .ok_or("loopback Powder recovery had no operation identity")?;
                     (
                         operation_id,
+                        state.recovery_outcome.clone(),
                         state.recovery_succeeds,
                         state.proof.clone(),
                         state.proof_url.clone(),
                     )
                 };
-                if recovery_succeeds {
+                if let Some(outcome) = recovery_outcome {
+                    outcome
+                } else if recovery_succeeds {
                     loopback_completion_outcome(&json!({
                         "operation_id": operation_id,
                         "proof": proof.ok_or("loopback Powder recovery had no proof")?,
@@ -24600,6 +25121,24 @@ mod tests {
         })
     }
 
+    fn loopback_pending_outcome(kind: &str, body: &Value) -> Value {
+        json!({
+            "schema_version": "powder.operation_status.v1",
+            "operation_id": body["operation_id"],
+            "state": "pending",
+            "request_digest": loopback_operation_request_digest(kind, body),
+            "kind": kind,
+            "target_card_id": "thub-powder-control-lifecycle",
+            "expected_run_id": "run-authoritative",
+            "result": Value::Null,
+            "failure": Value::Null,
+            "audit_event_id": Value::Null,
+            "created_at": 125,
+            "updated_at": 126,
+            "expires_at": 600,
+        })
+    }
+
     fn loopback_completion_outcome(body: &Value) -> Value {
         let operation_id = body["operation_id"].as_str().unwrap();
         loopback_operation_outcome(
@@ -24638,6 +25177,57 @@ mod tests {
                 "updated_at": 126,
             }),
         )
+    }
+
+    fn loopback_work_log_body(operation_id: &str, message: &str) -> Value {
+        json!({
+            "operation_id": operation_id,
+            "agent": "powder-agent",
+            "model": Value::Null,
+            "reasoning": Value::Null,
+            "harness": "codex",
+            "body": message,
+        })
+    }
+
+    fn seed_work_log_intent(
+        registry: &CaptainsRegistry,
+        ctx: &ControlContext,
+        operation_id: &str,
+        message: &str,
+        created_at: Option<u64>,
+    ) -> PowderMutationIntent {
+        let scope = resolve_crew_powder_scope(ctx, "crew-powder").unwrap();
+        let mut intent = powder_mutation_intent(
+            PowderMutationKind::WorkLogAppend,
+            &scope,
+            operation_id,
+            "crew-powder",
+            &json!({
+                "agent": "powder-agent",
+                "harness": "codex",
+                "message": message,
+            }),
+        );
+        if let Some(created_at) = created_at {
+            intent.created_at = created_at;
+        }
+        registry
+            .begin_crew_powder_mutation(&scope, intent.clone())
+            .unwrap();
+        intent
+    }
+
+    fn downgrade_persisted_mutation_intent_to_v1(path: &Path) {
+        let mut legacy: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        legacy["schemaVersion"] = json!(6);
+        let intent = legacy["captains"][0]["crew"][0]["powderWork"]["mutationIntent"]
+            .as_object_mut()
+            .unwrap();
+        intent.insert("schemaVersion".into(), json!(1));
+        intent.remove("powderRequestDigest");
+        std::fs::write(path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
     }
 
     fn loopback_criterion_review_outcome(body: &Value) -> Value {
@@ -25354,7 +25944,9 @@ mod tests {
         );
         assert_eq!(
             response.error.as_deref(),
-            Some("Powder run-bound mutation capability check failed")
+            Some(
+                "Powder work-log append: Powder mutation state 'unsupported': deployed run-bound capability verification failed"
+            )
         );
         assert!(registry.snapshot().captains[0].crew[0]
             .powder_work
@@ -25436,17 +26028,17 @@ mod tests {
         );
         let ctx = test_ctx("powder-mutation-intent").with_captains_registry(registry.clone());
         let scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
-        let intent = PowderMutationIntent {
-            schema_version: POWDER_MUTATION_INTENT_SCHEMA_VERSION,
-            operation_id: "work-log:durable-replay".into(),
-            payload_digest: "a".repeat(64),
-            repository: "t-hub".into(),
-            card_id: "thub-powder-control-lifecycle".into(),
-            expected_run_id: "run-authoritative".into(),
-            mutation_kind: PowderMutationKind::WorkLogAppend,
-            requested_by: "crew-powder".into(),
-            created_at: 10,
-        };
+        let intent = powder_mutation_intent(
+            PowderMutationKind::WorkLogAppend,
+            &scope,
+            "work-log:durable-replay",
+            "crew-powder",
+            &json!({
+                "agent": "powder-agent",
+                "harness": "codex",
+                "message": "durable replay",
+            }),
+        );
         let (_, changed) = registry
             .begin_crew_powder_mutation(&scope, intent.clone())
             .unwrap();
@@ -25509,21 +26101,589 @@ mod tests {
     }
 
     #[test]
+    fn powder_work_log_restart_recovers_exact_operation_without_reposting() {
+        let path = captains_tmp("powder-work-log-restart-recovery");
+        let _ = std::fs::remove_file(&path);
+        let operation_id = "work-log:restart-recovery";
+        let message = "recover after registry restart";
+        let server = LoopbackPowderServer::start(1);
+        let _profile = PowderProfileEnv::install("loopback-work-log-restart", server.addr);
+        let registry =
+            powder_lifecycle_registry_with_profile(Some(path.clone()), "loopback-work-log-restart");
+        let seed_ctx =
+            test_ctx("loopback-work-log-restart").with_captains_registry(registry.clone());
+        let intent = seed_work_log_intent(&registry, &seed_ctx, operation_id, message, None);
+        drop(seed_ctx);
+        drop(registry);
+
+        let body = loopback_work_log_body(operation_id, message);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(loopback_work_log_outcome(&body));
+        }
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let ctx = test_ctx("loopback-work-log-restart")
+            .with_identity_store(identities)
+            .with_captains_registry(restarted.clone());
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-restart",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["mutationState"], "recovered");
+        assert!(restarted.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+        assert_eq!(intent.operation_id, operation_id);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn powder_work_log_exact_replay_upgrades_legacy_intent_before_recovery() {
+        let path = captains_tmp("powder-work-log-legacy-recovery");
+        let _ = std::fs::remove_file(&path);
+        let operation_id = "work-log:legacy-recovery";
+        let message = "recover exact legacy operation";
+        let server = LoopbackPowderServer::start(1);
+        let _profile = PowderProfileEnv::install("loopback-work-log-legacy", server.addr);
+        let registry =
+            powder_lifecycle_registry_with_profile(Some(path.clone()), "loopback-work-log-legacy");
+        let seed_ctx =
+            test_ctx("loopback-work-log-legacy").with_captains_registry(registry.clone());
+        seed_work_log_intent(&registry, &seed_ctx, operation_id, message, None);
+        drop(seed_ctx);
+        drop(registry);
+        downgrade_persisted_mutation_intent_to_v1(&path);
+
+        let body = loopback_work_log_body(operation_id, message);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(loopback_work_log_outcome(&body));
+        }
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let ctx = test_ctx("loopback-work-log-legacy")
+            .with_identity_store(identities)
+            .with_captains_registry(restarted.clone());
+        let restored = restarted.snapshot();
+        let legacy_intent = restored.captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .unwrap();
+        assert_eq!(legacy_intent.schema_version, 1);
+        assert!(legacy_intent.powder_request_digest.is_none());
+
+        let changed = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-legacy",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": operation_id,
+                    "message": "changed legacy payload",
+                }),
+            ),
+        );
+        assert!(changed
+            .error
+            .unwrap()
+            .contains("conflicts with its durable payload or identity"));
+        let retained = restarted.snapshot();
+        let retained_intent = retained.captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .unwrap();
+        assert_eq!(retained_intent.schema_version, 1);
+        assert!(retained_intent.powder_request_digest.is_none());
+
+        let recovered = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-legacy",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(recovered.ok, "{:?}", recovered.error);
+        assert_eq!(recovered.result.unwrap()["mutationState"], "recovered");
+        assert!(restarted.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn powder_work_log_response_loss_recovers_by_status_without_reposting() {
+        for (suffix, failure) in [
+            ("eof", LoopbackPowderResponseFailure::Eof),
+            ("partial", LoopbackPowderResponseFailure::Partial),
+        ] {
+            let profile = format!("loopback-work-log-response-loss-{suffix}");
+            let operation_id = format!("work-log:response-loss-{suffix}");
+            let message = format!("recover {suffix} response loss");
+            let body = loopback_work_log_body(&operation_id, &message);
+            let server = LoopbackPowderServer::start(2);
+            server.state.lock().unwrap().work_log_response_failure = Some(failure);
+            server.state.lock().unwrap().recovery_outcome = Some(loopback_work_log_outcome(&body));
+            let _profile = PowderProfileEnv::install(&profile, server.addr);
+            let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+            let registry = powder_lifecycle_registry_with_profile(None, &profile);
+            let crew = mint_session(
+                &identities,
+                crate::identity::Role::Crew,
+                "powder-ship",
+                "crew-powder",
+            );
+            let ctx = test_ctx(&profile)
+                .with_identity_store(identities)
+                .with_captains_registry(registry.clone());
+            let response = dispatch_authenticated(
+                &ctx,
+                req_session(
+                    &profile,
+                    &crew,
+                    "append_crew_powder_work_log",
+                    json!({"operationId": operation_id, "message": message}),
+                ),
+            );
+            assert!(response.ok, "{suffix}: {:?}", response.error);
+            assert_eq!(response.result.unwrap()["mutationState"], "recovered");
+            assert!(registry.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .mutation_intent
+                .is_none());
+            let state = server.finish().unwrap();
+            assert_eq!(state.work_log_posts, vec![body]);
+            assert_eq!(state.recovery_gets, 1);
+        }
+    }
+
+    #[test]
+    fn powder_work_log_recovery_rejects_a_different_authoritative_payload() {
+        let operation_id = "work-log:wrong-recovery";
+        let message = "requested payload";
+        let server = LoopbackPowderServer::start(2);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.work_log_response_failure = Some(LoopbackPowderResponseFailure::Eof);
+            state.recovery_outcome = Some(loopback_work_log_outcome(&loopback_work_log_body(
+                operation_id,
+                "different committed payload",
+            )));
+        }
+        let _profile = PowderProfileEnv::install("loopback-work-log-wrong-recovery", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-work-log-wrong-recovery");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-wrong-recovery")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-wrong-recovery",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(!response.retryable);
+        assert!(response.error.unwrap().contains("state 'malformed'"));
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_some());
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 1);
+        assert_eq!(state.recovery_gets, 1);
+    }
+
+    #[test]
+    fn powder_work_log_recovery_accepts_normalized_result_with_original_digest() {
+        let operation_id = "work-log:normalized-recovery";
+        let message = "raw secret-shaped work-log evidence";
+        let body = loopback_work_log_body(operation_id, message);
+        let mut outcome = loopback_work_log_outcome(&body);
+        outcome["result"]["body"] = json!("[scrubbed work-log evidence]");
+        let server = LoopbackPowderServer::start(1);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(outcome);
+        }
+        let _profile =
+            PowderProfileEnv::install("loopback-work-log-normalized-recovery", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-work-log-normalized-recovery");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-normalized-recovery")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        seed_work_log_intent(&registry, &ctx, operation_id, message, None);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-normalized-recovery",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["mutationState"], "recovered");
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_recovered_terminal_rejection_clears_exact_mutation_intent() {
+        let operation_id = "work-log:recovered-rejection";
+        let message = "terminal rejection evidence";
+        let body = loopback_work_log_body(operation_id, message);
+        let server = LoopbackPowderServer::start(1);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(loopback_rejected_outcome(
+                "work_log_append",
+                &body,
+                "conflict",
+            ));
+        }
+        let _profile =
+            PowderProfileEnv::install("loopback-work-log-recovered-rejection", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-work-log-recovered-rejection");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-recovered-rejection")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        seed_work_log_intent(&registry, &ctx, operation_id, message, None);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-recovered-rejection",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        let error = response.error.unwrap();
+        assert!(error.contains("stale, released, or reclaimed"), "{error}");
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_work_log_http_conflict_never_adopts_another_payload() {
+        let operation_id = "work-log:http-conflict";
+        let message = "different requested payload";
+        let server = LoopbackPowderServer::start(1);
+        server.state.lock().unwrap().work_log_http_conflict = true;
+        let _profile = PowderProfileEnv::install("loopback-work-log-http-conflict", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry =
+            powder_lifecycle_registry_with_profile(None, "loopback-work-log-http-conflict");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-http-conflict")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-http-conflict",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(!response.retryable);
+        assert!(response.error.unwrap().contains("state 'conflict'"));
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_some());
+        let state = server.finish().unwrap();
+        assert_eq!(state.work_log_posts.len(), 1);
+        assert_eq!(state.recovery_gets, 0);
+    }
+
+    #[test]
+    fn powder_work_log_pending_status_retains_intent_without_reposting() {
+        let operation_id = "work-log:pending-status";
+        let message = "operation remains pending";
+        let body = loopback_work_log_body(operation_id, message);
+        let server = LoopbackPowderServer::start(1);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.recovery_operation_id = Some(operation_id.into());
+            state.recovery_outcome = Some(loopback_pending_outcome("work_log_append", &body));
+        }
+        let _profile = PowderProfileEnv::install("loopback-work-log-pending", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-work-log-pending");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-pending")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let intent = seed_work_log_intent(&registry, &ctx, operation_id, message, None);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-pending",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(response.retryable);
+        let error = response.error.unwrap();
+        assert!(error.contains("Powder mutation state 'pending'"), "{error}");
+        assert_eq!(
+            registry.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .mutation_intent
+                .as_ref(),
+            Some(&intent)
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_work_log_unknown_status_reissues_identical_request_once() {
+        let operation_id = "work-log:unknown-reissue";
+        let message = "reissue exact retained operation";
+        let body = loopback_work_log_body(operation_id, message);
+        let server = LoopbackPowderServer::start(2);
+        server.state.lock().unwrap().recovery_operation_id = Some(operation_id.into());
+        let _profile = PowderProfileEnv::install("loopback-work-log-unknown", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-work-log-unknown");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-unknown")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        seed_work_log_intent(&registry, &ctx, operation_id, message, None);
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-unknown",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["mutationState"], "committed");
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert_eq!(state.work_log_posts, vec![body]);
+    }
+
+    #[test]
+    fn powder_work_log_expired_intent_refuses_unknown_reissue() {
+        let operation_id = "work-log:expired-intent";
+        let message = "must not reissue outside retention";
+        let server = LoopbackPowderServer::start(1);
+        server.state.lock().unwrap().recovery_operation_id = Some(operation_id.into());
+        let _profile = PowderProfileEnv::install("loopback-work-log-expired", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-work-log-expired");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-work-log-expired")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let intent = seed_work_log_intent(
+            &registry,
+            &ctx,
+            operation_id,
+            message,
+            Some(now_ms().saturating_sub(POWDER_OPERATION_RETENTION_MS)),
+        );
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-work-log-expired",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({"operationId": operation_id, "message": message}),
+            ),
+        );
+        let error = response.error.unwrap();
+        assert!(!response.retryable);
+        assert!(error.contains("Powder mutation state 'expired'"), "{error}");
+        assert!(error.contains("refusing to reissue"), "{error}");
+        assert_eq!(
+            registry.snapshot().captains[0].crew[0]
+                .powder_work
+                .as_ref()
+                .unwrap()
+                .mutation_intent
+                .as_ref(),
+            Some(&intent)
+        );
+        let state = server.finish().unwrap();
+        assert_eq!(state.recovery_gets, 1);
+        assert!(state.work_log_posts.is_empty());
+    }
+
+    #[test]
+    fn powder_transport_recovery_states_are_structured_and_retryable() {
+        for (message, expected_state) in [
+            ("Powder transport timed out", "timeout"),
+            ("Powder connection reset by peer", "pending"),
+            ("Powder response ended at EOF", "pending"),
+        ] {
+            let response = ControlResponse::err(powder_recovery_unavailable(
+                "Powder work-log append",
+                &powder::PowderError {
+                    kind: powder::PowderErrorKind::Unreachable,
+                    message: message.into(),
+                },
+            ));
+            assert!(response.retryable, "{message}");
+            assert!(
+                response
+                    .error
+                    .unwrap()
+                    .contains(&format!("Powder mutation state '{expected_state}'")),
+                "{message}"
+            );
+        }
+        let malformed = ControlResponse::err(powder_recovery_unavailable(
+            "Powder work-log append",
+            &powder::PowderError {
+                kind: powder::PowderErrorKind::InvalidResponse,
+                message: "truncated JSON response".into(),
+            },
+        ));
+        assert!(!malformed.retryable);
+        assert!(malformed
+            .error
+            .unwrap()
+            .contains("Powder mutation state 'malformed'"));
+    }
+
+    #[test]
     fn powder_mutation_intent_finish_rejects_scoped_authority_aba() {
         let registry = powder_lifecycle_registry(None);
         let ctx = test_ctx("powder-mutation-authority").with_captains_registry(registry.clone());
         let initial_scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
-        let intent = PowderMutationIntent {
-            schema_version: POWDER_MUTATION_INTENT_SCHEMA_VERSION,
-            operation_id: "work-log:authority-aba".into(),
-            payload_digest: "c".repeat(64),
-            repository: "t-hub".into(),
-            card_id: "thub-powder-control-lifecycle".into(),
-            expected_run_id: "run-authoritative".into(),
-            mutation_kind: PowderMutationKind::WorkLogAppend,
-            requested_by: "crew-powder".into(),
-            created_at: 10,
-        };
+        let intent = powder_mutation_intent(
+            PowderMutationKind::WorkLogAppend,
+            &initial_scope,
+            "work-log:authority-aba",
+            "crew-powder",
+            &json!({
+                "agent": "powder-agent",
+                "harness": "codex",
+                "message": "authority ABA",
+            }),
+        );
         registry
             .begin_crew_powder_mutation(&initial_scope, intent.clone())
             .unwrap();
@@ -25579,7 +26739,7 @@ mod tests {
         assert!(response.ok, "{:?}", response.error);
         assert_eq!(
             response.result.unwrap()["messageBytes"],
-            "progress [REDACTED]".len()
+            "progress POWDER_API_KEY=secret".len()
         );
         let state = server.finish().unwrap();
         assert_eq!(state.work_log_posts.len(), 1);
@@ -25720,7 +26880,7 @@ mod tests {
         assert_eq!(state.recovery_gets, 1);
         drop(_profile);
 
-        let server = LoopbackPowderServer::start(3);
+        let server = LoopbackPowderServer::start(8);
         server.state.lock().unwrap().mutation_failure_code = Some("conflict".into());
         let _profile = PowderProfileEnv::install("loopback-completion-reclaimed", server.addr);
         let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
@@ -25745,8 +26905,6 @@ mod tests {
                 "url": "https://example.test/rejected"
             }]
         });
-        let proof = parse_completion_proof(&args).unwrap();
-        let digest = proof.digest();
         let expected_operation_id = "completion:reclaimed";
         let response = dispatch_authenticated(
             &ctx,
@@ -25760,20 +26918,43 @@ mod tests {
         let error = response.error.unwrap();
         assert!(error.contains("stale, released, or reclaimed"), "{error}");
         assert!(!error.contains("sensitive upstream details"));
-        assert!(matches!(
-            &resolve_crew_powder_scope(&ctx, "crew-powder")
-                .unwrap()
-                .work
-                .state,
-            PowderWorkState::CompletionPending { request_digest, .. }
-                if request_digest == &digest
-        ));
+        assert!(error.contains("corrected proof with a new operation identity"));
+        assert!(!error.contains("retry only with the same proof"));
+        let scope = resolve_crew_powder_scope(&ctx, "crew-powder").unwrap();
+        assert!(matches!(scope.work.state, PowderWorkState::Active));
+        assert!(scope.work.mutation_intent.is_none());
+        server.state.lock().unwrap().mutation_failure_code = None;
+        let corrected = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-completion-reclaimed",
+                &captain,
+                "complete_crew_powder",
+                json!({
+                    "crewSessionId": "crew-powder",
+                    "operationId": "completion:corrected",
+                    "proof": "corrected commit proof",
+                    "criterionProofs": [{
+                        "criterion": 0,
+                        "criterionId": loopback_criterion_id(),
+                        "url": "https://example.test/corrected"
+                    }]
+                }),
+            ),
+        );
+        assert!(corrected.ok, "{:?}", corrected.error);
+        assert_eq!(corrected.result.unwrap()["mutationState"], "committed");
         let state = server.finish().unwrap();
-        assert_eq!(state.completion_posts.len(), 1);
+        assert_eq!(state.completion_posts.len(), 2);
         assert_eq!(
             state.completion_posts[0]["operation_id"],
             expected_operation_id
         );
+        assert_eq!(
+            state.completion_posts[1]["operation_id"],
+            "completion:corrected"
+        );
+        assert_eq!(state.completion_posts[1]["proof"], "corrected commit proof");
     }
 
     #[test]
@@ -26239,6 +27420,140 @@ mod tests {
         let state = server.finish().unwrap();
         assert_eq!(state.release_posts, 1);
         assert_eq!(state.renew_posts, 0);
+    }
+
+    #[test]
+    fn powder_cleanup_preserves_every_unresolved_mutation_intent() {
+        let server = LoopbackPowderServer::start(0);
+        let profile = format!("cleanup-intent-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile, server.addr);
+
+        for (kind, operation_id) in [
+            (
+                PowderMutationKind::WorkLogAppend,
+                "work-log:cleanup-pending",
+            ),
+            (
+                PowderMutationKind::CriterionReview,
+                "criterion:cleanup-pending",
+            ),
+            (PowderMutationKind::Completion, "completion:cleanup-pending"),
+        ] {
+            let crew_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let registry =
+                powder_lifecycle_registry_with_profile_and_crew(None, &profile, &crew_id);
+            let ctx = test_ctx("cleanup-intent").with_captains_registry(registry.clone());
+            let scope = resolve_crew_powder_scope(&ctx, &crew_id).unwrap();
+            let (requested_by, payload) = match kind {
+                PowderMutationKind::WorkLogAppend => (
+                    crew_id.as_str(),
+                    json!({
+                        "agent": "powder-agent",
+                        "harness": "codex",
+                        "message": "unresolved work log",
+                    }),
+                ),
+                PowderMutationKind::CriterionReview => (
+                    "captain-powder",
+                    json!({
+                        "criterion": 0,
+                        "criterionId": loopback_criterion_id(),
+                        "criterionText": "Criterion 0",
+                        "decision": "approved",
+                        "proof": "unresolved review",
+                        "expectedReviewerIdentity": "actor-captain-powder",
+                    }),
+                ),
+                PowderMutationKind::Completion => (
+                    "captain-powder",
+                    json!({
+                        "proof": "unresolved completion",
+                        "criterionProofs": [{
+                            "criterion": 0,
+                            "url": "https://example.test/unresolved",
+                        }],
+                    }),
+                ),
+            };
+            let intent = powder_mutation_intent(kind, &scope, operation_id, requested_by, &payload);
+            registry
+                .begin_crew_powder_mutation(&scope, intent.clone())
+                .unwrap();
+
+            let (release, retained, changed) =
+                finalize_crew_powder_cleanup(&ctx, &crew_id, false).unwrap();
+
+            assert_eq!(release.as_ref().unwrap()["released"], false);
+            assert_eq!(release.as_ref().unwrap()["outcome"], "recovery_pending");
+            assert!(release.as_ref().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("mutation intent"));
+            assert!(retained);
+            assert!(changed);
+            let crew = registry.snapshot().captains[0].crew[0].clone();
+            assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
+            assert_eq!(
+                crew.powder_work.as_ref().unwrap().mutation_intent.as_ref(),
+                Some(&intent)
+            );
+        }
+
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+    }
+
+    #[test]
+    fn powder_cleanup_preserves_legacy_intent_without_remote_access() {
+        let path = captains_tmp("powder-cleanup-legacy-intent");
+        let _ = std::fs::remove_file(&path);
+        let server = LoopbackPowderServer::start(0);
+        let profile = format!("cleanup-legacy-intent-{}", uuid::Uuid::new_v4().simple());
+        let _profile = PowderProfileEnv::install(&profile, server.addr);
+        let registry = powder_lifecycle_registry_with_profile(Some(path.clone()), &profile);
+        let seed_ctx = test_ctx("cleanup-legacy-intent").with_captains_registry(registry.clone());
+        seed_work_log_intent(
+            &registry,
+            &seed_ctx,
+            "work-log:legacy-cleanup",
+            "legacy cleanup evidence",
+            None,
+        );
+        drop(seed_ctx);
+        drop(registry);
+        downgrade_persisted_mutation_intent_to_v1(&path);
+
+        let restarted = Arc::new(CaptainsRegistry::load(path.clone()));
+        let ctx = test_ctx("cleanup-legacy-intent").with_captains_registry(restarted.clone());
+        let (release, retained, changed) =
+            finalize_crew_powder_cleanup(&ctx, "crew-powder", false).unwrap();
+
+        assert_eq!(release.as_ref().unwrap()["released"], false);
+        assert_eq!(release.as_ref().unwrap()["outcome"], "recovery_pending");
+        assert!(release.as_ref().unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("legacy Powder mutation intent"));
+        assert!(retained);
+        assert!(changed);
+        let snapshot = restarted.snapshot();
+        let crew = &snapshot.captains[0].crew[0];
+        assert!(matches!(crew.state, CrewState::CleanupPending { .. }));
+        let retained_intent = crew
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .as_ref()
+            .unwrap();
+        assert_eq!(retained_intent.schema_version, 1);
+        assert!(retained_intent.powder_request_digest.is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.capability_requests, 0);
+        assert_eq!(state.recovery_gets, 0);
+        assert_eq!(state.release_posts, 0);
+        let _ = std::fs::remove_file(path.with_extension("json.bak"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
