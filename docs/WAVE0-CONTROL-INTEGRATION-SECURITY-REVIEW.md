@@ -1,0 +1,149 @@
+# Wave 0 Control Integration Security Review Packet
+
+Date: 2026-07-17
+
+Powder card: `thub-wave0-control-integration`
+
+Powder run: `run-odTeCbFC1-Gz`
+
+Integration branch: `integrate/wave0-control`
+
+This packet is evidence for an independent security review.
+It is not an approval and does not complete the Powder card.
+
+## Reviewed Inputs and Provenance
+
+The canonical coordinator base is `a3b136a4005afea05b2d72f21f5742d4ad0f08fe` from `fix/captain-control-runtime`.
+The frozen run-bound Powder mutation input is `4cc6e4438e602b0054812bbc3e99e0fab5e33ff5` from `fix/powder-run-bound-mutations`.
+The frozen Crew launch-attestation input is `82e8d48cfd0abf3802cf15dd362987186a0c5af7` from `fix/codex-permission-launch-attestation`.
+
+The run-bound mutation lane was integrated by merge commit `6b172dc98f168b08c17712e50e4c7db7c6aeea44`.
+Its parents are the exact coordinator base and the exact frozen mutation head.
+
+The launch-attestation lane was integrated by merge commit `59d4000f8644b2499d74c03b24e49bc9fdfbd624`.
+Its parents are the run-bound integration commit and the exact frozen launch-attestation head.
+
+Both frozen reviewed heads are ancestors of the integration head.
+Neither reviewed head was rebased or modified.
+
+## Pre-Edit Conflict Analysis
+
+Read-only merge-base, merge-tree, file-diff, and commit-equivalence analysis was completed before editing.
+
+The merge base between the coordinator and the run-bound mutation lane is `826c5fecb6294195e1f1ce3553bcc7225ae6fa64`.
+The merge base between the coordinator and the launch-attestation lane is `17c00ee1236ab021b6691445cb04515a1e38cf9c`.
+The merge base between the two reviewed lanes is also `17c00ee1236ab021b6691445cb04515a1e38cf9c`.
+
+The coordinator and run-bound lane produced a clean read-only merge tree `4c9292974042f5ed512197bbd3ba7617a7662fc6`.
+The coordinator and launch-attestation lane produced textual conflicts in `apps/desktop/src-tauri/crates/t-hub-agent/src/main.rs`, `apps/desktop/src-tauri/src/control.rs`, and `apps/desktop/src-tauri/src/harness/mod.rs`.
+The two reviewed lanes produced the same three textual conflict files, while `apps/desktop/src-tauri/src/powder.rs` auto-merged.
+The final launch-attestation merge exposed 57 textual conflict groups: 5 in the agent entry point, 34 in control, and 18 in the Harness adapter.
+
+The direct semantic file overlap between the two reviewed lanes was `apps/desktop/src-tauri/src/control.rs` and `apps/desktop/src-tauri/src/powder.rs`.
+Coordinator changes also overlapped launch attestation in the agent lifecycle producer, Harness adapters, control persistence, and real-process fixtures.
+Commit-equivalence analysis showed that the first ten launch-attestation commits already had patch-equivalent coordinator commits, while the final ten commits carried the new bypass policy, exact marker provenance, release receipt identity, process provenance, rollback isolation, and frontend permission-axis work.
+
+## Deliberate Reconciliation
+
+The integration preserves the run-bound mutation lane's exact card, run, repository, agent, operation, digest, criterion, reviewer, proof, and recovery validation.
+The integration preserves durable terminal conflict tombstones and refuses card-only automated completion.
+The integration preserves bounded evidence, bounded mutation payloads, replay-safe operation recovery, ambiguous response recovery, and fail-closed capability gates.
+
+Crew dispatch uses the fleet's explicit unrestricted local Harness posture and keeps the T-Hub control capability at `read`.
+The provider command uses the native Codex or Claude bypass flag without a wrapper obscuring the final foreground provider process.
+Dispatch observes a baseline shell, verifies the provider process transition, performs a final pre-persistence re-observation, persists the permission axes, and performs a final post-persistence re-observation.
+Every final observation binds the pane generation, process lifetime, executable device and inode, ancestry, and provider-native permission posture.
+Any attestation or persistence failure invokes transactional terminal, durable Crew, and exact Powder claim rollback.
+
+The interactive Codex degraded marker now combines the coordinator lifecycle schema with the reviewed lane's exact tmux session, window, pane, pane PID, and generation provenance.
+The marker remains a `CoreAction` telemetry-health event so existing supervision reducers and frontend state do not infer a false working session.
+The marker has bounded credential-safe output and must succeed before the shell executes Codex.
+
+Powder release now rejects receipts whose card, run, or agent differs from the exact expected claim.
+Control cleanup builds that expected claim from freshly verified authoritative ownership.
+Local Crew bindings remain retained when a release receipt is substituted or release cannot be confirmed.
+
+The frontend snapshot adapter retains `harnessPermission` and `tHubCapability` as separate compatibility axes.
+Unknown values remain omitted instead of being accepted as authoritative state.
+
+The production `apps/desktop/src-tauri/src/tmux.rs` is unchanged from the coordinator base.
+Only hermetic control test fixtures were reconciled to serialize real tmux process tests, keep an anchor process alive, reap isolated sessions, and keep issued claim, evidence, and release receipt identities coherent.
+
+## Focused Verification
+
+`cargo test -p t-hub-agent` passed 56 unit tests, 3 Codex tap E2E tests, and 1 exact unobserved-marker E2E test before duplicate compatibility code was removed.
+The final workspace run passed the resulting 55 agent unit tests, 3 Codex tap E2E tests, and 1 exact unobserved-marker E2E test.
+
+`cargo test -p t-hub --lib harness::tests -- --test-threads=1` passed 15 Harness adapter, generation, process, ancestry, parser, and final-observation tests.
+`cargo test -p t-hub --lib powder::tests -- --test-threads=1` passed 25 Powder client, capability, operation, evidence, receipt, and bounded-output tests.
+The focused control Powder suite initially passed 53 of 54 tests and exposed one fixture identity inconsistency after exact release-agent validation was integrated.
+The loopback fixture had issued a `t-hub` claim but later described the same run as owned by `powder-agent`.
+The fixture now carries the issued claim agent through evidence and the default release receipt, and the isolated failing test passed.
+The final workspace run confirmed the entire control Powder suite passes.
+
+The focused dispatch suite initially passed 7 tests, ignored the separately scripted real-agent gate, and exposed the same fixture identity inconsistency in two rollback tests.
+Both rollback tests passed after the fixture coherence fix.
+Four real process-level permission-attestation tests passed.
+The exact release-receipt substitution test, rollback retention test, and launch-attestation rollback test passed.
+Five scoped authority tests and the foreign/confused-deputy Powder authorization test passed.
+Both permission-axis persistence tests passed.
+
+`scripts/captain/verify-codex-permission-integration.sh` built the combined-tree agent and passed the ignored real-agent launch gate.
+The gate verified that the exact owning Codex Crew marker is written before provider execution and that the real tmux session remains correctly attributed.
+
+The standalone CLI Powder contract suite passed 10 tests.
+The MCP Powder schema tests passed in both library and binary targets.
+The real authenticated MCP Powder dispatch E2E initially stopped before execution because its expected standalone debug MCP binary had not been built.
+After `cargo build -p t-hub-mcp`, the exact E2E passed.
+
+## Broad Gates
+
+`cargo fmt --all -- --check` passed for the desktop Rust workspace.
+`cargo clippy --workspace --all-targets -- -D warnings` passed for the desktop Rust workspace.
+`cargo test --workspace` passed once without rerunning the broad gate.
+The core library reported 817 passed and 2 documented ignored tests.
+The MCP E2E target reported 2 passed and 1 helper ignored.
+All agent, MCP, protocol, and documentation tests executed by the workspace gate passed.
+
+`cargo fmt --all -- --check` passed for the standalone CLI crate.
+`cargo clippy --all-targets -- -D warnings` passed for the standalone CLI crate.
+`cargo test` passed 47 CLI unit tests and 10 Powder CLI contract tests.
+
+`git diff --check` passed.
+The tracked worktree was clean after the integration commits and gates.
+The pre-existing protected untracked `CLAUDE.md` remains untouched.
+
+Frontend dependencies were not present in this checkout, so frontend typecheck and Vitest were not run and no dependency installation was attempted.
+The frontend changes are limited to retaining and validating the two permission axes in the existing snapshot adapter and store type, with corresponding adapter expectations included in the diff.
+
+## Failures and Residual Risks
+
+Before the launch-attestation lane was integrated, the run-bound lane's focused control suite had one hermetic tmux teardown failure with `server exited unexpectedly`.
+The reviewed launch-attestation lane's serialized and anchored tmux fixtures resolved that failure without modifying production tmux code.
+
+The two integration-time failures described above were isolated once each and traced to hermetic fixture identity, not production release or attestation behavior.
+The full workspace gate subsequently passed the affected tests.
+
+The frontend typecheck and Vitest residual remains because dependencies were unavailable.
+Independent review should inspect the small TypeScript adapter and store diff directly.
+
+The installed T-Hub runtime was not modified, installed, or restarted.
+The currently installed Crew run-bound mutation surface rejected work-log capability verification during this task, so the Captain must maintain the exact-run Powder work log through a sanctioned working surface.
+
+No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
+No independent reviewer has approved this integration yet.
+
+## Independent Reviewer Checklist
+
+1. Verify both frozen source heads and the canonical coordinator base are exact merge parents in the recorded order.
+2. Verify no run-bound mutation path accepts a card-only identity, substituted repository, changed operation digest, changed result body, or unauthenticated reviewer.
+3. Verify terminal conflict tombstones are definitive, durable, replay-safe, and do not block later distinct operations after durable recording.
+4. Verify ambiguous transport outcomes recover by the same operation identity and digest without duplicate mutation.
+5. Verify completion remains gated on exact current-run criteria, reviewer identity, proof identity, repository authority, and fresh authoritative evidence.
+6. Verify dispatch attests provider-native unrestricted argv, pane generation, process identity, executable identity, ancestry, and exact permission posture at every acceptance boundary.
+7. Verify any failure after claim, terminal creation, durable Crew binding, or attestation persistence rolls back transactionally or retains an honest cleanup-pending binding.
+8. Verify release success requires exact card, run, and agent receipt identity and that substituted receipts retain local ownership evidence.
+9. Verify the Codex degraded marker is exact-pane bound, bounded, credential-safe, and cannot create a false working state.
+10. Verify Harness local permission and T-Hub control capability remain separate in persistence, MCP and CLI output, and frontend snapshot compatibility.
+11. Verify production tmux behavior is unchanged and fixture-only serialization cannot leak into runtime behavior.
+12. Decide whether frontend dependency installation and a separate TypeScript gate are required before exact-run approval.
