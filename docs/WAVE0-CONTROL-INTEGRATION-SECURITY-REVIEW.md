@@ -226,6 +226,11 @@ The MCP E2E target reported 2 passed and 1 helper ignored.
 All agent, MCP, protocol, and documentation tests executed by the workspace gate passed.
 
 The one-time broad workspace gate preceded the independent-review remediation commit.
+The successful workspace-wide gate above is pre-remediation provenance only.
+One post-remediation `cargo test --workspace` invocation did not complete and must not be treated as a passing current-head broad gate.
+Its Cargo parent PID `1665116` and desktop `t_hub_lib` child PID `1665814` remained alive for more than 31 minutes, blocked in `do_wait` or `futex`, with no recoverable final test output.
+Captain terminated only those two Wave 0-owned hung processes.
+No post-remediation workspace-wide result is claimed.
 Post-remediation `cargo fmt --all -- --check` and targeted `cargo clippy -p t-hub -p t-hub-agent --all-targets -- -D warnings` passed.
 The post-remediation deterministic race, cleanup, rollback, marker-consumer, and complete agent suites passed as recorded above.
 
