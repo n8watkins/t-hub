@@ -358,6 +358,17 @@ An authenticated `th send` report to Captain session `0c7b7560` was attempted fo
 The installed control plane rejected it with gated code 5 because `send_text` requires control capability and this Crew token is read-only.
 No Captain message is claimed as delivered.
 
+Commit `d1a5c0f` closes the producer-consumer release-recovery race found after `a78005c`.
+The originating post-bind rollback now acquires the same per-Crew Cleanup guard as periodic and ordinary recovery before persisting `Prepared` and retains it through terminal teardown, `Prepared` to `InFlight`, exact release, and exact clear or retained ambiguity.
+`rollback_trusted_dispatch_guarded` is the guarded-inner helper, so the producer does not recursively acquire its own guard.
+Four deterministic tests pause the producer at `release_prepared_before_teardown` and `release_inflight_before_post` while, respectively, periodic reconciliation or ordinary cleanup queues on that Crew guard.
+Each proves one exact original-scope release POST, no consumer evidence read or release POST after it waits, no replacement-scope I/O, terminal removal, empty pending claim and release collections, and preservation of the replacement Project binding.
+At `d1a5c0f`, the serialized dispatch filter passed 31 tests with one existing real-agent test intentionally ignored.
+The serialized control Powder filter passed 63 tests, the Powder client filter passed 30 tests, the Harness filter passed 15 tests, the close filter passed 7 tests, and the foreign close or heartbeat authority regression passed.
+The agent suite passed 55 unit tests, 3 Codex TAP E2E tests, and 1 unobserved E2E test.
+`cargo fmt --all -- --check`, `cargo clippy -p t-hub -p t-hub-agent --all-targets -- -D warnings`, `git diff --check`, and `git diff --cached --check` passed.
+No post-remediation workspace-wide test result is claimed.
+
 No push, protected-branch merge, install, restart, deploy, publish, release, or Powder completion was performed.
 No independent reviewer has approved this integration yet.
 
