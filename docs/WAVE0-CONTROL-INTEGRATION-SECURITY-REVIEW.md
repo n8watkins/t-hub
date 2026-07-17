@@ -23,6 +23,9 @@ Its parents are the exact coordinator base and the exact frozen mutation head.
 The launch-attestation lane was integrated by merge commit `59d4000f8644b2499d74c03b24e49bc9fdfbd624`.
 Its parents are the run-bound integration commit and the exact frozen launch-attestation head.
 
+Independent review findings were remediated by commit `08beabc7f09fa9c9e0d3fde3159f540fadba8bc9`.
+That commit restores the exact reviewed marker contract and closes the queued-heartbeat and terminal-close races described below.
+
 Both frozen reviewed heads are ancestors of the integration head.
 Neither reviewed head was rebased or modified.
 
@@ -55,8 +58,8 @@ Dispatch observes a baseline shell, verifies the provider process transition, pe
 Every final observation binds the pane generation, process lifetime, executable device and inode, ancestry, and provider-native permission posture.
 Any attestation or persistence failure invokes transactional terminal, durable Crew, and exact Powder claim rollback.
 
-The interactive Codex degraded marker now combines the coordinator lifecycle schema with the reviewed lane's exact tmux session, window, pane, pane PID, and generation provenance.
-The marker remains a `CoreAction` telemetry-health event so existing supervision reducers and frontend state do not infer a false working session.
+The interactive Codex degraded marker combines the coordinator lifecycle telemetry with the reviewed lane's exact tmux session, window, pane, pane PID, process, registry generation, schema, entity, and `AgentCommand` contract.
+The supervisor consumes the generic telemetry fields before event-specific reduction, so the exact reviewed marker type still degrades the session without inferring false working state.
 The marker has bounded credential-safe output and must succeed before the shell executes Codex.
 
 Powder release now rejects receipts whose card, run, or agent differs from the exact expected claim.
@@ -68,6 +71,19 @@ Unknown values remain omitted instead of being accepted as authoritative state.
 
 The production `apps/desktop/src-tauri/src/tmux.rs` is unchanged from the coordinator base.
 Only hermetic control test fixtures were reconciled to serialize real tmux process tests, keep an anchor process alive, reap isolated sessions, and keep issued claim, evidence, and release receipt identities coherent.
+
+## Independent Review Findings and Remediation
+
+Independent review found that the first integration changed the reviewed degraded-marker event from `AgentCommand` to `CoreAction`.
+The event is restored to `AgentCommand` without losing provider-neutral degraded telemetry, and the producer, exact marker E2E tests, supervisor reducer test, and combined real-agent gate now lock that contract.
+
+Independent review found that an authenticated Captain heartbeat could pass authority checks, wait behind a per-Crew operation guard, and renew after Captain authority changed.
+Heartbeat now resolves and validates the exact current owner again after acquiring the guard and rechecks Harness liveness before any Powder renewal.
+A deterministic test holds a completion guard, queues the authenticated Captain heartbeat, releases the Captain while it waits, and proves that the request is rejected with zero renewal posts.
+
+Independent review found that terminal close could kill the tmux session before acquiring the per-Crew lifecycle guard.
+Terminal close now holds the cleanup guard across liveness planning, tmux tree teardown, remote Powder disposition, and the final durable registry transition.
+A deterministic test queues close behind completion, proves the worker remains alive while close waits, completes the exact run, then proves close reports `killed`, observes `already_completed`, removes the binding, and leaves the session gone.
 
 ## Focused Verification
 
@@ -91,6 +107,11 @@ Both permission-axis persistence tests passed.
 `scripts/captain/verify-codex-permission-integration.sh` built the combined-tree agent and passed the ignored real-agent launch gate.
 The gate verified that the exact owning Codex Crew marker is written before provider execution and that the real tmux session remains correctly attributed.
 
+After independent review remediation, the deterministic queued-heartbeat authority race, close-versus-completion race, rollback retention, and complete close-terminal group all passed.
+The exact degraded-marker consumer test passed, and `cargo test -p t-hub-agent` again passed 55 unit tests, 3 Codex tap E2E tests, and 1 exact unobserved-marker E2E test.
+The focused control Powder suite passed all 55 tests after the remediation.
+The combined real-agent verification script passed with the restored `AgentCommand` marker.
+
 The standalone CLI Powder contract suite passed 10 tests.
 The MCP Powder schema tests passed in both library and binary targets.
 The real authenticated MCP Powder dispatch E2E initially stopped before execution because its expected standalone debug MCP binary had not been built.
@@ -104,6 +125,10 @@ After `cargo build -p t-hub-mcp`, the exact E2E passed.
 The core library reported 817 passed and 2 documented ignored tests.
 The MCP E2E target reported 2 passed and 1 helper ignored.
 All agent, MCP, protocol, and documentation tests executed by the workspace gate passed.
+
+The one-time broad workspace gate preceded the independent-review remediation commit.
+Post-remediation `cargo fmt --all -- --check` and targeted `cargo clippy -p t-hub -p t-hub-agent --all-targets -- -D warnings` passed.
+The post-remediation deterministic race, cleanup, rollback, marker-consumer, and complete agent suites passed as recorded above.
 
 `cargo fmt --all -- --check` passed for the standalone CLI crate.
 `cargo clippy --all-targets -- -D warnings` passed for the standalone CLI crate.
@@ -120,9 +145,14 @@ The frontend changes are limited to retaining and validating the two permission 
 
 Before the launch-attestation lane was integrated, the run-bound lane's focused control suite had one hermetic tmux teardown failure with `server exited unexpectedly`.
 The reviewed launch-attestation lane's serialized and anchored tmux fixtures resolved that failure without modifying production tmux code.
+Post-remediation rollback and close tests exposed two more last-session fixture races with the same tmux shutdown result.
+Both tests now use the existing serialized anchor fixture and pass without production tmux changes.
 
 The two integration-time failures described above were isolated once each and traced to hermetic fixture identity, not production release or attestation behavior.
 The full workspace gate subsequently passed the affected tests.
+
+The first post-remediation targeted clippy run found one `needless_borrow` in the new heartbeat path.
+The exact lint was corrected, and the targeted clippy gate then passed.
 
 The frontend typecheck and Vitest residual remains because dependencies were unavailable.
 Independent review should inspect the small TypeScript adapter and store diff directly.
@@ -147,3 +177,5 @@ No independent reviewer has approved this integration yet.
 10. Verify Harness local permission and T-Hub control capability remain separate in persistence, MCP and CLI output, and frontend snapshot compatibility.
 11. Verify production tmux behavior is unchanged and fixture-only serialization cannot leak into runtime behavior.
 12. Decide whether frontend dependency installation and a separate TypeScript gate are required before exact-run approval.
+13. Verify a heartbeat queued behind another Crew lifecycle operation revalidates the exact current Captain and worker liveness before renewal.
+14. Verify terminal close holds the same per-Crew lifecycle guard before tmux teardown and through authoritative Powder cleanup and persistence.
