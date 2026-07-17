@@ -525,6 +525,12 @@ fn schema_append_crew_powder_work_log() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "operationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Stable caller-owned idempotency identity. Exact replay must reuse this value with an identical payload."
+            },
             "message": {
                 "type": "string",
                 "minLength": 1,
@@ -532,7 +538,7 @@ fn schema_append_crew_powder_work_log() -> Value {
                 "description": "Work-log message up to 16 KiB UTF-8, attributed to the calling Crew session's bound card and run."
             }
         },
-        "required": ["message"],
+        "required": ["operationId", "message"],
         "additionalProperties": false
     })
 }
@@ -568,14 +574,33 @@ fn schema_complete_crew_powder() -> Value {
                 "maxLength": 256,
                 "description": "Crew session owned by the calling Captain. Its durable binding supplies the Powder card and run."
             },
+            "operationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Stable caller-owned idempotency identity. Exact replay must reuse this value with an identical payload."
+            },
             "proof": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 4096,
                 "description": "Completion proof up to 4096 UTF-8 bytes, recorded against the Crew-bound card and run."
+            },
+            "criterionProofs": {
+                "type": "array",
+                "maxItems": 128,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "criterion": { "type": "integer", "minimum": 0 },
+                        "url": { "type": "string", "minLength": 1, "maxLength": 4096 }
+                    },
+                    "required": ["criterion", "url"],
+                    "additionalProperties": false
+                }
             }
         },
-        "required": ["crewSessionId", "proof"],
+        "required": ["crewSessionId", "operationId", "proof"],
         "additionalProperties": false
     })
 }
@@ -1206,7 +1231,10 @@ mod tests {
     fn powder_evidence_tools_share_minimal_bound_authority_schemas() {
         let append = find("append_crew_powder_work_log").unwrap();
         assert_eq!(append.tier, Tier::Organization);
-        assert_eq!((append.input_schema)()["required"], json!(["message"]));
+        assert_eq!(
+            (append.input_schema)()["required"],
+            json!(["operationId", "message"])
+        );
 
         let evidence = find("read_crew_powder_evidence").unwrap();
         assert_eq!(evidence.tier, Tier::Read);
@@ -1219,7 +1247,11 @@ mod tests {
         assert_eq!(complete.tier, Tier::Organization);
         assert_eq!(
             (complete.input_schema)()["required"],
-            json!(["crewSessionId", "proof"])
+            json!(["crewSessionId", "operationId", "proof"])
+        );
+        assert_eq!(
+            (complete.input_schema)()["properties"]["criterionProofs"]["maxItems"],
+            128
         );
         assert_eq!(
             (append.input_schema)()["properties"]["message"]["maxLength"],

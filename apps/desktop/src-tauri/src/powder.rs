@@ -2081,7 +2081,7 @@ fn validate_id(label: &str, value: &str) -> Result<(), PowderError> {
     validate_required_bounded_text(label, value, MAX_ID_BYTES)
 }
 
-fn validate_operation_id(value: &str) -> Result<(), PowderError> {
+pub fn validate_operation_id(value: &str) -> Result<(), PowderError> {
     validate_required_bounded_text("operation id", value, MAX_OPERATION_ID_BYTES)?;
     if !valid_operation_id(value) {
         return Err(invalid_request(
