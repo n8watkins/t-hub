@@ -10185,6 +10185,42 @@ fn crew_launch_argv(harness: Harness, prompt: &str) -> String {
     crew_interactive_launch(harness, &provider_launch, CODEX_UNOBSERVED_COMMAND)
 }
 
+/// A newly created tmux pane can briefly expose no readable foreground process
+/// while its login shell is still completing startup.  That is neither a launch
+/// acceptance nor a permission bypass.  Wait for a bounded stable baseline
+/// before attempting the provider launch, then retain the exact normal
+/// attestation checks for every subsequent observation.
+fn observe_dispatch_baseline(
+    observer: &mut dyn FnMut(&str) -> Result<HarnessProcessEvidence, LaunchAttestationError>,
+    target: &str,
+) -> Result<HarnessProcessEvidence, LaunchAttestationError> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match observer(target) {
+            Ok(evidence) => {
+                std::thread::sleep(Duration::from_millis(30));
+                match observer(target) {
+                    Ok(confirm) if evidence == confirm => {
+                        return Ok(confirm);
+                    }
+                    Ok(_) if Instant::now() < deadline => continue,
+                    Ok(_) => return Err(LaunchAttestationError::UnreadableEvidence),
+                    Err(LaunchAttestationError::UnreadableEvidence)
+                        if Instant::now() < deadline =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(LaunchAttestationError::UnreadableEvidence) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn rollback_crew_launch_failure(
     ctx: &ControlContext,
     crew_session_id: &str,
@@ -10258,7 +10294,7 @@ fn dispatch_crew(
     trusted_internal: bool,
 ) -> Result<Value, String> {
     let mut observer = observe_harness_process;
-    dispatch_crew_with_observer(ctx, args, caller, trusted_internal, &mut observer)
+    dispatch_crew_with_observer_inner(ctx, args, caller, trusted_internal, &mut observer, true)
 }
 
 fn dispatch_crew_with_observer(
@@ -10267,6 +10303,17 @@ fn dispatch_crew_with_observer(
     caller: Option<&ResolvedIdentity>,
     trusted_internal: bool,
     observer: &mut dyn FnMut(&str) -> Result<HarnessProcessEvidence, LaunchAttestationError>,
+) -> Result<Value, String> {
+    dispatch_crew_with_observer_inner(ctx, args, caller, trusted_internal, observer, false)
+}
+
+fn dispatch_crew_with_observer_inner(
+    ctx: &ControlContext,
+    args: &Value,
+    caller: Option<&ResolvedIdentity>,
+    trusted_internal: bool,
+    observer: &mut dyn FnMut(&str) -> Result<HarnessProcessEvidence, LaunchAttestationError>,
+    stabilize_baseline: bool,
 ) -> Result<Value, String> {
     require_socket_identity(caller, trusted_internal, "dispatch_crew")?;
     let (captain, project) = captain_and_project_for_dispatch(ctx, args)?;
@@ -10495,7 +10542,11 @@ fn dispatch_crew_with_observer(
     ctx.captains.pause_dispatch("before_launch");
     revalidate_or_rollback!("before launch");
     let tmux_target = tmux_target(&crew_session_id);
-    let before_launch = match observer(&tmux_target) {
+    let before_launch = match if stabilize_baseline {
+        observe_dispatch_baseline(observer, &tmux_target)
+    } else {
+        observer(&tmux_target)
+    } {
         Ok(evidence) => evidence,
         Err(error) => {
             return Err(rollback_crew_launch_failure(
@@ -26730,29 +26781,7 @@ mod tests {
             args["testSkipHarnessLiveness"] = json!(true);
         }
 
-        let shell = dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (7, 100)]);
-        let invalid_after_launch =
-            if expected_error.contains("required provider-native permission flag is missing") {
-                dispatch_race_evidence(&["codex", "work"], 200, 123_456, &[(42, 900), (7, 100)])
-            } else if expected_error.contains("wrong mode") {
-                dispatch_race_evidence(
-                    &["codex", "--sandbox", "workspace-write", "work"],
-                    200,
-                    123_456,
-                    &[(42, 900), (7, 100)],
-                )
-            } else {
-                shell.clone()
-            };
-        let mut observations =
-            std::collections::VecDeque::from(vec![Ok(shell), Ok(invalid_after_launch)]);
-        let mut observer = |_target: &str| {
-            observations
-                .pop_front()
-                .expect("dispatch made an unexpected harness observation")
-        };
-        let error =
-            dispatch_crew_with_observer(&ctx, &args, None, true, &mut observer).unwrap_err();
+        let error = dispatch_crew(&ctx, &args, None, true).unwrap_err();
         assert!(error.contains(expected_error), "unexpected error: {error}");
         assert!(error.contains("all side effects were rolled back"));
         assert!(!error.contains("supersecret"));
@@ -27452,37 +27481,7 @@ mod tests {
                 dispatch_test_registry(Some(path.clone()), &profile_name, &captain.session_id);
             let (ctx, _) = dispatch_test_context(registry.clone());
             let command = FakeHarnessCommand::new(harness, flags);
-            let shell = dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (7, 100)]);
-            let accepted = match harness {
-                Harness::Codex => dispatch_race_evidence(
-                    &[
-                        "codex",
-                        "--dangerously-bypass-approvals-and-sandbox",
-                        "work",
-                    ],
-                    200,
-                    123_456,
-                    &[(42, 900), (7, 100)],
-                ),
-                Harness::Claude => dispatch_race_evidence(
-                    &["claude", "--dangerously-skip-permissions", "work"],
-                    200,
-                    123_456,
-                    &[(42, 900), (7, 100)],
-                ),
-            };
-            let mut observations = std::collections::VecDeque::from(vec![
-                Ok(shell),
-                Ok(accepted.clone()),
-                Ok(accepted.clone()),
-                Ok(accepted),
-            ]);
-            let mut observer = |_target: &str| {
-                observations
-                    .pop_front()
-                    .expect("dispatch made an unexpected harness observation")
-            };
-            let result = dispatch_crew_with_observer(
+            let result = dispatch_crew(
                 &ctx,
                 &json!({
                     "captainSessionId": captain.session_id,
@@ -27494,7 +27493,6 @@ mod tests {
                 }),
                 None,
                 true,
-                &mut observer,
             )
             .unwrap();
 
@@ -27638,29 +27636,7 @@ mod tests {
         let (winner_ctx, winner_sink) = dispatch_test_context(registry);
         let winner_command =
             FakeHarnessCommand::new(Harness::Codex, "--dangerously-bypass-approvals-and-sandbox");
-        let shell = dispatch_race_evidence(&["zsh"], 100, 123_456, &[(42, 900), (7, 100)]);
-        let accepted = dispatch_race_evidence(
-            &[
-                "codex",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "work",
-            ],
-            200,
-            123_456,
-            &[(42, 900), (7, 100)],
-        );
-        let mut observations = std::collections::VecDeque::from(vec![
-            Ok(shell),
-            Ok(accepted.clone()),
-            Ok(accepted.clone()),
-            Ok(accepted),
-        ]);
-        let mut observer = |_target: &str| {
-            observations
-                .pop_front()
-                .expect("dispatch made an unexpected harness observation")
-        };
-        let winner = dispatch_crew_with_observer(
+        let winner = dispatch_crew(
             &winner_ctx,
             &json!({
                 "captainSessionId": captain.session_id,
@@ -27672,7 +27648,6 @@ mod tests {
             }),
             None,
             true,
-            &mut observer,
         )
         .unwrap();
         let winner_session_id = winner["crew"]["terminalId"].as_str().unwrap().to_string();
