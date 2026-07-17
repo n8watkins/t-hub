@@ -259,7 +259,9 @@ Independent review should inspect the small TypeScript adapter and store diff di
 The post-M4 focused dispatch filter originally exposed a hermetic pre-launch unreadable-process-evidence race in `dispatch_test_harness_command_failures_roll_back_all_side_effects`.
 The H4 deterministic fixture correction resolved that test without changing production tmux behavior.
 
-The H4 fixture correction replaces timing-sensitive pre-launch tmux observation in the three affected hermetic dispatch tests with deterministic process-evidence fixtures while retaining real terminal creation, durable persistence, and rollback assertions.
+The H4 correction is production-path coverage for the authoritative zsh environment.
+Dispatch now requires two identical bounded foreground-process observations before provider launch, so a fresh zsh startup transition cannot be accepted as a stable baseline.
+This leaves the provider-native launch and every final attestation check unchanged and does not modify production `tmux.rs` or force bash.
 `dispatch_test_harness_command_failures_roll_back_all_side_effects`, `dispatch_test_harness_command_success_persists_separate_permission_axes`, and `dispatch_restart_rejects_contender_without_releasing_successful_winner` all passed after the correction.
 
 The installed T-Hub runtime was not modified, installed, or restarted.
