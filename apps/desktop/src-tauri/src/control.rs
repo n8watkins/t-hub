@@ -21942,7 +21942,10 @@ mod tests {
     impl PowderProfileEnv {
         fn install(profile: &str, addr: SocketAddr) -> Self {
             static LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
-            let lock = LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap();
+            let lock = LOCK
+                .get_or_init(|| StdMutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let path = std::env::temp_dir().join(format!(
                 "t-hub-control-powder-profile-{}-{}.json",
                 std::process::id(),
@@ -22476,11 +22479,12 @@ mod tests {
         let server = LoopbackPowderServer::start(3);
         let profile_name = format!("attestation-rollback-{}", uuid::Uuid::new_v4().simple());
         let _profile = PowderProfileEnv::install(&profile_name, server.addr);
+        let _tmux_guard = ProcessAttestationTmuxGuard::acquire();
         let crew_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let registry =
             powder_lifecycle_registry_with_profile_and_crew(None, &profile_name, &crew_id);
         let target = tmux_target(&crew_id);
-        tmux::new_session_with_env(&target, "/tmp", None, &[]).unwrap();
+        create_test_tmux_session(&target).unwrap();
         let ctx = test_ctx("secret").with_captains_registry(registry.clone());
 
         rollback_crew_dispatch(&ctx, &crew_id, None, None).unwrap();
