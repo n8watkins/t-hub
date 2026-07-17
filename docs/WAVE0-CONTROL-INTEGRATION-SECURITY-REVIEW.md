@@ -31,6 +31,9 @@ The post-rereview authority-generation finding was remediated by commit `e011125
 That commit revalidates queued Captain close authority, rejects authority ABA on queued heartbeat, and protects expiry persistence with an exact-scope compare-and-set.
 The foreign-heartbeat information-disclosure finding was remediated by commit `8b056fb35a59f4a73d257c3239c379a465d3c704`.
 That commit authorizes the target Crew or current Captain from a registry snapshot before resolving Project or Powder scope.
+The lifecycle-guard heartbeat reauthorization finding was remediated by commit `8bfa0fcd6bcde133a35abcbd58976cde0992ffd6`.
+The removed-Crew close authorization finding was remediated by commit `17c8ed5e7b7f1b31c295631dccd1435a178dccf6`.
+The initial Powder claim receipt identity finding was remediated by commit `a712df7a1d7222272f3c128d20e06ad074ff797c`.
 
 Both frozen reviewed heads are ancestors of the integration head.
 Neither reviewed head was rebased or modified.
@@ -78,6 +81,9 @@ Terminal close captures exact Captain authority before waiting and revalidates i
 Heartbeat now performs a minimal Crew and Captain ownership check from one registry snapshot before resolving the full Powder scope.
 Foreign target probes therefore fail with a generic ACL denial without disclosing target Project or Powder binding state.
 The existing full-scope checks, Harness liveness checks, operation guard, and post-guard authority-generation revalidation remain in force.
+Heartbeat repeats the same minimal ownership authorization after acquiring the renewal guard and before any repeated scope resolution.
+Terminal close performs minimal lifecycle ownership authorization before checking Removed Crew history or starting Project and Powder reconciliation.
+Initial claim receipts must match both the requested card and the protected profile's configured agent before dispatch can persist a Crew binding.
 
 The frontend snapshot adapter retains `harnessPermission` and `tHubCapability` as separate compatibility axes.
 Unknown values remain omitted instead of being accepted as authoritative state.
@@ -117,6 +123,21 @@ A cross-ship Captain could therefore learn that a foreign Crew ship had no Proje
 Heartbeat now uses a snapshot-only target ownership gate before full scope resolution and returns the generic exact-Crew-or-owning-Captain ACL denial for foreign probes.
 The regression test targets an active foreign Crew with a durable work binding but no Project binding and proves the loopback Powder server observes zero renewal posts.
 
+Fresh rereview found that heartbeat revalidated generation after waiting but resolved full scope before reauthorizing a queued caller.
+A former Captain whose Crew scope was removed while the renewal guard was held received the target-specific unknown-Crew error.
+Heartbeat now repeats snapshot-only exact-Crew-or-current-Captain authorization inside the guard before resolving current scope.
+The deterministic scope-removal regression proves generic ACL denial and zero renewal posts.
+
+Fresh rereview found that `close_terminal` inspected Removed Crew state before lifecycle ownership authorization.
+A cross-ship caller could reach historical cleanup and learn that a removed foreign Crew ship lacked a Project binding.
+Close now authorizes from minimal registry ownership before the removed-state probe.
+The regression proves generic ACL denial, no durable registry sequence change, retained local binding, and zero Powder release or renewal posts.
+
+Fresh rereview found that the initial Powder claim response was only structurally parsed before dispatch persisted it.
+A substituted card or agent could therefore become a durable Crew binding.
+The Powder client now validates the requested card and configured profile agent before returning the initial claim.
+Client regressions cover card and agent substitution, and the dispatch regression proves rollback removes the spawned terminal without a foreign binding or release request.
+
 ## Focused Verification
 
 `cargo test -p t-hub-agent` passed 56 unit tests, 3 Codex tap E2E tests, and 1 exact unobserved-marker E2E test before duplicate compatibility code was removed.
@@ -155,6 +176,11 @@ Formatting, targeted all-target clippy, and `git diff --check` passed at commit 
 After the foreign-heartbeat remediation, `captain_cannot_close_or_heartbeat_foreign_crew` and the new deterministic cross-ship non-Project probe test passed.
 The focused control Powder suite passed all 62 tests, the close-terminal group passed all 4 tests, and the Powder client suite passed all 26 tests.
 Formatting, targeted all-target clippy, and `git diff --check` passed at commit `8b056fb35a59f4a73d257c3239c379a465d3c704`.
+
+After the fresh M1, M2, and M3 remediation, the focused control Powder suite passed all 63 tests and the close-terminal group passed all 4 tests.
+The explicit cross-ship removed-Crew close regression passed.
+The dispatch suite passed 10 tests with the existing real-agent integration gate intentionally ignored, and the Powder client suite passed all 27 tests.
+Formatting, targeted all-target clippy, and `git diff --check` passed at code head `a712df7a1d7222272f3c128d20e06ad074ff797c`.
 
 The standalone CLI Powder contract suite passed 10 tests.
 The MCP Powder schema tests passed in both library and binary targets.
@@ -228,3 +254,6 @@ No independent reviewer has approved this integration yet.
 17. Verify queued heartbeat revalidates current authority generation, and expiry persistence compare-and-sets the exact pre-renewal Crew, Captain, Project, Powder binding, and generation scope.
 18. Verify the reconciler repeats Harness liveness validation inside the renewal guard before it can issue a remote renewal.
 19. Verify a foreign heartbeat probe is authorized from minimal registry ownership before full Project or Powder scope resolution and cannot disclose target binding state or issue a remote renewal.
+20. Verify heartbeat repeats minimal target ownership authorization after acquiring its lifecycle guard and rejects removed former-Captain scopes without a renewal.
+21. Verify close terminal authorizes foreign removed-Crew targets before historical Project or Powder resolution and leaves no local or remote side effect on denial.
+22. Verify initial Powder claim receipts match the requested card and configured profile agent before dispatch persists any Crew binding.
