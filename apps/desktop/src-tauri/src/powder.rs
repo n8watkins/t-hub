@@ -19,6 +19,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(12);
 const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EVIDENCE_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_MUTATION_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_CAPABILITY_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 4096;
 const MAX_EVIDENCE_ITEMS: usize = 20;
 const MAX_CRITERIA: usize = 100;
@@ -369,6 +370,16 @@ pub struct OperationOutcome<T> {
     pub updated_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunBoundMutationCapabilities {
+    pub schema_version: i64,
+    pub work_log: bool,
+    pub criterion_review: bool,
+    pub completion: bool,
+    pub operation_recovery: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -769,6 +780,78 @@ impl Client {
             Some(json!({ "run_id": claim.run_id })),
         )?;
         parse_claim(value)
+    }
+
+    /// Fail closed unless the connected Powder deployment advertises the full
+    /// schema-18 run-bound mutation and recovery contract.
+    pub fn require_run_bound_mutation_capabilities(
+        &self,
+    ) -> Result<RunBoundMutationCapabilities, PowderError> {
+        let ready =
+            self.request_typed_with_limit("GET", "/readyz", None, MAX_CAPABILITY_RESPONSE_BYTES)?;
+        if ready.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(invalid_response("Powder is not ready"));
+        }
+        let schema_version = ready
+            .get("schema_version")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| invalid_response("Powder readiness omitted schema_version"))?;
+        if schema_version < 18 {
+            return Err(invalid_request(format!(
+                "Powder schema {schema_version} does not support run-bound mutations"
+            )));
+        }
+        let routes = self.request_typed_with_limit(
+            "GET",
+            "/api/v1/routes",
+            None,
+            MAX_CAPABILITY_RESPONSE_BYTES,
+        )?;
+        let routes = routes
+            .as_array()
+            .filter(|routes| routes.len() <= 256)
+            .ok_or_else(|| invalid_response("Powder route catalog is invalid or oversized"))?;
+        let supports = |method: &str, path: &str, required_fields: &[&str]| {
+            routes.iter().any(|route| {
+                route.get("method").and_then(Value::as_str) == Some(method)
+                    && route.get("path").and_then(Value::as_str) == Some(path)
+                    && required_fields.iter().all(|field| {
+                        route
+                            .get("body_shape")
+                            .and_then(Value::as_str)
+                            .is_some_and(|shape| shape.contains(&format!("\"{field}\"")))
+                    })
+            })
+        };
+        let capabilities = RunBoundMutationCapabilities {
+            schema_version,
+            work_log: supports(
+                "POST",
+                "/api/v1/cards/{id}/runs/{run_id}/work-log",
+                &["operation_id", "agent", "body"],
+            ),
+            criterion_review: supports(
+                "POST",
+                "/api/v1/cards/{id}/runs/{run_id}/criteria/review",
+                &["operation_id", "criterion", "criterion_id", "decision"],
+            ),
+            completion: supports(
+                "POST",
+                "/api/v1/cards/{id}/runs/{run_id}/complete",
+                &["operation_id", "proof", "criterion_proofs"],
+            ),
+            operation_recovery: supports("GET", "/api/v1/operations/{id}", &[]),
+        };
+        if !capabilities.work_log
+            || !capabilities.criterion_review
+            || !capabilities.completion
+            || !capabilities.operation_recovery
+        {
+            return Err(invalid_request(
+                "Powder does not advertise the complete run-bound mutation contract",
+            ));
+        }
+        Ok(capabilities)
     }
 
     /// Atomically append one Crew-attributed entry to an exact current run.
@@ -2944,6 +3027,71 @@ mod tests {
         assert_eq!(claim.agent, "terminal-1");
         assert_eq!(claim.expires_at, 123);
         assert!(parse_claim(json!({ "card_id": "card-1" })).is_err());
+    }
+
+    #[test]
+    fn run_bound_mutations_require_schema_18_and_complete_route_contract() {
+        let route_catalog = json!([
+            {
+                "method": "POST",
+                "path": "/api/v1/cards/{id}/runs/{run_id}/work-log",
+                "body_shape": "{\"operation_id\":\"...\",\"agent\":\"...\",\"body\":\"...\"}"
+            },
+            {
+                "method": "POST",
+                "path": "/api/v1/cards/{id}/runs/{run_id}/criteria/review",
+                "body_shape": "{\"operation_id\":\"...\",\"criterion\":0,\"criterion_id\":\"...\",\"decision\":\"approved\"}"
+            },
+            {
+                "method": "POST",
+                "path": "/api/v1/cards/{id}/runs/{run_id}/complete",
+                "body_shape": "{\"operation_id\":\"...\",\"proof\":null,\"criterion_proofs\":null}"
+            },
+            {
+                "method": "GET",
+                "path": "/api/v1/operations/{id}",
+                "body_shape": null
+            }
+        ]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for response in [
+                json!({"ok": true, "auth_mode": "api_key", "schema_version": 18}),
+                route_catalog,
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(request.contains("GET /"));
+                write_json_response(&mut stream, "200 OK", &response.to_string());
+            }
+        });
+        let capabilities = test_client(addr)
+            .require_run_bound_mutation_capabilities()
+            .unwrap();
+        assert_eq!(capabilities.schema_version, 18);
+        assert!(capabilities.work_log);
+        assert!(capabilities.criterion_review);
+        assert!(capabilities.completion);
+        assert!(capabilities.operation_recovery);
+        server.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({"ok": true, "auth_mode": "api_key", "schema_version": 17}).to_string(),
+            );
+        });
+        let error = test_client(addr)
+            .require_run_bound_mutation_capabilities()
+            .unwrap_err();
+        assert_eq!(error.kind, PowderErrorKind::InvalidResponse);
+        server.join().unwrap();
     }
 
     #[test]

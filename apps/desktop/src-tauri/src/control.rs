@@ -10677,6 +10677,11 @@ fn append_crew_powder_work_log(
         .agent
         .as_deref()
         .ok_or("Powder run-bound mutations are unavailable for this legacy Crew binding")?;
+    let client = powder::Client::from_profile(&scope.binding.connection_profile)
+        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+    client
+        .require_run_bound_mutation_capabilities()
+        .map_err(|_| "Powder run-bound mutation capability check failed".to_string())?;
     let payload = json!({
         "agent": powder_agent,
         "harness": scope.crew.harness.clone(),
@@ -10698,8 +10703,6 @@ fn append_crew_powder_work_log(
         .agent
         .as_deref()
         .ok_or("Powder run-bound mutations are unavailable for this legacy Crew binding")?;
-    let client = powder::Client::from_profile(&scope.binding.connection_profile)
-        .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
     let attribution = powder::WorkLogAttribution {
         agent: powder_agent.to_string(),
         model: None,
@@ -10867,6 +10870,9 @@ fn review_crew_powder_criterion(
     }
     let client = powder::Client::from_profile(&scope.binding.connection_profile)
         .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+    client
+        .require_run_bound_mutation_capabilities()
+        .map_err(|_| "Powder run-bound mutation capability check failed".to_string())?;
     let (card, run) = read_bound_powder_evidence(&client, &scope)?;
     if bound_powder_reality(&scope, &card, &run)? != BoundPowderReality::Active {
         return Err("Powder criterion review requires the exact active Crew run".into());
@@ -11210,6 +11216,9 @@ fn complete_crew_powder(
 
     let client = powder::Client::from_profile(&scope.binding.connection_profile)
         .map_err(|_| "Powder profile unavailable for the bound Project".to_string())?;
+    client
+        .require_run_bound_mutation_capabilities()
+        .map_err(|_| "Powder run-bound mutation capability check failed".to_string())?;
     if was_completed {
         let (card, run) = read_bound_powder_evidence(&client, &scope)?;
         if bound_powder_reality(&scope, &card, &run)? == BoundPowderReality::Active {
@@ -23405,6 +23414,8 @@ mod tests {
     struct LoopbackPowderState {
         completed: bool,
         released: bool,
+        capability_requests: usize,
+        capability_schema_version: Option<i64>,
         proof: Option<String>,
         proof_url: Option<String>,
         completion_posts: Vec<Value>,
@@ -23546,18 +23557,20 @@ mod tests {
                 if let Err(error) = accept_result {
                     errors.push(error);
                 }
-                if handlers.len() != expected_requests {
-                    errors.push(format!(
-                        "loopback Powder request count mismatch: expected {expected_requests}, received {}",
-                        handlers.len()
-                    ));
-                }
+                let handler_count = handlers.len();
                 for handler in handlers {
                     match handler.join() {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => errors.push(error),
                         Err(_) => errors.push("loopback Powder request handler panicked".into()),
                     }
+                }
+                let capability_requests = server_state.lock().unwrap().capability_requests;
+                let counted_requests = handler_count.saturating_sub(capability_requests);
+                if counted_requests != expected_requests {
+                    errors.push(format!(
+                        "loopback Powder request count mismatch: expected {expected_requests}, received {counted_requests}"
+                    ));
                 }
                 let outcome = if errors.is_empty() {
                     Ok(server_state.lock().unwrap().clone())
@@ -24050,6 +24063,40 @@ mod tests {
         let path = request.path.as_str();
         let body = request.body;
         let response = match (method, path) {
+            ("GET", "/readyz") => {
+                let mut state = state.lock().unwrap();
+                state.capability_requests += 1;
+                json!({
+                    "ok": true,
+                    "auth_mode": "api_key",
+                    "schema_version": state.capability_schema_version.unwrap_or(18),
+                })
+            }
+            ("GET", "/api/v1/routes") => {
+                state.lock().unwrap().capability_requests += 1;
+                json!([
+                    {
+                        "method": "POST",
+                        "path": "/api/v1/cards/{id}/runs/{run_id}/work-log",
+                        "body_shape": "{\"operation_id\":\"stable-id\",\"agent\":\"...\",\"body\":\"...\"}"
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/api/v1/cards/{id}/runs/{run_id}/criteria/review",
+                        "body_shape": "{\"operation_id\":\"...\",\"criterion\":0,\"criterion_id\":\"...\",\"decision\":\"approved\"}"
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/api/v1/cards/{id}/runs/{run_id}/complete",
+                        "body_shape": "{\"operation_id\":\"stable-id\",\"proof\":null,\"criterion_proofs\":null}"
+                    },
+                    {
+                        "method": "GET",
+                        "path": "/api/v1/operations/{id}",
+                        "body_shape": null
+                    }
+                ])
+            }
             ("GET", "/api/v1/repositories/t-hub") => json!({"name": "t-hub"}),
             ("GET", path)
                 if path
@@ -25215,6 +25262,49 @@ mod tests {
         );
         assert!(state.work_log_posts[1].get("card_id").is_none());
         assert!(state.work_log_posts[1].get("expected_run_id").is_none());
+    }
+
+    #[test]
+    fn powder_mutations_are_disabled_before_write_on_unsupported_schema() {
+        let server = LoopbackPowderServer::start(0);
+        server.state.lock().unwrap().capability_schema_version = Some(17);
+        let _profile = PowderProfileEnv::install("loopback-unsupported-schema", server.addr);
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile(None, "loopback-unsupported-schema");
+        let crew = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "crew-powder",
+        );
+        let ctx = test_ctx("loopback-unsupported-schema")
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let response = dispatch_authenticated(
+            &ctx,
+            req_session(
+                "loopback-unsupported-schema",
+                &crew,
+                "append_crew_powder_work_log",
+                json!({
+                    "operationId": "work-log:unsupported",
+                    "message": "must not reach an unsupported Powder deployment",
+                }),
+            ),
+        );
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Powder run-bound mutation capability check failed")
+        );
+        assert!(registry.snapshot().captains[0].crew[0]
+            .powder_work
+            .as_ref()
+            .unwrap()
+            .mutation_intent
+            .is_none());
+        let state = server.finish().unwrap();
+        assert_eq!(state.capability_requests, 1);
+        assert!(state.work_log_posts.is_empty());
     }
 
     #[test]
