@@ -3250,6 +3250,120 @@ impl CaptainsRegistry {
         Ok(true)
     }
 
+    /// Compare and clear one historical binding only while every authority-bearing
+    /// part of the scope used for remote evidence is still exact. Remote reads stay
+    /// outside registry locks; this final durable mutation fails closed if ownership,
+    /// Project identity, Project Powder authority, or the Removed Crew row changed.
+    fn compare_and_clear_released_removed_crew_powder_binding(
+        &self,
+        expected: &CrewPowderScope,
+    ) -> Result<bool, String> {
+        let crew_session_id = expected.crew.terminal_id.as_str();
+        let _mutation = self.mutation.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.lock();
+        let previous = g.clone();
+        let crew_matches = g
+            .captains
+            .iter()
+            .enumerate()
+            .flat_map(|(captain_index, captain)| {
+                captain
+                    .crew
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, crew)| crew.terminal_id == crew_session_id)
+                    .map(move |(crew_index, _)| (captain_index, crew_index))
+            })
+            .collect::<Vec<_>>();
+        let (captain_index, crew_index) = match crew_matches.as_slice() {
+            [] => return Err(format!("unknown Crew session '{crew_session_id}'")),
+            [entry] => *entry,
+            _ => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' is ambiguously assigned to multiple Captains"
+                ));
+            }
+        };
+        let captain = &g.captains[captain_index];
+        let owner_matches = g
+            .captains
+            .iter()
+            .filter(|candidate| candidate.ship_slug == expected.ship_slug)
+            .count();
+        if owner_matches != 1
+            || captain.ship_slug != expected.ship_slug
+            || captain.role != expected.captain_role
+            || captain.terminal_id != expected.captain_terminal_id
+            || captain.project_id.as_deref() != Some(expected.project_id.as_str())
+        {
+            return Err(format!(
+                "Crew session '{crew_session_id}' historical Captain or Project ownership changed while Powder release evidence was being read"
+            ));
+        }
+        let project_matches = g
+            .projects
+            .iter()
+            .enumerate()
+            .filter(|(_, project)| project.project_id == expected.project_id)
+            .collect::<Vec<_>>();
+        let project_index = match project_matches.as_slice() {
+            [] => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' Project was removed while Powder release evidence was being read"
+                ));
+            }
+            [(project_index, _)] => *project_index,
+            _ => {
+                return Err(format!(
+                    "Crew session '{crew_session_id}' Project became ambiguous while Powder release evidence was being read"
+                ));
+            }
+        };
+        let project = &g.projects[project_index];
+        let project_root_matches = g
+            .projects
+            .iter()
+            .filter(|candidate| candidate.repo_root == expected.project_repo_root)
+            .count();
+        let binding = project.powder.as_ref().ok_or_else(|| {
+            format!(
+                "Crew session '{crew_session_id}' Project Powder binding was removed while release evidence was being read"
+            )
+        })?;
+        if project_root_matches != 1
+            || project.repo_root != expected.project_repo_root
+            || binding.connection_profile != expected.binding.connection_profile
+            || binding.repository != expected.binding.repository
+        {
+            return Err(format!(
+                "Crew session '{crew_session_id}' Project identity or Powder profile/repository changed while release evidence was being read"
+            ));
+        }
+        let crew = &g.captains[captain_index].crew[crew_index];
+        if crew != &expected.crew {
+            return Err(format!(
+                "Crew session '{crew_session_id}' historical row, state, or Powder binding changed while release evidence was being read"
+            ));
+        }
+        if !matches!(crew.state, CrewState::Removed { .. }) {
+            return Err(format!(
+                "Crew session '{crew_session_id}' is not removed; refusing to clear its Powder binding"
+            ));
+        }
+        let Some(work) = crew.powder_work.as_ref() else {
+            return Ok(false);
+        };
+        if work != &expected.work || !matches!(work.state, PowderWorkState::Active) {
+            return Err(format!(
+                "Crew session '{crew_session_id}' Powder card, run, or recovery state changed while release evidence was being read"
+            ));
+        }
+        g.captains[captain_index].crew[crew_index].powder_work = None;
+        g.seq = g.seq.saturating_add(1);
+        self.commit_mutation(g, previous)?;
+        Ok(true)
+    }
+
     /// Lifecycle transition for a closed/killed session (item-2 §2.4: death MARKS,
     /// it does not scrub - retiring the old `remove_session` C4 silent-leak). Two
     /// cases, both idempotent:
@@ -9143,7 +9257,10 @@ fn parse_completion_proof(args: &Value) -> Result<CrewCompletionProof, String> {
 #[derive(Debug, Clone)]
 struct CrewPowderScope {
     ship_slug: String,
+    captain_role: FleetRole,
+    captain_terminal_id: Option<String>,
     project_id: String,
+    project_repo_root: String,
     crew: CrewRef,
     binding: PowderProjectBinding,
     work: PowderWorkBinding,
@@ -9206,7 +9323,10 @@ fn resolve_crew_powder_scope(
     }
     Ok(CrewPowderScope {
         ship_slug: captain.ship_slug.clone(),
+        captain_role: captain.role,
+        captain_terminal_id: captain.terminal_id.clone(),
         project_id,
+        project_repo_root: project.repo_root.clone(),
         crew: crew.clone(),
         binding,
         work,
@@ -12754,11 +12874,7 @@ fn reconcile_removed_crew_powder_binding(
     })?;
     let cleared = ctx
         .captains
-        .clear_released_crew_powder_binding(
-            crew_session_id,
-            &scope.work.card_id,
-            &scope.work.run_id,
-        )
+        .compare_and_clear_released_removed_crew_powder_binding(&scope)
         .map_err(|error| {
             retryable_error(format!(
                 "Historical Powder release was verified, but the exact local binding could not be cleared; Crew session '{crew_session_id}' remains unchanged: {error}"
@@ -22047,6 +22163,7 @@ mod tests {
         duplicate_card_run: bool,
         malformed_card_evidence: bool,
         run_card_status_override: Option<String>,
+        pause_run_evidence: bool,
         release_response_run_id: Option<String>,
         claim_posts: usize,
         release_posts: usize,
@@ -22071,6 +22188,8 @@ mod tests {
         state: Arc<StdMutex<LoopbackPowderState>>,
         post_started: std::sync::mpsc::Receiver<Value>,
         release_post: std::sync::mpsc::SyncSender<()>,
+        run_evidence_started: std::sync::mpsc::Receiver<()>,
+        resume_run_evidence: std::sync::mpsc::SyncSender<()>,
         result: std::sync::mpsc::Receiver<Result<LoopbackPowderState, String>>,
         stop: std::sync::mpsc::SyncSender<()>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -22108,6 +22227,9 @@ mod tests {
             let (post_started_tx, post_started) = mpsc::sync_channel(1);
             let (release_post, release_post_rx) = mpsc::sync_channel(1);
             let release_post_rx = Arc::new(StdMutex::new(Some(release_post_rx)));
+            let (run_evidence_started_tx, run_evidence_started) = mpsc::sync_channel(1);
+            let (resume_run_evidence, resume_run_evidence_rx) = mpsc::sync_channel(1);
+            let resume_run_evidence_rx = Arc::new(StdMutex::new(Some(resume_run_evidence_rx)));
             let server_state = state.clone();
             let (result_tx, result) = mpsc::sync_channel(1);
             let (stop, stop_rx) = mpsc::sync_channel(1);
@@ -22138,6 +22260,8 @@ mod tests {
                         let state = server_state.clone();
                         let post_started_tx = post_started_tx.clone();
                         let release_post_rx = release_post_rx.clone();
+                        let run_evidence_started_tx = run_evidence_started_tx.clone();
+                        let resume_run_evidence_rx = resume_run_evidence_rx.clone();
                         let handler = std::thread::spawn(move || {
                             handle_loopback_powder_request(
                                 stream,
@@ -22145,6 +22269,8 @@ mod tests {
                                 &state,
                                 &post_started_tx,
                                 &release_post_rx,
+                                &run_evidence_started_tx,
+                                &resume_run_evidence_rx,
                                 behavior,
                             )
                         });
@@ -22180,6 +22306,8 @@ mod tests {
                 state,
                 post_started,
                 release_post,
+                run_evidence_started,
+                resume_run_evidence,
                 result,
                 stop,
                 thread: Some(thread),
@@ -22649,6 +22777,8 @@ mod tests {
         state: &Arc<StdMutex<LoopbackPowderState>>,
         post_started: &std::sync::mpsc::SyncSender<Value>,
         release_post: &Arc<StdMutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        run_evidence_started: &std::sync::mpsc::SyncSender<()>,
+        resume_run_evidence: &Arc<StdMutex<Option<std::sync::mpsc::Receiver<()>>>>,
         behavior: LoopbackPowderBehavior,
     ) -> Result<(), String> {
         let method = request.method.as_str();
@@ -22676,6 +22806,21 @@ mod tests {
                 }
             }
             ("GET", "/api/v1/runs/run-authoritative") => {
+                if state.lock().unwrap().pause_run_evidence {
+                    run_evidence_started.try_send(()).map_err(|_| {
+                        "loopback Powder run evidence observer unavailable".to_string()
+                    })?;
+                    let receiver = resume_run_evidence
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .ok_or("loopback Powder run evidence resume was already consumed")?;
+                    receiver
+                        .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+                        .map_err(|_| {
+                            "loopback Powder run evidence exceeded its resume deadline".to_string()
+                        })?;
+                }
                 loopback_run_evidence(&state.lock().unwrap())
             }
             (
@@ -24618,6 +24763,224 @@ mod tests {
 
         let state = server.finish().unwrap();
         assert_eq!(state.release_posts, 0);
+    }
+
+    #[derive(Clone, Copy)]
+    enum HistoricalProjectScopeRace {
+        ProfileRebind,
+        RepositoryRebind,
+        PowderUnbind,
+    }
+
+    impl HistoricalProjectScopeRace {
+        fn label(self) -> &'static str {
+            match self {
+                Self::ProfileRebind => "profile-rebind",
+                Self::RepositoryRebind => "repository-rebind",
+                Self::PowderUnbind => "powder-unbind",
+            }
+        }
+
+        fn rebound_profile(self, original_profile: &'static str) -> &'static str {
+            match self {
+                Self::ProfileRebind => "loopback-historical-profile-rebound",
+                Self::RepositoryRebind | Self::PowderUnbind => original_profile,
+            }
+        }
+
+        fn rebound_repository(self) -> &'static str {
+            match self {
+                Self::RepositoryRebind => "t-hub-rebound",
+                Self::ProfileRebind | Self::PowderUnbind => "t-hub",
+            }
+        }
+    }
+
+    fn assert_removed_crew_historical_cleanup_scope_race(race: HistoricalProjectScopeRace) {
+        let server = LoopbackPowderServer::start(2);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.released = true;
+            state.pause_run_evidence = true;
+        }
+        let original_profile = "loopback-historical-profile-race";
+        let rebound_profile = race.rebound_profile(original_profile);
+        let rebound_repository = race.rebound_repository();
+        let _profile = PowderProfileEnv::install(original_profile, server.addr);
+        let path = captains_tmp(race.label());
+        let crew_session_id = format!("powder-{}-{}", race.label(), uuid::Uuid::new_v4().simple());
+        let identities = Arc::new(crate::identity::IdentityStore::ephemeral());
+        let registry = powder_lifecycle_registry_with_profile_and_crew(
+            Some(path.clone()),
+            original_profile,
+            &crew_session_id,
+        );
+        registry.remove_session(&crew_session_id).unwrap();
+        let owner = mint_session(
+            &identities,
+            crate::identity::Role::Crew,
+            "powder-ship",
+            "captain-powder",
+        );
+        let ctx = test_ctx(original_profile)
+            .with_identity_store(identities)
+            .with_captains_registry(registry.clone());
+        let before = registry.snapshot();
+        let original_crew = before.captains[0].crew[0].clone();
+
+        let cleanup_ctx = ctx.clone();
+        let cleanup_owner = owner.clone();
+        let cleanup_crew_session_id = crew_session_id.clone();
+        let cleanup = std::thread::spawn(move || {
+            dispatch_authenticated(
+                &cleanup_ctx,
+                req_session(
+                    original_profile,
+                    &cleanup_owner,
+                    "close_terminal",
+                    json!({"sessionId": cleanup_crew_session_id}),
+                ),
+            )
+        });
+        server
+            .run_evidence_started
+            .recv_timeout(LOOPBACK_POWDER_HANDLER_TIMEOUT)
+            .expect("historical cleanup must pause during the remote run evidence read");
+
+        match race {
+            HistoricalProjectScopeRace::ProfileRebind
+            | HistoricalProjectScopeRace::RepositoryRebind => {
+                let rebound = dispatch_authenticated(
+                    &ctx,
+                    req_session(
+                        original_profile,
+                        &owner,
+                        "bind_project_powder",
+                        json!({
+                            "projectId": "project-powder-lifecycle",
+                            "connectionProfile": rebound_profile,
+                            "repository": rebound_repository,
+                            "testCanonicalPowderRepository": rebound_repository,
+                            "testInitialEventCursor": 0,
+                        }),
+                    ),
+                );
+                assert!(
+                    rebound.ok,
+                    "authorized {} failed: {:?}",
+                    race.label(),
+                    rebound.error
+                );
+            }
+            HistoricalProjectScopeRace::PowderUnbind => {
+                let mut project = registry.projects().into_iter().next().unwrap();
+                project.powder = None;
+                registry.upsert_project(project).unwrap();
+            }
+        }
+        let after_rebind = registry.snapshot();
+        assert_eq!(after_rebind.seq, before.seq + 1);
+        server.resume_run_evidence.send(()).unwrap();
+        let cleanup = cleanup.join().unwrap();
+
+        let memory = registry.snapshot();
+        let disk = CaptainsRegistry::load(path.clone()).snapshot();
+        let crew = &memory.captains[0].crew[0];
+        let duplicate_dispatch =
+            (!matches!(race, HistoricalProjectScopeRace::PowderUnbind)).then(|| {
+                ensure_dispatch_powder_binding_available(
+                    &ctx,
+                    rebound_profile,
+                    rebound_repository,
+                    "thub-powder-control-lifecycle",
+                    Some("run-authoritative"),
+                )
+            });
+        assert!(
+            !(cleanup.ok
+                && crew.powder_work.is_none()
+                && duplicate_dispatch.as_ref().is_some_and(|result| result.is_ok())),
+            "stale old-scope evidence cleared the historical binding and unblocked duplicate dispatch after {}",
+            race.label()
+        );
+        assert!(!cleanup.ok, "stale-scope cleanup must fail closed");
+        assert!(
+            cleanup.retryable,
+            "stale-scope cleanup must invite a fresh retry"
+        );
+        assert!(
+            cleanup
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed") || error.contains("removed")),
+            "stale-scope cleanup must report an honest scope error: {:?}",
+            cleanup.error
+        );
+        assert_eq!(memory.seq, after_rebind.seq);
+        assert_eq!(
+            serde_json::to_value(&memory).unwrap(),
+            serde_json::to_value(&disk).unwrap(),
+            "stale-scope refusal must leave memory and disk consistent"
+        );
+        assert!(matches!(crew.state, CrewState::Removed { .. }));
+        assert_eq!(crew, &original_crew);
+        assert_eq!(registry.ship_of(&crew_session_id), None);
+        if let Some(duplicate_dispatch) = duplicate_dispatch {
+            assert!(duplicate_dispatch.is_err());
+        } else {
+            assert!(resolve_crew_powder_scope(&ctx, &crew_session_id).is_err());
+        }
+        reconcile_powder_leases(&ctx);
+        assert_eq!(registry.snapshot().seq, after_rebind.seq);
+        if matches!(race, HistoricalProjectScopeRace::PowderUnbind) {
+            let mut project = registry.projects().into_iter().next().unwrap();
+            project.powder = Some(PowderProjectBinding {
+                connection_profile: original_profile.into(),
+                repository: "t-hub".into(),
+                event_cursor: 0,
+            });
+            registry.upsert_project(project).unwrap();
+            assert!(ensure_dispatch_powder_binding_available(
+                &ctx,
+                original_profile,
+                "t-hub",
+                "thub-powder-control-lifecycle",
+                Some("run-authoritative"),
+            )
+            .is_err());
+            let restored_memory = registry.snapshot();
+            let restored_disk = CaptainsRegistry::load(path.clone()).snapshot();
+            assert_eq!(
+                serde_json::to_value(restored_memory).unwrap(),
+                serde_json::to_value(restored_disk).unwrap()
+            );
+        }
+        let state = server.finish().unwrap();
+        assert_eq!(state.release_posts, 0);
+        assert_eq!(state.completion_posts.len(), 0);
+        assert_eq!(state.work_log_posts.len(), 0);
+        let backup = path.with_extension("json.bak");
+        let _ = std::fs::remove_file(backup);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_profile_rebind_during_evidence_read() {
+        assert_removed_crew_historical_cleanup_scope_race(
+            HistoricalProjectScopeRace::ProfileRebind,
+        );
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_repository_rebind_during_evidence_read() {
+        assert_removed_crew_historical_cleanup_scope_race(
+            HistoricalProjectScopeRace::RepositoryRebind,
+        );
+    }
+
+    #[test]
+    fn removed_crew_historical_cleanup_rejects_powder_unbind_during_evidence_read() {
+        assert_removed_crew_historical_cleanup_scope_race(HistoricalProjectScopeRace::PowderUnbind);
     }
 
     #[test]
