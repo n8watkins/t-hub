@@ -256,10 +256,8 @@ The exact lint was corrected, and the targeted clippy gate then passed.
 The frontend typecheck and Vitest residual remains because dependencies were unavailable.
 Independent review should inspect the small TypeScript adapter and store diff directly.
 
-The post-M4 focused dispatch filter ran 18 tests with one existing hermetic tmux fixture failure in `dispatch_test_harness_command_failures_roll_back_all_side_effects`.
-The isolated single rerun reproduced the same pre-launch unreadable-process-evidence result instead of the fixture's expected permission-posture assertion.
-All new M4 and M5 dispatch regressions passed in that run.
-No production tmux code was changed because this residual is outside the new dispatch authority and claim parsing paths.
+The post-M4 focused dispatch filter originally exposed a hermetic pre-launch unreadable-process-evidence race in `dispatch_test_harness_command_failures_roll_back_all_side_effects`.
+The H4 deterministic fixture correction resolved that test without changing production tmux behavior.
 
 The H4 fixture correction replaces timing-sensitive pre-launch tmux observation in the three affected hermetic dispatch tests with deterministic process-evidence fixtures while retaining real terminal creation, durable persistence, and rollback assertions.
 `dispatch_test_harness_command_failures_roll_back_all_side_effects`, `dispatch_test_harness_command_success_persists_separate_permission_axes`, and `dispatch_restart_rejects_contender_without_releasing_successful_winner` all passed after the correction.
